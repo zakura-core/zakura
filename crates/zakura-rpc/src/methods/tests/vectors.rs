@@ -3187,7 +3187,7 @@ async fn check_template_rejection_recovery(reject_before_poll: bool) {
         preparation.take().unwrap().respond_error(rejection());
         tokio::time::timeout(
             Duration::from_secs(1),
-            rpc.wait_for_mining_template_rejection(&work_id),
+            rpc.wait_for_mining_template_withdrawal(Some(&work_id)),
         )
         .await
         .unwrap();
@@ -3217,7 +3217,7 @@ async fn check_template_rejection_recovery(reject_before_poll: bool) {
     }
     tokio::time::timeout(
         Duration::from_secs(1),
-        rpc.wait_for_mining_template_rejection(&work_id),
+        rpc.wait_for_mining_template_withdrawal(Some(&work_id)),
     )
     .await
     .unwrap();

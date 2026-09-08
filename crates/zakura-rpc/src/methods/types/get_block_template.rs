@@ -66,6 +66,14 @@ pub use parameters::{
 };
 pub use proposal::{BlockProposalResponse, BlockTemplateTimeSource};
 
+/// How many rejected work IDs one parent retains before the server stops trusting any of its
+/// templates and falls back for the rest of that parent.
+const MAX_REJECTED_WORK_IDS: usize = 64;
+
+/// How many validated work IDs one parent retains. The oldest is forgotten first, so a miner
+/// holding very old work loses its withdrawal exemption rather than growing this queue.
+const MAX_PREPARED_WORK_IDS: usize = 64;
+
 /// Rejections for the current template parent. Overflow fails closed until the tip changes.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TemplateRejections {
@@ -90,7 +98,7 @@ impl TemplateRejections {
         if self.parent != Some(parent) || self.contains(work_id) {
             return false;
         }
-        if self.rejected.len() == 64 {
+        if self.rejected.len() == MAX_REJECTED_WORK_IDS {
             self.saturated = true;
         } else {
             self.rejected.insert(work_id.to_owned());
@@ -112,7 +120,7 @@ impl TemplateRejections {
 
     pub(crate) fn mark_prepared(&mut self, parent: block::Hash, work_id: &str) {
         if self.parent == Some(parent) && !self.prepared.iter().any(|id| id == work_id) {
-            if self.prepared.len() == 64 {
+            if self.prepared.len() == MAX_PREPARED_WORK_IDS {
                 self.prepared.pop_front();
             }
             self.prepared.push_back(work_id.to_owned());

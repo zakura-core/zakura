@@ -316,20 +316,27 @@ lscpu -J > "$OUT_DIR/cpu.json"
 
 if [[ "$HISTORICAL_PRUNED" == true ]]; then
   # Preparation runs only against this invocation's disposable state copy.
-  # A short sync drains the remaining 10,000-block retention window before timing.
-  WARMUP_HEIGHT=$(( START_HEIGHT + 1000 ))
+  # Normal startup migrates the baked format before the strict offline prune CLI.
+  # A second sync drains the remaining retention window before timing.
+  MIGRATION_HEIGHT=$(( START_HEIGHT + 1000 ))
+  WARMUP_HEIGHT=$(( MIGRATION_HEIGHT + 1000 ))
   (( STOP_HEIGHT > WARMUP_HEIGHT )) || die "stop height must exceed pruned warmup"
+  preparation_sync() {
+    local name="$1" storage="$2" height="$3"
+    local config="$OUT_DIR/$name-config.toml" logfile="$OUT_DIR/$name.log"
+    sed "s/^debug_stop_at_height = .*/debug_stop_at_height = $height/; s/^storage_mode = .*/storage_mode = \"$storage\"/; /trace_dir = /d" \
+      "$CFG" > "$config"
+    timeout --kill-after=30s 600s "$ZAKURAD_BIN" -c "$config" start \
+      > "$logfile" 2>&1 || die "$name failed or timed out"
+    grep -F 'stopping at configured height, flushing database to disk' "$logfile" \
+      | grep -Fq "height=Height($height)" || die "$name did not confirm the requested height"
+  }
+  preparation_sync migration archive "$MIGRATION_HEIGHT"
   timeout --kill-after=30s 1200s "$ZAKURAD_BIN" -c "$CFG" prune-state \
     --cache-dir "$STATE_CACHE_DIR" --network Mainnet --tx-retention 10000 --confirm \
     > "$OUT_DIR/prune-preparation.log" 2>&1 \
     || die "offline pruning failed or timed out"
-  WARMUP_CFG="$OUT_DIR/warmup-config.toml"
-  sed "s/^debug_stop_at_height = .*/debug_stop_at_height = $WARMUP_HEIGHT/; /trace_dir = /d" \
-    "$CFG" > "$WARMUP_CFG"
-  timeout --kill-after=30s 600s "$ZAKURAD_BIN" -c "$WARMUP_CFG" start \
-    > "$OUT_DIR/warmup.log" 2>&1 || die "pruned warmup failed or timed out"
-  grep -F 'stopping at configured height, flushing database to disk' "$OUT_DIR/warmup.log" \
-    | grep -Fq "height=Height($WARMUP_HEIGHT)" || die "warmup did not confirm the requested height"
+  preparation_sync warmup pruned "$WARMUP_HEIGHT"
   START_HEIGHT="$WARMUP_HEIGHT"
   sync
   echo 3 > /proc/sys/vm/drop_caches

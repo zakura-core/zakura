@@ -62,6 +62,10 @@ may still be waiting for QUIC. The slots return when the request, query, and all
 writes have finished or been discarded. QUIC may still hold bytes after accepting
 a write; we don't wait for the peer to confirm it has read them.
 
+Before encoding a response, we reserve a send-queue slot. A full queue therefore
+does not trigger serialization. If encoding fails, the queue slot is returned
+without sharing the response's producer with the transport.
+
 For example, if one response is stuck waiting to be written, the next GetBlocks
 request on that session waits for its slot. We retain its height and count, but
 keep reading so responses to our own downloads can get through. Otherwise two

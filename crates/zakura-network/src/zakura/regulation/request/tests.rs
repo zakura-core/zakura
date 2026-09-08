@@ -92,15 +92,14 @@ async fn finite_discovery_response_retains_work_through_its_write() {
         .encode()
         .unwrap();
     let payload_bytes = u64::try_from(payload.len()).unwrap();
-    send.try_send_guarded(
+    send.try_reserve_guarded().unwrap().send(
         Frame {
             message_type: 1,
             flags: 0,
             payload,
         },
-        || response.frame_guard(payload_bytes),
-    )
-    .unwrap();
+        response.frame_guard(payload_bytes),
+    );
     let queued = recv.recv().await.unwrap();
     drop(response);
     drop(work);

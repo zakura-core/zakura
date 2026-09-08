@@ -94,47 +94,32 @@ impl FramedSend {
         }
     }
 
-    /// Reserve a queue slot before attaching a response ownership guard.
-    ///
-    /// `make_guard` is called only after the transport owns a queue slot. This
-    /// prevents accounting from moving to the transport when the queue is full
-    /// or closed.
-    pub(crate) fn try_send_guarded(
-        &self,
-        frame: Frame,
-        make_guard: impl FnOnce() -> FrameGuard,
-    ) -> Result<(), GuardedSendError> {
+    /// Reserve queue space before encoding a response or sharing its ownership.
+    pub(crate) fn try_reserve_guarded(&self) -> Result<GuardedFrameSlot<'_>, GuardedReserveError> {
         let FramedSender::Queued(sender) = &self.sender else {
-            return Err(GuardedSendError::Unsupported(frame));
+            return Err(GuardedReserveError::Unsupported);
         };
-
-        match sender.try_reserve() {
-            Ok(slot) => {
-                slot.send(QueuedFrame::guarded(frame, make_guard()));
-                Ok(())
-            }
-            Err(mpsc::error::TrySendError::Full(())) => Err(GuardedSendError::Full(frame)),
-            Err(mpsc::error::TrySendError::Closed(())) => Err(GuardedSendError::Closed(frame)),
-        }
+        sender
+            .try_reserve()
+            .map(GuardedFrameSlot)
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(()) => GuardedReserveError::Full,
+                mpsc::error::TrySendError::Closed(()) => GuardedReserveError::Closed,
+            })
     }
 
-    /// Wait for a queue slot before attaching a response ownership guard.
-    /// Cancelling this wait leaves the guard with the caller.
-    pub(crate) async fn send_guarded(
+    /// Wait for queue space. Cancellation leaves response ownership with the caller.
+    pub(crate) async fn reserve_guarded(
         &self,
-        frame: Frame,
-        make_guard: impl FnOnce() -> FrameGuard,
-    ) -> Result<(), GuardedSendError> {
+    ) -> Result<GuardedFrameSlot<'_>, GuardedReserveError> {
         let FramedSender::Queued(sender) = &self.sender else {
-            return Err(GuardedSendError::Unsupported(frame));
+            return Err(GuardedReserveError::Unsupported);
         };
-        match sender.reserve().await {
-            Ok(slot) => {
-                slot.send(QueuedFrame::guarded(frame, make_guard()));
-                Ok(())
-            }
-            Err(_) => Err(GuardedSendError::Closed(frame)),
-        }
+        sender
+            .reserve()
+            .await
+            .map(GuardedFrameSlot)
+            .map_err(|_| GuardedReserveError::Closed)
     }
 
     /// Current free slots in the bounded transport queue.
@@ -154,34 +139,26 @@ impl FramedSend {
     }
 }
 
-/// Failure to queue a guarded frame.
+/// One reserved queue slot. Dropping it returns capacity without sending a frame.
 #[derive(Debug)]
-pub(crate) enum GuardedSendError {
-    /// The bounded transport queue has no free slot.
-    Full(Frame),
-    /// The transport worker has closed its receive half.
-    Closed(Frame),
-    /// This handle wraps a compatibility channel without guard support.
-    Unsupported(Frame),
+pub(crate) struct GuardedFrameSlot<'a>(mpsc::Permit<'a, QueuedFrame>);
+
+impl GuardedFrameSlot<'_> {
+    /// Transfer a validated frame and its ownership to the reserved queue slot.
+    pub(crate) fn send(self, frame: Frame, guard: FrameGuard) {
+        self.0.send(QueuedFrame::guarded(frame, guard));
+    }
 }
 
-impl GuardedSendError {
-    /// Recover the frame that was not queued.
-    pub(crate) fn into_frame(self) -> Frame {
-        match self {
-            Self::Full(frame) | Self::Closed(frame) | Self::Unsupported(frame) => frame,
-        }
-    }
-
-    /// Return whether the queue was temporarily full.
-    pub(crate) fn is_full(&self) -> bool {
-        matches!(self, Self::Full(_))
-    }
-
-    /// Return whether the worker permanently closed the queue.
-    pub(crate) fn is_closed(&self) -> bool {
-        matches!(self, Self::Closed(_))
-    }
+/// Failure to reserve space for a guarded response.
+#[derive(Debug)]
+pub(crate) enum GuardedReserveError {
+    /// The bounded transport queue has no free slot.
+    Full,
+    /// The transport worker has closed its receive half.
+    Closed,
+    /// This handle wraps a compatibility channel without guard support.
+    Unsupported,
 }
 
 /// Shared service ownership held until a frame finishes its application write.
@@ -275,10 +252,7 @@ fn map_queued_try_send_error(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    };
+    use std::sync::Arc;
 
     use super::*;
     use crate::zakura::regulation::SlotBudget;
@@ -342,8 +316,9 @@ mod tests {
         let reservation = Arc::new(budget.try_reserve().expect("the producer is free"));
 
         sender
-            .try_send_guarded(frame(1), || FrameGuard::new(reservation.clone()))
-            .expect("the worker queue has a slot");
+            .try_reserve_guarded()
+            .expect("the worker queue has a slot")
+            .send(frame(1), FrameGuard::new(reservation.clone()));
         drop(reservation);
         assert_eq!(budget.reserved(), 1);
 
@@ -362,8 +337,9 @@ mod tests {
         let budget = SlotBudget::new(1).unwrap();
         let reservation = Arc::new(budget.try_reserve().expect("the producer is free"));
         sender
-            .try_send_guarded(frame(1), || FrameGuard::new(reservation.clone()))
-            .expect("the worker queue has a slot");
+            .try_reserve_guarded()
+            .expect("the worker queue has a slot")
+            .send(frame(1), FrameGuard::new(reservation.clone()));
         drop(reservation);
         let queued = receiver.recv().await.expect("worker receives the frame");
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -387,8 +363,9 @@ mod tests {
         let budget = SlotBudget::new(1).unwrap();
         let reservation = Arc::new(budget.try_reserve().expect("the producer is free"));
         sender
-            .try_send_guarded(frame(1), || FrameGuard::new(reservation.clone()))
-            .expect("the worker queue has a slot");
+            .try_reserve_guarded()
+            .expect("the worker queue has a slot")
+            .send(frame(1), FrameGuard::new(reservation.clone()));
         drop(reservation);
         let queued = receiver.recv().await.expect("worker receives the frame");
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -414,17 +391,15 @@ mod tests {
         sender.try_send(frame(1)).expect("filler fits");
         let budget = SlotBudget::new(1).unwrap();
         let reservation = Arc::new(budget.try_reserve().expect("the producer is free"));
-        let called = AtomicBool::new(false);
-        let mut send = Box::pin(sender.send_guarded(frame(2), || {
-            called.store(true, Ordering::SeqCst);
-            FrameGuard::new(reservation.clone())
-        }));
-        assert!(futures::poll!(&mut send).is_pending());
-        assert!(!called.load(Ordering::SeqCst));
+        let mut pending = Box::pin(sender.reserve_guarded());
+        assert!(futures::poll!(&mut pending).is_pending());
+        assert_eq!(Arc::strong_count(&reservation), 1);
         assert_eq!(budget.reserved(), 1);
         drop(receiver.recv().await.expect("filler queued"));
-        send.await.expect("the freed slot admits the frame");
-        assert!(called.load(Ordering::SeqCst));
+        pending
+            .await
+            .expect("the freed slot admits the frame")
+            .send(frame(2), FrameGuard::new(reservation.clone()));
         drop(reservation);
         assert_eq!(budget.reserved(), 1);
         let queued = receiver.recv().await.expect("guarded frame queued");
@@ -444,66 +419,52 @@ mod tests {
         sender.try_send(frame(1)).expect("filler fits");
         let budget = SlotBudget::new(1).unwrap();
         let reservation = Arc::new(budget.try_reserve().expect("the producer is free"));
-        let called = AtomicBool::new(false);
-        let mut send = Box::pin(sender.send_guarded(frame(2), || {
-            called.store(true, Ordering::SeqCst);
-            FrameGuard::new(reservation.clone())
-        }));
-        assert!(futures::poll!(&mut send).is_pending());
-        drop(send);
+        let mut pending = Box::pin(sender.reserve_guarded());
+        assert!(futures::poll!(&mut pending).is_pending());
+        drop(pending);
         drop(receiver.recv().await.expect("filler queued"));
-        assert!(!called.load(Ordering::SeqCst));
+        assert_eq!(Arc::strong_count(&reservation), 1);
         assert_eq!(budget.reserved(), 1);
         drop(receiver);
-        let result = sender
-            .send_guarded(frame(2), || {
-                called.store(true, Ordering::SeqCst);
-                FrameGuard::new(reservation.clone())
-            })
-            .await;
-        assert!(matches!(result, Err(GuardedSendError::Closed(_))));
-        assert!(!called.load(Ordering::SeqCst));
+        assert!(matches!(
+            sender.reserve_guarded().await,
+            Err(GuardedReserveError::Closed)
+        ));
+        assert_eq!(Arc::strong_count(&reservation), 1);
         assert_eq!(budget.reserved(), 1);
         drop(reservation);
         assert_eq!(budget.reserved(), 0);
     }
 
     #[test]
-    fn failed_guarded_send_does_not_create_a_guard() {
-        let (sender, _receiver) = worker_framed_channel(1);
-        sender.try_send(frame(1)).expect("the queue slot is free");
-        let full_called = Arc::new(AtomicBool::new(false));
-        let called_by_factory = full_called.clone();
-
-        let result = sender.try_send_guarded(frame(2), move || {
-            called_by_factory.store(true, Ordering::SeqCst);
-            FrameGuard::new(Arc::new(()))
-        });
-
-        assert!(matches!(result, Err(GuardedSendError::Full(_))));
-        assert!(!full_called.load(Ordering::SeqCst));
-
+    fn guarded_reservation_reports_full_closed_and_unsupported_queues() {
         let (sender, receiver) = worker_framed_channel(1);
+        sender.try_send(frame(1)).unwrap();
+        assert!(matches!(
+            sender.try_reserve_guarded(),
+            Err(GuardedReserveError::Full)
+        ));
         drop(receiver);
-        let closed_called = Arc::new(AtomicBool::new(false));
-        let called_by_factory = closed_called.clone();
-        let result = sender.try_send_guarded(frame(3), move || {
-            called_by_factory.store(true, Ordering::SeqCst);
-            FrameGuard::new(Arc::new(()))
-        });
-        assert!(matches!(result, Err(GuardedSendError::Closed(_))));
-        assert!(!closed_called.load(Ordering::SeqCst));
+        assert!(matches!(
+            sender.try_reserve_guarded(),
+            Err(GuardedReserveError::Closed)
+        ));
 
         let (raw_sender, _raw_receiver) = mpsc::channel(1);
         let sender = FramedSend::new(raw_sender);
-        let unsupported_called = Arc::new(AtomicBool::new(false));
-        let called_by_factory = unsupported_called.clone();
-        let result = sender.try_send_guarded(frame(4), move || {
-            called_by_factory.store(true, Ordering::SeqCst);
-            FrameGuard::new(Arc::new(()))
-        });
-        assert!(matches!(result, Err(GuardedSendError::Unsupported(_))));
-        assert!(!unsupported_called.load(Ordering::SeqCst));
+        assert!(matches!(
+            sender.try_reserve_guarded(),
+            Err(GuardedReserveError::Unsupported)
+        ));
+    }
+
+    #[test]
+    fn dropping_reserved_slot_returns_queue_capacity() {
+        let (sender, _receiver) = worker_framed_channel(1);
+        let slot = sender.try_reserve_guarded().unwrap();
+        assert_eq!(sender.capacity(), 0);
+        drop(slot);
+        assert_eq!(sender.capacity(), 1);
     }
 
     #[test]
@@ -512,8 +473,9 @@ mod tests {
         let budget = SlotBudget::new(1).unwrap();
         let reservation = Arc::new(budget.try_reserve().expect("the producer is free"));
         sender
-            .try_send_guarded(frame(1), || FrameGuard::new(reservation.clone()))
-            .expect("the worker queue has a slot");
+            .try_reserve_guarded()
+            .expect("the worker queue has a slot")
+            .send(frame(1), FrameGuard::new(reservation.clone()));
         drop(reservation);
         assert_eq!(budget.reserved(), 1);
 
@@ -571,16 +533,14 @@ mod tests {
         let producer = SlotBudget::new(1).unwrap();
         let owner = Arc::new(producer.try_reserve().unwrap());
         let (queue, mut writer) = worker_framed_channel(1);
-        queue
-            .try_send_guarded(
-                Frame {
-                    message_type: 1,
-                    flags: 0,
-                    payload: vec![0; 2_000_001],
-                },
-                || FrameGuard::new(owner.clone()),
-            )
-            .unwrap();
+        queue.try_reserve_guarded().unwrap().send(
+            Frame {
+                message_type: 1,
+                flags: 0,
+                payload: vec![0; 2_000_001],
+            },
+            FrameGuard::new(owner.clone()),
+        );
         drop(owner);
         let queued = writer.recv().await.unwrap();
         let mut write = tokio::spawn(queued.write_with(move |frame| async move {

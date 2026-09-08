@@ -7942,11 +7942,10 @@ mod tests {
         };
         let producer = crate::zakura::regulation::SlotBudget::new(1).unwrap();
         let ownership = Arc::new(producer.try_reserve().unwrap());
-        outbound_tx
-            .try_send_guarded(response.clone(), || {
-                crate::zakura::transport::FrameGuard::new(ownership)
-            })
-            .unwrap();
+        outbound_tx.try_reserve_guarded().unwrap().send(
+            response.clone(),
+            crate::zakura::transport::FrameGuard::new(ownership),
+        );
         let written = timeout(
             Duration::from_secs(2),
             read_frame(

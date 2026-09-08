@@ -49,6 +49,8 @@ There is one addition exception: an otherwise eligible PR may add its own
 modify `deploy/zakura-watchdog/src/main.rs` and add
 `docs/changelog/unreleased/123.md`. Later edits to that new fragment within the
 same PR still qualify because it remains an addition relative to the base.
+The adapter requires this fragment when an eligible PR changes a Rust source
+file or `Cargo.toml`, including internal changes with a no-changelog fragment.
 The fragment must be a regular text file without `release-readiness` directives;
 release-policy waivers still need human review. The root `CHANGELOG.md`, other
 PRs' fragments, existing fragment edits/deletions, and changelog-only PRs remain

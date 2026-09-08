@@ -226,6 +226,16 @@ class EvidenceTests(unittest.TestCase):
 
 
 class PathTests(unittest.TestCase):
+    def test_rust_and_cargo_changes_require_own_fragment(self):
+        for path in ("deploy/zakura-watchdog/src/main.rs", "deploy/zakura-watchdog/Cargo.toml"):
+            for status in ("modified", "removed"):
+                with self.subTest(path=path, status=status):
+                    files = [{"filename": path, "status": status}]
+                    with self.assertRaisesRegex(adapter.Ineligible, "require this PR's changelog"):
+                        POLICY.check_files(files, 1, 123)
+                    files.append({"filename": "docs/changelog/unreleased/123.md", "status": "added"})
+                    self.assertEqual(POLICY.check_files(files, 2, 123), files[1]["filename"])
+
     def test_eligible_watchdog_change_can_add_its_own_fragment(self):
         files = [{"filename": "deploy/zakura-watchdog/src/main.rs", "status": "modified"},
                  {"filename": "docs/changelog/unreleased/123.md", "status": "added"}]

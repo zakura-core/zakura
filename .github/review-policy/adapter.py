@@ -109,6 +109,10 @@ class Policy:
             require(file["status"] != "renamed", "Renamed files require human classification")
         require(len(files) > int(fragment is not None),
                 "A changelog fragment must accompany an eligible CI or deployment change")
+        require(fragment is not None or not any(
+            f["filename"].endswith(".rs") or f["filename"].split("/")[-1] == "Cargo.toml"
+            for f in files
+        ), "Rust and Cargo.toml changes require this PR's changelog fragment")
         return fragment
 
     def native(self, obj):

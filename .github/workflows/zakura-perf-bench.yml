@@ -44,6 +44,15 @@ on:
         description: "Optional historical_sync A/B baseline (live_head is intentionally single-leg)"
         required: false
         default: ""
+      comparison:
+        description: "Compare refs, VCT on/off, dual/Zakura transport, or traces off/on"
+        type: choice
+        default: refs
+        options:
+          - refs
+          - vct
+          - transport
+          - tracing
       profile:
         description: "CPU profiling: cpu = flamegraph + CPU counters; off = workload only"
         type: choice
@@ -103,6 +112,7 @@ jobs:
           # 06:47 cron is the semantic baseline
           REF: ${{ inputs.ref || 'main' }}
           BASELINE_REF: ${{ inputs.baseline_ref }}
+          COMPARISON: ${{ inputs.comparison || 'refs' }}
           REQUESTED_WORKLOAD: ${{ github.event_name == 'schedule' && (github.event.schedule == '47 6 * * 1' && 'historical_semantic' || 'historical_checkpoint') || inputs.workload || 'historical_checkpoint' }}
         run: |
           set -euo pipefail
@@ -112,20 +122,38 @@ jobs:
             live_head) WORKLOAD=live_head; VERIFY_MODE=semantic ;;
             *) echo "unknown workload: $REQUESTED_WORKLOAD" >&2; exit 1 ;;
           esac
-          if [ "$WORKLOAD" = live_head ] && [ -n "$BASELINE_REF" ]; then
-            echo "live_head is observational and intentionally single-leg; leave baseline_ref blank" >&2
+          if [ "$WORKLOAD" = live_head ] && { [ -n "$BASELINE_REF" ] || [ "$COMPARISON" != refs ]; }; then
+            echo "live_head is observational and intentionally single-leg" >&2
             exit 1
           fi
+          case "$COMPARISON" in refs|vct|transport|tracing) ;; *) exit 1 ;; esac
+          if [ "$COMPARISON" != refs ] && [ "$VERIFY_MODE" != checkpoint ]; then
+            echo "configuration comparisons require historical_checkpoint" >&2
+            exit 1
+          fi
+          if [ "$COMPARISON" != refs ]; then BASELINE_REF="${BASELINE_REF:-$REF}"; fi
           resolve() { gh api "repos/${REPO}/commits/$1" --jq .sha; }
           PRIMARY_SHA=$(resolve "$REF")
-          legs="[{\"leg\":\"primary\",\"ref\":\"${REF}\",\"sha\":\"${PRIMARY_SHA}\"}"
+          leg() {
+            jq -nc --arg leg "$1" --arg ref "$2" --arg sha "$3" \
+              '{leg: $leg, ref: $ref, sha: $sha, p2p_stack: "", vct_fast_sync: "auto", traces: "true"}'
+          }
+          legs=$(leg primary "$REF" "$PRIMARY_SHA" | jq -sc '.')
           has_baseline=false
           if [ -n "$BASELINE_REF" ]; then
             BASELINE_SHA=$(resolve "$BASELINE_REF")
-            legs="${legs},{\"leg\":\"baseline\",\"ref\":\"${BASELINE_REF}\",\"sha\":\"${BASELINE_SHA}\"}"
+            baseline=$(leg baseline "$BASELINE_REF" "$BASELINE_SHA")
+            legs=$(jq -c --argjson baseline "$baseline" '. + [$baseline]' <<<"$legs")
             has_baseline=true
           fi
-          legs="${legs}]"
+          case "$COMPARISON" in
+            vct)
+              legs=$(jq -c 'map(.p2p_stack = "zakura" | .vct_fast_sync = (if .leg == "primary" then "true" else "false" end))' <<<"$legs") ;;
+            transport)
+              legs=$(jq -c 'map(.vct_fast_sync = "true" | .p2p_stack = (if .leg == "primary" then "dual" else "zakura" end))' <<<"$legs") ;;
+            tracing)
+              legs=$(jq -c 'map(.p2p_stack = "zakura" | .vct_fast_sync = "true" | .traces = (if .leg == "primary" then "false" else "true" end))' <<<"$legs") ;;
+          esac
           {
             echo "legs=${legs}"
             echo "has_baseline=${has_baseline}"
@@ -141,6 +169,7 @@ jobs:
     timeout-minutes: 180
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         leg: ${{ fromJSON(needs.plan.outputs.legs) }}
     steps:
@@ -188,6 +217,10 @@ jobs:
           HEAD_PROFILE_MINUTES: ${{ inputs.head_profile_minutes || '60' }}
           START_HEIGHT: ${{ vars.PERF_BENCH_START_HEIGHT || '1707210' }}
           PEERSET_SIZE: ${{ inputs.peerset_size || '75' }}
+          P2P_STACK: ${{ matrix.leg.p2p_stack }}
+          VCT_FAST_SYNC: ${{ matrix.leg.vct_fast_sync }}
+          ENABLE_TRACES: ${{ matrix.leg.traces }}
+          COMPARISON: ${{ inputs.comparison || 'refs' }}
           VOLUME_NAME: ${{ steps.droplet.outputs.volume_name }}
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -206,6 +239,10 @@ jobs:
             printf 'HEAD_PROFILE_MINUTES=%q\n' "${HEAD_PROFILE_MINUTES}"
             printf 'START_HEIGHT=%q\n'     "${START_HEIGHT}"
             printf 'PEERSET_SIZE=%q\n'     "${PEERSET_SIZE}"
+            printf 'P2P_STACK=%q\n'        "${P2P_STACK}"
+            printf 'VCT_FAST_SYNC=%q\n'    "${VCT_FAST_SYNC}"
+            printf 'ENABLE_TRACES=%q\n'    "${ENABLE_TRACES}"
+            printf 'COMPARISON=%q\n'       "${COMPARISON}"
             printf 'VOLUME_NAME=%q\n'      "${VOLUME_NAME}"
             printf 'GITHUB_RUN_URL=%q\n'   "${GITHUB_RUN_URL}"
             printf 'GITHUB_RUN_ID=%q\n'    "${GITHUB_RUN_ID}"
@@ -251,7 +288,9 @@ jobs:
         uses: ./.github/actions/do-teardown
         with:
           droplet_id: ${{ steps.droplet.outputs.id }}
+          droplet_name: zakura-perf-${{ matrix.leg.leg }}-${{ github.run_id }}
           volume_ids: ${{ steps.droplet.outputs.volume_id }}
+          volume_names: zakura-pr-perf-vol-${{ github.run_id }}-${{ matrix.leg.leg }}
           # string-compare: on schedule/pull_request the input is null, and
           # GitHub's loose `null == false` coercion would skip teardown
           enabled: ${{ format('{0}', inputs.teardown_after_run) == 'false' && 'false' || 'true' }}

@@ -48,6 +48,17 @@ def render(primary: dict | None, baseline: dict | None) -> tuple[str, bool]:
     if failed:
         return f"No comparison: zakurad failed in {', '.join(failed)}.", False
 
+    for meta in (primary, baseline):
+        if meta.get("workload") == "historical_sync" and (
+            not meta.get("clean_stop") or meta.get("end_height") != meta.get("stop_height", meta.get("end_height"))
+        ):
+            return f"No comparison: {meta['leg']} did not complete its requested range.", False
+    if primary.get("workload") == "historical_sync" and any(
+        primary.get(key) != baseline.get(key)
+        for key in ("workload", "verify_mode", "start_height", "end_height", "storage_mode")
+    ):
+        return "No comparison: the workloads or block ranges differ.", False
+
     # A zero-throughput baseline has no meaningful ratio; report it as nan
     # rather than crashing, and let the blocks/s column show what happened.
     speedup = primary["bps"] / baseline["bps"] if baseline["bps"] else float("nan")
@@ -68,6 +79,13 @@ def render(primary: dict | None, baseline: dict | None) -> tuple[str, bool]:
         f"({baseline['bps']} → {primary['bps']} blocks/s, "
         "both legs on identical parallel droplets)"
     )
+    if "comparison" in primary:
+        lines.extend(["", "Configuration for each leg:"])
+        for meta in (baseline, primary):
+            lines.append(
+                f"- {meta['leg']}: {meta.get('p2p_stack')}, VCT={meta.get('vct_fast_sync')}, "
+                f"traces={meta.get('traces')}, storage={meta.get('storage_mode')}"
+            )
     return "\n".join(lines), True
 
 

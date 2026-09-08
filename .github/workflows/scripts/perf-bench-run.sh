@@ -27,6 +27,8 @@
 #   HEAD_STABLE_SAMPLES, HEAD_MAX_ESTIMATED_DISTANCE, HEAD_MIN_HEALTHY_PEERS.
 #   P2P_STACK defaults to the production network default for live head and to
 #   Zakura for historical sync.
+#   VCT_FAST_SYNC=auto|true|false, ENABLE_TRACES=true|false select controlled
+#   checkpoint comparisons; each leg always starts from its own volume clone.
 #
 # Helper scripts scp'd next to this one by the workflow (from the workflow's
 # own checkout, so the benched ref does not need to contain them):
@@ -44,6 +46,11 @@ PROFILE_DWARF_STACK="${PROFILE_DWARF_STACK:-8192}"
 CKPT_LIMIT="${CKPT_LIMIT:-1500}"
 DL_LIMIT="${DL_LIMIT:-150}"
 P2P_STACK="${P2P_STACK:-}"
+VCT_FAST_SYNC="${VCT_FAST_SYNC:-auto}"
+ENABLE_TRACES="${ENABLE_TRACES:-true}"
+COMPARISON="${COMPARISON:-refs}"
+case "$VCT_FAST_SYNC" in auto|true|false) ;; *) exit 1 ;; esac
+case "$ENABLE_TRACES" in true|false) ;; *) exit 1 ;; esac
 METRICS_PORT=9999
 SAMPLE_INTERVAL=5
 HEAD_STABLE_SAMPLES="${HEAD_STABLE_SAMPLES:-6}"
@@ -229,7 +236,7 @@ CFG=/root/bench-config.toml
   echo ''
   if [[ "$P2P_STACK" == "zakura" || "$P2P_STACK" == "dual" ]]; then
     echo '[network.zakura]'
-    echo "trace_dir = \"$TRACE_DIR\""
+    [[ "$ENABLE_TRACES" == true ]] && echo "trace_dir = \"$TRACE_DIR\""
     echo 'bootstrap_peers = ['
     for peer in "${ZAKURA_BOOTSTRAP_PEERS[@]}"; do
       echo "  \"$peer\","
@@ -242,6 +249,11 @@ CFG=/root/bench-config.toml
     # below the sandblast tip, so every synced block gets script+proof checks.
     echo '[consensus]'
     echo 'checkpoint_sync = false'
+    echo ''
+  elif [[ "$VCT_FAST_SYNC" != auto ]]; then
+    echo '[consensus]'
+    echo 'checkpoint_sync = true'
+    echo "vct_fast_sync = $VCT_FAST_SYNC"
     echo ''
   fi
   echo '[state]'
@@ -266,6 +278,9 @@ CFG=/root/bench-config.toml
   echo '[tracing]'
   echo 'filter = "info"'
 } > "$CFG"
+cp "$CFG" "$OUT_DIR/bench-config.toml"
+sha256sum "$ZAKURAD_BIN" > "$OUT_DIR/binary.sha256"
+lscpu -J > "$OUT_DIR/cpu.json"
 
 [[ "$WORKLOAD" == live_head ]] && SNAPSHOT_HEIGHT=""
 
@@ -764,6 +779,9 @@ import json, sys
 json.dump({
     "leg": "$LEG", "sha": "$SHA", "workload": "$WORKLOAD",
     "verify_mode": "$VERIFY_MODE", "p2p_stack": "$P2P_STACK",
+    "comparison": "$COMPARISON", "vct_fast_sync": "$VCT_FAST_SYNC",
+    "traces": "$ENABLE_TRACES", "storage_mode": "$STORAGE_MODE",
+    "stop_height": $STOP_HEIGHT,
     "snapshot_height": ${SNAPSHOT_HEIGHT:-$START_HEIGHT},
     "start_height": $START_HEIGHT, "end_height": $END_HEIGHT,
     "start_hash": "${START_HASH}", "end_hash": "${END_HASH}",
@@ -787,5 +805,6 @@ if [[ "$WORKLOAD" == live_head ]]; then
   (( WINDOW_COMPLETE )) || die "live-head profile window did not complete"
   log "live-head profile done: $START_HEIGHT -> $END_HEIGHT ($BLOCKS blocks in ${TOTAL}s)"
 else
+  (( CLEAN_STOP )) || die "historical sync did not complete the requested range"
   log "leg $LEG done: $BLOCKS blocks in ${TOTAL}s ($BPS blk/s), verdict=${VERDICT:-n/a}"
 fi

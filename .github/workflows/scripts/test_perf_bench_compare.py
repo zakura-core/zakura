@@ -107,6 +107,19 @@ class Render(unittest.TestCase):
         self.assertTrue(comparable)
         self.assertIn("nan×", markdown)
 
+    def test_wall_cap_does_not_report_a_speedup(self):
+        partial = meta("primary", workload="historical_sync", clean_stop=False)
+        markdown, comparable = compare.render(partial, meta("baseline"))
+        self.assertFalse(comparable)
+        self.assertIn("did not complete", markdown)
+
+    def test_different_ranges_do_not_report_a_speedup(self):
+        primary = meta("primary", workload="historical_sync", clean_stop=True, start_height=100, end_height=200)
+        baseline = meta("baseline", workload="historical_sync", clean_stop=True, start_height=100, end_height=300)
+        markdown, comparable = compare.render(primary, baseline)
+        self.assertFalse(comparable)
+        self.assertIn("ranges differ", markdown)
+
 
 class LoadMeta(unittest.TestCase):
     def load(self, contents: str | None):

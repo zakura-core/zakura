@@ -14,11 +14,16 @@ Useful input combinations:
 
 - `-f workload=live_head` — single-leg 60-minute observational profile at real mainnet head. Mainnet's production default currently resolves to the legacy P2P stack. The gate requires the verified body tip to match the available header frontier for consecutive samples, at least three live peers, and a fresh estimated tip; the run fails if those conditions are lost for 30 seconds during capture. `baseline_ref` is rejected in this mode; use `head_profile_minutes` for a shorter smoke run.
 - `-f baseline_ref=main` — A/B: both refs bench simultaneously on identical droplets, and a compare job adds the blocks/s speedup, a per-function CPU self-share diff table, and a differential flamegraph (`flamegraph-diff.svg`).
+- `-f comparison=vct` — historical checkpoint comparison with the same ref and Zakura transport: primary enables VCT, baseline disables it.
+- `-f comparison=transport` — primary uses dual networking, baseline uses Zakura only; both enable VCT.
+- `-f comparison=tracing` — primary disables JSONL traces, baseline enables them; both use Zakura networking and VCT.
 - `-f workload=historical_semantic` — the fixed state range with full script and proof verification. `historical_checkpoint` is the default bulk-sync workload.
 - `-f droplet_size=c-32` — more cores per leg; `-f profile=off` — plain bench, no profiling sidecar.
 - `-f teardown_after_run=false` — keep the droplets up for SSH inspection (the hourly reaper removes them within 24h; they are tagged `zakura-pr-node`).
 
 Every Monday two scheduled runs profile `main` as standing baselines: 05:17 UTC in `checkpoint` mode and 06:47 UTC in `semantic` mode. Review them under Actions → Perf bench.
+
+Configuration comparisons require `historical_checkpoint` and create two independent clones of the same baked archive state. They keep archive storage on both legs; validate a promising result separately against pruned full sync. Leave `baseline_ref` empty to compare the same source revision. Artifacts include the generated benchmark config, binary checksum, and CPU description. A wall-time cap is an incomplete run and suppresses the throughput comparison. Droplets and cloned volumes are removed after artifact collection unless teardown was explicitly disabled.
 
 ## Read the results
 

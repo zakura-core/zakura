@@ -251,6 +251,8 @@ refund = upper_bound_response_bytes - actual_response_bytes
   admission boundary. It MUST stop reading that peer's ordered stream until Work becomes available.
   The existing bounded application and QUIC queues MUST provide backpressure. The implementation
   MUST NOT add a delayed-request queue or scheduler.
+  The GetBlocks rule below is an exception to these read-pause and queue requirements, because
+  requests and responses share the same ordered stream.
 - Pausing reads MUST propagate to the QUIC receive buffer. The transport MUST stop granting further
   stream credit as that buffer fills, so the peer cannot send more stream data after it exhausts
   existing credit. The resource bound MUST include already authorized data. The implementation MUST
@@ -677,9 +679,13 @@ Block sync already regulates its rate on the requesting side. Each sender sizes 
 limit the receiver advertises and operating at the measured bandwidth-delay product, which is
 normally far below that clamp. That window is the outbound obligation matching this inbound rule.
 
-The two sides meet through `Delay`. A receiver whose Work bucket is empty stops reading further
-frames from that peer's ordered stream until Work becomes available. Its bounded queues apply QUIC
-flow control instead of adding another request scheduler. The delay lengthens the sender's
+The two sides meet through `Delay`. A receiver whose Work is unavailable delays starting the
+request, but MUST continue reading so responses to its own downloads can progress. It MUST retain
+waiting GetBlocks requests in arrival order, storing only their request fields. The waiting queue
+and its single admission waiter together MUST NOT exceed the receiver's advertised inflight limit.
+Only the oldest waiting request competes for Work; the active response retains its Work ownership.
+If the waiting queue is full, the receiver MUST close that block-sync stream without scoring the
+peer: an older requester may have retried before earlier responses finished. The delay lengthens the sender's
 round-trip samples, the sender's delay gradient shrinks its window, and the sender settles below the
 rate the receiver serves.
 

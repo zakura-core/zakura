@@ -188,6 +188,24 @@ impl RepairRequirement {
         Ok(())
     }
 
+    /// Requeue a rejected batch after the caller limits that supplier to one header.
+    ///
+    /// Keep the range for other suppliers and preserve prior exclusions. A single-header
+    /// rejection cannot use this transition, so compatibility fallback cannot loop by itself.
+    pub fn retry_single_header_supplier(&mut self) -> Result<(), RepairPolicyError> {
+        let RepairPolicyState::Assigned { context } = &self.state else {
+            return Err(RepairPolicyError::IllegalState);
+        };
+        if context.selected_header_count() <= 1 {
+            return Err(RepairPolicyError::IllegalState);
+        }
+        self.state = RepairPolicyState::Ready {
+            context: context.clone(),
+        };
+        self.attempts = self.attempts.saturating_add(1);
+        Ok(())
+    }
+
     /// Rotate away from a supplier that returned semantic input excluded by durable state.
     pub fn exclude_input(&mut self, source: SourceId) -> Result<(), RepairPolicyError> {
         self.retry(source)?;

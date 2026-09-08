@@ -202,6 +202,8 @@ struct PeerState {
     last_status: Option<Status>,
     /// Consecutive requests this session answered with nothing usable.
     unproductive_requests: u32,
+    /// This session rejected a batched VCT repair using an older finalized-history locator rule.
+    single_header_vct_repairs: bool,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -377,6 +379,7 @@ impl HeaderRequestTerminal {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum VctRepairRetryAttribution {
     Supplier,
+    SingleHeaderFallback,
     ExcludedInput,
     Stale,
     Local,
@@ -969,6 +972,7 @@ impl HeaderSyncReactor {
                 status_publisher,
                 last_status: None,
                 unproductive_requests: 0,
+                single_header_vct_repairs: false,
             },
         ) {
             previous.session.cancel_token().cancel();
@@ -1714,12 +1718,38 @@ impl HeaderSyncReactor {
             HeaderRequestTerminal::MalformedResponse
         };
         if is_repair {
+            let repair_owner = active
+                .owner
+                .body_owner()
+                .expect("an auxiliary repair has body authority");
+            let single_header_fallback = terminal_outcome
+                == HeaderRequestTerminal::NoLocatorIntersection
+                && self.vct_repair.get(repair_owner).is_some_and(|task| {
+                    matches!(&task.state, RepairPolicyState::Assigned { context }
+                        if context.selected_header_count() > 1)
+                });
+            let source = active.source;
+            if single_header_fallback {
+                // Older suppliers only accept the target's immediate predecessor for finalized
+                // history. Narrow this session's requests without excluding an otherwise useful
+                // supplier. A failed single-header request still takes the ordinary failure path.
+                if let Some(state) = self.peer_state.get_mut(&peer) {
+                    state.single_header_vct_repairs = true;
+                }
+                metrics::counter!("sync.header.vct.repair.single_header_fallback.total")
+                    .increment(1);
+            }
             self.retry_vct_repair(
-                active
-                    .owner
-                    .body_owner()
-                    .expect("an auxiliary repair has body authority"),
-                VctRepairRetry::supplier(active.source, terminal_outcome),
+                repair_owner,
+                VctRepairRetry {
+                    source,
+                    terminal: terminal_outcome,
+                    attribution: if single_header_fallback {
+                        VctRepairRetryAttribution::SingleHeaderFallback
+                    } else {
+                        VctRepairRetryAttribution::Supplier
+                    },
+                },
             );
         } else {
             self.retire_peer_work(&peer, terminal_outcome);
@@ -2142,6 +2172,9 @@ impl HeaderSyncReactor {
                 .get_mut(owner)
                 .is_some_and(|task| match retry.attribution {
                     VctRepairRetryAttribution::Supplier => task.retry(source).is_ok(),
+                    VctRepairRetryAttribution::SingleHeaderFallback => {
+                        task.retry_single_header_supplier().is_ok()
+                    }
                     VctRepairRetryAttribution::ExcludedInput => task.exclude_input(source).is_ok(),
                     VctRepairRetryAttribution::Stale => false,
                     VctRepairRetryAttribution::Local => task
@@ -2161,6 +2194,7 @@ impl HeaderSyncReactor {
                     "retry",
                     Some(match retry.attribution {
                         VctRepairRetryAttribution::Supplier => "supplier_retry",
+                        VctRepairRetryAttribution::SingleHeaderFallback => "single_header_fallback",
                         VctRepairRetryAttribution::ExcludedInput => "excluded_input",
                         VctRepairRetryAttribution::Stale => "stale_episode",
                         VctRepairRetryAttribution::Local => "local_backoff",
@@ -2172,7 +2206,8 @@ impl HeaderSyncReactor {
                         predecessor,
                         VctSupplierRejections::default(),
                         match retry.attribution {
-                            VctRepairRetryAttribution::Supplier => {
+                            VctRepairRetryAttribution::Supplier
+                            | VctRepairRetryAttribution::SingleHeaderFallback => {
                                 VctRepairStallOutcome::SupplierFailure
                             }
                             VctRepairRetryAttribution::ExcludedInput => {
@@ -2187,7 +2222,9 @@ impl HeaderSyncReactor {
             }
             if matches!(
                 retry.attribution,
-                VctRepairRetryAttribution::Supplier | VctRepairRetryAttribution::ExcludedInput
+                VctRepairRetryAttribution::Supplier
+                    | VctRepairRetryAttribution::SingleHeaderFallback
+                    | VctRepairRetryAttribution::ExcludedInput
             ) {
                 self.try_assign_vct_repair();
             }
@@ -3233,7 +3270,12 @@ impl HeaderSyncReactor {
                 )
                 .unwrap_or(usize::MAX),
             );
-            let peer_supported_count = desired_count
+            let repair_limit = if state.single_header_vct_repairs {
+                1
+            } else {
+                desired_count
+            };
+            let peer_supported_count = repair_limit
                 .min(reachable_count)
                 .min(status.max_headers_per_response)
                 .min(self.serving_limits.max_headers_per_response())
@@ -3337,8 +3379,9 @@ impl HeaderSyncReactor {
                         VctRepairRetryAttribution::Local => {
                             local_send_failure = true;
                         }
-                        VctRepairRetryAttribution::Stale => unreachable!(
-                            "ordered-send failures cannot report a stale state episode"
+                        VctRepairRetryAttribution::Stale
+                        | VctRepairRetryAttribution::SingleHeaderFallback => unreachable!(
+                            "ordered-send failures cannot report stale state or protocol compatibility"
                         ),
                     }
                     continue;

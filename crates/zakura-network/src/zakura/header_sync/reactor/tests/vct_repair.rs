@@ -275,6 +275,15 @@ async fn committer_repair_replaces_and_then_restores_a_sweep_repair() {
 
 #[tokio::test]
 async fn vct_repair_restarts_after_state_rejection_and_refuses_the_same_semantic_input() {
+    check_vct_repair_admission_and_rejection(false).await;
+}
+
+#[tokio::test]
+async fn single_header_vct_fallback_preserves_admission_and_semantic_rejection() {
+    check_vct_repair_admission_and_rejection(true).await;
+}
+
+async fn check_vct_repair_admission_and_rejection(single_header_supplier: bool) {
     let shutdown = CancellationToken::new();
     let mut startup = startup(shutdown.clone());
     let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
@@ -327,7 +336,7 @@ async fn vct_repair_restarts_after_state_rejection_and_refuses_the_same_semantic
         selected_tip_hash: selected_tip.hash,
         suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
         oldest_retained_height: anchor.height,
-        max_headers_per_response: 1,
+        max_headers_per_response: 2,
         max_inflight_requests: 1,
         max_message_bytes: 2_000_000,
         tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
@@ -340,21 +349,64 @@ async fn vct_repair_restarts_after_state_rejection_and_refuses_the_same_semantic
         })
         .await
         .expect("the repair supplier status reaches the reactor");
+    let context = zakura_header_chain::VctRepairContext::from_durable_rows(
+        repair_header,
+        zakura_header_chain::HeaderLocator::for_continuation(anchor),
+        snapshot.state_version,
+        Some(selected_tip.hash),
+        true,
+        &[],
+    )
+    .expect("the selected height has no durable auxiliary rows");
+    let context = if single_header_supplier {
+        context
+            .extend_empty_selected_range(&[selected_tip], None)
+            .expect("the fixture has a two-header repair gap")
+    } else {
+        context
+    };
     handle
         .send(Event::VctRepairContextReady {
             owner,
-            result: VctRepairContextResult::Resolved(
-                zakura_header_chain::VctRepairContext::unconstrained(
-                    repair_header,
-                    zakura_header_chain::HeaderLocator::for_continuation(anchor),
-                    Some(selected_tip.hash),
-                ),
-            ),
+            result: VctRepairContextResult::Resolved(context),
         })
         .await
         .expect("the exact repair context reaches the reactor");
 
-    let request = outbound.recv().await.expect("the repair request is sent");
+    if single_header_supplier {
+        let frame = time::timeout(std::time::Duration::from_secs(1), outbound.recv())
+            .await
+            .expect("the batch is dispatched")
+            .expect("the supplier is connected");
+        let HeaderSyncMessage::GetHeaders(batch) = handle
+            .codec()
+            .decode_frame(frame, None)
+            .expect("the batch request decodes")
+        else {
+            panic!("the repair uses GetHeaders");
+        };
+        assert_eq!(batch.max_header_count, 2);
+        assert_eq!(batch.locator_hashes, vec![anchor.hash]);
+        assert_eq!(batch.target_tip_hash, selected_tip.hash);
+        // The old finalized-history server rejects a locator two heights below its target.
+        handle
+            .send(Event::SessionResponse {
+                peer: peer.clone(),
+                session_id: 0,
+                scope: owner.header_authority(),
+                msg: HeaderSyncMessage::HeadersOutcome(HeadersOutcome {
+                    request_id: batch.request_id,
+                    target_tip_hash: batch.target_tip_hash,
+                    outcome: HeadersOutcomeCode::NoLocatorIntersection,
+                }),
+            })
+            .await
+            .expect("the old supplier returns its locator rejection");
+    }
+    let request = time::timeout(std::time::Duration::from_secs(1), outbound.recv())
+        .await
+        .expect("the repair request is dispatched")
+        .expect("the repair supplier is connected");
     let HeaderSyncMessage::GetHeaders(request) = handle
         .codec()
         .decode_frame(request, None)

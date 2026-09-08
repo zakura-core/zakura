@@ -477,6 +477,41 @@ impl ReadyVctRepairFixture {
         }
     }
 
+    fn with_range() -> Self {
+        let mut fixture = Self::new();
+        fixture.context = zakura_header_chain::VctRepairContext::from_durable_rows(
+            fixture.target,
+            zakura_header_chain::HeaderLocator::for_continuation(fixture.anchor),
+            fixture.snapshot.state_version,
+            Some(fixture.snapshot.frontiers.header_best.hash),
+            true,
+            &[],
+        )
+        .expect("the first repair height has no durable evidence")
+        .extend_empty_selected_range(&[fixture.snapshot.frontiers.header_best], None)
+        .expect("the fixture has two consecutive missing heights");
+        fixture
+    }
+
+    fn reply_to_repair(&mut self, peer: &ZakuraPeerId, outcome: HeadersOutcomeCode) {
+        let active = self
+            .reactor
+            .peer_work_queue
+            .active(peer)
+            .expect("the peer owns a repair request")
+            .clone();
+        self.reactor.handle_headers_outcome(
+            peer.clone(),
+            active.owner.session_id(),
+            active.owner.header_authority(),
+            HeadersOutcome {
+                request_id: active.request_id.get(),
+                target_tip_hash: active.target.status.selected_tip_hash,
+                outcome,
+            },
+        );
+    }
+
     fn schedule(&mut self) {
         let mut repair = RepairRequirement::new(self.owner, self.target.height, 11);
         repair.state = RepairPolicyState::Ready {
@@ -493,7 +528,8 @@ impl ReadyVctRepairFixture {
             selected_tip_hash: self.snapshot.frontiers.header_best.hash,
             suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
             oldest_retained_height: self.anchor.height,
-            max_headers_per_response: 1,
+            max_headers_per_response: u32::try_from(self.context.selected_header_count())
+                .expect("the fixture range is small"),
             max_inflight_requests: 1,
             max_message_bytes: 2_000_000,
             tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
@@ -1839,4 +1875,151 @@ fn full_action_queue_retries_lease_release_on_maintenance() {
         found,
         "the retained release reaches the driver after capacity returns"
     );
+}
+
+#[test]
+fn batched_vct_repair_retries_an_old_supplier_once_with_one_header() {
+    let mut fixture = ReadyVctRepairFixture::with_range();
+    let (peers, _outbounds) = fixture.connect(&[1], 7);
+    let peer = &peers[0];
+    fixture.schedule();
+    fixture.advertise(&peers, 7);
+    let batch = fixture
+        .reactor
+        .peer_work_queue
+        .active(peer)
+        .unwrap()
+        .clone();
+    assert_eq!(batch.max_header_count, 2);
+    assert_eq!(
+        batch.target.status.selected_tip_hash,
+        fixture.snapshot.frontiers.header_best.hash
+    );
+
+    fixture.reply_to_repair(peer, HeadersOutcomeCode::NoLocatorIntersection);
+    let single = fixture.reactor.peer_work_queue.active(peer).unwrap();
+    assert_eq!(single.max_header_count, 1);
+    assert_eq!(single.target.status.selected_tip_hash, fixture.target.hash);
+    assert_eq!(single.sent_locator.entries(), &[fixture.anchor]);
+    assert_ne!(single.request_id, batch.request_id);
+    assert_eq!(single.tree_aux_schema, AuxSchema::V1);
+    let repair = fixture.reactor.vct_repair.current().unwrap();
+    assert!(repair.tried_sources.is_empty());
+    let RepairPolicyState::Assigned { context } = &repair.state else {
+        panic!("the narrowed repair is assigned");
+    };
+    assert_eq!(context.selected_header_count(), 1);
+    assert_eq!(context.request_target(), fixture.target);
+
+    fixture.reply_to_repair(peer, HeadersOutcomeCode::NoLocatorIntersection);
+    assert!(fixture.reactor.peer_work_queue.active(peer).is_none());
+    assert_eq!(
+        fixture.reactor.vct_repair.current().unwrap().tried_sources,
+        [source_id_from_peer(peer)].into_iter().collect()
+    );
+    fixture.reactor.try_assign_vct_repair();
+    assert!(
+        fixture.reactor.peer_work_queue.active(peer).is_none(),
+        "a rejected single-header fallback must not loop"
+    );
+}
+
+#[test]
+fn vct_compatibility_limit_does_not_reduce_other_suppliers_batches() {
+    let mut fixture = ReadyVctRepairFixture::with_range();
+    let (peers, _outbounds) = fixture.connect(&[1, 2], 7);
+    fixture.schedule();
+    fixture.advertise(&peers, 7);
+    assert!(fixture.reactor.peer_work_queue.active(&peers[0]).is_some());
+    fixture.reply_to_repair(&peers[0], HeadersOutcomeCode::NoLocatorIntersection);
+    assert!(fixture.reactor.peer_work_queue.active(&peers[0]).is_none());
+    let capable = fixture.reactor.peer_work_queue.active(&peers[1]).unwrap();
+    assert_eq!(capable.max_header_count, 2);
+    assert_eq!(
+        capable.target.status.selected_tip_hash,
+        fixture.snapshot.frontiers.header_best.hash
+    );
+    fixture.reply_to_repair(&peers[1], HeadersOutcomeCode::HistoryPruned);
+    assert_eq!(
+        fixture
+            .reactor
+            .peer_work_queue
+            .active(&peers[0])
+            .unwrap()
+            .max_header_count,
+        1
+    );
+}
+
+#[test]
+fn vct_compatibility_limit_survives_repairs_but_resets_with_the_session() {
+    let mut fixture = ReadyVctRepairFixture::with_range();
+    let (peers, mut outbounds) = fixture.connect(&[1], 7);
+    fixture.schedule();
+    fixture.advertise(&peers, 7);
+    fixture.reply_to_repair(&peers[0], HeadersOutcomeCode::NoLocatorIntersection);
+    fixture.reactor.retire_vct_repair();
+    fixture.schedule();
+    fixture.reactor.try_assign_vct_repair();
+    assert_eq!(
+        fixture
+            .reactor
+            .peer_work_queue
+            .active(&peers[0])
+            .unwrap()
+            .max_header_count,
+        1
+    );
+
+    fixture.reactor.retire_vct_repair();
+    let (_, replacements) = fixture.connect(&[1], 8);
+    outbounds.extend(replacements);
+    fixture.schedule();
+    fixture.advertise(&peers, 8);
+    assert_eq!(
+        fixture
+            .reactor
+            .peer_work_queue
+            .active(&peers[0])
+            .unwrap()
+            .max_header_count,
+        2
+    );
+}
+
+#[test]
+fn mismatched_or_other_vct_outcomes_do_not_enable_single_header_fallback() {
+    for outcome in [
+        HeadersOutcomeCode::Busy,
+        HeadersOutcomeCode::HistoryPruned,
+        HeadersOutcomeCode::TargetNotRetained,
+        HeadersOutcomeCode::NoLocatorIntersection,
+    ] {
+        let mut fixture = ReadyVctRepairFixture::with_range();
+        let (peers, _outbounds) = fixture.connect(&[1], 7);
+        fixture.schedule();
+        fixture.advertise(&peers, 7);
+        if outcome == HeadersOutcomeCode::NoLocatorIntersection {
+            let active = fixture
+                .reactor
+                .peer_work_queue
+                .active(&peers[0])
+                .unwrap()
+                .clone();
+            fixture.reactor.handle_headers_outcome(
+                peers[0].clone(),
+                active.owner.session_id(),
+                active.owner.header_authority(),
+                HeadersOutcome {
+                    request_id: active.request_id.get(),
+                    target_tip_hash: fixture.anchor.hash,
+                    outcome,
+                },
+            );
+        } else {
+            fixture.reply_to_repair(&peers[0], outcome);
+        }
+        assert!(!fixture.reactor.peer_state[&peers[0]].single_header_vct_repairs);
+        assert!(fixture.reactor.peer_work_queue.active(&peers[0]).is_none());
+    }
 }

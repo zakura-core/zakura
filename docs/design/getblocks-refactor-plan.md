@@ -11,6 +11,8 @@ show progress with the advertised request volume and a paused sibling service,
 but a stall when two paused streams fill the connection's receive allowance.
 The full-saturation criterion needs a design decision before proceeding past
 the first gate. The new service remains unimplemented and disabled.
+The independent state API prototype is implemented and has passed its initial
+ownership tests; production serving has not moved to it yet.
 
 ## Before and after
 

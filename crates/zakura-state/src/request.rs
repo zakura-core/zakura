@@ -1900,6 +1900,9 @@ pub enum ReadRequest {
     /// Returns contiguous committed blocks by height, in ascending order.
     ///
     /// The response stops before the first height without a committed body.
+    /// Callers that charge resources to the database job should instead use
+    /// [`crate::ReadStateService::read_owned_block_range`] so cancellation of
+    /// the caller cannot release those resources during a running read.
     BlocksByHeightRange {
         /// First height to read.
         start: block::Height,

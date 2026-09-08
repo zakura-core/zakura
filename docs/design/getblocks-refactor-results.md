@@ -99,10 +99,36 @@ choose between before proceeding past this gate:
   through real session management.
 
 No QUIC dependency, window setting, stream layout, or overload policy has been
-changed. Storage ownership and the remaining refactor steps have not started.
+changed. The independent storage prototype below has passed its initial focused
+tests; the transport and serving migration has not started.
 Matched downloads, impaired links, repeated reopening, production baseline
 comparisons, and their combined conditions remain unmeasured. The full
 acceptance gate has not passed.
+
+## Storage prototype
+
+Added `ReadStateService::read_owned_block_range` and `OwnedBlockRange<R>`.
+The API moves the caller's resources into one blocking database job and then
+into the returned block prefix. It reuses state readiness checks and the
+existing bounded range-read helper. The single-execution operation is separate
+from the cloneable `ReadRequest` enum.
+
+Cancellation is checked before the first lookup and between lookups. It stops
+further reads; a lookup already running keeps its resources until it exits.
+Dropping the async future or aborting its task does not release those resources.
+An undelivered result drops its blocks and resources when the job finishes.
+
+Nine tests passed, covering the byte cap and retained result,
+cancellation before/between lookups, a dropped waiter, an aborted caller,
+panic unwinding, and the public API against empty and populated databases,
+including failure of state readiness checks. The concurrency
+tests wait until a real blocking job has started, terminate its async owner,
+assert that capacity is still charged, then release the job and verify exactly
+one resource release.
+
+The network interface and node adapter are not wired yet. The existing driver
+still uses `BlockRangeQueryLease` and `ReadRequest::BlocksByHeightRange`; this
+prototype does not change its production behavior.
 
 ## Reproduction and checks
 
@@ -123,6 +149,9 @@ Validation completed for this checkpoint:
   including the existing transport regression. Peak RSS for this sequential
   combined run was 284.3 MiB.
 - `cargo +1.97.0 fmt --all -- --check` passed.
+- All nine `service::block_range::tests` state tests passed in 1.19 seconds.
+- `cargo +1.97.0 clippy -p zakura-state --lib --tests --locked -- -D warnings`
+  passed.
 - `cargo +1.97.0 clippy -p zakura-network --lib --tests --locked -- -D warnings`
   passed. The two diagnostic functions explicitly allow stderr output so
   standalone measurements remain visible regardless of tracing filters.
@@ -130,5 +159,5 @@ Validation completed for this checkpoint:
   `git diff --check` passed.
 
 The test link emitted the pre-existing macOS compact-unwind size warning. It
-did not prevent linking or execution. Workspace/state/node-driver validation
-is pending because production refactoring has not begun.
+did not prevent linking or execution. Full workspace and node-driver validation
+is pending because the serving migration has not begun.

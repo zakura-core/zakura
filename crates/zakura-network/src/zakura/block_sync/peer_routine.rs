@@ -825,6 +825,7 @@ impl PeerRoutine {
                 &self.peer,
                 self.window.bbr_rtprop_ms(now),
                 in_bypass,
+                now,
             );
             let mut items = Vec::new();
             if floor_arm_allowed && servable_low <= floor_high {
@@ -2141,7 +2142,7 @@ impl PeerRoutine {
                 // Filter the published RTprop by now so a peer that stopped completing
                 // requests stops advertising a stale-low RTprop to the cross-peer
                 // floor-preference comparison.
-                bbr_rtprop_ms: self.window.bbr_rtprop_ms(Instant::now()),
+                rtprop: self.window.bbr_rtprop_estimate(Instant::now()),
             },
         );
     }

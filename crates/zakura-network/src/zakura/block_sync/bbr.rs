@@ -90,6 +90,19 @@ impl WindowedSamples {
     }
 }
 
+/// A published minimum expires with the sample that supplied it, not its publication.
+#[derive(Copy, Clone, Debug)]
+pub(super) struct RtpropEstimate {
+    pub(super) millis: u64,
+    pub(super) valid_until: Instant,
+}
+
+impl RtpropEstimate {
+    pub(super) fn fresh_millis(self, now: Instant) -> Option<u64> {
+        (now <= self.valid_until).then_some(self.millis)
+    }
+}
+
 /// Per-peer BBR-lite control parameters extracted from config (Copy, lock-free).
 #[derive(Copy, Clone, Debug)]
 struct BbrParams {
@@ -561,6 +574,20 @@ impl BbrState {
         self.btlbw_per_sec.has_fresh_sample(now) && self.rtprop_secs.has_fresh_sample(now)
     }
 
+    pub(super) fn rtprop_estimate(&self, now: Instant) -> Option<RtpropEstimate> {
+        let cutoff = now.checked_sub(self.rtprop_secs.horizon);
+        let (at, secs) = self
+            .rtprop_secs
+            .samples
+            .iter()
+            .filter(|(at, _)| cutoff.is_none_or(|cutoff| *at >= cutoff))
+            .min_by(|(_, left), (_, right)| left.total_cmp(right))?;
+        Some(RtpropEstimate {
+            millis: secs_to_ms(*secs),
+            valid_until: at.checked_add(self.rtprop_secs.horizon)?,
+        })
+    }
+
     pub(super) fn rtprop_ms(&self, now: Instant) -> Option<u64> {
         self.rtprop_secs.min(now).map(secs_to_ms)
     }
@@ -954,6 +981,29 @@ mod bbr_tests {
             EXPECTED_CWND,
             "a fully-redeemed peer regains the full BDP target",
         );
+    }
+
+    #[test]
+    fn published_rtprop_expires_with_its_minimum_sample() {
+        let mut bbr = BbrState::new(&bbr_test_config());
+        let t0 = Instant::now();
+        record_delivery(&mut bbr, t0, CLEAN_ELAPSED, CLEAN_BLOCKS, 50);
+        let t1 = t0 + Duration::from_secs(9);
+        record_delivery(&mut bbr, t1, Duration::from_secs(2), CLEAN_BLOCKS, 50);
+        let published = bbr.rtprop_estimate(t1).unwrap();
+        assert_eq!(published.fresh_millis(t1), bbr.rtprop_ms(t1));
+        assert_eq!(
+            published.fresh_millis(t0 + Duration::from_secs(10)),
+            Some(10)
+        );
+        let later = t0 + Duration::from_secs(11);
+        assert_eq!(published.fresh_millis(later), None);
+        assert_eq!(bbr.rtprop_ms(later), Some(2000));
+        assert_eq!(
+            bbr.rtprop_estimate(later).unwrap().fresh_millis(later),
+            Some(2000)
+        );
+        assert!(bbr.rtprop_estimate(t0 + Duration::from_secs(20)).is_none());
     }
 
     #[test]

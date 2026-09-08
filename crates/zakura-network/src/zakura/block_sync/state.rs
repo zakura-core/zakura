@@ -473,6 +473,10 @@ impl DownloadWindow {
     /// floor-server preference. Filtering by `now` reports `None` (worst floor server)
     /// once a deteriorating peer's only fast samples age past the horizon, rather than a
     /// stale-low RTprop.
+    pub(super) fn bbr_rtprop_estimate(&self, now: Instant) -> Option<super::bbr::RtpropEstimate> {
+        self.bbr.rtprop_estimate(now)
+    }
+
     pub(super) fn bbr_rtprop_ms(&self, now: Instant) -> Option<u64> {
         self.bbr.rtprop_ms(now)
     }

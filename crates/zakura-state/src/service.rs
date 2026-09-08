@@ -1011,9 +1011,7 @@ impl StateService {
             } else {
                 let child_hash = semantically_verified.hash;
                 self.remember_failed_ancestor(child_hash, ancestor, kind);
-                let (rsp_tx, rsp_rx) = oneshot::channel();
-                let _ = rsp_tx.send(Err(Self::failed_ancestor_error(ancestor, kind).into()));
-                return rsp_rx;
+                return Self::respond_now(admission, Self::failed_ancestor_error(ancestor, kind));
             }
         }
 
@@ -1021,16 +1019,13 @@ impl StateService {
             .non_finalized_block_write_sent_hashes
             .contains(&semantically_verified.hash)
         {
-            if let Some(admission) = admission {
-                admission.reject();
-            }
-            let (rsp_tx, rsp_rx) = oneshot::channel();
-            let _ = rsp_tx.send(Err(CommitBlockError::new_duplicate(
-                Some(semantically_verified.hash.into()),
-                KnownBlock::WriteChannel,
-            )
-            .into()));
-            return rsp_rx;
+            return Self::respond_now(
+                admission,
+                CommitBlockError::new_duplicate(
+                    Some(semantically_verified.hash.into()),
+                    KnownBlock::WriteChannel,
+                ),
+            );
         }
 
         if self
@@ -1038,25 +1033,17 @@ impl StateService {
             .db
             .contains_height(semantically_verified.height)
         {
-            if let Some(admission) = admission {
-                admission.reject();
-            }
-            let (rsp_tx, rsp_rx) = oneshot::channel();
-            let _ = rsp_tx.send(Err(CommitBlockError::new_duplicate(
-                Some(semantically_verified.height.into()),
-                KnownBlock::Finalized,
-            )
-            .into()));
-            return rsp_rx;
+            return Self::respond_now(
+                admission,
+                CommitBlockError::new_duplicate(
+                    Some(semantically_verified.height.into()),
+                    KnownBlock::Finalized,
+                ),
+            );
         }
 
-        if let Some(admission) = &admission {
-            if !self.drains_the_non_finalized_queue_now(&parent_hash) {
-                admission.reject();
-                let (rsp_tx, rsp_rx) = oneshot::channel();
-                let _ = rsp_tx.send(Err(CommitBlockError::MissingMinedParent.into()));
-                return rsp_rx;
-            }
+        if admission.is_some() && !self.drains_the_non_finalized_queue_now(&parent_hash) {
+            return Self::respond_now(admission, CommitBlockError::MissingMinedParent);
         }
 
         // [`Request::CommitSemanticallyVerifiedBlock`] contract: a request to commit a block which
@@ -1069,18 +1056,14 @@ impl StateService {
         {
             tracing::debug!("replacing older queued request with new request");
             let (rsp_tx, rsp_rx) = oneshot::channel();
-            let (_, old_rsp_tx, old_admission) = self.non_finalized_state_queued_blocks.replace(
+            let old_queued = self.non_finalized_state_queued_blocks.replace(
                 semantically_verified.hash,
                 (semantically_verified, rsp_tx, admission),
             );
-            if let Some(old_admission) = old_admission {
-                old_admission.reject();
-            }
-            let _ = old_rsp_tx.send(Err(CommitBlockError::new_duplicate(
-                Some(hash.into()),
-                KnownBlock::Queue,
-            )
-            .into()));
+            Self::send_semantically_verified_block_error(
+                old_queued,
+                CommitBlockError::new_duplicate(Some(hash.into()), KnownBlock::Queue),
+            );
             rsp_rx
         } else if self.non_finalized_state_queued_blocks.is_full()
             && !self.drains_the_non_finalized_queue_now(&parent_hash)
@@ -1091,12 +1074,7 @@ impl StateService {
             // is never the parent that releases its own queued descendants, and nothing else
             // empties the queue while the chain is stalled, so rejecting it here would strand
             // them permanently.
-            if let Some(admission) = admission {
-                admission.reject();
-            }
-            let (rsp_tx, rsp_rx) = oneshot::channel();
-            let _ = rsp_tx.send(Err(CommitBlockError::QueueFull.into()));
-            rsp_rx
+            Self::respond_now(admission, CommitBlockError::QueueFull)
         } else {
             let (rsp_tx, rsp_rx) = oneshot::channel();
             self.non_finalized_state_queued_blocks.queue((
@@ -1142,16 +1120,9 @@ impl StateService {
     /// parents that pass a liveness check but that nothing goes on to drain.
     fn drains_the_non_finalized_queue_now(&self, parent_hash: &block::Hash) -> bool {
         if self.block_write_sender.finalized.is_some() {
-            // The write task is still committing checkpoint blocks, so `send_ready_non_finalized_queued`
-            // does not run for this parent and only the handoff empties the queue. The handoff
-            // needs the last hash we sent to be durably written, and it needs a queued child of
-            // that same hash. A block meeting both is drained by `try_handoff_to_non_finalized_write`
-            // below, and it fires at most once in the life of the node.
-            //
-            // The durable finalized tip is not enough on its own. It lags the last hash we sent
-            // for as long as checkpoint writes are in flight, and a block naming the lagging tip
-            // neither completes the handoff condition nor gets reached by the eventual handoff
-            // traversal, which walks forward from the last hash we sent.
+            // The durable finalized tip lags the last hash we sent for as long as checkpoint
+            // writes are in flight, so only a child of that last hash, once it is durable,
+            // completes the handoff condition and gets drained on this call.
             return self.read_service.db.finalized_tip_hash()
                 == self.finalized_block_write_last_sent_hash
                 && *parent_hash == self.finalized_block_write_last_sent_hash;
@@ -1160,6 +1131,19 @@ impl StateService {
         // The queue is live: `send_ready_non_finalized_queued` walks forward from this parent
         // later in this same call.
         self.can_fork_chain_at(parent_hash)
+    }
+
+    /// Rejects `admission` if there is one and answers the caller with `error` immediately.
+    fn respond_now(
+        admission: Option<BlockAdmission>,
+        error: impl Into<CommitSemanticallyVerifiedError>,
+    ) -> oneshot::Receiver<Result<block::Hash, CommitSemanticallyVerifiedError>> {
+        if let Some(admission) = admission {
+            admission.reject();
+        }
+        let (rsp_tx, rsp_rx) = oneshot::channel();
+        let _ = rsp_tx.send(Err(error.into()));
+        rsp_rx
     }
 
     /// Whether a candidate admitted right now may be advertised before its contextual commit.
@@ -1271,6 +1255,69 @@ impl StateService {
     /// Return the tip of the current best chain.
     pub fn best_tip(&self) -> Option<(block::Height, block::Hash)> {
         self.read_service.best_tip()
+    }
+
+    /// Queues a semantically verified block for contextual verification and awaits its result.
+    ///
+    /// A mined submission carries an admission and the instant its request was dispatched; a
+    /// synced block carries neither.
+    fn commit_semantically_verified(
+        &mut self,
+        block: SemanticallyVerifiedBlock,
+        admission: Option<BlockAdmission>,
+        requested_at: Option<Instant>,
+        span: Span,
+    ) -> Pin<Box<dyn Future<Output = Result<Response, BoxError>> + Send + 'static>> {
+        let timer = CodeTimer::start();
+        if let Some(requested_at) = requested_at {
+            metrics::histogram!("state.semantic_commit.dispatch.duration_seconds")
+                .record(requested_at.elapsed().as_secs_f64());
+        }
+
+        let prequeue_checks_start = Instant::now();
+        self.assert_block_can_be_validated(&block);
+        self.pending_utxos.check_against_ordered(&block.new_outputs);
+        metrics::histogram!("state.semantic_commit.prequeue_checks.duration_seconds")
+            .record(prequeue_checks_start.elapsed().as_secs_f64());
+
+        // # Performance
+        //
+        // Allow other async tasks to make progress while blocks are being verified
+        // and written to disk. But wait for the blocks to finish committing,
+        // so that `StateService` multi-block queries always observe a consistent state.
+        //
+        // Since each block is spawned into its own task,
+        // there shouldn't be any other code running in the same task,
+        // so we don't need to worry about blocking it:
+        // https://docs.rs/tokio/latest/tokio/task/fn.block_in_place.html
+        let queue_send_start = Instant::now();
+        let rsp_rx = tokio::task::block_in_place(move || {
+            span.in_scope(|| self.queue_and_commit_to_non_finalized_state(block, admission))
+        });
+        metrics::histogram!("state.semantic_commit.queue_and_commit.duration_seconds")
+            .record(queue_send_start.elapsed().as_secs_f64());
+
+        // TODO:
+        //   - check for panics in the block write task here,
+        //     as well as in poll_ready()
+
+        // The work is all done, the future just waits on a channel for the result
+        timer.finish_desc("CommitSemanticallyVerifiedBlock");
+
+        // Await the channel response, flatten the result, map receive errors to
+        // `CommitSemanticallyVerifiedError::WriteTaskExited`.
+        // Then flatten the nested Result and convert any errors to a BoxError.
+        let span = Span::current();
+        async move {
+            rsp_rx
+                .await
+                .map_err(|_recv_error| CommitBlockError::WriteTaskExited.into())
+                .and_then(|result| result)
+                .map_err(BoxError::from)
+                .map(Response::Committed)
+        }
+        .instrument(span)
+        .boxed()
     }
 
     fn send_invalidate_block(
@@ -1727,50 +1774,7 @@ impl Service<Request> for StateService {
             //
             // The expected error type for this request is `CommitSemanticallyVerifiedError`.
             Request::CommitSemanticallyVerifiedBlock(semantically_verified) => {
-                let timer = CodeTimer::start();
-                self.assert_block_can_be_validated(&semantically_verified);
-
-                self.pending_utxos
-                    .check_against_ordered(&semantically_verified.new_outputs);
-
-                // # Performance
-                //
-                // Allow other async tasks to make progress while blocks are being verified
-                // and written to disk. But wait for the blocks to finish committing,
-                // so that `StateService` multi-block queries always observe a consistent state.
-                //
-                // Since each block is spawned into its own task,
-                // there shouldn't be any other code running in the same task,
-                // so we don't need to worry about blocking it:
-                // https://docs.rs/tokio/latest/tokio/task/fn.block_in_place.html
-
-                let rsp_rx = tokio::task::block_in_place(move || {
-                    span.in_scope(|| {
-                        self.queue_and_commit_to_non_finalized_state(semantically_verified, None)
-                    })
-                });
-
-                // TODO:
-                //   - check for panics in the block write task here,
-                //     as well as in poll_ready()
-
-                // The work is all done, the future just waits on a channel for the result
-                timer.finish_desc("CommitSemanticallyVerifiedBlock");
-
-                // Await the channel response, flatten the result, map receive errors to
-                // `CommitSemanticallyVerifiedError::WriteTaskExited`.
-                // Then flatten the nested Result and convert any errors to a BoxError.
-                let span = Span::current();
-                async move {
-                    rsp_rx
-                        .await
-                        .map_err(|_recv_error| CommitBlockError::WriteTaskExited.into())
-                        .and_then(|result| result)
-                        .map_err(BoxError::from)
-                        .map(Response::Committed)
-                }
-                .instrument(span)
-                .boxed()
+                self.commit_semantically_verified(semantically_verified, None, None, span)
             }
 
             Request::CommitSemanticallyVerifiedBlockWithAdmission {
@@ -1778,37 +1782,7 @@ impl Service<Request> for StateService {
                 admission,
                 requested_at,
             } => {
-                let timer = CodeTimer::start();
-                metrics::histogram!("state.semantic_commit.dispatch.duration_seconds")
-                    .record(requested_at.elapsed().as_secs_f64());
-
-                let prequeue_checks_start = Instant::now();
-                self.assert_block_can_be_validated(&block);
-                self.pending_utxos.check_against_ordered(&block.new_outputs);
-                metrics::histogram!("state.semantic_commit.prequeue_checks.duration_seconds")
-                    .record(prequeue_checks_start.elapsed().as_secs_f64());
-
-                let queue_send_start = Instant::now();
-                let rsp_rx = tokio::task::block_in_place(move || {
-                    span.in_scope(|| {
-                        self.queue_and_commit_to_non_finalized_state(block, Some(admission))
-                    })
-                });
-                metrics::histogram!("state.semantic_commit.queue_and_commit.duration_seconds")
-                    .record(queue_send_start.elapsed().as_secs_f64());
-
-                timer.finish_desc("CommitSemanticallyVerifiedBlockWithAdmission");
-                let span = Span::current();
-                async move {
-                    rsp_rx
-                        .await
-                        .map_err(|_recv_error| CommitBlockError::WriteTaskExited.into())
-                        .and_then(|result| result)
-                        .map_err(BoxError::from)
-                        .map(Response::Committed)
-                }
-                .instrument(span)
-                .boxed()
+                self.commit_semantically_verified(block, Some(admission), Some(requested_at), span)
             }
 
             // Uses finalized_state_queued_blocks and pending_utxos in the StateService.

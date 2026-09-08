@@ -256,11 +256,6 @@ impl QueuedBlocks {
             .blocks
             .get(&hash)
             .expect("replacement was inserted under the same hash");
-        assert_eq!(old.0.height, replacement.0.height);
-        assert_eq!(
-            old.0.block.header.previous_block_hash,
-            replacement.0.block.header.previous_block_hash
-        );
 
         for outpoint in old.0.new_outputs.keys() {
             self.known_utxos.remove(outpoint);

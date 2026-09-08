@@ -52,6 +52,12 @@ Interpretation notes:
 
 Workflow inputs cover the common cases; the droplet-side script (`.github/workflows/scripts/perf-bench-run.sh`) documents the finer-grained profiling and live-head gate knobs. The A/B summary table is rendered by `.github/workflows/scripts/perf-bench-compare.py`, which also decides whether the legs are comparable at all (a leg whose `zakurad` exited non-zero, or produced no readable `meta.json`, suppresses the comparison and the CPU diff).
 
+## Commit timing
+
+With `commit-metrics`, the experiment instrumentation exports duration histograms under `zakura.state.write` for `prepare_total`, `spent_reads_and_raw_txs`, `batch_prepare`, `vct_sprout`, header lock waits, transition planning, header batch construction, DB writes, in-memory installation, and publication. `zakura.state.rocksdb.write.duration_seconds` measures the underlying RocksDB call across all callers. The older `zakura.state.rocksdb.batch_commit.duration_seconds` measures the full block commit callback, including native header processing.
+
+These spans overlap. `prepare_total` includes its input and batch phases, and the header spans are nested within native commit callbacks when invoked by the state writer. Generic header transitions also contribute to their respective histograms. Compare interval sums and counts alongside committed-block deltas; do not add every histogram together or interpret the callback timer as disk I/O alone. The extra clocks and recordings compile out without `commit-metrics`.
+
 ## Local profiling recipes
 
 Linux (any box, any running `zakurad`):

@@ -2598,6 +2598,8 @@ impl HeaderChainRuntime {
     where
         M: FnOnce(),
     {
+        #[cfg(feature = "commit-metrics")]
+        let lock_start = std::time::Instant::now();
         let _writer = self
             .store
             .writer
@@ -2607,6 +2609,9 @@ impl HeaderChainRuntime {
             .transition_engine
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        #[cfg(feature = "commit-metrics")]
+        metrics::histogram!("zakura.state.write.header_aux_lock_wait.duration_seconds")
+            .record(lock_start.elapsed().as_secs_f64());
         let lease_references = self
             .leases
             .lock()
@@ -2694,9 +2699,12 @@ impl HeaderChainRuntime {
                 "combined auxiliary transition has the wrong event kind",
             ));
         };
-        let first = transition_engine.plan_transition(
-            TransitionInput::AuxEvidence { event: first_event },
-            &first_context,
+        let first = timed_commit_phase!(
+            "zakura.state.write.header_aux_plan.duration_seconds",
+            transition_engine.plan_transition(
+                TransitionInput::AuxEvidence { event: first_event },
+                &first_context,
+            )
         )?;
         if first.effect().is_resource_stalled() {
             return Err(HeaderChainStoreError::Incoherent(
@@ -2710,7 +2718,10 @@ impl HeaderChainRuntime {
         // The publisher continues to expose the durable snapshot.
         // The writer can stage the first transition without exposing it.
         // The runtime reloads the unchanged durable engine after an error before the atomic write.
-        if let Err(error) = transition_engine.install_committed_transition(first) {
+        if let Err(error) = timed_commit_phase!(
+            "zakura.state.write.header_install.duration_seconds",
+            transition_engine.install_committed_transition(first)
+        ) {
             let error = restore_transition_engine_after_staging_error(
                 &self.store,
                 &mut transition_engine,
@@ -2726,15 +2737,18 @@ impl HeaderChainRuntime {
                 "combined checkpoint transition has the wrong event kind",
             ));
         };
-        let checkpoint = match transition_engine.plan_transition(
-            TransitionInput::VerifiedChainChanged {
-                expected_version,
-                event: checkpoint_event,
-                facts: HeaderValidationFacts {
-                    validation_leases: validation_leases.to_vec(),
+        let checkpoint = match timed_commit_phase!(
+            "zakura.state.write.header_checkpoint_plan.duration_seconds",
+            transition_engine.plan_transition(
+                TransitionInput::VerifiedChainChanged {
+                    expected_version,
+                    event: checkpoint_event,
+                    facts: HeaderValidationFacts {
+                        validation_leases: validation_leases.to_vec(),
+                    },
                 },
-            },
-            &checkpoint_context,
+                &checkpoint_context,
+            )
         ) {
             Ok(checkpoint) => checkpoint,
             Err(error) => {
@@ -2773,7 +2787,10 @@ impl HeaderChainRuntime {
                 return Err(error);
             }
         };
-        if let Err(error) = self.store.db.write(batch) {
+        if let Err(error) = timed_commit_phase!(
+            "zakura.state.write.header_aux_db_write.duration_seconds",
+            self.store.db.write(batch)
+        ) {
             let error = restore_transition_engine_after_staging_error(
                 &self.store,
                 &mut transition_engine,
@@ -2781,7 +2798,10 @@ impl HeaderChainRuntime {
             );
             return Err(error);
         }
-        if let Err(error) = transition_engine.install_committed_transition(checkpoint) {
+        if let Err(error) = timed_commit_phase!(
+            "zakura.state.write.header_install.duration_seconds",
+            transition_engine.install_committed_transition(checkpoint)
+        ) {
             let error = restore_transition_engine_after_staging_error(
                 &self.store,
                 &mut transition_engine,
@@ -2790,7 +2810,10 @@ impl HeaderChainRuntime {
             return Err(error);
         }
         memory_swap();
-        self.publisher.publish(current, checkpoint_effect);
+        timed_commit_phase!(
+            "zakura.state.write.header_publish.duration_seconds",
+            self.publisher.publish(current, checkpoint_effect)
+        );
         Ok(ApplyResult::Committed)
     }
 
@@ -2941,6 +2964,8 @@ impl HeaderChainRuntime {
     where
         M: FnOnce(),
     {
+        #[cfg(feature = "commit-metrics")]
+        let lock_start = std::time::Instant::now();
         let _writer = self
             .store
             .writer
@@ -2950,6 +2975,9 @@ impl HeaderChainRuntime {
             .transition_engine
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        #[cfg(feature = "commit-metrics")]
+        metrics::histogram!("zakura.state.write.header_combined_lock_wait.duration_seconds")
+            .record(lock_start.elapsed().as_secs_f64());
         let authoritative_full_state_fork_set = matches!(
             &request.event,
             TransitionEvent::VerifiedChainChanged(_)
@@ -3192,7 +3220,10 @@ impl HeaderChainRuntime {
             full_state_authority: Some(&state_authority),
             retention_references: base_context.retention_references,
         };
-        let transition = match transition_engine.plan_transition(input, &transition_context) {
+        let transition = match timed_commit_phase!(
+            "zakura.state.write.header_combined_plan.duration_seconds",
+            transition_engine.plan_transition(input, &transition_context)
+        ) {
             Ok(plan) => plan,
             Err(TransitionFailure::Stale { current }) => {
                 return Ok(ApplyResult::Stale(StaleReceipt {
@@ -3306,8 +3337,14 @@ impl HeaderChainRuntime {
         );
         #[cfg(test)]
         fault(FaultPoint::BeforeCommit)?;
-        self.store.db.write(batch)?;
-        transition_engine.install_committed_transition(transition)?;
+        timed_commit_phase!(
+            "zakura.state.write.header_combined_db_write.duration_seconds",
+            self.store.db.write(batch)
+        )?;
+        timed_commit_phase!(
+            "zakura.state.write.header_install.duration_seconds",
+            transition_engine.install_committed_transition(transition)
+        )?;
         #[cfg(test)]
         fault(FaultPoint::AfterCommit)?;
         if let Some(pin) = migrated_pin_refuted {
@@ -3316,7 +3353,10 @@ impl HeaderChainRuntime {
         memory_swap();
         #[cfg(test)]
         fault(FaultPoint::AfterMemorySwap)?;
-        self.publisher.publish(current, transition_effect);
+        timed_commit_phase!(
+            "zakura.state.write.header_publish.duration_seconds",
+            self.publisher.publish(current, transition_effect)
+        );
         #[cfg(test)]
         fault(FaultPoint::AfterPublish)?;
         Ok(ApplyResult::Committed)
@@ -4510,6 +4550,8 @@ impl HeaderChainStore {
         changes: &ChangeSet,
         mut batch: DiskWriteBatch,
     ) -> Result<DiskWriteBatch, HeaderChainStoreError> {
+        #[cfg(feature = "commit-metrics")]
+        let batch_start = std::time::Instant::now();
         let current_metadata = self.metadata_row()?;
         if let Some(metadata) = current_metadata
             .as_ref()
@@ -4902,6 +4944,9 @@ impl HeaderChainStore {
             METADATA_KEY,
             &changes.metadata,
         )?;
+        #[cfg(feature = "commit-metrics")]
+        metrics::histogram!("zakura.state.write.header_batch_prepare.duration_seconds")
+            .record(batch_start.elapsed().as_secs_f64());
         Ok(batch)
     }
 

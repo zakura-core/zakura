@@ -1111,9 +1111,11 @@ impl FinalizedState {
                         // history-tree payload. Reconstruct Sprout locally, but only after all
                         // retryable supplied-root and successor checks have succeeded so a
                         // deferred retry cannot append the same commitments twice.
-                        note_commitment_trees
-                            .update_sprout_tree(&block)
-                            .map_err(ValidateContextError::from)?;
+                        timed_commit_phase!(
+                            "zakura.state.write.vct_sprout.duration_seconds",
+                            note_commitment_trees.update_sprout_tree(&block)
+                        )
+                        .map_err(ValidateContextError::from)?;
 
                         history_tree = Arc::new(candidate);
                         if let Some(v) = self.vct.source() {

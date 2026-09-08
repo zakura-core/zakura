@@ -946,6 +946,8 @@ impl ZakuraDb {
     where
         C: FnOnce(&mut Self, DiskWriteBatch) -> Result<(), CommitCheckpointVerifiedError>,
     {
+        #[cfg(feature = "commit-metrics")]
+        let preparation_start = std::time::Instant::now();
         let tx_hash_indexes: HashMap<transaction::Hash, usize> = finalized
             .transaction_hashes
             .iter()
@@ -985,6 +987,8 @@ impl ZakuraDb {
         // `None` it serializes inline (e.g. the semantic path).
         let store_raw_txs = retention.stores_raw_transactions();
         let db: &ZakuraDb = self;
+        #[cfg(feature = "commit-metrics")]
+        let inputs_start = std::time::Instant::now();
         let (spent_utxos, precomputed_raw_txs): (
             Vec<(transparent::OutPoint, OutputLocation, transparent::Utxo)>,
             Option<Vec<RawBytes>>,
@@ -1036,6 +1040,9 @@ impl ZakuraDb {
             },
         );
 
+        #[cfg(feature = "commit-metrics")]
+        metrics::histogram!("zakura.state.write.spent_reads_and_raw_txs.duration_seconds")
+            .record(inputs_start.elapsed().as_secs_f64());
         let spent_utxos_by_outpoint: HashMap<transparent::OutPoint, transparent::Utxo> =
             spent_utxos
                 .iter()
@@ -1111,6 +1118,8 @@ impl ZakuraDb {
             }))
         };
 
+        #[cfg(feature = "commit-metrics")]
+        let batch_prepare_start = std::time::Instant::now();
         let mut batch = DiskWriteBatch::new();
 
         // In case of errors, propagate and do not write the batch.
@@ -1139,6 +1148,14 @@ impl ZakuraDb {
         // is a no-op.
         retention.prepare_prune(&mut batch, self, &finalized);
 
+        #[cfg(feature = "commit-metrics")]
+        {
+            metrics::histogram!("zakura.state.write.batch_prepare.duration_seconds")
+                .record(batch_prepare_start.elapsed().as_secs_f64());
+            // The total includes input reads, serialization, indexes, and batch preparation.
+            metrics::histogram!("zakura.state.write.prepare_total.duration_seconds")
+                .record(preparation_start.elapsed().as_secs_f64());
+        }
         // Track batch commit latency for observability
         let batch_start = std::time::Instant::now();
         commit(self, batch)?;

@@ -1395,7 +1395,10 @@ impl DiskDb {
 
     /// Writes `batch` to the database.
     pub(crate) fn write(&self, batch: DiskWriteBatch) -> Result<(), rocksdb::Error> {
-        self.db.write(batch.batch)
+        timed_commit_phase!(
+            "zakura.state.rocksdb.write.duration_seconds",
+            self.db.write(batch.batch)
+        )
     }
 
     /// Flushes pending writes to SST files.

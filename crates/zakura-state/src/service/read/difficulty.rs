@@ -256,8 +256,7 @@ fn difficulty_time_and_history_tree(
         tip_height,
         network,
         relevant_data.iter().cloned(),
-    )
-    .expect("the mining template requires a complete committed difficulty context");
+    )?;
     let expected_difficulty = difficulty_adjustment.expected_difficulty_threshold();
 
     let mut result = GetBlockTemplateChainInfo {
@@ -423,15 +422,18 @@ fn adjust_difficulty_and_time_for_testnet(
 mod tests {
     use super::*;
 
-    const LOCAL_TIME: DateTime32 = DateTime32::from_seconds(1_700_000_000);
+    fn local_time() -> DateTime32 {
+        1_700_000_000.into()
+    }
 
     #[test]
     fn block_template_max_time_respects_local_future_time_limit() {
-        let median_time_past = LOCAL_TIME
+        let local_time = local_time();
+        let median_time_past = local_time
             .checked_add(Duration32::from_minutes(31))
             .expect("test time is in range");
 
-        let time_range = valid_block_template_time_range(median_time_past, LOCAL_TIME)
+        let time_range = valid_block_template_time_range(median_time_past, local_time)
             .expect("the time ranges overlap");
 
         assert_eq!(
@@ -443,22 +445,44 @@ mod tests {
         assert_eq!(time_range.cur_time, time_range.min_time);
         assert_eq!(
             time_range.max_time,
-            LOCAL_TIME
+            local_time
                 .checked_add(MAX_BLOCK_TIME_SINCE_LOCAL_CLOCK)
                 .expect("test time is in range")
         );
+
+        let mut header = Network::Mainnet
+            .block_parsed_iter()
+            .next()
+            .expect("Mainnet test vectors contain a block")
+            .header
+            .as_ref()
+            .clone();
+        header.time = time_range.max_time.into();
+        header
+            .time_is_valid_at(local_time.into(), &Height::MIN, &header.hash())
+            .expect("the advertised maximum time passes local validation");
+
+        header.time = time_range
+            .max_time
+            .checked_add(Duration32::from_seconds(1))
+            .expect("test time is in range")
+            .into();
+        header
+            .time_is_valid_at(local_time.into(), &Height::MIN, &header.hash())
+            .expect_err("a time above the advertised maximum fails local validation");
     }
 
     #[test]
     fn block_template_max_time_uses_tighter_median_time_limit() {
-        let median_time_past = LOCAL_TIME
+        let local_time = local_time();
+        let median_time_past = local_time
             .checked_sub(Duration32::from_hours(1))
             .expect("test time is in range");
 
-        let time_range = valid_block_template_time_range(median_time_past, LOCAL_TIME)
+        let time_range = valid_block_template_time_range(median_time_past, local_time)
             .expect("the time ranges overlap");
 
-        assert_eq!(time_range.cur_time, LOCAL_TIME);
+        assert_eq!(time_range.cur_time, local_time);
         assert_eq!(
             time_range.max_time,
             median_time_past
@@ -469,12 +493,13 @@ mod tests {
 
     #[test]
     fn block_template_time_range_rejects_non_overlapping_limits() {
-        let median_time_past = LOCAL_TIME
+        let local_time = local_time();
+        let median_time_past = local_time
             .checked_add(MAX_BLOCK_TIME_SINCE_LOCAL_CLOCK)
             .expect("test time is in range");
 
         assert_eq!(
-            valid_block_template_time_range(median_time_past, LOCAL_TIME),
+            valid_block_template_time_range(median_time_past, local_time),
             Err("the local clock is too far behind the chain tip to create a valid block template")
         );
     }

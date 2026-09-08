@@ -54,6 +54,14 @@ on:
           - vct
           - transport
           - tracing
+      ref_mode:
+        description: "For refs comparisons, apply this same networking/VCT mode to both refs"
+        type: choice
+        default: default
+        options:
+          - default
+          - zakura_vct_off
+          - dual_vct_on
       profile:
         description: "Profiling: diagnostic = timed CPU/scheduling/system capture; cpu = summary; off = workload only"
         type: choice
@@ -118,6 +126,7 @@ jobs:
           # inputs.* is empty on scheduled runs; schedule benches main, and the
           # 06:47 cron is the semantic baseline
           REF: ${{ inputs.ref || 'main' }}
+          REF_MODE: ${{ inputs.ref_mode || 'default' }}
           BASELINE_REF: ${{ inputs.baseline_ref }}
           COMPARISON: ${{ inputs.comparison || 'refs' }}
           CROSSOVER: ${{ inputs.crossover || 'false' }}
@@ -137,6 +146,11 @@ jobs:
             exit 1
           fi
           case "$COMPARISON" in refs|vct|transport|tracing) ;; *) exit 1 ;; esac
+          case "$REF_MODE" in default|zakura_vct_off|dual_vct_on) ;; *) exit 1 ;; esac
+          if [ "$REF_MODE" != default ] && { [ "$COMPARISON" != refs ] || [ "$WORKLOAD" != historical_sync ]; }; then
+            echo "ref_mode overrides require historical ref comparisons" >&2
+            exit 1
+          fi
           if [ "$COMPARISON" != refs ] && [ "$VERIFY_MODE" != checkpoint ]; then
             echo "configuration comparisons require historical_checkpoint" >&2
             exit 1
@@ -167,6 +181,12 @@ jobs:
               legs=$(jq -c 'map(.vct_fast_sync = "true" | .p2p_stack = (if .leg == "primary" then "dual" else "zakura" end))' <<<"$legs") ;;
             tracing)
               legs=$(jq -c 'map(.p2p_stack = "zakura" | .vct_fast_sync = "true" | .traces = (if .leg == "primary" then "false" else "true" end))' <<<"$legs") ;;
+          esac
+          case "$REF_MODE" in
+            zakura_vct_off)
+              legs=$(jq -c 'map(.p2p_stack = "zakura" | .vct_fast_sync = "false")' <<<"$legs") ;;
+            dual_vct_on)
+              legs=$(jq -c 'map(.p2p_stack = "dual" | .vct_fast_sync = "true")' <<<"$legs") ;;
           esac
           {
             echo "legs=${legs}"

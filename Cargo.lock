@@ -7690,9 +7690,9 @@ dependencies = [
 
 [[package]]
 name = "zakura-assets"
-version = "0.3472489.0"
+version = "0.3474810.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b799969db8487a99e4de20d81ddc52d4b8142f3af62925a1ca5948fa8efbe481"
+checksum = "5bda658af77ed400be8636a2c4c81795f3b13d7a26ad8d6b0821c37800ffc956"
 
 [[package]]
 name = "zakura-bellman"

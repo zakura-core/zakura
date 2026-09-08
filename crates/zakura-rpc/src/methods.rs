@@ -1093,20 +1093,31 @@ where
 /// function* waiting without stopping the computation. The returned handle is how the caller
 /// observes when the computation actually finished; until it does, the caller must not start
 /// another one.
+///
+/// Returns `None`, having dispatched nothing, when the chain has already left this template's
+/// parent. A template can go stale while it waits its turn, and the stale watcher below only
+/// stops this function waiting: by the time it fires, the verification is already running and
+/// holding the one speculative worker away from a template a miner could still use.
 fn start_speculative_preparation<BlockVerifierRouter, Tip>(
     verifier: BlockVerifierRouter,
     template: &BlockTemplateResponse,
     latest_chain_tip: Tip,
     network: &Network,
-) -> (
+) -> Option<(
     impl std::future::Future<Output = Preparation>,
     tokio::task::JoinHandle<()>,
-)
+)>
 where
     BlockVerifierRouter: BlockVerifierService,
     Tip: ChainTip + Clone + Send + Sync + 'static,
 {
     let parent = template.previous_block_hash;
+    let mut latest_chain_tip = latest_chain_tip;
+    latest_chain_tip.mark_best_tip_seen();
+    if latest_chain_tip.best_tip_hash() != Some(parent) {
+        return None;
+    }
+
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     let computation = tokio::spawn({
         let template = template.clone();
@@ -1141,7 +1152,7 @@ where
         }
     };
 
-    (waiter, computation)
+    Some((waiter, computation))
 }
 
 /// Validates one template in the foreground, for a caller that needs the answer now.
@@ -1546,12 +1557,20 @@ where
                     }
 
                     if !withdrawn && !breaker_open {
-                        let (preparation, computation) = start_speculative_preparation(
+                        let Some((preparation, computation)) = start_speculative_preparation(
                             verifier.clone(),
                             &template,
                             latest_chain_tip.clone(),
                             &network,
-                        );
+                        ) else {
+                            // The chain left this template's parent while it waited its turn.
+                            metrics::counter!("mining.template_preparation.cancelled").increment(1);
+                            let Some(next) = gbt.next_template_preparation() else {
+                                break;
+                            };
+                            template = next;
+                            continue;
+                        };
 
                         match preparation.await {
                             Preparation::Prepared => {

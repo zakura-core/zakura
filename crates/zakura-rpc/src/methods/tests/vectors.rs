@@ -4681,7 +4681,8 @@ async fn a_preparation_deadline_does_not_stop_its_computation() {
     tip_sender.send_best_tip_height(Height(1));
 
     let (preparation, computation) =
-        start_speculative_preparation(Buffer::new(verifier, 1), &template, tip, &Mainnet);
+        start_speculative_preparation(Buffer::new(verifier, 1), &template, tip, &Mainnet)
+            .expect("the template's parent is the chain tip, so verification is dispatched");
 
     assert!(
         matches!(preparation.await, Preparation::TimedOut),
@@ -4925,4 +4926,44 @@ async fn a_timed_out_parent_is_not_speculated_on_again() {
         .expect("a template is returned after the preparation finishes");
     // The parent whose preparation missed its deadline is not speculated on again.
     verifier.expect_no_requests().await;
+}
+
+/// A template whose parent the chain has already left dispatches no verification at all.
+///
+/// A queued template can go stale while the preceding preparation runs. The stale watcher only
+/// stops the node waiting for an answer; by the time it fires the verification is running and
+/// holding the one speculative worker away from a template a miner could still use.
+#[tokio::test(start_paused = true)]
+async fn an_already_stale_template_dispatches_no_verification() {
+    let _init_guard = zakura_test::init();
+    let parent = Hash([1; 32]);
+    let template = speculative_test_template(parent);
+
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let verifier = {
+        let calls = calls.clone();
+        tower::service_fn(move |_request| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { Ok::<_, zakura_consensus::BoxError>(Hash([2; 32])) }
+        })
+    };
+
+    // The chain has moved past the parent this template was built on.
+    let (tip, tip_sender) = MockChainTip::new();
+    tip_sender.send_best_tip_height(Height(2));
+    tip_sender.send_best_tip_hash(Hash([9; 32]));
+
+    let dispatched =
+        start_speculative_preparation(Buffer::new(verifier, 1), &template, tip, &Mainnet);
+
+    assert!(
+        dispatched.is_none(),
+        "a template built on a parent the chain has left starts no preparation",
+    );
+    tokio::task::yield_now().await;
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the verifier is never called for an already-stale template",
+    );
 }

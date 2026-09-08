@@ -1539,3 +1539,86 @@ fn state_commit_context_errors_keep_misbehavior_scores() {
     let router_error = crate::router::RouterError::from(err);
     assert_eq!(router_error.misbehavior_score(), 100);
 }
+
+/// A server template's verification does not report completion while its own checks still run.
+///
+/// The response to a server-template preparation is what the mining RPC uses to decide that this
+/// block's verification is over, and it bounds speculative work on that. Returning the first
+/// transaction error would abandon the checks still in flight without stopping the batch work
+/// they dispatched, so the RPC would release its one speculative worker while compute continues
+/// and let the next preparation overlap it.
+#[tokio::test]
+async fn a_server_template_error_waits_for_the_checks_it_dispatched() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let _init_guard = zakura_test::init();
+    let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+    // Two transactions: the coinbase, and one that this test holds.
+    let candidate = Arc::new(nu5_prepared_test_block(
+        &network,
+        Some(LockTime::unlocked()),
+    ));
+
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let held_finished = Arc::new(AtomicBool::new(false));
+    let state = service_fn(|request: zs::Request| async move {
+        let response = match request {
+            zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+            zs::Request::CheckBlockProposalValidity(_) => zs::Response::ValidBlockProposal,
+            _ => panic!("the drain test received an unexpected state request: {request:?}"),
+        };
+        Ok::<_, BoxError>(response)
+    });
+    let transaction = {
+        let released = Arc::new(tokio::sync::Mutex::new(Some(released)));
+        let held_finished = held_finished.clone();
+        service_fn(move |request: tx::Request| {
+            let tx::Request::Block { transaction, .. } = &request else {
+                panic!("the drain test received a mempool transaction request");
+            };
+            let is_coinbase = transaction.is_coinbase();
+            let released = released.clone();
+            let held_finished = held_finished.clone();
+            async move {
+                if is_coinbase {
+                    // The failing check returns straight away.
+                    return Err::<tx::Response, BoxError>("invalid coinbase".into());
+                }
+                // The check still in flight, standing in for dispatched batch work.
+                if let Some(receiver) = released.lock().await.take() {
+                    let _ = receiver.await;
+                }
+                held_finished.store(true, Ordering::SeqCst);
+                Ok(accept_block_transaction(request))
+            }
+        })
+    };
+    let mut verifier = SemanticBlockVerifier::new(&network, state, transaction);
+
+    let preparation = tokio::spawn(verifier.ready().await.expect("the verifier is ready").call(
+        Request::Prepare {
+            block: candidate,
+            source: PreparedCandidateSource::ServerTemplate,
+        },
+    ));
+
+    // The failing check has returned, but the other one has not.
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !preparation.is_finished(),
+        "the preparation must not report completion while a check it dispatched still runs",
+    );
+
+    release.send(()).expect("the held check is still running");
+    let result = preparation
+        .await
+        .expect("the preparation task does not panic");
+
+    assert!(
+        held_finished.load(Ordering::SeqCst),
+        "every dispatched check finished before the error was reported",
+    );
+    assert!(matches!(result, Err(VerifyBlockError::Transaction(_))));
+}

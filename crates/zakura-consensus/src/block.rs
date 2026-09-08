@@ -458,12 +458,37 @@ where
             let mut sigops = 0;
             let mut block_miner_fees = Ok(Amount::zero());
 
+            // Returning the first error abandons the checks still running, and abandoning a
+            // check does not stop the batch work it already dispatched. A server template's
+            // caller reads this response as the signal that the block's verification is over,
+            // and bounds its speculative work on that, so this path must not report completion
+            // while nested work continues. Every other caller keeps failing fast: they do not
+            // account for the compute, and an invalid block should cost as little as possible.
+            let account_for_dispatched_work = matches!(
+                request,
+                Request::Prepare {
+                    source: PreparedCandidateSource::ServerTemplate,
+                    ..
+                }
+            );
+            let mut first_error = None;
+
             use futures::StreamExt;
             while let Some(result) = async_checks.next().await {
                 tracing::trace!(?result, remaining = async_checks.len());
-                let response = result
-                    .map_err(Into::into)
-                    .map_err(VerifyBlockError::Transaction)?;
+                let response = match result {
+                    Ok(response) => response,
+                    Err(error) => {
+                        let error = VerifyBlockError::Transaction(error.into());
+                        if !account_for_dispatched_work {
+                            return Err(error);
+                        }
+                        // Keep draining, so this block's dispatched work is finished before the
+                        // error goes back. The first error is the one that is reported.
+                        first_error.get_or_insert(error);
+                        continue;
+                    }
+                };
 
                 assert!(
                     matches!(response, tx::Response::Block { .. }),
@@ -477,6 +502,10 @@ where
                 if let Some(miner_fee) = response.miner_fee() {
                     block_miner_fees += miner_fee;
                 }
+            }
+
+            if let Some(error) = first_error {
+                return Err(error);
             }
 
             // Check the summed block totals

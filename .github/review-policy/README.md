@@ -103,6 +103,9 @@ webhook event, a completion event gets one short retry for the thumbs-up. Hourly
 reconciliation catches missed events, removed reactions, changed policy, and
 interrupted runners. Manual dispatch on `main` rechecks evidence without asking
 Codex for another review.
+PR events are not filtered by base branch, and periodic reconciliation includes
+all open PRs. If an approved PR moves away from `main`, the adapter withdraws its
+approval; PRs on other bases cannot receive a new approval.
 
 A read-only permission preflight skips the App job when no target PR has an
 authorized author. The exception is cleanup: a PR with an existing App approval

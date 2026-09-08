@@ -499,6 +499,17 @@ class AuthorTests(unittest.TestCase):
         self.assertEqual(self.worker.reconcile()["dismissed"], 1)
         self.assertEqual([c.args[1] for c in self.writer.request.call_args_list], ["PUT"])
 
+    def test_retargeted_pr_keeps_cleanup_job_but_cannot_receive_approval(self):
+        self.pull["base"]["ref"] = "release/v1"
+        self.reviews = [owned_review()]
+        self.assertTrue(self.worker.author_gate()["reconcile"])
+        self.assertEqual(self.worker.reconcile()["dismissed"], 1)
+        self.assertEqual([c.args[1] for c in self.writer.request.call_args_list], ["PUT"])
+        self.reviews = []
+        self.writer.reset_mock()
+        self.assertFalse(self.worker.reconcile()["approved"])
+        self.writer.request.assert_not_called()
+
     def test_unavailable_permissions_keep_cleanup_of_existing_approval(self):
         self.reviews = [owned_review()]
         self.api.request.side_effect = adapter.APIError("Unavailable")
@@ -881,6 +892,17 @@ class APITests(unittest.TestCase):
                                                        "comment": {"body": "@codex review PR 1234"}})
         self.assertEqual(numbers, [17])
         api.pages.assert_not_called()
+
+    def test_retargeted_pr_is_checked_by_event_and_periodic_cleanup(self):
+        api = Mock()
+        moved = {"number": 17, "base": {"ref": "release/v1"}}
+        event = {"action": "edited", "pull_request": moved,
+                 "changes": {"base": {"ref": {"from": "main"}}}}
+        self.assertEqual(adapter.target_numbers(api, POLICY, event), [17])
+        api.pages.assert_not_called()
+        api.pages.return_value = [moved, {"number": 18, "base": {"ref": "main"}}]
+        self.assertEqual(adapter.target_numbers(api, POLICY, {}), [17, 18])
+        api.pages.assert_called_once_with(f"/repos/{POLICY.data['repository']}/pulls?state=open")
 
 
 class CLITests(unittest.TestCase):

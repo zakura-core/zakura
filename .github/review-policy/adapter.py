@@ -550,10 +550,9 @@ def target_numbers(api, policy, event):
         return [int(event["issue"]["number"])]
     if event.get("inputs", {}).get("pr"):
         return [int(event["inputs"]["pr"])]
-    # Periodic/default-branch reconciliation also catches missed reaction events,
-    # revoked reactions, policy changes, and a previous interrupted runner.
-    branch = urllib.parse.quote(policy.data["base_branch"], safe="")
-    pulls = api.pages(f"/repos/{policy.data['repository']}/pulls?state=open&base={branch}")
+    # Include other bases so a missed retarget event cannot leave our approval
+    # active outside main. evaluate() still forbids approvals on other bases.
+    pulls = api.pages(f"/repos/{policy.data['repository']}/pulls?state=open")
     require(len(pulls) <= 100, "Too many PRs for one bounded reconciliation run")
     return [p["number"] for p in pulls]
 

@@ -4,7 +4,7 @@ on:
   issue_comment:
     types: [created, edited, deleted]
   pull_request_target: # zizmor: ignore[dangerous-triggers] -- reads PR metadata only; both jobs check out trusted main and never run PR code
-    branches: [main]
+    # Retargeting away from main must still withdraw an existing approval.
     types: [opened, reopened, synchronize, ready_for_review, converted_to_draft, edited]
   push:
     branches: [main]
@@ -16,7 +16,7 @@ on:
   workflow_dispatch:
     inputs:
       pr:
-        description: PR number to recheck (blank checks all open PRs; does not start a Codex review)
+        description: PR number to recheck (blank includes all open base branches for cleanup; does not start a Codex review)
         type: string
         required: false
 

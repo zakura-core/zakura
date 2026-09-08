@@ -216,6 +216,36 @@ fn nu5_prepared_test_block(network: &Network, lock_time: Option<LockTime>) -> Bl
     block
 }
 
+#[test]
+fn template_rejection_distinguishes_expiry_from_service_failure() {
+    let network = Network::new_regtest(Default::default());
+    let block = nu5_prepared_test_block(&network, Some(LockTime::unlocked()));
+    let transaction = &block.transactions[1];
+    tx::check::non_coinbase_expiry_height(&Height(1), transaction).unwrap();
+    let error = tx::check::non_coinbase_expiry_height(&Height(2), transaction).unwrap_err();
+    assert!(VerifyBlockError::Transaction(error).rejects_template());
+    assert!(
+        !VerifyBlockError::ValidateProposal("proposal parent changed".into()).rejects_template()
+    );
+    assert!(!VerifyBlockError::Commit(zs::CommitBlockError::QueueFull).rejects_template());
+    assert!(!VerifyBlockError::ValidateProposal(Box::new(
+        zs::ValidateContextError::InvalidAncestorBlock(block.hash())
+    ))
+    .rejects_template());
+    assert!(VerifyBlockError::ValidateProposal(Box::new(
+        zs::ValidateContextError::InvalidBlockCommitment(
+            zakura_chain::block::CommitmentError::InvalidSapingRootBytes,
+        )
+    ))
+    .rejects_template());
+    assert!(VerifyBlockError::from(BlockError::MissingHeight(block.hash())).rejects_template());
+    assert!(!VerifyBlockError::StateService {
+        source: "service unavailable".into(),
+        hash: block.hash()
+    }
+    .rejects_template());
+}
+
 #[tokio::test]
 async fn mined_orphan_replays_skip_transaction_verification() {
     let _init_guard = zakura_test::init();

@@ -101,6 +101,46 @@ pub enum VerifyBlockError {
 }
 
 impl VerifyBlockError {
+    /// Returns whether proposal validation proved the candidate invalid.
+    /// Local failures and missing proposal context must remain retryable.
+    pub fn rejects_template(&self) -> bool {
+        use zakura_header_chain::BodyVerificationClass;
+        let class = match self {
+            Self::ValidateProposal(source) => {
+                let Some(error) = source.downcast_ref::<zs::ValidateContextError>() else {
+                    return false;
+                };
+                // Header failures cannot condemn a peer's body, but the server must
+                // withdraw a template whose default header fails proposal validation.
+                if matches!(
+                    error,
+                    zs::ValidateContextError::NonSequentialBlock { .. }
+                        | zs::ValidateContextError::TimeTooEarly { .. }
+                        | zs::ValidateContextError::TimeTooLate { .. }
+                        | zs::ValidateContextError::InvalidDifficultyThreshold { .. }
+                ) {
+                    return true;
+                }
+                error.body_verification_class()
+            }
+            Self::Time(_) => return true,
+            Self::Block {
+                source:
+                    BlockError::InvalidHeaderEncoding(_)
+                    | BlockError::MissingHeight(_)
+                    | BlockError::MaxHeight(..)
+                    | BlockError::InvalidDifficulty(..)
+                    | BlockError::TargetDifficultyLimit(..)
+                    | BlockError::DifficultyFilter(..),
+            } => return true,
+            _ => self.body_verification_class(),
+        };
+        matches!(
+            class,
+            BodyVerificationClass::ConsensusInvalid(_) | BodyVerificationClass::PayloadMismatch(_)
+        )
+    }
+
     /// Classify semantic verification without treating local failures as invalid bodies.
     pub fn body_verification_class(&self) -> zakura_header_chain::BodyVerificationClass {
         use zakura_header_chain::{

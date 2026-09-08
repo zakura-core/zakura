@@ -49,6 +49,8 @@ P2P_STACK="${P2P_STACK:-}"
 VCT_FAST_SYNC="${VCT_FAST_SYNC:-auto}"
 ENABLE_TRACES="${ENABLE_TRACES:-true}"
 COMPARISON="${COMPARISON:-refs}"
+HISTORICAL_PRUNED="${HISTORICAL_PRUNED:-false}"
+case "$HISTORICAL_PRUNED" in true|false) ;; *) exit 1 ;; esac
 case "$VCT_FAST_SYNC" in auto|true|false) ;; *) exit 1 ;; esac
 case "$ENABLE_TRACES" in true|false) ;; *) exit 1 ;; esac
 METRICS_PORT=9999
@@ -102,6 +104,13 @@ case "$WORKLOAD" in
     ;;
   *) die "unknown workload: $WORKLOAD" ;;
 esac
+
+if [[ "$HISTORICAL_PRUNED" == true ]]; then
+  [[ "$WORKLOAD" == historical_sync && "$VERIFY_MODE" == checkpoint ]] \
+    || die "historical pruning requires checkpoint sync"
+  STORAGE_MODE=pruned
+  FRESH_STATE_COPY=true
+fi
 
 if [[ -z "$P2P_STACK" ]]; then
   if [[ "$WORKLOAD" == live_head ]]; then
@@ -304,6 +313,27 @@ CFG=/root/bench-config.toml
 cp "$CFG" "$OUT_DIR/bench-config.toml"
 sha256sum "$ZAKURAD_BIN" > "$OUT_DIR/binary.sha256"
 lscpu -J > "$OUT_DIR/cpu.json"
+
+if [[ "$HISTORICAL_PRUNED" == true ]]; then
+  # Preparation runs only against this invocation's disposable state copy.
+  # A short sync drains the remaining 10,000-block retention window before timing.
+  WARMUP_HEIGHT=$(( START_HEIGHT + 1000 ))
+  (( STOP_HEIGHT > WARMUP_HEIGHT )) || die "stop height must exceed pruned warmup"
+  timeout --kill-after=30s 1200s "$ZAKURAD_BIN" -c "$CFG" prune-state \
+    --cache-dir "$STATE_CACHE_DIR" --network Mainnet --tx-retention 10000 --confirm \
+    > "$OUT_DIR/prune-preparation.log" 2>&1 \
+    || die "offline pruning failed or timed out"
+  WARMUP_CFG="$OUT_DIR/warmup-config.toml"
+  sed "s/^debug_stop_at_height = .*/debug_stop_at_height = $WARMUP_HEIGHT/; /trace_dir = /d" \
+    "$CFG" > "$WARMUP_CFG"
+  timeout --kill-after=30s 600s "$ZAKURAD_BIN" -c "$WARMUP_CFG" start \
+    > "$OUT_DIR/warmup.log" 2>&1 || die "pruned warmup failed or timed out"
+  grep -F 'stopping at configured height, flushing database to disk' "$OUT_DIR/warmup.log" \
+    | grep -Fq "height=Height($WARMUP_HEIGHT)" || die "warmup did not confirm the requested height"
+  START_HEIGHT="$WARMUP_HEIGHT"
+  sync
+  echo 3 > /proc/sys/vm/drop_caches
+fi
 
 [[ "$WORKLOAD" == live_head ]] && SNAPSHOT_HEIGHT=""
 
@@ -804,6 +834,7 @@ json.dump({
     "verify_mode": "$VERIFY_MODE", "p2p_stack": "$P2P_STACK",
     "comparison": "$COMPARISON", "vct_fast_sync": "$VCT_FAST_SYNC",
     "traces": "$ENABLE_TRACES", "storage_mode": "$STORAGE_MODE",
+    "historical_pruned_preparation": "$HISTORICAL_PRUNED",
     "stop_height": $STOP_HEIGHT,
     "snapshot_height": ${SNAPSHOT_HEIGHT:-$START_HEIGHT},
     "start_height": $START_HEIGHT, "end_height": $END_HEIGHT,

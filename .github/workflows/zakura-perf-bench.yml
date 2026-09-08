@@ -38,6 +38,7 @@ on:
         default: "historical_checkpoint"
         options:
           - historical_checkpoint
+          - historical_pruned_checkpoint
           - historical_semantic
           - live_head
       baseline_ref:
@@ -106,6 +107,7 @@ jobs:
       has_baseline: ${{ steps.legs.outputs.has_baseline }}
       verify_mode: ${{ steps.legs.outputs.verify_mode }}
       workload: ${{ steps.legs.outputs.workload }}
+      historical_pruned: ${{ steps.legs.outputs.historical_pruned }}
     steps:
       - name: Resolve legs and modes
         id: legs
@@ -121,8 +123,10 @@ jobs:
           REQUESTED_WORKLOAD: ${{ github.event_name == 'schedule' && (github.event.schedule == '47 6 * * 1' && 'historical_semantic' || 'historical_checkpoint') || inputs.workload || 'historical_checkpoint' }}
         run: |
           set -euo pipefail
+          HISTORICAL_PRUNED=false
           case "$REQUESTED_WORKLOAD" in
             historical_checkpoint) WORKLOAD=historical_sync; VERIFY_MODE=checkpoint ;;
+            historical_pruned_checkpoint) WORKLOAD=historical_sync; VERIFY_MODE=checkpoint; HISTORICAL_PRUNED=true ;;
             historical_semantic) WORKLOAD=historical_sync; VERIFY_MODE=semantic ;;
             live_head) WORKLOAD=live_head; VERIFY_MODE=semantic ;;
             *) echo "unknown workload: $REQUESTED_WORKLOAD" >&2; exit 1 ;;
@@ -168,6 +172,7 @@ jobs:
             echo "has_baseline=${has_baseline}"
             echo "verify_mode=${VERIFY_MODE}"
             echo "workload=${WORKLOAD}"
+            echo "historical_pruned=${HISTORICAL_PRUNED}"
           } >> "$GITHUB_OUTPUT"
           echo "plan: ${legs} (workload=${WORKLOAD}, verify_mode=${VERIFY_MODE})"
 
@@ -232,6 +237,7 @@ jobs:
           COMPARISON: ${{ inputs.comparison || 'refs' }}
           CROSSOVER: ${{ inputs.crossover || 'false' }}
           BENCH_LEGS_JSON: ${{ needs.plan.outputs.legs }}
+          HISTORICAL_PRUNED: ${{ needs.plan.outputs.historical_pruned }}
           VOLUME_NAME: ${{ steps.droplet.outputs.volume_name }}
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -256,6 +262,7 @@ jobs:
             printf 'COMPARISON=%q\n'       "${COMPARISON}"
             printf 'CROSSOVER=%q\n'        "${CROSSOVER}"
             printf 'BENCH_LEGS_JSON=%q\n'  "${BENCH_LEGS_JSON}"
+            printf 'HISTORICAL_PRUNED=%q\n' "${HISTORICAL_PRUNED}"
             printf 'VOLUME_NAME=%q\n'      "${VOLUME_NAME}"
             printf 'GITHUB_RUN_URL=%q\n'   "${GITHUB_RUN_URL}"
             printf 'GITHUB_RUN_ID=%q\n'    "${GITHUB_RUN_ID}"

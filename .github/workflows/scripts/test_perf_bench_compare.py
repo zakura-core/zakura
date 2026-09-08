@@ -57,12 +57,7 @@ def meta(leg: str, **overrides) -> dict:
 
 class Render(unittest.TestCase):
     def test_summary_matches_the_workflow_output_byte_for_byte(self):
-        """Golden output: this is the summary the removed YAML heredoc produced.
-
-        The point of extracting the script was to keep that summary identical,
-        so assert the whole string -- a changed column set, truncation length,
-        or number format is a regression, not a detail.
-        """
+        """Keep the summary columns, SHA truncation, and noise caveat stable."""
         # verdict "" is what perf-bench-run.sh writes when it skips or fails
         # classification, which is every live_head run.
         markdown, comparable = compare.render(
@@ -80,7 +75,7 @@ class Render(unittest.TestCase):
             "| primary | `1a2b3c4d5` | 151.75 | 88.5 | faster |\n"
             "\n"
             "**Speedup (primary vs baseline): 1.50×** "
-            "(101.0 → 151.75 blocks/s, both legs on identical parallel droplets)",
+            "(101.0 → 151.75 blocks/s, legs run on separate parallel droplets; host and peer noise remain)",
         )
 
     def test_missing_meta_is_not_comparable(self):
@@ -119,6 +114,45 @@ class Render(unittest.TestCase):
         markdown, comparable = compare.render(primary, baseline)
         self.assertFalse(comparable)
         self.assertIn("ranges differ", markdown)
+
+    def test_configuration_comparison_requires_host_identity(self):
+        markdown, comparable = compare.render(
+            meta("primary", comparison="transport"),
+            meta("baseline", comparison="transport"),
+        )
+        self.assertFalse(comparable)
+        self.assertIn("identity is missing", markdown)
+
+    def test_different_cpu_models_do_not_report_a_speedup(self):
+        markdown, comparable = compare.render(
+            meta("primary", comparison="transport", environment={"Model name:": "8280"}),
+            meta("baseline", comparison="transport", environment={"Model name:": "8168"}),
+        )
+        self.assertFalse(comparable)
+        self.assertIn("identity differs", markdown)
+
+    def test_matching_host_identity_allows_comparison(self):
+        environment = {"Model name:": "8280", "state_snapshot_id": "same-snapshot"}
+        _, comparable = compare.render(
+            meta("primary", comparison="transport", environment=environment),
+            meta("baseline", comparison="transport", environment=environment),
+        )
+        self.assertTrue(comparable)
+
+
+class LoadEnvironment(unittest.TestCase):
+    def test_recorded_host_and_snapshot_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            fields = {"Architecture:": "x86_64", "Model name:": "8280", "CPU(s):": "16", "Thread(s) per core:": "1"}
+            (directory / "cpu.json").write_text(json.dumps({
+                "lscpu": [{"field": key, "data": value} for key, value in fields.items()]
+            }))
+            provision = {"region": "nyc1", "size": "c-16", "image_id": 123, "state_snapshot_id": "snapshot"}
+            (directory / "provisioning.json").write_text(json.dumps(provision))
+            self.assertEqual(compare.load_environment(str(directory / "meta.json")), fields | provision)
+            (directory / "cpu.json").write_text('{"lscpu": []}')
+            self.assertIsNone(compare.load_environment(str(directory / "meta.json")))
 
 
 class LoadMeta(unittest.TestCase):

@@ -23,7 +23,7 @@ Useful input combinations:
 
 Every Monday two scheduled runs profile `main` as standing baselines: 05:17 UTC in `checkpoint` mode and 06:47 UTC in `semantic` mode. Review them under Actions → Perf bench.
 
-Configuration comparisons require `historical_checkpoint` and create two independent clones of the same baked archive state. They keep archive storage on both legs; validate a promising result separately against pruned full sync. Leave `baseline_ref` empty to compare the same source revision. Artifacts include the generated benchmark config, binary checksum, and CPU description. A wall-time cap is an incomplete run and suppresses the throughput comparison. Droplets and cloned volumes are removed after artifact collection unless teardown was explicitly disabled.
+Configuration comparisons require `historical_checkpoint` and create two independent clones of the same baked archive state. They keep archive storage on both legs; validate a promising result separately against pruned full sync. Leave `baseline_ref` empty to compare the same source revision. Artifacts include the generated benchmark config, binary checksum, and CPU description. The comparison refuses missing or mismatched CPU, host configuration, and snapshot identities; a matching droplet size alone does not imply a matching CPU model. Matching metadata still leaves host, storage, and peer noise. A wall-time cap is an incomplete run and suppresses the throughput comparison. Droplets and cloned volumes are removed after artifact collection unless teardown was explicitly disabled.
 
 ## Read the results
 

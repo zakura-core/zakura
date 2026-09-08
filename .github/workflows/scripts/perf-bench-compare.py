@@ -6,8 +6,8 @@ Usage: perf-bench-compare.py PRIMARY_META BASELINE_META
 Both paths are the `meta.json` a leg leaves in its artifact. The markdown goes
 to stdout (the workflow appends it to the step summary); when GITHUB_OUTPUT is
 set, `compare=true|false` is written to it. `false` means the legs are not
-comparable -- one produced no meta.json, or zakurad exited non-zero on one of
-them -- and the caller must skip the CPU profile diff.
+comparable because a run failed, the workloads differ, or recorded host and
+snapshot identities do not match. The caller must skip the CPU profile diff.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from pathlib import Path
 
 
 def load_meta(path: str) -> dict | None:
@@ -39,6 +40,26 @@ def failed_legs(metas) -> list[str]:
     return [meta["leg"] for meta in metas if meta.get("node_exit_status", 0)]
 
 
+def load_environment(meta_path: str) -> dict | None:
+    """Read the host and snapshot identity recorded beside a leg's metadata."""
+    directory = Path(meta_path).parent
+    cpu = load_meta(str(directory / "cpu.json"))
+    provisioning = load_meta(str(directory / "provisioning.json"))
+    try:
+        fields = {row["field"]: row["data"] for row in cpu["lscpu"]}
+        identity = {
+            key: fields[key]
+            for key in ("Architecture:", "Model name:", "CPU(s):", "Thread(s) per core:")
+        }
+        identity.update({
+            key: provisioning[key]
+            for key in ("region", "size", "image_id", "state_snapshot_id")
+        })
+        return identity if all(identity.values()) else None
+    except (KeyError, TypeError):
+        return None
+
+
 def render(primary: dict | None, baseline: dict | None) -> tuple[str, bool]:
     """Return the summary markdown and whether the legs are comparable."""
     if primary is None or baseline is None:
@@ -59,6 +80,12 @@ def render(primary: dict | None, baseline: dict | None) -> tuple[str, bool]:
     ):
         return "No comparison: the workloads or block ranges differ.", False
 
+    if "comparison" in primary or "comparison" in baseline:
+        if not primary.get("environment") or not baseline.get("environment"):
+            return "No comparison: host or snapshot identity is missing.", False
+        if primary["environment"] != baseline["environment"]:
+            return "No comparison: CPU, host configuration, or snapshot identity differs.", False
+
     # A zero-throughput baseline has no meaningful ratio; report it as nan
     # rather than crashing, and let the blocks/s column show what happened.
     speedup = primary["bps"] / baseline["bps"] if baseline["bps"] else float("nan")
@@ -77,7 +104,7 @@ def render(primary: dict | None, baseline: dict | None) -> tuple[str, bool]:
     lines.append(
         f"**Speedup (primary vs baseline): {speedup:.2f}×** "
         f"({baseline['bps']} → {primary['bps']} blocks/s, "
-        "both legs on identical parallel droplets)"
+        "legs run on separate parallel droplets; host and peer noise remain)"
     )
     if "comparison" in primary:
         lines.extend(["", "Configuration for each leg:"])
@@ -94,7 +121,11 @@ def main(argv: list[str]) -> int:
         print(f"usage: {argv[0]} PRIMARY_META BASELINE_META", file=sys.stderr)
         return 2
 
-    markdown, comparable = render(load_meta(argv[1]), load_meta(argv[2]))
+    metas = [load_meta(path) for path in argv[1:]]
+    for path, meta in zip(argv[1:], metas):
+        if meta is not None and "comparison" in meta:
+            meta["environment"] = load_environment(path)
+    markdown, comparable = render(*metas)
 
     # Flag first: if printing the summary fails, the caller must still see a
     # decision rather than silently skipping the CPU diff.

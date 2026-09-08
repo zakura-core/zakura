@@ -5457,7 +5457,8 @@ where
     // # TODO
     // - add a separate request like BestChainNextMedianTimePast, but skipping the
     //   consistency check, because any block's difficulty is ok for display
-    // - return 1.0 for a "not enough blocks in the state" error, like `zcashd`:
+    //
+    // Return the minimum difficulty when the state is unavailable, like `zcashd`:
     // <https://github.com/zcash/zcash/blob/7b28054e8b46eb46a9589d0bdc8e29f9fa1dc82d/src/rpc/blockchain.cpp#L40-L41>
     let response = state
         .ready()
@@ -5466,9 +5467,7 @@ where
 
     let response = match (should_use_default, response) {
         (_, Ok(res)) => res,
-        (true, Err(_)) => {
-            return Ok((U256::from(network.target_difficulty_limit()) >> 128).as_u128() as f64);
-        }
+        (true, Err(_)) => return Ok(1.0),
         (false, Err(error)) => return Err(error).map_error(0),
     };
 

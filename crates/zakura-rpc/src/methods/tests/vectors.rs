@@ -4021,6 +4021,27 @@ async fn rpc_z_validateaddress_regtest() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn chain_tip_difficulty_uses_minimum_on_state_error() {
+    let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state_handler = read_state.clone();
+
+    let difficulty_fut = chain_tip_difficulty(Mainnet, read_state, true);
+    let state_error_fut = async move {
+        read_state_handler
+            .expect_request_that(|request| matches!(request, ReadRequest::ChainInfo))
+            .await
+            .respond(Err(BoxError::from("chain info is unavailable")));
+    };
+
+    let (difficulty, ()) = tokio::join!(difficulty_fut, state_error_fut);
+
+    assert_eq!(
+        difficulty.expect("the fallback difficulty is available"),
+        1.0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn rpc_getdifficulty() {
     let _init_guard = zakura_test::init();
 

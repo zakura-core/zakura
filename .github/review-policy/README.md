@@ -81,8 +81,10 @@ The adapter requires all of the following from live GitHub API reads:
   reaction. `Completed` alone also describes reviews that found problems.
 - No Codex findings submitted during that episode and no unresolved Codex threads,
   including outdated threads. Older resolved findings allow a new clean review.
-- For manual reviews, a visible, recent, unedited `@codex review` request.
-  A newer visible review request invalidates the previous receipt.
+- For manual reviews, a visible, recent, unedited `@codex review` request from
+  an account with current Write, Maintain, or Admin access. Commands from other
+  accounts are ignored, including for invalidation of an existing approval.
+  A newer visible request from an authorized account invalidates the previous receipt.
 
 The parser supports the native Code Review summary table. A changed format,
 missing history, additional unsupported review rows, ambiguous commit resolution,

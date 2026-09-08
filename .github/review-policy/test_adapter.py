@@ -56,13 +56,13 @@ def evidence(trigger="Draft marked ready"):
         # numeric ID matches the authenticated App summary and GraphQL Bot.
         "reactions": [{"id": 200, "content": "+1", "user": {**NATIVE, "type": "User"},
                        "created_at": "2026-09-01T10:02:03Z"}],
-        "reviews": [], "threads": [], "resolved_sha": HEAD,
+        "reviews": [], "threads": [], "resolved_sha": HEAD, "authorized_requesters": {900},
     }
 
 
 def command(body="@codex review", created="2026-09-01T09:59:58Z"):
     return {"id": 99, "body": body, "created_at": created, "updated_at": created,
-            "user": {"id": 900, "type": "User"}}
+            "user": {"id": 900, "type": "User", "login": "contributor"}}
 
 
 def native_review(when="2026-09-01T10:01:30Z", commit=HEAD):
@@ -529,6 +529,94 @@ class AuthorTests(unittest.TestCase):
         self.assertEqual([c.args[1] for c in self.writer.request.call_args_list], ["POST", "PUT"])
 
 
+class RequesterTests(unittest.TestCase):
+    def setUp(self):
+        self.case = AuthorTests()
+        self.case.setUp()
+        self.worker = self.case.worker
+        self.data = evidence()
+        self.outsider = {"id": 901, "login": "outsider", "type": "User"}
+        self.permissions = {"permission": "read", "role_name": "triage", "user": self.outsider}
+        self.case.api.request.side_effect = self.request
+        self.case.api.pages.side_effect = self.pages
+        self.case.api.graphql.return_value = {"node": self.data["summary"]}
+        self.worker.threads = Mock(return_value=[])
+        self.worker.evidence = adapter.Adapter.evidence.__get__(self.worker)
+
+    def request(self, path):
+        if path.endswith("/collaborators/outsider/permission"):
+            if isinstance(self.permissions, Exception):
+                raise self.permissions
+            return self.permissions
+        if path.endswith("/commits/" + HEAD[:7]):
+            return {"sha": HEAD}
+        return self.case.request(path)
+
+    def pages(self, path):
+        if path.endswith("/comments"):
+            return self.data["comments"]
+        if path.endswith("/reactions"):
+            return self.data["reactions"]
+        if path.endswith("/reviews"):
+            return self.case.reviews
+        if path.endswith("/files"):
+            return [{"filename": "deploy/a.py", "status": "modified"}]
+        raise AssertionError(path)
+
+    def outsider_command(self):
+        comment = command(created="2026-09-01T10:03:00Z")
+        comment.update(user=self.outsider, author_association="MEMBER")
+        self.data["comments"].append(comment)
+        return comment
+
+    def test_outsider_new_or_edited_command_cannot_withdraw_approval(self):
+        self.case.reviews = [owned_review()]
+        comment = self.outsider_command()
+        for created in ("2026-09-01T10:03:00Z", "2026-09-01T09:59:00Z"):
+            with self.subTest(created=created):
+                comment["created_at"] = created
+                self.assertTrue(self.worker.reconcile()["approved"])
+                self.case.writer.request.assert_not_called()
+
+    def test_missing_collaborator_is_ignored(self):
+        self.permissions = adapter.APIError("Not found", status=404)
+        self.case.reviews = [owned_review()]
+        self.outsider_command()
+        self.assertTrue(self.worker.reconcile()["approved"])
+        self.case.writer.request.assert_not_called()
+
+    def test_outsider_cannot_supply_manual_request_evidence(self):
+        self.data = evidence("Manual request")
+        self.case.api.graphql.return_value = {"node": self.data["summary"]}
+        comment = self.outsider_command()
+        comment.update(created_at="2026-09-01T09:59:58Z", updated_at="2026-09-01T09:59:58Z")
+        self.assertIn("Manual review request is missing", self.worker.reconcile()["reason"])
+        self.case.writer.request.assert_not_called()
+
+    def test_authorized_request_still_withdraws_old_approval(self):
+        self.case.reviews = [owned_review()]
+        self.data["comments"].append(command(created="2026-09-01T10:03:00Z"))
+        self.assertEqual(self.worker.reconcile()["dismissed"], 1)
+        self.assertEqual(self.case.writer.request.call_args.args[1], "PUT")
+
+    def test_requester_permissions_are_cached_only_within_one_evaluation(self):
+        self.outsider_command()
+        self.outsider_command()
+        self.worker.evidence(self.case.pull)
+        lookups = [c for c in self.case.api.request.call_args_list
+                   if c.args[0].endswith("/collaborators/outsider/permission")]
+        self.assertEqual(len(lookups), 1)
+        self.permissions["permission"] = "write"
+        with self.assertRaisesRegex(adapter.Ineligible, "newer or edited"):
+            self.worker.evidence(self.case.pull)
+
+    def test_permission_service_failure_is_not_treated_as_denied_access(self):
+        self.outsider_command()
+        self.permissions = adapter.APIError("Unavailable", status=503)
+        with self.assertRaises(adapter.APIError):
+            self.worker.evidence(self.case.pull)
+
+
 class RulesTests(unittest.TestCase):
     def setUp(self):
         self.rules = rules_fixture()
@@ -754,6 +842,14 @@ class ReconcileTests(unittest.TestCase):
 
 
 class APITests(unittest.TestCase):
+    def test_http_status_survives_as_api_error(self):
+        with adapter.urllib.error.HTTPError(
+                "https://api.github.com/test", 404, "Not found", {}, None) as error, \
+                patch("urllib.request.urlopen", side_effect=error):
+            with self.assertRaises(adapter.APIError) as result:
+                adapter.GitHub("unused").request("/test")
+            self.assertEqual(result.exception.status, 404)
+
     def test_partial_network_response_is_an_api_error(self):
         with patch("urllib.request.urlopen") as open_url:
             open_url.return_value.__enter__.return_value.read.side_effect = http.client.IncompleteRead(b"")

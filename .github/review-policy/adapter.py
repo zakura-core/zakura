@@ -49,6 +49,10 @@ class Ineligible(Exception):
 class APIError(Exception):
     """A GitHub API operation failed; its response body is not logged."""
 
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
+
 
 def require(condition, reason):
     if not condition:
@@ -149,7 +153,7 @@ class GitHub:
                     raise APIError("GitHub response exceeded the size limit")
                 return json.loads(raw) if raw else None
         except urllib.error.HTTPError as exc:
-            raise APIError(f"GitHub {method} failed with HTTP {exc.code}") from None
+            raise APIError(f"GitHub {method} failed with HTTP {exc.code}", status=exc.code) from None
         except (OSError, http.client.HTTPException, ValueError) as exc:
             raise APIError(f"GitHub {method} failed ({type(exc).__name__})") from None
 
@@ -184,7 +188,8 @@ def parse_summary(body):
     return row
 
 
-def check_evidence(policy, pull, comments, summary, reactions, reviews, threads, resolved_sha):
+def check_evidence(policy, pull, comments, summary, reactions, reviews, threads, resolved_sha,
+                   authorized_requesters):
     """Return a durable receipt only for one authenticated, finished review episode."""
     candidates = [c for c in comments if policy.native(c)
                   and c.get("body", "").startswith(SUMMARY_MARKER)]
@@ -218,6 +223,7 @@ def check_evidence(policy, pull, comments, summary, reactions, reviews, threads,
             "Codex reviewed a different or ambiguous commit")
 
     requests = [c for c in comments if c.get("user", {}).get("type") != "Bot"
+                and c.get("user", {}).get("id") in authorized_requesters
                 and COMMAND.search(c.get("body", ""))]
     for request in requests:
         require(instant(request["created_at"]) <= started["time"]
@@ -315,6 +321,13 @@ class Adapter:
 
     def evidence(self, pull):
         comments = self.api.pages(f"{self.prefix}/issues/{self.number}/comments")
+        requesters = {}
+        for comment in comments:
+            user = comment.get("user") or {}
+            if (user.get("type") == "User" and user.get("id") not in requesters
+                    and COMMAND.search(comment.get("body", ""))):
+                requesters[user.get("id")] = self.has_write_access(user)
+        authorized = {user_id for user_id, allowed in requesters.items() if allowed}
         summaries = [c for c in comments if self.policy.native(c)
                      and c.get("body", "").startswith(SUMMARY_MARKER)]
         require(len(summaries) == 1, "Expected exactly one native Codex summary")
@@ -331,7 +344,7 @@ class Adapter:
         reactions = self.api.pages(f"{self.prefix}/issues/{self.number}/reactions")
         reviews = self.api.pages(self.pull_path + "/reviews")
         return check_evidence(self.policy, pull, comments, summary, reactions, reviews,
-                              self.threads(), resolved)
+                              self.threads(), resolved, authorized)
 
     def check_fragment(self, path, head):
         """Read the regular fragment blob at the reviewed head without executing it."""
@@ -364,18 +377,26 @@ class Adapter:
         require("release-readiness" not in content.casefold(),
                 "Changelog release-policy directives require human review")
 
+    def has_write_access(self, user):
+        """Read current account permissions; a missing collaborator has no access."""
+        if not (user.get("type") == "User" and isinstance(user.get("id"), int)
+                and isinstance(user.get("login"), str) and bool(user["login"])):
+            return False
+        login = urllib.parse.quote(user["login"], safe="")
+        try:
+            access = self.api.request(f"{self.prefix}/collaborators/{login}/permission")
+        except APIError as exc:
+            if exc.status == 404:
+                return False
+            raise
+        require((access.get("user") or {}).get("id") == user["id"],
+                "Permission lookup does not match the account")
+        # GitHub maps Maintain to write and Triage to read, including custom roles.
+        return access.get("permission") in ("write", "admin")
+
     def check_author(self, pull):
         """Require the PR author's current write-level access to the base repository."""
-        author = pull.get("user") or {}
-        require(author.get("type") == "User" and isinstance(author.get("id"), int)
-                and isinstance(author.get("login"), str) and bool(author["login"]),
-                "PR author must be an identifiable human account")
-        login = urllib.parse.quote(author["login"], safe="")
-        access = self.api.request(f"{self.prefix}/collaborators/{login}/permission")
-        require((access.get("user") or {}).get("id") == author["id"],
-                "Permission lookup does not match the PR author")
-        # GitHub maps Maintain to write and Triage to read, including custom roles.
-        require(access.get("permission") in ("write", "admin"),
+        require(self.has_write_access(pull.get("user") or {}),
                 "PR author needs Write, Maintain, or Admin access to this repository")
 
     def author_gate(self):

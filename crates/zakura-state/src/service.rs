@@ -188,6 +188,9 @@ pub(crate) struct StateService {
     /// once the reserving height is finalized, alongside the other per-block maps.
     optimistic_relay_reserved_parents: HashMap<block::Hash, block::Height>,
 
+    /// Capacity held until the writer publishes each contextual or reconsideration result.
+    non_finalized_write_slots: Arc<tokio::sync::Semaphore>,
+
     /// Parents targeted by operator invalidation cannot authorize optimistic relay, counted by
     /// how many invalidations are outstanding for each hash.
     ///
@@ -591,6 +594,9 @@ impl StateService {
             finalized_block_write_last_sent_hash,
             non_finalized_block_write_sent_hashes,
             optimistic_relay_reserved_parents: HashMap::new(),
+            non_finalized_write_slots: Arc::new(tokio::sync::Semaphore::new(
+                queued_blocks::MAX_QUEUED_BLOCKS,
+            )),
             optimistic_relay_invalidated_parents: Arc::new(Mutex::new(HashMap::new())),
             non_finalized_failed_ancestors: IndexMap::new(),
             invalid_block_write_reset_receiver,
@@ -1060,6 +1066,15 @@ impl StateService {
             return rsp_rx;
         }
 
+        if let Some(admission) = &admission {
+            if !self.drains_the_non_finalized_queue_now(&parent_hash) {
+                admission.reject();
+                let (rsp_tx, rsp_rx) = oneshot::channel();
+                let _ = rsp_tx.send(Err(CommitBlockError::MissingMinedParent.into()));
+                return rsp_rx;
+            }
+        }
+
         // [`Request::CommitSemanticallyVerifiedBlock`] contract: a request to commit a block which
         // has been queued but not yet committed to the state fails the older request and replaces
         // it with the newer request.
@@ -1197,6 +1212,14 @@ impl StateService {
                     .dequeue_children(parent_hash);
 
                 for queued_child in queued_children {
+                    let Ok(write_slot) = self.non_finalized_write_slots.clone().try_acquire_owned()
+                    else {
+                        Self::send_semantically_verified_block_error(
+                            queued_child,
+                            CommitBlockError::QueueFull,
+                        );
+                        continue;
+                    };
                     let (SemanticallyVerifiedBlock { hash, .. }, _, _) = &queued_child;
                     let hash = *hash;
 
@@ -1207,6 +1230,8 @@ impl StateService {
                     let optimistic_relay_still_authorized = admission
                         .as_ref()
                         .is_some_and(BlockAdmission::optimistic_relay_authorized)
+                        && self.non_finalized_write_slots.available_permits()
+                            == queued_blocks::MAX_QUEUED_BLOCKS - 1
                         && self
                             .best_tip()
                             .is_some_and(|(_, tip_hash)| tip_hash == candidate_parent)
@@ -1217,14 +1242,19 @@ impl StateService {
                         && !self
                             .optimistic_relay_reserved_parents
                             .contains_key(&candidate_parent)
-                        && !self.optimistic_relay_parent_is_invalidated(&candidate_parent);
+                        && !self.optimistic_relay_is_blocked_by_invalidation();
                     if optimistic_relay_still_authorized {
                         // Only the first server candidate can reserve early relay for this parent.
                         // Siblings receive the normal committed relay after contextual validation.
                         self.optimistic_relay_reserved_parents
                             .insert(candidate_parent, queued_child.0.height);
                     }
-                    let send_result = non_finalized_block_write_sender.send(queued_child.into());
+                    let send_result =
+                        non_finalized_block_write_sender.send(NonFinalizedWriteMessage::Commit {
+                            queued: queued_child,
+                            queued_at: Instant::now(),
+                            write_slot,
+                        });
 
                     if let Err(SendError(NonFinalizedWriteMessage::Commit { queued, .. })) =
                         send_result
@@ -1267,12 +1297,13 @@ impl StateService {
             .retain(|_, height| *height > finalized_tip_height);
     }
 
-    /// Returns whether an operator invalidation still blocks optimistic relay off `parent`.
-    fn optimistic_relay_parent_is_invalidated(&self, parent: &block::Hash) -> bool {
-        self.optimistic_relay_invalidated_parents
+    /// Any outstanding invalidation can remove an ancestor of the published tip.
+    fn optimistic_relay_is_blocked_by_invalidation(&self) -> bool {
+        !self
+            .optimistic_relay_invalidated_parents
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(parent)
+            .is_empty()
     }
 
     /// Releases one outstanding invalidation of `hash`, after the writer confirmed that it was
@@ -1340,8 +1371,16 @@ impl StateService {
             return rsp_rx;
         };
 
+        let Ok(write_slot) = self.non_finalized_write_slots.clone().try_acquire_owned() else {
+            let _ = rsp_tx.send(Err(ReconsiderError::ReconsiderSendFailed));
+            return rsp_rx;
+        };
         if let Err(tokio::sync::mpsc::error::SendError(error)) =
-            sender.send(NonFinalizedWriteMessage::Reconsider { hash, rsp_tx })
+            sender.send(NonFinalizedWriteMessage::Reconsider {
+                hash,
+                rsp_tx,
+                write_slot,
+            })
         {
             let NonFinalizedWriteMessage::Reconsider { rsp_tx, .. } = error else {
                 unreachable!("should return the same Reconsider message could not be sent");

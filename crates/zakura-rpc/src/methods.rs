@@ -2963,6 +2963,10 @@ where
             .coinbase_height()
             .ok_or_error(0, "coinbase height not found")?;
         let block_hash = block.hash();
+        let submission = match self.gbt.reserve_mined_submission(block_hash) {
+            Ok(submission) => submission,
+            Err(response) => return Ok(response.into()),
+        };
         let block = Arc::new(block);
         let work_id = parameters.and_then(|parameters| parameters.work_id);
         let admission = zakura_state::BlockAdmission::pending();
@@ -2977,6 +2981,7 @@ where
 
         // This task owns the commit and registry lifecycle. RPC cancellation only detaches it.
         let lifecycle = tokio::spawn(async move {
+            let _submission = submission;
             let verification =
                 async move { block_verifier_router.ready().await?.call(request).await };
             tokio::pin!(verification);
@@ -3089,6 +3094,17 @@ where
 
         let response = match chain_error {
             Ok(source) if source.is_duplicate_request() => SubmitBlockErrorResponse::Duplicate,
+            Ok(RouterError::Block { source })
+                if matches!(
+                    source.as_ref(),
+                    zakura_consensus::VerifyBlockError::Commit(
+                        zakura_state::CommitBlockError::MissingMinedParent
+                            | zakura_state::CommitBlockError::QueueFull
+                    )
+                ) =>
+            {
+                SubmitBlockErrorResponse::Inconclusive
+            }
 
             // Currently, these match arms return Reject for the older duplicate in a queue,
             // but queued duplicates should be DuplicateInconclusive.

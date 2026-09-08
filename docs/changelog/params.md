@@ -32,6 +32,8 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| `MAX_MINED_SUBMISSIONS` | `crates/zakura-rpc/src/methods/types/submit_block.rs` | unbounded → `16` submissions | [#748](https://github.com/zakura-core/zakura/pull/748) | Bound detached verification work across RPC cancellation. |
+| `non_finalized_write_slots` | `crates/zakura-state/src/service.rs` | unbounded → `1,000` contextual writes | [#748](https://github.com/zakura-core/zakura/pull/748) | Bound writer block bodies using the existing orphan queue capacity. |
 | `LEGACY_FALLBACK_APPLY_DRAIN_DEADLINE` | `crates/zakurad/src/commands/start/zakura/coordinator.rs` | new → `30 min` | [#831](https://github.com/zakura-core/zakura/pull/831) | Terminate the node when native block applies prevent legacy fallback from acquiring exclusive ownership, instead of leaving the fallback handoff pending forever. |
 | `MAX_CANDIDATE_TIPS_V1` | `crates/zakura-header-chain/src/config.rs` | `10` → `11` | [#831](https://github.com/zakura-core/zakura/pull/831) | Retain ten full-state fork tips plus one independent selected header tip, so header candidate pressure cannot evict a branch that full state still owns. |
 | `VCT_LOCAL_OPERATION_FATAL_AFTER` | `crates/zakura-network/src/zakura/header_sync/reactor.rs` | new → `30 min` | [#821](https://github.com/zakura-core/zakura/pull/821) | Terminate a node whose local VCT repair prepare or apply operation remains pending, while allowing slow valid operations substantially more time than the existing one-minute stall diagnostic. |

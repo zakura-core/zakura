@@ -275,8 +275,12 @@ pub enum CommitBlockError {
         error: String,
     },
 
-    /// The orphan queue reached its memory bound.
-    #[error("too many blocks are waiting for unavailable parents")]
+    /// A mined submission cannot wait in the orphan queue.
+    #[error("mined block parent is unavailable")]
+    MissingMinedParent,
+
+    /// The orphan queue or contextual writer reached its memory bound.
+    #[error("too many blocks are waiting for contextual verification")]
     QueueFull,
 
     /// The write task exited (likely during shutdown).
@@ -342,6 +346,9 @@ impl CommitBlockError {
             Self::ValidateContextError(error) => error.body_verification_class(),
             Self::HeaderChainError { .. } => {
                 BodyVerificationClass::Retryable(TransientBodyFailureKind::Storage)
+            }
+            Self::MissingMinedParent => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::MissingContext)
             }
             Self::QueueFull => {
                 BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)

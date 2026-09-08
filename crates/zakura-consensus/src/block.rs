@@ -300,6 +300,39 @@ where
                 Err(BlockError::MaxHeight(height, hash, block::Height::MAX))?;
             }
 
+            // > The block data MUST be validated and checked against the server's usual
+            // > acceptance rules (excluding the check for a valid proof-of-work).
+            // <https://en.bitcoin.it/wiki/BIP_0023#Block_Proposal>
+            let pow_policy = zakura_header_chain::PowPolicy::for_network(&network)?;
+            if request.is_proposal() || pow_policy.is_authenticated_custom_waiver() {
+                check::difficulty_threshold_is_valid(&block.header, &network, &height, &hash)?;
+            } else {
+                // Do the difficulty checks first, to raise the threshold for
+                // attacks that use any other fields.
+                check::difficulty_is_valid(&block.header, &network, &height, &hash)?;
+                check::equihash_solution_is_valid(&block.header, &network)?;
+            }
+
+            if request.is_mined_commit() {
+                let parent = block.header.previous_block_hash;
+                match state_service
+                    .ready()
+                    .await
+                    .map_err(|source| VerifyBlockError::Depth { source, hash })?
+                    .call(zs::Request::KnownBlock(parent))
+                    .await
+                    .map_err(|source| VerifyBlockError::Depth { source, hash })?
+                {
+                    zs::Response::KnownBlock(Some(_)) => {}
+                    zs::Response::KnownBlock(None) => {
+                        return Err(VerifyBlockError::Commit(
+                            zs::CommitBlockError::MissingMinedParent,
+                        ));
+                    }
+                    _ => unreachable!("wrong response to Request::KnownBlock"),
+                }
+            }
+
             if request.is_mined_commit() {
                 let solved_header_start = std::time::Instant::now();
                 if let Some(prepared::CachedPreparedCandidate {
@@ -307,18 +340,6 @@ where
                     prepared: cached_prepared_block,
                 }) = prepared_candidates.lookup(&block, request.work_id(), &network)
                 {
-                    let pow_policy = zakura_header_chain::PowPolicy::for_network(&network)?;
-                    if pow_policy.is_authenticated_custom_waiver() {
-                        check::difficulty_threshold_is_valid(
-                            &block.header,
-                            &network,
-                            &height,
-                            &hash,
-                        )?;
-                    } else {
-                        check::difficulty_is_valid(&block.header, &network, &height, &hash)?;
-                        check::equihash_solution_is_valid(&block.header, &network)?;
-                    }
                     check::time_is_valid_at(&block.header, Utc::now(), &height, &hash)
                         .map_err(VerifyBlockError::Time)?;
                     for transaction in &block.transactions {
@@ -355,19 +376,6 @@ where
                 }
                 metrics::histogram!("mining.solved_header_check.duration_seconds")
                     .record(solved_header_start.elapsed().as_secs_f64());
-            }
-
-            // > The block data MUST be validated and checked against the server's usual
-            // > acceptance rules (excluding the check for a valid proof-of-work).
-            // <https://en.bitcoin.it/wiki/BIP_0023#Block_Proposal>
-            let pow_policy = zakura_header_chain::PowPolicy::for_network(&network)?;
-            if request.is_proposal() || pow_policy.is_authenticated_custom_waiver() {
-                check::difficulty_threshold_is_valid(&block.header, &network, &height, &hash)?;
-            } else {
-                // Do the difficulty checks first, to raise the threshold for
-                // attacks that use any other fields.
-                check::difficulty_is_valid(&block.header, &network, &height, &hash)?;
-                check::equihash_solution_is_valid(&block.header, &network)?;
             }
 
             // Next, check the Merkle root validity, to ensure that

@@ -140,7 +140,10 @@ fn prepared_test_verifier(
 ) -> impl Service<Request, Response = block::Hash, Error = VerifyBlockError> {
     let state = service_fn(|request: zs::Request| async move {
         let response = match request {
-            zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+            zs::Request::KnownBlock(hash) => zs::Response::KnownBlock(
+                (hash == block::Hash([0; 32]) || hash == block::Hash([1; 32]))
+                    .then_some(zs::KnownBlock::Finalized),
+            ),
             zs::Request::CheckBlockProposalValidity(_) => zs::Response::ValidBlockProposal,
             _ => panic!("prepared-path test received an unexpected state request: {request:?}"),
         };
@@ -211,6 +214,39 @@ fn nu5_prepared_test_block(network: &Network, lock_time: Option<LockTime>) -> Bl
     }
     Arc::make_mut(&mut block.header).merkle_root = block.transactions.iter().collect();
     block
+}
+
+#[tokio::test]
+async fn mined_orphan_replays_skip_transaction_verification() {
+    let _init_guard = zakura_test::init();
+    let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+    let candidate = Arc::new(nu5_prepared_test_block(&network, None));
+    let state = service_fn(|request| async move {
+        assert!(matches!(request, zs::Request::KnownBlock(_)));
+        Ok::<_, BoxError>(zs::Response::KnownBlock(None))
+    });
+    let transaction = service_fn(|_| -> std::future::Ready<Result<tx::Response, BoxError>> {
+        panic!("orphan replay must not reach transaction verification")
+    });
+    let mut verifier = SemanticBlockVerifier::new(&network, state, transaction);
+    for _ in 0..3 {
+        let result = verifier
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::CommitMined {
+                block: candidate.clone(),
+                work_id: None,
+                admission: zs::BlockAdmission::pending(),
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(VerifyBlockError::Commit(
+                zs::CommitBlockError::MissingMinedParent
+            ))
+        ));
+    }
 }
 
 #[tokio::test]
@@ -327,7 +363,9 @@ async fn failed_preparation_does_not_populate_the_cache() {
     });
     let state = service_fn(|request: zs::Request| async move {
         match request {
-            zs::Request::KnownBlock(_) => Ok(zs::Response::KnownBlock(None)),
+            zs::Request::KnownBlock(hash) => Ok(zs::Response::KnownBlock(
+                (hash == block::Hash([0; 32])).then_some(zs::KnownBlock::Finalized),
+            )),
             zs::Request::CheckBlockProposalValidity(_) => {
                 Err(std::io::Error::other("proposal rejected").into())
             }
@@ -389,7 +427,10 @@ async fn proposal_validation_succeeds_when_cache_insertion_conflicts() {
     });
     let state = service_fn(|request: zs::Request| async move {
         let response = match request {
-            zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+            zs::Request::KnownBlock(hash) => zs::Response::KnownBlock(
+                (hash == block::Hash([0; 32]) || hash == block::Hash([1; 32]))
+                    .then_some(zs::KnownBlock::Finalized),
+            ),
             zs::Request::CheckBlockProposalValidity(_) => zs::Response::ValidBlockProposal,
             zs::Request::CommitSemanticallyVerifiedBlockWithAdmission { block, .. } => {
                 zs::Response::Committed(block.hash)

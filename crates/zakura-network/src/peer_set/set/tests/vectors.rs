@@ -677,6 +677,10 @@ fn mined_block_gossip_reaches_ready_peers() {
         // are not dropped before we inspect the delivered requests.
         let hash = block::Hash([5; 32]);
         let _broadcast_fut = peer_set.broadcast_all(Request::AdvertiseBlockToAll(hash));
+        assert!(
+            peer_set.queued_broadcast_all.is_empty(),
+            "ready peers must not also receive a queued copy"
+        );
 
         let mut received = 0;
         for mut handle in handles {

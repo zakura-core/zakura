@@ -1637,6 +1637,8 @@ pub enum NonFinalizedWriteMessage {
         queued: QueuedSemanticallyVerified,
         /// The instant immediately before the state service attempted the channel send.
         queued_at: Instant,
+        /// Bounds queued block bodies and blocks relay against an unpublished transition.
+        write_slot: tokio::sync::OwnedSemaphorePermit,
     },
     /// The hash of a block that should be invalidated and removed from
     /// the non-finalized state, if present.
@@ -1649,16 +1651,8 @@ pub enum NonFinalizedWriteMessage {
     Reconsider {
         hash: block::Hash,
         rsp_tx: oneshot::Sender<Result<Vec<block::Hash>, ReconsiderError>>,
+        write_slot: tokio::sync::OwnedSemaphorePermit,
     },
-}
-
-impl From<QueuedSemanticallyVerified> for NonFinalizedWriteMessage {
-    fn from(block: QueuedSemanticallyVerified) -> Self {
-        NonFinalizedWriteMessage::Commit {
-            queued: block,
-            queued_at: Instant::now(),
-        }
-    }
 }
 
 /// A worker with a task that reads, validates, and writes blocks to the
@@ -2546,7 +2540,11 @@ impl WriteBlockWorkerTask {
                     let _ = rsp_tx.send(result);
                     None
                 }
-                NonFinalizedWriteMessage::Commit { queued, queued_at } => Some((queued, queued_at)),
+                NonFinalizedWriteMessage::Commit {
+                    queued,
+                    queued_at,
+                    write_slot,
+                } => Some((queued, queued_at, write_slot)),
                 NonFinalizedWriteMessage::Invalidate { hash, rsp_tx } => {
                     tracing::info!(?hash, "invalidating a block in the non-finalized state");
                     let result = if let Some(writer) = header_chain.as_ref() {
@@ -2573,7 +2571,11 @@ impl WriteBlockWorkerTask {
                     let _ = rsp_tx.send(result);
                     None
                 }
-                NonFinalizedWriteMessage::Reconsider { hash, rsp_tx } => {
+                NonFinalizedWriteMessage::Reconsider {
+                    hash,
+                    rsp_tx,
+                    write_slot: _write_slot,
+                } => {
                     tracing::info!(?hash, "reconsidering a block in the non-finalized state");
                     let result = if let Some(writer) = header_chain.as_ref() {
                         let mut staged = non_finalized_state.clone();
@@ -2611,7 +2613,8 @@ impl WriteBlockWorkerTask {
                 }
             };
 
-            let Some(((queued_child, rsp_tx, admission), queued_at)) = queued_child_and_rsp_tx
+            let Some(((queued_child, rsp_tx, admission), queued_at, _write_slot)) =
+                queued_child_and_rsp_tx
             else {
                 continue;
             };

@@ -621,6 +621,9 @@ where
     /// Blocks whose hashes were advertised before contextual commit completed.
     pending_blocks: PendingBlockRegistry,
 
+    /// Detached submissions that still own verification or contextual commit work.
+    mined_submissions: super::submit_block::MinedSubmissions,
+
     /// Whether state admission can trigger an early inventory.
     optimistic_block_inventory: bool,
 
@@ -650,9 +653,18 @@ where
             mined_block_sender: mined_block_sender
                 .unwrap_or(SubmitBlockChannel::default().sender()),
             pending_blocks,
+            mined_submissions: Default::default(),
             optimistic_block_inventory,
             template_preparation_queue: TemplatePreparationQueue::default(),
         }
+    }
+
+    pub(crate) fn reserve_mined_submission(
+        &self,
+        hash: block::Hash,
+    ) -> Result<super::submit_block::MinedSubmission, super::submit_block::SubmitBlockErrorResponse>
+    {
+        self.mined_submissions.reserve(hash)
     }
 
     /// Returns the miner parameters, including the address, data, and memo.

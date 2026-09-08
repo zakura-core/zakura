@@ -1341,8 +1341,9 @@ where
     fn broadcast_all(&mut self, req: Request) -> <Self as tower::Service<Request>>::Future {
         let ready_peers: Vec<_> = self.ready_services.keys().copied().collect();
         let had_ready_peers = !ready_peers.is_empty();
+        let queued_broadcast = self.queue_broadcast_all_unready(&req);
         let send_multiple_fut = self.send_multiple(req.clone(), ready_peers);
-        let Some(mut queued_broadcast_fut_receiver) = self.queue_broadcast_all_unready(&req) else {
+        let Some(mut queued_broadcast_fut_receiver) = queued_broadcast else {
             if !had_ready_peers {
                 return async {
                     Err(std::io::Error::other("block broadcast had no connected peers").into())

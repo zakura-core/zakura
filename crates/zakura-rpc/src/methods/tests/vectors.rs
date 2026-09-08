@@ -3378,6 +3378,78 @@ async fn gbt_with(net: Network, addr: ZcashAddress) {
     mempool.expect_no_requests().await;
 }
 
+#[tokio::test]
+async fn rpc_submitblock_cancellation_keeps_verification_ownership() {
+    let _init_guard = zakura_test::init();
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut verifier: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (mined_tx, mut mined_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (rpc, queue_task) = RpcImpl::new(
+        Mainnet,
+        Default::default(),
+        false,
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool, 1),
+        Buffer::new(state, 1),
+        Buffer::new(read_state, 1),
+        verifier.clone(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        Some(mined_tx),
+    );
+    let rpc = Arc::new(rpc);
+    let bytes = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.to_vec();
+    let request = tokio::spawn({
+        let rpc = rpc.clone();
+        let bytes = bytes.clone();
+        async move { rpc.submit_block(HexData(bytes), None).await }
+    });
+    let response = verifier
+        .expect_request_that(|request| {
+            matches!(request, zakura_consensus::Request::CommitMined { .. })
+        })
+        .await;
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        rpc.submit_block(HexData(bytes.clone()), None)
+            .await
+            .unwrap(),
+        SubmitBlockErrorResponse::DuplicateInconclusive.into()
+    );
+    response.respond(Mainnet.genesis_hash());
+    assert!(matches!(
+        mined_rx.recv().await,
+        Some(MinedBlockEvent::Committed { .. })
+    ));
+
+    let request = tokio::spawn({
+        let rpc = rpc.clone();
+        async move { rpc.submit_block(HexData(bytes), None).await }
+    });
+    verifier
+        .expect_request_that(|request| {
+            matches!(request, zakura_consensus::Request::CommitMined { .. })
+        })
+        .await
+        .respond(Err(Box::new(RouterError::Block {
+            source: Box::new(zakura_consensus::VerifyBlockError::Commit(
+                zakura_state::CommitBlockError::MissingMinedParent,
+            )),
+        }) as BoxError));
+    assert_eq!(
+        request.await.unwrap().unwrap(),
+        SubmitBlockErrorResponse::Inconclusive.into()
+    );
+    queue_task.abort();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_submitblock_errors() {
     let _init_guard = zakura_test::init();

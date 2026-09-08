@@ -14181,7 +14181,7 @@ async fn reactor_range_unavailable_retries_only_unverified_suffix() {
 #[tokio::test]
 async fn reactor_backpressures_serving_slots_without_scoring_peer() {
     let mut config = ZakuraBlockSyncConfig {
-        max_inflight_requests: 1,
+        max_inflight_requests: 4,
         ..ZakuraBlockSyncConfig::default()
     };
     config.peer_limits.outbound_queue_depth = 16;
@@ -14298,7 +14298,7 @@ async fn reactor_backpressures_serving_slots_without_scoring_peer() {
             }
         })
         .await
-        .expect("admission resumes without draining later requests");
+        .expect("admission serves retained requests in order");
         assert_ne!(previous, next);
         previous = next;
     }
@@ -14307,16 +14307,7 @@ async fn reactor_backpressures_serving_slots_without_scoring_peer() {
 }
 
 #[tokio::test]
-async fn delayed_serving_pauses_same_stream_download_until_capacity_returns() {
-    check_delayed_serving(true).await;
-}
-
-#[tokio::test]
-async fn delayed_serving_returns_downloads_without_closing_stream() {
-    check_delayed_serving(false).await;
-}
-
-async fn check_delayed_serving(resume: bool) {
+async fn delayed_serving_keeps_reading_same_stream_downloads() {
     let blocks = mainnet_blocks_1_to_3();
     let mut config = ZakuraBlockSyncConfig {
         max_blocks_per_response: 1,
@@ -14342,14 +14333,26 @@ async fn check_delayed_serving(resume: bool) {
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
-    let (peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
-        &service,
-        &mut actions,
-        64,
-        block::Height(2),
-        blocks[1].hash(),
-        1,
-        MAX_BS_RESPONSE_BYTES,
+    let peer_id = peer(64);
+    let (inbound_tx, inbound_rx) = framed_channel(16);
+    let (outbound_tx, mut outbound_rx) = framed_channel(16);
+    service.add_peer(Peer::new_with_direction(
+        peer_id.clone(),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC,
+        ServicePeerDirection::Outbound,
+        HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx.clone()))]),
+        CancellationToken::new(),
+    ));
+    wait_for_outbound_status(&mut outbound_rx).await;
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::Status(BlockSyncStatus {
+            servable_high: block::Height(2),
+            tip_hash: blocks[1].hash(),
+            max_inflight_requests: 1,
+            ..status()
+        }),
     )
     .await;
 
@@ -14362,112 +14365,304 @@ async fn check_delayed_serving(resume: bool) {
         (block::Height(2), 1)
     );
 
-    let wiring = handle
-        .routine_wiring
-        .as_ref()
-        .expect("a spawned reactor exposes test wiring");
-    let original_floor_deadline = wiring
-        .registry
-        .earliest_outstanding_deadline_at(block::Height(2))
-        .unwrap();
-    assert!(
-        original_floor_deadline.saturating_duration_since(Instant::now())
-            < Duration::from_millis(500)
-    );
+    // Keep our outbound queue full too. A response already sent by the peer
+    // must be read regardless of whether we can send another frame ourselves.
+    while outbound_tx.capacity() > 0 {
+        outbound_tx
+            .try_send(BlockSyncMessage::Status(status()).encode_frame().unwrap())
+            .unwrap();
+    }
+
+    let wiring = handle.routine_wiring.as_ref().unwrap();
     let blocker_session = wiring.serving_regulator.session(peer(0xee), u64::MAX);
-    let blocker = blocker_session
-        .try_admit(1)
-        .expect("the first request owns the node outstanding budget");
+    let blocker = blocker_session.try_admit(1).unwrap();
 
-    send_inbound(
-        &inbound_tx,
-        BlockSyncMessage::GetBlocks {
-            start_height: block::Height(1),
-            count: 1,
-        },
-    )
-    .await;
-    await_until(
-        "the serving request waits behind node response ownership",
-        Duration::from_secs(1),
-        || inbound_tx.capacity() == inbound_tx.max_capacity(),
-    )
+    // These requests must wait for the node slot. The response behind them must
+    // still reach our downloader, even while the serving slot remains occupied.
+    tokio::time::timeout(Duration::from_millis(500), async {
+        for height in 1..=32 {
+            send_inbound(
+                &inbound_tx,
+                BlockSyncMessage::GetBlocks {
+                    start_height: block::Height(height),
+                    count: 1,
+                },
+            )
+            .await;
+        }
+        send_inbound(&inbound_tx, BlockSyncMessage::Block(blocks[1].clone())).await;
+    })
     .await
-    .expect("the routine consumes the current request before pausing");
-
-    send_inbound(&inbound_tx, BlockSyncMessage::Block(blocks[1].clone())).await;
-    let unexpected = tokio::time::timeout(Duration::from_millis(50), async {
+    .expect("the reader must drain requests to reach the response");
+    tokio::time::timeout(Duration::from_millis(500), async {
         loop {
             match next_action(&mut actions).await {
+                BlockSyncAction::SubmitBlock { block, .. } => {
+                    assert_eq!(block.hash(), blocks[1].hash());
+                    break;
+                }
                 BlockSyncAction::QueryNeededBlocks { .. } => {}
-                action => return action,
+                action => panic!("unexpected action while serving is blocked: {action:?}"),
             }
         }
     })
-    .await;
-    assert!(
-        unexpected.is_err(),
-        "later responses wait at the same stream boundary: {unexpected:?}"
-    );
-    assert_eq!(inbound_tx.capacity(), inbound_tx.max_capacity() - 1);
+    .await
+    .expect("a blocked serving request must not block incoming responses");
+    assert_eq!(wiring.serving_regulator.snapshot().node_active, 1);
 
-    if !resume {
-        tokio::time::sleep(Duration::from_millis(1100)).await;
-        inbound_tx
+    drop(blocker);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let BlockSyncAction::QueryBlocksByHeightRange {
+                peer, start, count, ..
+            } = next_action(&mut actions).await
+            {
+                assert_eq!((peer, start, count), (peer_id, block::Height(1), 1));
+                break;
+            }
+        }
+    })
+    .await
+    .expect("capacity release starts the oldest waiting request");
+    reactor_task.abort();
+}
+
+/// Model finite transport buffers while retaining production admission, query,
+/// response, and write ownership. Each writer waits for the other reader to make
+/// room, so a routine that pauses reads behind its own response cannot progress.
+#[tokio::test]
+async fn bidirectional_serving_drains_requests_ahead_of_responses() {
+    use crate::zakura::transport::worker_framed_channel;
+    use tokio_util::task::AbortOnDropHandle;
+
+    const REQUESTS: u32 = 32;
+    let blocks = Arc::new(fake_sequential_blocks(REQUESTS));
+    let config = ZakuraBlockSyncConfig {
+        max_inflight_requests: REQUESTS,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    let tip = (block::Height(REQUESTS), blocks.last().unwrap().hash());
+    let (tip_tx, tip_rx) = watch::channel(tip);
+    let (left_in, left_recv) = framed_channel(1);
+    let (right_in, right_recv) = framed_channel(1);
+    // Requests are deliberately ahead of responses in both directions. This is
+    // the legal pipeline our advertised limit allows, even with tiny buffers.
+    let mut tasks = Vec::new();
+    let mut services = Vec::new();
+    let mut progress = Vec::new();
+    let mut regulators = Vec::new();
+    let mut cancellations = Vec::new();
+    for (index, (recv, remote_in)) in [(left_recv, right_in), (right_recv, left_in)]
+        .into_iter()
+        .enumerate()
+    {
+        let startup = BlockSyncStartup::new(
+            BlockSyncFrontiers {
+                finalized_height: tip.0,
+                verified_block_tip: tip.0,
+                verified_block_hash: tip.1,
+            },
+            tip,
+            tip_rx.clone(),
+            config.clone(),
+        );
+        let (handle, mut actions, reactor) = spawn_block_sync_reactor(startup);
+        tasks.push(AbortOnDropHandle::new(reactor));
+        regulators.push(
+            handle
+                .routine_wiring
+                .as_ref()
+                .unwrap()
+                .serving_regulator
+                .clone(),
+        );
+        let service = BlockSyncService::new_with_handle_for_test(config.clone(), handle.clone());
+        let (outbound, mut writer) = worker_framed_channel(64);
+        outbound
             .try_send(
-                BlockSyncMessage::BlocksDone {
-                    start_height: block::Height(2),
-                    returned: 1,
-                }
+                BlockSyncMessage::Status(BlockSyncStatus {
+                    servable_low: block::Height(1),
+                    servable_high: tip.0,
+                    tip_hash: tip.1,
+                    ..config.initial_status()
+                })
                 .encode_frame()
                 .unwrap(),
             )
-            .expect("local admission pressure must not close the remote peer's stream");
-        assert!(!wiring.registry.has_outstanding_height(block::Height(2)));
-        assert!(wiring.work.pending_contains(block::Height(2)));
-        assert_eq!(wiring.budget.reserved(), 0);
-        assert_eq!(wiring.serving_regulator.snapshot().node_active, 1);
-        assert_eq!(
-            wiring.registry.peer_park_deadline(&peer_id, Instant::now()),
-            None
-        );
-        assert_eq!(
-            inbound_tx.capacity(),
-            inbound_tx.max_capacity() - 2,
-            "later frames remain at the paused stream boundary"
-        );
-    } else {
-        tokio::time::sleep_until((original_floor_deadline + Duration::from_millis(20)).into())
-            .await;
-        assert!(
-            wiring.registry.has_outstanding_height(block::Height(2)),
-            "the floor watchdog must keep the claim while our own reads are paused"
-        );
-    }
-    drop(blocker);
-    let mut served = false;
-    let mut downloaded = false;
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while !served || !downloaded {
-            match next_action(&mut actions).await {
-                BlockSyncAction::QueryBlocksByHeightRange {
-                    peer, start, count, ..
-                } => {
-                    assert_eq!((peer, start, count), (peer_id.clone(), block::Height(1), 1));
-                    served = true;
-                }
-                BlockSyncAction::SubmitBlock { block, .. } => {
-                    assert_eq!(block.hash(), blocks[1].hash());
-                    downloaded = true;
-                }
-                BlockSyncAction::QueryNeededBlocks { .. } => {}
-                action => panic!("unexpected action after admission resumed: {action:?}"),
+            .unwrap();
+        for height in 1..=REQUESTS {
+            outbound
+                .try_send(
+                    BlockSyncMessage::GetBlocks {
+                        start_height: block::Height(height),
+                        count: 1,
+                    }
+                    .encode_frame()
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        tasks.push(AbortOnDropHandle::new(tokio::spawn(async move {
+            while let Some(queued) = writer.recv().await {
+                // Exactly like the transport writer, keep each frame's guard
+                // until the write completes. Removing it from the queue alone
+                // must not let another response start.
+                queued
+                    .write_with(|frame| remote_in.send(frame))
+                    .await
+                    .unwrap();
             }
+        })));
+        let cancel = CancellationToken::new();
+        service.add_peer(Peer::new_with_direction(
+            peer(if index == 0 { 0xc1 } else { 0xc2 }),
+            None,
+            ZAKURA_CAP_BLOCK_SYNC,
+            ServicePeerDirection::Outbound,
+            HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (recv, outbound))]),
+            cancel.clone(),
+        ));
+        let (progress_tx, progress_rx) = watch::channel(0u32);
+        let blocks = Arc::clone(&blocks);
+        tasks.push(AbortOnDropHandle::new(tokio::spawn(async move {
+            let mut queries = 0;
+            while let Some(action) = actions.recv().await {
+                match action {
+                    BlockSyncAction::QueryBlocksByHeightRange {
+                        lease,
+                        request_id,
+                        peer,
+                        start,
+                        count,
+                        ..
+                    } => {
+                        assert!(lease.try_start());
+                        assert_eq!(
+                            start,
+                            block::Height(queries + 1),
+                            "waiting requests stay in order"
+                        );
+                        assert_eq!(count, 1);
+                        let block = blocks[usize::try_from(start.0 - 1).unwrap()].clone();
+                        let bytes = block.zcash_serialized_size();
+                        handle
+                            .send(BlockSyncEvent::BlockRangeResponseReady {
+                                lease,
+                                request_id,
+                                peer,
+                                start_height: start,
+                                requested_count: count,
+                                blocks: vec![(start, block, bytes)],
+                            })
+                            .await
+                            .unwrap();
+                        queries += 1;
+                        progress_tx.send_replace(queries);
+                    }
+                    BlockSyncAction::QueryNeededBlocks { .. } => {}
+                    action => panic!("unexpected action: {action:?}"),
+                }
+            }
+        })));
+        progress.push(progress_rx);
+        cancellations.push(cancel);
+        services.push(service);
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        for observed in &mut progress {
+            while *observed.borrow_and_update() < REQUESTS {
+                observed.changed().await.unwrap();
+            }
+        }
+        while regulators
+            .iter()
+            .any(|regulator| regulator.snapshot().node_active != 0)
+        {
+            tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("capacity release resumes serving and reading");
+    .expect("both peers finish all responses without a timeout or disconnect");
+    for (service, cancel) in services.iter().zip(&cancellations) {
+        assert_eq!(service.peer_count(), 1);
+        assert!(!cancel.is_cancelled());
+        cancel.cancel();
+    }
+    drop(tasks);
+    drop(tip_tx);
+}
 
+#[tokio::test]
+async fn waiting_getblocks_overflow_closes_only_the_local_stream() {
+    let mut config = ZakuraBlockSyncConfig {
+        max_inflight_requests: 2,
+        ..ZakuraBlockSyncConfig::default()
+    };
+    config.get_blocks_regulation.node_active_requests = 1;
+    let block = mainnet_blocks_1_to_3()[0].clone();
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(1), block.hash()));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(1),
+            verified_block_tip: block::Height(1),
+            verified_block_hash: block.hash(),
+        },
+        (block::Height(1), block.hash()),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let wiring = handle.routine_wiring.as_ref().unwrap();
+    let blocker_session = wiring.serving_regulator.session(peer(0xee), u64::MAX);
+    let blocker = blocker_session.try_admit(1).unwrap();
+
+    let connection_cancel = CancellationToken::new();
+    let (inbound_tx, inbound_rx) = framed_channel(16);
+    let (outbound_tx, mut outbound_rx) = framed_channel(16);
+    service.add_peer(Peer::new_with_direction(
+        peer(64),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC,
+        ServicePeerDirection::Outbound,
+        HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]),
+        connection_cancel.clone(),
+    ));
+    wait_for_outbound_status(&mut outbound_rx).await;
+    send_inbound(&inbound_tx, BlockSyncMessage::Status(status())).await;
+    // The first request waits for the occupied node slot, the second queues,
+    // and the third exceeds the advertised allowance. No query can start.
+    for height in 1..=3 {
+        send_inbound(
+            &inbound_tx,
+            BlockSyncMessage::GetBlocks {
+                start_height: block::Height(height),
+                count: 1,
+            },
+        )
+        .await;
+    }
+    await_until(
+        "the overloaded stream closes",
+        Duration::from_secs(1),
+        || service.peer_count() == 0,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !connection_cancel.is_cancelled(),
+        "other services must keep their connection"
+    );
+    while let Ok(action) = actions.try_recv() {
+        assert!(
+            matches!(action, BlockSyncAction::QueryNeededBlocks { .. }),
+            "unexpected action: {action:?}"
+        );
+    }
+    assert_eq!(wiring.serving_regulator.snapshot().node_active, 1);
+    drop(blocker);
+    assert_eq!(wiring.serving_regulator.snapshot().node_active, 0);
+    assert_eq!(wiring.serving_regulator.snapshot().peer_active, 0);
     reactor_task.abort();
 }
 

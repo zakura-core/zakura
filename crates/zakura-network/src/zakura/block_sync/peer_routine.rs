@@ -19,7 +19,11 @@
 //! routine receives inbound traffic from its own `FramedRecv`. Its fill loop,
 //! matched-body path, and unmatched-body paths run in the same task.
 
-use std::{collections::BTreeMap, num::NonZeroU64, ops::Range};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    num::NonZeroU64,
+    ops::Range,
+};
 
 use tokio::sync::{futures::Notified, mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -319,13 +323,13 @@ pub(super) struct PeerRoutine {
     sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
     sequencer_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
     /// Shared routine-to-reactor channel for serving, status, re-query, and misbehavior events.
-    /// Serving waits with reads paused; control notifications use `try_send`.
+    /// Serving waits for channel capacity; control notifications use `try_send`.
     routine_to_reactor: mpsc::Sender<RoutineToReactor>,
-    /// The current request waiting at admission. Further stream reads pause.
+    /// One admission waiter, followed by compact requests in arrival order.
+    /// Together they hold at most our advertised in-flight request limit. Reads
+    /// keep running so responses behind these requests can reach the downloader.
     pending_serving: Option<PendingServing>,
-    /// Cumulative local admission delay since accepted block progress. Bounding
-    /// this grace prevents repeated requests from postponing download liveness forever.
-    admission_delay: Duration,
+    serving_queue: VecDeque<GetBlocksRequest>,
     serving: GetBlocksServingSession,
     sequencer_view: watch::Receiver<SequencerView>,
     /// Last `reset_epoch` that this routine processed.
@@ -410,7 +414,7 @@ impl PeerRoutine {
             sequencer_input_decoded_attributed_memory_bytes,
             routine_to_reactor,
             pending_serving: None,
-            admission_delay: Duration::ZERO,
+            serving_queue: VecDeque::new(),
             serving,
             sequencer_view,
             last_reset_epoch,
@@ -450,18 +454,14 @@ impl PeerRoutine {
             Notified::enable(capacity.as_mut());
             Notified::enable(available.as_mut());
 
-            let retry_filter_deadline =
-                if self.session.outbound_capacity() > 0 && self.pending_serving.is_none() {
-                    self.try_fill().await
-                } else {
-                    None
-                };
+            let retry_filter_deadline = if self.session.outbound_capacity() > 0 {
+                self.try_fill().await
+            } else {
+                None
+            };
+            self.start_serving_admission();
             let outbound_queue_has_capacity = self.session.outbound_capacity() > 0;
             let serving_pending = self.pending_serving.is_some();
-            let download_grace_deadline = self
-                .pending_serving
-                .as_ref()
-                .and_then(|pending| pending.download_grace_deadline);
             // Track the start of the current continuous outbound-full stretch so the
             // liveness check can bound the write-congestion grace: a peer that stopped
             // reading holds this full until `outbound_full_since` ages past
@@ -481,27 +481,21 @@ impl PeerRoutine {
             tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => return Ok(()),
-                () = async {
-                    time::sleep_until(download_grace_deadline.expect("download grace timer is enabled")).await;
-                }, if download_grace_deadline.is_some() => {
-                    // Reads are paused on our initiative. Let another peer fetch
-                    // these bodies, while this request keeps waiting for capacity.
-                    self.return_unreceived_requests("serving_admission_grace");
-                    self.window.note_locally_returned_requests();
-                    self.publish_outstanding();
-                    self.pending_serving.as_mut().expect("admission is pending").download_grace_deadline = None;
-                }
                 outcome = async {
                     self.pending_serving.as_mut()
                         .expect("admission is polled only while pending")
-                        .future.as_mut().await
+                        .as_mut().await
                 }, if serving_pending => {
                     match outcome {
-                        ServingAdmissionOutcome::Sent => self.finish_serving_admission(),
+                        ServingAdmissionOutcome::Sent => {
+                            self.pending_serving = None;
+                        }
                         ServingAdmissionOutcome::ChannelClosed => return Ok(()),
                     }
                 }
-                frame = self.recv.recv(), if outbound_queue_has_capacity && !serving_pending => {
+                // Requests and responses share one ordered stream. Never wait
+                // for our own writes or serving capacity before reading replies.
+                frame = self.recv.recv() => {
                     match frame {
                         // Decode the frame and run the download/serving dispatch
                         // in this same task. A protocol reject propagates out so
@@ -522,7 +516,7 @@ impl PeerRoutine {
                         Err(_) => return Ok(()),
                     }
                 }
-                _ = &mut timeout, if !serving_pending => self.handle_deadlines(Instant::now()).await?,
+                _ = &mut timeout => self.handle_deadlines(Instant::now()).await?,
                 _ = &mut capacity => {
                     self.trace_wake("budget_capacity");
                 }
@@ -603,7 +597,7 @@ impl PeerRoutine {
                 count,
             } => {
                 if self.received_status {
-                    self.retain_serving_request(start_height, count);
+                    self.retain_serving_request(start_height, count)?;
                 } else {
                     self.report_misbehavior(BlockSyncMisbehavior::GetBlocksBeforeStatus)
                         .await;
@@ -644,62 +638,42 @@ impl PeerRoutine {
         self.registry.clear_outstanding(&self.peer, self.generation);
     }
 
-    /// Hold one request at admission without draining later frames from the stream.
-    fn retain_serving_request(&mut self, start_height: block::Height, count: u32) {
-        assert!(
-            self.pending_serving.is_none(),
-            "reads pause during admission"
-        );
-        if self.window.block_liveness_deadline.is_none() {
-            self.admission_delay = Duration::ZERO;
+    /// Retain only the request fields, not a response or a new admission task.
+    /// Closing an overflowing session keeps memory bounded without pausing reads
+    /// and trapping legitimate responses behind excess requests.
+    fn retain_serving_request(
+        &mut self,
+        start_height: block::Height,
+        count: u32,
+    ) -> Result<(), SinkReject> {
+        let waiting = self.serving_queue.len() + usize::from(self.pending_serving.is_some());
+        // The advertised limit is clamped to at most 32,768 on supported targets.
+        let limit = self.config.advertised_max_inflight_requests() as usize;
+        if waiting >= limit {
+            // Older requesters can retry before prior responses finish. Treat
+            // a full local queue as session overload, not proof of peer fault.
+            return Err(SinkReject::local("GetBlocks waiting request queue is full"));
         }
-        let remaining = self
-            .config
-            .request_timeout
-            .saturating_sub(self.admission_delay);
-        // Publish the grace before reads pause, so the reactor's floor watchdog
-        // uses it too. Completion removes the unused part of this grace.
-        for outstanding in &mut self.window.outstanding {
-            outstanding.deadline += remaining;
+        self.serving_queue.push_back(GetBlocksRequest {
+            start_height,
+            count,
+        });
+        Ok(())
+    }
+
+    /// Only the oldest waiting request competes for a response producer.
+    fn start_serving_admission(&mut self) {
+        if self.pending_serving.is_some() {
+            return;
         }
-        if let Some(deadline) = &mut self.window.block_liveness_deadline {
-            *deadline += remaining;
-        }
-        self.publish_outstanding();
-        self.pending_serving = Some(PendingServing {
-            started: Instant::now(),
-            grace: remaining,
-            download_grace_deadline: Some(time::Instant::now() + remaining),
-            future: Box::pin(admit_and_forward_get_blocks(
+        if let Some(request) = self.serving_queue.pop_front() {
+            self.pending_serving = Some(Box::pin(admit_and_forward_get_blocks(
                 self.serving.clone(),
                 self.routine_to_reactor.clone(),
                 self.peer.clone(),
-                GetBlocksRequest {
-                    start_height,
-                    count,
-                },
-            )),
-        });
-    }
-
-    /// Exclude our bounded read pause from download deadlines. Delivery samples
-    /// still include it, so the requesting window observes the slower service.
-    fn finish_serving_admission(&mut self) {
-        let pending = self
-            .pending_serving
-            .take()
-            .expect("admission just completed");
-        let elapsed = pending.started.elapsed().min(pending.grace);
-        let unused = pending.grace - elapsed;
-        self.admission_delay = self.admission_delay.saturating_add(elapsed);
-        for outstanding in &mut self.window.outstanding {
-            outstanding.deadline -= unused;
+                request,
+            )));
         }
-        if let Some(deadline) = &mut self.window.block_liveness_deadline {
-            *deadline -= unused;
-        }
-        self.gc_obsolete_outstanding();
-        self.publish_outstanding();
     }
 
     async fn reserve_body_decode_permit(
@@ -1399,14 +1373,9 @@ impl PeerRoutine {
                     self.config.request_timeout,
                 ) =>
             {
-                // Outbound full but *only just* filled (< one `request_timeout` of
-                // continuous backpressure): plausibly transient local write congestion, not
-                // a dead peer. While outbound is full the select loop does not drain inbound
-                // frames (`if outbound_queue_has_capacity`), so a block the peer already sent
-                // may be waiting behind our write side. Grant one short, BOUNDED grace. This
-                // is the *only* liveness extension: a peer that stopped reading holds outbound
-                // full past `request_timeout`, falls through to the park arm, and is
-                // parked at the liveness deadline — it cannot dodge the timer.
+                // A briefly full outbound queue may mean our request has not
+                // reached the peer yet. Keep the existing bounded write grace;
+                // responses are read independently of that queue.
                 self.window
                     .extend_liveness_deadline(now, self.config.request_timeout);
                 Ok(())
@@ -1458,8 +1427,8 @@ impl PeerRoutine {
     /// regardless of `outstanding`, so parking here only moves the already
     /// scheduled outcome earlier. Frames are processed in-order in this task, so
     /// at EOF everything the peer sent has already been counted. The liveness
-    /// grace does not apply: it waits for in-flight frames stuck behind our full
-    /// outbound queue, and a closed stream has none.
+    /// grace does not apply: the peer closed its stream without answering the
+    /// requests we still own.
     fn handle_remote_stream_closed(&mut self, now: Instant) -> Result<(), SinkReject> {
         if self.window.outstanding.is_empty() && self.window.block_liveness_deadline.is_none() {
             return Ok(());
@@ -1689,7 +1658,6 @@ impl PeerRoutine {
             Some(request_elapsed_ms),
         );
 
-        self.admission_delay = Duration::ZERO;
         self.window
             .note_block_progress(Instant::now(), self.config.effective_liveness_timeout());
         let mut completed = None;
@@ -1907,7 +1875,6 @@ impl PeerRoutine {
         // parked as "silent". Deliberately do NOT feed the BBR RTprop/BtlBw estimators —
         // the originating request is gone, so there's no trustworthy send timestamp and a
         // stale late-delivery interval would corrupt the rate/latency samples.
-        self.admission_delay = Duration::ZERO;
         self.window
             .note_block_progress(Instant::now(), self.config.effective_liveness_timeout());
         // Also credit the reliability EWMA: this late body offsets the failure its own
@@ -2184,7 +2151,6 @@ impl PeerRoutine {
     /// the budget again. Count it as block progress since a real wanted body did
     /// arrive on this peer's stream.
     fn accept_already_settled_height(&mut self, index: usize, height: block::Height) {
-        self.admission_delay = Duration::ZERO;
         self.window
             .note_block_progress(Instant::now(), self.config.effective_liveness_timeout());
         let completed = self
@@ -2331,19 +2297,11 @@ enum ServingAdmissionOutcome {
     ChannelClosed,
 }
 
-struct PendingServing {
-    started: Instant,
-    /// Download deadline extension already published while admission waits.
-    grace: Duration,
-    /// When to return paused downloads. None after that work has been returned;
-    /// admission continues waiting until capacity arrives or the session closes.
-    download_grace_deadline: Option<time::Instant>,
-    future:
-        std::pin::Pin<Box<dyn std::future::Future<Output = ServingAdmissionOutcome> + Send + Sync>>,
-}
+type PendingServing =
+    std::pin::Pin<Box<dyn std::future::Future<Output = ServingAdmissionOutcome> + Send + Sync>>;
 
 /// Cancellation drops this future with the routine, releasing provisional slots
-/// and removing any capacity waiter. No separate task or request queue is needed.
+/// and removing its capacity waiter. Later requests hold only their fields.
 async fn admit_and_forward_get_blocks(
     serving: GetBlocksServingSession,
     routine_to_reactor: mpsc::Sender<RoutineToReactor>,
@@ -2685,15 +2643,15 @@ mod tests {
         );
     }
 
-    /// Local admission pauses share one grace with the floor watchdog.
+    /// Waiting to serve must not change deadlines for our own downloads.
     #[tokio::test]
-    async fn serving_pause_updates_watchdog_before_waiting_and_does_not_restore_retired_work() {
+    async fn serving_queue_is_bounded_and_does_not_extend_download_deadlines() {
         let config = ZakuraBlockSyncConfig::default();
 
         // Ample budget so the floor take reserves directly (no funding round-trip)
         // and sends a real request, creating the outstanding claim.
         let budget = ByteBudget::new(1_000_000);
-        let mut budget_probe = budget.clone();
+        let budget_probe = budget.clone();
 
         // Height 1 is the floor (download floor is 0) and this peer's only work item.
         let work = Arc::new(WorkQueue::new(block::Height(0)));
@@ -2775,38 +2733,26 @@ mod tests {
 
         let height = block::Height(1);
         let original_deadline = registry.earliest_outstanding_deadline_at(height).unwrap();
-        routine.retain_serving_request(height, 1);
+        routine.config.max_inflight_requests = 2;
+        routine.retain_serving_request(height, 1).unwrap();
+        routine.start_serving_admission();
+        routine.retain_serving_request(block::Height(2), 1).unwrap();
+        assert!(matches!(
+            routine.retain_serving_request(block::Height(3), 1),
+            Err(super::SinkReject::Local(_))
+        ));
+        assert_eq!(routine.serving_queue.len(), 1);
+        assert_eq!(routine.serving_queue[0].start_height, block::Height(2));
         assert_eq!(
             registry.earliest_outstanding_deadline_at(height),
-            Some(original_deadline + routine.config.request_timeout),
-            "the watchdog must see the grace before the routine stops reading"
+            Some(original_deadline),
+            "serving no longer pauses reads or extends download deadlines"
         );
-
-        // Finish after part of the grace. Only the time actually paused stays
-        // excluded from the deadline, so a short pause cannot grant a full grace.
-        routine.pending_serving.as_mut().unwrap().started = Instant::now() - Duration::from_secs(3);
-        routine.finish_serving_admission();
-        let resumed_deadline = registry.earliest_outstanding_deadline_at(height).unwrap();
-        assert!(resumed_deadline >= original_deadline + Duration::from_secs(3));
-        assert!(resumed_deadline < original_deadline + Duration::from_secs(4));
-        routine.retain_serving_request(height, 1);
-        assert_eq!(
-            registry.earliest_outstanding_deadline_at(height),
-            Some(original_deadline + routine.config.request_timeout),
-            "repeated pauses share one grace between accepted blocks"
-        );
-
-        // A reset or another scheduler path may retire this request while the
-        // routine waits. Resuming must not publish the old claim again.
-        let owner = routine.window.outstanding[0].request.owner;
-        assert!(registry.clear_outstanding_height_for_owner(&routine.peer, height, owner));
-        let released = work.release_reserved_and_return_items_detailed_for_owner(owner, [height]);
-        budget_probe.release(released.released_bytes);
-        routine.finish_serving_admission();
-        assert_eq!(registry.earliest_outstanding_deadline_at(height), None);
-        assert!(routine.window.outstanding.is_empty());
-        assert!(work.pending_contains(height));
+        // Dropping queued requests and an unpolled admission must not leak slots
+        // or the downloader's outstanding reservation.
+        drop(routine);
         assert_eq!(budget_probe.reserved(), 0);
+        assert!(work.pending_contains(height));
     }
 
     #[tokio::test]

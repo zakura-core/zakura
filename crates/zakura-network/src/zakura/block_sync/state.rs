@@ -742,17 +742,15 @@ impl DownloadWindow {
     }
 
     /// Clear the probe streak after we return requests on our own initiative,
-    /// such as a view reset or a long local read pause. Keep proof of earlier
+    /// such as a view reset. Keep proof of earlier
     /// progress, but let even an unproven peer receive work again when we resume.
     pub(super) fn note_locally_returned_requests(&mut self) {
         self.requests_without_block_progress = 0;
         self.clear_liveness_if_idle();
     }
 
-    /// Push the block-liveness deadline out by `timeout` when a would-be park is
-    /// attributable to *local* outbound backpressure, not the peer: while our outbound queue
-    /// is full the routine stops draining inbound, so a useful body may be sitting unread.
-    /// Avoids punishing the peer for our own write-side congestion.
+    /// Give a briefly congested writer time to deliver our queued request before
+    /// parking the peer for not answering it. The caller bounds this grace.
     pub(super) fn extend_liveness_deadline(&mut self, now: Instant, timeout: Duration) {
         self.block_liveness_deadline = Some(now + timeout);
     }

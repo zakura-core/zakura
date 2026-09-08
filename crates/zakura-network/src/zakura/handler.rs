@@ -4030,8 +4030,8 @@ async fn persistent_stream_worker(
     let context = Arc::new(context);
     let stream_kind = prelude.stream_kind;
 
-    // Reading and forwarding may both block. Keep them independent of writes:
-    // admission can pause reads while a response must finish to release capacity.
+    // Reading and forwarding may both block. Keep them independent of writes
+    // so waiting for inbound channel space cannot stall an outgoing response.
     // A dedicated reader also preserves partial frame reads across outbound writes.
     let (error_tx, mut error_rx) = mpsc::channel::<ZakuraHandlerError>(1);
     let reader_context = Arc::clone(&context);
@@ -5478,6 +5478,7 @@ impl ZakuraHandlerError {
 #[cfg(test)]
 mod tests {
     mod quic_progress;
+    mod serving_progress;
 
     use super::*;
     use crate::{

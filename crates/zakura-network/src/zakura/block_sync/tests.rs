@@ -6170,6 +6170,11 @@ fn received_tracker_handles_a_full_range_at_the_bitset_boundary() {
              whole range",
             height - 1,
         );
+
+        // A duplicate must not advance the count or release more reserved bytes.
+        outstanding.mark_received(block::Height(height));
+        assert_eq!(outstanding.received.len(), usize::try_from(height).unwrap());
+        assert_eq!(outstanding.reserved_bytes(), u64::from(count - height));
     }
 
     assert!(

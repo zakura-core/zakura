@@ -1013,12 +1013,12 @@ const _: () = assert!(MAX_BS_BLOCKS_PER_REQUEST <= RECEIVED_TRACKER_OFFSET_CAPAC
 #[derive(Clone, Debug, Default)]
 pub(super) struct ReceivedBlockTracker {
     bits: u128,
-    count: usize,
 }
 
 impl ReceivedBlockTracker {
     pub(super) fn len(&self) -> usize {
-        self.count
+        // At most 128 set bits fit in usize on every supported target.
+        self.bits.count_ones() as usize
     }
 
     fn contains_offset(&self, offset: u32) -> bool {
@@ -1033,7 +1033,6 @@ impl ReceivedBlockTracker {
             return false;
         }
         self.bits |= bit;
-        self.count = self.count.saturating_add(1);
         true
     }
 

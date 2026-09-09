@@ -1432,6 +1432,9 @@ fn reopening_interrupted_fast_sync_on_legacy_stack_refuses_to_park() {
         let state = FinalizedState::new(&v2_config, &Mainnet)
             .expect("the v2 stack can resume the interrupted VCT sync");
         assert_eq!(state.db.vct_synced_below(), Some(Height(100)));
+        let reader = FinalizedState::new_with_debug(&config, &Mainnet, true, true)
+            .expect("a read-only state does not resume VCT writes");
+        assert_eq!(reader.db.vct_synced_below(), Some(Height(100)));
     }
     let _state = FinalizedState::new(&config, &Mainnet);
 }

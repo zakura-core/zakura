@@ -448,7 +448,7 @@ impl FinalizedState {
         if enforce_resume_guard
             && new_state.vct.is_below_last_checkpoint()
             && (new_state.vct.source().is_none()
-                || !config.enable_zakura_header_seed_from_committed_blocks)
+                || (!read_only && !config.enable_zakura_header_seed_from_committed_blocks))
         {
             panic!(
                 "this database was previously synced in verified commitment tree mode that was \

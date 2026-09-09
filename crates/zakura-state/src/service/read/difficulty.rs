@@ -306,9 +306,7 @@ fn adjust_difficulty_and_time_for_testnet(
 
     // The tip is the first relevant data block, because they are in reverse order.
     let previous_block_time = relevant_data.first().expect("has at least one block").1;
-    let previous_block_time: DateTime32 = previous_block_time
-        .try_into()
-        .expect("valid blocks have in-range times");
+    let previous_block_time: DateTime32 = previous_block_time.try_into()?;
 
     let Some(minimum_difficulty_spacing) =
         NetworkUpgrade::minimum_difficulty_spacing_for_height(network, previous_block_height)
@@ -317,9 +315,7 @@ fn adjust_difficulty_and_time_for_testnet(
         return Ok(());
     };
 
-    let minimum_difficulty_spacing: Duration32 = minimum_difficulty_spacing
-        .try_into()
-        .expect("small positive values are in-range");
+    let minimum_difficulty_spacing: Duration32 = minimum_difficulty_spacing.try_into()?;
 
     // The first minimum difficulty time is strictly greater than the spacing.
     let std_difficulty_max_time = previous_block_time

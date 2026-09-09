@@ -35,6 +35,12 @@ and time limits to this pending state.
 Header admission does not validate the block body. Reconstructed blocks MUST
 enter the existing consensus block-validation path.
 
+The planning workload is 50,000 TPS after Tachyon, assuming 2 KiB per aggregated
+transaction. This requires 819.2 Mbps of body throughput and 1.024 Gbps with
+25% parity, before proofs, transport, challenges, and recovery. This assumption
+does not change consensus limits. The [design throughput budget](../design/dogwood.md#throughput-target)
+separates average rate, burst latency, forwarding load, and codeword limits.
+
 ## 2. Parts and authenticated metadata
 
 Encode the block body, not the already transmitted header. Let `B` be the
@@ -100,6 +106,38 @@ incorporate each distinct index at most once. It MUST bound total CPU and
 memory, including elimination state, and MUST NOT restart an unbounded job on
 each arrival. Received-part forwarding MUST NOT wait for decoding. Serving
 reconstructed parts requires complete codeword verification.
+
+### On-arrival decoding example
+
+This example uses the `k=2, n=3` vector above. The coefficient rows are
+`[1,0]`, `[0,1]`, and `[2,3]`. For each payload element, parity therefore equals
+`2*d0 XOR 3*d1`, with multiplication and division in GF(2^16).
+
+1. Parity part 2 arrives first. Verify its membership and retain equation
+   `2*d0 XOR 3*d1 = 4` for the first element. Normalize the pivot at `d0`.
+2. Data part 1 arrives. Verify its membership and insert `d1 = 2` as a pivot.
+   Eliminate `d1` from the retained equation immediately.
+3. The first equation now yields `d0 = (4 XOR (3*2))/2 = 1`.
+   The decoder has rank two without a separate batch elimination pass.
+4. Reconstruct the padded body and run the padding and codeword-root checks.
+   The recovered bytes remain provisional until those checks complete.
+
+Apply the same operations to every payload element. In a general eager
+decoder, each verified distinct arrival runs this loop:
+
+```text
+row, value = G[:, index], payload
+eliminate all retained pivots from row and value
+normalize the first remaining pivot in row and value
+eliminate that pivot from every retained row and payload
+retain the normalized row and payload; increment rank
+if rank == k: reconstruct, check padding, re-encode, and verify the root
+```
+
+Deduplicate indices before this loop. The any-`k` property applies to correctly
+encoded parts; a maliciously committed payload can still fail the final root
+check. Incremental work can overlap network arrivals, but a busy decoder can
+still accumulate a completion tail. This example does not set a CPU bound.
 
 ### Proposer preparation
 
@@ -540,6 +578,86 @@ Delivery requires a reachable honest source of enough parts or the full block.
 Neither parity nor local route counts prove this condition. Implementations
 MUST report when they cannot satisfy coverage or recovery policy.
 
+### Proposer seeding (candidate extension)
+
+Ordinary subscriptions retain the forwarding and fairness obligations above.
+An all-parts selection does not authorize the proposer to reinterpret the
+receiver's requested coverage as a discretionary seed subset. The proposed
+`SeedOffer` selection would distinguish permission to receive a sender-chosen
+subset from a request for ordinary coverage. It would use `SubscribeParts`,
+existing scope/height bounds, and immutable part/byte credit. It would not add
+a sixth message family. Its wire discriminator and negotiation remain `TBD`.
+Implementations MUST NOT send this selection under the current draft profile.
+
+A profile that adopts this extension MUST enforce these rules:
+
+1. A seed offer defines an eligible index set using a mask or block-specific
+   ranges. It permits any subset of that set within the grant's remaining
+   credit. It does not promise a minimum delivery count or particular indices.
+   An all-index offer is required for the unconstrained scheduling bound below.
+2. The receiver MUST install the offer before sending it. The sender MUST
+   consume one matching immutable grant before queueing each complete part.
+   Scope, admission, proof, height, send-once, cancellation, and replay rules
+   MUST also apply to seed traffic. Overlapping offers MUST NOT multiply credit
+   for the same send or create an unbounded per-block ledger.
+3. A seed grant MUST NOT establish incoming distinct-part coverage before its
+   actual indices arrive or an ordinary assignment establishes that coverage.
+   A receiver MUST NOT count every index in an offer as promised service.
+4. The proposer MUST share upload, queued-byte, and work limits across seed
+   traffic, ordinary subscriptions, repairs, and concurrent blocks. It SHOULD
+   prioritize unseeded distinct indices during its initial pass. Extra copies
+   for bootstrap or recovery MUST count against the same aggregate budget.
+5. The proposer MUST retain bounded per-block state for indices queued or sent
+   to each peer. It MUST NOT treat transport submission as receiver verification
+   or continued downstream availability. A failed path MAY require reseeding
+   elsewhere within the repair reserve.
+6. The receiver MUST verify and forward seeds under the ordinary part rules.
+   It MAY request additional indices through ordinary subscriptions when the
+   offered subset is insufficient. A completed receiver sends `FullBlock`;
+   authorized in-flight seed parts follow the existing cancellation rules.
+7. The proposer MUST report insufficient eligible credit, upload budget, or
+   service as degraded seeding. It MUST NOT send unsolicited parts or starve
+   ordinary accepted demand to preserve a claimed one-codeword upload budget.
+
+For a static reference, let `w` be complete part bytes, `N` the chosen number
+of distinct seeds with `0 < N <= n`, `U` the proposer byte rate, `c[p]` each
+peer's independent byte rate, and `g[p]` each peer's usable any-index part
+credit. Compute `g[p]` from both remaining part credit and `floor(byte_credit/w)`.
+Assume no existing queued work, fixed positive rates, and a valid codeword.
+A count allocation `a[p]` has:
+
+```text
+sum(a[p]) = N;  0 <= a[p] <= g[p]
+T(a) = max(N*w/U, max_p(a[p]*w/c[p]))
+```
+
+Select the `N` earliest slots `j*w/c[p]`, for `1 <= j <= g[p]`. Their peer
+counts minimize the second term. The first term is independent of allocation.
+Constant rates `a[p]*w/T` construct a feasible schedule under both rate limits,
+so this bound is attainable in the stated model. Restricted index sets,
+unknown or shared peer bottlenecks, deadlines, and downstream reconstruction
+invalidate that optimality claim. Production scheduling MUST use available
+measurements and bounded adaptation instead of claiming knowledge of `c[p]`.
+
+For a separate reachability reference, assume an honest connected graph,
+valid parts for an arbitrary body with no prior body information, adequate
+credit, retained data, and fair eventual service. Every relay edge subscribes
+to all indices. After removing the proposer, each remaining connected
+component requires at least `k` distinct seeded indices. That condition is
+necessary and sufficient for eventual reconstruction in this model.
+Subscription count, some parity at each peer, or `k` seeds spread across
+disconnected components MUST NOT be reported as satisfying that condition.
+
+If removing the proposer leaves `c` components, at least `c*k*S` payload bytes
+must cross those cuts in this reference model. Receivers cannot promise
+completion under a smaller aggregate source budget. Sparse subscriptions,
+Byzantine peers, finite retention, and fixed deadlines require additional
+evidence. A rooted repair path only establishes eventual delivery under its
+honesty, credit, retention, and service assumptions. Implementations MUST keep
+the bounded repair and fallback behavior above; fallback does not remove a
+physical upload bottleneck. The design tracks the remaining
+[bootstrap work](../design/dogwood.md#open-problems-and-todos).
+
 ## 7. Redundancy and route control
 
 The following byte-budgeted pairwise controller is the baseline experimental
@@ -547,9 +665,10 @@ policy. Its stability and performance have not been established. Implementations
 MAY improve its estimator while preserving explicit resource, exploration,
 recovery, and coverage bounds. The controller allocates subscriptions;
 transport congestion control separately paces bytes.
-The [reference experiments](../experiments/dogwood/README.md) test a reduced
-controller and do not consistently improve on static allocation. They do not
-validate the full policy or select production values for its learned budget.
+The [experiment report](../design/dogwood-experiments.md) records tests of a
+reduced controller. That controller does not consistently improve on static
+allocation. The tests do not validate the full policy or select production
+values for its learned budget.
 
 ### Core rules
 
@@ -597,8 +716,19 @@ indices MUST NOT increase reported coverage. If a fast peer exceeds its allowed
 share, the receiver needs extra distinct coverage elsewhere. This permits many
 parts per connection without silently abandoning redundancy.
 
-The steady-state target SHOULD be one supplier per part plus bounded
-challenges and any routes required by this coverage test. Unmeasured default
+With one supplier per index and zero safety margin, largest exclusive share
+`f = max_p |A[p]| / m`
+requires subscribed overhead `(m-k)/k >= f/(1-f)`. With balanced assignments
+to `d` suppliers, the exact integer test is `m-ceil(m/d) >= k`. For `k=32`
+and `m=40`, five suppliers can satisfy this test with eight parts each.
+Four suppliers cannot satisfy it without extra routes or a different parity
+profile. A receiver MUST report degraded coverage if it chooses concentration
+or reduced traffic that fails its configured failure model.
+
+The receiver SHOULD compare one supplier per part with duplicate subscriptions
+under its proposer-upload, receiver-byte, latency, and coverage targets.
+It MAY retain duplicates when they improve that tradeoff within byte limits.
+Committed parity MUST remain fixed by the selected profile. Unmeasured default
 or proposer routes SHOULD start with two selected suppliers per part where
 available. The receiver SHOULD distribute these assignments across eligible
 peers, subject to byte limits, rather than assigning every part to the same
@@ -616,6 +746,21 @@ new block size, topology, or proposer.
 All timestamps in this section come from the receiver's monotonic clock.
 The baseline MUST NOT depend on a sender timestamp, synchronized clocks, an
 application RTT estimate, or an inferred bandwidth-delay product.
+
+This baseline restriction does not preclude a future negotiated telemetry
+extension. A candidate `BlockPart` envelope could carry a connection-local
+sequence, a monotonic transport-submission timestamp, and bounded queue
+residence. These fields would change at each hop outside the part commitment.
+Their units, precision, reset/wrap behavior, authentication, and byte limits
+remain profile choices. They are not wire fields in this draft.
+
+Such an estimator MUST NOT treat remote-clock subtraction as measured one-way
+delay without accounting for clock error. It MUST NOT treat achieved delivery
+rate as unused capacity or grant authority. It MUST tolerate absent, stale,
+reordered, or dishonest telemetry without affecting part validity. Local
+arrival and verification measurements remain available when telemetry fails.
+The [design](../design/dogwood.md#delivery-feedback-and-sender-timestamps)
+describes the candidate estimator and its limits.
 
 Let `t0[b]` be local metadata admission. Local policy MUST select a bounded
 observation duration `D[b]` from the admitted block size and a configured
@@ -958,6 +1103,104 @@ fallback frequency, and time spent degraded. A low duplicate count alone is
 not success.
 
 ## 8. Profile choices and conformance
+
+### Parameter registry
+
+This registry is authoritative for the draft's parameter meanings and reference
+experiment settings. A value marked experimental defines a reproducible input,
+not a production recommendation or evidence of conformance. A value marked
+`TBD` MUST be fixed when required by an implementation's selected profile or
+local policy before that implementation claims conformance. Optional future
+extensions do not block baseline conformance. Reports MUST
+record all overrides. The [design rationale](../design/dogwood.md#param-tuning)
+does not override this registry or the requirements in earlier sections.
+
+#### Workload and local policy
+
+`S` denotes part payload bytes. `k_ref=32` defines the 2 MiB reference body.
+Byte-valued controller settings below use payload bytes; grant accounting
+continues to count complete encoded messages. Experimental queue and reserve
+counts MUST also have byte bounds in an implementation.
+
+| Parameter | Reference value | Meaning and authority |
+| --- | --- | --- |
+| Workload | 50,000 TPS; 2,048 bytes/transaction | Planning assumption, not consensus configuration. |
+| Utilization target; extra traffic allowance | 0.80; 0.05 | Experimental capacity-planning inputs. The allowance is relative to body plus parity. Neither reserves protocol credit. |
+| Reference body and cadence | `k_ref=32`; 20.48 ms | Sustained-load experiment at the planning rate; also test `k=128` at 81.92 ms. These are synthetic releases, not a proposed block interval. |
+| Subscribed distinct count `m` | `n` | Experimental starting point. Local policy MAY request fewer indices if it reports and handles the resulting coverage. |
+| Failure sets; `safety_parts` | Any one supplier; 0 | Default failure model and experimental margin. Local policy MUST declare correlated groups and any additional safety margin. |
+| Startup copies per index | 2 where available and affordable | Default local policy. Learned copy count is selected under coverage and byte limits; one copy is an experimental comparison. |
+| Seed distinct target `N`; proposer rate `U`; peer rates `c[p]` | `N=n`; 1 Gbps source in static examples | Experimental seeding objective and model inputs. Production rates come from bounded measurements; they do not authorize traffic. |
+| Seed credit `g[p]` | Receiver-granted; `n` per peer in static examples | Hard immutable part and byte credit. An eligible set may further constrain the scheduler. |
+| Seed upload budget; seed repair reserve; active seed peers | `TBD` local bounds | Required before enabling `SeedOffer`. Count ordinary demand and concurrent blocks too; a one-codeword budget cannot cover every topology. |
+| `SEED_BATCH_PARTS` | 1 | Experimental scheduling portion size; sweep 1/2/4. Each contained part retains separate proof and credit accounting. |
+| Small-block parity threshold and ratio | Candidate `k<=8`: 100%; otherwise 25% | Planned experiment only. The draft still requires `ceil(k/4)` parity; any size-dependent rule needs a selected profile. |
+| Seed ordering | `TBD` | Compare systematic-first, parity-first, and a decodable bootstrap receiver before selecting a policy. |
+| Observation duration `D[b]`; total recovery deadline | 400 ms; 1,200 ms at `k_ref` | Experimental values. Production size-to-deadline policy is `TBD`; section 7 fixes each admitted observation's deadline. |
+| `CONTROL_INTERVAL` | 250 ms | Experimental minimum interval between shared-budget updates. |
+| `W_min`, `W_initial`, `W_max` | `2*S`, `20*S`, `256*S` | Experimental payload assignment bounds per connection, shared across proposers. They are not a transport window. |
+| `Delta`; `beta`; `utilization_threshold` | `S`; 0.75; 0.80 | Experimental loaded-increase step, decrease factor, and success threshold. |
+| `MIN_FAILURE_BLOCKS` | 2 | Default minimum distinct eligible failures per decrease. |
+| `MIN_RACE_BLOCKS`; `SWITCH_THRESHOLD`; `race_epsilon` | 3; 2/3; 1 ms | Experimental decisive block votes, required winning fraction, and ignored timing difference. |
+| `STABLE_WINDOWS`; settling interval; acceptable uncensored yield | `TBD` | Required local policy. Reduced simulations omit the complete settling rule and MUST NOT claim conformance. |
+| `MIGRATION_BYTES` | `4*S` | Experimental maximum newly assigned payload per move; actual mask cost MUST fit. |
+| Loaded-probe allowance; concurrent loaded trials | `TBD` | Required node-wide local bounds in addition to `W`; not implicit spare capacity. |
+| `exploration_fraction` | 1/32 | Experimental authorization funding per completed validated encoded byte. |
+| `exploration_initial`; `exploration_cap` | `2*k_ref*S`; `4*k_ref*S` | Experimental initial and capped funds. Production node-wide values MUST include control bytes and fund a minimum trial. |
+| Challenge selection width | One mask bit | Experimental minimum comparison load; it does not multiply independent block votes. |
+| `CHALLENGE_MIN_INTERVAL`; jitter | 250 ms; uniform 0–25% extra | Experimental minimum time between starts and additional delay. |
+| `CHALLENGE_MAX_BLOCKS`; `CHALLENGE_MAX_AGE`; `MAX_CHALLENGES` | 12; 20 s; 2 | Experimental trial retention and concurrent count. Stop at either age or block cap. |
+| Candidate rate-estimator window; minimum samples; EWMA weight | 100 ms; 4 deliveries; 0.5 new sample | Experimental alternative only. Sender timing is not required by the baseline. |
+| Candidate rate-estimator initial rate | 100 Mbps per connection | Experimental prior, not discovered capacity or permission to send. |
+| Candidate queue-delay target; maximum rate change | `TBD` | Local experimental policy before deploying a queue-aware estimator; the reduced rate allocator omits these gates. |
+| Link queue; recovery-copy reserve | 256 parts; `2*k` copies/block | Experimental bounds. Production MUST also cap node-wide queues, concurrent recovery, and work in bytes. |
+| Scheduler | Work-conserving byte fairness across blocks | Default policy under section 6; starvation bound is `TBD`. |
+| Decoder schedule | Incremental; eager elimination MAY be used | Equivalent schedules preserve section 2 verification and resource requirements. |
+| Context history, staleness, workload quantiles, startup concurrency | `TBD` | Required bounded local forecasting and evidence policy. New keys do not create new connection budgets. |
+| Proposer history, active selectors, block retention, cancellation tails | `TBD` | Required count/time/byte bounds under sections 3–7. Soft tail retirement MUST NOT refund hard grant credit. |
+| Sender service rate/burst, admission timeout, incomplete-frame timeout | `TBD` | Required local regulation, with any peer-visible limits negotiated by the profile. |
+| Verification/decoder workers, assemblies, CPU and memory caps | `TBD` | Required per-peer and node-wide work limits before production. |
+
+The congestion experiment uses four suppliers with usable upload rates of
+800/400/200/100 Mbps and receiver ingress of 1,600 Mbps. It also tests balanced
+suppliers, 1,000 Mbps ingress, a capacity drop, delayed upstream availability,
+and lower offered load. Its 20 ms control delay and 384-byte per-part framing
+allowance are model inputs, not RTT estimates or a specified wire format.
+The parity experiment sweeps 12.5%, 25%, 50%, and 100% with the same
+single-supplier coverage test. Non-25% ratios are hypothetical profiles.
+
+#### Wire profile and changes
+
+The table below owns wire choices. The experimental mask width is `P=16`;
+the interoperable profile MUST fix both `P` and mapping hash `H`. The codec's
+65,535-part field bound does not authorize that much memory or change
+`MAX_BLOCK_BYTES`. `MAX_PARTS`, `MAX_PART_MESSAGE_BYTES`, `MAX_GRANT_PARTS`,
+`MAX_GRANT_HEIGHT_SPAN`, range count, frame/field lengths, and granted byte
+limits remain `TBD` profile bounds. The profile MUST specify hashes, Merkle
+tree shape, signature encoding, PoW key binding, and service version together.
+
+Optional sender telemetry remains outside the draft wire format. A future
+profile MUST define its sequence width, timestamp units and reset/wrap rules,
+queue-residence bound, and authenticated envelope before enabling it.
+The `SeedOffer` selection also requires a new mutually selected profile.
+Until then, the five message families and ordinary subscription semantics in
+section 4 remain unchanged.
+
+A size-dependent parity profile MUST define a deterministic function of admitted
+coding inputs, such as `parity_parts(k)`, and its maximum output. Receivers MUST
+check that function before allocation. A proposer MUST NOT select extra parity
+from a receiver-local load estimate. Scheduling portions MAY group existing
+parts locally; they MUST NOT replace per-part verification, credit, or send-once
+accounting. Portions that change coding stripes or serialization require a
+separate profile specification.
+
+A local-policy update MAY change estimates and future assignments within hard
+bounds. It MUST preserve immutable grants, coverage reporting, cancellation
+handling, and node-wide budgets. Reports MUST identify the policy version and
+the workload used for tuning. A codec, parity, part-size, mapping, or wire-format
+change MUST use a mutually selected profile before affected metadata or parts
+are sent. No proposer MAY vary parity unilaterally. This draft specifies no
+automatic parity adaptation mechanism.
 
 The profile MUST fix these before implementations claim interoperability:
 

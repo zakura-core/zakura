@@ -32,6 +32,7 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| `MAX_TRACKED_PARENTS` | `crates/zakura-rpc/src/methods/types/get_block_template.rs` | one parent (cleared on every parent change) → `8` parents retained | [#947](https://github.com/zakura-core/zakura/pull/947) | Keep what each parent rejected across a reorg away from it and back, forgetting the least recently tracked parent first. Bounds the retained work IDs at eight parents by the existing per-parent limits. |
 | `MAX_CONCURRENT_UTXO_LOOKUPS` | `crates/zakura-consensus/src/transaction.rs` | serial (`1`) → `64` per block transaction | [#918](https://github.com/zakura-core/zakura/pull/918) | Overlap external UTXO waits while bounding pending lookups per transaction. Concurrent lookups start their six-minute timeout clocks together. |
 | `MAX_MINED_SUBMISSIONS` | `crates/zakura-rpc/src/methods/types/submit_block.rs` | unbounded → `16` submissions | [#748](https://github.com/zakura-core/zakura/pull/748) | Bound detached verification work across RPC cancellation. |
 | `non_finalized_write_slots` | `crates/zakura-state/src/service.rs` | unbounded → `1,000` contextual writes | [#748](https://github.com/zakura-core/zakura/pull/748) | Bound writer block bodies using the existing orphan queue capacity. |

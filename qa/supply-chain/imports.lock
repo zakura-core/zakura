@@ -274,16 +274,6 @@ who = "Dan Gohman <dev@sunfishcode.online>"
 criteria = "safe-to-deploy"
 delta = "0.3.9 -> 0.3.10"
 
-[[audits.bytecode-alliance.audits.fallible-iterator]]
-who = "Alex Crichton <alex@alexcrichton.com>"
-criteria = "safe-to-deploy"
-delta = "0.2.0 -> 0.3.0"
-notes = """
-This major version update has a few minor breaking changes but everything
-this crate has to do with iterators and `Result` and such. No `unsafe` or
-anything like that, all looks good.
-"""
-
 [[audits.bytecode-alliance.audits.gimli]]
 who = "Alex Crichton <alex@alexcrichton.com>"
 criteria = "safe-to-deploy"
@@ -357,18 +347,6 @@ who = "Andrew Brown <andrew.brown@intel.com>"
 criteria = "safe-to-deploy"
 version = "0.1.3"
 notes = "A part of RustCrypto/utils, this crate is designed to handle unsafe buffers and carefully documents the safety concerns throughout. Older versions of this tally up to ~130k daily downloads."
-
-[[audits.bytecode-alliance.audits.instant]]
-who = "Chris Fallin <chris@cfallin.org>"
-criteria = "safe-to-deploy"
-version = "0.1.12"
-notes = "Small crate wrapping platform primitives for time that uses `unsafe` only for FFI."
-
-[[audits.bytecode-alliance.audits.instant]]
-who = "Alex Crichton <alex@alexcrichton.com>"
-criteria = "safe-to-deploy"
-delta = "0.1.12 -> 0.1.13"
-notes = "Nothing major changed in this update"
 
 [[audits.bytecode-alliance.audits.itertools]]
 who = "Nick Fitzgerald <fitzgen@gmail.com>"
@@ -727,12 +705,6 @@ who = "Johan Andersson <opensource@embark-studios.com>"
 criteria = "safe-to-deploy"
 version = "1.0.40"
 notes = "Found no unsafe or ambient capabilities used"
-
-[[audits.embark-studios.audits.uname]]
-who = "Johan Andersson <opensource@embark-studios.com>"
-criteria = "safe-to-deploy"
-version = "0.1.1"
-notes = "Inspected it and is tiny crate wrapping libc function with some unsafe usage for string handling"
 
 [[audits.embark-studios.audits.utf8parse]]
 who = "Johan Andersson <opensource@embark-studios.com>"
@@ -1503,11 +1475,6 @@ who = "David Cook <dcook@divviup.org>"
 criteria = "safe-to-deploy"
 version = "0.5.0"
 
-[[audits.isrg.audits.hmac]]
-who = "David Cook <dcook@divviup.org>"
-criteria = "safe-to-deploy"
-version = "0.12.1"
-
 [[audits.isrg.audits.once_cell]]
 who = "J.C. Jones <jc@insufficient.coffee>"
 criteria = "safe-to-deploy"
@@ -1667,15 +1634,6 @@ start = "2019-03-29"
 end = "2023-05-04"
 renew = false
 notes = "I've reviewed every source contribution that was neither authored nor reviewed by Mozilla."
-aggregated-from = "https://hg.mozilla.org/mozilla-central/raw-file/tip/supply-chain/audits.toml"
-
-[[audits.mozilla.wildcard-audits.unicode-normalization]]
-who = "Manish Goregaokar <manishsmail@gmail.com>"
-criteria = "safe-to-deploy"
-user-id = 1139 # Manish Goregaokar (Manishearth)
-start = "2019-11-06"
-end = "2027-04-23"
-notes = "All code written or reviewed by Manish"
 aggregated-from = "https://hg.mozilla.org/mozilla-central/raw-file/tip/supply-chain/audits.toml"
 
 [[audits.mozilla.wildcard-audits.unicode-segmentation]]
@@ -2000,12 +1958,6 @@ criteria = "safe-to-deploy"
 delta = "0.3.1 -> 0.3.3"
 aggregated-from = "https://hg.mozilla.org/mozilla-central/raw-file/tip/supply-chain/audits.toml"
 
-[[audits.mozilla.audits.fallible-iterator]]
-who = "Jan-Erik Rediger <jrediger@mozilla.com>"
-criteria = "safe-to-deploy"
-version = "0.2.0"
-aggregated-from = "https://raw.githubusercontent.com/mozilla/glean/main/supply-chain/audits.toml"
-
 [[audits.mozilla.audits.fnv]]
 who = "Bobby Holley <bobbyholley@gmail.com>"
 criteria = "safe-to-deploy"
@@ -2163,22 +2115,6 @@ https://github.com/madsmtm/objc2/blob/main/crates/objc2/src/topics/frameworks_so
 """
 aggregated-from = "https://hg.mozilla.org/mozilla-central/raw-file/tip/supply-chain/audits.toml"
 
-[[audits.mozilla.audits.objc2-core-graphics]]
-who = "Andy Leiserson <aleiserson@mozilla.com>"
-criteria = "safe-to-deploy"
-version = "0.3.2"
-notes = """
-Contains substantial unsafe code, as is typical for FFI.
-
-The (non-published) `header-translator` crate that produces generated bindings
-in this crate was also reviewed, in lieu of a full review of the generated
-bindings.
-
-Users of this crate should be aware of the information in
-https://github.com/madsmtm/objc2/blob/main/crates/objc2/src/topics/frameworks_soundness.md.
-"""
-aggregated-from = "https://hg.mozilla.org/mozilla-central/raw-file/tip/supply-chain/audits.toml"
-
 [[audits.mozilla.audits.objc2-encode]]
 who = "Andy Leiserson <aleiserson@mozilla.com>"
 criteria = "safe-to-deploy"
@@ -2187,38 +2123,6 @@ notes = "Support library for objc2 with no unsafe code"
 aggregated-from = "https://hg.mozilla.org/mozilla-central/raw-file/tip/supply-chain/audits.toml"
 
 [[audits.mozilla.audits.objc2-foundation]]
-who = "Andy Leiserson <aleiserson@mozilla.com>"
-criteria = "safe-to-deploy"
-version = "0.3.2"
-notes = """
-Contains substantial unsafe code, as is typical for FFI.
-
-The (non-published) `header-translator` crate that produces generated bindings
-in this crate was also reviewed, in lieu of a full review of the generated
-bindings.
-
-Users of this crate should be aware of the information in
-https://github.com/madsmtm/objc2/blob/main/crates/objc2/src/topics/frameworks_soundness.md.
-"""
-aggregated-from = "https://hg.mozilla.org/mozilla-central/raw-file/tip/supply-chain/audits.toml"
-
-[[audits.mozilla.audits.objc2-io-surface]]
-who = "Andy Leiserson <aleiserson@mozilla.com>"
-criteria = "safe-to-deploy"
-version = "0.3.2"
-notes = """
-Contains substantial unsafe code, as is typical for FFI.
-
-The (non-published) `header-translator` crate that produces generated bindings
-in this crate was also reviewed, in lieu of a full review of the generated
-bindings.
-
-Users of this crate should be aware of the information in
-https://github.com/madsmtm/objc2/blob/main/crates/objc2/src/topics/frameworks_soundness.md.
-"""
-aggregated-from = "https://hg.mozilla.org/mozilla-central/raw-file/tip/supply-chain/audits.toml"
-
-[[audits.mozilla.audits.objc2-quartz-core]]
 who = "Andy Leiserson <aleiserson@mozilla.com>"
 criteria = "safe-to-deploy"
 version = "0.3.2"
@@ -2727,12 +2631,6 @@ Additions are:
 """
 aggregated-from = "https://raw.githubusercontent.com/zcash/librustzcash/main/supply-chain/audits.toml"
 
-[[audits.zcash.audits.num_cpus]]
-who = "Jack Grigg <jack@electriccoin.co>"
-criteria = "safe-to-deploy"
-delta = "1.16.0 -> 1.17.0"
-aggregated-from = "https://raw.githubusercontent.com/zcash/zcash/master/qa/supply-chain/audits.toml"
-
 [[audits.zcash.audits.opaque-debug]]
 who = "Daira-Emma Hopwood <daira@jacaranda.org>"
 criteria = "safe-to-deploy"
@@ -2833,31 +2731,6 @@ who = "Sean Bowe <ewillbefull@gmail.com>"
 criteria = "safe-to-deploy"
 version = "0.3.0"
 aggregated-from = "https://raw.githubusercontent.com/zcash/zcash/master/qa/supply-chain/audits.toml"
-
-[[audits.zcash.audits.redjubjub]]
-who = "Daira Emma Hopwood <daira@jacaranda.org>"
-criteria = "safe-to-deploy"
-version = "0.7.0"
-notes = """
-This crate is a thin wrapper around the `reddsa` crate, which I did not review. I also
-did not review tests or verify test vectors.
-
-The comment on `batch::Verifier::verify` has an error in the batch verification equation,
-filed as https://github.com/ZcashFoundation/redjubjub/issues/163 . It does not affect the
-implementation which just delegates to `reddsa`. `reddsa` has the same comment bug filed as
-https://github.com/ZcashFoundation/reddsa/issues/52 , but its batch verification implementation
-is correct. (I checked the latter against https://zips.z.cash/protocol/protocol.pdf#reddsabatchvalidate
-which has had previous cryptographic review by NCC group; see finding NCC-Zcash2018-009 in
-https://research.nccgroup.com/wp-content/uploads/2020/07/NCC_Group_Zcash2018_Public_Report_2019-01-30_v1.3.pdf ).
-"""
-aggregated-from = "https://raw.githubusercontent.com/zcash/zcash/master/qa/supply-chain/audits.toml"
-
-[[audits.zcash.audits.redjubjub]]
-who = "Kris Nuttycombe <kris@nutty.land>"
-criteria = "safe-to-deploy"
-delta = "0.7.0 -> 0.8.0"
-notes = "This release adds `no-std` compatibility."
-aggregated-from = "https://raw.githubusercontent.com/zcash/librustzcash/main/supply-chain/audits.toml"
 
 [[audits.zcash.audits.redox_users]]
 who = "Jack Grigg <jack@electriccoin.co>"
@@ -3048,12 +2921,6 @@ who = "Jack Grigg <jack@electriccoin.co>"
 criteria = "safe-to-deploy"
 delta = "0.1.9 -> 0.1.11"
 aggregated-from = "https://raw.githubusercontent.com/zcash/wallet/main/supply-chain/audits.toml"
-
-[[audits.zcash.audits.windows-link]]
-who = "Jack Grigg <jack@electriccoin.co>"
-criteria = "safe-to-deploy"
-delta = "0.1.1 -> 0.1.3"
-aggregated-from = "https://raw.githubusercontent.com/zcash/librustzcash/main/supply-chain/audits.toml"
 
 [[audits.zcash.audits.windows-link]]
 who = "Jack Grigg <jack@electriccoin.co>"

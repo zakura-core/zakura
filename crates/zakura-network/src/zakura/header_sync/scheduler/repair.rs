@@ -58,8 +58,8 @@ pub(in crate::zakura::header_sync) enum RepairPolicyError {
     /// A wire owner changed the durable repair scope.
     #[error("wire assignment changed the VCT repair scope")]
     ScopeMismatch,
-    /// The resolved target is outside the exact one-height repair range.
-    #[error("resolved VCT repair target is outside its exact range")]
+    /// The resolved target is outside the selected repair range.
+    #[error("resolved VCT repair target is outside its selected range")]
     TargetMismatch,
     /// The requested edge is not part of the repair state machine.
     #[error("illegal VCT repair state transition")]
@@ -142,16 +142,27 @@ impl RepairRequirement {
     }
 
     /// Bind a resolved task to the actual canonical stream request.
-    pub fn assign(&mut self, owner: BodyWorkOwner) -> Result<(), RepairPolicyError> {
+    pub fn assign(
+        &mut self,
+        owner: BodyWorkOwner,
+        selected_context: VctRepairContext,
+    ) -> Result<(), RepairPolicyError> {
         if owner.header_authority() != self.owner.header_authority() {
             return Err(RepairPolicyError::ScopeMismatch);
         }
         let RepairPolicyState::Ready { context } = &self.state else {
             return Err(RepairPolicyError::IllegalState);
         };
+        if context
+            .bounded_prefix(selected_context.selected_header_count())
+            .as_ref()
+            != Some(&selected_context)
+        {
+            return Err(RepairPolicyError::TargetMismatch);
+        }
         self.owner = owner;
         self.state = RepairPolicyState::Assigned {
-            context: context.clone(),
+            context: selected_context,
         };
         Ok(())
     }
@@ -325,10 +336,11 @@ impl RepairRequirementSlot {
         &mut self,
         scheduled_owner: BodyWorkOwner,
         wire_owner: BodyWorkOwner,
+        selected_context: VctRepairContext,
     ) -> Result<(), RepairPolicyError> {
         self.get_mut(scheduled_owner)
             .ok_or(RepairPolicyError::IllegalState)?
-            .assign(wire_owner)
+            .assign(wire_owner, selected_context)
     }
 
     /// Retire one completed, stale, or canceled task.
@@ -437,7 +449,8 @@ mod tests {
         mark_context_requested(&mut task);
         task.resolve(context.clone())
             .expect("the exact context can resolve");
-        task.assign(task.owner).expect("ready work can go on wire");
+        task.assign(task.owner, context.clone())
+            .expect("ready work can go on wire");
         assert_eq!(task.retry(source), Ok(()));
         assert_eq!(
             task.state,
@@ -448,7 +461,7 @@ mod tests {
         assert_eq!(task.attempts, 1);
         assert!(task.tried_sources.contains(&source));
 
-        task.assign(task.owner)
+        task.assign(task.owner, context.clone())
             .expect("retried work can go on wire");
         task.complete()
             .expect("a matching state admission completes the task");
@@ -466,16 +479,21 @@ mod tests {
         mark_context_requested(&mut task);
         task.resolve(context.clone())
             .expect("the exact context resolves");
-        task.assign(task.owner)
+        task.assign(task.owner, context.clone())
             .expect("the first supplier goes on wire");
         task.retry(first).expect("the first supplier can fail");
-        task.assign(task.owner)
+        task.assign(task.owner, context.clone())
             .expect("the second supplier goes on wire");
         task.retry(second).expect("the second supplier can fail");
         task.resume_retry(Instant::now() + std::time::Duration::from_secs(1));
 
         assert_eq!(task.tried_sources, [first, second].into_iter().collect());
-        assert_eq!(task.state, RepairPolicyState::Ready { context });
+        assert_eq!(
+            task.state,
+            RepairPolicyState::Ready {
+                context: context.clone()
+            }
+        );
         assert_eq!(task.attempts, 2);
 
         let replacement = RepairRequirement::new(task.owner, task.height, 12);
@@ -491,7 +509,8 @@ mod tests {
             .expect("the exact context resolves");
 
         for byte in 1_u8..=64 {
-            task.assign(task.owner).expect("ready work can go on wire");
+            task.assign(task.owner, context.clone())
+                .expect("ready work can go on wire");
             task.retry(SourceId::from_digest([byte; 32]))
                 .expect("each distinct supplier can fail");
         }
@@ -543,7 +562,8 @@ mod tests {
         mark_context_requested(&mut task);
         task.resolve(context.clone())
             .expect("the exact context resolves");
-        task.assign(task.owner).expect("ready work can go on wire");
+        task.assign(task.owner, context.clone())
+            .expect("ready work can go on wire");
         let blocked_at = StateVersion::new(3);
         task.wait_for_state_change(blocked_at)
             .expect("a committed resource refusal blocks the assigned repair");
@@ -604,7 +624,8 @@ mod tests {
             .map(|byte| SourceId::from_digest([byte; 32]))
             .collect();
         for source in &excluded_sources {
-            task.assign(task.owner).expect("ready work can go on wire");
+            task.assign(task.owner, context.clone())
+                .expect("ready work can go on wire");
             task.exclude_input(*source)
                 .expect("durably excluded input rotates its supplier");
         }
@@ -618,10 +639,15 @@ mod tests {
             task.tried_sources,
             excluded_sources.iter().copied().collect()
         );
-        assert_eq!(task.state, RepairPolicyState::Ready { context });
+        assert_eq!(
+            task.state,
+            RepairPolicyState::Ready {
+                context: context.clone()
+            }
+        );
 
         let fourth = SourceId::from_digest([4; 32]);
-        task.assign(task.owner)
+        task.assign(task.owner, context.clone())
             .expect("a later supplier can own the same episode");
         task.exclude_input(fourth)
             .expect("the later supplier remains attributable");
@@ -642,10 +668,11 @@ mod tests {
                 .expect("the exact context resolves");
             let failed_source = SourceId::from_digest([1; 32]);
             if assigned {
-                task.assign(task.owner).expect("ready work can go on wire");
+                task.assign(task.owner, context.clone())
+                    .expect("ready work can go on wire");
                 task.retry(failed_source)
                     .expect("one supplier failure updates the current episode");
-                task.assign(task.owner)
+                task.assign(task.owner, context.clone())
                     .expect("another supplier can own the current episode");
             } else {
                 task.tried_sources.insert(failed_source);

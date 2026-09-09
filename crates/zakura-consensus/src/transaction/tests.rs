@@ -67,6 +67,527 @@ fn test_timeout() -> std::time::Duration {
     }
 }
 
+fn block_lookup_fixture(
+    input_count: u32,
+    known_every: u32,
+) -> (Request, HashMap<transparent::OutPoint, transparent::Utxo>) {
+    block_lookup_fixture_from(input_count, known_every, 0)
+}
+
+fn block_lookup_fixture_from(
+    input_count: u32,
+    known_every: u32,
+    first_input: u32,
+) -> (Request, HashMap<transparent::OutPoint, transparent::Utxo>) {
+    let mut inputs = Vec::new();
+    let mut known_utxos = HashMap::new();
+    let mut expected = HashMap::new();
+    for index in first_input..first_input + input_count {
+        let (input, _, utxos) = mock_transparent_transfer(
+            Height(1),
+            true,
+            index,
+            Amount::try_from(u64::from(index) + 1).unwrap(),
+        );
+        inputs.push(input);
+        for (outpoint, utxo) in utxos {
+            expected.insert(outpoint, utxo.utxo.clone());
+            if known_every != 0 && index % known_every == 0 {
+                known_utxos.insert(outpoint, utxo);
+            }
+        }
+    }
+    let transaction = Arc::new(Transaction::V5 {
+        network_upgrade: NetworkUpgrade::Nu5,
+        inputs,
+        outputs: Vec::new(),
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(2),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+    });
+    let request = Request::Block {
+        transaction_hash: transaction.hash(),
+        transaction,
+        known_outpoint_hashes: Arc::new(HashSet::new()),
+        known_utxos: Arc::new(known_utxos),
+        height: Height(2),
+        time: Utc::now(),
+    };
+    (request, expected)
+}
+
+#[tokio::test]
+async fn block_utxo_lookups_are_bounded_and_preserve_input_order() {
+    for input_count in [0, 1, 2, 63, 64, 65, 129] {
+        for known_every in [0, 1, 3] {
+            let (request, expected) = block_lookup_fixture(input_count, known_every);
+            let Request::Block { transaction, .. } = &request else {
+                unreachable!()
+            };
+            let expected_outputs: Vec<_> = transaction
+                .inputs()
+                .iter()
+                .map(|input| expected[&input.outpoint().unwrap()].output.clone())
+                .collect();
+            let sighash = |outputs| {
+                zakura_chain::transaction::SigHasher::new(
+                    transaction,
+                    NetworkUpgrade::Nu5,
+                    Arc::new(outputs),
+                )
+                .unwrap()
+                .sighash(HashType::ALL, None)
+            };
+            let expected_sighash = sighash(expected_outputs.clone());
+            if input_count > 1 {
+                let mut reversed = expected_outputs.clone();
+                reversed.reverse();
+                assert_ne!(sighash(reversed), expected_sighash);
+            }
+            let transaction = transaction.clone();
+            let mut remaining = expected.len() - request.known_utxos().len();
+            let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
+            let state = service_fn(move |request| {
+                let zakura_state::Request::AwaitUtxo(outpoint) = request else {
+                    panic!("block lookups must use AwaitUtxo")
+                };
+                let (respond, response) = tokio::sync::oneshot::channel();
+                requests.send((outpoint, respond)).unwrap();
+                async move { response.await.unwrap() }
+            });
+            let lookup = Verifier::<
+                _,
+                tower::util::BoxCloneService<mempool::Request, mempool::Response, BoxError>,
+            >::spent_utxos(
+                transaction.clone(),
+                request,
+                tower::timeout::Timeout::new(state, super::UTXO_LOOKUP_TIMEOUT),
+                None,
+            );
+            futures::pin_mut!(lookup);
+
+            while remaining > 0 {
+                tokio::task::yield_now().await;
+                assert!(futures::poll!(&mut lookup).is_pending());
+                let mut batch = Vec::new();
+                while let Ok(pending) = received.try_recv() {
+                    batch.push(pending);
+                }
+                // No response is available until the entire window has started.
+                assert_eq!(
+                    batch.len(),
+                    remaining.min(64),
+                    "inputs={input_count}, known_every={known_every}, remaining={remaining}"
+                );
+                remaining -= batch.len();
+                for (outpoint, respond) in batch.into_iter().rev() {
+                    respond
+                        .send(Ok(zakura_state::Response::Utxo(
+                            expected[&outpoint].clone(),
+                        )))
+                        .unwrap();
+                }
+            }
+
+            let (utxos, outputs, mempool_outpoints) =
+                timeout(test_timeout(), lookup).await.unwrap().unwrap();
+            assert_eq!(utxos, expected);
+            assert_eq!(outputs, expected_outputs);
+            assert_eq!(
+                zakura_chain::transaction::SigHasher::new(
+                    &transaction,
+                    NetworkUpgrade::Nu5,
+                    Arc::new(outputs),
+                )
+                .unwrap()
+                .sighash(HashType::ALL, None),
+                expected_sighash,
+            );
+            assert!(mempool_outpoints.is_empty());
+            assert!(received.try_recv().is_err());
+        }
+    }
+}
+
+#[tokio::test]
+async fn block_utxo_lookups_wait_for_readiness_once_per_transaction() {
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Context, Poll},
+    };
+
+    #[derive(Clone)]
+    struct PendingState(Arc<AtomicUsize>);
+
+    impl Service<zakura_state::Request> for PendingState {
+        type Response = zakura_state::Response;
+        type Error = BoxError;
+        type Future = futures::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Poll::Pending
+        }
+
+        fn call(&mut self, _: zakura_state::Request) -> Self::Future {
+            panic!("state has not admitted a request")
+        }
+    }
+
+    for transaction_count in [1, 4, 16] {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let mut lookups = Vec::new();
+        for index in 0..transaction_count {
+            let (request, _) = block_lookup_fixture_from(129, 0, index * 129);
+            let Request::Block { transaction, .. } = &request else {
+                unreachable!()
+            };
+            lookups.push(Box::pin(Verifier::<
+                _,
+                tower::util::BoxCloneService<mempool::Request, mempool::Response, BoxError>,
+            >::spent_utxos(
+                transaction.clone(),
+                request,
+                tower::timeout::Timeout::new(
+                    PendingState(polls.clone()),
+                    super::UTXO_LOOKUP_TIMEOUT,
+                ),
+                None,
+            )));
+        }
+        for lookup in &mut lookups {
+            assert!(futures::poll!(lookup).is_pending());
+        }
+        assert_eq!(
+            polls.load(Ordering::Relaxed),
+            usize::try_from(transaction_count).unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn block_utxo_aggregate_windows_are_independent_and_cancel_together() {
+    for transaction_count in [2, 8, 16] {
+        let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let state = service_fn(move |request| {
+            let zakura_state::Request::AwaitUtxo(outpoint) = request else {
+                panic!("block lookups use AwaitUtxo")
+            };
+            let (respond, response) = tokio::sync::oneshot::channel();
+            requests.send((outpoint, respond)).unwrap();
+            async move { response.await.unwrap() }
+        });
+        let mut lookups = Vec::new();
+        let mut expected = HashMap::new();
+        for index in 0..transaction_count {
+            let (request, utxos) = block_lookup_fixture_from(1001, 0, index * 1001);
+            expected.extend(utxos);
+            let Request::Block { transaction, .. } = &request else {
+                unreachable!()
+            };
+            lookups.push(Box::pin(Verifier::<
+                _,
+                tower::util::BoxCloneService<mempool::Request, mempool::Response, BoxError>,
+            >::spent_utxos(
+                transaction.clone(),
+                request,
+                tower::timeout::Timeout::new(state.clone(), super::UTXO_LOOKUP_TIMEOUT),
+                None,
+            )));
+        }
+        for lookup in &mut lookups {
+            assert!(futures::poll!(lookup).is_pending());
+        }
+        let mut pending = Vec::new();
+        while let Ok(request) = received.try_recv() {
+            pending.push(request);
+        }
+        // The bound multiplies across transactions; it is not a shared limit.
+        assert_eq!(
+            pending.len(),
+            usize::try_from(transaction_count).unwrap() * 64
+        );
+
+        // One completion admits one replacement while every other request waits.
+        let (outpoint, respond) = pending.pop().unwrap();
+        respond
+            .send(Ok(zakura_state::Response::Utxo(
+                expected[&outpoint].clone(),
+            )))
+            .unwrap();
+        for lookup in &mut lookups {
+            assert!(futures::poll!(lookup).is_pending());
+        }
+        pending.push(received.try_recv().unwrap());
+        assert!(received.try_recv().is_err());
+
+        // A failed transaction cancels its own window without cancelling its peers.
+        let (_, respond) = pending.remove(0);
+        respond
+            .send(Err(std::io::Error::other("injected state error").into()))
+            .unwrap();
+        assert!(matches!(
+            futures::poll!(&mut lookups[0]),
+            std::task::Poll::Ready(Err(_))
+        ));
+        for lookup in &mut lookups[1..] {
+            assert!(futures::poll!(lookup).is_pending());
+        }
+        assert_eq!(
+            pending
+                .iter()
+                .filter(|(_, respond)| respond.is_closed())
+                .count(),
+            63
+        );
+
+        drop(lookups);
+        assert!(pending.iter().all(|(_, respond)| respond.is_closed()));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn block_utxo_lookup_failure_cancels_pending_requests() {
+    for input_count in [1, 65] {
+        for expire in [false, true] {
+            let (request, _) = block_lookup_fixture(input_count, 0);
+            let Request::Block { transaction, .. } = &request else {
+                unreachable!()
+            };
+            let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
+            let state = service_fn(move |_| {
+                let (respond, response) = tokio::sync::oneshot::channel();
+                requests.send(respond).unwrap();
+                async move { response.await.unwrap() }
+            });
+            let lookup = Verifier::<
+                _,
+                tower::util::BoxCloneService<mempool::Request, mempool::Response, BoxError>,
+            >::spent_utxos(
+                transaction.clone(),
+                request,
+                tower::timeout::Timeout::new(state, super::UTXO_LOOKUP_TIMEOUT),
+                None,
+            );
+            futures::pin_mut!(lookup);
+            assert!(futures::poll!(&mut lookup).is_pending());
+            let mut pending = Vec::new();
+            while let Ok(respond) = received.try_recv() {
+                pending.push(respond);
+            }
+            assert_eq!(pending.len(), usize::try_from(input_count).unwrap().min(64));
+            if expire {
+                tokio::time::advance(super::UTXO_LOOKUP_TIMEOUT).await;
+            } else {
+                pending
+                    .pop()
+                    .unwrap()
+                    .send(Err("lookup failed".into()))
+                    .unwrap();
+            }
+            let error = lookup.await.unwrap_err();
+            if expire {
+                assert!(matches!(error, TransactionError::TransparentInputNotFound));
+            } else {
+                assert!(error.to_string().contains("lookup failed"), "{error}");
+            }
+            assert!(pending.iter().all(tokio::sync::oneshot::Sender::is_closed));
+            assert!(received.try_recv().is_err());
+        }
+    }
+}
+
+#[tokio::test]
+async fn block_utxo_lookup_refills_window_and_cancels_on_drop() {
+    let (request, expected) = block_lookup_fixture(129, 0);
+    let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let state = service_fn(move |request| {
+        let zakura_state::Request::AwaitUtxo(outpoint) = request else {
+            panic!("block lookups must use AwaitUtxo")
+        };
+        let (respond, response) = tokio::sync::oneshot::channel();
+        requests.send((outpoint, respond)).unwrap();
+        async move { response.await.unwrap() }
+    });
+    let mut lookup = Box::pin(Verifier::<
+        _,
+        tower::util::BoxCloneService<mempool::Request, mempool::Response, BoxError>,
+    >::spent_utxos(
+        request.transaction(),
+        request,
+        tower::timeout::Timeout::new(state, super::UTXO_LOOKUP_TIMEOUT),
+        None,
+    ));
+    assert!(futures::poll!(&mut lookup).is_pending());
+    let mut pending = Vec::new();
+    while let Ok(request) = received.try_recv() {
+        pending.push(request);
+    }
+    assert_eq!(pending.len(), 64);
+
+    // Keep the first 63 requests blocked while completing each new tail request.
+    for _ in 0..65 {
+        let (outpoint, respond) = pending.pop().unwrap();
+        respond
+            .send(Ok(zakura_state::Response::Utxo(
+                expected[&outpoint].clone(),
+            )))
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(futures::poll!(&mut lookup).is_pending());
+        pending.push(
+            received
+                .try_recv()
+                .expect("one completed lookup must free one slot"),
+        );
+        assert!(
+            received.try_recv().is_err(),
+            "the window must remain bounded"
+        );
+    }
+
+    drop(lookup);
+    assert!(pending.iter().all(|(_, respond)| respond.is_closed()));
+}
+
+#[tokio::test]
+async fn mempool_utxo_lookups_remain_serial_and_preserve_input_order() {
+    let (block_request, expected) = block_lookup_fixture(4, 0);
+    let transaction = block_request.transaction();
+    let outpoints: Vec<_> = transaction
+        .inputs()
+        .iter()
+        .map(|input| input.outpoint().unwrap())
+        .collect();
+    let expected_outputs: Vec<_> = outpoints
+        .iter()
+        .map(|outpoint| expected[outpoint].output.clone())
+        .collect();
+    let (state_requests, mut state_received) = tokio::sync::mpsc::unbounded_channel();
+    let state = service_fn(move |request| {
+        let zakura_state::Request::UnspentBestChainUtxo(outpoint) = request else {
+            panic!("mempool lookups must use UnspentBestChainUtxo")
+        };
+        let (respond, response) = tokio::sync::oneshot::channel();
+        state_requests.send((outpoint, respond)).unwrap();
+        async move { response.await.unwrap() }
+    });
+    let (mempool_requests, mut mempool_received) = tokio::sync::mpsc::unbounded_channel();
+    let mempool = service_fn(move |request| {
+        let mempool::Request::AwaitOutput(outpoint) = request else {
+            panic!("missing chain outputs must use AwaitOutput")
+        };
+        let (respond, response) = tokio::sync::oneshot::channel();
+        mempool_requests.send((outpoint, respond)).unwrap();
+        async move { response.await.unwrap() }
+    });
+    let request = Request::Mempool {
+        transaction: transaction.clone().into(),
+        height: Height(2),
+    };
+    let lookup = Verifier::spent_utxos(
+        transaction,
+        request,
+        tower::timeout::Timeout::new(state, super::UTXO_LOOKUP_TIMEOUT),
+        Some(tower::timeout::Timeout::new(
+            mempool,
+            super::MEMPOOL_OUTPUT_LOOKUP_TIMEOUT,
+        )),
+    );
+    futures::pin_mut!(lookup);
+    for (index, expected_outpoint) in outpoints.iter().enumerate() {
+        assert!(futures::poll!(&mut lookup).is_pending());
+        let (outpoint, respond) = state_received.try_recv().unwrap();
+        assert_eq!(outpoint, *expected_outpoint);
+        assert!(state_received.try_recv().is_err());
+        assert!(mempool_received.try_recv().is_err());
+        let utxo = (index % 2 == 1).then(|| expected[&outpoint].clone());
+        respond
+            .send(Ok::<_, BoxError>(
+                zakura_state::Response::UnspentBestChainUtxo(utxo),
+            ))
+            .unwrap();
+    }
+    for index in [0, 2] {
+        assert!(futures::poll!(&mut lookup).is_pending());
+        let (outpoint, respond) = mempool_received.try_recv().unwrap();
+        assert_eq!(outpoint, outpoints[index]);
+        assert!(mempool_received.try_recv().is_err());
+        respond
+            .send(Ok::<_, BoxError>(mempool::Response::UnspentOutput(
+                expected[&outpoint].output.clone(),
+            )))
+            .unwrap();
+    }
+    let (utxos, outputs, mempool_outpoints) =
+        timeout(test_timeout(), lookup).await.unwrap().unwrap();
+    assert_eq!(outputs, expected_outputs);
+    assert_eq!(mempool_outpoints, vec![outpoints[0], outpoints[2]]);
+    for index in [0, 2] {
+        assert_eq!(
+            utxos[&outpoints[index]],
+            transparent::Utxo::new(expected_outputs[index].clone(), Height(2), false)
+        );
+    }
+    for index in [1, 3] {
+        assert_eq!(utxos[&outpoints[index]], expected[&outpoints[index]]);
+    }
+}
+
+#[tokio::test]
+#[ignore = "manual lookup timing comparison; run with --ignored --nocapture"]
+#[allow(clippy::print_stdout)]
+async fn block_utxo_lookup_timing() {
+    for (input_count, known_every, delayed, iterations) in [
+        (0, 0, false, 100_000),
+        (1, 1, false, 100_000),
+        (1, 0, false, 100_000),
+        (4, 0, false, 100_000),
+        (64, 0, false, 1000),
+        (1001, 1, false, 1000),
+        (1001, 0, false, 1000),
+        (1001, 0, true, 3),
+    ] {
+        let (request, expected) = block_lookup_fixture(input_count, known_every);
+        let Request::Block { transaction, .. } = &request else {
+            unreachable!()
+        };
+        let expected = Arc::new(expected);
+        let state = service_fn(move |request| {
+            let zakura_state::Request::AwaitUtxo(outpoint) = request else {
+                panic!("block lookups must use AwaitUtxo")
+            };
+            let utxo = expected[&outpoint].clone();
+            async move {
+                if delayed {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                Ok::<_, BoxError>(zakura_state::Response::Utxo(utxo))
+            }
+        });
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let result = Verifier::<
+                _,
+                tower::util::BoxCloneService<mempool::Request, mempool::Response, BoxError>,
+            >::spent_utxos(
+                transaction.clone(),
+                request.clone(),
+                tower::timeout::Timeout::new(state.clone(), super::UTXO_LOOKUP_TIMEOUT),
+                None,
+            )
+            .await
+            .unwrap();
+            std::hint::black_box(result);
+        }
+        println!(
+            "inputs={input_count} known_every={known_every} delayed={delayed}: {:?}/transaction",
+            start.elapsed() / iterations
+        );
+    }
+}
+
 #[test]
 fn v5_transactions_basic_check() -> Result<(), Report> {
     let _init_guard = zakura_test::init();

@@ -34,10 +34,11 @@ use zakura_state as zs;
 use crate::{error::*, primitives, transaction as tx, BoxError};
 
 pub mod check;
+mod prepared;
 pub mod request;
 pub mod subsidy;
 
-pub use request::Request;
+pub use request::{PreparedCandidateSource, Request};
 
 #[cfg(test)]
 mod tests;
@@ -49,6 +50,7 @@ pub struct SemanticBlockVerifier<S, V> {
     network: Network,
     state_service: S,
     transaction_verifier: V,
+    prepared_candidates: prepared::PreparedCandidateCache,
 }
 
 /// Block verification errors.
@@ -99,6 +101,46 @@ pub enum VerifyBlockError {
 }
 
 impl VerifyBlockError {
+    /// Returns whether proposal validation proved the candidate invalid.
+    /// Local failures and missing proposal context must remain retryable.
+    pub fn rejects_template(&self) -> bool {
+        use zakura_header_chain::BodyVerificationClass;
+        let class = match self {
+            Self::ValidateProposal(source) => {
+                let Some(error) = source.downcast_ref::<zs::ValidateContextError>() else {
+                    return false;
+                };
+                // Header failures cannot condemn a peer's body, but the server must
+                // withdraw a template whose default header fails proposal validation.
+                if matches!(
+                    error,
+                    zs::ValidateContextError::NonSequentialBlock { .. }
+                        | zs::ValidateContextError::TimeTooEarly { .. }
+                        | zs::ValidateContextError::TimeTooLate { .. }
+                        | zs::ValidateContextError::InvalidDifficultyThreshold { .. }
+                ) {
+                    return true;
+                }
+                error.body_verification_class()
+            }
+            Self::Time(_) => return true,
+            Self::Block {
+                source:
+                    BlockError::InvalidHeaderEncoding(_)
+                    | BlockError::MissingHeight(_)
+                    | BlockError::MaxHeight(..)
+                    | BlockError::InvalidDifficulty(..)
+                    | BlockError::TargetDifficultyLimit(..)
+                    | BlockError::DifficultyFilter(..),
+            } => return true,
+            _ => self.body_verification_class(),
+        };
+        matches!(
+            class,
+            BodyVerificationClass::ConsensusInvalid(_) | BodyVerificationClass::PayloadMismatch(_)
+        )
+    }
+
     /// Classify semantic verification without treating local failures as invalid bodies.
     pub fn body_verification_class(&self) -> zakura_header_chain::BodyVerificationClass {
         use zakura_header_chain::{
@@ -231,6 +273,7 @@ where
             network: network.clone(),
             state_service,
             transaction_verifier,
+            prepared_candidates: Default::default(),
         }
     }
 }
@@ -258,6 +301,7 @@ where
         let mut state_service = self.state_service.clone();
         let mut transaction_verifier = self.transaction_verifier.clone();
         let network = self.network.clone();
+        let prepared_candidates = self.prepared_candidates.clone();
 
         let block = request.block();
 
@@ -267,6 +311,7 @@ where
         async move {
             let hash = zakura_header_chain::validate_encoding_version_hash(&block.header)
                 .map_err(BlockError::from)?;
+            let preparation_start = request.should_cache().then(std::time::Instant::now);
             // Check that this block is actually a new block.
             tracing::trace!("checking that block is not already in state");
             match state_service
@@ -306,6 +351,71 @@ where
                 // attacks that use any other fields.
                 check::difficulty_is_valid(&block.header, &network, &height, &hash)?;
                 check::equihash_solution_is_valid(&block.header, &network)?;
+            }
+
+            if request.is_mined_commit() {
+                let parent = block.header.previous_block_hash;
+                match state_service
+                    .ready()
+                    .await
+                    .map_err(|source| VerifyBlockError::Depth { source, hash })?
+                    .call(zs::Request::KnownBlock(parent))
+                    .await
+                    .map_err(|source| VerifyBlockError::Depth { source, hash })?
+                {
+                    zs::Response::KnownBlock(Some(_)) => {}
+                    zs::Response::KnownBlock(None) => {
+                        return Err(VerifyBlockError::Commit(
+                            zs::CommitBlockError::MissingMinedParent,
+                        ));
+                    }
+                    _ => unreachable!("wrong response to Request::KnownBlock"),
+                }
+            }
+
+            if request.is_mined_commit() {
+                let solved_header_start = std::time::Instant::now();
+                if let Some(prepared::CachedPreparedCandidate {
+                    source,
+                    prepared: cached_prepared_block,
+                }) = prepared_candidates.lookup(&block, request.work_id(), &network)
+                {
+                    check::time_is_valid_at(&block.header, Utc::now(), &height, &hash)
+                        .map_err(VerifyBlockError::Time)?;
+                    for transaction in &block.transactions {
+                        tx::check::lock_time_has_passed(transaction, height, block.header.time)
+                            .map_err(VerifyBlockError::Transaction)?;
+                    }
+                    check::merkle_root_validity(
+                        &network,
+                        &block,
+                        &cached_prepared_block.transaction_hashes,
+                    )?;
+                    metrics::histogram!("mining.solved_header_check.duration_seconds")
+                        .record(solved_header_start.elapsed().as_secs_f64());
+
+                    let mut prepared_block = cached_prepared_block.as_ref().clone();
+                    prepared_block.block = block;
+                    prepared_block.hash = hash;
+                    prepared_block.height = height;
+                    let admission = request.admission();
+                    if source == PreparedCandidateSource::ServerTemplate {
+                        if let Some(admission) = &admission {
+                            if check_prepared_mined_relay_eligibility(
+                                &mut state_service,
+                                (&prepared_block).into(),
+                            )
+                            .await?
+                                == zs::PreparedMinedRelayEligibility::Authorized
+                            {
+                                admission.authorize_optimistic_relay();
+                            }
+                        }
+                    }
+                    return commit_prepared_block(state_service, prepared_block, admission).await;
+                }
+                metrics::histogram!("mining.solved_header_check.duration_seconds")
+                    .record(solved_header_start.elapsed().as_secs_f64());
             }
 
             // Next, check the Merkle root validity, to ensure that
@@ -445,7 +555,8 @@ where
 
             // Return early for proposal requests.
             if request.is_proposal() {
-                return match state_service
+                let cache_copy = request.should_cache().then(|| prepared_block.clone());
+                let response = match state_service
                     .ready()
                     .await
                     .map_err(VerifyBlockError::ValidateProposal)?
@@ -456,26 +567,105 @@ where
                     zs::Response::ValidBlockProposal => Ok(hash),
                     _ => unreachable!("wrong response for CheckBlockProposalValidity"),
                 };
-            }
-
-            match state_service
-                .ready()
-                .await
-                .map_err(|source| VerifyBlockError::StateService { source, hash })?
-                .call(zs::Request::CommitSemanticallyVerifiedBlock(prepared_block))
-                .await
-            {
-                Ok(zs::Response::Committed(committed_hash)) => {
-                    assert_eq!(committed_hash, hash, "state must commit correct hash");
-                    Ok(hash)
+                if let (Ok(_), Some(cache_copy)) = (&response, cache_copy) {
+                    let candidate = cache_copy.block.clone();
+                    prepared_candidates.insert(
+                        &candidate,
+                        request.work_id(),
+                        request
+                            .prepared_candidate_source()
+                            .expect("cached preparation has a candidate source"),
+                        cache_copy,
+                        &network,
+                    );
+                    metrics::histogram!("mining.preparation.duration_seconds").record(
+                        preparation_start
+                            .expect("cached preparation records its start time")
+                            .elapsed()
+                            .as_secs_f64(),
+                    );
                 }
-
-                Err(source) => Err(map_commit_error(source, hash)),
-
-                _ => unreachable!("wrong response for CommitSemanticallyVerifiedBlock"),
+                return response;
             }
+
+            commit_prepared_block(state_service, prepared_block, request.admission()).await
         }
         .instrument(span)
         .boxed()
+    }
+}
+
+async fn check_prepared_mined_relay_eligibility<S>(
+    state_service: &mut S,
+    block: zs::BlockCommitmentData,
+) -> Result<zs::PreparedMinedRelayEligibility, VerifyBlockError>
+where
+    S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    S::Future: Send + 'static,
+{
+    let hash = block.block.hash();
+    let preflight_start = std::time::Instant::now();
+    let response = async {
+        state_service
+            .ready()
+            .await
+            .map_err(|source| VerifyBlockError::StateService { source, hash })?
+            .call(zs::Request::CheckPreparedMinedRelayEligibility(block))
+            .await
+            .map_err(|source| map_commit_error(source, hash))
+    }
+    .await;
+    metrics::histogram!("mining.prepared_relay_preflight.duration_seconds")
+        .record(preflight_start.elapsed().as_secs_f64());
+
+    match response? {
+        zs::Response::PreparedMinedRelayEligibility(eligibility) => Ok(eligibility),
+        _ => unreachable!("wrong response for prepared mined-block relay eligibility"),
+    }
+}
+
+async fn commit_prepared_block<S>(
+    mut state_service: S,
+    prepared_block: zs::SemanticallyVerifiedBlock,
+    admission: Option<zs::BlockAdmission>,
+) -> Result<block::Hash, VerifyBlockError>
+where
+    S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    S::Future: Send + 'static,
+{
+    let hash = prepared_block.hash;
+    let is_mined_commit = admission.is_some();
+    let commit_start = std::time::Instant::now();
+    let ready_start = std::time::Instant::now();
+    let ready_state_service = state_service
+        .ready()
+        .await
+        .map_err(|source| VerifyBlockError::StateService { source, hash })?;
+    if is_mined_commit {
+        metrics::histogram!("state.semantic_commit.ready_wait.duration_seconds")
+            .record(ready_start.elapsed().as_secs_f64());
+    }
+
+    let request = match admission {
+        Some(admission) => zs::Request::CommitSemanticallyVerifiedBlockWithAdmission {
+            block: prepared_block,
+            admission,
+            requested_at: std::time::Instant::now(),
+        },
+        None => zs::Request::CommitSemanticallyVerifiedBlock(prepared_block),
+    };
+    let response = ready_state_service.call(request).await;
+    if is_mined_commit {
+        metrics::histogram!("mining.contextual_commit.duration_seconds")
+            .record(commit_start.elapsed().as_secs_f64());
+    }
+
+    match response {
+        Ok(zs::Response::Committed(committed_hash)) => {
+            assert_eq!(committed_hash, hash, "state must commit correct hash");
+            Ok(hash)
+        }
+        Err(source) => Err(map_commit_error(source, hash)),
+        _ => unreachable!("wrong response for semantic block commit"),
     }
 }

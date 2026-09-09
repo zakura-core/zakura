@@ -995,11 +995,7 @@ where
     let Ok(start_height) = common_ancestor.height.next() else {
         return Ok(empty());
     };
-    let Some(end_height) = start_height + i64::from(count.saturating_sub(1)) else {
-        return Ok(empty());
-    };
-
-    let finalized_tip = match tokio::time::timeout(
+    let finalized_height = match tokio::time::timeout(
         ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
         read_state
             .clone()
@@ -1007,7 +1003,8 @@ where
     )
     .await
     {
-        Ok(Ok(zakura_state::ReadResponse::FinalizedTip(tip))) => tip,
+        Ok(Ok(zakura_state::ReadResponse::FinalizedTip(Some((height, _))))) => height,
+        Ok(Ok(zakura_state::ReadResponse::FinalizedTip(None))) => return Ok(empty()),
         Ok(Ok(_)) => return Err(PortError::Unavailable { source: None }),
         Ok(Err(error)) => {
             return Err(PortError::Unavailable {
@@ -1016,15 +1013,20 @@ where
         }
         Err(_) => return Err(PortError::Timeout),
     };
-    if finalized_tip.is_none_or(|(height, _)| end_height > height) {
+    let Some(finalized_count) = finalized_height
+        .0
+        .checked_sub(start_height.0)
+        .and_then(|distance| distance.checked_add(1))
+        .map(|available| available.min(count))
+    else {
         return Ok(empty());
-    }
+    };
 
     let roots = match tokio::time::timeout(
         ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
         read_state.oneshot(zakura_state::ReadRequest::BlockRoots {
             start_height,
-            count,
+            count: finalized_count,
         }),
     )
     .await
@@ -1038,14 +1040,16 @@ where
         }
         Err(_) => return Err(PortError::Timeout),
     };
-    if !block_roots_cover_range(start_height, count, &roots) {
+    if !block_roots_cover_range(start_height, finalized_count, &roots) {
         return Ok(empty());
     }
 
-    Ok(roots
+    let mut records: Vec<_> = roots
         .into_iter()
         .map(|roots| Some(finalized_tree_aux_record(roots, network)))
-        .collect())
+        .collect();
+    records.resize(header_count, None);
+    Ok(records)
 }
 
 fn finalized_tree_aux_record(
@@ -1584,6 +1588,56 @@ mod tests {
                 .sapling_tx_count,
             2
         );
+    }
+
+    #[tokio::test]
+    async fn mixed_pages_load_tree_aux_for_the_finalized_prefix() {
+        let read_state = tower::service_fn(move |request| async move {
+            Ok::<_, zakura_state::BoxError>(match request {
+                zakura_state::ReadRequest::FinalizedTip => {
+                    zakura_state::ReadResponse::FinalizedTip(Some((
+                        block::Height(1),
+                        block::Hash([1; 32]),
+                    )))
+                }
+                zakura_state::ReadRequest::BlockRoots {
+                    start_height,
+                    count,
+                } => {
+                    assert_eq!(start_height, block::Height(1));
+                    assert_eq!(count, 1);
+                    zakura_state::ReadResponse::BlockRoots(vec![BlockCommitmentRoots {
+                        height: block::Height(1),
+                        sapling_root: Default::default(),
+                        orchard_root: Default::default(),
+                        ironwood_root: Default::default(),
+                        sapling_tx: 1,
+                        orchard_tx: 0,
+                        ironwood_tx: 0,
+                        auth_data_root: [9; 32].into(),
+                    }])
+                }
+                request => panic!("unexpected mixed-page state request: {request:?}"),
+            })
+        });
+
+        let records = finalized_tree_aux_for_page(
+            read_state,
+            &zakura_chain::parameters::Network::Mainnet,
+            zakura_header_chain::Frontier::new(block::Height(0), block::Hash([0; 32])),
+            2,
+        )
+        .await
+        .expect("the finalized prefix roots are available");
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records[0]
+                .expect("height one has a finalized root record")
+                .height,
+            block::Height(1)
+        );
+        assert_eq!(records[1], None);
     }
 
     #[test]

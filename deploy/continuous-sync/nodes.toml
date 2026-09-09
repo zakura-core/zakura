@@ -52,6 +52,12 @@ bootstrap_peers = [
     "85e425233a68697d4be91dd5d542305a8a327cd06d992d53c0913cef2fa75084@168.144.173.250:8234",
 ]
 
+[summary]
+hostname = "temp-zakura-sync-test-1"
+timezone = "America/Denver"
+time = "17:00"
+state_file = "/var/lib/zakura-sync-summary/state.json"
+
 [[nodes]]
 name = "temp-zakura-sync-test-1"
 hostname = "temp-zakura-sync-test-1"

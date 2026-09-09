@@ -1319,6 +1319,7 @@ class NotificationTests(unittest.TestCase):
         args = argparse.Namespace(
             config=Path("unused"), node=selected, dry_run=False,
             max_completion_age=0, reminder_interval=86400, state_file=path,
+            legacy_digest=True,
         )
         node = deploy.Node({"name": "node", "ssh_string": "root@host"})
         with (

@@ -140,7 +140,7 @@ impl std::ops::Deref for BodyWorkAuthority {
 pub enum HeaderSyncWorkOwner {
     /// Ordinary header target work.
     Header(HeaderWorkOwner),
-    /// Body-authorized selected-header auxiliary repair.
+    /// Body-authorized selected-range auxiliary repair.
     BodyRepair(BodyWorkOwner),
 }
 

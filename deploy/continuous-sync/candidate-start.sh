@@ -12,6 +12,7 @@ assert not Path('/root/zakura').exists()
 PY
 trap 'systemctl stop zakura.service 2>/dev/null || true' EXIT
 export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=l
 systemctl stop apt-daily.timer apt-daily-upgrade.timer
 apt-get -o DPkg::Lock::Timeout=600 update
 apt-get -o DPkg::Lock::Timeout=600 install -y build-essential pkg-config clang libclang-dev libssl-dev cmake protobuf-compiler git curl zstd logrotate

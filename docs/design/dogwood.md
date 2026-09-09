@@ -37,6 +37,9 @@ can reduce delivered bytes, but capacity planning should reserve the requested
 load. Every forwarding copy also consumes upload capacity.
 Duplicate-heavy policies need a larger allowance; use their measured total
 wire/body ratio in the capacity budget.
+The concurrent experiment's busiest relay averaged about three body copies
+per body with two-supplier startup routes: roughly 2.46 Gbps before additional
+overhead and headroom. A network-wide average does not size that relay.
 
 Average throughput does not set block latency. At a block interval of `T`
 seconds, this workload produces about `102.4 * T` MB per body. Delivering that
@@ -438,6 +441,11 @@ or unavailable supplier invalidates the reference argument. The experiment
 does not establish concurrent throughput or single-supplier failure coverage.
 Do not enable stripe pruning under the present profile.
 
+The concurrent follow-up preserves normal delivery at the synthetic 819.2 Mbps
+body rate in its steady cases. Temporary upload changes still cause misses.
+Restoring startup suppliers after a miss does not consistently restore timely
+delivery. The candidate therefore does not complete the adaptive controller.
+
 ### Small blocks and portions
 
 More parity for small blocks is worth testing because its absolute proposer
@@ -623,6 +631,10 @@ implementation while the wire profile and chain binding remain unspecified.
   application stalls, loss, and ECN; retain receiver-local feedback as a candidate.
 - [x] Exhaust a finite grant model and test cancellation, exploration funding,
   loaded cohorts, settling gates, and migration coverage.
+- [x] Test concurrent synthetic bodies with shared upload, ingress, encoding,
+  and reconstruction queues; reject simple restoration as a complete controller.
+- [x] Specify and probe a coinbase-output key commitment for transparent-only
+  V5 transactions; exclude input-script keys backed only by a txid proof.
 - [ ] **Proposer grants:** specify and test `SeedOffer` negotiation, eligibility,
   credit consumption, expiry, cancellation, and coexistence with ordinary demand.
   Lifecycle rules and a finite grant model exist; negotiation, concurrent
@@ -661,11 +673,15 @@ contextual difficulty, before authenticating metadata or allocating assembly
 state. It then pushes `HeaderMeta` through header gossip without a per-hop
 request exchange. Peers without part subscriptions also receive metadata.
 
-The current header does not commit to the part root or authenticate a proposer
-key. The proposed wrapper carries a signature from a key bound to the mined
-block. A coinbase commitment with an inclusion proof is one candidate.
-The chain-compatible binding remains open. A self-chosen signing key would
-let anyone attach conflicting roots to someone else's proof of work.
+The current header does not commit to the part root or directly identify a
+Dogwood proposer key. The proposed wrapper carries a signature from a key bound
+to the mined block. The candidate binds a 32-byte key in a zero-value coinbase
+output and proves its txid membership at index zero. The
+[spec](../specs/dogwood.md#bind-the-proposer-to-the-proof-of-work) fixes the
+candidate script. A txid proof alone cannot authenticate a key in the V5
+coinbase input script. The post-Tachyon adapter and signature profile remain
+open. A self-chosen wrapper key would let anyone attach conflicting roots to
+someone else's proof of work.
 
 Nodes accept at most one authenticated metadata variant per block. An
 authenticated conflict stops coded propagation for that block and triggers

@@ -199,10 +199,39 @@ does not satisfy this rule. The key is the proposer identity used for routing;
 it does not establish a unique operator or a stable physical entry point.
 
 The proposed chain adapter commits the key before mining, then signs metadata
-after mining. A coinbase key commitment with a canonical transaction inclusion
-proof is a candidate. Its encoding, transaction-version rules, and proof
-validation are `TBD`. The adapter MUST demonstrate that the committed field is
-covered by the header for every supported transaction version.
+after mining. Its candidate uses one zero-value transparent coinbase output
+with this exact script for a 32-byte proposer key:
+
+```text
+6a 28 || ASCII("DOGWOOD") || 01 || proposer_key[32]
+```
+
+`6a` is `OP_RETURN`; `28` directly pushes the following 40 bytes. The verifier
+MUST require exactly one matching commitment output. Alternate push encodings,
+extra bytes, and a nonzero output value MUST NOT satisfy this candidate.
+The candidate does not put the part root in the coinbase.
+
+The proof carries the canonical coinbase transaction and its transaction-id
+Merkle path at index zero. The verifier MUST compute the txid with the existing
+chain implementation for the admitted height and transaction version. It MUST
+check the path against the admitted header's transaction Merkle root. Bounded
+parsing and an output key match do not replace that path check. The profile MUST
+bound the coinbase bytes, script bytes, output count, and path depth before
+allocation. Oversized or unsupported bindings use existing block propagation.
+
+Under [ZIP 244](https://zips.z.cash/zip-0244), the txid commits
+to transparent outputs. It excludes input scripts from that digest. A key in
+the coinbase input script MUST NOT be accepted with only a txid inclusion path.
+An adapter that uses authorizing data would need the separate header commitment
+proof for that data. It MUST NOT silently substitute one proof for the other.
+
+The local binding probe covers transparent-only V5 coinbases. It demonstrates
+the output commitment and rejects input-only substitution, duplicate key
+outputs, wrong position, malformed counts, and stale Merkle roots. It does not
+implement a complete chain adapter or metadata signature verifier. The selected
+profile still MUST fix the key/signature scheme, supported transaction versions,
+and production proof bounds. In particular, a post-Tachyon format requires its
+own commitment check; the V5 result does not establish that future binding.
 
 This proposal does not place the part root inside the block it encodes.
 Implementations MUST NOT assume that the current Zcash header already
@@ -362,6 +391,7 @@ BlockPart {
 }
 
 FullBlock {
+    control_seq: u64,
     block_id: Hash,
 }
 ```
@@ -1248,6 +1278,11 @@ production defaults or amend the codec and wire profile.
 | TCP workload | Four suppliers at 80/40/20/10 Mbps; shared 100 Mbps loopback netem with 5 ms delay and 128-packet limit; 120 bodies at 25 ms intervals; `k=4`, `n=5`, `S=65536` | Synthetic exact-part requests after release. Three repetitions per scenario and allocator. |
 | TCP disturbances | Fastest supplier drops to 5 Mbps at 1.5 s; 40 ms application stalls; 0.2% netem loss, optionally with ECN | Separate scenarios, not combined WAN conditions. |
 | TCP feedback and bounds | 25 Mbps initial estimate; 100 ms window; 4 samples; EWMA weight 0.5; maximum increase 25%; 256-part per-peer outstanding cap; 20 ms cancellation delay; 100 ms soft tail | Reduced allocator. Score every released body against 800 ms; allow an 8 s run horizon for eventual completion. |
+| Concurrent bodies | 120 bodies at 20.48 ms; `k=32`, `n=40`; 16/64 relays, degree 8, 4 source peers; 4 route seeds | Synthetic 819.2 Mbps body load, with a separate preinstalled reference route. |
+| Concurrent service | 1.25 Gbps source; 2.5 Gbps relay upload/ingress; 256 queued parts per node; 6.38 ms encoding/root; 0.02 ms proof; 8 ms reconstruction | Shared service queues. CPU costs are assumptions. Body and peer turns each serve one part. |
+| Concurrent disturbances | 1,000–2,000 ms: four relay links at 1/8 service; source at 750 Mbps; or selected CPU work at 10 times cost | Separate scenarios. Additional upload-only cases halve or divide four relay uploads by eight while preserving ingress. |
+| Restoration trial | Restore startup suppliers for future bodies after a miss and 20 ms control delay; no further pruning | Do not restore solely for local CPU backlog. This rule did not consistently improve normal completion. |
+| Coinbase binding probe | V5, NU5 branch; transparent-only coinbase; 16 KiB transaction, 128 outputs, 4 KiB script, 32 sibling hashes maximum | Local probe bounds. Production adapter bounds and supported formats remain profile choices. |
 
 #### Wire profile and changes
 

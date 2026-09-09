@@ -12,6 +12,98 @@ The local worktree is `zakura.dogwood-experiments`, alongside the docs worktree.
 Its `docs/experiments/dogwood` directory retains the September 5 experiments
 and adds the scripts and result directories named below.
 
+## Concurrent bodies and key binding
+
+The concurrent follow-up ran **128 streams of 120 synthetic 2 MiB bodies**.
+The 20.48 ms release interval supplies 819.2 Mbps of body bytes. It is a load
+generator, not a selected consensus block interval. Each stream starts with
+routes and seed placement learned from one separate reference body.
+
+`concurrent_push.py` shares each node's upload, ingress, and CPU service across
+all bodies. It serves one part per body turn, then rotates peers within that
+body. Each node can queue at most 256 parts for upload. The source has 1.25 Gbps
+upload; relays have 2.5 Gbps upload and ingress. Encoding/root work costs an
+assumed 6.38 ms per body, using the earlier local reference cost. Per-part proof
+work costs 0.02 ms and reconstruction costs 8 ms. These CPU costs drive shared
+queues; the simulation does not execute the codec. Metadata dissemination
+remains idealized. Every body keeps the 400 ms fallback and 1,200 ms final
+deadline, with at most `2k` extra requests per receiver.
+
+The first 80 streams compare two-supplier startup routes with retained reference
+paths. They cover steady service, heterogeneous upload, a temporary relay-link
+slowdown, a source slowdown, and a CPU slowdown. All steady and heterogeneous
+cases complete before fallback. Four route seeds produce these steady means:
+
+| Relays | Routes | Mean per-run p95 completion | Network part bytes / receiver body bytes | Largest relay upload / body bytes |
+| --- | --- | --- | --- | --- |
+| 16 | Two suppliers | 93.0 ms | 2.37 | 3.00 |
+| 16 | Retained reference paths | 74.7 ms | 1.15 | 1.89 |
+| 64 | Two suppliers | 239.3 ms | 2.21 | 2.92 |
+| 64 | Retained reference paths | 207.1 ms | 1.11 | 2.04 |
+
+The largest-relay column averages each run's maximum node upload. The network
+ratio includes source and relay part upload, including the 384-byte proof/frame
+allowance. It excludes transport and control overhead. Some receivers cancel
+parts after obtaining enough distinct indices, so delivered traffic can fall
+below a complete codeword per receiver. The source still seeds at most one
+codeword per body. These short traces do not establish long-run queue stability
+or end-to-end 50,000 TPS.
+
+Capacity planning must account for the largest relay, not only the network
+average. A relay serving three body copies at this workload needs about
+2.46 Gbps before additional overhead or utilization headroom. The retained-path
+candidate lowers that cost in the steady cases, but does not protect a deadline
+when service changes.
+
+The other 48 streams isolate upload changes. Four relays halve their upload or
+reduce it eightfold from 1,000 to 2,000 ms; ingress remains 2.5 Gbps. A third
+policy restores a receiver's startup suppliers for future bodies after a miss,
+paying 20 ms control delay. It does not restore routes solely because enough
+parts are waiting on local CPU work. It does not prune again during the run.
+
+| Relays | Upload change | Two suppliers: normal completions | Retained paths | Retained paths, then restore |
+| --- | --- | --- | --- | --- |
+| 16 | Half | 100% | 100% | 100% |
+| 16 | One eighth | 78.0% | 68.6% | 71.5% |
+| 64 | Half | 90.2% | 94.9% | 94.8% |
+| 64 | One eighth | 59.1% | 52.5% | 51.5% |
+
+These fractions include every receiver/body observation. Restoration does not
+consistently improve normal completion and sometimes adds traffic to a busy
+network. For the 64-relay eightfold slowdown, mean direct fallback traffic is
+225.7 MiB with two suppliers and 448.9 MiB with retained paths. Eventual
+completion is 95.9% and 95.5%, respectively. Fallback neither hides the missed
+normal deadline nor guarantees recovery within its caps. Do not select this
+restoration rule as a complete congestion controller.
+
+The source and CPU slowdowns also cause misses. Some disturbances reduce a
+node below the workload's required service rate. A routing policy cannot repair
+that capacity deficit. The model enforces upload queue and repair caps, but
+ingress and CPU queues are service-delay models without transport backpressure
+or production memory admission. Retained paths remain a candidate under fixed
+mapping and seed placement, not a deployed stripe profile.
+
+### Coinbase key commitment probe
+
+`coinbase_binding.py` constructs a canonical transparent-only V5 coinbase and
+checks a proposer key in one zero-value output. Its input-script mutation keeps
+the txid unchanged; its output-key mutation changes the txid and fails the old
+Merkle proof. This matches the split between transaction effects and authorizing
+data in [ZIP 244](https://zips.z.cash/zip-0244).
+
+The candidate script is `OP_RETURN`, a direct 40-byte push, `DOGWOOD`, byte
+`01`, and a 32-byte key. The proof must establish coinbase position zero against
+the admitted header. A txid proof cannot authenticate a key carried only in
+the V5 input script. The probe rejects duplicate matching outputs, nonzero
+commitment value, wrong position, stale roots, truncation, and noncanonical
+counts. Its example coinbase is 119 bytes. It does not check proof of work,
+metadata signatures, rewards, shielded coinbases, or post-Tachyon transaction
+formats. The chain adapter remains an implementation gate.
+
+The current local suite passes **60 tests**. Results and source snapshots are
+in `2026-09-09-concurrent-push`, `2026-09-09-concurrent-upload-change`, and
+`2026-09-09-coinbase-binding` under the local experiment results directory.
+
 ## Connected-network and transport follow-up
 
 The normal throughput target assumes that honest relays remain connected after
@@ -129,7 +221,7 @@ stability, or throughput at the post-Tachyon target.
 two-index grant model. It checks queueing, cancellation, crossed `FullBlock`,
 retirement, and send-once accounting. Separate tests cover exploration credit,
 loaded cohorts, failure precedence, migration overlap, and final coverage.
-The local suite passes 45 tests. This is bounded state exploration, not a proof
+That checkpoint passed 45 tests. This is bounded state exploration, not a proof
 of the full protocol or multi-connection controller.
 
 Retain two-supplier startup coverage where budgets allow it. Do not select

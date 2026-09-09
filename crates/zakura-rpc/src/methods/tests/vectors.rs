@@ -4719,9 +4719,17 @@ async fn a_stale_request_does_not_retarget_the_template_parent() {
         rpc.mining_template_withdrawn("work"),
         "a rejection names one template, so a parent change does not revive it",
     );
+    // Eight more parents evict the rejection before the waiter reads its notification.
+    for byte in 3..=10 {
+        let parent = Hash([byte; 32]);
+        tip_sender.send_best_tip_hash(parent);
+        rpc.track_template_parent(parent, &mut rejections)
+            .expect("the new tip is tracked");
+    }
+    assert!(!rpc.mining_template_withdrawn("work"));
     assert!(
         futures::poll!(&mut withdrawal).is_ready(),
-        "a parent change must not erase a rejection the waiter has not read",
+        "eviction must not erase a rejection the waiter has not read",
     );
 }
 
@@ -4909,8 +4917,10 @@ async fn a_rejection_is_recorded_on_the_parent_it_validated() {
         max_time: 1654008728.into(),
         chain_history_root: fake_history_tree(&Mainnet).hash(),
     };
+    let read_tip = tip.clone();
     let read_state = tower::service_fn(move |request| {
-        let chain_info = chain_info.clone();
+        let mut chain_info = chain_info.clone();
+        chain_info.tip_hash = read_tip.best_tip_hash().expect("the test sets a tip");
         async move {
             assert!(matches!(request, ReadRequest::ChainInfo));
             Ok::<_, BoxError>(ReadResponse::ChainInfo(chain_info))
@@ -4957,8 +4967,13 @@ async fn a_rejection_is_recorded_on_the_parent_it_validated() {
     // The chain leaves the parent while its template is still being validated.
     let mut rejections = rpc.gbt.template_rejections.subscribe();
     tip_sender.send_best_tip_hash(sibling);
-    rpc.track_template_parent(sibling, &mut rejections)
+    let sibling_state = rpc
+        .track_template_parent(sibling, &mut rejections)
         .expect("the sibling is tracked");
+
+    let sibling_withdrawal = rpc.wait_for_mining_template_withdrawal(Some("sibling-work"));
+    tokio::pin!(sibling_withdrawal);
+    assert!(futures::poll!(&mut sibling_withdrawal).is_pending());
 
     preparation.respond(Err::<Hash, _>(zakura_consensus::BoxError::from(
         zakura_consensus::VerifyBlockError::Block {
@@ -4975,6 +4990,31 @@ async fn a_rejection_is_recorded_on_the_parent_it_validated() {
     assert!(
         !rpc.mining_template_withdrawn("sibling-work"),
         "the parent the chain moved to is not put into fallback by another parent's rejection",
+    );
+    assert!(
+        futures::poll!(&mut sibling_withdrawal).is_pending(),
+        "another parent's rejection must not interrupt the sibling's solver",
+    );
+
+    assert!(
+        !rpc.recovery_context_changed(
+            &sibling_state,
+            &speculative_test_template(sibling),
+            sibling,
+        ),
+        "another parent's rejection must not abort the sibling's recovery",
+    );
+    let sibling_template = rpc
+        .get_block_template(None)
+        .await
+        .expect("the sibling can still publish work")
+        .try_into_template()
+        .expect("template mode was requested");
+    assert_eq!(sibling_template.previous_block_hash, sibling);
+    assert_eq!(
+        sibling_template.long_poll_id.revision,
+        sibling_state.current_revision(),
+        "another parent's rejection must not change the sibling's long-poll ID",
     );
 
     // The chain comes back to the parent, which still knows what it rejected there.

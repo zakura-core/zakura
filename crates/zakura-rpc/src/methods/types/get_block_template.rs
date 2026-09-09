@@ -81,6 +81,8 @@ const MAX_TRACKED_PARENTS: usize = 8;
 /// What one parent's templates are known to be worth. Overflow fails closed for that parent.
 #[derive(Clone, Debug, Default)]
 struct ParentRejections {
+    /// The global revision assigned to this parent's last rejection.
+    revision: u64,
     rejected: HashSet<String>,
     prepared: VecDeque<String>,
     saturated: bool,
@@ -121,6 +123,8 @@ pub(crate) struct TemplateRejections {
     /// Counts rejections, and never restarts: a waiter can tell it missed one it never read,
     /// whatever the parent has done since.
     pub(crate) revision: u64,
+    /// The newest rejection revision lost through parent eviction.
+    pub(crate) evicted_revision: u64,
     /// Least recently tracked first. The entries are shared, so cloning this state for one
     /// request does not copy every tracked parent's work IDs.
     parents: VecDeque<(block::Hash, Arc<ParentRejections>)>,
@@ -129,8 +133,7 @@ pub(crate) struct TemplateRejections {
 impl TemplateRejections {
     /// Points `parent` at the parent templates are built on now, and returns whether that moved.
     ///
-    /// Nothing is forgotten here. A parent that is tracked again keeps everything it recorded
-    /// before and returns to the back of the eviction order.
+    /// A retained parent keeps its state and returns to the back of the eviction order.
     pub(crate) fn track_parent(&mut self, parent: block::Hash) -> bool {
         let moved = self.parent != Some(parent);
         self.parent = Some(parent);
@@ -144,7 +147,11 @@ impl TemplateRejections {
         };
         self.parents.push_back(entry);
         while self.parents.len() > MAX_TRACKED_PARENTS {
-            self.parents.pop_front();
+            let (_, evicted) = self
+                .parents
+                .pop_front()
+                .expect("the queue exceeds capacity");
+            self.evicted_revision = self.evicted_revision.max(evicted.revision);
         }
 
         moved
@@ -156,6 +163,7 @@ impl TemplateRejections {
     /// while the chain is elsewhere still condemns the work it was validating, and that answer is
     /// the only one the node will get.
     pub(crate) fn reject(&mut self, parent: block::Hash, work_id: &str) -> bool {
+        let revision = self.revision;
         let Some(entry) = self.entry_mut(parent) else {
             return false;
         };
@@ -169,10 +177,10 @@ impl TemplateRejections {
             entry.rejected.insert(work_id.to_owned());
         }
 
-        self.revision = self
-            .revision
+        entry.revision = revision
             .checked_add(1)
             .expect("template revision cannot exhaust u64");
+        self.revision = entry.revision;
         true
     }
 
@@ -217,6 +225,11 @@ impl TemplateRejections {
     /// Whether the parent templates are built on now may only hand out validated templates.
     pub(crate) fn needs_fallback(&self) -> bool {
         self.current().is_some_and(ParentRejections::needs_fallback)
+    }
+
+    /// The current parent's last rejection revision, or zero before its first rejection.
+    pub(crate) fn current_revision(&self) -> u64 {
+        self.current().map_or(0, |entry| entry.revision)
     }
 
     /// Whether `parent` may only hand out templates validated in the foreground.

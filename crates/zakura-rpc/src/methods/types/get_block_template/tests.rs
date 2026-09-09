@@ -47,21 +47,25 @@ fn template_rejection_follows_the_work_across_parents() {
     assert!(state.withdrawn("unknown"));
     assert!(!state.reject(parent, "old"));
     assert_eq!(state.revision, 1);
+    assert_eq!(state.current_revision(), 1);
 
     // The chain leaves the parent. Its fallback and its prepared work go with it, but the work it
     // condemned stays condemned, and a validation that only now finishes is still recorded.
     assert!(state.track_parent(next_parent));
     assert!(!state.needs_fallback());
+    assert_eq!(state.current_revision(), 0);
     assert!(!state.is_prepared("new"));
     assert!(state.withdrawn("old"));
     assert!(!state.withdrawn("new"));
     assert!(state.reject(parent, "late"));
     assert_eq!(state.revision, 2);
+    assert_eq!(state.current_revision(), 0);
     assert!(state.withdrawn("late"));
 
     // The chain comes back. The parent knows everything it knew before.
     assert!(state.track_parent(parent));
     assert!(state.needs_fallback());
+    assert_eq!(state.current_revision(), 2);
     assert!(state.is_prepared("new"));
     assert!(!state.withdrawn("new"));
     assert!(state.withdrawn("old"));
@@ -118,6 +122,7 @@ fn template_rejections_forget_the_least_recently_tracked_parent() {
     }
 
     assert!(!state.withdrawn("condemned"));
+    assert_eq!(state.evicted_revision, 1);
     assert!(
         !state.reject(first, "late"),
         "a forgotten parent records nothing",
@@ -140,6 +145,7 @@ fn tracking_a_parent_again_keeps_it_from_being_forgotten() {
     state.track_parent(zakura_chain::block::Hash([200; 32]));
 
     assert!(state.withdrawn("condemned"));
+    assert_eq!(state.evicted_revision, 0);
 }
 
 #[test]

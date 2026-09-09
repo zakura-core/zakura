@@ -1399,10 +1399,10 @@ where
         loop {
             let withdrawn = {
                 let state = rejections.borrow_and_update();
-                // A parent change can clear a rejection before this waiter observes it.
-                // Keep the revision so clearing the work sets cannot erase that notification.
+                // Eviction can erase a rejection before this waiter observes it.
+                // Retained rejections use the predicate so other parents cannot cancel this work.
                 state.withdrawn(work_id)
-                    || (state.revision != revision && !state.is_prepared(work_id))
+                    || (state.evicted_revision > revision && !state.is_prepared(work_id))
             };
             if withdrawn {
                 return;
@@ -1505,12 +1505,12 @@ where
     ) -> Result<GetBlockTemplateResponse> {
         let mut long_poll_id = template.long_poll_id;
         // A miner holding work from an earlier revision must not resubmit it.
-        let submit_old = if long_poll_id.revision != state.revision {
+        let submit_old = if long_poll_id.revision != state.current_revision() {
             Some(false)
         } else {
             template.submit_old
         };
-        long_poll_id.revision = state.revision;
+        long_poll_id.revision = state.current_revision();
         let template = BlockTemplateResponse::new_internal(
             &self.network,
             None,
@@ -1582,7 +1582,7 @@ where
 
         // Another rejection landed on this parent, or withdrew this very work.
         current.parent != state.parent
-            || current.revision != state.revision
+            || current.current_revision() != state.current_revision()
             || current.contains(template.work_id())
             // The chain moved off the parent this template was built on.
             || self
@@ -3169,7 +3169,7 @@ where
                 mempool_txs.iter().map(|tx| tx.transaction.id()),
             )
             .generate_id();
-            server_long_poll_id.revision = rejection_state.revision;
+            server_long_poll_id.revision = rejection_state.current_revision();
 
             // The loop finishes if:
             // - the client didn't pass a long poll ID,
@@ -3301,7 +3301,7 @@ where
                         vec![]
                     )
                     .generate_id();
-                    server_long_poll_id.revision = rejection_state.revision;
+                    server_long_poll_id.revision = rejection_state.current_revision();
 
                     let submit_old = client_long_poll_id
                         .as_ref()

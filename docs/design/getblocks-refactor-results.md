@@ -229,3 +229,23 @@ loss, reopening, and repeated-saturation gates retain their earlier measurements
 they were not rerun for this cleanup. Their transport settings and serving
 algorithms are unchanged, and the routine matched-download and recovery tests
 pass again. The full workspace run was not repeated.
+
+### Test consolidation
+
+At `2fd9cac34`, duplicate admission checks are consolidated in the shared request
+tests. Separate regressions still cover dropping a read waiter, aborting its
+caller, and each transport-write outcome; they now share their setup. Paired QUIC
+fixtures also share native connection negotiation. The storage outcome matrix
+keeps all four distinct outcomes at three queue depths, removing six repeated
+failure cases.
+
+The independent ownership models, generated histories, and JSON replay move
+to #896. Fixed regressions for one block per response, 64 active responses, execution
+claims, reconnects, and cancellation remain in #892. This changes test placement
+and fixtures, with no change to production behavior or transport settings.
+
+The `blocksync-regression` profile passes all 84 tests without retries, and the
+integration profile passes all 22 tests. Workspace all-target Clippy passes.
+The earlier long transport measurements above remain the validation evidence for
+loss, repeated reopening, and sustained saturation; those gates were not rerun
+for this test consolidation.

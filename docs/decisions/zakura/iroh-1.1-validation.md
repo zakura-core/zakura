@@ -51,8 +51,9 @@ requirement and add review of each Git delta. The four recorded deltas cover
 only the compared source and manifest changes. They do not exempt the upstream
 baseline or trust all future publications from any maintainer.
 
-Cargo-vet still reports 27 versions missing `safe-to-deploy` coverage. Most
-are unfinished reviews; the specific concerns below remain audit holds.
+Cargo-vet now reports 24 versions missing `safe-to-deploy` coverage. All are
+unfinished reviews of the upstream Iroh 1.1 dependency graph; the two
+cryptographic concerns below are recorded as documented audit holds.
 The exact versions and suggested review bases are recorded in
 `qa/supply-chain/iroh-1.1-audit-backlog.json`. Refresh that file from
 `cargo vet check --output-format json` after dependency or audit changes.
@@ -64,7 +65,7 @@ core/protocol changes, WebSocket and browser-stream changes, and Windows import
 libraries. Delta records reuse reviewed baselines; full records cover the named
 package only. Notes state review scope, caller constraints and test limitations.
 Cargo-vet removed the obsolete Iroh metrics 0.35 exemption after its replacement
-was reviewed. No new exemptions or publisher trust were added.
+was reviewed. That pass added no exemptions or publisher trust.
 
 Four further records cover base64, quick-xml, simple-dns and LRU 0.18.3,
 reducing missing coverage from 31 to 27. Base64's new SIMD code passed
@@ -74,6 +75,15 @@ was inspected but not executed. XML/DNS boundary probes completed 123,136
 malformed-input cases without panic. These are targeted checks, not exhaustive
 parser conformance or hostile-load validation. Audit notes identify caller
 limits and untested feature paths.
+
+Three further changes reduce missing coverage from 27 to 24 without new source
+reviews. The expired `syn` publisher trust for David Tolnay, which this store
+already relied on for earlier `syn` releases, is renewed through 2027-09-09 so
+that `syn 3.0.5` resolves through the existing trust policy. AES-GCM 0.10.3
+and POLYVAL 0.6.2 are recorded as exact-version exemptions whose notes carry
+the review holds below, following the store's existing audit-hold convention
+for `hickory-proto 0.25.2` and `iroh-metrics 0.35.0`. Neither is a source
+certification.
 
 For the Windows import libraries, all 21 compared source/archive files match
 Microsoft commit `00fe13a47c3cdce3287069be671aaa3c273f1e0a`. LLVM inspection found
@@ -114,7 +124,8 @@ the eventual registry-package validation must check its resolved LRU version.
 The two remaining holds concern upstream cryptographic packages, not changes to
 cryptographic implementations in the compatibility fork. AES-GCM and POLYVAL
 are newly selected dependencies relative to the PR base; cipher remains the
-existing registry version 0.4.4. Neither held package has a new audit record.
+existing registry version 0.4.4. Neither held package has an audit record; both are held under exact-version
+exemptions carrying these notes.
 
 - **aes-gcm 0.10.3:** Its plaintext bound permits `2^36` bytes, exceeding the
   `2^36 - 32` byte limit in [NIST SP 800-38D, section 5.2.1.1][gcm-spec]. Its
@@ -153,6 +164,30 @@ Publication under the proposed names does not erase this review requirement.
 The new registry packages will need audit records tied to their published
 contents. The existing cargo-vet CI gate remains enabled and fails until the
 remaining coverage is supplied; no blanket exemption has been added.
+
+## Semver and packaging gates
+
+`cargo semver-checks` compares `zakura-network` against its stable crates.io
+baseline 7.0.1 and reports two major changes: the
+`ZakuraHandlerError::IrohRemoteId` variant and `ZakuraEndpoint::add_node_addr`
+are removed together with the Iroh APIs they wrapped. `zakura-network` is
+therefore bumped to 8.0.0 in this change, and `zakura-rpc`, whose published
+manifest pins the 7.x line, takes the cascade patch bump to 10.0.1-rc1 so that
+a later publish cannot select two majors side by side. The `zakura` package
+version is managed by release preparation.
+
+Both `cargo semver-checks` and `cargo package` resolve dependencies outside the
+workspace, where the root `[patch.crates-io]` entries do not apply, so they
+select registry Iroh 1.1.0 and fail on its stable SHA-2 requirement. The semver
+job already builds inside an isolated Cargo home to work around other
+fresh-resolution breakages; that home now mirrors the root Iroh patches, read
+from the root manifest so the two cannot drift, and also holds
+`precis-profiles` at 0.1.13. The 0.1.14 release of 2026-09-08 moved to
+`precis-core 0.2` and no longer compiles with the `stun-rs 0.1.11` present in
+every Iroh 0.92 baseline; the same breakage fails the warm-baseline job on
+`main`. The packaging and publish-graph checks deliberately receive no such
+patch: they exist to prove a registry-only dependency graph, which this branch
+cannot provide until the fork is consumed from crates.io.
 
 ## CI test correction
 

@@ -1,6 +1,5 @@
 //! GetBlocks ownership histories with an independent model and concrete JSON replay.
 
-mod defaults;
 mod model;
 mod negative_controls;
 mod production;
@@ -58,7 +57,7 @@ async fn replay_actions(scenario: &Scenario) -> Result<Vec<Observation>, String>
             tokio::time::advance(Duration::from_millis(*millis)).await;
             Outcome::Done
         } else {
-            production.apply(action)
+            production.apply(action).await
         };
         let elapsed = if let Action::Advance { millis } = action {
             Duration::from_millis(*millis)

@@ -4,5 +4,6 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-# Covers output backpressure under the production queue polling timer.
-cc 327f1c883a4d7508cd17e9b7790fb53a0f6cce38a991248cac56150038a09a57 # shrinks to depth = 1, responses = [(1, false)]
+# Preserved from the old serving property. The depth-one response regression
+# is also covered explicitly by the fixed sequential-serving matrix.
+cc 327f1c883a4d7508cd17e9b7790fb53a0f6cce38a991248cac56150038a09a57 # original witness: depth = 1, one nonempty response

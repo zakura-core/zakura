@@ -609,9 +609,8 @@ impl PeerRegistry {
         }
     }
 
-    /// Remove a peer without checking its session ID.
-    /// Used by public test or driver events that don't carry a session ID.
-    /// Session cleanup must use `remove_session` to protect a newer connection.
+    /// Remove a unit-test peer injected without a session ID.
+    #[cfg(test)]
     pub(super) fn remove(&self, peer: &ZakuraPeerId) {
         self.lock().remove(peer);
     }
@@ -625,12 +624,6 @@ impl PeerRegistry {
         self.lock()
             .get(peer)
             .is_some_and(|entry| entry.generation == generation)
-    }
-
-    #[cfg(test)]
-    /// Read the current session ID so tests can check reconnect handling.
-    pub(super) fn generation_for_test(&self, peer: &ZakuraPeerId) -> Option<u64> {
-        self.lock().get(peer).map(|entry| entry.generation)
     }
 
     /// Publish a freshly-applied `Status` (routine-side, inverted inbound flow): grow

@@ -41,18 +41,45 @@ pub(super) enum WriteEnd {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum Action {
-    Admit { peer: usize, request: usize },
-    Commit { request: usize },
-    ClaimQuery { request: usize },
-    CloneQueryLease { request: usize },
-    DropQueryLease { request: usize },
-    DropLedger { request: usize },
-    QueueBlock { request: usize },
-    QueueTerminal { request: usize },
-    BeginWrite { session: usize },
-    EndWrite { session: usize, outcome: WriteEnd },
-    Reconnect { peer: usize },
-    Advance { millis: u64 },
+    Admit {
+        peer: usize,
+        request: usize,
+    },
+    Commit {
+        request: usize,
+    },
+    ClaimQuery {
+        request: usize,
+    },
+    CloneQueryLease {
+        request: usize,
+    },
+    DropQueryLease {
+        request: usize,
+    },
+    #[serde(alias = "drop_ledger")]
+    DropProducer {
+        request: usize,
+    },
+    QueueBlock {
+        request: usize,
+    },
+    QueueTerminal {
+        request: usize,
+    },
+    BeginWrite {
+        session: usize,
+    },
+    EndWrite {
+        session: usize,
+        outcome: WriteEnd,
+    },
+    Reconnect {
+        peer: usize,
+    },
+    Advance {
+        millis: u64,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

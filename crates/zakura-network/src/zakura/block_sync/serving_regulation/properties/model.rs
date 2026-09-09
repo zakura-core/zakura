@@ -9,7 +9,7 @@ struct Request {
     peer: usize,
     session: usize,
     provisional: bool,
-    ledger: bool,
+    producer: bool,
     query_owners: usize,
     query_claimed: bool,
     sent_block: bool,
@@ -64,7 +64,7 @@ impl Model {
                 Action::ClaimQuery { request },
                 Action::CloneQueryLease { request },
                 Action::DropQueryLease { request },
-                Action::DropLedger { request },
+                Action::DropProducer { request },
                 Action::QueueBlock { request },
                 Action::QueueTerminal { request },
             ]);
@@ -86,7 +86,7 @@ impl Model {
                 peer < 2 && self.requests.get(request).is_some_and(Option::is_none)
             }
             Action::Commit { request } => {
-                self.request_matches(request, |state| state.provisional && state.ledger)
+                self.request_matches(request, |state| state.provisional && state.producer)
             }
             Action::ClaimQuery { request } | Action::DropQueryLease { request } => {
                 self.request_matches(request, |state| state.query_owners > 0)
@@ -94,12 +94,14 @@ impl Model {
             Action::CloneQueryLease { request } => self.request_matches(request, |state| {
                 state.query_owners > 0 && state.query_owners < 3
             }),
-            Action::DropLedger { request } => self.request_matches(request, |state| state.ledger),
+            Action::DropProducer { request } => {
+                self.request_matches(request, |state| state.producer)
+            }
             Action::QueueBlock { request } => self.request_matches(request, |state| {
-                !state.provisional && state.ledger && !state.sent_block && !state.sent_terminal
+                !state.provisional && state.producer && !state.sent_block && !state.sent_terminal
             }),
             Action::QueueTerminal { request } => self.request_matches(request, |state| {
-                !state.provisional && state.ledger && !state.sent_terminal
+                !state.provisional && state.producer && !state.sent_terminal
             }),
             Action::BeginWrite { session } => self
                 .sessions
@@ -145,7 +147,7 @@ impl Model {
                         peer,
                         session,
                         provisional: true,
-                        ledger: true,
+                        producer: true,
                         query_owners: 0,
                         query_claimed: false,
                         sent_block: false,
@@ -163,7 +165,7 @@ impl Model {
             }
             Action::ClaimQuery { request } => {
                 let state = self.requests[request].as_mut().unwrap();
-                let starts = state.ledger && !state.query_claimed;
+                let starts = state.producer && !state.query_claimed;
                 state.query_claimed |= starts;
                 outcome = Outcome::Started(starts);
             }
@@ -173,8 +175,8 @@ impl Model {
             Action::DropQueryLease { request } => {
                 self.requests[request].as_mut().unwrap().query_owners -= 1
             }
-            Action::DropLedger { request } => {
-                self.requests[request].as_mut().unwrap().ledger = false
+            Action::DropProducer { request } => {
+                self.requests[request].as_mut().unwrap().producer = false
             }
             Action::QueueBlock { request } | Action::QueueTerminal { request } => {
                 let state = self.requests[request].as_mut().unwrap();
@@ -210,7 +212,7 @@ impl Model {
                     .flatten()
                     .filter(|request| request.session == old)
                 {
-                    request.ledger = false;
+                    request.producer = false;
                 }
                 self.current_sessions[peer] = self.sessions.len();
                 self.sessions.push(Session::default());
@@ -224,7 +226,7 @@ impl Model {
     fn settle_unowned(&mut self) {
         for state in &mut self.requests {
             let Some(request) = state else { continue };
-            if request.ledger || request.query_owners > 0 || request.frame_owners > 0 {
+            if request.producer || request.query_owners > 0 || request.frame_owners > 0 {
                 continue;
             }
             *state = None;
@@ -252,7 +254,7 @@ impl Model {
             let next = self.actions().into_iter().find(|action| {
                 matches!(
                     action,
-                    Action::DropLedger { .. }
+                    Action::DropProducer { .. }
                         | Action::DropQueryLease { .. }
                         | Action::BeginWrite { .. }
                         | Action::EndWrite {

@@ -1,5 +1,6 @@
 //! The storage half of the serving byte contract, independent of network policy.
 
+use super::*;
 use proptest::prelude::*;
 use zakura_chain::block::{Height, MAX_BLOCK_BYTES};
 
@@ -49,5 +50,50 @@ proptest! {
         });
         prop_assert_eq!(actual, expected);
         prop_assert_eq!(actual_lookups, expected_lookups);
+    }
+}
+
+proptest! {
+    #[test]
+    fn owned_reads_preserve_the_prefix_at_generated_cancellation_boundaries(
+        sizes in prop::collection::vec(1u32..=2_000_000, 1..16),
+        count in 1u32..20,
+        byte_cap in 1u32..=32_000_000,
+        cancel_after in 0usize..20,
+    ) {
+        let mut expected = Vec::new();
+        let mut expected_lookups = 0;
+        let mut total = 0u64;
+        for index in 0..usize::try_from(count).unwrap() {
+            if index == cancel_after { break; }
+            expected_lookups += 1;
+            let Some(size) = sizes.get(index) else { break; };
+            total += u64::from(*size);
+            if total > u64::from(byte_cap) { break; }
+            expected.push((Height(u32::try_from(index).unwrap()), usize::try_from(*size).unwrap()));
+        }
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let (resources, drops, finished) = resources();
+            let block = genesis();
+            let lookups = Arc::new(AtomicUsize::new(0));
+            let cancelled = lookups.clone();
+            let reads = lookups.clone();
+            let result = timeout(DEADLINE, spawn_owned_block_range(
+                Height(0), count, byte_cap, resources,
+                move |_| cancelled.load(Ordering::SeqCst) >= cancel_after,
+                move |height| {
+                    reads.fetch_add(1, Ordering::SeqCst);
+                    sizes.get(usize::try_from(height.0).unwrap())
+                        .map(|size| (block.clone(), usize::try_from(*size).unwrap()))
+                },
+            )).await.unwrap().unwrap();
+            assert_eq!(lookups.load(Ordering::SeqCst), expected_lookups);
+            let actual: Vec<_> = result.blocks.iter().map(|(height, _, size)| (*height, *size)).collect();
+            assert_eq!(actual, expected);
+            assert_eq!(drops.load(Ordering::SeqCst), 0, "the returned prefix still owns the read resources");
+            drop(result);
+            timeout(DEADLINE, finished).await.unwrap().unwrap();
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+        });
     }
 }

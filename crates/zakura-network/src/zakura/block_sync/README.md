@@ -47,7 +47,13 @@ while anything anchored to the verified tip is pinned until real progress commit
 | Candidate selection | first pending in `[servable_low, min(servable_high, floor_high)]`, only if this peer is the preferred floor carrier | first pending in the peer's servable range, only when the floor arm produced nothing |
 | cwnd slots | may borrow up to `floor_bypass_slots` (default 2) beyond a saturated cwnd — bypass slots fund the floor **only** | normal cwnd slots only |
 | Byte funding | never refused: `reserve_request_budget`'s floor path overdrafts the in-flight budget by at most one request when `try_reserve` fails — reachable even at zero in-flight budget | non-blocking `try_reserve`; refused if the in-flight budget is spent |
-| Request deadline | short fixed leash (`floor_rescue_timeout`, default 2 s); on expiry the height is rescued to a faster carrier, the peer is retry-avoided but **not** disconnected | `request_timeout` (default 8 s) + expected transfer time (`estimated_bytes / measured BtlBw`, rate floored at 256 KiB/s) — patient, since it never gates the floor |
+| Request deadline | with a fresh delivery-rate sample, `floor_rescue_timeout` (default 2 s) + estimated transfer time; without a sample, use the normal deadline so the cold peer's only probe can finish | `request_timeout` (default 8 s) + estimated transfer time |
+
+Both lanes compute transfer time as `pending_response_bytes / measured_bytes_per_second`,
+using at least 256 KiB/s to keep the deadline bounded. An unmeasured peer uses
+256 KiB/s. Include this request and earlier unreceived responses in the byte
+estimate because they share an ordered data stream. Floor expiry returns the missing height for retry; the separate
+block-progress deadline controls session cooldown and repeated-stall disconnects.
 
 **Floor carrier preference:** the floor rides the fastest servable peer. Before taking
 floor work, a routine asks the shared registry
@@ -167,7 +173,7 @@ the worst-case decoded contribution is approximately
 
 1. **Commit-window heights are always fundable**, on both lanes, regardless of the
    look-ahead gates — a pinned checkpoint range can always assemble.
-2. **Floor grants never size below one byte**, and `take_in_range_budgeted` always
+2. **Floor grants never size below one byte**, and `take_for_request` always
    takes its first item regardless of the byte cap — so the floor block is taken even
    when the in-flight budget is exactly full, reaching the floor reservation path…
 3. **…which overdrafts instead of waiting.** When `try_reserve` fails,
@@ -207,7 +213,7 @@ borrowed a bypass slot.
 | `max_inflight_block_bytes` | 6 GiB | outstanding-request wire budget, released at receipt (separate from the resident gate) |
 | `max_blocks_per_response` | 1 | count cap per request (effective = min of both sides' advertisements, hard max 128) |
 | `floor_bypass_slots` | 2 | extra slots past a saturated cwnd, floor lane only |
-| `request_timeout` / `floor_rescue_timeout` | 8 s / 2 s | above-floor base deadline / floor rescue leash |
+| `request_timeout` / `floor_rescue_timeout` | 8 s / 2 s | normal base deadline / measured-peer floor-rescue base; both add ordered transfer time |
 | `max_submitted_block_applies` | 401 | sequencer submit window (floored at one checkpoint range; no ceiling — which is why the exemption span is a constant) |
 
 ## Known limitations and follow-ups

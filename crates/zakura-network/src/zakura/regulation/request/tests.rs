@@ -3,8 +3,16 @@
 
 use std::time::Duration;
 
+use futures::FutureExt;
+
 use super::*;
 use crate::zakura::discovery::{DiscoveryMessage, DiscoveryWireError, MAX_DISCOVERY_MESSAGE_BYTES};
+
+impl ResponsePermit {
+    pub(crate) fn weak_resources(&self) -> std::sync::Weak<WorkResources> {
+        Arc::downgrade(&self.resources)
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct GetPeersPolicy;
@@ -70,7 +78,7 @@ fn discovery_codec_runs_before_work_admission() {
     assert_eq!(node.reserved(), 0);
     let request = session.decode(frame(1)).unwrap();
     assert_eq!(request.limit, 1);
-    let attempt = session.try_admit(&request, None).unwrap();
+    let attempt = session.admit(&request).now_or_never().unwrap();
     assert_eq!(node.reserved(), 1);
     drop(attempt);
     assert_eq!(node.reserved(), 0);
@@ -82,7 +90,7 @@ async fn finite_discovery_response_retains_work_through_its_write() {
     let node = SlotBudget::new(1).unwrap();
     let session = admission(&node).session(&peer(1));
     let request = session.decode(frame(1)).unwrap();
-    let mut response = session.try_admit(&request, None).unwrap().commit();
+    let mut response = session.admit(&request).now_or_never().unwrap().commit();
     let lifetime = response.weak_resources();
     let work = response.work_lease();
     assert!(work.try_start());
@@ -105,7 +113,7 @@ async fn finite_discovery_response_retains_work_through_its_write() {
     drop(work);
     assert_eq!(node.reserved(), 1);
     assert!(lifetime.upgrade().is_some());
-    assert!(session.try_admit(&request, None).is_err());
+    assert!(session.admit(&request).now_or_never().is_none());
     queued
         .write_with(|_| async { Ok::<_, std::io::Error>(()) })
         .await
@@ -115,27 +123,37 @@ async fn finite_discovery_response_retains_work_through_its_write() {
 }
 
 #[tokio::test]
-async fn failed_admission_rolls_back_and_waiter_keeps_its_capacity() {
+async fn admission_waiters_retain_peer_capacity_and_receive_node_slots_in_order() {
     let node = SlotBudget::new(1).unwrap();
     let admission = admission(&node);
     let first = admission.session(&peer(1));
     let second = admission.session(&peer(2));
+    let third = admission.session(&peer(3));
     let request = first.decode(frame(1)).unwrap();
-    let held = first.try_admit(&request, None).unwrap();
-    let blocked = second.try_admit(&request, None).unwrap_err();
-    assert_eq!(blocked.kind(), WorkBound::Node);
-    assert_eq!(second.peer_budget().reserved(), 0);
-    let wait = blocked.wait();
-    tokio::pin!(wait);
-    assert!(futures::poll!(&mut wait).is_pending());
+    let held = first.admit(&request).await;
+    let mut second_wait = Box::pin(second.admit(&request));
+    let mut third_wait = Box::pin(third.admit(&request));
+    assert!(futures::poll!(&mut second_wait).is_pending());
+    assert!(futures::poll!(&mut third_wait).is_pending());
+    assert_eq!(second.peer_budget().reserved(), 1);
+    assert_eq!(third.peer_budget().reserved(), 1);
+    assert_eq!(node.reserved(), 1);
     drop(held);
-    let slot = tokio::time::timeout(Duration::from_secs(1), wait)
+    assert!(
+        node.try_reserve().is_none(),
+        "the first waiter owns the released slot"
+    );
+    let second_owner = tokio::time::timeout(Duration::from_secs(1), second_wait)
         .await
         .unwrap();
-    assert!(node.try_reserve().is_none());
-    let admitted = second.try_admit(&request, Some(slot)).unwrap();
-    drop(admitted);
+    assert!(futures::poll!(&mut third_wait).is_pending());
+    drop(second_owner);
+    let third_owner = tokio::time::timeout(Duration::from_secs(1), third_wait)
+        .await
+        .unwrap();
+    drop(third_owner);
     assert_eq!(node.reserved(), 0);
+    assert_eq!(admission.reserved_by_peers(), 0);
 }
 
 #[test]
@@ -143,7 +161,7 @@ fn closing_response_prevents_an_unclaimed_execution() {
     let node = SlotBudget::new(1).unwrap();
     let session = admission(&node).session(&peer(1));
     let request = session.decode(frame(1)).unwrap();
-    let response = session.try_admit(&request, None).unwrap().commit();
+    let response = session.admit(&request).now_or_never().unwrap().commit();
     let work = response.work_lease();
     drop(response);
     assert!(work.is_cancelled());
@@ -154,51 +172,63 @@ fn closing_response_prevents_an_unclaimed_execution() {
 }
 
 #[tokio::test]
-async fn wait_permit_cannot_be_used_for_another_peers_budget() {
-    let node = SlotBudget::new(2).unwrap();
+async fn cancelling_a_node_waiter_releases_its_partial_peer_claim() {
+    let node = SlotBudget::new(1).unwrap();
     let admission = admission(&node);
     let first = admission.session(&peer(1));
     let second = admission.session(&peer(2));
     let request = first.decode(frame(1)).unwrap();
-    let held_first = first.try_admit(&request, None).unwrap();
-    let held_second = second.try_admit(&request, None).unwrap();
-    let wait = first.try_admit(&request, None).unwrap_err().wait();
-    drop(held_first);
-    let slot = tokio::time::timeout(Duration::from_secs(1), wait)
-        .await
-        .unwrap();
-    assert_eq!(
-        second.try_admit(&request, Some(slot)).unwrap_err().kind(),
-        WorkBound::Peer
-    );
-    assert_eq!(first.peer_budget().reserved(), 0);
-    drop(held_second);
+    let held = first.admit(&request).await;
+    let mut wait = Box::pin(second.admit(&request));
+    assert!(futures::poll!(&mut wait).is_pending());
+    assert_eq!(second.peer_budget().reserved(), 1);
+    drop(wait);
+    assert_eq!(second.peer_budget().reserved(), 0);
+    assert_eq!(node.reserved(), 1);
+    drop(held);
+    assert!(second.admit(&request).now_or_never().is_some());
     assert_eq!(node.reserved(), 0);
 }
 
 #[test]
-fn reconnect_waits_for_an_old_response_frame() {
-    let node = SlotBudget::new(2).unwrap();
-    let admission = admission(&node);
-    let original = admission.session(&peer(1));
-    let request = original.decode(frame(1)).unwrap();
-    let mut response = original.try_admit(&request, None).unwrap().commit();
-    let writing = response.frame_guard(1);
-    drop(response);
-    drop(original);
+fn reconnect_waits_for_all_old_read_and_frame_owners() {
+    for read_finishes_first in [false, true] {
+        let node = SlotBudget::new(2).unwrap();
+        let admission = admission(&node);
+        let original = admission.session(&peer(1));
+        let request = original.decode(frame(1)).unwrap();
+        let mut response = original.admit(&request).now_or_never().unwrap().commit();
+        let mut work = Some(response.work_lease());
+        assert!(work.as_ref().unwrap().try_start());
+        let writing = response.frame_guard(1);
+        let ending = response.frame_guard(1);
+        drop(response);
+        drop(original);
 
-    let replacement = admission.session(&peer(1));
-    assert_eq!(
-        replacement.try_admit(&request, None).unwrap_err().kind(),
-        WorkBound::Peer
-    );
-    assert!(admission
-        .session(&peer(2))
-        .try_admit(&request, None)
-        .is_ok());
-    drop(writing);
-    assert!(replacement.try_admit(&request, None).is_ok());
-    assert_eq!(node.reserved(), 0);
+        for _ in 0..64 {
+            let replacement = admission.session(&peer(1));
+            assert!(replacement.admit(&request).now_or_never().is_none());
+            assert_eq!(node.reserved(), 1);
+        }
+        let replacement = admission.session(&peer(1));
+        assert!(admission
+            .session(&peer(2))
+            .admit(&request)
+            .now_or_never()
+            .is_some());
+        if read_finishes_first {
+            drop(work.take());
+        }
+        drop(writing);
+        assert!(replacement.admit(&request).now_or_never().is_none());
+        drop(ending);
+        if !read_finishes_first {
+            assert!(replacement.admit(&request).now_or_never().is_none());
+            drop(work);
+        }
+        assert!(replacement.admit(&request).now_or_never().is_some());
+        assert_eq!(node.reserved(), 0);
+    }
 }
 
 #[test]
@@ -207,24 +237,21 @@ fn peer_registry_prunes_churn_but_retains_outstanding_work() {
     let admission = admission(&node);
     let original = admission.session(&peer(0));
     let request = original.decode(frame(1)).unwrap();
-    let held = original.try_admit(&request, None).unwrap();
+    let held = original.admit(&request).now_or_never().unwrap();
     drop(original);
     for id in 1..=255 {
         drop(admission.session(&peer(id)));
         assert_eq!(admission.peers.lock().unwrap().len(), 2);
     }
-    assert_eq!(
-        admission
-            .session(&peer(0))
-            .try_admit(&request, None)
-            .unwrap_err()
-            .kind(),
-        WorkBound::Peer
-    );
+    assert!(admission
+        .session(&peer(0))
+        .admit(&request)
+        .now_or_never()
+        .is_none());
     drop(held);
     let replacement = admission.session(&peer(0));
     assert_eq!(admission.peers.lock().unwrap().len(), 1);
-    assert!(replacement.try_admit(&request, None).is_ok());
+    assert!(replacement.admit(&request).now_or_never().is_some());
 }
 
 #[test]
@@ -247,12 +274,9 @@ fn concurrent_sessions_for_one_identity_share_capacity() {
             .collect::<Vec<_>>()
     });
     let request = sessions[0].decode(frame(1)).unwrap();
-    let held = sessions[0].try_admit(&request, None).unwrap();
+    let held = sessions[0].admit(&request).now_or_never().unwrap();
     for session in &sessions[1..] {
-        assert_eq!(
-            session.try_admit(&request, None).unwrap_err().kind(),
-            WorkBound::Peer
-        );
+        assert!(session.admit(&request).now_or_never().is_none());
     }
     drop(held);
     assert_eq!(node.reserved(), 0);
@@ -264,22 +288,15 @@ async fn a_waiters_peer_slot_survives_session_replacement_and_cancellation() {
     let admission = admission(&node);
     let original = admission.session(&peer(1));
     let request = original.decode(frame(1)).unwrap();
-    let held = original.try_admit(&request, None).unwrap();
-    let wait = original.try_admit(&request, None).unwrap_err().wait();
-    tokio::pin!(wait);
+    let held = original.admit(&request).await;
+    let mut wait = Box::pin(async move { original.admit(&request).await });
     assert!(futures::poll!(&mut wait).is_pending());
-    drop(original);
     drop(held);
-    let slot = tokio::time::timeout(Duration::from_secs(1), wait)
-        .await
-        .unwrap();
     let replacement = admission.session(&peer(1));
-    assert_eq!(
-        replacement.try_admit(&request, None).unwrap_err().kind(),
-        WorkBound::Peer
-    );
-    // Cancellation returns a delivered slot even when its original session is gone.
-    drop(slot);
-    assert!(replacement.try_admit(&request, None).is_ok());
+    let request = replacement.decode(frame(1)).unwrap();
+    assert!(replacement.admit(&request).now_or_never().is_none());
+    // Cancel after capacity is assigned but before the waiting future resumes.
+    drop(wait);
+    assert!(replacement.admit(&request).now_or_never().is_some());
     assert_eq!(node.reserved(), 0);
 }

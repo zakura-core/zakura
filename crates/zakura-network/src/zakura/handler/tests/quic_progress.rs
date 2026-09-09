@@ -1,7 +1,6 @@
-//! Exercise the pinned transport without application queues or serving policy.
+//! Regression coverage for the pinned QUIC loss-recovery backport.
 
 use super::*;
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bidirectional_transfers_exceed_flow_control_windows() -> Result<(), BoxError> {
     let _guard = zakura_test::init();

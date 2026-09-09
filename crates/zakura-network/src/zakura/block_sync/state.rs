@@ -1,7 +1,6 @@
 use super::{
     bbr::{rounded_usize, BbrState},
     config::*,
-    events::BlockSyncPeerLifecycleEvent,
     request::*,
     work_queue::WorkQueue,
     *,
@@ -122,10 +121,11 @@ impl BlockSyncStartup {
 /// action/routine-to-reactor channels the reactor created.
 #[derive(Clone, Debug)]
 pub struct BlockSyncHandle {
+    pub(super) range_source: Option<Arc<dyn super::BlockRangeSource>>,
     pub(super) events: mpsc::Sender<BlockSyncEvent>,
     pub(super) lifecycle: mpsc::UnboundedSender<BlockSyncEvent>,
-    /// Internal peer-session lifecycle path with exact generation ownership.
-    pub(super) peer_lifecycle: mpsc::UnboundedSender<BlockSyncPeerLifecycleEvent>,
+    /// Current service admissions, reconciled through a coalescing watch.
+    pub(super) current_sessions: Arc<super::service::CurrentSessions>,
     pub(super) needed_query_failures: mpsc::UnboundedSender<NeededBlocksQueryFailure>,
     pub(super) peers: watch::Receiver<ServicePeerSnapshot>,
     pub(super) status: watch::Receiver<BlockSyncStatus>,
@@ -159,6 +159,11 @@ pub(super) struct RoutineWiring {
 }
 
 impl BlockSyncHandle {
+    pub(crate) fn with_range_source(mut self, source: Arc<dyn super::BlockRangeSource>) -> Self {
+        self.range_source = Some(source);
+        self
+    }
+
     /// Send a fact/event to the block-sync reactor.
     pub async fn send(
         &self,
@@ -653,7 +658,7 @@ impl DownloadWindow {
     /// Bytes reserved across this peer's in-flight requests (the per-request size
     /// estimates of heights not yet received). Recomputed on demand — the byte unit is
     /// experimental; a hot path would maintain a running counter instead.
-    fn outstanding_reserved_bytes(&self) -> u64 {
+    pub(super) fn outstanding_reserved_bytes(&self) -> u64 {
         self.outstanding.iter().fold(0u64, |acc, range| {
             acc.saturating_add(range.reserved_bytes())
         })
@@ -807,46 +812,6 @@ pub(super) struct PeerBlockState {
     /// `status_reply_meter`; this half stays reactor-side because the reactor owns
     /// serving-tip advertisement.
     pub(super) refresh_meter: RateMeter,
-    // Admission allows one response producer per peer.
-    serving_request: Option<ServingBlockRequest>,
-}
-
-/// Ledger entry for one admitted inbound `GetBlocks` request.
-#[derive(Debug)]
-pub(super) struct ServingBlockRequest {
-    id: BlockRangeRequestId,
-    start_height: block::Height,
-    original_count: u32,
-    requested_count: u32,
-    started: Instant,
-    /// Shared serving capacity retained through this request's query and writes.
-    permit: super::serving_regulation::GetBlocksServingPermit,
-}
-
-impl ServingBlockRequest {
-    /// Count received in the validated wire request and echoed by `RangeUnavailable`.
-    pub(super) fn original_count(&self) -> u32 {
-        self.original_count
-    }
-
-    /// Count accepted after the wire, configuration, and servable-range clamps.
-    pub(super) fn requested_count(&self) -> u32 {
-        self.requested_count
-    }
-
-    /// Time elapsed since this request entered the serving ledger.
-    pub(super) fn elapsed(&self) -> Duration {
-        self.started.elapsed()
-    }
-
-    /// Borrow the request's serving ownership while queueing response frames.
-    pub(super) fn permit_mut(&mut self) -> &mut super::serving_regulation::GetBlocksServingPermit {
-        &mut self.permit
-    }
-    /// Move request ownership into the terminal-response wait.
-    pub(super) fn into_permit(self) -> super::serving_regulation::GetBlocksServingPermit {
-        self.permit
-    }
 }
 
 impl PeerBlockState {
@@ -855,41 +820,7 @@ impl PeerBlockState {
             direction: session.direction(),
             session,
             refresh_meter: RateMeter::new(config.status_refresh_interval),
-            serving_request: None,
         }
-    }
-
-    /// Store the request, or return its permit if the peer already has one.
-    pub(super) fn try_start_serving_blocks(
-        &mut self,
-        request_id: BlockRangeRequestId,
-        start_height: block::Height,
-        original_count: u32,
-        requested_count: u32,
-        permit: super::serving_regulation::GetBlocksServingPermit,
-    ) -> Result<(), super::serving_regulation::GetBlocksServingPermit> {
-        if self.serving_request.is_some() {
-            return Err(permit);
-        }
-        self.serving_request = Some(ServingBlockRequest {
-            id: request_id,
-            start_height,
-            original_count,
-            requested_count,
-            started: Instant::now(),
-            permit,
-        });
-        Ok(())
-    }
-
-    /// Remove only the ledger entry matching both its ID and starting height.
-    pub(super) fn finish_serving_blocks(
-        &mut self,
-        request_id: BlockRangeRequestId,
-        start_height: block::Height,
-    ) -> Option<ServingBlockRequest> {
-        self.serving_request
-            .take_if(|request| request.id == request_id && request.start_height == start_height)
     }
 }
 

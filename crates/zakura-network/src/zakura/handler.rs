@@ -1,6 +1,8 @@
 //! Zakura P2P v2 endpoint, protocol handler, and bounded connection serving.
 
+mod ordered_pair;
 mod trace;
+use ordered_pair::{spawn_ordered_pair, PendingOrderedPairs, PreparedOrderedStream};
 
 use std::{
     collections::{HashMap, HashSet},
@@ -168,6 +170,9 @@ const STREAM_WORKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const ORDERED_STREAM_REOPEN_BACKOFF: Duration = Duration::from_millis(250);
 const ORDERED_STREAM_REOPEN_BACKOFF_CAP: Duration = Duration::from_secs(8);
 const OUTBOUND_STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+// A paused sibling can make shared-credit updates take longer than ten seconds
+// on a slow link even while complete blocks keep arriving.
+const PAIRED_DATA_WRITE_TIMEOUT: Duration = Duration::from_secs(32);
 const OUTBOUND_REQUEST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 // Mirrors the legacy gossip compatibility protocol. Compile-time assertions
 // below keep this transport-side budget validator pinned to the codec constants.
@@ -572,6 +577,8 @@ struct HeaderSyncBackgroundTasks {
 /// Durable state facts required before attaching the production header-sync driver.
 #[derive(Clone, Debug)]
 pub struct ZakuraHeaderSyncDriverStartup {
+    /// Owned block range reads supplied by the node for sequential block serving.
+    pub block_range_source: Arc<dyn super::BlockRangeSource>,
     /// Durable state frontiers loaded at node startup.
     pub frontiers: FullStateFrontiers,
     /// Durable best header tip loaded from state.
@@ -1538,6 +1545,7 @@ impl Drop for RegisteredPeerCleanupGuard {
 }
 
 struct StreamAdmission<'a> {
+    direction: ServicePeerDirection,
     conn: ZakuraConnTrace,
     peer_id: &'a ZakuraPeerId,
     stream_sem: &'a Arc<Semaphore>,
@@ -1589,6 +1597,9 @@ struct StreamWorkerContext {
     limits: ZakuraConnectionLimits,
     inbound_frame_cap: u32,
     message_payload_limits: &'static [(u16, usize)],
+    message_types: Option<&'static [u16]>,
+    queue_depths: Option<(usize, usize)>,
+    session_resources: Option<Arc<dyn crate::zakura::OrderedSessionResources>>,
     outbound_frame_cap: u32,
     message_bucket: SharedMessageBucket,
     connection_token: CancellationToken,
@@ -1604,6 +1615,43 @@ struct AdmittedOrderedSession {
     recv: FramedRecv,
     send: FramedSend,
     cancel_token: CancellationToken,
+    companion: Option<ServiceStreamRole>,
+}
+
+struct ServiceStreamRole {
+    kind: u16,
+    version: u16,
+    recv: FramedRecv,
+    send: FramedSend,
+}
+
+impl AdmittedOrderedSession {
+    fn into_service_streams(self) -> HashMap<u16, ServiceStream> {
+        let mut streams = HashMap::new();
+        if let Some(role) = self.companion {
+            streams.insert(
+                role.kind,
+                ServiceStream::new(
+                    self.session_id,
+                    role.version,
+                    role.recv,
+                    role.send,
+                    self.cancel_token.clone(),
+                ),
+            );
+        }
+        streams.insert(
+            self.kind,
+            ServiceStream::new(
+                self.session_id,
+                self.version,
+                self.recv,
+                self.send,
+                self.cancel_token,
+            ),
+        );
+        streams
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -2325,6 +2373,7 @@ impl ZakuraProtocolHandler {
         let mut workers = JoinSet::new();
         let (ordered_session_exit_tx, mut ordered_session_exit_rx) = mpsc::unbounded_channel();
         let mut ordered_session_waits = OrderedSessionWaits::new();
+        let mut pending_pairs = PendingOrderedPairs::default();
         let mut open_limiter = TokenBucket::new(limits.stream_open_rate_per_second);
         let mut message_buckets = MessageRateBuckets::new();
         let (freshness_tx, freshness_rx) = watch::channel(Instant::now());
@@ -2344,6 +2393,13 @@ impl ZakuraProtocolHandler {
         let mut ordered_streams = Vec::new();
         let mut deferred_ordered_streams = Vec::new();
         for stream in negotiated_ordered_streams.iter().copied() {
+            if self
+                .registry
+                .ordered_stream_pair(stream)
+                .is_some_and(|pair| stream != pair.data)
+            {
+                continue;
+            }
             let policy = self.registry.ordered_stream_policy(stream.kind);
             if !opens_ordered_stream_locally(
                 policy,
@@ -2368,7 +2424,7 @@ impl ZakuraProtocolHandler {
             .registry
             .request_response_streams_for_negotiated(accepted_capabilities)
             .len();
-        if ordered_streams.len() > usize::from(limits.max_open_streams) {
+        if negotiated_ordered_streams.len() > usize::from(limits.max_open_streams) {
             debug!(
                 max_open_streams = limits.max_open_streams,
                 ordered_stream_count = ordered_streams.len(),
@@ -2429,6 +2485,7 @@ impl ZakuraProtocolHandler {
                         freshness_tx.clone(),
                         conn.clone(),
                         peer_id.clone(),
+                        context.direction,
                         ordered_session_exit_tx.clone(),
                     )
                     .await
@@ -2453,16 +2510,7 @@ impl ZakuraProtocolHandler {
                     .get_mut(&admitted.kind)
                     .expect("opened ordered stream was selected from negotiated session state")
                     .local_session_id = Some(admitted.session_id);
-                service_streams.insert(
-                    admitted.kind,
-                    ServiceStream::new(
-                        admitted.session_id,
-                        admitted.version,
-                        admitted.recv,
-                        admitted.send,
-                        admitted.cancel_token,
-                    ),
-                );
+                service_streams.extend(admitted.into_service_streams());
             }
             if !connection_token.is_cancelled() {
                 // Escalation is already narrowed to opened ordered services.
@@ -2500,9 +2548,16 @@ impl ZakuraProtocolHandler {
         }
 
         loop {
+            let pair_deadline = pending_pairs.deadline();
             tokio::select! {
                 biased;
                 _ = connection_token.cancelled() => break,
+                _ = async {
+                    match pair_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => future::pending().await,
+                    }
+                } => pending_pairs.expire(Instant::now()),
                 _ = freshness_reaper(freshness_rx.clone(), limits.idle_timeout), if run_freshness_reaper => {
                     connection.close(VarInt::from_u32(ZAKURA_CLOSE_NEUTRAL), b"idle");
                     close_cause.record("idle_timeout");
@@ -2588,6 +2643,7 @@ impl ZakuraProtocolHandler {
                             freshness_tx.clone(),
                             conn.clone(),
                             peer_id.clone(),
+                            context.direction,
                             ordered_session_exit_tx.clone(),
                         )
                         .await
@@ -2598,16 +2654,7 @@ impl ZakuraProtocolHandler {
                                 .expect("opened ordered stream has negotiated session state");
                             session.cancel_wait(&mut ordered_session_waits);
                             session.local_session_id = Some(admitted.session_id);
-                            let service_streams = HashMap::from([(
-                                admitted.kind,
-                                ServiceStream::new(
-                                    admitted.session_id,
-                                    admitted.version,
-                                    admitted.recv,
-                                    admitted.send,
-                                    admitted.cancel_token,
-                                ),
-                            )]);
+                            let service_streams = admitted.into_service_streams();
                             let admitted_capabilities = self.registry.add_escalated_peer(
                                 Peer::new_with_service_streams(
                                     conn_id,
@@ -2645,6 +2692,7 @@ impl ZakuraProtocolHandler {
                     match accepted {
                         Ok((send, recv)) => {
                             let mut admission = StreamAdmission {
+                                direction: context.direction,
                                 conn: conn.clone(),
                                 peer_id: &peer_id,
                                 stream_sem: &stream_sem,
@@ -2664,6 +2712,7 @@ impl ZakuraProtocolHandler {
                                     &mut admission,
                                     per_stream_queue_depth,
                                     ordered_session_exit_tx.clone(),
+                                    &mut pending_pairs,
                                 )
                                 .await
                             {
@@ -2784,21 +2833,7 @@ impl ZakuraProtocolHandler {
                                     .get_mut(&kind)
                                     .expect("adopted ordered stream has negotiated session state")
                                     .cancel_wait(&mut ordered_session_waits);
-                                let service_streams = HashMap::from([(
-                                    kind,
-                                    ServiceStream::new(
-                                        admitted.session_id,
-                                        admitted.version,
-                                        admitted.recv,
-                                        admitted.send,
-                                        admitted.cancel_token.clone(),
-                                    ),
-                                )]);
-                                // Current ordered services own one ordered stream
-                                // each, so we fan out accepted streams one at a
-                                // time. Batch here if a service gains multiple
-                                // ordered streams.
-                                //
+                                let service_streams = admitted.into_service_streams();
                                 // We keep the full accepted capability context so
                                 // discovery can make cross-service ownership
                                 // decisions; disconnect fanout still uses the
@@ -2927,72 +2962,72 @@ impl ZakuraProtocolHandler {
         freshness_tx: watch::Sender<Instant>,
         conn: ZakuraConnTrace,
         peer_id: ZakuraPeerId,
+        direction: ServicePeerDirection,
         ordered_session_exit_tx: mpsc::UnboundedSender<OrderedSessionExit>,
     ) -> Result<AdmittedOrderedSession, ZakuraHandlerError> {
-        let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
-        let permit = stream_sem
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| ZakuraHandlerError::ResourceLimit("ordered stream permit"))?;
-        let (mut send, recv) = timeout(OUTBOUND_STREAM_WRITE_TIMEOUT, connection.open_bi())
-            .await
-            .map_err(|_| ZakuraHandlerError::Timeout("open ordered service stream"))??;
-        let prelude = StreamPrelude {
-            magic: STREAM_PRELUDE_MAGIC,
-            stream_kind: stream.kind,
-            stream_version: stream.version,
-            request_id: None,
-            max_frame_bytes: inbound_frame_cap_for_stream(&limits, stream),
+        let pair = self.registry.ordered_stream_pair(stream);
+        let resources = if pair.is_some() {
+            self.registry
+                .service_for_kind(stream.kind)
+                .expect("a selected stream has an owning service")
+                .reserve_ordered_session(direction)
+                .map_err(|_| ZakuraHandlerError::ResourceLimit("service session capacity"))?
+        } else {
+            None
         };
-        let prelude_bytes = prelude.encode()?;
-        timeout(
-            OUTBOUND_STREAM_WRITE_TIMEOUT,
-            send.write_all(&prelude_bytes),
-        )
-        .await
-        .map_err(|_| ZakuraHandlerError::Timeout("ordered stream prelude write"))??;
-
-        let message_bucket = message_bucket_for(
-            message_buckets,
-            stream.kind,
-            limits.message_rate_per_second,
-            RealClock,
-        );
-        let stream_token = connection_token.child_token();
-        let context = StreamWorkerContext {
-            conn: conn.clone(),
-            peer_id,
-            stream_id,
-            _permit: permit,
-            limits,
-            inbound_frame_cap: prelude.max_frame_bytes,
-            message_payload_limits: self.registry.message_payload_limits(stream),
-            outbound_frame_cap: application_frame_cap(&limits, stream),
-            message_bucket,
-            connection_token,
-            stream_token,
-            close_cause,
-            freshness_tx,
-        };
-
-        metrics::counter!(
-            "zakura.p2p.stream.accepted",
-            "stream_kind" => stream_kind_label(stream.kind),
-        )
-        .increment(1);
-        conn.trace_stream("accepted", stream_id, Some(stream_kind_label(stream.kind)));
-
-        Ok(spawn_persistent_stream_worker(
-            workers,
-            send,
-            recv,
-            stream,
-            prelude,
-            context,
-            per_stream_queue_depth,
-            true,
-            ordered_session_exit_tx,
-        ))
+        let pair_id = pair.map(|_| random_stream_session_seed());
+        let mut primary = self
+            .prepare_ordered_stream(
+                connection,
+                stream,
+                pair_id,
+                stream_sem,
+                message_buckets,
+                limits,
+                connection_token.clone(),
+                close_cause.clone(),
+                freshness_tx.clone(),
+                conn.clone(),
+                peer_id.clone(),
+            )
+            .await?;
+        primary.set_session_resources(resources.clone());
+        if let Some(pair) = pair {
+            if pair.data != stream {
+                return Err(ZakuraHandlerError::InvalidOrderedPair);
+            }
+            let mut requests = self
+                .prepare_ordered_stream(
+                    connection,
+                    pair.requests,
+                    pair_id,
+                    stream_sem,
+                    message_buckets,
+                    limits,
+                    connection_token,
+                    close_cause,
+                    freshness_tx,
+                    conn,
+                    peer_id,
+                )
+                .await?;
+            requests.set_session_resources(resources);
+            Ok(spawn_ordered_pair(
+                workers,
+                primary,
+                requests,
+                per_stream_queue_depth,
+                true,
+                ordered_session_exit_tx,
+            ))
+        } else {
+            Ok(primary.spawn_single(
+                workers,
+                per_stream_queue_depth,
+                true,
+                ordered_session_exit_tx,
+            ))
+        }
     }
 
     async fn admit_bi_stream(
@@ -3002,6 +3037,7 @@ impl ZakuraProtocolHandler {
         admission: &mut StreamAdmission<'_>,
         per_stream_queue_depth: usize,
         ordered_session_exit_tx: mpsc::UnboundedSender<OrderedSessionExit>,
+        pending_pairs: &mut PendingOrderedPairs,
     ) -> Option<AdmittedOrderedSession> {
         let stream_id = self.next_stream_id.fetch_add(1, Ordering::Relaxed);
         let Ok(permit) = admission.stream_sem.clone().try_acquire_owned() else {
@@ -3089,9 +3125,8 @@ impl ZakuraProtocolHandler {
             && self
                 .registry
                 .ordered_streams_for_negotiated(admission.accepted_capabilities)
-                .into_iter()
-                .find(|selected| selected.kind == stream.kind)
-                .is_some_and(|selected| selected.version != stream.version)
+                .iter()
+                .all(|selected| *selected != stream)
         {
             debug!(
                 stream_kind = prelude.stream_kind,
@@ -3149,9 +3184,45 @@ impl ZakuraProtocolHandler {
             .conn
             .trace_stream("accepted", stream_id, Some(stream_kind));
 
+        let pair = self.registry.ordered_stream_pair(stream);
+        let resources = if let Some(pair) = pair {
+            match pending_pairs.reserve_or_share(pair, &self.registry, admission.direction) {
+                Ok(resources) => resources,
+                Err(_) => {
+                    let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE));
+                    let _ = recv.stop(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE));
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+        let pair_id = if pair.is_some() {
+            if prelude.request_id.is_some() {
+                let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
+                let _ = recv.stop(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
+                return None;
+            }
+            let mut bytes = [0u8; 8];
+            if !matches!(
+                timeout(
+                    admission.limits.prelude_timeout,
+                    recv.read_exact(&mut bytes)
+                )
+                .await,
+                Ok(Ok(()))
+            ) {
+                let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
+                let _ = recv.stop(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
+                return None;
+            }
+            Some(u64::from_le_bytes(bytes))
+        } else {
+            None
+        };
         let message_bucket = message_bucket_for(
             admission.message_buckets,
-            prelude.stream_kind,
+            pair.map_or(prelude.stream_kind, |pair| pair.data.kind),
             admission.limits.message_rate_per_second,
             RealClock,
         );
@@ -3165,6 +3236,9 @@ impl ZakuraProtocolHandler {
             limits: admission.limits,
             inbound_frame_cap: inbound_frame_cap_for_stream(&admission.limits, stream),
             message_payload_limits: self.registry.message_payload_limits(stream),
+            message_types: self.registry.message_types(stream),
+            queue_depths: self.registry.stream_queue_depths(stream),
+            session_resources: resources,
             outbound_frame_cap: peer_accepted_frame_cap(
                 &admission.limits,
                 stream,
@@ -3177,6 +3251,30 @@ impl ZakuraProtocolHandler {
             freshness_tx: admission.freshness_tx.clone(),
         };
 
+        if let Some(pair) = pair {
+            let prepared = PreparedOrderedStream::new(send, recv, stream, prelude, context);
+            return match pending_pairs.insert(
+                pair,
+                pair_id.expect("pair setup was decoded"),
+                prepared,
+            ) {
+                Ok(Some((data, requests))) => Some(spawn_ordered_pair(
+                    admission.workers,
+                    data,
+                    requests,
+                    per_stream_queue_depth,
+                    false,
+                    ordered_session_exit_tx,
+                )),
+                Ok(None) => None,
+                Err(error) => {
+                    debug!(?error, "rejecting mismatched ordered stream pair");
+                    admission.close_cause.record("invalid_ordered_pair");
+                    admission.connection_token.cancel();
+                    None
+                }
+            };
+        }
         if stream.mode == StreamMode::RequestResponse {
             admission.workers.spawn(request_stream_worker(
                 send,
@@ -3641,6 +3739,7 @@ async fn spawn_zakura_endpoint_inner(
             startup.shutdown = header_sync_shutdown.clone();
             startup.trace = trace.clone();
             let (handle, actions, task) = spawn_block_sync_reactor(startup);
+            let handle = handle.with_range_source(driver_startup.block_range_source.clone());
             (Some(handle), Some(actions), Some(task))
         } else {
             (None, None, None)
@@ -3985,8 +4084,10 @@ fn spawn_persistent_stream_worker(
     opened_locally: bool,
     ordered_session_exit_tx: mpsc::UnboundedSender<OrderedSessionExit>,
 ) -> AdmittedOrderedSession {
-    let (to_service_tx, to_service_rx) = mpsc::channel(queue_depth);
-    let (from_service_tx, from_service_rx) = worker_framed_channel(queue_depth);
+    let (inbound_depth, outbound_depth) =
+        bounded_stream_queue_depths(queue_depth, context.queue_depths);
+    let (to_service_tx, to_service_rx) = mpsc::channel(inbound_depth);
+    let (from_service_tx, from_service_rx) = worker_framed_channel(outbound_depth);
     let admitted = AdmittedOrderedSession {
         kind: prelude.stream_kind,
         version: prelude.stream_version,
@@ -3994,6 +4095,7 @@ fn spawn_persistent_stream_worker(
         recv: FramedRecv::new(to_service_rx),
         send: from_service_tx,
         cancel_token: context.stream_token.clone(),
+        companion: None,
     };
 
     let exit = OrderedSessionExit {
@@ -4009,7 +4111,7 @@ fn spawn_persistent_stream_worker(
             context,
             to_service_tx,
             from_service_rx,
-            queue_depth,
+            inbound_depth,
         )
         .await;
         let _ = ordered_session_exit_tx.send(exit);
@@ -4018,7 +4120,49 @@ fn spawn_persistent_stream_worker(
     admitted
 }
 
+fn bounded_stream_queue_depths(
+    transport_depth: usize,
+    service: Option<(usize, usize)>,
+) -> (usize, usize) {
+    service.map_or((transport_depth, transport_depth), |(inbound, outbound)| {
+        (
+            transport_depth.min(inbound.max(1)),
+            transport_depth.min(outbound.max(1)),
+        )
+    })
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum OrderedWritePolicy {
+    Standalone,
+    PairData,
+    PairRequests,
+}
+
 async fn persistent_stream_worker(
+    send: SendStream,
+    recv: RecvStream,
+    prelude: StreamPrelude,
+    context: StreamWorkerContext,
+    inbound_tx: mpsc::Sender<Frame>,
+    outbound_rx: FramedWorkerRecv,
+    queue_depth_limit: usize,
+) {
+    persistent_stream_worker_with_policy(
+        send,
+        recv,
+        prelude,
+        context,
+        inbound_tx,
+        outbound_rx,
+        queue_depth_limit,
+        OrderedWritePolicy::Standalone,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persistent_stream_worker_with_policy(
     mut send: SendStream,
     recv: RecvStream,
     prelude: StreamPrelude,
@@ -4026,6 +4170,7 @@ async fn persistent_stream_worker(
     inbound_tx: mpsc::Sender<Frame>,
     outbound_rx: FramedWorkerRecv,
     queue_depth_limit: usize,
+    write_policy: OrderedWritePolicy,
 ) {
     let context = Arc::new(context);
     let stream_kind = prelude.stream_kind;
@@ -4042,10 +4187,11 @@ async fn persistent_stream_worker(
                 biased;
                 _ = reader_context.connection_token.cancelled() => break,
                 _ = reader_context.stream_token.cancelled() => break,
-                frame = read_frame(
+                frame = read_frame_with_types(
                     &mut recv,
                     reader_context.inbound_frame_cap,
                     reader_context.message_payload_limits,
+                    reader_context.message_types,
                     reader_context.limits.idle_timeout,
                     // A persistent ordered stream is legitimately quiet between
                     // frames; do not let an inter-frame gap time out and cancel
@@ -4131,26 +4277,32 @@ async fn persistent_stream_worker(
             } => {
                 match outbound {
                     Some(queued_frame) => {
-                        // Finish this frame before a stream-local close. Dropping
-                        // a partial write makes the peer see a truncated payload
-                        // and close the whole connection. The write still has its
-                        // normal timeout, and connection shutdown can interrupt it.
+                        // Standalone streams finish the current frame on local
+                        // cancellation. Paired streams can interrupt the write:
+                        // teardown resets both roles before either can be reused.
                         let result = tokio::select! {
                             biased;
                             _ = context.connection_token.cancelled() => break,
-                            result = write_queued_ordered_frame(
-                                &mut send,
-                                queued_frame,
-                                context.limits,
-                                context.outbound_frame_cap,
-                            ) => result,
+                            _ = context.stream_token.cancelled(),
+                                if write_policy != OrderedWritePolicy::Standalone => break,
+                            result = async {
+                                if write_policy == OrderedWritePolicy::Standalone {
+                                    write_queued_ordered_frame(&mut send, queued_frame,
+                                        context.limits, context.outbound_frame_cap).await
+                                } else {
+                                    queued_frame.write_with(|frame| write_ordered_frame_with_policy(
+                                        &mut send, frame, context.limits,
+                                        context.outbound_frame_cap, write_policy,
+                                    )).await
+                                }
+                            } => result,
                         };
                         if let Err(error) = result {
                             if ordered_stream_write_was_stopped(&error) {
                                 debug!(?error, "closing Zakura ordered stream after peer stopped receiving");
                                 break;
                             }
-                            debug!(?error, "closing Zakura ordered stream writer");
+                            debug!(stream_kind, stream_id = context.stream_id, ?error, "closing Zakura ordered stream writer");
                             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
                             context.close_cause.record("ordered_write_error");
                             context.connection_token.cancel();
@@ -4192,8 +4344,15 @@ async fn persistent_stream_worker(
         }
     }
 
-    // Dropping the worker also aborts a reader blocked in application forwarding.
+    if write_policy != OrderedWritePolicy::Standalone {
+        // A cancelled pair cannot leave a partial frame followed by a graceful
+        // FIN. Reset it before any replacement session may write.
+        let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_NEUTRAL));
+        context.stream_token.cancel();
+    }
     reader.abort();
+    // Keep the stream permit until the reader has actually dropped its buffers.
+    let _ = reader.await;
 }
 
 fn ordered_stream_write_was_stopped(error: &BoxError) -> bool {
@@ -4399,6 +4558,25 @@ async fn read_frame(
     read_timeout: Duration,
     first_byte_timeout: Option<Duration>,
 ) -> Result<Frame, ZakuraHandlerError> {
+    read_frame_with_types(
+        recv,
+        max_frame_bytes,
+        message_payload_limits,
+        None,
+        read_timeout,
+        first_byte_timeout,
+    )
+    .await
+}
+
+async fn read_frame_with_types(
+    recv: &mut RecvStream,
+    max_frame_bytes: u32,
+    message_payload_limits: &[(u16, usize)],
+    message_types: Option<&[u16]>,
+    read_timeout: Duration,
+    first_byte_timeout: Option<Duration>,
+) -> Result<Frame, ZakuraHandlerError> {
     let mut header = [0; FRAME_HEADER_BYTES];
     // The first header byte is the boundary between "waiting for the next frame"
     // and "reading a frame in progress". Wait for it under `first_byte_timeout`
@@ -4425,6 +4603,9 @@ async fn read_frame(
     }
     let mut reader = &header[..];
     let message_type = reader.read_u16::<LittleEndian>()?;
+    if message_types.is_some_and(|types| !types.contains(&message_type)) {
+        return Err(ZakuraHandlerError::InvalidMessageType(message_type));
+    }
     let flags = reader.read_u16::<LittleEndian>()?;
     let payload_len = usize::try_from(reader.read_u32::<LittleEndian>()?)
         .expect("u32 payload lengths fit usize on supported targets");
@@ -4448,14 +4629,31 @@ async fn read_frame(
         });
     }
     let mut payload = vec![0; payload_len];
-    timeout(read_timeout, recv.read_exact(&mut payload))
-        .await
-        .map_err(|_| ZakuraHandlerError::Timeout("frame payload"))??;
+    read_frame_payload(recv, &mut payload, read_timeout).await?;
     Ok(Frame {
         message_type,
         flags,
         payload,
     })
+}
+
+async fn read_frame_payload(
+    recv: &mut RecvStream,
+    payload: &mut [u8],
+    read_timeout: Duration,
+) -> Result<(), ZakuraHandlerError> {
+    match timeout(read_timeout, recv.read_exact(payload))
+        .await
+        .map_err(|_| ZakuraHandlerError::Timeout("frame payload"))?
+    {
+        Ok(()) => Ok(()),
+        // A peer can reset a pair during a partial frame. Reset ends that stream;
+        // a normal FIN with a truncated payload still reports a protocol error.
+        Err(iroh::endpoint::ReadExactError::ReadError(iroh::endpoint::ReadError::Reset(_))) => {
+            Err(ZakuraHandlerError::Closed)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn read_control_payload(
@@ -4510,6 +4708,23 @@ async fn write_ordered_frame(
     limits: ZakuraConnectionLimits,
     max_frame_bytes: u32,
 ) -> Result<(), BoxError> {
+    write_ordered_frame_with_policy(
+        send,
+        frame,
+        limits,
+        max_frame_bytes,
+        OrderedWritePolicy::Standalone,
+    )
+    .await
+}
+
+async fn write_ordered_frame_with_policy(
+    send: &mut SendStream,
+    frame: Frame,
+    limits: ZakuraConnectionLimits,
+    max_frame_bytes: u32,
+    write_policy: OrderedWritePolicy,
+) -> Result<(), BoxError> {
     // Mirror `write_response_frame`: a persistent ordered-stream frame whose
     // payload exceeds the peer's negotiated `max_message_bytes` would be
     // rejected by the peer as oversize, so reject it locally before wasting
@@ -4525,16 +4740,22 @@ async fn write_ordered_frame(
         .into());
     }
     let frame = frame.encode(max_frame_bytes)?;
-    timeout(OUTBOUND_STREAM_WRITE_TIMEOUT, send.write_all(&frame))
-        .await
-        .map_err(|_| -> BoxError { "Zakura outbound frame write timed out".into() })??;
+    if write_policy == OrderedWritePolicy::PairRequests {
+        send.write_all(&frame).await?;
+    } else {
+        let write_timeout = if write_policy == OrderedWritePolicy::PairData {
+            PAIRED_DATA_WRITE_TIMEOUT
+        } else {
+            OUTBOUND_STREAM_WRITE_TIMEOUT
+        };
+        timeout(write_timeout, send.write_all(&frame))
+            .await
+            .map_err(|_| -> BoxError { "Zakura outbound frame write timed out".into() })??;
+    }
     Ok(())
 }
 
-/// Write one queued frame while retaining its byte-accounting lease.
-///
-/// The lease remains owned until the QUIC write succeeds, fails, times out, or
-/// this future is dropped with the worker.
+/// Retain the queued frame's ownership through its QUIC write or cancellation.
 async fn write_queued_ordered_frame(
     send: &mut SendStream,
     queued_frame: QueuedFrame,
@@ -5232,6 +5453,7 @@ fn stream_kind_label(stream_kind: u16) -> &'static str {
         DISCOVERY_STREAM_KIND => "discovery",
         HEADER_SYNC_STREAM_KIND => "header_sync",
         ZAKURA_STREAM_BLOCK_SYNC => "block_sync",
+        crate::zakura::ZAKURA_STREAM_BLOCK_REQUESTS => "block_requests",
         _ => "unknown",
     }
 }
@@ -5390,6 +5612,12 @@ impl<C: Clock> TokenBucket<C> {
 /// Errors produced by the Zakura protocol handler.
 #[derive(Debug, Error)]
 pub enum ZakuraHandlerError {
+    /// The frame header names a message that is invalid on this stream role.
+    #[error("invalid message type {0} for this stream role")]
+    InvalidMessageType(u16),
+    /// Two ordered stream roles failed to name one complete session.
+    #[error("invalid Zakura ordered stream pair")]
+    InvalidOrderedPair,
     /// A bounded read/write timed out.
     #[error("Zakura {0} timed out")]
     Timeout(&'static str),
@@ -5477,6 +5705,8 @@ impl ZakuraHandlerError {
 
 #[cfg(test)]
 mod tests {
+    pub(super) mod connection;
+    mod paired_block_sync;
     mod quic_progress;
     mod serving_progress;
 
@@ -5526,7 +5756,8 @@ mod tests {
     #[tokio::test]
     async fn parked_block_sync_peer_gets_a_stream_when_its_cooldown_lapses() -> Result<(), BoxError>
     {
-        const COOLDOWN: Duration = Duration::from_secs(3);
+        const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+        const COOLDOWN: Duration = Duration::from_secs(15);
 
         let _guard = zakura_test::init();
 
@@ -5545,21 +5776,28 @@ mod tests {
         let dialer = node(140).await?;
         let listener = node(141).await?;
 
-        let listener_peer =
-            ZakuraPeerId::new(listener.node_addr().await.node_id.as_bytes().to_vec())?;
+        let listener_addr = listener.node_addr().await;
+        let listener_peer = ZakuraPeerId::new(listener_addr.node_id.as_bytes().to_vec())?;
         let block_sync = dialer
             .block_sync()
             .expect("the header-sync driver spawns the block-sync reactor");
 
         // Block sync evicts and parks the peer after its no-progress deadline.
-        // The transport redials during the cooldown.
+        // Keep the cooldown longer than connection setup so the first assertion
+        // tests a live park even when the dial is slow.
+        let parked_at = std::time::Instant::now();
         block_sync.park_peer_for_test(&listener_peer, COOLDOWN);
         dialer
-            .connect_native(&listener, Duration::from_secs(10))
+            .connect_native_to_addr(listener_addr, CONNECT_TIMEOUT)
             .await?;
 
         // The park remains active.
         // Withhold block sync from this connection.
+        assert!(
+            parked_at.elapsed() < COOLDOWN,
+            "connection setup outlasted the test cooldown: {:?}",
+            parked_at.elapsed(),
+        );
         assert_eq!(
             block_sync.peer_snapshot().outbound_peers,
             0,
@@ -7891,6 +8129,9 @@ mod tests {
             limits,
             inbound_frame_cap: stream.frame_cap,
             message_payload_limits: &[],
+            message_types: None,
+            queue_depths: None,
+            session_resources: None,
             outbound_frame_cap: stream.frame_cap,
             message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(128))),
             connection_token: cancel.clone(),
@@ -8091,6 +8332,9 @@ mod tests {
             limits,
             inbound_frame_cap: inbound_frame_cap_for_stream(&limits, stream),
             message_payload_limits: &[],
+            message_types: None,
+            queue_depths: None,
+            session_resources: None,
             outbound_frame_cap: application_frame_cap(&limits, stream),
             message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(128))),
             connection_token: connection_token.clone(),
@@ -8299,6 +8543,9 @@ mod tests {
                 limits,
                 inbound_frame_cap: inbound_frame_cap_for_stream(&limits, stream),
                 message_payload_limits: &[],
+                message_types: None,
+                queue_depths: None,
+                session_resources: None,
                 outbound_frame_cap: application_frame_cap(&limits, stream),
                 message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(
                     limits.message_rate_per_second,
@@ -8585,8 +8832,9 @@ mod tests {
 
         let service = Arc::new(BlockSyncService::new(ZakuraBlockSyncConfig::default()));
         let stream = service.streams()[0];
+        let requests = service.streams()[1];
         let registry = ServiceRegistry::new(vec![service])?;
-        let payload_limits = registry.message_payload_limits(stream);
+        let payload_limits = registry.message_payload_limits(requests);
         assert_eq!(payload_limits, &[(2, 9)]);
         assert!(registry
             .message_payload_limits(Stream {
@@ -8662,8 +8910,8 @@ mod tests {
             );
         }
 
-        // The GetBlocks limit must not shrink the allowance for Block responses
-        // on the same stream. Both real message encodings must still round-trip.
+        // The generic payload gate preserves the independent Block allowance.
+        // Role enforcement is covered by the paired-stream tests.
         let connection =
             timeout(Duration::from_secs(5), client.connect(server_addr, ALPN)).await??;
         let (mut send, _recv) = timeout(Duration::from_secs(2), connection.open_bi()).await??;
@@ -8981,6 +9229,7 @@ mod tests {
         let (freshness_tx, _freshness_rx) = watch::channel(Instant::now());
 
         let mut admission = StreamAdmission {
+            direction: ServicePeerDirection::Inbound,
             conn: ZakuraConnTrace::placeholder(),
             peer_id: &peer_id,
             stream_sem: &stream_sem,
@@ -9001,6 +9250,7 @@ mod tests {
                 &mut admission,
                 16,
                 ordered_session_exit_tx,
+                &mut PendingOrderedPairs::default(),
             )
             .await;
 
@@ -9216,7 +9466,8 @@ mod tests {
             );
         }
 
-        for kind in [7u16, 255, u16::MAX] {
+        assert_eq!(stream_kind_label(7), "block_requests");
+        for kind in [255u16, u16::MAX] {
             assert_eq!(stream_kind_label(kind), "unknown");
         }
     }

@@ -22,7 +22,8 @@ use tokio_util::sync::CancellationToken;
 use zakura_chain::block;
 
 use super::mock_blocksync::{
-    mainnet_genesis_hash, MockApplyFrontier, SyntheticBlockCorpus, SyntheticBlockShape,
+    mainnet_genesis_hash, CorpusRangeSource, MockApplyFrontier, SyntheticBlockCorpus,
+    SyntheticBlockShape,
 };
 use super::{SyntheticBlockSyncPeers, TraceCapture};
 use crate::zakura::{
@@ -110,6 +111,7 @@ pub(crate) async fn run_scenario(
     startup.shutdown = shutdown.clone();
 
     let (handle, actions, reactor_task) = crate::zakura::spawn_block_sync_reactor(startup);
+    let handle = handle.with_range_source(Arc::new(CorpusRangeSource::new(corpus.clone())));
 
     let (committed_tx, mut committed_rx) = watch::channel(initial_verified);
 
@@ -277,33 +279,6 @@ fn spawn_action_driver(
                                 )
                             },
                             blocks: metas,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                BlockSyncAction::QueryBlocksByHeightRange {
-                    lease,
-                    request_id,
-                    peer,
-                    start,
-                    count,
-                    ..
-                } => {
-                    if !lease.try_start() {
-                        continue;
-                    }
-                    let blocks = corpus.blocks_in_range(start, count, target);
-                    if handle
-                        .send(BlockSyncEvent::BlockRangeResponseReady {
-                            lease,
-                            request_id,
-                            peer,
-                            start_height: start,
-                            requested_count: count,
-                            blocks,
                         })
                         .await
                         .is_err()

@@ -65,11 +65,6 @@ impl SlotBudget {
         }
     }
 
-    /// Whether two handles draw from the same capacity pool.
-    pub(super) fn same_budget(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.permits, &other.permits)
-    }
-
     /// Reserve one slot without waiting.
     pub(crate) fn try_reserve(&self) -> Option<SlotPermit> {
         self.permits
@@ -81,8 +76,7 @@ impl SlotBudget {
 
     /// Wait for a slot and return its ownership in semaphore queue order.
     ///
-    /// Keep the returned permit through admission. If another resource cannot
-    /// be reserved, drop it before waiting for that resource. Cancelling this
+    /// Keep the returned permit while owning the resource. Cancelling this
     /// future removes its waiter without consuming a slot.
     pub(crate) async fn reserve(&self) -> SlotPermit {
         let permit = self

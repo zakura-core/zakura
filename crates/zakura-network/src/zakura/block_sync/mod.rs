@@ -46,6 +46,7 @@ mod request;
 mod sequencer;
 mod sequencer_task;
 mod service;
+mod serving;
 mod serving_regulation;
 mod state;
 #[cfg(test)]
@@ -71,8 +72,8 @@ pub use config::{
 };
 pub use error::BlockSyncWireError;
 pub use events::{
-    BlockApplyOutcome, BlockApplyResult, BlockApplyToken, BlockRangeRequestId, BlockSyncAction,
-    BlockSyncBlockMeta, BlockSyncEvent, BlockSyncMisbehavior,
+    BlockApplyOutcome, BlockApplyResult, BlockApplyToken, BlockSyncAction, BlockSyncBlockMeta,
+    BlockSyncEvent, BlockSyncMisbehavior,
 };
 pub use reactor::spawn_block_sync_reactor;
 pub use request::BlockSizeEstimate;
@@ -82,11 +83,13 @@ pub use service::BlockSyncPeerSession;
 pub(crate) use service::BlockSyncService;
 #[cfg(test)]
 pub(crate) use service::MAX_BS_FRAME_BYTES;
+pub use serving::{BlockRangeRead, BlockRangeReadResult, BlockRangeSource};
 pub use state::{BlockSyncFrontiers, BlockSyncHandle, BlockSyncStartup};
 pub use wire::{
     BlockSyncMessage, MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_MESSAGE_BYTES, MSG_BS_BLOCK,
     MSG_BS_BLOCKS_DONE, MSG_BS_GET_BLOCKS, MSG_BS_RANGE_UNAVAILABLE, MSG_BS_STATUS,
-    ZAKURA_BLOCK_SYNC_STREAM_VERSION, ZAKURA_CAP_BLOCK_SYNC, ZAKURA_STREAM_BLOCK_SYNC,
+    ZAKURA_BLOCK_SYNC_STREAM_VERSION, ZAKURA_CAP_BLOCK_SYNC, ZAKURA_STREAM_BLOCK_REQUESTS,
+    ZAKURA_STREAM_BLOCK_SYNC,
 };
 
 #[cfg(test)]
@@ -150,6 +153,4 @@ pub(crate) fn test_block_apply_outcome(result: BlockApplyResult) -> BlockApplyOu
     }
 }
 
-#[cfg(any(test, feature = "zakura-testkit"))]
-pub(crate) use serving_regulation::query_lease_for_test;
-pub use serving_regulation::BlockRangeQueryLease;
+pub use serving_regulation::BlockRangeReadLease;

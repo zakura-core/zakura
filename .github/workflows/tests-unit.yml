@@ -305,12 +305,6 @@ jobs:
         env:
           FULL_COVERAGE: ${{ github.event_name != 'pull_request' }}
 
-      - name: Replay regulation histories with a stable seed
-        env:
-          PROPTEST_CASES: "128"
-          PROPTEST_RNG_SEED: "0"
-        run: cargo nextest run --profile regulation-properties --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst" --partition "hash:${{ matrix.partition }}/3"
-
       - name: Explore regulation histories
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         env:

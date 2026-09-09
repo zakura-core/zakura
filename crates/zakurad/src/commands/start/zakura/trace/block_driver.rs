@@ -7,7 +7,7 @@ use zakura_chain::block;
 use zakura_jsonl_trace::{saturating_count, saturating_millis, JsonlTraceEvent};
 use zakura_network::zakura::{
     commit_state_trace as event, zakura_trace_peer_label, BlockApplyResult, BlockApplyToken,
-    BlockSyncAction, BlockSyncMisbehavior, ZakuraPeerId, ZakuraTrace, COMMIT_STATE_TABLE,
+    BlockSyncAction, BlockSyncMisbehavior, ZakuraTrace, COMMIT_STATE_TABLE,
 };
 
 use super::super::block_sync_driver::BlockApplyClass;
@@ -40,12 +40,6 @@ enum ReceivedAction {
         reason: &'static str,
     },
     NeededBlocks(NeededRange),
-    BlockRange {
-        action: &'static str,
-        peer: String,
-        range_start: u64,
-        range_count: u64,
-    },
     SubmitBlock {
         action: &'static str,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -77,22 +71,6 @@ struct NeededFailure<'a> {
     result: &'static str,
     reason: &'a str,
     elapsed_ms: u64,
-}
-
-#[derive(Serialize)]
-struct Range<'a> {
-    action: &'static str,
-    peer: String,
-    range_start: u64,
-    range_count: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reason: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    elapsed_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    requested_count: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -154,48 +132,6 @@ pub(crate) trait BlockDriverTraceExt {
     fn trace_needed_blocks_query_succeeded(&self, count: usize, started: Instant);
     fn trace_needed_blocks_query_failed(&self, reason: &str, started: Instant);
     fn trace_block_reactor_event(&self, action: &'static str);
-    fn trace_block_range_query_started(
-        &self,
-        peer: &ZakuraPeerId,
-        start: block::Height,
-        count: u32,
-    );
-    fn trace_block_range_query_succeeded(
-        &self,
-        peer: &ZakuraPeerId,
-        start: block::Height,
-        count: usize,
-        started: Instant,
-    );
-    fn trace_block_range_event(
-        &self,
-        action: &'static str,
-        peer: &ZakuraPeerId,
-        start: block::Height,
-        count: u32,
-    );
-    fn trace_block_range_query_failed(
-        &self,
-        peer: &ZakuraPeerId,
-        start: block::Height,
-        count: u32,
-        reason: &str,
-        started: Instant,
-    );
-    fn trace_block_range_query_timed_out(
-        &self,
-        peer: &ZakuraPeerId,
-        start: block::Height,
-        count: u32,
-        started: Instant,
-    );
-    fn trace_block_range_finished(
-        &self,
-        peer: &ZakuraPeerId,
-        start: block::Height,
-        requested: u32,
-        returned: u32,
-    );
     fn trace_block_submit_queued(
         &self,
         token: BlockApplyToken,
@@ -260,14 +196,6 @@ impl BlockDriverTraceExt for ZakuraTrace {
                     range_count: (*limit).into(),
                     best_header_tip: best_header_tip.0.into(),
                 }),
-                BlockSyncAction::QueryBlocksByHeightRange {
-                    peer, start, count, ..
-                } => ReceivedAction::BlockRange {
-                    action: "query_blocks_by_height_range",
-                    peer: zakura_trace_peer_label(peer),
-                    range_start: start.0.into(),
-                    range_count: (*count).into(),
-                },
                 BlockSyncAction::SubmitBlock { token, block, .. } => ReceivedAction::SubmitBlock {
                     action: "submit_block",
                     apply_token: *token,
@@ -323,132 +251,6 @@ impl BlockDriverTraceExt for ZakuraTrace {
 
     fn trace_block_reactor_event(&self, action: &'static str) {
         emit(self, event::REACTOR_EVENT_SENT, || Action { action });
-    }
-
-    fn trace_block_range_query_started(
-        &self,
-        peer: &ZakuraPeerId,
-        start: block::Height,
-        count: u32,
-    ) {
-        range(
-            self,
-            event::STATE_READ_START,
-            "query_blocks_by_height_range",
-            peer,
-            start,
-            count.into(),
-            None,
-            None,
-            None,
-            None,
-        );
-    }
-
-    fn trace_block_range_query_succeeded(
-        &self,
-        peer: &ZakuraPeerId,
-        start: block::Height,
-        count: usize,
-        started: Instant,
-    ) {
-        range(
-            self,
-            event::STATE_READ_SUCCESS,
-            "query_blocks_by_height_range",
-            peer,
-            start,
-            saturating_count(count),
-            None,
-            None,
-            Some(saturating_millis(started.elapsed())),
-            None,
-        );
-    }
-
-    fn trace_block_range_event(
-        &self,
-        action: &'static str,
-        peer: &ZakuraPeerId,
-        start: block::Height,
-        count: u32,
-    ) {
-        range(
-            self,
-            event::REACTOR_EVENT_SENT,
-            action,
-            peer,
-            start,
-            count.into(),
-            None,
-            None,
-            None,
-            None,
-        );
-    }
-
-    fn trace_block_range_query_failed(
-        &self,
-        peer: &ZakuraPeerId,
-        start: block::Height,
-        count: u32,
-        reason: &str,
-        started: Instant,
-    ) {
-        range(
-            self,
-            event::STATE_READ_ERROR,
-            "query_blocks_by_height_range",
-            peer,
-            start,
-            count.into(),
-            Some("error"),
-            Some(reason),
-            Some(saturating_millis(started.elapsed())),
-            None,
-        );
-    }
-
-    fn trace_block_range_query_timed_out(
-        &self,
-        peer: &ZakuraPeerId,
-        start: block::Height,
-        count: u32,
-        started: Instant,
-    ) {
-        range(
-            self,
-            event::STATE_READ_TIMEOUT,
-            "query_blocks_by_height_range",
-            peer,
-            start,
-            count.into(),
-            None,
-            None,
-            Some(saturating_millis(started.elapsed())),
-            None,
-        );
-    }
-
-    fn trace_block_range_finished(
-        &self,
-        peer: &ZakuraPeerId,
-        start: block::Height,
-        requested: u32,
-        returned: u32,
-    ) {
-        range(
-            self,
-            event::REACTOR_EVENT_SENT,
-            "block_range_response_finished",
-            peer,
-            start,
-            returned.into(),
-            None,
-            None,
-            None,
-            Some(requested.into()),
-        );
     }
 
     fn trace_block_submit_queued(
@@ -551,35 +353,6 @@ fn emit<F: Serialize>(trace: &ZakuraTrace, name: &'static str, fields: impl FnOn
     });
 }
 
-#[allow(clippy::too_many_arguments)]
-fn range(
-    trace: &ZakuraTrace,
-    name: &'static str,
-    action: &'static str,
-    peer: &ZakuraPeerId,
-    start: block::Height,
-    count: u64,
-    result: Option<&'static str>,
-    reason: Option<&str>,
-    elapsed_ms: Option<u64>,
-    requested_count: Option<u64>,
-) {
-    trace.emit_event(|| DriverEvent {
-        event: name,
-        source: SOURCE,
-        fields: Range {
-            action,
-            peer: zakura_trace_peer_label(peer),
-            range_start: start.0.into(),
-            range_count: count,
-            result,
-            reason,
-            elapsed_ms,
-            requested_count,
-        },
-    });
-}
-
 fn class_label(class: BlockApplyClass) -> &'static str {
     match class {
         BlockApplyClass::Checkpoint => "checkpoint",
@@ -601,7 +374,6 @@ fn misbehavior_label(reason: &BlockSyncMisbehavior) -> &'static str {
     match reason {
         BlockSyncMisbehavior::MalformedMessage => "malformed_message",
         BlockSyncMisbehavior::UnsolicitedBlock => "unsolicited_block",
-        BlockSyncMisbehavior::GetBlocksBeforeStatus => "get_blocks_before_status",
         BlockSyncMisbehavior::BodyPayloadMismatch(_) => "body_payload_mismatch",
         BlockSyncMisbehavior::ConsensusBodyInvalid(_) => "consensus_body_invalid",
         BlockSyncMisbehavior::InvalidBlock => "invalid_block",

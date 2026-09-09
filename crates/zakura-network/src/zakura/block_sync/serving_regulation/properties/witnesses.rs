@@ -21,11 +21,11 @@ fn every_admission_bound_blocks_then_recovers() {
                 Action::Commit { request: 0 },
                 Action::ClaimQuery { request: 0 },
                 Action::Admit { peer, request: 1 },
-                Action::DropLedger { request: 0 },
+                Action::DropProducer { request: 0 },
                 Action::DropQueryLease { request: 0 },
                 Action::Advance { millis: 0 },
                 Action::Admit { peer, request: 1 },
-                Action::DropLedger { request: 1 },
+                Action::DropProducer { request: 1 },
             ],
         };
         let observations = replay(&scenario).unwrap();
@@ -43,7 +43,7 @@ fn every_admission_bound_blocks_then_recovers() {
                 peer: 0,
                 request: 0,
             },
-            Action::DropLedger { request: 0 },
+            Action::DropProducer { request: 0 },
         ];
         checked_replay(&scenario).unwrap();
     }
@@ -92,7 +92,7 @@ fn queue_failure_keeps_ownership_and_query_leases_cannot_execute_twice() {
         QueueTerminal { request: 0 },
         BeginWrite { session: 0 },
         QueueTerminal { request: 0 },
-        DropLedger { request: 0 },
+        DropProducer { request: 0 },
         DropQueryLease { request: 0 },
         DropQueryLease { request: 0 },
         Admit {
@@ -141,10 +141,9 @@ proptest! {
         prop_assert_eq!(config.validate(), Ok(()));
         let count = requested.min(advertised_count);
         let payload = (u64::from(count) * 2_000_000).min(u64::from(body_cap)) + u64::from(count) + 9;
-        let actual = super::super::serving_cost(&config, requested).unwrap();
-        prop_assert_eq!(actual.count, count);
-        prop_assert_eq!(actual.response_cap, payload);
-        prop_assert!(actual.response_cap >= 2_000_000 + 1 + 9,
+        let actual = super::super::GetBlocksPolicy::new(&config).response_cap_for_count(requested).unwrap();
+        prop_assert_eq!(actual, payload);
+        prop_assert!(actual >= 2_000_000 + 1 + 9,
             "every accepted configuration reserves room for any first block and its terminal");
     }
 }
@@ -195,7 +194,7 @@ fn reconnect_cannot_bypass_old_query_or_write_ownership() {
                 peer: 1,
                 request: 2,
             },
-            DropLedger { request: 2 },
+            DropProducer { request: 2 },
         ]);
         actions.push(match write_end {
             Some(outcome) => EndWrite {
@@ -210,7 +209,7 @@ fn reconnect_cannot_bypass_old_query_or_write_ownership() {
                 peer: 0,
                 request: 1,
             },
-            DropLedger { request: 1 },
+            DropProducer { request: 1 },
         ]);
         let scenario = Scenario {
             version: 4,

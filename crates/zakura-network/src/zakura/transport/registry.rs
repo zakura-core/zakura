@@ -8,13 +8,22 @@ use std::{
 use thiserror::Error;
 
 use super::{
-    Frame, OrderedSessionDemand, OrderedStreamPolicy, Peer, Service, SinkReject, Stream, StreamMode,
+    Frame, OrderedSessionDemand, OrderedStreamPair, OrderedStreamPolicy, Peer, Service, SinkReject,
+    Stream, StreamMode,
 };
 use crate::zakura::{ServicePeerDirection, ZakuraConnId, ZakuraPeerId};
 
 /// Errors returned while building a [`ServiceRegistry`].
 #[derive(Debug, Error)]
 pub enum RegistryError {
+    /// A paired session has missing, mismatched, or inconsistently declared roles.
+    #[error("service {service} declared an invalid ordered stream pair for kind {kind}")]
+    InvalidOrderedPair {
+        /// Service declaring the pair.
+        service: &'static str,
+        /// Stream with an inconsistent pair declaration.
+        kind: u16,
+    },
     /// Two services declared the same stream kind.
     #[error(
         "duplicate Zakura stream kind {kind} declared by {first_service} and {second_service}"
@@ -81,6 +90,26 @@ impl ServiceRegistry {
             let mut service_streams = HashSet::new();
 
             for stream in service.streams() {
+                if let Some(pair) = service.ordered_stream_pair(*stream) {
+                    let valid = pair.data != pair.requests
+                        && pair.data.kind != pair.requests.kind
+                        && pair.data.mode == StreamMode::Ordered
+                        && pair.requests.mode == StreamMode::Ordered
+                        && pair.data.capability == pair.requests.capability
+                        && (*stream == pair.data || *stream == pair.requests)
+                        && service.streams().contains(&pair.data)
+                        && service.streams().contains(&pair.requests)
+                        && service.ordered_stream_pair(pair.data) == Some(pair)
+                        && service.ordered_stream_pair(pair.requests) == Some(pair)
+                        && service.ordered_stream_policy(pair.data.kind)
+                            == service.ordered_stream_policy(pair.requests.kind);
+                    if !valid {
+                        return Err(RegistryError::InvalidOrderedPair {
+                            service: service.name(),
+                            kind: stream.kind,
+                        });
+                    }
+                }
                 // Each stream must map to exactly one capability bit, otherwise
                 // `supported_capabilities` (the OR below) and per-bit
                 // `services_for_capability` lookups disagree.
@@ -146,6 +175,15 @@ impl ServiceRegistry {
         self.service_for_kind(stream.kind)
             .map(|service| service.message_payload_limits(stream))
             .unwrap_or(&[])
+    }
+
+    pub(crate) fn stream_queue_depths(&self, stream: Stream) -> Option<(usize, usize)> {
+        self.service_for_kind(stream.kind)?
+            .stream_queue_depths(stream)
+    }
+
+    pub(crate) fn message_types(&self, stream: Stream) -> Option<&'static [u16]> {
+        self.service_for_kind(stream.kind)?.message_types(stream)
     }
 
     /// Lookup the declared stream for `kind`.
@@ -222,13 +260,19 @@ impl ServiceRegistry {
         self.supported_capabilities
     }
 
+    /// Return this exact stream version's validated pair declaration.
+    pub fn ordered_stream_pair(&self, stream: Stream) -> Option<OrderedStreamPair> {
+        self.service_for_kind(stream.kind)?
+            .ordered_stream_pair(stream)
+    }
+
     /// Ordered streams negotiated with a peer, in registry service order.
     pub fn ordered_streams_for_negotiated(&self, negotiated: u64) -> Vec<Stream> {
         let mut streams = Vec::new();
 
         for service in self.services_for_negotiated(negotiated) {
             streams.extend(selected_streams(
-                service.streams(),
+                service.as_ref(),
                 negotiated,
                 StreamMode::Ordered,
             ));
@@ -257,7 +301,7 @@ impl ServiceRegistry {
             }
 
             streams.extend(selected_streams(
-                service.streams(),
+                service.as_ref(),
                 negotiated,
                 StreamMode::Ordered,
             ));
@@ -310,7 +354,7 @@ impl ServiceRegistry {
 
         for service in self.services_for_negotiated(negotiated) {
             streams.extend(selected_streams(
-                service.streams(),
+                service.as_ref(),
                 negotiated,
                 StreamMode::RequestResponse,
             ));
@@ -477,9 +521,10 @@ impl ServiceRegistry {
 /// Each capability bit declares one version alternative.
 /// Select the highest matching version before opening the prelude.
 /// The stream selection scopes decoding and preserves existing streams for older peers.
-fn selected_streams(streams: &[Stream], negotiated: u64, mode: StreamMode) -> Vec<Stream> {
+fn selected_streams(service: &dyn Service, negotiated: u64, mode: StreamMode) -> Vec<Stream> {
     let mut selected = Vec::<Stream>::new();
-    for stream in streams
+    for stream in service
+        .streams()
         .iter()
         .copied()
         .filter(|stream| stream.mode == mode && negotiated & stream.capability != 0)
@@ -496,6 +541,14 @@ fn selected_streams(streams: &[Stream], negotiated: u64, mode: StreamMode) -> Ve
         }
     }
     selected
+        .iter()
+        .copied()
+        .filter(|stream| {
+            service.ordered_stream_pair(*stream).is_none_or(|pair| {
+                selected.contains(&pair.data) && selected.contains(&pair.requests)
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -515,6 +568,7 @@ mod tests {
         added: Mutex<Vec<ZakuraPeerId>>,
         added_streams: Mutex<Vec<Vec<u16>>>,
         removed: Mutex<Vec<ZakuraPeerId>>,
+        pairs: Vec<OrderedStreamPair>,
     }
 
     impl TestService {
@@ -526,6 +580,7 @@ mod tests {
                 added: Mutex::new(Vec::new()),
                 added_streams: Mutex::new(Vec::new()),
                 removed: Mutex::new(Vec::new()),
+                pairs: Vec::new(),
             })
         }
 
@@ -544,6 +599,13 @@ mod tests {
 
         fn streams(&self) -> &[Stream] {
             &self.streams
+        }
+
+        fn ordered_stream_pair(&self, stream: Stream) -> Option<OrderedStreamPair> {
+            self.pairs
+                .iter()
+                .copied()
+                .find(|pair| pair.data == stream || pair.requests == stream)
         }
 
         fn wants_peer(
@@ -641,6 +703,62 @@ mod tests {
             registry.ordered_streams_for_negotiated(0b0011),
             vec![versioned_stream(5, 8, 0b0010)]
         );
+    }
+
+    #[test]
+    fn paired_versions_are_selected_together_and_cannot_leave_an_orphan_role() {
+        let legacy = versioned_stream(6, 2, 1);
+        let pair = OrderedStreamPair {
+            data: versioned_stream(6, 3, 2),
+            requests: versioned_stream(7, 1, 2),
+        };
+        let later = versioned_stream(6, 4, 4);
+        let mut service = TestService::new("pair", vec![legacy, pair.data, pair.requests, later]);
+        Arc::get_mut(&mut service).unwrap().pairs.push(pair);
+        let registry = ServiceRegistry::new(vec![service]).unwrap();
+        assert_eq!(registry.ordered_streams_for_negotiated(1), vec![legacy]);
+        assert_eq!(
+            registry.ordered_streams_for_negotiated(3),
+            vec![pair.data, pair.requests]
+        );
+        assert_eq!(registry.ordered_streams_for_negotiated(7), vec![later]);
+    }
+
+    #[test]
+    fn invalid_pair_declarations_are_rejected_before_handshake() {
+        let data = versioned_stream(6, 3, 2);
+        let requests = versioned_stream(7, 1, 2);
+        for pair in [
+            OrderedStreamPair {
+                data,
+                requests: data,
+            },
+            OrderedStreamPair {
+                data,
+                requests: Stream {
+                    capability: 4,
+                    ..requests
+                },
+            },
+            OrderedStreamPair {
+                data,
+                requests: Stream {
+                    mode: StreamMode::RequestResponse,
+                    ..requests
+                },
+            },
+            OrderedStreamPair {
+                data,
+                requests: versioned_stream(8, 1, 2),
+            },
+        ] {
+            let mut service = TestService::new("pair", vec![data, requests]);
+            Arc::get_mut(&mut service).unwrap().pairs.push(pair);
+            assert!(matches!(
+                ServiceRegistry::new(vec![service]),
+                Err(RegistryError::InvalidOrderedPair { .. })
+            ));
+        }
     }
 
     #[test]

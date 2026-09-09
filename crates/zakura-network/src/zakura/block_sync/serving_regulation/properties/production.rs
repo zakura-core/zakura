@@ -7,13 +7,12 @@ use tokio::sync::oneshot;
 
 use super::{super::*, scenario::*};
 use crate::zakura::transport::{worker_framed_channel, FramedWorkerRecv};
-use crate::zakura::OrderedSendError;
 
 struct RequestOwners {
     session: usize,
     attempt: Option<AdmissionAttempt>,
     permit: Option<GetBlocksServingPermit>,
-    query_leases: Vec<BlockRangeQueryLease>,
+    query_leases: Vec<BlockRangeReadLease>,
     sent_block: bool,
     lifetime: Option<std::sync::Weak<crate::zakura::regulation::WorkResources>>,
 }
@@ -59,7 +58,7 @@ impl Production {
     fn connect(&mut self, peer: usize) {
         let identity = ZakuraPeerId::new(vec![u8::try_from(peer + 1).unwrap(); 32]).unwrap();
         let generation = u64::try_from(self.sessions.len()).unwrap();
-        let account = self.regulator.session(identity.clone(), generation);
+        let account = self.regulator.session(identity.clone());
         let (sender, receiver) = worker_framed_channel(QUEUE_DEPTH);
         self.current_sessions[peer] = self.sessions.len();
         self.sessions.push(Session {
@@ -76,7 +75,7 @@ impl Production {
         });
     }
 
-    pub(super) fn apply(&mut self, action: &Action) -> Outcome {
+    pub(super) async fn apply(&mut self, action: &Action) -> Outcome {
         let outcome = match *action {
             Action::Admit { peer, request } => {
                 let session = self.current_sessions[peer];
@@ -84,9 +83,9 @@ impl Production {
                     .account
                     .as_ref()
                     .unwrap()
-                    .try_admit(1)
+                    .admit_now(1)
                 {
-                    Ok(attempt) => {
+                    Some(attempt) => {
                         self.requests[request] = Some(RequestOwners {
                             session,
                             lifetime: Some(attempt.work.weak_resources()),
@@ -97,17 +96,21 @@ impl Production {
                         });
                         Outcome::Admission(None)
                     }
-                    Err(blocked) => Outcome::Admission(Some(match blocked.kind() {
-                        WorkBound::Peer => Limit::PeerActive,
-                        WorkBound::Node => Limit::NodeActive,
-                    })),
+                    None => {
+                        let budget = &self.sessions[session].active;
+                        Outcome::Admission(Some(if budget.reserved() == budget.capacity() {
+                            Limit::PeerActive
+                        } else {
+                            Limit::NodeActive
+                        }))
+                    }
                 }
             }
             Action::Commit { request } => {
                 let owners = self.requests[request].as_mut().unwrap();
                 let permit = owners.attempt.take().unwrap().commit();
                 owners.lifetime = Some(permit.response.weak_resources());
-                owners.query_leases.push(permit.query_lease());
+                owners.query_leases.push(permit.work_lease());
                 owners.permit = Some(permit);
                 Outcome::Done
             }
@@ -123,7 +126,7 @@ impl Production {
                 drop(self.requests[request].as_mut().unwrap().query_leases.pop());
                 Outcome::Done
             }
-            Action::DropLedger { request } => {
+            Action::DropProducer { request } => {
                 let owners = self.requests[request].as_mut().unwrap();
                 drop(owners.attempt.take());
                 drop(owners.permit.take());
@@ -133,35 +136,33 @@ impl Production {
                 let owners = self.requests[request].as_mut().unwrap();
                 let sender = &self.sessions[owners.session].sender;
                 let permit = owners.permit.as_mut().unwrap();
-                let result = if matches!(action, Action::QueueBlock { .. }) {
-                    sender.try_send_regulated_block(self.fixture.clone(), permit)
+                let message = if matches!(action, Action::QueueBlock { .. }) {
+                    BlockSyncMessage::Block(self.fixture.clone())
                 } else if owners.sent_block {
-                    sender.try_send_regulated_message(
-                        BlockSyncMessage::BlocksDone {
-                            start_height: block::Height(1),
-                            returned: 1,
-                        },
-                        permit,
-                    )
+                    BlockSyncMessage::BlocksDone {
+                        start_height: block::Height(1),
+                        returned: 1,
+                    }
                 } else {
-                    sender.try_send_regulated_message(
-                        BlockSyncMessage::RangeUnavailable {
-                            start_height: block::Height(1),
-                            count: 1,
-                        },
-                        permit,
-                    )
+                    BlockSyncMessage::RangeUnavailable {
+                        start_height: block::Height(1),
+                        count: 1,
+                    }
                 };
-                if result.is_ok() && matches!(action, Action::QueueBlock { .. }) {
-                    owners.sent_block = true;
+                let sender = sender.data_sender();
+                // Only the scenario removes queued frames. A full queue stays
+                // pending until a later action; queue-wait cancellation has a
+                // separate production-task test.
+                let queued = sender.capacity() > 0;
+                if queued {
+                    crate::zakura::block_sync::serving::send_response(&sender, permit, message)
+                        .await
+                        .expect("the modeled queue has a reserved observation slot");
+                    if matches!(action, Action::QueueBlock { .. }) {
+                        owners.sent_block = true;
+                    }
                 }
-                if let Err(error) = &result {
-                    assert!(
-                        matches!(error, OrderedSendError::Full),
-                        "unexpected send failure: {error:?}"
-                    );
-                }
-                Outcome::Queued(result.is_ok())
+                Outcome::Queued(queued)
             }
             Action::BeginWrite { session } => {
                 let output = &mut self.sessions[session];

@@ -5,6 +5,8 @@ mod block_sync_peer;
 mod blocksync_fuzz;
 mod clock;
 mod cluster;
+#[cfg(test)]
+mod download_peer;
 mod endpoint;
 mod gossip;
 mod hostile;
@@ -21,6 +23,8 @@ mod wait;
 pub use block_sync_peer::{SyntheticBlockSyncPeer, SyntheticBlockSyncPeers};
 pub use clock::{Clock, RealClock, TestClock};
 pub use cluster::{ClusterTopology, ZakuraTestCluster};
+#[cfg(test)]
+pub(crate) use download_peer::DownloadOnlyPeer;
 pub use endpoint::LocalEndpointFactory;
 pub use gossip::GossipNode;
 pub use hostile::HostilePeer;
@@ -38,8 +42,3 @@ pub use trace_capture::TraceCapture;
 pub use trace_reader::{TraceQuery, TraceReader, TraceValue};
 pub use wait::{await_until, WaitError, TEST_NET_TIMEOUT};
 pub use zakura_jsonl_trace::JsonlTracer;
-
-/// Create a charged standalone serving query for driver fixtures without a reactor.
-pub fn block_range_query_lease() -> super::BlockRangeQueryLease {
-    super::block_sync::query_lease_for_test()
-}

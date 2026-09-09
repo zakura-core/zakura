@@ -99,15 +99,24 @@ the previous base round-trip, so one tick's burst can't inflate the BDR max.
 **A slow peer holds the contiguous floor.** The lowest missing height gates commit; one
 slow carrier must not pin it.
 
-- A floor request MUST carry a short leash (`floor_rescue_timeout`, 2 s); on expiry the
+- A floor request with a fresh delivery-rate sample MUST use `floor_rescue_timeout`
+  (2 s) plus estimated transfer time. Without a sample, it MUST use `request_timeout`
+  (8 s) plus transfer time so the cold peer's only probe can complete. On expiry the
   height MUST return to the queue and the peer be retry-avoided — rescued, not
   disconnected (record-only).
 - The floor MAY borrow up to `floor_bypass_slots` (2) bodies beyond a saturated window
   (within the request-count cap, reserving real budget). The borrow MUST scale by the
   peer's reliability, so a sealed peer earns **no** bypass; if every servable carrier is
   sealed, the floor waits for a fresh one.
-- Above-floor speculation SHOULD use a size-aware deadline (`request_timeout + bytes ÷
-  BDR`) and MUST NOT gate the floor.
+- Above-floor requests use `request_timeout` plus estimated transfer time.
+- Both lanes MUST include this response and earlier unreceived responses in the byte
+  estimate: responses share an ordered stream. Use the measured byte rate with a
+  256 KiB/s lower bound; use that lower bound when the rate is unmeasured.
+
+For example, suppose B takes four seconds to send each 2 MiB block. If A queues
+block 101 behind block 100, block 101 needs eight seconds of transfer allowance,
+plus its base timeout. Allowing time only for block 101 can expire it while B is
+still delivering the earlier response.
 
 **Unbounded memory under attacker-controlled bodies or stalls.**
 
@@ -128,9 +137,10 @@ slow carrier must not pin it.
   single always-taken item that guarantees floor progress.
 - The reorder look-ahead and the serving-request heap MUST be bounded.
 
-**An unbounded wait wedges a peer.** Every outbound request MUST have a network deadline —
-the only sanctioned timer. When BDR is near zero the above-floor deadline assumes a
-minimum delivery rate, so it stays finite (~16 s worst case).
+**An unbounded wait wedges a peer.** Every outbound request MUST have a finite network
+deadline. Admission bounds the outstanding byte estimate, and the minimum rate bounds
+its transfer allowance. The separate block-progress deadline still retires a silent
+session even when queued responses have later individual deadlines.
 
 **A peer accepts requests but never delivers bodies (probe-first).** Admission in front
 of the window MUST enforce a no-progress policy:

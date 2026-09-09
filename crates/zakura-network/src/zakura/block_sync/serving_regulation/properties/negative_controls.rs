@@ -32,7 +32,7 @@ fn missing_write_ownership_reduces_to_a_concrete_replay() {
         missing_write.node_active = 0;
         prop_assert_ne!(expected.node_active, 0);
         // This is the same structural equality used by the model comparison.
-        // The deliberately incomplete ledger must be rejected even after all
+        // The deliberately incomplete producer must be rejected even after all
         // unrelated time advances have been shrunk away.
         prop_assert_eq!(missing_write, expected.clone(), "missing write ownership");
         Ok(())

@@ -32,6 +32,9 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| Auxiliary commit reserve | `crates/zakura-header-chain/src/transition/planner/projected_state.rs` | `0` → up to `96` unfilled slots within the existing aggregate limit | [#950](https://github.com/zakura-core/zakura/pull/950) | Reserve 32 slots each for the finalized header and its first two selected successors, so speculative deliveries cannot consume commit capacity. |
+| VCT repair range under capacity pressure | `crates/zakura-state/src/service/finalized_state/header_chain.rs` | up to `4,000` → `1` when at most `4,096` aggregate slots remain | [#950](https://github.com/zakura-core/zakura/pull/950) | Admit the blocking prerequisite without a speculative suffix when capacity approaches the reserve. |
+| VCT capacity wait deadline | `crates/zakura-network/src/zakura/header_sync/reactor.rs` | unbounded → `30 min` | [#950](https://github.com/zakura-core/zakura/pull/950) | Report a continuous capacity wait through daemon shutdown while preserving protected data. |
 | `MAX_CONCURRENT_UTXO_LOOKUPS` | `crates/zakura-consensus/src/transaction.rs` | serial (`1`) → `64` per block transaction | [#918](https://github.com/zakura-core/zakura/pull/918) | Overlap external UTXO waits while bounding pending lookups per transaction. Concurrent lookups start their six-minute timeout clocks together. |
 | `MAX_MINED_SUBMISSIONS` | `crates/zakura-rpc/src/methods/types/submit_block.rs` | unbounded → `16` submissions | [#748](https://github.com/zakura-core/zakura/pull/748) | Bound detached verification work across RPC cancellation. |
 | `non_finalized_write_slots` | `crates/zakura-state/src/service.rs` | unbounded → `1,000` contextual writes | [#748](https://github.com/zakura-core/zakura/pull/748) | Bound writer block bodies using the existing orphan queue capacity. |

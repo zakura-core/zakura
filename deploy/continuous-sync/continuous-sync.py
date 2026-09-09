@@ -57,6 +57,7 @@ class Paths:
 @dataclass(frozen=True)
 class Policy:
     branch: str = "main"
+    pinned_sha: str = ""
     remote: str = "origin"
     service_name: str = "zakura.service"
     mode_label: str = "unknown"
@@ -251,6 +252,15 @@ def sha256_file(path: Path) -> str:
 
 def resolve_sha(config: Config) -> str:
     policy = config.policy
+    if policy.pinned_sha:
+        if not re.fullmatch(r"[0-9a-f]{40}", policy.pinned_sha):
+            raise ControllerError("pinned_sha must be a full lowercase commit SHA")
+        run(["git", "fetch", "--no-tags", policy.remote, policy.pinned_sha], cwd=config.paths.repo_dir)
+        result = run(["git", "rev-parse", "--verify", "FETCH_HEAD^{commit}"],
+                     cwd=config.paths.repo_dir, capture=True)
+        if result.stdout.strip() != policy.pinned_sha:
+            raise ControllerError("fetched commit differs from pinned_sha")
+        return policy.pinned_sha
     run(["git", "fetch", "--prune", policy.remote, policy.branch], cwd=config.paths.repo_dir)
     result = run(
         ["git", "rev-parse", "--verify", f"{policy.remote}/{policy.branch}^{{commit}}"],
@@ -854,7 +864,7 @@ def halt(config: Config, state_path: Path, state: dict[str, Any], run_state: dic
     log(config, f"halted reason={reason}")
 
 
-def run_loop(config: Config, config_path: Path) -> int:
+def run_loop(config: Config, config_path: Path, *, once: bool = False) -> int:
     state_path = config.paths.state_dir / "state.json"
     config.paths.state_dir.mkdir(parents=True, exist_ok=True)
     config.paths.runs_dir.mkdir(parents=True, exist_ok=True)
@@ -882,6 +892,8 @@ def run_loop(config: Config, config_path: Path) -> int:
         run_state: dict[str, Any] = {}
         try:
             state = one_cycle(config, state_path, state)
+            if once:
+                return 0
         except Exception as error:
             if isinstance(error, OSError) and error.errno == errno.ENOSPC:
                 error = DiskPressure(str(error))
@@ -899,7 +911,7 @@ def run_loop(config: Config, config_path: Path) -> int:
             if isinstance(error, DiskPressure):
                 cleanup_retention(config, active_run=run_dir, recovery=True)
             halt(config, state_path, state, run_state or state, reason)
-            if not isinstance(error, DiskPressure):
+            if once or not isinstance(error, DiskPressure):
                 return 1
         time.sleep(config.policy.cooldown_seconds)
 
@@ -957,7 +969,8 @@ def parse_args() -> argparse.Namespace:
         default=Path("/etc/zakura-continuous-sync/controller.toml"),
     )
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("run")
+    run_parser = sub.add_parser("run")
+    run_parser.add_argument("--once", action="store_true", help="complete one cycle and exit")
     sub.add_parser("status")
     sub.add_parser("resume")
     return parser.parse_args()
@@ -967,7 +980,7 @@ def main() -> int:
     args = parse_args()
     config = load_config(args.config)
     if args.command == "run":
-        return run_loop(config, args.config)
+        return run_loop(config, args.config, once=args.once)
     if args.command == "status":
         return status(config)
     if args.command == "resume":

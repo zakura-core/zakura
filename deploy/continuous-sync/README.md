@@ -15,6 +15,9 @@ controller, but it does not hold an SSH session open during the long sync.
 The dual-stack and Zakura/v2-only nodes exercise the experimental Zakura P2P
 v2 stack.
 
+For temporary baseline/candidate pairs that leave this fleet running, see
+[Manual genesis comparisons](CANDIDATES.md).
+
 ## Lifecycle
 
 `zakura-continuous-sync.service` runs

@@ -13,6 +13,9 @@ on:
           - status
           - resume
           - audit
+          - candidate-start
+          - candidate-collect
+          - candidate-cleanup
       node:
         description: "Optional node name; blank targets the whole fleet"
         required: false
@@ -23,6 +26,23 @@ on:
         required: false
         type: boolean
         default: false
+      candidate_ref:
+        description: "Candidate start: branch/tag/SHA; blank uses the selected workflow branch SHA"
+        type: string
+        default: ""
+      baseline_ref:
+        description: "Candidate start: baseline branch/tag/SHA, pinned at launch"
+        type: string
+        default: "main"
+      candidate_mode:
+        description: "Candidate comparison networking mode"
+        type: choice
+        options: [dual, zakura]
+        default: dual
+      candidate_run_id:
+        description: "Collect/cleanup: workflow run ID that launched the two temporary hosts"
+        type: string
+        default: ""
   schedule:
     - cron: "17,47 * * * *"
 
@@ -30,11 +50,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: zakura-continuous-sync
+  group: ${{ startsWith(inputs.action, 'candidate-') && 'zakura-genesis-candidates' || 'zakura-continuous-sync' }}
   cancel-in-progress: false
 
 jobs:
   fleet:
+    if: ${{ !startsWith(inputs.action, 'candidate-') }}
     name: "Continuous sync ${{ github.event_name == 'schedule' && 'audit' || inputs.action }}"
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -211,3 +232,55 @@ jobs:
       - name: Check daily summary delivery
         if: always() && env.ACTION == 'audit'
         run: python3 deploy/continuous-sync/deploy.py summary-status
+
+  candidate:
+    name: "Isolated genesis comparison"
+    if: ${{ github.event_name == 'workflow_dispatch' && startsWith(inputs.action, 'candidate-') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/do-cli
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+          ssh_private_key: ${{ secrets.DO_SSH_PRIVATE_KEY }}
+      - name: Start, collect, or clean only the isolated pair
+        env:
+          CANDIDATE_ACTION: ${{ inputs.action }}
+          CANDIDATE_REF: ${{ inputs.candidate_ref || github.sha }}
+          BASELINE_REF: ${{ inputs.baseline_ref || 'main' }}
+          MODE: ${{ inputs.candidate_mode }}
+          LAUNCH_RUN_ID: ${{ inputs.candidate_run_id }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+          HARNESS_SHA: ${{ github.sha }}
+          FINGERPRINT: ${{ vars.DO_SSH_KEY_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+          operation="${CANDIDATE_ACTION#candidate-}"
+          args=("$operation" --out candidate-results)
+          if [[ "$operation" == start ]]; then
+            git fetch --depth=1 -- origin "$BASELINE_REF"
+            baseline_sha=$(git rev-parse --verify 'FETCH_HEAD^{commit}')
+            git fetch --depth=1 -- origin "$CANDIDATE_REF"
+            candidate_sha=$(git rev-parse --verify 'FETCH_HEAD^{commit}')
+            args+=(--run-id "$CURRENT_RUN_ID" --mode "$MODE" --baseline-sha "$baseline_sha"
+              --candidate-sha "$candidate_sha" --harness-sha "$HARNESS_SHA" --fingerprint "$FINGERPRINT")
+          else
+            args+=(--run-id "$LAUNCH_RUN_ID")
+          fi
+          python3 deploy/continuous-sync/candidate.py "${args[@]}"
+      - name: Preserve launch or collected evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        with:
+          name: genesis-candidate-${{ github.run_id }}
+          path: candidate-results/
+          if-no-files-found: warn
+      - name: Show result
+        if: always()
+        run: |
+          if [[ -f candidate-results/summary.md ]]; then
+            cat candidate-results/summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi

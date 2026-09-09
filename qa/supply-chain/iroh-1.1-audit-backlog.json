@@ -17,13 +17,6 @@
       ]
     },
     {
-      "name": "cesu8",
-      "version": "1.1.0",
-      "missing_criteria": [
-        "safe-to-deploy"
-      ]
-    },
-    {
       "name": "cmov",
       "version": "0.5.4",
       "missing_criteria": [
@@ -45,27 +38,6 @@
       ]
     },
     {
-      "name": "data-encoding",
-      "version": "2.11.1",
-      "missing_criteria": [
-        "safe-to-deploy"
-      ]
-    },
-    {
-      "name": "data-encoding-macro",
-      "version": "0.1.21",
-      "missing_criteria": [
-        "safe-to-deploy"
-      ]
-    },
-    {
-      "name": "data-encoding-macro-internal",
-      "version": "0.1.19",
-      "missing_criteria": [
-        "safe-to-deploy"
-      ]
-    },
-    {
       "name": "dlopen2",
       "version": "0.8.2",
       "missing_criteria": [
@@ -75,13 +47,6 @@
     {
       "name": "enum-assoc",
       "version": "1.4.1",
-      "missing_criteria": [
-        "safe-to-deploy"
-      ]
-    },
-    {
-      "name": "ghash",
-      "version": "0.5.1",
       "missing_criteria": [
         "safe-to-deploy"
       ]
@@ -137,13 +102,6 @@
     },
     {
       "name": "iroh-metrics",
-      "version": "1.0.1",
-      "missing_criteria": [
-        "safe-to-deploy"
-      ]
-    },
-    {
-      "name": "iroh-metrics-derive",
       "version": "1.0.1",
       "missing_criteria": [
         "safe-to-deploy"
@@ -250,13 +208,6 @@
     {
       "name": "netlink-proto",
       "version": "0.12.2",
-      "missing_criteria": [
-        "safe-to-deploy"
-      ]
-    },
-    {
-      "name": "netlink-sys",
-      "version": "0.9.0",
       "missing_criteria": [
         "safe-to-deploy"
       ]
@@ -374,29 +325,8 @@
       ]
     },
     {
-      "name": "strum",
-      "version": "0.28.0",
-      "missing_criteria": [
-        "safe-to-deploy"
-      ]
-    },
-    {
-      "name": "strum_macros",
-      "version": "0.28.0",
-      "missing_criteria": [
-        "safe-to-deploy"
-      ]
-    },
-    {
       "name": "syn",
       "version": "3.0.5",
-      "missing_criteria": [
-        "safe-to-deploy"
-      ]
-    },
-    {
-      "name": "system-configuration",
-      "version": "0.7.0",
       "missing_criteria": [
         "safe-to-deploy"
       ]
@@ -477,32 +407,9 @@
       "missing_criteria": [
         "safe-to-deploy"
       ]
-    },
-    {
-      "name": "wmi",
-      "version": "0.18.4",
-      "missing_criteria": [
-        "safe-to-deploy"
-      ]
     }
   ],
   "suggestions": [
-    {
-      "name": "data-encoding",
-      "notable_parents": "iroh, iroh-base, iroh-relay, and 4 others",
-      "suggested_criteria": [
-        "safe-to-deploy"
-      ],
-      "suggested_diff": {
-        "from": "2.11.0",
-        "to": "2.11.1",
-        "diffstat": {
-          "insertions": 2,
-          "deletions": 4,
-          "files_changed": 2
-        }
-      }
-    },
     {
       "name": "windows_aarch64_gnullvm",
       "notable_parents": "windows-targets",
@@ -616,70 +523,6 @@
       }
     },
     {
-      "name": "ghash",
-      "notable_parents": "aes-gcm",
-      "suggested_criteria": [
-        "safe-to-deploy"
-      ],
-      "suggested_diff": {
-        "from": "0.5.0",
-        "to": "0.5.1",
-        "diffstat": {
-          "insertions": 36,
-          "deletions": 12,
-          "files_changed": 5
-        }
-      }
-    },
-    {
-      "name": "system-configuration",
-      "notable_parents": "hickory-resolver",
-      "suggested_criteria": [
-        "safe-to-deploy"
-      ],
-      "suggested_diff": {
-        "from": "0.6.1",
-        "to": "0.7.0",
-        "diffstat": {
-          "insertions": 43,
-          "deletions": 16,
-          "files_changed": 6
-        }
-      }
-    },
-    {
-      "name": "strum",
-      "notable_parents": "iroh, iroh-dns, and iroh-relay",
-      "suggested_criteria": [
-        "safe-to-deploy"
-      ],
-      "suggested_diff": {
-        "from": "0.27.2",
-        "to": "0.28.0",
-        "diffstat": {
-          "insertions": 38,
-          "deletions": 39,
-          "files_changed": 5
-        }
-      }
-    },
-    {
-      "name": "netlink-sys",
-      "notable_parents": "netdev",
-      "suggested_criteria": [
-        "safe-to-deploy"
-      ],
-      "suggested_diff": {
-        "from": "0.8.8",
-        "to": "0.9.0",
-        "diffstat": {
-          "insertions": 60,
-          "deletions": 29,
-          "files_changed": 5
-        }
-      }
-    },
-    {
       "name": "windows-targets",
       "notable_parents": "windows-sys",
       "suggested_criteria": [
@@ -712,22 +555,6 @@
       }
     },
     {
-      "name": "data-encoding-macro-internal",
-      "notable_parents": "data-encoding-macro",
-      "suggested_criteria": [
-        "safe-to-deploy"
-      ],
-      "suggested_diff": {
-        "from": null,
-        "to": "0.1.19",
-        "diffstat": {
-          "insertions": 268,
-          "deletions": 0,
-          "files_changed": 5
-        }
-      }
-    },
-    {
       "name": "wasm-streams",
       "notable_parents": "reqwest",
       "suggested_criteria": [
@@ -744,38 +571,6 @@
       }
     },
     {
-      "name": "data-encoding-macro",
-      "notable_parents": "iroh-base",
-      "suggested_criteria": [
-        "safe-to-deploy"
-      ],
-      "suggested_diff": {
-        "from": null,
-        "to": "0.1.21",
-        "diffstat": {
-          "insertions": 383,
-          "deletions": 0,
-          "files_changed": 5
-        }
-      }
-    },
-    {
-      "name": "iroh-metrics-derive",
-      "notable_parents": "iroh-metrics",
-      "suggested_criteria": [
-        "safe-to-deploy"
-      ],
-      "suggested_diff": {
-        "from": "0.2.0",
-        "to": "1.0.1",
-        "diffstat": {
-          "insertions": 407,
-          "deletions": 31,
-          "files_changed": 4
-        }
-      }
-    },
-    {
       "name": "objc2-security-foundation",
       "notable_parents": "objc2-core-wlan",
       "suggested_criteria": [
@@ -788,22 +583,6 @@
           "insertions": 451,
           "deletions": 0,
           "files_changed": 8
-        }
-      }
-    },
-    {
-      "name": "strum_macros",
-      "notable_parents": "strum",
-      "suggested_criteria": [
-        "safe-to-deploy"
-      ],
-      "suggested_diff": {
-        "from": "0.27.2",
-        "to": "0.28.0",
-        "diffstat": {
-          "insertions": 247,
-          "deletions": 208,
-          "files_changed": 17
         }
       }
     },
@@ -840,22 +619,6 @@
       }
     },
     {
-      "name": "wmi",
-      "notable_parents": "netwatch",
-      "suggested_criteria": [
-        "safe-to-deploy"
-      ],
-      "suggested_diff": {
-        "from": "0.17.3",
-        "to": "0.18.4",
-        "diffstat": {
-          "insertions": 495,
-          "deletions": 306,
-          "files_changed": 23
-        }
-      }
-    },
-    {
       "name": "identity-hash",
       "notable_parents": "noq-proto",
       "suggested_criteria": [
@@ -884,22 +647,6 @@
           "insertions": 979,
           "deletions": 0,
           "files_changed": 10
-        }
-      }
-    },
-    {
-      "name": "cesu8",
-      "notable_parents": "jni",
-      "suggested_criteria": [
-        "safe-to-deploy"
-      ],
-      "suggested_diff": {
-        "from": null,
-        "to": "1.1.0",
-        "diffstat": {
-          "insertions": 984,
-          "deletions": 0,
-          "files_changed": 7
         }
       }
     },

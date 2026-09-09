@@ -351,6 +351,12 @@ criteria = "safe-to-deploy"
 version = "1.2.66"
 notes = "Reviewed all packaged source, manifest, and tests. This crate exists to invoke a C compiler during someone else's build, so the capability is inherent; what is reviewable is whether it does anything beyond that, and it does not. It reads the documented CC, CFLAGS, AR, and target environment variables, spawns the compiler and archiver, and writes only into OUT_DIR. Compiler and flag selection comes from the target triple and the caller's configuration rather than from probing the filesystem for arbitrary binaries, and the parallel-build path coordinates through the jobserver rather than spawning without bound. All 43 tests passed with all features."
 
+[[audits.cesu8]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.1.0"
+notes = "Reviewed all source, manifest and both unchecked UTF-8 conversions. Decoder continuation/range checks restrict surrogate pairs to U+10000..U+10FFFF; the encoder slices only complete scalar boundaries from an existing str. No build script, dependencies or ambient operations. Two unit tests and five doctests pass. An additional probe round-trips all 1,112,064 Unicode scalars in both variants and checks valid UTF-8 output for all 65,536 two-byte inputs. The UTF-8 fast path is permissive, including ordinary NUL in Java mode; callers must not treat this API as a canonical-encoding validator."
+
 [[audits.cfg_aliases]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -694,6 +700,24 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.23.0"
 notes = "Full packaged-source review: source is identical to 0.20.11 aside from package metadata; no unsafe code, build script, I/O, or ambient capabilities; derive entry points delegate generation to separately policy-checked darling_core."
+
+[[audits.data-encoding]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "2.11.0 -> 2.11.1"
+notes = "Reviewed the complete packaged delta. Only package version and author metadata change; encoding/decoding source, tests and dependencies are identical."
+
+[[audits.data-encoding-macro]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.21"
+notes = "Reviewed all packaged source and manifest. Declarative wrappers expand to byte-array constants or validated Encoding tables through data-encoding-macro-internal. No unsafe or ambient operations. All 16 unit tests and 6 doctests pass with all features."
+
+[[audits.data-encoding-macro-internal]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.19"
+notes = "Reviewed all packaged source and manifest. Parses developer-supplied literal maps, validates specifications via data-encoding, and emits numeric arrays/tables. No unsafe, build script, filesystem, network or process operations. The array declaration name is developer-supplied syntax, not runtime peer input. Verified through the public wrapper crate: 16 unit tests and 6 doctests pass."
 
 [[audits.der_derive]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -1092,6 +1116,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.1.7"
 notes = "Reviewed all packaged source and manifest. The procedural derives parse visibility and prefix options and generate direct type-checked field borrows, clones, copies, and assignments; unsupported inputs become compile errors. There is no unsafe code, build script, runtime I/O, or ambient capability, and the all-feature library target passed."
+
+[[audits.ghash]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.5.0 -> 0.5.1"
+notes = "Reviewed the complete delta and GHASH wrapper source. The new initializer delegates a caller-supplied 128-bit starting value to Polyval; KeyInit still uses zero, preserving the existing transformation, block byte reversal, and zeroization behavior. No unsafe or ambient capabilities are added. The packaged known-answer vector passes with all features. Polyval implementation coverage remains a separate requirement."
 
 [[audits.git2]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -1501,6 +1531,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.2.0"
 notes = "Full packaged-source review: no unsafe code, build script, I/O, or ambient capabilities; generated code is limited to metric trait implementations, static metadata, field references, and Arc clones."
+
+[[audits.iroh-metrics-derive]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.2.0 -> 1.0.1"
+notes = "Reviewed the complete packaged delta and generated code. Adds scalar/family field partitioning, label encoding and default initialization from developer-supplied syntax. Generated code borrows fields and uses bounded field/variant lists, safe matches and ordinary trait calls. No unsafe, filesystem, network or process operations were added. Runtime metric implementation remains a separate audit requirement."
 
 [[audits.iroh-quinn]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
@@ -1922,6 +1958,12 @@ who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
 version = "0.24.0"
 notes = "Reviewed all packaged source and manifest. The crate contains no unsafe code and no build script; it encodes and decodes rtnetlink messages, and the decoding path is the one that reads kernel-supplied bytes. That path is written defensively: every attribute is parsed through a length-checked buffer wrapper that returns a DecodeError on truncation rather than indexing past the end, and unknown attribute types are preserved as raw bytes instead of being rejected or misinterpreted. The crate is Linux-only and cannot be built on the host used for this review, so it was reviewed by reading rather than by execution."
+
+[[audits.netlink-sys]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.8.8 -> 0.9.0"
+notes = "Reviewed the complete delta. IntoRawFd transfers the owned descriptor and suppresses Drop, preserving single close ownership. Existing netlink boolean getsockopt values now accept any nonzero result. Remaining changes affect docs, endian test gating and dev dependencies; syscall buffer sizing is unchanged."
 
 [[audits.netwatch]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
@@ -3171,6 +3213,18 @@ criteria = "safe-to-deploy"
 version = "0.1.0"
 notes = "Reviewed all packaged source, manifest, and tests. Unsafe string slicing uses monotonic offsets captured from String lengths after valid UTF-8 appends, and Writer records its final boundary on drop; an interrupted caller-supplied Read can leave an ungrouped valid prefix but cannot invalidate the slicing boundaries. There are no dependencies, build script, or independently acquired ambient capabilities. All 4 unit tests and 3 doctests passed."
 
+[[audits.strum]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.27.2 -> 0.28.0"
+notes = "Reviewed the complete delta. ParseError Display is available in no_std through core::fmt; its match arms are unchanged. Remaining changes update MSRV, docs and optional macro/hash-map dependencies, which require their own audit coverage. No new unsafe or ambient operations."
+
+[[audits.strum_macros]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.27.2 -> 0.28.0"
+notes = "Reviewed the complete delta. Generated enum parsing uses From for infallible default variants and TryFrom otherwise, preserving safe matching and delegated error functions. Discriminant attributes are parsed as syn Meta, with explicit Default propagation. No new unsafe or ambient operations. Two unit tests and 19 doctests pass after adding the missing strum 0.28 dev dependency in a disposable test copy; the unmodified archive had nine doctest failures from that missing dependency."
+
 [[audits.stun-rs]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
@@ -3206,6 +3260,12 @@ who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
 version = "0.6.1"
 notes = "Reviewed all packaged source, manifest, and tests. The crate reads macOS network configuration through the SystemConfiguration framework; its unsafe is the framework calls plus the CoreFoundation reference-count handling, which follows the Create versus Get rule. Everything it exposes is read-only: dynamic-store queries, network reachability, and preference lookups, with no setter that mutates system configuration. All 10 tests passed with all features."
+
+[[audits.system-configuration]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.6.1 -> 0.7.0"
+notes = "Reviewed the complete delta, including CoreFoundation ownership at changed FFI calls. Constructors now check null before wrapping create-rule pointers and return Option; successful ownership is unchanged. Other changes add error formatting and update examples. No new ambient capability."
 
 [[audits.system-configuration-sys]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -4033,6 +4093,12 @@ who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
 version = "0.17.3"
 notes = "Reviewed all packaged source and manifest. The crate queries Windows Management Instrumentation through COM; its unsafe is the COM vtable calls plus the VARIANT conversions, each checking the HRESULT before reading the returned value and freeing the variant afterwards. COM is initialized and uninitialized in matching pairs tied to a guard type. It is Windows-only and cannot be built or tested on the host used for this review, so it was reviewed by reading rather than by execution."
+
+[[audits.wmi]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.17.3 -> 0.18.4"
+notes = "Reviewed the complete packaged delta and the netwatch consumer. Changes retain local Call and remote PktPrivacy authentication defaults, preserve !Send connection ownership, initialize COM with CoIncrementMTAUsage when needed, and add explicitly invoked WMI instance writes/deletes. COM references and BSTR arguments remain alive across synchronous calls. The documented process-lifetime MTA retention is accepted; no shutdown-time initialization is introduced by netwatch. All 24 packaged Rust files match upstream commit 90dad22895ce91691470d15952f40cef87b4d856 after CRLF normalization. No obfuscation or hidden execution was found in this delta. Windows runtime tests were not run; this is a source delta audit, not a dismissal of Socket detector evidence that was unavailable behind sign-in."
 
 [[audits.writeable]]
 who = "OpenAI Codex <noreply@openai.com>"

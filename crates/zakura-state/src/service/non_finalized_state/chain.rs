@@ -11,6 +11,8 @@ use std::{
 use chrono::{DateTime, Utc};
 use tracing::instrument;
 
+#[cfg(zcash_unstable = "nutachyon")]
+use zakura_chain::tachyon;
 use zakura_chain::{
     amount::{Amount, NegativeAllowed, NonNegative},
     block::{self, Height},
@@ -217,6 +219,22 @@ pub struct ChainInner {
     /// This extra root is removed when the first non-finalized block is committed.
     pub(crate) ironwood_anchors_by_height: BTreeMap<block::Height, ironwood::tree::Root>,
 
+    /// Tachyon end-of-block anchors and the heights that created them.
+    #[cfg(zcash_unstable = "nutachyon")]
+    pub(crate) tachyon_anchors: HashMap<tachyon::Anchor, Vec<block::Height>>,
+    /// Tachyon end-of-block anchors indexed by height.
+    #[cfg(zcash_unstable = "nutachyon")]
+    pub(crate) tachyon_anchors_by_height: BTreeMap<block::Height, tachyon::Anchor>,
+    /// Tachyon epoch-boundary anchors indexed by epoch.
+    #[cfg(zcash_unstable = "nutachyon")]
+    pub(crate) tachyon_epoch_anchors_by_epoch: BTreeMap<u32, tachyon::Anchor>,
+    /// Tachygrams and every non-finalized height that revealed them.
+    #[cfg(zcash_unstable = "nutachyon")]
+    pub(crate) tachyon_tachygrams: HashMap<tachyon::Tachygram, Vec<block::Height>>,
+    /// Tachygrams revealed by each non-finalized block.
+    #[cfg(zcash_unstable = "nutachyon")]
+    pub(crate) tachyon_tachygrams_by_height: BTreeMap<block::Height, Vec<tachyon::Tachygram>>,
+
     // Nullifiers
     //
     /// The Sprout nullifiers revealed by `blocks` and, if the `indexer` feature is selected,
@@ -269,6 +287,7 @@ impl Chain {
         sapling_note_commitment_tree: Arc<sapling::tree::NoteCommitmentTree>,
         orchard_note_commitment_tree: Arc<orchard::tree::NoteCommitmentTree>,
         ironwood_note_commitment_tree: Arc<ironwood::tree::NoteCommitmentTree>,
+        #[cfg(zcash_unstable = "nutachyon")] finalized_tip_tachyon_anchor: tachyon::Anchor,
         history_tree: Arc<HistoryTree>,
         finalized_tip_chain_value_pools: ValueBalance<NonNegative>,
     ) -> Self {
@@ -294,6 +313,16 @@ impl Chain {
             ironwood_anchors_by_height: Default::default(),
             ironwood_trees_by_height: Default::default(),
             ironwood_subtrees: Default::default(),
+            #[cfg(zcash_unstable = "nutachyon")]
+            tachyon_anchors: Default::default(),
+            #[cfg(zcash_unstable = "nutachyon")]
+            tachyon_anchors_by_height: Default::default(),
+            #[cfg(zcash_unstable = "nutachyon")]
+            tachyon_epoch_anchors_by_epoch: Default::default(),
+            #[cfg(zcash_unstable = "nutachyon")]
+            tachyon_tachygrams: Default::default(),
+            #[cfg(zcash_unstable = "nutachyon")]
+            tachyon_tachygrams_by_height: Default::default(),
             sprout_nullifiers: Default::default(),
             sapling_nullifiers: Default::default(),
             orchard_nullifiers: Default::default(),
@@ -316,6 +345,13 @@ impl Chain {
         chain.add_orchard_tree_and_anchor(finalized_tip_height, orchard_note_commitment_tree);
         chain.add_ironwood_tree_and_anchor(finalized_tip_height, ironwood_note_commitment_tree);
         chain.add_history_tree(finalized_tip_height, history_tree);
+
+        // Only seed a real Tachyon anchor: the default anchor means the pool has not
+        // started (pre-NuTachyon finalized tip), and only NuTachyon-onward anchors are tracked.
+        #[cfg(zcash_unstable = "nutachyon")]
+        if finalized_tip_tachyon_anchor != tachyon::Anchor::default() {
+            chain.add_tachyon_anchor(finalized_tip_height, finalized_tip_tachyon_anchor);
+        }
 
         chain
     }
@@ -1316,6 +1352,179 @@ impl Chain {
         }
     }
 
+    /// Returns the Tachyon anchor after `hash_or_height`.
+    #[cfg(zcash_unstable = "nutachyon")]
+    pub fn tachyon_anchor(&self, hash_or_height: HashOrHeight) -> Option<tachyon::Anchor> {
+        let height =
+            hash_or_height.height_or_else(|hash| self.height_by_hash.get(&hash).copied())?;
+        Some(
+            self.tachyon_anchors_by_height
+                .range(..=height)
+                .next_back()
+                .map(|(_, anchor)| *anchor)
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Returns the Tachyon anchor after this chain's tip.
+    #[cfg(zcash_unstable = "nutachyon")]
+    pub fn tachyon_anchor_for_tip(&self) -> tachyon::Anchor {
+        self.tachyon_anchors_by_height
+            .last_key_value()
+            .map(|(_, anchor)| *anchor)
+            .unwrap_or_default()
+    }
+
+    #[cfg(zcash_unstable = "nutachyon")]
+    fn add_tachyon_anchor(&mut self, height: Height, anchor: tachyon::Anchor) {
+        assert_eq!(
+            self.tachyon_anchors_by_height.insert(height, anchor),
+            None,
+            "Tachyon anchors must be reverted before replacement",
+        );
+        self.tachyon_anchors.entry(anchor).or_default().push(height);
+    }
+
+    #[cfg(zcash_unstable = "nutachyon")]
+    fn remove_tachyon_anchor(&mut self, position: RevertPosition, height: Height) {
+        let removed: Vec<_> = if position == RevertPosition::Root {
+            let removed = self
+                .tachyon_anchors_by_height
+                .range(..=height)
+                .map(|(height, anchor)| (*height, *anchor))
+                .collect::<Vec<_>>();
+            for (height, _) in &removed {
+                self.tachyon_anchors_by_height.remove(height);
+            }
+            removed
+        } else {
+            self.tachyon_anchors_by_height
+                .remove(&height)
+                .map(|anchor| (height, anchor))
+                .into_iter()
+                .collect()
+        };
+
+        for (anchor_height, anchor) in removed {
+            let heights = self
+                .tachyon_anchors
+                .get_mut(&anchor)
+                .expect("the Tachyon anchor value index mirrors its height index");
+            let index = heights
+                .iter()
+                .position(|&height| height == anchor_height)
+                .expect("the Tachyon anchor height exists in both indexes");
+            heights.swap_remove(index);
+            if heights.is_empty() {
+                self.tachyon_anchors.remove(&anchor);
+            }
+        }
+    }
+
+    /// Returns the boundary anchor for `epoch`.
+    #[cfg(zcash_unstable = "nutachyon")]
+    pub fn tachyon_epoch_anchor(&self, epoch: u32) -> Option<tachyon::Anchor> {
+        self.tachyon_epoch_anchors_by_epoch.get(&epoch).copied()
+    }
+
+    /// Returns the Tachyon epoch containing this chain's tip.
+    #[cfg(zcash_unstable = "nutachyon")]
+    pub fn tachyon_current_epoch(&self) -> Option<u32> {
+        let tip_height = (!self.is_empty()).then(|| self.non_finalized_tip_height())?;
+        tachyon::epoch(&self.network, tip_height)
+    }
+
+    #[cfg(zcash_unstable = "nutachyon")]
+    fn add_tachyon_epoch_anchor(&mut self, epoch: u32, anchor: tachyon::Anchor) {
+        assert_eq!(
+            self.tachyon_epoch_anchors_by_epoch.insert(epoch, anchor),
+            None,
+            "a Tachyon epoch starts at most once per chain",
+        );
+    }
+
+    #[cfg(zcash_unstable = "nutachyon")]
+    fn remove_tachyon_epoch_anchor(&mut self, position: RevertPosition, height: Height) {
+        let Some(pool_height) = tachyon::pool_height(&self.network, height) else {
+            return;
+        };
+        if position == RevertPosition::Root {
+            let root_epoch = tachyon::epoch_of_pool_height(pool_height);
+            let epochs = self
+                .tachyon_epoch_anchors_by_epoch
+                .range(..=root_epoch)
+                .map(|(&epoch, _)| epoch)
+                .collect::<Vec<_>>();
+            for epoch in epochs {
+                self.tachyon_epoch_anchors_by_epoch.remove(&epoch);
+            }
+        } else if tachyon::is_epoch_first(pool_height) {
+            self.tachyon_epoch_anchors_by_epoch
+                .remove(&tachyon::epoch_of_pool_height(pool_height));
+        }
+    }
+
+    #[cfg(zcash_unstable = "nutachyon")]
+    fn add_tachyon_tachygrams(
+        &mut self,
+        height: Height,
+        tachygrams: Vec<tachyon::Tachygram>,
+    ) -> Result<(), ValidateContextError> {
+        if tachygrams.is_empty() {
+            return Ok(());
+        }
+
+        let network = self.network.clone();
+        for &tachygram in &tachygrams {
+            let revealed_heights = self.tachyon_tachygrams.entry(tachygram).or_default();
+            if revealed_heights
+                .iter()
+                .any(|&revealed| tachyon::within_scan_window(&network, revealed, height))
+            {
+                return Err(ValidateContextError::DuplicateTachyonTachygram {
+                    tachygram,
+                    in_finalized_state: false,
+                });
+            }
+            revealed_heights.push(height);
+        }
+        self.tachyon_tachygrams_by_height.insert(height, tachygrams);
+        Ok(())
+    }
+
+    #[cfg(zcash_unstable = "nutachyon")]
+    fn remove_tachyon_tachygrams(&mut self, position: RevertPosition, height: Height) {
+        let removed_heights: Vec<_> = if position == RevertPosition::Root {
+            self.tachyon_tachygrams_by_height
+                .range(..=height)
+                .map(|(height, _)| *height)
+                .collect()
+        } else {
+            self.tachyon_tachygrams_by_height
+                .contains_key(&height)
+                .then_some(height)
+                .into_iter()
+                .collect()
+        };
+
+        for height in removed_heights {
+            let tachygrams = self
+                .tachyon_tachygrams_by_height
+                .remove(&height)
+                .expect("the Tachygram height was selected from this index");
+            for tachygram in tachygrams {
+                let revealed_heights = self
+                    .tachyon_tachygrams
+                    .get_mut(&tachygram)
+                    .expect("the Tachygram value index mirrors its height index");
+                revealed_heights.retain(|&revealed| revealed != height);
+                if revealed_heights.is_empty() {
+                    self.tachyon_tachygrams.remove(&tachygram);
+                }
+            }
+        }
+    }
+
     /// Returns the History tree of the tip of this [`Chain`],
     /// including all finalized blocks, and the non-finalized blocks below the chain tip.
     ///
@@ -1391,6 +1600,17 @@ impl Chain {
         let sapling_subtree = self.sapling_subtree(hash_or_height);
         let orchard_subtree = self.orchard_subtree(hash_or_height);
         let ironwood_subtree = self.ironwood_subtree(hash_or_height);
+        #[cfg(zcash_unstable = "nutachyon")]
+        let tachyon_anchor = self.tachyon_anchor(hash_or_height)?;
+        #[cfg(zcash_unstable = "nutachyon")]
+        let height =
+            hash_or_height.height_or_else(|hash| self.height_by_hash.get(&hash).copied())?;
+        #[cfg(zcash_unstable = "nutachyon")]
+        let tachyon_epoch_anchor = tachyon::pool_height(&self.network, height)
+            .filter(|&pool_height| tachyon::is_epoch_first(pool_height))
+            .and_then(|pool_height| {
+                self.tachyon_epoch_anchor(tachyon::epoch_of_pool_height(pool_height))
+            });
 
         Some(Treestate::new(
             sprout_tree,
@@ -1400,6 +1620,10 @@ impl Chain {
             sapling_subtree,
             orchard_subtree,
             ironwood_subtree,
+            #[cfg(zcash_unstable = "nutachyon")]
+            tachyon_anchor,
+            #[cfg(zcash_unstable = "nutachyon")]
+            tachyon_epoch_anchor,
             history_tree,
         ))
     }
@@ -1687,6 +1911,10 @@ impl Chain {
             orchard_subtree: self.orchard_subtree_for_tip(),
             ironwood: self.ironwood_note_commitment_tree_for_tip(),
             ironwood_subtree: self.ironwood_subtree_for_tip(),
+            #[cfg(zcash_unstable = "nutachyon")]
+            tachyon_anchor: self.tachyon_anchor_for_tip(),
+            #[cfg(zcash_unstable = "nutachyon")]
+            tachyon_epoch_anchor: None,
         };
 
         let mut tree_result = None;
@@ -1731,6 +1959,40 @@ impl Chain {
         let orchard_root = self.orchard_note_commitment_tree_for_tip().root();
         let ironwood_root = self.ironwood_note_commitment_tree_for_tip().root();
 
+        // Advance the Tachyon pool anchor with this block, if the pool has started.
+        // `nct.tachyon_anchor` still holds the parent block's anchor here.
+        //
+        // In builds without tachyon support V7 transactions cannot be parsed, so a NuTachyon
+        // chain cannot be synced and the anchor legitimately stays at its default.
+        #[cfg(zcash_unstable = "nutachyon")]
+        {
+            if let Some(pool_height) = zakura_chain::tachyon::pool_height(&self.network, height) {
+                let advance = nct
+                    .tachyon_anchor
+                    .advance_with_block(pool_height, &contextually_valid.block)?;
+                nct.tachyon_anchor = advance.post_block;
+                nct.tachyon_epoch_anchor = advance.epoch_boundary;
+                self.add_tachyon_anchor(height, advance.post_block);
+                if let Some(boundary_anchor) = advance.epoch_boundary {
+                    self.add_tachyon_epoch_anchor(
+                        zakura_chain::tachyon::epoch_of_pool_height(pool_height),
+                        boundary_anchor,
+                    );
+                }
+            }
+            // Add this block's tachygrams to the epoch working set, rejecting same-epoch
+            // duplicates within this chain.
+            let block_tachygrams: Vec<_> = contextually_valid
+                .block
+                .transactions
+                .iter()
+                .flat_map(|transaction| transaction.tachyon_tachygrams())
+                .collect();
+            self.add_tachyon_tachygrams(height, block_tachygrams)?;
+        }
+        #[cfg(zcash_unstable = "nutachyon")]
+        let tachyon_anchor = nct.tachyon_anchor;
+
         // TODO: update the history trees in a rayon thread, if they show up in CPU profiles
         let mut history_tree = self.history_block_commitment_tree();
         let history_tree_mut = Arc::make_mut(&mut history_tree);
@@ -1741,6 +2003,8 @@ impl Chain {
                 &sapling_root,
                 &orchard_root,
                 &ironwood_root,
+                #[cfg(zcash_unstable = "nutachyon")]
+                &tachyon_anchor,
             )
             .map_err(Arc::new)?;
 
@@ -1848,6 +2112,23 @@ impl Chain {
                     &None::<ironwood::ShieldedData>,
                 ),
                 V6 {
+                    inputs,
+                    outputs,
+                    sapling_shielded_data,
+                    orchard_shielded_data,
+                    ironwood_shielded_data,
+                    ..
+                } => (
+                    inputs,
+                    outputs,
+                    &None,
+                    &None,
+                    sapling_shielded_data,
+                    orchard_shielded_data,
+                    ironwood_shielded_data,
+                ),
+                #[cfg(zcash_unstable = "nutachyon")]
+                V7 {
                     inputs,
                     outputs,
                     sapling_shielded_data,
@@ -2072,6 +2353,23 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
                     orchard_shielded_data,
                     ironwood_shielded_data,
                 ),
+                #[cfg(zcash_unstable = "nutachyon")]
+                V7 {
+                    inputs,
+                    outputs,
+                    sapling_shielded_data,
+                    orchard_shielded_data,
+                    ironwood_shielded_data,
+                    ..
+                } => (
+                    inputs,
+                    outputs,
+                    &None,
+                    &None,
+                    sapling_shielded_data,
+                    orchard_shielded_data,
+                    ironwood_shielded_data,
+                ),
 
                 V1 { .. } | V2 { .. } | V3 { .. } => unreachable!(
                     "older transaction versions only exist in finalized blocks, because of the mandatory canopy checkpoint",
@@ -2116,6 +2414,12 @@ impl UpdateWith<ContextuallyVerifiedBlock> for Chain {
         self.remove_sapling_tree_and_anchor(position, height);
         self.remove_orchard_tree_and_anchor(position, height);
         self.remove_ironwood_tree_and_anchor(position, height);
+        #[cfg(zcash_unstable = "nutachyon")]
+        {
+            self.remove_tachyon_anchor(position, height);
+            self.remove_tachyon_epoch_anchor(position, height);
+            self.remove_tachyon_tachygrams(position, height);
+        }
 
         // TODO: move this to the history tree UpdateWith.revert...()?
         self.remove_history_tree(position, height);
@@ -2724,5 +3028,155 @@ impl Chain {
         self.inner
             .ironwood_subtrees
             .insert(subtree.index, subtree.into_data());
+    }
+}
+
+#[cfg(all(test, zcash_unstable = "nutachyon"))]
+mod tachyon_tests {
+    use zakura_chain::parameters::testnet::ConfiguredActivationHeights;
+
+    use super::*;
+
+    /// A chain on a regtest network with NuTachyon (tachyon) activated at height 10, forked
+    /// from a finalized tip at height 9 (so pool height 0 is chain height 10).
+    fn nutachyon_chain() -> Chain {
+        let network = Network::new_regtest(
+            ConfiguredActivationHeights {
+                canopy: Some(1),
+                nu5: Some(2),
+                nu6: Some(3),
+                nu6_1: Some(4),
+                nu6_2: Some(5),
+                nu6_3: Some(6),
+                nu7: Some(8),
+                nu_tachyon: Some(10),
+                ..Default::default()
+            }
+            .into(),
+        );
+
+        Chain::new(
+            &network,
+            Height(9),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            ValueBalance::zero(),
+        )
+    }
+
+    fn tachygram(byte: u8) -> tachyon::Tachygram {
+        tachyon::Tachygram([byte; 32])
+    }
+
+    /// The height of the first block of `epoch` on the [`nutachyon_chain`] network
+    /// (NuTachyon activates at chain height 10).
+    fn epoch_first_height(epoch: u32) -> Height {
+        Height(10 + epoch * tachyon::EPOCH_LENGTH)
+    }
+
+    #[test]
+    fn same_epoch_duplicate_tachygram_is_rejected() {
+        let mut chain = nutachyon_chain();
+
+        chain
+            .add_tachyon_tachygrams(Height(20), vec![tachygram(1), tachygram(2)])
+            .expect("distinct tachygrams are accepted");
+
+        let result = chain.add_tachyon_tachygrams(Height(30), vec![tachygram(2)]);
+        assert!(
+            matches!(
+                result,
+                Err(ValidateContextError::DuplicateTachyonTachygram {
+                    in_finalized_state: false,
+                    ..
+                })
+            ),
+            "expected DuplicateTachyonTachygram, got: {result:?}",
+        );
+    }
+
+    #[test]
+    fn duplicate_tachygram_scan_window_spans_two_epochs() {
+        let mut chain = nutachyon_chain();
+
+        // Epoch 0 (chain heights 10..10+EPOCH_LENGTH).
+        chain
+            .add_tachyon_tachygrams(Height(20), vec![tachygram(1)])
+            .expect("first reveal is accepted");
+
+        // The same tachygram in the immediately following epoch is still within the
+        // two-epoch scan window: a repeat there is exactly what a double spend's
+        // next-epoch nullifier would look like.
+        let result = chain.add_tachyon_tachygrams(epoch_first_height(1), vec![tachygram(1)]);
+        assert!(
+            result.is_err(),
+            "adjacent-epoch duplicate must be rejected: {result:?}",
+        );
+
+        // Two epochs later the tachygram has left the scan window. (An honest repeat
+        // out here would imply a nullifier-derivation collision, but consensus no
+        // longer tracks it.)
+        chain
+            .add_tachyon_tachygrams(epoch_first_height(2), vec![tachygram(1)])
+            .expect("a tachygram outside the two-epoch window is accepted again");
+
+        // And the fresh reveal re-arms the window.
+        let result =
+            chain.add_tachyon_tachygrams(Height(epoch_first_height(2).0 + 1), vec![tachygram(1)]);
+        assert!(result.is_err(), "same-epoch duplicate must be rejected");
+    }
+
+    #[test]
+    fn reverting_a_block_restores_its_tachygrams() {
+        let mut chain = nutachyon_chain();
+
+        chain
+            .add_tachyon_tachygrams(Height(20), vec![tachygram(1)])
+            .expect("first reveal is accepted");
+        chain
+            .add_tachyon_tachygrams(Height(30), vec![tachygram(2)])
+            .expect("distinct tachygram is accepted");
+
+        // Fork off the tip block: its tachygram becomes revealable again.
+        chain.remove_tachyon_tachygrams(RevertPosition::Tip, Height(30));
+        chain
+            .add_tachyon_tachygrams(Height(30), vec![tachygram(2)])
+            .expect("a reverted tachygram is revealable again");
+
+        // A root revert (finalization) drops everything at or below the height.
+        chain.remove_tachyon_tachygrams(RevertPosition::Root, Height(30));
+        assert!(chain.tachyon_tachygrams.is_empty());
+        assert!(chain.tachyon_tachygrams_by_height.is_empty());
+    }
+
+    #[test]
+    fn epoch_anchors_are_tracked_and_reverted() {
+        let mut chain = nutachyon_chain();
+        let anchor_0 = tachyon::Anchor([10; 32]);
+        let anchor_1 = tachyon::Anchor([11; 32]);
+
+        chain.add_tachyon_epoch_anchor(0, anchor_0);
+        chain.add_tachyon_epoch_anchor(1, anchor_1);
+        assert_eq!(chain.tachyon_epoch_anchor(0), Some(anchor_0));
+        assert_eq!(chain.tachyon_epoch_anchor(1), Some(anchor_1));
+
+        // Reverting epoch 1's first block from the tip removes its epoch anchor.
+        chain.remove_tachyon_epoch_anchor(RevertPosition::Tip, epoch_first_height(1));
+        assert_eq!(chain.tachyon_epoch_anchor(1), None);
+        assert_eq!(chain.tachyon_epoch_anchor(0), Some(anchor_0));
+
+        // Reverting a mid-epoch block from the tip removes nothing.
+        chain.remove_tachyon_epoch_anchor(RevertPosition::Tip, Height(20));
+        assert_eq!(chain.tachyon_epoch_anchor(0), Some(anchor_0));
+
+        // A root revert at an epoch's first block drops that epoch and everything before it.
+        chain.add_tachyon_epoch_anchor(1, anchor_1);
+        chain.remove_tachyon_epoch_anchor(RevertPosition::Root, epoch_first_height(0));
+        assert_eq!(chain.tachyon_epoch_anchor(0), None);
+        assert_eq!(chain.tachyon_epoch_anchor(1), Some(anchor_1));
     }
 }

@@ -175,6 +175,8 @@ impl Strategy for PreparedChain {
                 &Default::default(),
                 &Default::default(),
                 &Default::default(),
+                #[cfg(zcash_unstable = "nutachyon")]
+                &Default::default(),
             )
             .expect("history tree should be created");
             *chain = Some((

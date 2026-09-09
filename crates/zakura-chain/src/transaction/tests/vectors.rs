@@ -1749,6 +1749,38 @@ fn binding_signatures() {
                                 .expect("verification passes");
                         }
                     }
+                    #[cfg(zcash_unstable = "nutachyon")]
+                    Transaction::V7 {
+                        sapling_shielded_data,
+                        ..
+                    } => {
+                        if let Some(sapling_shielded_data) = sapling_shielded_data {
+                            // V6 txs have the outputs spent by their transparent inputs hashed into
+                            // their SIGHASH, so we need to exclude txs with transparent inputs.
+                            //
+                            // References:
+                            //
+                            // <https://zips.z.cash/zip-0244#s-2c-amounts-sig-digest>
+                            // <https://zips.z.cash/zip-0244#s-2d-scriptpubkeys-sig-digest>
+                            if tx.has_transparent_inputs() {
+                                continue;
+                            }
+
+                            let sighash = tx
+                                .sighash(nu, HashType::ALL, Arc::new(Vec::new()), None)
+                                .expect("network upgrade is valid for tx");
+
+                            let bvk = redjubjub::VerificationKey::try_from(
+                                sapling_shielded_data
+                                    .binding_verification_key()
+                                    .expect("test transaction has valid value commitments"),
+                            )
+                            .expect("a valid redjubjub::VerificationKey");
+
+                            bvk.verify(sighash.as_ref(), &sapling_shielded_data.binding_sig)
+                                .expect("verification passes");
+                        }
+                    }
                 }
             }
         }

@@ -40,9 +40,13 @@ fn valid_history_tree() -> NonEmptyHistoryTree {
                 sapling_root: &sapling_root,
                 orchard_root: &orchard_root,
                 ironwood_root: &ironwood_root,
+                #[cfg(zcash_unstable = "nutachyon")]
+                tachyon_anchor: &Default::default(),
                 sapling_tx: 0,
                 orchard_tx: 0,
                 ironwood_tx: 0,
+                #[cfg(zcash_unstable = "nutachyon")]
+                tachyon_tx: 0,
             },
         )
         .expect("test history tree must be valid")
@@ -67,6 +71,26 @@ fn legacy_parts_from(tree: &NonEmptyHistoryTree) -> LegacyHistoryTreeParts {
                 let mut inner = [0; LEGACY_MAX_ENTRY_SIZE];
                 inner.copy_from_slice(&serialized[..LEGACY_MAX_ENTRY_SIZE]);
                 (*index, LegacyEntry { inner })
+            })
+            .collect(),
+        current_height: tree.current_height(),
+    }
+}
+
+fn ironwood_parts_from(tree: &NonEmptyHistoryTree) -> IronwoodHistoryTreeParts {
+    IronwoodHistoryTreeParts {
+        network_kind: tree.network().kind(),
+        size: tree.size(),
+        peaks: tree
+            .peaks()
+            .iter()
+            .map(|(index, entry)| {
+                let serialized = bincode::DefaultOptions::new()
+                    .serialize(entry)
+                    .expect("history tree entry serialization succeeds");
+                let mut inner = [0; IRONWOOD_MAX_ENTRY_SIZE];
+                inner.copy_from_slice(&serialized[..IRONWOOD_MAX_ENTRY_SIZE]);
+                (*index, IronwoodEntry { inner })
             })
             .collect(),
         current_height: tree.current_height(),
@@ -135,6 +159,30 @@ fn history_tree_parts_reads_legacy_entry_width() {
     assert!(parts.as_bytes().len() > legacy_bytes.len());
 }
 
+/// A history tree written with the NU6.3 entry width must be read in place and zero-padded to the
+/// current width.
+#[test]
+fn history_tree_parts_reads_ironwood_entry_width() {
+    let tree = valid_history_tree();
+    let ironwood = ironwood_parts_from(&tree);
+    let ironwood_bytes = bincode::DefaultOptions::new()
+        .serialize(&ironwood)
+        .expect("Ironwood serialization succeeds");
+
+    let parts =
+        HistoryTreeParts::try_from_bytes(&ironwood_bytes).expect("Ironwood snapshot must decode");
+
+    assert_eq!(parts.network_kind, tree.network().kind());
+    assert_eq!(parts.size, tree.size());
+    assert_eq!(parts.current_height, tree.current_height());
+    assert_eq!(parts.peaks.len(), tree.peaks().len());
+    assert_eq!(
+        parts.as_bytes(),
+        HistoryTreeParts::from(ironwood).as_bytes()
+    );
+    assert!(parts.as_bytes().len() > ironwood_bytes.len());
+}
+
 /// A legacy-width row can fail current-width decoding with a non-EOF error if the wider entry
 /// consumes into the next legacy map entry and interprets entry bytes as bincode control bytes.
 #[test]
@@ -154,7 +202,7 @@ fn history_tree_parts_reads_legacy_entry_width_after_non_eof_current_error() {
                 LegacyEntry {
                     inner: {
                         let mut inner = [0xCD; LEGACY_MAX_ENTRY_SIZE];
-                        inner[72] = 0xFE;
+                        inner[zcash_history::MAX_ENTRY_SIZE - LEGACY_MAX_ENTRY_SIZE - 1] = 0xFE;
                         inner
                     },
                 },
@@ -216,7 +264,7 @@ fn history_tree_parts_round_trips_current_width() {
 }
 
 #[test]
-fn malformed_history_tree_parts_return_both_decode_errors() {
+fn malformed_history_tree_parts_return_all_decode_errors() {
     let error = match HistoryTreeParts::try_from_bytes([0xFF]) {
         Ok(_) => panic!("malformed bytes must fail"),
         Err(error) => error,
@@ -226,6 +274,7 @@ fn malformed_history_tree_parts_return_both_decode_errors() {
         error,
         HistoryTreeDecodeError::InvalidEncoding {
             current: _,
+            ironwood: _,
             legacy: _
         }
     ));
@@ -337,6 +386,7 @@ fn try_history_tree_propagates_malformed_snapshot() {
         error,
         HistoryTreeDecodeError::InvalidEncoding {
             current: _,
+            ironwood: _,
             legacy: _
         }
     ));

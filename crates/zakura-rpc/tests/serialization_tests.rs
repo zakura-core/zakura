@@ -236,12 +236,22 @@ fn test_get_blockchain_info_accepts_legacy_value_pools() -> Result<(), Box<dyn s
     let obj: GetBlockchainInfoResponse = serde_json::from_value(json)?;
     let value_pools = obj.value_pools();
 
+    #[cfg(not(zcash_unstable = "nutachyon"))]
     assert_eq!(value_pools.len(), 6);
+    #[cfg(zcash_unstable = "nutachyon")]
+    assert_eq!(value_pools.len(), 7);
     assert_eq!(value_pools[4].id().as_str(), "deferred");
     assert_eq!(value_pools[5].id().as_str(), "ironwood");
     assert_eq!(value_pools[5].chain_value_zat().zatoshis(), 0);
     assert!(value_pools[5].value_delta().is_none());
     assert!(value_pools[5].value_delta_zat().is_none());
+    #[cfg(zcash_unstable = "nutachyon")]
+    {
+        assert_eq!(value_pools[6].id().as_str(), "tachyon");
+        assert_eq!(value_pools[6].chain_value_zat().zatoshis(), 0);
+        assert!(value_pools[6].value_delta().is_none());
+        assert!(value_pools[6].value_delta_zat().is_none());
+    }
 
     Ok(())
 }
@@ -474,7 +484,10 @@ fn test_get_block_accepts_legacy_value_pools() -> Result<(), Box<dyn std::error:
         .as_ref()
         .expect("verbose block has valuePools");
 
+    #[cfg(not(zcash_unstable = "nutachyon"))]
     assert_eq!(value_pools.len(), 6);
+    #[cfg(zcash_unstable = "nutachyon")]
+    assert_eq!(value_pools.len(), 7);
     assert_eq!(value_pools[4].id().as_str(), "lockbox");
     assert_eq!(value_pools[5].id().as_str(), "ironwood");
     assert_eq!(value_pools[5].chain_value_zat().zatoshis(), 0);
@@ -485,6 +498,18 @@ fn test_get_block_accepts_legacy_value_pools() -> Result<(), Box<dyn std::error:
             .map(|amount| amount.zatoshis()),
         Some(0)
     );
+    #[cfg(zcash_unstable = "nutachyon")]
+    {
+        assert_eq!(value_pools[6].id().as_str(), "tachyon");
+        assert_eq!(value_pools[6].chain_value_zat().zatoshis(), 0);
+        assert!(value_pools[6].value_delta().is_some());
+        assert_eq!(
+            value_pools[6]
+                .value_delta_zat()
+                .map(|amount| amount.zatoshis()),
+            Some(0)
+        );
+    }
 
     Ok(())
 }

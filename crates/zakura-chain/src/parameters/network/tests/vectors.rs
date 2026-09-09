@@ -222,10 +222,14 @@ fn bip70_network_names_are_stable_for_every_network_kind() {
 fn activates_network_upgrades_correctly() {
     let expected_nu6_3_activation_height = 1;
     let expected_nu7_activation_height = 2;
+    #[cfg(zcash_unstable = "nutachyon")]
+    let expected_nu_tachyon_activation_height = 3;
     let network = testnet::Parameters::build()
         .with_activation_heights(ConfiguredActivationHeights {
             nu6_3: Some(expected_nu6_3_activation_height),
             nu7: Some(expected_nu7_activation_height),
+            #[cfg(zcash_unstable = "nutachyon")]
+            nu_tachyon: Some(expected_nu_tachyon_activation_height),
             ..Default::default()
         })
         .expect("failed to set activation heights")
@@ -246,6 +250,8 @@ fn activates_network_upgrades_correctly() {
     for nu in NetworkUpgrade::iter().skip(1) {
         let expected_activation_height = match nu {
             NetworkUpgrade::Nu7 => expected_nu7_activation_height,
+            #[cfg(zcash_unstable = "nutachyon")]
+            NetworkUpgrade::NuTachyon => expected_nu_tachyon_activation_height,
             _ => expected_nu6_3_activation_height,
         };
 
@@ -339,6 +345,26 @@ fn configured_nu6_3_activation_preserves_upgrade_order() {
         Some(activation_height),
         "an overwritten NU6.3 activation must remain implicit at the NU7 height"
     );
+
+    #[cfg(zcash_unstable = "nutachyon")]
+    {
+        let nu_tachyon_network = testnet::Parameters::build()
+            .with_activation_heights(ConfiguredActivationHeights {
+                nu7: Some(activation_height.0),
+                nu_tachyon: Some(activation_height.0),
+                ..Default::default()
+            })
+            .expect("same-height upgrades are valid")
+            .clear_funding_streams()
+            .to_network()
+            .expect("valid configured network");
+
+        assert_eq!(
+            NetworkUpgrade::current(&nu_tachyon_network, activation_height),
+            NetworkUpgrade::NuTachyon,
+            "NuTachyon must overwrite NU7 when both activate at the same height"
+        );
+    }
 
     let out_of_order = testnet::Parameters::build()
         .with_activation_heights(ConfiguredActivationHeights {

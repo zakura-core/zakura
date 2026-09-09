@@ -392,6 +392,13 @@ pub struct TransactionObject {
     #[new(default)]
     pub(crate) ironwood: Option<Orchard>,
 
+    /// Tachyon actions and stamp data, omitted when the transaction has no
+    /// Tachyon shielded data.
+    #[cfg(zcash_unstable = "nutachyon")]
+    #[serde(rename = "tachyon", skip_serializing_if = "Option::is_none")]
+    #[new(default)]
+    pub(crate) tachyon: Option<Tachyon>,
+
     /// The net value of Sapling Spends minus Outputs in ZEC
     #[serde(rename = "valueBalance", skip_serializing_if = "Option::is_none")]
     #[getter(copy)]
@@ -801,6 +808,75 @@ pub struct OrchardAction {
     out_ciphertext: [u8; 80],
 }
 
+/// Object with Tachyon bundle information.
+#[cfg(zcash_unstable = "nutachyon")]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+pub struct Tachyon {
+    /// The Tachyon actions in wire order.
+    actions: Vec<TachyonAction>,
+    /// The net value of Tachyon actions in ZEC.
+    #[serde(rename = "valueBalance")]
+    value_balance: f64,
+    /// The net value of Tachyon actions in zatoshis.
+    #[serde(rename = "valueBalanceZat")]
+    value_balance_zat: i64,
+    /// The bundle binding signature on the transaction sighash.
+    #[serde(rename = "bindingSig", with = "hex")]
+    binding_sig: [u8; 64],
+    /// The opaque recipient-directed payload.
+    #[serde(with = "hex")]
+    memo: Vec<u8>,
+    /// The proof or pointer stamp authorizing the bundle.
+    stamp: TachyonStamp,
+}
+
+/// A Tachyon action in verbose transaction output.
+#[cfg(zcash_unstable = "nutachyon")]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize, Getters, new)]
+pub struct TachyonAction {
+    /// A commitment to the action's value effect.
+    #[serde(with = "hex")]
+    cv: [u8; 32],
+    /// The randomized action verification key.
+    #[serde(with = "hex")]
+    rk: [u8; 32],
+    /// The action authorization signature on the transaction sighash.
+    #[serde(rename = "spendAuthSig", with = "hex")]
+    spend_auth_sig: [u8; 64],
+}
+
+/// The state-specific data in a Tachyon bundle stamp.
+#[cfg(zcash_unstable = "nutachyon")]
+#[serde_with::serde_as]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum TachyonStamp {
+    /// A proof stamp carried by an autonome or aggregate transaction.
+    Proof {
+        /// Digest of the action descriptors covered by this proof.
+        #[serde(with = "hex")]
+        coverage: [u8; 32],
+        /// The historic Tachyon pool state for which this proof is valid.
+        #[serde(with = "hex")]
+        anchor: [u8; 32],
+        /// Commitment to the stamp's tachygram set.
+        #[serde(rename = "tachygramSet", with = "hex")]
+        tachygram_set: [u8; 32],
+        /// The stamp's canonically ordered tachygrams.
+        #[serde_as(as = "Vec<serde_with::hex::Hex>")]
+        tachygrams: Vec<[u8; 32]>,
+        /// The Ragu proof encoding.
+        #[serde(with = "hex")]
+        proof: Vec<u8>,
+    },
+    /// A pointer stamp carried by an adjunct transaction.
+    Pointer {
+        /// The witnessed transaction ID of the covering aggregate.
+        #[serde(rename = "aggregateId", with = "hex")]
+        aggregate_id: [u8; 64],
+    },
+}
+
 impl Orchard {
     fn from_orchard_shielded_data(
         shielded_data: Option<&orchard::ShieldedData>,
@@ -879,6 +955,140 @@ impl OrchardAction {
     }
 }
 
+#[cfg(zcash_unstable = "nutachyon")]
+impl Tachyon {
+    fn from_bundle(bundle: &zcash_tachyon::TachyonBundle) -> Option<Self> {
+        match bundle {
+            zcash_tachyon::TachyonBundle::NoBundle => None,
+            zcash_tachyon::TachyonBundle::Proven(bundle) => Some(Self::from_parts(
+                bundle,
+                TachyonStamp::from_proof(&bundle.stamp),
+            )),
+            zcash_tachyon::TachyonBundle::Adjunct(bundle) => Some(Self::from_parts(
+                bundle,
+                TachyonStamp::from_pointer(&bundle.stamp),
+            )),
+        }
+    }
+
+    fn from_parts<S: zcash_tachyon::bundle::BundleState + ?Sized>(
+        bundle: &zcash_tachyon::Bundle<S>,
+        stamp: TachyonStamp,
+    ) -> Self {
+        let value_balance_zat = i64::from(bundle.value_balance);
+        let value_balance = Amount::<NegativeAllowed>::try_from(value_balance_zat)
+            .expect("a valid Tachyon balance is within the Zcash monetary range");
+
+        let mut binding_sig = Vec::new();
+        bundle
+            .binding_sig
+            .write(&mut binding_sig)
+            .expect("writing a validated Tachyon binding signature to memory cannot fail");
+        let binding_sig = binding_sig
+            .try_into()
+            .expect("a Tachyon binding signature has a 64-byte encoding");
+
+        Self {
+            actions: bundle
+                .actions
+                .iter()
+                .map(TachyonAction::from_action)
+                .collect(),
+            value_balance: Zec::from(value_balance).lossy_zec(),
+            value_balance_zat,
+            binding_sig,
+            memo: bundle.memo.clone(),
+            stamp,
+        }
+    }
+}
+
+#[cfg(zcash_unstable = "nutachyon")]
+impl TachyonAction {
+    fn from_action(action: &zcash_tachyon::Action) -> Self {
+        let mut descriptor = Vec::new();
+        action
+            .descriptor()
+            .write(&mut descriptor)
+            .expect("writing a validated Tachyon action descriptor to memory cannot fail");
+        let (cv, rk) = descriptor.split_at(32);
+
+        let mut spend_auth_sig = Vec::new();
+        action
+            .sig
+            .write(&mut spend_auth_sig)
+            .expect("writing a validated Tachyon action signature to memory cannot fail");
+
+        Self {
+            cv: cv
+                .try_into()
+                .expect("a Tachyon value commitment has a 32-byte encoding"),
+            rk: rk
+                .try_into()
+                .expect("a Tachyon action verification key has a 32-byte encoding"),
+            spend_auth_sig: spend_auth_sig
+                .try_into()
+                .expect("a Tachyon action signature has a 64-byte encoding"),
+        }
+    }
+}
+
+#[cfg(zcash_unstable = "nutachyon")]
+impl TachyonStamp {
+    fn from_proof(stamp: &zcash_tachyon::ProofStamp) -> Self {
+        let mut anchor = Vec::new();
+        stamp
+            .anchor
+            .write(&mut anchor)
+            .expect("writing a validated Tachyon anchor to memory cannot fail");
+
+        let mut tachygram_set = Vec::new();
+        stamp
+            .tachygram_set
+            .write(&mut tachygram_set)
+            .expect("writing a validated Tachyon tachygram set to memory cannot fail");
+
+        let tachygrams = stamp
+            .tachygrams
+            .iter()
+            .map(|tachygram| {
+                let mut bytes = Vec::new();
+                tachygram
+                    .write(&mut bytes)
+                    .expect("writing a validated Tachyon tachygram to memory cannot fail");
+                bytes
+                    .try_into()
+                    .expect("a Tachyon tachygram has a 32-byte encoding")
+            })
+            .collect();
+
+        Self::Proof {
+            coverage: stamp.coverage,
+            anchor: anchor
+                .try_into()
+                .expect("a Tachyon anchor has a 32-byte encoding"),
+            tachygram_set: tachygram_set
+                .try_into()
+                .expect("a Tachyon tachygram set commitment has a 32-byte encoding"),
+            tachygrams,
+            proof: stamp.proof.serialize().as_ref().to_vec(),
+        }
+    }
+
+    fn from_pointer(stamp: &zcash_tachyon::PointerStamp) -> Self {
+        let mut aggregate_id = Vec::new();
+        stamp
+            .write(&mut aggregate_id)
+            .expect("writing a validated Tachyon pointer stamp to memory cannot fail");
+
+        Self::Pointer {
+            aggregate_id: aggregate_id
+                .try_into()
+                .expect("a Tachyon aggregate ID has a 64-byte encoding"),
+        }
+    }
+}
+
 impl Default for TransactionObject {
     fn default() -> Self {
         Self {
@@ -894,6 +1104,8 @@ impl Default for TransactionObject {
             joinsplits: Vec::new(),
             orchard: None,
             ironwood: None,
+            #[cfg(zcash_unstable = "nutachyon")]
+            tachyon: None,
             binding_sig: None,
             joinsplit_pub_key: None,
             joinsplit_sig: None,
@@ -1123,6 +1335,10 @@ impl TransactionObject {
                     tx.ironwood_value_balance().ironwood_amount(),
                 )
             }),
+            #[cfg(zcash_unstable = "nutachyon")]
+            tachyon: tx
+                .tachyon_shielded_data()
+                .and_then(|shielded_data| Tachyon::from_bundle(&shielded_data.0)),
             binding_sig: tx.sapling_binding_sig().map(|raw_sig| raw_sig.into()),
             joinsplit_pub_key: tx.joinsplit_pub_key().map(|raw_key| {
                 // Display order is reversed in the RPC output.
@@ -1160,6 +1376,8 @@ mod tests {
         strategy::{Strategy, ValueTree},
         test_runner::TestRunner,
     };
+    #[cfg(zcash_unstable = "nutachyon")]
+    use zakura_chain::transaction::TachyonShieldedData;
     use zakura_chain::{
         at_least_one,
         block::Height,
@@ -1167,6 +1385,12 @@ mod tests {
         parameters::NetworkUpgrade,
         primitives::Halo2Proof,
         transaction::LockTime,
+    };
+    #[cfg(zcash_unstable = "nutachyon")]
+    use zcash_tachyon::{
+        bundle::Plan as BundlePlan, entropy::ActionEntropy, keys::private,
+        note::CommitmentTrapdoor, nullifier, value, Note, PointerStamp, ProofStamp, TachyonBundle,
+        Unproven,
     };
 
     use super::*;
@@ -1307,5 +1531,136 @@ mod tests {
             transaction_json.get("ironwood").is_none(),
             "serialized verbose transaction output should not contain an empty Ironwood object"
         );
+    }
+
+    #[cfg(zcash_unstable = "nutachyon")]
+    #[test]
+    fn transaction_object_exposes_tachyon_adjunct_bundle() {
+        let _init_guard = zakura_test::init();
+
+        let aggregate_id = [0xee; 64];
+        let signed = signed_tachyon_bundle();
+        let bundle = zcash_tachyon::Bundle {
+            actions: signed.actions,
+            value_balance: signed.value_balance,
+            binding_sig: signed.binding_sig,
+            memo: signed.memo,
+            stamp: PointerStamp::try_from(aggregate_id).expect("the aggregate ID is nonzero"),
+        };
+        let transaction_object = transaction_object_with_tachyon(TachyonBundle::Adjunct(bundle));
+        let transaction_json = serde_json::to_value(&transaction_object)
+            .expect("the verbose transaction object serializes to JSON");
+
+        let tachyon = transaction_object
+            .tachyon
+            .expect("Tachyon data should be present in verbose RPC output");
+        assert_eq!(tachyon.actions.len(), 1);
+        assert_eq!(tachyon.value_balance_zat, 100);
+        assert_eq!(tachyon.value_balance, 0.000_001);
+        assert_eq!(tachyon.memo, b"rpc-test");
+        assert_eq!(transaction_json["tachyon"]["stamp"]["type"], "pointer");
+        assert_eq!(
+            transaction_json["tachyon"]["stamp"]["aggregateId"],
+            hex::encode(aggregate_id)
+        );
+        assert_eq!(
+            transaction_json["tachyon"]["actions"][0]["cv"]
+                .as_str()
+                .expect("the value commitment is hex")
+                .len(),
+            64
+        );
+        assert_eq!(
+            transaction_json["tachyon"]["actions"][0]["spendAuthSig"]
+                .as_str()
+                .expect("the action signature is hex")
+                .len(),
+            128
+        );
+    }
+
+    #[cfg(zcash_unstable = "nutachyon")]
+    #[test]
+    fn transaction_object_exposes_tachyon_proof_stamp() {
+        let _init_guard = zakura_test::init();
+
+        let coverage = [0x42; 32];
+        let bundle = signed_tachyon_bundle().stamp(ProofStamp {
+            coverage,
+            anchor: zcash_tachyon::Anchor::default(),
+            tachygram_set: zcash_tachyon::TachygramSetCommit::default(),
+            tachygrams: Default::default(),
+            proof: Box::new(ragu::Proof::trivial()),
+        });
+        let transaction_object = transaction_object_with_tachyon(TachyonBundle::Proven(bundle));
+        let transaction_json = serde_json::to_value(transaction_object)
+            .expect("the verbose transaction object serializes to JSON");
+
+        assert_eq!(transaction_json["tachyon"]["stamp"]["type"], "proof");
+        assert_eq!(
+            transaction_json["tachyon"]["stamp"]["coverage"],
+            hex::encode(coverage)
+        );
+        assert_eq!(
+            transaction_json["tachyon"]["stamp"]["tachygrams"],
+            serde_json::json!([])
+        );
+        assert!(
+            !transaction_json["tachyon"]["stamp"]["proof"]
+                .as_str()
+                .expect("the proof is hex")
+                .is_empty(),
+            "the proof encoding should be included"
+        );
+    }
+
+    #[cfg(zcash_unstable = "nutachyon")]
+    fn signed_tachyon_bundle() -> zcash_tachyon::Bundle<Unproven> {
+        let mut rng = rand_10::rng();
+        let spending_key = private::SpendingKey::random(&mut rng);
+        let ask = spending_key.derive_auth_private();
+        let note = Note {
+            pk: spending_key.derive_payment_key(),
+            value: value::Positive::try_from(100u64).expect("100 zatoshis is positive"),
+            psi: nullifier::Trapdoor::random(&mut rng),
+            rcm: CommitmentTrapdoor::random(&mut rng),
+        };
+        let spend = zcash_tachyon::action::Plan::spend(
+            note,
+            ActionEntropy::random(&mut rng),
+            value::Trapdoor::random(&mut rng),
+            |alpha| ask.derive_action_private(&alpha).derive_action_public(),
+        );
+
+        BundlePlan::new(vec![spend], Vec::new())
+            .with_memo(b"rpc-test".to_vec())
+            .sign(&mut rng, &[0u8; 32], &ask)
+            .expect("the test Tachyon bundle signs")
+    }
+
+    #[cfg(zcash_unstable = "nutachyon")]
+    fn transaction_object_with_tachyon(bundle: TachyonBundle) -> TransactionObject {
+        let tx = Arc::new(Transaction::V7 {
+            network_upgrade: NetworkUpgrade::NuTachyon,
+            lock_time: LockTime::unlocked(),
+            expiry_height: Height(1),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+            ironwood_shielded_data: None,
+            tachyon_shielded_data: Some(TachyonShieldedData(bundle)),
+        });
+
+        TransactionObject::from_transaction(
+            tx.clone(),
+            None,
+            None,
+            &Network::Mainnet,
+            None,
+            None,
+            None,
+            tx.hash(),
+        )
     }
 }

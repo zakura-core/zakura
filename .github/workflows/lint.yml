@@ -133,6 +133,10 @@ jobs:
       # the MSRV toolchain. Stable CI retains final code generation and linking
       # coverage.
       - run: cargo check --workspace --bins
+        env:
+          # Clear the repository-level opt-in cfg so this job also checks the
+          # supported cfg-off build.
+          RUSTFLAGS: ""
 
   docs:
     name: docs

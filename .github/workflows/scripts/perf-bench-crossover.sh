@@ -11,6 +11,23 @@ jq -e 'length == 2 and ([.[].leg] | sort == ["baseline", "primary"])' \
 
 ORDER=(primary baseline)
 [[ "$HOST_LEG" == baseline ]] && ORDER=(baseline primary)
+# This wrapper is used only on this replay's new disposable droplet.
+cloud-init status --wait >/dev/null 2>&1
+systemctl stop apt-daily.timer apt-daily-upgrade.timer
+for _ in $(seq 1 180); do
+  if ! systemctl is-active --quiet apt-daily.service && ! systemctl is-active --quiet apt-daily-upgrade.service; then break; fi
+  sleep 5
+done
+if systemctl is-active --quiet apt-daily.service || systemctl is-active --quiet apt-daily-upgrade.service; then
+  echo "Package maintenance did not finish before the replay" >&2
+  exit 1
+fi
+export NEEDRESTART_MODE=l
+mkdir -p /root/out
+# shellcheck source=/dev/null
+[[ -f "$HOME/.cargo/env" ]] && . "$HOME/.cargo/env"
+{ rustc --version; cargo --version; uname -a; } > /root/out/replay-toolchain.txt
+dpkg-query -W > /root/out/packages-before.txt
 export FRESH_STATE_COPY=true
 if [[ "${HISTORICAL_PRUNED:-false}" == true ]]; then
   # Warm up the baseline once, then clone that exact stopped state for both refs.
@@ -36,3 +53,5 @@ for LEG in "${ORDER[@]}"; do
     '{host: $host, leg: $leg, first: ($host == $leg), fresh_state_copy: true}' > "$OUT_DIR/order.json"
   bash /root/perf-bench-run.sh
 done
+
+dpkg-query -W > /root/out/packages-after.txt

@@ -29,6 +29,13 @@ user-id = 3618
 user-login = "dtolnay"
 user-name = "David Tolnay"
 
+[[publisher.syn]]
+version = "3.0.5"
+when = "2026-09-04"
+user-id = 3618
+user-login = "dtolnay"
+user-name = "David Tolnay"
+
 [[publisher.unicode-segmentation]]
 version = "1.13.3"
 when = "2026-06-01"

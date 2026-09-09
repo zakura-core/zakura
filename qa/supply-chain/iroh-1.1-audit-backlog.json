@@ -3,13 +3,6 @@
   "criteria": "safe-to-deploy",
   "failures": [
     {
-      "name": "aes-gcm",
-      "version": "0.10.3",
-      "missing_criteria": [
-        "safe-to-deploy"
-      ]
-    },
-    {
       "name": "dlopen2",
       "version": "0.8.2",
       "missing_criteria": [
@@ -157,13 +150,6 @@
       ]
     },
     {
-      "name": "polyval",
-      "version": "0.6.2",
-      "missing_criteria": [
-        "safe-to-deploy"
-      ]
-    },
-    {
       "name": "prefix-trie",
       "version": "0.8.4",
       "missing_criteria": [
@@ -173,13 +159,6 @@
     {
       "name": "seize",
       "version": "0.5.1",
-      "missing_criteria": [
-        "safe-to-deploy"
-      ]
-    },
-    {
-      "name": "syn",
-      "version": "3.0.5",
       "missing_criteria": [
         "safe-to-deploy"
       ]
@@ -238,22 +217,6 @@
           "insertions": 1853,
           "deletions": 0,
           "files_changed": 9
-        }
-      }
-    },
-    {
-      "name": "polyval",
-      "notable_parents": "ghash",
-      "suggested_criteria": [
-        "safe-to-deploy"
-      ],
-      "suggested_diff": {
-        "from": null,
-        "to": "0.6.2",
-        "diffstat": {
-          "insertions": 2004,
-          "deletions": 0,
-          "files_changed": 16
         }
       }
     },
@@ -318,38 +281,6 @@
           "insertions": 4139,
           "deletions": 0,
           "files_changed": 25
-        }
-      }
-    },
-    {
-      "name": "syn",
-      "notable_parents": "enum-assoc and data-encoding-macro-internal",
-      "suggested_criteria": [
-        "safe-to-deploy"
-      ],
-      "suggested_diff": {
-        "from": "2.0.118",
-        "to": "3.0.5",
-        "diffstat": {
-          "insertions": 4454,
-          "deletions": 2451,
-          "files_changed": 55
-        }
-      }
-    },
-    {
-      "name": "aes-gcm",
-      "notable_parents": "noq-proto",
-      "suggested_criteria": [
-        "safe-to-deploy"
-      ],
-      "suggested_diff": {
-        "from": null,
-        "to": "0.10.3",
-        "diffstat": {
-          "insertions": 7201,
-          "deletions": 0,
-          "files_changed": 13
         }
       }
     },

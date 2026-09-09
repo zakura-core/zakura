@@ -54,7 +54,14 @@ def directly_changed_packages(metadata, changed_files):
     workspace_root = Path(metadata["workspace_root"]).resolve()
     changed_paths = [Path(path) for path in changed_files]
 
-    if Path("Cargo.toml") in changed_paths:
+    # Registry patches affect fresh resolution for every semver build.
+    if any(
+        path in changed_paths
+        for path in (
+            Path("Cargo.toml"),
+            Path(".github/workflows/scripts/patch_registry_for_semver.sh"),
+        )
+    ):
         return set(packages)
 
     roots_by_depth = sorted(

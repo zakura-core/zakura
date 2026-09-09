@@ -61,6 +61,13 @@ mod tests;
 ///     chain in the correct order.)
 const UTXO_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6 * 60);
 
+/// Maximum pending state lookups per block transaction, not across the verifier.
+///
+/// Concurrent lookups start their timeout clocks together. During out-of-order sync,
+/// a later input can therefore time out sooner than with serial lookups. The existing
+/// sync restart recovers missing ancestors, as described on `UTXO_LOOKUP_TIMEOUT`.
+const MAX_CONCURRENT_UTXO_LOOKUPS: usize = 64;
+
 /// A timeout applied to output lookup requests sent to the mempool. This is shorter than the
 /// timeout for the state UTXO lookups because a block is likely to be mined every 75 seconds
 /// after Blossom is active, changing the best chain tip and requiring re-verification of transactions
@@ -800,6 +807,7 @@ where
         let mut spent_outputs: Vec<Option<transparent::Output>> = vec![None; inputs.len()];
         // Stores (input_idx, outpoint) for UTXOs not found in the best chain (fetched from mempool later).
         let mut spent_mempool_outpoints: Vec<(usize, transparent::OutPoint)> = Vec::new();
+        let mut block_outpoints_to_lookup = Vec::new();
 
         for (input_idx, input) in inputs.iter().enumerate() {
             if let transparent::Input::PrevOut { outpoint, .. } = input {
@@ -826,26 +834,64 @@ where
 
                     utxo
                 } else {
-                    let response = state
-                        .clone()
-                        .oneshot(zakura_state::Request::AwaitUtxo(*outpoint))
-                        .await
-                        .map_err(|boxed_error| match boxed_error.downcast::<Elapsed>() {
-                            Ok(_) => TransactionError::TransparentInputNotFound,
-                            Err(boxed_error) => TransactionError::from(boxed_error),
-                        })?;
-
-                    if let zakura_state::Response::Utxo(utxo) = response {
-                        utxo
-                    } else {
-                        unreachable!("AwaitUtxo always responds with Utxo")
-                    }
+                    block_outpoints_to_lookup.push((input_idx, *outpoint));
+                    continue;
                 };
                 tracing::trace!(?utxo, "got UTXO");
                 spent_outputs[input_idx] = Some(utxo.output.clone());
                 spent_utxos.insert(*outpoint, utxo);
             } else {
                 continue;
+            }
+        }
+
+        if !block_outpoints_to_lookup.is_empty() {
+            let single_lookup = block_outpoints_to_lookup.len() == 1;
+            // The verifier keeps one pending admission wait per transaction and overlaps responses.
+            // Queuing 64 readiness waits per transaction delays unrelated state requests.
+            #[allow(clippy::async_yields_async)] // Admission and response need separate awaits.
+            let lookups =
+                futures::stream::iter(block_outpoints_to_lookup)
+                    .then(move |(input_idx, outpoint)| {
+                        let mut state = state.clone();
+                        async move {
+                            let response = state
+                                .ready()
+                                .await
+                                .map(|state| state.call(zs::Request::AwaitUtxo(outpoint)));
+                            async move {
+                                let response = match response {
+                                    Ok(response) => response.await,
+                                    Err(error) => Err(error),
+                                }
+                                .map_err(|boxed_error| match boxed_error.downcast::<Elapsed>() {
+                                    Ok(_) => TransactionError::TransparentInputNotFound,
+                                    Err(boxed_error) => TransactionError::from(boxed_error),
+                                })?;
+
+                                let zs::Response::Utxo(utxo) = response else {
+                                    unreachable!("AwaitUtxo always responds with Utxo")
+                                };
+                                Ok::<_, TransactionError>((input_idx, outpoint, utxo))
+                            }
+                        }
+                    })
+                    .boxed();
+            // A single lookup cannot overlap another lookup, so skip the concurrency queue.
+            let lookups = if single_lookup {
+                lookups.then(std::convert::identity).left_stream()
+            } else {
+                lookups
+                    .buffer_unordered(MAX_CONCURRENT_UTXO_LOOKUPS)
+                    .right_stream()
+            };
+            futures::pin_mut!(lookups);
+
+            while let Some(result) = lookups.next().await {
+                let (input_idx, outpoint, utxo) = result?;
+                tracing::trace!(?utxo, "got UTXO");
+                spent_outputs[input_idx] = Some(utxo.output.clone());
+                spent_utxos.insert(outpoint, utxo);
             }
         }
 

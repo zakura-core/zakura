@@ -2,7 +2,8 @@
 
 Status: protocol draft. This document defines the proposed behavior.
 The [design document](../design/dogwood.md) explains the choices. The five message families are
-settled for this draft; the wire profile and chain binding are not.
+settled for this draft. Section 8 fixes candidate payload profile W1.
+Transport negotiation and the production chain adapter remain open.
 
 `MUST` defines a security or interoperability requirement. `SHOULD` defines
 the default policy. An alternative policy must preserve every `MUST`.
@@ -229,8 +230,8 @@ The local binding probe covers transparent-only V5 coinbases. It demonstrates
 the output commitment and rejects input-only substitution, duplicate key
 outputs, wrong position, malformed counts, and stale Merkle roots. It does not
 implement a complete chain adapter or metadata signature verifier. The selected
-profile still MUST fix the key/signature scheme, supported transaction versions,
-and production proof bounds. In particular, a post-Tachyon format requires its
+profile still MUST fix supported transaction versions and chain-verification
+work bounds. W1 fixes the key/signature scheme and proof byte bounds. In particular, a post-Tachyon format requires its
 own commitment check; the V5 result does not establish that future binding.
 
 This proposal does not place the part root inside the block it encodes.
@@ -343,7 +344,7 @@ present row in this order:
 An absent row inherits. An empty explicit row disables all its parts.
 Changing an override MUST NOT change the row it overrides.
 The initial default row is empty.
-Receivers MUST remove persistent overrides with `Inherit` before retiring
+Receivers MUST remove persistent overrides with the matching inheritance action before retiring
 their local copies. Senders MUST NOT silently evict an active persistent row.
 Capacity pressure requires rejecting new state or closing the service.
 Block-row retirement MUST follow the block retention rules.
@@ -363,8 +364,8 @@ These are the only five application message families:
 
 ```text
 Scope = Default | Proposer(PublicKey) | Block(Hash)
-Selection = PartMask | PartRanges
-UnsubscribeAction = Remove(Selection) | Inherit
+Selection = PartMask | PartRanges | SeedMask | SeedRanges
+UnsubscribeAction = Remove(Selection) | InheritOrdinary | InheritSeed
 
 SubscribeParts {
     control_seq: u64,
@@ -400,7 +401,14 @@ Section 2 defines `HeaderMeta`. All hashes and integer encodings are fixed by
 the selected profile. `PartMask` has exactly `ceil(P/8)` bytes and zero
 unused bits. `PartRanges` contains sorted, disjoint, non-adjacent, non-empty
 half-open ranges inside `[0,n)`. Selections MUST be non-empty.
-Only `Block` scope uses `PartRanges`.
+Only `Block` scope uses ranges. `SeedMask` and `SeedRanges` define the
+`SeedOffer` class in section 6. Ordinary and seed selections MUST use separate
+rows with the same inheritance order. A seed update MUST NOT change ordinary
+demand or promised coverage. A removal changes only its selection class;
+`InheritOrdinary` and `InheritSeed` restore only their respective class.
+`FullBlock` terminates both classes for the block. Each send MUST match an
+enabled row and an immutable grant of the same class. Connection budgets,
+credit accounting, and send-once records remain shared across both classes.
 
 Route updates and `FullBlock` MUST share one ordered control stream per
 connection direction.
@@ -523,7 +531,7 @@ Additional obligations:
 - A block-scoped subscription requires admitted metadata previously received
   from that peer. The handler MUST schedule retained requested parts and watch
   for parts that arrive later. It need not already possess them.
-- `Inherit` is valid only for proposer or block scope. Repeated removals and
+- `InheritOrdinary` and `InheritSeed` are valid only for proposer or block scope. Repeated removals and
   inheritance requests are idempotent. Control sequences still advance.
 - A proposer-scoped update need not follow that proposer's next block, but it
   MUST fit the receiver's bounded selector capacity. Only authenticated metadata
@@ -649,8 +657,9 @@ receiver's requested coverage as a discretionary seed subset. The proposed
 `SeedOffer` selection would distinguish permission to receive a sender-chosen
 subset from a request for ordinary coverage. It would use `SubscribeParts`,
 existing scope/height bounds, and immutable part/byte credit. It would not add
-a sixth message family. Its wire discriminator and negotiation remain `TBD`.
-Implementations MUST NOT send this selection under the current draft profile.
+a sixth message family. W1 defines its discriminators and cancellation classes.
+Implementations MUST NOT enable W1 before selecting transport negotiation,
+chain admission, and aggregate production resource bounds.
 
 A receiver SHOULD offer indices for which it has outgoing demand, or enough
 indices to support a decodable local bootstrap. The proposer SHOULD prefer
@@ -1199,6 +1208,132 @@ not success.
 
 ## 8. Profile choices and conformance
 
+### Candidate payload profile W1
+
+W1 is a concrete payload profile for review and conformance tests. It does not
+enable a network service. Peers MUST negotiate a complete transport and chain
+profile before using it. W1 retains section 2's whole-body codeword and 25%
+parity. It does not adopt the large-body stripe candidate.
+
+All integers below are unsigned little-endian. Concatenation has no implicit
+padding. Hashes contain 32 raw bytes. Consensus block identifiers use the chain
+hash bytes, not reversed display-hex bytes. Length prefixes count bytes unless
+stated otherwise. A parser MUST reject unknown tags, nonzero flags, truncated
+fields, trailing bytes, and lengths above these bounds before allocation.
+Canonical consensus serialization applies inside header and coinbase fields.
+
+| W1 limit | Value |
+| --- | --- |
+| `S`; `P`; codec identifier | 65,536 bytes; 16 bits; 1 |
+| `MAX_PARTS`; maximum part-proof depth | 65,535; 16 siblings |
+| Complete frame; `MAX_PART_MESSAGE_BYTES` | 131,072 bytes; 66,102 bytes |
+| `MAX_GRANT_PARTS`; `MAX_GRANT_HEIGHT_SPAN` | 256; 64 heights inclusive |
+| Range count; header bytes; key-binding bytes | 128; 4,096; 17,413 |
+| Coinbase bytes; coinbase Merkle siblings | 16,384; 32 |
+
+These are syntax limits, not assembly reservations or performance guarantees.
+The profile MUST impose lower admission bounds where consensus or node-wide
+work budgets require them. Checked arithmetic MUST enforce `k=ceil(body_bytes/S)`,
+`n=k+ceil(k/4)`, and `0<k<n<=MAX_PARTS` before allocation.
+
+#### Hashes, commitments, and signatures
+
+Define `T(name, bytes)` as one SHA-256 invocation over
+`ASCII("Dogwood/" + name + "/1") || 00 || bytes`. Define the 22-byte coding tuple:
+
+```text
+coding = u16(1) || u64(body_bytes) || u32(65536) || u32(k) || u32(n)
+encoding_id = T("encoding", coding)
+leaf[i] = T("leaf", encoding_id || u32(i) || payload[i])
+pad[i] = T("pad", encoding_id || u32(i))
+parent = T("node", left_hash || right_hash)
+```
+
+The Merkle tree has the next power of two at or above `n` leaves. Fill real
+positions with `leaf[i]` and remaining positions with `pad[i]`. Do not duplicate
+the last real leaf. A proof contains exactly `ceil(log2(n))` siblings in
+leaf-to-root order. Bit zero of the part index selects the orientation at the
+first level: zero places the current hash on the left. Reject `index>=n`.
+The section 2 codec vector has this W1 root:
+
+```text
+b930ceb4cc32a00ecd316e1430447d7e8cfd89de5384faecb32c46d7991ee1e6
+```
+
+The balanced mapping in section 3 sorts by
+`(T("route", block_id || u32(i)), i)` in lexicographic byte order, then assigns
+rank modulo 16. The mask encodes bit zero in the least significant bit of its
+first byte.
+
+Use pure Ed25519 from [RFC 8032](https://www.rfc-editor.org/rfc/rfc8032.html),
+with these additional acceptance restrictions. The 32-byte public key and
+signature point `R` MUST use canonical compressed Edwards encodings and MUST
+be nonidentity points in the prime-order subgroup. Reject mixed-torsion and
+small-order points, noncanonical field encodings, and negative zero. The
+64-byte signature consists of `R || S`; the little-endian scalar MUST satisfy
+`S < 2^252 + 27742317777372353535851937790883648493`. Verify the usual Ed25519
+equation after these checks. Implementations MUST test library behavior against
+these restrictions. Ed25519ph and Ed25519ctx do not implement W1.
+
+The chain identifier is the consensus genesis block's raw 32-byte hash.
+The signature covers this exact 171-byte transcript:
+
+```text
+ASCII("Dogwood/metadata/1") || 00 || chain_id || u16(1) ||
+block_id || proposer_key || coding || part_root
+```
+
+Header admission MUST supply `block_id`; a sender-supplied identifier does not
+substitute for admission. The metadata variant identifier is
+`T("variant", transcript)`. It excludes the signature and key-binding proof.
+A signature does not replace proof of the coinbase commitment or body validation.
+
+#### Frame and field grammar
+
+The complete frame is `u16(type) || u16(0) || u32(payload_length) || payload`.
+The payload starts with a duplicate `u8(type)` that MUST match the outer type.
+Types 1–5 respectively identify `HeaderMeta`, `BlockPart`, `SubscribeParts`,
+`UnsubscribeParts`, and `FullBlock`. The native service carrier and its stream
+identifiers remain integration choices; this frame defines application bytes.
+The following table lists fields after the payload type, in transmission order.
+
+| Message | Fields |
+| --- | --- |
+| `HeaderMeta` | `u16(header_length)`, header, proposer key (32 bytes), `u16(binding_length)`, binding, coding tuple, root (32 bytes), signature (64 bytes) |
+| `BlockPart` | block identifier, `u64(grant_seq)`, `u32(index)`, payload (65,536 bytes), `u8(sibling_count)`, sibling hashes |
+| `SubscribeParts` | `u64(control_seq)`, scope, selection, `u32(first_height)`, `u32(last_height)`, `u32(part_credit)`, `u64(byte_credit)` |
+| `UnsubscribeParts` | `u64(control_seq)`, scope, `u8(action)`, selection only for action 0 |
+| `FullBlock` | `u64(control_seq)`, block identifier |
+
+Header and binding fields MUST be nonempty. The binding contains
+`u32(coinbase_length) || canonical_coinbase || u8(sibling_count) || siblings`.
+The coinbase MUST be nonempty. The transaction path always starts at index
+zero. Its hashing and transaction-id rules come from the selected chain
+adapter, not the Dogwood part tree. Parsing this envelope does not establish
+that its transaction, header, or commitment is valid.
+
+A scope starts with one byte: 0 for `Default`, 1 followed by a proposer key,
+or 2 followed by a block identifier. A selection starts with one byte: 0 for
+ordinary mask, 1 for ordinary ranges, 2 for seed mask, or 3 for seed ranges.
+A mask is a nonzero `u16` and is valid only with default or proposer scope.
+Ranges are valid only with block scope and contain `u16(count)` followed by
+`u32(start), u32(end)` pairs. Require 1–128 sorted, disjoint, non-adjacent,
+nonempty half-open ranges with `end<=65535`. Admission MUST also require
+`end<=n` for the admitted block.
+
+Unsubscribe action 0 removes its selection. Action 1 restores ordinary
+inheritance; action 2 restores seed inheritance. Inheritance actions have no
+selection and MUST NOT use default scope. Empty explicit rows remain distinct
+from absent rows under section 3.
+
+All sequence values MUST be nonzero and obey section 4's ordering rules.
+A grant MUST cover 1–64 heights inclusive and 1–256 parts. Its `byte_credit`
+MUST equal `part_credit * 66102`. This reserves the largest legal complete
+part frame for each authorized part. Actual sends still charge their complete
+frame length under the immutable-credit rules. A W1 part at `n=40` occupies
+65,782 bytes; the experiments' 384-byte overhead allowance is a model input.
+Stream/transport overhead requires additional capacity outside this frame credit.
+
 ### Parameter registry
 
 This registry is authoritative for the draft's parameter meanings and reference
@@ -1286,20 +1421,12 @@ production defaults or amend the codec and wire profile.
 
 #### Wire profile and changes
 
-The table below owns wire choices. The experimental mask width is `P=16`;
-the interoperable profile MUST fix both `P` and mapping hash `H`. The codec's
-65,535-part field bound does not authorize that much memory or change
-`MAX_BLOCK_BYTES`. `MAX_PARTS`, `MAX_PART_MESSAGE_BYTES`, `MAX_GRANT_PARTS`,
-`MAX_GRANT_HEIGHT_SPAN`, range count, frame/field lengths, and granted byte
-limits remain `TBD` profile bounds. The profile MUST specify hashes, Merkle
-tree shape, signature encoding, PoW key binding, and service version together.
-
-Optional sender telemetry remains outside the draft wire format. A future
-profile MUST define its sequence width, timestamp units and reset/wrap rules,
-queue-residence bound, and authenticated envelope before enabling it.
-The `SeedOffer` selection also requires a new mutually selected profile.
-Until then, the five message families and ordinary subscription semantics in
-section 4 remain unchanged.
+W1 below owns payload choices. Its codec field bound does not authorize that
+much memory or change `MAX_BLOCK_BYTES`. Production implementations MUST also
+select chain admission, transport negotiation, aggregate work budgets, and
+retention limits. Optional sender telemetry remains outside W1. A future
+profile MUST define timestamp units, sequence reset/wrap rules, queue-residence
+bounds, and an authenticated envelope before enabling telemetry.
 
 A size-dependent parity profile MUST define a deterministic function of admitted
 coding inputs, such as `parity_parts(k)`, and its maximum output. Receivers MUST
@@ -1321,12 +1448,12 @@ The profile MUST fix these before implementations claim interoperability:
 
 | Item | Draft choice |
 | --- | --- |
-| Part payload | 64 KiB default; selected profile fixes the value |
+| Part payload | W1 fixes 65,536 bytes |
 | Codec and parity schedule | Section 2 fixes systematic Reed–Solomon over GF(2^16), little-endian elements, and `ceil(k/4)` parity parts |
-| Part-mask width and hash | Balanced mapping in section 3; `P` and `H` `TBD` |
-| Proposer authentication | PoW-bound key and signed metadata; chain binding and signature scheme `TBD` |
-| Serialization | Message discriminators, integer encoding, Merkle proof format, and canonical key encoding `TBD` |
-| Resource bounds | Frame and field caps, part count, grants, height span, candidates, selectors, queues, and retention `TBD` |
+| Part-mask width and hash | W1 fixes `P=16` and tagged SHA-256 |
+| Proposer authentication | W1 fixes Ed25519 and the transcript; supported chain formats and admission adapter remain `TBD` |
+| Serialization | W1 below fixes payload encoding; service identifier, capability, stream carrier, and negotiation remain `TBD` |
+| Resource bounds | W1 fixes syntax and grant caps; candidates, selectors, aggregate queues/work, and retention remain `TBD` |
 | Regulation | Negotiated sender budgets, cadence/burst allowance, response work, and incomplete-frame deadline `TBD` |
 
 Local policy MUST define reconstruction and recovery deadlines, failure groups,

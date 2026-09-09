@@ -12,6 +12,38 @@ The local worktree is `zakura.dogwood-experiments`, alongside the docs worktree.
 Its `docs/experiments/dogwood` directory retains the September 5 experiments
 and adds the scripts and result directories named below.
 
+## W1 payload conformance
+
+The W1 follow-up fixes candidate payload bytes, tagged SHA-256 commitments,
+balanced 16-bit selection, and the metadata signature transcript. It preserves
+the whole-body codec. The profile separates seed permission from ordinary
+demand and gives each class its own inheritance action. Default scope cannot
+inherit. Both classes retain shared connection budgets and send-once records.
+
+`wire_profile.py` emits six frame fixtures and checks their round trips. Tests
+cover all five message families, all selection classes, frame and field bounds,
+range canonicalization, proof shape, body counts, byte credit, and malformed
+input. The largest part frame is 66,102 bytes. The codec's two-data-part vector
+has a fixed Merkle root in the spec. These checks do not implement the service
+state machine or production allocation controls.
+
+`ed25519_profile.py` uses OpenSSL 3.6.3 to reproduce the published
+[RFC 8032 test 2](https://www.rfc-editor.org/rfc/rfc8032.html#section-7.1)
+signature. It checks canonical nonidentity prime-order points before signature
+verification. Tests reject small-order points, mixed torsion, noncanonical
+points/scalars, and malformed lengths. The probe signs the 171-byte W1
+transcript and rejects changes to the chain identifier, admitted block
+identifier, and part root. This is not a cryptographic performance benchmark.
+
+The complete local Python suite passes **78 tests**. Reviewed results live in
+`results/2026-09-09-wire-w1-reviewed` and
+`results/2026-09-09-ed25519-w1-reviewed`, with source snapshots and hashes.
+Earlier W1 directories preserve intermediate experiments. Header and coinbase
+fields in these frame fixtures are structural placeholders. They are not
+consensus-valid blocks or evidence of successful header/key-binding admission.
+The production chain adapter, transport negotiation, and aggregate resource
+bounds remain open. No result establishes sustained 50,000 TPS.
+
 ## Concurrent bodies and key binding
 
 The concurrent follow-up ran **128 streams of 120 synthetic 2 MiB bodies**.

@@ -354,10 +354,10 @@ The candidate is a negotiated `SeedOffer` selection within `SubscribeParts`.
 The receiver permits any subset of the selected parts up to its existing part
 and byte credits. The proposer chooses the actual indices. This is permission
 to receive seeds, not a promise that every selected index will arrive. Ordinary
-subscriptions continue to request specific coverage. The current draft wire
-does not yet encode this distinction; the
+subscriptions continue to request specific coverage. Candidate payload profile
+W1 encodes separate ordinary and seed selections and cancellation actions. The
 [spec rules](../specs/dogwood.md#proposer-seeding-candidate-extension) define the
-requirements before enabling it.
+remaining requirements before enabling it.
 
 The proposer keeps one upload budget across seed transfers, ordinary
 subscriptions, repairs, and concurrent blocks. It tracks indices already seeded
@@ -614,7 +614,8 @@ topology assumption. Its repair-heavy completion results do not establish the
 normal throughput path. The [connected-network follow-up](dogwood-experiments.md#connected-network-and-transport-follow-up)
 measures completion before fallback and tests local pruning. Its failures keep
 the complete adaptive controller open. The design is not ready for interoperable
-implementation while the wire profile and chain binding remain unspecified.
+implementation until transport negotiation, chain admission, and production
+resource bounds are selected. W1 fixes candidate payload bytes and signatures.
 
 - [x] Test finite single-block recovery on single-peer, star, bridge, and mesh
   topologies with equal and mixed relay upload rates.
@@ -637,8 +638,8 @@ implementation while the wire profile and chain binding remain unspecified.
   V5 transactions; exclude input-script keys backed only by a txid proof.
 - [ ] **Proposer grants:** specify and test `SeedOffer` negotiation, eligibility,
   credit consumption, expiry, cancellation, and coexistence with ordinary demand.
-  Lifecycle rules and a finite grant model exist; negotiation, concurrent
-  grants, and wire encoding remain.
+  Lifecycle rules, candidate wire encoding, and a finite grant model exist;
+  negotiation and concurrent grant validation remain.
 - [ ] **Proposer scheduling:** test learned bandwidth against the static optimum
   with changing rates, shared bottlenecks, pending work, and insufficient credit.
 - [ ] **Bootstrap coverage:** test one peer, equal peers, mixed peers, star cuts,
@@ -662,8 +663,10 @@ implementation while the wire profile and chain binding remain unspecified.
   grant, and cancellation rules omitted by the reduced simulations.
 - [ ] **Large bodies:** select a block interval and burst target for 50,000 TPS;
   test codec memory/CPU and revise the single-codeword profile if necessary.
-- [ ] **Wire and authentication:** finish PoW key binding, serialization,
-  mapping, optional extensions, and all required resource limits in the registry.
+- [x] Specify W1 payload encoding, tagged hashes, Merkle proofs, signatures,
+  and separate seed cancellation; test bounds and signature context binding.
+- [ ] **Wire and authentication:** finish the production chain adapter,
+  transport negotiation, and aggregate resource limits in the registry.
 
 ## Headerchain integration
 
@@ -679,14 +682,15 @@ to the mined block. The candidate binds a 32-byte key in a zero-value coinbase
 output and proves its txid membership at index zero. The
 [spec](../specs/dogwood.md#bind-the-proposer-to-the-proof-of-work) fixes the
 candidate script. A txid proof alone cannot authenticate a key in the V5
-coinbase input script. The post-Tachyon adapter and signature profile remain
-open. A self-chosen wrapper key would let anyone attach conflicting roots to
+coinbase input script. W1 selects Ed25519 and a chain-bound signature
+transcript. The post-Tachyon adapter remains open. A self-chosen wrapper key would let anyone attach conflicting roots to
 someone else's proof of work.
 
 Nodes accept at most one authenticated metadata variant per block. An
 authenticated conflict stops coded propagation for that block and triggers
 ordinary block recovery.
 
-The spec leaves proposer-key binding, wire formats, and resource limits to be
-finalized. Controller simulations and codec measurements must establish the
+The [W1 payload profile](../specs/dogwood.md#candidate-payload-profile-w1) fixes
+canonical bytes and cryptographic commitments. The spec leaves the production
+chain adapter, service negotiation, and aggregate resource limits open. Controller simulations and codec measurements must establish the
 latency and throughput this design can achieve.

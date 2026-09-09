@@ -119,22 +119,9 @@ fn decode_request(
     admission: &GetBlocksServingSession,
     frame: Frame,
 ) -> Result<GetBlocksRequest, SinkReject> {
-    match admission
+    admission
         .decode_request(frame)
-        .map_err(SinkReject::protocol)?
-    {
-        BlockSyncMessage::GetBlocks {
-            start_height,
-            count,
-        } => Ok(GetBlocksRequest {
-            start_height,
-            count,
-        }),
-        _ => Err(SinkReject::protocol(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "the request stream accepts only GetBlocks",
-        ))),
-    }
+        .map_err(SinkReject::protocol)
 }
 
 pub(in crate::zakura::block_sync) async fn send_response(
@@ -193,7 +180,7 @@ mod tests {
         let regulator = GetBlocksServingRegulator::new(ZakuraBlockSyncConfig::default());
         let permit = regulator
             .session(ZakuraPeerId::new(vec![1; 32]).unwrap())
-            .try_admit(1)
+            .admit_now(1)
             .unwrap()
             .commit();
         let (sender, receiver) = worker_framed_channel(1);

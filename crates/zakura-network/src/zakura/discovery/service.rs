@@ -2414,8 +2414,7 @@ mod tests {
             connected_rx,
         )?;
         let service = DiscoveryService::new(handle.clone());
-        let (block_sync, _block_events) =
-            BlockSyncService::new_for_test(ZakuraBlockSyncConfig::default());
+        let block_sync = BlockSyncService::new_for_test(ZakuraBlockSyncConfig::default());
         let block_sync = Arc::new(block_sync);
         service.set_connection_owners(vec![block_sync.clone()]);
 

@@ -4277,10 +4277,9 @@ async fn persistent_stream_worker_with_policy(
             } => {
                 match outbound {
                     Some(queued_frame) => {
-                        // Finish this frame before a stream-local close. Dropping
-                        // a partial write makes the peer see a truncated payload
-                        // and close the whole connection. The write still has its
-                        // normal timeout, and connection shutdown can interrupt it.
+                        // Standalone streams finish the current frame on local
+                        // cancellation. Paired streams can interrupt the write:
+                        // teardown resets both roles before either can be reused.
                         let result = tokio::select! {
                             biased;
                             _ = context.connection_token.cancelled() => break,
@@ -4756,10 +4755,7 @@ async fn write_ordered_frame_with_policy(
     Ok(())
 }
 
-/// Write one queued frame while retaining its byte-accounting lease.
-///
-/// The lease remains owned until the QUIC write succeeds, fails, times out, or
-/// this future is dropped with the worker.
+/// Retain the queued frame's ownership through its QUIC write or cancellation.
 async fn write_queued_ordered_frame(
     send: &mut SendStream,
     queued_frame: QueuedFrame,
@@ -5759,7 +5755,8 @@ mod tests {
     #[tokio::test]
     async fn parked_block_sync_peer_gets_a_stream_when_its_cooldown_lapses() -> Result<(), BoxError>
     {
-        const COOLDOWN: Duration = Duration::from_secs(3);
+        const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+        const COOLDOWN: Duration = Duration::from_secs(15);
 
         let _guard = zakura_test::init();
 
@@ -5778,21 +5775,28 @@ mod tests {
         let dialer = node(140).await?;
         let listener = node(141).await?;
 
-        let listener_peer =
-            ZakuraPeerId::new(listener.node_addr().await.node_id.as_bytes().to_vec())?;
+        let listener_addr = listener.node_addr().await;
+        let listener_peer = ZakuraPeerId::new(listener_addr.node_id.as_bytes().to_vec())?;
         let block_sync = dialer
             .block_sync()
             .expect("the header-sync driver spawns the block-sync reactor");
 
         // Block sync evicts and parks the peer after its no-progress deadline.
-        // The transport redials during the cooldown.
+        // Keep the cooldown longer than connection setup so the first assertion
+        // tests a live park even when the dial is slow.
+        let parked_at = std::time::Instant::now();
         block_sync.park_peer_for_test(&listener_peer, COOLDOWN);
         dialer
-            .connect_native(&listener, Duration::from_secs(10))
+            .connect_native_to_addr(listener_addr, CONNECT_TIMEOUT)
             .await?;
 
         // The park remains active.
         // Withhold block sync from this connection.
+        assert!(
+            parked_at.elapsed() < COOLDOWN,
+            "connection setup outlasted the test cooldown: {:?}",
+            parked_at.elapsed(),
+        );
         assert_eq!(
             block_sync.peer_snapshot().outbound_peers,
             0,

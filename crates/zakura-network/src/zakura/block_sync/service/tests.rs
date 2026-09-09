@@ -56,24 +56,28 @@ async fn abandoned_pair_setup_returns_capacity_and_wakes_demand() {
 
 #[tokio::test]
 async fn session_churn_coalesces_and_changes_during_reconciliation_remain_visible() {
-    let current = CurrentSessions::new();
+    let service = BlockSyncService::new_for_test(ZakuraBlockSyncConfig::default());
+    let current = service.current_sessions_for_test();
     let mut changed = current.subscribe();
     let peer = ZakuraPeerId::new(vec![211; 32]).unwrap();
     let mut old = Vec::new();
-    for id in 1..=1000 {
-        let (send, _recv) = crate::zakura::framed_channel(1);
-        let cancel = CancellationToken::new();
-        current
-            .apply_for_test(BlockSyncPeerLifecycleEvent::Connected(
-                BlockSyncPeerSession::for_test_with_session_id(
-                    peer.clone(),
-                    id,
-                    send,
-                    cancel.clone(),
-                ),
-            ))
-            .unwrap();
-        old.push(cancel);
+    let mut streams = Vec::new();
+    for conn_id in 1..=1000 {
+        let (input, recv) = crate::zakura::framed_channel(1);
+        let (send, output) = crate::zakura::framed_channel(1);
+        service.add_peer(
+            crate::zakura::testkit::DownloadOnlyPeer::create_with_conn_id_and_direction(
+                conn_id,
+                peer.clone(),
+                None,
+                ZAKURA_CAP_BLOCK_SYNC,
+                ServicePeerDirection::Outbound,
+                HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (recv, send))]),
+                CancellationToken::new(),
+            ),
+        );
+        old.push(current.snapshot()[&peer].cancel_token());
+        streams.push((input, output));
     }
     changed.changed().await.unwrap();
     let snapshot = current.snapshot();
@@ -85,12 +89,7 @@ async fn session_churn_coalesces_and_changes_during_reconciliation_remain_visibl
         !changed.has_changed().unwrap(),
         "one observation consumes the coalesced change"
     );
-    current
-        .apply_for_test(BlockSyncPeerLifecycleEvent::Disconnected {
-            peer,
-            session_id: 1000,
-        })
-        .unwrap();
+    service.remove_peer(&peer, 1000);
     assert!(
         changed.has_changed().unwrap(),
         "a change after the snapshot schedules another pass"
@@ -149,8 +148,56 @@ impl BlockSyncHandle {
                 bytes[..8].copy_from_slice(&u64::try_from(index).unwrap().to_le_bytes());
                 let peer = ZakuraPeerId::new(bytes.to_vec()).unwrap();
                 let session = wiring.serving_regulator.session(peer);
-                Box::new(session.try_admit(1).unwrap().commit()) as Box<dyn Send>
+                Box::new(session.admit_now(1).unwrap().commit()) as Box<dyn Send>
             })
             .collect()
+    }
+}
+
+impl BlockSyncService {
+    pub(crate) fn new_for_test(config: ZakuraBlockSyncConfig) -> Self {
+        let sessions = CurrentSessions::new();
+        let (_peer_snapshot_tx, peer_snapshot) =
+            watch::channel(ServicePeerSnapshot::new(0, 0, config.peer_limits));
+        let (_candidates_tx, candidates) = watch::channel(ZakuraBlockSyncCandidateState::default());
+        Self {
+            range_source: None,
+            local_status: None,
+            inner: Arc::new(BlockSyncServiceInner {
+                capacity: SessionCapacity::new(config.peer_limits),
+                config,
+                sessions,
+                routine_wiring: None,
+                peer_snapshot,
+                candidates,
+                session_gap_claims: StdMutex::new(HashMap::new()),
+                next_session_id: AtomicU64::new(1),
+            }),
+            service_demand: None,
+            _reactor_task: None,
+        }
+    }
+    pub(in crate::zakura::block_sync) fn current_sessions_for_test(&self) -> Arc<CurrentSessions> {
+        self.inner.sessions.clone()
+    }
+}
+
+impl CurrentSessions {
+    pub(in crate::zakura::block_sync) fn insert_fixture(
+        &self,
+        conn_id: ZakuraConnId,
+        session: BlockSyncPeerSession,
+    ) {
+        self.active.lock().unwrap().insert(
+            session.peer_id().clone(),
+            BlockSyncPeerRecord {
+                conn_id,
+                session_id: session.session_id(),
+                direction: session.direction(),
+                cancel_token: session.cancel_token(),
+                session,
+            },
+        );
+        self.notify();
     }
 }

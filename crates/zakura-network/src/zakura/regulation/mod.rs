@@ -6,12 +6,10 @@
 
 mod request;
 #[cfg(test)]
-pub(crate) use request::{AcquiredWorkSlot, WorkBlocked};
+pub(crate) use request::WorkResources;
 pub(crate) use request::{
     RequestAdmission, RequestPolicy, RequestSession, ResponsePermit, WorkAttempt, WorkLease,
 };
-#[cfg(test)]
-pub(crate) use request::{WorkBound, WorkResources};
 
 mod slots;
 pub(crate) use slots::{SlotBudget, SlotPermit};

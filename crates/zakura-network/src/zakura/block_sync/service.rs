@@ -1,4 +1,4 @@
-use super::{config::*, events::*, peer_registry::SessionAdmission, wire::*, *};
+use super::{config::*, peer_registry::SessionAdmission, wire::*, *};
 use crate::zakura::{
     handle_pipe_exit, spawn_supervised_pipe, FramedRecv, FramedSend, OrderedSendError,
     OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPair, OrderedStreamPolicy, Peer,
@@ -181,104 +181,19 @@ impl BlockSyncPeerSession {
 
     /// Send a typed status advertisement.
     pub fn try_send_status(&self, status: BlockSyncStatus) -> Result<(), OrderedSendError> {
-        self.try_send_message(BlockSyncMessage::Status(status))
-    }
-
-    /// Send a typed status advertisement, waiting for transport queue capacity.
-    pub async fn send_status(&self, status: BlockSyncStatus) -> Result<(), OrderedSendError> {
-        self.send_message(BlockSyncMessage::Status(status)).await
-    }
-
-    /// Send a typed block range request.
-    pub fn try_send_get_blocks(
-        &self,
-        start_height: block::Height,
-        count: u32,
-    ) -> Result<(), OrderedSendError> {
-        self.try_send_message(BlockSyncMessage::GetBlocks {
-            start_height,
-            count,
-        })
-    }
-
-    /// Send one typed block body frame.
-    pub fn try_send_block(&self, block: Arc<block::Block>) -> Result<(), OrderedSendError> {
-        self.try_send_message(BlockSyncMessage::Block(block))
-    }
-
-    /// Send one typed block body frame, waiting for transport queue capacity.
-    pub async fn send_block(&self, block: Arc<block::Block>) -> Result<(), OrderedSendError> {
-        self.send_message(BlockSyncMessage::Block(block)).await
-    }
-
-    /// Send a typed response terminator.
-    pub fn try_send_blocks_done(
-        &self,
-        start_height: block::Height,
-        returned: u32,
-    ) -> Result<(), OrderedSendError> {
-        self.try_send_message(BlockSyncMessage::BlocksDone {
-            start_height,
-            returned,
-        })
-    }
-
-    /// Send a typed response terminator, waiting for transport queue capacity.
-    pub async fn send_blocks_done(
-        &self,
-        start_height: block::Height,
-        returned: u32,
-    ) -> Result<(), OrderedSendError> {
-        self.send_message(BlockSyncMessage::BlocksDone {
-            start_height,
-            returned,
-        })
-        .await
-    }
-
-    /// Send a typed unavailable-range response.
-    pub fn try_send_range_unavailable(
-        &self,
-        start_height: block::Height,
-        count: u32,
-    ) -> Result<(), OrderedSendError> {
-        self.try_send_message(BlockSyncMessage::RangeUnavailable {
-            start_height,
-            count,
-        })
-    }
-
-    /// Send a typed unavailable-range response, waiting for transport queue capacity.
-    pub async fn send_range_unavailable(
-        &self,
-        start_height: block::Height,
-        count: u32,
-    ) -> Result<(), OrderedSendError> {
-        self.send_message(BlockSyncMessage::RangeUnavailable {
-            start_height,
-            count,
-        })
-        .await
-    }
-
-    fn try_send_message(&self, msg: BlockSyncMessage) -> Result<(), OrderedSendError> {
-        let sender = if matches!(msg, BlockSyncMessage::GetBlocks { .. }) {
-            self.request_sender_ref()
-        } else {
-            &self.send
-        };
-        let frame = msg
+        let frame = BlockSyncMessage::Status(status)
             .encode_frame()
             .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
-        match sender.try_send(frame) {
+        match self.send.try_send(frame) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_frame)) => Err(OrderedSendError::Full),
             Err(mpsc::error::TrySendError::Closed(_frame)) => Err(OrderedSendError::Closed),
         }
     }
 
-    async fn send_message(&self, msg: BlockSyncMessage) -> Result<(), OrderedSendError> {
-        let frame = msg
+    /// Send a typed status advertisement, waiting for transport queue capacity.
+    pub async fn send_status(&self, status: BlockSyncStatus) -> Result<(), OrderedSendError> {
+        let frame = BlockSyncMessage::Status(status)
             .encode_frame()
             .map_err(|error| OrderedSendError::Encode(Box::new(error)))?;
         self.send
@@ -296,7 +211,6 @@ pub(crate) struct BlockSyncService {
     local_status: Option<watch::Receiver<BlockSyncStatus>>,
     service_demand:
         Option<watch::Receiver<zakura_node_services::sync_lifecycle::SyncServiceDemand>>,
-    _held_events: Option<Arc<StdMutex<mpsc::Receiver<BlockSyncEvent>>>>,
     _reactor_task: Option<JoinHandle<()>>,
 }
 
@@ -305,9 +219,8 @@ struct BlockSyncServiceInner {
     capacity: SessionCapacity,
     config: ZakuraBlockSyncConfig,
     sessions: Arc<CurrentSessions>,
-    /// Shared download primitives every per-peer pipe-routine is wired with at
-    /// `add_peer` (per-peer routines). `None` for the inert/handle-less constructors that never
-    /// spawn routines (they only observe `events`/`lifecycle`).
+    /// Shared download primitives wired into each peer routine by `add_peer`.
+    /// Tests without a reactor use `None` and drain incoming frames.
     routine_wiring: Option<super::state::RoutineWiring>,
     peer_snapshot: watch::Receiver<ServicePeerSnapshot>,
     candidates: watch::Receiver<ZakuraBlockSyncCandidateState>,
@@ -391,7 +304,6 @@ impl BlockSyncService {
                 next_session_id: AtomicU64::new(1),
             }),
             service_demand: None,
-            _held_events: None,
             _reactor_task: None,
         }
     }
@@ -431,84 +343,8 @@ impl BlockSyncService {
                 next_session_id: AtomicU64::new(1),
             }),
             service_demand: None,
-            _held_events: None,
             _reactor_task: Some(reactor_task),
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new_for_test(
-        config: ZakuraBlockSyncConfig,
-    ) -> (Self, mpsc::Receiver<BlockSyncEvent>) {
-        let (events, event_rx) = mpsc::channel(config.peer_limits.inbound_queue_depth.max(1));
-        let sessions = CurrentSessions::new();
-        let observed = sessions.clone();
-        let mut changed = sessions.subscribe();
-        let (_peer_snapshot_tx, peer_snapshot) =
-            watch::channel(ServicePeerSnapshot::new(0, 0, config.peer_limits));
-        let (_candidates_tx, candidates) = watch::channel(ZakuraBlockSyncCandidateState::default());
-        tokio::spawn(async move {
-            let mut known = HashMap::new();
-            loop {
-                tokio::select! {
-                    () = events.closed() => return,
-                    result = changed.changed() => if result.is_err() { return; },
-                }
-                let current = observed.snapshot();
-                for peer in known.keys() {
-                    if !current.contains_key(peer)
-                        && events
-                            .send(BlockSyncEvent::PeerDisconnected(peer.clone()))
-                            .await
-                            .is_err()
-                    {
-                        return;
-                    }
-                }
-                for (peer, session) in &current {
-                    if known.get(peer) != Some(&session.session_id())
-                        && events
-                            .send(BlockSyncEvent::PeerConnected(session.clone()))
-                            .await
-                            .is_err()
-                    {
-                        return;
-                    }
-                }
-                known = current
-                    .into_iter()
-                    .map(|(peer, session)| (peer, session.session_id()))
-                    .collect();
-            }
-        });
-        (
-            Self {
-                range_source: None,
-                local_status: None,
-                inner: Arc::new(BlockSyncServiceInner {
-                    capacity: SessionCapacity::new(config.peer_limits),
-                    config,
-                    sessions,
-                    routine_wiring: None,
-                    peer_snapshot,
-                    candidates,
-                    session_gap_claims: StdMutex::new(HashMap::new()),
-                    next_session_id: AtomicU64::new(1),
-                }),
-                service_demand: None,
-                _held_events: None,
-                _reactor_task: None,
-            },
-            event_rx,
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new_with_handle_for_test(
-        config: ZakuraBlockSyncConfig,
-        handle: BlockSyncHandle,
-    ) -> Self {
-        Self::new_with_handle(config, handle)
     }
 
     pub(crate) fn with_service_demand(

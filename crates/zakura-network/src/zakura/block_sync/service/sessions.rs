@@ -156,48 +156,4 @@ impl CurrentSessions {
             .map(|(peer, record)| (peer.clone(), record.session.clone()))
             .collect()
     }
-
-    #[cfg(test)]
-    pub(in crate::zakura::block_sync) fn apply_for_test(
-        &self,
-        event: BlockSyncPeerLifecycleEvent,
-    ) -> Result<(), &'static str> {
-        let mut active = self.active.lock().map_err(|_| "session table poisoned")?;
-        match event {
-            BlockSyncPeerLifecycleEvent::Connected(session) => {
-                let peer = session.peer_id().clone();
-                if active
-                    .get(&peer)
-                    .is_some_and(|old| old.session_id >= session.session_id())
-                {
-                    session.cancel_token().cancel();
-                    session.mark_reactor_ready();
-                    return Ok(());
-                }
-                let old = active.insert(
-                    peer,
-                    BlockSyncPeerRecord {
-                        conn_id: 0,
-                        session_id: session.session_id(),
-                        direction: session.direction(),
-                        cancel_token: session.cancel_token(),
-                        session,
-                    },
-                );
-                if let Some(old) = old {
-                    old.cancel_token.cancel();
-                }
-            }
-            BlockSyncPeerLifecycleEvent::Disconnected { peer, session_id } => {
-                if active
-                    .get(&peer)
-                    .is_some_and(|old| old.session_id == session_id)
-                {
-                    active.remove(&peer).unwrap().cancel_token.cancel();
-                }
-            }
-        }
-        self.notify();
-        Ok(())
-    }
 }

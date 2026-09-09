@@ -206,7 +206,7 @@ Session cancellation or a reset that invalidates an active write cancels that wr
 
 ### 5. Remove the old path and finish integration
 
-The new task replaces the following serving machinery. Remove each component only after its last consumer has moved:
+The sequential task now replaces the following serving machinery. Its old consumers and temporary migration adapters have been removed:
 
 | Old component | Replacement |
 | --- | --- |
@@ -214,8 +214,17 @@ The new task replaces the following serving machinery. Remove each component onl
 | `QueryBlocksByHeightRange`, `serve_block_range`, and serving result/completion events | Storage adapter returns an owned result directly to the serving task |
 | Reactor serving record and `pending_serving_terminals` | Response permit owned by the task, plus the ordered data queue |
 | Driver-held `BlockRangeQueryLease` | `BlockRangeReadLease` retained inside the database job and result; the shared execution claim still prevents duplicate dispatch |
+| Queued session lifecycle events and their test bridge | Current-session table and watch notification; tests exercise real publication and reconciliation |
+| Unused raw request/response send methods | Guarded request publication and the serving task's guarded data queue |
+| Duplicate synchronous admission algorithm used by tests | Tests poll the actual asynchronous admission future; the independent expected model remains separate |
 
 Keep download IDs, response guards, shared regulation policy, and unrelated apply/verification work.
+
+The existing unowned state-read API keeps its original signature. Serving uses
+the separate owned API, which enforces the byte cap and retains the permit inside
+the real database job. Completed matched-download and recovery tests replace the
+temporary raw-stream probes; retain the QUIC backport regression and version-4
+ownership histories.
 
 #### Activation and compatibility
 

@@ -451,9 +451,11 @@ pub(super) struct BlockEventReceived {
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum BlockEventDetail {
+    #[cfg(test)]
     PeerConnected {
         peer: String,
     },
+    #[cfg(test)]
     PeerDisconnected {
         peer: String,
     },
@@ -498,9 +500,11 @@ enum BlockEventDetail {
 impl BlockEventReceived {
     pub(super) fn new(event: &BlockSyncEvent) -> Self {
         let detail = match event {
+            #[cfg(test)]
             BlockSyncEvent::PeerConnected(session) => BlockEventDetail::PeerConnected {
                 peer: peer_label(session.peer_id()),
             },
+            #[cfg(test)]
             BlockSyncEvent::PeerDisconnected(peer) => BlockEventDetail::PeerDisconnected {
                 peer: peer_label(peer),
             },

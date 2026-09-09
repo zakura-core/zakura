@@ -197,7 +197,7 @@ impl Node {
         });
         let (handle, mut actions, reactor) = spawn_block_sync_reactor(startup);
         let handle = handle.with_range_source(Arc::new(MemorySource(blocks.clone())));
-        let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+        let service = BlockSyncService::new_with_handle(config, handle.clone());
         let (progress_tx, received) = watch::channel(0);
         let driver_handle = handle.clone();
         let driver = tokio::spawn(async move {

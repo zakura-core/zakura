@@ -83,9 +83,9 @@ impl Production {
                     .account
                     .as_ref()
                     .unwrap()
-                    .try_admit(1)
+                    .admit_now(1)
                 {
-                    Ok(attempt) => {
+                    Some(attempt) => {
                         self.requests[request] = Some(RequestOwners {
                             session,
                             lifetime: Some(attempt.work.weak_resources()),
@@ -96,10 +96,14 @@ impl Production {
                         });
                         Outcome::Admission(None)
                     }
-                    Err(blocked) => Outcome::Admission(Some(match blocked.kind() {
-                        WorkBound::Peer => Limit::PeerActive,
-                        WorkBound::Node => Limit::NodeActive,
-                    })),
+                    None => {
+                        let budget = &self.sessions[session].active;
+                        Outcome::Admission(Some(if budget.reserved() == budget.capacity() {
+                            Limit::PeerActive
+                        } else {
+                            Limit::NodeActive
+                        }))
+                    }
                 }
             }
             Action::Commit { request } => {
@@ -122,7 +126,7 @@ impl Production {
                 drop(self.requests[request].as_mut().unwrap().query_leases.pop());
                 Outcome::Done
             }
-            Action::DropLedger { request } => {
+            Action::DropProducer { request } => {
                 let owners = self.requests[request].as_mut().unwrap();
                 drop(owners.attempt.take());
                 drop(owners.permit.take());

@@ -96,8 +96,9 @@ counts establishing and retiring sessions as well as current ones;
 
 ## Transport and memory
 
-QUIC and its windows are unchanged: 16 MiB receive allowance per stream, 32 MiB
-shared receive allowance per connection, and a 32 MiB connection send window.
+The transport uses a 16 MiB receive allowance per stream, a 32 MiB shared receive
+allowance per connection, and a 32 MiB connection send window. It needs no
+per-stream window extension.
 Opening two streams does not allocate or reserve that memory in advance. Paused
 services can consume the shared allowance and delay otherwise-ready streams.
 

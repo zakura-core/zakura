@@ -92,7 +92,7 @@ mod tests {
     async fn observation_follows_the_last_response_owner_without_retaining_it() {
         let regulator = GetBlocksServingRegulator::new(ZakuraBlockSyncConfig::default());
         let session = regulator.session(ZakuraPeerId::new(vec![8; 32]).unwrap());
-        let mut response = session.try_admit(1).unwrap().commit();
+        let mut response = session.admit_now(1).unwrap().commit();
         let read = response.work_lease();
         let frame = response.frame_guard(9);
         drop(response);

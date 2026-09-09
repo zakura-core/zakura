@@ -1,7 +1,7 @@
 //! Admission and ownership for requests that produce a finite response.
 //!
-//! Policies supply the codec and response bound. Peer routines own waiting and
-//! dispatch, so this layer neither queues messages nor chooses scheduling policy.
+//! Policies supply the codec and response bound. Sequential serving tasks wait
+//! for admission before dispatching work; this layer owns capacity and lifetimes.
 
 use std::{
     collections::HashMap,
@@ -113,25 +113,6 @@ impl<P: RequestPolicy> RequestSession<P> {
         }
     }
 
-    /// Acquire all work bounds or release partial acquisition before returning.
-    /// A permit obtained by a fair waiter is reused on its next attempt.
-    #[cfg(test)]
-    pub(crate) fn try_admit(
-        &self,
-        request: &P::Request,
-        mut acquired: Option<AcquiredWorkSlot>,
-    ) -> Result<WorkAttempt, WorkBlocked> {
-        let peer = reserve_slot(WorkBound::Peer, &self.peer, &mut acquired)?;
-        let node = reserve_slot(WorkBound::Node, &self.node, &mut acquired)?;
-        Ok(WorkAttempt {
-            resources: Arc::new(WorkResources {
-                _peer: peer,
-                _node: node,
-            }),
-            response_cap: self.policy.response_cap(request),
-        })
-    }
-
     #[cfg(test)]
     pub(crate) fn peer_budget(&self) -> &SlotBudget {
         &self.peer
@@ -161,59 +142,6 @@ async fn reserve_response_slot(budget: &SlotBudget, bound: WorkBound) -> SlotPer
     }
     metrics::counter!("sync.block.serving.delayed", "bound" => bound.label()).increment(1);
     budget.reserve().await
-}
-
-/// A fair waiter's capacity, usable only for its original budget.
-#[cfg(test)]
-#[derive(Debug)]
-pub(crate) struct AcquiredWorkSlot {
-    budget: SlotBudget,
-    permit: SlotPermit,
-}
-
-#[cfg(test)]
-fn reserve_slot(
-    kind: WorkBound,
-    budget: &SlotBudget,
-    acquired: &mut Option<AcquiredWorkSlot>,
-) -> Result<SlotPermit, WorkBlocked> {
-    if acquired
-        .as_ref()
-        .is_some_and(|slot| budget.same_budget(&slot.budget))
-    {
-        return Ok(acquired
-            .take()
-            .expect("the matching slot was checked")
-            .permit);
-    }
-    budget.try_reserve().ok_or_else(|| WorkBlocked {
-        kind,
-        budget: budget.clone(),
-    })
-}
-
-/// Capacity exhaustion is a local delay, not evidence of a peer violation.
-#[cfg(test)]
-#[derive(Debug)]
-pub(crate) struct WorkBlocked {
-    kind: WorkBound,
-    budget: SlotBudget,
-}
-
-#[cfg(test)]
-impl WorkBlocked {
-    pub(crate) fn kind(&self) -> WorkBound {
-        self.kind
-    }
-
-    /// The caller must also poll session cancellation while waiting.
-    pub(crate) async fn wait(self) -> AcquiredWorkSlot {
-        let permit = self.budget.reserve().await;
-        AcquiredWorkSlot {
-            budget: self.budget,
-            permit,
-        }
-    }
 }
 
 /// Provisional work ownership. Dropping it rolls back admission.
@@ -342,9 +270,6 @@ impl WorkLease {
     }
     pub(crate) fn is_cancelled(&self) -> bool {
         self.execution.cancelled.is_cancelled()
-    }
-    pub(crate) async fn cancelled(&self) {
-        self.execution.cancelled.cancelled().await;
     }
 }
 

@@ -609,9 +609,8 @@ impl PeerRegistry {
         }
     }
 
-    /// Remove a peer without checking its session ID.
-    /// Used by public test or driver events that don't carry a session ID.
-    /// Session cleanup must use `remove_session` to protect a newer connection.
+    /// Remove a unit-test peer injected without a session ID.
+    #[cfg(test)]
     pub(super) fn remove(&self, peer: &ZakuraPeerId) {
         self.lock().remove(peer);
     }

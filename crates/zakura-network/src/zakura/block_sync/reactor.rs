@@ -312,15 +312,12 @@ pub(super) struct BlockSyncReactor {
     /// only entry insert (admission) / remove (teardown).
     registry: Arc<PeerRegistry>,
     events: mpsc::Receiver<BlockSyncEvent>,
-    /// A keep-alive sender clone for the bounded driver-event channel so the
-    /// receiver never resolves to `None` while the reactor lives. The service no
-    /// longer stores an `events` sender (it was only used by the deleted
-    /// `deliver_frame` pipe path), so without this the channel would close as soon
-    /// as a consumer moved (not cloned) the handle. The reactor never sends on it.
+    /// Keep the driver-event channel open if the service takes ownership of the
+    /// last external handle. The reactor never sends through this clone.
     _events_keepalive: mpsc::Sender<BlockSyncEvent>,
     lifecycle: mpsc::UnboundedReceiver<BlockSyncEvent>,
-    /// Keeps the public control path alive after the service retains only the
-    /// private peer lifecycle sender.
+    /// Keep the public control path open after the service retains only the
+    /// current-session table.
     _lifecycle_keepalive: mpsc::UnboundedSender<BlockSyncEvent>,
     /// Service-owned lifecycle facts with exact session identity.
     current_sessions: Arc<super::service::CurrentSessions>,
@@ -617,7 +614,9 @@ impl BlockSyncReactor {
             .trace
             .emit_event(|| BlockEventReceived::new(&event));
         match event {
+            #[cfg(test)]
             BlockSyncEvent::PeerConnected(session) => self.handle_peer_connected(session).await,
+            #[cfg(test)]
             BlockSyncEvent::PeerDisconnected(peer) => {
                 if let Some(session_id) = self
                     .state

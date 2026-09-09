@@ -81,7 +81,8 @@ check that admission does not depend on a refill timer.
 
 Shared-request histories use a test-only GetPeers policy with the production
 discovery codec. They exercise provisional, execution, response, and frame owners,
-including rollback and fair-waiter pool identity. This does not enable discovery
+including FIFO admission and cancellation of partial peer claims. They poll the
+production async admission future; there is no separate admission algorithm. This does not enable discovery
 regulation or establish its full protocol conformance.
 
 ## Replay and reuse
@@ -89,7 +90,8 @@ regulation or establish its full protocol conformance.
 JSON version 4 records one active response per identity, including old work that
 survives reconnects. Earlier versions describe a different admission contract and
 are rejected. The committed reconnect replay attributes each owner to its original
-session, so matching node totals cannot conceal a session error.
+session, so matching node totals cannot conceal a session error. The old
+`drop_ledger` action name remains accepted as an alias for `drop_producer`.
 
 For another message family, define its work unit and every owner that can outlive
 the handler. Reuse the shared request primitives where applicable, then exercise

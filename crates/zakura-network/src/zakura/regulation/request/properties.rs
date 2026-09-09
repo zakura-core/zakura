@@ -1,5 +1,6 @@
 //! Independent lifecycle histories for shared finite-request admission.
 
+use futures::FutureExt;
 use proptest::prelude::*;
 
 use super::{
@@ -94,12 +95,12 @@ proptest! {
             let owner = &mut owners[peer];
             match action {
                 Action::Admit => {
-                    let result = sessions[peer].try_admit(&requests[peer], None);
+                    let result = sessions[peer].admit(&requests[peer]).now_or_never();
                     if occupied < node_capacity {
                         owner.attempt = Some(result.unwrap());
                         *model = Model { attempt: true, ..Model::default() };
                     } else {
-                        prop_assert_eq!(result.unwrap_err().kind(), WorkBound::Node, "{:?}", history);
+                        prop_assert!(result.is_none(), "{:?}", history);
                     }
                 }
                 Action::Commit => {

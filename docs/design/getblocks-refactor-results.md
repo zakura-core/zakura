@@ -138,7 +138,7 @@ ending. A read lasting beyond the former eight-second query timeout can finish
 normally. Cancellation and stale-session tests keep the actual job charged and
 prevent old output from reaching a replacement.
 
-Nine owned-state-read tests exercise the byte cap, retained results, cancellation
+Eleven owned-state-read tests exercise the byte cap, retained results, cancellation
 before and between lookups, a dropped waiter, an aborted caller, panic unwinding,
 and the public API against empty and populated databases. The concurrency tests
 wait for a real blocking job, terminate its caller, verify retained ownership,
@@ -163,9 +163,11 @@ Build the network tests with
 Run the emitted executable with `/usr/bin/time -l`, the fully qualified test
 name, and `--exact --nocapture` to measure RSS without compilation.
 
-Raw probes are in `handler/tests/quic_progress.rs`. Matched downloads are in
-`handler/tests/paired_block_sync.rs`; long comparisons and reopen repetitions
-are under its `gate` module. The `blocksync-transport-gate` nextest profile
+Matched downloads are in `handler/tests/paired_block_sync.rs`; long comparisons
+and reopen repetitions are under its `gate` module. The earlier raw probes were
+removed after the paired tests covered completion, pauses, saturation, and retry.
+Their [source remains in history](https://github.com/zakura-core/zakura/blob/7cf0d46d0c0b0a3680f032935384a397d0c324d9/crates/zakura-network/src/zakura/handler/tests/quic_progress.rs).
+`quic_progress.rs` retains the QUIC backport regression test. The `blocksync-transport-gate` nextest profile
 selects those explicit long-running measurements. Local measurement logs and
 median JSON files are retained under `target/getblocks-gate/`.
 
@@ -173,7 +175,7 @@ A passing diagnostic stall test confirms the expected stall and recovery;
 it is not a successful completion measurement. The matched results above are
 the activation evidence.
 
-Completed checks:
+Checks before the cleanup, at `c7481f0cd`:
 
 - Workspace Clippy with all targets and warnings denied passes.
 - The regulation profile lists and runs 102 tests; all pass without retries,
@@ -201,3 +203,29 @@ P2P stack, fail to establish usable public peer connections, and expire waiting
 for sync progress. These are not paired-transport runs. Host networking and
 legacy peer policy were left unchanged. The macOS compact-unwind linker warning
 also remains; it does not prevent linking or execution.
+
+### Cleanup validation against main
+
+The file-by-file cleanup removes unused send APIs, duplicate test admission and
+lifecycle adapters, and superseded raw transport probes. Tests now use the real
+admission future and session table. The owned state-read API retains its byte
+cap; the existing unowned API keeps its original signature.
+
+With Rust 1.97.0 on September 9, 2026:
+
+- All 1,230 selected network tests and 11 owned-state-read tests pass.
+- The regulation profile lists and passes 103 tests without retries.
+- All 22 integration tests pass without retries.
+- Workspace Clippy with all targets and warnings denied, formatting, Markdown
+  lint, and changelog validation pass.
+
+The first network run exposed a test timing assumption: connection setup took
+3.27 seconds after starting a three-second cooldown. The test now keeps its
+cooldown longer than its connection deadline and asserts that the park is still
+live before checking admission. No production cooldown changed.
+
+The three unavailable loopback-address tests above remain excluded. The long
+loss, reopening, and repeated-saturation gates retain their earlier measurements;
+they were not rerun for this cleanup. Their transport settings and serving
+algorithms are unchanged, and the routine matched-download and recovery tests
+pass again. The full workspace run was not repeated.

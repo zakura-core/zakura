@@ -443,7 +443,7 @@ async fn a_stale_session_cannot_read_after_waiting_for_admission() {
         .map(|id| {
             f.regulator
                 .session(ZakuraPeerId::new(vec![id; 32]).unwrap())
-                .try_admit(1)
+                .admit_now(1)
                 .unwrap()
                 .commit()
         })

@@ -7,7 +7,7 @@ use tower::ServiceExt;
 use tracing::Span;
 use zakura_chain::{block, diagnostic::CodeTimer};
 
-use super::{collect_bounded_height_range, read, ReadStateService};
+use super::{read, ReadStateService};
 use crate::{request::TimedSpan, BoxError, ReadRequest};
 
 /// A bounded block prefix together with the resources charged for reading it.
@@ -23,16 +23,6 @@ pub struct OwnedBlockRange<R> {
 }
 
 impl<R> OwnedBlockRange<R> {
-    /// Borrow the contiguous block prefix, including each block's encoded size.
-    pub fn blocks(&self) -> &[(block::Height, Arc<block::Block>, usize)] {
-        &self.blocks
-    }
-
-    /// Borrow the resources retained by this result.
-    pub fn resources(&self) -> &R {
-        &self.resources
-    }
-
     /// Transfer the blocks and their resources to the next owner.
     ///
     /// The caller must retain the resources for as long as its resource policy
@@ -45,9 +35,9 @@ impl<R> OwnedBlockRange<R> {
 impl ReadStateService {
     /// Read a bounded contiguous prefix while the database job owns `resources`.
     ///
-    /// This uses the same readiness checks, chain snapshot, byte cap, and missing
-    /// block behavior as [`ReadRequest::BlocksByHeightRange`]. It dispatches one
-    /// blocking job, then transfers its resources into the returned result.
+    /// This uses the same readiness checks, chain snapshot, and missing-block
+    /// behavior as [`ReadRequest::BlocksByHeightRange`], with an additional byte
+    /// cap. One blocking job transfers its resources into the returned result.
     ///
     /// `is_cancelled` is checked before the first lookup and between lookups.
     /// Cancellation stops further lookups and returns the prefix already read.
@@ -63,12 +53,7 @@ impl ReadStateService {
         is_cancelled: impl FnMut(&R) -> bool + Send + 'static,
     ) -> Result<OwnedBlockRange<R>, BoxError> {
         self.ready().await?;
-        ReadRequest::BlocksByHeightRange {
-            start,
-            count,
-            max_response_bytes,
-        }
-        .count_metric();
+        ReadRequest::BlocksByHeightRange { start, count }.count_metric();
         let state = self.clone();
         let best_chain = state.latest_best_chain();
         spawn_owned_block_range(
@@ -105,6 +90,33 @@ fn spawn_owned_block_range<R: Send + 'static>(
         });
         Ok(OwnedBlockRange { blocks, resources })
     })
+}
+
+/// Read a contiguous prefix without retaining more encoded block bytes than
+/// the caller permits.
+///
+/// The first block that does not fit can be materialized by the lookup, but is
+/// dropped immediately and never enters the returned response.
+fn collect_bounded_height_range<T>(
+    start: block::Height,
+    count: u32,
+    max_response_bytes: u32,
+    mut get_block: impl FnMut(block::Height) -> Option<(T, usize)>,
+) -> Vec<(block::Height, T, usize)> {
+    let mut response_bytes = 0u64;
+    (0..count)
+        .map_while(|offset| {
+            let height = start.0.checked_add(offset).map(block::Height)?;
+            let (block, size) = get_block(height)?;
+            let size_u64 = u64::try_from(size).ok()?;
+            let next_response_bytes = response_bytes.checked_add(size_u64)?;
+            if next_response_bytes > u64::from(max_response_bytes) {
+                return None;
+            }
+            response_bytes = next_response_bytes;
+            Some((height, block, size))
+        })
+        .collect()
 }
 
 #[cfg(test)]

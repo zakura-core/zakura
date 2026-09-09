@@ -83,13 +83,13 @@ async fn returned_blocks_retain_resources_and_respect_the_byte_cap() {
     assert_eq!(reads.load(Ordering::SeqCst), 3);
     assert_eq!(
         result
-            .blocks()
+            .blocks
             .iter()
             .map(|(height, _, _)| *height)
             .collect::<Vec<_>>(),
         [block::Height(1), block::Height(2)]
     );
-    assert_eq!(result.resources().drops.load(Ordering::SeqCst), 0);
+    assert_eq!(result.resources.drops.load(Ordering::SeqCst), 0);
     let (blocks, resources) = result.into_parts();
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     drop(blocks);
@@ -115,7 +115,7 @@ async fn cancellation_before_the_first_lookup_skips_the_range() {
     .await
     .unwrap()
     .unwrap();
-    assert!(result.blocks().is_empty());
+    assert!(result.blocks.is_empty());
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     drop(result);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -145,7 +145,7 @@ async fn cancellation_between_lookups_retains_the_completed_prefix() {
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(result.blocks().len(), 1);
+    assert_eq!(result.blocks.len(), 1);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     drop(result);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -250,7 +250,7 @@ async fn the_state_api_returns_an_owned_empty_range() {
     .await
     .unwrap()
     .unwrap();
-    assert!(result.blocks().is_empty());
+    assert!(result.blocks.is_empty());
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     drop(result);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -281,7 +281,7 @@ async fn the_state_api_returns_committed_blocks_with_their_resources() {
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(result.blocks(), [(block::Height(0), block, size)]);
+    assert_eq!(result.blocks, [(block::Height(0), block, size)]);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
     drop(result);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -311,4 +311,50 @@ async fn readiness_failure_releases_resources_without_dispatching_a_read() {
     assert_eq!(error.to_string(), failure.to_string());
     timeout(DEADLINE, finished).await.unwrap().unwrap();
     assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn block_range_response_stops_before_crossing_its_byte_limit() {
+    let sizes = [3usize, 2, 4];
+    let exact = super::collect_bounded_height_range(block::Height(10), 3, 5, |height| {
+        let index = usize::try_from(height.0.checked_sub(10)?).ok()?;
+        sizes.get(index).copied().map(|size| (index, size))
+    });
+    assert_eq!(
+        exact,
+        vec![(block::Height(10), 0, 3), (block::Height(11), 1, 2)],
+        "the exact-fit prefix is returned and the first over-limit block is excluded",
+    );
+
+    let one_byte_short = super::collect_bounded_height_range(block::Height(10), 3, 4, |height| {
+        let index = usize::try_from(height.0.checked_sub(10)?).ok()?;
+        sizes.get(index).copied().map(|size| (index, size))
+    });
+    assert_eq!(
+        one_byte_short,
+        vec![(block::Height(10), 0, 3)],
+        "a prefix that would cross the cap by one byte stops before that block",
+    );
+
+    let first_too_large = super::collect_bounded_height_range(block::Height(10), 3, 2, |height| {
+        let index = usize::try_from(height.0.checked_sub(10)?).ok()?;
+        sizes.get(index).copied().map(|size| (index, size))
+    });
+    assert!(
+        first_too_large.is_empty(),
+        "a first block larger than the response budget is not retained",
+    );
+}
+
+#[test]
+fn block_range_response_includes_a_maximum_size_first_block() {
+    let maximum = usize::try_from(block::MAX_BLOCK_BYTES).unwrap();
+    let cap = u32::try_from(block::MAX_BLOCK_BYTES).unwrap();
+    let result = super::collect_bounded_height_range(block::Height(10), 2, cap, |height| {
+        Some((height, maximum))
+    });
+    assert_eq!(
+        result,
+        vec![(block::Height(10), block::Height(10), maximum)]
+    );
 }

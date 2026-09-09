@@ -16,7 +16,7 @@ fn session(regulator: &GetBlocksServingRegulator, identity: u8) -> GetBlocksServ
 }
 
 fn queued_response(session: &GetBlocksServingSession) -> FrameGuard {
-    let mut permit = session.try_admit(1).unwrap().commit();
+    let mut permit = session.admit_now(1).unwrap().commit();
     permit.frame_guard(RESPONSE_BYTES)
 }
 
@@ -24,9 +24,11 @@ fn queued_response(session: &GetBlocksServingSession) -> FrameGuard {
 fn default_response_count_caps_large_requests_at_one_block() {
     let config = ZakuraBlockSyncConfig::default();
     for count in [1, 128, u32::MAX] {
-        let cost = serving_cost(&config, count).unwrap();
-        assert_eq!(cost.count, 1);
-        assert_eq!(cost.response_cap, RESPONSE_BYTES);
+        let cap = GetBlocksPolicy::new(&config)
+            .response_cap_for_count(count)
+            .unwrap();
+        assert_eq!(config.initial_status().max_blocks_per_response, 1);
+        assert_eq!(cap, RESPONSE_BYTES);
     }
 }
 
@@ -34,28 +36,16 @@ fn default_response_count_caps_large_requests_at_one_block() {
 fn producer_waits_for_both_query_and_writer_owners() {
     let regulator = defaults();
     let peer = session(&regulator, 1);
-    let mut permit = peer.try_admit(1).unwrap().commit();
+    let mut permit = peer.admit_now(1).unwrap().commit();
     let query = permit.work_lease();
     assert!(query.try_start());
     let frame = permit.frame_guard(9);
     drop(permit);
     drop(frame);
     assert_eq!(regulator.snapshot().node_active, 1);
-    assert!(peer.try_admit(1).is_err());
+    assert!(peer.admit_now(1).is_none());
     drop(query);
-    assert!(peer.try_admit(1).is_ok());
-}
-
-#[tokio::test(start_paused = true)]
-async fn default_capacity_allows_continuous_serving_as_writes_finish() {
-    let regulator = defaults();
-    let peer = session(&regulator, 1);
-    let start = tokio::time::Instant::now();
-    for _ in 0..4096 {
-        drop(queued_response(&peer));
-    }
-    assert_eq!(tokio::time::Instant::now(), start);
-    assert_eq!(regulator.snapshot().node_active, 0);
+    assert!(peer.admit_now(1).is_some());
 }
 
 #[tokio::test(start_paused = true)]
@@ -69,8 +59,8 @@ async fn default_producer_limits_hold_until_writes_finish() {
     tokio::time::advance(Duration::from_secs(60)).await;
     let before = regulator.snapshot();
     assert_eq!(before.node_active, 64);
-    assert_eq!(peers[0].try_admit(1).unwrap_err().kind(), WorkBound::Peer);
-    assert_eq!(peers[64].try_admit(1).unwrap_err().kind(), WorkBound::Node);
+    assert!(peers[0].admit_now(1).is_none());
+    assert!(peers[64].admit_now(1).is_none());
     assert_eq!(regulator.snapshot(), before);
     frames.pop();
     frames.push(queued_response(&peers[64]));

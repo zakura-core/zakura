@@ -67,6 +67,9 @@ gh workflow run zakura-continuous-sync.yml --repo zakura-core/zakura \
 Use the same harness branch as the launch. Collection is safe while syncing;
 it reports the current phase without stopping the hosts. A completed or failed
 run also uploads its logs, traces, configuration and bootstrap/service journal.
+Each collection saves a read-only metrics and host-counter snapshot plus build
+environment/configuration, so counters remain available after the node stops.
+Unavailable metrics during build or after shutdown are recorded explicitly.
 Download the collection workflow's `genesis-candidate-<collection-run-id>`
 artifact before cleanup. A missing host, failed bootstrap, stalled sync or
 unconfirmed height has no BPS result.

@@ -94,7 +94,7 @@ criteria = "safe-to-deploy"
 [[exemptions.aes-gcm]]
 version = "0.10.3"
 criteria = "safe-to-deploy"
-notes = "Audit hold: the documented plaintext bound of 2^36 bytes exceeds the 2^36 - 32 byte limit of NIST SP 800-38D section 5.2.1.1, and the cipher 0.4.4 counter helper checks remaining blocks with remainder instead of division, so oversized GCM input can wrap the counter. noq-proto uses this crate only for QUIC Retry integrity tags over empty plaintext, which cannot reach that bound. Upstream has corrected the length bound but no 0.10.x patch release exists as of 2026-09-08. Retain the exemption until a fixed release is adopted or the restricted use is certified explicitly; see docs/decisions/zakura/iroh-1.1-validation.md."
+notes = "Audit hold: the documented plaintext bound of 2^36 bytes exceeds the 2^36 - 32 byte limit of NIST SP 800-38D section 5.2.1.1, and the cipher 0.4.4 counter helper checks remaining blocks with remainder instead of division, so oversized GCM input can wrap the counter. noq-proto uses this crate only for QUIC Retry integrity tags over empty plaintext, which cannot reach that bound. Upstream has corrected the length bound but no 0.10.x patch release exists as of 2026-09-08. Retain the exemption until a fixed release is adopted or the restricted use is certified explicitly."
 
 [[exemptions.async_io_stream]]
 version = "0.3.3"
@@ -291,7 +291,7 @@ notes = "Audit hold: binary-plist dates below roughly -6.3e10 seconds pass the r
 [[exemptions.polyval]]
 version = "0.6.2"
 criteria = "safe-to-deploy"
-notes = "Audit hold: the software-32, software-64 and ARM backends produce different tags when initialized with a nonzero starting value, and the autodetect wrapper keeps its backend in ManuallyDrop without a destructor, which bypasses optional clearing when an unfinished value is dropped. The GHASH constructor used by AES-GCM initializes with zero, where all backends agree, so the divergence was not found reachable from noq-proto. No later 0.6 patch release exists as of 2026-09-08. Retain the exemption pending an upstream fix or an explicit review of the restricted use; see docs/decisions/zakura/iroh-1.1-validation.md."
+notes = "Audit hold: the software-32, software-64 and ARM backends produce different tags when initialized with a nonzero starting value, and the autodetect wrapper keeps its backend in ManuallyDrop without a destructor, which bypasses optional clearing when an unfinished value is dropped. The GHASH constructor used by AES-GCM initializes with zero, where all backends agree, so the divergence was not found reachable from noq-proto. No later 0.6 patch release exists as of 2026-09-08. Retain the exemption pending an upstream fix or an explicit review of the restricted use."
 
 [[exemptions.prefix-trie]]
 version = "0.8.4"

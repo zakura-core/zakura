@@ -118,8 +118,9 @@ reqwest stack:
   crates are recorded narrowly in `deny.toml` for duplicate detection until the
   upstream crates converge.
 
-`cargo deny check bans licenses sources` passes locally; current validation
-evidence is recorded in [the validation report](iroh-1.1-validation.md).
+`cargo deny check bans licenses sources` passes locally. Dependency review
+evidence and exemptions are recorded in `qa/supply-chain/audits.toml` and
+`qa/supply-chain/config.toml`.
 
 ## Reserved Identity Surface
 
@@ -157,27 +158,41 @@ Old and upgraded dual-stack nodes reject the native upgrade before handing off
 TCP and retain legacy connectivity. Independently built old/new process tests
 verify two Ping/Pong exchanges in both dialing directions with no native session
 registered. Full-node propagation and fresh-client catch-up also pass in both
-directions at a 66-block gap. Smaller gaps use the existing ten-minute fallback
-window; see the [measured recovery evidence](iroh-1.1-validation.md).
+directions at a 66-block gap, recovering in about 31 seconds. The faster legacy
+probe requires a gap of at least 64 blocks; smaller gaps use the existing
+ten-minute fallback window. Six-block restart tests took about 603 seconds in
+both directions, despite working TCP. Ping/Pong success does not imply fast
+restart recovery.
 Native-only nodes in different cohorts cannot communicate. They
 need reachable same-cohort seeds and a coordinated upgrade; a protocol bump does
 not supply them with a legacy fallback.
 
 ## Validation and Release Gate
 
+The authentication review confirmed TLS 1.3 raw-public-key identity binding and
+Dalek `verify_strict` for handshake signatures. The server key must match the
+requested endpoint identity; the retained Dalek version rejects small-order
+keys and signature points and noncanonical scalars. `legacy_compatibility` is
+not enabled. Known-answer and malformed-signature tests passed with both the
+fork and upstream Iroh 1.1, supporting the narrow dependency change without
+constituting a full cryptographic audit.
+
 The independently built process probes verified 1 MiB payload delivery for
 old-old and new-new native pairs, bounded rejection in both mixed native
 directions, and successful Ping/Pong exchanges in both mixed TCP directions.
-The probes and their runner are deferred to a separate testing PR; the completed
-results remain recorded in the [validation report](iroh-1.1-validation.md).
+The probes and their runner are deferred to a separate testing PR.
 
 The large bidirectional transfer regression sends 64 MiB each way with production
 transport limits, exceeding the send and receive windows. The exact noq 1.2.0
 `tail_loss_respect_max_datagrams` regression passes on macOS and Linux. Local
 workspace tests also cover identity persistence, per-IP admission, decoy
 addresses, legacy handoff/recovery, cancellation, framing and block sync.
-These checks do not replace independently pinned full-node sync/propagation
-tests, Linux impairment tests or an authorized mixed-cohort Testnet soak.
+Ten local Linux full-node cases also passed across both versions, covering
+baseline, loss/delay, reordering, MTU 1280 and outage recovery without TCP.
+The emulated runs used different build profiles, so they are not a performance
+comparison or proof of long-term memory stability under hostile load. An
+authorized long-duration deployment soak remains a separate release gate; no
+deployment has been performed.
 
 Root Cargo patches are not inherited by library consumers and are not a
 registry distribution strategy. The existing crate publish-graph and release
@@ -186,6 +201,14 @@ no packages are created or published to crates.io. A registry-compatible
 upstream release or separately approved publication strategy is required before
 release readiness. Retire the fork when the upstream dependency graph resolves
 and passes the same interoperability checks.
+
+The proposed registry family is `zakura-iroh`, `zakura-iroh-base`,
+`zakura-iroh-relay` and `zakura-iroh-dns` at `1.1.0-rc.1`. The fork's
+`PUBLICATION.md` and generated `zakura-consumer.toml` describe the switch.
+Prepared archives and a consumer workspace passed local checks with temporary
+source patches; this does not prove crates.io resolution. Published contents
+need matching audit records, and the registry graph must retain the reviewed
+LRU version because consumers do not inherit Zakura's lockfile or deny policy.
 
 The Git source has explicit cargo-vet policy and reviewed compatibility deltas,
 and the upstream baseline and dependency graph are covered by audit records and
@@ -196,6 +219,9 @@ fork or upstream before native transport is enabled on public nodes. Existing
 release and supply-chain checks remain enabled; passing cargo-deny does not
 satisfy cargo-vet or constitute a cryptographic audit.
 
-The follow-up [preparation evidence](iroh-1.1-validation.md) records the proposed
-package family, archive and consumer checks, authentication review, full-node
-recovery timing, and remaining cargo-vet coverage.
+Pre-existing review concerns around ban admission, peer-directed internal-address
+probes, advertised addresses, dial/backoff behavior and handoff metadata binding
+still need separate fixes or explicit security dispositions before broader native
+deployment. Their presence before this upgrade does not establish safety;
+exploitability and the reported severity labels have not been independently
+confirmed.

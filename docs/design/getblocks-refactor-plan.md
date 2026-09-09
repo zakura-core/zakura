@@ -52,7 +52,8 @@ Keep the [proposal's](https://github.com/zakura-core/zakura/pull/892#issuecommen
 
 1. **Allow request writes to wait under serving pressure.** Today's generic write timeout closes the connection after ten seconds. In the example above, that could disconnect B while useful block data is arriving. Once a write starts, finish the frame while the session remains valid; cancellation of that write resets the pair. Retain deadlines for data writes, session establishment, and ordinary downloads.
 2. **Allow a slow peer to establish and maintain delivery progress.** The loss test also fails on the original PR: its only cold probe expires under the short floor deadline. Give an unmeasured peer the normal bounded request deadline. Include transfer time for the requested body and earlier unreceived responses on the ordered data stream, using the measured rate with the existing 256 KiB/s lower bound. Keep the probe cap, ownership checks, and block-progress timeout. This policy fix is included by the user's explicit decision.
-3. **Move download-index optimization into a separate effort.** Preserve the current matching, retry, and ownership bookkeeping here. Optimizing it alongside the stream migration adds correctness risk and is not needed to complete this refactor.
+3. **Allow data writes to wait for shared connection credit.** With a paused sibling and packet loss, a healthy block-data write can take about 14 seconds while earlier blocks are still arriving. The existing ten-second deadline closes that connection. Use a bounded 32-second deadline for the paired data stream, including its control and ending messages. Cancellation still interrupts the write, and request expiry and block-progress liveness still apply. The user approved this amendment after a prototype completed the combined workload.
+4. **Move download-index optimization into a separate effort.** Preserve the current matching, retry, and ownership bookkeeping here. Optimizing it alongside the stream migration adds correctness risk and is not needed to complete this refactor.
 
 ## Implementation order
 
@@ -148,7 +149,7 @@ Adding a stream must not double the peer's allowance or let reconnects accumulat
 - Keep storage workers and outgoing frames charged to response permits across session replacement. Retain the weak per-identity permit registry and prune expired entries so reconnects cannot bypass the peer limit.
 - Share the existing block-sync message budget across both streams. Check message roles and payload limits before allocation, preserving malformed-message checks and the nine-byte `GetBlocks` payload limit: 17 bytes with framing. Account for pair setup separately.
 
-Keep bounded deadlines for data writes. Request writes follow the cancellation-aware policy under Proposal adjustments.
+Bound paired data writes to 32 seconds. Request writes follow the cancellation-aware policy under Proposal adjustments. Session setup and unrelated services retain their existing deadlines.
 
 ### 3. Move serving into a sequential task
 

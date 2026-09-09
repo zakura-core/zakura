@@ -170,6 +170,9 @@ const STREAM_WORKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const ORDERED_STREAM_REOPEN_BACKOFF: Duration = Duration::from_millis(250);
 const ORDERED_STREAM_REOPEN_BACKOFF_CAP: Duration = Duration::from_secs(8);
 const OUTBOUND_STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+// A paused sibling can make shared-credit updates take longer than ten seconds
+// on a slow link even while complete blocks keep arriving.
+const PAIRED_DATA_WRITE_TIMEOUT: Duration = Duration::from_secs(32);
 const OUTBOUND_REQUEST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 // Mirrors the legacy gossip compatibility protocol. Compile-time assertions
 // below keep this transport-side budget validator pinned to the codec constants.
@@ -4300,7 +4303,7 @@ async fn persistent_stream_worker_with_policy(
                                 debug!(?error, "closing Zakura ordered stream after peer stopped receiving");
                                 break;
                             }
-                            debug!(?error, "closing Zakura ordered stream writer");
+                            debug!(stream_kind, stream_id = context.stream_id, ?error, "closing Zakura ordered stream writer");
                             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
                             context.close_cause.record("ordered_write_error");
                             context.connection_token.cancel();
@@ -4741,7 +4744,12 @@ async fn write_ordered_frame_with_policy(
     if write_policy == OrderedWritePolicy::PairRequests {
         send.write_all(&frame).await?;
     } else {
-        timeout(OUTBOUND_STREAM_WRITE_TIMEOUT, send.write_all(&frame))
+        let write_timeout = if write_policy == OrderedWritePolicy::PairData {
+            PAIRED_DATA_WRITE_TIMEOUT
+        } else {
+            OUTBOUND_STREAM_WRITE_TIMEOUT
+        };
+        timeout(write_timeout, send.write_all(&frame))
             .await
             .map_err(|_| -> BoxError { "Zakura outbound frame write timed out".into() })??;
     }

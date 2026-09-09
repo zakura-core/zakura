@@ -75,8 +75,10 @@ while its session remains valid, even if its request deadline expires. Cancellin
 an unfinished write resets the pair; never append another frame after an
 abandoned partial frame.
 
-Request writes have no independent ten-second write timeout. Data writes retain
-that timeout. Stream resets, including resets during a payload, remain local to
+Request writes have no independent write timeout. The data stream has a bounded
+32-second write deadline, including control and ending messages. This allows
+shared-credit waits on slow links while other services are paused. Cancellation
+can still interrupt a data write. Stream resets during a payload remain local to
 the stream pair. A graceful end with a truncated frame payload remains invalid.
 
 ## Flow control

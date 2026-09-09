@@ -136,9 +136,11 @@ reserves output space before each blocking encode, and retains ownership in
 database jobs, encoded results, and queued frames. The node constructs the real
 state adapter at startup. The production version switch remains off.
 
-Five serving tests pass, including request arrival before Status, bounded Status
+Six serving tests pass, including request arrival before Status, bounded Status
 setup, a queued frame retaining the peer's slot, and aborting a running database
-job while a replacement session waits for the same peer capacity. The full
+job while a replacement session waits for the same peer capacity. Eighteen
+storage/queue combinations also preserve the exact available prefix and ending,
+including empty reads and storage failures. The full
 node compiles with the adapter. The session table replaces queued lifecycle
 history, and transport queues now use block sync's configured depths. The
 network regression run after these changes passed 934 tests, with three
@@ -200,7 +202,60 @@ The full network-library run passed 1,230 tests. Three listener tests cannot bin
 their additional loopback source addresses on this Mac. A fourth test required a
 reliability dip even when no request expired; after adapting that assertion, all
 947 Zakura tests passed, with 11 standalone gates ignored. The node also compiles.
-Five-run baseline comparisons and impaired reopen rounds remain in progress.
+The five-run comparisons below are complete. Impaired reopen rounds remain in
+progress.
+
+### Completed throughput comparisons
+
+Each row below contains five independent runs of each implementation, on the
+same host and link fixture. The baseline is the original PR with the same
+download-policy fix. Paused fixture streams use a one-frame queue on both paths;
+the baseline's production block-sync queues are unchanged. All 40 runs completed
+every block and ending without replacing their sessions.
+
+| Workload | Original median | Paired median | Paired useful throughput versus original | Highest RSS across both paths |
+| --- | --- | --- | --- | --- |
+| Ordinary download | 1.802 s | 1.781 s | 101.2% | 182.4 MiB |
+| 32,000 reverse requests | 1.830 s | 1.827 s | 100.1% | 186.3 MiB |
+| Reverse requests and a paused 16 MiB sibling | 1.781 s | 1.803 s | 98.8% | 210.2 MiB |
+| Reverse requests, 50 ms RTT, and 1% loss | 203.164 s | 205.934 s | 98.7% | 150.0 MiB |
+
+These rows pass their completion, throughput, and memory thresholds. They do not
+establish the combined paused-sibling/loss result or the remaining recovery gate.
+
+### Combined-condition failure
+
+With reverse requests, a paused sibling, and packet loss together, the original
+serving path completes only 16 of 32 blocks before its session closes. The paired
+path fails too: two diagnostic runs reach 16 and 17 blocks. Tracing identifies an
+outbound frame write timeout while accepted blocks are still arriving. This is a
+separate application deadline from the corrected download-request policy.
+
+An isolated prototype with a 32-second data-write deadline
+completes all 32 blocks and endings in 208.527 seconds, with 171.9 MiB peak RSS.
+Several writes take 13.8–14.1 seconds while complete blocks continue arriving.
+This separates the write deadline from insufficient transport capacity. The
+prototype changes neither QUIC nor its windows. The user approved this deadline
+for the paired data stream after reviewing the result. Both implementations in
+the combined comparison must use the same deadline. The paired data path now
+uses 32 seconds; its feature switch remains disabled until the remaining gates
+pass. Session setup and unrelated services keep their existing deadlines.
+
+Twenty saturation-and-retry cycles with the approved data deadline pass in one
+process, peaking at 257.6 MiB RSS. Every cycle releases the old session and
+serving capacity, then a fresh peer completes the returned download without a
+new work submission. A blocked sibling service's unchanged ten-second write
+deadline closes these connections first; this test verifies recovery and
+ownership, rather than the exact block-sync write-deadline duration.
+
+### Property coverage
+
+The ported regulation profile passed all 108 selected network and state tests
+without retries. It includes the independent serving ownership model, shared
+request histories, eight atomic request-write tests, sequential serving, pair
+setup/cancellation, and the nine owned-state-read tests. Long impaired and repeated
+transport measurements have a separate profile and are excluded from routine CI,
+including lanes that run ignored tests.
 
 ## Paired transport and request ownership
 

@@ -1848,9 +1848,13 @@ def compute_chain_summary(
                 group["fork_depth"] = depth_info.get("depth")
                 group["fork_depth_label"] = depth_info.get("label") or "unknown"
             else:
-                behind = majority["height"] - group["height"]
-                group["fork_depth"] = behind
-                group["fork_depth_label"] = f"{behind} behind"
+                height_delta = majority["height"] - group["height"]
+                group["fork_depth"] = abs(height_delta)
+                group["fork_depth_label"] = (
+                    f"{height_delta} behind"
+                    if height_delta > 0
+                    else f"{-height_delta} ahead"
+                )
 
     return {
         "status": status,
@@ -2244,6 +2248,7 @@ button { font: inherit; }
   border-radius: var(--r-md);
 }
 .tip-group.is-majority { border-left-color: var(--ok); }
+.tip-group.is-behind, .tip-group.is-ahead { border-left-color: var(--warn); }
 .tip-group.is-fork { border-left-color: var(--bad); }
 .tip-group-top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .tip-group-top .height { font-weight: 640; font-variant-numeric: tabular-nums; }
@@ -3015,6 +3020,14 @@ function renderStats(data) {
   el('stale-window').textContent =
     'stale after ' + Math.round(data.stale_after) + 's without a new block';
 }
+function tipGroupRole(group, chain) {
+  const isMajority = group.height === chain.majority_height
+    && group.block_hash === chain.majority_hash;
+  if (isMajority) return 'majority';
+  if (group.height === chain.majority_height) return 'fork';
+  if (group.height > chain.majority_height) return 'ahead';
+  return 'behind';
+}
 function renderChain(data) {
   const chain = data.chain || {};
   const status = chain.status || 'unknown';
@@ -3023,20 +3036,20 @@ function renderChain(data) {
 
   el('chain-summary').textContent = {
     split: 'Nodes disagree on the tip hash at the leading height.',
-    lagging: 'One tip hash leads; some nodes are behind.',
+    lagging: 'Nodes report different tip heights.',
     agreed: 'All observed nodes share the same tip.',
   }[status] || 'Waiting for tip observations.';
 
   el('tip-groups').innerHTML = tipGroups.length
     ? tipGroups.map((group) => {
-      const isMajority = group.height === chain.majority_height
-        && group.block_hash === chain.majority_hash;
+      const role = tipGroupRole(group, chain);
+      const isMajority = role === 'majority';
       const depth = group.fork_depth_label && !isMajority
         ? badge(group.fork_depth_label, 'warn')
         : '';
-      return '<div class="tip-group ' + (isMajority ? 'is-majority' : 'is-fork') + '">'
+      return '<div class="tip-group is-' + role + '">'
         + '<div class="tip-group-top">'
-        + badge(isMajority ? 'majority' : 'fork', isMajority ? 'ok' : 'bad')
+        + badge(role, tone(CHAIN_TONE, role))
         + '<span class="height num">height ' + num(group.height) + '</span>'
         + '<span class="mono muted" style="font-size:0.78rem">'
         + copyCell(group.block_hash, shortHash(group.block_hash), 'Copy tip hash') + '</span>'

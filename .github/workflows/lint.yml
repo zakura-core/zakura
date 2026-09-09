@@ -222,6 +222,9 @@ jobs:
       - name: Continuous-sync tests
         if: ${{ !cancelled() }}
         run: python3 deploy/continuous-sync/tests/test_continuous_sync.py
+      - name: Daily sync summary tests
+        if: ${{ !cancelled() }}
+        run: python3 deploy/continuous-sync/tests/test_daily_summary.py
 
       - name: Cluster dashboard and watchdog tests
         if: ${{ !cancelled() }}

@@ -172,6 +172,12 @@ criteria = "safe-to-deploy"
 version = "0.5.1"
 notes = "Reviewed all packaged source, manifest, and tests. This dependency-free no_std library performs bounded table-based Base32 encoding and decoding with no unsafe code, build script, runtime I/O, or ambient capabilities. All 19 unit tests, including QuickCheck round trips, and 1 doctest passed."
 
+[[audits.base64]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.22.1 -> 0.23.1"
+notes = "Reviewed the new SIMD implementation, feature/constructor guards, scalar encode/decode integration, padding/alphabet changes and manifest. All new unsafe is confined to SIMD: loads/stores have checked vector-width bounds, unaligned tails use unaligned writes, and CPU support is checked or required by an unsafe constructor/target cfg. Decode keeps the terminal quad in the scalar validator and falls back there on invalid vector bytes. No build script or new ambient capability; stream adapters only use caller-provided readers/writers. Ran 3,356,628 SIMD/scalar comparisons on AArch64 covering both alphabets, padding policies, vector boundaries, offsets, short outputs, malformed bytes and output canaries. AVX2 was source-reviewed, not executed."
+
 [[audits.base64ct]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -1823,6 +1829,12 @@ criteria = "safe-to-deploy"
 version = "0.7.2"
 notes = "Reviewed all packaged source, manifest, and tests. Loom is a test-only concurrency model checker: it replaces atomics, cells, and threads with instrumented versions and explores interleavings, so it is never linked into a production build. Its unsafe is the instrumented UnsafeCell and the thread-state bookkeeping, both of which exist only under the model checker's own scheduler. There is no build script and no ambient capability beyond the LOOM_ environment variables it documents. All 143 tests passed with all features."
 
+[[audits.lru]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.13.0 -> 0.18.3"
+notes = "Reviewed the complete production delta and surrounding list/map ownership: clone preserves the hasher and handles unbounded capacity, borrowed insertion ties returned mutable references to self, IterMut no longer creates an exclusive key reference, and pop detaches before a key destructor can panic. New constructors and key-aware insertion closures preserve ownership; find_and_promote only relinks a live node. No build script or ambient I/O. Focused probes with hashbrown 0.17.1 passed for panicking key destruction/recovery, bounded immutable-key caching, unbounded clone and double-ended mutable iteration. Not Miri or sanitizer execution. This record excludes 0.18.4 and its newly introduced retain method."
+
 [[audits.lru-slab]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -2611,6 +2623,12 @@ criteria = "safe-to-deploy"
 version = "0.41.0"
 notes = "Reviewed the manifest, the module-level documentation, and the unsafe surface, which is ten expressions of unchecked UTF-8 over spans the reader has already validated. XML is untrusted input and the reader is built for it: it is pull-based so nesting depth is the caller's loop rather than the stack, entity expansion is not performed for external or recursive entities, and the configuration exposes explicit limits for attribute and namespace handling. There is no build script. All 240 library tests passed."
 
+[[audits.quick-xml]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.41.0 -> 0.42.0"
+notes = "Reviewed manifest and capability boundaries, including the UTF-8 event/reader conversion, checked byte-to-string conversion, scalar parsing state, escaping and entity normalization. The crate forbids unsafe code and has no build script. File access only opens a caller-supplied path; other I/O uses supplied streams. Entity expansion calls a supplied resolver and does not fetch external resources; callers must bound input/depth and resolver expansion size. Changed string slices follow ASCII delimiters after UTF-8 validation. Combined parser probes exercised 71,936 malformed XML cases plus multilingual XML, invalid UTF-8 and unknown entities without panic. Optional encoding/serde/async paths were not runtime-tested; this is not a full XML conformance or resource-exhaustion audit."
+
 [[audits.quinn]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
@@ -3207,6 +3225,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.9.3"
 notes = "Reviewed all packaged source, manifest, DNS packet and zone parsers, writers, and tests. The safe parser checks every wire slice, caps labels and names, bounds record counts to header u16 values, and requires compression pointers to move strictly backward, preventing pointer cycles. Runtime operations are limited to caller-provided bytes and I/O; filesystem reads occur only in tests. All 117 unit tests and 6 doctests passed with all features."
+
+[[audits.simple-dns]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.9.3 -> 0.12.0"
+notes = "Reviewed manifest, unsafe/ambient surface (none), buffer/cursor primitives, compressed-name progress and length checks, packet sections, resource-data sub-buffer bounds, and caller-provided output adapters. Packet parsers use checked slices; record counts are u16 but preallocate before decoding, so callers must bound concurrent parsing. Pointer-only name chains move backward and chains with labels hit the name-length bound. No build script or hidden network/file/process I/O. Probes exercised 51,200 malformed DNS inputs with small section counts plus maximal-count short packets and compression-pointer boundaries without panic. This is not exhaustive record-type conformance coverage. Caller-built messages must fit wire-size limits; the custom Write helper can panic on a zero-progress writer, so use adequately sized output or a growable buffer."
 
 [[audits.sinsemilla]]
 who = "Claude Opus 5 <noreply@anthropic.com>"

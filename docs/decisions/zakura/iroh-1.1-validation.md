@@ -51,7 +51,7 @@ requirement and add review of each Git delta. The four recorded deltas cover
 only the compared source and manifest changes. They do not exempt the upstream
 baseline or trust all future publications from any maintainer.
 
-Cargo-vet still reports 31 versions missing `safe-to-deploy` coverage. Most
+Cargo-vet still reports 27 versions missing `safe-to-deploy` coverage. Most
 are unfinished reviews; the specific concerns below remain audit holds.
 The exact versions and suggested review bases are recorded in
 `qa/supply-chain/iroh-1.1-audit-backlog.json`. Refresh that file from
@@ -66,6 +66,15 @@ package only. Notes state review scope, caller constraints and test limitations.
 Cargo-vet removed the obsolete Iroh metrics 0.35 exemption after its replacement
 was reviewed. No new exemptions or publisher trust were added.
 
+Four further records cover base64, quick-xml, simple-dns and LRU 0.18.3,
+reducing missing coverage from 31 to 27. Base64's new SIMD code passed
+3,356,628 comparisons with its scalar implementation on AArch64, including
+malformed input, padding modes, vector boundaries and output canaries; AVX2
+was inspected but not executed. XML/DNS boundary probes completed 123,136
+malformed-input cases without panic. These are targeted checks, not exhaustive
+parser conformance or hostile-load validation. Audit notes identify caller
+limits and untested feature paths.
+
 For the Windows import libraries, all 21 compared source/archive files match
 Microsoft commit `00fe13a47c3cdce3287069be671aaa3c273f1e0a`. LLVM inspection found
 import data and indirect import stubs, without startup code; Windows execution
@@ -73,25 +82,40 @@ and complete API ABI validation were not performed. Conditional-move tests
 passed on native AArch64 and the portable fallback: 105 core tests and four
 regressions on each. This is not a timing guarantee for every architecture.
 
-The remaining 31 reviews include 15 without a reusable same-package baseline.
+The remaining 27 reviews include 15 without a reusable same-package baseline.
 They include Iroh/noq transport, DNS parsers/resolvers, OS bindings and concurrent
 collections. Passing integration tests does not complete those source reviews.
 
+### LRU version selection
+
+The workspace lockfile now selects published LRU 0.18.3, which retains the
+earlier lifetime, mutable-iterator and panic-safety fixes and does not contain
+0.18.4's new `retain` method. The latter can free a list node after a failed map
+removal when a key changes its hash through interior mutability, leaving a
+dangling entry. A small safe-Rust reproduction observed the inconsistent map
+length and skipped the destructor; the memory-safety conclusion comes from
+source inspection, not Miri or a sanitizer. Iroh relay uses immutable public-key
+keys and does not call `retain`; no peer-triggered path was found.
+
+The reviewed 0.13.0-to-0.18.3 delta has an audit record. Focused checks with
+hashbrown 0.17.1 pass for key-destructor panic recovery, bounded public-key-shaped
+caching, unbounded clone and double-ended mutable iteration. The consuming
+Iroh relay library passes `cargo check --locked`. Cargo metadata and the inverse
+dependency tree confirm that only LRU 0.18.3 is selected, and cargo-deny bans pass.
+An explicit ban on 0.18.4 prevents a routine lockfile update from reintroducing
+it unnoticed. A future version must be reviewed before adoption.
+
+This resolves the LRU hold for the current workspace graph without a new fork.
+A downstream workspace does not inherit this lockfile or cargo-deny policy;
+the eventual registry-package validation must check its resolved LRU version.
+
 ### Review holds
 
-These are upstream package concerns found during source review, not changes to
-cryptographic implementations in the compatibility fork. Compared with the PR
-base, AES-GCM and POLYVAL are newly selected dependencies, LRU changes from
-0.13.0 to 0.18.4, and cipher remains the existing registry version 0.4.4.
-No audit was recorded for the three held packages below.
+The two remaining holds concern upstream cryptographic packages, not changes to
+cryptographic implementations in the compatibility fork. AES-GCM and POLYVAL
+are newly selected dependencies relative to the PR base; cipher remains the
+existing registry version 0.4.4. Neither held package has a new audit record.
 
-- **lru 0.18.4:** The new `retain` method ignores a failed map removal before
-  freeing the list node. A key that changes its hash through interior mutability
-  can leave a dangling map entry. A small safe-Rust reproduction removes the sole
-  list entry but observes map length one; it deliberately skips the destructor
-  to avoid dereferencing freed storage. The memory-safety conclusion comes from
-  ownership inspection, not Miri or sanitizer execution. Iroh relay uses immutable
-  public-key keys and does not call `retain`, so no peer-triggered path was found.
 - **aes-gcm 0.10.3:** Its plaintext bound permits `2^36` bytes, exceeding the
   `2^36 - 32` byte limit in [NIST SP 800-38D, section 5.2.1.1][gcm-spec]. Its
   counter helper in cipher 0.4.4 also uses remainder instead of division when
@@ -109,12 +133,21 @@ No audit was recorded for the three held packages below.
   backend in `ManuallyDrop` without a destructor, bypassing optional clearing
   when an unfinished value is dropped; ARM clearing is also unimplemented.
 
+Upstream has [corrected the AES-GCM length bound][gcm-fix]. The registry has
+no later 0.10 patch release than 0.10.3, and no later POLYVAL 0.6 patch release
+than 0.6.2 as checked on September 8, 2026. Newer release series exist, but they
+change cryptographic trait dependencies and are not drop-in lockfile updates.
+They have not been adopted or certified here. The upstream fix references an
+advisory identifier whose details were unavailable; no advisory disposition is
+inferred from that reference.
+
 These holds need a supported upstream fix/version or an explicit review of the
 restricted usage before coverage can be completed. They are not evidence that
 Zakura must fork BIP32 or another cryptographic package. The large transport and
 platform reviews remain unfinished independently of these holds.
 
 [gcm-spec]: https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-38d.pdf
+[gcm-fix]: https://github.com/RustCrypto/AEADs/commit/94366496b72126872292d8e99631560383db4471
 
 Publication under the proposed names does not erase this review requirement.
 The new registry packages will need audit records tied to their published

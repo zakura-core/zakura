@@ -10,13 +10,6 @@
       ]
     },
     {
-      "name": "base64",
-      "version": "0.23.1",
-      "missing_criteria": [
-        "safe-to-deploy"
-      ]
-    },
-    {
       "name": "dlopen2",
       "version": "0.8.2",
       "missing_criteria": [
@@ -61,13 +54,6 @@
     {
       "name": "jni-sys",
       "version": "0.3.1",
-      "missing_criteria": [
-        "safe-to-deploy"
-      ]
-    },
-    {
-      "name": "lru",
-      "version": "0.18.4",
       "missing_criteria": [
         "safe-to-deploy"
       ]
@@ -185,22 +171,8 @@
       ]
     },
     {
-      "name": "quick-xml",
-      "version": "0.42.0",
-      "missing_criteria": [
-        "safe-to-deploy"
-      ]
-    },
-    {
       "name": "seize",
       "version": "0.5.1",
-      "missing_criteria": [
-        "safe-to-deploy"
-      ]
-    },
-    {
-      "name": "simple-dns",
-      "version": "0.12.0",
       "missing_criteria": [
         "safe-to-deploy"
       ]
@@ -234,22 +206,6 @@
           "insertions": 451,
           "deletions": 0,
           "files_changed": 8
-        }
-      }
-    },
-    {
-      "name": "lru",
-      "notable_parents": "iroh-relay",
-      "suggested_criteria": [
-        "safe-to-deploy"
-      ],
-      "suggested_diff": {
-        "from": "0.13.0",
-        "to": "0.18.4",
-        "diffstat": {
-          "insertions": 677,
-          "deletions": 49,
-          "files_changed": 6
         }
       }
     },
@@ -318,38 +274,6 @@
       }
     },
     {
-      "name": "base64",
-      "notable_parents": "plist",
-      "suggested_criteria": [
-        "safe-to-deploy"
-      ],
-      "suggested_diff": {
-        "from": "0.22.1",
-        "to": "0.23.1",
-        "diffstat": {
-          "insertions": 2751,
-          "deletions": 619,
-          "files_changed": 30
-        }
-      }
-    },
-    {
-      "name": "simple-dns",
-      "notable_parents": "iroh-dns",
-      "suggested_criteria": [
-        "safe-to-deploy"
-      ],
-      "suggested_diff": {
-        "from": "0.9.3",
-        "to": "0.12.0",
-        "diffstat": {
-          "insertions": 2278,
-          "deletions": 1203,
-          "files_changed": 53
-        }
-      }
-    },
-    {
       "name": "objc2-core-wlan",
       "notable_parents": "netdev",
       "suggested_criteria": [
@@ -394,22 +318,6 @@
           "insertions": 4139,
           "deletions": 0,
           "files_changed": 25
-        }
-      }
-    },
-    {
-      "name": "quick-xml",
-      "notable_parents": "plist",
-      "suggested_criteria": [
-        "safe-to-deploy"
-      ],
-      "suggested_diff": {
-        "from": "0.41.0",
-        "to": "0.42.0",
-        "diffstat": {
-          "insertions": 2334,
-          "deletions": 2207,
-          "files_changed": 36
         }
       }
     },

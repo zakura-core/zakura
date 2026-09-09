@@ -1300,6 +1300,56 @@ async fn queued_commit_failure_after_reset_must_reset_recovered_progress() -> Re
     Ok(())
 }
 
+/// A canceled caller must not discard recovery after a failed state commit.
+#[tokio::test]
+async fn dropped_response_must_preserve_failed_commit_reset() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+    let genesis =
+        Arc::<Block>::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])?;
+    let block = Arc::<Block>::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES[..])?;
+    let initial_tip = (block::Height(0), genesis.hash());
+    let checkpoints = BTreeMap::from([initial_tip, (block::Height(1), block.hash())]);
+    let (release, gate) = tokio::sync::watch::channel(false);
+    let state = tower::service_fn(move |request: zs::Request| {
+        let mut gate = gate.clone();
+        async move {
+            match request {
+                zs::Request::CommitCheckpointVerifiedBlock(_) => {
+                    gate.wait_for(|released| *released)
+                        .await
+                        .expect("the test retains the sender");
+                    Err::<zs::Response, BoxError>(
+                        std::io::Error::other("injected commit failure").into(),
+                    )
+                }
+                zs::Request::Tip => Ok(zs::Response::Tip(Some(initial_tip))),
+                _ => unreachable!("the verifier only commits blocks and reads the tip"),
+            }
+        }
+    });
+    let mut verifier =
+        CheckpointVerifier::from_list(checkpoints, &Mainnet, Some(initial_tip), state)
+            .map_err(|error| eyre!(error))?;
+    let response = verifier.call(block);
+    assert_eq!(verifier.previous_checkpoint_height(), FinalCheckpoint);
+    drop(response);
+    release.send_replace(true);
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while verifier.reset_generation == 0 {
+            verifier.apply_pending_reset();
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a failed commit must request recovery even after its caller drops the response");
+    assert_eq!(
+        verifier.previous_checkpoint_height(),
+        InitialTip(block::Height(0))
+    );
+    Ok(())
+}
+
 /// Duplicate block errors must stay classified as duplicate requests after the
 /// state wraps them, so they don't restart the syncer during checkpoint sync.
 #[test]

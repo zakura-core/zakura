@@ -1261,6 +1261,8 @@ where
         // we don't reject the entire checkpoint.
         // Instead, we reset the verifier to the successfully committed state tip.
         let state_service = self.state_service.clone();
+        let recovery_state = self.state_service.clone();
+        let reset_sender = self.reset_sender.clone();
         let network = self.network.clone();
         let commit_checkpoint_verified = tokio::spawn(async move {
             let queued_result = req_block
@@ -1303,32 +1305,17 @@ where
             }
             .await;
 
-            (result, reset_generation)
-        });
-
-        let state_service = self.state_service.clone();
-        let reset_sender = self.reset_sender.clone();
-        async move {
-            let commit_result = commit_checkpoint_verified.await;
-            // Avoid a panic on shutdown
-            //
-            // When `zakurad` is terminated using Ctrl-C, the `commit_checkpoint_verified` task
-            // can return a `JoinError::Cancelled`. We expect task cancellation on shutdown,
-            // so we don't need to panic here. The persistent state is correct even when the
-            // task is cancelled, because block data is committed inside transactions, in
-            // height order.
+            // The commit task owns recovery so a canceled caller cannot discard the reset.
             if zakura_chain::shutdown::is_shutting_down() {
                 return Err(VerifyCheckpointError::ShuttingDown);
             }
-            let (result, reset_generation) =
-                commit_result.expect("commit_checkpoint_verified should not panic");
             // Only a failed state commit can leave verified progress ahead of the state.
             // Block rejections must preserve progress while a verified range commits:
             // resetting to the lagging state tip would reopen an already-consumed range.
             // Duplicate commits also leave progress intact.
             if let Err(error @ VerifyCheckpointError::CommitCheckpointVerified(_)) = &result {
                 if !error.is_duplicate_request() {
-                    let tip = match state_service
+                    let tip = match recovery_state
                         .oneshot(zs::Request::Tip)
                         .await
                         .map_err(VerifyCheckpointError::Tip)?
@@ -1345,6 +1332,15 @@ where
                 }
             }
             result
+        });
+
+        async move {
+            let commit_result = commit_checkpoint_verified.await;
+            // Shutdown can cancel the commit task. State commits remain transactional.
+            if zakura_chain::shutdown::is_shutting_down() {
+                return Err(VerifyCheckpointError::ShuttingDown);
+            }
+            commit_result.expect("commit_checkpoint_verified should not panic")
         }
         .boxed()
     }

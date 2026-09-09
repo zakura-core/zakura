@@ -22,7 +22,8 @@ pub(crate) use guard::{Admit, ByteBudget, PeerMeters, SessionGuard};
 pub use io::{framed_channel, FramedRecv, FramedSend};
 #[allow(unused_imports)] // used by the first message policy in the stacked PR
 pub(crate) use io::{
-    worker_framed_channel, FrameGuard, FramedWorkerRecv, GuardedReserveError, QueuedFrame,
+    worker_framed_channel, FrameGuard, FrameWriteClaim, FramedWorkerRecv, GuardedFrameSlot,
+    GuardedReserveError, QueuedFrame,
 };
 pub(crate) use pipe::{
     handle_pipe_exit, spawn_supervised_peer_task, spawn_supervised_pipe, CloseCause, Edge, Flow,
@@ -31,7 +32,8 @@ pub(crate) use pipe::{
 pub use registry::{RegistryError, ServiceRegistry};
 pub(crate) use service::ServiceStream;
 pub use service::{
-    BoxRunFuture, OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPolicy, Peer,
-    RequestResponseService, Service, Sink, SinkReject, Source, Stream, StreamMode,
+    BoxRunFuture, OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPair,
+    OrderedStreamPolicy, Peer, RequestResponseService, Service, Sink, SinkReject, Source, Stream,
+    StreamMode,
 };
 pub use session::{OrderedSendError, PeerStreamSession};

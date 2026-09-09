@@ -41,7 +41,16 @@ impl FramedRecv {
         match &mut self.receiver {
             FramedReceiver::Plain(receiver) => receiver.recv().await,
             FramedReceiver::Queued(receiver) => {
-                receiver.recv().await.map(|queued| queued.into_parts().0)
+                while let Some(queued) = receiver.recv().await {
+                    if let Some(claim) = &queued.claim {
+                        if !claim.try_start() {
+                            continue;
+                        }
+                        claim.written();
+                    }
+                    return Some(queued.frame);
+                }
+                None
             }
         }
     }
@@ -101,7 +110,7 @@ impl FramedSend {
         };
         sender
             .try_reserve()
-            .map(GuardedFrameSlot)
+            .map(|permit| GuardedFrameSlot { permit, sender })
             .map_err(|error| match error {
                 mpsc::error::TrySendError::Full(()) => GuardedReserveError::Full,
                 mpsc::error::TrySendError::Closed(()) => GuardedReserveError::Closed,
@@ -118,7 +127,7 @@ impl FramedSend {
         sender
             .reserve()
             .await
-            .map(GuardedFrameSlot)
+            .map(|permit| GuardedFrameSlot { permit, sender })
             .map_err(|_| GuardedReserveError::Closed)
     }
 
@@ -141,13 +150,40 @@ impl FramedSend {
 
 /// One reserved queue slot. Dropping it returns capacity without sending a frame.
 #[derive(Debug)]
-pub(crate) struct GuardedFrameSlot<'a>(mpsc::Permit<'a, QueuedFrame>);
+pub(crate) struct GuardedFrameSlot<'a> {
+    permit: mpsc::Permit<'a, QueuedFrame>,
+    sender: &'a mpsc::Sender<QueuedFrame>,
+}
 
 impl GuardedFrameSlot<'_> {
     /// Transfer a validated frame and its ownership to the reserved queue slot.
     pub(crate) fn send(self, frame: Frame, guard: FrameGuard) {
-        self.0.send(QueuedFrame::guarded(frame, guard));
+        self.permit.send(QueuedFrame::guarded(frame, guard));
     }
+
+    /// Publish a request whose ownership must be claimed before its first byte.
+    /// A false result requires explicit settlement after publication unlocks:
+    /// Tokio can retain a send made through a permit after its receiver drops.
+    pub(crate) fn send_request(self, frame: Frame, claim: Arc<dyn FrameWriteClaim>) -> bool {
+        if self.sender.is_closed() {
+            return false;
+        }
+        self.permit.send(QueuedFrame {
+            frame,
+            guard: None,
+            claim: Some(claim),
+        });
+        !self.sender.is_closed()
+    }
+}
+
+/// Arbitrates an unwritten request against expiry and reset. Dropping a started
+/// but unfinished claim must retire the stream session before another write.
+pub(crate) trait FrameWriteClaim: std::fmt::Debug + Send + Sync {
+    /// Atomically claim current ownership, or skip this obsolete frame.
+    fn try_start(&self) -> bool;
+    /// Mark the complete frame accepted by the transport write.
+    fn written(&self);
 }
 
 /// Failure to reserve space for a guarded response.
@@ -182,17 +218,23 @@ impl FrameGuard {
 pub(crate) struct QueuedFrame {
     frame: Frame,
     guard: Option<FrameGuard>,
+    claim: Option<Arc<dyn FrameWriteClaim>>,
 }
 
 impl QueuedFrame {
     fn plain(frame: Frame) -> Self {
-        Self { frame, guard: None }
+        Self {
+            frame,
+            guard: None,
+            claim: None,
+        }
     }
 
     fn guarded(frame: Frame, guard: FrameGuard) -> Self {
         Self {
             frame,
             guard: Some(guard),
+            claim: None,
         }
     }
 
@@ -202,13 +244,24 @@ impl QueuedFrame {
     }
 
     /// Run the transport write while retaining this frame's guard.
-    pub(crate) async fn write_with<T, F, Fut>(self, write: F) -> T
+    pub(crate) async fn write_with<E, F, Fut>(self, write: F) -> Result<(), E>
     where
         F: FnOnce(Frame) -> Fut,
-        Fut: std::future::Future<Output = T>,
+        Fut: std::future::Future<Output = Result<(), E>>,
     {
-        let (frame, _guard) = self.into_parts();
-        write(frame).await
+        let Self {
+            frame,
+            guard: _guard,
+            claim,
+        } = self;
+        if claim.as_ref().is_some_and(|claim| !claim.try_start()) {
+            return Ok(());
+        }
+        write(frame).await?;
+        if let Some(claim) = &claim {
+            claim.written();
+        }
+        Ok(())
     }
 }
 
@@ -348,12 +401,16 @@ mod tests {
         let write = tokio::spawn(queued.write_with(move |_frame| async move {
             let _ = started_tx.send(());
             let _ = finish_rx.await;
+            Ok::<_, std::convert::Infallible>(())
         }));
         started_rx.await.expect("the write reaches its wait point");
         assert_eq!(budget.reserved(), 1);
 
         let _ = finish_tx.send(());
-        write.await.expect("the write task should not panic");
+        write
+            .await
+            .expect("the write task should not panic")
+            .unwrap();
         assert_eq!(budget.reserved(), 0);
     }
 
@@ -372,7 +429,7 @@ mod tests {
 
         let write = tokio::spawn(queued.write_with(move |_frame| async move {
             let _ = started_tx.send(());
-            std::future::pending::<()>().await;
+            std::future::pending::<Result<(), std::convert::Infallible>>().await
         }));
         started_rx.await.expect("the write reaches its wait point");
         assert_eq!(budget.reserved(), 1);
@@ -405,7 +462,7 @@ mod tests {
         let queued = receiver.recv().await.expect("guarded frame queued");
         let mut write = Box::pin(queued.write_with(|received| async move {
             assert_eq!(received, frame(2));
-            std::future::pending::<()>().await;
+            std::future::pending::<Result<(), std::convert::Infallible>>().await
         }));
         assert!(futures::poll!(&mut write).is_pending());
         assert_eq!(budget.reserved(), 1);
@@ -546,6 +603,7 @@ mod tests {
         let mut write = tokio::spawn(queued.write_with(move |frame| async move {
             send.write_all(&frame.payload).await.unwrap();
             send.finish().unwrap();
+            Ok::<_, std::convert::Infallible>(())
         }));
         let (_remote_send, mut slow_read) =
             tokio::time::timeout(Duration::from_secs(5), remote.accept_bi())
@@ -575,7 +633,7 @@ mod tests {
                 slow_read.read_to_end(2_000_001).await.unwrap().len(),
                 2_000_001
             );
-            write.await.unwrap();
+            write.await.unwrap().unwrap();
         })
         .await
         .expect("draining the peer resumes the write");

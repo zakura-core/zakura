@@ -18,11 +18,13 @@ guarantee. A missing result leaves the new service disabled.
 
 | Workload | Topology and load | Completion and throughput | Memory |
 | --- | --- | --- | --- |
-| Raw transport prerequisite | Two loopback endpoints in one process; one connection; one active data stream; zero, one, or two other streams each retaining a full 16 MiB window; transfer 64 MiB in one direction | Receive and verify all 64 MiB within 30 seconds, at least 2.13 MiB/s, without reading the paused streams | Peak process RSS at most 512 MiB, measured on the test executable |
+| Supported raw transport | Two loopback endpoints in one process; one connection; one active data stream; up to the advertised 32,000 request frames and one sibling service retaining a full 16 MiB window; transfer 64 MiB in one direction | Receive and verify all 64 MiB within 30 seconds, at least 2.13 MiB/s, without reading the paused streams | Peak process RSS at most 512 MiB, measured on the test executable |
 | Matched block download | Same endpoints and default windows; A downloads 32 near-maximum-size blocks from B, respecting the advertised count and byte caps; each actual outstanding request matched through its ending message | Complete within 30 seconds; median useful throughput over five runs at least 90% of the current #892 baseline under the same conditions | Peak process RSS at most 512 MiB |
-| Incoming request pressure | Same matched download; A's serving slots occupied; B also supplies synthetic requests up to the transport's receive allowance | A's matched download meets the same deadline and throughput floor; request queues plateau at their configured bounds | Same envelope, including retained transport bytes |
+| Incoming request pressure | Same matched download; A's serving slots occupied; B also supplies up to the advertised 32,000 synthetic requests | A's matched download meets the same deadline and throughput floor; request queues plateau at their configured bounds | Same envelope, including retained transport bytes |
 | Paused services and impaired link | Matched download and pressure cases with a paused sibling service, then 50 ms RTT and 1% packet loss, then both together | Same completion deadline; at least 90% of the corresponding baseline's useful throughput | Same envelope |
 | Reopening | Twenty sequential session replacements on the same connection, also under pressure and link impairment | Every new session completes its matched download within 30 seconds; no old-session delivery | Same peak envelope; session/task counts return to the configured steady-state bound |
+| Sustained saturation | Two paused streams each consume 16 MiB; include a case where sibling services retain all credit and a peer that repeats saturation | Cleanup finishes within 10 seconds after the existing block-progress deadline expires; a usable replacement session or peer completes the retry within 30 seconds; preserve existing cooldown and exponential reopen backoff | Same envelope over twenty repetitions; pending/retiring tasks return to their steady-state bounds and unfinished workers keep their permits |
+| Transient saturation | The same full buffers, but a paused consumer resumes before the block-progress deadline | The original download completes without a reset or disconnect, within the same 30-second transfer deadline after the consumer resumes | Same envelope |
 
 The raw prerequisite diagnoses shared receive credit. It does not exercise
 message framing, serving admission, outstanding-request matching, or the new
@@ -32,8 +34,11 @@ bidirectional byte-transfer regression remains separate transport coverage.
 
 ## Transport results
 
-The full-saturation prerequisite fails with default windows. No new capability
-has been implemented or enabled. The checks below use one connection and an
+The original full-saturation completion criterion fails with default windows.
+The user subsequently selected bounded cleanup and recovery for excessive
+traffic. That policy amendment does not turn the diagnostic stall into a
+successful recovery test. The generic paired-stream implementation is tested below. No new block-sync capability is enabled.
+The checks below use one connection and an
 already-established, continuously polled data reader. They transfer bytes in
 one direction, from B to A.
 
@@ -85,25 +90,58 @@ send half so acknowledgment confirms receipt; the blocked reader has not
 reached that end marker. The full-window frame burst ends inside a frame that
 also remains unread.
 
-Keep the failed criterion recorded. There are two different contracts to
-choose between before proceeding past this gate:
+The selected contract requires completed downloads within the supported
+request/service workload and bounded teardown and recovery under excessive
+traffic. Full buffers alone do not trigger cancellation. Let temporary
+backpressure clear naturally, and use the existing request-expiry and
+block-progress deadlines for sustained stalls. Keep the default windows and
+QUIC dependency. The original attempt
+may fail; its unreceived work must become retryable without losing completed
+work or releasing resources still owned by running jobs. If resetting the
+block-sync pair does not clear the condition, close the peer connection.
+Repeated saturation must leave another usable peer able to make progress.
 
-- Preserve completed downloads even when multiple other streams consume their
-  entire allowances. This requires an enforceable source of receive credit for
-  data, such as isolation or a revised window and stream-admission policy.
-  Two streams and small application queues alone do not provide it.
-- Guarantee progress within an explicit supported request/service workload;
-  require bounded teardown and successful later reopening under excessive
-  traffic. This could retain the selected default windows, but changes the
-  full-saturation completion criterion. That recovery path still needs testing
-  through real session management.
+The saturation rows above record recovery thresholds before measuring
+that behavior. Recovery still needs testing through real session management.
+The original failed completion measurements remain above as diagnostic evidence.
 
-No QUIC dependency, window setting, stream layout, or overload policy has been
-changed. The independent storage prototype below has passed its initial focused
-tests; the transport and serving migration has not started.
+QUIC dependencies and window settings are unchanged. Paired transport support and
+request ownership are implemented below. Production block sync still uses the
+existing layout and serving driver while the remaining work is tested.
 Matched downloads, impaired links, repeated reopening, production baseline
 comparisons, and their combined conditions remain unmeasured. The full
 acceptance gate has not passed.
+
+## Paired transport and request ownership
+
+The transport can now admit two declared ordered streams as one session. Each
+prelude is followed by the same nonzero eight-byte little-endian pair ID, scoped
+to that connection and opener. Neither role reaches the service alone. A missing
+role expires under the setup deadline; mismatched or duplicate roles are rejected.
+Both workers share cancellation and the service message budget. Retirement waits
+for both workers, including their readers, before reporting a single session exit.
+Request writes can wait beyond the generic ten-second timeout. Data writes retain
+their deadline. An interrupted partial write resets the pair.
+
+Three real-QUIC tests passed: repeated pair reopening on the same connection,
+request backpressure beyond ten seconds while data continues, and bounded cleanup
+of incomplete or mismatched setup. These exchange test frames; they are not yet
+matched block downloads through the new serving task.
+
+Outgoing requests now reserve a queue slot first. The work queue gives each take
+an exact provisional owner. Outstanding-request publication, byte-ledger transfer,
+and enqueue happen under the same lock as reset and the writer's initial claim.
+Expiry skips an unwritten frame but lets a started frame finish. Dropping an
+unfinished write cancels its session. Only the matching work owner can return
+unreceived reservations; received blocks and replacement attempts survive cleanup.
+A queue that closes after slot reservation triggers explicit settlement.
+
+Eight focused ownership tests passed, including a reset on another thread while
+publication holds the lock. The broader network regression run passed 929 tests
+with three ignored tests in 52.75 seconds, including version-selection coverage.
+Network library/test Clippy also passed.
+The new service version remains disabled: full matched-download, loss, memory,
+throughput, and saturation-recovery gates are still outstanding.
 
 ## Storage prototype
 
@@ -160,4 +198,11 @@ Validation completed for this checkpoint:
 
 The test link emitted the pre-existing macOS compact-unwind size warning. It
 did not prevent linking or execution. Full workspace and node-driver validation
-is pending because the serving migration has not begun.
+is pending until production serving moves to the new path.
+
+The original worktree disappeared during execution. Its uncommitted edits were
+recovered from this task's recorded changes into
+`/Users/czstudio/Documents/zakura-worktrees/getblocks-two-stream-refactor`.
+The original task path links to that checkout. The 929-test run and Clippy results
+above were repeated against the recovered source; Markdown and changelog checks
+also passed.

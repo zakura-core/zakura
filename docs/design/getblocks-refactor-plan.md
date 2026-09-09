@@ -4,13 +4,16 @@ Simplify #892's serving path while preserving response reads when requests to se
 
 A **session** is one active block-sync relationship with a peer. A **permit** reserves capacity for one response. Storage work and outgoing data retain that permit until they finish or are discarded.
 
-This plan replaces the shared-stream implementation before #892 ships. It describes work to implement and validate; the new design has not been tested or benchmarked yet.
+This plan replaces the shared-stream implementation before #892 ships. It describes the remaining implementation and the tests required before activation.
 
 Execution has started. The initial [transport results](getblocks-refactor-results.md)
 show progress with the advertised request volume and a paused sibling service,
 but a stall when two paused streams fill the connection's receive allowance.
-The full-saturation criterion needs a design decision before proceeding past
-the first gate. The new service remains unimplemented and disabled.
+Supported workloads must complete normally. Excessive traffic that exhausts
+the shared allowance must trigger bounded cleanup and successful recovery;
+the original download attempt may be retried. Generic paired transport and atomic request publication are implemented and tested.
+The new block-sync version remains disabled until its serving path and full
+recovery tests are complete.
 The independent state API prototype is implemented and has passed its initial
 ownership tests; production serving has not moved to it yet.
 
@@ -76,7 +79,11 @@ Before measuring the prototype, record each workload, connection/stream counts, 
 
 Use an ordinary download from B to A: A must receive its requested blocks and the ending message, with responses matched to its actual outstanding request. Exercise other paused services, delayed acknowledgments/loss, and reset/reopen cycles, including combined conditions. Starting queries or accepting bytes into a send queue is insufficient.
 
-Separately, inject extra `GetBlocks` requests from test peer B while A's serving capacity is occupied. A's download must still complete and the extra requests must remain bounded. This checks resilience to incoming request pressure. Remove the earlier requirement that both peers complete matched downloads from each other simultaneously.
+Separately, inject extra `GetBlocks` requests from test peer B while A's serving capacity is occupied. Within the declared supported workload, A's download must still complete and the extra requests must remain bounded. This checks resilience to incoming request pressure. Remove the earlier requirement that both peers complete matched downloads from each other simultaneously.
+
+Full buffers are ordinary backpressure, not a reason to disconnect. Let paused consumers resume and release transport allowance naturally. If expected block progress remains absent until the existing block-progress deadline, retire the affected stream pair and apply the existing cooldown and repeated-stall policy. Request expiry can return missing work earlier. Reuse these timers rather than adding a separate fullness timer.
+
+For sustained saturation, require bounded cleanup and recovery instead of completion of the original attempt. Return unreceived work for retry, preserve received blocks, and keep running reads and encodes charged until they end. If other streams prevent recovery, close the peer connection. Repeated saturation must not create an endless immediate reopen loop or prevent use of another available peer. Test natural recovery before the deadline, recovery on a fresh session, and escape from a repeatedly saturating peer. Stream replacement alone is not evidence that syncing recovered.
 
 Passing the completion, memory, and throughput criteria is a prerequisite for enabling the new service version. An unmeasured case is not a pass. If these default settings fail the gate, keep the new version disabled and record the failed condition before revisiting the design.
 

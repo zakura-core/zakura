@@ -136,6 +136,11 @@ impl BlockSyncPeerSession {
         self.send.max_capacity()
     }
 
+    /// Queue used by the download routine, which reserves space before taking work.
+    pub(super) fn request_sender(&self) -> FramedSend {
+        self.send.clone()
+    }
+
     /// Send a typed status advertisement.
     pub fn try_send_status(&self, status: BlockSyncStatus) -> Result<(), OrderedSendError> {
         self.try_send_message(BlockSyncMessage::Status(status))

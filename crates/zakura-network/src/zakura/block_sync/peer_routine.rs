@@ -46,13 +46,11 @@ use super::{
         DownloadWindow, LivenessOutcome, OutstandingBlockRange, ReceivedBlockTracker,
         ThroughputMeter,
     },
-    work_queue::{WorkItem, WorkQueue, WorkReturnOutcome},
+    work_queue::{RequestWrite, WorkItem, WorkQueue, WorkReturnOutcome},
     BlockSyncMessage, BlockSyncMisbehavior, BlockSyncPeerSession, BlockSyncStatus,
     ZakuraBlockSyncConfig, ZakuraPeerId, ZakuraTrace, MSG_BS_BLOCK,
 };
-use crate::zakura::{
-    trace::BlockBodySource, Admit, FramedRecv, OrderedSendError, SinkReject, ZakuraConnId,
-};
+use crate::zakura::{trace::BlockBodySource, Admit, FramedRecv, SinkReject, ZakuraConnId};
 use std::{sync::Arc, time::Duration, time::Instant};
 use tokio::time;
 use zakura_chain::{block, serialization::ZcashSerialize};
@@ -852,6 +850,7 @@ impl PeerRoutine {
         // `&'static str` reason via `break`; a pass that issues nothing (`fill_sent == 0`)
         // is a candidate bubble.
         let mut fill_sent = 0u32;
+        let request_sender = self.session.request_sender();
         let fill_stop: FillStop = loop {
             // Floor bypass scaled by reliability: a healthy saturated carrier keeps the
             // full bypass so the floor keeps moving; a failing/sealed peer earns *no*
@@ -878,6 +877,21 @@ impl PeerRoutine {
             if floor_slots == 0 {
                 break FillStop::CwndSaturated;
             }
+            // Reserve transport capacity before taking work or charging bytes.
+            let slot = match request_sender.try_reserve_guarded() {
+                Ok(slot) => slot,
+                Err(crate::zakura::transport::GuardedReserveError::Full) => {
+                    break FillStop::OutboundFull
+                }
+                Err(_) => {
+                    self.session.cancel_token().cancel();
+                    break FillStop::SendError;
+                }
+            };
+            let Some(request_id) = self.next_request_id else {
+                break FillStop::Internal;
+            };
+            self.next_request_id = request_id.get().checked_add(1).and_then(NonZeroU64::new);
             let in_bypass = normal_slots == 0;
             let (servable_low, servable_high) = (self.servable_low, self.servable_high);
 
@@ -933,11 +947,13 @@ impl PeerRoutine {
                                 .window
                                 .cwnd_byte_headroom_at(floor_bonus, now)
                                 .unwrap_or(u64::MAX);
-                            items = self.work.take_in_range_budgeted(
+                            items = self.work.take_for_request(
                                 servable_low,
                                 grant.take_high,
                                 max_count,
                                 grant.max_request_bytes.min(floor_cwnd_cap).max(1),
+                                self.generation,
+                                request_id,
                             );
                         }
                         AdmissionOutcome::LookaheadAtCap => break FillStop::LookaheadCap,
@@ -978,11 +994,13 @@ impl PeerRoutine {
                             .window
                             .cwnd_byte_headroom_at(0, now)
                             .unwrap_or(u64::MAX);
-                        items = self.work.take_in_range_budgeted(
+                        items = self.work.take_for_request(
                             servable_low,
                             grant.take_high,
                             max_count,
                             grant.max_request_bytes.min(above_cwnd_cap),
+                            self.generation,
+                            request_id,
                         );
                     }
                     // A floor-priority start while the floor arm deferred to a
@@ -1003,7 +1021,7 @@ impl PeerRoutine {
             // with heights this routine recently *failed* (RangeUnavailable /
             // timeout / send-failure), quietly put those back so another peer can
             // contest them first, and only keep the suffix this routine is allowed
-            // to re-take. `return_items_quiet` does NOT notify (the other peers were
+            // to re-take. `return_unpublished` does NOT notify (the other peers were
             // already woken by the original failure return), so this cannot
             // self-wake into a take/return spin. If the whole chunk is still
             // avoided, break — the routine wakes to retry when the avoid window
@@ -1021,22 +1039,20 @@ impl PeerRoutine {
                 let Some(keep) =
                     first_allowed_run(&items, |(height, item)| is_allowed(height, item))
                 else {
-                    let avoided: Vec<_> = items.iter().map(|(h, _)| *h).collect();
-                    self.work.return_items_quiet(avoided);
+                    self.work.return_unpublished(&items);
                     retry_filter_deadline = Some(self.retry_filter_wake_deadline(now));
                     break FillStop::RetryAvoid;
                 };
                 let keep_len = keep.len();
                 let mut returned_avoided = false;
                 if keep.start > 0 {
-                    let avoided: Vec<_> = items.drain(..keep.start).map(|(h, _)| h).collect();
-                    self.work.return_items_quiet(avoided);
+                    let avoided: Vec<_> = items.drain(..keep.start).collect();
+                    self.work.return_unpublished(&avoided);
                     returned_avoided = true;
                 }
                 if keep_len < items.len() {
                     let avoided = items.split_off(keep_len);
-                    self.work
-                        .return_items_quiet(avoided.into_iter().map(|(height, _)| height));
+                    self.work.return_unpublished(&avoided);
                     returned_avoided = true;
                 }
                 if returned_avoided {
@@ -1078,39 +1094,17 @@ impl PeerRoutine {
                 self.return_taken_items(&items);
                 break FillStop::Budget;
             }
-            let Some(request_id) = self.next_request_id else {
-                self.budget.release(reserved_bytes);
-                self.return_taken_items(&items);
-                break FillStop::Internal;
-            };
-            self.next_request_id = request_id.get().checked_add(1).and_then(NonZeroU64::new);
             let owner = scope.bind(self.generation, request_id);
-            let marked = self
-                .work
-                .mark_reserved_for_owner(owner, items.iter().map(|(height, _)| *height));
-            if marked != reserved_bytes {
-                self.budget.release(reserved_bytes);
-                let _ = self
-                    .work
-                    .release_reserved_and_return_items_detailed_for_owner(
-                        owner,
-                        items.iter().map(|(height, _)| *height),
-                    );
-                break FillStop::Internal;
-            }
-
+            let claim = RequestWrite::new(
+                owner,
+                items.clone(),
+                self.work.clone(),
+                self.budget.clone(),
+                self.session.cancel_token(),
+            );
             let count = match u32::try_from(kept_count) {
                 Ok(count) => count,
-                Err(_) => {
-                    let released = self
-                        .work
-                        .release_reserved_and_return_items_detailed_for_owner(
-                            owner,
-                            items.iter().map(|(height, _)| *height),
-                        );
-                    self.budget.release(released.released_bytes);
-                    break FillStop::Internal;
-                }
+                Err(_) => break FillStop::Internal,
             };
             let request = BlockRangeRequest {
                 owner,
@@ -1136,35 +1130,13 @@ impl PeerRoutine {
                 start_height: request.start_height,
                 count: request.count,
             };
-            if let Err(error) = self
-                .session
-                .try_send_get_blocks(request.start_height, request.count)
-            {
-                tracing::debug!(
-                    peer = ?self.peer,
-                    start_height = ?request.start_height,
-                    count = request.count,
-                    ?error,
-                    "failed to queue Zakura block-sync GetBlocks"
-                );
-                self.trace_queue_send_failed(&msg, &error);
-                // Return every still-reserved height to the queue. A competing
-                // peer's late body may have claimed a taken height and released its
-                // request reservation during the reserve await; leave that height
-                // in flight rather than re-queueing or releasing it twice.
-                let released = self
-                    .work
-                    .release_reserved_and_return_items_detailed_for_owner(
-                        request.owner,
-                        items.iter().map(|(height, _)| *height),
-                    );
-                self.budget.release(released.released_bytes);
-                if matches!(error, OrderedSendError::Full) {
-                    break FillStop::OutboundFull;
+            let frame = match msg.encode_frame() {
+                Ok(frame) => frame,
+                Err(_) => {
+                    self.session.cancel_token().cancel();
+                    break FillStop::SendError;
                 }
-                self.session.cancel_token().cancel();
-                break FillStop::SendError;
-            }
+            };
 
             let deadline = request_deadline(
                 request_priority,
@@ -1176,22 +1148,32 @@ impl PeerRoutine {
                 // now-slow peer cannot tighten the deadline below what it can meet.
                 self.window.bbr_btlbw_bytes_per_sec(queued_at),
             );
+            let request_start_height = request.start_height;
+            let request_count = request.count;
+            let request_estimated_bytes = request.estimated_bytes;
+            let mut delivered = false;
+            if !claim.publish(|| {
+                self.window.outstanding.push(OutstandingBlockRange {
+                    request,
+                    queued_at,
+                    deadline,
+                    delivery_snapshot: self.window.delivery_snapshot(queued_at),
+                    delivered_bytes: 0,
+                    received: ReceivedBlockTracker::default(),
+                });
+                delivered = slot.send_request(frame, claim.clone());
+            }) {
+                break FillStop::Internal;
+            }
+            if !delivered {
+                claim.delivery_failed();
+                break FillStop::SendError;
+            }
             metrics::counter!("sync.block.request.sent").increment(1);
             if in_bypass {
                 // A floor request borrowed a bypass slot while the cwnd was saturated.
                 metrics::counter!("sync.block.request.floor_bypass").increment(1);
             }
-            let request_start_height = request.start_height;
-            let request_count = request.count;
-            let request_estimated_bytes = request.estimated_bytes;
-            self.window.outstanding.push(OutstandingBlockRange {
-                request,
-                queued_at,
-                deadline,
-                delivery_snapshot: self.window.delivery_snapshot(queued_at),
-                delivered_bytes: 0,
-                received: ReceivedBlockTracker::default(),
-            });
             self.window
                 .arm_liveness(queued_at, self.config.effective_liveness_timeout());
             self.publish_outstanding();
@@ -1298,8 +1280,7 @@ impl PeerRoutine {
     /// not re-wake its own want-work arm into a take/return spin, and any other
     /// peer waiting on budget capacity is woken by the matching `budget.release`.
     fn return_taken_items(&self, items: &[(block::Height, WorkItem)]) {
-        self.work
-            .return_items_quiet(items.iter().map(|(height, _)| *height));
+        self.work.return_unpublished(items);
     }
 
     /// Record heights this routine just returned on a failure so it will not

@@ -90,6 +90,20 @@ pub struct Stream {
     pub mode: StreamMode,
 }
 
+/// Two persistent ordered streams selected and retired as one service session.
+///
+/// Both roles belong to the same service and capability. The data stream is the
+/// session's transport identity; the request stream shares its cancellation and
+/// message budget. Each role carries the same nonzero eight-byte pair identifier
+/// immediately after its ordinary prelude, scoped to its connection and opener.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct OrderedStreamPair {
+    /// Stream carrying responses and control messages, with bounded writes.
+    pub data: Stream,
+    /// Stream whose writes may wait while the session remains valid.
+    pub requests: Stream,
+}
+
 /// Transport state for one ordered service stream.
 #[derive(Debug)]
 pub(crate) struct ServiceStream {
@@ -374,6 +388,14 @@ pub trait Service: fmt::Debug + Send + Sync + 'static {
     /// message types keep that cap; message validity is checked by the codec.
     fn message_payload_limits(&self, _stream: Stream) -> &'static [(u16, usize)] {
         &[]
+    }
+
+    /// Return the complete pair containing `stream`, if this version uses one.
+    ///
+    /// Both declarations must be present in [`Service::streams`] with the same
+    /// capability and opening policy. Ordinary ordered streams return `None`.
+    fn ordered_stream_pair(&self, _stream: Stream) -> Option<OrderedStreamPair> {
+        None
     }
 
     /// Return the transport-owned opening and re-admission policy for `kind`.

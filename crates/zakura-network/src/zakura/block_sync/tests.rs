@@ -4092,8 +4092,15 @@ async fn block_liveness_parks_silent_peer_and_traces_reason() {
 
 #[tokio::test]
 async fn late_unowned_body_is_rejected_and_the_session_is_parked() {
-    // A body cannot count as progress after its request ownership expires.
-    // Verify both the missing submission and the local park.
+    check_cold_probe_deadline(true).await;
+}
+
+#[tokio::test]
+async fn cold_probe_can_finish_after_the_short_floor_rescue_deadline() {
+    check_cold_probe_deadline(false).await;
+}
+
+async fn check_cold_probe_deadline(expired: bool) {
     let mut config = immediate_body_download_config();
     // Short request/floor-rescue leash so the probe times out fast; the liveness
     // deadline (request_timeout * 4 = 1.2s) is what a false disconnect would trip.
@@ -4163,12 +4170,10 @@ async fn late_unowned_body_is_rejected_and_the_session_is_parked() {
     assert_eq!(start_height, block::Height(1));
     assert_eq!(count, 1);
 
-    // Let that probe time out on the floor-rescue leash: height 1 returns to the
-    // queue and, being unproven, the peer is now gated at its one-probe cap.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // An unmeasured peer gets the normal deadline for its only probe. Deliver
+    // after the short rescue deadline, or after the normal deadline has expired.
+    tokio::time::sleep(Duration::from_millis(if expired { 500 } else { 200 })).await;
 
-    // The body arrives after retirement of its request owner.
-    // Do not submit it to the verifier or count it as timely progress.
     inbound_tx
         .send(
             BlockSyncMessage::Block(blocks[0].clone())
@@ -4178,20 +4183,27 @@ async fn late_unowned_body_is_rejected_and_the_session_is_parked() {
         .await
         .expect("late block frame queues");
 
-    assert!(
-        tokio::time::timeout(Duration::from_millis(200), async {
-            loop {
-                if matches!(
-                    next_action(&mut actions).await,
-                    BlockSyncAction::SubmitBlock { .. }
-                ) {
-                    break;
-                }
+    let submitted = tokio::time::timeout(Duration::from_millis(200), async {
+        loop {
+            if matches!(
+                next_action(&mut actions).await,
+                BlockSyncAction::SubmitBlock { .. }
+            ) {
+                break;
             }
-        })
-        .await
-        .is_err(),
-        "a completion whose request owner retired must not reach the verifier",
+        }
+    })
+    .await;
+    if !expired {
+        submitted.expect("the still-owned cold probe must reach the verifier");
+        assert_eq!(handle.peer_snapshot().outbound_peers, 1);
+        assert!(!connection_cancel.is_cancelled());
+        reactor_task.abort();
+        return;
+    }
+    assert!(
+        submitted.is_err(),
+        "a retired owner cannot reach the verifier"
     );
     await_until(
         "late unowned body does not prevent the session park",

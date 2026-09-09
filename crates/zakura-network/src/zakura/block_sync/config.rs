@@ -75,12 +75,9 @@ pub const BS_CHECKPOINT_RANGE_BYTE_FLOOR: u64 =
     MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u64 * BS_PER_BLOCK_WORST_CASE_BYTES;
 /// Default block-sync request timeout.
 pub const DEFAULT_BS_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
-/// Default short leash on a floor (lowest-missing-height) request.
-///
-/// A floor request that has not been served within this window is rescued to a
-/// faster carrier (returned to the queue + the peer retry-avoided), never letting
-/// the contiguous download floor wait on a slow peer. Far tighter than the base
-/// `request_timeout`, which governs patient above-floor speculation instead.
+/// Base floor-rescue deadline after a fresh delivery-rate measurement. Estimated
+/// transfer time is added for this response and earlier unreceived responses.
+/// Unmeasured peers use the normal request timeout for their initial probe.
 pub const DEFAULT_BS_FLOOR_RESCUE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Request-timeout windows allowed before block-progress liveness parks a session.
 const BLOCK_PROGRESS_TIMEOUT_REQUESTS: u32 = 4;
@@ -261,8 +258,10 @@ pub struct ZakuraBlockSyncConfig {
     /// Timeout for an outstanding block-body range request.
     #[serde(with = "humantime_serde")]
     pub request_timeout: Duration,
-    /// Short leash on a floor request before its height is rescued to a faster
-    /// carrier. Clamped positive and never above `request_timeout`.
+    /// Base deadline for a floor request when the peer has a fresh delivery-rate
+    /// measurement. Unmeasured peers use `request_timeout` to let their initial
+    /// probe finish. Both deadlines add estimated transfer time. Clamped positive
+    /// and never above `request_timeout`.
     #[serde(with = "humantime_serde")]
     pub floor_rescue_timeout: Duration,
     /// How long to withhold a block-sync session after it makes no accepted block progress.

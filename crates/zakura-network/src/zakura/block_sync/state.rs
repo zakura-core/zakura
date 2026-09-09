@@ -658,7 +658,7 @@ impl DownloadWindow {
     /// Bytes reserved across this peer's in-flight requests (the per-request size
     /// estimates of heights not yet received). Recomputed on demand — the byte unit is
     /// experimental; a hot path would maintain a running counter instead.
-    fn outstanding_reserved_bytes(&self) -> u64 {
+    pub(super) fn outstanding_reserved_bytes(&self) -> u64 {
         self.outstanding.iter().fold(0u64, |acc, range| {
             acc.saturating_add(range.reserved_bytes())
         })

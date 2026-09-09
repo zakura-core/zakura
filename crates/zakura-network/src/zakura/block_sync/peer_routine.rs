@@ -1150,7 +1150,11 @@ impl PeerRoutine {
                 queued_at,
                 self.config.request_timeout,
                 self.config.effective_floor_rescue_timeout(),
-                reserved_bytes,
+                // Responses share an ordered stream. Include earlier unreceived
+                // work so this request cannot expire while those bodies arrive.
+                self.window
+                    .outstanding_reserved_bytes()
+                    .saturating_add(reserved_bytes),
                 // Filter BtlBw by the request's send time so a stale-high rate from a
                 // now-slow peer cannot tighten the deadline below what it can meet.
                 self.window.bbr_btlbw_bytes_per_sec(queued_at),

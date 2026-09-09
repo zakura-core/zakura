@@ -47,7 +47,13 @@ while anything anchored to the verified tip is pinned until real progress commit
 | Candidate selection | first pending in `[servable_low, min(servable_high, floor_high)]`, only if this peer is the preferred floor carrier | first pending in the peer's servable range, only when the floor arm produced nothing |
 | cwnd slots | may borrow up to `floor_bypass_slots` (default 2) beyond a saturated cwnd — bypass slots fund the floor **only** | normal cwnd slots only |
 | Byte funding | never refused: `reserve_request_budget`'s floor path overdrafts the in-flight budget by at most one request when `try_reserve` fails — reachable even at zero in-flight budget | non-blocking `try_reserve`; refused if the in-flight budget is spent |
-| Request deadline | short fixed leash (`floor_rescue_timeout`, default 2 s); on expiry the height is rescued to a faster carrier, the peer is retry-avoided but **not** disconnected | `request_timeout` (default 8 s) + expected transfer time (`estimated_bytes / measured BtlBw`, rate floored at 256 KiB/s) — patient, since it never gates the floor |
+| Request deadline | with a fresh delivery-rate sample, `floor_rescue_timeout` (default 2 s) + estimated transfer time; without a sample, use the normal deadline so the cold peer's only probe can finish | `request_timeout` (default 8 s) + estimated transfer time |
+
+Both lanes compute transfer time as `pending_response_bytes / measured_bytes_per_second`,
+using at least 256 KiB/s to keep the deadline bounded. An unmeasured peer uses
+256 KiB/s. Include this request and earlier unreceived responses in the byte
+estimate because they share an ordered data stream. Floor expiry returns the missing height for retry; the separate
+block-progress deadline controls session cooldown and repeated-stall disconnects.
 
 **Floor carrier preference:** the floor rides the fastest servable peer. Before taking
 floor work, a routine asks the shared registry

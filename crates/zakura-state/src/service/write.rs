@@ -2176,6 +2176,8 @@ impl WriteBlockWorkerTask {
                 },
             };
 
+            tracing::debug!(target: "sync_phase", height = ordered_block.0.height.0, phase = "state_writer_received");
+
             // TODO: split these checks into separate functions
 
             if invalid_block_reset_sender.is_closed() {
@@ -2334,8 +2336,9 @@ impl WriteBlockWorkerTask {
             let checkpoint_header_writer = header_chain.as_ref();
             let checkpoint_block = ordered_block.0.clone();
 
-            // Try committing the block
-            match finalized_state.commit_finalized_with_aux_and(
+            let phase_height = ordered_block.0.height.0;
+            tracing::debug!(target: "sync_phase", height = phase_height, phase = "state_commit_begin");
+            let commit_result = finalized_state.commit_finalized_with_aux_and(
                 ordered_block,
                 prev_note_commitment_trees,
                 vct_auxiliary_window,
@@ -2364,7 +2367,9 @@ impl WriteBlockWorkerTask {
                     }
                     Ok(())
                 },
-            ) {
+            );
+            tracing::debug!(target: "sync_phase", height = phase_height, phase = "state_commit_end", success = commit_result.is_ok());
+            match commit_result {
                 Ok((finalized, note_commitment_trees)) => {
                     // Whether this successful commit consumed header-carried
                     // tree-aux roots to skip the note-commitment frontier rebuild.

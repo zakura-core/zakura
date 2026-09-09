@@ -964,6 +964,7 @@ where
         let reset_generation = self.reset_generation;
         for qblock in rev_valid_blocks.drain(..).rev() {
             // Sending can fail, but there's nothing we can do about it.
+            tracing::debug!(target: "sync_phase", height = qblock.block.height.0, phase = "checkpoint_released");
             let _ = qblock.tx.send(QueuedBlockResult {
                 result: Ok(qblock.block.hash),
                 reset_generation,
@@ -1227,11 +1228,14 @@ where
             return async { Err(VerifyCheckpointError::Finished) }.boxed();
         }
 
+        tracing::debug!(target: "sync_phase", height = ?block.coinbase_height(), phase = "checkpoint_call");
         let mut req_block = match self.queue_block(block) {
             Ok(req_block) => req_block,
             Err(e) => return async { Err(e) }.boxed(),
         };
 
+        let phase_height = req_block.block.height.0;
+        tracing::debug!(target: "sync_phase", height = phase_height, phase = "checkpoint_queued");
         self.process_checkpoint_range();
 
         metrics::gauge!("checkpoint.queued_slots").set(self.queued.len() as f64);
@@ -1273,6 +1277,7 @@ where
 
             let result: Result<block::Hash, VerifyCheckpointError> = async move {
                 let hash = queued_result.result?;
+                tracing::debug!(target: "sync_phase", height = phase_height, phase = "checkpoint_ready");
 
                 if req_block.block.auth_data_root.is_none()
                     && NetworkUpgrade::current(&network, req_block.block.height)
@@ -1289,6 +1294,7 @@ where
 
                 // We use a `ServiceExt::oneshot`, so that every state service
                 // `poll_ready` has a corresponding `call`. See #1593.
+                tracing::debug!(target: "sync_phase", height = phase_height, phase = "checkpoint_state_request");
                 match state_service
                     .oneshot(zs::Request::CommitCheckpointVerifiedBlock(req_block.block))
                     .map_err(VerifyCheckpointError::CommitCheckpointVerified)

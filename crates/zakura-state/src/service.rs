@@ -782,6 +782,7 @@ impl StateService {
             // If we've finished sending finalized blocks, ignore any repeated blocks.
             // (Blocks can be repeated after a syncer reset.)
             if let Some(finalized_block_write_sender) = &self.block_write_sender.finalized {
+                tracing::debug!(target: "sync_phase", height = last_sent_finalized_block_height.0, phase = "state_writer_send");
                 let send_result = finalized_block_write_sender.send(queued_block);
 
                 // If the receiver is closed, we can't send any more blocks.
@@ -1892,6 +1893,7 @@ impl Service<Request> for StateService {
                 //
                 // This method doesn't block, access the database, or perform CPU-intensive tasks,
                 // so we can run it directly in the tokio executor's Future threads.
+                tracing::debug!(target: "sync_phase", height = finalized.height.0, phase = "state_queue_enter");
                 let rsp_rx = self.queue_and_commit_to_finalized_state(finalized);
 
                 // TODO:

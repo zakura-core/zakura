@@ -524,11 +524,19 @@ impl PeerRoutine {
         }
 
         let frame_payload_bytes = frame.payload.len();
-        let body_permit = if is_block_frame(&frame) {
+        let is_body = is_block_frame(&frame);
+        let phase_started = (is_body
+            && tracing::enabled!(target: "sync_phase", tracing::Level::DEBUG))
+        .then(Instant::now);
+        if is_body {
+            tracing::debug!(target: "sync_phase", peer = ?self.peer, phase = "body_frame_seen", frame_payload_bytes);
+        }
+        let body_permit = if is_body {
             Some(self.reserve_body_decode_permit().await?)
         } else {
             None
         };
+        let decode_started = phase_started.map(|_| Instant::now());
         // Measured here, on the per-peer task, so the body size never has to be
         // recomputed by re-serializing the block on another thread (A1).
         let (msg, raw_block_payload) =
@@ -570,6 +578,12 @@ impl PeerRoutine {
                     });
             }
             BlockSyncMessage::Block(block) => {
+                if let (Some(frame_started), Some(decode_started)) = (phase_started, decode_started)
+                {
+                    tracing::debug!(target: "sync_phase", peer = ?self.peer, height = ?block.coinbase_height(), phase = "body_decoded",
+                        frame_to_decoded_us = u64::try_from(frame_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                        decode_us = u64::try_from(decode_started.elapsed().as_micros()).unwrap_or(u64::MAX));
+                }
                 self.trace_wake("own_body");
                 self.handle_body(block, body_wire_bytes, body_permit, raw_block_payload)
                     .await;

@@ -154,7 +154,8 @@ pub fn spawn_block_sync_reactor(
     let events_keepalive = events_tx.clone();
     let (lifecycle_tx, lifecycle_rx) = mpsc::unbounded_channel();
     let lifecycle_keepalive = lifecycle_tx.clone();
-    let (peer_lifecycle_tx, peer_lifecycle_rx) = mpsc::unbounded_channel();
+    let current_sessions = super::service::CurrentSessions::new();
+    let sessions_changed = current_sessions.subscribe();
     let (needed_query_failure_tx, needed_query_failure_rx) = mpsc::unbounded_channel();
     let needed_query_failure_keepalive = needed_query_failure_tx.clone();
     // Size the action channel so the Sequencer can dispatch a full checkpoint
@@ -263,9 +264,10 @@ pub fn spawn_block_sync_reactor(
     };
 
     let handle = BlockSyncHandle {
+        range_source: None,
         events: events_tx,
         lifecycle: lifecycle_tx,
-        peer_lifecycle: peer_lifecycle_tx,
+        current_sessions: current_sessions.clone(),
         needed_query_failures: needed_query_failure_tx,
         peers: peers_rx,
         status: status_rx,
@@ -300,7 +302,8 @@ pub fn spawn_block_sync_reactor(
         _events_keepalive: events_keepalive,
         lifecycle: lifecycle_rx,
         _lifecycle_keepalive: lifecycle_keepalive,
-        peer_lifecycle: peer_lifecycle_rx,
+        current_sessions,
+        sessions_changed,
         needed_query_failures: needed_query_failure_rx,
         _needed_query_failure_keepalive: needed_query_failure_keepalive,
         actions: actions_tx,
@@ -345,7 +348,8 @@ pub(super) struct BlockSyncReactor {
     /// private peer lifecycle sender.
     _lifecycle_keepalive: mpsc::UnboundedSender<BlockSyncEvent>,
     /// Service-owned lifecycle facts with exact session identity.
-    peer_lifecycle: mpsc::UnboundedReceiver<BlockSyncPeerLifecycleEvent>,
+    current_sessions: Arc<super::service::CurrentSessions>,
+    sessions_changed: watch::Receiver<()>,
     needed_query_failures: mpsc::UnboundedReceiver<NeededBlocksQueryFailure>,
     /// Keep the private driver-completion channel open while the reactor lives.
     _needed_query_failure_keepalive: mpsc::UnboundedSender<NeededBlocksQueryFailure>,
@@ -467,9 +471,9 @@ impl BlockSyncReactor {
                     let Some(event) = event else { break };
                     self.handle_event(event).await;
                 }
-                event = self.peer_lifecycle.recv() => {
-                    let Some(event) = event else { break };
-                    self.handle_peer_lifecycle_event(event).await;
+                changed = self.sessions_changed.changed() => {
+                    if changed.is_err() { break; }
+                    self.reconcile_sessions().await;
                 }
                 failure = self.needed_query_failures.recv() => {
                     let Some(failure) = failure else { break };
@@ -748,31 +752,41 @@ impl BlockSyncReactor {
         self.publish_metrics();
     }
 
-    /// Apply service-owned lifecycle events only when their exact registry
-    /// generation is still current.
-    async fn handle_peer_lifecycle_event(&mut self, event: BlockSyncPeerLifecycleEvent) {
-        match event {
-            BlockSyncPeerLifecycleEvent::Connected(session) => {
-                let trace_event = BlockSyncEvent::PeerConnected(session.clone());
-                self.startup
-                    .trace
-                    .emit_event(|| BlockEventReceived::new(&trace_event));
-                let peer = session.peer_id().clone();
-                let session_id = session.session_id();
-                if !self.registry.owns_generation(&peer, session_id) {
-                    session.cancel_token().cancel();
-                    session.mark_reactor_ready();
-                    self.registry.remove_session(&peer, session_id);
-                } else {
-                    self.handle_peer_connected(session).await;
-                }
+    /// The watch is marked observed before taking this snapshot. Admissions
+    /// during this pass schedule another pass; old cleanup uses exact generations.
+    async fn reconcile_sessions(&mut self) {
+        let current = self.current_sessions.snapshot();
+        let removed: Vec<_> = self
+            .state
+            .peers
+            .iter()
+            .filter_map(|(peer, state)| {
+                let id = state.session.session_id();
+                (!current
+                    .get(peer)
+                    .is_some_and(|session| session.session_id() == id))
+                .then(|| (peer.clone(), id))
+            })
+            .collect();
+        for (peer, id) in removed {
+            self.handle_peer_disconnected(peer, id);
+        }
+        for (peer, session) in current {
+            let id = session.session_id();
+            if self
+                .state
+                .peers
+                .get(&peer)
+                .is_some_and(|state| state.session.session_id() == id)
+            {
+                continue;
             }
-            BlockSyncPeerLifecycleEvent::Disconnected { peer, session_id } => {
-                let trace_event = BlockSyncEvent::PeerDisconnected(peer.clone());
-                self.startup
-                    .trace
-                    .emit_event(|| BlockEventReceived::new(&trace_event));
-                self.handle_peer_disconnected(peer, session_id);
+            if session.cancel_token().is_cancelled() || !self.registry.owns_generation(&peer, id) {
+                session.cancel_token().cancel();
+                session.mark_reactor_ready();
+                self.registry.remove_session(&peer, id);
+            } else {
+                self.handle_peer_connected(session).await;
             }
         }
         self.publish_metrics();

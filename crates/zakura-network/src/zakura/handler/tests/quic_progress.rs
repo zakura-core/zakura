@@ -352,6 +352,7 @@ async fn fill_paused_frame_worker(
         &[]
     };
     let context = StreamWorkerContext {
+        queue_depths: None,
         conn: ZakuraConnTrace::without_peer(1),
         peer_id: test_peer(73),
         stream_id: index + 2,

@@ -574,6 +574,8 @@ struct HeaderSyncBackgroundTasks {
 /// Durable state facts required before attaching the production header-sync driver.
 #[derive(Clone, Debug)]
 pub struct ZakuraHeaderSyncDriverStartup {
+    /// Owned block range reads supplied by the node for sequential block serving.
+    pub block_range_source: Arc<dyn super::BlockRangeSource>,
     /// Durable state frontiers loaded at node startup.
     pub frontiers: FullStateFrontiers,
     /// Durable best header tip loaded from state.
@@ -1591,6 +1593,7 @@ struct StreamWorkerContext {
     limits: ZakuraConnectionLimits,
     inbound_frame_cap: u32,
     message_payload_limits: &'static [(u16, usize)],
+    queue_depths: Option<(usize, usize)>,
     outbound_frame_cap: u32,
     message_bucket: SharedMessageBucket,
     connection_token: CancellationToken,
@@ -3200,6 +3203,7 @@ impl ZakuraProtocolHandler {
             limits: admission.limits,
             inbound_frame_cap: inbound_frame_cap_for_stream(&admission.limits, stream),
             message_payload_limits: self.registry.message_payload_limits(stream),
+            queue_depths: self.registry.stream_queue_depths(stream),
             outbound_frame_cap: peer_accepted_frame_cap(
                 &admission.limits,
                 stream,
@@ -3700,6 +3704,7 @@ async fn spawn_zakura_endpoint_inner(
             startup.shutdown = header_sync_shutdown.clone();
             startup.trace = trace.clone();
             let (handle, actions, task) = spawn_block_sync_reactor(startup);
+            let handle = handle.with_range_source(driver_startup.block_range_source.clone());
             (Some(handle), Some(actions), Some(task))
         } else {
             (None, None, None)
@@ -4044,8 +4049,10 @@ fn spawn_persistent_stream_worker(
     opened_locally: bool,
     ordered_session_exit_tx: mpsc::UnboundedSender<OrderedSessionExit>,
 ) -> AdmittedOrderedSession {
-    let (to_service_tx, to_service_rx) = mpsc::channel(queue_depth);
-    let (from_service_tx, from_service_rx) = worker_framed_channel(queue_depth);
+    let (inbound_depth, outbound_depth) =
+        bounded_stream_queue_depths(queue_depth, context.queue_depths);
+    let (to_service_tx, to_service_rx) = mpsc::channel(inbound_depth);
+    let (from_service_tx, from_service_rx) = worker_framed_channel(outbound_depth);
     let admitted = AdmittedOrderedSession {
         kind: prelude.stream_kind,
         version: prelude.stream_version,
@@ -4069,13 +4076,25 @@ fn spawn_persistent_stream_worker(
             context,
             to_service_tx,
             from_service_rx,
-            queue_depth,
+            inbound_depth,
         )
         .await;
         let _ = ordered_session_exit_tx.send(exit);
     });
 
     admitted
+}
+
+fn bounded_stream_queue_depths(
+    transport_depth: usize,
+    service: Option<(usize, usize)>,
+) -> (usize, usize) {
+    service.map_or((transport_depth, transport_depth), |(inbound, outbound)| {
+        (
+            transport_depth.min(inbound.max(1)),
+            transport_depth.min(outbound.max(1)),
+        )
+    })
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -5606,6 +5625,7 @@ impl ZakuraHandlerError {
 
 #[cfg(test)]
 mod tests {
+    mod paired_block_sync;
     mod quic_progress;
     mod serving_progress;
 
@@ -8020,6 +8040,7 @@ mod tests {
             limits,
             inbound_frame_cap: stream.frame_cap,
             message_payload_limits: &[],
+            queue_depths: None,
             outbound_frame_cap: stream.frame_cap,
             message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(128))),
             connection_token: cancel.clone(),
@@ -8220,6 +8241,7 @@ mod tests {
             limits,
             inbound_frame_cap: inbound_frame_cap_for_stream(&limits, stream),
             message_payload_limits: &[],
+            queue_depths: None,
             outbound_frame_cap: application_frame_cap(&limits, stream),
             message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(128))),
             connection_token: connection_token.clone(),
@@ -8428,6 +8450,7 @@ mod tests {
                 limits,
                 inbound_frame_cap: inbound_frame_cap_for_stream(&limits, stream),
                 message_payload_limits: &[],
+                queue_depths: None,
                 outbound_frame_cap: application_frame_cap(&limits, stream),
                 message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(
                     limits.message_rate_per_second,

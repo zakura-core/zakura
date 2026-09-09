@@ -108,9 +108,44 @@ The original failed completion measurements remain above as diagnostic evidence.
 QUIC dependencies and window settings are unchanged. Paired transport support and
 request ownership are implemented below. Production block sync still uses the
 existing layout and serving driver while the remaining work is tested.
-Matched downloads, impaired links, repeated reopening, production baseline
-comparisons, and their combined conditions remain unmeasured. The full
-acceptance gate has not passed.
+Initial matched downloads are recorded below. Impaired links, repeated matched
+downloads after reopening, baseline medians, and combined conditions still need
+measurement. The full acceptance gate has not passed.
+
+## Sequential serving and matched downloads
+
+The paired service now reads requests in one sequential task and calls the
+storage adapter directly. It waits for peer capacity before node capacity,
+reserves output space before each blocking encode, and retains ownership in
+database jobs, encoded results, and queued frames. The node constructs the real
+state adapter at startup. The production version switch remains off.
+
+Five serving tests pass, including request arrival before Status, bounded Status
+setup, a queued frame retaining the peer's slot, and aborting a running database
+job while a replacement session waits for the same peer capacity. The full
+node compiles with the adapter. The session table replaces queued lifecycle
+history, and transport queues now use block sync's configured depths. The
+network regression run after these changes passed 934 tests, with three
+diagnostic tests ignored.
+
+The first matched-download fixture uses two real QUIC endpoints, normal service
+negotiation, peer routines, serving, and the download sequencer. Storage is an
+in-memory bounded source; consensus verification is a fixture. A downloads 32
+blocks of about 1.9 MB each and consumes every ending message without replacing
+either session. These blocks have internally consistent commitments but are not
+consensus-valid test-chain blocks.
+
+| Case | Matched completion | Peak process RSS |
+| --- | --- | --- |
+| Existing serving path in the working tree | 1.789 s | Not measured |
+| Paired serving | 1.744 s | Not measured |
+| Paired serving; A's 64 serving slots held; B sends 32,000 extra requests | 1.760 s | 148.1 MiB in a separate 1.761 s run |
+
+These are initial single runs. The existing path measurement uses the working
+tree, including the request-ownership and queue-limit changes; it is not the
+required comparison against the original PR head. The tests establish matched
+completion and the pressure run fits the predeclared memory envelope. They do
+not complete the full activation gate.
 
 ## Paired transport and request ownership
 

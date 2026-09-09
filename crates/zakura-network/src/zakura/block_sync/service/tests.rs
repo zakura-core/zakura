@@ -1,4 +1,47 @@
 use super::*;
+
+impl BlockSyncService {
+    pub(crate) fn sessions_for_transport_test(
+        &self,
+    ) -> Vec<(u64, BlockSyncPeerSession, FramedSend)> {
+        self.inner
+            .sessions
+            .snapshot()
+            .into_values()
+            .map(|session| {
+                (
+                    session.session_id(),
+                    session.clone(),
+                    session.request_sender(),
+                )
+            })
+            .collect()
+    }
+}
+
+impl BlockSyncHandle {
+    pub(crate) fn outstanding_requests_for_test(&self) -> usize {
+        self.routine_wiring
+            .as_ref()
+            .unwrap()
+            .registry
+            .slot_summary()
+            .outstanding_requests
+    }
+
+    pub(crate) fn hold_serving_capacity_for_test(&self) -> Vec<Box<dyn Send>> {
+        let wiring = self.routine_wiring.as_ref().unwrap();
+        (0..wiring.config.get_blocks_regulation.node_active_requests)
+            .map(|index| {
+                let mut bytes = [0xff; 32];
+                bytes[..8].copy_from_slice(&u64::try_from(index).unwrap().to_le_bytes());
+                let peer = ZakuraPeerId::new(bytes.to_vec()).unwrap();
+                let session = wiring.serving_regulator.session(peer, 1);
+                Box::new(session.try_admit(1).unwrap().commit()) as Box<dyn Send>
+            })
+            .collect()
+    }
+}
 use crate::zakura::{
     block_sync::serving_regulation::{GetBlocksServingPermit, GetBlocksServingRegulator},
     transport::{worker_framed_channel, FramedWorkerRecv},

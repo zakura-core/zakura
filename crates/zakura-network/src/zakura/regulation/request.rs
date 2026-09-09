@@ -98,6 +98,21 @@ impl<P: RequestPolicy> RequestSession<P> {
         self.policy.decode(frame)
     }
 
+    /// One sequential serving task waits for its peer before entering the node
+    /// queue. A previous response cannot make this peer hold extra node slots.
+    /// Dropping this future removes its FIFO waiter and releases a partial claim.
+    pub(crate) async fn admit(&self, request: &P::Request) -> WorkAttempt {
+        let peer = self.peer.reserve().await;
+        let node = self.node.reserve().await;
+        WorkAttempt {
+            resources: Arc::new(WorkResources {
+                _peer: peer,
+                _node: node,
+            }),
+            response_cap: self.policy.response_cap(request),
+        }
+    }
+
     /// Acquire all work bounds or release partial acquisition before returning.
     /// A permit obtained by a fair waiter is reused on its next attempt.
     pub(crate) fn try_admit(

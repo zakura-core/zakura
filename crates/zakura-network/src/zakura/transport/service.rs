@@ -390,6 +390,12 @@ pub trait Service: fmt::Debug + Send + Sync + 'static {
         &[]
     }
 
+    /// Optional per-stream inbound and outbound application queue limits.
+    /// The transport also applies its connection-wide inbound queue allowance.
+    fn stream_queue_depths(&self, _stream: Stream) -> Option<(usize, usize)> {
+        None
+    }
+
     /// Return the complete pair containing `stream`, if this version uses one.
     ///
     /// Both declarations must be present in [`Service::streams`] with the same

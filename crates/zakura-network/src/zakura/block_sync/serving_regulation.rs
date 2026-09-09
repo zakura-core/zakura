@@ -146,6 +146,16 @@ pub(super) struct GetBlocksServingSession {
 }
 
 impl GetBlocksServingSession {
+    /// Wait in peer-then-node order. The enclosing session cancels this wait.
+    pub(super) async fn admit_request(&self, request: &GetBlocksRequest) -> GetBlocksServingPermit {
+        AdmissionAttempt {
+            peer: self.peer.clone(),
+            session_id: self.session_id,
+            work: self.work.admit(request).await,
+        }
+        .commit()
+    }
+
     /// Apply the declared codec before admitting an inbound request.
     pub(super) fn decode_request(
         &self,

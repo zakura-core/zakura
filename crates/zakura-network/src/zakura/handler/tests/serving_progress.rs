@@ -152,6 +152,7 @@ async fn check_bidirectional_serving_progress(
             limits: local.clamp(&local.initial_limits()),
             inbound_frame_cap: MAX_BS_FRAME_BYTES,
             message_payload_limits: service.message_payload_limits(service.streams()[0]),
+            queue_depths: service.stream_queue_depths(service.streams()[0]),
             outbound_frame_cap: MAX_BS_FRAME_BYTES,
             message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(
                 local.message_rate_per_second,
@@ -281,7 +282,7 @@ async fn check_bidirectional_serving_progress(
     Ok(())
 }
 
-fn large_block_template() -> Arc<Block> {
+pub(super) fn large_block_template() -> Arc<Block> {
     let mut block =
         Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES[..]).unwrap();
     let transaction = block.transactions[0].clone();
@@ -290,7 +291,7 @@ fn large_block_template() -> Arc<Block> {
     Arc::new(block)
 }
 
-fn block_at_height(template: &Arc<Block>, height: block::Height) -> Arc<Block> {
+pub(super) fn block_at_height(template: &Arc<Block>, height: block::Height) -> Arc<Block> {
     let mut block = template.as_ref().clone();
     let mut coinbase = block.transactions[0].as_ref().clone();
     let inputs = match &mut coinbase {

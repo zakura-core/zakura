@@ -6452,15 +6452,17 @@ async fn lifecycle_events_bypass_full_bounded_wire_queue() {
         })
         .expect("test fills bounded wire queue");
     let (lifecycle, _lifecycle_rx) = mpsc::unbounded_channel();
-    let (peer_lifecycle, mut peer_lifecycle_rx) = mpsc::unbounded_channel();
+    let current_sessions = super::service::CurrentSessions::new();
+    let mut sessions_changed = current_sessions.subscribe();
     let (needed_query_failures, _needed_query_failure_rx) = mpsc::unbounded_channel();
     let (_peers_tx, peers) = watch::channel(ServicePeerSnapshot::new(0, 0, config.peer_limits));
     let (_status_tx, status) = watch::channel(config.initial_status());
     let (_candidates_tx, candidates) = watch::channel(ZakuraBlockSyncCandidateState::default());
     let handle = BlockSyncHandle {
+        range_source: None,
         events,
         lifecycle,
-        peer_lifecycle,
+        current_sessions: current_sessions.clone(),
         needed_query_failures,
         peers,
         status,
@@ -6485,23 +6487,17 @@ async fn lifecycle_events_bypass_full_bounded_wire_queue() {
     ));
     let _inbound_tx = inbound_tx;
 
-    assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(1), peer_lifecycle_rx.recv())
-            .await
-            .expect("lifecycle event arrives")
-            .expect("lifecycle channel stays open"),
-        BlockSyncPeerLifecycleEvent::Connected(session) if session.peer_id() == &peer
-    ));
-
+    tokio::time::timeout(Duration::from_secs(1), sessions_changed.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(current_sessions.snapshot().contains_key(&peer));
     service.remove_peer(&peer, 0);
-    assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(1), peer_lifecycle_rx.recv())
-            .await
-            .expect("lifecycle event arrives")
-            .expect("lifecycle channel stays open"),
-        BlockSyncPeerLifecycleEvent::Disconnected { peer: disconnected, .. }
-            if disconnected == peer
-    ));
+    tokio::time::timeout(Duration::from_secs(1), sessions_changed.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(current_sessions.snapshot().is_empty());
 }
 
 #[tokio::test]
@@ -6564,12 +6560,12 @@ async fn reactor_lifecycle_events_cannot_replace_or_remove_a_newer_session() {
     );
 
     handle
-        .peer_lifecycle
-        .send(BlockSyncPeerLifecycleEvent::Connected(newer))
+        .current_sessions
+        .apply_for_test(BlockSyncPeerLifecycleEvent::Connected(newer))
         .expect("newer lifecycle event queues");
     handle
-        .peer_lifecycle
-        .send(BlockSyncPeerLifecycleEvent::Connected(older))
+        .current_sessions
+        .apply_for_test(BlockSyncPeerLifecycleEvent::Connected(older))
         .expect("delayed older lifecycle event queues");
     wait_for_outbound_status(&mut newer_recv).await;
     await_until(
@@ -6601,8 +6597,8 @@ async fn reactor_lifecycle_events_cannot_replace_or_remove_a_newer_session() {
         let (send, _recv) = framed_channel(4);
         let cancelled = CancellationToken::new();
         handle
-            .peer_lifecycle
-            .send(BlockSyncPeerLifecycleEvent::Connected(
+            .current_sessions
+            .apply_for_test(BlockSyncPeerLifecycleEvent::Connected(
                 BlockSyncPeerSession::for_test_with_session_id(
                     rejected_peer.clone(),
                     rejected_id,
@@ -6641,8 +6637,8 @@ async fn reactor_lifecycle_events_cannot_replace_or_remove_a_newer_session() {
         .await
         .unwrap();
         handle
-            .peer_lifecycle
-            .send(BlockSyncPeerLifecycleEvent::Disconnected {
+            .current_sessions
+            .apply_for_test(BlockSyncPeerLifecycleEvent::Disconnected {
                 peer: rejected_peer,
                 session_id: rejected_id,
             })
@@ -6658,8 +6654,8 @@ async fn reactor_lifecycle_events_cannot_replace_or_remove_a_newer_session() {
     }
 
     handle
-        .peer_lifecycle
-        .send(BlockSyncPeerLifecycleEvent::Disconnected {
+        .current_sessions
+        .apply_for_test(BlockSyncPeerLifecycleEvent::Disconnected {
             peer: peer_id.clone(),
             session_id: older_id,
         })
@@ -6672,8 +6668,8 @@ async fn reactor_lifecycle_events_cannot_replace_or_remove_a_newer_session() {
     );
 
     handle
-        .peer_lifecycle
-        .send(BlockSyncPeerLifecycleEvent::Disconnected {
+        .current_sessions
+        .apply_for_test(BlockSyncPeerLifecycleEvent::Disconnected {
             peer: peer_id,
             session_id: newer_id,
         })

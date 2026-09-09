@@ -11,11 +11,14 @@ show progress with the advertised request volume and a paused sibling service,
 but a stall when two paused streams fill the connection's receive allowance.
 Supported workloads must complete normally. Excessive traffic that exhausts
 the shared allowance must trigger bounded cleanup and successful recovery;
-the original download attempt may be retried. Generic paired transport and atomic request publication are implemented and tested.
-The new block-sync version remains disabled until its serving path and full
-recovery tests are complete.
-The independent state API prototype is implemented and has passed its initial
-ownership tests; production serving has not moved to it yet.
+the original download attempt may be retried. Paired transport, atomic request
+publication, the sequential serving task, and the node's owned storage adapter
+are implemented. Initial matched downloads and cancellation tests pass.
+Current sessions now use a table and watch notification, and block sync's
+configured queue depths bound its actual transport queues.
+The new block-sync version remains disabled until the full acceptance gate
+passes. The existing serving driver remains active in production during this
+validation.
 
 ## Before and after
 

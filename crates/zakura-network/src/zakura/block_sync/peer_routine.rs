@@ -594,6 +594,12 @@ impl PeerRoutine {
                 start_height,
                 count,
             } => {
+                if self.session.is_paired() {
+                    return Err(SinkReject::protocol(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "GetBlocks belongs on the request stream",
+                    )));
+                }
                 if self.received_status {
                     self.retain_serving_request(start_height, count)?;
                 } else {
@@ -716,6 +722,7 @@ impl PeerRoutine {
         // the remote's later Status retry arriving after this meter reopens.
         let send_reply = self.status_reply_meter.try_take(now);
         self.received_status = true;
+        self.session.mark_status_received();
         self.servable_low = status.servable_low;
         self.servable_high = status.servable_high;
         self.max_blocks_per_response =

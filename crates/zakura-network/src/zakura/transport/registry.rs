@@ -177,6 +177,11 @@ impl ServiceRegistry {
             .unwrap_or(&[])
     }
 
+    pub(crate) fn stream_queue_depths(&self, stream: Stream) -> Option<(usize, usize)> {
+        self.service_for_kind(stream.kind)?
+            .stream_queue_depths(stream)
+    }
+
     /// Lookup the declared stream for `kind`.
     pub fn stream_for_kind(&self, kind: u16) -> Option<Stream> {
         let service = self.service_for_kind(kind)?;

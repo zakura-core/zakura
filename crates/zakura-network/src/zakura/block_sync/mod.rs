@@ -46,6 +46,7 @@ mod request;
 mod sequencer;
 mod sequencer_task;
 mod service;
+mod serving;
 mod serving_regulation;
 mod state;
 #[cfg(test)]
@@ -82,6 +83,7 @@ pub use service::BlockSyncPeerSession;
 pub(crate) use service::BlockSyncService;
 #[cfg(test)]
 pub(crate) use service::MAX_BS_FRAME_BYTES;
+pub use serving::{BlockRangeRead, BlockRangeReadResult, BlockRangeSource};
 pub use state::{BlockSyncFrontiers, BlockSyncHandle, BlockSyncStartup};
 pub use wire::{
     BlockSyncMessage, MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_MESSAGE_BYTES, MSG_BS_BLOCK,

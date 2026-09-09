@@ -113,6 +113,7 @@ pub enum BlockSyncEvent {
 /// This internal channel carries the session generation needed to reject stale
 /// connect and disconnect events without exposing transport bookkeeping in the
 /// public driver API.
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub(super) enum BlockSyncPeerLifecycleEvent {
     /// A newly admitted stream session is ready for reactor bookkeeping.

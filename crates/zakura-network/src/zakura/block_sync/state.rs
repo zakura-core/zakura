@@ -1,7 +1,6 @@
 use super::{
     bbr::{rounded_usize, BbrState},
     config::*,
-    events::BlockSyncPeerLifecycleEvent,
     request::*,
     work_queue::WorkQueue,
     *,
@@ -122,10 +121,11 @@ impl BlockSyncStartup {
 /// action/routine-to-reactor channels the reactor created.
 #[derive(Clone, Debug)]
 pub struct BlockSyncHandle {
+    pub(super) range_source: Option<Arc<dyn super::BlockRangeSource>>,
     pub(super) events: mpsc::Sender<BlockSyncEvent>,
     pub(super) lifecycle: mpsc::UnboundedSender<BlockSyncEvent>,
-    /// Internal peer-session lifecycle path with exact generation ownership.
-    pub(super) peer_lifecycle: mpsc::UnboundedSender<BlockSyncPeerLifecycleEvent>,
+    /// Current service admissions, reconciled through a coalescing watch.
+    pub(super) current_sessions: Arc<super::service::CurrentSessions>,
     pub(super) needed_query_failures: mpsc::UnboundedSender<NeededBlocksQueryFailure>,
     pub(super) peers: watch::Receiver<ServicePeerSnapshot>,
     pub(super) status: watch::Receiver<BlockSyncStatus>,
@@ -159,6 +159,11 @@ pub(super) struct RoutineWiring {
 }
 
 impl BlockSyncHandle {
+    pub(crate) fn with_range_source(mut self, source: Arc<dyn super::BlockRangeSource>) -> Self {
+        self.range_source = Some(source);
+        self
+    }
+
     /// Send a fact/event to the block-sync reactor.
     pub async fn send(
         &self,

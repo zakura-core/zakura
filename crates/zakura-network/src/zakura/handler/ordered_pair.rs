@@ -138,8 +138,10 @@ pub(super) fn spawn_ordered_pair(
     let cancel = data.context.connection_token.child_token();
     data.context.stream_token = cancel.clone();
     requests.context.stream_token = cancel.clone();
-    let (data_tx, data_rx) = mpsc::channel(queue_depth);
-    let (data_send, data_out) = worker_framed_channel(queue_depth);
+    let (inbound_depth, outbound_depth) =
+        bounded_stream_queue_depths(queue_depth, data.context.queue_depths);
+    let (data_tx, data_rx) = mpsc::channel(inbound_depth);
+    let (data_send, data_out) = worker_framed_channel(outbound_depth);
     // One raw queued request plus one reader-held frame. The service owns its
     // decoded waiting request separately from these transport bounds.
     let (request_tx, request_rx) = mpsc::channel(1);
@@ -176,7 +178,7 @@ pub(super) fn spawn_ordered_pair(
                     data.context,
                     data_tx,
                     data_out,
-                    queue_depth,
+                    inbound_depth,
                     OrderedWritePolicy::PairData,
                 )
                 .await;
@@ -265,6 +267,7 @@ impl ZakuraProtocolHandler {
             limits,
             inbound_frame_cap: prelude.max_frame_bytes,
             message_payload_limits: self.registry.message_payload_limits(stream),
+            queue_depths: self.registry.stream_queue_depths(stream),
             outbound_frame_cap: application_frame_cap(&limits, stream),
             message_bucket,
             stream_token: connection_token.child_token(),

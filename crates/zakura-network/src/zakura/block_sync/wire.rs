@@ -7,6 +7,12 @@ pub const ZAKURA_CAP_BLOCK_SYNC: u64 = 1 << 3;
 /// Version of the native block-sync stream.
 pub const ZAKURA_BLOCK_SYNC_STREAM_VERSION: u16 = 2;
 
+// Reserved for the paired prototype. Production advertises it only after the
+// matched-download and saturation-recovery acceptance gate passes.
+pub(super) const ZAKURA_STREAM_BLOCK_REQUESTS: u16 = 7;
+pub(super) const ZAKURA_CAP_BLOCK_SYNC_PAIR: u64 = 1 << 6;
+pub(super) const ZAKURA_BLOCK_SYNC_PAIR_VERSION: u16 = 3;
+
 /// Peer status advertisement.
 pub const MSG_BS_STATUS: u8 = 1;
 /// Request a contiguous range of block bodies by height.

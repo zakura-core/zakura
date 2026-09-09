@@ -1,9 +1,24 @@
+//! Tracks block-sync session capacity and each peer's current session.
+//!
+//! A session is the request stream and data stream paired on one QUIC connection.
+//! The service reserves capacity during setup and publishes the assembled pair
+//! for the reactor (the download coordinator).
+//!
+//! [`SessionCapacity`] counts pairs during setup, active use, and cleanup.
+//! [`CurrentSessions`] holds only the current session for each peer. Replacing
+//! its entry doesn't free the old pair's capacity while that pair still has
+//! workers or send handles finishing cleanup.
+
 use super::*;
 use crate::zakura::{OrderedSessionFull, OrderedSessionResources, ServicePeerLimits};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-/// Setup and retirement retain the same directional session slot. A separate
-/// allowance bounds pairs whose second stream has not arrived yet.
+/// Limits session counts by connection direction and bounds incomplete pairs.
+///
+/// Inbound means the peer connected to us; outbound means we connected to the
+/// peer. Each pair takes one slot from its direction and one temporary setup slot
+/// from the allowance shared across both directions. A semaphore permit represents
+/// one occupied slot.
 #[derive(Debug)]
 pub(super) struct SessionCapacity {
     inbound: Arc<Semaphore>,
@@ -30,10 +45,14 @@ impl SessionCapacity {
         }
     }
 
+    /// Subscribe before checking [`Self::available`], so a capacity release
+    /// between the check and waiting for a change cannot be missed.
     pub(super) fn subscribe(&self) -> watch::Receiver<()> {
         self.changed.subscribe()
     }
 
+    /// Check whether setup could start now, without taking any slots.
+    /// Another task can claim them before [`Self::reserve`], so this is only a hint.
     pub(super) fn available(&self, direction: ServicePeerDirection) -> bool {
         self.pool(direction).available_permits() > 0 && self.pending.available_permits() > 0
     }
@@ -47,6 +66,11 @@ impl SessionCapacity {
         )
     }
 
+    /// Take one session slot for `direction` and one temporary setup slot.
+    ///
+    /// Returns [`OrderedSessionFull`] immediately if either limit is reached;
+    /// an error leaves no slots held by this call. Both streams share the returned
+    /// reservation, so opening the second stream must reuse it.
     pub(super) fn reserve(
         &self,
         direction: ServicePeerDirection,
@@ -59,6 +83,7 @@ impl SessionCapacity {
         let session = match self.pool(direction).clone().try_acquire_owned() {
             Ok(session) => session,
             Err(_) => {
+                // Wake callers that may have seen the setup slot occupied.
                 drop(pending);
                 self.changed.send_replace(());
                 return Err(OrderedSessionFull);
@@ -79,6 +104,10 @@ impl SessionCapacity {
     }
 }
 
+/// Holds a pair's session and setup slots on behalf of its workers and send handles.
+///
+/// Each owner retains an `Arc` to this value. The session slot stays occupied
+/// after cancellation until the last owner drops its reference.
 #[derive(Debug)]
 struct SessionResources {
     reserved: metrics::Gauge,
@@ -89,6 +118,8 @@ struct SessionResources {
 }
 
 impl OrderedSessionResources for SessionResources {
+    /// Release the temporary setup slot once both streams are ready.
+    /// The session slot stays reserved; repeated calls cannot release setup twice.
     fn admitted(&self) {
         if self
             .pending
@@ -104,6 +135,8 @@ impl OrderedSessionResources for SessionResources {
 }
 
 impl Drop for SessionResources {
+    /// Return the session slot and any setup slot left by an incomplete pair,
+    /// then wake callers waiting to open a session.
     fn drop(&mut self) {
         if self
             .pending
@@ -120,8 +153,11 @@ impl Drop for SessionResources {
     }
 }
 
-/// Authoritative admissions shared by the service and reactor. Notifications
-/// carry no history: reconciliation reads a bounded snapshot of current owners.
+/// The service's current session for each peer, shared with the reactor.
+///
+/// The service updates the table and calls [`Self::notify`]. The reactor reads a
+/// [`Self::snapshot`] and updates its download state to match those sessions.
+/// Notifications merge together, so reconnects cannot build a history queue.
 #[derive(Debug)]
 pub(in crate::zakura::block_sync) struct CurrentSessions {
     pub(super) active: StdMutex<HashMap<ZakuraPeerId, BlockSyncPeerRecord>>,
@@ -136,16 +172,20 @@ impl CurrentSessions {
         })
     }
 
+    /// Watch for table changes; a notification means to read the current table.
     pub(in crate::zakura::block_sync) fn subscribe(&self) -> watch::Receiver<()> {
         self.changed.subscribe()
     }
 
+    /// Signal a table change after publishing an updated entry or removal.
     pub(super) fn notify(&self) {
         self.changed.send_replace(());
     }
 
-    /// Mark the watch observed before taking this snapshot. A change during
-    /// reconciliation then remains pending for the next pass.
+    /// Clone the current session handles so the reactor can work without the lock.
+    ///
+    /// Mark the watch notification as seen before taking this snapshot. A change
+    /// arriving while the reactor updates its state then triggers another pass.
     pub(in crate::zakura::block_sync) fn snapshot(
         &self,
     ) -> HashMap<ZakuraPeerId, BlockSyncPeerSession> {

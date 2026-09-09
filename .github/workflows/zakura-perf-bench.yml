@@ -1,46 +1,39 @@
 name: Header-prefix original-range profile replay
 
-# Branch-only manual replay; no scheduled jobs or existing fleet mutations.
-# Both builds sync 1,709,210 -> 1,750,000 from one baseline-prepared state.
+# Manual branch-only replay on two additional disposable hosts. Existing fleet untouched.
 on:
   workflow_dispatch:
-
 concurrency:
   group: isolated-original-range-header-prefix-profile
   cancel-in-progress: false
-
 permissions:
   contents: read
-
 jobs:
   replay:
-    name: Original range, baseline then header-prefix patch
+    name: Profile original and patched nodes in parallel
     if: github.event_name == 'workflow_dispatch' && github.repository == 'zakura-core/zakura'
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
-      - name: Checkout (for the run + digest scripts)
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+      - name: Checkout isolated harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-
-      - name: Install doctl and the fleet SSH key
+      - name: Install DigitalOcean client and SSH key
         uses: ./.github/actions/do-cli
         with:
           token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
           ssh_private_key: ${{ secrets.DO_SSH_PRIVATE_KEY }}
-
-      - name: Enforce experiment resource ceiling
+      - name: Check capacity for the two authorized additional hosts
         run: |
           set -euo pipefail
           count=$(doctl compute droplet list --output json | jq '[.[] | select(.name | test("^zakura-(genesis-|perf-|sync-variance|sync-fixture)"))] | length')
-          if (( count >= 4 )); then
-            echo "No free experiment slot: $count temporary experiment hosts already exist" >&2
+          if (( count > 4 )); then
+            echo "Two-host replay would exceed its six-host campaign ceiling" >&2
             exit 1
           fi
-
-      - name: Create droplet (+ state volume)
-        id: droplet
+      - name: Create baseline droplet and cloned volume
+        id: baseline
         uses: ./.github/actions/do-droplet
         with:
           policy: fixed
@@ -50,116 +43,109 @@ jobs:
           name: zakura-perf-baseline-${{ github.run_id }}
           size: c-16
           ssh_fingerprint: ${{ vars.DO_SSH_KEY_FINGERPRINT }}
-          # tagged zakura-pr-node so the hourly reaper covers failed teardowns
           tag: zakura-pr-node
           state_network: mainnet
           volume_name: zakura-pr-perf-vol-${{ github.run_id }}-baseline
-
-      - name: Wait for SSH
+      - name: Wait for baseline SSH
         uses: ./.github/actions/do-wait-ssh
         with:
-          ip: ${{ steps.droplet.outputs.ip }}
-
-      - name: Run the profiled bench leg
+          ip: ${{ steps.baseline.outputs.ip }}
+      - name: Preserve baseline resource identity
+        run: cp /tmp/out/provisioning.json /tmp/baseline-provisioning.json
+      - name: Create primary droplet and cloned volume
+        id: primary
+        uses: ./.github/actions/do-droplet
+        with:
+          policy: fixed
+          regions: nyc1
+          image_id: "244455463"
+          state_snapshot_id: f773fe89-aaa0-11f1-9dae-aebfafd73072
+          name: zakura-perf-primary-${{ github.run_id }}
+          size: c-16
+          ssh_fingerprint: ${{ vars.DO_SSH_KEY_FINGERPRINT }}
+          tag: zakura-pr-node
+          state_network: mainnet
+          volume_name: zakura-pr-perf-vol-${{ github.run_id }}-primary
+      - name: Wait for primary SSH
+        uses: ./.github/actions/do-wait-ssh
+        with:
+          ip: ${{ steps.primary.outputs.ip }}
+      - name: Preserve primary resource identity
+        run: cp /tmp/out/provisioning.json /tmp/primary-provisioning.json
+      - name: Shared preparation and parallel diagnostic profiles
         env:
-          IP: ${{ steps.droplet.outputs.ip }}
+          BASELINE_IP: ${{ steps.baseline.outputs.ip }}
+          BASELINE_VOLUME: ${{ steps.baseline.outputs.volume_name }}
+          PRIMARY_IP: ${{ steps.primary.outputs.ip }}
+          PRIMARY_VOLUME: ${{ steps.primary.outputs.volume_name }}
           GH_CLONE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          LEG: baseline
-          SHA: 1b77bb18a7f4f915d760971e97083896221f70bf
-          WORKLOAD: historical_sync
-          VERIFY_MODE: checkpoint
-          PROFILE: diagnostic
-          STOP_HEIGHT: '1750000'
-          WALL_CAP: '1800'
-          HEAD_PROFILE_MINUTES: 60
-          START_HEIGHT: '1707210'
-          PEERSET_SIZE: '75'
-          P2P_STACK: zakura
-          VCT_FAST_SYNC: auto
-          ENABLE_TRACES: 'true'
-          COMPARISON: refs
-          CROSSOVER: 'true'
-          BENCH_LEGS_JSON: '[{"leg":"baseline","ref":"original","sha":"1b77bb18a7f4f915d760971e97083896221f70bf","p2p_stack":"zakura","vct_fast_sync":"auto","traces":"true"},{"leg":"primary","ref":"original-plus-prefix","sha":"c8cde61726d2822a758ae08815efce3dcdd16bc3","p2p_stack":"zakura","vct_fast_sync":"auto","traces":"true"}]'
-          HISTORICAL_PRUNED: 'true'
-          VOLUME_NAME: ${{ steps.droplet.outputs.volume_name }}
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          umask 077
-          {
-            printf 'GH_REPO=%q\n'          "${GITHUB_REPOSITORY}"
-            printf 'GH_CLONE_TOKEN=%q\n'   "${GH_CLONE_TOKEN}"
-            printf 'SHA=%q\n'              "${SHA}"
-            printf 'LEG=%q\n'              "${LEG}"
-            printf 'WORKLOAD=%q\n'         "${WORKLOAD}"
-            printf 'VERIFY_MODE=%q\n'      "${VERIFY_MODE}"
-            printf 'PROFILE=%q\n'          "${PROFILE}"
-            printf 'STOP_HEIGHT=%q\n'      "${STOP_HEIGHT}"
-            printf 'WALL_CAP=%q\n'         "${WALL_CAP}"
-            printf 'HEAD_PROFILE_MINUTES=%q\n' "${HEAD_PROFILE_MINUTES}"
-            printf 'START_HEIGHT=%q\n'     "${START_HEIGHT}"
-            printf 'PEERSET_SIZE=%q\n'     "${PEERSET_SIZE}"
-            printf 'P2P_STACK=%q\n'        "${P2P_STACK}"
-            printf 'VCT_FAST_SYNC=%q\n'    "${VCT_FAST_SYNC}"
-            printf 'ENABLE_TRACES=%q\n'    "${ENABLE_TRACES}"
-            printf 'COMPARISON=%q\n'       "${COMPARISON}"
-            printf 'CROSSOVER=%q\n'        "${CROSSOVER}"
-            printf 'BENCH_LEGS_JSON=%q\n'  "${BENCH_LEGS_JSON}"
-            printf 'HISTORICAL_PRUNED=%q\n' "${HISTORICAL_PRUNED}"
-            printf 'VOLUME_NAME=%q\n'      "${VOLUME_NAME}"
-            printf 'GITHUB_RUN_URL=%q\n'   "${GITHUB_RUN_URL}"
-            printf 'GITHUB_RUN_ID=%q\n'    "${GITHUB_RUN_ID}"
-          } > /tmp/run.env
-          scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
-            /tmp/run.env \
-            .github/workflows/scripts/perf-bench-run.sh \
-            .github/workflows/scripts/perf-bench-crossover.sh \
-            scripts/zakura-bench-digest.py \
-            scripts/zakura-sync-profile-sample.py \
-            scripts/zakura-metrics-dashboard.py \
-            "root@${IP}:/root/"
-          rm -f /tmp/run.env
-          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-            -o ServerAliveInterval=30 -o ServerAliveCountMax=240 -i /tmp/do_ssh "root@${IP}" \
-            'set -euo pipefail; set -a; . /root/run.env; set +a; if [ "$CROSSOVER" = true ]; then bash /root/perf-bench-crossover.sh; else bash /root/perf-bench-run.sh; fi'
-
-      - name: Collect leg outputs
-        if: always() && steps.droplet.outputs.ip != ''
+        run: bash .github/workflows/scripts/profile-replay-parallel.sh
+      - name: Collect both profiles and failure logs
+        if: always()
         env:
-          IP: ${{ steps.droplet.outputs.ip }}
+          BASELINE_IP: ${{ steps.baseline.outputs.ip }}
+          PRIMARY_IP: ${{ steps.primary.outputs.ip }}
         run: |
           set -euo pipefail
-          mkdir -p leg-out
-          cp /tmp/out/provisioning.json leg-out/provisioning.json
-          scp -r -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
-            "root@${IP}:/root/out/." leg-out/ || true
-          for nested in leg-out/primary leg-out/baseline; do
-            if [ -d "$nested" ]; then
-              cp leg-out/provisioning.json "$nested/provisioning.json"
-              if [ -f "$nested/leg-summary.md" ]; then cat "$nested/leg-summary.md" >> "$GITHUB_STEP_SUMMARY"; fi
+          mkdir -p replay-out
+          for leg in baseline primary; do
+            mkdir -p "replay-out/$leg"
+            if [ "$leg" = baseline ]; then ip=$BASELINE_IP; else ip=$PRIMARY_IP; fi
+            if [ -f "/tmp/$leg-provisioning.json" ]; then cp "/tmp/$leg-provisioning.json" "replay-out/$leg/provisioning.json"; fi
+            if [ -n "$ip" ]; then
+              scp -r -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh "root@$ip:/root/out/." "replay-out/$leg/" || true
             fi
           done
-          if [ -f leg-out/leg-summary.md ]; then
-            cat leg-out/leg-summary.md >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "### Leg: baseline — no outputs collected" >> "$GITHUB_STEP_SUMMARY"
-          fi
-
-      - name: Upload leg artifacts
+          for log in /tmp/profile-*.log; do [ ! -f "$log" ] || cp "$log" replay-out/; done
+      - name: Validate matching state and completed profile range
+        run: |
+          python3 - <<'PYCODE'
+          import json, pathlib, re
+          root = pathlib.Path('replay-out')
+          expected = {'baseline':'1b77bb18a7f4f915d760971e97083896221f70bf', 'primary':'c8cde61726d2822a758ae08815efce3dcdd16bc3'}
+          manifests = []
+          binaries = []
+          for leg, sha in expected.items():
+              p = root / leg
+              meta = json.loads((p / 'meta.json').read_text())
+              assert meta['sha'] == sha, meta
+              assert meta['start_height'] == 1709210 and meta['end_height'] == 1750000, meta
+              assert meta['blocks'] == 40790 and meta['clean_stop'] and meta['profiled'], meta
+              assert meta['p2p_stack'] == 'zakura' and meta['storage_mode'] == 'pruned', meta
+              manifests.append((p / 'state.sha256').read_bytes())
+              binaries.append((p / 'binary.sha256').read_text().split()[0])
+              for name in ['sampling.json','system-timeline.jsonl.gz','perf.data.zst','zakurad-profile-binary.zst','cpu-timeline.perf.txt.gz','scheduling-timeline.perf.txt.gz','zakura-traces.tar.zst']:
+                  assert (p / name).stat().st_size > 0, (leg, name)
+              counters = re.findall(r'^state_vct_fast_block_count(?:\{[^\n]*\})? ([0-9.eE+\-]+)$', (p / 'metrics-final.prom').read_text(), re.M)
+              assert len(counters) == 1 and float(counters[0]) == 40790, (leg, counters)
+          assert manifests[0] == manifests[1], 'Prepared state differs between arms'
+          assert binaries[0] != binaries[1], 'Different sources unexpectedly produced the same executable'
+          (root / 'pair-validation.json').write_text(json.dumps({'status':'passed','start':1709210,'stop':1750000,'blocks':40790,'same_prepared_state':True})+'\n')
+          PYCODE
+      - name: Upload both captures before deleting the new hosts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: zakura-perf-bench-${{ github.run_id }}-baseline
-          path: leg-out/
-          if-no-files-found: ignore
+          name: original-range-prefix-profile-${{ github.run_id }}
+          path: replay-out/
+          if-no-files-found: error
           retention-days: 30
-
-      - name: Teardown droplet + volume
+      - name: Delete only the new baseline droplet and volume
         if: always()
         uses: ./.github/actions/do-teardown
         with:
-          droplet_id: ${{ steps.droplet.outputs.id }}
+          droplet_id: ${{ steps.baseline.outputs.id }}
           droplet_name: zakura-perf-baseline-${{ github.run_id }}
-          volume_ids: ${{ steps.droplet.outputs.volume_id }}
+          volume_ids: ${{ steps.baseline.outputs.volume_id }}
           volume_names: zakura-pr-perf-vol-${{ github.run_id }}-baseline
+          enabled: 'true'
+      - name: Delete only the new primary droplet and volume
+        if: always()
+        uses: ./.github/actions/do-teardown
+        with:
+          droplet_id: ${{ steps.primary.outputs.id }}
+          droplet_name: zakura-perf-primary-${{ github.run_id }}
+          volume_ids: ${{ steps.primary.outputs.volume_id }}
+          volume_names: zakura-pr-perf-vol-${{ github.run_id }}-primary
           enabled: 'true'

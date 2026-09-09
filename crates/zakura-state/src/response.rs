@@ -35,6 +35,17 @@ use crate::{
 #[cfg(test)]
 mod tests;
 
+/// State's decision for a prepared mined block's optimistic relay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparedMinedRelayEligibility {
+    /// The block proves expected work and extends the selected tip.
+    Authorized,
+    /// The block proves expected work but does not extend the selected tip.
+    CommitFirst,
+    /// State cannot prove expected work from the available context.
+    Unavailable,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// A response to a [`StateService`](crate::service::StateService) [`Request`].
 pub enum Response {
@@ -113,6 +124,9 @@ pub enum Response {
     ///
     /// Does not check transparent UTXO inputs
     ValidBestChainTipNullifiersAndAnchors,
+
+    /// Response to [`Request::CheckPreparedMinedRelayEligibility`].
+    PreparedMinedRelayEligibility(PreparedMinedRelayEligibility),
 
     /// Response to [`Request::BestChainNextMedianTimePast`].
     /// Contains the median-time-past for the *next* block on the best chain.
@@ -580,6 +594,9 @@ pub enum ReadResponse {
     /// Does not check transparent UTXO inputs
     ValidBestChainTipNullifiersAndAnchors,
 
+    /// Response to [`ReadRequest::CheckPreparedMinedRelayEligibility`].
+    PreparedMinedRelayEligibility(PreparedMinedRelayEligibility),
+
     /// Response to [`ReadRequest::BestChainNextMedianTimePast`].
     /// Contains the median-time-past for the *next* block on the best chain.
     BestChainNextMedianTimePast(DateTime32),
@@ -696,6 +713,9 @@ impl TryFrom<ReadResponse> for Response {
             ReadResponse::BlockHeaders(headers) => Ok(Response::BlockHeaders(headers)),
 
             ReadResponse::ValidBestChainTipNullifiersAndAnchors => Ok(Response::ValidBestChainTipNullifiersAndAnchors),
+            ReadResponse::PreparedMinedRelayEligibility(eligibility) => {
+                Ok(Response::PreparedMinedRelayEligibility(eligibility))
+            }
 
             ReadResponse::UsageInfo(_)
             | ReadResponse::PruningInfo { .. }

@@ -128,7 +128,8 @@ python3 deploy/continuous-sync/deploy.py status
 python3 deploy/continuous-sync/deploy.py --node temp-zakura-sync-test-5 status
 ```
 
-The scheduled workflow runs `audit` twice per hour. It alerts when a host is
+The workflow requests `audit` twice per hour, but GitHub scheduling can delay or
+skip runs for hours. It alerts when a host is
 unreachable, the controller is halted, the node service is inactive while a run
 claims to be syncing, metrics are unavailable during sync, disk free space is
 below the configured 10 GiB floor, or the node has not completed a run in four
@@ -149,13 +150,36 @@ receipt confirms delivery there. It does not send recoveries for incidents known
 only to the old destination. Cache records without a destination cannot suppress
 an alert without a matching receipt.
 
-Unchanged failures and routine completions share a daily digest, replacing the
-six-hour reminders and individual completion messages. The first digest is due
-24 hours after the audit begins tracking it; subsequent digests follow that
-cadence. New failures and recoveries do not wait for the digest. Completion counts
-include runs since the controller enabled digest reporting, then since the last
-successful digest. An unchanged failure appears only in a digest at least 24 hours
-after its last alert or reminder; a recent alert waits for a later digest.
+Unchanged failures remain in the audit's daily reminder. New failures and
+recoveries do not wait for that reminder. Routine completions are delivered by
+the separate daily sender described below; normal audits never emit them.
+
+### Daily summary
+
+`daily_summary.py` runs on the single sender named in `[summary]` in `nodes.toml`.
+`zakura-sync-summary.timer` checks once per minute, with a deadline of **5:00 p.m.
+America/Denver**, following daylight saving changes. The first check at or after
+the deadline sends the summary. A failed delivery retries on the next check.
+For example, a post delayed until 5:10 p.m. does not move tomorrow's 5:00 p.m.
+deadline. After downtime, one catch-up post includes all still-unreported runs.
+
+The sender uses the existing monitor's read-only peer SSH access and stores the
+last delivered run number and ID for each node in
+`/var/lib/zakura-sync-summary/state.json`, independently of the Actions cache and
+disposable chain state. Only a confirmed Slack response advances these cursors.
+The state file is atomically replaced and flushed to disk, and a file lock prevents
+concurrent senders on that host. Missing or corrupt state fails visibly instead
+of restarting a 24-hour wait or replaying old completions. The configured Slack
+destination must match the saved delivery history.
+
+Each post includes runs completed since that node was last successfully reported.
+Runs still in progress wait for the next day. An unavailable node is identified in
+the message and retains its cursor, so its unreported runs are included when it
+becomes reachable. A reset or inconsistent completion counter is treated as
+unavailable until the operator restores the correct history. New nodes require an
+explicit cursor; use number zero and an empty run ID only if none of their runs
+have ever been reported. Before retiring a node, deliver its pending results.
+
 The summary names each networking mode (dual, Zakura only, or legacy only),
 keeps the host ID for troubleshooting, and includes hosts with zero completions.
 It shows one row per completed run, with duration and average blocks
@@ -190,22 +214,75 @@ Legacy networking only · 1 completed
 The Slack summary also retains host IDs and current status for troubleshooting.
 
 Controllers retain the latest 256 completion durations and ending heights in their
-state, independently of run-log cleanup. Audits accumulate up to 256 per-run
-records per host until delivery.
-Older controllers and existing audit caches still contribute their completion
-counts and latest timing, with BPS unavailable for old records.
+state, independently of run-log cleanup. The sender reads these on each delivery
+attempt. Counts remain available when older timings are no longer retained.
 Missing records, including those beyond retention, are explicitly marked unavailable.
 Malformed optional controller history is discarded without failing a successful
-sync; completion counters remain authoritative. Retired hosts leave the summary
-after any pending completions have been delivered. Per-run logs and artifacts remain available
-on each host.
-A lost audit cache may repeat already summarized completions or alerts.
+sync; completion counters remain authoritative. Per-run logs and artifacts remain
+available on each host.
 
-Alert state is carried between workflow runs in the Actions cache. A failed Slack
+Failure-alert state is still carried between workflow runs in the Actions cache;
+cache loss can repeat audit alerts but cannot reset the daily summary. A failed Slack
 post does not advance notification state; the next audit retries it. Targeted
 audits preserve other nodes' incidents and do not send the fleet digest. The audit
-job still exits non-zero whenever an inspected node has a problem, including when
-its notification has already been delivered.
+job exits non-zero when an inspected node has a problem or Slack delivery fails.
+The workflow also checks that the daily sender's timer is active and its latest
+deadline is no more than 15 minutes overdue. Host-local failures appear in
+`systemctl status zakura-sync-summary.service` and its journal immediately; the
+external check remains subject to GitHub scheduling delays.
+
+### Sender rollout and recovery
+
+Install from the reviewed revision, without starting the sender or restarting any
+sync controller:
+
+```bash
+python3 deploy/continuous-sync/deploy.py deploy-summary --no-start
+```
+
+On the sender, prepare a root-only seed JSON file with `last_posted_at` (UTC Unix
+seconds of the last confirmed summary) and `cursors`. Each cursor is keyed by the
+configured node name and contains `number` and `run_id` from that node's last
+reported completion. Verify them against the Slack post and controller history;
+do not use the current counters, which would silently skip pending runs, or a
+reset Actions cache, which may include previously reported runs. Initialization
+requires every configured node and refuses to overwrite existing state.
+
+After the GitHub audit revision that disables routine summaries is active, and
+any older audit has finished, initialize and preview on the sender:
+
+```bash
+systemd-run --wait --collect -p EnvironmentFile=/etc/zakura-alerts.env \
+  /usr/bin/python3 /opt/zakura-sync-summary/daily_summary.py \
+  initialize --from-file /root/sync-summary-seed.json
+systemd-run --wait --collect -p EnvironmentFile=/etc/zakura-alerts.env \
+  /usr/bin/python3 /opt/zakura-sync-summary/daily_summary.py run --dry-run
+```
+
+The preview respects the deadline and never advances state. Enable the timer only
+after reviewing the migration and pending message:
+
+```bash
+systemctl enable --now zakura-sync-summary.timer
+python3 /opt/zakura-sync-summary/daily_summary.py status
+journalctl -u zakura-sync-summary.service --since today
+```
+
+If today's deadline has passed, enabling sends one catch-up summary on the next
+minute. Check delivery and the saved cursors before declaring rollout complete.
+Keep a backup of the delivery state. For a host replacement, stop the old sender
+first and restore that state on the newly configured owner. Missing state must be
+reconstructed from confirmed posts; never silently initialize from the present.
+Changing the destination or schedule also requires reviewing the saved history.
+
+Slack incoming webhooks do not make delivery and the local state update one atomic
+operation. If Slack accepts a post but its response is lost, or the host crashes
+before saving confirmation, a retry can duplicate that post. Known failed
+deliveries retain all runs; the sender never claims exactly-once delivery.
+
+For rollback, stop the timer first. `audit --legacy-digest` retains the old reporting
+path, but its cache is not updated by the new sender; reconstruct its completion
+baseline from the last confirmed post before using it. Never enable both senders.
 
 ### VCT canary notifications
 
@@ -219,8 +296,8 @@ cancelled and skipped results do not clear it. Delivery failure retains the prio
 state, and missing cache state causes another alert rather than suppressing one.
 
 A completely unreachable host cannot run its local minute monitor. Its fallback
-alert therefore comes from the audit, with an expected maximum detection delay
-of about 30 minutes, plus GitHub Actions scheduling and job startup time.
+alert comes from the audit. The requested cadence is 30 minutes, but observed
+GitHub scheduling gaps mean this is not a maximum detection delay.
 
 On a host:
 

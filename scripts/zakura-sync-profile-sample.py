@@ -35,8 +35,7 @@ def thread_stat(text):
     }
 
 
-def capture(pid, metrics_url):
-    proc = Path("/proc")
+def capture(pid, metrics_url, *, include_threads=True, proc=Path("/proc")):
     task = proc / str(pid)
     stat = read_text(task / "stat")
     if stat is None:
@@ -45,6 +44,8 @@ def capture(pid, metrics_url):
         "epoch_ns": time.time_ns(),
         "monotonic_ns": time.monotonic_ns(),
         "process": thread_stat(stat),
+        "process_status": read_text(task / "status"),
+        "process_schedstat": read_text(task / "schedstat"),
         "threads": {},
         "io": read_text(task / "io"),
         "host_stat": read_text(proc / "stat"),
@@ -53,7 +54,8 @@ def capture(pid, metrics_url):
         "meminfo": read_text(proc / "meminfo"),
         "pressure": {k: read_text(proc / "pressure" / k) for k in ("cpu", "io", "memory")},
     }
-    for thread in sorted((task / "task").glob("[0-9]*")):
+    threads = sorted((task / "task").glob("[0-9]*")) if include_threads else ()
+    for thread in threads:
         stat = read_text(thread / "stat")
         if stat is None:
             continue
@@ -83,9 +85,11 @@ def main():
     parser.add_argument("--seconds", type=int, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--metrics-url", default="http://127.0.0.1:9999/metrics")
+    parser.add_argument("--mode", choices=("lightweight", "full"), default="full",
+                        help="lightweight omits per-thread enumeration")
     args = parser.parse_args()
-    if args.pid <= 0 or not 1 <= args.seconds <= 7200:
-        parser.error("positive PID and a duration of 1–7200 seconds required")
+    if args.pid <= 0 or not 1 <= args.seconds <= 86400:
+        parser.error("positive PID and a duration of 1–86400 seconds required")
     running = True
 
     def stop(_signum, _frame):
@@ -104,6 +108,7 @@ def main():
         "sched_schedstats": read_text(Path("/proc/sys/kernel/sched_schedstats")),
         "interval_seconds": 1,
         "maximum_seconds": args.seconds,
+        "mode": args.mode,
     }
     (args.out / "sampling.json").write_text(json.dumps(metadata, indent=2) + "\n")
     start = time.monotonic()
@@ -111,7 +116,7 @@ def main():
     with gzip.open(args.out / "system-timeline.jsonl.gz", "wt") as output:
         while running and time.monotonic() - start < args.seconds:
             tick = time.monotonic()
-            row = capture(args.pid, args.metrics_url)
+            row = capture(args.pid, args.metrics_url, include_threads=args.mode == "full")
             if row is None:
                 break
             if start_ticks is None:

@@ -401,11 +401,14 @@ LOGF="$OUT_DIR/node.log"
 log "starting zakurad ($SHA), workload=$WORKLOAD leg=$LEG verify_mode=$VERIFY_MODE p2p_stack=$P2P_STACK cap=${WALL_CAP}s peers=${FEED_PEER:-DNS-seeders}/${PEERSET_SIZE}"
 "$ZAKURAD_BIN" -c "$CFG" start >"$LOGF" 2>&1 &
 NODE_PID=$!
-if [[ "$DETAILED_PROFILE" == true ]]; then
-  python3 /root/zakura-sync-profile-sample.py --pid "$NODE_PID" \
-    --seconds "$WALL_CAP" --out "$OUT_DIR" >"$OUT_DIR/system-sampler.log" 2>&1 &
-  SYSTEM_PID=$!
-fi
+SYSTEM_MODE=lightweight
+SYSTEM_SECONDS="$WALL_CAP"
+[[ "$WORKLOAD" == live_head ]] && SYSTEM_SECONDS=$((WALL_CAP + PROFILE_SECONDS))
+[[ "$DETAILED_PROFILE" == true ]] && SYSTEM_MODE=full
+python3 /root/zakura-sync-profile-sample.py --pid "$NODE_PID" \
+  --seconds "$SYSTEM_SECONDS" --out "$OUT_DIR" --mode "$SYSTEM_MODE" \
+  >"$OUT_DIR/system-sampler.log" 2>&1 &
+SYSTEM_PID=$!
 T0=$(date +%s)
 sleep 3
 kill -0 "$NODE_PID" 2>/dev/null || { tail -20 "$LOGF" >&2; die "zakurad died on startup"; }

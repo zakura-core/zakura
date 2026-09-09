@@ -1322,17 +1322,12 @@ where
             }
             let (result, reset_generation) =
                 commit_result.expect("commit_checkpoint_verified should not panic");
-            // Only reset on real commit/state desyncs. Duplicate / NewerRequest
-            // failures are expected when sync resubmits in-queue bodies; resetting
-            // for them rewinds progress behind the already-verified checkpoint and
-            // leaves a permanent queue gap for the next range.
-            if let Err(error) = &result {
-                if !error.is_duplicate_request()
-                    && !matches!(
-                        error,
-                        VerifyCheckpointError::ShuttingDown | VerifyCheckpointError::Dropped
-                    )
-                {
+            // Only a failed state commit can leave verified progress ahead of the state.
+            // Block rejections must preserve progress while a verified range commits:
+            // resetting to the lagging state tip would reopen an already-consumed range.
+            // Duplicate commits also leave progress intact.
+            if let Err(error @ VerifyCheckpointError::CommitCheckpointVerified(_)) = &result {
+                if !error.is_duplicate_request() {
                     let tip = match state_service
                         .oneshot(zs::Request::Tip)
                         .await

@@ -1025,6 +1025,85 @@ async fn newer_request_must_not_rewind_verified_checkpoint_progress() -> Result<
     Ok(())
 }
 
+/// A side-chain rejection must preserve verified progress while state commits lag behind.
+#[tokio::test]
+async fn side_chain_must_not_rewind_committing_checkpoint_range() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+    let blocks: Vec<_> = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .values()
+        .map(|bytes| Arc::<Block>::zcash_deserialize(*bytes).expect("block deserializes"))
+        .collect();
+    let checkpoints: BTreeMap<_, _> = [0usize, 3, 6, 10]
+        .into_iter()
+        .map(|index| {
+            (
+                blocks[index].coinbase_height().unwrap(),
+                blocks[index].hash(),
+            )
+        })
+        .collect();
+    let initial_tip = (block::Height(3), blocks[3].hash());
+    let (release_commits, gate) = tokio::sync::watch::channel(false);
+    let state = tower::service_fn(move |request: zs::Request| {
+        let mut gate = gate.clone();
+        async move {
+            match request {
+                zs::Request::Tip => Ok(zs::Response::Tip(Some(initial_tip))),
+                zs::Request::CommitCheckpointVerifiedBlock(block) => {
+                    gate.wait_for(|released| *released)
+                        .await
+                        .expect("the test retains the commit gate");
+                    Ok::<_, BoxError>(zs::Response::Committed(block.hash))
+                }
+                _ => unreachable!("the verifier only requests commits and the tip"),
+            }
+        }
+    });
+    let mut verifier =
+        CheckpointVerifier::from_list(checkpoints, &Mainnet, Some(initial_tip), state)
+            .map_err(|error| eyre!(error))?;
+
+    let side_chain = verifier.call(blocks[4].clone());
+    // Model a competing block after basic validation without mining another valid PoW.
+    let side_hash = block::Hash([0xAA; 32]);
+    verifier.queued.get_mut(&block::Height(4)).unwrap()[0].block =
+        CheckpointVerifiedBlock::new(blocks[4].clone(), Some(side_hash), None);
+    let mut commits = FuturesUnordered::new();
+    for block in &blocks[4..=6] {
+        commits.push(verifier.call(block.clone()));
+    }
+    assert_eq!(
+        verifier.previous_checkpoint_height(),
+        PreviousCheckpoint(block::Height(6))
+    );
+    assert!(matches!(
+        timeout(Duration::from_secs(VERIFY_TIMEOUT_SECONDS), side_chain).await.unwrap(),
+        Err(VerifyCheckpointError::UnexpectedSideChain { found, .. }) if found == side_hash
+    ));
+
+    // This call applies any reset while the state tip remains at height 3.
+    commits.push(verifier.call(blocks[7].clone()));
+    assert_eq!(
+        verifier.previous_checkpoint_height(),
+        PreviousCheckpoint(block::Height(6)),
+        "a side-chain rejection must not reopen the consumed checkpoint range"
+    );
+    assert_eq!(verifier.reset_generation, 0);
+    for block in &blocks[8..=10] {
+        commits.push(verifier.call(block.clone()));
+    }
+    release_commits.send_replace(true);
+    timeout(Duration::from_secs(VERIFY_TIMEOUT_SECONDS), async {
+        while let Some(result) = commits.next().await {
+            result.expect("both checkpoint ranges must commit");
+        }
+    })
+    .await
+    .expect("checkpoint commits must finish");
+    assert_eq!(verifier.previous_checkpoint_height(), FinalCheckpoint);
+    Ok(())
+}
+
 /// A late reset from an earlier commit generation must not rewind recovered progress.
 #[tokio::test(flavor = "multi_thread")]
 async fn stale_commit_reset_must_not_rewind_recovered_checkpoint_progress() -> Result<(), Report> {

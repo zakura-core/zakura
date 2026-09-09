@@ -5,6 +5,8 @@ use zakura_chain::block;
 
 use super::{Frame, ZakuraPeerId, FRAME_HEADER_BYTES};
 
+#[cfg(feature = "internal-bench")]
+mod bench_page_schedule;
 mod config;
 mod error;
 mod events;

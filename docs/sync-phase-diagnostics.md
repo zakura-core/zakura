@@ -1,5 +1,11 @@
 # Sync phase diagnostics
 
+The ordinary release feature set compiles out debug events. Build the diagnostic binary explicitly without that static cap:
+
+```sh
+cargo build --release --locked -p zakura --no-default-features --features prometheus,commit-metrics,progress-bar,sentry,opentelemetry,release_max_level_debug,zakura-network/internal-bench
+```
+
 Enable the `sync_phase` tracing target at debug level on a disposable diagnostic node:
 
 ```toml
@@ -27,3 +33,9 @@ This diagnostic branch adds observations to the unchanged sync baseline. It does
 Use block height and phase order to pair events. Retries can produce multiple writer/commit observations for one height. Ordinary tracing timestamps align with the system sampler's wall clock; the existing JSONL process epoch provides the bridge to its relative timestamps. Logs are bounded by the disposable workload and disabled unless this target is enabled. `body_decoded` durations use a monotonic clock and are measured only when the target is enabled.
 
 The state commit function includes its preparation, validation, header-state update and database write. Use its existing narrower timers and system CPU/I/O counters to separate those operations; do not describe its entire duration as disk time. Pair service frame observations with serving-node traces to distinguish transport/service queuing from remote preparation. The receiving node alone cannot establish the remote portion.
+
+## Controlled header serving
+
+The `zakura-network/internal-bench` feature also includes a private serving hook. On the isolated feeder only, set `ZAKURA_BENCH_HEADER_SCHEDULE=2:2500` to release the first two page completions without a delay and hold each subsequent page completion for 2,500 ms. The hook runs after the state read and before delivery to the header reactor. It neither changes block serving nor holds a database transaction during its timer. It logs page-ready and page-release observations under `sync_fixture`.
+
+Restart the feeder before each replay: the page counter is process-wide. Connect exactly one test client, keep the feeder's state and selected tip fixed, and validate the observed request/page sequence. Do not set the variable during public-network preparation or on the client. `0:0` provides the same serving instrumentation without delay. The hook is absent from ordinary builds, and does nothing when its variable is absent. This fixture is for diagnosing controlled schedules; its artificial latency must not be described as public-network throughput.

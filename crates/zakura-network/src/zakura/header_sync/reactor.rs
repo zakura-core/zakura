@@ -4419,6 +4419,14 @@ impl HeaderSyncReactor {
                                 HeaderPathPageResult::Unavailable
                             }
                         };
+                        #[cfg(feature = "internal-bench")]
+                        if matches!(&result, HeaderPathPageResult::Page(_)) {
+                            super::bench_page_schedule::before_page_completion(
+                                &peer,
+                                request_id.get(),
+                            )
+                            .await;
+                        }
                         Box::new(move |reactor: &mut HeaderSyncReactor| {
                             reactor.handle_header_path_page_ready(
                                 peer,

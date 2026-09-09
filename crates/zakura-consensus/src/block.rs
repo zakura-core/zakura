@@ -202,6 +202,9 @@ impl VerifyBlockError {
     /// Returns the state location for duplicate commit requests.
     pub fn duplicate_location(&self) -> Option<&zs::KnownBlock> {
         match self {
+            VerifyBlockError::Block {
+                source: BlockError::AlreadyInChain(_, location),
+            } => Some(location),
             VerifyBlockError::Commit(commit_err) => commit_err.duplicate_location(),
             _ => None,
         }
@@ -314,19 +317,28 @@ where
             let preparation_start = request.should_cache().then(std::time::Instant::now);
             // Check that this block is actually a new block.
             tracing::trace!("checking that block is not already in state");
-            match state_service
-                .ready()
-                .await
-                .map_err(|source| VerifyBlockError::Depth { source, hash })?
-                .call(zs::Request::KnownBlock(hash))
-                .await
-                .map_err(|source| VerifyBlockError::Depth { source, hash })?
-            {
-                zs::Response::KnownBlock(Some(location)) => {
-                    return Err(BlockError::AlreadyInChain(hash, location).into())
+            loop {
+                match state_service
+                    .ready()
+                    .await
+                    .map_err(|source| VerifyBlockError::Depth { source, hash })?
+                    .call(zs::Request::KnownBlock(hash))
+                    .await
+                    .map_err(|source| VerifyBlockError::Depth { source, hash })?
+                {
+                    // The previous caller may have timed out after submitting its commit.
+                    // Wait for that commit before reporting a duplicate or verifying again.
+                    zs::Response::KnownBlock(Some(
+                        zs::KnownBlock::WriteChannel | zs::KnownBlock::Queue,
+                    )) => {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                    zs::Response::KnownBlock(Some(location)) => {
+                        return Err(BlockError::AlreadyInChain(hash, location).into())
+                    }
+                    zs::Response::KnownBlock(None) => break,
+                    _ => unreachable!("wrong response to Request::KnownBlock"),
                 }
-                zs::Response::KnownBlock(None) => {}
-                _ => unreachable!("wrong response to Request::KnownBlock"),
             }
 
             tracing::trace!("performing block checks");

@@ -2215,3 +2215,56 @@ async fn unpublished_writer_transitions_block_optimistic_relay_and_bound_bodies(
         super::queued_blocks::MAX_QUEUED_BLOCKS
     );
 }
+
+/// The sent cache must not hide a completed commit from a same-hash retry.
+#[tokio::test]
+async fn known_block_prefers_committed_state_over_sent_cache() {
+    use crate::KnownBlock;
+    use tower::{Service, ServiceExt};
+
+    let _init_guard = zakura_test::init();
+    let mut config = Config::ephemeral();
+    config.enable_zakura_header_seed_from_committed_blocks = true;
+    config.vct_fast_sync = false;
+    let (mut state, _, _, _) = StateService::new(config, &Network::Mainnet, Height::MAX, 0)
+        .await
+        .unwrap();
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let hash = block.hash();
+    let checkpoint = CheckpointVerifiedBlock::from(block);
+    state
+        .non_finalized_block_write_sent_hashes
+        .add_finalized(&checkpoint);
+    assert_eq!(
+        state
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::KnownBlock(hash))
+            .await
+            .unwrap(),
+        Response::KnownBlock(Some(KnownBlock::WriteChannel))
+    );
+
+    timeout(
+        Duration::from_secs(5),
+        state.queue_and_commit_to_finalized_state(checkpoint),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    assert!(state.non_finalized_block_write_sent_hashes.contains(&hash));
+    assert_eq!(
+        state
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::KnownBlock(hash))
+            .await
+            .unwrap(),
+        Response::KnownBlock(Some(KnownBlock::Finalized))
+    );
+}

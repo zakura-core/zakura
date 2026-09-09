@@ -340,6 +340,19 @@ where
     fn call(&mut self, request: Request) -> Self::Future {
         let block = request.block();
 
+        // V5+ transaction IDs authenticate the expiry height, but not the coinbase input height.
+        // Check their agreement before a peer-controlled height selects the checkpoint verifier.
+        if let Some(height) = block.coinbase_height() {
+            let coinbase = &block.transactions[0];
+            if coinbase.version() >= 5 {
+                if let Err(error) =
+                    transaction::check::coinbase_height_matches_expiry(&height, coinbase)
+                {
+                    return async { Err(VerifyBlockError::Transaction(error).into()) }.boxed();
+                }
+            }
+        }
+
         match block.coinbase_height() {
             // There's currently no known use case for block proposals below the checkpoint height,
             // so it's okay to immediately return an error here.

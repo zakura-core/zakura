@@ -2004,16 +2004,15 @@ impl Service<Request> for StateService {
                 let read_service = self.read_service.clone();
 
                 async move {
-                    if sent_hash_response.is_some() {
-                        return Ok(Response::KnownBlock(sent_hash_response));
-                    };
-
+                    // The sent cache retains committed blocks until finalization.
+                    // Prefer committed state so retries can observe a completed write.
                     let response = read::non_finalized_state_contains_block_hash(
                         &read_service.latest_non_finalized_state(),
                         hash,
                     )
                     // TODO: Move this to a blocking task, perhaps by moving some of this logic to the ReadStateService.
-                    .or_else(|| read::finalized_state_contains_block_hash(&read_service.db, hash));
+                    .or_else(|| read::finalized_state_contains_block_hash(&read_service.db, hash))
+                    .or(sent_hash_response);
 
                     timer.finish_desc("Request::KnownBlock");
 

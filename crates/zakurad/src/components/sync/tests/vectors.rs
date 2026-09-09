@@ -2720,7 +2720,12 @@ async fn utxo_timeout_wave_restarts_without_progress() {
 /// The downloader preserves the final checkpoint and emits a typed timeout for its child.
 #[tokio::test(start_paused = true)]
 async fn short_verify_timeout_starts_after_final_checkpoint() -> Result<(), crate::BoxError> {
-    for checkpoint_height in [Height(1), Height(0)] {
+    for checkpoint_height in [
+        Height(1),
+        Height(0),
+        Height::MAX,
+        Height(Height::MAX.0 - 99),
+    ] {
         let (mut chain_sync, _, mut verifier, mut peers, _state, _tip) =
             setup_chain_sync_with_options(checkpoint_height, sync::BLOCK_VERIFY_TIMEOUT * 2);
         let block: Arc<Block> =
@@ -2736,7 +2741,7 @@ async fn short_verify_timeout_starts_after_final_checkpoint() -> Result<(), crat
             .await;
         tokio::time::advance(sync::FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT + Duration::from_secs(1))
             .await;
-        if checkpoint_height == Height(1) {
+        if checkpoint_height != Height(0) {
             assert!(
                 tokio::time::timeout(Duration::from_secs(1), chain_sync.downloads.next())
                     .await
@@ -4062,57 +4067,89 @@ async fn non_tip_child_keeps_the_behind_tip_policy() {
 /// A poisoned tip child must be requeued immediately, and its supplier scored, instead of
 /// leaving the newest block for the next discovery round.
 #[tokio::test]
-async fn poisoned_tip_child_requeues_and_scores_its_supplier() -> Result<(), crate::BoxError> {
-    let (
-        mut chain_sync,
-        _sync_status,
-        mut block_verifier_router,
-        mut peer_set,
-        _state_service,
-        _mock_chain_tip_sender,
-    ) = setup_chain_sync();
+async fn poisoned_body_requeues_and_scores_its_supplier() -> Result<(), crate::BoxError> {
+    for error_kind in 0..3 {
+        let (
+            mut chain_sync,
+            _sync_status,
+            mut block_verifier_router,
+            mut peer_set,
+            _state_service,
+            _mock_chain_tip_sender,
+        ) = setup_chain_sync();
 
-    let (misbehavior_tx, mut misbehavior_rx) = tokio::sync::mpsc::channel(1);
-    chain_sync.misbehavior_sender = misbehavior_tx;
+        let (misbehavior_tx, mut misbehavior_rx) = tokio::sync::mpsc::channel(1);
+        chain_sync.misbehavior_sender = misbehavior_tx;
 
-    let block_hash = block::Hash::from([0xAB; 32]);
-    let addr: PeerSocketAddr = "127.0.0.1:8233".parse().expect("valid peer address");
+        let block_hash = block::Hash::from([0xAB; 32]);
+        let addr: PeerSocketAddr = "127.0.0.1:8233".parse().expect("valid peer address");
 
-    let error = BlockDownloadVerifyError::TipChildHeightMismatch {
-        height: Height(1),
-        expected_height: Height(1_687_107),
-        hash: block_hash,
-        advertiser_addr: Some(addr),
-    };
+        let error = match error_kind {
+            0 => BlockDownloadVerifyError::TipChildHeightMismatch {
+                height: Height(1),
+                expected_height: Height(1_687_107),
+                hash: block_hash,
+                advertiser_addr: Some(addr),
+            },
+            1 => BlockDownloadVerifyError::Invalid {
+                error: RouterError::Block {
+                    source: Box::new(VerifyBlockError::Transaction(
+                        TransactionError::CoinbaseExpiryBlockHeight {
+                            expiry_height: Some(Height(1_687_107)),
+                            block_height: Height(1_687_105),
+                            transaction_hash: zakura_chain::transaction::Hash([0xAB; 32]),
+                        },
+                    )),
+                },
+                height: Height(1_687_105),
+                hash: block_hash,
+                advertiser_addr: Some(addr),
+            },
+            _ => BlockDownloadVerifyError::Invalid {
+                error: RouterError::Checkpoint {
+                    source: Box::new(zakura_consensus::VerifyCheckpointError::VerifyBlock(
+                        VerifyBlockError::Block {
+                            source: zakura_consensus::BlockError::BadMerkleRoot {
+                                actual: block::merkle::Root([0; 32]),
+                                expected: block::merkle::Root([1; 32]),
+                            },
+                        },
+                    )),
+                },
+                height: Height(1_687_105),
+                hash: block_hash,
+                advertiser_addr: Some(addr),
+            },
+        };
 
-    let requeue = tokio::spawn(async move {
-        let result = chain_sync
-            .handle_block_response_with_missing_retry(Err(error))
-            .await;
-        (result, chain_sync)
-    });
+        let requeue = tokio::spawn(async move {
+            let result = chain_sync
+                .handle_block_response_with_missing_retry(Err(error))
+                .await;
+            (result, chain_sync)
+        });
 
-    peer_set
-        .expect_request(zn::Request::BlocksByHash(iter::once(block_hash).collect()))
-        .await
-        .respond(Err(not_found_block_error(block_hash)));
+        peer_set
+            .expect_request(zn::Request::BlocksByHash(iter::once(block_hash).collect()))
+            .await
+            .respond(Err(not_found_block_error(block_hash)));
 
-    let (result, chain_sync) = requeue.await.expect("the retry task should not panic");
-    result?;
+        let (result, chain_sync) = requeue.await.expect("the retry task should not panic");
+        result?;
 
-    assert_eq!(
-        misbehavior_rx.recv().await,
-        Some((addr, 100)),
-        "the supplier of a poisoned body must be scored for a ban"
-    );
-    assert_eq!(
-        chain_sync.poisoned_block_retry_counts.get(&block_hash),
-        Some(&1),
-        "the requeue must be counted against the retry budget"
-    );
+        assert_eq!(
+            misbehavior_rx.recv().await,
+            Some((addr, 100)),
+            "the supplier of a poisoned body must be scored for a ban"
+        );
+        assert_eq!(
+            chain_sync.poisoned_block_retry_counts.get(&block_hash),
+            Some(&1),
+            "the requeue must be counted against the retry budget"
+        );
 
-    block_verifier_router.expect_no_requests().await;
-
+        block_verifier_router.expect_no_requests().await;
+    }
     Ok(())
 }
 
@@ -4208,4 +4245,68 @@ async fn tip_height_without_a_tip_hash_keeps_the_behind_tip_policy() {
     );
 
     verifier.expect_no_requests().await;
+}
+
+/// A completed duplicate commit restores the same retry budgets as a direct success.
+#[tokio::test]
+async fn committed_duplicate_clears_verification_retry_budgets() {
+    for location in [
+        zs::KnownBlock::BestChain,
+        zs::KnownBlock::SideChain,
+        zs::KnownBlock::Finalized,
+    ] {
+        let (mut chain_sync, _, _verifier, mut peers, _state, _tip) = setup_chain_sync();
+        let hash = block::Hash([0xCD; 32]);
+        chain_sync.verify_timeout_retry_counts.insert(hash, 2);
+        chain_sync.utxo_race_drops = 1;
+        chain_sync
+            .handle_block_response_with_missing_retry(Err(BlockDownloadVerifyError::Invalid {
+                error: RouterError::Block {
+                    source: Box::new(VerifyBlockError::Block {
+                        source: zakura_consensus::error::BlockError::AlreadyInChain(hash, location),
+                    }),
+                },
+                height: Height(1),
+                hash,
+                advertiser_addr: None,
+            }))
+            .await
+            .unwrap();
+        assert!(chain_sync.verify_timeout_retry_counts.is_empty());
+        assert_eq!(chain_sync.utxo_race_drops, 0);
+        peers.expect_no_requests().await;
+    }
+}
+
+/// A duplicate from the commit stage must remain required until its state write settles.
+#[tokio::test]
+async fn pending_duplicate_requeues_without_clearing_verification_retry_budgets() {
+    for location in [zs::KnownBlock::Queue, zs::KnownBlock::WriteChannel] {
+        let (mut chain_sync, _, _verifier, mut peers, _state, _tip) = setup_chain_sync();
+        let hash = block::Hash([0xCE; 32]);
+        chain_sync.verify_timeout_retry_counts.insert(hash, 1);
+        chain_sync.utxo_race_drops = 1;
+        chain_sync
+            .handle_block_response_with_missing_retry(Err(BlockDownloadVerifyError::Invalid {
+                error: RouterError::Block {
+                    source: Box::new(VerifyBlockError::Commit(zs::CommitBlockError::Duplicate {
+                        hash_or_height: Some(hash.into()),
+                        location,
+                    })),
+                },
+                height: Height(1),
+                hash,
+                advertiser_addr: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(chain_sync.verify_timeout_retry_counts.get(&hash), Some(&2));
+        assert_eq!(chain_sync.utxo_race_drops, 1);
+        peers
+            .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
+            .await
+            .respond_error("finish the test download".into());
+        assert!(chain_sync.downloads.next().await.unwrap().is_err());
+        peers.expect_no_requests().await;
+    }
 }

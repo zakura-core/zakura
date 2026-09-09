@@ -2525,6 +2525,7 @@ where
     /// is requeued immediately, bounded by [`POISONED_BLOCK_RETRY_LIMIT`]. Without the requeue the
     /// newest block would wait for the next discovery round, which is exactly the delay the attack
     /// is trying to cause.
+    /// Coinbase expiry-height mismatches and transaction Merkle-root mismatches use this budget.
     ///
     /// The block download service may hedge each `BlocksByHash` request to another peer. If a peer
     /// still responds `notfound` ([`NotFoundKind::Response`]), the syncer
@@ -2539,6 +2540,7 @@ where
     /// A UTXO lookup timeout or short post-checkpoint verification timeout requeues only the
     /// affected hash, bounded by [`BLOCK_VERIFY_TIMEOUT_RETRY_LIMIT`]. The syncer restarts if
     /// a full verification wave times out on UTXO lookups without a successful verification.
+    /// A duplicate with a pending commit uses the same per-hash retry budget.
     ///
     /// A [`NotFoundKind::Registry`] miss means the peer set found that *every* ready peer is marked
     /// missing the block, so it can't be served right now. Rather than blocking the loop on an inline
@@ -2552,6 +2554,25 @@ where
         &mut self,
         response: Result<(Height, block::Hash), BlockDownloadVerifyError>,
     ) -> Result<(), Report> {
+        let response = match response {
+            Err(BlockDownloadVerifyError::Invalid {
+                ref error,
+                height,
+                hash,
+                ..
+            }) if matches!(
+                error.duplicate_location(),
+                Some(
+                    zs::KnownBlock::Finalized
+                        | zs::KnownBlock::BestChain
+                        | zs::KnownBlock::SideChain
+                )
+            ) =>
+            {
+                Ok((height, hash))
+            }
+            response => response,
+        };
         if let Ok((_height, hash)) = response.as_ref() {
             self.missing_block_retry_counts.remove(hash);
             self.transient_block_retry_counts.remove(hash);
@@ -2561,7 +2582,9 @@ where
         }
 
         if let Some(error) = response.as_ref().err().filter(|error| {
-            Self::is_utxo_lookup_timeout(error) || Self::is_post_checkpoint_verify_timeout(error)
+            Self::is_utxo_lookup_timeout(error)
+                || Self::is_post_checkpoint_verify_timeout(error)
+                || Self::is_pending_commit(error)
         }) {
             let hash = match error {
                 BlockDownloadVerifyError::Invalid { hash, .. }
@@ -2594,7 +2617,7 @@ where
             debug!(
                 ?hash,
                 retry_attempt = *retry_count,
-                "block verification timed out waiting for parent outputs, retrying required block"
+                "block verification has no completed result, retrying required block"
             );
             match self.downloads.download_and_verify(hash).await {
                 Ok(()) | Err(BlockDownloadVerifyError::DuplicateBlockQueuedForDownload { .. }) => {}
@@ -2610,6 +2633,12 @@ where
                 advertiser_addr,
                 ..
             } => Some((*hash, *advertiser_addr)),
+            BlockDownloadVerifyError::Invalid {
+                error,
+                hash,
+                advertiser_addr,
+                ..
+            } if Self::is_poisoned_body(error) => Some((*hash, *advertiser_addr)),
             _ => None,
         }) {
             let retry_count = self.poisoned_block_retry_counts.entry(hash).or_default();
@@ -2630,8 +2659,7 @@ where
                     ?hash,
                     retry_attempt = *retry_count,
                     retry_limit = POISONED_BLOCK_RETRY_LIMIT,
-                    "sync block body claimed the wrong height for our tip child, \
-                     retrying required block"
+                    "sync block body failed height or transaction commitment checks, retrying required block"
                 );
                 metrics::counter!("sync.poisoned.block.requeued.count").increment(1);
 
@@ -2885,6 +2913,23 @@ where
         );
     }
 
+    /// Identifies a body that disagrees with its transaction commitments.
+    fn is_poisoned_body(error: &RouterError) -> bool {
+        use zakura_header_chain::{BodyCommitmentKind, BodyVerificationClass};
+
+        matches!(
+            error.body_verification_class(),
+            BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::TransactionMerkleRoot)
+        ) || matches!(error, RouterError::Block { source }
+                if matches!(**source, VerifyBlockError::Transaction(TransactionError::CoinbaseExpiryBlockHeight { .. })))
+    }
+
+    /// Identifies a duplicate whose original commit has no known outcome yet.
+    fn is_pending_commit(error: &BlockDownloadVerifyError) -> bool {
+        matches!(error, BlockDownloadVerifyError::Invalid { error, .. }
+            if matches!(error.duplicate_location(), Some(zs::KnownBlock::Queue | zs::KnownBlock::WriteChannel)))
+    }
+
     /// Identifies the state service's `AwaitUtxo` timeout.
     fn is_utxo_lookup_timeout(error: &BlockDownloadVerifyError) -> bool {
         matches!(
@@ -2915,8 +2960,11 @@ where
 
         match e {
             // The retry handler bounds these races without cancelling the parent's commit.
-            e if Self::is_utxo_lookup_timeout(e) || Self::is_post_checkpoint_verify_timeout(e) => {
-                debug!(error = ?e, %peer, "transient block verification timeout, continuing sync");
+            e if Self::is_utxo_lookup_timeout(e)
+                || Self::is_post_checkpoint_verify_timeout(e)
+                || Self::is_pending_commit(e) =>
+            {
+                debug!(error = ?e, %peer, "block verification remains incomplete, continuing sync");
                 false
             }
             // Structural matches: downcasts

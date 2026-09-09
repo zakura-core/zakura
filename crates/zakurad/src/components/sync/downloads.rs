@@ -827,7 +827,7 @@ where
                     .call(zakura_consensus::Request::Commit(block)).boxed();
 
                 // Add a shorter timeout to workaround a known bug (#5125)
-                let short_timeout_max = (max_checkpoint_height + FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT_LIMIT).expect("checkpoint block height is in valid range");
+                let short_timeout_max = (max_checkpoint_height + FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT_LIMIT).unwrap_or(Height::MAX);
                 // The final checkpoint can wait for its entire range; only fully verified blocks
                 // need the short timeout. Preserve the error type for the sync retry handler.
                 if block_height > max_checkpoint_height && block_height <= short_timeout_max {

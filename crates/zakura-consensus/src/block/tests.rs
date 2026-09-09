@@ -1598,3 +1598,57 @@ fn state_commit_context_errors_keep_misbehavior_scores() {
     let router_error = crate::router::RouterError::from(err);
     assert_eq!(router_error.misbehavior_score(), 100);
 }
+
+/// A retry must observe the queued commit's outcome before reporting a duplicate.
+#[tokio::test(start_paused = true)]
+async fn pending_commit_retry_waits_for_state_outcome() {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    for committed in [true, false] {
+        let mut block: Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        // If the previous commit fails, revalidation must reach this malformed body.
+        block.transactions.clear();
+        let hash = block.hash();
+        let locations = Arc::new(Mutex::new(VecDeque::from([
+            Some(zs::KnownBlock::Queue),
+            Some(zs::KnownBlock::WriteChannel),
+            committed.then_some(zs::KnownBlock::BestChain),
+        ])));
+        let state = service_fn({
+            let locations = locations.clone();
+            move |request| {
+                assert_eq!(request, zs::Request::KnownBlock(hash));
+                let location = locations
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("three state queries");
+                async move { Ok::<_, BoxError>(zs::Response::KnownBlock(location)) }
+            }
+        });
+        let transaction = service_fn(|_| -> std::future::Ready<Result<tx::Response, BoxError>> {
+            panic!("duplicate and missing-height blocks cannot reach transaction verification")
+        });
+        let verifier = SemanticBlockVerifier::new(&Network::Mainnet, state, transaction);
+        let start = tokio::time::Instant::now();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            verifier.oneshot(Request::Commit(Arc::new(block))),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(start.elapsed() >= std::time::Duration::from_secs(2));
+        assert!(locations.lock().unwrap().is_empty());
+        if committed {
+            assert_eq!(error.duplicate_location(), Some(&zs::KnownBlock::BestChain));
+        } else {
+            assert!(
+                matches!(error, VerifyBlockError::Block { source: BlockError::MissingHeight(h) } if h == hash)
+            );
+        }
+    }
+}

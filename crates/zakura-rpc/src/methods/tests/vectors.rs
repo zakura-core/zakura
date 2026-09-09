@@ -3114,6 +3114,7 @@ async fn check_template_rejection_recovery(reject_before_poll: bool) {
         }
     });
     let chain_info = GetBlockTemplateChainInfo {
+        value_pools: Default::default(),
         expected_difficulty: CompactDifficulty::from(ExpandedDifficulty::from(U256::one())),
         tip_height: height,
         tip_hash: parent,

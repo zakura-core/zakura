@@ -12,6 +12,67 @@ The local worktree is `zakura.dogwood-experiments`, alongside the docs worktree.
 Its `docs/experiments/dogwood` directory retains the September 5 experiments
 and adds the scripts and result directories named below.
 
+## Burst capacity calculation
+
+`capacity_budget.py` records the arithmetic behind the design's example burst
+table in `results/2026-09-09-capacity-decision`. It uses 50,000 TPS, 2 KiB per
+transaction, and 25% parity. It excludes the transaction-vector prefix, coding
+rounding, proofs, transport, and CPU. This calculation is not an experiment.
+
+The exact W1 field bound permits 52,428 data parts, or 3,435,921,408 body bytes.
+At the planning rate, that holds about 33.55392 seconds of transaction bytes.
+A 75-second example exceeds the field bound. Sending its codeword within five
+seconds requires at least 15.36 Gbps of source upload. The 1.344 Gbps average
+capacity example needs at least 57.14 seconds for that transfer. Stripes cannot
+remove this serialization time. The user must select the intended block
+interval and propagation deadline before a burst result can meet the target.
+
+## Reference codec scaling
+
+The scaling follow-up runs the existing reference Reed–Solomon kernels on the
+same **64 MiB of body data** with 25% parity. It compares 32 stripes of 2 MiB
+through one codeword of 64 MiB. Each stripe runs encoding, its Merkle root,
+verified on-arrival eager decoding, and re-encoding/root verification. The
+benchmark compares systematic-first and parity-first arrivals with three data
+seeds each: 30 successful processes. Every stripe reconstructs the original data
+and matches its committed root.
+
+The benchmark uses one serial worker and caches the generator matrix across
+equal-shape stripes. It processes one stripe at a time. These are measured
+kernel durations, not a network replay. At 50,000 TPS and 2 KiB per transaction,
+64 MiB arrives every **655.36 ms**. Compare each column's CPU time with that
+cadence; source and receiver work belong to separate roles.
+
+| Stripe body | Stripes | Mean source encoding/root | Mean receiver, systematic first | Mean receiver, parity first | Maximum process RSS |
+| --- | --- | --- | --- | --- | --- |
+| 2 MiB | 32 | 179 ms | 231 ms | 382 ms | 21.9 MiB |
+| 8 MiB | 8 | 589 ms | 640 ms | 1,191 ms | 44.1 MiB |
+| 16 MiB | 4 | 1,146 ms | 1,211 ms | 2,318 ms | 80.3 MiB |
+| 32 MiB | 2 | 2,268 ms | 2,304 ms | 4,558 ms | 153.2 MiB |
+| 64 MiB | 1 | 4,462 ms | 4,614 ms | 9,132 ms | 301.0 MiB |
+
+Source means combine both arrival orders. Receiver time includes membership
+proofs, elimination, and re-encoding/root verification. It excludes consensus
+validation. The table excludes generator construction, which averages about
+1.2 seconds for the 64 MiB codeword and less than 0.1 ms for 2 MiB stripes.
+A new shape can require that construction even when prior shapes were cached.
+
+The 2 MiB cases fit the body cadence in this serial reference. Larger cases
+exceed it under parity-first reception. This supports 2 MiB as the next stripe
+size to test. It does not prove that larger stripes require these costs in an
+optimized implementation. The benchmark uses the earlier experimental Merkle
+tree, not W1 tags/padding or an authenticated outer stripe commitment. It also
+excludes whole-body retention, concurrent workers, transport, and adversarial
+work. Its RSS values do not size production assembly memory.
+
+`stripe_scaling.cpp`, `run_stripe_scaling.py`, and `summarize_stripe_scaling.py`
+produce `results/2026-09-09-stripe-scaling`. The archive records source hashes,
+compiler/host details, raw process output, and summaries. The measured work
+also bounds interpretation of the earlier concurrent simulation: its fixed
+8 ms reconstruction cost and 0.02 ms proof cost are assumptions, not these
+measurements. The large-body profile still needs an outer commitment, bounded
+pipeline and retention, and an experiment at the selected block burst.
+
 ## W1 payload conformance
 
 The W1 follow-up fixes candidate payload bytes, tagged SHA-256 commitments,

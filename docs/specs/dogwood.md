@@ -41,6 +41,10 @@ transaction. This requires 819.2 Mbps of body throughput and 1.024 Gbps with
 25% parity, before proofs, transport, challenges, and recovery. This assumption
 does not change consensus limits. The [design throughput budget](../design/dogwood.md#throughput-target)
 separates average rate, burst latency, forwarding load, and codeword limits.
+The intended block interval and propagation deadline remain required sizing
+inputs. A frame-valid codeword is not evidence that decoding fits a work budget.
+The [reference scaling experiment](../design/dogwood-experiments.md#reference-codec-scaling)
+supports testing smaller stripes; W1 does not yet encode them.
 
 The normal throughput claim assumes that the participating honest relay
 network remains connected after removing the proposer. Experiments MUST state

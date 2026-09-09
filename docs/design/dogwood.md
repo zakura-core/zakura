@@ -49,6 +49,32 @@ At 64 KiB and 25% parity, at most 52,428 data parts hold about 3.2 GiB.
 This workload reaches that bound in about 33.55 seconds. A larger body would
 require a revised profile, such as multiple committed stripes, and new tests.
 
+These example burst budgets separate the missing sizing decisions. They assume
+that body propagation starts after block release and that the proposer seeds
+one codeword. They exclude framing, integer padding, CPU, and relay delay.
+The intervals and deadlines are examples, not proposed consensus parameters.
+
+| Block interval | Body bytes | Propagation deadline | Minimum receiver body ingress | Proposer upload for 25% parity | Fits W1 field bound |
+| --- | --- | --- | --- | --- | --- |
+| 1 s | 102.4 MB | 1 s | 0.8192 Gbps | 1.024 Gbps | Yes |
+| 10 s | 1.024 GB | 1 s | 8.192 Gbps | 10.24 Gbps | Yes |
+| 30 s | 3.072 GB | 1 s | 24.576 Gbps | 30.72 Gbps | Yes |
+| 75 s | 7.68 GB | 5 s | 12.288 Gbps | 15.36 Gbps | No |
+| 75 s | 7.68 GB | 1 s | 61.44 Gbps | 76.8 Gbps | No |
+
+A 1.344 Gbps proposer needs at least 57.14 seconds to send the 75-second
+example's codeword. That link can satisfy the average source budget but cannot
+satisfy a five-second propagation deadline. Stripes remove the single-codeword
+field limit; they do not reduce the source's byte count. Fitting the field
+limit also does not establish an affordable decoder.
+
+The design needs a selected block interval and propagation deadline before it
+can select the large-body profile and a meaningful burst experiment. The
+50,000 TPS assumption fixes neither value. The synthetic 2 MiB releases in the
+concurrent experiment cannot substitute for that decision. Until those values
+are selected, this document claims capacity bounds and measured reference
+behavior, not a complete post-Tachyon performance design.
+
 Peers will have widely different usable upload rates after other traffic.
 The controller must allocate against observed delivery and aggregate receiver
 capacity. A high advertised link rate does not establish either quantity.
@@ -441,6 +467,15 @@ or unavailable supplier invalidates the reference argument. The experiment
 does not establish concurrent throughput or single-supplier failure coverage.
 Do not enable stripe pruning under the present profile.
 
+The [reference codec scaling test](dogwood-experiments.md#reference-codec-scaling)
+compares the same 64 MiB body at different stripe sizes. With 2 MiB stripes,
+source encoding/root work takes about 179 ms and receiver work takes 382 ms
+under parity-first reception. One 64 MiB codeword takes about 4.46 seconds and
+9.13 seconds respectively. These are serial reference-kernel measurements.
+They support testing 2 MiB stripes and show why the field bound alone cannot
+select a practical codeword size. They do not implement an authenticated
+stripe profile or establish production throughput.
+
 The concurrent follow-up preserves normal delivery at the synthetic 819.2 Mbps
 body rate in its steady cases. Temporary upload changes still cause misses.
 Restoring startup suppliers after a miss does not consistently restore timely
@@ -661,8 +696,11 @@ resource bounds are selected. W1 fixes candidate payload bytes and signatures.
   separate clock-drift and dishonest-sender tests.
 - [ ] **Controller completeness:** implement settling, migration, stale-history,
   grant, and cancellation rules omitted by the reduced simulations.
-- [ ] **Large bodies:** select a block interval and burst target for 50,000 TPS;
-  test codec memory/CPU and revise the single-codeword profile if necessary.
+- [x] Measure equal-body reference codec scaling from 2 MiB stripes to one
+  64 MiB codeword; separate the field bound from practical CPU cost.
+- [ ] **Large bodies:** obtain the intended block interval and propagation
+  deadline; select the committed-stripe profile and test the resulting burst
+  with measured coding work, bounded memory, and separately measured fallback.
 - [x] Specify W1 payload encoding, tagged hashes, Merkle proofs, signatures,
   and separate seed cancellation; test bounds and signature context binding.
 - [ ] **Wire and authentication:** finish the production chain adapter,

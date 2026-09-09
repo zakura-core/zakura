@@ -600,3 +600,6 @@ mod tests {
         assert!(session.try_admit(1).is_ok());
     }
 }
+
+#[cfg(test)]
+mod properties;

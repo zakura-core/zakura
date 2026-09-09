@@ -7,10 +7,10 @@ use super::*;
 use crate::zakura::discovery::{DiscoveryMessage, DiscoveryWireError, MAX_DISCOVERY_MESSAGE_BYTES};
 
 #[derive(Clone, Debug)]
-struct GetPeersPolicy;
+pub(super) struct GetPeersPolicy;
 
 #[derive(Debug)]
-struct GetPeersRequest {
+pub(super) struct GetPeersRequest {
     limit: u16,
 }
 
@@ -38,7 +38,7 @@ impl RequestPolicy for GetPeersPolicy {
     }
 }
 
-fn frame(limit: u16) -> Frame {
+pub(super) fn frame(limit: u16) -> Frame {
     Frame {
         message_type: 1,
         flags: 0,

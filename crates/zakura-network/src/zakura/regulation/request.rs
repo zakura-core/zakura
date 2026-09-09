@@ -212,6 +212,11 @@ pub(crate) struct WorkAttempt {
 }
 
 impl WorkAttempt {
+    #[cfg(test)]
+    pub(crate) fn weak_resources(&self) -> std::sync::Weak<WorkResources> {
+        Arc::downgrade(&self.resources)
+    }
+
     pub(crate) fn commit(self) -> ResponsePermit {
         ResponsePermit {
             resources: self.resources,
@@ -337,3 +342,6 @@ impl WorkLease {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod properties;

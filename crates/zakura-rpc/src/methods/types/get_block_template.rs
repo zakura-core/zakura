@@ -74,35 +74,101 @@ const MAX_REJECTED_WORK_IDS: usize = 64;
 /// holding very old work loses its withdrawal exemption rather than growing this queue.
 const MAX_PREPARED_WORK_IDS: usize = 64;
 
-/// Rejections for the current template parent. Overflow fails closed until the tip changes.
+/// How many parents retain what they recorded. The least recently tracked parent is forgotten
+/// first.
+const MAX_TRACKED_PARENTS: usize = 8;
+
+/// What one parent's templates are known to be worth. Overflow fails closed for that parent.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct TemplateRejections {
-    pub(crate) parent: Option<block::Hash>,
-    pub(crate) revision: u64,
+struct ParentRejections {
     rejected: HashSet<String>,
     prepared: VecDeque<String>,
-    pub(crate) saturated: bool,
+    saturated: bool,
+}
+
+impl ParentRejections {
+    /// Whether this parent condemned `work_id`, or condemned so much that it trusts none of its
+    /// own templates.
+    fn contains(&self, work_id: &str) -> bool {
+        self.saturated || self.rejected.contains(work_id)
+    }
+
+    /// Whether this parent may only hand out templates it validated in the foreground.
+    fn needs_fallback(&self) -> bool {
+        self.saturated || !self.rejected.is_empty()
+    }
+
+    /// Whether this parent validated `work_id` and has not condemned it since.
+    fn is_prepared(&self, work_id: &str) -> bool {
+        self.prepared.iter().any(|id| id == work_id) && !self.contains(work_id)
+    }
+}
+
+/// What every tracked parent recorded about its templates, and which parent they are built on now.
+///
+/// A work ID names one template, and that template extends one parent, so a rejection recorded
+/// under that parent stays true for as long as the work does. Retaining one entry per parent is
+/// what lets the chain leave a parent and come back to it — a reorg, or `invalidateblock`
+/// followed by `reconsiderblock` — without losing what was learned there.
+///
+/// Only the explicit rejection follows the work across parents. Fallback and saturation are
+/// policies about which templates a parent may hand out, so they stay scoped to the parent
+/// templates are built on now: one saturated parent must not withdraw every other parent's work.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TemplateRejections {
+    /// The parent templates are built on now.
+    pub(crate) parent: Option<block::Hash>,
+    /// Counts rejections, and never restarts: a waiter can tell it missed one it never read,
+    /// whatever the parent has done since.
+    pub(crate) revision: u64,
+    /// Least recently tracked first. The entries are shared, so cloning this state for one
+    /// request does not copy every tracked parent's work IDs.
+    parents: VecDeque<(block::Hash, Arc<ParentRejections>)>,
 }
 
 impl TemplateRejections {
-    pub(crate) fn set_parent(&mut self, parent: block::Hash) {
-        if self.parent != Some(parent) {
-            self.parent = Some(parent);
-            self.rejected.clear();
-            self.prepared.clear();
-            self.saturated = false;
+    /// Points `parent` at the parent templates are built on now, and returns whether that moved.
+    ///
+    /// Nothing is forgotten here. A parent that is tracked again keeps everything it recorded
+    /// before and returns to the back of the eviction order.
+    pub(crate) fn track_parent(&mut self, parent: block::Hash) -> bool {
+        let moved = self.parent != Some(parent);
+        self.parent = Some(parent);
+
+        let entry = match self.position(parent) {
+            Some(position) => self
+                .parents
+                .remove(position)
+                .expect("position is in bounds"),
+            None => (parent, Arc::default()),
+        };
+        self.parents.push_back(entry);
+        while self.parents.len() > MAX_TRACKED_PARENTS {
+            self.parents.pop_front();
         }
+
+        moved
     }
 
+    /// Records that `work_id` failed validation on `parent`, and returns whether that is news.
+    ///
+    /// `parent` need not be the parent templates are built on now. A validation that finishes
+    /// while the chain is elsewhere still condemns the work it was validating, and that answer is
+    /// the only one the node will get.
     pub(crate) fn reject(&mut self, parent: block::Hash, work_id: &str) -> bool {
-        if self.parent != Some(parent) || self.contains(work_id) {
+        let Some(entry) = self.entry_mut(parent) else {
+            return false;
+        };
+        if entry.contains(work_id) {
             return false;
         }
-        if self.rejected.len() == MAX_REJECTED_WORK_IDS {
-            self.saturated = true;
+
+        if entry.rejected.len() == MAX_REJECTED_WORK_IDS {
+            entry.saturated = true;
         } else {
-            self.rejected.insert(work_id.to_owned());
+            entry.rejected.insert(work_id.to_owned());
         }
+
         self.revision = self
             .revision
             .checked_add(1)
@@ -110,38 +176,95 @@ impl TemplateRejections {
         true
     }
 
-    pub(crate) fn contains(&self, work_id: &str) -> bool {
-        self.saturated || self.rejected.contains(work_id)
-    }
-
-    pub(crate) fn needs_fallback(&self) -> bool {
-        self.saturated || !self.rejected.is_empty()
-    }
-
     /// Records that `work_id` passed validation on `parent`.
     ///
     /// Returns whether this withdrew any other work: the oldest prepared ID is forgotten when the
-    /// queue is full, and during fallback losing that exemption withdraws it. Waiters observe
-    /// withdrawal through the watch channel, so the caller must publish that change.
+    /// queue is full, and during that parent's fallback losing that exemption withdraws it.
+    /// Waiters observe withdrawal through the watch channel, so the caller must publish that
+    /// change.
     pub(crate) fn mark_prepared(&mut self, parent: block::Hash, work_id: &str) -> bool {
-        if self.parent != Some(parent) || self.prepared.iter().any(|id| id == work_id) {
+        let Some(entry) = self.entry_mut(parent) else {
+            return false;
+        };
+        if entry.prepared.iter().any(|id| id == work_id) {
             return false;
         }
-        let evicted = if self.prepared.len() == MAX_PREPARED_WORK_IDS {
-            self.prepared.pop_front().is_some()
+
+        let evicted = if entry.prepared.len() == MAX_PREPARED_WORK_IDS {
+            entry.prepared.pop_front().is_some()
         } else {
             false
         };
-        self.prepared.push_back(work_id.to_owned());
-        evicted && self.needs_fallback()
+        entry.prepared.push_back(work_id.to_owned());
+        evicted && entry.needs_fallback()
     }
 
+    /// Whether the parent templates are built on now condemned `work_id`.
+    pub(crate) fn contains(&self, work_id: &str) -> bool {
+        self.current().is_some_and(|entry| entry.contains(work_id))
+    }
+
+    /// Whether any tracked parent condemned `work_id` by name.
+    ///
+    /// Saturation is deliberately not consulted here: it says a parent stopped trusting its own
+    /// templates, not that this work was validated and found invalid.
+    fn rejected_anywhere(&self, work_id: &str) -> bool {
+        self.parents
+            .iter()
+            .any(|(_, entry)| entry.rejected.contains(work_id))
+    }
+
+    /// Whether the parent templates are built on now may only hand out validated templates.
+    pub(crate) fn needs_fallback(&self) -> bool {
+        self.current().is_some_and(ParentRejections::needs_fallback)
+    }
+
+    /// Whether `parent` may only hand out templates validated in the foreground.
+    pub(crate) fn needs_fallback_on(&self, parent: block::Hash) -> bool {
+        self.entry(parent)
+            .is_some_and(ParentRejections::needs_fallback)
+    }
+
+    /// Whether the parent templates are built on now has stopped trusting its own templates.
+    pub(crate) fn saturated(&self) -> bool {
+        self.current().is_some_and(|entry| entry.saturated)
+    }
+
+    /// Whether the parent templates are built on now validated `work_id`.
     pub(crate) fn is_prepared(&self, work_id: &str) -> bool {
-        self.prepared.iter().any(|id| id == work_id) && !self.contains(work_id)
+        self.current()
+            .is_some_and(|entry| entry.is_prepared(work_id))
     }
 
+    /// Whether a miner holding `work_id` must stop working on it.
     pub(crate) fn withdrawn(&self, work_id: &str) -> bool {
+        // A rejection follows the work: the parent it was recorded under condemned this exact
+        // template, and returning to that parent does not make the template valid again.
+        if self.rejected_anywhere(work_id) {
+            return true;
+        }
+
+        // Fallback is what the parent templates are built on now will still hand out, so it is
+        // asked of that parent alone.
         self.contains(work_id) || (self.needs_fallback() && !self.is_prepared(work_id))
+    }
+
+    fn current(&self) -> Option<&ParentRejections> {
+        self.entry(self.parent?)
+    }
+
+    fn entry(&self, parent: block::Hash) -> Option<&ParentRejections> {
+        self.position(parent)
+            .map(|position| &*self.parents[position].1)
+    }
+
+    fn entry_mut(&mut self, parent: block::Hash) -> Option<&mut ParentRejections> {
+        let position = self.position(parent)?;
+        Some(Arc::make_mut(&mut self.parents[position].1))
+    }
+
+    fn position(&self, parent: block::Hash) -> Option<usize> {
+        self.parents.iter().position(|(hash, _)| *hash == parent)
     }
 }
 

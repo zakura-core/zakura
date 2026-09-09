@@ -26,12 +26,17 @@ use crate::config::mining::{default_miner_address, MinerAddressType};
 
 use super::{MinerParams, TemplatePreparationQueue};
 
+/// A rejection names one template, so it survives the chain leaving that template's parent.
+///
+/// Work IDs are drawn at random per response, so one names exactly one template on exactly one
+/// parent. Fallback and prepared work are policies about a single parent, so they follow the
+/// parent templates are built on now rather than the work.
 #[test]
-fn template_rejection_targets_work_and_ignores_old_parents() {
+fn template_rejection_follows_the_work_across_parents() {
     let parent = zakura_chain::block::Hash([1; 32]);
     let next_parent = zakura_chain::block::Hash([2; 32]);
     let mut state = super::TemplateRejections::default();
-    state.set_parent(parent);
+    assert!(state.track_parent(parent));
     state.mark_prepared(parent, "new");
     assert!(state.reject(parent, "old"));
     assert!(state.contains("old"));
@@ -42,38 +47,111 @@ fn template_rejection_targets_work_and_ignores_old_parents() {
     assert!(state.withdrawn("unknown"));
     assert!(!state.reject(parent, "old"));
     assert_eq!(state.revision, 1);
-    state.set_parent(next_parent);
+
+    // The chain leaves the parent. Its fallback and its prepared work go with it, but the work it
+    // condemned stays condemned, and a validation that only now finishes is still recorded.
+    assert!(state.track_parent(next_parent));
     assert!(!state.needs_fallback());
     assert!(!state.is_prepared("new"));
-    assert!(!state.reject(parent, "late"));
-    assert_eq!(state.revision, 1);
-    assert!(state.reject(next_parent, "new"));
+    assert!(state.withdrawn("old"));
+    assert!(!state.withdrawn("new"));
+    assert!(state.reject(parent, "late"));
     assert_eq!(state.revision, 2);
+    assert!(state.withdrawn("late"));
+
+    // The chain comes back. The parent knows everything it knew before.
+    assert!(state.track_parent(parent));
+    assert!(state.needs_fallback());
+    assert!(state.is_prepared("new"));
+    assert!(!state.withdrawn("new"));
+    assert!(state.withdrawn("old"));
+    assert!(!state.track_parent(parent));
 }
 
 #[test]
 fn template_rejection_storage_fails_closed_at_capacity() {
     let parent = zakura_chain::block::Hash([1; 32]);
     let mut state = super::TemplateRejections::default();
-    state.set_parent(parent);
+    state.track_parent(parent);
     for id in 0..100 {
         state.reject(parent, &id.to_string());
     }
-    assert_eq!(state.rejected.len(), 64);
+    assert_eq!(state.entry(parent).unwrap().rejected.len(), 64);
     assert!(state.contains("unknown"));
     assert!(state.needs_fallback());
+}
+
+/// One parent's saturation must not withdraw another parent's work.
+///
+/// Saturation says a parent stopped trusting its own templates. Reading it across parents would
+/// let a single unlucky parent withdraw every miner's work for as long as it is tracked.
+#[test]
+fn a_saturated_parent_does_not_withdraw_another_parents_work() {
+    let saturated = zakura_chain::block::Hash([1; 32]);
+    let current = zakura_chain::block::Hash([2; 32]);
+    let mut state = super::TemplateRejections::default();
+    state.track_parent(saturated);
+    for id in 0..=super::MAX_REJECTED_WORK_IDS {
+        state.reject(saturated, &id.to_string());
+    }
+    assert!(state.entry(saturated).unwrap().saturated);
+
+    state.track_parent(current);
+    state.mark_prepared(current, "work");
+    assert!(!state.withdrawn("work"));
+    assert!(!state.withdrawn("unrelated"));
+
+    // The parent that saturated still fails closed when the chain returns to it.
+    state.track_parent(saturated);
+    assert!(state.withdrawn("unrelated"));
+}
+
+#[test]
+fn template_rejections_forget_the_least_recently_tracked_parent() {
+    let first = zakura_chain::block::Hash([0; 32]);
+    let mut state = super::TemplateRejections::default();
+    state.track_parent(first);
+    assert!(state.reject(first, "condemned"));
+
+    for id in 1..=super::MAX_TRACKED_PARENTS {
+        state.track_parent(zakura_chain::block::Hash([id as u8; 32]));
+    }
+
+    assert!(!state.withdrawn("condemned"));
+    assert!(
+        !state.reject(first, "late"),
+        "a forgotten parent records nothing",
+    );
+}
+
+#[test]
+fn tracking_a_parent_again_keeps_it_from_being_forgotten() {
+    let first = zakura_chain::block::Hash([0; 32]);
+    let mut state = super::TemplateRejections::default();
+    state.track_parent(first);
+    assert!(state.reject(first, "condemned"));
+
+    for id in 1..super::MAX_TRACKED_PARENTS {
+        state.track_parent(zakura_chain::block::Hash([id as u8; 32]));
+    }
+    // Returning to the parent moves it back to the newest end of the eviction order, so the next
+    // parent forgets one of the others instead.
+    state.track_parent(first);
+    state.track_parent(zakura_chain::block::Hash([200; 32]));
+
+    assert!(state.withdrawn("condemned"));
 }
 
 #[test]
 fn prepared_template_tracking_keeps_new_recovery_work_at_capacity() {
     let parent = zakura_chain::block::Hash([1; 32]);
     let mut state = super::TemplateRejections::default();
-    state.set_parent(parent);
+    state.track_parent(parent);
     state.reject(parent, "invalid");
     for id in 0..100 {
         state.mark_prepared(parent, &id.to_string());
     }
-    assert_eq!(state.prepared.len(), 64);
+    assert_eq!(state.entry(parent).unwrap().prepared.len(), 64);
     assert!(!state.withdrawn("99"));
     assert!(state.withdrawn("0"));
 }
@@ -82,7 +160,7 @@ fn prepared_template_tracking_keeps_new_recovery_work_at_capacity() {
 async fn template_rejection_retains_notifications_for_late_subscribers() {
     let parent = zakura_chain::block::Hash([1; 32]);
     let mut state = super::TemplateRejections::default();
-    state.set_parent(parent);
+    state.track_parent(parent);
     let sender = tokio::sync::watch::channel(state).0;
     let mut early = sender.subscribe();
     sender.send_if_modified(|state| state.reject(parent, "work"));

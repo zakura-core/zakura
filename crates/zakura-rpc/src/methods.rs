@@ -1180,7 +1180,7 @@ async fn prepare_one_server_template<BlockVerifierRouter, Tip, SyncStatus>(
 
     // Once a parent needs recovery, only foreground-validated fallback work may be published.
     // Discard its queued speculative preparations.
-    if gbt.template_rejections.borrow().needs_fallback() {
+    if gbt.template_rejections.borrow().needs_fallback_on(parent) {
         return;
     }
     if !gbt.speculation_breaker.allows(parent) {
@@ -1223,16 +1223,8 @@ async fn prepare_one_server_template<BlockVerifierRouter, Tip, SyncStatus>(
                 .send_if_modified(|state| state.mark_prepared(parent, &work_id));
         }
         Ok(Preparation::Rejected) => {
-            gbt.template_rejections.send_if_modified(|state| {
-                // A reorg away from this parent and back leaves the rejection state naming
-                // another parent while this validation finishes. Re-point it when the chain is
-                // back here, so the rejection is recorded rather than silently dropped.
-                if state.parent != Some(parent) && latest_chain_tip.best_tip_hash() == Some(parent)
-                {
-                    state.set_parent(parent);
-                }
-                state.reject(parent, &work_id)
-            });
+            gbt.template_rejections
+                .send_if_modified(|state| state.reject(parent, &work_id));
             metrics::counter!("mining.template_preparation.rejected").increment(1);
         }
         // The background path has no inner deadline, so `TimedOut` cannot reach here: both
@@ -1426,12 +1418,11 @@ where
     /// Returns `None` when `latest_chain_tip` no longer agrees with the tip a template is being
     /// built on, so the caller must fetch the chain state again.
     ///
-    /// The tip is checked while the rejection state is locked, because `set_parent` clears every
-    /// rejection recorded for the parent it replaces. Holding the lock across the check stops two
-    /// concurrent requests interleaving their checks and writes, so a request that already lost
-    /// the tip cannot erase the withdrawals of the parent that replaced it. `rejections` is both
-    /// the snapshot the caller works from and the marker of what it has seen, taken together so a
-    /// rejection published in between cannot be acknowledged unread.
+    /// The tip is checked while the rejection state is locked, so two concurrent requests cannot
+    /// interleave their checks and writes and leave `parent` naming a parent the chain has
+    /// already left. `rejections` is both the snapshot the caller works from and the marker of
+    /// what it has seen, taken together so a rejection published in between cannot be
+    /// acknowledged unread.
     fn track_template_parent(
         &self,
         tip_hash: block::Hash,
@@ -1448,9 +1439,7 @@ where
                 return false;
             }
 
-            let changed = state.parent != Some(tip_hash);
-            state.set_parent(tip_hash);
-            changed
+            state.track_parent(tip_hash)
         });
 
         tip_is_current.then(|| rejections.borrow_and_update().clone())
@@ -1490,7 +1479,7 @@ where
             }
         }
 
-        if state.saturated {
+        if state.saturated() {
             return Err(ErrorObject::owned(
                 0,
                 "template rejection limit reached; wait for a new tip",

@@ -66,6 +66,7 @@ impl SlotBudget {
     }
 
     /// Whether two handles draw from the same capacity pool.
+    #[cfg(test)]
     pub(super) fn same_budget(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.permits, &other.permits)
     }

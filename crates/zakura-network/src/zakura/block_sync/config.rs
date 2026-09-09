@@ -104,7 +104,6 @@ pub const MAX_BS_RESPONSE_BYTES: u32 = DEFAULT_BS_MAX_RESPONSE_BYTES;
 pub const GET_BLOCKS_TERMINAL_PAYLOAD_BYTES: u64 = 9;
 
 const DEFAULT_GET_BLOCKS_NODE_ACTIVE_REQUESTS: usize = 64;
-const DEFAULT_GET_BLOCKS_QUERY_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Default steady-state cwnd gain, percent of the bandwidth-delay product. 300% ramps a
 /// proven peer up as `1 → 3 → 9 …`; the reliability discount and delay-gradient ceiling
@@ -336,17 +335,12 @@ pub struct ZakuraBlockSyncConfig {
 pub struct GetBlocksRegulationConfig {
     /// State queries and responses that may remain active across all peers.
     pub node_active_requests: usize,
-    /// Response deadline for a state query. Timed-out reads keep their resource
-    /// charges until the underlying state work finishes.
-    #[serde(with = "humantime_serde")]
-    pub query_timeout: Duration,
 }
 
 impl Default for GetBlocksRegulationConfig {
     fn default() -> Self {
         Self {
             node_active_requests: DEFAULT_GET_BLOCKS_NODE_ACTIVE_REQUESTS,
-            query_timeout: DEFAULT_GET_BLOCKS_QUERY_TIMEOUT,
         }
     }
 }

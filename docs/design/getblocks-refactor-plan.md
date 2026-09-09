@@ -4,27 +4,18 @@ Simplify #892's serving path while preserving response reads when requests to se
 
 A **session** is one active block-sync relationship with a peer. A **permit** reserves capacity for one response. Storage work and outgoing data retain that permit until they finish or are discarded.
 
-This plan replaces the shared-stream implementation before #892 ships. It describes the remaining implementation and the tests required before activation.
-
-Execution has started. The initial [transport results](getblocks-refactor-results.md)
-show progress with the advertised request volume and a paused sibling service,
-but a stall when two paused streams fill the connection's receive allowance.
-Supported workloads must complete normally. Excessive traffic that exhausts
-the shared allowance must trigger bounded cleanup and successful recovery;
-the original download attempt may be retried. Paired transport, atomic request
-publication, the sequential serving task, and the node's owned storage adapter
-are implemented. Initial matched downloads and cancellation tests pass.
-Current sessions now use a table and watch notification, and block sync's
-configured queue depths bound its actual transport queues.
-The new block-sync version remains disabled until the full acceptance gate
-passes. The existing serving driver remains active in production during this
-validation.
+This plan replaces the shared-stream implementation before #892 ships. The
+[transport gate](getblocks-refactor-results.md) has passed with the selected
+windows and the approved 32-second data-write deadline. The new version is
+activated in the implementation, and the old serving driver is removed. The
+focused integration checks pass; the results document records the broader test
+results and environment limitations.
 
 ## Before and after
 
 **Overload example:** A is downloading block 200 from B, and A's 64 serving slots are occupied. The test peer B also sends a request for block 100 to put pressure on A's serving path. Only A has a download that must complete; B's extra request is test traffic.
 
-**Today:** Requests and responses share one stream. A queues B's request so it can keep reading block 200. The current #892 implements this progress fix.
+**Before:** Requests and responses share one stream. A queues B's request so it can keep reading block 200. The current #892 implements this progress fix.
 
 **After:** A holds one decoded request for block 100 and pauses request intake. It continues reading block 200 from the separate data stream. A dedicated serving task handles the request when capacity becomes available.
 
@@ -41,7 +32,7 @@ These changes are complete in the inspected #892 source. Preserve their behavior
 
 - [x] Kept response reads progressing during serving admission and outbound congestion.
 - [x] Removed admission-grace timers and compensating download-deadline extensions.
-- [x] Represented the active serving request with `Option<ServingBlockRequest>`.
+- [x] Made each active serving response explicit. The sequential task now owns it directly.
 - [x] Derived the received-block count from the exact bitmap with `count_ones()`.
 - [x] Reserved output-queue capacity before encoding responses.
 - [x] Added production-QUIC serving-progress regressions and separate matched-download coverage.
@@ -144,7 +135,7 @@ Preserve readiness signals, download cleanup, and peer counts, including changes
 
 Adding a stream must not double the peer's allowance or let reconnects accumulate unfinished work:
 
-- Enforce small bounded request queues and bounded data queues. The `ServicePeerLimits` queue-depth and pending-escalation fields currently do not enforce limits; wire the actual queues and admission checks. Count a reader-held frame separately from the raw queue and the serving task's decoded request.
+- Enforce small bounded request queues and bounded data queues. Wire `ServicePeerLimits` queue-depth and pending-escalation fields to the actual queues and admission checks. Count a reader-held frame separately from the raw queue and the serving task's decoded request.
 - Count sessions being established and tasks being retired against admission limits until they finish. Replacing a table entry does not mean its old work has ended.
 - Keep storage workers and outgoing frames charged to response permits across session replacement. Retain the weak per-identity permit registry and prune expired entries so reconnects cannot bypass the peer limit.
 - Share the existing block-sync message budget across both streams. Check message roles and payload limits before allocation, preserving malformed-message checks and the nine-byte `GetBlocks` payload limit: 17 bytes with framing. Account for pair setup separately.
@@ -222,7 +213,7 @@ The new task replaces the following serving machinery. Remove each component onl
 | Routine serving queue, pending admission, and `ServeGetBlocks` forwarding | One decoded request waiting in the session's serving task |
 | `QueryBlocksByHeightRange`, `serve_block_range`, and serving result/completion events | Storage adapter returns an owned result directly to the serving task |
 | Reactor serving record and `pending_serving_terminals` | Response permit owned by the task, plus the ordered data queue |
-| `BlockRangeQueryLease` and its execution mutex | Database job that owns the permit and guarantees one dispatch |
+| Driver-held `BlockRangeQueryLease` | `BlockRangeReadLease` retained inside the database job and result; the shared execution claim still prevents duplicate dispatch |
 
 Keep download IDs, response guards, shared regulation policy, and unrelated apply/verification work.
 
@@ -234,7 +225,7 @@ Test old-only, new-only, and mixed peers through negotiation and existing fallba
 
 #### Documentation and tests
 
-Update the stream specification, GetBlocks design, parameter ledger, configuration examples, public API docs, and existing `docs/changelog/unreleased/892.md` entry. Adapt #896's model, production tests, trace/replay format, regression seeds, and test filters together. Preserve the meaning of old failing histories through an explicit replay version or conversion. Update #747 to describe pausing request intake while response processing continues.
+Update the stream specification, GetBlocks design, parameter ledger, configuration examples, public API docs, and existing `docs/changelog/unreleased/892.md` entry. Adapt #896's model, production tests, trace/replay format, regression seeds, and test filters together. Preserve the meaning of old failing histories through an explicit replay version or conversion. The local design describes pausing request intake while response processing continues; changing the external draft is a separate editorial action.
 
 Use the one-way download and request-pressure cases below when adapting the existing serving regressions. Preserve coverage of admission bounds, output congestion, ownership, and cleanup.
 
@@ -299,7 +290,7 @@ cargo nextest run --profile regulation-properties --locked
 cargo nextest run --profile zakura-integration --locked
 ```
 
-The `regulation-properties` profile comes from #896 and must be adapted before use. Confirm the intended tests actually run. Preserve #933's transport fixes and the current QUIC crate-family pin and lockfile. Run the relevant documentation/configuration checks too.
+The `regulation-properties` profile and version-4 replay model have been ported from #896 to the sequential serving path. Confirm the intended tests actually run. Preserve #933's transport fixes and the current QUIC crate-family pin and lockfile. Run the relevant documentation/configuration checks too.
 
 ## Code map and baseline
 
@@ -308,13 +299,13 @@ Network paths below are relative to `crates/zakura-network/src/zakura/`.
 | Area | Main targets |
 | --- | --- |
 | Stream pair, queues, and write policy | `handler.rs`, `handshake.rs`, `transport/` |
-| Serving task and permits | New `block_sync/serving.rs`, existing `block_sync/serving_regulation.rs`, `regulation/request.rs`, `regulation/slots.rs` |
+| Serving task and permits | `block_sync/serving.rs`, `block_sync/serving_regulation.rs`, `regulation/request.rs`, `regulation/slots.rs` |
 | Sessions, downloads, and old serving removal | `block_sync/service.rs`, `block_sync/peer_routine.rs`, `block_sync/reactor.rs`, and their state/event modules |
-| State API | `crates/zakura-state/src/service.rs` and a focused serving module if needed |
+| State API | `crates/zakura-state/src/service/block_range.rs` |
 | Production adapter and wiring | `crates/zakurad/src/commands/start.rs`, `crates/zakurad/src/commands/start/zakura/`, and `crates/zakura-network/src/peer_set/initialize.rs` |
-| Tests and wire contract | `handler/tests/serving_progress.rs`, block-sync/transport tests and testkit, #896, and a proposed `docs/specs/blocksync/stream-pair.md` |
+| Tests and wire contract | `handler/tests/paired_block_sync.rs`, block-sync/transport tests and testkit, the ported #896 model, and `docs/specs/blocksync/stream-pair.md` |
 
-The source baseline is [#892 at `5d5c8abc8f5b`](https://github.com/zakura-core/zakura/tree/5d5c8abc8f5b6c00f3a2e7adc03256b55cb18c3c), inspected September 8, 2026. Its base is [the transport fixes at `53ccc72b5dcb`](https://github.com/zakura-core/zakura/tree/53ccc72b5dcb65713ee4af17216432d1fcfdb134), with the QUIC family pinned to `1dcc7a43488fecd199d343d47e93e9ed8319fcaa`. Refresh these before implementation.
+The source baseline is [#892 at `5d5c8abc8f5b`](https://github.com/zakura-core/zakura/tree/5d5c8abc8f5b6c00f3a2e7adc03256b55cb18c3c), inspected September 8, 2026. Its base is [the transport fixes at `53ccc72b5dcb`](https://github.com/zakura-core/zakura/tree/53ccc72b5dcb65713ee4af17216432d1fcfdb134), with the QUIC family pinned to `1dcc7a43488fecd199d343d47e93e9ed8319fcaa`. These refs were refreshed before implementation.
 
 Useful source anchors:
 

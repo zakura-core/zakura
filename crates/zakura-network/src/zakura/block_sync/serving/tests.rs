@@ -130,6 +130,8 @@ struct Fixture {
     requests: FramedSend,
     data: FramedWorkerRecv,
     regulator: GetBlocksServingRegulator,
+    registry: Arc<PeerRegistry>,
+    status: watch::Sender<BlockSyncStatus>,
     task: AbortOnDropHandle<Result<(), crate::zakura::SinkReject>>,
 }
 
@@ -155,7 +157,7 @@ impl Fixture {
             panic!("fresh fixture")
         };
         let regulator = GetBlocksServingRegulator::new(config.clone());
-        let admission = regulator.session(peer.clone(), generation);
+        let admission = regulator.session(peer.clone());
         let (send, data) = worker_framed_channel(depth);
         let session = BlockSyncPeerSession::for_test_with_session_id(
             peer,
@@ -164,7 +166,7 @@ impl Fixture {
             CancellationToken::new(),
         );
         let (requests, recv) = framed_channel(1);
-        let (_, status) = watch::channel(BlockSyncStatus {
+        let (status, status_rx) = watch::channel(BlockSyncStatus {
             servable_low: block::Height(1),
             servable_high: block::Height(2),
             ..config.initial_status()
@@ -173,15 +175,18 @@ impl Fixture {
             session.clone(),
             recv,
             admission,
-            registry,
-            status,
-            source,
+            registry.clone(),
+            status_rx,
+            Some(source),
+            crate::zakura::ZakuraTrace::noop(),
         )));
         Self {
             session,
             requests,
             data,
             regulator,
+            registry,
+            status,
             task,
         }
     }
@@ -324,9 +329,7 @@ async fn aborting_the_serving_task_keeps_a_running_database_job_charged() {
     assert!((&mut f.task).await.unwrap_err().is_cancelled());
     assert_eq!(f.regulator.snapshot().node_active, 1);
     assert_eq!(f.regulator.snapshot().peer_active, 1);
-    let replacement = f
-        .regulator
-        .session(f.session.peer_id().clone(), f.session.session_id() + 1);
+    let replacement = f.regulator.session(f.session.peer_id().clone());
     let request = super::super::serving_regulation::GetBlocksRequest {
         start_height: block::Height(1),
         count: 2,
@@ -358,12 +361,143 @@ async fn missing_status_expires_without_starting_storage() {
 }
 
 #[tokio::test]
-async fn paired_version_requires_explicit_test_activation() {
+async fn paired_version_is_selected_without_a_test_override() {
     use crate::zakura::Service;
-    let source = Source::new(true);
     let service = BlockSyncService::new(ZakuraBlockSyncConfig::default());
-    assert_eq!(service.streams().len(), 1);
-    let service = service.with_paired_source_for_test(source);
     assert_eq!(service.streams().len(), 2);
     assert!(service.ordered_stream_pair(service.streams()[0]).is_some());
+    assert_eq!(service.streams()[0].version, 3);
+    assert_eq!(service.streams()[0].capability, 1 << 6);
+}
+
+#[tokio::test]
+async fn a_slow_storage_read_keeps_ownership_without_a_query_timeout() {
+    let source = Source::new(false);
+    let mut f = Fixture::new(source.clone());
+    f.session.mark_status_received();
+    f.request().await;
+    source.wait_calls(1).await;
+    time::pause();
+    time::advance(Duration::from_secs(9)).await;
+    assert!(!f.task.is_finished());
+    assert_eq!(f.regulator.snapshot().node_active, 1);
+    time::resume();
+    source.release();
+    assert!(matches!(f.next().await, BlockSyncMessage::Block(_)));
+    assert!(matches!(f.next().await, BlockSyncMessage::Block(_)));
+    assert!(matches!(
+        f.next().await,
+        BlockSyncMessage::BlocksDone { returned: 2, .. }
+    ));
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn serving_does_not_read_above_the_committed_status_range() {
+    let source = Source::new(true);
+    let mut f = Fixture::new(source.clone());
+    f.status
+        .send_modify(|status| status.servable_high = block::Height(0));
+    f.session.mark_status_received();
+    f.request().await;
+    assert!(matches!(
+        f.next().await,
+        BlockSyncMessage::RangeUnavailable {
+            start_height: block::Height(1),
+            count: 2
+        }
+    ));
+    assert_eq!(source.0.calls.load(Ordering::Acquire), 0);
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn local_count_and_byte_limits_end_after_the_permitted_prefix() {
+    for byte_limit in [false, true] {
+        let source = Source::new(true);
+        let mut f = Fixture::new(source);
+        f.status.send_modify(|status| {
+            if byte_limit {
+                status.max_response_bytes =
+                    u32::try_from(zakura_test::vectors::BLOCK_MAINNET_1_BYTES.len()).unwrap();
+            } else {
+                status.max_blocks_per_response = 1;
+            }
+        });
+        f.session.mark_status_received();
+        f.request().await;
+        assert!(matches!(f.next().await, BlockSyncMessage::Block(_)));
+        assert!(matches!(
+            f.next().await,
+            BlockSyncMessage::BlocksDone { returned: 1, .. }
+        ));
+        f.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn a_stale_session_cannot_read_after_waiting_for_admission() {
+    let source = Source::new(true);
+    let mut f = Fixture::new(source.clone());
+    let held: Vec<_> = (0..64)
+        .map(|id| {
+            f.regulator
+                .session(ZakuraPeerId::new(vec![id; 32]).unwrap())
+                .try_admit(1)
+                .unwrap()
+                .commit()
+        })
+        .collect();
+    f.session.mark_status_received();
+    f.request().await;
+    time::timeout(Duration::from_secs(2), async {
+        while f.regulator.snapshot().peer_active < 65 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(source.0.calls.load(Ordering::Acquire), 0);
+    f.registry
+        .remove_session(f.session.peer_id(), f.session.session_id());
+    drop(held);
+    time::timeout(Duration::from_secs(2), &mut f.task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(source.0.calls.load(Ordering::Acquire), 0);
+    assert_eq!(f.regulator.snapshot().node_active, 0);
+    assert_eq!(f.regulator.snapshot().peer_active, 0);
+    assert!(time::timeout(Duration::from_millis(20), f.data.recv())
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn cancellation_during_storage_suppresses_old_output_and_retains_the_job() {
+    let source = Source::new(false);
+    let mut f = Fixture::new(source.clone());
+    f.session.mark_status_received();
+    f.request().await;
+    source.wait_calls(1).await;
+    f.session.cancel_token().cancel();
+    time::timeout(Duration::from_secs(2), &mut f.task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(f.regulator.snapshot().node_active, 1);
+    source.release();
+    time::timeout(Duration::from_secs(2), async {
+        while f.regulator.snapshot().node_active > 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(f.regulator.snapshot().peer_active, 0);
+    assert!(time::timeout(Duration::from_millis(20), f.data.recv())
+        .await
+        .is_err());
 }

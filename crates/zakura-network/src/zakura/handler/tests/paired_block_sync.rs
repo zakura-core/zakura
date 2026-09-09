@@ -27,7 +27,6 @@ mod link;
 mod paused;
 
 struct Workload {
-    paired: bool,
     pressure: bool,
     impaired: bool,
     rounds: u32,
@@ -39,7 +38,6 @@ struct Workload {
 impl Default for Workload {
     fn default() -> Self {
         Self {
-            paired: true,
             pressure: false,
             impaired: false,
             rounds: 1,
@@ -157,7 +155,7 @@ struct Node {
 }
 
 impl Node {
-    fn new(blocks: Arc<Vec<Arc<Block>>>, serving: bool, paired: bool) -> Self {
+    fn new(blocks: Arc<Vec<Arc<Block>>>, serving: bool) -> Self {
         let genesis = Block::zcash_deserialize(&BLOCK_MAINNET_GENESIS_BYTES[..])
             .unwrap()
             .hash();
@@ -198,10 +196,8 @@ impl Node {
             capture
         });
         let (handle, mut actions, reactor) = spawn_block_sync_reactor(startup);
-        let mut service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
-        if paired {
-            service = service.with_paired_source_for_test(Arc::new(MemorySource(blocks.clone())));
-        }
+        let handle = handle.with_range_source(Arc::new(MemorySource(blocks.clone())));
+        let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
         let (progress_tx, received) = watch::channel(0);
         let driver_handle = handle.clone();
         let driver = tokio::spawn(async move {
@@ -242,40 +238,6 @@ impl Node {
                             .await
                             .unwrap();
                         progress_tx.send_replace(completed);
-                    }
-                    BlockSyncAction::QueryBlocksByHeightRange {
-                        request_id,
-                        peer,
-                        start,
-                        count,
-                        lease,
-                        ..
-                    } => {
-                        assert!(!paired, "paired serving bypasses reactor storage actions");
-                        assert!(lease.try_start());
-                        let returned = blocks
-                            .iter()
-                            .skip(usize::try_from(start.0.saturating_sub(1)).unwrap())
-                            .take(usize::try_from(count).unwrap())
-                            .map(|block| {
-                                (
-                                    block.coinbase_height().unwrap(),
-                                    block.clone(),
-                                    block.zcash_serialized_size(),
-                                )
-                            })
-                            .collect();
-                        driver_handle
-                            .send(BlockSyncEvent::BlockRangeResponseReady {
-                                lease,
-                                request_id,
-                                peer,
-                                start_height: start,
-                                requested_count: count,
-                                blocks: returned,
-                            })
-                            .await
-                            .unwrap();
                     }
                     BlockSyncAction::QueryNeededBlocks { .. } => {}
                     action => panic!("unexpected download action: {action:?}"),
@@ -325,26 +287,20 @@ fn blocks() -> Arc<Vec<Arc<Block>>> {
     )
 }
 
-async fn download(paired: bool, pressure: bool) -> Result<Duration, BoxError> {
-    download_over_link(paired, pressure, false).await
+async fn download(pressure: bool) -> Result<Duration, BoxError> {
+    download_over_link(pressure, false).await
 }
 
-async fn download_over_link(
-    paired: bool,
-    pressure: bool,
-    impaired: bool,
-) -> Result<Duration, BoxError> {
-    download_rounds(paired, pressure, impaired, 1).await
+async fn download_over_link(pressure: bool, impaired: bool) -> Result<Duration, BoxError> {
+    download_rounds(pressure, impaired, 1).await
 }
 
 async fn download_rounds(
-    paired: bool,
     pressure: bool,
     impaired: bool,
     rounds: u32,
 ) -> Result<Duration, BoxError> {
     run_download(Workload {
-        paired,
         pressure,
         impaired,
         rounds,
@@ -355,7 +311,6 @@ async fn download_rounds(
 
 async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
     let Workload {
-        paired,
         pressure,
         impaired,
         rounds,
@@ -365,8 +320,8 @@ async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
     } = workload;
     let completion_deadline = if impaired { LOSS_DEADLINE } else { DEADLINE };
     let blocks = blocks();
-    let mut downloader = Node::new(blocks.clone(), false, paired);
-    let server_node = Node::new(blocks.clone(), true, paired);
+    let mut downloader = Node::new(blocks.clone(), false);
+    let server_node = Node::new(blocks.clone(), true);
     let initial_client_slots = downloader.service.available_session_slots_for_test();
     let initial_server_slots = server_node.service.available_session_slots_for_test();
     let mut serving_service = server_node.service.clone();
@@ -522,7 +477,7 @@ async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
             })));
         }
         if recover_on_fresh_peer {
-            assert!(paired && !impaired && !pressure && rounds == 1 && paused_siblings == 2);
+            assert!(!impaired && !pressure && rounds == 1 && paused_siblings == 2);
             await_until(
                 "the original request arms block-progress liveness",
                 DEADLINE,
@@ -560,7 +515,7 @@ async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
                 connection.close_reason()
             );
 
-            let fresh_node = Node::new(blocks.clone(), true, paired);
+            let fresh_node = Node::new(blocks.clone(), true);
             let fresh_endpoint =
                 LocalEndpointFactory::with_transport_config(limits.transport_config())
                     .endpoint(94103)
@@ -712,10 +667,7 @@ async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn paired_download_matches_every_block_and_ending() -> Result<(), BoxError> {
-    eprintln!(
-        "paired matched download: {:?}",
-        download(true, false).await?
-    );
+    eprintln!("paired matched download: {:?}", download(false).await?);
     Ok(())
 }
 
@@ -723,16 +675,7 @@ async fn paired_download_matches_every_block_and_ending() -> Result<(), BoxError
 async fn paired_download_completes_while_serving_capacity_is_full() -> Result<(), BoxError> {
     eprintln!(
         "paired matched download under 32000-request pressure: {:?}",
-        download(true, true).await?
-    );
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn legacy_download_baseline_matches_every_block_and_ending() -> Result<(), BoxError> {
-    eprintln!(
-        "legacy matched download: {:?}",
-        download(false, false).await?
+        download(true).await?
     );
     Ok(())
 }
@@ -813,8 +756,7 @@ async fn reset_during_a_frame_is_stream_local_but_truncated_fin_is_invalid() -> 
 
 #[tokio::test]
 async fn paired_roles_reject_wrong_messages_before_reading_payloads() -> Result<(), BoxError> {
-    let service = BlockSyncService::new(ZakuraBlockSyncConfig::default())
-        .with_paired_source_for_test(Arc::new(MemorySource(Arc::new(Vec::new()))));
+    let service = BlockSyncService::new(ZakuraBlockSyncConfig::default());
     let pair = service.ordered_stream_pair(service.streams()[0]).unwrap();
     let server = LocalEndpointFactory::new().endpoint(94103).await?;
     let (connection_tx, _connections) = mpsc::channel(4);

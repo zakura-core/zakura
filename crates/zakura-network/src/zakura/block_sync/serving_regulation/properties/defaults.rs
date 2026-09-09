@@ -12,10 +12,7 @@ fn defaults() -> GetBlocksServingRegulator {
 }
 
 fn session(regulator: &GetBlocksServingRegulator, identity: u8) -> GetBlocksServingSession {
-    regulator.session(
-        ZakuraPeerId::new(vec![identity; 32]).unwrap(),
-        u64::from(identity),
-    )
+    regulator.session(ZakuraPeerId::new(vec![identity; 32]).unwrap())
 }
 
 fn queued_response(session: &GetBlocksServingSession) -> FrameGuard {
@@ -38,7 +35,7 @@ fn producer_waits_for_both_query_and_writer_owners() {
     let regulator = defaults();
     let peer = session(&regulator, 1);
     let mut permit = peer.try_admit(1).unwrap().commit();
-    let query = permit.query_lease();
+    let query = permit.work_lease();
     assert!(query.try_start());
     let frame = permit.frame_guard(9);
     drop(permit);

@@ -627,12 +627,6 @@ impl PeerRegistry {
             .is_some_and(|entry| entry.generation == generation)
     }
 
-    #[cfg(test)]
-    /// Read the current session ID so tests can check reconnect handling.
-    pub(super) fn generation_for_test(&self, peer: &ZakuraPeerId) -> Option<u64> {
-        self.lock().get(peer).map(|entry| entry.generation)
-    }
-
     /// Publish a freshly-applied `Status` (routine-side, inverted inbound flow): grow
     /// servable range, clamp the advertised caps, and mark the peer as having sent
     /// a status. Generation-gated like the other routine writers so a superseded

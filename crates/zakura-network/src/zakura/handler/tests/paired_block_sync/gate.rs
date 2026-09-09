@@ -8,17 +8,7 @@ use super::*;
 async fn paired_download_completes_with_request_pressure_and_packet_loss() -> Result<(), BoxError> {
     eprintln!(
         "paired matched download, 32000 requests, 50ms RTT, 1% loss: {:?}",
-        download_over_link(true, true, true).await?
-    );
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "standalone impaired-link comparison using the same download-policy fix"]
-async fn legacy_download_with_request_pressure_and_packet_loss() -> Result<(), BoxError> {
-    eprintln!(
-        "legacy matched download, 32000 requests, 50ms RTT, 1% loss: {:?}",
-        download_over_link(false, true, true).await?
+        download_over_link(true, true).await?
     );
     Ok(())
 }
@@ -146,7 +136,7 @@ async fn twenty_pair_reopens_complete_matched_downloads_under_request_pressure(
 ) -> Result<(), BoxError> {
     eprintln!(
         "twenty matched downloads under request pressure: {:?}",
-        download_rounds(true, true, false, 20).await?
+        download_rounds(true, false, 20).await?
     );
     Ok(())
 }
@@ -157,7 +147,7 @@ async fn twenty_pair_reopens_complete_matched_downloads_under_request_pressure_a
 ) -> Result<(), BoxError> {
     eprintln!(
         "twenty matched downloads under request pressure and loss: {:?}",
-        download_rounds(true, true, true, 20).await?
+        download_rounds(true, true, 20).await?
     );
     Ok(())
 }

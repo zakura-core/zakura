@@ -1,8 +1,8 @@
 //! Resource admission for serving inbound `GetBlocks` requests.
 //!
 //! This module turns the generic regulation primitives into one message policy.
-//! Each routine queues compact requests within its advertised in-flight limit.
-//! One admission waiter starts work in arrival order while stream reads continue.
+//! Each session holds one decoded request while waiting for capacity.
+//! The separate data reader continues processing downloads during this wait.
 //! Admission acquires a response producer before the state query starts. The query,
 //! result, and queued frames share that producer until the last owner drops. A blocked
 //! transport writer therefore prevents another query for the same peer, including after reconnect.
@@ -16,12 +16,15 @@ use super::{config::*, *};
 use crate::zakura::regulation::WorkBound;
 use crate::zakura::{
     regulation::{
-        AcquiredWorkSlot, RequestAdmission, RequestSession, ResponsePermit, SlotBudget,
-        WorkAttempt, WorkBlocked, WorkLease,
+        RequestAdmission, RequestSession, ResponsePermit, SlotBudget, WorkAttempt, WorkLease,
     },
     transport::FrameGuard,
 };
 
+#[cfg(test)]
+use crate::zakura::regulation::{AcquiredWorkSlot, WorkBlocked};
+
+mod observations;
 mod policy;
 use policy::GetBlocksPolicy;
 
@@ -35,12 +38,6 @@ pub(super) fn message_payload_limits() -> &'static [(u16, usize)] {
 pub(super) struct GetBlocksRequest {
     pub(super) start_height: block::Height,
     pub(super) count: u32,
-}
-
-impl GetBlocksRequest {
-    pub(super) fn into_parts(self) -> (block::Height, u32) {
-        (self.start_height, self.count)
-    }
 }
 
 /// The bounded work declaration for one decoded request.
@@ -77,9 +74,6 @@ pub(super) fn validate_config(config: &ZakuraBlockSyncConfig) -> Result<(), &'st
     if regulation.node_active_requests > tokio::sync::Semaphore::MAX_PERMITS {
         return Err("get_blocks_regulation.node_active_requests exceeds Tokio's semaphore limit");
     }
-    if regulation.query_timeout < Duration::from_millis(1) {
-        return Err("get_blocks_regulation.query_timeout must be at least 1ms");
-    }
 
     Ok(())
 }
@@ -93,6 +87,7 @@ pub(super) struct GetBlocksServingRegulator {
 #[derive(Debug)]
 struct RegulatorInner {
     admission: RequestAdmission<GetBlocksPolicy>,
+    metrics: observations::ServingMetrics,
     #[cfg(test)]
     node_active: SlotBudget,
 }
@@ -106,6 +101,7 @@ impl GetBlocksServingRegulator {
             .expect("GetBlocks configuration validates the active-request capacity");
         Self {
             inner: Arc::new(RegulatorInner {
+                metrics: observations::ServingMetrics::default(),
                 admission: RequestAdmission::new(
                     GetBlocksPolicy::new(&config),
                     node_active.clone(),
@@ -118,14 +114,17 @@ impl GetBlocksServingRegulator {
     }
 
     /// Create one session policy within the node admission bounds.
-    pub(super) fn session(&self, peer: ZakuraPeerId, session_id: u64) -> GetBlocksServingSession {
+    pub(super) fn session(&self, peer: ZakuraPeerId) -> GetBlocksServingSession {
         let work = self.inner.admission.session(&peer);
 
         GetBlocksServingSession {
-            peer,
-            session_id,
             work,
+            metrics: self.inner.metrics.clone(),
         }
+    }
+
+    pub(super) fn publish_metrics(&self) {
+        self.inner.metrics.publish();
     }
 
     #[cfg(test)]
@@ -140,17 +139,16 @@ impl GetBlocksServingRegulator {
 /// Per-session entry point for decoding and work admission.
 #[derive(Clone, Debug)]
 pub(super) struct GetBlocksServingSession {
-    peer: ZakuraPeerId,
-    session_id: u64,
+    metrics: observations::ServingMetrics,
     work: RequestSession<GetBlocksPolicy>,
 }
 
 impl GetBlocksServingSession {
     /// Wait in peer-then-node order. The enclosing session cancels this wait.
     pub(super) async fn admit_request(&self, request: &GetBlocksRequest) -> GetBlocksServingPermit {
+        let _waiting = self.metrics.waiting();
         AdmissionAttempt {
-            peer: self.peer.clone(),
-            session_id: self.session_id,
+            metrics: self.metrics.clone(),
             work: self.work.admit(request).await,
         }
         .commit()
@@ -170,6 +168,7 @@ impl GetBlocksServingSession {
     }
 
     /// Admit an already decoded, retained request before dispatching its state work.
+    #[cfg(test)]
     pub(super) fn try_admit_request(
         &self,
         request: &GetBlocksRequest,
@@ -177,13 +176,12 @@ impl GetBlocksServingSession {
     ) -> Result<AdmissionAttempt, WorkBlocked> {
         let work = self.work.try_admit(request, acquired)?;
         Ok(AdmissionAttempt {
-            peer: self.peer.clone(),
-            session_id: self.session_id,
             work,
+            metrics: self.metrics.clone(),
         })
     }
 
-    #[cfg(any(test, feature = "zakura-testkit"))]
+    #[cfg(test)]
     pub(super) fn try_admit(&self, count: u32) -> Result<AdmissionAttempt, WorkBlocked> {
         self.try_admit_request(
             &GetBlocksRequest {
@@ -214,34 +212,27 @@ impl GetBlocksServingSession {
 #[derive(Debug)]
 #[must_use = "dropping a GetBlocks admission attempt rolls back every reservation"]
 pub(super) struct AdmissionAttempt {
-    peer: ZakuraPeerId,
-    session_id: u64,
+    metrics: observations::ServingMetrics,
     work: WorkAttempt,
 }
 
 impl AdmissionAttempt {
-    pub(super) fn peer(&self) -> &ZakuraPeerId {
-        &self.peer
-    }
-
-    pub(super) fn session_id(&self) -> u64 {
-        self.session_id
-    }
-
-    /// Transfer admitted resources to the reactor ledger for this exact session.
+    /// Transfer admitted resources to the sequential response producer.
     pub(super) fn commit(self) -> GetBlocksServingPermit {
         metrics::counter!("sync.block.serving.admitted").increment(1);
         GetBlocksServingPermit {
             response: self.work.commit(),
+            observation: self.metrics.active(),
         }
     }
 }
 
-/// Committed request ownership retained by the reactor's serving ledger.
+/// Committed ownership retained while producing and writing a response.
 #[derive(Debug)]
-#[must_use = "the serving ledger must retain this permit until request settlement"]
+#[must_use = "the response producer retains this permit until its ending is queued"]
 pub(super) struct GetBlocksServingPermit {
     response: ResponsePermit,
+    observation: Arc<observations::Active>,
 }
 
 impl GetBlocksServingPermit {
@@ -250,30 +241,34 @@ impl GetBlocksServingPermit {
     }
 
     pub(super) fn frame_guard(&mut self, bytes: u64) -> FrameGuard {
-        self.response.frame_guard(bytes)
+        FrameGuard::new(Arc::new((
+            self.response.frame_guard(bytes),
+            self.observation.clone(),
+        )))
     }
 
-    pub(super) fn query_lease(&self) -> BlockRangeQueryLease {
-        BlockRangeQueryLease {
+    pub(super) fn work_lease(&self) -> BlockRangeReadLease {
+        BlockRangeReadLease {
             work: self.response.work_lease(),
+            _observation: self.observation.clone(),
         }
     }
 }
 
 /// Capacity retained by a serving query and its completed response.
 ///
-/// The driver must claim a query once, retain this lease until its underlying
-/// state future completes (even after a response timeout), and transfer it to
-/// `BlockRangeResponseReady` with the returned blocks. Clones share the same
-/// charge and cannot start additional queries. Ledger removal cancels delivery,
-/// but resources return only after the last ledger, worker, and result owner drops.
+/// The storage adapter claims execution once and moves this lease into the
+/// actual blocking job and its returned result. Clones retain the same capacity
+/// and cannot start another read. Dropping the response producer cancels delivery;
+/// capacity returns after the last worker, result, and frame owner drops.
 #[derive(Clone, Debug)]
-pub struct BlockRangeQueryLease {
+pub struct BlockRangeReadLease {
     work: WorkLease,
+    _observation: Arc<observations::Active>,
 }
 
-impl BlockRangeQueryLease {
-    /// Claim the only execution, serialized against ledger closure.
+impl BlockRangeReadLease {
+    /// Claim the only execution, serialized against producer cancellation.
     ///
     /// If closure wins, no read starts. If the claim wins, the worker retains
     /// capacity until the read finishes, even if delivery is then cancelled.
@@ -286,27 +281,10 @@ impl BlockRangeQueryLease {
         self.work.is_cancelled()
     }
 
-    /// Wait for the ledger to close. This does not cancel an active state read.
+    /// Wait for the producer to close. This does not cancel an active state read.
     pub async fn cancelled(&self) {
         self.work.cancelled().await;
     }
-}
-
-#[cfg(any(test, feature = "zakura-testkit"))]
-pub(crate) fn query_lease_for_test() -> BlockRangeQueryLease {
-    let regulator = GetBlocksServingRegulator::new(ZakuraBlockSyncConfig::default());
-    let session = regulator.session(
-        ZakuraPeerId::new(vec![0; 32]).expect("a 32-byte test identity fits"),
-        0,
-    );
-    let permit = session
-        .try_admit(1)
-        .expect("the test budget is initially full")
-        .commit();
-    let mut lease = permit.query_lease();
-    // Standalone driver fixtures have no reactor ledger to signal cancellation.
-    lease.work.detach_cancellation_for_test();
-    lease
 }
 
 #[cfg(test)]
@@ -327,26 +305,26 @@ mod tests {
     #[test]
     fn reconnects_share_the_peer_limit_until_old_reads_finish() {
         let regulator = GetBlocksServingRegulator::new(ZakuraBlockSyncConfig::default());
-        let original = regulator.session(peer(8), 1);
+        let original = regulator.session(peer(8));
         let permit = original.try_admit(1).unwrap().commit();
-        let query = permit.query_lease();
+        let query = permit.work_lease();
         assert!(query.try_start());
         drop(permit);
         drop(original);
 
         // Neither dropping the old session nor replacing it repeatedly releases
         // the work still owned by its running storage read.
-        for generation in 2..=65 {
-            let replacement = regulator.session(peer(8), generation);
+        for _ in 2..=65 {
+            let replacement = regulator.session(peer(8));
             assert_eq!(
                 replacement.try_admit(1).unwrap_err().kind(),
                 WorkBound::Peer
             );
             assert_eq!(regulator.snapshot().node_active, 1);
-            let other = regulator.session(peer(9), generation);
+            let other = regulator.session(peer(9));
             assert!(other.try_admit(1).is_ok(), "another peer can still serve");
         }
-        let replacement = regulator.session(peer(8), 66);
+        let replacement = regulator.session(peer(8));
         drop(query);
         assert!(
             replacement.try_admit(1).is_ok(),
@@ -356,14 +334,14 @@ mod tests {
     }
 
     #[test]
-    fn query_and_result_keep_capacity_after_the_ledger_closes() {
+    fn query_and_result_keep_capacity_after_the_producer_closes() {
         let regulator = GetBlocksServingRegulator::new(ZakuraBlockSyncConfig::default());
-        let session = regulator.session(peer(8), 8);
+        let session = regulator.session(peer(8));
         let permit = session
             .try_admit(1)
             .expect("the initial request fits")
             .commit();
-        let query = permit.query_lease();
+        let query = permit.work_lease();
         assert!(query.try_start());
         assert!(
             !query.clone().try_start(),
@@ -382,14 +360,14 @@ mod tests {
     }
 
     #[test]
-    fn closed_ledger_prevents_queued_query_execution() {
+    fn closed_producer_prevents_queued_query_execution() {
         let regulator = GetBlocksServingRegulator::new(ZakuraBlockSyncConfig::default());
-        let session = regulator.session(peer(9), 9);
+        let session = regulator.session(peer(9));
         let permit = session
             .try_admit(1)
             .expect("the initial request fits")
             .commit();
-        let query = permit.query_lease();
+        let query = permit.work_lease();
         drop(permit);
         assert!(!query.try_start());
         drop(query);
@@ -399,10 +377,10 @@ mod tests {
     #[test]
     fn separately_issued_query_leases_share_one_execution_claim() {
         let regulator = GetBlocksServingRegulator::new(ZakuraBlockSyncConfig::default());
-        let session = regulator.session(peer(9), 9);
+        let session = regulator.session(peer(9));
         let permit = session.try_admit(1).unwrap().commit();
-        let first = permit.query_lease();
-        let second = permit.query_lease();
+        let first = permit.work_lease();
+        let second = permit.work_lease();
         assert!(first.try_start());
         assert!(!second.try_start());
         drop(permit);
@@ -421,9 +399,9 @@ mod tests {
         // ordered outcomes. This does not claim exhaustive schedule coverage.
         for _ in 0..64 {
             let regulator = GetBlocksServingRegulator::new(ZakuraBlockSyncConfig::default());
-            let session = regulator.session(peer(9), 9);
+            let session = regulator.session(peer(9));
             let permit = session.try_admit(1).unwrap().commit();
-            let lease = permit.query_lease();
+            let lease = permit.work_lease();
 
             let barrier = Barrier::new(4);
 
@@ -466,9 +444,9 @@ mod tests {
         let mut config = ZakuraBlockSyncConfig::default();
         config.get_blocks_regulation.node_active_requests = 1;
         let regulator = GetBlocksServingRegulator::new(config);
-        let session = regulator.session(peer(10), 10);
+        let session = regulator.session(peer(10));
         let owner = session.try_admit(1).expect("one request fits").commit();
-        let waiting_session = regulator.session(peer(11), 11);
+        let waiting_session = regulator.session(peer(11));
         let blocked = waiting_session
             .try_admit(1)
             .expect_err("the active slot is owned");
@@ -527,21 +505,14 @@ mod tests {
             validate_config(&no_active_slots),
             Err("get_blocks_regulation.node_active_requests must be greater than zero"),
         );
-
-        let mut no_query_time = base;
-        no_query_time.get_blocks_regulation.query_timeout = Duration::ZERO;
-        assert_eq!(
-            validate_config(&no_query_time),
-            Err("get_blocks_regulation.query_timeout must be at least 1ms"),
-        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn provisional_admission_rolls_back_every_earlier_reservation() {
         let config = ZakuraBlockSyncConfig::default();
         let regulator = GetBlocksServingRegulator::new(config);
-        let session = regulator.session(peer(1), 1);
-        let other_peer = regulator.session(peer(7), 1);
+        let session = regulator.session(peer(1));
+        let other_peer = regulator.session(peer(7));
         let first = session.try_admit(1).expect("the first request fits");
         let before = regulator.snapshot();
         let blocked = session
@@ -561,7 +532,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn completed_requests_release_capacity_without_waiting_for_time() {
         let regulator = GetBlocksServingRegulator::new(ZakuraBlockSyncConfig::default());
-        let session = regulator.session(peer(2), 2);
+        let session = regulator.session(peer(2));
         let now = time::Instant::now();
         for _ in 0..4096 {
             let mut permit = session
@@ -585,8 +556,8 @@ mod tests {
     #[test]
     fn frames_keep_the_producer_until_the_last_write_finishes() {
         let regulator = GetBlocksServingRegulator::new(ZakuraBlockSyncConfig::default());
-        let session = regulator.session(peer(3), 3);
-        let other = regulator.session(peer(4), 4);
+        let session = regulator.session(peer(3));
+        let other = regulator.session(peer(4));
         let mut permit = session.try_admit(1).unwrap().commit();
         let block = permit.frame_guard(100);
         let terminal = permit.frame_guard(9);

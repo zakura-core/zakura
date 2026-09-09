@@ -493,18 +493,6 @@ enum BlockEventDetail {
         #[serde(skip_serializing_if = "Option::is_none")]
         verified_block_tip: Option<u64>,
     },
-    BlockRangeResponseFinished {
-        peer: String,
-        range_start: u64,
-        range_count: u64,
-        expected_count: u64,
-    },
-    BlockRangeResponseReady {
-        peer: String,
-        range_start: u64,
-        range_count: u64,
-        expected_count: u64,
-    },
 }
 
 impl BlockEventReceived {
@@ -567,30 +555,6 @@ impl BlockEventReceived {
                 result: block_apply_result_label(outcome.result()),
                 verified_block_tip: None,
             },
-            BlockSyncEvent::BlockRangeResponseFinished {
-                peer,
-                start_height,
-                requested_count,
-                returned_count,
-                ..
-            } => BlockEventDetail::BlockRangeResponseFinished {
-                peer: peer_label(peer),
-                range_start: height(*start_height),
-                range_count: u64::from(*returned_count),
-                expected_count: u64::from(*requested_count),
-            },
-            BlockSyncEvent::BlockRangeResponseReady {
-                peer,
-                start_height,
-                requested_count,
-                blocks,
-                ..
-            } => BlockEventDetail::BlockRangeResponseReady {
-                peer: peer_label(peer),
-                range_start: height(*start_height),
-                range_count: saturating_usize(blocks.len()),
-                expected_count: u64::from(*requested_count),
-            },
         };
         Self {
             event: "block_event_received",
@@ -617,11 +581,6 @@ enum BlockActionDetail {
         range_start: u64,
         range_count: u64,
         best_header_tip: u64,
-    },
-    QueryBlocksByHeightRange {
-        peer: String,
-        range_start: u64,
-        range_count: u64,
     },
     SubmitBlock {
         apply_token: u64,
@@ -651,13 +610,6 @@ impl BlockActionDispatched {
                 range_start: height(*from),
                 range_count: u64::from(*limit),
                 best_header_tip: height(*best_header_tip),
-            },
-            BlockSyncAction::QueryBlocksByHeightRange {
-                peer, start, count, ..
-            } => BlockActionDetail::QueryBlocksByHeightRange {
-                peer: peer_label(peer),
-                range_start: height(*start),
-                range_count: u64::from(*count),
             },
             BlockSyncAction::SubmitBlock { token, block, .. } => BlockActionDetail::SubmitBlock {
                 apply_token: *token,
@@ -714,7 +666,6 @@ fn block_misbehavior_label(reason: &BlockSyncMisbehavior) -> &'static str {
     match reason {
         BlockSyncMisbehavior::MalformedMessage => "malformed_message",
         BlockSyncMisbehavior::UnsolicitedBlock => "unsolicited_block",
-        BlockSyncMisbehavior::GetBlocksBeforeStatus => "get_blocks_before_status",
         BlockSyncMisbehavior::BodyPayloadMismatch(_) => "body_payload_mismatch",
         BlockSyncMisbehavior::ConsensusBodyInvalid(_) => "consensus_body_invalid",
         BlockSyncMisbehavior::InvalidBlock => "invalid_block",
@@ -916,24 +867,6 @@ mod tests {
                 },
                 json!({"kind": "block_apply_finished", "apply_token": 3, "height": 1, "hash": "h", "result": "committed", "verified_block_tip": 1}),
             ),
-            (
-                BlockEventDetail::BlockRangeResponseFinished {
-                    peer: "p".into(),
-                    range_start: 1,
-                    range_count: 2,
-                    expected_count: 3,
-                },
-                json!({"kind": "block_range_response_finished", "peer": "p", "range_start": 1, "range_count": 2, "expected_count": 3}),
-            ),
-            (
-                BlockEventDetail::BlockRangeResponseReady {
-                    peer: "p".into(),
-                    range_start: 1,
-                    range_count: 2,
-                    expected_count: 3,
-                },
-                json!({"kind": "block_range_response_ready", "peer": "p", "range_start": 1, "range_count": 2, "expected_count": 3}),
-            ),
         ];
 
         for (detail, expected) in cases {
@@ -956,14 +889,6 @@ mod tests {
                     best_header_tip: 3,
                 },
                 json!({"kind": "query_needed_blocks", "range_start": 1, "range_count": 2, "best_header_tip": 3}),
-            ),
-            (
-                BlockActionDetail::QueryBlocksByHeightRange {
-                    peer: "p".into(),
-                    range_start: 1,
-                    range_count: 2,
-                },
-                json!({"kind": "query_blocks_by_height_range", "peer": "p", "range_start": 1, "range_count": 2}),
             ),
             (
                 BlockActionDetail::SubmitBlock {

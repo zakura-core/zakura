@@ -2427,7 +2427,7 @@ mod tests {
 
         let (_peer_block_send, service_block_recv) = framed_channel(4);
         let (service_block_send, _peer_block_recv) = framed_channel(4);
-        block_sync.add_peer(Peer::new(
+        block_sync.add_peer(crate::zakura::testkit::DownloadOnlyPeer::create(
             peer_id.clone(),
             None,
             ZAKURA_CAP_BLOCK_SYNC,

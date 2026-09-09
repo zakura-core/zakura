@@ -1,8 +1,8 @@
 # Block-sync stream pair
 
-The paired prototype uses two persistent bidirectional QUIC streams on one
-authenticated connection. It remains disabled in production until the
-[acceptance gate](../../design/getblocks-refactor-results.md) passes.
+Native block sync uses two persistent bidirectional QUIC streams on one
+authenticated connection. The [acceptance gate](../../design/getblocks-refactor-results.md)
+passed before this layout was activated.
 
 ## Negotiation
 
@@ -13,7 +13,7 @@ Both peers must select capability bit 6 (`1 << 6`) and both stream roles:
 | Data and control | 6 | 3 | Status (1), Block (3), BlocksDone (4), RangeUnavailable (5) | 3 MiB + 8 bytes |
 | Requests | 7 | 1 | GetBlocks (2) | 17 bytes |
 
-The existing single-stream layout uses kind 6, version 2, and capability bit 3.
+The previous single-stream layout used kind 6, version 2, and capability bit 3.
 Its encoding does not contain a pair identifier. Never interpret that stream as
 one role of this layout. If negotiation cannot select both roles of a pair, it
 must select neither.

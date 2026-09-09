@@ -102,8 +102,8 @@ impl<P: RequestPolicy> RequestSession<P> {
     /// queue. A previous response cannot make this peer hold extra node slots.
     /// Dropping this future removes its FIFO waiter and releases a partial claim.
     pub(crate) async fn admit(&self, request: &P::Request) -> WorkAttempt {
-        let peer = self.peer.reserve().await;
-        let node = self.node.reserve().await;
+        let peer = reserve_response_slot(&self.peer, WorkBound::Peer).await;
+        let node = reserve_response_slot(&self.node, WorkBound::Node).await;
         WorkAttempt {
             resources: Arc::new(WorkResources {
                 _peer: peer,
@@ -115,6 +115,7 @@ impl<P: RequestPolicy> RequestSession<P> {
 
     /// Acquire all work bounds or release partial acquisition before returning.
     /// A permit obtained by a fair waiter is reused on its next attempt.
+    #[cfg(test)]
     pub(crate) fn try_admit(
         &self,
         request: &P::Request,
@@ -154,13 +155,23 @@ impl WorkBound {
     }
 }
 
+async fn reserve_response_slot(budget: &SlotBudget, bound: WorkBound) -> SlotPermit {
+    if let Some(permit) = budget.try_reserve() {
+        return permit;
+    }
+    metrics::counter!("sync.block.serving.delayed", "bound" => bound.label()).increment(1);
+    budget.reserve().await
+}
+
 /// A fair waiter's capacity, usable only for its original budget.
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct AcquiredWorkSlot {
     budget: SlotBudget,
     permit: SlotPermit,
 }
 
+#[cfg(test)]
 fn reserve_slot(
     kind: WorkBound,
     budget: &SlotBudget,
@@ -182,12 +193,14 @@ fn reserve_slot(
 }
 
 /// Capacity exhaustion is a local delay, not evidence of a peer violation.
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct WorkBlocked {
     kind: WorkBound,
     budget: SlotBudget,
 }
 
+#[cfg(test)]
 impl WorkBlocked {
     pub(crate) fn kind(&self) -> WorkBound {
         self.kind
@@ -332,11 +345,6 @@ impl WorkLease {
     }
     pub(crate) async fn cancelled(&self) {
         self.execution.cancelled.cancelled().await;
-    }
-
-    #[cfg(any(test, feature = "zakura-testkit"))]
-    pub(crate) fn detach_cancellation_for_test(&mut self) {
-        self.execution = Arc::new(Execution::default());
     }
 }
 

@@ -4,6 +4,8 @@ use super::*;
 use futures::future::BoxFuture;
 
 mod task;
+#[cfg(test)]
+pub(super) use task::send_response;
 pub(super) use task::serve_requests;
 
 #[cfg(test)]
@@ -28,13 +30,13 @@ pub struct BlockRangeRead {
     start: block::Height,
     count: u32,
     max_response_bytes: u32,
-    lease: BlockRangeQueryLease,
+    lease: BlockRangeReadLease,
 }
 
 impl BlockRangeRead {
     /// Transfer the read bounds and lease to the storage adapter. The adapter
     /// calls `lease.try_start()` once, then moves the lease into its blocking job.
-    pub fn into_parts(self) -> (block::Height, u32, u32, BlockRangeQueryLease) {
+    pub fn into_parts(self) -> (block::Height, u32, u32, BlockRangeReadLease) {
         (self.start, self.count, self.max_response_bytes, self.lease)
     }
 }
@@ -44,14 +46,14 @@ impl BlockRangeRead {
 pub struct BlockRangeReadResult {
     // Drop block allocations before releasing their shared work resources.
     blocks: Vec<(block::Height, Arc<block::Block>, usize)>,
-    _lease: BlockRangeQueryLease,
+    _lease: BlockRangeReadLease,
 }
 
 impl BlockRangeReadResult {
     /// Transfer a completed blocking job's blocks and original lease together.
     pub fn new(
         blocks: Vec<(block::Height, Arc<block::Block>, usize)>,
-        lease: BlockRangeQueryLease,
+        lease: BlockRangeReadLease,
     ) -> Self {
         Self {
             blocks,

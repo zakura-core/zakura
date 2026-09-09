@@ -5,9 +5,10 @@
 //! Peer routines retain protocol dispatch and scheduling decisions.
 
 mod request;
+#[cfg(test)]
+pub(crate) use request::{AcquiredWorkSlot, WorkBlocked};
 pub(crate) use request::{
-    AcquiredWorkSlot, RequestAdmission, RequestPolicy, RequestSession, ResponsePermit, WorkAttempt,
-    WorkBlocked, WorkLease,
+    RequestAdmission, RequestPolicy, RequestSession, ResponsePermit, WorkAttempt, WorkLease,
 };
 #[cfg(test)]
 pub(crate) use request::{WorkBound, WorkResources};

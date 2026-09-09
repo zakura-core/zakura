@@ -98,5 +98,5 @@ Announcements and subscriptions need their own lifetime rules.
 
 These are finite generated histories, not exhaustive state exploration. They do
 not establish whole-node overload protection, RocksDB capacity, or full sync
-performance. The paired transport remains disabled until its separate acceptance
-gate passes.
+performance. The separate [transport gate](../design/getblocks-refactor-results.md)
+passed before activation.

@@ -1,217 +1,46 @@
-# GetBlocks refactor execution
+# GetBlocks refactor results
 
-## Baseline
+The transport acceptance gate passed with the existing QUIC dependency and
+windows. The paired service is now selected normally, and the old serving driver
+has been removed. Final integration checks are recorded below as they complete.
 
-Execution starts from #892 at `5d5c8abc8f5b6c00f3a2e7adc03256b55cb18c3c`, with
-base `53ccc72b5dcb65713ee4af17216432d1fcfdb134` already included. Both refs were
-refreshed on September 8, 2026. The QUIC family remains pinned to
+## Baseline and criteria
+
+The baseline is #892 at `5d5c8abc8f5b6c00f3a2e7adc03256b55cb18c3c`, including
+base `53ccc72b5dcb65713ee4af17216432d1fcfdb134`. Both refs were refreshed on
+September 8, 2026. The QUIC family stays pinned to
 `1dcc7a43488fecd199d343d47e93e9ed8319fcaa`.
 
-Use Rust 1.97.0 on this Mac Studio. The installed stable toolchain lacks its
-standard-library archive. Use the same compiler and build profile for baseline
-and prototype measurements.
+Measurements use Rust 1.97.0 debug test executables on the same Mac Studio.
+Each matched download uses two real QUIC endpoints in one process. A receives
+32 blocks of about 1.9 MB each from B, matching every block and ending to its
+actual outstanding request. Storage and consensus verification are fixtures;
+the blocks have consistent commitments but are not consensus-valid chain blocks.
 
-## Criteria fixed before measurement
+These local engineering thresholds were fixed before measuring each comparison.
+They are not a production memory guarantee.
 
-These are local engineering acceptance thresholds, not a production memory
-guarantee. A missing result leaves the new service disabled.
-
-| Workload | Topology and load | Completion and throughput | Memory |
-| --- | --- | --- | --- |
-| Supported raw transport | Two loopback endpoints in one process; one connection; one active data stream; up to the advertised 32,000 request frames and one sibling service retaining a full 16 MiB window; transfer 64 MiB in one direction | Receive and verify all 64 MiB within 30 seconds, at least 2.13 MiB/s, without reading the paused streams | Peak process RSS at most 512 MiB, measured on the test executable |
-| Matched block download | Same endpoints and default windows; A downloads 32 near-maximum-size blocks from B, respecting the advertised count and byte caps; each actual outstanding request matched through its ending message | Complete within 30 seconds; median useful throughput over five runs at least 90% of the current #892 baseline under the same conditions | Peak process RSS at most 512 MiB |
-| Incoming request pressure | Same matched download; A's serving slots occupied; B also supplies up to the advertised 32,000 synthetic requests | A's matched download meets the same deadline and throughput floor; request queues plateau at their configured bounds | Same envelope, including retained transport bytes |
-| Paused services and impaired link | Matched download and pressure cases with a paused sibling service, then 50 ms RTT and 1% packet loss, then both together | Same completion deadline; at least 90% of the corresponding baseline's useful throughput | Same envelope |
-| Reopening | Twenty sequential session replacements on the same connection, also under pressure and link impairment | Every new session completes its matched download within 30 seconds; no old-session delivery | Same peak envelope; session/task counts return to the configured steady-state bound |
-| Sustained saturation | Two paused streams each consume 16 MiB; include a case where sibling services retain all credit and a peer that repeats saturation | Cleanup finishes within 10 seconds after the existing block-progress deadline expires; a usable replacement session or peer completes the retry within 30 seconds; preserve existing cooldown and exponential reopen backoff | Same envelope over twenty repetitions; pending/retiring tasks return to their steady-state bounds and unfinished workers keep their permits |
-| Transient saturation | The same full buffers, but a paused consumer resumes before the block-progress deadline | The original download completes without a reset or disconnect, within the same 30-second transfer deadline after the consumer resumes | Same envelope |
-
-### Approved loss-gate revision
-
-The original 30-second loss gate failed on both the original PR and the paired
-prototype. The original PR completed zero matched blocks because its only cold
-probe expired. A separate raw QUIC transfer, without block-sync policy, moved
-4 MiB in 12.706 seconds at 50 ms RTT and 1% loss. The existing transport therefore
-falls below the original absolute throughput requirement.
-
-On September 8, the user approved including the download-policy fix and keeping
-the transport defaults. Before measuring complete downloads with that fix, the
-loss gate is revised to **240 seconds**, with a five-run median useful throughput
-of at least **90% of the original serving path with the same policy fix**. Apply
-this deadline to all impaired-link combinations and reopen rounds. The memory
-envelope and all loss-free thresholds above remain unchanged. Keep the original
-failed measurements as evidence; they are not passes under the revised gate.
-
-The raw prerequisite diagnoses shared receive credit. It does not exercise
-message framing, serving admission, outstanding-request matching, or the new
-stream-pair implementation, and cannot establish that the full gate passes.
-Use one-way traffic throughout the new probes. The existing generic QUIC
-bidirectional byte-transfer regression remains separate transport coverage.
-
-## Transport results
-
-The original full-saturation completion criterion fails with default windows.
-The user subsequently selected bounded cleanup and recovery for excessive
-traffic. That policy amendment does not turn the diagnostic stall into a
-successful recovery test. The generic paired-stream implementation is tested below. No new block-sync capability is enabled.
-The checks below use one connection and an
-already-established, continuously polled data reader. They transfer bytes in
-one direction, from B to A.
-
-Individual measurements on the debug test executable:
-
-| Paused traffic | Data received before releasing paused traffic | Peak RSS | Outcome |
-| --- | --- | --- | --- |
-| None | 64 MiB in 0.750 s, 85.4 MiB/s | 150.9 MiB | Raw prerequisite passes |
-| One unread 16 MiB stream | 64 MiB in 0.719 s, 89.0 MiB/s | 187.6 MiB | Raw prerequisite passes |
-| Two unread 16 MiB streams | Zero bytes in 30 s | 187.8 MiB | Completion and throughput fail |
-| Production frame workers: request and header queues each hold one frame, with another frame waiting to enter; each stream receives 16 MiB | Zero bytes in 30 s | 189.5 MiB | Completion and throughput fail despite bounded application queues |
-| Production frame workers: the advertised 32,000 requests, plus a sibling header stream receiving 16 MiB | 64 MiB in 0.767 s, 83.5 MiB/s | 196.5 MiB | This smaller traffic case passes the raw deadline and memory thresholds |
-
-These are individual diagnostic runs, not five-run matched-download medians.
-RSS includes both endpoints and the eventual recovery transfer. All measured
-cases fit the declared local memory envelope; the failure is progress.
-
-In both stalled cases, releasing just one paused sibling restored the same
-data transfer, which finished about 0.77 seconds later. The data stream and
-connection were neither reset nor reopened. In the raw test the application
-drained a sibling; in the frame-worker test it stopped the header worker.
-
-### Cause
-
-Two 16 MiB streams can consume the connection's entire 32 MiB receive
-allowance. Reading the otherwise-empty data stream cannot release bytes held
-by its siblings. The default stream-count allowance is 1,024, so it does not
-exclude this three-stream topology.
-
-The production frame reader waits when its bounded application queue is full.
-At that point it also stops checking later messages against the message-rate
-budget. Reducing that queue to one frame does not prevent QUIC from receiving
-the rest of its stream window.
-
-The failed frame-worker case deliberately supplies about 986,895 GetBlocks
-frames, well above the default advertised ceiling of 32,000. The advertised
-ceiling corresponds to only 544,000 encoded request bytes. That smaller burst
-leaves enough connection credit even with one full paused header stream, as
-the last measurement demonstrates.
-
-### Scope and decision
-
-The frame-worker probe uses real QUIC, frame parsing, per-message payload caps,
-rate admission, and bounded queues. It deliberately pauses the application
-consumers and bypasses service negotiation and reactors. It proves what happens
-if those consumers remain paused; it does not establish that ordinary peers
-produce the full-saturation workload. The sender finishes the paused stream's
-send half so acknowledgment confirms receipt; the blocked reader has not
-reached that end marker. The full-window frame burst ends inside a frame that
-also remains unread.
-
-The selected contract requires completed downloads within the supported
-request/service workload and bounded teardown and recovery under excessive
-traffic. Full buffers alone do not trigger cancellation. Let temporary
-backpressure clear naturally, and use the existing request-expiry and
-block-progress deadlines for sustained stalls. Keep the default windows and
-QUIC dependency. The original attempt
-may fail; its unreceived work must become retryable without losing completed
-work or releasing resources still owned by running jobs. If resetting the
-block-sync pair does not clear the condition, close the peer connection.
-Repeated saturation must leave another usable peer able to make progress.
-
-The saturation rows above record recovery thresholds before measuring
-that behavior. Recovery still needs testing through real session management.
-The original failed completion measurements remain above as diagnostic evidence.
-
-QUIC dependencies and window settings are unchanged. Paired transport support and
-request ownership are implemented below. Production block sync still uses the
-existing layout and serving driver while the remaining work is tested.
-Initial matched downloads are recorded below. Impaired links, repeated matched
-downloads after reopening, baseline medians, and combined conditions are being
-measured. The full acceptance gate has not passed.
-
-## Sequential serving and matched downloads
-
-The paired service now reads requests in one sequential task and calls the
-storage adapter directly. It waits for peer capacity before node capacity,
-reserves output space before each blocking encode, and retains ownership in
-database jobs, encoded results, and queued frames. The node constructs the real
-state adapter at startup. The production version switch remains off.
-
-Six serving tests pass, including request arrival before Status, bounded Status
-setup, a queued frame retaining the peer's slot, and aborting a running database
-job while a replacement session waits for the same peer capacity. Eighteen
-storage/queue combinations also preserve the exact available prefix and ending,
-including empty reads and storage failures. The full
-node compiles with the adapter. The session table replaces queued lifecycle
-history, and transport queues now use block sync's configured depths. The
-network regression run after these changes passed 934 tests, with three
-diagnostic tests ignored.
-
-The first matched-download fixture uses two real QUIC endpoints, normal service
-negotiation, peer routines, serving, and the download sequencer. Storage is an
-in-memory bounded source; consensus verification is a fixture. A downloads 32
-blocks of about 1.9 MB each and consumes every ending message without replacing
-either session. These blocks have internally consistent commitments but are not
-consensus-valid test-chain blocks.
-
-| Case | Matched completion | Peak process RSS |
-| --- | --- | --- |
-| Existing serving path in the working tree | 1.789 s | Not measured |
-| Paired serving | 1.744 s | Not measured |
-| Paired serving; A's 64 serving slots held; B sends 32,000 extra requests | 1.760 s | 148.1 MiB in a separate 1.761 s run |
-
-These are initial single runs. The existing path measurement uses the working
-tree, including the request-ownership and queue-limit changes; it is not the
-required comparison against the original PR head. The tests establish matched
-completion and the pressure run fits the predeclared memory envelope. They do
-not complete the full activation gate.
-
-### Download-policy fix and recovery
-
-The original PR at the baseline commit also fails the 30-second impaired test:
-zero of 32 blocks complete, after its only cold probe expires. The raw 4 MiB
-measurement above separates the transport's throughput limit from that policy
-failure.
-
-The shared download-policy fix gives an unmeasured peer the normal request
-deadline. Once measured, floor requests retain their shorter base timeout, with
-a 256 KiB/s minimum transfer rate. Each deadline includes earlier unreceived
-responses because those bytes must pass through the same ordered data stream.
-Probe counts, exact ownership checks, and the block-progress timeout remain.
-
-The cold-probe regression verifies delivery after the short rescue deadline and
-rejection after the normal deadline. The slow-peer scenario still requires full
-completion, no rejection or park, and a smaller final congestion window; it now
-allows reliability to remain perfect when the corrected deadlines avoid every
-timeout.
-
-| New measurement | Outcome |
+| Workload | Required result |
 | --- | --- |
-| Paired download with 32,000 reverse requests, 50 ms RTT, and 1% loss | All 32 blocks and endings in 205.002 s; no session replacement |
-| Paired download with reverse requests and one paused sibling service | All blocks and endings in 1.809 s |
-| Two paused siblings; consumers resume after one second | No complete body before resume; original pair completes in 2.782 s |
-| Two siblings remain paused | Existing data-write timeout closes the connection; session and serving slots return to their initial counts; a fresh peer completes returned work in 1.473 s |
-| Twenty pair replacements with reverse request pressure, without loss | Every round completes; summed transfer time 35.236 s; real reopen backoff retained |
+| Ordinary matched download | All blocks and endings within 30 seconds |
+| Incoming request pressure | Same completion while A's serving slots are occupied and B sends 32,000 synthetic requests |
+| Paused sibling service | Same completion with one sibling retaining a full 16 MiB window |
+| 50 ms RTT and 1% loss, including pressure and paused sibling | All blocks and endings within 240 seconds |
+| Throughput comparison | Five-run median useful throughput at least 90% of the original serving path with the same policy fixes |
+| Process memory | Peak RSS at most 512 MiB, including both endpoints |
+| Reopening | Twenty replacements on the same connection, including loss; each new session completes within its applicable deadline |
+| Temporary saturation | Resuming a paused consumer before liveness expires lets the original pair complete without a reset |
+| Sustained saturation | Bounded cleanup returns unreceived work; a usable peer completes the retry within 30 seconds; twenty cycles stay within memory and session bounds |
 
-The saturation test originally assumed the 32-second block-progress timeout
-would act first. The existing ten-second data-write timeout actually closes this
-fully blocked connection first, about 9.6 seconds after download timing starts.
-This is an existing deadline, not a new fullness timer. Both temporary and
-sustained cases keep the default windows.
+Only A must complete a matched download. B's extra requests are synthetic serving
+pressure, not a second matched download requirement.
 
-The full network-library run passed 1,230 tests. Three listener tests cannot bind
-their additional loopback source addresses on this Mac. A fourth test required a
-reliability dip even when no request expired; after adapting that assertion, all
-947 Zakura tests passed, with 11 standalone gates ignored. The node also compiles.
-The five-run comparisons below are complete. Impaired reopen rounds remain in
-progress.
+## Completed comparisons
 
-### Completed throughput comparisons
-
-Each row below contains five independent runs of each implementation, on the
-same host and link fixture. The baseline is the original PR with the same
-download-policy fix. Paused fixture streams use a one-frame queue on both paths;
-the baseline's production block-sync queues are unchanged. All 40 runs completed
-every block and ending without replacing their sessions.
+Each row contains five runs of each implementation. Every run completed all
+blocks and endings without replacing its session. The baseline includes the same
+download-policy fix. Paused fixture streams use a one-frame application queue on
+both paths; the original block-sync queues are otherwise unchanged.
 
 | Workload | Original median | Paired median | Paired useful throughput versus original | Highest RSS across both paths |
 | --- | --- | --- | --- | --- |
@@ -219,135 +48,153 @@ every block and ending without replacing their sessions.
 | 32,000 reverse requests | 1.830 s | 1.827 s | 100.1% | 186.3 MiB |
 | Reverse requests and a paused 16 MiB sibling | 1.781 s | 1.803 s | 98.8% | 210.2 MiB |
 | Reverse requests, 50 ms RTT, and 1% loss | 203.164 s | 205.934 s | 98.7% | 150.0 MiB |
+| Reverse requests, paused sibling, 50 ms RTT, and 1% loss | 210.156 s | 210.811 s | 99.7% | 179.7 MiB |
 
-These rows pass their completion, throughput, and memory thresholds. They do not
-establish the combined paused-sibling/loss result or the remaining recovery gate.
+All 50 runs pass. Both implementations use the approved 32-second block-sync
+data-write deadline in the combined-condition row. The first four rows used the
+previous ten-second deadline; it did not fire. QUIC and its windows are identical
+throughout.
 
-### Combined-condition failure
+After removing the activation override, the combined-condition test completed
+again through normal service selection: **213.178 seconds**, every block and
+ending, and **183.5 MiB peak RSS**.
 
-With reverse requests, a paused sibling, and packet loss together, the original
-serving path completes only 16 of 32 blocks before its session closes. The paired
-path fails too: two diagnostic runs reach 16 and 17 blocks. Tracing identifies an
-outbound frame write timeout while accepted blocks are still arriving. This is a
-separate application deadline from the corrected download-request policy.
+| Recovery test | Result |
+| --- | --- |
+| Twenty loss-free replacements under request pressure | Every round completes; 35.236 seconds of useful transfer in total; real reopen backoff retained |
+| Twenty replacements with loss | 640 matched blocks and endings; every round within 240 seconds; 4,129.461 seconds of useful transfer in total; 171.3 MiB peak RSS |
+| Two full paused siblings resume after one second | Original pair completes in 2.782 seconds without a reset |
+| Twenty sustained-saturation and fresh-peer retries with the approved data deadline | Every retry completes from returned work without a new work submission; serving and session slots return to initial counts; 257.6 MiB peak RSS |
 
-An isolated prototype with a 32-second data-write deadline
-completes all 32 blocks and endings in 208.527 seconds, with 171.9 MiB peak RSS.
-Several writes take 13.8–14.1 seconds while complete blocks continue arriving.
-This separates the write deadline from insufficient transport capacity. The
-prototype changes neither QUIC nor its windows. The user approved this deadline
-for the paired data stream after reviewing the result. Both implementations in
-the combined comparison must use the same deadline. The paired data path now
-uses 32 seconds; its feature switch remains disabled until the remaining gates
-pass. Session setup and unrelated services keep their existing deadlines.
+In the sustained-saturation fixture, an unrelated sibling's unchanged ten-second
+write deadline closes the blocked connection first. That test proves recovery
+and resource ownership; it does not measure the exact 32-second block-sync timer.
 
-Twenty saturation-and-retry cycles with the approved data deadline pass in one
-process, peaking at 257.6 MiB RSS. Every cycle releases the old session and
-serving capacity, then a fresh peer completes the returned download without a
-new work submission. A blocked sibling service's unchanged ten-second write
-deadline closes these connections first; this test verifies recovery and
-ownership, rather than the exact block-sync write-deadline duration.
+## Decisions supported by failed probes
 
-### Property coverage
+### Shared connection credit
 
-The ported regulation profile passed all 108 selected network and state tests
-without retries. It includes the independent serving ownership model, shared
-request histories, eight atomic request-write tests, sequential serving, pair
-setup/cancellation, and the nine owned-state-read tests. Long impaired and repeated
-transport measurements have a separate profile and are excluded from routine CI,
-including lanes that run ignored tests.
+Two paused streams can consume all 32 MiB of connection receive allowance.
+Reading an empty data stream cannot release bytes held by those siblings.
+Reducing the application queues to one frame does not reduce QUIC's windows.
 
-## Paired transport and request ownership
+| Raw transport probe | Result before releasing paused traffic | Peak RSS |
+| --- | --- | --- |
+| No paused stream | 64 MiB in 0.750 s | 150.9 MiB |
+| One full 16 MiB paused stream | 64 MiB in 0.719 s | 187.6 MiB |
+| Two full 16 MiB paused streams | Zero data bytes in 30 s | 187.8 MiB |
+| Two full windows behind bounded production frame workers | Zero data bytes in 30 s | 189.5 MiB |
+| Advertised 32,000 requests plus one full paused sibling | 64 MiB in 0.767 s | 196.5 MiB |
 
-The transport can now admit two declared ordered streams as one session. Each
-prelude is followed by the same nonzero eight-byte little-endian pair ID, scoped
-to that connection and opener. Neither role reaches the service alone. A missing
-role expires under the setup deadline; mismatched or duplicate roles are rejected.
-Both workers share cancellation and the service message budget. Retirement waits
-for both workers, including their readers, before reporting a single session exit.
-Request writes can wait beyond the generic ten-second timeout. Data writes retain
-their deadline. An interrupted partial write resets the pair.
+The full-window request burst is about 986,895 frames. The advertised 32,000
+requests occupy only 544,000 framed bytes. Releasing one paused sibling restored
+the original stalled transfer, which completed about 0.77 seconds later.
 
-Three real-QUIC tests passed: repeated pair reopening on the same connection,
-request backpressure beyond ten seconds while data continues, and bounded cleanup
-of incomplete or mismatched setup. These exchange test frames; they are not yet
-matched block downloads through the new serving task.
+The user selected bounded cleanup and a completed retry for sustained excessive
+traffic, rather than requiring the original saturated attempt to complete.
+Fullness alone does not trigger a new timer. Temporary pressure can clear;
+existing write, request, and block-progress deadlines handle sustained stalls.
+The recovery tests above establish this behavior through real session management.
 
-Outgoing requests now reserve a queue slot first. The work queue gives each take
-an exact provisional owner. Outstanding-request publication, byte-ledger transfer,
-and enqueue happen under the same lock as reset and the writer's initial claim.
-Expiry skips an unwritten frame but lets a started frame finish. Dropping an
-unfinished write cancels its session. Only the matching work owner can return
-unreceived reservations; received blocks and replacement attempts survive cleanup.
-A queue that closes after slot reservation triggers explicit settlement.
+### Download deadlines
 
-Eight focused ownership tests passed, including a reset on another thread while
-publication holds the lock. The broader network regression run passed 929 tests
-with three ignored tests in 52.75 seconds, including version-selection coverage.
-Network library/test Clippy also passed.
-The new service version remains disabled: full matched-download, loss, memory,
-throughput, and saturation-recovery gates are still outstanding.
+The original PR and paired prototype both failed the original 30-second loss
+gate. The original completed zero matched blocks because its only cold probe
+expired. A raw 4 MiB transfer without block-sync policy took 12.706 seconds under
+the same 50 ms RTT and 1% loss. The default transport could not meet the original
+absolute throughput requirement.
 
-## Storage prototype
+The user approved including the download-policy fix and, before measuring the
+complete comparisons, revising lossy completion to 240 seconds plus the 90%
+relative throughput floor. Loss-free deadlines and the memory envelope stayed
+unchanged. The failed original measurements remain failures.
 
-Added `ReadStateService::read_owned_block_range` and `OwnedBlockRange<R>`.
-The API moves the caller's resources into one blocking database job and then
-into the returned block prefix. It reuses state readiness checks and the
-existing bounded range-read helper. The single-execution operation is separate
-from the cloneable `ReadRequest` enum.
+The policy fix gives an unmeasured peer the normal bounded request deadline.
+Measured peers include transfer time for the requested body and earlier
+unreceived responses on the ordered data stream, with the existing 256 KiB/s
+minimum estimated rate. Cold-probe limits, exact ownership, and block-progress
+liveness remain in force.
 
-Cancellation is checked before the first lookup and between lookups. It stops
-further reads; a lookup already running keeps its resources until it exits.
-Dropping the async future or aborting its task does not release those resources.
-An undelivered result drops its blocks and resources when the job finishes.
+### Data writes
 
-Nine tests passed, covering the byte cap and retained result,
-cancellation before/between lookups, a dropped waiter, an aborted caller,
-panic unwinding, and the public API against empty and populated databases,
-including failure of state readiness checks. The concurrency
-tests wait until a real blocking job has started, terminate its async owner,
-assert that capacity is still charged, then release the job and verify exactly
-one resource release.
+Combining loss with a paused sibling exposed a separate limit. The original
+serving path completed 16 of 32 blocks before a write timeout; paired diagnostic
+runs reached 16 and 17 blocks. Healthy writes took 13.8–14.1 seconds while earlier
+blocks were still arriving, exceeding the generic ten-second deadline.
 
-The network interface and node adapter are wired into the paired serving task.
-The old production driver still uses `BlockRangeQueryLease` and
-`ReadRequest::BlocksByHeightRange` until the paired version is enabled.
+A 32-second prototype completed the combined workload in 208.527 seconds at
+171.9 MiB peak RSS. The user approved that deadline for paired data writes,
+including Status and ending messages. The completed comparison gives both paths
+the same deadline. Request writes remain cancellation-aware; setup and unrelated
+services retain their existing deadlines. No QUIC change was needed.
 
-## Reproduction and checks
+## Correctness coverage
 
-The probes live in `handler/tests/quic_progress.rs` in the network crate.
-Build with `cargo +1.97.0 test -p zakura-network --lib --locked --no-run`.
-Use the emitted test-executable path with `/usr/bin/time -l`, a fully qualified
-test name, and `--exact --nocapture` to measure a single test's peak RSS without
-including compilation. The test prints bytes received and transfer duration.
+The sequential serving tests cover requests arriving before Status, missing
+Status, bounded and unavailable ranges, storage failures, and output congestion.
+Eighteen storage/queue combinations preserve the exact available prefix and
+ending. A read lasting beyond the former eight-second query timeout can finish
+normally. Cancellation and stale-session tests keep the actual job charged and
+prevent old output from reaching a replacement.
 
-`two_paused_streams_exhaust_default_connection_credit` and
-`paused_frame_workers_exhaust_default_connection_credit` succeed as regression
-tests when they reproduce the stall and recovery. A passing test therefore
-records a failed transport acceptance criterion, not successful activation.
+Nine owned-state-read tests exercise the byte cap, retained results, cancellation
+before and between lookups, a dropped waiter, an aborted caller, panic unwinding,
+and the public API against empty and populated databases. The concurrency tests
+wait for a real blocking job, terminate its caller, verify retained ownership,
+then release the job and observe exactly one resource release.
 
-Validation completed for this checkpoint:
+The request ownership tests cover expiry versus the writer's first claim and
+reset on another thread during publication. Publication, ledger transfer,
+enqueue, and reset share an explicit lock. Only the exact owner can return
+unreceived reservations; received blocks and replacement work survive cleanup.
+An unfinished write cancels its pair.
 
-- All six `zakura::handler::tests::quic_progress` tests passed in 69.37 seconds,
-  including the existing transport regression. Peak RSS for this sequential
-  combined run was 284.3 MiB.
-- `cargo +1.97.0 fmt --all -- --check` passed.
-- All nine `service::block_range::tests` state tests passed in 1.19 seconds.
-- `cargo +1.97.0 clippy -p zakura-state --lib --tests --locked -- -D warnings`
-  passed.
-- `cargo +1.97.0 clippy -p zakura-network --lib --tests --locked -- -D warnings`
-  passed. The two diagnostic functions explicitly allow stderr output so
-  standalone measurements remain visible regardless of tracing filters.
-- Both design documents passed the repository's Markdown lint configuration;
-  `git diff --check` passed.
+Pair tests cover incomplete and mismatched setup, duplicate roles, request
+backpressure beyond ten seconds while data continues, and repeated reopening.
+The independent ownership model retains negative controls and uses replay format
+version 4. Long transport gates have a separate profile and are excluded from
+routine CI, including profiles that run ignored tests.
 
-The test link emitted the pre-existing macOS compact-unwind size warning. It
-did not prevent linking or execution. Full workspace and node-driver validation
-is pending until production serving moves to the new path.
+## Reproduction and final checks
 
-The original worktree disappeared during execution. Its uncommitted edits were
-recovered from this task's recorded changes into
-`/Users/czstudio/Documents/zakura-worktrees/getblocks-two-stream-refactor`.
-The original task path links to that checkout. The 929-test run and Clippy results
-above were repeated against the recovered source; Markdown and changelog checks
-also passed.
+Build the network tests with
+`cargo +1.97.0 test -p zakura-network --lib --locked --no-run`.
+Run the emitted executable with `/usr/bin/time -l`, the fully qualified test
+name, and `--exact --nocapture` to measure RSS without compilation.
+
+Raw probes are in `handler/tests/quic_progress.rs`. Matched downloads are in
+`handler/tests/paired_block_sync.rs`; long comparisons and reopen repetitions
+are under its `gate` module. The `blocksync-transport-gate` nextest profile
+selects those explicit long-running measurements. Local measurement logs and
+median JSON files are retained under `target/getblocks-gate/`.
+
+A passing diagnostic stall test confirms the expected stall and recovery;
+it is not a successful completion measurement. The matched results above are
+the activation evidence.
+
+Completed checks:
+
+- Workspace Clippy with all targets and warnings denied passes.
+- The regulation profile lists and runs 102 tests; all pass without retries,
+  including the final observation guards and nine owned-state-read tests.
+- All 22 Zakura integration tests pass, including old and mixed capability
+  advertisements retaining other negotiated services after rejecting the old
+  block-sync layout.
+- The workspace run passes all 402 node library tests, 572 state library tests,
+  and 1,234 network library tests. Other workspace library and doc-test targets
+  pass. Six tests fail for the conditions listed below. This broad run precedes
+  the final metrics additions; the focused checks above include them.
+- Formatting, Markdown lint, and changelog validation pass.
+
+The three network failures are
+`listener_bans_zcashd_compat_peer_before_reserved_slot`,
+`listener_reserves_one_zcashd_compat_inbound_slot`, and
+`listener_zcashd_compat_reconnect_bypasses_recent_ip_limit`. Their additional
+loopback source addresses are unavailable on this Mac (OS error 49).
+
+The three node acceptance failures are `activate_mempool_mainnet`,
+`restart_stop_at_height`, and `sync_one_checkpoint_mainnet`. They run the legacy
+P2P stack, fail to establish usable public peer connections, and expire waiting
+for sync progress. These are not paired-transport runs. Host networking and
+legacy peer policy were left unchanged. The macOS compact-unwind linker warning
+also remains; it does not prevent linking or execution.

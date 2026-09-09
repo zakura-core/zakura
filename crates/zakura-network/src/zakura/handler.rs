@@ -5457,6 +5457,7 @@ fn stream_kind_label(stream_kind: u16) -> &'static str {
         DISCOVERY_STREAM_KIND => "discovery",
         HEADER_SYNC_STREAM_KIND => "header_sync",
         ZAKURA_STREAM_BLOCK_SYNC => "block_sync",
+        crate::zakura::ZAKURA_STREAM_BLOCK_REQUESTS => "block_requests",
         _ => "unknown",
     }
 }
@@ -8826,8 +8827,9 @@ mod tests {
 
         let service = Arc::new(BlockSyncService::new(ZakuraBlockSyncConfig::default()));
         let stream = service.streams()[0];
+        let requests = service.streams()[1];
         let registry = ServiceRegistry::new(vec![service])?;
-        let payload_limits = registry.message_payload_limits(stream);
+        let payload_limits = registry.message_payload_limits(requests);
         assert_eq!(payload_limits, &[(2, 9)]);
         assert!(registry
             .message_payload_limits(Stream {
@@ -8903,8 +8905,8 @@ mod tests {
             );
         }
 
-        // The GetBlocks limit must not shrink the allowance for Block responses
-        // on the same stream. Both real message encodings must still round-trip.
+        // The generic payload gate preserves the independent Block allowance.
+        // Role enforcement is covered by the paired-stream tests.
         let connection =
             timeout(Duration::from_secs(5), client.connect(server_addr, ALPN)).await??;
         let (mut send, _recv) = timeout(Duration::from_secs(2), connection.open_bi()).await??;
@@ -9459,7 +9461,8 @@ mod tests {
             );
         }
 
-        for kind in [7u16, 255, u16::MAX] {
+        assert_eq!(stream_kind_label(7), "block_requests");
+        for kind in [255u16, u16::MAX] {
             assert_eq!(stream_kind_label(kind), "unknown");
         }
     }

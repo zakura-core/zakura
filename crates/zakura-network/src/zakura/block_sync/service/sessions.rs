@@ -64,7 +64,14 @@ impl SessionCapacity {
                 return Err(OrderedSessionFull);
             }
         };
+        let reserved =
+            metrics::gauge!("sync.block.sessions.reserved", "direction" => direction.trace_label());
+        let pending_count = metrics::gauge!("sync.block.sessions.pending");
+        reserved.increment(1.0);
+        pending_count.increment(1.0);
         Ok(Arc::new(SessionResources {
+            reserved,
+            pending_count,
             session: Some(session),
             pending: StdMutex::new(Some(pending)),
             changed: self.changed.clone(),
@@ -74,6 +81,8 @@ impl SessionCapacity {
 
 #[derive(Debug)]
 struct SessionResources {
+    reserved: metrics::Gauge,
+    pending_count: metrics::Gauge,
     session: Option<OwnedSemaphorePermit>,
     pending: StdMutex<Option<OwnedSemaphorePermit>>,
     changed: watch::Sender<()>,
@@ -81,21 +90,32 @@ struct SessionResources {
 
 impl OrderedSessionResources for SessionResources {
     fn admitted(&self) {
-        self.pending
+        if self
+            .pending
             .lock()
             .expect("session setup ownership is not poisoned")
-            .take();
+            .take()
+            .is_some()
+        {
+            self.pending_count.decrement(1.0);
+        }
         self.changed.send_replace(());
     }
 }
 
 impl Drop for SessionResources {
     fn drop(&mut self) {
-        self.pending
+        if self
+            .pending
             .get_mut()
             .expect("session setup ownership is not poisoned")
-            .take();
+            .take()
+            .is_some()
+        {
+            self.pending_count.decrement(1.0);
+        }
         self.session.take();
+        self.reserved.decrement(1.0);
         self.changed.send_replace(());
     }
 }

@@ -1,139 +1,132 @@
-# GetBlocks serving regulation
+# GetBlocks serving
 
-GetBlocks admits bounded state work and holds its response producer until the
-query, result, and application writes finish. QUIC flow and congestion control
-provide transport backpressure.
+Native block sync uses two persistent QUIC streams on one connection. Requests
+travel on one stream; Status, blocks, and response endings travel on the other.
+One sequential task serves each session. Waiting for serving capacity pauses
+request intake while the data reader continues processing downloads.
 
-## Message rules
+The [stream specification](../specs/blocksync/stream-pair.md) defines negotiation,
+framing, and retirement. The [execution results](getblocks-refactor-results.md)
+record the transport gate, including its memory and throughput limits.
 
-The GetBlocks declaration in the peer-message regulation draft selects Frame,
-Decode, and Work. The four categories organize message rules; they do not require
-every message to select every filter.
+## Request flow
 
-| Category | Current GetBlocks path |
+**Example:** A is downloading block 200 from B while A's 64 serving slots are
+occupied. B also asks A for block 100. A holds that request and waits for a
+serving slot. Block 200 can still arrive on A's separate data stream.
+
+The serving task:
+
+1. Decodes one GetBlocks request. If the initial Status has not arrived on the
+   data stream, waits for it under a ten-second setup deadline.
+2. Acquires the authenticated peer's response slot, then the node's slot. Both
+   waits are cancellable and use FIFO admission. Waiting for an earlier response
+   from this identity does not consume another node slot.
+3. Rechecks the session and snapshots the committed serving range and response
+   limits. An unavailable range gets RangeUnavailable without a storage read.
+4. Dispatches one bounded storage read through the node's state adapter.
+5. Reserves an output-queue slot before encoding each response frame. Queue
+   pressure waits for space; it does not truncate the available response.
+6. Queues the available contiguous prefix followed by BlocksDone. An empty read
+   or storage failure produces RangeUnavailable. All output uses the original
+   session's data sender.
+
+A request may arrive before Status because the streams are independent. That
+ordering alone is not a peer fault. Wrong-role messages, malformed ranges, and
+oversized headers are rejected before expensive work.
+
+## Ownership
+
+A response slot remains held by every resource that can outlive its caller:
+its producer, database job, retained result, encode, and queued or writing frames.
+The slot returns only after all of those owners finish or are discarded.
+
+**Example:** B disconnects while A is reading block 100 for it. A cancels delivery,
+but the running database job still owns its slot. B's replacement session waits
+for that same identity's slot instead of starting another read alongside it.
+
+The state adapter claims execution once, then moves the lease into the blocking
+job and its returned result. Cancellation is checked before and between lookups.
+Aborting the async caller does not release resources still owned by a real read.
+There is no serving-query timeout. A database call that never ends keeps its slot.
+
+Each queued frame has a guard that retains the response's slots through its
+application write or discard. Taking a frame out of the queue does not release
+those slots. QUIC can retain bytes after accepting the write; the application
+permit does not wait for the remote peer to read them.
+
+The producer drops its ownership after queuing the ending message. The next
+request can wait for the final frame guard to release the peer's slot. It must
+not hold the old producer while waiting for all old owners to disappear.
+
+## Bounds and cancellation
+
+| Resource or wait | Limit or behavior |
 | --- | --- |
-| Safe | The frame reader rejects GetBlocks payloads above 9 bytes before allocation. The codec bounds the request count and checks that the whole requested range fits within the supported heights, on both send and receive. Serving enforces the advertised response count and body-byte cap, including the encoded framing allowance. |
-| Authorized | Serving uses the authenticated session after its initial Status. Reservation checks belong to the Block and terminal responses on the requesting side. |
-| Useful | GetBlocks has no Relevant predicate in the draft. Stale session work is cancelled before dispatch. Completed requests may be legitimate retries; the server does not infer what the requester has stored. |
-| Budgeted | An authenticated peer owns one response producer across its sessions. Shared concurrency permits bound state queries, retained results, and writes; each routine bounds waiting requests by its advertised in-flight limit. |
+| Decoded waiting requests | One per admitted session |
+| Raw request queues | One inbound and one outbound frame; a reader or writer can also hold a frame |
+| Data queues | Configured block-sync inbound and outbound queue depths |
+| Active responses | One per authenticated identity, including reconnects; 64 per node by default |
+| Storage and encoding | One storage dispatch and at most one active encode per response |
+| Request writes | Finish once claimed while the session is valid; cancellation resets the pair |
+| Data writes | 32 seconds, including Status and ending messages |
+| Initial Status | Ten seconds |
+| Incomplete stream pair | Prelude deadline, three seconds by default |
 
-This implements serving ownership, not complete conformance to the draft. The
-complete filter inventory and its full reservation rules are not introduced here. In particular, the draft prohibits overlapping live GetBlocks
-ranges, while the current sender has reassignment and late-response behavior
-that needs a coordinated requester/responder change before that rule can be
-enforced. Serial response production does not reject overlapping requests.
+Outgoing requests reserve queue space before publishing outstanding work. The
+same ownership lock orders publication, reset, enqueue failure, and the writer's
+initial claim. If expiry wins before that claim, no bytes are written. If the
+writer wins, it finishes the frame while its session remains valid. Cancellation
+of a partial write resets both streams before another frame can be sent.
+Received blocks and replacement requests keep their exact ownership during
+cleanup; an obsolete request cannot return their reservations.
 
-## Shared request admission
+Full buffers alone do not cause a disconnect. Existing request expiry,
+block-progress liveness, and bounded data writes handle sustained stalls.
+Cancellation returns unreceived work for retry and keeps running jobs charged.
+Pair reopening uses the existing cooldown and backoff. Other services remain
+usable unless a connection-wide failure or repeated-stall policy closes the
+connection.
 
-Admission means deciding whether a request can start work now. A slot is room for
-one active response.
+Active responses, admission waiters, and the oldest response age are reported
+under `sync.block.serving.*`. Observations follow the last database/result/frame
+owner and do not retain that work themselves. `sync.block.sessions.reserved`
+counts establishing and retiring sessions as well as current ones;
+`sync.block.sessions.pending` counts incomplete setup. Labels contain no peer IDs.
 
-For GetBlocks, the steps are:
+## Transport and memory
 
-1. Check the request's fields and that the session has sent its initial `Status`.
-2. Take a slot from both the peer and the node's GetBlocks pool. If either is
-   full, return any slot already taken and wait. Later requests queue in arrival
-   order while we keep reading the stream.
-3. Check that the session is still current, then start reading the blocks.
-4. Keep the slots held until the block query ends and the response is written to
-   the transport or discarded. Then another request can use them.
+QUIC and its windows are unchanged: 16 MiB receive allowance per stream, 32 MiB
+shared receive allowance per connection, and a 32 MiB connection send window.
+Opening two streams does not allocate or reserve that memory in advance. Paused
+services can consume the shared allowance and delay otherwise-ready streams.
 
-If the request is cancelled before its query starts, the query won't run. If the
-query has already started, it keeps its slots until it finishes.
+The default advertised burst of 32,000 requests is 544,000 framed bytes. It fits
+alongside one paused 16 MiB sibling in the measured workload. Excessive traffic
+can fill two stream windows and consume all shared receive credit. Tests require
+natural recovery from a temporary pause and bounded cleanup followed by a
+completed retry for sustained saturation.
 
-The shared code handles taking, holding, and returning slots. Each message
-supplies its own rules for reading the request and limiting its response.
-GetBlocks supplies those rules through `GetBlocksPolicy`; block sync still reads
-the blocks and sends them. Each message's setup chooses its slot pool. GetBlocks
-currently has its own node pool.
-
-This shared code supports requests whose responses end. A GetPeers test checks
-that a second message can use the same code. GetPeers regulation is only enabled
-in that test.
-
-## Backpressure and ownership
-
-Backpressure means making the sender wait when we have no room for more work.
-Ownership means keeping a request's slots held until its work is done.
-
-The admitted request, block query, returned blocks, and queued messages share
-the same slots. Taking a message out of the send queue does not free those slots: its write
-may still be waiting for QUIC. The slots return when the request, query, and all
-writes have finished or been discarded. QUIC may still hold bytes after accepting
-a write; we don't wait for the peer to confirm it has read them.
-
-Before encoding a response, we reserve a send-queue slot. A full queue therefore
-does not trigger serialization. If encoding fails, the queue slot is returned
-without sharing the response's producer with the transport.
-
-For example, if one response is stuck waiting to be written, the next GetBlocks
-request on that session waits for its slot. We retain its height and count, but
-keep reading so responses to our own downloads can get through. Otherwise two
-nodes serving each other could both stop reading while waiting for their writes
-to finish. Neither could finish until the other resumed reading.
-
-A peer may send requests ahead of time within the advertised request limit. A
-request waiting for room is not a peer fault. The queue and its single admission
-waiter together hold at most our advertised in-flight request limit (32,000 by
-default). If another request arrives when this queue is full, we close the
-block-sync stream to release the backlog. We do not score the peer or close its
-other services: an older requester may have retried before earlier responses
-finished. These records contain only a height and count; they do not start queries
-or allocate responses. The active response separately holds its producer.
-If we cannot take both required slots, we return any slot already taken before
-waiting. Once the wait gives us a slot, we use that same slot when trying again.
-
-| Limit | Default | What happens at the limit |
-| --- | --- | --- |
-| Waiting requests | Up to 32,000 per session, from our advertised in-flight limit | Close this stream on overflow; continue reading within the limit |
-| Active responses | 1 per authenticated peer, 64 per node | Wait for the previous work and writes to release their slots |
-| Waiting for a query result | 8 seconds | Stop waiting for the result; the query keeps its slots until it ends |
-| Waiting to queue the ending message | Until queue space or cancellation | Keep the response slots held; the transport write timeout bounds a stopped reader |
-| Waiting to admit a request | Until capacity or cancellation | One waiter holds its place while later requests queue and responses keep flowing |
-
-If we cancel a request before its query starts, the query won't run. Starting the
-query and checking cancellation happen together. A query that has already started
-keeps its slots until it ends, even after a timeout or disconnect. A query that
-never ends keeps those slots; the timeout cannot stop the storage work. Reconnecting
-does not reset the peer limit: the new session shares its slot with any reads or
-writes still running for that identity. Once those owners finish, the new session
-can use the slot. Entries for departed peers are pruned as sessions connect.
-
-If the send queue fills partway through a response, we send only the blocks already
-queued, followed by an ending message. That ending message waits for queue space
-without blocking other reactor work. It keeps the response's slots held and stays
-tied to the original session. Cancellation, shutdown, or a closed queue ends the
-wait. Once queued, the message keeps holding the slots through its write. A local
-stream close lets the current frame finish under the existing write timeout, so
-the peer receives a complete frame.
-
-Waiting to serve does not extend download deadlines, because reads continue.
-A full outbound queue also does not pause reads. The normal download timeout and
-bounded write-congestion grace still apply.
-Each QUIC stream has a 16 MiB receive window within the connection's 32 MiB window,
-leaving room for another service when one stream pauses.
-
-Services supply message-specific payload limits through `Service::message_payload_limits`.
-The shared frame reader applies the tighter of that limit and the stream's existing
-limit before allocating or reading a payload. GetBlocks declares 9 bytes in its
-policy; messages without a declaration retain the stream limit. Discovery and
-header-sync policies can supply their own limits through the same interface.
-
-Each response also has a size limit. For the block count we allow in that response,
-its maximum payload size is
+For each admitted response, the payload bound is
 `min(count * MAX_BLOCK_BYTES, advertised_max_response_bytes) + count + 9`.
-The extra `count` allows one message tag per block; the final 9 bytes allow the
-ending message. All messages in a response share its slots rather than taking a
-new slot for each message.
+The extra count allows a tag per block; nine bytes cover the ending. Output queue
+capacity is reserved before serialization, and all frames share the original
+response slot.
 
-## Resource boundary
+This bound does not measure decoded blocks, encoding temporaries, total RSS, or
+QUIC buffers. Connection limits and existing decode bounds still matter. The
+512 MiB gate envelope applies to the documented local fixture, not every possible
+configuration or node workload.
 
-The response wire bound does not measure decoded block memory or total process
-RSS. State decoding, serialization temporaries, and a block fetched while finding
-the range boundary can add memory. At defaults, each response contains at most
-one 2,000,000-byte block plus framing; larger configured ranges remain capped by
-32 MiB of bodies. The transport separately allows a 32 MiB send window per
-connection. Connection limits and existing decode bounds remain relevant.
+## Shared policy and scope
 
-Message prioritization is outside this change. These controls do not establish
-consensus progress under every combined CPU, storage, and network workload.
+`GetBlocksPolicy` supplies decoding and response-size rules to the shared finite
+request admission code. GetBlocks uses its own node slot pool. A GetPeers test
+checks reuse of the generic mechanism; production GetPeers regulation is outside
+this change.
+
+This implements serving ownership and progress under the declared workloads,
+not all requirements of the broader regulation draft. Overlapping live ranges
+are still handled by the requester's existing reassignment and late-response
+rules; serial serving does not reject them. Message prioritization, download-index
+optimization, and regulation of other services remain separate work.

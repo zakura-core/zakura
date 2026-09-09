@@ -1,6 +1,7 @@
 {
   "repository": "zakura-core/zakura",
   "base_branch": "main",
+  "slack_channel": "C0BCQ7PP32A",
   "changelog_fragment_root": "docs/changelog/unreleased/",
   "eligible_roots": [
     "deploy/",

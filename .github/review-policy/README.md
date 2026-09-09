@@ -110,8 +110,42 @@ approval; PRs on other bases cannot receive a new approval.
 A read-only permission preflight skips the App job when no target PR has an
 authorized author. The exception is cleanup: a PR with an existing App approval
 still reaches the writer so it can withdraw that approval if access was revoked
-or cannot be verified. The writer independently checks the author's access on
+or cannot be verified. Pending Slack withdrawal notifications also reach the
+writer after access is revoked. The writer independently checks the author's access on
 every evaluation before and after approval, including scheduled runs.
+
+## Slack notifications
+
+The first App approval creates a message in **#gh-alerts** (`C0BCQ7PP32A`).
+Withdrawals and subsequent approvals reply in that same thread, with links to
+the PR, the GitHub review, and the reviewed commit. For example, approval of
+commit A starts the thread; withdrawal after a push and approval of commit B
+add two replies. Unchanged reconciliations send nothing. A review withdrawn
+before its approval could be announced does not create an approval alert.
+
+The workflow reuses the repository's `SLACK_BOT_TOKEN`. Its Slack bot needs
+`chat:write` and membership in **#gh-alerts**. No Slack history permissions,
+GitHub App webhook, new channel variable, or separate service is needed.
+It uses `chat.postMessage` because that API returns the timestamp needed for
+thread replies; an incoming webhook does not return it.
+
+Thread timestamps and delivery receipts are stored in hidden
+`zakura-codex-slack:v1` markers in the App's GitHub reviews. Only the dedicated
+App's marked reviews are updated; the approval receipt remains intact.
+Slack failure appears as a separate `notification_error` in Actions and never
+changes the GitHub approval decision. Definite Slack rejections can retry on
+the next reconciliation after configuration or rate-limit recovery.
+
+Before sending, the adapter saves a `pending` checkpoint. If delivery is
+uncertain, such as a timeout after Slack accepted the message, it stops sending
+for that PR instead of risking duplicate threads. An operator must inspect
+**#gh-alerts** and repair that review's Slack marker using the approval App:
+if delivered, set `thread_ts` to the root message timestamp, append the pending
+status to `sent`, and clear `pending` to `null`; if confirmed undelivered,
+clear only `pending`. Preserve the approval marker and review state.
+Do not clear an uncertain checkpoint without checking Slack first.
+Then dispatch reconciliation for that PR. Hourly retries cover open PRs;
+closed PRs require an explicit dispatch if notification delivery is outstanding.
 
 ## Administrator setup
 
@@ -126,6 +160,8 @@ needed.
 2. Under repository **Settings → Secrets and variables → Actions**, add the
    repository secret `CODEX_APPROVAL_APP_PRIVATE_KEY` with the full PEM key
    contents. Keep the key in a dedicated Infisical scope and sync it here.
+   Reuse the existing `SLACK_BOT_TOKEN`; confirm its bot has `chat:write` and
+   invite it to **#gh-alerts** if it is not already a member.
 3. On the **Variables** tab, add these repository variables:
 
    | Variable | Value |
@@ -175,6 +211,9 @@ rejections for another PR's fragment and a fragment containing a release waiver.
 Verify that Write, Maintain, and Admin authors qualify, while Read, Triage, and
 outside authors do not, regardless of who requested review. Also verify that
 revoking an author's access withdraws an existing App approval on reconciliation.
+Confirm that approval, withdrawal, and reapproval appear in one **#gh-alerts**
+thread, and that repeating reconciliation adds no messages. Verify that a Slack
+delivery failure reports an Actions error without undoing a valid App approval.
 
 Verify that the adapter withholds a new approval when Codex reviewed an older
 commit, and withdraws an existing approval after detecting a push. The adapter
@@ -208,3 +247,4 @@ approval requirement so ordinary human review keeps working.
 - [Native Codex GitHub reviews](https://learn.chatgpt.com/docs/third-party/github)
 - [GitHub PR approval and freshness rules](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets)
 - [GitHub pull request review API](https://docs.github.com/en/rest/pulls/reviews#create-a-review-for-a-pull-request)
+- [Slack message and thread API](https://docs.slack.dev/reference/methods/chat.postMessage/)

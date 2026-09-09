@@ -24,6 +24,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+import slack_notify
+
 
 POLICY_PATH = Path(__file__).with_name("policy.json")
 SUMMARY_MARKER = "<!-- codex-pull-request-review-summary -->"
@@ -406,7 +408,8 @@ class Adapter:
             return {"reconcile": True, "reason": "PR author has write-level access"}
         except (Ineligible, APIError, KeyError, TypeError) as exc:
             cleanup = self.bot_id > 0 and any(
-                r["state"] == "APPROVED" for r in self.owned_reviews())
+                r["state"] == "APPROVED" or slack_notify.needs_notification(r)
+                for r in self.owned_reviews())
             return {"reconcile": bool(cleanup), "reason": str(exc)}
 
     def evaluate(self, enforce_rules=True):
@@ -615,6 +618,15 @@ def main():
                 time.sleep(args.wait_seconds)
             else:
                 break
+        if writer:
+            # Slack delivery must never withdraw an otherwise valid approval.
+            # Also report withdrawals made while reconciliation handled a failure.
+            try:
+                result["slack_messages"] = slack_notify.notify(
+                    adapter, os.environ.get("SLACK_BOT_TOKEN", ""), approved=result.get("approved") is True)
+            except (slack_notify.NotificationError, Ineligible, APIError, KeyError, TypeError) as exc:
+                result["notification_error"] = (str(exc) if isinstance(exc, slack_notify.NotificationError)
+                                                else "Could not verify or save Slack notification state")
         results.append({"pr": number, **result})
         print(json.dumps(results[-1], sort_keys=True), flush=True)
     if args.check_authors and os.environ.get("GITHUB_OUTPUT"):
@@ -624,7 +636,7 @@ def main():
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as output:
             output.write("### Codex approval adapter\n\n```json\n"
                          + json.dumps(results, indent=2, sort_keys=True) + "\n```\n")
-    return int(any("error" in r for r in results))
+    return int(any("error" in r or "notification_error" in r for r in results))
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import adapter
+import slack_notify
 
 
 HEAD = "a" * 40
@@ -852,6 +853,198 @@ class ReconcileTests(unittest.TestCase):
                     adapter.Adapter(self.api, POLICY, 1).evaluate()
 
 
+
+class NotificationTests(unittest.TestCase):
+    def setUp(self):
+        self.reviews = [owned_review()]
+        self.api, self.writer = Mock(), Mock()
+        self.api.pages.side_effect = lambda _: deepcopy(self.reviews)
+        self.worker = adapter.Adapter(self.api, POLICY, 123, writer=self.writer,
+                                      app_id=APP_ID, bot_id=BOT_ID, trusted_sha=BASE)
+        self.worker.check_trusted_revision = Mock()
+        self.worker.evaluate = Mock(return_value=receipt())
+        self.writer.request.side_effect = self.write
+        self.post_patch = patch("slack_notify.Slack.post", return_value="1788909592.000001")
+        self.post = self.post_patch.start()
+        self.addCleanup(self.post_patch.stop)
+
+    def write(self, path, method, payload):
+        self.assertEqual(method, "PUT")
+        review = next(r for r in self.reviews if path.endswith(f"/reviews/{r['id']}"))
+        review["body"] = payload["body"]
+        return deepcopy(review)
+
+    def notify(self):
+        return slack_notify.notify(self.worker, "unused", approved=True)
+
+    def test_failed_approval_verification_only_allows_withdrawal_notifications(self):
+        self.assertEqual(slack_notify.notify(self.worker, "unused", approved=False), 0)
+        self.post.assert_not_called()
+        self.notify()
+        self.reviews[0]["state"] = "DISMISSED"
+        self.assertEqual(slack_notify.notify(self.worker, "unused", approved=False), 1)
+        self.assertIn("withdrawn", self.post.call_args.args[1])
+
+    def test_approve_withdraw_reapprove_stays_in_one_thread_across_runs(self):
+        original = self.reviews[0]["body"].splitlines()[0]
+        self.assertEqual(self.notify(), 1)
+        self.assertIsNone(self.post.call_args.args[2])
+        root = slack_notify.checkpoint(self.reviews[0])["thread_ts"]
+        self.assertEqual(self.notify(), 0)
+        self.reviews[0]["state"] = "DISMISSED"
+        self.assertEqual(self.notify(), 1)
+        self.assertEqual(self.post.call_args.args[2], root)
+        self.assertIn("withdrawn", self.post.call_args.args[1])
+        self.assertEqual(self.notify(), 0)
+        self.reviews.append({**owned_review(), "id": 500})
+        self.assertEqual(self.notify(), 1)
+        self.assertEqual(self.post.call_args.args[2], root)
+        self.assertIn("Zakura #123", self.post.call_args.args[1])
+        self.assertEqual(self.notify(), 0)
+        self.assertEqual(self.post.call_count, 3)
+        self.assertEqual(self.reviews[0]["body"].splitlines()[0], original)
+        self.worker.automatic_withdrawals = Mock(return_value={400})
+        self.assertTrue(self.worker.reconcile()["approved"])
+        self.assertNotIn("review_id", self.worker.reconcile())
+
+    def test_delayed_withdrawal_is_sent_before_reapproval(self):
+        self.notify()
+        self.reviews[0]["state"] = "DISMISSED"
+        self.reviews.append({**owned_review(), "id": 500})
+        self.assertEqual(self.notify(), 2)
+        calls = self.post.call_args_list
+        self.assertIn("withdrawn", calls[-2].args[1])
+        self.assertNotIn("withdrawn", calls[-1].args[1])
+        self.assertEqual(calls[-2].args[2], calls[-1].args[2])
+
+    def test_no_messages_for_human_native_or_unannounced_dismissed_reviews(self):
+        self.reviews = [owned_review(identity=999), native_review(), owned_review("DISMISSED")]
+        self.assertEqual(self.notify(), 0)
+        self.post.assert_not_called()
+        self.writer.request.assert_not_called()
+
+    def test_missing_token_does_not_checkpoint_or_change_approval(self):
+        with self.assertRaisesRegex(slack_notify.NotificationError, "SLACK_BOT_TOKEN"):
+            slack_notify.notify(self.worker, "", approved=True)
+        self.writer.request.assert_not_called()
+        self.post.assert_not_called()
+        self.assertEqual(self.reviews[0]["state"], "APPROVED")
+
+    def test_definite_rejection_can_retry_without_a_duplicate_thread(self):
+        self.post.side_effect = slack_notify.Rejected("not_in_channel")
+        with self.assertRaises(slack_notify.Rejected):
+            self.notify()
+        self.assertIsNone(slack_notify.checkpoint(self.reviews[0])["pending"])
+        self.post.side_effect = None
+        self.assertEqual(self.notify(), 1)
+        self.assertIsNone(self.post.call_args.args[2])
+        self.assertEqual(self.notify(), 0)
+
+    def test_uncertain_post_is_not_repeated_even_after_approval_withdrawal(self):
+        self.post.side_effect = slack_notify.NotificationError("delivery is uncertain")
+        with self.assertRaises(slack_notify.NotificationError):
+            self.notify()
+        self.reviews[0]["state"] = "DISMISSED"
+        self.post.side_effect = None
+        with self.assertRaisesRegex(slack_notify.NotificationError, "pending"):
+            self.notify()
+        self.assertEqual(self.post.call_count, 1)
+
+    def test_failed_initial_checkpoint_never_posts(self):
+        self.writer.request.side_effect = adapter.APIError("GitHub unavailable")
+        with self.assertRaises(adapter.APIError):
+            self.notify()
+        self.post.assert_not_called()
+
+    def test_lost_receipt_write_does_not_repeat_successful_slack_post(self):
+        calls = 0
+
+        def write(path, method, payload):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise adapter.APIError("GitHub unavailable")
+            return self.write(path, method, payload)
+
+        self.writer.request.side_effect = write
+        with self.assertRaises(adapter.APIError):
+            self.notify()
+        self.writer.request.side_effect = self.write
+        with self.assertRaisesRegex(slack_notify.NotificationError, "pending"):
+            self.notify()
+        self.assertEqual(self.post.call_count, 1)
+
+    def test_author_revocation_keeps_pending_withdrawal_delivery_reachable(self):
+        self.notify()
+        self.reviews[0]["state"] = "DISMISSED"
+        self.worker.check_author = Mock(side_effect=adapter.Ineligible("Access revoked"))
+        self.assertTrue(self.worker.author_gate()["reconcile"])
+        self.notify()
+        self.assertFalse(self.worker.author_gate()["reconcile"])
+
+    def test_corrupted_or_conflicting_checkpoint_stops_delivery(self):
+        self.notify()
+        saved = deepcopy(self.reviews[0])
+        for body in (saved["body"] + slack_notify.MARKER,
+                     saved["body"].replace('"sent":["APPROVED"]', '"sent":["DISMISSED"]'),
+                     saved["body"].replace(POLICY.data["slack_channel"], "COTHER")):
+            with self.subTest(body=body):
+                self.reviews[0]["body"] = body
+                with self.assertRaises(slack_notify.NotificationError):
+                    self.notify()
+        self.reviews = [saved, {**saved, "id": 500,
+                                "body": saved["body"].replace("1788909592.000001", "1788909592.000002")}]
+        with self.assertRaisesRegex(slack_notify.NotificationError, "Conflicting"):
+            self.notify()
+        self.assertEqual(self.post.call_count, 1)
+
+
+class SlackAPITests(unittest.TestCase):
+    def test_post_returns_timestamp_and_uses_thread_without_broadcast(self):
+        with patch("urllib.request.urlopen") as open_url:
+            response = open_url.return_value.__enter__.return_value
+            response.read.return_value = json.dumps({"ok": True, "channel": "C123",
+                                                     "ts": "1788909592.000002"}).encode()
+            self.assertEqual(slack_notify.Slack("unused").post("C123", "message", "1788909592.000001"),
+                             "1788909592.000002")
+            request = open_url.call_args.args[0]
+            self.assertEqual(request.full_url, "https://slack.com/api/chat.postMessage")
+            payload = json.loads(request.data)
+            self.assertEqual(payload["thread_ts"], "1788909592.000001")
+            self.assertFalse(payload.get("reply_broadcast"))
+            self.assertFalse(payload["unfurl_links"])
+            self.assertEqual(open_url.call_args.kwargs["timeout"], 30)
+
+    def test_definite_slack_rejection_is_retryable(self):
+        with patch("urllib.request.urlopen") as open_url:
+            open_url.return_value.__enter__.return_value.read.return_value = b'{"ok":false,"error":"not_in_channel"}'
+            with self.assertRaisesRegex(slack_notify.Rejected, "not_in_channel"):
+                slack_notify.Slack("unused").post("C123", "message", None)
+
+    def test_rate_limit_is_retryable_but_server_failure_is_uncertain(self):
+        for status in (429, 503):
+            with self.subTest(status=status), patch("urllib.request.urlopen", side_effect=
+                    adapter.urllib.error.HTTPError("https://slack.com", status, "error", {}, None)):
+                with self.assertRaises(slack_notify.NotificationError) as caught:
+                    slack_notify.Slack("unused").post("C123", "message", None)
+                self.assertEqual(isinstance(caught.exception, slack_notify.Rejected), status == 429)
+
+    def test_malformed_or_incomplete_success_is_uncertain(self):
+        for raw in (b"{", b"[]", b'{"ok":true}', b'x' * (1024 * 1024 + 1),
+                    b'{"ok":true,"channel":"COTHER","ts":"1788909592.000001"}'):
+            with self.subTest(raw=raw[:80]), patch("urllib.request.urlopen") as open_url:
+                open_url.return_value.__enter__.return_value.read.return_value = raw
+                with self.assertRaises(slack_notify.NotificationError) as caught:
+                    slack_notify.Slack("unused").post("C123", "message", None)
+                self.assertNotIsInstance(caught.exception, slack_notify.Rejected)
+
+    def test_timeout_does_not_expose_request_details(self):
+        with patch("urllib.request.urlopen", side_effect=TimeoutError("secret request detail")):
+            with self.assertRaises(slack_notify.NotificationError) as caught:
+                slack_notify.Slack("unused").post("C123", "message", None)
+            self.assertNotIn("secret", str(caught.exception))
+
+
 class APITests(unittest.TestCase):
     def test_http_status_survives_as_api_error(self):
         with adapter.urllib.error.HTTPError(
@@ -906,6 +1099,26 @@ class APITests(unittest.TestCase):
 
 
 class CLITests(unittest.TestCase):
+    def test_slack_failure_reports_error_without_repeating_or_reversing_approval(self):
+        environment = {"GH_TOKEN": "unused", "GH_APPROVAL_TOKEN": "unused",
+                       "CODEX_APPROVAL_ENABLED": "true", "CODEX_APPROVAL_APP_SLUG": "approval",
+                       "CODEX_APPROVAL_APP_ID": str(APP_ID), "CODEX_APPROVAL_APP_CLIENT_ID": "client",
+                       "CODEX_APPROVAL_BOT_ID": str(BOT_ID)}
+        with (patch.dict(os.environ, environment, clear=True),
+              patch("sys.argv", ["adapter.py", "--pr", "1", "--apply"]),
+              patch("adapter.GitHub") as github, patch("adapter.Adapter") as worker,
+              patch("slack_notify.notify", side_effect=slack_notify.NotificationError("delivery failed")),
+              patch("builtins.print") as output):
+            github.return_value.request.side_effect = [
+                {"id": APP_ID, "client_id": "client"}, {"id": BOT_ID, "type": "Bot"}]
+            worker.return_value.reconcile.return_value = {"approved": True}
+            self.assertEqual(adapter.main(), 1)
+            result = json.loads(output.call_args.args[0])
+            self.assertTrue(result["approved"])
+            self.assertEqual(result["notification_error"], "delivery failed")
+            worker.return_value.reconcile.assert_called_once()
+            worker.return_value.dismiss.assert_not_called()
+
     def test_author_preflight_gates_single_and_scheduled_batches_without_writer(self):
         for decisions, expected in (([False], "false"), ([True], "true"),
                                     ([False, True], "true"), ([False, False], "false"), ([], "false")):

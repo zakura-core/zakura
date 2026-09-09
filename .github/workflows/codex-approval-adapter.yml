@@ -84,6 +84,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_APPROVAL_TOKEN: ${{ steps.approval-token.outputs.token }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           CODEX_APPROVAL_ENABLED: ${{ vars.CODEX_APPROVAL_ENABLED }}
           CODEX_APPROVAL_APP_ID: ${{ vars.CODEX_APPROVAL_APP_ID }}
           CODEX_APPROVAL_APP_CLIENT_ID: ${{ vars.CODEX_APPROVAL_APP_CLIENT_ID }}

@@ -170,7 +170,10 @@ tar -C / -czf /root/genesis-candidate-result.tar.gz "${paths[@]}"
 
 
 def cleanup(args):
-    for node, volume in owned(args.run_id).values():
+    resources = owned(args.run_id)
+    node_ids = {n['id'] for n, _ in resources.values() if n}
+    volume_ids = {v['id'] for _, v in resources.values() if v}
+    for node, volume in resources.values():
         if node:
             run(['doctl', 'compute', 'droplet', 'delete', str(node['id']), '--force'])
         if volume:
@@ -179,7 +182,13 @@ def cleanup(args):
                 if time.monotonic() >= deadline: raise RuntimeError('volume did not detach')
                 time.sleep(3)
             run(['doctl', 'compute', 'volume', 'delete', volume['id'], '--force'])
-    if any(n or v for n, v in owned(args.run_id).values()): raise RuntimeError('cleanup verification failed')
+    # Deletion can clear a volume's tags before removing its inventory row.
+    # Ownership was checked before deletion; now wait for those exact IDs to vanish.
+    deadline = time.monotonic()+120
+    while (node_ids & {n['id'] for n in do('droplet', 'list')}
+           or volume_ids & {v['id'] for v in do('volume', 'list')}):
+        if time.monotonic() >= deadline: raise RuntimeError('cleanup verification timed out')
+        time.sleep(3)
     return {'launch_run_id': args.run_id, 'status': 'cleanup_verified'}
 
 

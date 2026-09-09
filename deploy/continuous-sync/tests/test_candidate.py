@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import tempfile
 import tomllib
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -15,6 +16,19 @@ host = load_module('genesis_candidate_host', ROOT/'deploy/continuous-sync/candid
 
 
 class CandidateTests(unittest.TestCase):
+    def test_cleanup_waits_for_deleted_volume_inventory_to_disappear(self):
+        node, disk = {'id': 1}, {'id': 'disk'}
+        with patch.object(candidate, 'owned', return_value={'baseline': (node, disk)}) as owned, \
+             patch.object(candidate, 'do', side_effect=[
+                 [{'droplet_ids': []}], [], [{'id': 'disk', 'tags': []}], [], [],
+             ]), patch.object(candidate, 'run') as run, patch.object(candidate.time, 'sleep'):
+            self.assertEqual(candidate.cleanup(SimpleNamespace(run_id='123'))['status'], 'cleanup_verified')
+        owned.assert_called_once_with('123')
+        self.assertEqual([call.args[0] for call in run.call_args_list], [
+            ['doctl', 'compute', 'droplet', 'delete', '1', '--force'],
+            ['doctl', 'compute', 'volume', 'delete', 'disk', '--force'],
+        ])
+
     def test_owner_names_cannot_address_fleet_or_escape_shell(self):
         for run_id in ['', '0', '../1', '1\n2', 'temp-zakura-sync-test-1', '1;true']:
             with self.subTest(run_id=run_id), self.assertRaises(ValueError):

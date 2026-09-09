@@ -2470,7 +2470,6 @@ impl ZakuraProtocolHandler {
         } else if !connection_token.is_cancelled() {
             let mut opened_capabilities = 0;
             for stream in ordered_streams {
-                opened_capabilities |= stream.capability;
                 let admitted = match self
                     .open_ordered_service_stream(
                         &connection,
@@ -2491,6 +2490,15 @@ impl ZakuraProtocolHandler {
                     .await
                 {
                     Ok(admitted) => admitted,
+                    Err(ZakuraHandlerError::OrderedSessionFull) => {
+                        // Demand is advisory: another connection can reserve the
+                        // last slot before this open. Retry only this service.
+                        ordered_sessions
+                            .get_mut(&stream.kind)
+                            .expect("selected stream has negotiated session state")
+                            .schedule_transport_backoff(&mut ordered_session_waits);
+                        continue;
+                    }
                     Err(error) => {
                         debug!(
                             ?error,
@@ -2506,6 +2514,7 @@ impl ZakuraProtocolHandler {
                         break;
                     }
                 };
+                opened_capabilities |= stream.capability;
                 ordered_sessions
                     .get_mut(&admitted.kind)
                     .expect("opened ordered stream was selected from negotiated session state")
@@ -2981,7 +2990,7 @@ impl ZakuraProtocolHandler {
                 .service_for_kind(stream.kind)
                 .expect("a selected stream has an owning service")
                 .reserve_ordered_session(direction)
-                .map_err(|_| ZakuraHandlerError::ResourceLimit("service session capacity"))?
+                .map_err(|_| ZakuraHandlerError::OrderedSessionFull)?
         } else {
             None
         };
@@ -5673,6 +5682,9 @@ pub enum ZakuraHandlerError {
     /// A local resource cap rejected the operation.
     #[error("Zakura resource limit exceeded: {0}")]
     ResourceLimit(&'static str),
+    /// Another connection reserved the last service session slot.
+    #[error("ordered service session capacity is full")]
+    OrderedSessionFull,
     /// The peer exceeded its per-kind inbound message rate.
     #[error("Zakura message rate exceeded")]
     RateLimited,

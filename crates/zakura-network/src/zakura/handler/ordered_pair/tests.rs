@@ -24,6 +24,7 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 struct PairService {
+    fail_first_reservation: std::sync::atomic::AtomicBool,
     sessions: mpsc::Sender<Peer>,
 }
 
@@ -47,6 +48,21 @@ impl Service for SiblingService {
 }
 
 impl Service for PairService {
+    fn reserve_ordered_session(
+        &self,
+        _: ServicePeerDirection,
+    ) -> Result<
+        Option<Arc<dyn crate::zakura::OrderedSessionResources>>,
+        crate::zakura::OrderedSessionFull,
+    > {
+        // Inject the outcome of another connection taking the final slot after
+        // this connection's advisory OpenNow check. A retry can succeed.
+        if self.fail_first_reservation.swap(false, Ordering::SeqCst) {
+            Err(crate::zakura::OrderedSessionFull)
+        } else {
+            Ok(None)
+        }
+    }
     fn name(&self) -> &'static str {
         "test-pair"
     }
@@ -126,6 +142,10 @@ struct Fixture {
 
 impl Fixture {
     async fn start() -> Result<Self, BoxError> {
+        Self::start_with_reservation_race(false).await
+    }
+
+    async fn start_with_reservation_race(fail_first_reservation: bool) -> Result<Self, BoxError> {
         let local = ZakuraLocalLimits::from_config(&Config::default());
         let server = LocalEndpointFactory::with_transport_config(local.transport_config())
             .endpoint(93101)
@@ -137,7 +157,7 @@ impl Fixture {
         let (client_tx, client_sessions) = mpsc::channel(2);
         let (server_sibling_tx, server_siblings) = mpsc::channel(1);
         let (client_sibling_tx, client_siblings) = mpsc::channel(1);
-        let handler = |sessions, siblings, endpoint: Endpoint| {
+        let handler = |sessions, siblings, endpoint: Endpoint, fail_reservation| {
             ZakuraProtocolHandler::new_with_registry(
                 ZakuraSupervisorHandle::new(16),
                 Network::Mainnet,
@@ -145,7 +165,12 @@ impl Fixture {
                 local.clone(),
                 Arc::new(
                     ServiceRegistry::new(vec![
-                        Arc::new(PairService { sessions }),
+                        Arc::new(PairService {
+                            sessions,
+                            fail_first_reservation: std::sync::atomic::AtomicBool::new(
+                                fail_reservation,
+                            ),
+                        }),
                         Arc::new(SiblingService(siblings)),
                     ])
                     .unwrap(),
@@ -153,8 +178,19 @@ impl Fixture {
             )
             .with_endpoint(endpoint)
         };
-        let server_handler = handler(server_tx, server_sibling_tx, server.clone());
-        let client_handler = handler(client_tx, client_sibling_tx, client.clone());
+        let server_opens = i_open_collision_winner(&server.node_id(), &client.node_id());
+        let server_handler = handler(
+            server_tx,
+            server_sibling_tx,
+            server.clone(),
+            fail_first_reservation && server_opens,
+        );
+        let client_handler = handler(
+            client_tx,
+            client_sibling_tx,
+            client.clone(),
+            fail_first_reservation && !server_opens,
+        );
         let router = Router::builder(server).accept(ALPN, server_handler).spawn();
         let address = LocalEndpointFactory::node_addr(router.endpoint()).await;
         let (connection, serving) = super::super::tests::connection::connect_and_serve(
@@ -393,6 +429,7 @@ async fn incomplete_pairs_expire_and_mismatched_roles_release_stream_permits(
         ZakuraHandshakeConfig::for_network(&Network::Mainnet),
         local.clone(),
         Arc::new(ServiceRegistry::new(vec![Arc::new(PairService {
+            fail_first_reservation: std::sync::atomic::AtomicBool::new(false),
             sessions,
         })])?),
     );
@@ -471,4 +508,24 @@ async fn incomplete_pairs_expire_and_mismatched_roles_release_stream_permits(
     timeout(TEST_TIMEOUT, client.close()).await?;
     timeout(TEST_TIMEOUT, router.shutdown()).await??;
     Ok(())
+}
+
+#[tokio::test]
+async fn initial_pair_capacity_race_preserves_the_connection() -> Result<(), BoxError> {
+    let mut fixture = Fixture::start_with_reservation_race(true).await?;
+    let mut client_sibling = timeout(TEST_TIMEOUT, fixture.client_siblings.recv())
+        .await?
+        .ok_or("missing client sibling")?;
+    let mut server_sibling = timeout(TEST_TIMEOUT, fixture.server_siblings.recv())
+        .await?
+        .ok_or("missing server sibling")?;
+    let (mut recv, _) = client_sibling.take_stream(SIBLING.kind).unwrap();
+    let (_, send) = server_sibling.take_stream(SIBLING.kind).unwrap();
+    let ping = frame(1, 19, 64);
+    timeout(TEST_TIMEOUT, send.send(ping.clone())).await??;
+    assert_eq!(timeout(TEST_TIMEOUT, recv.recv()).await?, Some(ping));
+    let (mut client, mut server) = fixture.sessions().await?;
+    exchange(&mut client, &mut server).await?;
+    assert!(fixture.connection.close_reason().is_none());
+    fixture.close().await
 }

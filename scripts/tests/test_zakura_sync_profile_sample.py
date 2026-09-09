@@ -24,7 +24,7 @@ class SamplingTests(unittest.TestCase):
     def test_stat_parsing_preserves_units_and_complex_command(self):
         row = sample.thread_stat(proc_stat())
         self.assertEqual(row, dict(comm='node (worker)', state='S', utime_ticks=23,
-                                  stime_ticks=7, start_ticks=1234, rss_pages=99,
+                                  stime_ticks=7, nice=0, start_ticks=1234, rss_pages=99,
                                   processor=3, blkio_delay_ticks=5))
 
     def test_lightweight_preserves_process_io_and_metrics_without_thread_scan(self):
@@ -54,6 +54,27 @@ class SamplingTests(unittest.TestCase):
     def test_exited_process_stops_capture(self):
         with tempfile.TemporaryDirectory() as temp:
             self.assertIsNone(sample.capture(42, 'http://unused', proc=Path(temp)))
+
+    def test_host_process_accounting_skips_exits_and_omits_arguments(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for pid in ('42', '73', '99'):
+                (root / pid).mkdir()
+            (root / '42' / 'stat').write_text(proc_stat())
+            fields = proc_stat().split(') ')[-1].split()
+            fields[16] = '19'
+            (root / '73' / 'stat').write_text('73 (maintenance) ' + ' '.join(fields))
+            (root / '73' / 'cmdline').write_text('must not collect arguments')
+            with mock.patch.object(sample.urllib.request, 'urlopen',
+                                   return_value=io.BytesIO(b'height 123\n')):
+                row = sample.capture(42, 'http://unused', include_threads=False,
+                                     include_host_processes=True, proc=root)
+            self.assertEqual(set(row['host_processes']), {'42', '73'})
+            process = row['host_processes']['73']
+            self.assertEqual(process['comm'], 'maintenance')
+            self.assertEqual(process['nice'], 19)
+            self.assertEqual(process['utime_ticks'], 23)
+            self.assertNotIn('cmdline', process)
 
 
 if __name__ == '__main__':

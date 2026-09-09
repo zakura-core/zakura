@@ -30,6 +30,8 @@ Configuration comparisons require `historical_checkpoint` and create two indepen
 
 Every measured invocation captures one-second process CPU, RSS, I/O and scheduler counters, host CPU and disk counters, pressure indicators, and aligned Prometheus metrics in `system-timeline.jsonl.gz`. `sampling.json` records the sampling mode and clock units. Lightweight mode avoids per-thread enumeration; diagnostic profiling adds per-thread details. Samples include their capture start/end timestamps so collection overhead can be measured. Keep the same sampling mode on both sides of a comparison and establish an unchanged-binary control before assigning performance credit.
 
+For isolated host diagnostics, the sampler's `--host-processes` option also records process names, nice values and CPU counters. It omits command arguments and environment variables. Use it to identify competing maintenance jobs; host-wide nice or system CPU alone cannot name the process. Record the option consistently across comparisons. On disposable fixtures, also record scheduled maintenance and package/library state before and after each run: automatic package upgrades can contaminate a comparison even when the node binary and database snapshot match.
+
 Each leg appends its result, CPU digest, absolute CPU counters, and block-latency digest to the run summary. Historical A/B runs also add the comparison and bottleneck verdict. Live-head summaries record the baked tip, catch-up time, exact start/end tips and hashes, profile duration, and committed blocks without claiming a speedup. Download `zakura-perf-bench-<run>-primary` and open `flamegraph.svg` in a browser, or run `gh run download <run-id> -n zakura-perf-bench-<run-id>-primary -D out`.
 
 | file | what it is |

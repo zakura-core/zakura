@@ -28,6 +28,7 @@ def thread_stat(text):
         "state": fields[0],
         "utime_ticks": int(fields[11]),
         "stime_ticks": int(fields[12]),
+        "nice": int(fields[16]),
         "start_ticks": int(fields[19]),
         "rss_pages": int(fields[21]),
         "processor": int(fields[36]),
@@ -35,7 +36,7 @@ def thread_stat(text):
     }
 
 
-def capture(pid, metrics_url, *, include_threads=True, proc=Path("/proc")):
+def capture(pid, metrics_url, *, include_threads=True, include_host_processes=False, proc=Path("/proc")):
     task = proc / str(pid)
     stat = read_text(task / "stat")
     if stat is None:
@@ -47,6 +48,7 @@ def capture(pid, metrics_url, *, include_threads=True, proc=Path("/proc")):
         "process_status": read_text(task / "status"),
         "process_schedstat": read_text(task / "schedstat"),
         "threads": {},
+        "host_processes": {},
         "io": read_text(task / "io"),
         "host_stat": read_text(proc / "stat"),
         "diskstats": read_text(proc / "diskstats"),
@@ -54,6 +56,15 @@ def capture(pid, metrics_url, *, include_threads=True, proc=Path("/proc")):
         "meminfo": read_text(proc / "meminfo"),
         "pressure": {k: read_text(proc / "pressure" / k) for k in ("cpu", "io", "memory")},
     }
+    if include_host_processes:
+        for process in proc.iterdir():
+            if not process.name.isdigit():
+                continue
+            stat = read_text(process / "stat")
+            if stat is not None:
+                # comm and accounting fields identify competing work without
+                # collecting command arguments or environment variables.
+                row["host_processes"][process.name] = thread_stat(stat)
     threads = sorted((task / "task").glob("[0-9]*")) if include_threads else ()
     for thread in threads:
         stat = read_text(thread / "stat")
@@ -87,6 +98,8 @@ def main():
     parser.add_argument("--metrics-url", default="http://127.0.0.1:9999/metrics")
     parser.add_argument("--mode", choices=("lightweight", "full"), default="full",
                         help="lightweight omits per-thread enumeration")
+    parser.add_argument("--host-processes", action="store_true",
+                        help="capture host process names and CPU accounting, without command arguments")
     args = parser.parse_args()
     if args.pid <= 0 or not 1 <= args.seconds <= 86400:
         parser.error("positive PID and a duration of 1–86400 seconds required")
@@ -109,6 +122,7 @@ def main():
         "interval_seconds": 1,
         "maximum_seconds": args.seconds,
         "mode": args.mode,
+        "host_processes": args.host_processes,
     }
     (args.out / "sampling.json").write_text(json.dumps(metadata, indent=2) + "\n")
     start = time.monotonic()
@@ -116,7 +130,8 @@ def main():
     with gzip.open(args.out / "system-timeline.jsonl.gz", "wt") as output:
         while running and time.monotonic() - start < args.seconds:
             tick = time.monotonic()
-            row = capture(args.pid, args.metrics_url, include_threads=args.mode == "full")
+            row = capture(args.pid, args.metrics_url, include_threads=args.mode == "full",
+                          include_host_processes=args.host_processes)
             if row is None:
                 break
             if start_ticks is None:

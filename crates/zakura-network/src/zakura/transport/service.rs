@@ -459,6 +459,21 @@ pub trait Service: fmt::Debug + Send + Sync + 'static {
         }
     }
 
+    /// Recheck demand for a complete pair that already owns its setup reservation.
+    ///
+    /// Services with session reservations must retain cooldown and usefulness
+    /// checks here without requiring capacity for a second reservation. The
+    /// default preserves ordinary demand checks for services without reservations.
+    fn reserved_ordered_session_demand(
+        &self,
+        conn_id: ZakuraConnId,
+        peer: &ZakuraPeerId,
+        negotiated: u64,
+        direction: ServicePeerDirection,
+    ) -> OrderedSessionDemand {
+        self.ordered_session_demand(conn_id, peer, negotiated, direction)
+    }
+
     /// Return whether this service currently wants a new session for `peer`.
     ///
     /// This is a cheap, advisory demand check used by the transport before

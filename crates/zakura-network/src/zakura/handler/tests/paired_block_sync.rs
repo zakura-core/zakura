@@ -27,6 +27,7 @@ mod link;
 mod paused;
 
 struct Workload {
+    peer_limit: Option<usize>,
     pressure: bool,
     impaired: bool,
     rounds: u32,
@@ -38,6 +39,7 @@ struct Workload {
 impl Default for Workload {
     fn default() -> Self {
         Self {
+            peer_limit: None,
             pressure: false,
             impaired: false,
             rounds: 1,
@@ -120,6 +122,14 @@ struct Node {
 
 impl Node {
     fn new(blocks: Arc<Vec<Arc<Block>>>, serving: bool) -> Self {
+        Self::with_peer_limit(blocks, serving, None)
+    }
+
+    fn with_peer_limit(
+        blocks: Arc<Vec<Arc<Block>>>,
+        serving: bool,
+        peer_limit: Option<usize>,
+    ) -> Self {
         let genesis = Block::zcash_deserialize(&BLOCK_MAINNET_GENESIS_BYTES[..])
             .unwrap()
             .hash();
@@ -133,6 +143,10 @@ impl Node {
         let mut config = ZakuraBlockSyncConfig::default();
         config.peer_limits.inbound_queue_depth = 8;
         config.peer_limits.outbound_queue_depth = 8;
+        if let Some(limit) = peer_limit {
+            config.peer_limits.max_inbound_peers = limit;
+            config.peer_limits.max_outbound_peers = limit;
+        }
         let cancel = CancellationToken::new();
         let mut startup = BlockSyncStartup::new(
             BlockSyncFrontiers {
@@ -275,6 +289,7 @@ async fn download_rounds(
 
 async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
     let Workload {
+        peer_limit,
         pressure,
         impaired,
         rounds,
@@ -284,8 +299,8 @@ async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
     } = workload;
     let completion_deadline = if impaired { LOSS_DEADLINE } else { DEADLINE };
     let blocks = blocks();
-    let mut downloader = Node::new(blocks.clone(), false);
-    let server_node = Node::new(blocks.clone(), true);
+    let mut downloader = Node::with_peer_limit(blocks.clone(), false, peer_limit);
+    let server_node = Node::with_peer_limit(blocks.clone(), true, peer_limit);
     let initial_client_slots = downloader.service.available_session_slots_for_test();
     let initial_server_slots = server_node.service.available_session_slots_for_test();
     let mut serving_service = server_node.service.clone();
@@ -627,6 +642,16 @@ async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
     client.close().await;
     router.shutdown().await?;
     Ok(total)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn incoming_pair_uses_the_last_reserved_session_slot() -> Result<(), BoxError> {
+    run_download(Workload {
+        peer_limit: Some(1),
+        ..Workload::default()
+    })
+    .await?;
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

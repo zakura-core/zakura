@@ -44,6 +44,9 @@ arrive within the configured prelude deadline, three seconds by default.
 Setup holds the service's pending and directional session permits. Admission
 releases the pending permit; transport tasks and application senders retain the
 session permit through teardown.
+The demand check for a complete incoming pair reuses that reservation, so the
+last available slot can admit a session. It still honors parks and useful-work
+policy; opening another pair requires a new reservation.
 
 ## Messages
 

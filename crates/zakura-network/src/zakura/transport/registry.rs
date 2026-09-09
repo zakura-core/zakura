@@ -348,6 +348,21 @@ impl ServiceRegistry {
         service.ordered_session_demand(conn_id, peer_id, negotiated, direction)
     }
 
+    /// Recheck demand after a complete pair has reserved its service capacity.
+    pub(crate) fn reserved_ordered_session_demand(
+        &self,
+        kind: u16,
+        conn_id: ZakuraConnId,
+        negotiated: u64,
+        peer_id: &ZakuraPeerId,
+        direction: ServicePeerDirection,
+    ) -> OrderedSessionDemand {
+        let Some(service) = self.service_for_kind(kind) else {
+            return OrderedSessionDemand::Retire;
+        };
+        service.reserved_ordered_session_demand(conn_id, peer_id, negotiated, direction)
+    }
+
     /// Request/response streams negotiated with a peer, in registry service order.
     pub fn request_response_streams_for_negotiated(&self, negotiated: u64) -> Vec<Stream> {
         let mut streams = Vec::new();

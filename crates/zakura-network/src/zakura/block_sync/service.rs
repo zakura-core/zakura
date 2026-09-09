@@ -478,15 +478,24 @@ impl Service for BlockSyncService {
         _negotiated: u64,
         direction: ServicePeerDirection,
     ) -> OrderedSessionDemand {
-        if let Some(deadline) = self.peer_park_deadline(peer) {
-            return OrderedSessionDemand::RetryAt(deadline);
-        }
-
         let mut capacity = self.inner.capacity.subscribe();
         if !self.inner.capacity.available(direction) {
             return OrderedSessionDemand::WaitForChange(Box::pin(async move {
                 let _ = capacity.changed().await;
             }));
+        }
+        self.reserved_ordered_session_demand(conn_id, peer, _negotiated, direction)
+    }
+
+    fn reserved_ordered_session_demand(
+        &self,
+        conn_id: ZakuraConnId,
+        peer: &ZakuraPeerId,
+        _negotiated: u64,
+        direction: ServicePeerDirection,
+    ) -> OrderedSessionDemand {
+        if let Some(deadline) = self.peer_park_deadline(peer) {
+            return OrderedSessionDemand::RetryAt(deadline);
         }
         let mut peer_snapshot = self.inner.peer_snapshot.clone();
         peer_snapshot.borrow_and_update();

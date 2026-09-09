@@ -2779,13 +2779,23 @@ impl ZakuraProtocolHandler {
                                 // demand. For a collision we lost, demand is
                                 // implied because we already opened the same kind.
                                 let demand = (!is_collision).then(|| {
-                                    self.registry.ordered_session_demand(
-                                        kind,
-                                        conn_id,
-                                        accepted_capabilities,
-                                        &peer_id,
-                                        context.direction,
-                                    )
+                                    if admitted.companion.is_some() {
+                                        self.registry.reserved_ordered_session_demand(
+                                            kind,
+                                            conn_id,
+                                            accepted_capabilities,
+                                            &peer_id,
+                                            context.direction,
+                                        )
+                                    } else {
+                                        self.registry.ordered_session_demand(
+                                            kind,
+                                            conn_id,
+                                            accepted_capabilities,
+                                            &peer_id,
+                                            context.direction,
+                                        )
+                                    }
                                 });
                                 if demand
                                     .as_ref()

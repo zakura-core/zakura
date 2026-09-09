@@ -21,6 +21,7 @@ struct Storage {
     changed: Notify,
     release: (Mutex<bool>, Condvar),
     fail: bool,
+    available: usize,
 }
 
 #[derive(Debug)]
@@ -28,11 +29,16 @@ struct Source(Arc<Storage>);
 
 impl Source {
     fn new(released: bool) -> Arc<Self> {
+        Self::with_outcome(released, false, 2)
+    }
+
+    fn with_outcome(released: bool, fail: bool, available: usize) -> Arc<Self> {
         Arc::new(Self(Arc::new(Storage {
             calls: AtomicUsize::new(0),
             changed: Notify::new(),
             release: (Mutex::new(released), Condvar::new()),
-            fail: false,
+            fail,
+            available,
         })))
     }
 
@@ -94,7 +100,9 @@ impl BlockRangeSource for Source {
                 let mut bytes = 0;
                 for (index, encoded) in vectors.into_iter().enumerate() {
                     let height = block::Height(u32::try_from(index + 1).unwrap());
-                    if lease.is_cancelled() || blocks.len() >= usize::try_from(count).unwrap() {
+                    if lease.is_cancelled()
+                        || blocks.len() >= usize::try_from(count).unwrap().min(storage.available)
+                    {
                         break;
                     }
                     if height < start {
@@ -127,6 +135,10 @@ struct Fixture {
 
 impl Fixture {
     fn new(source: Arc<dyn BlockRangeSource>) -> Self {
+        Self::with_queue_depth(source, 1)
+    }
+
+    fn with_queue_depth(source: Arc<dyn BlockRangeSource>, depth: usize) -> Self {
         let config = ZakuraBlockSyncConfig {
             max_blocks_per_response: 2,
             ..ZakuraBlockSyncConfig::default()
@@ -144,7 +156,7 @@ impl Fixture {
         };
         let regulator = GetBlocksServingRegulator::new(config.clone());
         let admission = regulator.session(peer.clone(), generation);
-        let (send, data) = worker_framed_channel(1);
+        let (send, data) = worker_framed_channel(depth);
         let session = BlockSyncPeerSession::for_test_with_session_id(
             peer,
             generation,
@@ -226,6 +238,53 @@ async fn request_before_status_waits_and_then_receives_the_complete_range() {
     ));
     assert_eq!(source.0.calls.load(Ordering::Acquire), 1);
     f.finish().await;
+}
+
+#[tokio::test]
+async fn storage_outcomes_preserve_the_response_prefix_and_ending_under_backpressure() {
+    for depth in 1..=3 {
+        for available in 0..=2 {
+            for fail in [false, true] {
+                let source = Source::with_outcome(true, fail, available);
+                let mut f = Fixture::with_queue_depth(source.clone(), depth);
+                let regulator = f.regulator.clone();
+                f.session.mark_status_received();
+                f.request().await;
+                let returned = if fail { 0 } else { available };
+                for height in 1..=returned {
+                    let BlockSyncMessage::Block(block) = f.next().await else {
+                        panic!("the response prefix must contain its available blocks");
+                    };
+                    assert_eq!(
+                        block.coinbase_height(),
+                        Some(block::Height(u32::try_from(height).unwrap()))
+                    );
+                }
+                match f.next().await {
+                    BlockSyncMessage::RangeUnavailable {
+                        start_height,
+                        count,
+                    } => {
+                        assert_eq!(returned, 0);
+                        assert_eq!((start_height, count), (block::Height(1), 2));
+                    }
+                    BlockSyncMessage::BlocksDone {
+                        start_height,
+                        returned: count,
+                    } => {
+                        assert!(returned > 0);
+                        assert_eq!(start_height, block::Height(1));
+                        assert_eq!(usize::try_from(count).unwrap(), returned);
+                    }
+                    other => panic!("the response must end after its available prefix: {other:?}"),
+                }
+                assert_eq!(source.0.calls.load(Ordering::Acquire), 1);
+                f.finish().await;
+                assert_eq!(regulator.snapshot().node_active, 0);
+                assert_eq!(regulator.snapshot().peer_active, 0);
+            }
+        }
+    }
 }
 
 #[tokio::test]

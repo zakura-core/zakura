@@ -13,6 +13,122 @@ The local worktree is `zakura.dogwood-experiments`, alongside the docs worktree.
 Its `docs/experiments/dogwood` directory retains the September 5 experiments
 and adds the scripts and result directories named below.
 
+## Bounded-recovery follow-up
+
+The follow-up ran **2,448 deterministic single-block simulations** and eight
+reference codec configurations. The simulations replace the earlier timeless,
+all-index relay closure with sparse per-index subscriptions and serialized
+upload. They advance the bootstrap and small-block TODOs; transport feedback
+and controller convergence remain untested here.
+
+### Method
+
+The recovery sweep covers one receiver and three eight-receiver topologies:
+a star, two branches with bridge peers, and a mesh with alternate paths.
+The proposer seeds each encoded index once, spread evenly across its neighbors.
+Each relay index selects one random non-source neighbor. Seeds 0–11 select
+those subscriptions. The proposer has 1 Gbps upload; relays have either
+200 Mbps each or repeated 800/400/200/100 Mbps upload rates.
+These rates constrain aggregate node upload, not independently measured links.
+The one-copy comparison does not implement the draft's startup coverage policy.
+
+We compare no repair, header-parent repair, and repair that tries alternatives
+after the first attempt. A failed peer remains silent from the start; metadata
+and the parent tree are preinstalled. Repairs start at 100/300/600 ms and pay
+20 ms control delay. Each receiver can add at most `2k` requests. Source credit
+allows either `n` parts or `n + nodes*k` parts, including initial seeds.
+The experiment ends at 1,200 ms and counts unfinished receivers as failures.
+
+The model forwards a complete part after upload plus 5 ms propagation.
+It assumes unlimited ingress, instant verification and regeneration, and one
+valid block. It charges 384 bytes per part for proof/framing, includes sends
+to failed peers, and allows a 20 ms cancellation tail after reconstruction.
+It does not simulate full-block fallback, transport loss, competing blocks,
+negotiated grants, or adaptive routes. Completion establishes reconstruction
+in this model, not verified end-to-end production delivery.
+
+### Recovery result
+
+These rows use 2 MiB bodies, 25% parity, and equal relay rates. Completion time
+is the mean time when the last healthy receiver finishes, over successful runs.
+Source MiB includes seeds, repair, and cancellation tails.
+
+| Topology and failure | Source budget / repair | All healthy receivers finish | Completion ms | Source MiB |
+| --- | --- | --- | --- | --- |
+| Single receiver | One codeword / none | 12/12 | 21.9 | 2.515 |
+| Eight-leaf star | One codeword / alternatives | 0/12 | — | 2.515 |
+| Eight-leaf star | Reserve / alternatives | 12/12 | 238.9 | 16.094 |
+| Mesh, healthy | One codeword / alternatives | 12/12 | 385.8 | 2.515 |
+| Mesh, healthy | Reserve / parent | 12/12 | 205.6 | 5.270 |
+| Mesh, failed parent | Reserve / parent | 0/12 | — | 5.501 |
+| Mesh, failed parent | Reserve / alternatives | 12/12 | 355.8 | 5.501 |
+| Bridge cut, failed bridge | Reserve / alternatives | 0/12 | — | 3.269 |
+
+The star requires eight body copies across eight separate source cuts.
+Its 16.094 MiB result matches that payload lower bound plus framing.
+The healthy mesh can trade repair delay for lower source upload.
+Alternatives recover the connected mesh after parent failure. They cannot
+recover the three honest receivers disconnected by the failed bridge.
+These cases do not support an unconditional one-codeword bootstrap guarantee.
+
+### Small blocks, parity, and portions
+
+The mesh sweep varies `k=1/2/4/8/32`, 16/64 KiB parts, 25%/100% parity,
+one/two/four-part service portions, and systematic-first/parity-first seeding.
+All 1,440 runs finish with the repair reserve. At `k=1`, parity rounding makes
+both ratios identical. The table uses 64 KiB parts, one-part portions, and
+systematic-first seeding.
+Times include repair; byte totals cover the whole network's source or relays.
+
+| Body | Parity | Completion ms | Source MiB | Relay MiB |
+| --- | --- | --- | --- | --- |
+| 256 KiB | 25% | 125.7 | 0.545 | 2.635 |
+| 256 KiB | 100% | 66.6 | 0.545 | 3.641 |
+| 512 KiB | 25% | 154.5 | 1.425 | 5.564 |
+| 512 KiB | 100% | 71.3 | 1.058 | 6.470 |
+
+More parity can reduce total source bytes by avoiding repair copies, while
+increasing relay bytes. Smaller parts also change that tradeoff: at 512 KiB
+and 100% parity, 16 KiB parts finish in 56.9 ms with 7.024 MiB relay upload.
+A threshold stated only as `k<=8` changes its body-size meaning when `S` changes.
+
+Across the equally weighted sweep, mean completion is 93.3/93.7/94.1 ms for
+one/two/four-part portions with systematic-first seeding. Parity-first gives
+92.3/92.5/93.0 ms. These small differences do not select a larger portion or
+an ordering rule. Portions change local service fairness here; they add no
+wire aggregation or measured CPU savings.
+
+The codec run uses the existing 64 KiB reference kernel, one warm-up, and three
+retained repetitions per configuration on an unreserved host. At 512 KiB,
+the sum of median encoding and root times rises from 0.71 ms at 25% parity to
+1.77 ms at 100%. At 2 MiB it rises from 6.38 to 21.70 ms. These CPU measurements
+are separate from the network simulation; we have not tested their queueing
+interaction. They argue against extrapolating the small-block result to all
+block sizes.
+
+### Decisions and next gates
+
+- **Source budget:** retain an initial seed budget plus a bounded repair reserve.
+  Decide which source-cut fanout and repair latency the supported topology must
+  accommodate. A global one-codeword cap cannot support the star case.
+- **Recovery:** retain alternative suppliers after a parent stalls. The spec now
+  makes the shared deadline and non-resetting credit rules explicit.
+- **Small-block profile:** keep 100% parity as a candidate, with a threshold in
+  body bytes and an explicit part size. Keep the draft's 25% rule until a joint
+  CPU/network run includes correlated failures and competing blocks.
+- **Portions:** retain one part as the reference service quantum. No wire portion
+  message follows from this sweep.
+- **Next implementation work:** build the complete grant/controller state model,
+  then test real transport feedback. Wire negotiation, PoW key binding, resource
+  caps, and the target block interval still require profile decisions.
+
+Run `python3 bounded_overlay.py results/my-bounded-overlay` and
+`python3 summarize_bounded.py results/my-bounded-overlay` in the local experiment
+directory. Final raw runs, summaries, source snapshots, and environment records
+are in `results/2026-09-08-bounded-overlay-final`; codec CSVs and exact commands
+are in `results/2026-09-08-small-codec`. All 25 Python tests pass, including
+analytic serialization and source-cut checks, replay, credit, and deadline tests.
+
 ## Congestion baseline
 
 The model releases 400 synthetic 2 MiB bodies at 20.48 ms intervals, equivalent

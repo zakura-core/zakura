@@ -537,18 +537,34 @@ change. No automatic parity tuner or timestamp extension is selected yet.
 
 ## Open problems and TODOs
 
+The [bounded-recovery follow-up](dogwood-experiments.md#bounded-recovery-follow-up)
+tests sparse routes, failed parents, source caps, small-block parity, and
+scheduling portions. It supports alternate repair suppliers and a separately
+reserved source repair budget. It leaves the production profile unchanged.
+
+- [x] Test finite single-block recovery on single-peer, star, bridge, and mesh
+  topologies with equal and mixed relay upload rates.
+- [x] Sweep 25%/100% parity, 16/64 KiB parts, and 1/2/4-part service portions;
+  measure reference encoding costs for small codewords.
+- [x] Specify that repair retries cannot reset credit or the total deadline;
+  require separate per-part accounting inside a scheduling portion.
 - [ ] **Proposer grants:** specify and test `SeedOffer` negotiation, eligibility,
   credit consumption, expiry, cancellation, and coexistence with ordinary demand.
+  Lifecycle rules are drafted; a complete state model and wire encoding remain.
 - [ ] **Proposer scheduling:** test learned bandwidth against the static optimum
   with changing rates, shared bottlenecks, pending work, and insufficient credit.
 - [ ] **Bootstrap coverage:** test one peer, equal peers, mixed peers, star cuts,
   bridge peers, and failed header parents under bounded source upload and repair.
+  The finite single-block sweep is complete; add concurrent blocks, changing
+  failures, finite ingress, and real verification queues.
 - [ ] **Overlay delivery:** replace all-part relay subscriptions in the local
   proof with sparse per-part routes and test multiple adapting receivers.
 - [ ] **Parity versus copies:** measure proposer encoding and upload, relay
   upload, receiver bytes, and reconstruction latency under the same failure model.
 - [ ] **Small blocks and portions:** sweep size-dependent parity, part size,
   scheduling group size, and systematic-first versus parity-first seeding.
+  The initial sweep is complete; test correlated loss and joint CPU/network
+  costs before selecting a body-size threshold or changing the profile.
 - [ ] **Congestion feedback:** test actual transport signals, application-limited
   samples, dishonest timestamps, clock drift, and receiver-wide queue control.
 - [ ] **Controller completeness:** implement settling, migration, stale-history,

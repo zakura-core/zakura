@@ -570,6 +570,17 @@ No separate repair request, acknowledgement, or unavailable message is needed:
 the subscription schedules current and future availability, and a local
 deadline handles silence.
 
+A recovery attempt MUST retain its supplier, requested indices, consumed
+credit, and progress deadline within the block's bounded recovery state.
+Reissuing an unchanged subscription to a silent supplier MUST NOT reset the
+total recovery deadline or replenish credit. After a no-progress deadline,
+the receiver SHOULD try another eligible supplier when one exists.
+An admitted `FullBlock` report MAY prioritize a candidate, but MUST NOT bypass
+authorization, verification, or the remaining recovery budget.
+The receiver MUST charge concurrent attempts to one block recovery budget
+and the node's aggregate limits. Exhausting that budget triggers bounded
+fallback even if the physical peer graph remains connected.
+
 After a bounded number of attempts or a fixed total recovery deadline, the
 node MUST use the existing full-block download path. It MUST verify that result
 against the consensus header. Bad coding metadata MUST NOT suppress this path.
@@ -618,6 +629,15 @@ A profile that adopts this extension MUST enforce these rules:
 7. The proposer MUST report insufficient eligible credit, upload budget, or
    service as degraded seeding. It MUST NOT send unsolicited parts or starve
    ordinary accepted demand to preserve a claimed one-codeword upload budget.
+
+The selected profile MUST distinguish ordinary selections from seed offers
+before either peer installs a seed grant. An unsupported selection MUST NOT
+silently become an all-part subscription. A route change, offer replacement,
+or switch from seeding to ordinary repair MUST NOT reset consumed counters.
+Cancellation releases queued reservations once without restoring part or byte
+credit. Grant retirement and delayed parts follow section 4. A scheduling
+portion is a local service quantum: the sender MUST authorize and charge each
+part separately and MUST NOT wait to fill a portion before serving queued work.
 
 For a static reference, let `w` be complete part bytes, `N` the chosen number
 of distinct seeds with `0 < N <= n`, `U` the proposer byte rate, `c[p]` each
@@ -1134,7 +1154,9 @@ counts MUST also have byte bounds in an implementation.
 | Seed credit `g[p]` | Receiver-granted; `n` per peer in static examples | Hard immutable part and byte credit. An eligible set may further constrain the scheduler. |
 | Seed upload budget; seed repair reserve; active seed peers | `TBD` local bounds | Required before enabling `SeedOffer`. Count ordinary demand and concurrent blocks too; a one-codeword budget cannot cover every topology. |
 | `SEED_BATCH_PARTS` | 1 | Experimental scheduling portion size; sweep 1/2/4. Each contained part retains separate proof and credit accounting. |
-| Small-block parity threshold and ratio | Candidate `k<=8`: 100%; otherwise 25% | Planned experiment only. The draft still requires `ceil(k/4)` parity; any size-dependent rule needs a selected profile. |
+| Small-block parity threshold and ratio | Candidate `k<=8`: 100%; otherwise 25% | Tested in a finite sparse overlay; no profile change selected. The draft still requires `ceil(k/4)` parity. A threshold must also identify `S` or body bytes. |
+| Bounded-overlay repair times; control and propagation delay | 100/300/600 ms; 20 ms; 5 ms | Single-block experiment overrides, measured from simultaneous metadata admission. These do not replace the controller's 400 ms observation target. |
+| Bounded-overlay source credit; receiver repair credit | `n` or `n + nodes*k` parts; `2k` additional requests per receiver | Finite experiment caps at `S + 384` bytes per part. Source credit includes initial seeds and repair. Production must reserve aggregate bytes across concurrent blocks. |
 | Seed ordering | `TBD` | Compare systematic-first, parity-first, and a decodable bootstrap receiver before selecting a policy. |
 | Observation duration `D[b]`; total recovery deadline | 400 ms; 1,200 ms at `k_ref` | Experimental values. Production size-to-deadline policy is `TBD`; section 7 fixes each admitted observation's deadline. |
 | `CONTROL_INTERVAL` | 250 ms | Experimental minimum interval between shared-budget updates. |

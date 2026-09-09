@@ -14,13 +14,9 @@ set -euo pipefail
 #   build script panics with "a `libclang` shared library is not loaded on this
 #   thread". The workspace enables `bindgen-runtime`, but published baselines
 #   cannot change, so give the crate's bindgen build-dependency the feature.
-# - precis-profiles 0.1.14 (published 2026-09-08) moved to precis-core 0.2,
-#   but stun-rs 0.1.11 in the iroh 0.92 crates.io baselines still requires
-#   precis-core 0.1 and precis-profiles ^0.1.12. A fresh resolution selects
-#   both precis-core lines and stun-rs no longer compiles. Hold precis-profiles
-#   at the last precis-core 0.1 release. Remove once no stable baseline of
-#   zakura-network or its dependents resolves stun-rs, i.e. once a stable
-#   zakura-network release ships with Iroh 1.1.
+# - stun-rs 0.1.11 uses precis-core 0.1 traits, but precis-profiles 0.1.14
+#   switched to precis-core 0.2. Pin its profiles dependency to the compatible
+#   version in our workspace lock file.
 # - The workspace root pins the Iroh family to the zakura-core/iroh
 #   compatibility revision through [patch.crates-io]. cargo-semver-checks
 #   builds the current crate from a placeholder workspace under target/, where
@@ -82,9 +78,17 @@ fi
 sed -i '/^\[build-dependencies\.bindgen\]$/,/^default-features = false$/ s/^default-features = false$/default-features = false\nfeatures = ["runtime"]/' \
   "$librocksdb_sys_manifest"
 
-readonly precis_profiles_version=0.1.13
-precis_profiles_source=$(copy_registry_source precis-profiles "$precis_profiles_version")
-readonly precis_profiles_source
+readonly stun_rs_version=0.1.11
+stun_rs_source=$(copy_registry_source stun-rs "$stun_rs_version")
+readonly stun_rs_source
+readonly stun_rs_manifest="$stun_rs_source/Cargo.toml"
+expected_profiles_block=$'[dependencies.precis-profiles]\nversion = "0.1.12"'
+if [[ "$(grep -Fx -A1 '[dependencies.precis-profiles]' "$stun_rs_manifest")" != "$expected_profiles_block" ]]; then
+  echo "stun-rs $stun_rs_version no longer matches the expected precis-profiles dependency" >&2
+  exit 1
+fi
+sed -i '/^\[dependencies\.precis-profiles\]$/,/^version = / s/^version = "0.1.12"$/version = "=0.1.13"/' \
+  "$stun_rs_manifest"
 
 root_manifest="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/Cargo.toml"
 readonly root_manifest
@@ -107,7 +111,7 @@ cat > "$patched_cargo_home/config.toml" <<EOF
 [patch.crates-io]
 tinyvec = { path = "$tinyvec_source" }
 librocksdb-sys = { path = "$librocksdb_sys_source" }
-precis-profiles = { path = "$precis_profiles_source" }
+stun-rs = { path = "$stun_rs_source" }
 iroh = { git = "$iroh_fork_git", rev = "$iroh_fork_rev" }
 iroh-base = { git = "$iroh_fork_git", rev = "$iroh_fork_rev" }
 iroh-relay = { git = "$iroh_fork_git", rev = "$iroh_fork_rev" }

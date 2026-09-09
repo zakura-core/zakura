@@ -1,10 +1,9 @@
 # Dogwood experiment report
 
-The September 8, 2026 local experiments estimate subscription allocation under
-congestion and compare parity with duplicate routes. They support testing
-ordinary-delivery feedback alongside the challenge baseline. They do not
-establish production congestion control, proposer seeding latency, or overlay
-convergence. The [design](dogwood.md) explains the tradeoffs; the
+The September 8–9, 2026 experiments test subscription allocation, proposer
+seeding, connected relay graphs, bounded fallback, and TCP delivery feedback.
+They do not establish production congestion control or sustained 50,000 TPS.
+The [design](dogwood.md) explains the tradeoffs; the
 [spec](../specs/dogwood.md#parameter-registry) owns parameter definitions.
 
 The experiment source and raw results remain on the local branch
@@ -12,6 +11,146 @@ The experiment source and raw results remain on the local branch
 The local worktree is `zakura.dogwood-experiments`, alongside the docs worktree.
 Its `docs/experiments/dogwood` directory retains the September 5 experiments
 and adds the scripts and result directories named below.
+
+## Connected-network and transport follow-up
+
+The normal throughput target assumes that honest relays remain connected after
+removing the proposer. `FullBlock`-triggered requests for missing parts are
+bounded fallback. These experiments report completion before fallback separately
+from eventual completion. The planning workload is **50,000 TPS at 2 KiB per
+transaction after Tachyon**: 819.2 Mbps of body bytes, or 1.024 Gbps with 25%
+parity before proof and transport overhead.
+
+### Connected push and route pruning
+
+`push_overlay.py` ran 656 single-block cases on rings with additional local
+edges. It used 16/64 relays, degree 4/8, one/four source neighbors, and one/two
+suppliers per mask bit. Every relay graph remains connected without the source
+and one failed relay. The 2 MiB body has 32 data parts and eight parity parts.
+The source seeds at most one codeword. The model compares spread seeds with
+seeding a decodable subset to one neighbor first.
+
+Source upload is 1 Gbps. Relay upload and ingress are 1.6/2 Gbps, either equal
+or divided by 1/2/4/8 across peers. The model serializes upload, ingress, and
+verification queues. Proof verification costs 0.02 ms per part; reconstruction
+costs 8 ms. These CPU values are assumptions. Metadata is preinstalled, parts
+pay 5 ms propagation, and control messages pay 20 ms. Fallback starts at
+400 ms, requests at most `2k` extra copies per receiver, and ends at 1,200 ms.
+Only completion advertisements authorize pull attempts. Failed peers remain
+silent; a separate case sends false completion advertisements.
+
+The following healthy, equal-rate cases use degree eight and four source
+neighbors. Values average eight distinct route seeds. The 16-relay cases also
+appear in the failure sweep; those repeated configurations add no independent
+evidence.
+
+| Relays | Suppliers per bit | Seed policy | Receivers complete before fallback | Last completion, mean |
+| --- | --- | --- | --- | --- |
+| 16 | 1 | Spread | 0/16 | 542.6 ms, with fallback |
+| 16 | 1 | Decodable first | 1/16 | 516.9 ms, with fallback |
+| 16 | 2 | Spread | 16/16 | 65.5 ms |
+| 64 | 1 | Spread | 0/64 | 889.4 ms, with fallback |
+| 64 | 2 | Spread | 64/64 | 167.2 ms |
+
+Two suppliers establish useful startup delivery in these cases, but consume
+bandwidth. Total source plus relay part upload divided by receiver count and
+body size is 2.42 with 16 relays and 2.30 with 64 relays. These network averages
+include the 384-byte per-part proof/framing allowance. They exclude transport
+overhead and do not bound an individual relay's upload. A 5% allowance cannot
+cover this duplicate traffic.
+
+`prune_routes.py` tests 72 sequences of 24 blocks. Local majority wins and a
+one-supplier-loss coverage check do not preserve global delivery when several
+nodes prune routes. `seed_offer_routes.py` adds 192 sequences. Its source sends
+each seed only to an eligible neighbor with outgoing demand for that mask bit.
+Every static two-supplier configuration then completes normally in the tested
+six route seeds. Coverage-preserving pruning still causes fallback in three
+of eight configuration groups. Physical connectivity, local coverage, and
+past wins therefore do not establish a safe pruning rule.
+
+`witness_pruning.py` tests a separate stripe candidate. Each node retains every
+incoming supplier that delivered a distinct part before its reconstruction of
+one shared reference stripe. Subsequent equal-shape stripes retain the mask
+mapping and source seed recipients. This preserves the reference's causal
+delivery paths under honest peers, unchanged availability, adequate credit,
+retention, and fair service. The argument establishes eventual delivery under
+those assumptions; it does not establish a deadline or failure tolerance.
+
+All 48 paired configurations complete before fallback with and without this
+pruning. Retained routes reduce mean relay upload by 45.8–52.5% across groups.
+The 24 sequential stripes repeat fixed service and routes; they are not 24
+independent observations or a concurrent stream. This candidate requires a new
+striped codec profile. The present whole-body codeword cannot apply its result
+directly. Changing the mapping, seed placement, codeword shape, or availability
+invalidates the reference argument. The earlier witness directory varied the
+mapping and does not support that argument.
+
+These simulations omit transport backpressure and real coding work. Direct
+pull responses have separate byte counters; later forwarding of repaired parts
+still counts as relay forwarding. Normal success always requires completion
+before the fallback timer. The models do not implement every grant and
+controller rule.
+
+### Real TCP feedback
+
+`run_tcp_feedback.py` ran 45 isolated TCP experiments: five scenarios, three
+allocation policies, and three repetitions. Four suppliers use application
+pacing at 80/40/20/10 Mbps. They share a 100 Mbps loopback qdisc with 5 ms delay.
+Each run releases 120 bodies at 25 ms intervals, with four required 64 KiB parts
+and five available parts. The capacity-drop case reduces the fastest supplier
+to 5 Mbps after 1.5 seconds. The application-limited case inserts 40 ms stalls.
+The loss and ECN cases configure 0.2% netem loss; ECN marks eligible packets.
+
+The allocator compares equal assignment, receiver arrival-rate feedback, and
+feedback using the larger of sender and receiver spans. It assigns exact parts
+after release. This is a transport experiment, not Dogwood standing push or a
+complete controller. It hashes synthetic payloads and does not run Reed–Solomon.
+
+| Scenario | Equal: complete within 800 ms | Receiver-rate feedback | Sender-span feedback |
+| --- | --- | --- | --- |
+| Baseline | 198/360 | 360/360 | 358/360 |
+| Capacity drop | 148/360 | 272/360 | 270/360 |
+| Application limited | 137/360 | 319/360 | 244/360 |
+| Loss | 199/360 | 358/360 | 358/360 |
+| ECN | 198/360 | 358/360 | 358/360 |
+
+Baseline mean per-run p95 completion falls from 1,011.8 ms with equal assignment
+to 82.3 ms with receiver-rate feedback. That p95 includes completed bodies only;
+the table includes every released body. Sender spans provide no consistent
+advantage and perform worse during application stalls. Keep sender timestamps
+out of the baseline wire profile. Continue testing receiver-local feedback.
+TCP counters confirm ECN marks, but retransmission counts are small. These
+short loopback runs do not establish WAN loss behavior, full controller
+stability, or throughput at the post-Tachyon target.
+
+### Grants and remaining decisions
+
+`grant_model.py` exhausts 380 states and 1,270 transitions for a finite
+two-index grant model. It checks queueing, cancellation, crossed `FullBlock`,
+retirement, and send-once accounting. Separate tests cover exploration credit,
+loaded cohorts, failure precedence, migration overlap, and final coverage.
+The local suite passes 45 tests. This is bounded state exploration, not a proof
+of the full protocol or multi-connection controller.
+
+Retain two-supplier startup coverage where budgets allow it. Do not select
+majority-based pruning as a demonstrated path to one-copy throughput. Keep
+`FullBlock` pull strictly as fallback. Keep 25% parity and one-part scheduling
+portions in the current draft; the earlier small-block results remain candidate
+profile evidence. A complete implementation still needs a joint controller,
+codec, and transport test with concurrent bodies and changing routes.
+
+The remaining profile choices depend on the block interval, propagation
+deadline, supported peak body size, and post-Tachyon chain binding. At this
+workload, the current single-codeword limit is reached after about 33.55 seconds
+of transactions. A stripe profile needs authenticated stripe identifiers,
+commitments, completion semantics, resource limits, and failure tests before
+adoption. These experiments do not complete that profile.
+
+The local result directories are `2026-09-09-connected-push`,
+`2026-09-09-route-pruning-final`, `2026-09-09-seed-offer-routes`,
+`2026-09-09-witness-pruning-final`, `2026-09-09-tcp-feedback-run`, and
+`2026-09-09-grants` under `docs/experiments/dogwood/results`.
+They retain source snapshots and provenance. The local README records commands.
 
 ## Bounded-recovery follow-up
 

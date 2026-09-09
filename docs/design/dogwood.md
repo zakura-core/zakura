@@ -13,7 +13,8 @@ The tradeoff is bandwidth: standing routes avoid request latency, but stale
 routes need redundancy and recovery. The [protocol specification](../specs/dogwood.md)
 defines the rules. This document explains the design.
 The [experiment report](dogwood-experiments.md) records the local codec and
-congestion-control estimates. They do not establish overlay convergence.
+congestion-control estimates and connected-relay tests. They do not establish
+overlay convergence or sustained throughput at the planning target.
 
 ## Throughput target
 
@@ -52,6 +53,35 @@ Full nodes below the required sustained ingress rate cannot keep up through
 congestion control alone.
 
 ## Tradeoffs
+
+### Topology and the normal propagation path
+
+The throughput design assumes that participating relay nodes remain connected
+after removing the proposer. The intended network has multiple relay paths
+and enough aggregate upload to carry standing subscriptions. A star whose
+leaves can communicate only through the proposer falls outside this operating
+assumption. Its source-cut cost remains a useful failure test, not a reason to
+budget several body copies for normal proposer seeding.
+
+Physical connectivity does not ensure that every per-part subscription graph
+has a path from its seed. Normal propagation must establish useful standing
+routes and distribute seeds within the initial source budget. Experiments must
+measure completion before repair on connected relay graphs, including unfamiliar
+proposers. They must not use successful repair to claim that those routes work.
+
+`FullBlock`-triggered requests for missing parts form a strict fallback.
+A stalled receiver can request enough distinct missing indices from a peer
+that advertises completion. That peer serves retained or regenerated parts
+through bounded block-scoped subscriptions. Normal forwarding continues to
+push verified parts without requests or reconstruction delays.
+
+Fallback pays a request delay and additional upload. Frequent fallback would
+make the system behave like pull-based block distribution and defeat the
+throughput goal. Reports must separate normal completion, fallback frequency,
+fallback bytes, and eventual completion. Attackers and topology failures must
+not turn fallback into unlimited grants or unbounded proposer reseeding.
+
+### Latency, throughput, and robustness
 
 Block propagation balances latency, throughput, and robustness.
 
@@ -245,8 +275,10 @@ active routes; bounded exploration still tests unused routes and changed
 upstream availability. Holding the allocator fixed and using only receiver
 arrival spans gave almost the same latency in the local traces. The experiment
 therefore supports testing delivery-aware allocation, but does not establish
-that sender timestamps are worth their wire cost. A negotiated timestamp
-profile remains open.
+that sender timestamps are worth their wire cost. The subsequent real TCP
+experiment also found no consistent benefit from sender spans. Keep sender
+timestamps out of the baseline wire profile. Receiver-local delivery feedback
+still needs joint tests with the full subscription controller.
 
 ### Baseline challenge controller
 
@@ -277,6 +309,12 @@ After:             Receiver <── B
 
 The receiver keeps A if it still needs A for failure coverage. Random challenges
 continue so peers can recover from past losses.
+
+Local coverage does not protect global delivery paths. Several nodes can prune
+different supplier edges and strand parts that previously reached them. The
+connected-relay experiments reproduce this failure despite local coverage
+checks. Treat the challenge controller as experimental. Retain startup routes
+until a pruning policy demonstrates normal delivery under concurrent changes.
 
 A part mask's byte cost grows with block size and concurrent block count.
 Selecting a quarter of a 40-part block costs 640 KiB at 64 KiB per part.
@@ -325,6 +363,13 @@ measured service and receiver credit, not advertised bandwidth. A receiver
 verifies and forwards each seed immediately through its normal subscriptions.
 The proposer retains bounded repair service after the initial pass.
 
+Seed offers should identify parts the receiver can forward through outgoing
+subscriptions. A receiver can also offer a decodable subset for local bootstrap.
+The proposer should prefer eligible recipients with useful outgoing demand.
+This local hint improved static startup in the connected-relay experiment, but
+does not prove downstream reachability. Missing eligible credit must appear as
+degraded seeding, not unsolicited sends or hidden normal-path repair.
+
 ### What can be optimal locally
 
 For equal-size parts, fixed known peer rates, sufficient any-index seed credit,
@@ -339,7 +384,7 @@ time or infer changing bandwidth.
 | --- | --- | --- |
 | One peer | Send enough distinct parts for that peer to decode; test whether to send remaining parity before cancellation. | That peer is the only exit. No routing or parity choice protects against its loss. |
 | Equal-rate peers | Divide the first pass evenly when peers have comparable credit and relay reachability. | Disjoint seeds work only if each downstream group can collect enough distinct parts. |
-| A few fast peers and many slow peers | Assign more seed parts to the fast peers; a slow peer need not receive an initial seed. | A slow peer may be the only path to a separate group. Rate alone cannot justify starving that group. |
+| A few fast peers and many slow peers | Assign more seed parts to the fast peers; a slow peer need not receive an initial seed. | Seed recipients still need useful outgoing part routes. Separate relay components are outside the normal topology assumption. |
 
 The 2 MiB local example seeds 40 parts through a 1 Gbps proposer in a minimum
 21.1 ms including the model's framing allowance. With peer rates of
@@ -367,14 +412,31 @@ parts. More generally, `c` isolated downstream components need at least
 indices. A seeding budget of one codeword cannot meet every such topology.
 
 Real sparse subscriptions have different graphs for different parts. The
-proposer also does not know global relay connectivity. We therefore retain a
-bounded repair path toward the first authenticated header supplier, with
-alternative suppliers and full-block fallback. On an honest rooted header
-tree, retained data and sufficient service let children recover after parents
-reconstruct. Fixed byte caps, deadlines, failed parents, and correlated paths
-can invalidate those assumptions. The receiver must report degraded service
+proposer also does not know global relay connectivity. The normal design assumes
+one connected relay component and tests standing routes within it. A stalled
+receiver uses bounded `FullBlock`-based pull repair as a fallback. The earlier
+parent-tree repair experiment is not the selected normal propagation path.
+Fixed byte caps, deadlines, failed suppliers, and correlated paths still bound
+what fallback can recover. The receiver must report degraded service
 when it cannot meet them. All-part relay subscriptions are a correctness
 baseline, not a selected production fanout policy.
+
+### Large-body stripe candidate
+
+The whole-body codeword remains the current profile. A separate large-body
+candidate uses equal-shape coding stripes. Nodes retain the incoming suppliers
+that delivered one shared reference stripe before reconstruction. They keep
+the part-mask mapping and seed recipients fixed for subsequent stripes of that
+body. Under unchanged availability, adequate credit, and fair service, these
+retained paths can reproduce the reference's delivery. The local paired sweep
+reduced relay upload by 45.8–52.5% without fallback in the tested static cases.
+
+This candidate needs authenticated stripe commitments and identifiers, bounded
+pipeline state, stripe completion semantics, and failure recovery. It cannot
+reuse `FullBlock` for individual stripes. A changed mapping, shape, seed plan,
+or unavailable supplier invalidates the reference argument. The experiment
+does not establish concurrent throughput or single-supplier failure coverage.
+Do not enable stripe pruning under the present profile.
 
 ### Small blocks and portions
 
@@ -539,8 +601,12 @@ change. No automatic parity tuner or timestamp extension is selected yet.
 
 The [bounded-recovery follow-up](dogwood-experiments.md#bounded-recovery-follow-up)
 tests sparse routes, failed parents, source caps, small-block parity, and
-scheduling portions. It supports alternate repair suppliers and a separately
-reserved source repair budget. It leaves the production profile unchanged.
+scheduling portions. Its star and bridge cuts test behavior outside the normal
+topology assumption. Its repair-heavy completion results do not establish the
+normal throughput path. The [connected-network follow-up](dogwood-experiments.md#connected-network-and-transport-follow-up)
+measures completion before fallback and tests local pruning. Its failures keep
+the complete adaptive controller open. The design is not ready for interoperable
+implementation while the wire profile and chain binding remain unspecified.
 
 - [x] Test finite single-block recovery on single-peer, star, bridge, and mesh
   topologies with equal and mixed relay upload rates.
@@ -548,25 +614,38 @@ reserved source repair budget. It leaves the production profile unchanged.
   measure reference encoding costs for small codewords.
 - [x] Specify that repair retries cannot reset credit or the total deadline;
   require separate per-part accounting inside a scheduling portion.
+- [x] Test sparse connected relay graphs with finite ingress, assumed CPU
+  queues, one-codeword seeding, and separately accounted `FullBlock` fallback.
+- [x] Test simultaneous local pruning and forwardable seed eligibility;
+  identify failures that local coverage does not prevent.
+- [x] Test a fixed-reference stripe pruning candidate under static conditions.
+- [x] Run real TCP allocation tests with shared capacity, a capacity drop,
+  application stalls, loss, and ECN; retain receiver-local feedback as a candidate.
+- [x] Exhaust a finite grant model and test cancellation, exploration funding,
+  loaded cohorts, settling gates, and migration coverage.
 - [ ] **Proposer grants:** specify and test `SeedOffer` negotiation, eligibility,
   credit consumption, expiry, cancellation, and coexistence with ordinary demand.
-  Lifecycle rules are drafted; a complete state model and wire encoding remain.
+  Lifecycle rules and a finite grant model exist; negotiation, concurrent
+  grants, and wire encoding remain.
 - [ ] **Proposer scheduling:** test learned bandwidth against the static optimum
   with changing rates, shared bottlenecks, pending work, and insufficient credit.
 - [ ] **Bootstrap coverage:** test one peer, equal peers, mixed peers, star cuts,
   bridge peers, and failed header parents under bounded source upload and repair.
   The finite single-block sweep is complete; add concurrent blocks, changing
-  failures, finite ingress, and real verification queues.
-- [ ] **Overlay delivery:** replace all-part relay subscriptions in the local
-  proof with sparse per-part routes and test multiple adapting receivers.
+  failures, and measured coding work in the connected push model.
+- [ ] **Overlay delivery:** select and validate a pruning policy that preserves
+  delivery when several receivers adapt. Local coverage and majority wins failed
+  this gate; the fixed-reference stripe candidate needs a separate profile.
 - [ ] **Parity versus copies:** measure proposer encoding and upload, relay
   upload, receiver bytes, and reconstruction latency under the same failure model.
 - [ ] **Small blocks and portions:** sweep size-dependent parity, part size,
   scheduling group size, and systematic-first versus parity-first seeding.
   The initial sweep is complete; test correlated loss and joint CPU/network
   costs before selecting a body-size threshold or changing the profile.
-- [ ] **Congestion feedback:** test actual transport signals, application-limited
-  samples, dishonest timestamps, clock drift, and receiver-wide queue control.
+- [ ] **Congestion feedback:** integrate receiver-local feedback with standing
+  push, grants, and receiver-wide queue control. The bounded TCP experiment is
+  complete. Sender timestamps remain omitted; adopting them would require
+  separate clock-drift and dishonest-sender tests.
 - [ ] **Controller completeness:** implement settling, migration, stale-history,
   grant, and cancellation rules omitted by the reduced simulations.
 - [ ] **Large bodies:** select a block interval and burst target for 50,000 TPS;

@@ -1,7 +1,7 @@
 # Dogwood protocol specification
 
 Status: protocol draft. This document defines the proposed behavior.
-[design document](../design/dogwood.md) explains the choices. The five message families are
+The [design document](../design/dogwood.md) explains the choices. The five message families are
 settled for this draft; the wire profile and chain binding are not.
 
 `MUST` defines a security or interoperability requirement. `SHOULD` defines
@@ -40,6 +40,15 @@ transaction. This requires 819.2 Mbps of body throughput and 1.024 Gbps with
 25% parity, before proofs, transport, challenges, and recovery. This assumption
 does not change consensus limits. The [design throughput budget](../design/dogwood.md#throughput-target)
 separates average rate, burst latency, forwarding load, and codeword limits.
+
+The normal throughput claim assumes that the participating honest relay
+network remains connected after removing the proposer. Experiments MUST state
+the relay degree, path diversity, available service, and failures that preserve
+this assumption. A connected physical graph does not establish reachability
+in its per-part subscription graphs. Experiments MUST measure normal-path
+completion independently of pull repair and existing full-block download.
+Disconnected relay components are failure cases outside the throughput claim;
+implementations MUST still bound their resource use and recovery attempts.
 
 ## 2. Parts and authenticated metadata
 
@@ -497,6 +506,9 @@ Additional obligations:
   still process control sequencing and unrelated future-block demand. A node
   that later loses its data MUST recover through another connection or the
   existing full-block service.
+- Completion is directional: receiving a peer's `FullBlock` stops sends to
+  that completed peer. It MUST NOT prevent the local incomplete node from
+  requesting missing parts from that peer within the fallback rules below.
 - A node SHOULD send `FullBlock` to each peer that knows the metadata. If a new
   peer announces it later, the node SHOULD reply with `FullBlock`.
   Repeated completion notices are idempotent and cadence-bounded.
@@ -552,19 +564,23 @@ retained and regenerated parts to incomplete peers for a bounded retention
 interval. It MUST retain part proofs or regenerate the canonical Merkle tree.
 
 A node MUST start a monotonic reconstruction deadline when it admits metadata.
-It MUST NOT reset that deadline indefinitely on partial progress. On a stall,
-peer loss, or deadline expiry, it MUST add bounded block-scoped subscriptions
-to other peers that announced metadata. It SHOULD prefer peers that reported
-`FullBlock`, subject to independent timeouts and diversity.
+It MUST NOT reset that deadline indefinitely on partial progress. Normal
+propagation MUST use standing push subscriptions and authorized initial seeds.
+On a stall, peer loss, or deadline expiry, the node MUST enter a bounded
+fallback state. It SHOULD request missing parts from peers that announced the
+same metadata and reported `FullBlock`, subject to independent timeouts and
+diversity. Receipt of `FullBlock` alone MUST NOT cause normal-path demand to
+expand. An incomplete node already in fallback MAY start a bounded request when
+a newly eligible completion report arrives.
 
 Recovery MUST first request enough distinct missing indices to make decoding
 possible. Additional parity indices are valid substitutes for missing data.
-The receiver MAY retain the first peer that supplied its admitted, authenticated
-`HeaderMeta` as a block-scoped repair candidate. Header propagation can provide
-a dependency path toward the source when standing part routes have none.
-Metadata arrival does not prove part availability or honesty. This candidate
-MUST remain subject to the same credits, timeouts, and alternative recovery
-paths as other suppliers; it MUST NOT replace bounded fallback.
+The receiver MAY retain the first authenticated header supplier as a bounded
+candidate record. Header arrival alone MUST NOT count as part availability or
+authorize automatic parent-tree repair in the normal propagation path.
+If no eligible peer advertises completion, the node MUST wait within the fixed
+fallback deadline or use the existing block-download path. It MUST NOT issue
+unbounded speculative requests to propagate a tree of unknown availability.
 It MAY add duplicate requests when expected latency justifies their cost.
 No separate repair request, acknowledgement, or unavailable message is needed:
 the subscription schedules current and future availability, and a local
@@ -580,6 +596,12 @@ authorization, verification, or the remaining recovery budget.
 The receiver MUST charge concurrent attempts to one block recovery budget
 and the node's aggregate limits. Exhausting that budget triggers bounded
 fallback even if the physical peer graph remains connected.
+
+The node MUST record the reason and time of fallback entry, requested and
+delivered repair bytes, control bytes, cancellation tails, and the terminal
+outcome. Reports MUST exclude fallback completion from normal-path success.
+Fallback MUST share transport and aggregate resource limits with normal work;
+it MUST NOT reset ordinary grants or authorize unlimited source upload.
 
 After a bounded number of attempts or a fixed total recovery deadline, the
 node MUST use the existing full-block download path. It MUST verify that result
@@ -599,6 +621,13 @@ subset from a request for ordinary coverage. It would use `SubscribeParts`,
 existing scope/height bounds, and immutable part/byte credit. It would not add
 a sixth message family. Its wire discriminator and negotiation remain `TBD`.
 Implementations MUST NOT send this selection under the current draft profile.
+
+A receiver SHOULD offer indices for which it has outgoing demand, or enough
+indices to support a decodable local bootstrap. The proposer SHOULD prefer
+eligible recipients with useful outgoing demand. An offer is a local forwarding
+hint, not proof of a global delivery path. The proposer MUST report a shortage
+of distinct eligible seeds within its budget. It MUST NOT hide that shortage
+by treating ordinary pull repair as normal seeding.
 
 A profile that adopts this extension MUST enforce these rules:
 
@@ -623,8 +652,9 @@ A profile that adopts this extension MUST enforce these rules:
    or continued downstream availability. A failed path MAY require reseeding
    elsewhere within the repair reserve.
 6. The receiver MUST verify and forward seeds under the ordinary part rules.
-   It MAY request additional indices through ordinary subscriptions when the
-   offered subset is insufficient. A completed receiver sends `FullBlock`;
+   If the offered subset and standing routes fail to complete the block, it
+   MAY request additional indices only after entering bounded fallback.
+   A completed receiver sends `FullBlock`;
    authorized in-flight seed parts follow the existing cancellation rules.
 7. The proposer MUST report insufficient eligible credit, upload budget, or
    service as degraded seeding. It MUST NOT send unsolicited parts or starve
@@ -1050,6 +1080,21 @@ load before another promotion into that connection. Old wins MUST NOT justify
 an arbitrary sequence of load increases. A miss or peer loss triggers immediate
 bounded additions; pruning waits for `STABLE_WINDOWS >= 2` successful windows.
 
+These local checks do not establish global reachability. Concurrent pruning
+can remove causal delivery paths despite sufficient local distinct-part
+coverage. Implementations MUST NOT claim convergence or normal-path delivery
+from coverage counts and past race wins alone. The default experimental policy
+SHOULD retain startup supplier edges until a pruning policy passes connected
+overlay tests with concurrent changes and separately accounted fallback.
+
+A fixed-reference stripe experiment preserves suppliers that delivered before
+one reference reconstruction. Its argument requires unchanged mask mapping,
+codeword shape, seed placement, availability, retained data, and adequate credit.
+It establishes eventual delivery under fair service, not a deadline or failure
+coverage. This experiment does not amend the whole-body codeword in section 2.
+A stripe profile MUST define authenticated stripe identity, commitments,
+completion, pipeline bounds, and recovery before enabling that policy.
+
 ### Adjust the shared byte budget
 
 The baseline uses additive increase and multiplicative decrease on `W`, not on
@@ -1190,6 +1235,19 @@ and lower offered load. Its 20 ms control delay and 384-byte per-part framing
 allowance are model inputs, not RTT estimates or a specified wire format.
 The parity experiment sweeps 12.5%, 25%, 50%, and 100% with the same
 single-supplier coverage test. Non-25% ratios are hypothetical profiles.
+
+The September 9 experiments use these additional overrides. They do not select
+production defaults or amend the codec and wire profile.
+
+| Experiment | Parameters | Scope |
+| --- | --- | --- |
+| Connected push | 16/64 relays; degree 4/8; 1/4 source neighbors; 1/2 suppliers per mask bit; `k=32`, `n=40`, `S=65536`, `P=16` | Rings with additional local edges, including failure of one relay. Source seeds at most `n` parts. |
+| Connected service | 1 Gbps source; 1.6 Gbps relay upload; 2 Gbps relay ingress; mixed rates divide relay service by 1/2/4/8 | Aggregate serialized node service. Per-part proof/framing allowance: 384 bytes. |
+| Connected CPU and fallback | 0.02 ms proof; 8 ms reconstruction; 5 ms propagation; 20 ms control; fallback at 400 ms; request timeout 100 ms; total deadline 1,200 ms; `2k` extra requests | Assumed CPU costs, one block, preinstalled metadata. Report direct repair bytes separately. |
+| Route pruning | Degree 8; 4 source neighbors, extended to 8 for seed-offer/witness tests; 24 sequential bodies; 6 route seeds; 2 stable windows; 4-block cooldown; 12-vote history | Majority and coverage policies do not establish delivery. Witness tests fix the reference mapping and seed plan across equal-shape stripes. |
+| TCP workload | Four suppliers at 80/40/20/10 Mbps; shared 100 Mbps loopback netem with 5 ms delay and 128-packet limit; 120 bodies at 25 ms intervals; `k=4`, `n=5`, `S=65536` | Synthetic exact-part requests after release. Three repetitions per scenario and allocator. |
+| TCP disturbances | Fastest supplier drops to 5 Mbps at 1.5 s; 40 ms application stalls; 0.2% netem loss, optionally with ECN | Separate scenarios, not combined WAN conditions. |
+| TCP feedback and bounds | 25 Mbps initial estimate; 100 ms window; 4 samples; EWMA weight 0.5; maximum increase 25%; 256-part per-peer outstanding cap; 20 ms cancellation delay; 100 ms soft tail | Reduced allocator. Score every released body against 800 ms; allow an 8 s run horizon for eventual completion. |
 
 #### Wire profile and changes
 

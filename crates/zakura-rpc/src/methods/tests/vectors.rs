@@ -3631,6 +3631,16 @@ async fn rpc_submitblock_cancellation_keeps_verification_ownership() {
 #[tokio::test]
 async fn rpc_submitblock_rejects_invalid_proof_of_work_without_a_submission_slot() {
     let _init_guard = zakura_test::init();
+    check_invalid_pow_submissions(Mainnet, false).await;
+    let custom = Parameters::build()
+        .with_target_difficulty_limit(U256::MAX)
+        .expect("the target limit is valid")
+        .to_network()
+        .expect("the custom network parameters are valid");
+    check_invalid_pow_submissions(custom, true).await;
+}
+
+async fn check_invalid_pow_submissions(network: Network, invalid_equihash: bool) {
     let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
@@ -3638,7 +3648,7 @@ async fn rpc_submitblock_rejects_invalid_proof_of_work_without_a_submission_slot
     let (_tx, rx) = tokio::sync::watch::channel(None);
     let (mined_tx, _mined_rx) = tokio::sync::mpsc::unbounded_channel();
     let (rpc, queue_task) = RpcImpl::new(
-        Mainnet,
+        network.clone(),
         Default::default(),
         false,
         "0.0.1",
@@ -3664,6 +3674,29 @@ async fn rpc_submitblock_rejects_invalid_proof_of_work_without_a_submission_slot
         .map(|nonce| {
             let mut block = genesis.clone();
             Arc::make_mut(&mut block.header).nonce = [nonce; 32].into();
+            if invalid_equihash {
+                Arc::make_mut(&mut block.header).difficulty_threshold =
+                    network.target_difficulty_limit().to_compact();
+                assert!(
+                    zakura_consensus::difficulty_is_valid(
+                        &block.header,
+                        &network,
+                        &block.coinbase_height().unwrap(),
+                        &block.hash()
+                    )
+                    .is_ok(),
+                    "the easy target isolates Equihash rejection"
+                );
+                assert!(matches!(
+                    zakura_consensus::proof_of_work_is_valid(
+                        &block.header,
+                        &network,
+                        &block.coinbase_height().unwrap(),
+                        &block.hash()
+                    ),
+                    Err(zakura_consensus::VerifyBlockError::Equihash { .. })
+                ));
+            }
             let bytes = block.zcash_serialize_to_vec().expect("block serializes");
             let rpc = rpc.clone();
             tokio::spawn(async move { rpc.submit_block(HexData(bytes), None).await })
@@ -3700,6 +3733,89 @@ async fn rpc_submitblock_rejects_invalid_proof_of_work_without_a_submission_slot
         SubmitBlockResponse::Accepted
     );
     queue_task.abort();
+}
+
+#[tokio::test]
+async fn rpc_submitblock_preserves_custom_network_pow_waivers() {
+    let _init_guard = zakura_test::init();
+    let custom = Parameters::build()
+        .with_network_name("PowDisabledCustom")
+        .expect("the custom network name is valid")
+        .with_disable_pow(true)
+        .to_network()
+        .expect("the custom network parameters are valid");
+    let mainnet_genesis: Block = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("genesis bytes deserialize");
+    for (network, mut block) in [
+        (
+            Network::new_regtest(Default::default()),
+            (*zakura_chain::block::genesis::regtest_genesis_block()).clone(),
+        ),
+        (custom, mainnet_genesis),
+    ] {
+        let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+        let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+        let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+        let mut verifier: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        let (mined_tx, _mined_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (rpc, queue_task) = RpcImpl::new(
+            network.clone(),
+            Default::default(),
+            false,
+            "0.0.1",
+            "RPC test",
+            Buffer::new(mempool, 1),
+            Buffer::new(state, 1),
+            Buffer::new(read_state, 1),
+            verifier.clone(),
+            MockSyncStatus::default(),
+            NoChainTip,
+            MockAddressBookPeers::default(),
+            rx,
+            Some(mined_tx),
+        );
+        Arc::make_mut(&mut block.header).nonce = [0; 32].into();
+        let height = block.coinbase_height().unwrap();
+        assert!(
+            zakura_consensus::difficulty_is_valid(&block.header, &network, &height, &block.hash())
+                .is_err(),
+            "the fixture must fail the unwaived proof-of-work check"
+        );
+
+        // A waiver still rejects a target above the network limit before the verifier.
+        let mut invalid_target = block.clone();
+        Arc::make_mut(&mut invalid_target.header).difficulty_threshold =
+            ExpandedDifficulty::from(U256::MAX).to_compact();
+        assert_eq!(
+            rpc.submit_block(
+                HexData(invalid_target.zcash_serialize_to_vec().unwrap()),
+                None
+            )
+            .await
+            .unwrap(),
+            SubmitBlockErrorResponse::Rejected.into()
+        );
+        verifier.expect_no_requests().await;
+
+        let hash = block.hash();
+        let submission = tokio::spawn(async move {
+            rpc.submit_block(HexData(block.zcash_serialize_to_vec().unwrap()), None)
+                .await
+        });
+        verifier
+            .expect_request_that(|request| {
+                matches!(request, zakura_consensus::Request::CommitMined { .. })
+            })
+            .await
+            .respond(hash);
+        assert_eq!(
+            submission.await.unwrap().unwrap(),
+            SubmitBlockResponse::Accepted
+        );
+        queue_task.abort();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

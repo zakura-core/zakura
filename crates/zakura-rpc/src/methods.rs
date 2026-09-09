@@ -3163,11 +3163,9 @@ where
             .ok_or_error(0, "coinbase height not found")?;
         let block_hash = block.hash();
 
-        // Check the proof of work before this call holds a submission slot. The verifier repeats
-        // these checks, but a block that fails them here costs no slot, no task, and no
-        // verification work, so a caller that sends invalid blocks cannot make a solved block
-        // wait for a slot.
-        if let Err(error) = zakura_consensus::difficulty_is_valid(
+        // Reject invalid proof of work before reserving a submission slot.
+        // The verifier repeats this check under the same network policy.
+        if let Err(error) = zakura_consensus::proof_of_work_is_valid(
             &block.header,
             &self.network,
             &height,
@@ -3177,18 +3175,7 @@ where
                 ?error,
                 ?block_hash,
                 ?height,
-                "submit block failed: invalid difficulty"
-            );
-            return Ok(SubmitBlockErrorResponse::Rejected.into());
-        }
-        if let Err(error) =
-            zakura_consensus::equihash_solution_is_valid(&block.header, &self.network)
-        {
-            tracing::info!(
-                ?error,
-                ?block_hash,
-                ?height,
-                "submit block failed: invalid solution"
+                "submit block failed: invalid proof of work"
             );
             return Ok(SubmitBlockErrorResponse::Rejected.into());
         }

@@ -1542,6 +1542,7 @@ impl Drop for RegisteredPeerCleanupGuard {
 }
 
 struct StreamAdmission<'a> {
+    direction: ServicePeerDirection,
     conn: ZakuraConnTrace,
     peer_id: &'a ZakuraPeerId,
     stream_sem: &'a Arc<Semaphore>,
@@ -1593,7 +1594,9 @@ struct StreamWorkerContext {
     limits: ZakuraConnectionLimits,
     inbound_frame_cap: u32,
     message_payload_limits: &'static [(u16, usize)],
+    message_types: Option<&'static [u16]>,
     queue_depths: Option<(usize, usize)>,
+    session_resources: Option<Arc<dyn crate::zakura::OrderedSessionResources>>,
     outbound_frame_cap: u32,
     message_bucket: SharedMessageBucket,
     connection_token: CancellationToken,
@@ -2479,6 +2482,7 @@ impl ZakuraProtocolHandler {
                         freshness_tx.clone(),
                         conn.clone(),
                         peer_id.clone(),
+                        context.direction,
                         ordered_session_exit_tx.clone(),
                     )
                     .await
@@ -2636,6 +2640,7 @@ impl ZakuraProtocolHandler {
                             freshness_tx.clone(),
                             conn.clone(),
                             peer_id.clone(),
+                            context.direction,
                             ordered_session_exit_tx.clone(),
                         )
                         .await
@@ -2684,6 +2689,7 @@ impl ZakuraProtocolHandler {
                     match accepted {
                         Ok((send, recv)) => {
                             let mut admission = StreamAdmission {
+                                direction: context.direction,
                                 conn: conn.clone(),
                                 peer_id: &peer_id,
                                 stream_sem: &stream_sem,
@@ -2953,11 +2959,21 @@ impl ZakuraProtocolHandler {
         freshness_tx: watch::Sender<Instant>,
         conn: ZakuraConnTrace,
         peer_id: ZakuraPeerId,
+        direction: ServicePeerDirection,
         ordered_session_exit_tx: mpsc::UnboundedSender<OrderedSessionExit>,
     ) -> Result<AdmittedOrderedSession, ZakuraHandlerError> {
         let pair = self.registry.ordered_stream_pair(stream);
+        let resources = if pair.is_some() {
+            self.registry
+                .service_for_kind(stream.kind)
+                .expect("a selected stream has an owning service")
+                .reserve_ordered_session(direction)
+                .map_err(|_| ZakuraHandlerError::ResourceLimit("service session capacity"))?
+        } else {
+            None
+        };
         let pair_id = pair.map(|_| random_stream_session_seed());
-        let primary = self
+        let mut primary = self
             .prepare_ordered_stream(
                 connection,
                 stream,
@@ -2972,11 +2988,12 @@ impl ZakuraProtocolHandler {
                 peer_id.clone(),
             )
             .await?;
+        primary.set_session_resources(resources.clone());
         if let Some(pair) = pair {
             if pair.data != stream {
                 return Err(ZakuraHandlerError::InvalidOrderedPair);
             }
-            let requests = self
+            let mut requests = self
                 .prepare_ordered_stream(
                     connection,
                     pair.requests,
@@ -2991,6 +3008,7 @@ impl ZakuraProtocolHandler {
                     peer_id,
                 )
                 .await?;
+            requests.set_session_resources(resources);
             Ok(spawn_ordered_pair(
                 workers,
                 primary,
@@ -3164,6 +3182,18 @@ impl ZakuraProtocolHandler {
             .trace_stream("accepted", stream_id, Some(stream_kind));
 
         let pair = self.registry.ordered_stream_pair(stream);
+        let resources = if let Some(pair) = pair {
+            match pending_pairs.reserve_or_share(pair, &self.registry, admission.direction) {
+                Ok(resources) => resources,
+                Err(_) => {
+                    let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE));
+                    let _ = recv.stop(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE));
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
         let pair_id = if pair.is_some() {
             if prelude.request_id.is_some() {
                 let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_BAD_PRELUDE));
@@ -3203,7 +3233,9 @@ impl ZakuraProtocolHandler {
             limits: admission.limits,
             inbound_frame_cap: inbound_frame_cap_for_stream(&admission.limits, stream),
             message_payload_limits: self.registry.message_payload_limits(stream),
+            message_types: self.registry.message_types(stream),
             queue_depths: self.registry.stream_queue_depths(stream),
+            session_resources: resources,
             outbound_frame_cap: peer_accepted_frame_cap(
                 &admission.limits,
                 stream,
@@ -4152,10 +4184,11 @@ async fn persistent_stream_worker_with_policy(
                 biased;
                 _ = reader_context.connection_token.cancelled() => break,
                 _ = reader_context.stream_token.cancelled() => break,
-                frame = read_frame(
+                frame = read_frame_with_types(
                     &mut recv,
                     reader_context.inbound_frame_cap,
                     reader_context.message_payload_limits,
+                    reader_context.message_types,
                     reader_context.limits.idle_timeout,
                     // A persistent ordered stream is legitimately quiet between
                     // frames; do not let an inter-frame gap time out and cancel
@@ -4523,6 +4556,25 @@ async fn read_frame(
     read_timeout: Duration,
     first_byte_timeout: Option<Duration>,
 ) -> Result<Frame, ZakuraHandlerError> {
+    read_frame_with_types(
+        recv,
+        max_frame_bytes,
+        message_payload_limits,
+        None,
+        read_timeout,
+        first_byte_timeout,
+    )
+    .await
+}
+
+async fn read_frame_with_types(
+    recv: &mut RecvStream,
+    max_frame_bytes: u32,
+    message_payload_limits: &[(u16, usize)],
+    message_types: Option<&[u16]>,
+    read_timeout: Duration,
+    first_byte_timeout: Option<Duration>,
+) -> Result<Frame, ZakuraHandlerError> {
     let mut header = [0; FRAME_HEADER_BYTES];
     // The first header byte is the boundary between "waiting for the next frame"
     // and "reading a frame in progress". Wait for it under `first_byte_timeout`
@@ -4549,6 +4601,9 @@ async fn read_frame(
     }
     let mut reader = &header[..];
     let message_type = reader.read_u16::<LittleEndian>()?;
+    if message_types.is_some_and(|types| !types.contains(&message_type)) {
+        return Err(ZakuraHandlerError::InvalidMessageType(message_type));
+    }
     let flags = reader.read_u16::<LittleEndian>()?;
     let payload_len = usize::try_from(reader.read_u32::<LittleEndian>()?)
         .expect("u32 payload lengths fit usize on supported targets");
@@ -4572,14 +4627,31 @@ async fn read_frame(
         });
     }
     let mut payload = vec![0; payload_len];
-    timeout(read_timeout, recv.read_exact(&mut payload))
-        .await
-        .map_err(|_| ZakuraHandlerError::Timeout("frame payload"))??;
+    read_frame_payload(recv, &mut payload, read_timeout).await?;
     Ok(Frame {
         message_type,
         flags,
         payload,
     })
+}
+
+async fn read_frame_payload(
+    recv: &mut RecvStream,
+    payload: &mut [u8],
+    read_timeout: Duration,
+) -> Result<(), ZakuraHandlerError> {
+    match timeout(read_timeout, recv.read_exact(payload))
+        .await
+        .map_err(|_| ZakuraHandlerError::Timeout("frame payload"))?
+    {
+        Ok(()) => Ok(()),
+        // A peer can reset a pair during a partial frame. Reset ends that stream;
+        // a normal FIN with a truncated payload still reports a protocol error.
+        Err(iroh::endpoint::ReadExactError::ReadError(iroh::endpoint::ReadError::Reset(_))) => {
+            Err(ZakuraHandlerError::Closed)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn read_control_payload(
@@ -5535,6 +5607,9 @@ impl<C: Clock> TokenBucket<C> {
 /// Errors produced by the Zakura protocol handler.
 #[derive(Debug, Error)]
 pub enum ZakuraHandlerError {
+    /// The frame header names a message that is invalid on this stream role.
+    #[error("invalid message type {0} for this stream role")]
+    InvalidMessageType(u16),
     /// Two ordered stream roles failed to name one complete session.
     #[error("invalid Zakura ordered stream pair")]
     InvalidOrderedPair,
@@ -8040,7 +8115,9 @@ mod tests {
             limits,
             inbound_frame_cap: stream.frame_cap,
             message_payload_limits: &[],
+            message_types: None,
             queue_depths: None,
+            session_resources: None,
             outbound_frame_cap: stream.frame_cap,
             message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(128))),
             connection_token: cancel.clone(),
@@ -8241,7 +8318,9 @@ mod tests {
             limits,
             inbound_frame_cap: inbound_frame_cap_for_stream(&limits, stream),
             message_payload_limits: &[],
+            message_types: None,
             queue_depths: None,
+            session_resources: None,
             outbound_frame_cap: application_frame_cap(&limits, stream),
             message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(128))),
             connection_token: connection_token.clone(),
@@ -8450,7 +8529,9 @@ mod tests {
                 limits,
                 inbound_frame_cap: inbound_frame_cap_for_stream(&limits, stream),
                 message_payload_limits: &[],
+                message_types: None,
                 queue_depths: None,
+                session_resources: None,
                 outbound_frame_cap: application_frame_cap(&limits, stream),
                 message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(
                     limits.message_rate_per_second,
@@ -9133,6 +9214,7 @@ mod tests {
         let (freshness_tx, _freshness_rx) = watch::channel(Instant::now());
 
         let mut admission = StreamAdmission {
+            direction: ServicePeerDirection::Inbound,
             conn: ZakuraConnTrace::placeholder(),
             peer_id: &peer_id,
             stream_sem: &stream_sem,

@@ -182,6 +182,10 @@ impl ServiceRegistry {
             .stream_queue_depths(stream)
     }
 
+    pub(crate) fn message_types(&self, stream: Stream) -> Option<&'static [u16]> {
+        self.service_for_kind(stream.kind)?.message_types(stream)
+    }
+
     /// Lookup the declared stream for `kind`.
     pub fn stream_for_kind(&self, kind: u16) -> Option<Stream> {
         let service = self.service_for_kind(kind)?;

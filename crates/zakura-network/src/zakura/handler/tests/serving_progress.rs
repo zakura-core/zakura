@@ -152,7 +152,9 @@ async fn check_bidirectional_serving_progress(
             limits: local.clamp(&local.initial_limits()),
             inbound_frame_cap: MAX_BS_FRAME_BYTES,
             message_payload_limits: service.message_payload_limits(service.streams()[0]),
+            message_types: service.message_types(service.streams()[0]),
             queue_depths: service.stream_queue_depths(service.streams()[0]),
+            session_resources: None,
             outbound_frame_cap: MAX_BS_FRAME_BYTES,
             message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(
                 local.message_rate_per_second,

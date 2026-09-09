@@ -32,8 +32,8 @@ pub(crate) use pipe::{
 pub use registry::{RegistryError, ServiceRegistry};
 pub(crate) use service::ServiceStream;
 pub use service::{
-    BoxRunFuture, OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPair,
-    OrderedStreamPolicy, Peer, RequestResponseService, Service, Sink, SinkReject, Source, Stream,
-    StreamMode,
+    BoxRunFuture, OrderedSessionDemand, OrderedSessionFull, OrderedSessionResources,
+    OrderedStreamOpening, OrderedStreamPair, OrderedStreamPolicy, Peer, RequestResponseService,
+    Service, Sink, SinkReject, Source, Stream, StreamMode,
 };
 pub use session::{OrderedSendError, PeerStreamSession};

@@ -60,6 +60,7 @@ impl FramedRecv {
 #[derive(Clone, Debug)]
 pub struct FramedSend {
     sender: FramedSender,
+    session_resources: Option<Arc<dyn super::service::OrderedSessionResources>>,
 }
 
 #[derive(Clone, Debug)]
@@ -73,13 +74,24 @@ impl FramedSend {
     pub fn new(sender: mpsc::Sender<Frame>) -> Self {
         Self {
             sender: FramedSender::Plain(sender),
+            session_resources: None,
         }
     }
 
     fn queued(sender: mpsc::Sender<QueuedFrame>) -> Self {
         Self {
             sender: FramedSender::Queued(sender),
+            session_resources: None,
         }
+    }
+
+    /// Keep service admission charged while application senders still own the session.
+    pub(crate) fn with_session_resources(
+        mut self,
+        resources: Option<Arc<dyn super::service::OrderedSessionResources>>,
+    ) -> Self {
+        self.session_resources = resources;
+        self
     }
 
     /// Queue a frame for transport-owned encoding and writing.

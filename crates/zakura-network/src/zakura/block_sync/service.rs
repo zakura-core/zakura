@@ -13,6 +13,7 @@ use tokio::sync::Notify;
 
 mod sessions;
 pub(super) use sessions::CurrentSessions;
+use sessions::SessionCapacity;
 
 #[cfg(test)]
 mod tests;
@@ -381,6 +382,7 @@ pub(crate) struct BlockSyncService {
 
 #[derive(Debug)]
 struct BlockSyncServiceInner {
+    capacity: SessionCapacity,
     config: ZakuraBlockSyncConfig,
     sessions: Arc<CurrentSessions>,
     /// Shared download primitives every per-peer pipe-routine is wired with at
@@ -460,6 +462,7 @@ impl BlockSyncService {
             local_status: Some(handle.subscribe_status()),
             paired: PAIRED_BLOCK_SYNC_ENABLED && handle.range_source.is_some(),
             inner: Arc::new(BlockSyncServiceInner {
+                capacity: SessionCapacity::new(config.peer_limits),
                 config,
                 sessions: handle.current_sessions.clone(),
                 routine_wiring: handle.routine_wiring.clone(),
@@ -500,6 +503,7 @@ impl BlockSyncService {
             local_status: Some(handle.subscribe_status()),
             paired: false,
             inner: Arc::new(BlockSyncServiceInner {
+                capacity: SessionCapacity::new(config.peer_limits),
                 config,
                 sessions: handle.current_sessions.clone(),
                 routine_wiring: handle.routine_wiring.clone(),
@@ -565,6 +569,7 @@ impl BlockSyncService {
                 local_status: None,
                 paired: false,
                 inner: Arc::new(BlockSyncServiceInner {
+                    capacity: SessionCapacity::new(config.peer_limits),
                     config,
                     sessions,
                     routine_wiring: None,
@@ -675,6 +680,20 @@ impl Service for BlockSyncService {
         (self.paired && BLOCK_SYNC_PAIR_STREAMS.contains(&stream)).then_some(BLOCK_SYNC_PAIR)
     }
 
+    fn reserve_ordered_session(
+        &self,
+        direction: ServicePeerDirection,
+    ) -> Result<
+        Option<Arc<dyn crate::zakura::OrderedSessionResources>>,
+        crate::zakura::OrderedSessionFull,
+    > {
+        if self.paired {
+            self.inner.capacity.reserve(direction).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
     fn stream_queue_depths(&self, stream: Stream) -> Option<(usize, usize)> {
         if self.paired && stream == BLOCK_SYNC_PAIR.requests {
             Some((1, 1))
@@ -690,9 +709,9 @@ impl Service for BlockSyncService {
     fn message_payload_limits(&self, stream: Stream) -> &'static [(u16, usize)] {
         if self.paired {
             return if stream == BLOCK_SYNC_PAIR.requests {
-                &[(1, 0), (2, 9), (3, 0), (4, 0), (5, 0)]
+                &[(2, 9)]
             } else {
-                &[(2, 0)]
+                &[(1, 53), (4, 9), (5, 9)]
             };
         }
         match (stream.kind, stream.version) {
@@ -701,6 +720,15 @@ impl Service for BlockSyncService {
             }
             _ => &[],
         }
+    }
+
+    fn message_types(&self, stream: Stream) -> Option<&'static [u16]> {
+        self.paired
+            .then_some(if stream == BLOCK_SYNC_PAIR.requests {
+                &[2]
+            } else {
+                &[1, 3, 4, 5]
+            })
     }
 
     fn ordered_stream_policy(&self, _kind: u16) -> OrderedStreamPolicy {
@@ -721,6 +749,12 @@ impl Service for BlockSyncService {
             return OrderedSessionDemand::RetryAt(deadline);
         }
 
+        let mut capacity = self.inner.capacity.subscribe();
+        if self.paired && !self.inner.capacity.available(direction) {
+            return OrderedSessionDemand::WaitForChange(Box::pin(async move {
+                let _ = capacity.changed().await;
+            }));
+        }
         let mut peer_snapshot = self.inner.peer_snapshot.clone();
         peer_snapshot.borrow_and_update();
         if !self.peer_slots_free(direction) {

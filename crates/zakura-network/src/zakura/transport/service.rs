@@ -104,6 +104,19 @@ pub struct OrderedStreamPair {
     pub requests: Stream,
 }
 
+/// A service slot held from paired-stream setup through the last transport and
+/// application sender owner. The service can release its setup allowance once
+/// both roles are ready, while retaining its session allowance through teardown.
+pub trait OrderedSessionResources: fmt::Debug + Send + Sync {
+    /// Both roles have completed setup. Called once for a successfully built pair.
+    fn admitted(&self);
+}
+
+/// The service has no capacity for another establishing or retiring session.
+#[derive(Debug, Error)]
+#[error("ordered service session capacity is full")]
+pub struct OrderedSessionFull;
+
 /// Transport state for one ordered service stream.
 #[derive(Debug)]
 pub(crate) struct ServiceStream {
@@ -390,10 +403,25 @@ pub trait Service: fmt::Debug + Send + Sync + 'static {
         &[]
     }
 
+    /// Optional message types accepted on this role. The transport rejects an
+    /// unlisted type from its header, before allocating or reading its payload.
+    fn message_types(&self, _stream: Stream) -> Option<&'static [u16]> {
+        None
+    }
+
     /// Optional per-stream inbound and outbound application queue limits.
     /// The transport also applies its connection-wide inbound queue allowance.
     fn stream_queue_depths(&self, _stream: Stream) -> Option<(usize, usize)> {
         None
+    }
+
+    /// Reserve service capacity before starting a stream pair. The returned
+    /// owner lives through incomplete setup and both workers' eventual teardown.
+    fn reserve_ordered_session(
+        &self,
+        _direction: ServicePeerDirection,
+    ) -> Result<Option<std::sync::Arc<dyn OrderedSessionResources>>, OrderedSessionFull> {
+        Ok(None)
     }
 
     /// Return the complete pair containing `stream`, if this version uses one.

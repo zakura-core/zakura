@@ -338,6 +338,7 @@ async fn incomplete_pairs_expire_and_mismatched_roles_release_stream_permits(
     let mut open_limiter = TokenBucket::new(100);
     let (exits, _exit_rx) = mpsc::unbounded_channel();
     let mut admission = StreamAdmission {
+        direction: ServicePeerDirection::Inbound,
         conn: ZakuraConnTrace::without_peer(1),
         peer_id: &peer,
         stream_sem: &permits,

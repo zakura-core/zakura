@@ -353,6 +353,7 @@ async fn fill_paused_frame_worker(
     };
     let context = StreamWorkerContext {
         queue_depths: None,
+        session_resources: None,
         conn: ZakuraConnTrace::without_peer(1),
         peer_id: test_peer(73),
         stream_id: index + 2,
@@ -360,6 +361,7 @@ async fn fill_paused_frame_worker(
         limits: limits.clamp(&limits.initial_limits()),
         inbound_frame_cap: frame_cap,
         message_payload_limits: payload_limits,
+        message_types: None,
         outbound_frame_cap: frame_cap,
         message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(
             limits.message_rate_per_second,

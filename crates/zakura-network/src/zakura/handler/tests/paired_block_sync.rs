@@ -20,6 +20,34 @@ use zakura_chain::serialization::ZcashSerialize;
 const ALPN: &[u8] = b"/zakura/test/paired-block-download/1";
 const COUNT: u32 = 32;
 const DEADLINE: Duration = Duration::from_secs(30);
+const LOSS_DEADLINE: Duration = Duration::from_secs(240);
+
+mod link;
+mod paused;
+
+struct Workload {
+    paired: bool,
+    pressure: bool,
+    impaired: bool,
+    rounds: u32,
+    paused_siblings: u16,
+    resume_after: Option<Duration>,
+    recover_on_fresh_peer: bool,
+}
+
+impl Default for Workload {
+    fn default() -> Self {
+        Self {
+            paired: true,
+            pressure: false,
+            impaired: false,
+            rounds: 1,
+            paused_siblings: 0,
+            resume_after: None,
+            recover_on_fresh_peer: false,
+        }
+    }
+}
 
 #[derive(Debug)]
 struct MemorySource(Arc<Vec<Arc<Block>>>);
@@ -56,6 +84,67 @@ impl BlockRangeSource for MemorySource {
     }
 }
 
+struct ConnectedPeer {
+    connection: Connection,
+    _task: AbortOnDropHandle<Result<(), ZakuraHandlerError>>,
+}
+
+impl Drop for ConnectedPeer {
+    fn drop(&mut self) {
+        self.connection.close(0u32.into(), b"test finished");
+    }
+}
+
+async fn connect_download_peer(
+    client: &Endpoint,
+    address: NodeAddr,
+    handler: ZakuraProtocolHandler,
+    limits: ZakuraLocalLimits,
+) -> Result<ConnectedPeer, BoxError> {
+    let remote_id = address.node_id;
+    let local_id = client.node_id();
+    let connection = timeout(DEADLINE, client.connect(address, ALPN)).await??;
+    let local_peer = ZakuraPeerId::new(local_id.as_bytes().to_vec())?;
+    let remote_peer = ZakuraPeerId::new(remote_id.as_bytes().to_vec())?;
+    let conn = ZakuraConnTrace::without_peer(1);
+    let negotiated = run_native_initiator_handshake(
+        &connection,
+        &limits,
+        &handler.current_handshake_config(),
+        &local_peer,
+        &ZakuraTrace::noop(),
+        &conn,
+    )
+    .await?;
+    let serving_connection = connection.clone();
+    let transport = AbortOnDropHandle::new(tokio::spawn(async move {
+        handler
+            .register_and_serve(
+                serving_connection,
+                remote_peer,
+                None,
+                ConnectionServeContext {
+                    limits: limits.clamp(&negotiated.limits),
+                    accepted_capabilities: negotiated.accepted_capabilities,
+                    role: "initiator",
+                    direction: ServicePeerDirection::Outbound,
+                    transcript_hash: native_connection_transcript_hash(
+                        ServicePeerDirection::Outbound,
+                        &local_id,
+                        &remote_id,
+                    ),
+                    i_open_collision_winner: i_open_collision_winner(&local_id, &remote_id),
+                    conn,
+                },
+            )
+            .await
+    }));
+    Ok(ConnectedPeer {
+        connection,
+        _task: transport,
+    })
+}
+
 struct Node {
     handle: BlockSyncHandle,
     service: Arc<BlockSyncService>,
@@ -63,6 +152,7 @@ struct Node {
     _tasks: Vec<AbortOnDropHandle<()>>,
     _tip: watch::Sender<(block::Height, block::Hash)>,
     received: watch::Receiver<u32>,
+    _capture: Option<crate::zakura::testkit::TraceCapture>,
 }
 
 impl Node {
@@ -92,6 +182,20 @@ impl Node {
             config.clone(),
         );
         startup.shutdown = cancel.clone();
+        let capture = std::env::var_os("ZAKURA_DOWNLOAD_TRACE").map(|_| {
+            let mut capture = crate::zakura::testkit::TraceCapture::for_test(if serving {
+                "paired-gate-server"
+            } else {
+                "paired-gate-downloader"
+            })
+            .unwrap();
+            startup.trace = ZakuraTrace::new(
+                capture.tracer(),
+                if serving { "server" } else { "downloader" },
+            );
+            eprintln!("download trace: {}", capture.path().display());
+            capture
+        });
         let (handle, mut actions, reactor) = spawn_block_sync_reactor(startup);
         let mut service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
         if paired {
@@ -112,7 +216,7 @@ impl Node {
                         assert!(!serving, "only the downloader has matched body work");
                         completed += 1;
                         let height = block.coinbase_height().unwrap();
-                        assert_eq!(height.0, completed);
+                        assert_eq!(height.0, (completed - 1) % COUNT + 1);
                         assert_eq!(
                             block.hash(),
                             blocks[usize::try_from(height.0 - 1).unwrap()].hash()
@@ -187,6 +291,7 @@ impl Node {
             ],
             _tip: tip_tx,
             received,
+            _capture: capture,
         }
     }
 }
@@ -220,9 +325,50 @@ fn blocks() -> Arc<Vec<Arc<Block>>> {
 }
 
 async fn download(paired: bool, pressure: bool) -> Result<Duration, BoxError> {
+    download_over_link(paired, pressure, false).await
+}
+
+async fn download_over_link(
+    paired: bool,
+    pressure: bool,
+    impaired: bool,
+) -> Result<Duration, BoxError> {
+    download_rounds(paired, pressure, impaired, 1).await
+}
+
+async fn download_rounds(
+    paired: bool,
+    pressure: bool,
+    impaired: bool,
+    rounds: u32,
+) -> Result<Duration, BoxError> {
+    run_download(Workload {
+        paired,
+        pressure,
+        impaired,
+        rounds,
+        ..Workload::default()
+    })
+    .await
+}
+
+async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
+    let Workload {
+        paired,
+        pressure,
+        impaired,
+        rounds,
+        paused_siblings,
+        resume_after,
+        recover_on_fresh_peer,
+    } = workload;
+    let completion_deadline = if impaired { LOSS_DEADLINE } else { DEADLINE };
     let blocks = blocks();
     let mut downloader = Node::new(blocks.clone(), false, paired);
     let server_node = Node::new(blocks.clone(), true, paired);
+    let initial_client_slots = downloader.service.available_session_slots_for_test();
+    let initial_server_slots = server_node.service.available_session_slots_for_test();
+    let mut serving_service = server_node.service.clone();
     let mut limits = ZakuraLocalLimits::from_config(&Config::default());
     // Let the declared request burst test serving pressure, not rate rejection.
     limits.message_rate_per_second = 40_000;
@@ -232,145 +378,335 @@ async fn download(paired: bool, pressure: bool) -> Result<Duration, BoxError> {
     let client = LocalEndpointFactory::with_transport_config(limits.transport_config())
         .endpoint(94102)
         .await?;
-    let handler = |service: Arc<BlockSyncService>, endpoint| {
-        ZakuraProtocolHandler::new_with_registry(
-            ZakuraSupervisorHandle::new(16),
-            Network::Mainnet,
-            ZakuraHandshakeConfig::for_network(&Network::Mainnet),
-            limits.clone(),
-            Arc::new(ServiceRegistry::new(vec![service]).unwrap()),
-        )
-        .with_endpoint(endpoint)
-    };
-    let server_handler = handler(server_node.service.clone(), server.clone());
-    let client_handler = handler(downloader.service.clone(), client.clone());
-    let router = Router::builder(server).accept(ALPN, server_handler).spawn();
-    let address = LocalEndpointFactory::node_addr(router.endpoint()).await;
-    let remote_id = address.node_id;
-    let local_id = client.node_id();
-    let connection = timeout(DEADLINE, client.connect(address, ALPN)).await??;
-    let local_peer = ZakuraPeerId::new(local_id.as_bytes().to_vec())?;
-    let remote_peer = ZakuraPeerId::new(remote_id.as_bytes().to_vec())?;
-    let conn = ZakuraConnTrace::without_peer(1);
-    let negotiated = run_native_initiator_handshake(
-        &connection,
-        &limits,
-        &client_handler.current_handshake_config(),
-        &local_peer,
-        &ZakuraTrace::noop(),
-        &conn,
-    )
-    .await?;
-    let serving_connection = connection.clone();
-    let transport = AbortOnDropHandle::new(tokio::spawn(async move {
-        client_handler
-            .register_and_serve(
-                serving_connection,
-                remote_peer,
-                None,
-                ConnectionServeContext {
-                    limits: limits.clamp(&negotiated.limits),
-                    accepted_capabilities: negotiated.accepted_capabilities,
-                    role: "initiator",
-                    direction: ServicePeerDirection::Outbound,
-                    transcript_hash: native_connection_transcript_hash(
-                        ServicePeerDirection::Outbound,
-                        &local_id,
-                        &remote_id,
-                    ),
-                    i_open_collision_winner: i_open_collision_winner(&local_id, &remote_id),
-                    conn,
-                },
+    let handler =
+        |service: Arc<BlockSyncService>, sibling: Arc<paused::PausedService>, endpoint| {
+            let mut services: Vec<Arc<dyn Service>> = vec![service];
+            if paused_siblings > 0 {
+                services.push(sibling);
+            }
+            ZakuraProtocolHandler::new_with_registry(
+                ZakuraSupervisorHandle::new(16),
+                Network::Mainnet,
+                ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+                limits.clone(),
+                Arc::new(ServiceRegistry::new(services).unwrap()),
             )
-            .await
-    }));
+            .with_endpoint(endpoint)
+        };
+    let (server_sibling, mut server_siblings) = paused::PausedService::new(paused_siblings);
+    let (client_sibling, mut client_siblings) = paused::PausedService::new(paused_siblings);
+    let server_handler = handler(server_node.service.clone(), server_sibling, server.clone());
+    let client_handler = handler(downloader.service.clone(), client_sibling, client.clone());
+    let router = Router::builder(server).accept(ALPN, server_handler).spawn();
+    let mut address = LocalEndpointFactory::node_addr(router.endpoint()).await;
+    let link = if impaired {
+        let server_address = *address
+            .direct_addresses()
+            .find(|address| address.is_ipv4())
+            .unwrap();
+        let link = link::ImpairedLink::new(server_address).await?;
+        address = NodeAddr::new(address.node_id).with_direct_addresses([link.address]);
+        Some(link)
+    } else {
+        None
+    };
+    let remote_id = address.node_id;
+    let transport =
+        connect_download_peer(&client, address, client_handler.clone(), limits.clone()).await?;
+    let mut connection = transport.connection.clone();
+    let mut recovery = None;
     await_until("both block-sync sessions admitted", DEADLINE, || {
         downloader.service.peer_count() == 1 && server_node.service.peer_count() == 1
     })
     .await?;
-    let client_session = downloader
-        .service
-        .sessions_for_transport_test()
-        .pop()
-        .unwrap();
-    let server_session = server_node
-        .service
-        .sessions_for_transport_test()
-        .pop()
-        .unwrap();
+    let mut paused_receivers = Vec::new();
+    let mut paused_senders = Vec::new();
+    let before_siblings = connection.stats().udp_rx.bytes;
+    for _ in 0..paused_siblings {
+        let sender = paused::PausedSession::receive(&mut server_siblings).await?;
+        let receiver = paused::PausedSession::receive(&mut client_siblings).await?;
+        sender.fill_window().await?;
+        paused_senders.push(sender);
+        paused_receivers.push(receiver);
+    }
+    if paused_siblings > 0 {
+        await_until(
+            "sibling window traffic reaches the receiver",
+            completion_deadline,
+            || {
+                connection
+                    .stats()
+                    .udp_rx
+                    .bytes
+                    .saturating_sub(before_siblings)
+                    >= u64::from(paused_siblings) * u64::from(DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW)
+            },
+        )
+        .await?;
+    }
+    let mut resume = None;
     let capacity = pressure.then(|| downloader.handle.hold_serving_capacity_for_test());
-    if pressure {
-        // All requests precede the download. Their receiver waits for capacity;
-        // only A's download below must complete.
-        timeout(DEADLINE, async {
-            for _ in 0..32_000 {
-                server_session
-                    .2
-                    .send(
-                        crate::zakura::block_sync::BlockSyncMessage::GetBlocks {
-                            start_height: block::Height(1),
-                            count: 1,
-                        }
-                        .encode_frame()?,
-                    )
+    let mut total = Duration::ZERO;
+    for round in 0..rounds {
+        let mut client_session = downloader
+            .service
+            .sessions_for_transport_test()
+            .pop()
+            .unwrap();
+        let mut server_session = server_node
+            .service
+            .sessions_for_transport_test()
+            .pop()
+            .unwrap();
+        if pressure {
+            // All requests precede the download. Their receiver waits for capacity;
+            // only A's download below must complete.
+            timeout(DEADLINE, async {
+                for _ in 0..32_000 {
+                    server_session
+                        .2
+                        .send(
+                            crate::zakura::block_sync::BlockSyncMessage::GetBlocks {
+                                start_height: block::Height(1),
+                                count: 1,
+                            }
+                            .encode_frame()?,
+                        )
+                        .await?;
+                }
+                Ok::<_, BoxError>(())
+            })
+            .await
+            .map_err(|_| std::io::Error::other("request pressure setup timed out"))??;
+        }
+        let mut start = Instant::now();
+        downloader
+            ._tip
+            .send_replace((block::Height(COUNT), blocks.last().unwrap().hash()));
+        downloader
+            .handle
+            .send(BlockSyncEvent::NeededBlocks(
+                blocks
+                    .iter()
+                    .map(|block| BlockSyncBlockMeta {
+                        height: block.coinbase_height().unwrap(),
+                        hash: block.hash(),
+                        size: BlockSizeEstimate::Advertised(
+                            u32::try_from(block.zcash_serialized_size()).unwrap(),
+                        ),
+                    })
+                    .collect(),
+            ))
+            .await?;
+        if let Some(delay) = resume_after {
+            assert_eq!(rounds, 1, "transient saturation resumes once");
+            await_until("a request is outstanding before resuming", DEADLINE, || {
+                downloader.handle.outstanding_requests_for_test() > 0
+            })
+            .await?;
+            let receivers = std::mem::take(&mut paused_receivers);
+            let progress = downloader.received.clone();
+            resume = Some(AbortOnDropHandle::new(tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                assert_eq!(
+                    *progress.borrow(),
+                    0,
+                    "saturation must prevent a complete body before resuming"
+                );
+                let _readers: Vec<_> = receivers
+                    .into_iter()
+                    .map(paused::PausedSession::resume)
+                    .collect();
+                std::future::pending::<()>().await;
+            })));
+        }
+        if recover_on_fresh_peer {
+            assert!(paired && !impaired && !pressure && rounds == 1 && paused_siblings == 2);
+            await_until(
+                "the original request arms block-progress liveness",
+                DEADLINE,
+                || downloader.handle.outstanding_requests_for_test() > 0,
+            )
+            .await?;
+            await_until(
+                "an existing write or block-progress deadline retires the saturated pair",
+                Duration::from_secs(42),
+                || client_session.1.cancel_token().is_cancelled(),
+            )
+            .await?;
+            assert_eq!(*downloader.received.borrow(), 0);
+            drop(client_session);
+            drop(server_session);
+            await_until(
+                "retiring workers and serving frames release their slots",
+                Duration::from_secs(10),
+                || {
+                    downloader.service.peer_count() == 0
+                        && server_node.service.peer_count() == 0
+                        && downloader.handle.outstanding_requests_for_test() == 0
+                        && downloader.handle.active_serving_requests_for_test() == 0
+                        && server_node.handle.active_serving_requests_for_test() == 0
+                        && downloader.service.available_session_slots_for_test()
+                            == initial_client_slots
+                        && server_node.service.available_session_slots_for_test()
+                            == initial_server_slots
+                },
+            )
+            .await?;
+            eprintln!(
+                "saturated pair cleaned up after {:?}; connection {:?}",
+                start.elapsed(),
+                connection.close_reason()
+            );
+
+            let fresh_node = Node::new(blocks.clone(), true, paired);
+            let fresh_endpoint =
+                LocalEndpointFactory::with_transport_config(limits.transport_config())
+                    .endpoint(94103)
                     .await?;
+            let (fresh_sibling, fresh_siblings) = paused::PausedService::new(paused_siblings);
+            let fresh_handler = handler(
+                fresh_node.service.clone(),
+                fresh_sibling,
+                fresh_endpoint.clone(),
+            );
+            let fresh_router = Router::builder(fresh_endpoint)
+                .accept(ALPN, fresh_handler)
+                .spawn();
+            start = Instant::now();
+            let fresh_transport = connect_download_peer(
+                &client,
+                LocalEndpointFactory::node_addr(fresh_router.endpoint()).await,
+                client_handler.clone(),
+                limits.clone(),
+            )
+            .await?;
+            connection = fresh_transport.connection.clone();
+            await_until(
+                "a fresh peer admits the returned download work",
+                DEADLINE,
+                || downloader.service.peer_count() == 1 && fresh_node.service.peer_count() == 1,
+            )
+            .await?;
+            client_session = downloader
+                .service
+                .sessions_for_transport_test()
+                .pop()
+                .unwrap();
+            server_session = fresh_node
+                .service
+                .sessions_for_transport_test()
+                .pop()
+                .unwrap();
+            serving_service = fresh_node.service.clone();
+            recovery = Some((fresh_node, fresh_router, fresh_transport, fresh_siblings));
+        }
+        timeout(completion_deadline, async {
+            while *downloader.received.borrow_and_update() != (round + 1) * COUNT {
+                downloader.received.changed().await?;
+                if impaired {
+                    eprintln!(
+                        "matched {}/{} blocks after {:?}",
+                        *downloader.received.borrow(),
+                        (round + 1) * COUNT,
+                        start.elapsed()
+                    );
+                }
             }
             Ok::<_, BoxError>(())
         })
-        .await??;
-    }
-    let start = Instant::now();
-    downloader
-        ._tip
-        .send_replace((block::Height(COUNT), blocks.last().unwrap().hash()));
-    downloader
-        .handle
-        .send(BlockSyncEvent::NeededBlocks(
-            blocks
-                .iter()
-                .map(|block| BlockSyncBlockMeta {
-                    height: block.coinbase_height().unwrap(),
-                    hash: block.hash(),
-                    size: BlockSizeEstimate::Advertised(
-                        u32::try_from(block.zcash_serialized_size()).unwrap(),
-                    ),
-                })
-                .collect(),
-        ))
+        .await
+        .map_err(|_| {
+            std::io::Error::other(format!(
+                "download deadline: {}/{} blocks, {} outstanding; link {:?}; transport {:?}",
+                *downloader.received.borrow(),
+                COUNT,
+                downloader.handle.outstanding_requests_for_test(),
+                link.as_ref().map(link::ImpairedLink::counters),
+                connection.stats(),
+            ))
+        })??;
+        await_until(
+            "all matched requests consume their ending",
+            DEADLINE,
+            || downloader.handle.outstanding_requests_for_test() == 0,
+        )
         .await?;
-    timeout(DEADLINE, async {
-        while *downloader.received.borrow_and_update() != COUNT {
-            downloader.received.changed().await?;
+        let elapsed = start.elapsed();
+        total += elapsed;
+        if rounds > 1 {
+            eprintln!("matched round {}/{}: {:?}", round + 1, rounds, elapsed);
         }
-        Ok::<_, BoxError>(())
-    })
-    .await??;
-    await_until(
-        "all matched requests consume their ending",
-        DEADLINE,
-        || downloader.handle.outstanding_requests_for_test() == 0,
-    )
-    .await?;
-    let elapsed = start.elapsed();
-    assert!(!client_session.1.cancel_token().is_cancelled());
-    assert!(!server_session.1.cancel_token().is_cancelled());
-    assert_eq!(
-        downloader.service.sessions_for_transport_test()[0].0,
-        client_session.0
-    );
-    assert_eq!(
-        server_node.service.sessions_for_transport_test()[0].0,
-        server_session.0
-    );
-    assert!(connection.close_reason().is_none());
+        assert!(!client_session.1.cancel_token().is_cancelled());
+        assert!(!server_session.1.cancel_token().is_cancelled());
+        assert_eq!(
+            downloader.service.sessions_for_transport_test()[0].0,
+            client_session.0
+        );
+        assert_eq!(
+            serving_service.sessions_for_transport_test()[0].0,
+            server_session.0
+        );
+        assert!(connection.close_reason().is_none());
+        if let Some(link) = &link {
+            let useful = blocks
+                .iter()
+                .map(|block| u64::try_from(block.zcash_serialized_size()).unwrap())
+                .sum();
+            link.verify_path(&client, remote_id, useful);
+        }
+        if round + 1 < rounds {
+            let previous_client = client_session.0;
+            let previous_server = server_session.0;
+            client_session.1.cancel_token().cancel();
+            drop(client_session);
+            drop(server_session);
+            await_until(
+                "replacement pair admitted on the same connection",
+                DEADLINE,
+                || {
+                    downloader
+                        .service
+                        .sessions_for_transport_test()
+                        .first()
+                        .is_some_and(|session| session.0 != previous_client)
+                        && server_node
+                            .service
+                            .sessions_for_transport_test()
+                            .first()
+                            .is_some_and(|session| session.0 != previous_server)
+                },
+            )
+            .await?;
+            let genesis = Block::zcash_deserialize(&BLOCK_MAINNET_GENESIS_BYTES[..])
+                .unwrap()
+                .hash();
+            downloader
+                .handle
+                .send(BlockSyncEvent::ChainTipReset(BlockSyncFrontiers {
+                    finalized_height: block::Height(0),
+                    verified_block_tip: block::Height(0),
+                    verified_block_hash: genesis,
+                }))
+                .await?;
+        }
+    }
     drop(capacity);
+    drop(resume);
+    drop(paused_receivers);
+    drop(paused_senders);
     downloader.cancel.cancel();
     server_node.cancel.cancel();
     connection.close(0u32.into(), b"done");
     drop(transport);
+    if let Some((fresh_node, fresh_router, fresh_transport, _siblings)) = recovery {
+        fresh_node.cancel.cancel();
+        drop(fresh_transport);
+        fresh_router.shutdown().await?;
+    }
     client.close().await;
     router.shutdown().await?;
-    Ok(elapsed)
+    Ok(total)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -396,6 +732,277 @@ async fn legacy_download_baseline_matches_every_block_and_ending() -> Result<(),
     eprintln!(
         "legacy matched download: {:?}",
         download(false, false).await?
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "standalone 240-second impaired-link activation gate"]
+async fn paired_download_completes_with_request_pressure_and_packet_loss() -> Result<(), BoxError> {
+    eprintln!(
+        "paired matched download, 32000 requests, 50ms RTT, 1% loss: {:?}",
+        download_over_link(true, true, true).await?
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "standalone impaired-link comparison using the same download-policy fix"]
+async fn legacy_download_with_request_pressure_and_packet_loss() -> Result<(), BoxError> {
+    eprintln!(
+        "legacy matched download, 32000 requests, 50ms RTT, 1% loss: {:?}",
+        download_over_link(false, true, true).await?
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "standalone slow-link policy diagnostic"]
+async fn paired_slow_link_download_policy_diagnostic() -> Result<(), BoxError> {
+    eprintln!(
+        "paired matched slow-link diagnostic: {:?}",
+        download_over_link(true, true, true).await?
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn paired_download_completes_with_request_pressure_and_a_paused_service(
+) -> Result<(), BoxError> {
+    eprintln!(
+        "paired matched download with pressure and paused service: {:?}",
+        run_download(Workload {
+            pressure: true,
+            paused_siblings: 1,
+            ..Workload::default()
+        })
+        .await?
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "standalone combined impairment and paused-service activation gate"]
+async fn paired_download_completes_with_request_pressure_paused_service_and_loss(
+) -> Result<(), BoxError> {
+    eprintln!(
+        "paired matched download with pressure, paused service, and loss: {:?}",
+        run_download(Workload {
+            pressure: true,
+            impaired: true,
+            paused_siblings: 1,
+            ..Workload::default()
+        })
+        .await?
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transient_full_connection_credit_resumes_the_original_matched_download(
+) -> Result<(), BoxError> {
+    eprintln!(
+        "paired matched download after transient connection saturation: {:?}",
+        run_download(Workload {
+            paused_siblings: 2,
+            resume_after: Some(Duration::from_secs(1)),
+            ..Workload::default()
+        })
+        .await?
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "standalone saturation recovery gate using the default 32-second liveness deadline"]
+async fn sustained_saturation_cleans_up_and_retries_on_a_fresh_peer() -> Result<(), BoxError> {
+    let _guard = zakura_test::init();
+    eprintln!(
+        "matched retry on a fresh peer: {:?}",
+        run_download(Workload {
+            paused_siblings: 2,
+            recover_on_fresh_peer: true,
+            ..Workload::default()
+        })
+        .await?
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "standalone impaired-link throughput diagnostic; does not establish the activation gate"]
+async fn raw_download_with_packet_loss_measures_transport_throughput() -> Result<(), BoxError> {
+    const BYTES: usize = 4 * 1024 * 1024;
+    let limits = ZakuraLocalLimits::from_config(&Config::default());
+    let server = LocalEndpointFactory::with_transport_config(limits.transport_config())
+        .endpoint(94201)
+        .await?;
+    let client = LocalEndpointFactory::with_transport_config(limits.transport_config())
+        .endpoint(94202)
+        .await?;
+    let (connection_tx, mut connection_rx) = mpsc::channel(1);
+    let (stream_tx, mut stream_rx) = mpsc::channel(1);
+    let router = Router::builder(server)
+        .accept(
+            ALPN,
+            CaptureConnection {
+                connection_tx,
+                stream_tx,
+            },
+        )
+        .spawn();
+    let address = LocalEndpointFactory::node_addr(router.endpoint()).await;
+    let proxy =
+        link::ImpairedLink::new(*address.direct_addresses().find(|a| a.is_ipv4()).unwrap()).await?;
+    let remote_id = address.node_id;
+    let address = NodeAddr::new(remote_id).with_direct_addresses([proxy.address]);
+    let connection = timeout(DEADLINE, client.connect(address, ALPN)).await??;
+    let remote = timeout(DEADLINE, connection_rx.recv()).await?.unwrap();
+    let (mut send, mut recv) = connection.open_bi().await?;
+    send.write_all(&[1]).await?;
+    let (mut response, _request) = timeout(DEADLINE, stream_rx.recv()).await?.unwrap();
+    let started = Instant::now();
+    timeout(DEADLINE, async {
+        tokio::try_join!(
+            async {
+                response.write_all(&vec![42; BYTES]).await?;
+                response.finish()?;
+                Ok::<_, BoxError>(())
+            },
+            async {
+                let mut chunk = [0; 64 * 1024];
+                let mut received = 0;
+                while let Some(count) = recv.read(&mut chunk).await? {
+                    assert!(chunk[..count].iter().all(|byte| *byte == 42));
+                    received += count;
+                }
+                assert_eq!(received, BYTES);
+                Ok::<_, BoxError>(())
+            }
+        )?;
+        Ok::<_, BoxError>(())
+    })
+    .await??;
+    let elapsed = started.elapsed();
+    proxy.verify_path(&client, remote_id, u64::try_from(BYTES)?);
+    eprintln!(
+        "raw 4 MiB download, 50ms RTT, 1% loss: {elapsed:?}; sender {:?}",
+        remote.stats()
+    );
+    connection.close(0u32.into(), b"done");
+    client.close().await;
+    router.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn reset_during_a_frame_is_stream_local_but_truncated_fin_is_invalid() -> Result<(), BoxError>
+{
+    let server = LocalEndpointFactory::new().endpoint(94105).await?;
+    let (connection_tx, _connections) = mpsc::channel(2);
+    let (stream_tx, mut streams) = mpsc::channel(2);
+    let router = Router::builder(server)
+        .accept(
+            ALPN,
+            CaptureConnection {
+                connection_tx,
+                stream_tx,
+            },
+        )
+        .spawn();
+    let client = LocalEndpointFactory::new().endpoint(94106).await?;
+    let address = LocalEndpointFactory::node_addr(router.endpoint()).await;
+    let connection = timeout(DEADLINE, client.connect(address, ALPN)).await??;
+    for reset in [true, false] {
+        let (mut send, _recv) = connection.open_bi().await?;
+        send.write_all(&[42]).await?;
+        let (_, mut recv) = timeout(DEADLINE, streams.recv()).await?.unwrap();
+        let mut first = [0];
+        timeout(DEADLINE, recv.read_exact(&mut first)).await??;
+        assert_eq!(first, [42], "the peer consumed the beginning of this frame");
+        if reset {
+            send.reset(0u32.into())?;
+        } else {
+            send.finish()?;
+        }
+        let result = read_frame_payload(&mut recv, &mut [0; 16], DEADLINE).await;
+        if reset {
+            assert!(matches!(result, Err(ZakuraHandlerError::Closed)));
+        } else {
+            assert!(result.is_err() && !matches!(result, Err(ZakuraHandlerError::Closed)));
+        }
+        assert!(connection.close_reason().is_none());
+    }
+    connection.close(0u32.into(), b"done");
+    client.close().await;
+    router.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn paired_roles_reject_wrong_messages_before_reading_payloads() -> Result<(), BoxError> {
+    let service = BlockSyncService::new(ZakuraBlockSyncConfig::default())
+        .with_paired_source_for_test(Arc::new(MemorySource(Arc::new(Vec::new()))));
+    let pair = service.ordered_stream_pair(service.streams()[0]).unwrap();
+    let server = LocalEndpointFactory::new().endpoint(94103).await?;
+    let (connection_tx, _connections) = mpsc::channel(4);
+    let (stream_tx, mut streams) = mpsc::channel(4);
+    let router = Router::builder(server)
+        .accept(
+            ALPN,
+            CaptureConnection {
+                connection_tx,
+                stream_tx,
+            },
+        )
+        .spawn();
+    let client = LocalEndpointFactory::new().endpoint(94104).await?;
+    let address = LocalEndpointFactory::node_addr(router.endpoint()).await;
+    for (role, message) in [
+        (pair.requests, 1u16),
+        (pair.requests, 3),
+        (pair.data, 2),
+        (pair.data, 99),
+    ] {
+        let connection = timeout(DEADLINE, client.connect(address.clone(), ALPN)).await??;
+        let (mut send, _recv) = connection.open_bi().await?;
+        let mut header = Vec::new();
+        header.extend_from_slice(&message.to_le_bytes());
+        header.extend_from_slice(&0u16.to_le_bytes());
+        header.extend_from_slice(&100u32.to_le_bytes());
+        send.write_all(&header).await?;
+        let (_, mut recv) = timeout(DEADLINE, streams.recv()).await?.unwrap();
+        assert!(
+            matches!(timeout(Duration::from_secs(1), read_frame_with_types(
+            &mut recv, role.frame_cap, service.message_payload_limits(role), service.message_types(role),
+            Duration::from_secs(5), None,
+        )).await?, Err(ZakuraHandlerError::InvalidMessageType(kind)) if kind == message)
+        );
+        connection.close(0u32.into(), b"checked");
+    }
+    client.close().await;
+    router.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "transport acceptance gate: twenty matched downloads and real reopen backoff"]
+async fn twenty_pair_reopens_complete_matched_downloads_under_request_pressure(
+) -> Result<(), BoxError> {
+    eprintln!(
+        "twenty matched downloads under request pressure: {:?}",
+        download_rounds(true, true, false, 20).await?
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "standalone twenty-round impaired-link activation gate"]
+async fn twenty_pair_reopens_complete_matched_downloads_under_request_pressure_and_loss(
+) -> Result<(), BoxError> {
+    eprintln!(
+        "twenty matched downloads under request pressure and loss: {:?}",
+        download_rounds(true, true, true, 20).await?
     );
     Ok(())
 }

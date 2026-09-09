@@ -32,6 +32,13 @@ pub(super) struct PreparedOrderedStream {
 }
 
 impl PreparedOrderedStream {
+    pub(super) fn set_session_resources(
+        &mut self,
+        resources: Option<Arc<dyn crate::zakura::OrderedSessionResources>>,
+    ) {
+        self.context.session_resources = resources;
+    }
+
     pub(super) fn new(
         send: SendStream,
         recv: RecvStream,
@@ -83,6 +90,24 @@ pub(super) struct PendingOrderedPairs {
 }
 
 impl PendingOrderedPairs {
+    pub(super) fn reserve_or_share(
+        &self,
+        pair: OrderedStreamPair,
+        registry: &ServiceRegistry,
+        direction: ServicePeerDirection,
+    ) -> Result<
+        Option<Arc<dyn crate::zakura::OrderedSessionResources>>,
+        crate::zakura::OrderedSessionFull,
+    > {
+        match self.pairs.get(&pair.data.kind) {
+            Some(pending) => Ok(pending.first.context.session_resources.clone()),
+            None => registry
+                .service_for_kind(pair.data.kind)
+                .expect("a selected pair has an owning service")
+                .reserve_ordered_session(direction),
+        }
+    }
+
     pub(super) fn deadline(&self) -> Option<Instant> {
         self.pairs.values().map(|pair| pair.deadline).min()
     }
@@ -135,6 +160,9 @@ pub(super) fn spawn_ordered_pair(
     opened_locally: bool,
     exits: mpsc::UnboundedSender<OrderedSessionExit>,
 ) -> AdmittedOrderedSession {
+    if let Some(resources) = &data.context.session_resources {
+        resources.admitted();
+    }
     let cancel = data.context.connection_token.child_token();
     data.context.stream_token = cancel.clone();
     requests.context.stream_token = cancel.clone();
@@ -151,13 +179,13 @@ pub(super) fn spawn_ordered_pair(
         version: data.stream.version,
         session_id: data.context.stream_id,
         recv: FramedRecv::new(data_rx),
-        send: data_send,
+        send: data_send.with_session_resources(data.context.session_resources.clone()),
         cancel_token: cancel.clone(),
         companion: Some(ServiceStreamRole {
             kind: requests.stream.kind,
             version: requests.stream.version,
             recv: FramedRecv::new(request_rx),
-            send: request_send,
+            send: request_send.with_session_resources(requests.context.session_resources.clone()),
         }),
     };
     let exit = OrderedSessionExit {
@@ -267,7 +295,9 @@ impl ZakuraProtocolHandler {
             limits,
             inbound_frame_cap: prelude.max_frame_bytes,
             message_payload_limits: self.registry.message_payload_limits(stream),
+            message_types: self.registry.message_types(stream),
             queue_depths: self.registry.stream_queue_depths(stream),
+            session_resources: None,
             outbound_frame_cap: application_frame_cap(&limits, stream),
             message_bucket,
             stream_token: connection_token.child_token(),

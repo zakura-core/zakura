@@ -26,6 +26,22 @@ guarantee. A missing result leaves the new service disabled.
 | Sustained saturation | Two paused streams each consume 16 MiB; include a case where sibling services retain all credit and a peer that repeats saturation | Cleanup finishes within 10 seconds after the existing block-progress deadline expires; a usable replacement session or peer completes the retry within 30 seconds; preserve existing cooldown and exponential reopen backoff | Same envelope over twenty repetitions; pending/retiring tasks return to their steady-state bounds and unfinished workers keep their permits |
 | Transient saturation | The same full buffers, but a paused consumer resumes before the block-progress deadline | The original download completes without a reset or disconnect, within the same 30-second transfer deadline after the consumer resumes | Same envelope |
 
+### Approved loss-gate revision
+
+The original 30-second loss gate failed on both the original PR and the paired
+prototype. The original PR completed zero matched blocks because its only cold
+probe expired. A separate raw QUIC transfer, without block-sync policy, moved
+4 MiB in 12.706 seconds at 50 ms RTT and 1% loss. The existing transport therefore
+falls below the original absolute throughput requirement.
+
+On September 8, the user approved including the download-policy fix and keeping
+the transport defaults. Before measuring complete downloads with that fix, the
+loss gate is revised to **240 seconds**, with a five-run median useful throughput
+of at least **90% of the original serving path with the same policy fix**. Apply
+this deadline to all impaired-link combinations and reopen rounds. The memory
+envelope and all loss-free thresholds above remain unchanged. Keep the original
+failed measurements as evidence; they are not passes under the revised gate.
+
 The raw prerequisite diagnoses shared receive credit. It does not exercise
 message framing, serving admission, outstanding-request matching, or the new
 stream-pair implementation, and cannot establish that the full gate passes.
@@ -109,8 +125,8 @@ QUIC dependencies and window settings are unchanged. Paired transport support an
 request ownership are implemented below. Production block sync still uses the
 existing layout and serving driver while the remaining work is tested.
 Initial matched downloads are recorded below. Impaired links, repeated matched
-downloads after reopening, baseline medians, and combined conditions still need
-measurement. The full acceptance gate has not passed.
+downloads after reopening, baseline medians, and combined conditions are being
+measured. The full acceptance gate has not passed.
 
 ## Sequential serving and matched downloads
 
@@ -146,6 +162,45 @@ tree, including the request-ownership and queue-limit changes; it is not the
 required comparison against the original PR head. The tests establish matched
 completion and the pressure run fits the predeclared memory envelope. They do
 not complete the full activation gate.
+
+### Download-policy fix and recovery
+
+The original PR at the baseline commit also fails the 30-second impaired test:
+zero of 32 blocks complete, after its only cold probe expires. The raw 4 MiB
+measurement above separates the transport's throughput limit from that policy
+failure.
+
+The shared download-policy fix gives an unmeasured peer the normal request
+deadline. Once measured, floor requests retain their shorter base timeout, with
+a 256 KiB/s minimum transfer rate. Each deadline includes earlier unreceived
+responses because those bytes must pass through the same ordered data stream.
+Probe counts, exact ownership checks, and the block-progress timeout remain.
+
+The cold-probe regression verifies delivery after the short rescue deadline and
+rejection after the normal deadline. The slow-peer scenario still requires full
+completion, no rejection or park, and a smaller final congestion window; it now
+allows reliability to remain perfect when the corrected deadlines avoid every
+timeout.
+
+| New measurement | Outcome |
+| --- | --- |
+| Paired download with 32,000 reverse requests, 50 ms RTT, and 1% loss | All 32 blocks and endings in 205.002 s; no session replacement |
+| Paired download with reverse requests and one paused sibling service | All blocks and endings in 1.809 s |
+| Two paused siblings; consumers resume after one second | No complete body before resume; original pair completes in 2.782 s |
+| Two siblings remain paused | Existing data-write timeout closes the connection; session and serving slots return to their initial counts; a fresh peer completes returned work in 1.473 s |
+| Twenty pair replacements with reverse request pressure, without loss | Every round completes; summed transfer time 35.236 s; real reopen backoff retained |
+
+The saturation test originally assumed the 32-second block-progress timeout
+would act first. The existing ten-second data-write timeout actually closes this
+fully blocked connection first, about 9.6 seconds after download timing starts.
+This is an existing deadline, not a new fullness timer. Both temporary and
+sustained cases keep the default windows.
+
+The full network-library run passed 1,230 tests. Three listener tests cannot bind
+their additional loopback source addresses on this Mac. A fourth test required a
+reliability dip even when no request expired; after adapting that assertion, all
+947 Zakura tests passed, with 11 standalone gates ignored. The node also compiles.
+Five-run baseline comparisons and impaired reopen rounds remain in progress.
 
 ## Paired transport and request ownership
 
@@ -199,9 +254,9 @@ tests wait until a real blocking job has started, terminate its async owner,
 assert that capacity is still charged, then release the job and verify exactly
 one resource release.
 
-The network interface and node adapter are not wired yet. The existing driver
-still uses `BlockRangeQueryLease` and `ReadRequest::BlocksByHeightRange`; this
-prototype does not change its production behavior.
+The network interface and node adapter are wired into the paired serving task.
+The old production driver still uses `BlockRangeQueryLease` and
+`ReadRequest::BlocksByHeightRange` until the paired version is enabled.
 
 ## Reproduction and checks
 

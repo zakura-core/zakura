@@ -3628,6 +3628,80 @@ async fn rpc_submitblock_cancellation_keeps_verification_ownership() {
     queue_task.abort();
 }
 
+#[tokio::test]
+async fn rpc_submitblock_rejects_invalid_proof_of_work_without_a_submission_slot() {
+    let _init_guard = zakura_test::init();
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut verifier: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (mined_tx, _mined_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (rpc, queue_task) = RpcImpl::new(
+        Mainnet,
+        Default::default(),
+        false,
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool, 1),
+        Buffer::new(state, 1),
+        Buffer::new(read_state, 1),
+        verifier.clone(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        Some(mined_tx),
+    );
+    let rpc = Arc::new(rpc);
+    let genesis: Block = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("genesis bytes deserialize");
+
+    // More distinct invalid blocks than the submission bound. The verifier never answers, so
+    // any slot these blocks held would stay held for the rest of the test.
+    let invalid_submissions: Vec<_> = (0..32u8)
+        .map(|nonce| {
+            let mut block = genesis.clone();
+            Arc::make_mut(&mut block.header).nonce = [nonce; 32].into();
+            let bytes = block.zcash_serialize_to_vec().expect("block serializes");
+            let rpc = rpc.clone();
+            tokio::spawn(async move { rpc.submit_block(HexData(bytes), None).await })
+        })
+        .collect();
+    let responses = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        futures::future::join_all(invalid_submissions),
+    )
+    .await
+    .expect("invalid blocks are rejected without waiting for the verifier");
+    for response in responses {
+        assert_eq!(
+            response.unwrap().unwrap(),
+            SubmitBlockErrorResponse::Rejected.into()
+        );
+    }
+    verifier.expect_no_requests().await;
+
+    // A solved block still reaches the verifier.
+    let solved = tokio::spawn({
+        let rpc = rpc.clone();
+        let bytes = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.to_vec();
+        async move { rpc.submit_block(HexData(bytes), None).await }
+    });
+    verifier
+        .expect_request_that(|request| {
+            matches!(request, zakura_consensus::Request::CommitMined { .. })
+        })
+        .await
+        .respond(Mainnet.genesis_hash());
+    assert_eq!(
+        solved.await.unwrap().unwrap(),
+        SubmitBlockResponse::Accepted
+    );
+    queue_task.abort();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_submitblock_errors() {
     let _init_guard = zakura_test::init();

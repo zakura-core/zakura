@@ -47,7 +47,7 @@ pub(super) async fn before_page_completion(peer: &ZakuraPeerId, request_id: u64)
     static SCHEDULE: OnceLock<Option<Schedule>> = OnceLock::new();
     static PAGE: AtomicU64 = AtomicU64::new(0);
     let Some(schedule) =
-        SCHEDULE.get_or_init(|| match std::env::var("ZAKURA_BENCH_HEADER_SCHEDULE") {
+        SCHEDULE.get_or_init(|| match std::env::var("SYNC_BENCH_HEADER_SCHEDULE") {
             Ok(value) => Some(
                 Schedule::parse(&value)
                     .unwrap_or_else(|error| panic!("invalid benchmark header schedule: {error}")),

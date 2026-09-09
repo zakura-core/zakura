@@ -79,15 +79,11 @@ not supply them with a legacy fallback.
 
 ## Validation and release gate
 
-The native process probe in `testkit/interop.rs` runs in independently built
-network test binaries. `scripts/test_iroh_interop.py --expect-mixed-rejection`
-checks successful old-old and new-new payload delivery and bounded failure in
-both mixed native directions. Each successful pair uses the production native
-control handshake and checks 1 MiB across bounded gossip frames. With `--mode legacy`, the runner instead executes the ignored legacy handshake probe in both
-mixed directions and requires successful Ping/Pong completion. These tests are
-ignored because they require an externally coordinated peer process. Both
-binaries must include the same probes, adapting only the renamed Iroh APIs on
-the old revision and assigning ephemeral native ports to test endpoints.
+The independently built process probes verified 1 MiB payload delivery for
+old-old and new-new native pairs, bounded rejection in both mixed native
+directions, and successful Ping/Pong exchanges in both mixed TCP directions.
+The probes and their runner are deferred to a separate testing PR; the completed
+results remain recorded in the [validation report](iroh-1.1-validation.md).
 
 The large bidirectional transfer regression sends 64 MiB each way with production
 transport limits, exceeding the send and receive windows. The exact noq 1.2.0

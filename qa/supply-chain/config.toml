@@ -28,6 +28,18 @@ url = "https://raw.githubusercontent.com/zcash/rust-ecosystem/main/supply-chain/
 [imports.zcashd]
 url = "https://raw.githubusercontent.com/zcash/zcash/master/qa/supply-chain/audits.toml"
 
+[policy.iroh]
+audit-as-crates-io = true
+
+[policy.iroh-base]
+audit-as-crates-io = true
+
+[policy.iroh-dns]
+audit-as-crates-io = true
+
+[policy.iroh-relay]
+audit-as-crates-io = true
+
 [policy.zakura]
 audit-as-crates-io = false
 

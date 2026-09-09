@@ -1469,11 +1469,32 @@ criteria = "safe-to-deploy"
 version = "0.92.0"
 notes = "Reviewed the manifest, the module-level documentation, and the endpoint and connection paths. The crate contains no unsafe code and its build script only emits target cfgs. It layers node discovery, relay fallback, and hole punching over QUIC, and it delegates all packet parsing to iroh-quinn-proto rather than doing its own; peer identity is a public key verified through the QUIC handshake, so a relayed path cannot impersonate a node. The library builds; its test target needs iroh-relay's server feature, which the standalone resolution does not enable, and the suite is network-dependent."
 
+[[audits.iroh]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "1.1.0 -> 1.1.0@git:9e6cbf251d2edd6304c2d9799fc29bf39788d305"
+importable = false
+notes = "Compared all 72 packaged Rust files with the registry release; they are byte-identical. The only package delta is the ed25519-dalek requirement from 3.x to published 2.2. Reviewed raw-public-key certificate identity matching, TLS 1.3 signature delegation, and the retained Dalek strict verification path. It rejects small-order keys and R points and noncanonical scalar encodings; legacy_compatibility is absent from the resolved features. RFC8032 known-answer and mutated-message, wrong-key, signature-mutation, weak-key and scalar rejection tests pass. This delta does not attest the unaudited upstream 1.1.0 baseline or its dependencies."
+
 [[audits.iroh-base]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.92.0"
 notes = "Reviewed all packaged source, manifest, and tests. Public keys are validated through ed25519-dalek before construction, signature verification is strict, key generation requires a CryptoRngCore, secret Debug output is redacted, and ticket decoding checks kind, base32 length, postcard structure, and public-key validity. There is no unsafe code, build script, or ambient capability. All 10 unit tests passed with all features."
+
+[[audits.iroh-base]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "1.1.0 -> 1.1.0@git:9e6cbf251d2edd6304c2d9799fc29bf39788d305"
+importable = false
+notes = "Compared all four packaged Rust files with the registry release; they are byte-identical. Only the ed25519-dalek and curve25519-dalek manifest requirements differ, retaining published 2.2.0 and 4.1.3. Reviewed parsing, signing and verify_strict use; the strict verification checks remain enabled. Fifteen existing key, serialization and endpoint-address tests, one doctest and two added authentication regression tests pass. This delta does not attest the unaudited upstream 1.1.0 baseline or its dependencies."
+
+[[audits.iroh-dns]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "1.1.0 -> 1.1.0@git:9e6cbf251d2edd6304c2d9799fc29bf39788d305"
+importable = false
+notes = "The packaged source, original manifest and build inputs are unchanged from registry 1.1.0. Compared all seven packaged Rust files byte for byte. Only the root workspace resolves the compatibility versions of sibling packages. This zero-source delta does not attest the unaudited upstream baseline or dependency graph."
 
 [[audits.iroh-metrics-derive]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -1504,6 +1525,13 @@ who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
 version = "0.92.0"
 notes = "Reviewed all packaged source, manifest, build script, and tests. The crate contains no unsafe code and its build script only emits target cfgs. The relay forwards opaque frames between nodes that authenticate with their own keys, so it cannot read the traffic it carries; frame decoding checks the declared length against the configured maximum before allocating, and per-client send queues are bounded so a slow reader is dropped rather than allowed to grow the server's memory. All 7 tests passed."
+
+[[audits.iroh-relay]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "1.1.0 -> 1.1.0@git:9e6cbf251d2edd6304c2d9799fc29bf39788d305"
+importable = false
+notes = "The packaged source, original manifest and build inputs are unchanged from registry 1.1.0. Compared all 32 packaged Rust files byte for byte. Only the root workspace resolves the compatibility versions of sibling packages. This zero-source delta does not attest the unaudited upstream baseline or dependency graph."
 
 [[audits.is-terminal]]
 who = "OpenAI Codex <noreply@openai.com>"

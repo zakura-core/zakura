@@ -70,7 +70,10 @@ The existing prelude and control encoding versions remain unchanged.
 Old and upgraded dual-stack nodes reject the native upgrade before handing off
 TCP and retain legacy connectivity. Independently built old/new process tests
 verify two Ping/Pong exchanges in both dialing directions with no native session
-registered. Native-only nodes in different cohorts cannot communicate. They
+registered. Full-node propagation and fresh-client catch-up also pass in both
+directions at a 66-block gap. Smaller gaps use the existing ten-minute fallback
+window; see the [measured recovery evidence](iroh-1.1-validation.md).
+Native-only nodes in different cohorts cannot communicate. They
 need reachable same-cohort seeds and a coordinated upgrade; a protocol bump does
 not supply them with a legacy fallback.
 
@@ -102,6 +105,11 @@ upstream release or separately approved publication strategy is required before
 release readiness. Retire the fork when the upstream dependency graph resolves
 and passes the same interoperability checks.
 
-The Git source also needs explicit cargo-vet policy and audit coverage. Existing
+The Git source has explicit cargo-vet policy and reviewed compatibility deltas,
+but upstream baseline and dependency coverage remains incomplete. Existing
 release and supply-chain checks remain enabled; passing cargo-deny does not
 satisfy cargo-vet or constitute a cryptographic audit.
+
+The follow-up [preparation evidence](iroh-1.1-validation.md) records the proposed
+package family, archive and consumer checks, authentication review, full-node
+recovery timing, and remaining cargo-vet coverage.

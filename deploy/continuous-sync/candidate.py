@@ -113,6 +113,9 @@ def launch(args, out):
         upload(node, args.key, bundle, '/root/genesis-candidate/host-tools.tar')
         upload(node, args.key, owner_path, '/root/genesis-candidate/owner.json')
         remote(node, args.key, ['tar', '-xf', '/root/genesis-candidate/host-tools.tar', '-C', '/root/genesis-candidate'])
+        # First-boot package upgrades can restart transient services. Finish them
+        # before starting the non-restartable build/sync controller.
+        remote(node, args.key, ['cloud-init', 'status', '--wait'], timeout=900)
         remote(node, args.key, ['systemd-run', '--unit=zakura-genesis-candidate', '--property=RuntimeMaxSec=22h',
                                '--property=ExecStopPost=/usr/bin/systemctl stop zakura.service',
                                '/bin/bash', '/root/genesis-candidate/candidate-start.sh'])
@@ -139,6 +142,10 @@ def collect(args, out):
         state_text = remote(node, args.key, ['python3', '-c', "from pathlib import Path; p=Path('/var/lib/zakura-continuous-sync/state.json'); print(p.read_text() if p.exists() else '{}')"])
         state = json.loads(state_text)
         unit = remote(node, args.key, ['systemctl', 'show', 'zakura-genesis-candidate', '-p', 'ActiveState', '-p', 'Result'])
+        journal = remote(node, args.key, ['journalctl', '--no-pager', '-n', '300',
+                         '-u', 'zakura-genesis-candidate', '-u', 'cloud-final',
+                         '-u', 'apt-daily-upgrade', '-u', 'unattended-upgrades'])
+        (out/(leg+'-bootstrap-journal.log')).write_text(journal)
         result = {'owner': owner, 'state': state, 'unit': unit, 'blocks_per_second': rate(state)}
         results[leg] = result
         # A complete/failed controller has stopped the node. Preserve its full evidence.

@@ -130,6 +130,16 @@ impl Node {
         serving: bool,
         peer_limit: Option<usize>,
     ) -> Self {
+        Self::with_range_source(blocks, serving, peer_limit, None, None)
+    }
+
+    fn with_range_source(
+        blocks: Arc<Vec<Arc<Block>>>,
+        serving: bool,
+        peer_limit: Option<usize>,
+        source: Option<Arc<dyn BlockRangeSource>>,
+        cooldown: Option<Duration>,
+    ) -> Self {
         let genesis = Block::zcash_deserialize(&BLOCK_MAINNET_GENESIS_BYTES[..])
             .unwrap()
             .hash();
@@ -141,6 +151,9 @@ impl Node {
         };
         let (tip_tx, tip_rx) = watch::channel(verified);
         let mut config = ZakuraBlockSyncConfig::default();
+        if let Some(cooldown) = cooldown {
+            config.no_progress_peer_cooldown = cooldown;
+        }
         config.peer_limits.inbound_queue_depth = 8;
         config.peer_limits.outbound_queue_depth = 8;
         if let Some(limit) = peer_limit {
@@ -174,7 +187,8 @@ impl Node {
             capture
         });
         let (handle, mut actions, reactor) = spawn_block_sync_reactor(startup);
-        let handle = handle.with_range_source(Arc::new(MemorySource(blocks.clone())));
+        let handle = handle
+            .with_range_source(source.unwrap_or_else(|| Arc::new(MemorySource(blocks.clone()))));
         let service = BlockSyncService::new_with_handle(config, handle.clone());
         let (progress_tx, received) = watch::channel(0);
         let driver_handle = handle.clone();
@@ -783,6 +797,155 @@ async fn paired_roles_reject_wrong_messages_before_reading_payloads() -> Result<
         );
         connection.close(0u32.into(), b"checked");
     }
+    client.close().await;
+    router.shutdown().await?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct StalledSource(Arc<tokio::sync::Notify>);
+impl BlockRangeSource for StalledSource {
+    fn read_range(
+        &self,
+        request: BlockRangeRead,
+    ) -> BoxFuture<'static, Result<BlockRangeReadResult, BoxError>> {
+        let seen = self.0.clone();
+        Box::pin(async move {
+            let (_, _, _, lease) = request.into_parts();
+            assert!(lease.try_start());
+            seen.notify_one();
+            std::future::pending::<()>().await;
+            drop(lease);
+            unreachable!()
+        })
+    }
+}
+
+#[tokio::test]
+async fn remote_pair_reset_with_unanswered_work_preserves_no_progress_policy(
+) -> Result<(), BoxError> {
+    let blocks = blocks();
+    let downloader = Node::with_range_source(
+        blocks.clone(),
+        false,
+        None,
+        None,
+        Some(Duration::from_secs(2)),
+    );
+    let seen = Arc::new(tokio::sync::Notify::new());
+    let server_node = Node::with_range_source(
+        blocks.clone(),
+        true,
+        None,
+        Some(Arc::new(StalledSource(seen.clone()))),
+        None,
+    );
+    let limits = ZakuraLocalLimits::from_config(&Config::default());
+    let server = LocalEndpointFactory::with_transport_config(limits.transport_config())
+        .endpoint(94301)
+        .await?;
+    let client = LocalEndpointFactory::with_transport_config(limits.transport_config())
+        .endpoint(94302)
+        .await?;
+    let remote_peer = ZakuraPeerId::new(server.node_id().as_bytes().to_vec())?;
+    let handler = |service: Arc<BlockSyncService>, endpoint| {
+        ZakuraProtocolHandler::new_with_registry(
+            ZakuraSupervisorHandle::new(16),
+            Network::Mainnet,
+            ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+            limits.clone(),
+            Arc::new(ServiceRegistry::new(vec![service]).unwrap()),
+        )
+        .with_endpoint(endpoint)
+    };
+    let server_handler = handler(server_node.service.clone(), server.clone());
+    let client_handler = handler(downloader.service.clone(), client.clone());
+    let router = Router::builder(server).accept(ALPN, server_handler).spawn();
+    let mut transport = connect_download_peer(
+        &client,
+        LocalEndpointFactory::node_addr(router.endpoint()).await,
+        client_handler,
+        limits.clone(),
+    )
+    .await?;
+    await_until("sessions admitted", DEADLINE, || {
+        downloader.service.peer_count() == 1 && server_node.service.peer_count() == 1
+    })
+    .await?;
+    downloader
+        ._tip
+        .send_replace((block::Height(COUNT), blocks.last().unwrap().hash()));
+    downloader
+        .handle
+        .send(BlockSyncEvent::NeededBlocks(
+            blocks
+                .iter()
+                .map(|block| BlockSyncBlockMeta {
+                    height: block.coinbase_height().unwrap(),
+                    hash: block.hash(),
+                    size: BlockSizeEstimate::Advertised(
+                        u32::try_from(block.zcash_serialized_size()).unwrap(),
+                    ),
+                })
+                .collect(),
+        ))
+        .await?;
+    timeout(DEADLINE, seen.notified())
+        .await
+        .expect("server sees initial request");
+    assert!(downloader.handle.outstanding_requests_for_test() > 0);
+    // Local retirement returns work without charging the remote peer a stall.
+    downloader
+        .service
+        .sessions_for_transport_test()
+        .pop()
+        .unwrap()
+        .1
+        .cancel_token()
+        .cancel();
+    timeout(DEADLINE, seen.notified())
+        .await
+        .expect("local cancellation permits another request");
+    assert!(!downloader.service.is_peer_parked_for_test(&remote_peer));
+    assert!(downloader.handle.outstanding_requests_for_test() > 0);
+    server_node
+        .service
+        .sessions_for_transport_test()
+        .pop()
+        .unwrap()
+        .1
+        .cancel_token()
+        .cancel();
+    await_until("remote reset parks unanswered download", DEADLINE, || {
+        downloader.service.is_peer_parked_for_test(&remote_peer)
+    })
+    .await?;
+    assert!(transport.connection.close_reason().is_none());
+    assert!(
+        timeout(Duration::from_secs(1), seen.notified())
+            .await
+            .is_err(),
+        "cooldown must prevent new requests"
+    );
+    timeout(DEADLINE, seen.notified())
+        .await
+        .expect("cooldown permits one readmission");
+    server_node
+        .service
+        .sessions_for_transport_test()
+        .pop()
+        .unwrap()
+        .1
+        .cancel_token()
+        .cancel();
+    // This fixture keeps a QUIC clone after register_and_serve returns. The
+    // production caller closes it when the cancelled connection handler exits.
+    timeout(DEADLINE, &mut transport._task)
+        .await
+        .expect("repeated remote reset ends the connection handler")??;
+    assert_eq!(downloader.service.peer_count(), 0);
+    assert_eq!(*downloader.received.borrow(), 0);
+    drop(transport);
     client.close().await;
     router.shutdown().await?;
     Ok(())

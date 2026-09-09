@@ -14,6 +14,7 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub struct FramedRecv {
     receiver: FramedReceiver,
+    remote_close: Option<tokio_util::sync::CancellationToken>,
 }
 
 #[derive(Debug)]
@@ -27,13 +28,30 @@ impl FramedRecv {
     pub fn new(receiver: mpsc::Receiver<Frame>) -> Self {
         Self {
             receiver: FramedReceiver::Plain(receiver),
+            remote_close: None,
         }
     }
 
     fn queued(receiver: mpsc::Receiver<QueuedFrame>) -> Self {
         Self {
             receiver: FramedReceiver::Queued(receiver),
+            remote_close: None,
         }
+    }
+
+    pub(crate) fn with_remote_close(
+        mut self,
+        remote_close: tokio_util::sync::CancellationToken,
+    ) -> Self {
+        self.remote_close = Some(remote_close);
+        self
+    }
+
+    /// Whether the peer closed either role of this pair before local cancellation.
+    pub(crate) fn remotely_closed(&self) -> bool {
+        self.remote_close
+            .as_ref()
+            .is_some_and(|closed| closed.is_cancelled())
     }
 
     /// Receive the next admitted frame, or `None` after the transport closes the stream.

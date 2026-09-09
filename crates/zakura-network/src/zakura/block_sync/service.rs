@@ -780,13 +780,24 @@ impl Service for BlockSyncService {
                                 run_cancel.clone(),
                                 wiring.trace.clone(),
                             );
+                            let download = routine.run();
+                            tokio::pin!(download);
                             let result = tokio::select! {
-                                result = routine.run() => result,
+                                result = &mut download => result,
                                 result = super::serving::serve_requests(
                                     block_sync_session, incoming_requests, serving, wiring.registry,
                                     local_status.expect("paired serving has a local status watch"),
                                     source, wiring.trace,
-                                ) => result,
+                                ) => {
+                                    // Do not drop unanswered downloads before their
+                                    // remote-close policy has been applied.
+                                    run_cancel.cancel();
+                                    match (result, download.await) {
+                                        (Err(error @ SinkReject::Protocol(_)), _)
+                                        | (_, Err(error @ SinkReject::Protocol(_))) => Err(error),
+                                        (serving, download) => serving.and(download),
+                                    }
+                                },
                             };
                             run_cancel.cancel();
                             result

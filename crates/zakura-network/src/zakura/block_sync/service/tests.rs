@@ -201,3 +201,9 @@ impl CurrentSessions {
         self.notify();
     }
 }
+
+impl BlockSyncService {
+    pub(crate) fn is_peer_parked_for_test(&self, peer: &ZakuraPeerId) -> bool {
+        self.peer_is_parked(peer)
+    }
+}

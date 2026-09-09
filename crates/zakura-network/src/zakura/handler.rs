@@ -4180,6 +4180,7 @@ async fn persistent_stream_worker(
         outbound_rx,
         queue_depth_limit,
         OrderedWritePolicy::Standalone,
+        None,
     )
     .await;
 }
@@ -4194,6 +4195,7 @@ async fn persistent_stream_worker_with_policy(
     outbound_rx: FramedWorkerRecv,
     queue_depth_limit: usize,
     write_policy: OrderedWritePolicy,
+    remote_close: Option<CancellationToken>,
 ) {
     let context = Arc::new(context);
     let stream_kind = prelude.stream_kind;
@@ -4203,6 +4205,7 @@ async fn persistent_stream_worker_with_policy(
     // A dedicated reader also preserves partial frame reads across outbound writes.
     let (error_tx, mut error_rx) = mpsc::channel::<ZakuraHandlerError>(1);
     let reader_context = Arc::clone(&context);
+    let reader_remote_close = remote_close.clone();
     let reader = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
         let mut recv = recv;
         loop {
@@ -4277,6 +4280,13 @@ async fn persistent_stream_worker_with_policy(
             // the disconnect is guaranteed even if the main loop tore the worker
             // down for a stopped outbound write before processing it.
             let must_disconnect = !matches!(error, ZakuraHandlerError::Closed);
+            if !must_disconnect && !reader_context.stream_token.is_cancelled() {
+                if let Some(closed) = &reader_remote_close {
+                    // Publish the cause before waking either the service EOF or
+                    // the sibling worker's cancellation path.
+                    closed.cancel();
+                }
+            }
             let _ = error_tx.send(error).await;
             if must_disconnect {
                 reader_context.close_cause.record("ordered_read_error");
@@ -4329,6 +4339,11 @@ async fn persistent_stream_worker_with_policy(
                                 break;
                             }
                             if ordered_stream_write_was_stopped(&error) {
+                                if !context.stream_token.is_cancelled() {
+                                    if let Some(closed) = &remote_close {
+                                        closed.cancel();
+                                    }
+                                }
                                 debug!(?error, "closing Zakura ordered stream after peer stopped receiving");
                                 break;
                             }

@@ -411,6 +411,22 @@ impl PeerRoutine {
     /// reject. A reject returns `Err(SinkReject::protocol(..))` so the supervised
     /// pipe tears the whole connection down.
     pub(super) async fn run(mut self) -> Result<(), SinkReject> {
+        let cancel = self.cancel.clone();
+        let result = tokio::select! {
+            biased;
+            () = cancel.cancelled() => Ok(()),
+            result = self.run_inner() => result,
+        };
+        // Transport cancels both roles when either closes. Settle the download
+        // policy even if cancellation interrupts a local capacity wait.
+        if result.is_ok() && self.recv.remotely_closed() {
+            self.handle_remote_stream_closed(Instant::now())
+        } else {
+            result
+        }
+    }
+
+    async fn run_inner(&mut self) -> Result<(), SinkReject> {
         // Local clones so the `Notified` futures below borrow these handles, not
         // `self` — `self.try_fill()` needs `&mut self` while the notifications are
         // pinned. The clones share the same underlying `Arc`, so the wakes still

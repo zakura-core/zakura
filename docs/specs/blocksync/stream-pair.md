@@ -82,7 +82,9 @@ Request writes have no independent write timeout. The data stream has a bounded
 32-second write deadline, including control and ending messages. This allows
 shared-credit waits on slow links while other services are paused. Cancellation
 can still interrupt a data write. Stream resets during a payload remain local to
-the stream pair. A graceful end with a truncated frame payload remains invalid.
+the stream pair. A data-write timeout also resets only the pair, preserving
+unrelated services on the connection while block sync reopens. A graceful end
+with a truncated frame payload remains invalid.
 
 ## Flow control
 

@@ -10,6 +10,11 @@ const DATA: Stream = Stream {
     mode: StreamMode::Ordered,
 };
 const REQUESTS: Stream = Stream { kind: 65, ..DATA };
+const SIBLING: Stream = Stream {
+    kind: 66,
+    capability: 1 << 17,
+    ..DATA
+};
 const PAIR: OrderedStreamPair = OrderedStreamPair {
     data: DATA,
     requests: REQUESTS,
@@ -22,6 +27,25 @@ struct PairService {
     sessions: mpsc::Sender<Peer>,
 }
 
+#[derive(Debug)]
+struct SiblingService(mpsc::Sender<Peer>);
+
+impl Service for SiblingService {
+    fn name(&self) -> &'static str {
+        "test-sibling"
+    }
+    fn streams(&self) -> &[Stream] {
+        &[SIBLING]
+    }
+    fn add_peer(&self, peer: Peer) {
+        let cancel = peer.service_cancel_token();
+        if self.0.try_send(peer).is_err() {
+            cancel.cancel();
+        }
+    }
+    fn remove_peer(&self, _: &ZakuraPeerId, _: ZakuraConnId) {}
+}
+
 impl Service for PairService {
     fn name(&self) -> &'static str {
         "test-pair"
@@ -31,6 +55,9 @@ impl Service for PairService {
     }
     fn ordered_stream_pair(&self, stream: Stream) -> Option<OrderedStreamPair> {
         [DATA, REQUESTS].contains(&stream).then_some(PAIR)
+    }
+    fn stream_queue_depths(&self, _: Stream) -> Option<(usize, usize)> {
+        Some((1, 1))
     }
     fn ordered_stream_policy(&self, _: u16) -> OrderedStreamPolicy {
         OrderedStreamPolicy {
@@ -93,6 +120,8 @@ struct Fixture {
     serving: AbortOnDropHandle<Result<(), ZakuraHandlerError>>,
     server_sessions: mpsc::Receiver<Peer>,
     client_sessions: mpsc::Receiver<Peer>,
+    server_siblings: mpsc::Receiver<Peer>,
+    client_siblings: mpsc::Receiver<Peer>,
 }
 
 impl Fixture {
@@ -106,18 +135,26 @@ impl Fixture {
             .await?;
         let (server_tx, server_sessions) = mpsc::channel(2);
         let (client_tx, client_sessions) = mpsc::channel(2);
-        let handler = |sessions, endpoint: Endpoint| {
+        let (server_sibling_tx, server_siblings) = mpsc::channel(1);
+        let (client_sibling_tx, client_siblings) = mpsc::channel(1);
+        let handler = |sessions, siblings, endpoint: Endpoint| {
             ZakuraProtocolHandler::new_with_registry(
                 ZakuraSupervisorHandle::new(16),
                 Network::Mainnet,
                 ZakuraHandshakeConfig::for_network(&Network::Mainnet),
                 local.clone(),
-                Arc::new(ServiceRegistry::new(vec![Arc::new(PairService { sessions })]).unwrap()),
+                Arc::new(
+                    ServiceRegistry::new(vec![
+                        Arc::new(PairService { sessions }),
+                        Arc::new(SiblingService(siblings)),
+                    ])
+                    .unwrap(),
+                ),
             )
             .with_endpoint(endpoint)
         };
-        let server_handler = handler(server_tx, server.clone());
-        let client_handler = handler(client_tx, client.clone());
+        let server_handler = handler(server_tx, server_sibling_tx, server.clone());
+        let client_handler = handler(client_tx, client_sibling_tx, client.clone());
         let router = Router::builder(server).accept(ALPN, server_handler).spawn();
         let address = LocalEndpointFactory::node_addr(router.endpoint()).await;
         let (connection, serving) = super::super::tests::connection::connect_and_serve(
@@ -136,6 +173,8 @@ impl Fixture {
             serving,
             server_sessions,
             client_sessions,
+            server_siblings,
+            client_siblings,
         })
     }
 
@@ -177,6 +216,68 @@ async fn exchange(client: &mut Session, server: &mut Session) -> Result<(), BoxE
         Some(response)
     );
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn paired_data_timeout_preserves_sibling_and_reopens_pair() -> Result<(), BoxError> {
+    let _guard = zakura_test::init();
+    let mut fixture = Fixture::start().await?;
+    let (client, server) = fixture.sessions().await?;
+    let mut client_sibling = timeout(TEST_TIMEOUT, fixture.client_siblings.recv())
+        .await
+        .expect("the client admits the sibling service")
+        .ok_or("missing client sibling")?;
+    let mut server_sibling = timeout(TEST_TIMEOUT, fixture.server_siblings.recv())
+        .await
+        .expect("the server admits the sibling service")
+        .ok_or("missing server sibling")?;
+    let (mut sibling_recv, _send) = client_sibling.take_stream(SIBLING.kind).unwrap();
+    let (_recv, sibling_send) = server_sibling.take_stream(SIBLING.kind).unwrap();
+
+    // Keep the peer's data consumer paused past the actual production deadline.
+    // More than both transport windows ensures a data write must wait.
+    let started = Instant::now();
+    let sender = client.data_send.clone();
+    let writes = AbortOnDropHandle::new(tokio::spawn(async move {
+        for _ in 0..80 {
+            sender.send(frame(2, 43, 1024 * 1024)).await?;
+        }
+        Ok::<_, BoxError>(())
+    }));
+    timeout(PAIRED_DATA_WRITE_TIMEOUT + Duration::from_secs(10), async {
+        loop {
+            let ping = frame(1, 17, 64);
+            sibling_send.send(ping.clone()).await?;
+            assert_eq!(sibling_recv.recv().await, Some(ping));
+            tokio::select! {
+                () = client.cancel.cancelled() => break,
+                () = tokio::time::sleep(Duration::from_millis(100)) => {},
+            }
+        }
+        Ok::<_, BoxError>(())
+    })
+    .await
+    .expect("the paired data writer retires its session at the write deadline")?;
+    assert!(started.elapsed() >= PAIRED_DATA_WRITE_TIMEOUT);
+    timeout(TEST_TIMEOUT, server.cancel.cancelled()).await?;
+    assert!(!client.connection_cancel.is_cancelled());
+    assert!(!server.connection_cancel.is_cancelled());
+    assert!(!client_sibling.service_cancel_token().is_cancelled());
+    assert!(!server_sibling.service_cancel_token().is_cancelled());
+    assert!(fixture.connection.close_reason().is_none());
+    assert!(timeout(TEST_TIMEOUT, writes).await??.is_err());
+
+    let (mut replacement_client, mut replacement_server) = fixture.sessions().await?;
+    assert_eq!(replacement_client.conn_id, client.conn_id);
+    assert_ne!(replacement_client.id, client.id);
+    exchange(&mut replacement_client, &mut replacement_server).await?;
+    let ping = frame(1, 19, 64);
+    timeout(TEST_TIMEOUT, sibling_send.send(ping.clone())).await??;
+    assert_eq!(
+        timeout(TEST_TIMEOUT, sibling_recv.recv()).await?,
+        Some(ping)
+    );
+    fixture.close().await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

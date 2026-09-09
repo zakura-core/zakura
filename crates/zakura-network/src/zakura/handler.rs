@@ -4149,6 +4149,10 @@ enum OrderedWritePolicy {
     PairRequests,
 }
 
+#[derive(Debug, Error)]
+#[error("Zakura outbound frame write timed out")]
+struct OrderedFrameWriteTimeout;
+
 async fn persistent_stream_worker(
     send: SendStream,
     recv: RecvStream,
@@ -4308,6 +4312,13 @@ async fn persistent_stream_worker_with_policy(
                             } => result,
                         };
                         if let Err(error) = result {
+                            if write_policy == OrderedWritePolicy::PairData
+                                && error.is::<OrderedFrameWriteTimeout>()
+                            {
+                                debug!(stream_kind, stream_id = context.stream_id,
+                                    "retiring Zakura stream pair after data write timeout");
+                                break;
+                            }
                             if ordered_stream_write_was_stopped(&error) {
                                 debug!(?error, "closing Zakura ordered stream after peer stopped receiving");
                                 break;
@@ -4760,7 +4771,7 @@ async fn write_ordered_frame_with_policy(
         };
         timeout(write_timeout, send.write_all(&frame))
             .await
-            .map_err(|_| -> BoxError { "Zakura outbound frame write timed out".into() })??;
+            .map_err(|_| -> BoxError { Box::new(OrderedFrameWriteTimeout) })??;
     }
     Ok(())
 }

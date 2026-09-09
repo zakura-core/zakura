@@ -14,6 +14,34 @@ ROOT = Path(__file__).resolve().parent
 LEGS = ('baseline', 'candidate')
 TAG = 'zakura-pr-node'
 
+# Read-only observations run from collection, outside the host's sync controller.
+LIVE_OBSERVATION = '''
+import json, time, urllib.request
+from pathlib import Path
+result = {'observed_at_epoch': time.time(), 'errors': {}}
+for name, path in {
+    'environment': '/root/genesis-candidate/environment.json',
+    'node_config': '/etc/zakura/node.toml',
+    'cpu_counters': '/proc/stat',
+    'memory': '/proc/meminfo',
+    'disk_counters': '/proc/diskstats',
+    'uptime': '/proc/uptime',
+}.items():
+    try:
+        result[name] = Path(path).read_text()
+    except OSError as error:
+        result['errors'][name] = str(error)
+try:
+    with urllib.request.urlopen('http://127.0.0.1:9999/metrics', timeout=5) as response:
+        limit = 4 * 1024 * 1024
+        data = response.read(limit + 1)
+        result['metrics_truncated'] = len(data) > limit
+        result['metrics'] = data[:limit].decode('utf-8', errors='replace')
+except OSError as error:
+    result['errors']['metrics'] = str(error)
+print(json.dumps(result))
+'''
+
 
 def run(args, **kwargs):
     return subprocess.run(args, check=True, text=True, capture_output=True, timeout=kwargs.pop('timeout', 120), **kwargs).stdout
@@ -146,6 +174,8 @@ def collect(args, out):
                          '-u', 'zakura-genesis-candidate', '-u', 'cloud-final',
                          '-u', 'apt-daily-upgrade', '-u', 'unattended-upgrades'])
         (out/(leg+'-bootstrap-journal.log')).write_text(journal)
+        observation = remote(node, args.key, ['python3', '-c', LIVE_OBSERVATION])
+        (out/(leg+'-live-observation.json')).write_text(observation)
         result = {'owner': owner, 'state': state, 'unit': unit, 'blocks_per_second': rate(state)}
         results[leg] = result
         # A complete/failed controller has stopped the node. Preserve its full evidence.

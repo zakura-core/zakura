@@ -75,7 +75,7 @@ Before measuring the prototype, record each workload, connection/stream counts, 
 
 Use an ordinary download from B to A: A must receive its requested blocks and the ending message, with responses matched to its actual outstanding request. Exercise other paused services, delayed acknowledgments/loss, and reset/reopen cycles, including combined conditions. Starting queries or accepting bytes into a send queue is insufficient.
 
-Separately, inject extra `GetBlocks` requests from test peer B while A's serving capacity is occupied. Within the declared supported workload, A's download must still complete and the extra requests must remain bounded. This checks resilience to incoming request pressure. Remove the earlier requirement that both peers complete matched downloads from each other simultaneously.
+Separately, inject extra `GetBlocks` requests from test peer B while A's serving capacity is occupied. Within the declared supported workload, A's download must still complete and the extra requests must remain bounded. This checks resilience to incoming request pressure.
 
 Full buffers are ordinary backpressure, not a reason to disconnect. Let paused consumers resume and release transport allowance naturally. If expected block progress remains absent until the existing block-progress deadline, retire the affected stream pair and apply the existing cooldown and repeated-stall policy. Request expiry can return missing work earlier. Reuse these timers rather than adding a separate fullness timer.
 

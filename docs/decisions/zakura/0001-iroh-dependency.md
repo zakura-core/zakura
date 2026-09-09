@@ -106,7 +106,11 @@ release readiness. Retire the fork when the upstream dependency graph resolves
 and passes the same interoperability checks.
 
 The Git source has explicit cargo-vet policy and reviewed compatibility deltas,
-but upstream baseline and dependency coverage remains incomplete. Existing
+and the upstream baseline and dependency graph are covered by audit records and
+documented exemptions. One hold gates deployment: the Iroh 1.1 delta retains
+mapped-address entries for every authenticated identity for the life of the
+endpoint, a remotely driven memory-exhaustion vector that must be fixed in the
+fork or upstream before native transport is enabled on public nodes. Existing
 release and supply-chain checks remain enabled; passing cargo-deny does not
 satisfy cargo-vet or constitute a cryptographic audit.
 

@@ -51,12 +51,12 @@ requirement and add review of each Git delta. The four recorded deltas cover
 only the compared source and manifest changes. They do not exempt the upstream
 baseline or trust all future publications from any maintainer.
 
-Cargo-vet now reports 24 versions missing `safe-to-deploy` coverage. All are
-unfinished reviews of the upstream Iroh 1.1 dependency graph; the two
-cryptographic concerns below are recorded as documented audit holds.
-The exact versions and suggested review bases are recorded in
-`qa/supply-chain/iroh-1.1-audit-backlog.json`. Refresh that file from
-`cargo vet check --output-format json` after dependency or audit changes.
+`cargo vet check` now passes for the complete Iroh 1.1 dependency graph. The
+final pass added thirteen audit records and eleven exact-version exemptions
+whose notes carry audit holds; the holds are listed below, and the first of them
+gates native deployment. `qa/supply-chain/iroh-1.1-audit-backlog.json` records
+the empty failure list from `cargo vet check --output-format json`; refresh it
+after dependency or audit changes.
 
 Refreshing the eight configured audit imports and recording eleven source
 reviews first reduced missing coverage from 69 to 58. A further 27 records
@@ -92,9 +92,15 @@ and complete API ABI validation were not performed. Conditional-move tests
 passed on native AArch64 and the portable fallback: 105 core tests and four
 regressions on each. This is not a timing guarantee for every architecture.
 
-The remaining 27 reviews include 15 without a reusable same-package baseline.
-They include Iroh/noq transport, DNS parsers/resolvers, OS bindings and concurrent
-collections. Passing integration tests does not complete those source reviews.
+The final pass reviewed the remaining transport, DNS, OS-binding and concurrent-
+collection packages. Full or delta certifications cover hickory-proto, hickory-
+resolver and hickory-net 0.26.2, netwatch 0.19.3, the netdev 0.45.1 to 0.46.2
+delta, windows-sys 0.45.0, jni-sys 0.3.1, three of the four objc2 framework
+crates, and noq, noq-proto and noq-udp 1.2.0. Each record names the files,
+unsafe surfaces, tests and probes behind it and the caller constraints it relies
+on; source review on macOS did not execute Linux, Windows or Android code paths.
+Eleven packages did not meet `safe-to-deploy` as shipped and are held under
+exemptions that record the defect, listed under review holds below.
 
 ### LRU version selection
 
@@ -121,11 +127,57 @@ the eventual registry-package validation must check its resolved LRU version.
 
 ### Review holds
 
-The two remaining holds concern upstream cryptographic packages, not changes to
-cryptographic implementations in the compatibility fork. AES-GCM and POLYVAL
-are newly selected dependencies relative to the PR base; cipher remains the
-existing registry version 0.4.4. Neither held package has an audit record; both are held under exact-version
-exemptions carrying these notes.
+Every hold is an exact-version exemption whose note records the defect, its
+reachability from the node, and the upstream change that would lift it. The
+first hold gates deployment; the others concern code that peer input does not
+reach in Zakura's configuration.
+
+- **iroh 1.1.0 (release gate):** the 0.92.0 to 1.1.0 delta dropped the inactive-
+  node bound the audited base enforced, and the mapped-address tables have
+  insert-on-miss lookups with no removal path, so every completed handshake from
+  a fresh identity, inbound included, leaves entries for the life of the
+  endpoint. On an internet-exposed acceptor that is a remotely driven memory-
+  exhaustion vector of roughly 100 to 200 bytes per identity, and the consumer
+  cannot evict entries through the public API. The delta also retries failed
+  path opens from an uncapped, undeduplicated queue that a remote can grow
+  geometrically when the local node holds two or more client connections to it.
+  The rest of the delta, including the raw-public-key TLS identity binding, was
+  reviewed and found sound. The compatibility fork or an upstream fix must
+  remove mapped-address entries when a remote actor is retired, or restore an
+  inactive bound, and cap the pending path queue before native transport is
+  enabled on public nodes; until the queue is bounded, keep at most one client-
+  initiated connection per remote.
+- **iroh-relay 1.1.0:** derived Debug output includes relay bearer tokens and
+  the server keeps an uncapped list of duplicate-identity clients; relays are
+  disabled and the server feature is not compiled, so neither path is reachable.
+- **papaya 0.2.5 and seize 0.5.1:** papaya's shared-collector configuration
+  frees memory still reachable through a safe guard, its set type has an under-
+  constrained Sync bound, and seize can hand a reused thread ID to a live guard
+  during thread-local teardown; iroh uses only per-map default collectors and
+  holds no guards in thread-local destructors.
+- **prefix-trie 0.8.4:** mutable iterators and views auto-implement Send without
+  a T: Send bound; hickory-proto stores only IP networks.
+- **dlopen2 0.8.2:** the new safe open_with_flags entry point builds a C string
+  without rejecting interior NUL bytes; netdev passes only fixed library names.
+- **netdev 0.45.1:** the Windows address conversion reads a SOCKADDR_INET view
+  without checking the reported length; netwatch selects this line only on
+  Windows, and 0.46.2 fixes it.
+- **netlink-packet-route 0.31.0 and 0.33.0:** each release carries a parse panic
+  on a short attribute (wireless events in 0.31.0, bareudp source ports in
+  0.33.0) and an incorrect IPv6 tunnel value length; messages come only from the
+  Linux kernel.
+- **plist 1.10.1:** out-of-range binary dates panic during ordinary
+  deserialization, an acyclic shared-object graph materializes exponentially
+  from a few hundred bytes, and nesting depth is unbounded; netdev reads only
+  local macOS configuration through it.
+- **objc2-system-configuration 0.3.2:** three generated wrappers are safe but
+  accept any CFArray where the framework requires a specific array; netdev and
+  netwatch never call them.
+
+The two cryptographic holds concern upstream packages, not changes to
+cryptographic implementations in the compatibility fork. AES-GCM and POLYVAL are
+newly selected dependencies relative to the PR base; cipher remains the existing
+registry version 0.4.4.
 
 - **aes-gcm 0.10.3:** Its plaintext bound permits `2^36` bytes, exceeding the
   `2^36 - 32` byte limit in [NIST SP 800-38D, section 5.2.1.1][gcm-spec]. Its
@@ -152,18 +204,17 @@ They have not been adopted or certified here. The upstream fix references an
 advisory identifier whose details were unavailable; no advisory disposition is
 inferred from that reference.
 
-These holds need a supported upstream fix/version or an explicit review of the
-restricted usage before coverage can be completed. They are not evidence that
-Zakura must fork BIP32 or another cryptographic package. The large transport and
-platform reviews remain unfinished independently of these holds.
+These holds need a supported upstream fix or an explicit review of the
+restricted usage before the exemptions can be retired. They are not evidence
+that Zakura must fork BIP32 or another cryptographic package.
 
 [gcm-spec]: https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-38d.pdf
 [gcm-fix]: https://github.com/RustCrypto/AEADs/commit/94366496b72126872292d8e99631560383db4471
 
 Publication under the proposed names does not erase this review requirement.
 The new registry packages will need audit records tied to their published
-contents. The existing cargo-vet CI gate remains enabled and fails until the
-remaining coverage is supplied; no blanket exemption has been added.
+contents. The cargo-vet CI gate remains enabled and now passes; no blanket exemption has
+been added, and every exemption names the defect it covers.
 
 ## Semver and packaging gates
 

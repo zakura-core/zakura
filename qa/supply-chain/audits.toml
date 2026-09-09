@@ -4381,3 +4381,24 @@ criteria = "safe-to-deploy"
 user-id = 169181 # Kris Nuttycombe (nuttycom)
 start = "2024-12-17"
 end = "2027-07-10"
+
+[[audits.iroh-quinn]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.14.0 -> 0.14.0@git:1dcc7a43488fecd199d343d47e93e9ed8319fcaa"
+importable = false
+notes = "Compared the 25 packaged files, including the original manifest, with the pinned Git source. They are byte-identical to the already audited registry release. The related protocol crate carries the separately audited loss-recovery fix."
+
+[[audits.iroh-quinn-proto]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.13.0 -> 0.13.0@git:1dcc7a43488fecd199d343d47e93e9ed8319fcaa"
+importable = false
+notes = "Compared all 53 packaged files with the pinned source. Only the transmit-bound condition and its regression test differ. The condition counts datagrams directly instead of inferring their count from bytes, so a short loss probe cannot admit a second datagram when the socket supports only one. The integer conversion is bounded by the existing ten-segment clamp. The regression failed on the original condition; all 254 default-feature protocol tests pass with the fix. No parsing, cryptography, dependency, or unsafe-code changes."
+
+[[audits.iroh-quinn-udp]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.5.7 -> 0.5.7@git:1dcc7a43488fecd199d343d47e93e9ed8319fcaa"
+importable = false
+notes = "Compared the 13 packaged files, including the original manifest and build script, with the pinned Git source. They are byte-identical to the already audited registry release. Socket and platform-specific code is unchanged."

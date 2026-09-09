@@ -5465,6 +5465,7 @@ impl ZakuraHandlerError {
 
 #[cfg(test)]
 mod tests {
+    mod quic_progress;
     use super::*;
     use crate::{
         protocol::internal::{InventoryResponse, Response},

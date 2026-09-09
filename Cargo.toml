@@ -35,6 +35,14 @@ keywords = ["zakura", "zcash"]
 rust-version = "1.97"
 edition = "2021"
 
+# Backport the loss-probe datagram limit fix to Iroh 0.92's exact QUIC versions.
+# Keep the related crates on one revision. Workspace patches are not inherited
+# by downstream library users; they must apply the same patch in their workspace.
+[patch.crates-io]
+iroh-quinn = { git = "https://github.com/zakura-core/iroh-quinn", rev = "1dcc7a43488fecd199d343d47e93e9ed8319fcaa" }
+iroh-quinn-proto = { git = "https://github.com/zakura-core/iroh-quinn", rev = "1dcc7a43488fecd199d343d47e93e9ed8319fcaa" }
+iroh-quinn-udp = { git = "https://github.com/zakura-core/iroh-quinn", rev = "1dcc7a43488fecd199d343d47e93e9ed8319fcaa" }
+
 [workspace.dependencies]
 # Zakura's published binary assets: the reviewed Mainnet historical frontier grid, which is too
 # large to carry in git history at the weekly cadence the release state advances.

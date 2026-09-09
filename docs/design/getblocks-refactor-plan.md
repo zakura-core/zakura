@@ -290,7 +290,7 @@ cargo nextest run --profile regulation-properties --locked
 cargo nextest run --profile zakura-integration --locked
 ```
 
-The `regulation-properties` profile and version-4 replay model have been ported from #896 to the sequential serving path. Confirm the intended tests actually run. Preserve #933's transport fixes and the current QUIC crate-family pin and lockfile. Run the relevant documentation/configuration checks too.
+The `regulation-properties` profile and version-4 replay model have been ported from #896 to the sequential serving path. Confirm the intended tests actually run. Preserve the included QUIC loss-recovery backport and the current crate-family pin and lockfile. Run the relevant documentation/configuration checks too.
 
 ## Code map and baseline
 

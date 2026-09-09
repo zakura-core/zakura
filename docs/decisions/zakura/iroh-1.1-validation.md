@@ -51,17 +51,63 @@ requirement and add review of each Git delta. The four recorded deltas cover
 only the compared source and manifest changes. They do not exempt the upstream
 baseline or trust all future publications from any maintainer.
 
-Cargo-vet still reports 69 versions missing `safe-to-deploy` coverage. This is
-missing audit evidence, not 69 identified vulnerabilities. The remaining work
+Cargo-vet still reports 58 versions missing `safe-to-deploy` coverage. This is
+missing audit evidence rather than identified vulnerabilities. The remaining work
 includes Iroh/noq, their networking and platform dependencies, and new versions
 of smaller supporting packages. The exact versions and suggested review bases
 are recorded in `qa/supply-chain/iroh-1.1-audit-backlog.json`. Refresh that file
 from `cargo vet check --output-format json` after dependency or audit changes.
 
+Refreshing the eight configured audit imports and recording eleven completed
+source reviews reduced the missing versions from 69 to 58. The new records cover
+cesu8, data-encoding and its two macros, ghash, iroh-metrics-derive, netlink-sys,
+strum, strum_macros, system-configuration and wmi. Delta records reuse existing
+reviewed baselines; full records cover the named package only. Audit notes record
+source scope and test limitations. No new exemptions or publisher trust were added.
+
+The remaining 58 suggested reviews include 25 without a reusable same-package
+baseline. Prioritize the Iroh/noq transport, authentication and parser boundaries,
+then OS/FFI and concurrent collection ownership, and the remaining support crates.
+Windows import-library packages contain binary changes despite their small text
+diffs; those need provenance and binary review. Passing integration tests does
+not complete these source reviews. Dependency review remains unfinished.
+
 Publication under the proposed names does not erase this review requirement.
 The new registry packages will need audit records tied to their published
 contents. The existing cargo-vet CI gate remains enabled and fails until the
 remaining coverage is supplied; no blanket exemption has been added.
+
+## CI test correction
+
+The historical-tree-error RPC test returned its mocked Orchard error before
+receiving the other concurrent block-info requests. On Ubuntu, early error
+propagation could cancel those requests, leaving the test waiting for calls that
+would never arrive. The test now receives both requests before releasing the
+error. Production RPC code is unchanged. Six focused RPC tests and 100 repeated
+runs of the affected test pass; all three Ubuntu unit-test shards pass at
+`22f7af9b93d95d34f4219a9e09d9a835312d75c2`.
+
+## Automated feedback
+
+The WMI warning concerns registry package wmi 0.18.4, selected through netwatch
+on Windows; the base used 0.17.3. All 24 packaged Rust files match upstream commit
+`90dad22895ce91691470d15952f40cef87b4d856` after line-ending normalization. Review
+of the complete delta found no obfuscation or hidden execution. Netwatch uses a
+fixed local route-table query and does not call the added WMI mutation APIs.
+This supports a likely false-positive assessment, but Socket's detailed detector
+evidence was unavailable behind sign-in. The alert remains open, and Windows
+runtime tests were not run.
+
+The nine V12 findings from run 7562 describe mechanisms already present at base
+`0c854abf187d1baf001de6af85f2d7e15972e7cd`. Source review supports concerns around
+native ban admission, peer-directed internal-address probes, advertised-address
+construction, stale maintained dials, address-success bookkeeping and handoff
+metadata binding. The Sybil/backoff finding involves an existing anti-poisoning
+tradeoff: replacing identity/IP backoff with global IP backoff alone would allow
+forged records to suppress honest addresses. These need separate fixes or explicit
+security dispositions before broader native deployment. Their pre-existing origin
+does not establish safety; exploitability and the tool's severity labels have not
+been independently demonstrated. No finding or alert state was changed.
 
 ## Network validation
 
@@ -113,5 +159,51 @@ in 603.58 seconds and the old client in 603.26 seconds. Both peers reach the sam
 tip, retain two legacy connections each and report no native handoff. This
 existing recovery delay remains an operational limitation for a mixed cohort.
 
-Long-duration deployment soak and broader Linux loss, delay, reordering and MTU
-comparisons remain separate release gates; no deployment has been performed.
+## Linux native impairment comparison
+
+The local comparison runs Ubuntu 24.04 amd64 in a disposable Docker container
+with network administration confined to that container. Base source
+`0c854abf187d1baf001de6af85f2d7e15972e7cd` comes from CI run 34290566584;
+upgrade source `5f94410f97507652f58e194ed17112ef6727cbb5` comes from CI run
+34296029999. The later RPC test correction changes no production code.
+
+The binary SHA-256 values are:
+
+- Base: `2cfb748d8db40618b9617022be082103f8eaabd41d0502cc07992418fe801e71`.
+- Upgrade: `2b481d04747ab468eec0880817d9496dbce02ba5e9b640ea52f49530c1b7cc72`.
+
+Each same-version pair mines 33 blocks on each peer, requires propagation both
+ways, and restarts the client with empty ephemeral state. The seed has no TCP
+peers and the client enables only native transport. Both retain a native
+connection and report zero TCP peers at completion. Propagation and fresh-state
+catch-up each have a 180-second deadline. The outage profile drops all native
+UDP for five seconds, mines one extra block, verifies that it cannot propagate
+while blocked, then checks recovery after removing the impairment.
+
+The profiles use 50 ms delay with 10 ms variation and 1% loss; 20 ms delay with
+5 ms variation and 25% reordering at 50% correlation; loopback MTU 1280; and the
+five-second outage. Packet counters confirm that netem affected native traffic.
+
+All ten cases pass. Restart catch-up times, in seconds:
+
+| Profile | Base | Upgrade |
+| --- | ---: | ---: |
+| baseline | 13.21 | 4.24 |
+| delay-loss | 7.60 | 7.83 |
+| reorder | 5.15 | 16.49 |
+| mtu1280 | 1.60 | 4.27 |
+| outage | 13.27 | 14.85 |
+
+Outage recovery after restoring traffic takes 53.74 seconds on the base and
+53.17 seconds on the upgrade. Both finish at height 67; other cases finish at
+height 66. Across all cases, maximum sampled per-process RSS is 421 MiB and
+summed process CPU time stays below 22 seconds per case. All pass the declared
+sanity limits of 2 GiB per process and 660 CPU seconds per case.
+
+The host emulates amd64, and the base binary uses the CI test profile while the
+upgrade uses the debug profile. CPU and RSS are therefore local sanity checks,
+not a controlled performance comparison or evidence of an Iroh memory regression.
+These small regtest blocks and short runs do not establish production throughput,
+long-term memory stability, or behavior under sustained hostile load.
+Long-duration authorized deployment soak remains a separate release gate;
+no deployment has been performed.

@@ -2,7 +2,7 @@
 
 The transport acceptance gate passed with the existing QUIC dependency and
 windows. The paired service is now selected normally, and the old serving driver
-has been removed. Final integration checks are recorded below as they complete.
+has been removed. The implementation and final validation are recorded below.
 
 ## Baseline and criteria
 
@@ -57,7 +57,8 @@ throughout.
 
 After removing the activation override, the combined-condition test completed
 again through normal service selection: **213.178 seconds**, every block and
-ending, and **183.5 MiB peak RSS**.
+ending, and **183.5 MiB peak RSS**. With the final ownership observations and
+session metrics, it passed again in **211.588 seconds** at **170.1 MiB peak RSS**.
 
 | Recovery test | Result |
 | --- | --- |
@@ -180,6 +181,8 @@ Completed checks:
 - All 22 Zakura integration tests pass, including old and mixed capability
   advertisements retaining other negotiated services after rejecting the old
   block-sync layout.
+- The final network run passes 1,236 tests. Ten remain ignored, and the three
+  unavailable loopback tests listed below are excluded.
 - The workspace run passes all 402 node library tests, 572 state library tests,
   and 1,234 network library tests. Other workspace library and doc-test targets
   pass. Six tests fail for the conditions listed below. This broad run precedes

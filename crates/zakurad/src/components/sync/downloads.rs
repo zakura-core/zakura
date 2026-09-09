@@ -828,9 +828,11 @@ where
 
                 // Add a shorter timeout to workaround a known bug (#5125)
                 let short_timeout_max = (max_checkpoint_height + FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT_LIMIT).expect("checkpoint block height is in valid range");
-                if block_height >= max_checkpoint_height && block_height <= short_timeout_max {
+                // The final checkpoint can wait for its entire range; only fully verified blocks
+                // need the short timeout. Preserve the error type for the sync retry handler.
+                if block_height > max_checkpoint_height && block_height <= short_timeout_max {
                     rsp = timeout(FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT, rsp)
-                        .map_err(|timeout| format!("initial fully verified block timed out: retrying: {timeout:?}").into())
+                        .map_err(BoxError::from)
                         .map(|nested_result| nested_result.and_then(convert::identity)).boxed();
                 }
 

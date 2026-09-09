@@ -33,6 +33,7 @@ use zakura_chain::{
     block::{self, Height, HeightDiff},
     chain_tip::ChainTip,
 };
+use zakura_consensus::{error::TransactionError, RouterError, VerifyBlockError};
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state as zs;
 
@@ -103,6 +104,12 @@ const MISSING_BLOCK_DOWNLOAD_RETRY_LIMIT: usize = 8;
 /// attempt plus these three retries, with at most two peer requests per attempt, creates a hard
 /// ceiling of eight peer requests for each transient hash in one sync round.
 const TRANSIENT_BLOCK_DOWNLOAD_RETRY_LIMIT: usize = 3;
+
+/// Maximum requeues of one block after a transient verification timeout in a sync round.
+const BLOCK_VERIFY_TIMEOUT_RETRY_LIMIT: usize = 3;
+
+/// Minimum UTXO lookup timeouts without a verified block before the syncer restarts.
+const MIN_UTXO_RACE_DROPS_BEFORE_RESTART: usize = 4;
 
 const MAX_TRANSIENT_BLOCK_PEER_REQUESTS_PER_SYNC_ROUND: usize =
     (TRANSIENT_BLOCK_DOWNLOAD_RETRY_LIMIT + 1) * MAX_BLOCK_PEER_REQUESTS_PER_QUEUE_ATTEMPT;
@@ -907,6 +914,12 @@ where
     /// Per-hash retry counts for transient peer and transport download failures.
     transient_block_retry_counts: HashMap<block::Hash, usize>,
 
+    /// Per-hash verification timeout retries in this sync round.
+    verify_timeout_retry_counts: HashMap<block::Hash, usize>,
+
+    /// UTXO lookup timeouts since the last verified block.
+    utxo_race_drops: usize,
+
     /// Queue-level retry counts for required blocks whose body claimed a coinbase height that
     /// contradicts our own tip. Bounded by [`POISONED_BLOCK_RETRY_LIMIT`].
     poisoned_block_retry_counts: HashMap<block::Hash, usize>,
@@ -1071,6 +1084,8 @@ where
             recent_syncs,
             missing_block_retry_counts: HashMap::new(),
             transient_block_retry_counts: HashMap::new(),
+            verify_timeout_retry_counts: HashMap::new(),
+            utxo_race_drops: 0,
             poisoned_block_retry_counts: HashMap::new(),
             registry_miss_retry_counts: HashMap::new(),
             registry_miss_retry: HashMap::new(),
@@ -1432,6 +1447,8 @@ where
         self.prospective_tips = HashSet::new();
         self.missing_block_retry_counts.clear();
         self.transient_block_retry_counts.clear();
+        self.verify_timeout_retry_counts.clear();
+        self.utxo_race_drops = 0;
         self.poisoned_block_retry_counts.clear();
         self.registry_miss_retry_counts.clear();
         self.registry_miss_retry.clear();
@@ -2449,6 +2466,8 @@ where
         match response {
             Ok((height, hash)) => {
                 trace!(?height, ?hash, "verified and committed block to state");
+                self.verify_timeout_retry_counts.remove(&hash);
+                self.utxo_race_drops = 0;
                 return Ok(());
             }
 
@@ -2517,6 +2536,10 @@ where
     /// A transient peer or transport error also affects only one requested hash. The syncer
     /// requeues that hash. The requeues are bounded by [`TRANSIENT_BLOCK_DOWNLOAD_RETRY_LIMIT`].
     ///
+    /// A UTXO lookup timeout or short post-checkpoint verification timeout requeues only the
+    /// affected hash, bounded by [`BLOCK_VERIFY_TIMEOUT_RETRY_LIMIT`]. The syncer restarts if
+    /// a full verification wave times out on UTXO lookups without a successful verification.
+    ///
     /// A [`NotFoundKind::Registry`] miss means the peer set found that *every* ready peer is marked
     /// missing the block, so it can't be served right now. Rather than blocking the loop on an inline
     /// `sleep`, the hash is recorded in [`Self::registry_miss_retry`] with a backoff deadline; while
@@ -2535,6 +2558,49 @@ where
             self.poisoned_block_retry_counts.remove(hash);
             self.registry_miss_retry_counts.remove(hash);
             self.registry_miss_retry.remove(hash);
+        }
+
+        if let Some(error) = response.as_ref().err().filter(|error| {
+            Self::is_utxo_lookup_timeout(error) || Self::is_post_checkpoint_verify_timeout(error)
+        }) {
+            let hash = match error {
+                BlockDownloadVerifyError::Invalid { hash, .. }
+                | BlockDownloadVerifyError::ValidationRequestError { hash, .. } => *hash,
+                _ => unreachable!("verification timeouts carry a block hash"),
+            };
+
+            if Self::is_utxo_lookup_timeout(error) {
+                self.utxo_race_drops = self.utxo_race_drops.saturating_add(1);
+                if self.utxo_race_drops
+                    >= self
+                        .full_verify_concurrency_limit
+                        .max(MIN_UTXO_RACE_DROPS_BEFORE_RESTART)
+                {
+                    warn!(drops = self.utxo_race_drops, "no block verified across a full wave of UTXO lookup timeouts, restarting sync");
+                    return response.map(|_| ()).map_err(Report::from);
+                }
+            }
+
+            let retry_count = self.verify_timeout_retry_counts.entry(hash).or_default();
+            if *retry_count >= BLOCK_VERIFY_TIMEOUT_RETRY_LIMIT {
+                warn!(
+                    ?hash,
+                    retry_limit = BLOCK_VERIFY_TIMEOUT_RETRY_LIMIT,
+                    "block verification timeout retry budget exhausted, restarting sync"
+                );
+                return response.map(|_| ()).map_err(Report::from);
+            }
+            *retry_count += 1;
+            debug!(
+                ?hash,
+                retry_attempt = *retry_count,
+                "block verification timed out waiting for parent outputs, retrying required block"
+            );
+            match self.downloads.download_and_verify(hash).await {
+                Ok(()) | Err(BlockDownloadVerifyError::DuplicateBlockQueuedForDownload { .. }) => {}
+                Err(error) => self.handle_block_response(Err(error))?,
+            }
+            return Ok(());
         }
 
         if let Some((hash, advertiser_addr)) = response.as_ref().err().and_then(|error| match error
@@ -2819,12 +2885,40 @@ where
         );
     }
 
+    /// Identifies the state service's `AwaitUtxo` timeout.
+    fn is_utxo_lookup_timeout(error: &BlockDownloadVerifyError) -> bool {
+        matches!(
+            error,
+            BlockDownloadVerifyError::Invalid {
+                error: RouterError::Block { source },
+                ..
+            } if matches!(
+                **source,
+                VerifyBlockError::Transaction(TransactionError::TransparentInputNotFound)
+            )
+        )
+    }
+
+    /// Identifies the short Tokio timeout; the eight-minute Tower timeout has a different type.
+    fn is_post_checkpoint_verify_timeout(error: &BlockDownloadVerifyError) -> bool {
+        matches!(
+            error,
+            BlockDownloadVerifyError::ValidationRequestError { error, .. }
+                if error.is::<tokio::time::error::Elapsed>()
+        )
+    }
+
     /// Return if the sync should be restarted based on the given error
     /// from the block downloader and verifier stream.
     fn should_restart_sync(e: &BlockDownloadVerifyError, expose_peer_addresses: bool) -> bool {
         let peer = block_error_peer_label(e, expose_peer_addresses);
 
         match e {
+            // The retry handler bounds these races without cancelling the parent's commit.
+            e if Self::is_utxo_lookup_timeout(e) || Self::is_post_checkpoint_verify_timeout(e) => {
+                debug!(error = ?e, %peer, "transient block verification timeout, continuing sync");
+                false
+            }
             // Structural matches: downcasts
             BlockDownloadVerifyError::Invalid { error, .. } if error.is_duplicate_request() => {
                 debug!(error = ?e, %peer, "block was already verified or committed, possibly from a previous sync run, continuing");

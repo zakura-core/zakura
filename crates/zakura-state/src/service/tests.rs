@@ -826,8 +826,6 @@ fn frontier_grid_coverage_is_incomparable_until_both_sides_exist() {
 
 #[test]
 fn historical_frontier_coverage_is_rechecked_once_the_vct_marker_exists() {
-    use std::sync::OnceLock;
-
     use zakura_node_services::sync_lifecycle::{
         HeaderRuntimeDetachedReason, HeaderRuntimeStatus, LifecycleEpoch,
     };
@@ -881,7 +879,7 @@ fn historical_frontier_coverage_is_rechecked_once_the_vct_marker_exists() {
     let read_state = ReadStateService::new(
         &finalized_state,
         None,
-        Arc::new(OnceLock::new()),
+        Arc::new(crate::service::write::BlockWriteFailure::default()),
         WatchReceiver::new(non_finalized_receiver),
         repair_receiver,
         HeaderChainSubscriptions {

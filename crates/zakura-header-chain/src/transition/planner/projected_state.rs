@@ -251,6 +251,8 @@ impl<'a> SettledProjectedState<'a> {
         &self,
         engine: &HeaderChainEngine,
         limits: EngineLimits,
+        selected: &[Frontier],
+        integrated: bool,
     ) -> Result<(), TransitionFailure> {
         let deleted = self
             .aux_changes
@@ -272,6 +274,31 @@ impl<'a> SettledProjectedState<'a> {
             .saturating_add(inserted);
         if projected_total > limits.max_aux_deliveries_total.get() {
             return Err(TransitionFailure::AuxiliaryLimitExceeded);
+        }
+        // Keep the finalized root and the next commit's two-header authentication window
+        // within the hard limit even when speculative deliveries saturate the remaining store.
+        let commit_window = &selected[..selected.len().min(3)];
+        let adds_speculative_delivery = self.aux_changes.iter().any(|change| {
+            matches!(change, AuxDelta::Put(delivery)
+                if engine.aux_delivery(delivery.delivery_id).is_none()
+                    && !commit_window.iter().any(|frontier| frontier.hash == delivery.header_hash))
+        });
+        if integrated && adds_speculative_delivery {
+            let occupied = commit_window.iter().try_fold(0usize, |count, frontier| {
+                let node = self
+                    .graph
+                    .view_header_node(frontier.hash)
+                    .ok_or(GraphError::UnknownHeaderNode(frontier.hash))?;
+                Ok::<_, GraphError>(count.saturating_add(node.aux_delivery_ids.len()))
+            })?;
+            let reserve = limits
+                .max_aux_deliveries_per_header
+                .get()
+                .saturating_mul(3)
+                .saturating_sub(occupied);
+            if projected_total.saturating_add(reserve) > limits.max_aux_deliveries_total.get() {
+                return Err(TransitionFailure::AuxiliaryLimitExceeded);
+            }
         }
         for delivery in self.aux_changes.iter().filter_map(|change| match change {
             AuxDelta::Put(delivery) => Some(delivery),

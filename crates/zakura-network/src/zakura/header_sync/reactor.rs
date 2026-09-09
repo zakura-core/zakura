@@ -180,6 +180,7 @@ fn build_header_sync_reactor(
         completed_targets: CompletedHeaderTargets::default(),
         vct_repair: RepairRequirementSlot::default(),
         vct_repair_stall: None,
+        vct_capacity_wait: None,
         vct_local_operation: None,
         vct_supplier_order: VecDeque::new(),
         served_paths: HashMap::new(),
@@ -280,6 +281,8 @@ struct HeaderSyncReactor {
     vct_repair: RepairRequirementSlot,
     /// Escalation state for a repair generation that has not completed.
     vct_repair_stall: Option<VctRepairStall>,
+    /// Deadline for a repair that cannot acquire local storage capacity.
+    vct_capacity_wait: Option<VctCapacityWait>,
     /// Hard deadline for the one locally executing VCT repair mutation.
     vct_local_operation: Option<VctLocalOperation>,
     /// Admitted authenticated peers in stable supplier selection order.
@@ -577,6 +580,13 @@ struct VctRepairStall {
     outcome: VctRepairStallOutcome,
 }
 
+#[derive(Copy, Clone, Debug)]
+struct VctCapacityWait {
+    generation: u64,
+    since: Instant,
+    fatal_sent: bool,
+}
+
 #[derive(Clone, Debug)]
 struct VctLocalOperation {
     phase: HeaderTargetPhase,
@@ -741,6 +751,7 @@ impl HeaderSyncReactor {
                 .vct_local_operation
                 .as_ref()
                 .is_some_and(|operation| operation.fatal_sent)
+                || self.vct_capacity_wait.is_some_and(|wait| wait.fatal_sent)
             {
                 self.startup.shutdown.cancelled().await;
                 break HeaderRequestTerminal::Shutdown;
@@ -3586,7 +3597,7 @@ impl HeaderSyncReactor {
 
     fn refresh_statuses(&mut self) {
         let now = Instant::now();
-        if self.report_fatal_vct_local_operation(now) {
+        if self.report_fatal_vct_local_operation(now) || self.report_fatal_vct_capacity_wait(now) {
             return;
         }
         self.refresh_vct_repair_stall(now);
@@ -3635,6 +3646,11 @@ impl HeaderSyncReactor {
             )
             .chain(self.vct_repair_stall.map(VctRepairStall::next_deadline))
             .chain(
+                self.vct_capacity_wait
+                    .filter(|wait| !wait.fatal_sent)
+                    .map(|wait| wait.since + VCT_LOCAL_OPERATION_FATAL_AFTER),
+            )
+            .chain(
                 self.vct_local_operation
                     .as_ref()
                     .filter(|operation| !operation.fatal_sent)
@@ -3656,6 +3672,70 @@ impl HeaderSyncReactor {
         }) {
             self.vct_local_operation = None;
         }
+    }
+
+    /// Bound a continuous capacity wait while allowing writer maintenance to free space.
+    fn report_fatal_vct_capacity_wait(&mut self, now: Instant) -> bool {
+        let Some(task) = self.vct_repair.current() else {
+            self.vct_capacity_wait = None;
+            return false;
+        };
+        let RepairPolicyState::StateBlocked { context, .. } = &task.state else {
+            self.vct_capacity_wait = None;
+            return false;
+        };
+        let wait = self.vct_capacity_wait.get_or_insert(VctCapacityWait {
+            generation: task.repair_generation,
+            since: now,
+            fatal_sent: false,
+        });
+        if wait.generation != task.repair_generation {
+            *wait = VctCapacityWait {
+                generation: task.repair_generation,
+                since: now,
+                fatal_sent: false,
+            };
+        }
+        if wait.fatal_sent {
+            return true;
+        }
+        let elapsed = now.saturating_duration_since(wait.since);
+        if elapsed < VCT_LOCAL_OPERATION_FATAL_AFTER {
+            return false;
+        }
+        let event = HeaderSyncFatalEvent {
+            phase: "auxiliary_capacity",
+            owner: task.owner.into(),
+            repair_generation: task.repair_generation,
+            target: context.target,
+            elapsed,
+        };
+        // A committed capacity change can arrive in the same turn as the deadline.
+        let latest = self
+            .startup
+            .committed_snapshots
+            .as_ref()
+            .and_then(|snapshots| snapshots.borrow().clone())
+            .filter(|snapshot| {
+                self.committed_snapshot
+                    .as_ref()
+                    .is_none_or(|observed| snapshot.state_version > observed.state_version)
+            });
+        if let Some(snapshot) = latest {
+            self.observe_latest_committed_snapshot(snapshot);
+            self.vct_capacity_wait = None;
+            return false;
+        }
+        self.vct_capacity_wait
+            .as_mut()
+            .expect("the blocked capacity wait remains installed")
+            .fatal_sent = true;
+        tracing::error!(%event, "VCT repair cannot acquire storage capacity; terminating the node");
+        metrics::counter!("sync.header.vct.repair.capacity_fatal.total").increment(1);
+        if let Some(events) = self.startup.fatal_events.as_ref() {
+            let _ = events.send(event);
+        }
+        true
     }
 
     /// Report one fatal event while retaining the original operation future until shutdown.

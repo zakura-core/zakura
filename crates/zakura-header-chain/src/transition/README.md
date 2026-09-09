@@ -158,6 +158,17 @@ Keep these three resource-limit outcomes separate:
 
 ## Recovery audit
 
+Integrated admission reserves auxiliary capacity for the finalized header and its two selected
+successors. Each header receives up to the per-header limit within the existing aggregate limit.
+The planner charges new deliveries outside that window against the remaining capacity after
+retention. The planner refuses speculative admission that would consume the reserve.
+Finality releases old deliveries through the existing retention rules.
+
+The reserve is an admission policy, so recovery can still open an older database that meets the
+hard limits but has consumed the reserve. The policy never deletes protected evidence to make
+room. Header sync reports a fatal capacity failure after a continuous thirty-minute state wait.
+A restart does not itself repair a saturated database.
+
 Recovery reads a coherent durable snapshot and audits every authoritative row. It fails closed on contradictions in
 node identity, ancestry, work, validation, body authority, trust pins, eligibility roots, auxiliary provenance,
 finality, configuration, protected paths, or limits.

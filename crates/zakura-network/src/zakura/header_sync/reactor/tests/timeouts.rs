@@ -642,6 +642,76 @@ async fn reactor_run_wakes_for_each_vct_local_operation_hard_deadline() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn capacity_deadline_wakes_the_reactor_and_observes_a_simultaneous_state_change() {
+    for capacity_changed in [false, true] {
+        let shutdown = CancellationToken::new();
+        let mut startup = startup(shutdown.clone());
+        let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel();
+        startup.fatal_events = Some(fatal_tx);
+        let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+        let snapshot = committed_snapshot(anchor);
+        let (snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+        startup.committed_snapshots = Some(snapshots_rx);
+        let (_handle, mut actions, mut reactor) = build_header_sync_reactor(startup).unwrap();
+        let peer = peer();
+        let (source, owner, context) = seed_vct_active_request(
+            &mut reactor,
+            &snapshot,
+            peer.clone(),
+            7,
+            HeaderTargetPhase::Applying,
+        );
+        reactor.vct_repair_status = zakura_header_chain::VctRootRepairStatus {
+            state: zakura_header_chain::VctRootRepairState::Unavailable {
+                height: context.target.height,
+            },
+            generation: 11,
+        };
+        reactor.handle_header_target_admission_ready(
+            peer,
+            source,
+            owner,
+            HeaderTargetAdmissionResult::Failed(Arc::new(
+                zakura_header_chain::HeaderChainError::auxiliary_capacity(None),
+            )),
+        );
+        assert!(!reactor.report_fatal_vct_capacity_wait(Instant::now()));
+        let task = tokio::spawn(reactor.run());
+        tokio::task::yield_now().await;
+        time::advance(VCT_LOCAL_OPERATION_FATAL_AFTER - std::time::Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(fatal_rx.try_recv().is_err());
+        if capacity_changed {
+            let mut advanced = snapshot.clone();
+            advanced.state_version = advanced.state_version.checked_next().unwrap();
+            advanced.frontiers.header_best = context.target;
+            snapshots_tx.send_replace(Some(advanced));
+        }
+        time::advance(std::time::Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        if capacity_changed {
+            assert!(
+                fatal_rx.try_recv().is_err(),
+                "new committed state wins over the capacity deadline"
+            );
+            let actions: Vec<_> = std::iter::from_fn(|| actions.try_recv().ok()).collect();
+            assert!(
+                actions.iter().any(|action| matches!(
+                    action,
+                    HeaderPortOperation::QueryVctRepairContext { .. }
+                )),
+                "{actions:?}"
+            );
+        } else {
+            assert_eq!(fatal_rx.try_recv().unwrap().phase, "auxiliary_capacity");
+        }
+        assert!(!task.is_finished());
+        shutdown.cancel();
+        task.await.unwrap();
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn vct_apply_completion_wins_at_the_hard_deadline() {
     let port = PendingVctLocalPort::with_apply_delay(VCT_LOCAL_OPERATION_FATAL_AFTER);
     let mut fixture = VctLocalFixture::new(port.clone(), HeaderTargetPhase::Applying);
@@ -1080,7 +1150,7 @@ fn vct_resource_refusal_waits_for_a_newer_committed_state() {
 }
 
 #[test]
-fn vct_auxiliary_capacity_refusal_waits_without_timed_replay() {
+fn vct_auxiliary_capacity_refusal_resumes_only_after_state_changes() {
     let mut startup = startup(CancellationToken::new());
     let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
     let snapshot = committed_snapshot(anchor);
@@ -1123,6 +1193,10 @@ fn vct_auxiliary_capacity_refusal_waits_without_timed_replay() {
     assert!(task.next_deadline().is_none());
     assert!(reactor.peer_work_queue.active(&peer).is_none());
 
+    let now = Instant::now();
+    assert!(!reactor.report_fatal_vct_capacity_wait(now));
+    assert!(reactor.vct_capacity_wait.is_some());
+
     reactor.vct_repair_status = zakura_header_chain::VctRootRepairStatus {
         state: zakura_header_chain::VctRootRepairState::Unavailable {
             height: repair_height,
@@ -1139,6 +1213,8 @@ fn vct_auxiliary_capacity_refusal_waits_without_timed_replay() {
         owner.header_authority().branch.target_tip_hash,
     );
     reactor.observe_latest_committed_snapshot(advanced);
+    assert!(!reactor.report_fatal_vct_capacity_wait(now + std::time::Duration::from_secs(1)));
+    assert!(reactor.vct_capacity_wait.is_none());
     let actions: Vec<_> = std::iter::from_fn(|| actions.try_recv().ok()).collect();
     assert!(
         actions.iter().any(|action| matches!(
@@ -1150,6 +1226,57 @@ fn vct_auxiliary_capacity_refusal_waits_without_timed_replay() {
         )),
         "new committed state must query the blocked repair context: {actions:?}; task: {:?}",
         reactor.vct_repair.current()
+    );
+}
+
+#[test]
+fn saturated_vct_repair_reports_one_fatal_event_without_retrying() {
+    let mut startup = startup(CancellationToken::new());
+    let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel();
+    startup.fatal_events = Some(fatal_tx);
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let snapshot = committed_snapshot(anchor);
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let (_handle, _actions, mut reactor) = build_header_sync_reactor(startup).unwrap();
+    let peer = peer();
+    let (source, owner, context) = seed_vct_active_request(
+        &mut reactor,
+        &snapshot,
+        peer.clone(),
+        7,
+        HeaderTargetPhase::Applying,
+    );
+    reactor.handle_header_target_admission_ready(
+        peer,
+        source,
+        owner,
+        HeaderTargetAdmissionResult::Failed(Arc::new(
+            zakura_header_chain::HeaderChainError::auxiliary_capacity(None),
+        )),
+    );
+    let now = Instant::now();
+    assert!(!reactor.report_fatal_vct_capacity_wait(now));
+    assert!(!reactor.report_fatal_vct_capacity_wait(
+        now + VCT_LOCAL_OPERATION_FATAL_AFTER - std::time::Duration::from_millis(1),
+    ));
+    assert!(fatal_rx.try_recv().is_err());
+    assert!(reactor.report_fatal_vct_capacity_wait(now + VCT_LOCAL_OPERATION_FATAL_AFTER));
+    let event = fatal_rx
+        .try_recv()
+        .expect("the capacity deadline reaches daemon supervision");
+    assert_eq!(event.phase, "auxiliary_capacity");
+    assert_eq!(event.target, context.target);
+    assert!(event
+        .to_string()
+        .contains("protected data remains retained"));
+    assert!(reactor.report_fatal_vct_capacity_wait(now + VCT_LOCAL_OPERATION_FATAL_AFTER));
+    assert!(fatal_rx.try_recv().is_err(), "the fatal event is sent once");
+    let task = reactor.vct_repair.current().unwrap();
+    assert!(matches!(task.state, RepairPolicyState::StateBlocked { .. }));
+    assert!(
+        task.tried_sources.is_empty(),
+        "local capacity failure does not blame the supplier"
     );
 }
 

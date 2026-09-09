@@ -271,7 +271,12 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
     };
 
     let projected = projected.finish_after_retention(engine)?;
-    projected.validate_auxiliary_limits(engine, context.config.limits)?;
+    projected.validate_auxiliary_limits(
+        engine,
+        context.config.limits,
+        &selected,
+        context.config.mode == EngineMode::Integrated,
+    )?;
     Ok(FinalityRetentionOutcome::Settled(Box::new(
         SettledTransition {
             projected,

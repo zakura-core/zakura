@@ -1504,7 +1504,7 @@ async fn raw_block_range_read_stops_at_pruned_gap_before_retained_bodies() {
     let read_state = ReadStateService::new(
         &state,
         None,
-        Arc::new(std::sync::OnceLock::new()),
+        Arc::new(crate::service::write::BlockWriteFailure::default()),
         WatchReceiver::new(non_finalized_state_receiver),
         vct_root_repair_receiver,
         HeaderChainSubscriptions {

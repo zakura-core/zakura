@@ -1817,8 +1817,20 @@ impl HeaderChainReader {
             .max_aux_deliveries_total
             .get()
             .saturating_sub(total_delivery_count);
-        let range_limit =
-            available_aggregate_capacity.min(self.config.limits.max_headers_per_transition.get());
+        // Under capacity pressure, repair the prerequisite without a speculative suffix.
+        let reserve = self
+            .config
+            .limits
+            .max_aux_deliveries_per_header
+            .get()
+            .saturating_mul(3);
+        let range_limit = if available_aggregate_capacity
+            <= reserve.saturating_add(self.config.limits.max_headers_per_transition.get())
+        {
+            1
+        } else {
+            available_aggregate_capacity.min(self.config.limits.max_headers_per_transition.get())
+        };
         if range_limit <= 1 {
             return Ok(Some(context));
         }

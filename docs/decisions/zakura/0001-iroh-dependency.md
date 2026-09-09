@@ -1,12 +1,18 @@
-# Zakura P2P Iroh dependency
+# Zakura P2P iroh Dependency
+
+Plan: `/home/evan/src/valar/art/inbox/zakura_p2p/00.0_iroh_dependency.md`
+
+> **Status:** This decision contributes to the experimental Zakura P2P v2
+> stack.
 
 ## Decision
 
-Use Iroh 1.1.0 with default features disabled and the explicit `tls-ring`
-backend. Root `[patch.crates-io]` entries pin `iroh`, `iroh-base`, `iroh-relay`
-and `iroh-dns` to one revision of `https://github.com/zakura-core/iroh`.
-`Cargo.lock` records that revision and the upstream noq 1.2.0 transport family.
-The workspace Rust requirement remains 1.97.
+Zakura pins `iroh = "=1.1.0"` in the workspace with `default-features = false`
+and the explicit `tls-ring` backend. Root `[patch.crates-io]` entries pin
+`iroh`, `iroh-base`, `iroh-relay`, and `iroh-dns` to one revision of
+`https://github.com/zakura-core/iroh`. `Cargo.lock` records that revision and
+upstream noq 1.2.0. The dependency is wired into `zakura-network`'s native
+protocol, endpoint service, handshake, and discovery.
 
 The compatibility source starts from upstream Iroh 1.1.0 and changes three
 manifest requirements. Iroh and Iroh-base retain published ed25519-dalek 2.2;
@@ -21,18 +27,50 @@ The compatibility source avoids a BIP32 fork and a broader Zcash dependency
 migration. It still requires review of authentication compatibility and ongoing
 monitoring of upstream Iroh and Dalek security changes.
 
-## Endpoint behavior
+The latest stable iroh checked during the initial implementation was `0.98.2`,
+but it could not resolve with Zebra's librustzcash dependency set at the time. `iroh-base 0.98`
+pulls the `sha2 0.11.0-rc` line, while the current Zcash stack pulls
+`sha2 0.11.0-pre` through `bip32 0.6.0-pre.1`. `iroh 0.95.1` had the same
+conflict through `ed25519-dalek 3.0.0-pre`. `iroh 0.92.0` was the newest iroh
+line selected during the initial review fixes that resolved with that tree,
+used the patched `rustls-webpki 0.103.13` line, and still exposed the protocol router and
+endpoint APIs needed by later Zakura plans.
 
-`zakura_network::zakura::direct_endpoint_builder` uses the `Minimal` preset,
-explicitly disables relays and address lookup, and clears default IP transports.
+`iroh 0.92.0` declares `rust-version = "1.85"`, but its transitive dependencies
+(`time`, and the `tonic`/`darling`/`serde_with` chain) have since moved to
+`rust-version = "1.88"` to pick up upstream fixes — including the
+RUSTSEC-2026-0009 stack-exhaustion fix shipped in `time 0.3.47`. The workspace
+MSRV was therefore unified at 1.91 (matching the `zebrad` binary) rather than
+held at the former 1.85.1 library floor. The current workspace requirement is
+1.97 and is unchanged by this upgrade.
+
+## Privacy Posture
+
+Network defaults remain legacy on Mainnet and dual on other networks.
+`zakura_network::zakura::direct_endpoint_builder` constructs an iroh endpoint
+builder with:
+
+- the `Minimal` preset;
+- `RelayMode::Disabled`;
+- `clear_address_lookup()`;
+- `clear_ip_transports()`;
+- a caller-provided durable `SecretKey`.
+
+The iroh dependency is built with `default-features = false` and only the
+`tls-ring` feature enabled. No relay or external discovery service is installed.
+The local smoke test binds only to `127.0.0.1:0`, reads back the endpoint
+`EndpointAddr`, confirms there is at least one direct address, and confirms both
+relay URL and address lookup are absent.
+
 Callers must add explicit bind addresses. Production uses the configured native
 listen address; an unset address binds only IPv4 and IPv6 loopback sockets.
 A configured port already in use now fails startup instead of silently choosing
 an ephemeral port. Parallel test endpoints explicitly request loopback port zero.
 
-No relay or external discovery service is installed. Direct connectivity still
-requires reachable addresses supplied by Zakura's discovery or legacy upgrade
-hints. Network defaults remain legacy on Mainnet and dual on other networks.
+With relays and external discovery disabled, connectivity is limited to
+directly reachable peers, local networks, forwarded ports, and addresses
+supplied by Zakura's discovery or legacy-upgrade address hints. Hard-NAT peers
+remain out of scope until a future relay/discovery decision.
 
 The transport's current selected connection path supplies the peer IP for
 admission limits. Advertised addresses are not used for that attribution. A
@@ -42,23 +80,71 @@ to the address that actually carries the connection.
 Existing stream counts, receive/send windows, idle deadlines, keepalive interval
 and disabled QUIC datagrams are preserved through `QuicTransportConfig`.
 
-## Identity and API changes
+## API Names Confirmed
 
-The durable identity location and 32-byte secret encoding are unchanged. New
-production identities still draw their bytes from the operating system RNG.
-`network.zakura_node_secret_key` remains redacted in debug and serialized output.
-Without an override, identities persist under `network.identity_dir`, outside
-state/cache snapshots, at `~/.zakura/<network>.zakura-iroh-secret-key` by default.
+Against `iroh 1.1.0`, these names compile:
 
-Iroh now exposes `EndpointId`, `EndpointAddr`, `Endpoint::id`, `Endpoint::addr`,
-`Connection::remote_id` and `QuicTransportConfig`. Dialers pass the complete
-`EndpointAddr` directly. The obsolete `ZakuraEndpoint::add_node_addr` and unused
-test-factory `wire` helpers are removed rather than installing an unbounded
-address-lookup cache. `ZakuraTestNodeBuilder::transport` now accepts a complete
-`QuicTransportConfig` instead of a closure mutating the old transport type.
-These exposed Rust API changes require normal downstream compatibility review.
+- `iroh::protocol::{Router, ProtocolHandler}`;
+- `ProtocolHandler::accept(&self, iroh::endpoint::Connection) ->
+  impl Future<Output = Result<(), iroh::protocol::AcceptError>> + Send`;
+- `iroh::{Endpoint, RelayMode, SecretKey}`;
+- `Endpoint::builder(endpoint::presets::Minimal)`, `Endpoint::addr()`,
+  `Endpoint::id()`, and `Endpoint::address_lookup()`;
+- `iroh::{EndpointAddr, EndpointId}`;
+- `Connection::remote_id()`;
+- `iroh::endpoint::QuicTransportConfig`.
 
-## Rolling compatibility
+Dialers pass the complete `EndpointAddr` directly. The obsolete
+`ZakuraEndpoint::add_node_addr` and unused test-factory `wire` helpers are removed
+rather than installing an unbounded address-lookup cache.
+`ZakuraTestNodeBuilder::transport` now accepts a complete `QuicTransportConfig`
+instead of a closure mutating the old transport type. These exposed Rust API
+changes require normal downstream compatibility review.
+
+Later Zakura plans should target these names unless the iroh pin is changed.
+
+## Dependency Reconciliation
+
+The selected pin keeps the main TLS backend unified with Zakura's existing
+reqwest stack:
+
+- `rustls v0.23.41` is shared by reqwest and iroh;
+- `ring v0.17.14` is shared by rustls and iroh;
+- `rustls-webpki v0.103.13` is shared by rustls and iroh, with no older
+  `rustls-webpki 0.102.x` copy left in `Cargo.lock`;
+- iroh brings `noq v1.2.0`, a quinn-derived transport stack, rather than the
+  upstream `quinn` package currently pulled by reqwest HTTP/3 paths;
+- smaller iroh subtree duplicates from the iroh-side network/interface helper
+  crates are recorded narrowly in `deny.toml` for duplicate detection until the
+  upstream crates converge.
+
+`cargo deny check bans licenses sources` passes locally; current validation
+evidence is recorded in [the validation report](iroh-1.1-validation.md).
+
+## Reserved Identity Surface
+
+`network.zakura_node_secret_key` remains an optional explicit iroh
+secret-key override. It is deserialized into a redacted config newtype so the
+value does not appear in startup `Debug` logs or generated serialized config.
+If it is unset, Zakura endpoint construction generates an ed25519 iroh
+`SecretKey` on first use and persists it under `network.identity_dir`, which
+defaults outside Zakura's cache and state directories at:
+
+```text
+~/.zakura/<network>.zakura-iroh-secret-key
+```
+
+This location is intentionally independent from `network.cache_dir`, so state
+or cache snapshots do not clone a node's long-term iroh identity. Operators can
+override it with `network.identity_dir`, but should keep it outside snapshot
+paths.
+
+`network.identity_dir` is the canonical config surface for this reserved
+storage path. The durable identity location and 32-byte secret encoding are
+unchanged. New production identities still draw their bytes from the operating
+system RNG.
+
+## Rolling Compatibility
 
 The native transport now requires Zakura protocol 2 and ALPN `p2p-v2/2`.
 Both the legacy upgrade prelude and native discovery advertise only protocol 2.
@@ -77,7 +163,7 @@ Native-only nodes in different cohorts cannot communicate. They
 need reachable same-cohort seeds and a coordinated upgrade; a protocol bump does
 not supply them with a legacy fallback.
 
-## Validation and release gate
+## Validation and Release Gate
 
 The independently built process probes verified 1 MiB payload delivery for
 old-old and new-new native pairs, bounded rejection in both mixed native

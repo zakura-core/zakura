@@ -100,47 +100,11 @@ async fn connect_download_peer(
     handler: ZakuraProtocolHandler,
     limits: ZakuraLocalLimits,
 ) -> Result<ConnectedPeer, BoxError> {
-    let remote_id = address.node_id;
-    let local_id = client.node_id();
-    let connection = timeout(DEADLINE, client.connect(address, ALPN)).await??;
-    let local_peer = ZakuraPeerId::new(local_id.as_bytes().to_vec())?;
-    let remote_peer = ZakuraPeerId::new(remote_id.as_bytes().to_vec())?;
-    let conn = ZakuraConnTrace::without_peer(1);
-    let negotiated = run_native_initiator_handshake(
-        &connection,
-        &limits,
-        &handler.current_handshake_config(),
-        &local_peer,
-        &ZakuraTrace::noop(),
-        &conn,
-    )
-    .await?;
-    let serving_connection = connection.clone();
-    let transport = AbortOnDropHandle::new(tokio::spawn(async move {
-        handler
-            .register_and_serve(
-                serving_connection,
-                remote_peer,
-                None,
-                ConnectionServeContext {
-                    limits: limits.clamp(&negotiated.limits),
-                    accepted_capabilities: negotiated.accepted_capabilities,
-                    role: "initiator",
-                    direction: ServicePeerDirection::Outbound,
-                    transcript_hash: native_connection_transcript_hash(
-                        ServicePeerDirection::Outbound,
-                        &local_id,
-                        &remote_id,
-                    ),
-                    i_open_collision_winner: i_open_collision_winner(&local_id, &remote_id),
-                    conn,
-                },
-            )
-            .await
-    }));
+    let (connection, task) =
+        connection::connect_and_serve(client, address, handler, limits, ALPN, DEADLINE).await?;
     Ok(ConnectedPeer {
         connection,
-        _task: transport,
+        _task: task,
     })
 }
 

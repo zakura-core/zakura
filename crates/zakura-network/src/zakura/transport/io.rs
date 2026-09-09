@@ -330,6 +330,17 @@ mod tests {
         }
     }
 
+    fn guarded_queue() -> (FramedSend, FramedWorkerRecv, SlotBudget) {
+        let (sender, receiver) = worker_framed_channel(1);
+        let budget = SlotBudget::new(1).unwrap();
+        let reservation = Arc::new(budget.try_reserve().expect("the producer is free"));
+        sender
+            .try_reserve_guarded()
+            .expect("the worker queue has a slot")
+            .send(frame(1), FrameGuard::new(reservation));
+        (sender, receiver, budget)
+    }
+
     #[tokio::test]
     async fn public_channel_preserves_order_capacity_and_errors() {
         let (sender, mut receiver) = framed_channel(2);
@@ -376,15 +387,7 @@ mod tests {
 
     #[tokio::test]
     async fn queued_frame_holds_guard_until_transport_consumes_it() {
-        let (sender, mut receiver) = worker_framed_channel(1);
-        let budget = SlotBudget::new(1).unwrap();
-        let reservation = Arc::new(budget.try_reserve().expect("the producer is free"));
-
-        sender
-            .try_reserve_guarded()
-            .expect("the worker queue has a slot")
-            .send(frame(1), FrameGuard::new(reservation.clone()));
-        drop(reservation);
+        let (_sender, mut receiver, budget) = guarded_queue();
         assert_eq!(budget.reserved(), 1);
 
         let queued = receiver.recv().await.expect("worker receives the frame");
@@ -398,14 +401,7 @@ mod tests {
 
     #[tokio::test]
     async fn queued_frame_holds_guard_while_write_is_pending() {
-        let (sender, mut receiver) = worker_framed_channel(1);
-        let budget = SlotBudget::new(1).unwrap();
-        let reservation = Arc::new(budget.try_reserve().expect("the producer is free"));
-        sender
-            .try_reserve_guarded()
-            .expect("the worker queue has a slot")
-            .send(frame(1), FrameGuard::new(reservation.clone()));
-        drop(reservation);
+        let (_sender, mut receiver, budget) = guarded_queue();
         let queued = receiver.recv().await.expect("worker receives the frame");
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
@@ -428,14 +424,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_pending_write_releases_guard() {
-        let (sender, mut receiver) = worker_framed_channel(1);
-        let budget = SlotBudget::new(1).unwrap();
-        let reservation = Arc::new(budget.try_reserve().expect("the producer is free"));
-        sender
-            .try_reserve_guarded()
-            .expect("the worker queue has a slot")
-            .send(frame(1), FrameGuard::new(reservation.clone()));
-        drop(reservation);
+        let (_sender, mut receiver, budget) = guarded_queue();
         let queued = receiver.recv().await.expect("worker receives the frame");
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
 
@@ -538,14 +527,7 @@ mod tests {
 
     #[test]
     fn dropping_worker_queue_releases_queued_guard() {
-        let (sender, receiver) = worker_framed_channel(1);
-        let budget = SlotBudget::new(1).unwrap();
-        let reservation = Arc::new(budget.try_reserve().expect("the producer is free"));
-        sender
-            .try_reserve_guarded()
-            .expect("the worker queue has a slot")
-            .send(frame(1), FrameGuard::new(reservation.clone()));
-        drop(reservation);
+        let (_sender, receiver, budget) = guarded_queue();
         assert_eq!(budget.reserved(), 1);
 
         drop(receiver);

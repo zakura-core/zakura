@@ -248,46 +248,44 @@ async fn request_before_status_waits_and_then_receives_the_complete_range() {
 #[tokio::test]
 async fn storage_outcomes_preserve_the_response_prefix_and_ending_under_backpressure() {
     for depth in 1..=3 {
-        for available in 0..=2 {
-            for fail in [false, true] {
-                let source = Source::with_outcome(true, fail, available);
-                let mut f = Fixture::with_queue_depth(source.clone(), depth);
-                let regulator = f.regulator.clone();
-                f.session.mark_status_received();
-                f.request().await;
-                let returned = if fail { 0 } else { available };
-                for height in 1..=returned {
-                    let BlockSyncMessage::Block(block) = f.next().await else {
-                        panic!("the response prefix must contain its available blocks");
-                    };
-                    assert_eq!(
-                        block.coinbase_height(),
-                        Some(block::Height(u32::try_from(height).unwrap()))
-                    );
-                }
-                match f.next().await {
-                    BlockSyncMessage::RangeUnavailable {
-                        start_height,
-                        count,
-                    } => {
-                        assert_eq!(returned, 0);
-                        assert_eq!((start_height, count), (block::Height(1), 2));
-                    }
-                    BlockSyncMessage::BlocksDone {
-                        start_height,
-                        returned: count,
-                    } => {
-                        assert!(returned > 0);
-                        assert_eq!(start_height, block::Height(1));
-                        assert_eq!(usize::try_from(count).unwrap(), returned);
-                    }
-                    other => panic!("the response must end after its available prefix: {other:?}"),
-                }
-                assert_eq!(source.0.calls.load(Ordering::Acquire), 1);
-                f.finish().await;
-                assert_eq!(regulator.snapshot().node_active, 0);
-                assert_eq!(regulator.snapshot().peer_active, 0);
+        for (fail, available) in [(false, 0), (false, 1), (false, 2), (true, 0)] {
+            let source = Source::with_outcome(true, fail, available);
+            let mut f = Fixture::with_queue_depth(source.clone(), depth);
+            let regulator = f.regulator.clone();
+            f.session.mark_status_received();
+            f.request().await;
+            let returned = if fail { 0 } else { available };
+            for height in 1..=returned {
+                let BlockSyncMessage::Block(block) = f.next().await else {
+                    panic!("the response prefix must contain its available blocks");
+                };
+                assert_eq!(
+                    block.coinbase_height(),
+                    Some(block::Height(u32::try_from(height).unwrap()))
+                );
             }
+            match f.next().await {
+                BlockSyncMessage::RangeUnavailable {
+                    start_height,
+                    count,
+                } => {
+                    assert_eq!(returned, 0);
+                    assert_eq!((start_height, count), (block::Height(1), 2));
+                }
+                BlockSyncMessage::BlocksDone {
+                    start_height,
+                    returned: count,
+                } => {
+                    assert!(returned > 0);
+                    assert_eq!(start_height, block::Height(1));
+                    assert_eq!(usize::try_from(count).unwrap(), returned);
+                }
+                other => panic!("the response must end after its available prefix: {other:?}"),
+            }
+            assert_eq!(source.0.calls.load(Ordering::Acquire), 1);
+            f.finish().await;
+            assert_eq!(regulator.snapshot().node_active, 0);
+            assert_eq!(regulator.snapshot().peer_active, 0);
         }
     }
 }

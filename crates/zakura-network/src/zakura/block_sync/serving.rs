@@ -4,8 +4,6 @@ use super::*;
 use futures::future::BoxFuture;
 
 mod task;
-#[cfg(test)]
-pub(super) use task::send_response;
 pub(super) use task::serve_requests;
 
 #[cfg(test)]

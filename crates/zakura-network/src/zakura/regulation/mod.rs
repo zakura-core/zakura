@@ -5,8 +5,6 @@
 //! Peer routines retain protocol dispatch and scheduling decisions.
 
 mod request;
-#[cfg(test)]
-pub(crate) use request::WorkResources;
 pub(crate) use request::{
     RequestAdmission, RequestPolicy, RequestSession, ResponsePermit, WorkAttempt, WorkLease,
 };
@@ -16,6 +14,3 @@ pub(crate) use slots::{SlotBudget, SlotPermit};
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod properties;

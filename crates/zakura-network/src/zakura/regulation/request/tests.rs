@@ -8,6 +8,12 @@ use futures::FutureExt;
 use super::*;
 use crate::zakura::discovery::{DiscoveryMessage, DiscoveryWireError, MAX_DISCOVERY_MESSAGE_BYTES};
 
+impl ResponsePermit {
+    pub(crate) fn weak_resources(&self) -> std::sync::Weak<WorkResources> {
+        Arc::downgrade(&self.resources)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct GetPeersPolicy;
 
@@ -185,26 +191,44 @@ async fn cancelling_a_node_waiter_releases_its_partial_peer_claim() {
 }
 
 #[test]
-fn reconnect_waits_for_an_old_response_frame() {
-    let node = SlotBudget::new(2).unwrap();
-    let admission = admission(&node);
-    let original = admission.session(&peer(1));
-    let request = original.decode(frame(1)).unwrap();
-    let mut response = original.admit(&request).now_or_never().unwrap().commit();
-    let writing = response.frame_guard(1);
-    drop(response);
-    drop(original);
+fn reconnect_waits_for_all_old_read_and_frame_owners() {
+    for read_finishes_first in [false, true] {
+        let node = SlotBudget::new(2).unwrap();
+        let admission = admission(&node);
+        let original = admission.session(&peer(1));
+        let request = original.decode(frame(1)).unwrap();
+        let mut response = original.admit(&request).now_or_never().unwrap().commit();
+        let mut work = Some(response.work_lease());
+        assert!(work.as_ref().unwrap().try_start());
+        let writing = response.frame_guard(1);
+        let ending = response.frame_guard(1);
+        drop(response);
+        drop(original);
 
-    let replacement = admission.session(&peer(1));
-    assert!(replacement.admit(&request).now_or_never().is_none());
-    assert!(admission
-        .session(&peer(2))
-        .admit(&request)
-        .now_or_never()
-        .is_some());
-    drop(writing);
-    assert!(replacement.admit(&request).now_or_never().is_some());
-    assert_eq!(node.reserved(), 0);
+        for _ in 0..64 {
+            let replacement = admission.session(&peer(1));
+            assert!(replacement.admit(&request).now_or_never().is_none());
+            assert_eq!(node.reserved(), 1);
+        }
+        let replacement = admission.session(&peer(1));
+        assert!(admission
+            .session(&peer(2))
+            .admit(&request)
+            .now_or_never()
+            .is_some());
+        if read_finishes_first {
+            drop(work.take());
+        }
+        drop(writing);
+        assert!(replacement.admit(&request).now_or_never().is_none());
+        drop(ending);
+        if !read_finishes_first {
+            assert!(replacement.admit(&request).now_or_never().is_none());
+            drop(work);
+        }
+        assert!(replacement.admit(&request).now_or_never().is_some());
+        assert_eq!(node.reserved(), 0);
+    }
 }
 
 #[test]

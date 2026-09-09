@@ -151,9 +151,33 @@ async fn cancellation_between_lookups_retains_the_completed_prefix() {
     assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 
-#[tokio::test]
-async fn dropping_the_waiter_keeps_a_running_read_charged() {
-    let _guard = zakura_test::init();
+struct BlockedRead {
+    started: oneshot::Receiver<()>,
+    resume: mpsc::SyncSender<()>,
+    drops: Arc<AtomicUsize>,
+    finished: oneshot::Receiver<()>,
+}
+
+impl BlockedRead {
+    async fn wait_started(&mut self) {
+        timeout(DEADLINE, &mut self.started).await.unwrap().unwrap();
+    }
+
+    async fn finish(self) {
+        assert_eq!(self.drops.load(Ordering::SeqCst), 0);
+        self.resume.send(()).unwrap();
+        timeout(DEADLINE, self.finished).await.unwrap().unwrap();
+        assert_eq!(self.drops.load(Ordering::SeqCst), 1);
+    }
+}
+
+fn blocked_read() -> (
+    futures::future::BoxFuture<
+        'static,
+        Result<super::OwnedBlockRange<DropSignal>, crate::BoxError>,
+    >,
+    BlockedRead,
+) {
     let (resources, drops, finished) = resources();
     let (started_tx, started) = oneshot::channel();
     let mut started_tx = Some(started_tx);
@@ -171,48 +195,39 @@ async fn dropping_the_waiter_keeps_a_running_read_charged() {
             Some((block.clone(), 2))
         },
     );
-    timeout(DEADLINE, started).await.unwrap().unwrap();
+    (
+        job,
+        BlockedRead {
+            started,
+            resume,
+            drops,
+            finished,
+        },
+    )
+}
+
+#[tokio::test]
+async fn dropping_the_waiter_keeps_a_running_read_charged() {
+    let _guard = zakura_test::init();
+    let (job, mut read) = blocked_read();
+    read.wait_started().await;
     drop(job);
-    assert_eq!(drops.load(Ordering::SeqCst), 0);
-    resume.send(()).unwrap();
-    timeout(DEADLINE, finished).await.unwrap().unwrap();
-    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    read.finish().await;
 }
 
 #[tokio::test]
 async fn aborting_the_caller_keeps_a_running_read_charged() {
     let _guard = zakura_test::init();
-    let (resources, drops, finished) = resources();
-    let (started_tx, started) = oneshot::channel();
-    let mut started_tx = Some(started_tx);
-    let (resume, blocked) = mpsc::sync_channel(1);
-    let block = genesis();
-    let caller = tokio::spawn(async move {
-        spawn_owned_block_range(
-            block::Height(1),
-            1,
-            10,
-            resources,
-            |_| false,
-            move |_| {
-                started_tx.take().unwrap().send(()).unwrap();
-                blocked.recv_timeout(DEADLINE).unwrap();
-                Some((block.clone(), 2))
-            },
-        )
-        .await
-    });
-    timeout(DEADLINE, started).await.unwrap().unwrap();
+    let (job, mut read) = blocked_read();
+    let caller = tokio::spawn(job);
+    read.wait_started().await;
     caller.abort();
     assert!(timeout(DEADLINE, caller)
         .await
         .unwrap()
         .unwrap_err()
         .is_cancelled());
-    assert_eq!(drops.load(Ordering::SeqCst), 0);
-    resume.send(()).unwrap();
-    timeout(DEADLINE, finished).await.unwrap().unwrap();
-    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    read.finish().await;
 }
 
 #[tokio::test]

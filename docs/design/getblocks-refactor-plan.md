@@ -294,12 +294,12 @@ During implementation, run focused network regulation, block-sync, transport, st
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
-cargo nextest list --profile regulation-properties --locked
-cargo nextest run --profile regulation-properties --locked
+cargo nextest list --profile blocksync-regression --locked
+cargo nextest run --profile blocksync-regression --locked
 cargo nextest run --profile zakura-integration --locked
 ```
 
-The `regulation-properties` profile and version-4 replay model have been ported from #896 to the sequential serving path. Confirm the intended tests actually run. Preserve the included QUIC loss-recovery backport and the current crate-family pin and lockfile. Run the relevant documentation/configuration checks too.
+The `blocksync-regression` profile covers the fixed regressions in this refactor. Generated ownership histories and version-4 JSON replay belong to the follow-on property-testing PR, #896. Confirm the intended tests actually run. Preserve the included QUIC loss-recovery backport and the current crate-family pin and lockfile. Run the relevant documentation/configuration checks too.
 
 ## Code map and baseline
 

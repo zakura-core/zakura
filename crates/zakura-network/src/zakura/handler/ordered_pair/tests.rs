@@ -120,47 +120,15 @@ impl Fixture {
         let client_handler = handler(client_tx, client.clone());
         let router = Router::builder(server).accept(ALPN, server_handler).spawn();
         let address = LocalEndpointFactory::node_addr(router.endpoint()).await;
-        let remote_id = address.node_id;
-        let local_id = client.node_id();
-        let connection = timeout(TEST_TIMEOUT, client.connect(address, ALPN)).await??;
-        let local_peer = ZakuraPeerId::new(local_id.as_bytes().to_vec())?;
-        let remote_peer = ZakuraPeerId::new(remote_id.as_bytes().to_vec())?;
-        let conn = ZakuraConnTrace::without_peer(1);
-        let negotiated = timeout(
+        let (connection, serving) = super::super::tests::connection::connect_and_serve(
+            &client,
+            address,
+            client_handler,
+            local,
+            ALPN,
             TEST_TIMEOUT,
-            run_native_initiator_handshake(
-                &connection,
-                &local,
-                &client_handler.current_handshake_config(),
-                &local_peer,
-                &ZakuraTrace::noop(),
-                &conn,
-            ),
         )
-        .await??;
-        let serving_connection = connection.clone();
-        let serving = AbortOnDropHandle::new(tokio::spawn(async move {
-            client_handler
-                .register_and_serve(
-                    serving_connection,
-                    remote_peer,
-                    None,
-                    ConnectionServeContext {
-                        limits: local.clamp(&negotiated.limits),
-                        accepted_capabilities: negotiated.accepted_capabilities,
-                        role: "initiator",
-                        direction: ServicePeerDirection::Outbound,
-                        transcript_hash: native_connection_transcript_hash(
-                            ServicePeerDirection::Outbound,
-                            &local_id,
-                            &remote_id,
-                        ),
-                        i_open_collision_winner: i_open_collision_winner(&local_id, &remote_id),
-                        conn,
-                    },
-                )
-                .await
-        }));
+        .await?;
         Ok(Self {
             router,
             client,

@@ -25,34 +25,6 @@ fn peer(byte: u8) -> ZakuraPeerId {
 }
 
 #[test]
-fn reconnects_share_the_peer_limit_until_old_reads_finish() {
-    let regulator = GetBlocksServingRegulator::new(ZakuraBlockSyncConfig::default());
-    let original = regulator.session(peer(8));
-    let permit = original.admit_now(1).unwrap().commit();
-    let query = permit.work_lease();
-    assert!(query.try_start());
-    drop(permit);
-    drop(original);
-
-    // Neither dropping the old session nor replacing it repeatedly releases
-    // the work still owned by its running storage read.
-    for _ in 2..=65 {
-        let replacement = regulator.session(peer(8));
-        assert!(replacement.admit_now(1).is_none());
-        assert_eq!(regulator.snapshot().node_active, 1);
-        let other = regulator.session(peer(9));
-        assert!(other.admit_now(1).is_some(), "another peer can still serve");
-    }
-    let replacement = regulator.session(peer(8));
-    drop(query);
-    assert!(
-        replacement.admit_now(1).is_some(),
-        "completion frees this peer's slot"
-    );
-    assert_eq!(regulator.snapshot().node_active, 0);
-}
-
-#[test]
 fn query_and_result_keep_capacity_after_the_producer_closes() {
     let regulator = GetBlocksServingRegulator::new(ZakuraBlockSyncConfig::default());
     let session = regulator.session(peer(8));
@@ -66,6 +38,11 @@ fn query_and_result_keep_capacity_after_the_producer_closes() {
         !query.clone().try_start(),
         "cloning a query never authorizes another read"
     );
+    let second = permit.work_lease();
+    assert!(
+        !second.try_start(),
+        "separately issued leases share the execution claim"
+    );
     let result = query.clone();
 
     drop(permit);
@@ -73,40 +50,9 @@ fn query_and_result_keep_capacity_after_the_producer_closes() {
     assert_eq!(regulator.snapshot().node_active, 1);
 
     drop(query);
-
-    drop(result);
-    assert_eq!(regulator.snapshot().node_active, 0);
-}
-
-#[test]
-fn closed_producer_prevents_queued_query_execution() {
-    let regulator = GetBlocksServingRegulator::new(ZakuraBlockSyncConfig::default());
-    let session = regulator.session(peer(9));
-    let permit = session
-        .admit_now(1)
-        .expect("the initial request fits")
-        .commit();
-    let query = permit.work_lease();
-    drop(permit);
-    assert!(!query.try_start());
-    drop(query);
-    assert_eq!(regulator.snapshot().node_active, 0);
-}
-
-#[test]
-fn separately_issued_query_leases_share_one_execution_claim() {
-    let regulator = GetBlocksServingRegulator::new(ZakuraBlockSyncConfig::default());
-    let session = regulator.session(peer(9));
-    let permit = session.admit_now(1).unwrap().commit();
-    let first = permit.work_lease();
-    let second = permit.work_lease();
-    assert!(first.try_start());
-    assert!(!second.try_start());
-    drop(permit);
-    assert!(first.is_cancelled());
-    assert!(second.is_cancelled());
+    drop(second);
     assert_eq!(regulator.snapshot().node_active, 1);
-    drop((first, second));
+    drop(result);
     assert_eq!(regulator.snapshot().node_active, 0);
 }
 
@@ -223,28 +169,6 @@ fn config_rejects_nonprogressing_or_unbounded_admission_settings() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn provisional_admission_rolls_back_every_earlier_reservation() {
-    let config = ZakuraBlockSyncConfig::default();
-    let regulator = GetBlocksServingRegulator::new(config);
-    let session = regulator.session(peer(1));
-    let other_peer = regulator.session(peer(7));
-    let first = session.admit_now(1).expect("the first request fits");
-    let before = regulator.snapshot();
-    assert!(
-        session.admit_now(1).is_none(),
-        "the peer producer is occupied by the first request"
-    );
-    assert_eq!(regulator.snapshot(), before);
-
-    let independent = other_peer
-        .admit_now(1)
-        .expect("one peer's producer does not consume another peer's capacity");
-    assert_eq!(regulator.snapshot().node_active, 2);
-    drop(independent);
-    drop(first);
-}
-
-#[tokio::test(start_paused = true)]
 async fn completed_requests_release_capacity_without_waiting_for_time() {
     let regulator = GetBlocksServingRegulator::new(ZakuraBlockSyncConfig::default());
     let session = regulator.session(peer(2));
@@ -268,20 +192,44 @@ async fn completed_requests_release_capacity_without_waiting_for_time() {
     );
 }
 
-#[test]
-fn frames_keep_the_producer_until_the_last_write_finishes() {
-    let regulator = GetBlocksServingRegulator::new(ZakuraBlockSyncConfig::default());
-    let session = regulator.session(peer(3));
-    let other = regulator.session(peer(4));
+const RESPONSE_BYTES: u64 = 2_000_010;
+
+fn queued_response(session: &GetBlocksServingSession) -> FrameGuard {
     let mut permit = session.admit_now(1).unwrap().commit();
-    let block = permit.frame_guard(100);
-    let terminal = permit.frame_guard(9);
-    drop(permit);
-    assert!(session.admit_now(1).is_none());
-    assert!(other.admit_now(1).is_some());
-    drop(block);
-    assert!(session.admit_now(1).is_none());
-    drop(terminal);
+    permit.frame_guard(RESPONSE_BYTES)
+}
+
+#[test]
+fn default_response_count_caps_large_requests_at_one_block() {
+    let config = ZakuraBlockSyncConfig::default();
+    for count in [1, 128, u32::MAX] {
+        let cap = GetBlocksPolicy::new(&config)
+            .response_cap_for_count(count)
+            .unwrap();
+        assert_eq!(config.initial_status().max_blocks_per_response, 1);
+        assert_eq!(cap, RESPONSE_BYTES);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn default_producer_limits_hold_until_writes_finish() {
+    let config = ZakuraBlockSyncConfig::default();
+    validate_config(&config).unwrap();
+    let regulator = GetBlocksServingRegulator::new(config);
+    let peers: Vec<_> = (0..65).map(|id| regulator.session(peer(id))).collect();
+    let mut frames = Vec::new();
+    for peer in &peers[..64] {
+        frames.push(queued_response(peer));
+    }
+    tokio::time::advance(Duration::from_secs(60)).await;
+    let before = regulator.snapshot();
+    assert_eq!(before.node_active, 64);
+    assert!(peers[0].admit_now(1).is_none());
+    assert!(peers[64].admit_now(1).is_none());
+    assert_eq!(regulator.snapshot(), before);
+    frames.pop();
+    frames.push(queued_response(&peers[64]));
+    assert_eq!(regulator.snapshot().node_active, 64);
+    drop(frames);
     assert_eq!(regulator.snapshot().node_active, 0);
-    assert!(session.admit_now(1).is_some());
 }

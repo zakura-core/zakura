@@ -5705,6 +5705,7 @@ impl ZakuraHandlerError {
 
 #[cfg(test)]
 mod tests {
+    pub(super) mod connection;
     mod paired_block_sync;
     mod quic_progress;
     mod serving_progress;

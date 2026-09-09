@@ -212,12 +212,17 @@ LRU version because consumers do not inherit Zakura's lockfile or deny policy.
 
 The Git source has explicit cargo-vet policy and reviewed compatibility deltas,
 and the upstream baseline and dependency graph are covered by audit records and
-documented exemptions. One hold gates deployment: the Iroh 1.1 delta retains
-mapped-address entries for every authenticated identity for the life of the
-endpoint, a remotely driven memory-exhaustion vector that must be fixed in the
-fork or upstream before native transport is enabled on public nodes. Existing
-release and supply-chain checks remain enabled; passing cargo-deny does not
-satisfy cargo-vet or constitute a cryptographic audit.
+documented exemptions. Zakura accepts Iroh 1.1's mapped-address retention of
+roughly 100–200 bytes per distinct authenticated identity until endpoint shutdown,
+with no public eviction API. Track this growth under sustained identity churn
+and adopt the upstream fix when released. No additional fork patch is planned.
+
+The path-open retry issue requires two or more outgoing connections to one peer.
+Zakura deduplicates pending dials and evicts duplicate connections, keeping one
+connection per identity, so no change is planned for this integration.
+
+Existing release and supply-chain checks remain enabled; passing cargo-deny
+does not satisfy cargo-vet or constitute a cryptographic audit.
 
 Pre-existing review concerns around ban admission, peer-directed internal-address
 probes, advertised addresses, dial/backoff behavior and handoff metadata binding

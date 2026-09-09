@@ -51,26 +51,70 @@ requirement and add review of each Git delta. The four recorded deltas cover
 only the compared source and manifest changes. They do not exempt the upstream
 baseline or trust all future publications from any maintainer.
 
-Cargo-vet still reports 58 versions missing `safe-to-deploy` coverage. This is
-missing audit evidence rather than identified vulnerabilities. The remaining work
-includes Iroh/noq, their networking and platform dependencies, and new versions
-of smaller supporting packages. The exact versions and suggested review bases
-are recorded in `qa/supply-chain/iroh-1.1-audit-backlog.json`. Refresh that file
-from `cargo vet check --output-format json` after dependency or audit changes.
+Cargo-vet still reports 31 versions missing `safe-to-deploy` coverage. Most
+are unfinished reviews; the specific concerns below remain audit holds.
+The exact versions and suggested review bases are recorded in
+`qa/supply-chain/iroh-1.1-audit-backlog.json`. Refresh that file from
+`cargo vet check --output-format json` after dependency or audit changes.
 
-Refreshing the eight configured audit imports and recording eleven completed
-source reviews reduced the missing versions from 69 to 58. The new records cover
-cesu8, data-encoding and its two macros, ghash, iroh-metrics-derive, netlink-sys,
-strum, strum_macros, system-configuration and wmi. Delta records reuse existing
-reviewed baselines; full records cover the named package only. Audit notes record
-source scope and test limitations. No new exemptions or publisher trust were added.
+Refreshing the eight configured audit imports and recording eleven source
+reviews first reduced missing coverage from 69 to 58. A further 27 records
+reduce it to 31, covering supporting libraries, Iroh base/DNS/metrics, Netlink
+core/protocol changes, WebSocket and browser-stream changes, and Windows import
+libraries. Delta records reuse reviewed baselines; full records cover the named
+package only. Notes state review scope, caller constraints and test limitations.
+Cargo-vet removed the obsolete Iroh metrics 0.35 exemption after its replacement
+was reviewed. No new exemptions or publisher trust were added.
 
-The remaining 58 suggested reviews include 25 without a reusable same-package
-baseline. Prioritize the Iroh/noq transport, authentication and parser boundaries,
-then OS/FFI and concurrent collection ownership, and the remaining support crates.
-Windows import-library packages contain binary changes despite their small text
-diffs; those need provenance and binary review. Passing integration tests does
-not complete these source reviews. Dependency review remains unfinished.
+For the Windows import libraries, all 21 compared source/archive files match
+Microsoft commit `00fe13a47c3cdce3287069be671aaa3c273f1e0a`. LLVM inspection found
+import data and indirect import stubs, without startup code; Windows execution
+and complete API ABI validation were not performed. Conditional-move tests
+passed on native AArch64 and the portable fallback: 105 core tests and four
+regressions on each. This is not a timing guarantee for every architecture.
+
+The remaining 31 reviews include 15 without a reusable same-package baseline.
+They include Iroh/noq transport, DNS parsers/resolvers, OS bindings and concurrent
+collections. Passing integration tests does not complete those source reviews.
+
+### Review holds
+
+These are upstream package concerns found during source review, not changes to
+cryptographic implementations in the compatibility fork. Compared with the PR
+base, AES-GCM and POLYVAL are newly selected dependencies, LRU changes from
+0.13.0 to 0.18.4, and cipher remains the existing registry version 0.4.4.
+No audit was recorded for the three held packages below.
+
+- **lru 0.18.4:** The new `retain` method ignores a failed map removal before
+  freeing the list node. A key that changes its hash through interior mutability
+  can leave a dangling map entry. A small safe-Rust reproduction removes the sole
+  list entry but observes map length one; it deliberately skips the destructor
+  to avoid dereferencing freed storage. The memory-safety conclusion comes from
+  ownership inspection, not Miri or sanitizer execution. Iroh relay uses immutable
+  public-key keys and does not call `retain`, so no peer-triggered path was found.
+- **aes-gcm 0.10.3:** Its plaintext bound permits `2^36` bytes, exceeding the
+  `2^36 - 32` byte limit in [NIST SP 800-38D, section 5.2.1.1][gcm-spec]. Its
+  counter helper in cipher 0.4.4 also uses remainder instead of division when
+  checking required blocks. A 32-byte reproduction starting with one counter
+  block remaining returns success. Source inspection shows that excessive GCM
+  input can wrap the counter; a 64 GiB encryption was not run. Noq uses this crate
+  for Retry tags with empty plaintext, so that path cannot reach this length
+  failure. This does not establish a vulnerability in existing Zcash consumers
+  of cipher, or a need to modify them.
+- **polyval 0.6.2:** Directly compiling the packaged software-32, software-64
+  and ARM implementations reproduces three different tags when initializing
+  with integer one and immediately finalizing. All agree for zero. The normal
+  AES-GCM/GHASH constructor uses zero, so the nonzero-initialization problem was
+  not found reachable from noq. Separately, the autodetect wrapper stores its
+  backend in `ManuallyDrop` without a destructor, bypassing optional clearing
+  when an unfinished value is dropped; ARM clearing is also unimplemented.
+
+These holds need a supported upstream fix/version or an explicit review of the
+restricted usage before coverage can be completed. They are not evidence that
+Zakura must fork BIP32 or another cryptographic package. The large transport and
+platform reviews remain unfinished independently of these holds.
+
+[gcm-spec]: https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-38d.pdf
 
 Publication under the proposed names does not erase this review requirement.
 The new registry packages will need audit records tied to their published
@@ -95,7 +139,8 @@ on Windows; the base used 0.17.3. All 24 packaged Rust files match upstream comm
 of the complete delta found no obfuscation or hidden execution. Netwatch uses a
 fixed local route-table query and does not call the added WMI mutation APIs.
 This supports a likely false-positive assessment, but Socket's detailed detector
-evidence was unavailable behind sign-in. The alert remains open, and Windows
+evidence was unavailable behind sign-in. Both Socket checks subsequently pass at `d13381d4dc4fee27c9ea33c4c1347a6e7e24a790`;
+that check status does not establish a formal detector disposition. Windows
 runtime tests were not run.
 
 The nine V12 findings from run 7562 describe mechanisms already present at base

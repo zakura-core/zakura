@@ -199,11 +199,6 @@ notes = "Audit held: the generated data package embeds 249 unsafe unchecked zero
 version = "0.17.11"
 criteria = "safe-to-deploy"
 
-[[exemptions.iroh-metrics]]
-version = "0.35.0"
-criteria = "safe-to-deploy"
-notes = "Audit held: start_metrics_exporter unwraps reading the body of any non-success response from the remote exporter endpoint. A network/body read failure can therefore panic the exporter task; retain the exemption pending fallible error propagation."
-
 [[exemptions.libm]]
 version = "0.2.16"
 criteria = "safe-to-deploy"

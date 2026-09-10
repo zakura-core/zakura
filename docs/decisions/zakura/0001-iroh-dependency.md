@@ -166,6 +166,11 @@ probe requires a gap of at least 64 blocks; smaller gaps use the existing
 ten-minute fallback window. Six-block restart tests took about 603 seconds in
 both directions, despite working TCP. Ping/Pong success does not imply fast
 restart recovery.
+During checkpoint sync, a dual-stack node with current commitment-tree frontiers
+can verify TCP blocks by recomputing the trees when native VCT roots or successor
+metadata are unavailable. Once a VCT fast commit freezes those frontiers, the node
+still needs authenticated metadata from a compatible native supplier until the
+checkpoint handoff restores the full trees.
 Native-only nodes in different cohorts cannot communicate. They
 need reachable same-cohort seeds and a coordinated upgrade; a protocol bump does
 not supply them with a legacy fallback.

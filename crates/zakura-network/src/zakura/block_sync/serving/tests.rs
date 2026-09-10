@@ -502,3 +502,5 @@ async fn cancellation_during_storage_suppresses_old_output_and_retains_the_job()
         .await
         .is_err());
 }
+
+mod properties;

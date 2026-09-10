@@ -373,3 +373,5 @@ fn block_range_response_includes_a_maximum_size_first_block() {
         vec![(block::Height(10), block::Height(10), maximum)]
     );
 }
+
+mod properties;

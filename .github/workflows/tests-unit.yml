@@ -305,6 +305,13 @@ jobs:
         env:
           FULL_COVERAGE: ${{ github.event_name != 'pull_request' }}
 
+      - name: Explore regulation histories
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        env:
+          PROPTEST_CASES: "2048"
+          PROPTEST_RNG_SEED: ${{ github.run_id }}
+        run: cargo nextest run --profile regulation-properties --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst" --partition "hash:${{ matrix.partition }}/3"
+
   zakura-config:
     name: zakura config compatibility
     needs: [build-tests, changes]

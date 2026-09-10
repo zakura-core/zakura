@@ -217,3 +217,6 @@ pub(super) struct ServingRegulationSnapshot {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod properties;

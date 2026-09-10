@@ -92,7 +92,7 @@ impl RequestPolicy for GetBlocksPolicy {
 mod tests {
     use super::*;
 
-    fn frame(start_height: block::Height, count: u32) -> Frame {
+    pub(super) fn frame(start_height: block::Height, count: u32) -> Frame {
         Frame {
             message_type: u16::from(super::super::super::wire::MSG_BS_GET_BLOCKS),
             flags: 0,
@@ -191,3 +191,6 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod properties;

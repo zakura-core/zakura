@@ -427,9 +427,12 @@ impl Mempool {
     fn enable_at_tip(&mut self, tip_action: &TipAction) {
         let (last_seen_tip_hash, tip_height) = tip_action.best_tip_hash_and_height();
 
+        // Attribute the readiness claim to the heuristic: the sync status is
+        // estimated from recent sync history, it is not proof that the local
+        // chain has reached the current network frontier.
         info!(
             ?tip_height,
-            "activating mempool: Zakura is close to the tip"
+            "activating mempool: sync status heuristic reports Zakura is close to the tip"
         );
 
         let tx_downloads = Box::pin(TxDownloads::new(
@@ -751,7 +754,16 @@ impl Service<Request> for Mempool {
                     Ok(Err(boxed_err)) => {
                         let (tx_id, error) = *boxed_err;
                         if let Some((advertiser_addr, score)) = transaction_misbehavior(&error) {
-                            let _ = self.misbehavior_sender.try_send((advertiser_addr, score));
+                            // The channel is bounded, so a full channel silently
+                            // drops the report and the peer keeps its old score.
+                            if self
+                                .misbehavior_sender
+                                .try_send((advertiser_addr, score))
+                                .is_err()
+                            {
+                                metrics::counter!("mempool.misbehavior.reports.dropped.total")
+                                    .increment(1);
+                            }
                         }
 
                         let peer_label =

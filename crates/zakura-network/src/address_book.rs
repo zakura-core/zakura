@@ -261,7 +261,10 @@ pub struct AddressBook {
     // TODO: Replace with `by_ip: HashMap<IpAddr, BTreeMap<DateTime32, MetaAddr>>` to support configured `max_connections_per_ip` greater than 1
     most_recent_by_ip: Option<HashMap<IpAddr, MetaAddr>>,
 
-    /// A list of banned addresses, with the time they were banned.
+    /// A bounded FIFO list of banned peer IP addresses.
+    ///
+    /// Bans do not store timestamps and have no expiry: they last until the
+    /// process exits or the entry is evicted at [`constants::MAX_BANNED_IPS`].
     bans_by_ip: BannedIps,
 
     /// The local listener address.

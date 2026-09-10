@@ -7620,9 +7620,9 @@ dependencies = [
 
 [[package]]
 name = "zakura-iroh"
-version = "1.1.0-rc.0"
+version = "1.1.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac6fec6c66b110158cfce2908bb5d7bf8c76d8c241304ee2917f14ec33ce78a1"
+checksum = "c32bb2578da5ea98b56bd19870b43947b7b39ba52bd7a22fce1d8cb58a225165"
 dependencies = [
  "backon",
  "blake3",
@@ -7670,9 +7670,9 @@ dependencies = [
 
 [[package]]
 name = "zakura-iroh-base"
-version = "1.1.0-rc.0"
+version = "1.1.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "99e54869bce612c0e4fe2cd0a1056809aa8486f04e01a113722182ac5ac971f3"
+checksum = "36e889fe68964ae5eebb8253d24e7de3b8c46062533bb7c6b19f6b2468825f0e"
 dependencies = [
  "curve25519-dalek",
  "data-encoding",
@@ -7689,9 +7689,9 @@ dependencies = [
 
 [[package]]
 name = "zakura-iroh-dns"
-version = "1.1.0-rc.0"
+version = "1.1.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80258351d6fb3a6f66a55d83861764d27c14a183355a2d2bff3489f6d69cbf22"
+checksum = "48a28442c6ddb68211eca23bd3635f3012a07fbc6b705364efd78d6d9c0b9700"
 dependencies = [
  "arc-swap",
  "cfg_aliases",
@@ -7713,9 +7713,9 @@ dependencies = [
 
 [[package]]
 name = "zakura-iroh-relay"
-version = "1.1.0-rc.0"
+version = "1.1.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c188f66d3eea54830dab8fd68c5fc62706dd130a3ca16f1b522603bcc44c054c"
+checksum = "6d0436ae0c626e7771d9a4164529964ec69f3e9ee5960a2698f8803082154271"
 dependencies = [
  "blake3",
  "bytes",

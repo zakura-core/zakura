@@ -7,7 +7,7 @@ Plan: `/home/evan/src/valar/art/inbox/zakura_p2p/00.0_iroh_dependency.md`
 
 ## Decision
 
-Zakura pins `iroh = { package = "zakura-iroh", version = "=1.1.0-rc.0" }`
+Zakura pins `iroh = { package = "zakura-iroh", version = "=1.1.0-rc.1" }`
 in the workspace with `default-features = false` and the explicit `tls-ring`
 backend. The four registry packages (`zakura-iroh`, `zakura-iroh-base`,
 `zakura-iroh-dns`, and `zakura-iroh-relay`) retain the original Rust library
@@ -18,8 +18,9 @@ and discovery. Consumers do not need workspace source patches.
 
 The compatibility source starts from upstream Iroh 1.1.0 and retains three
 compatibility manifest requirements. Iroh and Iroh-base retain published
-ed25519-dalek 2.2; Iroh-base retains curve25519-dalek 4.1.3. The fork changes no production Rust
-source. Its relay manifest pins LRU to 0.18.3 so fresh consumers cannot select
+ed25519-dalek 2.2; Iroh-base retains curve25519-dalek 4.1.3. Rc1 adds an explicit
+QUIC NAT traversal opt-out to the transport builder. Its relay manifest pins
+LRU to 0.18.3 so fresh consumers cannot select
 0.18.4's faulty `retain` implementation. BIP32, the Zcash cryptographic packages,
 and their digest requirements remain unchanged. The Iroh fork's `FORK.md` records its consumption and
 maintenance policy.
@@ -68,20 +69,34 @@ relay URL and address lookup are absent.
 Callers must add explicit bind addresses. Production uses the configured native
 listen address; an unset address binds only IPv4 and IPv6 loopback sockets.
 A configured port already in use now fails startup instead of silently choosing
-an ephemeral port. Parallel test endpoints explicitly request loopback port zero.
+an ephemeral port. Only the configured address family is bound, including for
+wildcard addresses. An IPv6-only bind cannot dial IPv4 bootstrap peers. Parallel
+test endpoints explicitly request loopback port zero.
+
+Automatic UPnP, NAT-PMP and PCP port mapping is not compiled in. Operators behind
+a router must forward the native UDP port manually and advertise a reachable
+address. Public-IP nodes do not need this mapping.
+
+QUIC NAT traversal is explicitly disabled with
+`max_remote_nat_traversal_addresses(0)`. The rc1 fork allows zero to disable the
+extension, preventing its interface-address exchange and peer-directed UDP
+probes even when the other endpoint enables it. Relay configuration alone does
+not disable this extension. Direct connections remain available.
 
 With relays and external discovery disabled, connectivity is limited to
 directly reachable peers, local networks, forwarded ports, and addresses
 supplied by Zakura's discovery or legacy-upgrade address hints. Hard-NAT peers
 remain out of scope until a future relay/discovery decision.
 
-The transport's current selected connection path supplies the peer IP for
-admission limits. Advertised addresses are not used for that attribution. A
-record with a decoy address before the reachable address must still be charged
-to the address that actually carries the connection.
+The connection's selected path supplies the peer IP for admission limits. Iroh
+can select a path on a different concurrent connection to the same identity. If
+this connection has no selected path, its sole open IP path supplies the IP.
+Connections without an attributable IP are refused admission. Advertised
+addresses never supply the admission IP.
 
-Existing stream counts, receive/send windows, idle deadlines, keepalive interval
-and disabled QUIC datagrams are preserved through `QuicTransportConfig`.
+Existing stream counts, receive/send windows, idle deadlines
+and disabled QUIC datagrams are preserved through `QuicTransportConfig`. Iroh also enables a five-second
+per-path heartbeat independently of the connection keepalive interval.
 
 ## API Names Confirmed
 
@@ -202,7 +217,7 @@ comparison or proof of long-term memory stability under hostile load. An
 authorized long-duration deployment soak remains a separate release gate; no
 deployment has been performed.
 
-The compatibility family is distributed as registry packages at `1.1.0-rc.0`,
+The compatibility family is distributed as registry packages at `1.1.0-rc.1`,
 prepared from the committed fork using `scripts/prepare-zakura-packages.py`.
 The preparation manifest records the source revision and hashes every Rust
 file; package verification checks the renamed manifests and registry contents.
@@ -220,7 +235,7 @@ graph resolves and passes the same interoperability checks.
 Zakura accepts Iroh 1.1's mapped-address retention of
 roughly 100–200 bytes per distinct authenticated identity until endpoint shutdown,
 with no public eviction API. Track this growth under sustained identity churn
-and adopt the upstream fix when released. No additional fork patch is planned.
+and adopt the upstream fix when released. No patch for mapped-address retention is planned.
 
 The path-open retry issue requires two or more outgoing connections to one peer.
 Zakura deduplicates pending dials and evicts duplicate connections, keeping one

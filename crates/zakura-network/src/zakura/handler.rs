@@ -473,6 +473,7 @@ impl ZakuraLocalLimits {
     /// Returns the QUIC transport config matching these local limits.
     pub fn transport_config(&self) -> QuicTransportConfig {
         QuicTransportConfig::builder()
+            .max_remote_nat_traversal_addresses(0)
             .max_concurrent_bidi_streams(VarInt::from_u32(u32::from(self.max_open_streams)))
             .max_concurrent_uni_streams(VarInt::from_u32(0))
             .stream_receive_window(VarInt::from_u32(DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW))
@@ -1934,13 +1935,7 @@ pub struct ZakuraProtocolHandler {
     admission: Arc<Semaphore>,
     pending_handshakes: Arc<Semaphore>,
     shutdown: CancellationToken,
-    // Bound iroh endpoint, used to recover the inbound peer's UDP source IP so
-    // the per-IP admission cap applies to Router-accepted connections. Iroh's
-    // Router consumes the `Incoming` (which carries the address) before
-    // `ProtocolHandler::accept` hands us the established `Connection`, so the
-    // address is looked up from the endpoint's node map instead. `None` for
-    // unit tests that drive the handler without a bound endpoint, in which case
-    // inbound accepts fall back to the previous `remote_ip = None` behaviour.
+    // Bound endpoint supplies the local identity for connection collision handling.
     endpoint: Option<Endpoint>,
 }
 
@@ -1954,21 +1949,22 @@ fn random_stream_session_seed() -> u64 {
     }
 }
 
-/// Charge the selected authenticated IP path, never an advertised dial hint.
+/// Charge an established IP path, never an advertised dial hint.
 ///
-/// A peer can advertise decoy addresses. The completed control handshake has
-/// exchanged application data on this connection, whose selected path identifies
-/// the actual source IP. Relay and custom paths have no attributable IP here.
+/// Iroh selects a path across all connections to an identity. A concurrent
+/// connection can have no selected path even after its control handshake, so
+/// use its sole open path in that case. Ambiguous or non-IP paths yield `None`
+/// and cannot enter the direct-only connection registry.
 fn confirmed_remote_ip(connection: &Connection) -> Option<IpAddr> {
-    connection.paths().iter().find_map(|path| {
-        if !path.is_selected() {
-            return None;
-        }
-        match path.remote_addr() {
-            iroh::TransportAddr::Ip(addr) => Some(addr.ip()),
-            _ => None,
-        }
-    })
+    let paths = connection.paths();
+    let path = paths
+        .iter()
+        .find(|path| path.is_selected())
+        .or_else(|| paths.iter().next().filter(|_| paths.len() == 1))?;
+    match path.remote_addr() {
+        iroh::TransportAddr::Ip(addr) => Some(addr.ip()),
+        _ => None,
+    }
 }
 
 fn native_connection_transcript_hash(
@@ -3166,6 +3162,16 @@ impl ZakuraProtocolHandler {
         remote_ip: Option<IpAddr>,
         context: ConnectionServeContext,
     ) -> Result<(), ZakuraHandlerError> {
+        // Production endpoints are direct-only, so every admitted peer needs an IP slot.
+        if remote_ip.is_none() {
+            debug!(
+                ?peer_id,
+                "rejecting native connection without an attributable IP"
+            );
+            connection.close(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE), b"unattributed IP");
+            return Ok(());
+        }
+
         // Bound the precheck by the demanded service sessions that this connection can admit.
         // Count each symmetric session regardless of which endpoint opens it.
         let ordered_stream_count = self
@@ -9259,6 +9265,191 @@ mod tests {
                  request stream worker disconnects the peer; got {validate:?}",
             );
         }
+    }
+
+    #[tokio::test]
+    async fn production_transport_disables_nat_traversal() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let limits = ZakuraLocalLimits::from_config(&Config::default());
+            for production_is_server in [true, false] {
+                let production =
+                    LocalEndpointFactory::with_transport_config(limits.transport_config())
+                        .endpoint(886)
+                        .await?;
+                // The other endpoint retains Iroh's enabled NAT traversal default.
+                let other = LocalEndpointFactory::new().endpoint(887).await?;
+                let (server, client) = if production_is_server {
+                    (&production, &other)
+                } else {
+                    (&other, &production)
+                };
+                server.set_alpns(vec![P2P_V2_ALPN.to_vec()]);
+                let (accepted, connected) = tokio::join!(
+                    async {
+                        server
+                            .accept()
+                            .await
+                            .expect("test connection arrives")
+                            .await
+                    },
+                    client.connect(server.addr(), P2P_V2_ALPN),
+                );
+                let accepted = accepted?;
+                let connected = connected?;
+                let (served, received) = tokio::join!(
+                    async {
+                        let (mut send, mut recv) = accepted.accept_bi().await?;
+                        assert_eq!(recv.read_to_end(32).await?, b"request");
+                        send.write_all(b"response").await?;
+                        send.finish()?;
+                        Ok::<_, BoxError>(())
+                    },
+                    async {
+                        let (mut send, mut recv) = connected.open_bi().await?;
+                        send.write_all(b"request").await?;
+                        send.finish()?;
+                        assert_eq!(recv.read_to_end(32).await?, b"response");
+                        Ok::<_, BoxError>(())
+                    }
+                );
+                served?;
+                received?;
+                for connection in [&accepted, &connected] {
+                    let stats = connection.stats();
+                    assert_eq!(stats.frame_tx.add_address, 0);
+                    assert_eq!(stats.frame_rx.add_address, 0);
+                    assert_eq!(stats.frame_tx.reach_out, 0);
+                    assert_eq!(stats.frame_rx.reach_out, 0);
+                }
+                accepted.close(0u32.into(), b"done");
+                client.close().await;
+                server.close().await;
+            }
+            Ok(())
+        })
+        .await
+        .expect("production NAT traversal test timed out")
+    }
+
+    #[tokio::test]
+    async fn inbound_unselected_connection_is_charged_to_its_ip() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            #[derive(Clone, Debug)]
+            struct CaptureAccepted {
+                handler: ZakuraProtocolHandler,
+                accepted: mpsc::Sender<Connection>,
+            }
+            impl ProtocolHandler for CaptureAccepted {
+                async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+                    self.accepted
+                        .send(connection.clone())
+                        .await
+                        .map_err(AcceptError::from_err)?;
+                    self.handler.accept(connection).await
+                }
+            }
+            let limits = ZakuraLocalLimits::from_config(&Config::default());
+            let supervisor = ZakuraSupervisorHandle::new(1);
+            let server = LocalEndpointFactory::with_transport_config(limits.transport_config())
+                .endpoint(883)
+                .await?;
+            let (accepted_tx, mut accepted_rx) = mpsc::channel(3);
+            let handler = ZakuraProtocolHandler::new(
+                supervisor.clone(),
+                Network::Mainnet,
+                ZakuraHandshakeConfig::for_network(&Network::Mainnet),
+                limits.clone(),
+            )
+            .with_endpoint(server.clone());
+            let router = Router::builder(server)
+                .accept(
+                    P2P_V2_ALPN,
+                    CaptureAccepted {
+                        handler,
+                        accepted: accepted_tx,
+                    },
+                )
+                .spawn();
+            let server_addr = router.endpoint().addr();
+            // Separate endpoints reuse one identity but bind different UDP ports.
+            let first = LocalEndpointFactory::with_transport_config(limits.transport_config())
+                .endpoint(884)
+                .await?;
+            let second = LocalEndpointFactory::with_transport_config(limits.transport_config())
+                .endpoint(884)
+                .await?;
+            let first_conn = first.connect(server_addr.clone(), P2P_V2_ALPN).await?;
+            let first_accepted = accepted_rx.recv().await.expect("first accept is captured");
+            let second_conn = second.connect(server_addr.clone(), P2P_V2_ALPN).await?;
+            let second_accepted = accepted_rx.recv().await.expect("second accept is captured");
+            assert!(first_accepted.paths().iter().any(|path| path.is_selected()));
+            assert_eq!(second_accepted.paths().len(), 1);
+            assert!(
+                !second_accepted
+                    .paths()
+                    .iter()
+                    .any(|path| path.is_selected()),
+                "the second connection must exercise the unselected-path case"
+            );
+            let config = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+            let peer = ZakuraPeerId::new(second.id().as_bytes().to_vec())?;
+            // Complete the second connection's control handshake first.
+            run_native_initiator_handshake_without_trace(&second_conn, &limits, &config, &peer)
+                .await?;
+            while supervisor.registered_ids().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+            assert_eq!(
+                supervisor.inner.lock().await.active_by_ip.get(&ip),
+                Some(&1),
+                "the unselected connection must consume the IP slot"
+            );
+            // Duplicate admission can close the transport before the client reads the ack.
+            let _ =
+                run_native_initiator_handshake_without_trace(&first_conn, &limits, &config, &peer)
+                    .await;
+            assert!(matches!(first_conn.closed().await,
+                iroh::endpoint::ConnectionError::ApplicationClosed(close)
+                    if close.error_code == VarInt::from_u32(ZAKURA_CLOSE_NEUTRAL)
+                        && close.reason.as_ref() == b"duplicate"));
+            assert_eq!(supervisor.registered_ids().await, vec![peer]);
+            assert_eq!(
+                supervisor.inner.lock().await.active_by_ip.get(&ip),
+                Some(&1),
+                "closing the duplicate must preserve the incumbent's IP slot"
+            );
+
+            let third = LocalEndpointFactory::with_transport_config(limits.transport_config())
+                .endpoint(885)
+                .await?;
+            let third_conn = third.connect(server_addr, P2P_V2_ALPN).await?;
+            let _third_accepted = accepted_rx.recv().await.expect("third accept is captured");
+            let third_peer = ZakuraPeerId::new(third.id().as_bytes().to_vec())?;
+            let _ = run_native_initiator_handshake_without_trace(
+                &third_conn,
+                &limits,
+                &config,
+                &third_peer,
+            )
+            .await;
+            assert!(
+                matches!(third_conn.closed().await,
+                iroh::endpoint::ConnectionError::ApplicationClosed(close)
+                    if close.error_code == VarInt::from_u32(ZAKURA_CLOSE_RESOURCE)),
+                "a new identity from the same IP must be rejected at the IP cap"
+            );
+            assert_eq!(supervisor.registered_ids().await.len(), 1);
+            third.close().await;
+            first.close().await;
+            second.close().await;
+            router.shutdown().await?;
+            Ok(())
+        })
+        .await
+        .expect("unselected connection admission test timed out")
     }
 
     // SECURITY AUDIT (candidate claude-inbound-per-ip-cap-bypassed /

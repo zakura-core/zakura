@@ -4751,3 +4751,15 @@ criteria = "safe-to-deploy"
 user-id = 169181 # Kris Nuttycombe (nuttycom)
 start = "2024-12-17"
 end = "2027-07-10"
+
+[[audits.zakura-iroh-base]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "1.1.0-rc.0 -> 1.1.0-rc.1"
+notes = "Compared every Rust file in the rc0 registry package with rc1 staged from fork revision 6562f6f3be8a9c9591fc89911cf8217196b824ec; all are byte-identical. Only release metadata changes. The archive rebuilt successfully. Prior audit scope and limitations remain."
+
+[[audits.zakura-iroh-dns]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "1.1.0-rc.0 -> 1.1.0-rc.1"
+notes = "Compared every Rust file in the rc0 registry package with rc1 staged from fork revision 6562f6f3be8a9c9591fc89911cf8217196b824ec; all are byte-identical. Release metadata and exact sibling package versions change. The archive rebuilt successfully. Prior audit scope and limitations remain."

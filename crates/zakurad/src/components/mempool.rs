@@ -24,10 +24,11 @@ use std::{
     iter,
     pin::{pin, Pin},
     task::{Context, Poll},
+    time::Instant,
 };
 
 use futures::{future::FutureExt, stream::Stream};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, oneshot};
 use tower::{
     buffer::Buffer,
     timeout::Timeout,
@@ -57,6 +58,7 @@ mod crawler;
 pub mod downloads;
 mod error;
 pub mod gossip;
+mod peer_cooldown;
 mod pending_outputs;
 mod queue_checker;
 mod storage;
@@ -122,9 +124,12 @@ type TxVerifier = Buffer<
 >;
 type InboundTxDownloads = TxDownloads<Timeout<Outbound>, Timeout<TxVerifier>, ReadState>;
 
-fn transaction_misbehavior(
-    error: &TransactionDownloadVerifyError,
-) -> Option<(PeerSocketAddr, u32)> {
+/// Returns the peer to put in a transaction cooldown for `error`, if any.
+///
+/// Only consensus failures that would otherwise count as peer misbehavior
+/// start a cooldown. Policy rejections, duplicate spends, and failures without
+/// a legacy advertiser address do not.
+fn transaction_cooldown_peer(error: &TransactionDownloadVerifyError) -> Option<PeerSocketAddr> {
     let TransactionDownloadVerifyError::Invalid {
         error,
         advertiser_addr: Some(advertiser_addr),
@@ -133,8 +138,7 @@ fn transaction_misbehavior(
         return None;
     };
 
-    let score = error.mempool_misbehavior_score();
-    (score != 0).then_some((*advertiser_addr, score))
+    (error.mempool_misbehavior_score() != 0).then_some(*advertiser_addr)
 }
 
 /// The state of the mempool.
@@ -308,8 +312,9 @@ pub struct Mempool {
     /// Used to broadcast transaction ids to peers.
     transaction_sender: broadcast::Sender<MempoolChange>,
 
-    /// Sender for reporting peer addresses that advertised unexpectedly invalid transactions.
-    misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
+    /// Peers whose transaction advertisements are ignored after they relayed
+    /// invalid transactions. Kept across mempool resets and deactivations.
+    peer_cooldowns: peer_cooldown::PeerCooldowns,
 
     // Diagnostics
     //
@@ -346,7 +351,6 @@ impl Mempool {
         sync_status: SyncStatus,
         latest_chain_tip: zs::LatestChainTip,
         chain_tip_change: ChainTipChange,
-        misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
     ) -> (Self, MempoolTxSubscriber) {
         let (transaction_sender, _) =
             tokio::sync::broadcast::channel(gossip::MEMPOOL_CHANGE_CHANNEL_CAPACITY);
@@ -365,7 +369,7 @@ impl Mempool {
             _state_guard: state,
             tx_verifier,
             transaction_sender,
-            misbehavior_sender,
+            peer_cooldowns: peer_cooldown::PeerCooldowns::default(),
             #[cfg(feature = "progress-bar")]
             queued_count_bar: None,
             #[cfg(feature = "progress-bar")]
@@ -750,8 +754,23 @@ impl Service<Request> for Mempool {
                     }
                     Ok(Err(boxed_err)) => {
                         let (tx_id, error) = *boxed_err;
-                        if let Some((advertiser_addr, score)) = transaction_misbehavior(&error) {
-                            let _ = self.misbehavior_sender.try_send((advertiser_addr, score));
+                        if let Some(advertiser_addr) = transaction_cooldown_peer(&error) {
+                            if let Some(cooldown) = self
+                                .peer_cooldowns
+                                .record_invalid_transaction(advertiser_addr.ip(), Instant::now())
+                            {
+                                tracing::debug!(
+                                    ?tx_id,
+                                    peer = %legacy_peer_log_label(
+                                        advertiser_addr,
+                                        self.expose_peer_addresses,
+                                    ),
+                                    ?cooldown,
+                                    "ignoring peer transaction advertisements after an invalid transaction"
+                                );
+                                metrics::counter!("mempool.peer_cooldown.started.total")
+                                    .increment(1);
+                            }
                         }
 
                         let peer_label =
@@ -1078,15 +1097,31 @@ impl Service<Request> for Mempool {
                         "got mempool QueueFromPeer request"
                     );
 
-                    for gossiped_tx in transactions {
-                        if storage.should_download_or_verify(gossiped_tx.id()).is_err() {
-                            continue;
-                        }
-                        let _ = tx_downloads.download_if_needed_and_verify(
-                            gossiped_tx,
-                            Some(source.clone()),
-                            None,
+                    let is_cooling_down = match &source {
+                        QueueSource::LegacySocket(addr) => self
+                            .peer_cooldowns
+                            .is_cooling_down(addr.ip(), Instant::now()),
+                        QueueSource::Zakura(_) => false,
+                    };
+
+                    if is_cooling_down {
+                        trace!(
+                            req_count = ?transactions.len(),
+                            "ignored transactions from a peer in a transaction cooldown"
                         );
+                        metrics::counter!("mempool.peer_cooldown.ignored.transactions.total")
+                            .increment(u64::try_from(transactions.len()).unwrap_or(u64::MAX));
+                    } else {
+                        for gossiped_tx in transactions {
+                            if storage.should_download_or_verify(gossiped_tx.id()).is_err() {
+                                continue;
+                            }
+                            let _ = tx_downloads.download_if_needed_and_verify(
+                                gossiped_tx,
+                                Some(source.clone()),
+                                None,
+                            );
+                        }
                     }
 
                     self.update_metrics();

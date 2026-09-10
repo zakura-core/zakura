@@ -73,13 +73,13 @@ fn peer_source_from_queue_source(source: &QueueSource) -> Option<zn::PeerSource>
 }
 
 /// Returns the peer address to attribute a peer-pushed transaction's verification
-/// failure to, for the mempool misbehavior channel.
+/// failure to, for the mempool's peer cooldowns.
 ///
-/// Only legacy-socket peers carry a routable [`PeerSocketAddr`], which is the key
-/// the misbehavior channel bans on. Zakura peers yield `None`, matching the
-/// advertised-download path, which also delivers Zakura-served transactions with
-/// no advertiser address (see `legacy_gossip.rs`).
-fn misbehavior_addr_from_queue_source(source: &QueueSource) -> Option<PeerSocketAddr> {
+/// Only legacy-socket peers carry a routable [`PeerSocketAddr`], whose IP address
+/// keys the cooldowns. Zakura peers yield `None`, matching the advertised-download
+/// path, which also delivers Zakura-served transactions with no advertiser address
+/// (see `legacy_gossip.rs`).
+fn advertiser_addr_from_queue_source(source: &QueueSource) -> Option<PeerSocketAddr> {
     match source {
         QueueSource::LegacySocket(addr) => Some(PeerSocketAddr::from(*addr)),
         QueueSource::Zakura(_) => None,
@@ -437,7 +437,7 @@ where
         let verifier = self.verifier.clone();
         let mut state = self.state.clone();
         let download_source = source.as_ref().and_then(peer_source_from_queue_source);
-        let pushed_advertiser_addr = source.as_ref().and_then(misbehavior_addr_from_queue_source);
+        let pushed_advertiser_addr = source.as_ref().and_then(advertiser_addr_from_queue_source);
         let max_transaction_bytes = self.max_transaction_bytes;
 
         let gossiped_tx_req = gossiped_tx.clone();
@@ -1147,7 +1147,7 @@ mod tests {
 
     /// A directly pushed transaction from a legacy-socket peer must keep that
     /// peer's address on the `Invalid` verification error, so the mempool can
-    /// score the peer's misbehavior. Regression test for the push-path
+    /// start a cooldown for that peer. Regression test for the push-path
     /// attribution gap.
     #[tokio::test]
     async fn pushed_transaction_attributes_invalid_error_to_peer() {
@@ -1161,7 +1161,7 @@ mod tests {
             BoxCloneService::new(service_fn(|_request| async move {
                 panic!("pushed transactions must not be downloaded");
             })),
-            // Reject with a consensus error that carries a nonzero misbehavior score.
+            // Reject with a consensus error that starts a peer cooldown.
             BoxCloneService::new(service_fn(|_request| async move {
                 Err(Box::new(TransactionError::WrongVersion) as BoxError)
             })),

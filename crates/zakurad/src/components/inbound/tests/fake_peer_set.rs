@@ -1408,7 +1408,6 @@ async fn setup_with_misbehavior_receiver(
     // Don't wait for the chain tip update here, we wait for expect_request(AdvertiseBlock) below,
     // which is called by the gossip_best_tip_block_hashes task once the chain tip changes.
 
-    let (misbehavior_tx, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
     let (mut mempool_service, transaction_subscriber) = Mempool::new(
         &MempoolConfig::default(),
         false,
@@ -1419,7 +1418,6 @@ async fn setup_with_misbehavior_receiver(
         sync_status.clone(),
         latest_chain_tip.clone(),
         chain_tip_change.clone(),
-        misbehavior_tx,
     );
 
     // Pretend we're close to tip

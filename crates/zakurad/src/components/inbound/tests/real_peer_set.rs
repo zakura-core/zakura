@@ -1023,7 +1023,6 @@ async fn setup(
         .service(BoxService::new(mock_tx_verifier.clone()));
 
     // Mempool
-    let (misbehavior_tx, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
     let mempool_config = MempoolConfig::default();
     let (mut mempool_service, transaction_subscriber) = Mempool::new(
         &mempool_config,
@@ -1035,7 +1034,6 @@ async fn setup(
         sync_status.clone(),
         latest_chain_tip.clone(),
         chain_tip_change.clone(),
-        misbehavior_tx,
     );
 
     // Enable the mempool

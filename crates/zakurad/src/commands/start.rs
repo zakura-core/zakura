@@ -652,7 +652,6 @@ impl StartCmd {
             sync_status.clone(),
             latest_chain_tip.clone(),
             chain_tip_change.clone(),
-            misbehavior_sender.clone(),
         );
         let mempool = BoxService::new(mempool);
         let mempool = ServiceBuilder::new()

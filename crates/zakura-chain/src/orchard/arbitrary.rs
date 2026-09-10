@@ -2,7 +2,7 @@
 
 use group::{
     ff::{FromUniformBytes, PrimeField},
-    prime::PrimeCurveAffine,
+    CurveAffine,
 };
 use halo2::pasta::pallas;
 use reddsa::{orchard::SpendAuth, Signature, SigningKey, VerificationKey, VerificationKeyBytes};

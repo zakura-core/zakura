@@ -1,0 +1,12 @@
+# Daily release-state publication. The import side is weekly, so a missed run
+# costs nothing beyond a slightly older bundle.
+[Unit]
+Description=Daily Mainnet release-state publication
+
+[Timer]
+OnCalendar=*-*-* 05:40:00 UTC
+RandomizedDelaySec=600
+Persistent=true
+
+[Install]
+WantedBy=timers.target

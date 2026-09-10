@@ -1346,6 +1346,7 @@ impl Transaction {
     /// using the outputs spent by this transaction.
     ///
     /// See `transparent_value_balance` for details.
+    #[cfg(any(test, feature = "proptest-impl"))]
     #[allow(clippy::unwrap_in_result)]
     fn transparent_value_balance_from_outputs(
         &self,
@@ -1364,6 +1365,38 @@ impl Transaction {
             .outputs()
             .iter()
             .map(|o| o.value())
+            .sum::<Result<Amount<NonNegative>, AmountError>>()
+            .map_err(ValueBalanceError::Transparent)?
+            .constrain()
+            .expect("conversion from NonNegative to NegativeAllowed is always valid");
+
+        (input_value - output_value)
+            .map(ValueBalance::from_transparent_amount)
+            .map_err(ValueBalanceError::Transparent)
+    }
+
+    /// Return the transparent value balance using borrowed UTXOs.
+    #[allow(clippy::unwrap_in_result)]
+    fn transparent_value_balance_from_utxos<U>(
+        &self,
+        utxos: &HashMap<transparent::OutPoint, U>,
+    ) -> Result<ValueBalance<NegativeAllowed>, ValueBalanceError>
+    where
+        U: AsRef<transparent::Utxo>,
+    {
+        let input_value = self
+            .inputs()
+            .iter()
+            .map(|input| input.value_from_utxos(utxos))
+            .sum::<Result<Amount<NonNegative>, AmountError>>()
+            .map_err(ValueBalanceError::Transparent)?
+            .constrain()
+            .expect("conversion from NonNegative to NegativeAllowed is always valid");
+
+        let output_value = self
+            .outputs()
+            .iter()
+            .map(|output| output.value())
             .sum::<Result<Amount<NonNegative>, AmountError>>()
             .map_err(ValueBalanceError::Transparent)?
             .constrain()
@@ -1681,6 +1714,7 @@ impl Transaction {
     }
 
     /// Returns the value balances for this transaction using the provided transparent outputs.
+    #[cfg(any(test, feature = "proptest-impl"))]
     pub(crate) fn value_balance_from_outputs(
         &self,
         outputs: &HashMap<transparent::OutPoint, transparent::Output>,
@@ -1716,16 +1750,38 @@ impl Transaction {
         &self,
         utxos: &HashMap<transparent::OutPoint, transparent::Utxo>,
     ) -> Result<ValueBalance<NegativeAllowed>, ValueBalanceError> {
-        let outputs = self
-            .spent_outpoints()
-            .filter_map(|outpoint| {
-                utxos
-                    .get(&outpoint)
-                    .map(|utxo| (outpoint, utxo.output.clone()))
-            })
-            .collect();
+        self.value_balance_from_utxos(utxos)
+    }
 
-        self.value_balance_from_outputs(&outputs)
+    /// Returns the value balances for this transaction using borrowed ordered UTXOs.
+    ///
+    /// `utxos` must contain the [`transparent::OrderedUtxo`] of every input in
+    /// the transaction. This includes UTXOs created by earlier transactions in
+    /// the same block. The map can also contain unrelated UTXOs, which this
+    /// method ignores.
+    ///
+    /// # Panics
+    ///
+    /// This method panics if `utxos` omits a transparent input's UTXO.
+    pub fn value_balance_from_ordered_utxos(
+        &self,
+        utxos: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
+    ) -> Result<ValueBalance<NegativeAllowed>, ValueBalanceError> {
+        self.value_balance_from_utxos(utxos)
+    }
+
+    fn value_balance_from_utxos<U>(
+        &self,
+        utxos: &HashMap<transparent::OutPoint, U>,
+    ) -> Result<ValueBalance<NegativeAllowed>, ValueBalanceError>
+    where
+        U: AsRef<transparent::Utxo>,
+    {
+        self.transparent_value_balance_from_utxos(utxos)?
+            + self.sprout_value_balance()?
+            + self.sapling_value_balance()
+            + self.orchard_value_balance()
+            + self.ironwood_value_balance()
     }
 
     /// Converts [`Transaction`] to [`zcash_primitives::transaction::Transaction`].

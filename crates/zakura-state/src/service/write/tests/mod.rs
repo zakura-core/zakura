@@ -50,7 +50,7 @@ use crate::{
         ChainTipSender,
     },
     tests::FakeChainHelper,
-    CheckpointVerifiedBlock, Config,
+    CheckpointVerifiedBlock, CommitBlockError, Config, ValidateContextError,
 };
 use zakura_header_chain::{
     AdjustedDifficulty, AlarmSet, ApplyResult, BodyRuleId, BodyUnavailableSummary,
@@ -61,8 +61,43 @@ use zakura_header_chain::{
     StateVersion, SuffixWork, SystemClock, TargetCompletion, TransientBodyFailure,
     TransientBodyFailureKind, TransitionContext, TransitionEvent, TransitionFailure,
     TransitionRequest, TrustedAnchor, VerifiedChangeCause, VerifiedGeneration, VerifiedHeaderRef,
-    WorkCoordinate, POW_ADJUSTMENT_BLOCK_SPAN,
+    WorkCoordinate, MAX_CANDIDATE_TIPS_V1, POW_ADJUSTMENT_BLOCK_SPAN,
 };
+
+#[test]
+fn write_failure_kind_preserves_invalid_and_retryable_context() {
+    let retryable = CommitBlockError::ValidateContextError(Box::new(
+        ValidateContextError::VctSuppliedRootUnavailable {
+            height: block::Height(1),
+        },
+    ));
+    assert_eq!(
+        NonFinalizedWriteFailureKind::from_error(&retryable),
+        NonFinalizedWriteFailureKind::Retryable
+    );
+
+    let invalid = CommitBlockError::ValidateContextError(Box::new(
+        ValidateContextError::DuplicateTransparentSpend {
+            outpoint: transparent::OutPoint {
+                hash: [1; 32].into(),
+                index: 0,
+            },
+            location: "test chain",
+        },
+    ));
+    assert_eq!(
+        NonFinalizedWriteFailureKind::from_error(&invalid),
+        NonFinalizedWriteFailureKind::Invalid
+    );
+
+    let invalid_ancestor = CommitBlockError::ValidateContextError(Box::new(
+        ValidateContextError::InvalidAncestorBlock(block::Hash([2; 32])),
+    ));
+    assert_eq!(
+        NonFinalizedWriteFailureKind::from_error(&invalid_ancestor),
+        NonFinalizedWriteFailureKind::Invalid
+    );
+}
 
 fn header_owner(
     snapshot: &EngineSnapshot,

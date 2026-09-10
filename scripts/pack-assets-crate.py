@@ -1,0 +1,381 @@
+#!/usr/bin/env python3
+"""Pack a verified Mainnet frontier grid into the publishable asset crate.
+
+The payload never enters git. This script materialises it, and the constants that declare its
+identity, into `crates/zakura-assets/` immediately before `cargo publish`, so the bytes live only
+in the release-state bundle they came from and in the crates.io archive they are published to.
+
+The crate version is derived from the grid rather than passed in: `0.<last_checkpoint>.<revision>`.
+That makes the version a consumer pins a statement about which checkpoint the payload covers, which
+is what `scripts/check-release-state.sh` checks against the committed provenance manifest.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import struct
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+CRATE_DIR = Path("crates/zakura-assets")
+GRID_NAME = "mainnet-frontier-grid.bin"
+GENERATED_NAME = "generated.rs"
+
+# magic, version, network, grid spacing, last checkpoint, entry count.
+HEADER_PREFIX = struct.Struct("<8sHBIII")
+HEADER_LEN = HEADER_PREFIX.size + 32
+MAGIC = b"ZKVCTFR1"
+FORMAT_VERSION = 1
+MAINNET_TAG = 1
+MAX_ENTRIES = 16_000_000
+# A height and three u32 blob length prefixes; empty tree blobs are legal framing.
+MIN_ENTRY_LEN = 4 + 4 + 4 + 4
+
+NAME_PATTERN = re.compile(r'^name = "([^"]+)"$', re.MULTILINE)
+VERSION_PATTERN = re.compile(r'^version = "[^"]*"$', re.MULTILINE)
+
+
+class AssetPackError(RuntimeError):
+    """The grid cannot be packaged into a publishable crate."""
+
+
+def parse_grid(data: bytes, label: str) -> tuple[int, int, bytes]:
+    """Validate one frontier grid's framing and return its checkpoint, entry count, and payload.
+
+    This repeats the checks `FrontierArtifact::decode` makes, so a malformed grid is refused
+    before it reaches crates.io rather than after.
+    """
+
+    if len(data) < HEADER_LEN:
+        raise AssetPackError(f"{label} is too short to hold a frontier grid header")
+    magic, version, network, _spacing, last_checkpoint, count = HEADER_PREFIX.unpack_from(data, 0)
+    if magic != MAGIC:
+        raise AssetPackError(f"{label} is not a frontier grid")
+    if version != FORMAT_VERSION:
+        raise AssetPackError(f"{label} declares format version {version}, expected 1")
+    if network != MAINNET_TAG:
+        raise AssetPackError(f"{label} is not a Mainnet frontier grid")
+    if count > MAX_ENTRIES:
+        raise AssetPackError(f"{label} declares an impossible entry count {count}")
+
+    payload = data[HEADER_LEN:]
+    digest = hashlib.sha256(data[: HEADER_PREFIX.size] + payload).digest()
+    if digest != data[HEADER_PREFIX.size : HEADER_LEN]:
+        raise AssetPackError(f"{label} has an invalid frontier grid digest")
+    # A producer can create a valid digest over an invalid frame, so reject impossible counts
+    # before walking the payload.
+    if count * MIN_ENTRY_LEN > len(payload):
+        raise AssetPackError(f"{label} declares more entries than its payload holds")
+
+    offset = 0
+    previous: int | None = None
+    for _ in range(count):
+        (height,) = struct.unpack_from("<I", payload, offset)
+        offset += 4
+        if previous is not None and height <= previous:
+            raise AssetPackError(f"{label} entries are not in increasing height order")
+        previous = height
+        for _pool in range(3):
+            if offset + 4 > len(payload):
+                raise AssetPackError(f"{label} has truncated frontier grid framing")
+            (blob_len,) = struct.unpack_from("<I", payload, offset)
+            offset += 4 + blob_len
+            if offset > len(payload):
+                raise AssetPackError(f"{label} has truncated frontier grid framing")
+    if offset != len(payload):
+        raise AssetPackError(f"{label} has trailing frontier grid bytes")
+    if previous is not None and previous >= last_checkpoint:
+        raise AssetPackError(
+            f"{label} has an entry at height {previous}, at or above its checkpoint "
+            f"{last_checkpoint}"
+        )
+
+    return last_checkpoint, count, payload
+
+
+def crate_name(crate_dir: Path) -> str:
+    """Read the published package name, so no caller has to hardcode it."""
+
+    manifest = crate_dir / "Cargo.toml"
+    try:
+        text = manifest.read_text(encoding="utf-8")
+    except OSError as error:
+        raise AssetPackError(f"cannot read {manifest}: {error}") from error
+    match = NAME_PATTERN.search(text)
+    if match is None:
+        raise AssetPackError(f"{manifest} does not declare a package name")
+    return match.group(1)
+
+
+def _render_generated(data: bytes, last_checkpoint: int, entries: int) -> str:
+    digest = hashlib.sha256(data).digest()
+    rows = []
+    for start in range(0, len(digest), 16):
+        row = ", ".join(f"0x{byte:02x}" for byte in digest[start : start + 16])
+        rows.append(f"    {row},")
+    body = "\n".join(rows)
+    return f"""// @generated by scripts/pack-assets-crate.py. Do not edit, and do not commit.
+//
+// These constants declare what the packaged payload is. `src/lib.rs` tests them against the
+// payload itself, so they cannot drift from the bytes they ship beside.
+
+/// Length of the Mainnet historical frontier grid in bytes.
+pub const MAINNET_FRONTIER_GRID_LEN: usize = {len(data)};
+
+/// SHA-256 of the complete Mainnet historical frontier grid.
+pub const MAINNET_FRONTIER_GRID_SHA256: [u8; 32] = [
+{body}
+];
+
+/// SHA-256 of the grid as lowercase hex, matching Zakura's provenance manifest.
+pub const MAINNET_FRONTIER_GRID_SHA256_HEX: &str = "{digest.hex()}";
+
+/// Last checkpoint the grid covers.
+pub const MAINNET_FRONTIER_GRID_CHECKPOINT: u32 = {last_checkpoint};
+
+/// Number of frontier entries the grid holds.
+pub const MAINNET_FRONTIER_GRID_ENTRIES: u32 = {entries};
+"""
+
+
+def _write_atomic(path: Path, data: bytes) -> None:
+    handle, staged = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.")
+    try:
+        with os.fdopen(handle, "wb") as file:
+            file.write(data)
+        # mkstemp creates 0600; packaged sources should look like every other source file.
+        os.chmod(staged, 0o644)
+        os.replace(staged, path)
+    except BaseException:
+        Path(staged).unlink(missing_ok=True)
+        raise
+
+
+def _stamp_version(crate_dir: Path, version: str) -> None:
+    manifest = crate_dir / "Cargo.toml"
+    text = manifest.read_text(encoding="utf-8")
+    stamped, count = VERSION_PATTERN.subn(f'version = "{version}"', text, count=1)
+    if count != 1:
+        raise AssetPackError(f"{manifest} does not declare a package version to stamp")
+    _write_atomic(manifest, stamped.encode("utf-8"))
+
+
+def pack(grid_path: Path, crate_dir: Path, revision: int) -> dict[str, object]:
+    """Materialise the crate payload and return the record describing what was packed."""
+
+    try:
+        data = grid_path.read_bytes()
+    except OSError as error:
+        raise AssetPackError(f"cannot read {grid_path}: {error}") from error
+
+    last_checkpoint, entries, _payload = parse_grid(data, str(grid_path))
+    if revision < 0:
+        raise AssetPackError("revision must not be negative")
+    version = f"0.{last_checkpoint}.{revision}"
+
+    source = crate_dir / "src"
+    if not source.is_dir():
+        raise AssetPackError(f"{source} is not a directory; is --crate-dir correct?")
+
+    _write_atomic(source / GRID_NAME, data)
+    _write_atomic(
+        source / GENERATED_NAME,
+        _render_generated(data, last_checkpoint, entries).encode("utf-8"),
+    )
+    _stamp_version(crate_dir, version)
+
+    return {
+        "name": crate_name(crate_dir),
+        "version": version,
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "size": len(data),
+        "entries": entries,
+        "last_checkpoint": last_checkpoint,
+    }
+
+
+def _build_grid(
+    *,
+    heights: list[int],
+    last_checkpoint: int,
+    magic: bytes = MAGIC,
+    version: int = FORMAT_VERSION,
+    network: int = MAINNET_TAG,
+    count: int | None = None,
+) -> bytes:
+    payload = b""
+    for height in heights:
+        payload += struct.pack("<I", height)
+        for _pool in range(3):
+            payload += struct.pack("<I", 0)
+    prefix = HEADER_PREFIX.pack(
+        magic,
+        version,
+        network,
+        0,
+        last_checkpoint,
+        len(heights) if count is None else count,
+    )
+    return prefix + hashlib.sha256(prefix + payload).digest() + payload
+
+
+def _self_test() -> int:
+    class SelfTest(unittest.TestCase):
+        def setUp(self) -> None:
+            self.temp = tempfile.TemporaryDirectory()
+            self.addCleanup(self.temp.cleanup)
+            self.crate = Path(self.temp.name) / "zakura-assets"
+            (self.crate / "src").mkdir(parents=True)
+            (self.crate / "Cargo.toml").write_text(
+                '[package]\nname = "example-assets"\nversion = "0.0.0"\n'
+                'rust-version = "1.91"\n',
+                encoding="utf-8",
+            )
+            self.grid_path = Path(self.temp.name) / GRID_NAME
+
+        def write_grid(self, data: bytes) -> Path:
+            self.grid_path.write_bytes(data)
+            return self.grid_path
+
+        def test_packs_a_valid_grid_and_derives_its_version(self) -> None:
+            data = _build_grid(heights=[0, 10, 20], last_checkpoint=100)
+            record = pack(self.write_grid(data), self.crate, 0)
+            self.assertEqual(record["version"], "0.100.0")
+            self.assertEqual(record["name"], "example-assets")
+            self.assertEqual(record["entries"], 3)
+            self.assertEqual(record["last_checkpoint"], 100)
+            self.assertEqual(record["size"], len(data))
+            self.assertEqual(record["sha256"], hashlib.sha256(data).hexdigest())
+            self.assertEqual((self.crate / "src" / GRID_NAME).read_bytes(), data)
+            self.assertIn(
+                'version = "0.100.0"',
+                (self.crate / "Cargo.toml").read_text(encoding="utf-8"),
+            )
+            # The stamp must not disturb the neighbouring rust-version key.
+            self.assertIn(
+                'rust-version = "1.91"',
+                (self.crate / "Cargo.toml").read_text(encoding="utf-8"),
+            )
+
+        def test_generated_constants_describe_the_payload(self) -> None:
+            data = _build_grid(heights=[5], last_checkpoint=9)
+            pack(self.write_grid(data), self.crate, 3)
+            generated = (self.crate / "src" / GENERATED_NAME).read_text(encoding="utf-8")
+            self.assertIn(f"MAINNET_FRONTIER_GRID_LEN: usize = {len(data)}", generated)
+            self.assertIn("MAINNET_FRONTIER_GRID_CHECKPOINT: u32 = 9", generated)
+            self.assertIn("MAINNET_FRONTIER_GRID_ENTRIES: u32 = 1", generated)
+            self.assertIn(hashlib.sha256(data).hexdigest(), generated)
+
+        def test_revision_selects_the_patch_component(self) -> None:
+            data = _build_grid(heights=[1], last_checkpoint=2)
+            record = pack(self.write_grid(data), self.crate, 7)
+            self.assertEqual(record["version"], "0.2.7")
+
+        def test_packing_is_deterministic(self) -> None:
+            data = _build_grid(heights=[1, 2], last_checkpoint=3)
+            pack(self.write_grid(data), self.crate, 0)
+            first = (self.crate / "src" / GENERATED_NAME).read_bytes()
+            pack(self.write_grid(data), self.crate, 0)
+            self.assertEqual((self.crate / "src" / GENERATED_NAME).read_bytes(), first)
+
+        def test_rejects_wrong_magic(self) -> None:
+            data = _build_grid(heights=[1], last_checkpoint=2, magic=b"ZKVCTST1")
+            with self.assertRaisesRegex(AssetPackError, "not a frontier grid"):
+                pack(self.write_grid(data), self.crate, 0)
+
+        def test_rejects_wrong_network(self) -> None:
+            data = _build_grid(heights=[1], last_checkpoint=2, network=0)
+            with self.assertRaisesRegex(AssetPackError, "not a Mainnet"):
+                pack(self.write_grid(data), self.crate, 0)
+
+        def test_rejects_unsupported_version(self) -> None:
+            data = _build_grid(heights=[1], last_checkpoint=2, version=2)
+            with self.assertRaisesRegex(AssetPackError, "format version 2"):
+                pack(self.write_grid(data), self.crate, 0)
+
+        def test_rejects_a_tampered_payload(self) -> None:
+            data = bytearray(_build_grid(heights=[1], last_checkpoint=2))
+            data[-1] ^= 0x01
+            with self.assertRaisesRegex(AssetPackError, "invalid frontier grid digest"):
+                pack(self.write_grid(bytes(data)), self.crate, 0)
+
+        def test_rejects_a_tampered_header(self) -> None:
+            data = bytearray(_build_grid(heights=[1], last_checkpoint=2))
+            # The checkpoint field lives inside the framing digest, so flipping it must fail.
+            data[15] ^= 0x01
+            with self.assertRaisesRegex(AssetPackError, "invalid frontier grid digest"):
+                pack(self.write_grid(bytes(data)), self.crate, 0)
+
+        def test_rejects_an_absurd_entry_count(self) -> None:
+            data = _build_grid(heights=[1], last_checkpoint=2, count=MAX_ENTRIES + 1)
+            with self.assertRaisesRegex(AssetPackError, "impossible entry count"):
+                pack(self.write_grid(data), self.crate, 0)
+
+        def test_rejects_a_count_larger_than_the_payload(self) -> None:
+            data = _build_grid(heights=[1], last_checkpoint=2, count=1000)
+            with self.assertRaisesRegex(AssetPackError, "more entries than its payload"):
+                pack(self.write_grid(data), self.crate, 0)
+
+        def test_rejects_an_entry_at_the_checkpoint(self) -> None:
+            data = _build_grid(heights=[1, 2], last_checkpoint=2)
+            with self.assertRaisesRegex(AssetPackError, "at or above its checkpoint"):
+                pack(self.write_grid(data), self.crate, 0)
+
+        def test_rejects_unordered_entries(self) -> None:
+            data = _build_grid(heights=[5, 5], last_checkpoint=9)
+            with self.assertRaisesRegex(AssetPackError, "increasing height order"):
+                pack(self.write_grid(data), self.crate, 0)
+
+        def test_rejects_a_truncated_grid(self) -> None:
+            data = _build_grid(heights=[1], last_checkpoint=2)[:HEADER_LEN - 1]
+            with self.assertRaisesRegex(AssetPackError, "too short"):
+                pack(self.write_grid(data), self.crate, 0)
+
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(SelfTest)
+    return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--grid", type=Path, help=f"verified {GRID_NAME} to package")
+    parser.add_argument(
+        "--crate-dir",
+        type=Path,
+        default=CRATE_DIR,
+        help="asset crate to materialise into",
+    )
+    parser.add_argument(
+        "--revision",
+        type=int,
+        default=0,
+        help="patch component, for republishing one checkpoint",
+    )
+    parser.add_argument("--result-out", type=Path, help="write the packed record as JSON")
+    args = parser.parse_args()
+
+    if args.self_test:
+        return _self_test()
+    if args.grid is None:
+        parser.error("--grid is required unless --self-test is given")
+
+    try:
+        record = pack(args.grid, args.crate_dir, args.revision)
+    except AssetPackError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+    if args.result_out is not None:
+        args.result_out.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(record, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

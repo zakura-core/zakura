@@ -1405,6 +1405,18 @@ fn checkpoint_auxiliary_staging_does_not_clone_the_retained_engine() {
         implementation.contains("transition_engine.graph().header_node(header.hash).is_some()"),
         "the predecessor-lease fast path must be justified by the coherent retained graph"
     );
+    let validated = implementation
+        .find("validate_full_state_finality_provenance")
+        .expect("the combined checkpoint path validates full-state finality provenance");
+    let staged = implementation
+        .find("install_committed_transition")
+        .expect("the combined checkpoint path stages the auxiliary transition");
+    assert!(
+        validated < staged,
+        "checkpoint provenance must be validated against the pre-auxiliary snapshot, \
+         because staging the auxiliary transition advances the state version the \
+         state writer bound its evidence to"
+    );
 }
 
 #[test]
@@ -1464,5 +1476,278 @@ fn repeated_compatible_finality_publications_preserve_body_work_epoch() {
         publisher.view().body_work_epoch,
         zakura_header_chain::BodyWorkEpoch::default(),
         "compatible checkpoint publications must not advance the cumulative epoch"
+    );
+}
+
+#[test]
+fn combined_checkpoint_rejects_stale_version_and_accepts_pre_auxiliary_evidence() {
+    let cache = tempfile::tempdir().expect("the test cache directory is created");
+    let db_config = Config {
+        cache_dir: cache.path().to_owned(),
+        ephemeral: false,
+        debug_skip_non_finalized_state_backup_task: true,
+        ..Config::default()
+    };
+    let (engine_config, anchor, metadata) = fixture();
+    let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
+    store
+        .initialize(metadata, anchor.clone())
+        .expect("the empty schema initializes");
+    let (runtime, _) = store
+        .startup(&engine_config)
+        .expect("the initial store audits");
+    let initial = runtime.publisher().snapshot();
+    let anchor_frontier = Frontier::new(anchor.height, anchor.hash);
+
+    let lease = runtime
+        .reader()
+        .validation_context(anchor.hash)
+        .expect("the anchor validation context is coherent")
+        .expect("the initialized anchor is retained");
+    let rules = HeaderRules::for_validation_lease(&lease)
+        .expect("the authenticated regtest policy is valid");
+    let mut child_header = *anchor.header;
+    child_header.previous_block_hash = anchor.hash;
+    child_header.time += chrono::Duration::seconds(1);
+    child_header.nonce.0[0] = 0x81;
+    let child_header = Arc::new(child_header);
+    // Authenticating a VCT delivery reads the delivery's direct successor on the owned
+    // branch, so the fixture admits one header past the checkpoint target.
+    let mut successor_header = *child_header;
+    successor_header.previous_block_hash = child_header.hash();
+    successor_header.time += chrono::Duration::seconds(1);
+    successor_header.nonce.0[0] = 0x85;
+    let successor_header = Arc::new(successor_header);
+    let headers = [child_header.clone(), successor_header.clone()];
+    let insertion_batch = zakura_header_chain::prepare_headers(
+        HeaderBatchInput::new(&headers),
+        lease.parent(),
+        &rules,
+        &SystemClock,
+    )
+    .expect("the checkpoint fixture passes production validation");
+    let child = Frontier::new(
+        anchor
+            .height
+            .next()
+            .expect("the genesis anchor has a next height"),
+        child_header.hash(),
+    );
+    let successor = Frontier::new(
+        child.height.next().expect("the child has a next height"),
+        successor_header.hash(),
+    );
+
+    // The unauthenticated delivery gives the auxiliary transition real durable work, which is
+    // what advances the state version between the writer's read and the checkpoint plan.
+    let source = SourceId::from_digest([0x82; 32]);
+    // The admission rule requires the delivery and its insertion to share one owner.
+    let insertion_owner = header_owner(&initial, successor.hash, 63, 64);
+    let delivery = zakura_header_chain::AuxDelivery::new(
+        EvidenceId::from_digest([0x83; 32]),
+        child.hash,
+        source,
+        insertion_owner,
+        zakura_header_chain::BodySizeHint::Unknown,
+        Some(zakura_header_chain::TreeAuxRecordV1 {
+            height: child.height,
+            sapling_root: Default::default(),
+            orchard_root: Default::default(),
+            ironwood_root: Default::default(),
+            sapling_tx_count: 4,
+            orchard_tx_count: 5,
+            ironwood_tx_count: 6,
+            auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([0x84; 32]),
+        }),
+    );
+    runtime
+        .apply(
+            TransitionRequest {
+                expected_version: initial.state_version,
+                event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                    owner: insertion_owner,
+                    source,
+                    parent_hash: anchor.hash,
+                    target_tip_hash: successor.hash,
+                    completion: TargetCompletion::TargetComplete {
+                        common_ancestor: anchor_frontier,
+                    },
+                    batch: insertion_batch,
+                    aux: vec![delivery],
+                })),
+            },
+            &TransitionContext {
+                config: &engine_config,
+                clock: &SystemClock,
+                full_state_authority: None,
+                retention_references: &[],
+            },
+        )
+        .expect("the checkpoint header inserts with its unauthenticated delivery");
+
+    let before = runtime.publisher().snapshot();
+    assert_eq!(before.frontiers.verified_best, anchor_frontier);
+
+    // The state writer binds checkpoint finality evidence to the version it read.
+    let checkpoint_evidence =
+        zakura_header_chain::checkpoint_finality_evidence(before.state_version, child);
+    let checkpoint_event = TransitionEvent::VerifiedChainChanged(VerifiedChainChanged {
+        full_state_transition_id: checkpoint_evidence,
+        old_tip: before.frontiers.verified_best,
+        new_path: vec![zakura_header_chain::VerifiedHeaderRef {
+            height: child.height,
+            hash: child.hash,
+            header: child_header,
+        }],
+        cause: VerifiedChangeCause::CheckpointFinalizedGrow,
+    });
+
+    let observation = zakura_header_chain::AuxObservationV1::from_vct(
+        body_owner(&before, 63, 64),
+        vec![delivery],
+        zakura_header_chain::AuxVerificationFactV1::current_delivery_verified(),
+        Some(zakura_chain::block::merkle::AuthDataRoot::from([0x84; 32])),
+    )
+    .expect("the VCT authentication observation is well formed");
+    let aux_event = TransitionEvent::AuxEvidence(Box::new(
+        zakura_header_chain::AuxEvidence::observed(observation),
+    ));
+    let aux_authority = Authority(
+        aux_event
+            .idempotency_key()
+            .expect("the auxiliary observation has an identity"),
+    );
+    let checkpoint_authority = Authority(checkpoint_evidence);
+
+    let stale_version = StateVersion::new(
+        before
+            .state_version
+            .get()
+            .checked_sub(1)
+            .expect("header insertion advanced the initial version"),
+    );
+    let mut stale_full_state_batch = DiskWriteBatch::new();
+    stage_full_state_canonical_hash(&runtime.store, &mut stale_full_state_batch, child);
+    let mut stale_memory_swapped = false;
+    let stale_result = runtime
+        .apply_aux_then_checkpoint_combined(
+            TransitionRequest {
+                expected_version: before.state_version,
+                event: aux_event.clone(),
+            },
+            &TransitionContext {
+                config: &engine_config,
+                clock: &SystemClock,
+                full_state_authority: Some(&aux_authority),
+                retention_references: &[],
+            },
+            TransitionRequest {
+                expected_version: stale_version,
+                event: checkpoint_event.clone(),
+            },
+            &TransitionContext {
+                config: &engine_config,
+                clock: &SystemClock,
+                full_state_authority: Some(&checkpoint_authority),
+                retention_references: &[],
+            },
+            stale_full_state_batch,
+            || stale_memory_swapped = true,
+        )
+        .expect("a stale checkpoint request returns a typed result");
+
+    assert_eq!(
+        stale_result,
+        ApplyResult::Stale(StaleReceipt {
+            current_version: before.state_version,
+            branch: None,
+        })
+    );
+    assert!(!stale_memory_swapped);
+    assert_eq!(runtime.publisher().snapshot(), before);
+
+    let mut full_state_batch = DiskWriteBatch::new();
+    stage_full_state_canonical_hash(&runtime.store, &mut full_state_batch, child);
+
+    let result = runtime
+        .apply_aux_then_checkpoint_combined(
+            TransitionRequest {
+                expected_version: before.state_version,
+                event: aux_event,
+            },
+            &TransitionContext {
+                config: &engine_config,
+                clock: &SystemClock,
+                full_state_authority: Some(&aux_authority),
+                retention_references: &[],
+            },
+            TransitionRequest {
+                expected_version: before.state_version,
+                event: checkpoint_event,
+            },
+            &TransitionContext {
+                config: &engine_config,
+                clock: &SystemClock,
+                full_state_authority: Some(&checkpoint_authority),
+                retention_references: &[],
+            },
+            full_state_batch,
+            || {},
+        )
+        .expect("the checkpoint commits against evidence bound to the pre-auxiliary version");
+
+    assert!(matches!(result, ApplyResult::Committed));
+    let after = runtime.publisher().snapshot();
+    assert_eq!(after.frontiers.verified_best, child);
+    assert_eq!(
+        after.state_version.get(),
+        before.state_version.get() + 2,
+        "the auxiliary transition must advance the version the checkpoint evidence was bound to"
+    );
+
+    drop(runtime);
+    let (reopened, report) = HeaderChainStore::new(open(&db_config, engine_config.network()))
+        .startup(&engine_config)
+        .expect("recovery authenticates the pre-auxiliary checkpoint provenance");
+    assert_eq!(report.current, after);
+    assert_eq!(reopened.publisher().snapshot(), after);
+}
+
+#[test]
+fn checkpoint_grow_provenance_is_bound_to_one_state_version() {
+    let (_, anchor, metadata) = fixture();
+    let snapshot = metadata.snapshot();
+    let current = Frontier::new(
+        anchor
+            .height
+            .next()
+            .expect("the anchor has a successor height"),
+        block::Hash([0x95; 32]),
+    );
+    let event = TransitionEvent::VerifiedChainChanged(VerifiedChainChanged {
+        full_state_transition_id: zakura_header_chain::checkpoint_finality_evidence(
+            snapshot.state_version,
+            current,
+        ),
+        old_tip: metadata.frontiers.verified_best,
+        new_path: vec![zakura_header_chain::VerifiedHeaderRef {
+            height: current.height,
+            hash: current.hash,
+            header: anchor.header.clone(),
+        }],
+        cause: VerifiedChangeCause::CheckpointFinalizedGrow,
+    });
+    assert!(validate_full_state_finality_provenance(&event, &snapshot).is_ok());
+
+    let mut advanced = snapshot.clone();
+    advanced.state_version = StateVersion::new(snapshot.state_version.get() + 1);
+    assert!(
+        matches!(
+            validate_full_state_finality_provenance(&event, &advanced),
+            Err(HeaderChainStoreError::Incoherent(
+                "full-state finality provenance does not match the authorized transition"
+            ))
+        ),
+        "checkpoint evidence must not validate against a version the state writer never read"
     );
 }

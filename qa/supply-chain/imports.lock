@@ -76,6 +76,13 @@ version = "0.57.1"
 when = "2026-04-17"
 trusted-publisher = "github:bytecodealliance/wit-bindgen"
 
+[[publisher.zakura-assets]]
+version = "0.3457371.0"
+when = "2026-08-24"
+user-id = 1244
+user-login = "ebfull"
+user-name = "Sean Bowe"
+
 [[publisher.zcash_address]]
 version = "0.13.0"
 when = "2026-07-09"
@@ -90,30 +97,9 @@ user-id = 169181
 user-login = "nuttycom"
 user-name = "Kris Nuttycombe"
 
-[[publisher.zcash_keys]]
-version = "0.16.0"
-when = "2026-07-25"
-user-id = 169181
-user-login = "nuttycom"
-user-name = "Kris Nuttycombe"
-
-[[publisher.zcash_primitives]]
-version = "0.30.0"
-when = "2026-07-24"
-user-id = 169181
-user-login = "nuttycom"
-user-name = "Kris Nuttycombe"
-
-[[publisher.zcash_proofs]]
-version = "0.30.0"
-when = "2026-07-24"
-user-id = 169181
-user-login = "nuttycom"
-user-name = "Kris Nuttycombe"
-
 [[publisher.zcash_protocol]]
-version = "0.10.1"
-when = "2026-07-24"
+version = "0.10.5"
+when = "2026-08-19"
 user-id = 169181
 user-login = "nuttycom"
 user-name = "Kris Nuttycombe"

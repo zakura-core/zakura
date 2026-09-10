@@ -129,13 +129,13 @@ cargo test -p zakura-network zakura::testkit::handshake -- --nocapture
 Compile the byte-level fuzz target:
 
 ```console
-cargo check --manifest-path fuzz/handshake/Cargo.toml
+cargo check --manifest-path qa/fuzz/handshake/Cargo.toml
 ```
 
 Run the fuzz target with `cargo-fuzz` installed:
 
 ```console
-cargo +nightly fuzz run --fuzz-dir fuzz/handshake control_payload
+cargo +nightly fuzz run --fuzz-dir qa/fuzz/handshake control_payload
 ```
 
 The fuzz target checks length admission and canonical hello and ack round trips. It feeds arbitrary

@@ -187,7 +187,7 @@ pub struct DerivationSample {
 
     /// How many blocks the derivation replayed.
     ///
-    /// Zero means the height was already memoized, so nothing was replayed.
+    /// Zero means the height was already in the cache, so nothing was replayed.
     pub replayed_blocks: u64,
 
     /// How long the derivation took, including the root check.
@@ -208,7 +208,7 @@ impl DerivationSample {
 /// height *is* a root match at that height, and the first mismatch stops the walk. That makes this
 /// both the invariant check and the cost measurement.
 ///
-/// `cache` carries memoized frontiers between heights. Pass a fresh cache to measure cold cost from
+/// `cache` carries derived frontiers between heights. Pass a fresh cache to measure cold cost from
 /// the bottom of the band; reuse one across ascending heights to measure the sequential cost a
 /// wallet actually pays.
 pub fn measure_derivations(
@@ -220,7 +220,7 @@ pub fn measure_derivations(
 ) -> Result<(), (Height, HistoricalTreeDerivationError)> {
     for height in heights {
         let start = Instant::now();
-        // The derivation reports its own replay length: it may have anchored on the memo, on a
+        // The derivation reports its own replay length: it may have anchored on the cache, on a
         // published grid entry, or on genesis, and only it knows which.
         let derivation = derive_historical_frontiers_measured(db, cache, height, max_replay_blocks)
             .map_err(|error| (height, error))?;

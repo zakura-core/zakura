@@ -2,6 +2,11 @@
 # objects. Added after a 68 MB embedded artifact had to be removed from
 # history with a force push: large artifacts belong in release assets or
 # external storage with a pinned hash, never in git history.
+#
+# Release-state refreshes are the one committed exception: they replace an
+# append-only frontier grid of a few megabytes. They get a larger allowance,
+# and only when the change touches nothing outside the release-state files, so
+# the allowance cannot be borrowed to land an unrelated artifact alongside one.
 name: History growth
 
 on:
@@ -24,7 +29,7 @@ permissions:
 
 jobs:
   check:
-    name: Limit history growth to 2 MiB
+    name: Limit history growth
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
@@ -49,8 +54,38 @@ jobs:
             echo "head=${PR_HEAD_SHA}" >> "${GITHUB_OUTPUT}"
           fi
 
+      - name: Select the growth limit
+        id: limit
+        env:
+          BASE_SHA: ${{ steps.range.outputs.base }}
+          HEAD_SHA: ${{ steps.range.outputs.head }}
+        run: |
+          set -euo pipefail
+          sort > "${RUNNER_TEMP}/release-state-files" <<'EOF'
+          Cargo.lock
+          Cargo.toml
+          crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
+          crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
+          crates/zakura-state/src/service/finalized_state/vct/mainnet-subtrees.bin
+          crates/zakura-state/src/service/finalized_state/vct/mainnet-vct-manifest.json
+          crates/zakurad/src/components/sync/end_of_support.rs
+          EOF
+          git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" | sort -u \
+            > "${RUNNER_TEMP}/changed-files"
+          OUTSIDE=$(comm -23 "${RUNNER_TEMP}/changed-files" "${RUNNER_TEMP}/release-state-files")
+          if [ -s "${RUNNER_TEMP}/changed-files" ] && [ -z "${OUTSIDE}" ]; then
+            # The frontier grid used to dominate this budget. It now ships as a pinned crates.io
+            # dependency, so a refresh is an appended checkpoint list plus small artifacts, and
+            # the headroom shrinks accordingly: a grid committed by mistake must fail here.
+            echo "Release-state-only change; allowing 3 MiB of history growth."
+            echo "bytes=3145728" >> "${GITHUB_OUTPUT}"
+          else
+            echo "bytes=2097152" >> "${GITHUB_OUTPUT}"
+          fi
+
       - name: Check history growth
         env:
           BASE_SHA: ${{ steps.range.outputs.base }}
           HEAD_SHA: ${{ steps.range.outputs.head }}
+          HISTORY_GROWTH_LIMIT_BYTES: ${{ steps.limit.outputs.bytes }}
         run: ./scripts/check-history-growth.sh "${BASE_SHA}" "${HEAD_SHA}"

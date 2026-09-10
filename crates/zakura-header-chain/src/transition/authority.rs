@@ -2,7 +2,9 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::{EngineConfig, InsertHeaders, OperatorBodyRetry, TransitionEvent, ValidationLease};
+use crate::{
+    EngineConfig, InsertHeaders, OperatorBodyRetry, StateVersion, TransitionEvent, ValidationLease,
+};
 
 /// The consensus-local clock supplies time to transition events.
 /// Transition events cannot supply time.
@@ -39,6 +41,11 @@ impl Clock for SystemClock {
 pub trait FullStateEvidenceAuthority: Send + Sync {
     /// Return true only when the complete event is the writer's staged mutation.
     fn authorizes_full_state(&self, event: &TransitionEvent) -> bool;
+
+    /// Return the header-engine version that the writer consumed to authorize this event.
+    fn full_state_authorization_version(&self, _event: &TransitionEvent) -> Option<StateVersion> {
+        None
+    }
 
     /// Return true only when the serialized scheduler staged this exact retry action.
     fn authorizes_scheduler_retry(&self, _retry: &OperatorBodyRetry) -> bool {

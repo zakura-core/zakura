@@ -1,6 +1,6 @@
 //! Leaf commit-invariant checks grouped by responsibility.
 
-mod aux;
+mod auxiliary;
 mod generations;
 mod indexes;
 mod nodes;
@@ -8,7 +8,7 @@ mod pins;
 mod projections;
 mod protected;
 
-pub(crate) use aux::verify_aux;
+pub(crate) use auxiliary::verify_aux;
 pub(crate) use generations::verify_generations;
 pub(crate) use indexes::verify_indexes;
 pub(crate) use nodes::verify_node;

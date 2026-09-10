@@ -9,6 +9,7 @@ use std::{
 
 mod header_conformance;
 mod header_fuzz;
+mod rpc_artifacts;
 
 const DEFAULT_FEATURES: &str = "default-release-binaries";
 const DEFAULT_UBUNTU_IMAGE: &str = "ubuntu:22.04";
@@ -61,6 +62,24 @@ fn try_main() -> Result<(), BoxError> {
                 )));
             }
             header_fuzz::minimize(&repo_root()?, Path::new(&artifact))
+        }
+        Some("generate-rpc-artifacts") => {
+            if args.next().is_some() {
+                return Err(Box::new(UsageError(
+                    "`cargo xtask generate-rpc-artifacts` does not accept arguments",
+                )));
+            }
+
+            rpc_artifacts::update(&repo_root()?)
+        }
+        Some("check-rpc-artifacts") => {
+            if args.next().is_some() {
+                return Err(Box::new(UsageError(
+                    "`cargo xtask check-rpc-artifacts` does not accept arguments",
+                )));
+            }
+
+            rpc_artifacts::check(&repo_root()?)
         }
         Some("-h" | "--help") | None => {
             if args.next().is_some() {
@@ -263,6 +282,8 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(output, "  cargo xtask package ubuntu")?;
     writeln!(output, "  cargo xtask header-conformance [LC-…]")?;
     writeln!(output, "  cargo xtask minimize-header-fuzz <artifact>")?;
+    writeln!(output, "  cargo xtask generate-rpc-artifacts")?;
+    writeln!(output, "  cargo xtask check-rpc-artifacts")?;
     writeln!(output)?;
     writeln!(
         output,
@@ -286,5 +307,11 @@ fn print_usage(output: &mut impl fmt::Write) -> fmt::Result {
     writeln!(
         output,
         "its SHA-256, decoded bounded operations, and a deterministic Rust regression."
-    )
+    )?;
+    writeln!(output)?;
+    writeln!(
+        output,
+        "Regenerates deterministic protobuf and OpenRPC source artifacts, or checks that"
+    )?;
+    writeln!(output, "the checked-in artifacts are current.")
 }

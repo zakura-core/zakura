@@ -39,14 +39,24 @@ pub const STATE_DATABASE_KIND: &str = "state";
 /// get the network-specific floor.
 pub const MIN_PRUNING_RETENTION: u32 = 10_000;
 
-/// The default bound on how many blocks one historical note commitment tree derivation may
-/// replay. Used as the `audit-historical-treestates` CLI default until the config knob lands.
+/// The most blocks one historical note commitment tree derivation may replay to serve a request.
 ///
-/// Sized to cover a cold request anywhere in a from-genesis fast-synced node's absent band on
-/// Mainnet, so the first request of a wallet sweep succeeds rather than failing at a limit. Later
-/// requests in the sweep replay only from the previous memoized frontier, so the bound applies to
-/// the cold case alone.
-pub const DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS: u64 = 4_000_000;
+/// One number bounds the cost two ways, because they are the same cost. Startup refuses a
+/// configured frontier grid whose largest cold-request gap, measured from genesis, exceeds this,
+/// and serving refuses a request that would still replay more than this. Checking only the grid
+/// would leave the request path open when entries load but fail their root checks, and checking
+/// only the request path would let a node start on a grid it can never serve from.
+///
+/// Sized to sit far above a real grid's gaps and far below the absent band it must never replay.
+/// The published Mainnet grid's largest cold request is 1,333 blocks, so this leaves roughly 75x
+/// headroom, while the band itself is ~3.4M blocks. Generation is deliberately not bounded by it:
+/// `export-historical-treestates` replays between grid targets, and the grid-free
+/// `audit-historical-treestates` walk measures the whole band on purpose.
+///
+/// Deliberately a constant rather than a setting. It bounds nothing an operator picks: the grid an
+/// operator does pick is what decides replay cost, and no value of this backstop makes a node with
+/// a gappy grid serve faster or a node with a dense one serve more.
+pub const MAX_HISTORICAL_TREE_REPLAY_BLOCKS: u64 = 100_000;
 
 /// The minimum retention window allowed in pruned storage mode on `network`.
 ///

@@ -17,13 +17,22 @@ use color_eyre::eyre::{eyre, Result};
 use zakura_chain::{block::Height, parameters::Network};
 use zakura_state::{
     DerivationSample, HistoricalTreeCache, PruningConfig, StorageMode, SubtreeVerification,
-    VctTreestateInventory, DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
+    VctTreestateInventory,
 };
 
 use crate::prelude::APPLICATION;
 
 /// Bounds audit bookkeeping and catches accidentally enormous CLI ranges before any allocation.
 const MAX_AUDIT_SAMPLES: u64 = 5_000_000;
+
+/// The replay bound for an audit walk: none.
+///
+/// This walk runs with no frontier grid, deliberately, because measuring what a grid-free cold
+/// replay costs is the whole point of the command. Serving's
+/// [`zakura_state::MAX_HISTORICAL_TREE_REPLAY_BLOCKS`] would stop that walk at the first height
+/// past its bound, so the audit opts out rather than reusing it. `--to` and [`MAX_AUDIT_SAMPLES`]
+/// are what bound an audit run.
+const AUDIT_REPLAY_BLOCKS: u64 = u64::MAX;
 
 /// Audit historical note commitment treestate serving in an existing state database
 #[derive(Command, Debug, Default, Parser)]
@@ -69,11 +78,11 @@ pub struct AuditHistoricalTreestatesCmd {
     #[clap(long, help = "last height to derive")]
     to: Option<u32>,
 
-    /// Start each derivation from a fresh memo, measuring cold replay rather than sequential.
+    /// Start each derivation from a fresh cache, measuring cold replay rather than sequential.
     ///
     /// This is what sizes the published frontier grid: it reports what a client pays when no
-    /// nearby frontier is memoized.
-    #[clap(long, help = "clear the memo before each derivation")]
+    /// nearby frontier is cached.
+    #[clap(long, help = "clear the cache before each derivation")]
     cold: bool,
 
     /// Print one line per derivation with its measured cost and its replay inputs.
@@ -284,7 +293,7 @@ impl AuditHistoricalTreestatesCmd {
                     db,
                     &cache,
                     [height],
-                    DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
+                    AUDIT_REPLAY_BLOCKS,
                 )
                 .map_err(|(height, error)| {
                     eyre!("derivation failed at height {}: {error}", height.0)
@@ -336,7 +345,7 @@ impl AuditHistoricalTreestatesCmd {
         let new_cache = HistoricalTreeCache::default;
 
         let result = if self.cold {
-            // A fresh memo per height forces every derivation to replay from the bottom of the
+            // A fresh cache per height forces every derivation to replay from the bottom of the
             // band, which is the cost a client pays with no nearby frontier.
             let mut result = Ok(());
             for height in heights {
@@ -345,7 +354,7 @@ impl AuditHistoricalTreestatesCmd {
                     db,
                     &cache,
                     [height],
-                    DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
+                    AUDIT_REPLAY_BLOCKS,
                     &mut report,
                 ) {
                     Ok(_) => {}
@@ -358,13 +367,7 @@ impl AuditHistoricalTreestatesCmd {
             result
         } else {
             let cache = Mutex::new(new_cache());
-            zakura_state::measure_derivations(
-                db,
-                &cache,
-                heights,
-                DEFAULT_MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
-                &mut report,
-            )
+            zakura_state::measure_derivations(db, &cache, heights, AUDIT_REPLAY_BLOCKS, &mut report)
         };
 
         print_walk_summary(&samples);

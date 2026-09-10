@@ -26,8 +26,8 @@ use tokio::{
 use tokio_stream::wrappers::IntervalStream;
 use tokio_util::codec::Framed;
 use tower::Service;
+use tracing::Instrument;
 use tracing::{span, Level, Span};
-use tracing_futures::Instrument;
 
 use zakura_chain::{
     block,

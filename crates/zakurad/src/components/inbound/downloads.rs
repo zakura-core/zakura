@@ -19,7 +19,7 @@ use tokio::{
     task::JoinHandle,
 };
 use tower::{Service, ServiceExt};
-use tracing_futures::Instrument;
+use tracing::Instrument;
 
 use zakura_chain::{
     block::{self, HeightDiff},

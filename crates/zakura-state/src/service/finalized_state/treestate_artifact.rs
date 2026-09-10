@@ -3,10 +3,11 @@
 //! Two artifacts, with deliberately different trust stories (see
 //! `docs/design/verified-commitment-trees.md` §16):
 //!
-//! - The **frontier artifact** holds per-pool note commitment frontiers at a sparse height grid.
-//!   Every entry is checked against the authenticated root in `commitment_roots_by_height` before
-//!   use, so the artifact carries no trust weight: a corrupt or hostile one is rejected rather
-//!   than absorbed. That is what lets it be coarse, small, and distributed outside the binary.
+//! - The **frontier artifact** holds per-pool note commitment frontiers at a sparse height grid
+//!   from genesis through the last checkpoint. Every entry is checked against the authenticated
+//!   root in `commitment_roots_by_height` before use, so the artifact carries no trust weight: a
+//!   corrupt or hostile one is rejected rather than absorbed. The reviewed Mainnet artifact is
+//!   embedded in the binary.
 //! - The **subtree-root artifact** holds completed subtree roots. The final frontier pins all of
 //!   them through its ommers, so the embedded artifact is checked against the embedded frontier
 //!   before a read service can use it.
@@ -15,28 +16,72 @@
 //! explicit record counts, and a SHA-256 over the non-digest header fields and payload, with the
 //! parser validating the whole frame before any record is used.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
+use bincode::Options;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use zakura_chain::{
     block::Height,
-    orchard,
+    ironwood, orchard,
     parameters::{Network, NetworkKind},
+    sapling,
     subtree::{NoteCommitmentSubtreeData, NoteCommitmentSubtreeIndex},
     subtree_verify::SubtreeRootsError,
 };
 
+use crate::service::finalized_state::disk_format::IntoDisk;
+
 use super::commitment_aux::FinalFrontiers;
+
+/// Deserializes a note commitment tree blob without panicking on malformed bytes.
+///
+/// The blobs use the same encoding as [`IntoDisk`], but the matching `FromDisk` impl `expect`s on
+/// a decode failure, which is right for the node's own database and wrong here: an artifact is
+/// untrusted input, and a hostile one must be rejected rather than crash the node.
+fn decode_tree<T: serde::de::DeserializeOwned>(blob: &[u8]) -> Option<T> {
+    bincode::DefaultOptions::new().deserialize(blob).ok()
+}
+
+/// Magic bytes identifying a frontier artifact.
+const FRONTIER_MAGIC: &[u8; 8] = b"ZKVCTFR1";
 
 /// Magic bytes identifying a subtree-root artifact.
 const SUBTREE_MAGIC: &[u8; 8] = b"ZKVCTST1";
 
+/// Fixed header length: magic, version, network, grid spacing, checkpoint, record count, digest.
+const FRONTIER_HEADER_LEN: usize = 8 + 2 + 1 + 4 + 4 + 4 + 32;
+
+/// The most frontier entries an artifact may declare.
+///
+/// A one-block grid across a chain far longer than any real one still fits well inside this, so a
+/// declared count above it is a corrupt or hostile header rather than a legitimate artifact. This
+/// is a coarse sanity cap; the payload-length check in [`FrontierArtifact::decode`] is what stops
+/// a still-legal count from driving a huge allocation.
+const MAX_FRONTIER_ENTRIES: usize = 16_000_000;
+
+/// Minimum encoded size of one frontier entry: a height and three `u32` length prefixes.
+///
+/// Empty tree blobs are legal in the framing, so this is the floor. Decode rejects a count that
+/// cannot fit in the payload at this size before allocating the entry vector.
+const MIN_FRONTIER_ENTRY_LEN: usize = 4 + 4 + 4 + 4;
+
+/// Offset of the digest after magic, version, network, spacing, checkpoint, and record count.
+const FRONTIER_DIGEST_OFFSET: usize = 8 + 2 + 1 + 4 + 4 + 4;
+
 /// Reviewed completed-subtree roots shipped with the Mainnet last checkpoint.
 pub(super) const MAINNET_SUBTREES: &[u8] = include_bytes!("vct/mainnet-subtrees.bin");
 
-/// The format version subtree-root artifacts are written at.
+/// Reviewed historical frontier grid shipped with the Mainnet last checkpoint.
+///
+/// Published as a crates.io package rather than committed here: it is regenerated on every
+/// release-state refresh, and at ~2.1 MB per revision that is history the repository would carry
+/// forever. `Cargo.lock` pins the exact bytes, and `mainnet-vct-manifest.json` records the digest
+/// this checkpoint was reviewed with.
+const MAINNET_FRONTIER_GRID: &[u8] = zakura_assets::MAINNET_FRONTIER_GRID;
+
+/// The format version treestate artifacts are written at.
 const VERSION: u16 = 1;
 
 /// Offset of the digest after magic, version, network, last_checkpoint, and three record counts.
@@ -121,7 +166,7 @@ pub enum TreestateArtifactError {
         max: usize,
     },
 
-    /// The authenticated header fields and payload do not hash to the stored digest.
+    /// The bytes authenticated by this artifact format do not hash to the stored digest.
     #[error("{kind} artifact contents do not match the digest in its header")]
     DigestMismatch {
         /// Which artifact was being parsed.
@@ -225,6 +270,30 @@ pub enum TreestateArtifactError {
     /// This network ships no frontier to check subtree roots against.
     #[error("no embedded frontier is available for this network")]
     NoEmbeddedFrontier,
+
+    /// A note commitment tree blob could not be deserialized.
+    #[error("{kind} artifact has an unreadable {pool} tree at height {height:?}")]
+    UnreadableTree {
+        /// Which artifact was being parsed.
+        kind: &'static str,
+        /// Which pool's tree failed.
+        pool: &'static str,
+        /// The entry's height.
+        height: Height,
+    },
+
+    /// Entry heights are not strictly increasing.
+    ///
+    /// Ordering is what makes "nearest entry at or below `h`" a binary search rather than a scan.
+    #[error("{kind} artifact entries are out of order: {previous:?} is followed by {found:?}")]
+    OutOfOrder {
+        /// Which artifact was being parsed.
+        kind: &'static str,
+        /// The previous entry's key.
+        previous: u32,
+        /// The offending entry's key.
+        found: u32,
+    },
 }
 
 /// How many subtree roots were proven against a frontier, per pool.
@@ -268,6 +337,298 @@ fn read_array<const N: usize>(
             offset,
             needed: N,
         })
+}
+
+/// Reads a `u32`-length-prefixed blob at `offset`, returning it and the offset just past it.
+fn read_blob(
+    bytes: &[u8],
+    offset: usize,
+    kind: &'static str,
+) -> Result<(Vec<u8>, usize), TreestateArtifactError> {
+    // Zakura's supported platforms have at least 32-bit `usize`, so every `u32` length fits.
+    let len = u32::from_le_bytes(read_array::<4>(bytes, offset, kind)?) as usize;
+    let start = offset
+        .checked_add(4)
+        .ok_or(TreestateArtifactError::Truncated {
+            kind,
+            offset,
+            needed: 4,
+        })?;
+    let end = start
+        .checked_add(len)
+        .ok_or(TreestateArtifactError::Truncated {
+            kind,
+            offset: start,
+            needed: len,
+        })?;
+    let blob = bytes
+        .get(start..end)
+        .ok_or(TreestateArtifactError::Truncated {
+            kind,
+            offset: start,
+            needed: len,
+        })?;
+
+    Ok((blob.to_vec(), end))
+}
+
+/// Appends a `u32`-length-prefixed blob to `out`.
+fn write_blob(out: &mut Vec<u8>, blob: &[u8]) {
+    let len = u32::try_from(blob.len()).expect("a note commitment tree fits in u32 bytes");
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(blob);
+}
+
+/// Per-pool note commitment frontiers at one height in the grid.
+#[derive(Clone, Debug)]
+pub struct FrontierEntry {
+    /// The height these frontiers are the state at the end of.
+    pub height: Height,
+
+    /// The Sapling frontier.
+    pub sapling: Arc<sapling::tree::NoteCommitmentTree>,
+
+    /// The Orchard frontier.
+    pub orchard: Arc<orchard::tree::NoteCommitmentTree>,
+
+    /// The Ironwood frontier.
+    pub ironwood: Arc<ironwood::tree::NoteCommitmentTree>,
+}
+
+/// Note commitment frontiers at a sparse height grid, used to anchor on-demand derivation.
+///
+/// Entries must be strictly increasing in height. Nothing here is trusted: a consumer checks each
+/// entry's roots against authenticated per-height commitment roots before using it.
+#[derive(Clone, Debug)]
+pub struct FrontierArtifact {
+    /// The height spacing the grid was generated at.
+    ///
+    /// Recorded for provenance; consumers locate entries by searching rather than assuming this
+    /// spacing.
+    pub spacing: u32,
+
+    /// The last checkpoint the grid was generated against.
+    pub last_checkpoint: Height,
+
+    /// Grid entries, strictly increasing in height.
+    pub entries: Vec<FrontierEntry>,
+}
+
+impl FrontierArtifact {
+    /// The name used in error messages.
+    const KIND: &'static str = "frontier";
+
+    /// Serializes to the artifact byte format.
+    pub fn encode(&self, network: &Network) -> Vec<u8> {
+        let mut payload = Vec::new();
+        for entry in &self.entries {
+            payload.extend_from_slice(&entry.height.0.to_le_bytes());
+            write_blob(&mut payload, &IntoDisk::as_bytes(&*entry.sapling));
+            write_blob(&mut payload, &IntoDisk::as_bytes(&*entry.orchard));
+            write_blob(&mut payload, &IntoDisk::as_bytes(&*entry.ironwood));
+        }
+
+        let mut out = Vec::with_capacity(FRONTIER_HEADER_LEN + payload.len());
+        out.extend_from_slice(FRONTIER_MAGIC);
+        out.extend_from_slice(&VERSION.to_le_bytes());
+        out.push(network_byte(network));
+        out.extend_from_slice(&self.spacing.to_le_bytes());
+        out.extend_from_slice(&self.last_checkpoint.0.to_le_bytes());
+        out.extend_from_slice(
+            &u32::try_from(self.entries.len())
+                .expect("entry count is bounded by MAX_FRONTIER_ENTRIES")
+                .to_le_bytes(),
+        );
+        debug_assert_eq!(out.len(), FRONTIER_DIGEST_OFFSET);
+
+        let digest = {
+            let mut hasher = Sha256::new();
+            hasher.update(&out);
+            hasher.update(&payload);
+            hasher.finalize()
+        };
+        out.extend_from_slice(&digest);
+        out.extend_from_slice(&payload);
+
+        out
+    }
+
+    /// Parses the artifact byte format, validating the whole frame before returning any entry.
+    pub fn decode(bytes: &[u8], network: &Network) -> Result<Self, TreestateArtifactError> {
+        let kind = Self::KIND;
+
+        if read_array::<8>(bytes, 0, kind)? != *FRONTIER_MAGIC {
+            return Err(TreestateArtifactError::InvalidMagic { kind });
+        }
+
+        let version = u16::from_le_bytes(read_array::<2>(bytes, 8, kind)?);
+        if version != VERSION {
+            return Err(TreestateArtifactError::UnsupportedVersion {
+                kind,
+                found: version,
+            });
+        }
+
+        let found = read_array::<1>(bytes, 10, kind)?[0];
+        let expected = network_byte(network);
+        if found != expected {
+            return Err(TreestateArtifactError::WrongNetwork {
+                kind,
+                found,
+                expected,
+            });
+        }
+
+        let spacing = u32::from_le_bytes(read_array::<4>(bytes, 11, kind)?);
+        let last_checkpoint = Height(u32::from_le_bytes(read_array::<4>(bytes, 15, kind)?));
+        // Zakura's supported platforms have at least 32-bit `usize`, so every `u32` count fits.
+        let count = u32::from_le_bytes(read_array::<4>(bytes, 19, kind)?) as usize;
+        if count > MAX_FRONTIER_ENTRIES {
+            return Err(TreestateArtifactError::TooManyRecords {
+                kind,
+                found: count,
+                max: MAX_FRONTIER_ENTRIES,
+            });
+        }
+
+        let digest = read_array::<32>(bytes, FRONTIER_DIGEST_OFFSET, kind)?;
+        let payload =
+            bytes
+                .get(FRONTIER_HEADER_LEN..)
+                .ok_or(TreestateArtifactError::Truncated {
+                    kind,
+                    offset: FRONTIER_HEADER_LEN,
+                    needed: 0,
+                })?;
+
+        // Check the digest before decoding anything: a record is only worth parsing once the
+        // frame is known to be the one the encoder wrote.
+        let actual_digest = {
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes[..FRONTIER_DIGEST_OFFSET]);
+            hasher.update(payload);
+            hasher.finalize()
+        };
+        if actual_digest.as_slice() != digest {
+            return Err(TreestateArtifactError::DigestMismatch { kind });
+        }
+
+        // Keep this structural check even though the digest covers the count: an artifact producer
+        // can create a valid digest over an invalid frame, and parsing must remain allocation-safe.
+        let min_payload_len = count.saturating_mul(MIN_FRONTIER_ENTRY_LEN);
+        if min_payload_len > payload.len() {
+            return Err(TreestateArtifactError::Truncated {
+                kind,
+                offset: FRONTIER_HEADER_LEN,
+                needed: min_payload_len - payload.len(),
+            });
+        }
+
+        let mut entries = Vec::with_capacity(count);
+        let mut offset = 0;
+        let mut previous = None;
+
+        for _ in 0..count {
+            let height = Height(u32::from_le_bytes(read_array::<4>(payload, offset, kind)?));
+            offset += 4;
+
+            if let Some(previous) = previous {
+                if height.0 <= previous {
+                    return Err(TreestateArtifactError::OutOfOrder {
+                        kind,
+                        previous,
+                        found: height.0,
+                    });
+                }
+            }
+            previous = Some(height.0);
+
+            let (sapling, next) = read_blob(payload, offset, kind)?;
+            let (orchard, next) = read_blob(payload, next, kind)?;
+            let (ironwood, next) = read_blob(payload, next, kind)?;
+            offset = next;
+
+            let unreadable = |pool| TreestateArtifactError::UnreadableTree { kind, pool, height };
+
+            entries.push(FrontierEntry {
+                height,
+                sapling: Arc::new(decode_tree(&sapling).ok_or_else(|| unreadable("sapling"))?),
+                orchard: Arc::new(decode_tree(&orchard).ok_or_else(|| unreadable("orchard"))?),
+                ironwood: Arc::new(decode_tree(&ironwood).ok_or_else(|| unreadable("ironwood"))?),
+            });
+        }
+
+        if offset != payload.len() {
+            return Err(TreestateArtifactError::TrailingBytes {
+                kind,
+                trailing: payload.len() - offset,
+            });
+        }
+
+        Ok(Self {
+            spacing,
+            last_checkpoint,
+            entries,
+        })
+    }
+
+    /// Returns the highest entry at or below `height`, the anchor a derivation replays from.
+    pub fn anchor_at_or_below(&self, height: Height) -> Option<&FrontierEntry> {
+        let index = self
+            .entries
+            .partition_point(|entry| entry.height <= height)
+            .checked_sub(1)?;
+
+        self.entries.get(index)
+    }
+
+    /// The most blocks a cold request would replay from this grid on a from-scratch node, where
+    /// heights below the first entry have no stored trees to anchor on.
+    pub fn max_cold_replay_blocks(&self) -> u64 {
+        self.max_cold_replay_blocks_from(Height(0))
+    }
+
+    /// The most blocks a cold request would replay if coverage started at `coverage_from`.
+    ///
+    /// Entries at or above [`Self::last_checkpoint`] cannot anchor a request in the half-open
+    /// absent band and are ignored.
+    pub fn max_cold_replay_blocks_from(&self, coverage_from: Height) -> u64 {
+        let band_end = self.last_checkpoint.0;
+        if band_end <= coverage_from.0 {
+            return 0;
+        }
+
+        let mut previous = coverage_from.0.checked_sub(1);
+        let mut max_blocks = 0u64;
+
+        for height in self
+            .entries
+            .iter()
+            .map(|entry| entry.height.0)
+            .filter(|height| *height < band_end)
+        {
+            if height < coverage_from.0 {
+                previous = Some(previous.map_or(height, |anchor| anchor.max(height)));
+                continue;
+            }
+
+            if height > coverage_from.0 {
+                max_blocks = max_blocks.max(cold_replay_len(previous, height - 1));
+            }
+            previous = Some(height);
+        }
+
+        max_blocks.max(cold_replay_len(previous, band_end - 1))
+    }
+}
+
+/// How many block bodies a replay from `anchor` (or genesis) through `height` would apply.
+fn cold_replay_len(anchor: Option<u32>, height: u32) -> u64 {
+    match anchor {
+        Some(anchor) if anchor >= height => 0,
+        Some(anchor) => u64::from(height.saturating_sub(anchor)),
+        None => u64::from(height).saturating_add(1),
+    }
 }
 
 /// One completed subtree's root and the height it completed at.
@@ -695,6 +1056,36 @@ impl SubtreeArtifact {
     }
 }
 
+/// Returns the historical frontier grid embedded for `network`, if supported.
+///
+/// Mainnet parses its embedded artifact once per process. Other networks have no published grid.
+pub(crate) fn embedded_historical_frontier_artifact(
+    network: &Network,
+) -> Option<Arc<FrontierArtifact>> {
+    match network {
+        Network::Mainnet => {
+            static MAINNET_ARTIFACT: OnceLock<Arc<FrontierArtifact>> = OnceLock::new();
+
+            Some(
+                MAINNET_ARTIFACT
+                    .get_or_init(|| {
+                        Arc::new(
+                            FrontierArtifact::decode(MAINNET_FRONTIER_GRID, network)
+                                .unwrap_or_else(|error| {
+                                    panic!(
+                                        "invalid embedded Mainnet historical frontier artifact: \
+                                         {error}"
+                                    )
+                                }),
+                        )
+                    })
+                    .clone(),
+            )
+        }
+        Network::Testnet(_) => None,
+    }
+}
+
 /// Returns subtree roots verified against `network`'s embedded final frontier.
 ///
 /// Mainnet verifies its embedded artifact once per process before any read service can use it.
@@ -791,6 +1182,328 @@ mod tests {
     use super::*;
 
     use zakura_chain::parameters::Network;
+
+    fn sapling_tree(count: u8) -> Arc<sapling::tree::NoteCommitmentTree> {
+        let mut tree = sapling::tree::NoteCommitmentTree::default();
+        for value in 0..count {
+            let commitment =
+                sapling_crypto::note::ExtractedNoteCommitment::from_bytes(&[value; 32]);
+            if let Some(commitment) = commitment.into_option() {
+                tree.append(commitment).expect("test tree is not full");
+            }
+        }
+        Arc::new(tree)
+    }
+
+    fn pallas_tree(count: u8) -> Arc<orchard::tree::NoteCommitmentTree> {
+        let mut tree = orchard::tree::NoteCommitmentTree::default();
+        for value in 1..=count {
+            tree.append(halo2::pasta::pallas::Base::from(u64::from(value)))
+                .expect("test tree is not full");
+        }
+        Arc::new(tree)
+    }
+
+    fn sample_frontiers() -> FrontierArtifact {
+        FrontierArtifact {
+            spacing: 10,
+            last_checkpoint: Height(31),
+            entries: (0..3)
+                .map(|index| {
+                    let tree_size = u8::try_from(index).expect("sample entry indexes fit in u8");
+                    FrontierEntry {
+                        height: Height(index * 10),
+                        sapling: sapling_tree(tree_size),
+                        orchard: pallas_tree(tree_size),
+                        ironwood: pallas_tree(tree_size.saturating_add(1)),
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    fn replace_frontier_payload(bytes: &mut Vec<u8>, payload: &[u8]) {
+        bytes.truncate(FRONTIER_HEADER_LEN);
+        bytes.extend_from_slice(payload);
+        let digest = {
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes[..FRONTIER_DIGEST_OFFSET]);
+            hasher.update(payload);
+            hasher.finalize()
+        };
+        bytes[FRONTIER_DIGEST_OFFSET..FRONTIER_HEADER_LEN].copy_from_slice(&digest);
+    }
+
+    #[test]
+    fn frontier_artifact_round_trips() {
+        let artifact = sample_frontiers();
+        let bytes = artifact.encode(&Network::Mainnet);
+        let decoded = FrontierArtifact::decode(&bytes, &Network::Mainnet)
+            .expect("a freshly encoded artifact decodes");
+
+        assert_eq!(decoded.spacing, artifact.spacing);
+        assert_eq!(decoded.last_checkpoint, artifact.last_checkpoint);
+        assert_eq!(decoded.entries.len(), artifact.entries.len());
+        for (decoded, original) in decoded.entries.iter().zip(&artifact.entries) {
+            assert_eq!(decoded.height, original.height);
+            assert_eq!(decoded.sapling.root(), original.sapling.root());
+            assert_eq!(decoded.orchard.root(), original.orchard.root());
+            assert_eq!(decoded.ironwood.root(), original.ironwood.root());
+        }
+    }
+
+    #[test]
+    fn frontier_encoding_is_deterministic() {
+        let artifact = sample_frontiers();
+        assert_eq!(
+            artifact.encode(&Network::Mainnet),
+            artifact.encode(&Network::Mainnet)
+        );
+    }
+
+    #[test]
+    fn frontier_artifact_rejects_duplicate_heights() {
+        let mut artifact = sample_frontiers();
+        artifact.entries[1].height = artifact.entries[0].height;
+
+        assert_eq!(
+            FrontierArtifact::decode(&artifact.encode(&Network::Mainnet), &Network::Mainnet).err(),
+            Some(TreestateArtifactError::OutOfOrder {
+                kind: "frontier",
+                previous: 0,
+                found: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn frontier_artifact_rejects_malformed_trees_with_a_valid_digest() {
+        let artifact = sample_frontiers();
+        let entry = &artifact.entries[0];
+        let valid_blobs = [
+            IntoDisk::as_bytes(&*entry.sapling),
+            IntoDisk::as_bytes(&*entry.orchard),
+            IntoDisk::as_bytes(&*entry.ironwood),
+        ];
+
+        for (malformed_pool, expected_pool) in [(0, "sapling"), (1, "orchard"), (2, "ironwood")] {
+            let mut payload = entry.height.0.to_le_bytes().to_vec();
+            for (pool, valid_blob) in valid_blobs.iter().enumerate() {
+                if pool == malformed_pool {
+                    write_blob(&mut payload, &[0xff]);
+                } else {
+                    write_blob(&mut payload, valid_blob);
+                }
+            }
+
+            let mut bytes = artifact.encode(&Network::Mainnet);
+            bytes[19..23].copy_from_slice(&1u32.to_le_bytes());
+            replace_frontier_payload(&mut bytes, &payload);
+
+            assert_eq!(
+                FrontierArtifact::decode(&bytes, &Network::Mainnet).err(),
+                Some(TreestateArtifactError::UnreadableTree {
+                    kind: "frontier",
+                    pool: expected_pool,
+                    height: Height(0),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn frontier_artifact_rejects_trailing_bytes_with_a_valid_digest() {
+        let mut bytes = sample_frontiers().encode(&Network::Mainnet);
+        let mut payload = bytes[FRONTIER_HEADER_LEN..].to_vec();
+        payload.extend_from_slice(&[0xaa, 0xbb]);
+        replace_frontier_payload(&mut bytes, &payload);
+
+        assert_eq!(
+            FrontierArtifact::decode(&bytes, &Network::Mainnet).err(),
+            Some(TreestateArtifactError::TrailingBytes {
+                kind: "frontier",
+                trailing: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn frontier_artifact_rejects_header_tampering() {
+        let good = sample_frontiers().encode(&Network::Mainnet);
+
+        let mut network_changed = good.clone();
+        network_changed[10] = network_byte(&Network::new_default_testnet());
+        assert!(matches!(
+            FrontierArtifact::decode(&network_changed, &Network::Mainnet),
+            Err(TreestateArtifactError::WrongNetwork { .. })
+        ));
+
+        // These fields have no independent identity check, so the frame digest must bind them to
+        // the payload. Keep each mutation structurally plausible to isolate digest validation.
+        for offset in [11, 15, 19] {
+            let mut changed_header = good.clone();
+            changed_header[offset] ^= 0x01;
+            assert_eq!(
+                FrontierArtifact::decode(&changed_header, &Network::Mainnet).err(),
+                Some(TreestateArtifactError::DigestMismatch { kind: "frontier" }),
+                "tampering with frontier header byte {offset} must invalidate the frame digest"
+            );
+        }
+    }
+
+    #[test]
+    fn frontier_artifact_rejects_tampering_and_truncation() {
+        let good = sample_frontiers().encode(&Network::Mainnet);
+
+        let mut wrong_magic = good.clone();
+        wrong_magic[0] ^= 0xff;
+        assert_eq!(
+            FrontierArtifact::decode(&wrong_magic, &Network::Mainnet).err(),
+            Some(TreestateArtifactError::InvalidMagic { kind: "frontier" })
+        );
+
+        let mut wrong_version = good.clone();
+        wrong_version[8] = 9;
+        assert!(matches!(
+            FrontierArtifact::decode(&wrong_version, &Network::Mainnet),
+            Err(TreestateArtifactError::UnsupportedVersion { .. })
+        ));
+
+        let mut flipped = good.clone();
+        *flipped.last_mut().expect("artifact has a payload") ^= 0x01;
+        assert_eq!(
+            FrontierArtifact::decode(&flipped, &Network::Mainnet).err(),
+            Some(TreestateArtifactError::DigestMismatch { kind: "frontier" })
+        );
+
+        for truncate_to in [0, 4, FRONTIER_HEADER_LEN - 1, FRONTIER_HEADER_LEN + 2] {
+            assert!(
+                FrontierArtifact::decode(&good[..truncate_to], &Network::Mainnet).is_err(),
+                "a frame truncated to {truncate_to} bytes must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn frontier_artifact_bounds_record_allocation_by_limit_and_payload() {
+        let mut absurd = sample_frontiers().encode(&Network::Mainnet);
+        absurd[19..23].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            FrontierArtifact::decode(&absurd, &Network::Mainnet),
+            Err(TreestateArtifactError::TooManyRecords { .. })
+        ));
+
+        let mut empty = FrontierArtifact {
+            spacing: 10,
+            last_checkpoint: Height(31),
+            entries: Vec::new(),
+        }
+        .encode(&Network::Mainnet);
+        empty[19..23].copy_from_slice(
+            &u32::try_from(MAX_FRONTIER_ENTRIES)
+                .expect("the frontier entry limit fits in its count field")
+                .to_le_bytes(),
+        );
+        let payload = empty[FRONTIER_HEADER_LEN..].to_vec();
+        replace_frontier_payload(&mut empty, &payload);
+        assert!(matches!(
+            FrontierArtifact::decode(&empty, &Network::Mainnet),
+            Err(TreestateArtifactError::Truncated { .. })
+        ));
+    }
+
+    #[test]
+    fn frontier_anchor_selection_picks_the_nearest_entry_at_or_below() {
+        let artifact = sample_frontiers();
+
+        assert!(
+            artifact.anchor_at_or_below(Height(0)).is_some(),
+            "an exact match on the first entry is an anchor"
+        );
+        assert!(
+            artifact.anchor_at_or_below(Height(9)).is_some(),
+            "a height above the first entry has an anchor"
+        );
+        assert_eq!(
+            artifact
+                .anchor_at_or_below(Height(15))
+                .expect("an entry exists below 15")
+                .height,
+            Height(10)
+        );
+        assert_eq!(
+            artifact
+                .anchor_at_or_below(Height(9_999))
+                .expect("an entry exists below 9999")
+                .height,
+            Height(20)
+        );
+    }
+
+    #[test]
+    fn frontier_max_cold_replay_blocks_measures_the_largest_hole() {
+        assert_eq!(
+            FrontierArtifact {
+                spacing: 10,
+                last_checkpoint: Height(31),
+                entries: Vec::new(),
+            }
+            .max_cold_replay_blocks(),
+            31
+        );
+        assert_eq!(sample_frontiers().max_cold_replay_blocks(), 10);
+
+        let mid_chain = FrontierArtifact {
+            spacing: 1,
+            last_checkpoint: Height(2_000_100),
+            entries: vec![FrontierEntry {
+                height: Height(2_000_000),
+                sapling: Arc::new(Default::default()),
+                orchard: Arc::new(Default::default()),
+                ironwood: Arc::new(Default::default()),
+            }],
+        };
+        assert_eq!(mid_chain.max_cold_replay_blocks_from(Height(2_000_000)), 99);
+        assert_eq!(mid_chain.max_cold_replay_blocks(), 2_000_000);
+    }
+
+    /// Encoding a nested entry list is a byte prefix of encoding the longer list. The exporter
+    /// omits partial final cells so real successive exports produce nested lists; this test is
+    /// the encoder half of that append-only contract.
+    #[test]
+    fn frontier_encoding_is_prefix_compatible_across_tips() {
+        let later = sample_frontiers();
+        let earlier = FrontierArtifact {
+            spacing: later.spacing,
+            last_checkpoint: later.last_checkpoint,
+            entries: later.entries[..later.entries.len() - 1].to_vec(),
+        };
+
+        let earlier_bytes = earlier.encode(&Network::Mainnet);
+        let later_bytes = later.encode(&Network::Mainnet);
+
+        // The headers differ (the record count changed), so the append contract holds over the
+        // payload, which is where the entries live.
+        assert_eq!(
+            later_bytes[FRONTIER_HEADER_LEN..][..earlier_bytes.len() - FRONTIER_HEADER_LEN],
+            earlier_bytes[FRONTIER_HEADER_LEN..],
+            "a later export must extend the earlier payload, not rewrite it"
+        );
+    }
+
+    #[test]
+    fn embedded_mainnet_frontier_grid_respects_replay_limit() {
+        let artifact = embedded_historical_frontier_artifact(&Network::Mainnet)
+            .expect("Mainnet has an embedded historical frontier artifact");
+        let max_gap = artifact.max_cold_replay_blocks();
+        let limit = crate::MAX_HISTORICAL_TREE_REPLAY_BLOCKS;
+
+        assert!(
+            max_gap <= limit,
+            "embedded Mainnet historical frontier artifact requires replaying {max_gap} blocks, \
+             exceeding the {limit}-block limit"
+        );
+    }
 
     fn sample_subtrees() -> SubtreeArtifact {
         SubtreeArtifact {

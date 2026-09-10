@@ -34,7 +34,7 @@ pub(super) fn minimize(repo_root: &Path, artifact: &Path) -> Result<(), BoxError
             TARGETS.join(", ")
         )
     })?;
-    let fuzz_dir = repo_root.join("fuzz").join("header-chain");
+    let fuzz_dir = repo_root.join("qa").join("fuzz").join("header-chain");
     let artifacts_dir = fuzz_dir.join("artifacts").join(target);
     let before = artifact_files(&artifacts_dir)?;
 
@@ -205,7 +205,7 @@ mod tests {
     fn target_inference_requires_an_exact_path_component() {
         assert_eq!(
             infer_target(Path::new(
-                "fuzz/header-chain/artifacts/header_pursuit/crash-deadbeef"
+                "qa/fuzz/header-chain/artifacts/header_pursuit/crash-deadbeef"
             )),
             Some("header_pursuit")
         );

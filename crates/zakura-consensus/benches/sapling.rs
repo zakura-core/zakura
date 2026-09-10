@@ -26,7 +26,7 @@ mod common;
 use std::sync::Arc;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use rand::thread_rng;
+use rand_10::rng as thread_rng;
 
 use zakura_chain::{
     block::{self, Block},

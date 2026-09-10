@@ -109,6 +109,7 @@ impl ZakuraTestNode {
             self.endpoint.clone(),
             self.discovery.clone(),
             self.limits.clone(),
+            Vec::new(),
         ))
     }
 
@@ -563,6 +564,7 @@ impl ZakuraTestNodeBuilder {
             base_service,
             discovery_service,
             None,
+            Vec::new(),
         )?;
         let mut handler = ZakuraProtocolHandler::new_with_registry_and_trace(
             supervisor.clone(),

@@ -150,13 +150,6 @@ where
         let _ = num_live_peer_sender.send(metrics);
     }
 
-    // Refresh metrics in the background using a watch channel so request
-    // handlers can read the latest snapshot without taking locks.
-    let metrics_task = tokio::spawn(peer_metrics_refresh_task(
-        address_book.clone(),
-        num_live_peer_sender,
-    ));
-
     let shared = Arc::new(HealthCtx {
         config,
         network,
@@ -165,14 +158,10 @@ where
         num_live_peer_receiver,
     });
 
-    let server_task = tokio::spawn(run_health_server(listener, shared));
-
-    // Keep both async tasks tied to a single JoinHandle so shutdown and
-    // abort semantics mirror other components.
     let task = tokio::spawn(async move {
         tokio::select! {
-            _ = metrics_task => {},
-            _ = server_task => {},
+            _ = peer_metrics_refresh_task(address_book, num_live_peer_sender) => {},
+            _ = run_health_server(listener, shared) => {},
         }
     });
 

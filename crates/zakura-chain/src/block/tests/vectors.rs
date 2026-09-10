@@ -115,6 +115,67 @@ fn chain_value_pool_change_propagates_transaction_value_balance_errors() {
     );
 }
 
+#[test]
+fn ordered_utxo_value_balances_match_plain_utxo_value_balances() {
+    let _init_guard = zakura_test::init();
+
+    let outpoint = transparent::OutPoint {
+        hash: crate::transaction::Hash([1; 32]),
+        index: 0,
+    };
+    let input_value = 5.try_into().expect("five zatoshi is a valid amount");
+    let output_value = 3.try_into().expect("three zatoshi is a valid amount");
+    let spent_utxo = transparent::Utxo::new(
+        transparent::Output::new(input_value, transparent::Script::new(&[])),
+        Height(1),
+        false,
+    );
+    let transaction = Arc::new(Transaction::V1 {
+        inputs: vec![transparent::Input::PrevOut {
+            outpoint,
+            unlock_script: transparent::Script::new(&[]),
+            sequence: u32::MAX,
+        }],
+        outputs: vec![transparent::Output::new(
+            output_value,
+            transparent::Script::new(&[]),
+        )],
+        lock_time: LockTime::unlocked(),
+    });
+    let plain_utxos = HashMap::from([(outpoint, spent_utxo.clone())]);
+    let unrelated_outpoint = transparent::OutPoint {
+        hash: crate::transaction::Hash([2; 32]),
+        index: 1,
+    };
+    let ordered_utxos = HashMap::from([
+        (
+            outpoint,
+            transparent::OrderedUtxo::from_utxo(spent_utxo.clone(), 0),
+        ),
+        (
+            unrelated_outpoint,
+            transparent::OrderedUtxo::from_utxo(spent_utxo, 1),
+        ),
+    ]);
+
+    assert_eq!(
+        transaction.value_balance(&plain_utxos),
+        transaction.value_balance_from_ordered_utxos(&ordered_utxos),
+    );
+
+    let header = zakura_test::vectors::DUMMY_HEADER
+        .zcash_deserialize_into()
+        .expect("dummy header should deserialize");
+    let block = Block {
+        header: Arc::new(header),
+        transactions: vec![transaction],
+    };
+    assert_eq!(
+        block.chain_value_pool_change(&plain_utxos, None),
+        block.chain_value_pool_change_from_ordered_utxos(&ordered_utxos, None),
+    );
+}
+
 /// The block-level Orchard and Ironwood accessors must read from their own
 /// pool's shielded data and preserve transaction order.
 ///

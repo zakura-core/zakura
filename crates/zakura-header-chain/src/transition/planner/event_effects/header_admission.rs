@@ -210,6 +210,8 @@ pub(super) fn admit_prepared_headers(
         .map(|header| (header.hash, header.height))
         .collect();
     let mut delivery_ids = HashSet::new();
+    let mut admitted_semantic_payloads = HashSet::new();
+    let mut admitted_root_sources = HashSet::new();
     for delivery in &event.aux {
         let expected_height = batch_headers.get(&delivery.header_hash).copied();
         if !delivery_ids.insert(delivery.delivery_id)
@@ -245,7 +247,29 @@ pub(super) fn admit_prepared_headers(
                 .into());
             }
         }
+        let semantic_fingerprint = delivery.semantic_fingerprint();
+        let semantic_payload_exists = admitted_semantic_payloads
+            .contains(&(delivery.header_hash, semantic_fingerprint))
+            || engine
+                .aux_deliveries(delivery.header_hash)
+                .iter()
+                .any(|existing| existing.semantic_fingerprint() == semantic_fingerprint);
+        let rooted_source_exists = delivery.tree_aux.is_some()
+            && (admitted_root_sources.contains(&(delivery.header_hash, delivery.source))
+                || engine
+                    .aux_deliveries(delivery.header_hash)
+                    .iter()
+                    .any(|existing| {
+                        existing.tree_aux.is_some() && existing.source == delivery.source
+                    }));
+        if semantic_payload_exists || rooted_source_exists {
+            continue;
+        }
         projected.record_aux_delivery(*delivery)?;
+        admitted_semantic_payloads.insert((delivery.header_hash, semantic_fingerprint));
+        if delivery.tree_aux.is_some() {
+            admitted_root_sources.insert((delivery.header_hash, delivery.source));
+        }
     }
     Ok(())
 }

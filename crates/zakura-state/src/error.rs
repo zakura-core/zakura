@@ -132,6 +132,35 @@ pub enum HistoricalSubtreeUnavailableReason {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum StateInitError {
+    /// The configured historical frontier artifact could not be read or decoded.
+    ///
+    /// Only nodes that derive historical trees reach this. A node that does not derive ignores an
+    /// unusable artifact, because nothing would have read it.
+    #[error(
+        "the historical frontier artifact configured at {path:?} could not be loaded: {source}. \
+         Hint: remove state.historical_frontier_artifact to serve without it"
+    )]
+    HistoricalFrontierArtifact {
+        /// Artifact path that failed to load.
+        path: PathBuf,
+        /// Underlying I/O or artifact decoding error.
+        source: BoxError,
+    },
+
+    /// The configured historical frontier artifact has gaps larger than one request may replay.
+    #[error(
+        "historical frontier artifact at {path:?} has a {blocks}-block gap, more than \
+         MAX_HISTORICAL_TREE_REPLAY_BLOCKS = {limit}; a cold request would replay that range"
+    )]
+    HistoricalFrontierArtifactTooSparse {
+        /// Artifact path whose grid does not tile genesis through `last_checkpoint`.
+        path: PathBuf,
+        /// Largest cold-request replay the file would require.
+        blocks: u64,
+        /// Configured per-request replay limit.
+        limit: u64,
+    },
+
     /// State could not read or parse the on-disk semantic format version.
     #[error(
         "cannot read state database format version at {path:?}. Hint: check the cache directory permissions and version file contents"

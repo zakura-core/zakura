@@ -180,7 +180,7 @@ pub use crate::{
         SharedPeerError,
     },
     peer_registry::ConnectedPeer,
-    peer_set::{init, init_with_zakura_header_sync},
+    peer_set::{init, init_with_zakura, init_with_zakura_header_sync},
     policies::RetryLimit,
     protocol::{
         external::{Version, VersionMessage, MAX_TX_INV_IN_SENT_MESSAGE},

@@ -4,393 +4,236 @@
 > the [peer message regulation design](../design/peer-message-regulation.md). It covers the 14 native
 > application messages in discovery, header sync, and block sync.
 
-## Filter model
+## Regulation model
 
-Each message has one role. The role selects the bound on the work caused by that message.
+### Throughput and scope
 
-| Role | Work bound | Budget verdict |
-| --- | --- | --- |
-| Announcement | A cadence declared by the protocol | `Disconnect` when the cadence budget is empty |
-| Request | The upper-bound cost of the response | `Delay` when the work budget is empty |
-| Response | A one-shot, range, or subscription reservation created by the receiver | `Disconnect` when no matching reservation or credit exists |
+Message regulation MUST preserve high throughput. Implementations SHOULD rely on QUIC flow control,
+congestion control, and the protections in this specification. Implementations MUST bound message
+size, decoded allocations, active work, retained results, buffered bytes, and response authorization.
+They MUST apply node-wide resource bounds as well as per-peer bounds.
 
-Each message declaration selects concrete filters from four categories:
+This specification does not require application-level byte-rate buckets, response-byte charges,
+refunds, or serving-rate refill timers. A future rate limit requires a measured resource cost that
+the existing bounds cannot control. Cadence remains required for announcements and discovery
+requests because those messages serve infrequent metadata exchanges.
 
-| Category | Filters | Purpose |
-| --- | --- | --- |
-| **Safe** | Frame, Decode, Verify | Bound parsing, allocation, and verification before they occur |
-| **Authorized** | Reservation | Bind responses and subscription updates to receiver-created bounds |
-| **Useful** | Unique, Relevant | Remove repeated or obsolete work without blaming the peer for a race |
-| **Budgeted** | Cadence, Work | Bound message frequency or response work |
+Message prioritization and peer-slot selection remain separate work. A conformant peer can request
+blocks continuously. Per-peer limits cannot prevent an attacker from creating more identities.
+Connection admission MUST bound aggregate connection state. Resource admission MUST bound aggregate
+active work and memory without depending on future prioritization. Prioritization can later choose
+which eligible peers receive service within those bounds.
 
-The admission path returns one of five results:
+### Roles and results
+
+| Role | Required bounds |
+| --- | --- |
+| Announcement | Frame and allocation bounds; protocol cadence |
+| Request | Bounded execution and output capacity; message-specific limits and cadence where declared |
+| Response | Frame and allocation bounds; a receiver-created one-shot, range, or subscription reservation |
+
+The message rules below describe observable behavior. They do not require a declaration builder,
+one handler function per message, or a particular filter API.
 
 | Result | Meaning |
 | --- | --- |
 | `Continue` | The handler may process the message. |
-| `Drop` | The message is legal but cannot help now. |
-| `Delay` | The request is legal, but its work budget is empty. |
-| `Disconnect` | A conformant sender cannot produce the message. |
-| `LocalFault` | The receiver accepted work and then failed to complete it. |
+| `Drop` | The message is legal but cannot change accepted state. |
+| `Disconnect` | The sender violated a protocol obligation. |
+| `LocalFault` | The receiver failed to complete accepted work. |
 
-The implementation MUST apply filters before the work that they bound. Applicable filters MUST run
-in this order:
+Capacity waiting belongs to the receive or serving loop. It need not produce an admission verdict.
+Local capacity exhaustion MUST NOT constitute a peer violation. After an ordinary local failure,
+the receiver MUST release resources whose work has ended and return affected work to its scheduler.
+It MUST NOT restore a consumed response reservation. It MUST keep the connection open if its
+protocol state remains usable. A receiver defect MUST NOT count as a peer violation or ban reason.
+Universal panic recovery is separate runtime work.
+
+The implementation MUST apply checks before the work that they bound:
 
 ```text
-frame
-  -> cadence
-  -> reservation precheck
-  -> bounded decode
-  -> reservation match
-  -> stateless verification
-  -> uniqueness and relevance
-  -> work charge
-  -> handler
+frame -> cadence where declared -> reservation precheck -> bounded decode
+      -> reservation match -> required stateless verification -> handler policy
 ```
 
-The order MAY skip filters that the message declaration does not select. The Reservation filter MAY
-split into a precheck and an exact match. The precheck MUST establish decode bounds before any
-allocation. The exact match MUST run before Verify. A fixed-prefix read used by either step MUST NOT
-allocate from a peer-declared value.
+A reservation precheck MUST establish request-selected allocation bounds before allocation.
+A fixed-prefix read MUST NOT allocate from an unchecked peer-declared value. Exact reservation
+matching MUST precede expensive verification. Execution and buffer capacity MUST bound decoding,
+verification, and response production before each resource commitment occurs.
 
-### Requirements common to every filter
+### Common requirements
 
-1. Every message type MUST have one declaration and one handler. Every handler MUST have one
-   declaration.
-2. Every declaration MUST select exactly one role and one work bound.
-3. Every filter MUST hold O(1) state per peer. The receiver MUST choose every state bound.
-4. A filter MUST NOT grow a map or queue from peer-chosen keys or counts.
-5. Every enforced inbound rule MUST have a matching outbound obligation.
-6. An outbound cadence MUST NOT exceed half of the cadence enforced inbound.
-7. Local scheduling, finality, reorganization, and work reassignment MUST NOT produce a peer
-   violation.
-8. `Delay` MUST stall only the responsible peer and message class. It MUST NOT block an inbound
-   response on the same connection.
-9. Every non-`Continue` result MUST emit the service, message type, filter, direction, peer, key,
-   result, and reason to `regulation.jsonl`. A full-trace mode SHOULD emit `Continue` results.
-   The implementation MUST rotate `regulation.jsonl` and bound its total size.
-10. Each peer MUST have an independent processing path. Admitted work from one peer MUST NOT
-    starve another peer's path.
-11. The receiver MUST size every per-peer bound so that the bound multiplied by the maximum peer
-    count fits its resource budget.
+1. Every supported message kind MUST have explicit payload and decoded-allocation bounds,
+   validation, handling, and tests. Bounds MAY depend on a checked fixed prefix, a protocol limit,
+   and a live reservation. Tests MUST cover all supported kinds without requiring a new common
+   declaration or reference-model framework.
+2. Each peer's protocol state MUST have a receiver-configured capacity and defined behavior at
+   capacity. Peer-provided keys and counts MUST NOT increase that capacity. Aggregate state across
+   admitted connections MUST fit node-wide resource bounds.
+3. Every enforced inbound rule MUST have a matching outbound obligation. Local scheduling,
+   finality, reorganization, work reassignment, and read pauses MUST NOT create a peer violation.
+4. Diagnostics MUST identify protocol violations and local failures while bounding logging work
+   and retained output. Implementations MAY sample or aggregate diagnostics. Complete decision
+   traces MAY be enabled for tests and debugging; no particular file or trace schema is required.
+5. One peer's blocked work MUST NOT hold a shared lock or writer that prevents another peer from
+   progressing. Implementations MUST bound the work performed before yielding shared execution.
+6. Each response path MUST bound queued unsent bytes. Reaching that bound MUST stop new response
+   production for that peer. Decoded objects, storage results, application queues, and transport
+   buffers MUST all fit their resource bounds.
 
-In this specification, a peer is one authenticated connection. Filter state and budgets end when
-the connection ends. Reconnect churn, dial policy, and bans after a `Disconnect` are peer-set
-policy. Peer-set policy MUST receive every `Disconnect` verdict.
-
-`LocalFault` keeps the connection open and does not blame the peer. A caught panic is the one
-exception, described under Panic isolation. The reservation part consumed
-by the failed message stays consumed. The receiver MUST return the affected work to its scheduler.
-`LocalFault` classifies the cause of the failure, not the sender's intent. The implementation MUST
-NOT infer intent. If a sender deliberately uses a conformant message to expose a receiver defect,
-the implementation MUST still return `LocalFault`. The implementation MUST classify a
-message-caused protocol or contextual failure as a peer violation even when the sender acts
-accidentally.
-
-This specification bounds complete messages. The transport MUST bound the time a frame may remain
-incomplete. The stream layout specification states that bound.
-
-### Panic isolation
-
-A panic inside a decoder, verifier, handler, or reactor port operation is a receiver defect, not
-peer behavior. The implementation MUST catch it at a boundary. It MUST NOT let a panic end the
-process or another peer's processing path.
-
-- Peer-controlled decoding MUST run inside an unwind boundary. "Decode MUST be total" states the
-  requirement; this boundary bounds the damage when an implementation fails to meet it.
-- Each reactor port operation and each spawned per-peer worker MUST run inside an unwind boundary.
-  The boundary MUST return the affected work to the scheduler and MUST release every resource the
-  operation reserved.
-- A caught panic MUST NOT reach peer-set ban policy, and MUST NOT count as a peer violation.
-- A caught panic MAY close the connection whose boundary caught it. A panic leaves parser, session,
-  and handler state indeterminate, so continuing on that connection is unsafe. The close is a local
-  fault, not a `Disconnect` verdict.
-- Every boundary MUST increment a metric that names the boundary.
-
-The header-sync reactor already implements this boundary. It wraps each port operation in
-[`catch_unwind`][hs-catch-unwind] and routes the caught panic through
-[`handle_port_panic`][hs-port-panic], which increments `sync.header.port.panicked`, returns the
-affected work, and cancels that one connection. It reaches no ban API. It does emit the caught
-panic under the `header_peer_violation` trace event, which contradicts the rule above. An
-implementation MUST emit a caught panic under a local-fault event instead.
+Transport framing MUST bound incomplete-frame retention. A transport progress deadline MUST NOT
+classify the receiver's intentional read pause as sender misconduct. The concrete stream layout
+is separate design work, but it MUST satisfy the progress requirements under Capacity admission.
 
 ## Safe filters
 
 ### Frame
 
-The Frame filter takes `(stream_kind, stream_version, message_type, flags, payload_len)` and does not
-read the payload.
-
-Every cap in this specification bounds `payload_len` alone. A cap excludes the frame header, the
-stream framing, and the transport's encryption overhead, so it states the maximum encoded body of
-one message. A message whose body is a single 4-byte height therefore has a 4-byte payload cap.
+Frame validates `(stream_kind, stream_version, message_type, flags, payload_len)` without reading
+the payload. A payload cap excludes the frame header, stream framing, and transport encryption
+overhead.
 
 - The Frame filter MUST require `flags == 0`.
 - The Frame filter MUST require `message_type` to appear in the allowlist for the stream kind and
   version.
-- The Frame filter MUST reject `payload_len` above the message cap before allocating a payload
-  buffer.
-- Each message cap MUST equal the maximum encoded payload size for that message and network.
-- A test MUST compare each declared cap with the codec's computed maximum.
+- The Frame filter MUST reject `payload_len` above the applicable payload cap before allocating a
+  payload buffer. Each message's absolute cap MUST equal the codec's maximum encoded payload size
+  for that message and network.
 - The frame header MUST carry the message discriminator. A payload copy MAY exist only when the
   codec verifies that both copies match.
 - A Frame failure MUST return `Disconnect`.
 
 ### Decode
 
-The Decode filter converts a bounded frame into one canonical message.
+Decode converts a bounded payload into one canonical message.
 
-- Decode MUST be total and MUST consume the payload exactly.
+- Decode MUST return a result without panicking for every bounded payload and consume every valid
+  payload exactly.
 - Decode MUST reject trailing bytes, unknown flags, reserved bits, non-canonical values, and values
-  outside their declared ranges.
-- Decode MUST reject an invalid field. It MUST NOT clamp that field into range.
-- Decode MUST bound every allocation before it occurs.
-- A collection allocation MUST NOT exceed the smallest of its declared count, its protocol limit,
-  and `remaining_bytes / minimum_item_size`.
-- A live reservation MUST supply every response bound chosen by the request.
+  outside their declared ranges. It MUST NOT clamp invalid values.
+- Decode MUST bound every allocation before it occurs. A collection allocation MUST NOT exceed the
+  smallest of its declared count, protocol limit, and
+  `remaining_bytes / minimum_item_size`.
+- The decoder MUST expose requested-allocation and retained decoded-state bounds to tests. A payload
+  cap MUST NOT serve as an allocation bound.
+- A live reservation MUST supply request-selected response bounds.
 - A Decode failure MUST return `Disconnect`.
 
 ### Verify
 
-The Verify filter performs every check that does not need chain state or mutable service state.
+Verify performs checks that need no chain state or mutable service state.
 
-- Verify MUST perform no I/O.
-- Verify MUST hold no lock and access no shared mutable state.
-- Each data type MUST have one verifier and one ingress call site.
-- Verify MUST run before the handler and before any shared-state lock.
+- Verify MUST run before the handler without I/O, locks, or shared mutable state.
+- Implementations SHOULD reuse existing validators. Every ingress path MUST perform the required
+  checks before the state or resource commitment they protect. This does not require one call site.
 - A Verify failure MUST return `Disconnect`.
-- A contextual check MUST run in the handler. A contextual failure caused by the message MUST
-  return `Disconnect`.
-- A handler failure caused by local state or local capacity MUST return `LocalFault` or retry
-  internally. It MUST NOT return `Disconnect`.
-
-Each Verify bullet in a message declaration names the function that performs the check. Zakura
-already has one context-free validator per data type:
-
-- Headers use [`prepare_headers`][prepare-headers], which applies the rules in
-  [`validation::context_free`][context-free].
-- Blocks use [`CheckpointVerifier::check_block`][check-block], which applies the rules in
-  [`block::check`][block-check].
-- Discovery records use [`ZakuraNodeRecord::verify`][record-verify].
-
-A declaration MUST reference one of those functions instead of restating its checks. Adding a
-stateless check means adding it to the referenced function, not to this specification.
+- The handler MUST perform contextual checks and return `Disconnect` for a message-caused failure.
+  It MUST return `LocalFault` or retry for a failure caused by local state or capacity.
 
 ## Authorized filter
 
 ### Reservation
 
-A reservation represents one protocol exchange. It is not the scheduler's current interest in the
-work.
+A reservation is the requester's local authorization for an expected response. It keeps that
+response admissible even when the scheduler no longer wants the work.
 
-- The sender MUST create a reservation before sending a request.
-- The reservation MUST record the peer, response kind, correlation identity, decode bounds, and
-  expected object identity. Where an identity names a work scope, it means the scope recorded when
-  the reservation was created.
-- Each response MUST match and consume exactly one live reservation or one unconsumed part of a
-  bounded range reservation.
-- A missing, duplicate, or mismatched reservation MUST return `Disconnect`.
-- A reservation MUST remain live until the complete response arrives or the connection ends.
-- A local work deadline MAY reassign work. It MUST NOT remove or change the reservation.
-- A protocol deadline MAY close a connection when the peer produces no terminal response. The
-  protocol deadline MUST be separate from every work deadline.
-- Reservation state MUST NOT exceed the inflight request limit chosen by the sender.
+- The requester MUST create the reservation before sending the request. The reservation MUST
+  identify and bound the authorized response.
+- Each response MUST match and consume one live reservation or one unconsumed part of a bounded
+  range reservation. A missing, duplicate, or mismatched reservation MUST return `Disconnect`.
+- A local work deadline MAY reassign the work. It MUST NOT change or remove the reservation. The
+  requester MAY close an unproductive connection under local liveness policy without treating slow
+  progress alone as a protocol violation. The reservation MUST remain live until the exchange
+  completes or the connection ends.
+- Reservation state MUST remain within the requester's inflight limit.
 
-A subscription is a reservation with renewable credit.
+A subscription turns one request into a bounded response stream. The publisher can push follow-on
+work without a new request for each response. The subscriber controls the stream with object and
+byte credit. Each response spends that credit. An acknowledgement advances the accepted cursor. A
+later grant renews the credit from that cursor. Closing the subscription stops future responses.
+The subscriber still admits responses that it already authorized.
 
-- The subscriber MUST create or add credit to its reservation before sending the corresponding
-  subscription message.
-- The subscription MUST record its initial target, schema, receive cursor, remaining object credit,
-  remaining byte credit, and update sequence.
-- The first pushed response MUST extend one initial locator. Each later response MUST extend the
-  receive cursor. Every response MUST consume its object count and encoded bytes before the handler
-  starts.
-- The publisher MUST keep sent cursors in a bounded ring until the subscriber acknowledges them.
-- The subscriber MUST acknowledge only a cursor that its handler accepted.
-- The publisher MUST add credit only after it validates the acknowledged cursor and update sequence.
-- A close update MUST stop new responses. The reservation MUST remain live until every response
-  already sent and the terminal response arrives.
-- A local decision MUST NOT revoke outstanding credit. It MUST stop new credit and MAY close the
-  subscription.
-- A protocol deadline MAY cover the initial catch-up or a requested close. It MUST NOT require a
-  terminal response while a live subscription waits for a new direct descendant and no push
-  obligation is outstanding.
+- The subscriber MUST add each credit grant to its local reservation before sending the update that
+  carries the grant. Each response MUST consume its object and byte credit before the subscriber's
+  handler starts.
+- The subscriber MUST acknowledge only progress accepted by its handler. The publisher MUST retain
+  bounded sent-response state. It MUST validate each update sequence and acknowledgement against
+  that state before it applies added credit.
+- A subscriber that stops wanting the work MUST stop granting credit. It MAY close the subscription.
+  It MUST NOT revoke existing credit. After a close update, the publisher MUST stop producing new
+  responses. The subscriber MUST keep its local reservation live through the terminal response.
+- A subscriber MAY use local progress tracking to select another peer or close an unproductive
+  connection. This specification imposes no mandatory push deadline. An idle subscription MUST NOT
+  require a terminal response merely because no new header is available.
 
-A response that matches a live reservation is relevant. The receiver asked for it, spent bandwidth
-on it, and cannot re-derive it for free. Work reassignment, a competing request for the same object,
-or another peer answering first MUST NOT drop a matched response. A receiver that stops wanting the
-work stops issuing requests and stops granting credit. It does not discard what it already ordered.
+A matched response MUST reach its handler despite work reassignment, a competing response, or a
+change in local interest. The receiver MAY stop issuing requests or granting credit for future work.
 
-## Useful filters
+## Handler policy
 
-### Unique
+Handlers MUST preserve sequence, expiry, empty-response, and chain-selection semantics. They MAY
+discard obsolete data or suppress redundant scheduling after the applicable cadence or reservation
+check. An unchanged or expired legal message MUST NOT become a protocol violation. A matched
+response MUST still consume its reservation and reach its handler.
 
-The Unique filter stores recent keys in a fixed-size per-peer ring.
+Implementations SHOULD keep cheap no-op checks where they avoid work. They need not maintain a
+separate lock-free relevance snapshot. A changed metadata field alone does not require expensive
+target selection or scheduling. Cadence limits frequency independently of usefulness.
 
-- A declaration MUST state the key, ring capacity, window, and repeat result.
-- A key MUST identify the work. It MUST NOT use only a peer-chosen request identifier.
-- An announcement repeat MUST return `Drop`.
-- A request repeat MAY return `Disconnect` only when the first request was fulfilled and the key
-  pins an immutable answer for the entire window.
-- A request whose answer can change MUST omit this filter or return `Drop`.
-- The sender MUST NOT repeat a fulfilled request within the declared window.
+## Cadence
 
-### Relevant
+Cadence uses a bounded monotonic message-count bucket per `(peer, message_type)` where declared.
+The message rules state candidate burst capacities, refill rates, and matching sender intervals.
+Cadence MUST run before expensive verification, sampling, or handler work. Stale, expired, and
+unchanged messages MUST count toward cadence.
 
-The Relevant filter decides whether a legal message can affect a receiver decision.
+- The sender MUST obey the declared minimum interval, including across configurable refreshes.
+  It MAY send one initial message where the message rules permit it.
+- Receiver capacity MUST tolerate the allowed initial send, jitter, coalescing, and buffered
+  arrivals after transport stalls or intentional read pauses.
+- A sender rate below half the receiver refill rate does not by itself prove burst tolerance.
+  Before enforcing exhaustion as `Disconnect`, the implementation MUST establish that its buffer
+  and timing policy cannot reject a conformant sender. An ambiguous buffered burst MUST NOT count
+  as a peer violation. Capacity admission MUST still bound its processing.
+- Implementations MUST validate candidate cadence values with the tests under Parameters to
+  validate. Reopening a stream MUST NOT permit unbounded resets of initial-message allowances
+  within an admitted connection.
 
-- The predicate MUST use the decoded message and a cheap, bounded snapshot.
-- The predicate MUST take no lock.
-- A false predicate MUST return `Drop`.
-- The Relevant filter MUST NOT return `Delay` or `Disconnect`.
-- The predicate MUST NOT test whether the receiver still wants the work. A response that matches a
-  live reservation is wanted by construction. The predicate MAY test whether the message content can
-  change receiver state.
-- The sender MUST include enough information for the receiver to distinguish a peer violation from
-  a local race.
-- A difference from the last accepted message MUST NOT establish relevance unless the changed field
-  can affect a receiver decision.
-- A publisher MUST send a pushed payload only under a live subscription. The first payload MUST
-  extend an initial locator. Each later payload MUST extend the subscribed cursor. Every payload
-  MUST consume subscriber-issued credit.
-- A subscriber MUST grant credit only for a selected branch and accepted base.
-- A subscriber that stops wanting a branch MUST stop granting credit and MAY send `Close`. Those are
-  its only levers. Credit it already granted stays valid.
-- A peer MAY send bounded announcement metadata without a subscription only when a strict Cadence
-  rule applies. It MUST NOT send headers, blocks, or other application objects under that exception.
+## Capacity admission
 
-A conformant pushed payload can arrive after the subscriber stops wanting the branch. Another peer,
-a reorganization, or finality can cause this race. The payload MUST consume outstanding credit and
-MUST reach its handler. It MUST NOT return `Disconnect`.
+The receiver MUST start response work only when worker capacity and bounded output capacity are
+available. When capacity is unavailable, it MUST stop draining the affected request stream.
+Capacity release MUST resume eligible processing. Local capacity exhaustion is not a peer violation.
 
-A dropped announcement has already consumed a Cadence token. A dropped response has already
-consumed reservation capacity. A declaration that has neither bound MUST declare a separate drop
-budget.
+- Execution slots MUST bound actual running work. Protocol inflight limits bound accepted
+  commitments and MAY exceed execution slots. A sender MUST obey advertised inflight limits.
+  Exceeding a protocol limit is distinct from finding all local workers occupied.
+- The implementation MUST bound per-peer and node-wide execution, read-ahead, retained storage
+  results, decoded data, and unsent output. It MUST acquire capacity before producing data that
+  consumes it. It MUST NOT drain QUIC into an unbounded application queue.
+- A job MUST retain its execution slot until the underlying operation finishes. Cancellation,
+  connection closure, or dropping a waiting future MUST NOT release capacity still used by an
+  operation. No separate serving query-result timer is required. Finished work and discarded
+  output MUST release their owned resources exactly once.
+- Pausing reads MUST propagate to the QUIC receive buffer. The transport MUST stop extending stream
+  credit as that buffer fills. The accounting MUST include bytes already authorized by existing
+  credit. Connection credit MUST leave room for required independent streams to progress.
+- A paused request reader MUST NOT trap responses or control messages needed to finish active
+  work. This includes simultaneous requests in both directions on one connection. The stream
+  arrangement and bounded queues MUST demonstrate this property before deployment.
+- Waiting work MUST NOT hold shared locks or writers. Capacity waiting MUST NOT require artificial
+  byte-rate tokens, refill timers, or a second delayed-request scheduler. A resumed message MUST
+  NOT consume cadence or reservation state twice.
+- Empty responses and control updates still consume CPU or storage work. Their processing MUST
+  obey bounded execution and yield to other runnable work even when output backpressure is weak.
 
-## Budgeted filters
-
-### Cadence
-
-Cadence uses one monotonic token bucket per `(peer, message_type)`.
-
-```text
-Cadence {
-  capacity: messages,
-  refill: messages / second,
-  on_empty: Disconnect,
-}
-```
-
-- Cadence MUST run before Decode or Verify when either operation has material cost.
-- Capacity MUST absorb the allowed connect-time send, jitter, and message coalescing.
-- The protocol MUST state the matching sender cadence.
-- The sender cadence MUST NOT exceed half of the receiver refill rate.
-- Cadence exhaustion MAY return `Disconnect` only when a conformant sender cannot exhaust it.
-
-### Work
-
-Work uses one token bucket and one concurrency bound per `(peer, request_type)`.
-
-```text
-charge = upper_bound_response_bytes + REQUEST_OVERHEAD
-refund = charge - actual_response_bytes
-```
-
-- `REQUEST_OVERHEAD` MUST equal 64 KiB.
-- Work MUST charge the upper bound before the handler starts.
-- Work SHOULD refund unused response bytes after the terminal response is queued.
-- A close operation MAY charge zero only when it adds no work and the existing reservation charge
-  covers its terminal response.
-- Work exhaustion MUST return `Delay(deficit / refill)`.
-- Work MUST NOT discard an accepted request.
-- Work MUST refund the unused charge when the handler returns `LocalFault`.
-- The bucket capacity MUST be at least the largest request that the receiver accepts.
-- The refill MUST state the per-peer response bandwidth that the receiver grants.
-- The concurrency bound MUST NOT exceed the inflight limit advertised by the receiver.
-- A request that exceeds the advertised concurrency bound MUST return `Disconnect`.
-
-#### Delayed request isolation
-
-For Work, a message class is one `request_type`. Each `(peer, request_type)` MUST own one FIFO
-request lane. The request lane MUST have a fixed capacity equal to that request type's advertised
-concurrency bound. A request occupies one concurrency slot after it passes every filter before Work.
-It MUST keep that slot until it reaches the completion point declared for that request, its handler
-returns `LocalFault`, or the connection ends. A one-shot or range request completes when its terminal
-response is queued. A subscription update completes when the handler atomically commits the update
-to bounded send state. Work charge and refund accounting MAY outlive the concurrency slot.
-
-The Work filter MUST apply these steps in order:
-
-1. If the request lane has no free concurrency slot, return `Disconnect`.
-2. Compute the request's full charge and acquire one concurrency slot.
-3. If the bucket has enough tokens and no earlier request waits in the request lane, subtract the
-   charge and dispatch the request to its handler.
-4. Otherwise, append the request to the request lane and return `Delay`.
-
-A zero-charge operation declared as unable to `Delay` MUST bypass delayed charged requests. It MUST
-NOT consume a Work concurrency slot. It MUST use separately bounded control state when it changes
-protocol state that an earlier delayed request reserved or snapshotted.
-
-The implementation MUST retain each delayed request as a bounded decoded message plus the bounded
-admission state needed by its handler. It MUST NOT repeat Frame, Decode, Verify, or another charged
-filter when the request becomes eligible. It MUST reserve or snapshot mutable protocol state checked
-before Work so that a later local state change cannot turn the delayed request into a peer violation.
-
-For a delayed request, `deficit` is the request's charge plus the charges of every earlier delayed
-request in its request lane, minus the bucket's available tokens. The implementation MUST clamp a
-negative deficit to zero. `Delay(deficit / refill)` is the request's eligibility estimate when no
-earlier request receives a refund. A token refund MUST prompt the request lane to recompute the head
-request's eligibility. The request lane MUST dispatch eligible requests in FIFO order and subtract
-each charge exactly once before its handler starts.
-
-The request lane MUST arm a monotonic timer for the head request's eligibility estimate. The timer
-and every Work refund MUST wake the request lane. A timer wait MUST NOT hold a shared lock, a
-transport reader, a stream writer, or a handler execution permit. The request lane MUST recompute
-the bucket and the head request's deficit after every wake-up.
-
-The transport reader MUST continue reading complete frames while a request waits in a request lane.
-It MUST dispatch an inbound response without waiting for a delayed request on the same connection or
-ordered stream. It MUST also dispatch every other message class through its own processing path. The
-implementation MUST NOT implement `Delay` by sleeping in the transport reader, by stopping reads
-from the ordered stream, or by filling a transport ingress queue. QUIC flow-control backpressure is
-not the Work delay mechanism.
-
-The request lane is application state in addition to the transport's receive buffers and ingress
-queues. Its capacity and maximum retained bytes MUST satisfy the per-peer resource requirements in
-this specification. When the connection ends, the implementation MUST discard its delayed requests
-and release their concurrency slots. A delayed request has not consumed Work tokens, so connection
-closure refunds no Work tokens for that request.
-
-The refund and refill regenerate admission tokens, not delivery. Three rules bound the outbound
-queue behind them:
-
-- The receiver MUST bound the unsent response bytes queued per peer.
-- When a peer reaches its unsent-byte bound, response production MUST block only that peer's
-  processing path.
-- A drain deadline MAY disconnect a peer that stops reading its responses.
-
-The sender-side obligations for Work:
-
-- The sender MUST size its protocol deadlines using the receiver's advertised refill, concurrency,
-  and inflight limits.
-- The sender SHOULD NOT hold outstanding requests whose combined charge exceeds what the advertised
-  refill sustains within those deadlines.
-
-## Message declarations
-
-All byte caps below cover payload bytes. The transport frame header is not part of the cap. Only
-the filters listed in a declaration apply to that message.
-
-Each declaration lists its filters as bullets. A Verify bullet names the function that performs the
-check instead of restating it. Every link pins commit
-[`f892b90`](https://github.com/zakura-core/zakura/tree/f892b9074002a04a678ef2365ec7658795796572) on
-`main`. When one of those functions changes, this specification follows it; the specification does
-not define a second copy of the same rule.
+## Message rules
 
 ### Discovery — stream 4, version 2
 
 Discovery MUST carry discriminators `1..=5` in the frame header. It MUST remove the payload
-discriminator used by version 1. The following limits apply to every discovery message:
+discriminator used by version 1. The remaining field order and integer encodings stay unchanged.
+The following limits apply to every discovery message:
 
 ```text
 MAX_DIRECT_ADDRS             = 8
@@ -402,8 +245,6 @@ MAX_SERVICE_SUMMARIES        = 8
 MAX_SERVICE_SUMMARY_BYTES    = 256
 NODE_RECORD_MAX              = 648 bytes
 SERVICE_ENVELOPE_MAX         = 294 bytes
-DISCOVERY_WORK_CAPACITY      = 4 MiB
-DISCOVERY_WORK_REFILL        = 1 MiB/s
 ```
 
 #### `Hello` — Announcement, discriminator 1
@@ -417,24 +258,29 @@ DISCOVERY_WORK_REFILL        = 1 MiB/s
   - `protocol_min <= protocol_max`
   - record body <= 580 bytes
   - exact consumption
-- **Verify** — [`ZakuraNodeRecord::verify`][record-verify], which calls
-  [`validate_record_body_for_import`][record-import]
+- **Verify** — [`ZakuraNodeRecord::verify`][record-verify], with time-varying import policy split
+  from [`validate_record_body_for_import`][record-import]
   - record signature
   - network and chain IDs
   - protocol overlap
   - record author == authenticated peer
-- **Relevant**
-  - sequence > peer-local stored sequence
-  - expiry is acceptable under local policy
 - **Cadence**
   - capacity = 4
   - refill = 1 message / 7 seconds
   - on_empty = `Disconnect`
 
-The sender MUST send at most one `Hello` every 15 seconds. Verify MUST run before the discovery
-book lock. The handler MUST NOT store an address that is not globally routable unless local policy
-allows that address class. A stored record's sequence comparison ends when the stored record
-expires, so a peer that reset its sequence recovers after expiry.
+The sender MAY send one initial `Hello`. It MUST send later `Hello` messages at least 15 seconds
+apart. A long-lived shared connection MAY carry periodic `Hello` messages, including an unchanged
+signed record. A discovery-only connection can finish after one exchange; this does not impose a
+lifetime limit of one or two messages on shared connections. The handler MUST apply sequence and
+expiry policy. It need not maintain a separate relevance snapshot. A repeated valid record MUST
+still satisfy initial-exchange progress when the receiver already knows that record.
+Verify MUST run before the discovery book lock. Expiry and sequence checks MUST return `Drop`
+for obsolete records because clock passage and local record
+state can make an otherwise valid record obsolete. The handler MUST NOT store an address that is
+not globally routable unless local policy allows that address class. A stored record's sequence
+comparison ends when the stored record expires, so a peer that reset its sequence recovers after
+expiry.
 
 #### `GetPeers` — Request, discriminator 2
 
@@ -446,14 +292,19 @@ expires, so a peer that reset its sequence recovers after expiry.
   - excluded node IDs <= 256
   - service IDs are 1..=32 ASCII bytes and unique
   - excluded node IDs are sorted and unique
-- **Work**
-  - charge = 2 bytes + limit * 648 bytes + 64 KiB
-  - capacity = 4 MiB
-  - refill = 1 MiB/s
-  - concurrency = 1
-  - on_empty = `Delay`
+  - exact consumption
+- **Cadence**
+  - capacity = 4
+  - refill = 1 message / 7 seconds
+  - on_empty = `Disconnect`, subject to the common burst-tolerance requirement
+- **Capacity**
+  - one outstanding `GetPeers` per peer stream
+  - bounded sampling work and queued response bytes
 
-The handler MUST apply `wanted_services` when it samples the discovery book. It MUST sample
+The sender MAY send one initial `GetPeers`. It MUST send later requests at least 15 seconds apart
+and wait for the previous response before sending the next request. Configurable refresh intervals
+MUST obey this minimum. The handler MUST bound sampling work independently of discovery-book size.
+It MUST apply `wanted_services` when it samples the discovery book. It MUST sample
 qualifying records at random. It MAY apply the excluded node IDs on a best-effort basis: exclusion
 improves sampling efficiency and does not entitle the sender to enumerate the book. The handler
 MUST send exactly one `Peers` response for every admitted request.
@@ -468,22 +319,25 @@ MUST send exactly one `Peers` response for every admitted request.
   - records <= 32
   - node IDs unique
   - exact consumption
-- **Verify** — [`ZakuraNodeRecord::verify`][record-verify] for each record, before the discovery
-  book lock
-  - record signature
-  - record body bounds
-  - network ID and chain ID
-  - protocol range
 - **Reservation**
   - one outstanding `GetPeers` on this stream
   - bounds count and payload bytes
   - consumed by this message
+- **Verify** — the signature and immutable import checks from
+  [`ZakuraNodeRecord::verify`][record-verify] for each record, before the discovery book lock
+  - record signature
+  - record body bounds
+  - network ID and chain ID
+  - structurally valid protocol range
 
-A malformed record, invalid signature, wrong network, wrong chain, or incompatible protocol range
-MUST disconnect the relaying peer. The handler MUST discard an otherwise valid record when local
-staleness, expiry, address, or storage policy rejects it. The handler MUST NOT store an address
-that is not globally routable unless local policy allows that address class. Storage policy MUST
-bound the number of stored records attributed to each source peer.
+A malformed record, invalid signature, wrong network, or wrong chain MUST disconnect the relaying
+peer. The handler MUST discard an otherwise valid record whose protocol range does not overlap
+local support. A relaying peer can legitimately know nodes with different protocol compatibility.
+Expiry MUST remain a handler policy check because a record can expire in transit.
+The handler MUST discard an otherwise valid record when local staleness, expiry,
+address, or storage policy rejects it. The handler MUST NOT store an address that is not globally
+routable unless local policy allows that address class. Storage policy MUST bound the number of
+stored records attributed to each source peer.
 
 #### `GetServices` — Request, discriminator 4
 
@@ -493,13 +347,17 @@ bound the number of stored records attributed to each source peer.
   - wanted services <= 32
   - service IDs are 1..=32 ASCII bytes and unique
   - exact consumption
-- **Work**
-  - response_cap = 42 bytes + min(matching local services, 8) * 294 bytes
-  - charge = response_cap + 64 KiB
-  - capacity = 4 MiB
-  - refill = 1 MiB/s
-  - concurrency = 1
-  - on_empty = `Delay`
+- **Cadence**
+  - capacity = 4
+  - refill = 1 message / 7 seconds
+  - on_empty = `Disconnect`, subject to the common burst-tolerance requirement
+- **Capacity**
+  - one outstanding `GetServices` per peer stream
+  - bounded summary generation and queued response bytes
+
+The sender MAY send one initial `GetServices`. It MUST send later requests at least 15 seconds
+apart and wait for the previous response before sending the next request. Configurable refreshes
+MUST obey this minimum. The receiver MUST acquire output capacity before generating summaries.
 
 The handler MUST apply `wanted_services`. An empty list means all supported services. The handler
 MUST send exactly one `Services` response for every admitted request.
@@ -516,42 +374,46 @@ MUST send exactly one `Services` response for every admitted request.
   - summary length <= 256 bytes
   - service IDs unique
   - exact consumption
-- **Verify** — [`validate_summary_envelope`][summary-envelope] for the envelope, and
-  [`import_connected_peer_services`][services-peer-binding] for the peer binding
-  - envelope tag matches the service ID
-  - each known summary decodes strictly
-  - `node_id` == authenticated peer
 - **Reservation**
   - one outstanding `GetServices` on this stream
   - supplies allowed service IDs, summary count, and payload cap
   - an empty request reserves all service IDs and eight summaries
   - consumed by this message
-- **Relevant**
-  - expiry is not in the past
-  - at least one summary differs from stored live state
+- **Verify** — [`validate_summary_envelope`][summary-envelope] for the envelope, and
+  [`import_connected_peer_services`][services-peer-binding] for the peer binding
+  - each known envelope tag matches the service ID
+  - each known summary decodes strictly
+  - an unknown summary stays length-bounded and is ignored
+  - `node_id` == authenticated peer
 
-An empty summary list remains legal and clears the peer's live service state.
+The handler MUST apply expiry and state-update policy after reservation consumption. An empty
+summary list remains legal and clears the peer's live service state. Unchanged summary contents MAY
+renew validity. The handler MUST NOT suppress renewal merely because service values match.
 
 ### Header sync — stream 5, version 9
 
-Header sync version 9 MUST allow discriminators `1..=4`. Let `H` equal 1,487 bytes on Mainnet and Testnet and
-177 bytes on Regtest. Let `A` equal 156 bytes when the request selects tree auxiliary schema V1 and
-zero otherwise. The following subscription limits apply:
+Header sync version 9 MUST allow discriminators `1..=4` in the frame header. It MUST remove the
+duplicate payload discriminator used by version 8. Let `H` equal 1,487 bytes on Mainnet and Testnet
+and 177 bytes on Regtest. For a selected auxiliary schema, let `A` equal 156 bytes for V1 and zero
+otherwise. The following subscription limits apply:
 
 ```text
 MAX_HS_PUSH_CREDIT_HEADERS   = 4,000
 MAX_HS_PUSH_CREDIT_BYTES     = 8 MiB
-MAX_HS_SUBSCRIPTIONS         = 1 per peer
+MAX_HS_SUBSCRIPTIONS         = 1 live or closing subscription per peer
 MAX_HS_RANGE                 = 4,000 headers per response
-HEADERS_RESPONSE_FIXED_BYTES = encoded size of a Headers response with zero entries
+HEADERS_RESPONSE_FIXED_BYTES = 82 bytes
+HEADERS_OUTCOME_BYTES        = 41 bytes
 HS_SENT_CURSOR_RING          = 4,096 sent cursors per subscription
-HS_PUSH_DEADLINE             = 30 seconds
-HS_WORK_CAPACITY             = MAX_HS_PUSH_CREDIT_BYTES + 64 KiB
-HS_WORK_REFILL               = 1 MiB/s
 ```
 
 The cap test pins `HEADERS_RESPONSE_FIXED_BYTES` to the codec. The frame cap already has an
 implementation in [`HeaderSyncMessage::check_payload_size`][hs-payload-size].
+
+`Status` retains the version 8 fields in the same order: work-anchor height and hash, selected-tip
+height and hash, 32-byte cumulative work, oldest-retained height, maximum headers per response,
+maximum subscriptions, maximum message bytes, and the auxiliary-schema mask. Removing the payload
+discriminator makes its encoded size 122 bytes.
 
 A subscription has **reached its initial target** when its receive cursor equals
 `initial_target_tip_hash`. Until then the publisher serves the path to that target. After that the
@@ -567,27 +429,33 @@ renewable, so the publisher can keep the link full without accepting an unbounde
 acknowledged counts, a locator-count byte, up to 13 locator hashes, two `u32` credit grants, and a
 schema byte. Its maximum encoded size is 523 bytes.
 
+`Headers` retains the version 8 response fields and order. It renames `request_id` to
+`subscription_id` and `complete` to `reaches_initial_target`. The fixed fields occupy 82 bytes.
+`reaches_initial_target` is true exactly on the page whose last header is the initial target and is
+false on every other page. `HeadersOutcome` encodes the `u64` subscription ID, the 32-byte initial
+target hash, and a one-byte outcome.
+
 #### `Status` — Announcement, discriminator 1
 
 - **Frame**
-  - payload cap = 123 bytes
+  - payload cap = 122 bytes
 - **Decode** — [`HeaderSyncMessage::decode`][hs-decode]
   - `work_anchor_height <= selected_tip_height`
   - `oldest_retained_height <= selected_tip_height`
   - `max_headers_per_response` = 1..=`MAX_HS_RANGE`
   - `max_subscriptions` = 1
-  - `max_message_bytes` = `HEADERS_RESPONSE_FIXED_BYTES + H + 4` ..= 2 MiB
+  - `max_message_bytes` = `HEADERS_RESPONSE_FIXED_BYTES + H + 4 + A` ..= 2 MiB for every advertised
+    auxiliary schema
   - `tree_aux_schema_mask` contains only known bits
   - exact consumption
-- **Relevant**
-  - the advertised target or a serving-limit change can affect target selection, failover, or a
-    future credit grant
 - **Cadence**
   - capacity = 4
   - refill = 2 messages/s
   - on_empty = `Disconnect`
 
-The sender MUST coalesce changes to at most one `Status` per second. `work_anchor_height` is the
+The sender MUST coalesce changes to at most one `Status` per second. The handler MUST retain
+bounded latest-status state and SHOULD suppress redundant target-selection work. It need not
+maintain a separate relevance snapshot. `work_anchor_height` is the
 height of the sender's finality anchor. `oldest_retained_height` is the lowest height for which
 the sender retains headers.
 
@@ -604,7 +472,7 @@ the sender retains headers.
   - `added_byte_credit <= 8 MiB`
   - exact consumption
 - **Reservation**
-  - `Open` requires a free publisher slot and creates send state after the Work charge
+  - `Open` requires a free publisher slot and creates bounded send state
   - `Grant` and `Close` match one live subscription or the terminal tombstone
   - `update_sequence` increases by exactly one
   - `initial_target_tip_hash` and `tree_aux_schema` remain fixed
@@ -613,28 +481,30 @@ the sender retains headers.
   - remaining header credit <= 4,000
   - remaining byte credit <= 8 MiB
   - terminal tombstone capacity = 1
-- **Work**
-  - `Open` or `Grant` charge = `added_byte_credit` + 64 KiB
-  - `Close` charge = 0 and cannot `Delay`
-  - capacity = `HS_WORK_CAPACITY`
-  - refill = `HS_WORK_REFILL`
-  - concurrency = 1
-  - on_empty = `Delay`
+- **Capacity**
+  - one live or closing subscription per peer
+  - bounded control processing and response production
+  - `Close` processing MUST NOT wait for serving worker or output capacity
+
+The publisher MUST process updates atomically in stream order. It MUST bound control-processing
+work before yielding to other runnable work. Grant processing MUST NOT allocate an unbounded queue
+of response jobs. Credit authorizes future responses; it does not allocate executing workers.
+The implementation MUST preserve control progress while response output is blocked.
 
 `Open` MUST carry `1..=13` unique locator hashes. Its acknowledged cursor MUST equal the first
 locator. Its acknowledged header and byte counts MUST equal zero. It MUST add nonzero header and byte
 credit. The byte credit MUST fit the fixed response fields and one entry under the selected schema.
-The subscriber MUST select the target from a relevant `Status`. It MUST create the inbound
+The subscriber MUST select the target from a received `Status`. It MUST create the local
 subscription reservation before it sends `Open`.
 
 `Grant` MUST carry no locator hashes. It MUST acknowledge a cursor accepted from this subscription.
-It MUST add nonzero header or byte credit. The subscriber MUST add the credit to its inbound
-reservation before it sends `Grant`. Until the subscription reaches its initial target, the
-resulting header and byte credit MUST fit at least one legal nonempty page. A smaller grant stalls
-the subscription: the publisher cannot legally send a page, and the subscriber waits for one. After
-the subscription reaches its target the publisher may have nothing to send, so the subscriber need
-not hold credit for a full page. The subscriber SHOULD keep header and byte
-credit for at least one page outstanding on a live subscription.
+It MUST add nonzero header or byte credit. The subscriber MUST add the credit to its local
+subscription reservation before it sends `Grant`. Until the subscription reaches its initial
+target, the resulting header and byte credit MUST fit at least one legal nonempty page. A smaller
+grant stalls the subscription: the publisher cannot legally send a page, and the subscriber waits
+for one. After the subscription reaches its target, the publisher may have nothing to send. The
+subscriber does not need to hold credit for a full page in that state. The subscriber SHOULD keep
+header and byte credit for at least one page outstanding on a live subscription.
 
 `Close` MUST carry no locator hashes or added credit. The publisher MUST stop producing new pages
 when it receives `Close`. It MUST send `HeadersOutcome(SubscriptionClosed)` after every page already
@@ -645,15 +515,15 @@ Receiving `Close` or queueing a terminal outcome frees the publisher slot. The p
 retain a terminal tombstone until it receives a crossing `Close` or the next `Open`. The tombstone
 prevents a conformant update that crossed the terminal outcome from causing a violation. A
 tombstone match validates only the subscription ID. A crossing `Grant` that matches the tombstone
-MUST return `Drop`, MUST charge no work, and MUST NOT consume the tombstone. A crossing `Close`
+MUST return `Drop` and MUST NOT consume the tombstone. A crossing `Close`
 consumes the tombstone. An `Open` that finds no free publisher slot MUST return `Disconnect`,
 because the subscriber knows its own live subscription count.
 
-The next `Open` clears the tombstone. It MUST use a subscription ID that differs from the retained
-tombstone's ID, so a crossing update never matches two subscriptions. The subscriber MUST retain
-the old reservation until its terminal outcome arrives. It MAY open a new subscription while it
-waits for that outcome. The current subscription work charge covers the terminal outcome, which
-consumes no header or byte credit.
+The subscriber MUST receive the terminal outcome before it sends the next `Open`. The next `Open`
+clears the tombstone and MUST use a different subscription ID. This rule bounds each side to one
+live or closing subscription and prevents terminal reservations from accumulating. The terminal
+outcome consumes no header or byte credit. The publisher MUST reserve bounded terminal-output
+capacity so exhausted data credit cannot prevent closure.
 
 The publisher MUST split output into frames that satisfy its advertised per-response count and byte
 limits. It MAY send several frames without another `Grant` while credit remains. It MUST NOT treat
@@ -664,7 +534,7 @@ one-header pages, so `HS_SENT_CURSOR_RING` always suffices.
 #### `Headers` — Response, discriminator 3
 
 - **Frame**
-  - absolute payload cap = `computed_max_encoded_size(Headers, network)` <= 2 MiB
+  - absolute payload cap = 2 MiB
   - reservation payload cap = min(publisher_advertised_message_bytes,
     remaining_subscription_byte_credit)
 - **Decode** — [`HeaderSyncMessage::decode`][hs-decode]
@@ -673,9 +543,19 @@ one-header pages, so `HS_SENT_CURSOR_RING` always suffices.
   - encoded payload bytes <= remaining byte credit
   - response schema matches the subscription
   - `header_count >= 1`
+  - `reaches_initial_target` is 0 or 1
   - `body_size <= 2,000,000`
   - canonical network solution size
   - exact consumption
+- **Reservation**
+  - identity = (`subscription_id`, work scope, `initial_target_tip_hash`, sent locator entries,
+    requested schema)
+  - the first parent is a sent locator; each later parent equals the reservation receive cursor
+  - consume `header_count` and the encoded payload bytes
+  - advance the receive cursor
+  - require `reaches_initial_target` exactly when the final header hash equals the initial target
+  - record when the initial target is reached and reject a second such marker
+  - remain live
 - **Verify** — [`prepare_headers`][prepare-headers], the context-free header validator, over the
   decoded page. It establishes the supported encoding version, the locally computed hash, the
   inferred height, the commitment interpretation, the canonical compact target, the hash-to-target
@@ -683,17 +563,9 @@ one-header pages, so `HS_SENT_CURSOR_RING` always suffices.
   Header sync already calls it on this path in
   [`header_sync_driver`][hs-driver]. The individual rules live in
   [`validation::context_free`][context-free].
-- **Reservation**
-  - identity = (`subscription_id`, work scope, `initial_target_tip_hash`, sent locator entries,
-    requested schema)
-  - the first parent is a sent locator; each later parent equals the reservation receive cursor
-  - consume `header_count` and the encoded payload bytes
-  - advance the receive cursor
-  - record when the initial target is reached
-  - remain live
 
-Page linkage is a reservation rule, not a context-free one: it holds against the sent-cursor ring
-this receiver owns, so [`prepare_headers`][prepare-headers] cannot decide it.
+Page linkage is a reservation rule, not a context-free one. It holds against the sent locator and
+receive cursor in the local reservation, so [`prepare_headers`][prepare-headers] cannot decide it.
 
 The first page MUST extend the locator intersection selected by the publisher. The publisher MUST
 reach the initial target before it pushes a descendant beyond that target. Each later page MUST
@@ -703,12 +575,10 @@ remains. If its selected chain no longer extends that cursor, it MUST stop pushi
 `HeadersOutcome(SubscriptionSuperseded)`. The subscriber MUST acknowledge only a cursor that passes
 contextual difficulty, time, chain-connection, and auxiliary-root validation.
 
-A push obligation is outstanding while the subscription holds credit for at least one nonempty
-page and the publisher's latest `Status` advertises a selected tip that extends the subscription
-cursor. The publisher MUST queue a page or a terminal outcome within `HS_PUSH_DEADLINE` of the
-obligation arising. The subscriber MAY treat the obligation as violated only after twice
-`HS_PUSH_DEADLINE`. This rule makes a quiet subscription either honestly idle or a violation: a
-publisher cannot advertise work and then withhold it.
+The publisher SHOULD produce an eligible page when credit, chain data, and execution/output
+capacity are available. This specification imposes no mandatory push deadline. The subscriber MAY
+track progress and select another peer under local policy. Slow progress alone is not a protocol
+violation, and local failover MUST NOT revoke outstanding authorization.
 
 The handler MUST verify contextual difficulty, time, chain connection, and auxiliary roots. The
 transition planner performs those checks; [`prepare_headers`][prepare-headers] documents the split.
@@ -717,15 +587,17 @@ The handler MUST disconnect the peer when one of those checks fails.
 #### `HeadersOutcome` — Response, discriminator 4
 
 - **Frame**
-  - payload cap = 42 bytes
+  - payload cap = 41 bytes
 - **Decode** — [`HeaderSyncMessage::decode`][hs-decode]
   - `subscription_id != 0`
+  - `initial_target_tip_hash` matches the subscription
   - outcome is `TargetNotRetained`, `NoLocatorIntersection`, `TargetNotSelected`, `HistoryPruned`,
     `SubscriptionSuperseded`, or `SubscriptionClosed`
   - exact consumption
 - **Reservation**
   - same identity and reservation as `Headers`
   - consumes no header or byte credit
+  - releases unused subscription credit
   - closes this subscription
 
 Each outcome is legal only in its window:
@@ -741,144 +613,134 @@ Each outcome is legal only in its window:
 
 An outcome outside its window MUST return `Disconnect`.
 
-`Busy` is not a protocol outcome. Local capacity exhaustion MUST delay the request before
-admission. A local failure after admission MUST return `LocalFault`. `TargetNotSelected` reports
+`Busy` is not a protocol outcome. Local capacity exhaustion MUST pause response-work admission
+under Capacity admission. A local failure after admission MUST return `LocalFault`.
+`TargetNotSelected` reports
 that the publisher changed its selected chain between `Status` and `Open`. `SubscriptionSuperseded`
 reports that the publisher's selected chain stopped extending the subscription cursor. Neither is
 a peer violation.
 
 ### Block sync — stream 6, version 2
 
-Version 2 requests bodies by height range. That suits the checkpoint range, where the heights are
-contiguous and no validated header identity exists yet. Above the checkpoint a height does not name
-a block: competing branches occupy the same height, and a height range cannot say which branch the
-requester wants. Version 3 addresses that. Version 2 keeps heights.
+Version 2 requests bodies by height range. The requester still reserves the expected header hash for
+each height, but the wire request does not identify that hash. Competing branches can occupy the
+same height, so version 2 cannot safely overlap live ranges on one connection. A future version must
+make request and body correlation explicit.
 
-Block sync MUST allow discriminators `1..=5` in the frame header. It MUST remove the duplicate
-payload discriminator. [`BlockSyncMessage::decode`][bs-decode] reads that duplicate today. The
-following limits apply:
+Block sync MUST allow discriminators `1..=5` in the frame header. Version 2 also carries the same
+one-byte discriminator at the start of each payload. The decoder MUST require both copies to match.
+Removing the payload copy requires a new stream version. The following limits apply:
 
 ```text
 MAX_BLOCKS_PER_RESPONSE  = 128
 MAX_BLOCK_BYTES          = 2,000,000 bytes
 MAX_BS_RESPONSE_BYTES    = 33,554,432 bytes
 MAX_BS_INFLIGHT_REQUESTS = 32,768
-BLOCK_WORK_CAPACITY      >= 8 bytes + min(local_max_blocks_per_response * MAX_BLOCK_BYTES,
-                           local_max_response_bytes) + 64 KiB
-BLOCK_WORK_REFILL        = local per-peer serving rate, bytes/second
 ```
 
-The receiver MUST advertise its actual block count, response byte, inflight, and work-refill
-limits. It MUST NOT inherit the header-sync work budget.
+The receiver MUST advertise its actual block count, response body-byte limit, and protocol
+inflight limit. The inflight limit bounds outstanding commitments; it does not specify the number
+of executing storage jobs. Worker and memory capacity MUST remain bounded independently.
 
-Block sync already regulates its rate on the requesting side. Each sender sizes its outstanding
-`GetBlocks` work with a per-peer BBR window ([`DownloadWindow`][bs-window]), clamped by the inflight
-limit the receiver advertises and operating at the measured bandwidth-delay product, which is
-normally far below that clamp. That window is the outbound obligation matching this inbound rule.
+The requester sizes outstanding work through its existing per-peer download window
+([`DownloadWindow`][bs-window]) and MUST obey the receiver's advertised inflight limit. Receiver
+safety MUST NOT depend on requester adaptation. Continuous serving is legal while resources are
+available. This specification adds no per-peer serving-rate setting or artificial refill delay.
 
-The two sides meet through `Delay`. A receiver whose Work bucket is empty delays the request instead
-of answering it. The delay lengthens the sender's round-trip samples, the sender's delay gradient
-shrinks its window, and the sender settles below the rate the receiver serves. Neither side needs to
-advertise a rate.
-
-`BLOCK_WORK_REFILL` therefore binds only a sender that ignores its own controller. The receiver MUST
-set the rate from local policy. It MUST NOT derive the rate from a peer-supplied or peer-influenced
-measurement, because a peer able to move that measurement would set its own budget. The receiver
-MUST size the rate so that the rate multiplied by the maximum peer count fits its serving egress
-budget. No configuration key sets this rate today: [`block_sync::config`][bs-config] bounds the
-requesting side (inflight requests, inflight block bytes, look-ahead bytes) and has no serving-rate
-setting. An implementation of this specification MUST add one.
+A stream layout that pauses request intake MUST preserve response and control progress in both
+directions. Capacity admission defines that requirement independently of the concrete layout.
 
 `MAX_BLOCKS_PER_RESPONSE` and `MAX_BS_RESPONSE_BYTES` both apply to one range response, and the
-smaller one stops it. The count binds for small blocks. The byte total binds for large ones: at
-`MAX_BLOCK_BYTES` the byte total admits about 16 blocks, so the count never engages there.
+smaller one stops it. `MAX_BS_RESPONSE_BYTES` counts encoded block bodies and excludes message
+discriminators and the terminal response. The count binds for small blocks. The byte total binds for
+large ones: at `MAX_BLOCK_BYTES` the byte total admits about 16 blocks, so the count never engages
+there.
 
 #### `Status` — Announcement, discriminator 1
 
 - **Frame**
-  - payload cap = 20 bytes
+  - payload cap = 53 bytes
 - **Decode** — [`BlockSyncMessage::decode`][bs-decode]
   - `servable_low <= servable_high`
   - `max_blocks_per_response` = 1..=128
   - `max_inflight_requests` = 1..=32,768
   - `max_response_bytes` = 1..=33,554,432
   - exact consumption
-- **Relevant**
-  - the range or a serving-limit change can affect candidate selection, pending demand, failover,
-    or an open request
 - **Cadence**
   - capacity = 4
   - refill = 1 message / 15 seconds
   - on_empty = `Disconnect`
 
 The sender MUST send at most one `Status` every 30 seconds. It MAY send one immediate `Status` when
-the connection opens.
+the connection opens. The handler MUST retain bounded latest-status state and SHOULD suppress
+redundant candidate-selection work without requiring a separate relevance snapshot.
 
 #### `GetBlocks` — Request, discriminator 2
 
 - **Frame**
-  - payload cap = 8 bytes
+  - payload cap = 9 bytes
 - **Decode** — [`BlockSyncMessage::decode`][bs-decode], [`validate_block_count`][bs-count]
   - count = 1..=128
   - `start_height + count - 1 <= Height::MAX`
   - exact consumption
-- **Work**
-  - response_cap = 8 bytes + min(min(count, local_max_blocks_per_response) * 2,000,000 bytes,
-    local_max_response_bytes)
-  - charge = response_cap + 64 KiB
-  - capacity = `BLOCK_WORK_CAPACITY`
-  - refill = `BLOCK_WORK_REFILL`
-  - concurrency = local_max_inflight_requests
-  - on_empty = `Delay`
+- **Capacity**
+  - outstanding commitments <= advertised inflight limit
+  - bounded per-peer and node-wide storage execution, retained results, and queued output
 
-The handler MUST perform at most one contiguous read. It MUST send no more than one `Block` for
-each requested height. It MUST finish with exactly one `BlocksDone` or `RangeUnavailable`.
+The handler MUST bound storage work and retained results for each range. It MAY use bounded
+sequential reads rather than retaining the whole response from one contiguous read. It MUST send
+no more than one `Block` for each requested height. It MUST finish with exactly one `BlocksDone`
+or `RangeUnavailable`.
 
-The sender MUST NOT hold two live ranges with the same `start_height` on one connection. A
-`GetBlocks` whose `start_height` equals a live admitted range from the same peer MUST return
-`Disconnect`, so every terminal response matches exactly one range.
+Repeated unavailable-range requests still consume lookup work. The receiver MUST bound that work
+even when responses are small and output backpressure does not engage. Continuous requests MUST
+yield shared execution so another runnable peer can progress. Prioritization policy remains
+separate from these resource bounds.
+
+The requester MUST NOT send overlapping live ranges on one connection. A `GetBlocks` that overlaps
+a live admitted range from the same peer MUST return `Disconnect`. This rule makes every `Block`
+and terminal response match exactly one range despite version 2's missing request ID.
 
 #### `Block` — Response, discriminator 3
 
 - **Frame**
-  - payload cap = 2,000,000 bytes
+  - payload cap = 2,000,001 bytes
 - **Decode** — [`BlockSyncMessage::decode`][bs-decode],
   [`validate_encoded_block_len`][bs-block-len]
   - one complete block
   - exact consumption
+- **Reservation** — [`BlockRangeRequest::expected_hash`][bs-expected-hash]
+  - one live `GetBlocks` range whose next unconsumed height expects this header hash
+  - consumes that hash's part of the reservation
 - **Verify** — [`CheckpointVerifier::check_block`][check-block], the existing stateless block
   check. It establishes the encoding version and hash, the coinbase height, the compact target,
   and the Equihash solution, then recomputes the Merkle root. The individual rules live in
   [`block::check`][block-check].
-- **Reservation** — [`BlockRangeRequest::expected_hash`][bs-expected-hash]
-  - one live `GetBlocks` range expecting this header hash
-  - consumes that hash's part of the reservation
-- **Unique**
-  - key = expected header hash
-  - scope = reservation
-  - capacity = reserved count
-  - window = reservation lifetime
-  - on_repeat = `Drop`
 
 The receiver matches a `Block` by hashing its header and comparing that hash with the committed
-header hashes expected by live ranges. A block whose hash matches no live expectation MUST return
-`Disconnect`. The publisher MUST send the blocks of a range in ascending height order. The
-reservation identity commits to a header that header sync already validated, so Verify re-checks
-Equihash and the target only as defense in depth; an implementation MAY skip both checks when the
-header bytes hash to the expected identity. Block sync takes that option today: it matches the hash
-at [`peer_routine`][bs-expected-hash] and leaves
-[`CheckpointVerifier::check_block`][check-block] to run downstream.
+header hashes expected by live ranges. A block that does not match the next expected hash of exactly
+one live range MUST return `Disconnect`. The publisher MUST send the blocks of a range in ascending
+height order. The reservation identity commits to a header that header sync already validated, so
+Verify re-checks Equihash and the target only as defense in depth. An implementation MAY skip both
+checks when the header bytes hash to the expected identity. Block sync takes that option today: it
+matches the hash at [`peer_routine`][bs-expected-hash] and leaves
+[`CheckpointVerifier::check_block`][check-block] to run downstream. Matching a known header does not
+validate its supplied body. The implementation MUST retain body-commitment checks and required
+downstream consensus validation before accepting
+the block. It SHOULD reuse those validation paths rather than add duplicate ingress checks.
 
 #### `BlocksDone` — Response, discriminator 4
 
 - **Frame**
-  - payload cap = 8 bytes
+  - payload cap = 9 bytes
 - **Decode** — [`BlockSyncMessage::decode`][bs-decode], [`validate_block_count`][bs-count]
   - `start_height <= Height::MAX`
   - returned = 1..=128
   - exact consumption
 - **Reservation**
   - live `GetBlocks` range with this `start_height`
+  - `returned` equals the number of blocks consumed from the range and does not exceed its requested
+    count
   - consumes the terminal part and closes the reservation
 
 [`validate_block_count`][bs-count] rejects zero, so `BlocksDone` reports at least one block. A peer
@@ -890,68 +752,87 @@ peer that serves no blocks for heights inside its advertised servable range.
 #### `RangeUnavailable` — Response, discriminator 5
 
 - **Frame**
-  - payload cap = 8 bytes
+  - payload cap = 9 bytes
 - **Decode** — [`BlockSyncMessage::decode`][bs-decode], [`validate_block_count`][bs-count]
   - `start_height <= Height::MAX`
   - count = 1..=128
   - exact consumption
 - **Reservation**
-  - live `GetBlocks` range with this `start_height`
+  - live `GetBlocks` range with this `start_height` and requested count
+  - no block has been consumed from the range
+  - `count` equals the requested count
   - consumes the terminal part and closes the reservation
 
 The handler MUST requeue the range. A retry policy MAY avoid this peer for the immediate retry.
 
-### Block sync — stream 6, version 3 (planned)
+### Block sync successor (planned)
 
-Version 3 names bodies by header hash, the same identity header sync already uses. Each requested
-item carries an optional hash beside its height. When a request supplies a hash, the returned body
-MUST hash to that value; a body that does not MUST return `Disconnect`. When a request omits the
-hash, height alone identifies the item and version 2 behavior applies.
+A successor version should identify each request with a receiver-chosen nonzero request ID and name
+each requested body by header hash. Every body and terminal response must echo the request ID. Those
+fields would remove version 2's overlap restriction and bind each body to the header chain that the
+requester selected.
 
-The hash removes version 2's restriction against two live ranges over the same heights. Two ranges
-on one connection MAY cover the same heights when each supplies a distinct hash, because the hash
-correlates every body and every terminal response to exactly one range. Two live ranges that cover
-the same heights without hashes remain a violation, because nothing separates their terminal
-responses.
+This section is non-normative. The successor message set, encoding, caps, reservation rules, and
+work bounds remain unspecified. Implementations MUST support only version 2 until a separate change
+defines that complete wire contract.
 
-This section is a placeholder. The message set, its caps, and its budgets are not yet specified.
+## Parameters to validate
+
+Wire caps and reservation identities follow from message encodings. Policy values remain candidates
+while this specification has first-draft status. Implementations MUST obtain the following evidence
+before enforcing those values:
+
+| Parameters | Required evidence |
+| --- | --- |
+| Cadence capacities, refill rates, and discovery request intervals | Initial and periodic exchanges, summary renewal before expiry, configurable refreshes, and buffered arrivals after pauses; flood rejection without rejecting conformant bursts |
+| Execution slots, inflight commitments, retained-result and output bounds | CPU, lock, storage, and memory measurements at the maximum admitted peer count; continuous serving and repeated unavailable-range requests |
+| Header credit and cursor-ring size | Open, grant, close, crossing updates, reorganization, credit exhaustion, and control floods while data output is blocked |
+| Incomplete-frame retention and transport windows | Partial-frame tests, intentional read pauses, non-reading peers, existing-credit accounting, and independent stream progress |
 
 ## Conformance tests
 
-The implementation MUST provide these checks:
+The implementation MUST provide focused checks for the following properties. It MAY use existing
+unit, property, synthetic-peer, and transport test infrastructure. A new declaration framework,
+universal panic-recovery suite, and exhaustive model explorer are not prerequisites.
 
-1. A declaration test MUST prove that the 14 declarations and 14 handler branches match exactly.
-2. A cap test MUST prove that every maximal legal encoding fits its declared cap and that no
-   computed maximum exceeds that cap.
-3. Property tests MUST generate legal messages and gate-event sequences. They MUST preserve
-   reservation, budget, and state-size invariants. A conformant sequence MUST never return
-   `Disconnect`.
-4. Model-based reservation tests MUST generate subscription opens, grants, closes, exhausted credit,
-   crossed and spontaneous terminal responses, work reassignment, finality changes, response
-   reordering, duplicate responses, and connection closure. Each pushed response MUST consume the
-   exact header and byte credit from one live subscription.
-5. Fuzz tests MUST prove that each decoder is total, exact, and allocation-bounded for arbitrary
-   frames.
-6. Honest-node regtest traces MUST contain no `Disconnect` result.
-7. Load tests MUST drive one peer at the maximum conformant rate and show that CPU, memory, and
-   filter state stay within their declared bounds. They MUST drive a non-conformant flood and show
-   that the receiver reaches `Disconnect` within bounded work.
-8. Panic-isolation tests MUST inject a panic in a decoder, in a handler, and in a reactor port
-   operation. Each test MUST show that the process survives, that other peers' processing paths
-   continue, that the affected work returns to the scheduler, and that the result reaches neither
-   peer-set ban policy nor the peer-violation count.
-9. Delay-isolation tests MUST exhaust one request type's Work bucket and place a request in its
-   request lane. A later response and a message of another class on the same ordered stream MUST
-   reach their handlers before the delayed request becomes eligible. The tests MUST also prove FIFO
-   dispatch, prompt wake-up after a refund, and `Disconnect` at the concurrency bound.
+1. Every supported message kind has legal boundary cases, canonical round trips, exact decoding,
+   payload caps, and decoded-allocation checks. Deterministic cases MUST cover every kind and rule;
+   random generation MUST NOT provide the only coverage.
+2. Cadence checks cover announcements and discovery requests, including initial sends, periodic
+   refreshes, unchanged messages, configured sender intervals, floods, and buffered bursts after
+   transport stalls or local pauses. Conformant sequences MUST NOT produce `Disconnect`.
+3. Reservation tests cover unsolicited, duplicate, mismatched, and reordered responses; local work
+   reassignment; finality changes; completion; and connection closure. Local scheduler actions MUST
+   NOT revoke response authorization.
+4. Subscription tests cover open, grant, close, exhausted credit, crossing updates and terminal
+   outcomes, bounded cursor history, and control processing while output is blocked. Each page
+   MUST consume the exact header and byte credit of its subscription.
+5. Fuzz and property tests check decoder panics, trailing-byte acceptance, and allocation-bound
+   violations over bounded payloads. These checks do not require universal runtime panic recovery.
+6. Capacity tests saturate workers and output buffers and verify that new response work stops.
+   They check resource release, ordinary local failures, blocked storage operations, and connection
+   churn. A cancelled waiter MUST NOT release a slot still used by its underlying operation.
+7. Real-transport tests show that paused reads fill bounded QUIC receive buffers and stop further
+   data after existing credit is exhausted. Capacity release resumes processing. Tests MUST cover
+   simultaneous bidirectional serving and required control progress, including on one connection.
+8. Load tests check aggregate CPU, memory, execution, and protocol-state bounds across admitted
+   peers. They cover continuous useful serving and repeated empty responses. Available capacity
+   MUST NOT wait for a serving-rate refill timer.
+9. Discovery tests cover repeated valid `Hello` records, expiry, sequence checks, empty `Services`
+   clearing live state, and unchanged summaries renewing validity. Honest regtest exchanges MUST
+   produce no protocol-violation result.
 
-Peer-slot selection, message priority, and stream layout are outside this specification. Peer-slot
-selection must remain separate because a conformant peer can waste a slot without violating a
-message rule.
+Tests MUST state scheduling assumptions and finite progress bounds where they assert progress.
+Optional traces MUST bound their logging and storage costs. Generated tests search for failures;
+they do not prove all executions correct. The [testing design](../design/property-testing.md) and
+[`GetBlocks` checks](../design/property-testing-block-sync-infrastructure.md) describe the initial
+implementation scope.
 
 ## Reference implementations
 
-Every link below pins commit `f892b9074002a04a678ef2365ec7658795796572` on `main`.
+Every link below pins commit
+[`f892b9074002a04a678ef2365ec7658795796572`](https://github.com/zakura-core/zakura/tree/f892b9074002a04a678ef2365ec7658795796572)
+on `main`.
 
 [record-verify]: https://github.com/zakura-core/zakura/blob/f892b9074002a04a678ef2365ec7658795796572/crates/zakura-network/src/zakura/discovery/protocol.rs#L286
 [record-import]: https://github.com/zakura-core/zakura/blob/f892b9074002a04a678ef2365ec7658795796572/crates/zakura-network/src/zakura/discovery/protocol.rs#L3882
@@ -975,5 +856,3 @@ Every link below pins commit `f892b9074002a04a678ef2365ec7658795796572` on `main
 [bs-expected-hash]: https://github.com/zakura-core/zakura/blob/f892b9074002a04a678ef2365ec7658795796572/crates/zakura-network/src/zakura/block_sync/peer_routine.rs#L1437
 [bs-window]: https://github.com/zakura-core/zakura/blob/f892b9074002a04a678ef2365ec7658795796572/crates/zakura-network/src/zakura/block_sync/state.rs#L333
 [bs-config]: https://github.com/zakura-core/zakura/blob/f892b9074002a04a678ef2365ec7658795796572/crates/zakura-network/src/zakura/block_sync/config.rs
-[hs-catch-unwind]: https://github.com/zakura-core/zakura/blob/f892b9074002a04a678ef2365ec7658795796572/crates/zakura-network/src/zakura/header_sync/reactor.rs#L3639
-[hs-port-panic]: https://github.com/zakura-core/zakura/blob/f892b9074002a04a678ef2365ec7658795796572/crates/zakura-network/src/zakura/header_sync/reactor.rs#L3790

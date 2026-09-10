@@ -1513,6 +1513,13 @@ async fn raw_block_range_read_stops_at_pruned_gap_before_retained_bodies() {
             runtime_status: header_runtime_status_receiver,
             reader: header_chain_reader_receiver,
         },
+        crate::service::load_historical_frontier_artifact(
+            &state.network(),
+            state.db.config(),
+            state.db.vct_synced_below().is_some(),
+        )
+        .expect("the default historical frontier configuration loads")
+        .discard_if_before_vct_handoff(state.db.config(), &state.db),
     );
 
     let response = read_state

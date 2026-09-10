@@ -911,7 +911,7 @@ impl PursuitHarness {
 /// Replay one bounded byte stream through the production queue and ownership gate.
 pub fn replay_header_pursuit_bytes(data: &[u8]) -> HeaderPursuitReplaySummary {
     let mut harness = PursuitHarness::new();
-    for operation in data[..data.len().min(MAX_INPUT_BYTES)].chunks_exact(4) {
+    for operation in data[..data.len().min(MAX_INPUT_BYTES)].as_chunks::<4>().0 {
         harness.apply(operation);
     }
     harness.summary

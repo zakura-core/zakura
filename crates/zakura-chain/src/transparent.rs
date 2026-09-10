@@ -7,7 +7,7 @@ mod script;
 mod serialize;
 mod utxo;
 
-use std::{collections::HashMap, fmt, iter, ops::AddAssign};
+use std::{collections::HashMap, fmt, ops::AddAssign};
 
 use zcash_script::{opcode::Evaluable as _, pattern::push_num};
 use zcash_transparent::{address::TransparentAddress, bundle::TxOut};
@@ -241,6 +241,7 @@ impl Input {
     /// # Panics
     ///
     /// If the provided [`Output`]s don't have this input's [`OutPoint`].
+    #[cfg(any(test, feature = "proptest-impl"))]
     pub(crate) fn value_from_outputs(
         &self,
         outputs: &HashMap<OutPoint, Output>,
@@ -271,17 +272,29 @@ impl Input {
     ///
     /// If the provided [`Utxo`]s don't have this input's [`OutPoint`].
     pub fn value(&self, utxos: &HashMap<OutPoint, utxo::Utxo>) -> Amount<NonNegative> {
+        self.value_from_utxos(utxos)
+    }
+
+    /// Get the value spent by this input from any UTXO index whose values
+    /// reference [`Utxo`](utxo::Utxo).
+    pub(crate) fn value_from_utxos<U>(&self, utxos: &HashMap<OutPoint, U>) -> Amount<NonNegative>
+    where
+        U: AsRef<utxo::Utxo>,
+    {
         if let Some(outpoint) = self.outpoint() {
-            // look up the specific Output and convert it to the expected format
-            let output = utxos
+            utxos
                 .get(&outpoint)
-                .expect("provided Utxos don't have spent OutPoint")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "spent outpoint {outpoint:?} is missing from the {} provided UTXOs; the caller must supply every spent UTXO",
+                        utxos.len()
+                    )
+                })
+                .as_ref()
                 .output
-                .clone();
-            self.value_from_outputs(&iter::once((outpoint, output)).collect())
+                .value
         } else {
-            // coinbase inputs don't need any UTXOs
-            self.value_from_outputs(&HashMap::new())
+            Amount::zero()
         }
     }
 }

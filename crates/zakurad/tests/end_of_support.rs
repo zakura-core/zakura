@@ -66,6 +66,44 @@ fn end_of_support_height_per_network() {
     end_of_support::check(Height::MAX, &testnet);
 }
 
+/// Test the end of support values reported to the metrics endpoint.
+#[test]
+fn end_of_support_remaining_blocks() {
+    let last_supported_height =
+        Height(ESTIMATED_RELEASE_HEIGHT + (EOS_PANIC_AFTER * ESTIMATED_BLOCKS_PER_DAY));
+    let warning_height =
+        Height(ESTIMATED_RELEASE_HEIGHT + (EOS_WARN_AFTER * ESTIMATED_BLOCKS_PER_DAY));
+
+    assert_eq!(
+        end_of_support::remaining_blocks(Height(ESTIMATED_RELEASE_HEIGHT), &Network::Mainnet),
+        Some(i64::from(EOS_PANIC_AFTER * ESTIMATED_BLOCKS_PER_DAY)),
+    );
+    assert_eq!(
+        end_of_support::remaining_blocks(warning_height, &Network::Mainnet),
+        Some(i64::from(3 * ESTIMATED_BLOCKS_PER_DAY)),
+    );
+    assert_eq!(
+        end_of_support::remaining_blocks(Height(warning_height.0 + 1), &Network::Mainnet),
+        Some(i64::from(3 * ESTIMATED_BLOCKS_PER_DAY) - 1),
+    );
+    assert_eq!(
+        end_of_support::remaining_blocks(last_supported_height, &Network::Mainnet),
+        Some(0),
+    );
+
+    // The count goes negative at the height that halts the node.
+    assert_eq!(
+        end_of_support::remaining_blocks(Height(last_supported_height.0 + 1), &Network::Mainnet),
+        Some(-1),
+    );
+
+    // Support is not enforced outside Mainnet, so there is nothing to report.
+    assert_eq!(
+        end_of_support::remaining_blocks(last_supported_height, &Network::new_default_testnet()),
+        None,
+    );
+}
+
 /// Test that we are never in end of support warning or panic.
 #[test]
 #[tracing_test::traced_test]

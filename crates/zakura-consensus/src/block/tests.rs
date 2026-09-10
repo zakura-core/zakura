@@ -1,0 +1,1600 @@
+//! Tests for block verification
+
+#![allow(clippy::unwrap_in_result)]
+
+use chrono::DateTime;
+use color_eyre::eyre::{eyre, Report};
+use once_cell::sync::Lazy;
+use tower::{buffer::Buffer, service_fn, util::BoxService, Service, ServiceExt};
+
+use zakura_chain::{amount::NegativeAllowed, ironwood};
+use zakura_chain::{
+    amount::{DeferredPoolBalanceChange, MAX_MONEY},
+    block::{
+        tests::generate::{
+            large_multi_transaction_block, large_single_transaction_block_many_inputs,
+        },
+        Block, Height,
+    },
+    local_genesis::generate_local_testnet_with_funded_keys,
+    orchard,
+    parameters::{
+        subsidy::block_subsidy,
+        testnet::{ConfiguredActivationHeights, Parameters},
+        NetworkUpgrade,
+    },
+    primitives::Halo2Proof,
+    serialization::{ZcashDeserialize, ZcashDeserializeInto},
+    transaction::{
+        arbitrary::{transaction_to_fake_v5, v5_transactions},
+        LockTime, Transaction,
+    },
+    work::difficulty::{ParameterDifficulty as _, INVALID_COMPACT_DIFFICULTY},
+};
+use zakura_script::Sigops;
+use zakura_test::transcript::{ExpectedTranscriptError, Transcript};
+
+use crate::{block::check::subsidy_is_valid, transaction};
+
+use super::*;
+
+static VALID_BLOCK_TRANSCRIPT: Lazy<Vec<(Request, Result<block::Hash, ExpectedTranscriptError>)>> =
+    Lazy::new(|| {
+        let block: Arc<_> =
+            Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+                .unwrap()
+                .into();
+        let hash = Ok(block.as_ref().into());
+        vec![(Request::Commit(block), hash)]
+    });
+
+static INVALID_TIME_BLOCK_TRANSCRIPT: Lazy<
+    Vec<(Request, Result<block::Hash, ExpectedTranscriptError>)>,
+> = Lazy::new(|| {
+    let mut block: Block =
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..]).unwrap();
+
+    // Modify the block's time
+    // Changing the block header also invalidates the header hashes, but
+    // those checks should be performed later in validation, because they
+    // are more expensive.
+    let three_hours_in_the_future = Utc::now()
+        .checked_add_signed(chrono::Duration::hours(3))
+        .ok_or_else(|| eyre!("overflow when calculating 3 hours in the future"))
+        .unwrap();
+    Arc::make_mut(&mut block.header).time = three_hours_in_the_future;
+
+    vec![(
+        Request::Commit(Arc::new(block)),
+        Err(ExpectedTranscriptError::Any),
+    )]
+});
+
+static INVALID_HEADER_SOLUTION_TRANSCRIPT: Lazy<
+    Vec<(Request, Result<block::Hash, ExpectedTranscriptError>)>,
+> = Lazy::new(|| {
+    let mut block: Block =
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..]).unwrap();
+
+    // Change nonce to something invalid
+    Arc::make_mut(&mut block.header).nonce = [0; 32].into();
+
+    vec![(
+        Request::Commit(Arc::new(block)),
+        Err(ExpectedTranscriptError::Any),
+    )]
+});
+
+static INVALID_COINBASE_TRANSCRIPT: Lazy<
+    Vec<(Request, Result<block::Hash, ExpectedTranscriptError>)>,
+> = Lazy::new(|| {
+    let header = block::Header::zcash_deserialize(&zakura_test::vectors::DUMMY_HEADER[..]).unwrap();
+
+    // Test 1: Empty transaction
+    let block1 = Block {
+        header: header.into(),
+        transactions: Vec::new(),
+    };
+
+    // Test 2: Transaction at first position is not coinbase
+    let mut transactions = Vec::new();
+    let tx = zakura_test::vectors::DUMMY_TX1
+        .zcash_deserialize_into()
+        .unwrap();
+    transactions.push(tx);
+    let block2 = Block {
+        header: header.into(),
+        transactions,
+    };
+
+    // Test 3: Invalid coinbase position
+    let mut block3 =
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..]).unwrap();
+    assert_eq!(block3.transactions.len(), 1);
+
+    // Extract the coinbase transaction from the block
+    let coinbase_transaction = block3.transactions.first().unwrap().clone();
+
+    // Add another coinbase transaction to block
+    block3.transactions.push(coinbase_transaction);
+    assert_eq!(block3.transactions.len(), 2);
+
+    vec![
+        (
+            Request::Commit(Arc::new(block1)),
+            Err(ExpectedTranscriptError::Any),
+        ),
+        (
+            Request::Commit(Arc::new(block2)),
+            Err(ExpectedTranscriptError::Any),
+        ),
+        (
+            Request::Commit(Arc::new(block3)),
+            Err(ExpectedTranscriptError::Any),
+        ),
+    ]
+});
+
+fn prepared_test_verifier(
+    network: &Network,
+) -> impl Service<Request, Response = block::Hash, Error = VerifyBlockError> {
+    let state = service_fn(|request: zs::Request| async move {
+        let response = match request {
+            zs::Request::KnownBlock(hash) => zs::Response::KnownBlock(
+                (hash == block::Hash([0; 32]) || hash == block::Hash([1; 32]))
+                    .then_some(zs::KnownBlock::Finalized),
+            ),
+            zs::Request::CheckBlockProposalValidity(_) => zs::Response::ValidBlockProposal,
+            _ => panic!("prepared-path test received an unexpected state request: {request:?}"),
+        };
+        Ok::<_, BoxError>(response)
+    });
+    let transaction =
+        service_fn(|request| async move { Ok::<_, BoxError>(accept_block_transaction(request)) });
+
+    SemanticBlockVerifier::new(network, state, transaction)
+}
+
+fn accept_block_transaction(request: tx::Request) -> tx::Response {
+    let tx::Request::Block { transaction, .. } = request else {
+        panic!("prepared-path test received a mempool transaction request");
+    };
+    let miner_fee = (!transaction.is_coinbase()).then(Amount::zero);
+    tx::Response::Block {
+        tx_id: transaction.as_ref().into(),
+        miner_fee,
+        sigops: 0,
+    }
+}
+
+async fn prepare_for_test<V>(verifier: &mut V, block: Arc<Block>)
+where
+    V: Service<Request, Response = block::Hash, Error = VerifyBlockError>,
+{
+    verifier
+        .ready()
+        .await
+        .expect("the verifier is ready")
+        .call(Request::Prepare {
+            block,
+            work_id: Some("work".to_owned()),
+            source: PreparedCandidateSource::ServerTemplate,
+        })
+        .await
+        .expect("the candidate prepares successfully");
+}
+
+fn nu5_prepared_test_block(network: &Network, lock_time: Option<LockTime>) -> Block {
+    let height = Height(1);
+    let mut block =
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+            .expect("the genesis block deserializes");
+    block.transactions = vec![Arc::new(v5_coinbase_transaction(
+        NetworkUpgrade::Nu5,
+        height,
+        network,
+    ))];
+    if let Some(lock_time) = lock_time {
+        block.transactions.push(Arc::new(Transaction::V5 {
+            network_upgrade: NetworkUpgrade::Nu5,
+            lock_time,
+            expiry_height: height,
+            inputs: vec![transparent::Input::PrevOut {
+                outpoint: transparent::OutPoint {
+                    hash: zakura_chain::transaction::Hash([1; 32]),
+                    index: 0,
+                },
+                unlock_script: transparent::Script::new(&[]),
+                sequence: 0,
+            }],
+            outputs: vec![],
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+        }));
+    }
+    Arc::make_mut(&mut block.header).merkle_root = block.transactions.iter().collect();
+    block
+}
+
+#[test]
+fn template_rejection_distinguishes_expiry_from_service_failure() {
+    let network = Network::new_regtest(Default::default());
+    let block = nu5_prepared_test_block(&network, Some(LockTime::unlocked()));
+    let transaction = &block.transactions[1];
+    tx::check::non_coinbase_expiry_height(&Height(1), transaction).unwrap();
+    let error = tx::check::non_coinbase_expiry_height(&Height(2), transaction).unwrap_err();
+    assert!(VerifyBlockError::Transaction(error).rejects_template());
+    assert!(
+        !VerifyBlockError::ValidateProposal("proposal parent changed".into()).rejects_template()
+    );
+    assert!(!VerifyBlockError::Commit(zs::CommitBlockError::QueueFull).rejects_template());
+    assert!(!VerifyBlockError::ValidateProposal(Box::new(
+        zs::ValidateContextError::InvalidAncestorBlock(block.hash())
+    ))
+    .rejects_template());
+    assert!(VerifyBlockError::ValidateProposal(Box::new(
+        zs::ValidateContextError::InvalidBlockCommitment(
+            zakura_chain::block::CommitmentError::InvalidSapingRootBytes,
+        )
+    ))
+    .rejects_template());
+    assert!(VerifyBlockError::from(BlockError::MissingHeight(block.hash())).rejects_template());
+    assert!(!VerifyBlockError::StateService {
+        source: "service unavailable".into(),
+        hash: block.hash()
+    }
+    .rejects_template());
+}
+
+#[tokio::test]
+async fn mined_orphan_replays_skip_transaction_verification() {
+    let _init_guard = zakura_test::init();
+    let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+    let candidate = Arc::new(nu5_prepared_test_block(&network, None));
+    let state = service_fn(|request| async move {
+        assert!(matches!(request, zs::Request::KnownBlock(_)));
+        Ok::<_, BoxError>(zs::Response::KnownBlock(None))
+    });
+    let transaction = service_fn(|_| -> std::future::Ready<Result<tx::Response, BoxError>> {
+        panic!("orphan replay must not reach transaction verification")
+    });
+    let mut verifier = SemanticBlockVerifier::new(&network, state, transaction);
+    for _ in 0..3 {
+        let result = verifier
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::CommitMined {
+                block: candidate.clone(),
+                work_id: None,
+                admission: zs::BlockAdmission::pending(),
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(VerifyBlockError::Commit(
+                zs::CommitBlockError::MissingMinedParent
+            ))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn prepared_mined_commit_rechecks_equihash() {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let candidate = Arc::new(
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+            .expect("the genesis block deserializes"),
+    );
+    let mut verifier = prepared_test_verifier(&network);
+    prepare_for_test(&mut verifier, candidate.clone()).await;
+
+    let mut solved = (*candidate).clone();
+    Arc::make_mut(&mut solved.header).solution =
+        zakura_chain::work::equihash::Solution::for_proposal_for_network(&network);
+    let height = solved
+        .coinbase_height()
+        .expect("the candidate has a coinbase height");
+    for nonce in 0u32.. {
+        Arc::make_mut(&mut solved.header).nonce.0[..4].copy_from_slice(&nonce.to_le_bytes());
+        let hash = solved.hash();
+        if check::difficulty_is_valid(&solved.header, &network, &height, &hash).is_ok() {
+            break;
+        }
+    }
+    let result = verifier
+        .ready()
+        .await
+        .expect("the verifier is ready")
+        .call(Request::CommitMined {
+            block: Arc::new(solved),
+            work_id: Some("work".to_owned()),
+            admission: zs::BlockAdmission::pending(),
+        })
+        .await;
+
+    assert!(matches!(result, Err(VerifyBlockError::Equihash { .. })));
+}
+
+#[tokio::test]
+async fn prepared_mined_commit_rechecks_header_time() {
+    let _init_guard = zakura_test::init();
+    let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+    let candidate = Arc::new(nu5_prepared_test_block(&network, None));
+    let mut verifier = prepared_test_verifier(&network);
+    prepare_for_test(&mut verifier, candidate.clone()).await;
+
+    let mut solved = (*candidate).clone();
+    Arc::make_mut(&mut solved.header).time = Utc::now()
+        .checked_add_signed(chrono::Duration::hours(3))
+        .expect("three hours fits in the supported time range");
+    let result = verifier
+        .ready()
+        .await
+        .expect("the verifier is ready")
+        .call(Request::CommitMined {
+            block: Arc::new(solved),
+            work_id: Some("work".to_owned()),
+            admission: zs::BlockAdmission::pending(),
+        })
+        .await;
+
+    assert!(matches!(result, Err(VerifyBlockError::Time(_))));
+}
+
+#[tokio::test]
+async fn prepared_mined_commit_rechecks_transaction_lock_time() {
+    let _init_guard = zakura_test::init();
+    let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+    let unlock_time = DateTime::from_timestamp(Utc::now().timestamp() - 60, 0)
+        .expect("the recent timestamp is valid");
+    let mut candidate = nu5_prepared_test_block(&network, Some(LockTime::Time(unlock_time)));
+    Arc::make_mut(&mut candidate.header).time = unlock_time + chrono::Duration::seconds(1);
+    let candidate = Arc::new(candidate);
+    let mut verifier = prepared_test_verifier(&network);
+    prepare_for_test(&mut verifier, candidate.clone()).await;
+
+    let mut solved = (*candidate).clone();
+    Arc::make_mut(&mut solved.header).time = unlock_time;
+    let result = verifier
+        .ready()
+        .await
+        .expect("the verifier is ready")
+        .call(Request::CommitMined {
+            block: Arc::new(solved),
+            work_id: Some("work".to_owned()),
+            admission: zs::BlockAdmission::pending(),
+        })
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(VerifyBlockError::Transaction(
+            TransactionError::LockedUntilAfterBlockTime(_)
+        ))
+    ));
+}
+
+#[tokio::test]
+async fn failed_preparation_does_not_populate_the_cache() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let _init_guard = zakura_test::init();
+    let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+    let candidate = Arc::new(nu5_prepared_test_block(&network, None));
+    let transaction_calls = Arc::new(AtomicUsize::new(0));
+    let transaction = service_fn({
+        let transaction_calls = transaction_calls.clone();
+        move |request| {
+            transaction_calls.fetch_add(1, Ordering::Relaxed);
+            async move { Ok::<_, BoxError>(accept_block_transaction(request)) }
+        }
+    });
+    let state = service_fn(|request: zs::Request| async move {
+        match request {
+            zs::Request::KnownBlock(hash) => Ok(zs::Response::KnownBlock(
+                (hash == block::Hash([0; 32])).then_some(zs::KnownBlock::Finalized),
+            )),
+            zs::Request::CheckBlockProposalValidity(_) => {
+                Err(std::io::Error::other("proposal rejected").into())
+            }
+            zs::Request::CommitSemanticallyVerifiedBlockWithAdmission { block, .. } => {
+                Ok(zs::Response::Committed(block.hash))
+            }
+            _ => panic!("failed-preparation test received an unexpected request: {request:?}"),
+        }
+    });
+    let mut verifier = SemanticBlockVerifier::new(&network, state, transaction);
+
+    let prepare_result = verifier
+        .ready()
+        .await
+        .expect("the verifier is ready")
+        .call(Request::Prepare {
+            block: candidate.clone(),
+            work_id: Some("work".to_owned()),
+            source: PreparedCandidateSource::ServerTemplate,
+        })
+        .await;
+    assert!(matches!(
+        prepare_result,
+        Err(VerifyBlockError::ValidateProposal(_))
+    ));
+    assert_eq!(transaction_calls.load(Ordering::Relaxed), 1);
+
+    let commit_result = verifier
+        .ready()
+        .await
+        .expect("the verifier is ready")
+        .call(Request::CommitMined {
+            block: candidate,
+            work_id: Some("work".to_owned()),
+            admission: zs::BlockAdmission::pending(),
+        })
+        .await;
+    assert!(commit_result.is_ok());
+    assert_eq!(transaction_calls.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn proposal_validation_succeeds_when_cache_insertion_conflicts() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let _init_guard = zakura_test::init();
+    let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+    let candidate = Arc::new(nu5_prepared_test_block(&network, None));
+    let mut conflicting_proposal = (*candidate).clone();
+    Arc::make_mut(&mut conflicting_proposal.header).previous_block_hash = block::Hash([1; 32]);
+    let conflicting_proposal = Arc::new(conflicting_proposal);
+    let transaction_calls = Arc::new(AtomicUsize::new(0));
+    let transaction = service_fn({
+        let transaction_calls = transaction_calls.clone();
+        move |request| {
+            transaction_calls.fetch_add(1, Ordering::Relaxed);
+            async move { Ok::<_, BoxError>(accept_block_transaction(request)) }
+        }
+    });
+    let state = service_fn(|request: zs::Request| async move {
+        let response = match request {
+            zs::Request::KnownBlock(hash) => zs::Response::KnownBlock(
+                (hash == block::Hash([0; 32]) || hash == block::Hash([1; 32]))
+                    .then_some(zs::KnownBlock::Finalized),
+            ),
+            zs::Request::CheckBlockProposalValidity(_) => zs::Response::ValidBlockProposal,
+            zs::Request::CommitSemanticallyVerifiedBlockWithAdmission { block, .. } => {
+                zs::Response::Committed(block.hash)
+            }
+            _ => panic!("cache-conflict test received an unexpected request: {request:?}"),
+        };
+        Ok::<_, BoxError>(response)
+    });
+    let mut verifier = SemanticBlockVerifier::new(&network, state, transaction);
+
+    prepare_for_test(&mut verifier, candidate).await;
+    let proposal_result = verifier
+        .ready()
+        .await
+        .expect("the verifier is ready")
+        .call(Request::Prepare {
+            block: conflicting_proposal.clone(),
+            work_id: Some("work".to_owned()),
+            source: PreparedCandidateSource::ClientProposal,
+        })
+        .await;
+    assert!(proposal_result.is_ok());
+    assert_eq!(transaction_calls.load(Ordering::Relaxed), 2);
+
+    let commit_result = verifier
+        .ready()
+        .await
+        .expect("the verifier is ready")
+        .call(Request::CommitMined {
+            block: conflicting_proposal,
+            work_id: Some("work".to_owned()),
+            admission: zs::BlockAdmission::pending(),
+        })
+        .await;
+    assert!(commit_result.is_ok());
+    assert_eq!(transaction_calls.load(Ordering::Relaxed), 2);
+}
+
+// TODO: enable this test after implementing contextual verification
+// #[tokio::test]
+// #[ignore]
+#[allow(dead_code)]
+async fn check_transcripts_test() -> Result<(), Report> {
+    check_transcripts().await
+}
+
+#[allow(dead_code)]
+#[spandoc::spandoc]
+async fn check_transcripts() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+
+    let network = Network::Mainnet;
+    let state_service = zakura_state::init_test(&network).await;
+
+    let transaction = transaction::Verifier::new_for_tests(&network, state_service.clone());
+    let transaction = Buffer::new(BoxService::new(transaction), 1);
+    let block_verifier = Buffer::new(
+        SemanticBlockVerifier::new(&network, state_service.clone(), transaction),
+        1,
+    );
+
+    for transcript_data in &[
+        &VALID_BLOCK_TRANSCRIPT,
+        &INVALID_TIME_BLOCK_TRANSCRIPT,
+        &INVALID_HEADER_SOLUTION_TRANSCRIPT,
+        &INVALID_COINBASE_TRANSCRIPT,
+    ] {
+        let transcript = Transcript::from(transcript_data.iter().cloned());
+        transcript.check(block_verifier.clone()).await.unwrap();
+    }
+    Ok(())
+}
+
+#[test]
+fn coinbase_is_first_for_historical_blocks() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+
+    let block_iter = zakura_test::vectors::BLOCKS.iter();
+
+    for block in block_iter {
+        let block = block
+            .zcash_deserialize_into::<Block>()
+            .expect("block is structurally valid");
+
+        check::coinbase_is_first(&block)
+            .expect("the coinbase in a historical block should be valid");
+    }
+
+    Ok(())
+}
+
+#[test]
+fn difficulty_is_valid_for_historical_blocks() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+    for network in Network::iter() {
+        difficulty_is_valid_for_network(network)?;
+    }
+
+    Ok(())
+}
+
+fn difficulty_is_valid_for_network(network: Network) -> Result<(), Report> {
+    let block_iter = network.block_iter();
+
+    for (&height, block) in block_iter {
+        let block = block
+            .zcash_deserialize_into::<Block>()
+            .expect("block is structurally valid");
+
+        check::difficulty_is_valid(&block.header, &network, &Height(height), &block.hash())
+            .expect("the difficulty from a historical block should be valid");
+    }
+
+    Ok(())
+}
+
+#[test]
+fn difficulty_validation_failure() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+
+    // Get a block in the mainnet, and mangle its difficulty field
+    let block =
+        Arc::<Block>::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_415000_BYTES[..])
+            .expect("block should deserialize");
+    let mut block = Arc::try_unwrap(block).expect("block should unwrap");
+    let height = block.coinbase_height().unwrap();
+    let hash = block.hash();
+
+    // Set the difficulty field to an invalid value
+    Arc::make_mut(&mut block.header).difficulty_threshold = INVALID_COMPACT_DIFFICULTY;
+
+    // Validate the block
+    let result =
+        check::difficulty_is_valid(&block.header, &Network::Mainnet, &height, &hash).unwrap_err();
+    let expected = BlockError::InvalidDifficulty(height, hash);
+    assert_eq!(expected, result);
+
+    // Get a block in the testnet, but tell the validator it's from the mainnet
+    let block =
+        Arc::<Block>::zcash_deserialize(&zakura_test::vectors::BLOCK_TESTNET_925483_BYTES[..])
+            .expect("block should deserialize");
+    let block = Arc::try_unwrap(block).expect("block should unwrap");
+    let height = block.coinbase_height().unwrap();
+    let hash = block.hash();
+    let difficulty_threshold = block.header.difficulty_threshold.to_expanded().unwrap();
+
+    // Validate the block as if it is a mainnet block
+    let result =
+        check::difficulty_is_valid(&block.header, &Network::Mainnet, &height, &hash).unwrap_err();
+    let expected = BlockError::TargetDifficultyLimit(
+        height,
+        hash,
+        difficulty_threshold,
+        Network::Mainnet,
+        Network::Mainnet.target_difficulty_limit(),
+    );
+    assert_eq!(expected, result);
+
+    // Get a block in the mainnet, but pass an easy hash to the validator
+    let block =
+        Arc::<Block>::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_415000_BYTES[..])
+            .expect("block should deserialize");
+    let block = Arc::try_unwrap(block).expect("block should unwrap");
+    let height = block.coinbase_height().unwrap();
+    let bad_hash = block::Hash([0xff; 32]);
+    let difficulty_threshold = block.header.difficulty_threshold.to_expanded().unwrap();
+
+    // Validate the block
+    let result = check::difficulty_is_valid(&block.header, &Network::Mainnet, &height, &bad_hash)
+        .unwrap_err();
+    let expected =
+        BlockError::DifficultyFilter(height, bad_hash, difficulty_threshold, Network::Mainnet);
+    assert_eq!(expected, result);
+
+    Ok(())
+}
+
+#[test]
+fn equihash_is_valid_for_historical_blocks() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+
+    let block_iter = zakura_test::vectors::BLOCKS.iter();
+
+    for block in block_iter {
+        let block = block
+            .zcash_deserialize_into::<Block>()
+            .expect("block is structurally valid");
+
+        check::equihash_solution_is_valid(&block.header, &Network::Mainnet)
+            .expect("the equihash solution from a historical block should be valid");
+    }
+
+    Ok(())
+}
+
+#[test]
+fn subsidy_is_valid_for_historical_blocks() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+    for network in Network::iter() {
+        subsidy_is_valid_for_network(network)?;
+    }
+
+    Ok(())
+}
+
+fn subsidy_is_valid_for_network(network: Network) -> Result<(), Report> {
+    let block_iter = network.block_iter();
+
+    for (&height, block) in block_iter {
+        let height = block::Height(height);
+        let block = block
+            .zcash_deserialize_into::<Block>()
+            .expect("block is structurally valid");
+
+        let canopy_activation_height = NetworkUpgrade::Canopy
+            .activation_height(&network)
+            .expect("Canopy activation height is known");
+
+        // TODO: first halving, second halving, third halving, and very large halvings
+        if height >= canopy_activation_height {
+            let expected_block_subsidy =
+                zakura_chain::parameters::subsidy::block_subsidy(height, &network)
+                    .expect("valid block subsidy");
+
+            check::subsidy_is_valid(&block, &network, expected_block_subsidy)
+                .expect("subsidies should pass for this block");
+        }
+    }
+
+    Ok(())
+}
+
+/// A generated local testnet's NU6.3 activation block must be able to satisfy
+/// the ZIP-271 lockbox-disbursement subsidy rule.
+///
+/// NU6.1's activation height falls through to the shared activation height of
+/// the local network, so `subsidy_is_valid` demands its one-time disbursement
+/// outputs there. The generated network configures a zero-value P2SH marker
+/// for this, so a coinbase that pays that marker must pass with no deferred
+/// pool change.
+#[test]
+fn local_genesis_nu6_3_activation_has_satisfiable_lockbox_rule() -> Result<(), Report> {
+    let generated = generate_local_testnet_with_funded_keys(
+        vec!["alice".to_string(), "bob".to_string()],
+        Default::default(),
+    )
+    .map_err(|error| eyre!(error.to_string()))?;
+    let network = generated.network;
+    let height = NetworkUpgrade::Nu6_3
+        .activation_height(&network)
+        .expect("the default local network activates NU6.3");
+    let lockbox_disbursements = network.lockbox_disbursements(height);
+    let [(lockbox_address, lockbox_amount)] = lockbox_disbursements.as_slice() else {
+        panic!("the local network configures one lockbox marker output");
+    };
+    let coinbase = Transaction::V5 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::unlocked(),
+        expiry_height: height,
+        inputs: vec![zakura_chain::transparent::Input::Coinbase {
+            height,
+            data: b"local activation".to_vec(),
+            sequence: 0,
+        }],
+        outputs: vec![zakura_chain::transparent::Output::new(
+            *lockbox_amount,
+            lockbox_address.script(),
+        )],
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+    };
+    let block = Block {
+        header: generated
+            .blocks
+            .last()
+            .expect("the generated chain contains genesis")
+            .header
+            .clone(),
+        transactions: vec![Arc::new(coinbase)],
+    };
+    let expected_block_subsidy =
+        block_subsidy(height, &network).expect("the local activation height has a block subsidy");
+
+    // `subsidy_is_valid` skips all checks (including the lockbox rule) for a
+    // zero subsidy, which would make this test vacuous.
+    assert!(!expected_block_subsidy.is_zero());
+    assert_eq!(
+        subsidy_is_valid(&block, &network, expected_block_subsidy)?,
+        DeferredPoolBalanceChange::zero()
+    );
+
+    Ok(())
+}
+
+#[test]
+fn coinbase_validation_failure() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+
+    // Get a block in the mainnet that is inside the funding stream period,
+    // and delete the coinbase transaction
+    let block =
+        Arc::<Block>::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_1046400_BYTES[..])
+            .expect("block should deserialize");
+    let mut block = Arc::try_unwrap(block).expect("block should unwrap");
+
+    let expected_block_subsidy = zakura_chain::parameters::subsidy::block_subsidy(
+        block
+            .coinbase_height()
+            .expect("block should have coinbase height"),
+        &network,
+    )
+    .expect("valid block subsidy");
+
+    // Remove coinbase transaction
+    block.transactions.remove(0);
+
+    // Validate the block using coinbase_is_first
+    let result = check::coinbase_is_first(&block).unwrap_err();
+    let expected = BlockError::NoTransactions;
+    assert_eq!(expected, result);
+
+    let result = check::subsidy_is_valid(&block, &network, expected_block_subsidy).unwrap_err();
+    let expected = BlockError::Transaction(TransactionError::Subsidy(SubsidyError::NoCoinbase));
+    assert_eq!(expected, result);
+
+    // Get another funding stream block, and delete the coinbase transaction
+    let block =
+        Arc::<Block>::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_1046401_BYTES[..])
+            .expect("block should deserialize");
+    let mut block = Arc::try_unwrap(block).expect("block should unwrap");
+
+    let expected_block_subsidy = zakura_chain::parameters::subsidy::block_subsidy(
+        block
+            .coinbase_height()
+            .expect("block should have coinbase height"),
+        &network,
+    )
+    .expect("valid block subsidy");
+
+    // Remove coinbase transaction
+    block.transactions.remove(0);
+
+    // Validate the block using coinbase_is_first
+    let result = check::coinbase_is_first(&block).unwrap_err();
+    let expected = BlockError::Transaction(TransactionError::CoinbasePosition);
+    assert_eq!(expected, result);
+
+    let result = check::subsidy_is_valid(&block, &network, expected_block_subsidy).unwrap_err();
+    let expected = BlockError::Transaction(TransactionError::Subsidy(SubsidyError::NoCoinbase));
+    assert_eq!(expected, result);
+
+    // Get another funding stream, and duplicate the coinbase transaction
+    let block =
+        Arc::<Block>::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_1180900_BYTES[..])
+            .expect("block should deserialize");
+    let mut block = Arc::try_unwrap(block).expect("block should unwrap");
+
+    // Remove coinbase transaction
+    block.transactions.push(
+        block
+            .transactions
+            .first()
+            .expect("block has coinbase")
+            .clone(),
+    );
+
+    // Validate the block using coinbase_is_first
+    let result = check::coinbase_is_first(&block).unwrap_err();
+    let expected = BlockError::Transaction(TransactionError::CoinbaseAfterFirst);
+    assert_eq!(expected, result);
+
+    let expected_block_subsidy = zakura_chain::parameters::subsidy::block_subsidy(
+        block
+            .coinbase_height()
+            .expect("block should have coinbase height"),
+        &network,
+    )
+    .expect("valid block subsidy");
+
+    check::subsidy_is_valid(&block, &network, expected_block_subsidy)
+        .expect("subsidy does not check for extra coinbase transactions");
+
+    Ok(())
+}
+
+#[test]
+fn funding_stream_validation() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+    for network in Network::iter() {
+        funding_stream_validation_for_network(network)?;
+    }
+
+    Ok(())
+}
+
+fn funding_stream_validation_for_network(network: Network) -> Result<(), Report> {
+    let block_iter = network.block_iter();
+
+    let canopy_activation_height = NetworkUpgrade::Canopy
+        .activation_height(&network)
+        .expect("Canopy activation height is known");
+
+    for (&height, block) in block_iter {
+        let height = Height(height);
+
+        if height >= canopy_activation_height {
+            let block = Block::zcash_deserialize(&block[..]).expect("block should deserialize");
+            let expected_block_subsidy =
+                zakura_chain::parameters::subsidy::block_subsidy(height, &network)
+                    .expect("valid block subsidy");
+
+            // Validate
+            let result = check::subsidy_is_valid(&block, &network, expected_block_subsidy);
+            assert!(result.is_ok());
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn funding_stream_validation_failure() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+
+    // Get a block in the mainnet that is inside the funding stream period.
+    let block =
+        Arc::<Block>::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_1046400_BYTES[..])
+            .expect("block should deserialize");
+
+    // Build the new transaction with modified coinbase outputs
+    let tx = block
+        .transactions
+        .first()
+        .map(|transaction| {
+            let mut output = transaction.outputs()[0].clone();
+            output.value = Amount::try_from(i32::MAX).unwrap();
+            Transaction::V4 {
+                inputs: transaction.inputs().to_vec(),
+                outputs: vec![output],
+                lock_time: transaction.lock_time().unwrap_or_else(LockTime::unlocked),
+                expiry_height: Height(0),
+                joinsplit_data: None,
+                sapling_shielded_data: None,
+            }
+        })
+        .unwrap();
+
+    // Build new block
+    let transactions: Vec<Arc<zakura_chain::transaction::Transaction>> = vec![Arc::new(tx)];
+    let block = Block {
+        header: block.header.clone(),
+        transactions,
+    };
+
+    // Validate it
+    let expected_block_subsidy = zakura_chain::parameters::subsidy::block_subsidy(
+        block
+            .coinbase_height()
+            .expect("block should have coinbase height"),
+        &network,
+    )
+    .expect("valid block subsidy");
+
+    let result = check::subsidy_is_valid(&block, &network, expected_block_subsidy);
+    let expected = Err(BlockError::Transaction(TransactionError::Subsidy(
+        SubsidyError::FundingStreamNotFound,
+    )));
+    assert_eq!(expected, result);
+
+    Ok(())
+}
+
+#[test]
+fn miner_fees_validation_success() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+    for network in Network::iter() {
+        miner_fees_validation_for_network(network)?;
+    }
+
+    Ok(())
+}
+
+fn miner_fees_validation_for_network(network: Network) -> Result<(), Report> {
+    let block_iter = network.block_iter();
+
+    for (&height, block) in block_iter {
+        let height = Height(height);
+        if height > network.slow_start_shift() {
+            let block = Block::zcash_deserialize(&block[..]).expect("block should deserialize");
+            let coinbase_tx = check::coinbase_is_first(&block)?;
+
+            let expected_block_subsidy = block_subsidy(height, &network)?;
+            // See [ZIP-1015](https://zips.z.cash/zip-1015).
+            let deferred_pool_balance_change =
+                match NetworkUpgrade::Canopy.activation_height(&network) {
+                    Some(activation_height) if height >= activation_height => {
+                        subsidy_is_valid(&block, &network, expected_block_subsidy)?
+                    }
+                    _other => DeferredPoolBalanceChange::zero(),
+                };
+
+            assert!(check::miner_fees_are_valid(
+                &coinbase_tx,
+                height,
+                // Set the miner fees to a high-enough amount.
+                Amount::try_from(MAX_MONEY / 2).unwrap(),
+                expected_block_subsidy,
+                deferred_pool_balance_change,
+                &network,
+            )
+            .is_ok(),);
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn miner_fees_validation_failure() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let block = Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_347499_BYTES[..])
+        .expect("block should deserialize");
+    let height = block.coinbase_height().expect("valid coinbase height");
+    let expected_block_subsidy = block_subsidy(height, &network)?;
+    // See [ZIP-1015](https://zips.z.cash/zip-1015).
+    let deferred_pool_balance_change = match NetworkUpgrade::Canopy.activation_height(&network) {
+        Some(activation_height) if height >= activation_height => {
+            subsidy_is_valid(&block, &network, expected_block_subsidy)?
+        }
+        _other => DeferredPoolBalanceChange::zero(),
+    };
+
+    assert_eq!(
+        check::miner_fees_are_valid(
+            check::coinbase_is_first(&block)?.as_ref(),
+            height,
+            // Set the miner fee to an invalid amount.
+            Amount::zero(),
+            expected_block_subsidy,
+            deferred_pool_balance_change,
+            &network
+        ),
+        Err(BlockError::Transaction(TransactionError::Subsidy(
+            SubsidyError::InvalidMinerFees,
+        )))
+    );
+
+    Ok(())
+}
+
+#[derive(Copy, Clone)]
+struct LibrustzcashConversionFailure {
+    name: &'static str,
+    network_upgrade: NetworkUpgrade,
+    rk: Option<[u8; 32]>,
+}
+
+#[tokio::test]
+async fn block_rejects_transactions_failing_librustzcash_conversion() {
+    let _init_guard = zakura_test::init();
+
+    let cases = [
+        LibrustzcashConversionFailure {
+            name: "unrecognized consensus branch ID",
+            network_upgrade: NetworkUpgrade::Nu7,
+            rk: None,
+        },
+        LibrustzcashConversionFailure {
+            name: "incorrect curve point encoding",
+            network_upgrade: NetworkUpgrade::Nu5,
+            rk: Some([0xff; 32]),
+        },
+        LibrustzcashConversionFailure {
+            name: "rk=identity",
+            network_upgrade: NetworkUpgrade::Nu5,
+            rk: Some([0; 32]),
+        },
+    ];
+
+    for case in cases {
+        let network = librustzcash_conversion_test_network(case.network_upgrade);
+        let block = block_with_librustzcash_conversion_failure(case, &network);
+        let state_service = zakura_state::init_test(&network).await;
+        let transaction = transaction::Verifier::new_for_tests(&network, state_service.clone());
+        let transaction = Buffer::new(BoxService::new(transaction), 1);
+        let block_verifier =
+            SemanticBlockVerifier::new(&network, state_service.clone(), transaction);
+
+        let result = block_verifier
+            .oneshot(Request::CheckProposal(Arc::new(block)))
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(VerifyBlockError::Transaction(
+                    TransactionError::UnsupportedByNetworkUpgrade(5, nu),
+                )) if nu == case.network_upgrade
+            ),
+            "{}: expected librustzcash conversion failure, got {result:?}",
+            case.name,
+        );
+    }
+}
+
+fn librustzcash_conversion_test_network(network_upgrade: NetworkUpgrade) -> Network {
+    let genesis_block =
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+            .expect("genesis block should deserialize");
+    let target_difficulty_limit = genesis_block
+        .header
+        .difficulty_threshold
+        .to_expanded()
+        .expect("genesis difficulty threshold should be valid");
+
+    let activation_heights = match network_upgrade {
+        NetworkUpgrade::Nu5 => ConfiguredActivationHeights {
+            nu5: Some(1),
+            ..Default::default()
+        },
+        NetworkUpgrade::Nu7 => ConfiguredActivationHeights {
+            nu7: Some(1),
+            ..Default::default()
+        },
+        _ => panic!("test cases only use NU5 and NU7"),
+    };
+
+    Parameters::build()
+        .with_activation_heights(activation_heights)
+        .expect("failed to set test activation heights")
+        .clear_funding_streams()
+        .with_slow_start_interval(Height::MIN)
+        .with_disable_pow(true)
+        .disable_temporary_orchard_disabling_soft_fork()
+        .with_target_difficulty_limit(target_difficulty_limit)
+        .expect("failed to set target difficulty limit")
+        .to_network()
+        .expect("failed to build configured network")
+}
+
+fn block_with_librustzcash_conversion_failure(
+    case: LibrustzcashConversionFailure,
+    network: &Network,
+) -> Block {
+    let height = Height(1);
+    let mut block =
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+            .expect("genesis block should deserialize");
+
+    block.transactions = vec![
+        Arc::new(v5_coinbase_transaction(
+            case.network_upgrade,
+            height,
+            network,
+        )),
+        Arc::new(failing_librustzcash_v5_transaction(case, height)),
+    ];
+    Arc::make_mut(&mut block.header).merkle_root = block.transactions.iter().collect();
+
+    block
+}
+
+fn v5_coinbase_transaction(
+    network_upgrade: NetworkUpgrade,
+    height: Height,
+    network: &Network,
+) -> Transaction {
+    let mut outputs = vec![transparent::Output {
+        value: block_subsidy(height, network).expect("valid test block subsidy"),
+        lock_script: transparent::Script::new(&[0]),
+    }];
+
+    outputs.extend(
+        network
+            .lockbox_disbursements(height)
+            .into_iter()
+            .map(|(address, value)| transparent::Output {
+                value,
+                lock_script: address.script(),
+            }),
+    );
+
+    Transaction::V5 {
+        network_upgrade,
+        lock_time: LockTime::unlocked(),
+        expiry_height: height,
+        inputs: vec![transparent::Input::Coinbase {
+            height,
+            data: vec![],
+            sequence: u32::MAX,
+        }],
+        outputs,
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+    }
+}
+
+fn failing_librustzcash_v5_transaction(
+    case: LibrustzcashConversionFailure,
+    height: Height,
+) -> Transaction {
+    let mut shielded_data = orchard_fixture();
+    shielded_data.flags = orchard::Flags::ENABLE_SPENDS | orchard::Flags::ENABLE_OUTPUTS;
+    shielded_data.value_balance = Amount::zero();
+    shielded_data.proof = Halo2Proof(vec![
+        0;
+        ::orchard::Proof::expected_proof_size(
+            shielded_data.actions.len()
+        )
+    ]);
+
+    if let Some(rk) = case.rk {
+        shielded_data
+            .actions
+            .iter_mut()
+            .next()
+            .expect("Orchard fixture has at least one action")
+            .action
+            .rk = rk.into();
+    }
+
+    Transaction::V5 {
+        network_upgrade: case.network_upgrade,
+        lock_time: LockTime::unlocked(),
+        expiry_height: height,
+        inputs: vec![],
+        outputs: vec![],
+        sapling_shielded_data: None,
+        orchard_shielded_data: Some(shielded_data),
+    }
+}
+
+fn orchard_fixture() -> orchard::ShieldedData {
+    v5_transactions(Network::new_default_testnet().block_iter())
+        .find_map(|transaction| transaction.orchard_shielded_data().cloned())
+        .expect("test vectors include a transaction with Orchard shielded data")
+}
+
+#[test]
+fn miner_fees_validation_includes_ironwood_balance() {
+    let _init_guard = zakura_test::init();
+
+    let network = Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            nu6_3: Some(1),
+            ..Default::default()
+        })
+        .expect("failed to set NU6.3 activation height")
+        .clear_funding_streams()
+        .to_network()
+        .expect("failed to build configured network");
+    let height = Height(1);
+    let output_value = Amount::try_from(10).expect("valid test amount");
+    let coinbase_tx = Transaction::V6 {
+        network_upgrade: NetworkUpgrade::Nu6_3,
+        lock_time: LockTime::Height(Height(0)),
+        expiry_height: height,
+        inputs: vec![transparent::Input::Coinbase {
+            height,
+            data: vec![],
+            sequence: u32::MAX,
+        }],
+        outputs: vec![transparent::Output {
+            value: output_value,
+            lock_script: transparent::Script::new(&[0]),
+        }],
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        ironwood_shielded_data: Some(ironwood_shielded_data(1)),
+    };
+
+    assert_eq!(
+        check::miner_fees_are_valid(
+            &coinbase_tx,
+            height,
+            Amount::zero(),
+            output_value,
+            DeferredPoolBalanceChange::zero(),
+            &network,
+        ),
+        Err(BlockError::Transaction(TransactionError::Subsidy(
+            SubsidyError::InvalidMinerFees,
+        )))
+    );
+
+    assert_eq!(
+        check::miner_fees_are_valid(
+            &coinbase_tx,
+            height,
+            Amount::zero(),
+            Amount::try_from(9).expect("valid test amount"),
+            DeferredPoolBalanceChange::zero(),
+            &network,
+        ),
+        Ok(())
+    );
+}
+
+fn ironwood_shielded_data(value_balance: i64) -> ironwood::ShieldedData {
+    let mut shielded_data = orchard_fixture();
+
+    shielded_data.value_balance =
+        Amount::<NegativeAllowed>::try_from(value_balance).expect("valid test amount");
+
+    shielded_data
+}
+
+#[test]
+fn time_is_valid_for_historical_blocks() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+
+    let block_iter = zakura_test::vectors::BLOCKS.iter();
+    let now = Utc::now();
+
+    for block in block_iter {
+        let block = block
+            .zcash_deserialize_into::<Block>()
+            .expect("block is structurally valid");
+
+        // This check is non-deterministic, but the block test vectors are
+        // all in the past. So it's unlikely that the test machine will have
+        // a clock that's far enough in the past for the test to fail.
+        check::time_is_valid_at(
+            &block.header,
+            now,
+            &block
+                .coinbase_height()
+                .expect("block test vector height should be valid"),
+            &block.hash(),
+        )
+        .expect("the header time from a historical block should be valid, based on the test machine's local clock. Hint: check the test machine's time, date, and timezone.");
+    }
+
+    Ok(())
+}
+
+#[test]
+fn merkle_root_is_valid() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+
+    // test all original blocks available, all blocks validate
+    for network in Network::iter() {
+        merkle_root_is_valid_for_network(network)?;
+    }
+
+    // create and test fake blocks with v5 transactions, all blocks fail validation
+    for network in Network::iter() {
+        merkle_root_fake_v5_for_network(network)?;
+    }
+
+    Ok(())
+}
+
+fn merkle_root_is_valid_for_network(network: Network) -> Result<(), Report> {
+    let block_iter = network.block_iter();
+
+    for (_height, block) in block_iter {
+        let block = block
+            .zcash_deserialize_into::<Block>()
+            .expect("block is structurally valid");
+
+        let transaction_hashes = block
+            .transactions
+            .iter()
+            .map(|tx| tx.hash())
+            .collect::<Vec<_>>();
+
+        check::merkle_root_validity(&network, &block, &transaction_hashes)
+            .expect("merkle root should be valid for this block");
+    }
+
+    Ok(())
+}
+
+fn merkle_root_fake_v5_for_network(network: Network) -> Result<(), Report> {
+    let block_iter = network.block_iter();
+
+    for (height, block) in block_iter {
+        let mut block = block
+            .zcash_deserialize_into::<Block>()
+            .expect("block is structurally valid");
+
+        // skip blocks that are before overwinter as they will not have a valid consensus branch id
+        if *height
+            < NetworkUpgrade::Overwinter
+                .activation_height(&network)
+                .expect("a valid overwinter activation height")
+                .0
+        {
+            continue;
+        }
+
+        // convert all transactions from the block to V5
+        let transactions: Vec<Arc<Transaction>> = block
+            .transactions
+            .iter()
+            .map(AsRef::as_ref)
+            .map(|t| transaction_to_fake_v5(t, &network, Height(*height)))
+            .map(Into::into)
+            .collect();
+
+        block.transactions = transactions;
+
+        let transaction_hashes = block
+            .transactions
+            .iter()
+            .map(|tx| tx.hash())
+            .collect::<Vec<_>>();
+
+        // Replace the merkle root so that it matches the modified transactions.
+        // This test provides some transaction id and merkle root coverage,
+        // but we also need to test against zcashd test vectors.
+        Arc::make_mut(&mut block.header).merkle_root = transaction_hashes.iter().cloned().collect();
+
+        check::merkle_root_validity(&network, &block, &transaction_hashes)
+            .expect("merkle root should be valid for this block");
+    }
+
+    Ok(())
+}
+
+/// A block whose transaction list contains the same `transaction::Hash`
+/// twice must be rejected with [`BlockError::DuplicateTransaction`].
+///
+/// This guards against Bitcoin's Merkle tree malleability (CVE-2012-2459),
+/// where two identical transaction hashes can produce the same Merkle root
+/// as the underlying unique list.
+#[test]
+fn merkle_root_validity_rejects_duplicate_transaction_hash() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+
+    let network = Network::Mainnet;
+
+    let mut block =
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_1180900_BYTES[..])
+            .expect("block should deserialize");
+
+    // Duplicate the coinbase transaction so the block contains two
+    // transactions with the same hash.
+    let duplicate = block
+        .transactions
+        .first()
+        .expect("block has coinbase")
+        .clone();
+    block.transactions.push(duplicate);
+
+    let transaction_hashes: Vec<_> = block.transactions.iter().map(|tx| tx.hash()).collect();
+
+    // Recompute the Merkle root from the duplicated transaction list so
+    // that `merkle_root_validity` passes the `BadMerkleRoot` check and
+    // reaches the duplicate-hash check.
+    Arc::make_mut(&mut block.header).merkle_root = transaction_hashes.iter().cloned().collect();
+
+    let result = check::merkle_root_validity(&network, &block, &transaction_hashes);
+    assert_eq!(result, Err(BlockError::DuplicateTransaction));
+
+    Ok(())
+}
+
+#[test]
+fn legacy_sigops_count_for_large_generated_blocks() {
+    let _init_guard = zakura_test::init();
+
+    // We can't test sigops using the transaction verifier, because it looks up UTXOs.
+
+    let block = large_single_transaction_block_many_inputs();
+    let mut legacy_sigop_count = 0;
+    for tx in block.transactions {
+        let tx_sigop_count = tx.sigops().expect("unexpected invalid sigop count");
+        assert_eq!(tx_sigop_count, 0);
+        legacy_sigop_count += tx_sigop_count;
+    }
+    // We know this block has no sigops.
+    assert_eq!(legacy_sigop_count, 0);
+
+    let block = large_multi_transaction_block();
+    let mut sigops = 0;
+    for tx in block.transactions {
+        let tx_sigop_count = tx.sigops().expect("unexpected invalid sigop count");
+        assert_eq!(tx_sigop_count, 1);
+        sigops += tx_sigop_count;
+    }
+    // Test that large blocks can actually fail the sigops check.
+    assert!(sigops > MAX_BLOCK_SIGOPS);
+}
+
+#[test]
+fn legacy_sigops_count_for_historic_blocks() {
+    let _init_guard = zakura_test::init();
+
+    // We can't test sigops using the transaction verifier, because it looks up UTXOs.
+
+    for block in zakura_test::vectors::BLOCKS.iter() {
+        let mut sigops = 0;
+
+        let block: Block = block
+            .zcash_deserialize_into()
+            .expect("block test vector is valid");
+        for tx in block.transactions {
+            sigops += tx.sigops().expect("unexpected invalid sigop count");
+        }
+
+        // Test that historic blocks pass the sigops check.
+        assert!(sigops <= MAX_BLOCK_SIGOPS);
+    }
+}
+
+#[test]
+fn transaction_expiration_height_validation() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+
+    for network in Network::iter() {
+        transaction_expiration_height_for_network(&network)?;
+    }
+
+    Ok(())
+}
+
+fn transaction_expiration_height_for_network(network: &Network) -> Result<(), Report> {
+    let block_iter = network.block_iter();
+
+    for (&height, block) in block_iter {
+        let block = Block::zcash_deserialize(&block[..]).expect("block should deserialize");
+
+        for (n, transaction) in block.transactions.iter().enumerate() {
+            if n == 0 {
+                // coinbase
+                let result = transaction::check::coinbase_expiry_height(
+                    &Height(height),
+                    transaction,
+                    network,
+                );
+                assert!(result.is_ok());
+            } else {
+                // non coinbase
+                let result =
+                    transaction::check::non_coinbase_expiry_height(&Height(height), transaction);
+                assert!(result.is_ok());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn block_error_misbehavior_scores() {
+    use crate::error::BlockError;
+
+    assert_eq!(BlockError::NoTransactions.misbehavior_score(), 100);
+    assert_eq!(
+        BlockError::BadMerkleRoot {
+            actual: zakura_chain::block::merkle::Root([0; 32]),
+            expected: zakura_chain::block::merkle::Root([1; 32]),
+        }
+        .misbehavior_score(),
+        100
+    );
+    assert_eq!(
+        BlockError::WrongTransactionConsensusBranchId.misbehavior_score(),
+        100
+    );
+    assert_eq!(
+        BlockError::MissingHeight(zakura_chain::block::Hash([0; 32])).misbehavior_score(),
+        100
+    );
+}
+
+#[test]
+fn verify_block_error_misbehavior_scores() {
+    let dup_err = zakura_state::CommitBlockError::Duplicate {
+        hash_or_height: None,
+        location: zakura_state::KnownBlock::BestChain,
+    };
+    assert_eq!(VerifyBlockError::Commit(dup_err).misbehavior_score(), 0);
+}
+
+/// Duplicate block errors must stay classified as duplicate requests after the
+/// state wraps them, so they don't restart the syncer or turn `submitblock`
+/// duplicates into rejections.
+#[test]
+fn state_commit_duplicate_errors_are_duplicate_requests() {
+    let duplicate = zakura_state::CommitBlockError::Duplicate {
+        hash_or_height: None,
+        location: zakura_state::KnownBlock::BestChain,
+    };
+
+    // Box the error the same way the state's `CommitSemanticallyVerifiedBlock`
+    // handler does. This mirrors the wrapping manually, so it won't fail
+    // automatically if the state changes its error type — keep it in sync by hand.
+    let source: BoxError = Box::new(zakura_state::CommitSemanticallyVerifiedError::from(
+        duplicate,
+    ));
+
+    let err = map_commit_error(source, zakura_chain::block::Hash([0; 32]));
+
+    assert!(
+        matches!(err, VerifyBlockError::Commit(_)),
+        "state commit errors must be unwrapped into VerifyBlockError::Commit, got: {err:?}"
+    );
+    assert!(err.is_duplicate_request());
+    assert_eq!(
+        err.duplicate_location(),
+        Some(&zakura_state::KnownBlock::BestChain)
+    );
+    assert_eq!(err.misbehavior_score(), 0);
+}
+
+/// Peer-attributable contextual errors must keep their misbehavior score after
+/// the state wraps them for the consensus verifier.
+#[test]
+fn state_commit_context_errors_keep_misbehavior_scores() {
+    let invalid_commitment = zakura_state::CommitBlockError::ValidateContextError(Box::new(
+        zakura_state::ValidateContextError::InvalidBlockCommitment(
+            zakura_chain::block::CommitmentError::InvalidChainHistoryActivationReserved {
+                actual: [1; 32],
+            },
+        ),
+    ));
+    let source: BoxError = Box::new(zakura_state::CommitSemanticallyVerifiedError::from(
+        invalid_commitment,
+    ));
+
+    let err = map_commit_error(source, zakura_chain::block::Hash([0; 32]));
+
+    assert!(
+        matches!(err, VerifyBlockError::Commit(_)),
+        "state commit errors must be unwrapped into VerifyBlockError::Commit, got: {err:?}"
+    );
+    assert_eq!(err.misbehavior_score(), 100);
+
+    let router_error = crate::router::RouterError::from(err);
+    assert_eq!(router_error.misbehavior_score(), 100);
+}

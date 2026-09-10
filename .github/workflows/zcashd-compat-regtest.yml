@@ -2,14 +2,14 @@ name: zcashd-compat Regtest
 
 # Runs the managed zcashd-compat Regtest integration suite.
 #
-# The test harness spawns a fresh zebrad and zcashd on randomised ports, so no
+# The test harness spawns a fresh zakurad and zcashd on randomised ports, so no
 # external infrastructure is required.
 #
 # TEMPORARILY manual-only: the suite now requires a P2P-sidecar zcashd build
 # (miner RPCs removed, -regtestacceptunvalidatedpow support), but the managed
 # download manifest still pins the previous RPC-ingest build. Re-enable the
 # push trigger once a sidecar zcashd release is cut and
-# zebrad/zcashd-compat-manifest.json is bumped. Until then run locally with
+# crates/zakurad/zcashd-compat-manifest.json is bumped. Until then run locally with
 # `make compat-test-regtest TEST_ZCASHD_PATH=/path/to/sidecar/zcashd`.
 on:
   workflow_dispatch:
@@ -37,22 +37,23 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 #v1.16.1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
         with:
           toolchain: stable
           cache-key: zcashd-compat-regtest
           cache-on-failure: true
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - uses: taiki-e/install-action@65851e10cd6c377f11a60e600abc07cb08643468 #v2.79.3
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b #v2.87.4
         with:
           tool: cargo-nextest
 
-      - uses: ./.github/actions/setup-zebra-build
+      - uses: ./.github/actions/setup-zakura-build
 
-      # Uses the managed zcashd download (TEST_ZCASHD_PATH unset).
+      # Uses the embedded zcashd download (TEST_ZCASHD_PATH unset).
       - name: Run zcashd-compat regtest suite
         run: make compat-test-regtest

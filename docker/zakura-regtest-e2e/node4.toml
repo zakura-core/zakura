@@ -9,8 +9,7 @@
 [network]
 network = "Regtest"
 listen_addr = "127.0.0.1:18533"
-v2_p2p = true
-legacy_p2p = true
+p2p_stack = "dual"
 cache_dir = false
 initial_testnet_peers = ["127.0.0.1:18233"]
 # Host networking puts every node on 127.0.0.1; raise the per-IP cap above 1.
@@ -34,4 +33,4 @@ internal_miner = false
 miner_address = "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV"
 
 [tracing]
-filter = "info,zebra_network::zakura=debug,zebrad::components::sync=debug,zebrad::components::inbound=debug"
+filter = "info,zakura_network::zakura=debug,zakurad::components::sync=debug,zakurad::components::inbound=debug"

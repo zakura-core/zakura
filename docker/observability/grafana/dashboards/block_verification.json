@@ -35,7 +35,7 @@
       "dashes": false,
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "decimals": 0,
       "fill": 1,
@@ -79,7 +79,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "editorMode": "code",
           "exemplar": true,
@@ -93,7 +93,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "editorMode": "code",
           "exemplar": true,
@@ -107,7 +107,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "editorMode": "code",
           "expr": "state_memory_queued_max_height{job=\"$job\"}",
@@ -119,7 +119,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "editorMode": "code",
           "expr": "state_memory_queued_min_height{job=\"$job\"}",
@@ -131,7 +131,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "editorMode": "code",
           "expr": "state_checkpoint_queued_max_height{job=\"$job\"}",
@@ -143,7 +143,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "editorMode": "code",
           "expr": "state_checkpoint_queued_min_height{job=\"$job\"}",
@@ -155,7 +155,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "editorMode": "code",
           "expr": "state_memory_sent_block_height{job=\"$job\"}",
@@ -167,7 +167,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "editorMode": "code",
           "expr": "state_checkpoint_sent_block_height{job=\"$job\"}",
@@ -179,7 +179,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "editorMode": "code",
           "exemplar": true,
@@ -192,7 +192,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "editorMode": "code",
           "exemplar": true,
@@ -243,7 +243,7 @@
       "dashes": false,
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fill": 1,
       "fillGradient": 0,
@@ -285,7 +285,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "rate(zcash_chain_verified_block_total{job=\"$job\"}[1m])",
           "interval": "",
@@ -295,7 +295,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "rate(sync_downloaded_block_count{job=\"$job\"}[1m])",
           "interval": "",
@@ -305,7 +305,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "sync_downloads_in_flight{job=\"$job\"}",
           "interval": "",
@@ -315,7 +315,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "rate(sync_verified_block_count{job=\"$job\"}[1m])",
           "interval": "",
@@ -362,7 +362,7 @@
       "dashes": false,
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fill": 1,
       "fillGradient": 0,
@@ -404,7 +404,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "rate(zcash_chain_verified_block_total{job=\"$job\"}[1m])",
           "interval": "",
@@ -414,7 +414,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "rate(gossip_downloaded_block_count{job=\"$job\"}[1m])",
           "interval": "",
@@ -424,7 +424,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "rate(gossip_verified_block_count{job=\"$job\"}[1m])",
           "interval": "",
@@ -434,7 +434,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "gossip_queued_block_count{job=\"$job\"}",
           "interval": "",
@@ -493,7 +493,7 @@
         },
         "datasource": {
           "type": "prometheus",
-          "uid": "zebra-prometheus"
+          "uid": "zakura-prometheus"
         },
         "definition": "label_values(zcash_chain_verified_block_height, job)",
         "hide": 0,
@@ -503,7 +503,7 @@
         "options": [],
         "query": {
           "query": "label_values(zcash_chain_verified_block_height, job)",
-          "refId": "Prometheus-Zebra-job-Variable-Query"
+          "refId": "Prometheus-Zakura-job-Variable-Query"
         },
         "refresh": 1,
         "regex": "",

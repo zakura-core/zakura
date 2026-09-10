@@ -1,0 +1,434 @@
+# Gate PRs on cargo-semver-checks against the latest STABLE crates.io release
+# of each changed publishable workspace crate and its publishable reverse
+# dependencies. A PR that changes a published API must carry the corresponding
+# version bump in the same PR — the check passes once the bump level covers the
+# change, so an intentional break plus its major bump is green, and a second
+# break in the same cycle needs no further bump.
+#
+# Retro driver: v1.0.3 shipped with semver debt discovered on release day
+# (#361 forced zakura-chain 2.0.0 / zakura-consensus 4.0.0 / zakura-script
+# 2.0.0 mid-incident). This job settles bump levels when the change merges,
+# not when the release is being cut.
+#
+# This check cannot see a dependency's major bump underneath unchanged
+# type names (the silent-duplicate-major failure). The `crates.io publish
+# graph` job in tests-unit.yml is the gate for that: it dry-run-publishes
+# against the live index, including skipped dependents.
+#
+# Notes:
+# - `--default-features` matches the documented release-prep invocation and
+#   keeps optional heavy features (e.g. lightwalletd-grpc-tests and its
+#   protoc dependency) out of the rustdoc builds. Feature-gated public APIs
+#   are not semver-checked, mirroring existing release practice.
+# - The `zakura` node binary package is excluded because its Rust types are not
+#   a supported library API. Its release version is managed separately.
+# - publish = false members (xtask, zakura-watchdog) are skipped automatically.
+# - A NEW publishable crate that has never been published to crates.io fails
+#   with "no baseline": add `--exclude <crate>` to the check command in the
+#   same PR that introduces the crate, and remove it after its first publish.
+# - Baseline downloads come from crates.io; an outage fails the job
+#   (deliberately fail-closed — re-run when the registry recovers).
+name: Semver checks
+
+on:
+  pull_request:
+    branches: [main, "feat/**", "release/**"]
+    paths:
+      - "**/*.rs"
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - .github/workflows/semver-checks.yml
+      - .github/workflows/scripts/affected_semver_packages.py
+      - .github/workflows/scripts/patch_registry_for_semver.sh
+      - .github/workflows/scripts/test_affected_semver_packages.py
+  push:
+    branches: [main]
+    paths:
+      - "**/*.rs"
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - .github/workflows/semver-checks.yml
+      - .github/workflows/scripts/affected_semver_packages.py
+      - .github/workflows/scripts/patch_registry_for_semver.sh
+      - .github/workflows/scripts/test_affected_semver_packages.py
+
+  # Run in the merge queue so queued changes are revalidated against the latest
+  # `main`. `merge_group` ignores path filters; select-packages diffs the queued
+  # group and checks only its affected publishable crates.
+  merge_group:
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # PR numbers are repository-wide, unlike same-named head branches from forks.
+  # Other events use their full ref (including each merge-queue ref).
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  select-packages:
+    name: Select semver packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      baseline_tag: ${{ steps.affected.outputs.baseline_tag }}
+      has_packages: ${{ steps.affected.outputs.has_packages }}
+      packages: ${{ steps.affected.outputs.packages }}
+      packages_json: ${{ steps.affected.outputs.packages_json }}
+      public_api_packages_json: ${{ steps.affected.outputs.public_api_packages_json }}
+      has_public_api_packages: ${{ steps.affected.outputs.has_public_api_packages }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Find crates affected by this change
+        id: affected
+        env:
+          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MERGE_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          python3 .github/workflows/scripts/test_affected_semver_packages.py
+
+          case "${{ github.event_name }}" in
+            pull_request)
+              packages="$(
+                python3 .github/workflows/scripts/affected_semver_packages.py \
+                  --base "$PR_BASE_SHA" \
+                  --head "$GITHUB_SHA"
+              )"
+              ;;
+            merge_group)
+              packages="$(
+                python3 .github/workflows/scripts/affected_semver_packages.py \
+                  --base "$MERGE_BASE_SHA" \
+                  --head "$MERGE_HEAD_SHA"
+              )"
+              ;;
+            *)
+              # Trusted main and explicitly requested runs populate reusable
+              # rustdoc JSON for both the stable PR baseline and the exact
+              # latest-tag baseline used by release preparation. Check every
+              # publishable crate so one cache entry can warm any package
+              # selected later.
+              packages="$(
+                python3 .github/workflows/scripts/affected_semver_packages.py --all
+              )"
+              ;;
+          esac
+
+          packages_json="$(
+            printf '%s\n' "$packages" \
+              | jq --raw-input --slurp --compact-output \
+                'split("\n") | map(select(length > 0))'
+          )"
+          # The release preparation has always limited the independent
+          # public-API evidence to library crates in its crate bump plan;
+          # `zakura` is versioned separately from that plan.
+          public_api_packages_json="$(
+            jq --compact-output 'map(select(. != "zakura"))' <<<"$packages_json"
+          )"
+          has_public_api_packages="$(
+            jq --raw-output 'length > 0' <<<"$public_api_packages_json"
+          )"
+
+          {
+            echo "baseline_tag=$(git describe --tags --abbrev=0 --match 'v[0-9]*')"
+            echo "has_packages=$([[ -n "$packages" ]] && echo true || echo false)"
+            echo "has_public_api_packages=$has_public_api_packages"
+            echo "packages<<EOF"
+            echo "$packages"
+            echo "EOF"
+            echo "packages_json=$packages_json"
+            echo "public_api_packages_json=$public_api_packages_json"
+          } >> "$GITHUB_OUTPUT"
+
+          if [[ -n "$packages" ]]; then
+            echo "Checking affected packages:"
+            echo "$packages"
+          else
+            echo "No publishable crates need semver checks."
+          fi
+
+  check-package:
+    name: semver (${{ matrix.package }})
+    if: >-
+      (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+      && needs.select-packages.outputs.has_packages == 'true'
+    needs: select-packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJSON(needs.select-packages.outputs.packages_json) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+        id: toolchain
+        with:
+          toolchain: stable
+          # cargo-semver-checks removes its temporary build directories after
+          # producing rustdoc JSON. Cache that small final output rather than
+          # retaining unrelated Cargo registry and target artifacts.
+          cache: false
+
+      # cargo-semver-checks reuses generated baseline rustdoc JSON from
+      # target/semver-checks/cache (~1-2 MB per crate baseline; a hit skips
+      # that baseline's download and rustdoc build entirely). Keyed on the
+      # rustc version because the rustdoc JSON format rotates with the
+      # toolchain, and on the last release tag because published baselines
+      # remain immutable until the next release.
+      - name: Restore baseline rustdoc cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
+        with:
+          path: target/semver-checks/cache
+          key: semver-baselines-full-${{ steps.toolchain.outputs.cachekey }}-${{ needs.select-packages.outputs.baseline_tag }}
+          restore-keys: |
+            semver-baselines-full-${{ steps.toolchain.outputs.cachekey }}-
+            semver-baselines-${{ steps.toolchain.outputs.cachekey }}-
+
+      # Deliberately unpinned (like cargo-hack): cargo-semver-checks must
+      # track new stable rustdoc formats; pin only if a regression forces it.
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b #v2.87.4
+        with:
+          tool: cargo-semver-checks
+
+      - uses: ./.github/actions/setup-zakura-build
+
+      - name: Patch registry crates for semver rustdoc builds
+        run: .github/workflows/scripts/patch_registry_for_semver.sh
+
+      - name: Check package against its stable crates.io baseline
+        env:
+          PACKAGE: ${{ matrix.package }}
+        run: cargo semver-checks --package "$PACKAGE" --default-features
+
+      - name: Explain the failure
+        if: failure()
+        run: |
+          cat >&2 <<'EOF'
+          cargo-semver-checks found published-API changes not covered by a
+          version bump. Either bump the affected crate in THIS PR to the
+          level the report requires:
+
+            cargo release version --verbose --execute --allow-branch '*' -p <crate> major|minor
+
+          (this also rewrites workspace-internal dependency requirements),
+          or revert the API change if it was accidental. See
+          docs/changelog/guidelines.md ("Library crates") and the release
+          checklist ("Update Crate Versions").
+          EOF
+
+  public-api-diff:
+    name: public API (${{ matrix.package }})
+    if: >-
+      github.event_name == 'pull_request'
+      && startsWith(github.head_ref, 'release/v')
+      && needs.select-packages.outputs.has_public_api_packages == 'true'
+    needs: select-packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # rustdoc on nightly 2026-09-07 and later hits a next-trait-solver ICE
+      # ("did not expect successful goal when collecting ambiguity errors",
+      # rust-lang/rust#124834) on the tower-batch-control `Service` impls in
+      # zakura-consensus, zakura-network, and zakura-state. Pin the last good
+      # nightly, and drop the pin once a current nightly documents these
+      # crates again. cargo-public-api has no toolchain option, so the rustup
+      # `+` shim selects the toolchain for its rustdoc builds.
+      PUBLIC_API_NIGHTLY: nightly-2026-09-06
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJSON(needs.select-packages.outputs.public_api_packages_json) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+        with:
+          toolchain: stable
+          cache: false
+
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b #v2.87.4
+        with:
+          tool: cargo-public-api
+
+      - uses: ./.github/actions/setup-zakura-build
+
+      - name: Patch registry crates for semver rustdoc builds
+        run: .github/workflows/scripts/patch_registry_for_semver.sh
+
+      - name: Install pinned nightly rustdoc toolchain
+        run: rustup toolchain install "$PUBLIC_API_NIGHTLY" --profile minimal
+
+      - name: Diff against the latest published API
+        env:
+          PACKAGE: ${{ matrix.package }}
+        run: |
+          # cargo-public-api builds both the current and published crate with
+          # the pinned nightly. Nightly-only warnings are evidence, not the
+          # lint gate.
+          RUSTFLAGS='' cargo "+$PUBLIC_API_NIGHTLY" public-api diff latest -p "$PACKAGE" -sss
+
+  warm-baselines:
+    name: Warm semver baselines
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && needs.select-packages.outputs.has_packages == 'true'
+    needs: select-packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+        id: toolchain
+        with:
+          toolchain: stable
+          cache: false
+
+      - name: Restore baseline rustdoc cache
+        id: baseline-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
+        with:
+          path: target/semver-checks/cache
+          key: semver-baselines-full-${{ steps.toolchain.outputs.cachekey }}-${{ needs.select-packages.outputs.baseline_tag }}
+          restore-keys: |
+            semver-baselines-full-${{ steps.toolchain.outputs.cachekey }}-
+            semver-baselines-${{ steps.toolchain.outputs.cachekey }}-
+
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b #v2.87.4
+        with:
+          tool: cargo-semver-checks
+
+      - uses: ./.github/actions/setup-zakura-build
+
+      - name: Patch registry crates for semver rustdoc builds
+        run: .github/workflows/scripts/patch_registry_for_semver.sh
+
+      - name: Check all crates and warm published release baselines
+        id: warm
+        env:
+          BASELINE_TAG: ${{ needs.select-packages.outputs.baseline_tag }}
+          PACKAGES: ${{ needs.select-packages.outputs.packages }}
+        run: |
+          source scripts/lib/crates-index.sh
+          source scripts/lib/release-packages.sh
+
+          declare -A release_versions=()
+          while IFS=$'\t' read -r package version _manifest; do
+            release_versions["$package"]="$version"
+          done < <(list_release_packages_at "$BASELINE_TAG")
+
+          cache_complete=true
+          while IFS= read -r package; do
+            [[ -n "$package" ]] || continue
+
+            release_version="${release_versions[$package]:-}"
+            if [[ -z "$release_version" ]]; then
+              echo "${package} is absent from ${BASELINE_TAG}; checking the stable baseline only."
+              cargo semver-checks --package "$package" --default-features
+              cache_complete=false
+              continue
+            fi
+
+            index_rc=0
+            crates_index_has_version "$package" "$release_version" \
+              || index_rc=$?
+            case "$index_rc" in
+              0) ;;
+              1)
+                echo "${package}@${release_version} is not published; checking the stable baseline only."
+                cargo semver-checks --package "$package" --default-features
+                cache_complete=false
+                continue
+                ;;
+              *)
+                echo "Could not query the crates.io index for ${package}." >&2
+                exit 1
+                ;;
+            esac
+
+            # cargo-semver-checks deliberately chooses a stable release by
+            # default. Preserve that baseline for ordinary PR checks when the
+            # latest tag is a release candidate, then also cache the exact RC
+            # baseline needed by release preparation.
+            if [[ "$release_version" == *-* ]]; then
+              cargo semver-checks --package "$package" --default-features
+            fi
+            cargo semver-checks --package "$package" --default-features \
+              --baseline-version "$release_version"
+          done <<< "$PACKAGES"
+
+          echo "cache_complete=$cache_complete" >> "$GITHUB_OUTPUT"
+
+      - name: Save baseline rustdoc cache
+        if: >-
+          github.ref == 'refs/heads/main'
+          && steps.baseline-cache.outputs.cache-hit != 'true'
+          && steps.warm.outputs.cache_complete == 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
+        with:
+          path: target/semver-checks/cache
+          key: semver-baselines-full-${{ steps.toolchain.outputs.cachekey }}-${{ needs.select-packages.outputs.baseline_tag }}
+
+      - name: Explain the failure
+        if: failure()
+        run: |
+          cat >&2 <<'EOF'
+          cargo-semver-checks failed while warming the latest release
+          baselines. Review the package report above before retrying.
+          EOF
+
+  semver-checks:
+    name: semver-checks
+    if: always()
+    needs: [select-packages, check-package, public-api-diff, warm-baselines]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check semver job results
+        env:
+          CHECK_RESULT: ${{ needs.check-package.result }}
+          EVENT_NAME: ${{ github.event_name }}
+          HAS_PACKAGES: ${{ needs.select-packages.outputs.has_packages }}
+          HAS_PUBLIC_API_PACKAGES: ${{ needs.select-packages.outputs.has_public_api_packages }}
+          PUBLIC_API_RESULT: ${{ needs.public-api-diff.result }}
+          RELEASE_PR: ${{ startsWith(github.head_ref, 'release/v') }}
+          SELECT_RESULT: ${{ needs.select-packages.result }}
+          WARM_RESULT: ${{ needs.warm-baselines.result }}
+        run: |
+          if [[ "$SELECT_RESULT" != "success" ]]; then
+            echo "Package selection failed: $SELECT_RESULT" >&2
+            exit 1
+          fi
+
+          if [[ "$EVENT_NAME" == "pull_request" || "$EVENT_NAME" == "merge_group" ]]; then
+            if [[ "$HAS_PACKAGES" == "true" && "$CHECK_RESULT" != "success" ]]; then
+              echo "Package checks failed: $CHECK_RESULT" >&2
+              exit 1
+            fi
+            if [[ "$EVENT_NAME" == "pull_request" && "$RELEASE_PR" == "true" \
+              && "$HAS_PUBLIC_API_PACKAGES" == "true" \
+              && "$PUBLIC_API_RESULT" != "success" ]]; then
+              echo "Public API diffs failed: $PUBLIC_API_RESULT" >&2
+              exit 1
+            fi
+          elif [[ "$HAS_PACKAGES" == "true" && "$WARM_RESULT" != "success" ]]; then
+            echo "Baseline warmer failed: $WARM_RESULT" >&2
+            exit 1
+          fi

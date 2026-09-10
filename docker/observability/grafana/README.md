@@ -1,11 +1,11 @@
-# Zebra Grafana Dashboards
+# Zakura Grafana Dashboards
 
-Pre-built dashboards for monitoring Zebra nodes.
+Pre-built dashboards for monitoring Zakura nodes.
 
 ## Quick Start
 
 ```bash
-# From repository root - starts Zebra + all observability tools
+# From repository root - starts Zakura + all observability tools
 docker compose -f docker/docker-compose.observability.yml up -d
 ```
 
@@ -33,7 +33,7 @@ Grafana is provisioned with two datasources:
 
 | Datasource | UID | Description |
 |------------|-----|-------------|
-| Prometheus | `zebra-prometheus` | Metrics storage and queries |
+| Prometheus | `zakura-prometheus` | Metrics storage and queries |
 | Jaeger | `zebra-jaeger` | Distributed tracing |
 
 Configuration: `provisioning/datasources/datasources.yml`
@@ -50,7 +50,7 @@ To explore traces:
 
 1. Go to **Explore** in Grafana
 2. Select **Jaeger** datasource
-3. Search for service `zebra`
+3. Search for service `zakura`
 
 Or access Jaeger UI directly at <http://localhost:16686> for full trace exploration.
 See the [Jaeger README](../jaeger/README.md) for detailed tracing documentation.
@@ -75,7 +75,7 @@ If you modify `../prometheus/prometheus.yaml` scrape_interval, update dashboard 
 ### Job Label
 
 The `$job` variable in dashboards is populated from Prometheus. The default job
-name is `zebra` (configured in `../prometheus/prometheus.yaml`).
+name is `zakura` (configured in `../prometheus/prometheus.yaml`).
 
 ## Creating New Dashboards
 

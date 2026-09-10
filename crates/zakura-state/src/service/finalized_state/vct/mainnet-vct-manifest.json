@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "network": "Mainnet",
+  "source": "release-state-bundle",
+  "generated_at": "2026-09-09T05:45:24Z",
+  "finalized_height": 3476010,
+  "finalized_hash": "0000000000578f7471e9e82abd7d9fb46c400093381f3507c90daefb476702be",
+  "checkpoints_sha256": "cc463f68bb657d720c70cc57e8f6f412a1c3aebcbedebf8ddbd1bebc6a801cda",
+  "frontier_sha256": "dabfd1d0e11abedf767f9f26ca362146fc464e60029174d9da73d3a2053de7a6",
+  "frontier_size": 1816,
+  "subtrees_sha256": "262e17715aa5426b8d1003b99abb854f693249aba14b40a1ceb69149589caa30",
+  "subtrees_size": 72297,
+  "frontier_grid_sha256": "4f4de74d5fb357f47fef652db9bcec2dba0cabfd2dc624e8a19a4e86d1f1b6b7",
+  "frontier_grid_size": 2176252,
+  "frontier_grid_entries": 2288,
+  "meta_sha256": "d515dfca08392fcce4fd7a756fb8229f13998848be7ffe8e53943e278e5c8354"
+}

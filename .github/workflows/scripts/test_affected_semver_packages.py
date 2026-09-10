@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""Tests for affected_semver_packages.py."""
+
+import tempfile
+import unittest
+from pathlib import Path
+
+import affected_semver_packages
+
+
+class AffectedSemverPackagesTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name).resolve()
+
+    def tearDown(self):
+        self.temporary_directory.cleanup()
+
+    def package(self, name, *, publish=None, dependencies=None):
+        package_root = self.root / name
+        package = {
+            "id": name,
+            "name": name,
+            "manifest_path": str(package_root / "Cargo.toml"),
+            "dependencies": dependencies or [],
+        }
+        if publish is not None:
+            package["publish"] = publish
+        return package
+
+    def dependency(self, name, *, kind=None):
+        return {
+            "name": name,
+            "kind": kind,
+            "path": str(self.root / name),
+        }
+
+    def metadata(self, packages):
+        return {
+            "workspace_root": str(self.root),
+            "workspace_members": [package["id"] for package in packages],
+            "packages": packages,
+        }
+
+    def test_includes_publishable_reverse_dependencies(self):
+        packages = [
+            self.package("base"),
+            self.package(
+                "dependent",
+                dependencies=[self.dependency("base")],
+            ),
+            self.package(
+                "transitive",
+                dependencies=[self.dependency("dependent", kind="build")],
+            ),
+            self.package(
+                "dev-only",
+                dependencies=[self.dependency("base", kind="dev")],
+            ),
+            self.package(
+                "private-middle",
+                publish=[],
+                dependencies=[self.dependency("base")],
+            ),
+            self.package(
+                "public-after-private",
+                dependencies=[self.dependency("private-middle")],
+            ),
+        ]
+
+        affected = affected_semver_packages.affected_publishable_packages(
+            self.metadata(packages),
+            changed_files=["base/src/lib.rs"],
+        )
+
+        self.assertEqual(
+            affected,
+            ["base", "dependent", "public-after-private", "transitive"],
+        )
+
+    def test_root_manifest_selects_every_publishable_package(self):
+        packages = [
+            self.package("z-last"),
+            self.package("a-first"),
+            self.package("private", publish=[]),
+        ]
+
+        affected = affected_semver_packages.affected_publishable_packages(
+            self.metadata(packages),
+            changed_files=["Cargo.toml"],
+        )
+
+        self.assertEqual(affected, ["a-first", "z-last"])
+
+    def test_ignores_lockfiles_and_non_rust_package_files(self):
+        packages = [self.package("base")]
+
+        affected = affected_semver_packages.affected_publishable_packages(
+            self.metadata(packages),
+            changed_files=["Cargo.lock", "base/README.md"],
+        )
+
+        self.assertEqual(affected, [])
+
+    def test_registry_patch_selects_every_publishable_library(self):
+        packages = [
+            self.package("zakura-rpc"),
+            self.package("zakura-network"),
+            self.package("private", publish=[]),
+            self.package("zakura"),
+            self.package("zakura-header-chain"),
+        ]
+
+        affected = affected_semver_packages.affected_publishable_packages(
+            self.metadata(packages),
+            changed_files=[".github/workflows/scripts/patch_registry_for_semver.sh"],
+        )
+
+        self.assertEqual(affected, ["zakura-network", "zakura-rpc"])
+
+    def test_package_manifest_selects_that_package(self):
+        registry_dependency = {
+            "name": "registry-package",
+            "kind": None,
+        }
+        packages = [
+            self.package("base", dependencies=[registry_dependency]),
+            self.package("other"),
+        ]
+
+        affected = affected_semver_packages.affected_publishable_packages(
+            self.metadata(packages),
+            changed_files=["base/Cargo.toml"],
+        )
+
+        self.assertEqual(affected, ["base"])
+
+    def test_excludes_publishable_crate_without_registry_baseline(self):
+        packages = [
+            self.package("zakura-header-chain"),
+            self.package(
+                "dependent",
+                dependencies=[self.dependency("zakura-header-chain")],
+            ),
+        ]
+
+        affected = affected_semver_packages.affected_publishable_packages(
+            self.metadata(packages),
+            changed_files=["zakura-header-chain/src/lib.rs"],
+        )
+
+        self.assertEqual(affected, ["dependent"])
+
+    def test_excludes_zakura_node_package_from_semver_enforcement(self):
+        packages = [
+            self.package("library"),
+            self.package(
+                "zakura",
+                dependencies=[self.dependency("library")],
+            ),
+        ]
+
+        affected = affected_semver_packages.affected_publishable_packages(
+            self.metadata(packages),
+            changed_files=["library/src/lib.rs", "zakura/src/main.rs"],
+        )
+
+        self.assertEqual(affected, ["library"])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -42,7 +42,7 @@ assignees: ""
 
 ### Description
 
-<!-- What does the task entail? e.g downloading, building and running zebrad -->
+<!-- What does the task entail? e.g downloading, building and running zakurad -->
 
 ### Scenario
 

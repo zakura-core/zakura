@@ -1,0 +1,298 @@
+---
+name: release-zakura
+description: >-
+  Prepare, review, and publish Zakura releases and release candidates. Use when
+  bumping Zakura versions, preparing a release PR, validating the crates.io
+  package graph, reviewing release readiness, or running the protected Create
+  release workflow.
+---
+
+# Release Zakura
+
+Use the repository's
+`.github/PULL_REQUEST_TEMPLATE/release-checklist.md` as the canonical checklist.
+Release policy (tag protection, promotion, retention) is canonical in
+`docs/release-tag-protection.md`; this skill points at policy rather than
+defining it, and adds the Zakura-specific checks that are easy to miss.
+
+## Safety
+
+- Preparing or reviewing a release does not authorize publishing it.
+- Get explicit confirmation immediately before dispatching `create-release.yml`
+  or publishing crates to crates.io.
+- Dispatch releases only from merged `main`.
+- Never create a `v*` tag manually. `create-release.yml` is the only supported
+  tag creation path.
+- Do not promote a release candidate from pre-release to Latest. Published
+  release candidates stay up as pre-releases; removing one is an owner-level
+  decision, never part of a release flow.
+- If a release-capable maintainer has announced a release hold, stop: do not
+  prepare or publish until it is lifted. A security hotfix may be in flight
+  for the same version, invisible under embargo.
+
+## Gather release context
+
+Determine:
+
+- target tag, including the `v` prefix, such as `v1.0.0-rc5`
+- previous GitHub tag
+- latest published version of each affected crate on crates.io
+- whether this release publishes crates, GitHub assets, Docker images, or all
+  three
+- changed crates since each crate's last published version
+- the release tracking issue and checkpoint plan
+
+Do not infer the crate publish set only from the previous GitHub tag. A binary
+release may have skipped crates.io publishing.
+
+Useful commands:
+
+```bash
+gh release list --repo zakura-core/zakura --limit 10
+cargo search zakura --limit 5
+git diff --stat <previous-tag>
+```
+
+## Prepare the release branch
+
+The `Prepare release PR` workflow (`prepare-release-pr.yml`, wrapping
+`scripts/prepare-release.sh` / `make prepare-release`) performs the mechanical
+preparation below for a given tag and opens a draft PR through the release
+bot. Prefer dispatching it, then finish the judgment items it lists in the PR
+body (bump-level review, authoritative end-of-support height, changelog
+curation). The manual steps below remain the fallback and the reference for
+what the automation must produce.
+
+Name the branch `release/v<version>`. Never use `hotfix/v*` — that namespace
+is reserved for the hotfix release process
+(`docs/security-hotfix-release.md`), and keeping the namespaces disjoint is
+what prevents collisions with an embargoed hotfix.
+
+### Package versions
+
+Always update the `zakura` package version in `crates/zakurad/Cargo.toml`; release
+binaries self-report `CARGO_PKG_VERSION`.
+
+Stable releases always publish to crates.io. Release candidates decide
+per-release: a crates.io-publishing release candidate bumps all changed
+crates like a stable release; a GitHub-only release candidate bumps only
+`zakura`.
+
+For crates.io publishing:
+
+1. Identify changed publishable crates.
+2. Bump those crates before their dependents.
+3. Update every direct dependency requirement that must select the new crate.
+4. Cascade-republish dependents: a crate already published at its
+   workspace version is skipped at publish time, and its **index** manifest
+   is what dependents resolve. A prerelease bump makes those manifests
+   unresolvable (a requirement without a pre-release tag never matches a
+   pre-release). A new major never fails resolution at all: a skipped crate
+   pinning the old major makes cargo select both majors side by side, and
+   consumers get a duplicated crate with mismatched types. Either way,
+   every published crate that depends on the bumped crate — directly or
+   transitively — must republish with a patch bump. `prepare-release.sh`
+   plans that dependent closure as `cascade` rows; never drop them from a
+   crates.io-publishing release.
+5. Refresh `Cargo.lock`.
+6. Confirm unchanged published versions still satisfy the resulting graph:
+   `./scripts/check-crate-publish-graph.sh` dry-run-publishes the publish
+   set against the live index, then asserts that the Cargo.lock cargo
+   writes into each packaged archive resolves every workspace crate at its
+   workspace version — a duplicated major passes the dry-run itself. PR CI
+   runs the same script as the `crates.io publish graph` job in
+   `tests-unit.yml` (part of `test success`), so a missing cascade bump
+   cannot merge. It is also step 5 of `make pre-release`.
+7. Reserve any crate name the release adds. The same check warns when a
+   selected crate has never been published; CI cannot bootstrap it, because
+   its crates.io Trusted Publishing entry lives on a crate that must already
+   exist. Publish the name manually and configure it before the release.
+
+Partial version graphs are allowed, but all tooling must handle them. Do not
+assume every publishable crate has the `zakura` package version.
+
+### Release metadata
+
+Update:
+
+- the README `cargo install --git ... --tag` example for stable releases only;
+  while preparing a release candidate, keep the general install example on the
+  latest stable tag
+- `crates/zakurad/tests/common/configs/<version>.toml`, then remove stale generated
+  release fixtures so the directory retains only the current release fixture
+  and custom test configurations
+- `ESTIMATED_RELEASE_HEIGHT` from the current chain tip and expected tag date
+- pending `docs/changelog/unreleased/<PR-number>.md` fragments according to project
+  policy
+- the root changelog by running the fragment assembler after the `zakura`
+  package version bump is final
+- examples in release documentation only when they are intended to track the
+  current release
+
+Generate the stored config from the release branch; do not copy it blindly when
+config defaults or fields changed. Run the exact acceptance config test to
+verify both the generated fixture and the retained fixture set:
+
+```bash
+cargo test -p zakura --test acceptance config_tests -- --exact
+```
+
+After the `zakura` package version bump is final, run:
+
+```bash
+make prepare-release-changelog RELEASE_TAG=<tag>
+```
+
+This target is defined in `scripts/make/release.mk`. It must consume every
+`docs/changelog/unreleased/<PR-number>.md` fragment into the root changelog,
+including explicit no-changelog fragments. Keep
+`docs/changelog/unreleased/README.md`; it documents the fragment format and is not a
+pending fragment.
+
+Review and commit the generated root changelog and numbered fragment deletions.
+For a stable release, confirm the generated section combines and replaces all
+matching release-candidate sections; no `X.Y.Z-rc*` section for that stable
+version should remain in the root changelog.
+
+## Verify before opening or approving the PR
+
+Run:
+
+```bash
+cargo metadata --no-deps --format-version 1 --locked
+make pre-release RELEASE_TAG=<tag> BASE_TAG=<previous-tag>
+./scripts/check-crate-publish-graph.sh
+./scripts/check-crate-packaging.sh --verify
+```
+
+`check-crate-publish-graph.sh` needs network access and is the only check
+that resolves the publish set against the live index — packaging checks
+resolve every crate locally and cannot see that a published crate would be
+skipped. PR CI runs it on every Cargo.toml change and in the merge queue
+so `main` stays publishable; `make pre-release` runs it again at release
+time. For a deliberately GitHub-only release candidate the documented
+override is `ZAKURA_ALLOW_UNPUBLISHABLE_CRATE_GRAPH=1` (workflow input
+`allow_unpublishable_crate_graph`); crates must not be published under it.
+
+Also:
+
+- run Markdown lint on every changed Markdown file
+- check IDE diagnostics on changed files
+- run `cargo semver-checks` and `cargo public-api diff` for changed library
+  crates when publishing them
+- verify the packaging script resolves each archive using that crate's actual
+  version when the workspace contains mixed versions
+- confirm the package preflight rebuilds packaged archives, not just workspace
+  sources
+- confirm checkpoints are current or record an explicit rapid-RC waiver
+
+Follow the repository's risk policy for additional Rust checks. Report skipped
+checks and why.
+
+## Release PR requirements
+
+- Use a conventional title such as
+  `chore(release): prepare v1.0.0-rc5`.
+- Add the `A-release` label before treating CI as complete.
+- Confirm `Check no git dependencies` and Docker configuration/build checks ran;
+  a skipped result usually means the label is missing.
+- Include motivation, solution, test evidence, issue/reference links, risk
+  classification, follow-up work, and AI disclosure.
+- Confirm all `docs/changelog/unreleased/<PR-number>.md` files were consumed and the
+  generated root changelog was committed.
+- Verify the release graph independently; a green ordinary PR build does not
+  prove crates.io packaging.
+- Post-1.0.0 releases only: confirm the assembled root changelog contains
+  concrete release notes for every user-visible change since the previous
+  release. Through 1.0.0 the changelog is frozen — 1.0.0 ships "Initial
+  release" only in the root changelog.
+- Audit the checklist against `docs/release-tag-protection.md`.
+- Wait for required human approval and all enabled CI checks.
+
+## Publish
+
+After the release PR is merged and explicit confirmation is given, run the
+T-0 orchestrator — it preflights competing release trains, dispatches,
+watches to the approval gate, and verifies the published release; it is
+resumable and re-runs skip completed steps:
+
+```bash
+./scripts/release-t0.sh publish --tag <tag> --mode main \
+  --head-sha <merged-commit> --expected-tag-delay-days <days>
+```
+
+Raw dispatch fallback:
+
+```bash
+gh workflow run create-release.yml \
+  --repo zakura-core/zakura \
+  --ref main \
+  -f release_tag=<tag>
+```
+
+The workflow must:
+
+1. validate the tag against the `zakura` package version
+2. boot from a retained Mainnet state below the VCT handoff and prove finalized
+   state crosses it using the Zakura P2P stack
+3. deploy the release commit to `us-east-0` and verify that the service remains
+   active with working RPC and no restarts for the settle window
+4. build and verify assets before tag creation
+5. wait for approval of the `release` environment
+6. create the immutable tag and GitHub pre-release
+7. publish the release assets; the tag push then triggers
+   `release-binaries.yml`, which publishes the Docker images
+8. dispatch `publish-crates.yml` for the new tag, unless `publish_crates` is
+   `never`, the tag is a release candidate under the default `auto`, or
+   `allow_unpublishable_crate_graph` is set
+
+The start canary runs in parallel with asset staging and is not a dependency
+of the protected `release` environment, so it never delays the approval
+request. Its failure is intentionally advisory: investigate it, but
+infrastructure or fleet reliability issues do not block release publication.
+A canary failure restores `us-east-0` to the previously deployed binary before
+reporting, so the fleet is not left on an unvalidated build; if the rollback
+itself fails the run says so explicitly and the node needs manual recovery.
+
+The documented emergency source-first mode skips the pre-tag VCT crossing,
+start canary, and asset build. The independently dispatched handoff canary
+also remains advisory and alerts `#zakura-alerts` on failure.
+
+Before a Mode A hotfix from an older release line, confirm the PR-node assets
+include a database-compatible snapshot below that branch's checkpoint. If
+retention cannot satisfy the older checkpoint, use the explicitly approved
+source-first emergency path and record why the canary could not run.
+
+Do not retry from an unmerged branch. A version mismatch failure means `main`
+still has the previous package version.
+
+## Post-release verification
+
+- Verify both `zakurad-<tag>` archives, the manifest, and `SHA256SUMS.txt` are
+  present.
+- Verify release checksums.
+- Verify the standard Docker image has amd64 and arm64; verify the
+  zcashd-compat image has amd64.
+- Approve the `crates-io` deployment on the dispatched `Publish crates` run
+  after reviewing its plan table; that approval is the crates.io publish, and
+  it is irreversible. Retry a partial publish by dispatching the workflow again
+  for the same tag, never by yanking.
+- Confirm the run's `Verify the published versions` and `Install zakurad from
+  crates.io` jobs passed; they replace publishing and installing by hand.
+- Replace the boilerplate GitHub release body with concrete notes from the final
+  changelog or approved release-note draft.
+- Promote stable releases with `./scripts/release-t0.sh promote --tag <tag>`
+  after signing; it refuses unsigned releases and release candidates.
+- Keep release candidates marked as pre-releases.
+
+## Review output
+
+When reviewing readiness, report:
+
+1. blockers
+2. missing gates or skipped checks
+3. verified items
+4. exact remaining publish steps
+
+Distinguish repository changes required before merge from post-release
+automation and operator follow-up.

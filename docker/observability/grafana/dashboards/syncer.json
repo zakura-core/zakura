@@ -36,7 +36,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "description": "Current blockchain height",
       "fieldConfig": {
@@ -82,7 +82,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "state_finalized_block_height",
           "legendFormat": "Height",
@@ -95,7 +95,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "description": "Total blocks downloaded during sync",
       "fieldConfig": {
@@ -141,7 +141,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "sync_downloaded_block_count",
           "legendFormat": "Downloaded",
@@ -154,7 +154,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "description": "Total blocks verified during sync",
       "fieldConfig": {
@@ -200,7 +200,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "sync_verified_block_count",
           "legendFormat": "Verified",
@@ -213,7 +213,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "description": "Block downloads currently in progress",
       "fieldConfig": {
@@ -267,7 +267,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "sync_downloads_in_flight",
           "legendFormat": "In-Flight",
@@ -284,7 +284,7 @@
       "dashes": false,
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {},
@@ -324,8 +324,8 @@
       "scopedVars": {
         "job": {
           "selected": false,
-          "text": "zebrad-mainnet",
-          "value": "zebrad-mainnet"
+          "text": "zakurad-mainnet",
+          "value": "zakurad-mainnet"
         }
       },
       "seriesOverrides": [],
@@ -341,7 +341,7 @@
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         },
         {
@@ -353,7 +353,7 @@
           "refId": "B",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         }
       ],
@@ -407,7 +407,7 @@
       "dashes": false,
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {},
@@ -448,8 +448,8 @@
       "scopedVars": {
         "job": {
           "selected": false,
-          "text": "zebrad-testnet",
-          "value": "zebrad-testnet"
+          "text": "zakurad-testnet",
+          "value": "zakurad-testnet"
         }
       },
       "seriesOverrides": [],
@@ -465,7 +465,7 @@
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         },
         {
@@ -477,7 +477,7 @@
           "refId": "B",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         }
       ],
@@ -539,7 +539,7 @@
       "dataFormat": "timeseries",
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {},
@@ -564,8 +564,8 @@
       "scopedVars": {
         "job": {
           "selected": false,
-          "text": "zebrad-mainnet",
-          "value": "zebrad-mainnet"
+          "text": "zakurad-mainnet",
+          "value": "zakurad-mainnet"
         }
       },
       "targets": [
@@ -578,7 +578,7 @@
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         },
         {
@@ -591,7 +591,7 @@
           "refId": "B",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         }
       ],
@@ -636,7 +636,7 @@
       "dataFormat": "timeseries",
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {},
@@ -662,8 +662,8 @@
       "scopedVars": {
         "job": {
           "selected": false,
-          "text": "zebrad-testnet",
-          "value": "zebrad-testnet"
+          "text": "zakurad-testnet",
+          "value": "zakurad-testnet"
         }
       },
       "targets": [
@@ -676,7 +676,7 @@
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         },
         {
@@ -689,7 +689,7 @@
           "refId": "B",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         }
       ],
@@ -726,7 +726,7 @@
       "dashes": false,
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {},
@@ -766,8 +766,8 @@
       "scopedVars": {
         "job": {
           "selected": false,
-          "text": "zebrad-mainnet",
-          "value": "zebrad-mainnet"
+          "text": "zakurad-mainnet",
+          "value": "zakurad-mainnet"
         }
       },
       "seriesOverrides": [],
@@ -783,7 +783,7 @@
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         },
         {
@@ -795,7 +795,7 @@
           "refId": "B",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         },
         {
@@ -807,7 +807,7 @@
           "refId": "C",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         },
         {
@@ -819,7 +819,7 @@
           "refId": "D",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         },
         {
@@ -831,7 +831,7 @@
           "refId": "E",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         },
         {
@@ -843,7 +843,7 @@
           "refId": "F",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         }
       ],
@@ -897,7 +897,7 @@
       "dashes": false,
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {},
@@ -938,8 +938,8 @@
       "scopedVars": {
         "job": {
           "selected": false,
-          "text": "zebrad-testnet",
-          "value": "zebrad-testnet"
+          "text": "zakurad-testnet",
+          "value": "zakurad-testnet"
         }
       },
       "seriesOverrides": [],
@@ -955,7 +955,7 @@
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         },
         {
@@ -967,7 +967,7 @@
           "refId": "B",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         },
         {
@@ -979,7 +979,7 @@
           "refId": "C",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         },
         {
@@ -991,7 +991,7 @@
           "refId": "D",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         },
         {
@@ -1003,7 +1003,7 @@
           "refId": "E",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         },
         {
@@ -1015,7 +1015,7 @@
           "refId": "F",
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           }
         }
       ],
@@ -1065,7 +1065,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -1139,7 +1139,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "sync_stage_duration_seconds{quantile=\"0.5\"}",
           "legendFormat": "{{stage}} p50",
@@ -1148,7 +1148,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "sync_stage_duration_seconds{quantile=\"0.95\"}",
           "legendFormat": "{{stage}} p95",
@@ -1157,7 +1157,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "sync_stage_duration_seconds{quantile=\"0.99\"}",
           "legendFormat": "{{stage}} p99",
@@ -1170,7 +1170,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -1244,7 +1244,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "sync_block_download_duration_seconds{quantile=\"0.95\"}",
           "legendFormat": "download {{result}} p95",
@@ -1253,7 +1253,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
           "expr": "sync_block_verify_duration_seconds{quantile=\"0.95\"}",
           "legendFormat": "verify {{result}} p95",

@@ -1,0 +1,25 @@
+[package]
+name = "zakura-watchdog"
+version = "0.1.0"
+authors.workspace = true
+description = "Standalone watchdog sidecar that checks Zakura services and reports statuses to Sentry"
+license.workspace = true
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# This crate is deploy/operator tooling, not a published library.
+publish = false
+
+[dependencies]
+base64 = { workspace = true }
+clap = { workspace = true, features = ["derive", "env"] }
+sentry = { workspace = true, features = ["backtrace", "logs", "rustls", "tracing", "ureq"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+ureq = { version = "3.0.11", default-features = false }
+
+[lints]
+workspace = true

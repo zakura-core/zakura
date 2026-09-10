@@ -1,60 +1,74 @@
 [workspace]
 members = [
-        "zebrad",
-        "zebra-chain",
-        "zebra-network",
-        "zebra-state",
-        "zebra-script",
-        "zebra-consensus",
-        "zebra-rpc",
-        "zebra-node-services",
-        "zebra-test",
-        "zebra-utils",
-        "tower-batch-control",
-        "tower-fallback",
-        "deploy/watchdog",
-        "xtask",
-        "zebra-jsonl-trace",
+        "crates/zakurad",
+        "crates/zakura-chain",
+        "crates/zakura-header-chain",
+        "crates/zakura-network",
+        "crates/zakura-state",
+        "crates/zakura-script",
+        "crates/zakura-consensus",
+        "crates/zakura-rpc",
+        "crates/zakura-node-services",
+        "crates/zakura-test",
+        "crates/zakura-utils",
+        "crates/tower-batch-control",
+        "crates/tower-fallback",
+        "deploy/zakura-watchdog",
+        "crates/xtask",
+        "crates/zakura-jsonl-trace",
 ]
+
+# The asset packaging crate publishes on the release-state cadence rather than with the
+# workspace, and its payload is generated rather than committed, so it is deliberately not a
+# member. Zakura consumes the published crate from crates.io like any other dependency.
+exclude = ["crates/zakura-assets"]
 
 # Use the edition 2021 dependency resolver in the workspace, to match the crates
 resolver = "2"
 
 [workspace.package]
-authors = ["Zcash Foundation <zebra@zfnd.org>"]
+authors = ["Zakura Contributors"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/valargroup/zebra"
-homepage = "https://zfnd.org/zebra/"
-keywords = ["zebra", "zcash"]
-rust-version = "1.91"
+repository = "https://github.com/zakura-core/zakura"
+homepage = "https://github.com/zakura-core/zakura"
+keywords = ["zakura", "zcash"]
+rust-version = "1.97"
 edition = "2021"
 
-# `cargo release` settings
-
 [workspace.dependencies]
+# Zakura's published binary assets: the reviewed Mainnet historical frontier grid, which is too
+# large to carry in git history at the weekly cadence the release state advances.
+#
+# The version is `0.<last_checkpoint>.<revision>`, so the pin states which checkpoint the payload
+# covers and `scripts/check-release-state.sh` can hold it against the committed provenance
+# manifest without fetching anything. The requirement is exact because these are reviewed bytes,
+# not a compatible range; `Cargo.lock` carries the registry checksum that pins them.
+#
+# Published from `crates/zakura-assets/` in this repository. The dependency name and the
+# published name now match, so no `package` rename is needed: every consumer, script, and
+# gate refers to `zakura-assets` and nothing else.
+zakura-assets = { version = "=0.3476010.0" }
 incrementalmerkletree = { version = "0.8.2", features = ["legacy-api"] }
-orchard = "0.15.0-pre.1"
-sapling-crypto = "0.7"
-zcash_address = "0.13.0-pre.0"
-zcash_encoding = "0.4"
-zcash_history = "0.5.0-pre.0"
-zcash_keys = "0.15.0-pre.0"
-zcash_primitives = "0.29.0-pre.0"
-zcash_proofs = "0.29.0-pre.0"
-zcash_transparent = "0.9.0-pre.0"
-zcash_protocol = "0.10.0-pre.0"
-zip32 = "0.2"
-abscissa_core = "0.7"
+orchard = { version = "1.2.0", package = "zakura-orchard" }
+sapling-crypto = { version = "1.2.0", package = "zakura-sapling-crypto" }
+zcash_address = "0.13.0"
+zcash_history = "0.5.0"
+zcash_keys = { version = "1.2.0", package = "zakura-keys" }
+zcash_primitives = { version = "1.2.0", package = "zakura-primitives" }
+zcash_proofs = { version = "1.2.0", package = "zakura-proofs" }
+zcash_transparent = "0.10.0"
+zcash_protocol = "0.10.1"
+abscissa_core = { version = "0.7", default-features = false }
 base64 = "0.22.1"
 bech32 = "0.11.0"
-bellman = "0.14"
+bellman = { version = "1.2.0", package = "zakura-bellman" }
 bincode = "1.3"
 bitflags = "2.9"
 bitflags-serde-legacy = "0.1.1"
 bitvec = "1.0"
 blake2b_simd = "1.0"
 blake2s_simd = "1.0"
-bls12_381 = "0.8"
+bls12_381 = { version = "1.2.0", package = "zakura-bls12-381" }
 bs58 = "0.5"
 byteorder = "1.5"
 bytes = "1.10"
@@ -68,20 +82,17 @@ derive-getters = "0.5"
 derive-new = "0.5"
 dirs = "6.0"
 ed25519-zebra = "4.2"
-elasticsearch = { version = "8.17.0-alpha.1", default-features = false }
 equihash = "0.3"
-ff = "0.13"
 futures = "0.3.31"
 futures-core = "0.3.31"
 futures-util = "0.3.31"
-group = "0.13"
-halo2 = "0.3"
+group = "0.14"
+halo2 = { version = "1.2.0", package = "zakura-halo2-proofs" }
 hex = "0.4.3"
 hex-literal = "0.4"
 howudoin = "0.1"
 http-body = "1.0.1"
 http-body-util = "0.1.3"
-human_bytes = { version = "0.4", default-features = false }
 humantime = "2.2"
 humantime-serde = "1.1"
 hyper = "1.6"
@@ -92,22 +103,18 @@ indicatif = "0.17"
 inferno = { version = "0.12", default-features = false }
 insta = "1.42"
 itertools = "0.14"
-jsonrpc = "0.18"
 jsonrpsee = "0.24.8"
 jsonrpsee-proc-macros = "0.24.9"
 jsonrpsee-types = "0.24.9"
-jubjub = "0.10"
+jubjub = { version = "1.2.0", package = "zakura-jubjub" }
 lazy_static = "1.4"
 libzcash_script = "0.1"
 log = "0.4.27"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
-mset = "0.1"
-nix = "0.30"
-num-integer = "0.1.46"
+nix = "0.31"
 once_cell = "1.21"
 openrpsee = "0.1.0"
-ordered-map = "0.4.2"
 owo-colors = "4.2.0"
 phf = "0.12"
 pin-project = "1.1.10"
@@ -115,18 +122,26 @@ primitive-types = "0.12"
 proptest = "1.6"
 proptest-derive = "0.5"
 prost = "0.14"
-quote = "1.0.40"
 rand = "0.8.5"
 rand_chacha = "0.3"
 rand_core = "0.6"
+rand_10 = { package = "rand", version = "0.10" }
+rand_chacha_10 = { package = "rand_chacha", version = "0.10" }
+rand_core_10 = { package = "rand_core", version = "0.10" }
 rayon = "1.10"
-reddsa = "0.5"
-redjubjub = "0.8"
+reddsa = { version = "1.2.0", package = "zakura-reddsa" }
+redjubjub = { version = "1.2.0", package = "zakura-redjubjub" }
 regex = "1.11"
 reqwest = { version = "0.12", default-features = false }
 ripemd = "0.1"
 rlimit = "0.10"
-rocksdb = { version = "0.22", default-features = false }
+# `bindgen-runtime` makes librocksdb-sys's bindgen load libclang itself. Without
+# it, a build that resolves a second bindgen version elsewhere (for example the
+# fresh placeholder project cargo-semver-checks generates) unifies clang-sys
+# into runtime mode while this bindgen never loads the library, and the
+# librocksdb-sys build script panics with "a `libclang` shared library is not
+# loaded on this thread".
+rocksdb = { version = "0.24", default-features = false, features = ["bindgen-runtime"] }
 secp256k1 = "0.29"
 semver = "1.0.26"
 sentry = { version = "0.47", default-features = false }
@@ -134,27 +149,23 @@ serde = "1.0.219"
 serde-big-array = "0.5"
 serde_json = "1.0.140"
 serde_with = "3.12"
-serde_yml = "0.0"
 sha2 = "0.10"
 schemars = "1"
+sinsemilla = { version = "1.2.0", package = "zakura-sinsemilla" }
 spandoc = "0.2"
-static_assertions = "1.1"
-structopt = "0.3"
 anyhow = "1.0"
 strum = "0.27"
 strum_macros = "0.27"
-syn = "2.0.100"
 subtle = { version = "2.6", default-features = false }
 tempfile = "3.20"
 thiserror = "2.0"
 thread-priority = "1.2"
-tinyvec = "1.9"
 tokio = "1.44"
 tokio-stream = "0.1.17"
 tokio-test = "0.4"
 tokio-util = "0.7.14"
 toml = "1.0"
-tonic = "0.14"
+tonic = { version = "0.14", features = ["tls-ring"] }
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
 tonic-reflection = "0.14"
@@ -168,27 +179,46 @@ tracing-futures = "0.2.5"
 tracing-journald = "0.3"
 tracing-subscriber = "0.3.19"
 tracing-test = "0.2.4"
-tracing-opentelemetry = "0.32"
-opentelemetry = "0.31"
-opentelemetry_sdk = "0.31"
-opentelemetry-otlp = "0.31"
+tracing-opentelemetry = "0.33"
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.32", default-features = false }
 uint = "0.10"
-vergen-git2 = { version = "9", default-features = false }
 x25519-dalek = "2.0.1"
 zcash_note_encryption = "0.4.1"
 zcash_script = "0.4.5"
-config = { version = "0.15.14", features = ["toml"] }
-which = "8.0.0"
+config = { version = "0.15.14", default-features = false, features = ["toml"] }
 
-[patch.crates-io]
-# TEMPORARY: Pin librustzcash crates to https://github.com/zcash/librustzcash/pull/2509
-equihash = { git = "https://github.com/zcash/librustzcash.git", rev = "cabbc6cab07562fe1b94868f65f6af2871d9cbc5" }
-zcash_encoding = { git = "https://github.com/zcash/librustzcash.git", rev = "cabbc6cab07562fe1b94868f65f6af2871d9cbc5" }
-
+# All cargo-release configuration lives in this table. Do not add a root
+# release.toml: it would silently shadow every setting here (cargo-release
+# reads a workspace release.toml in preference to this metadata table).
 [workspace.metadata.release]
 
-# We always do releases from the ironwood-main branch
-allow-branch = ["ironwood-main"]
+# Only allow releases from the main branch or a hotfix release branch
+# (see docs/security-hotfix-release.md)
+allow-branch = ["main", "hotfix/v*"]
+
+# Workspace crate versions are deliberately independent: a crate is bumped and
+# published only when it has changes to publish. Do not configure
+# `shared-version` groups.
+
+# Verify releases with release features
+#
+# TODO: add this feature to all crates
+#enable-features = ["default-release-binaries"]
+
+# Don't do a git push or tag: `v*` tags are created only by the release App
+# via the `Create release` workflow (see docs/release-tag-protection.md)
+push = false
+tag = false
+
+# Owners for new crates
+owners = ["valardragon", "p0mvn", "evan-forbes", "czarcas7ic", "ebfull"]
+
+# Only rewrite dependent version requirements when the existing requirement
+# no longer matches: unchanged crates must stay untouched (and unpublished)
+# when a dependency takes a compatible bump.
+dependent-version = "fix"
 
 # Compilation settings
 
@@ -198,7 +228,7 @@ allow-branch = ["ironwood-main"]
 # peer, never abort the whole node (a trivial remote DoS otherwise). Because we
 # now unwind, every shared/consensus-state critical section must stay panic-free
 # (no `.await`/`.expect()`/`.unwrap()`/indexing under a lock) — a panic mid-
-# mutation would unwind through it instead of aborting. zebra-network enforces
+# mutation would unwind through it instead of aborting. zakura-network enforces
 # unwind with a `#[cfg(panic = "abort")] compile_error!`. See
 # security_requirements.md SR-1 and SR-2.
 panic = "unwind"
@@ -230,28 +260,28 @@ overflow-checks = false
 incremental = false
 codegen-units = 16
 
-[profile.dev.package.pasta_curves]
+[profile.dev.package.zakura-pasta-curves]
 opt-level = 3
 debug-assertions = false
 overflow-checks = false
 incremental = false
 codegen-units = 16
 
-[profile.dev.package.halo2_proofs]
+[profile.dev.package.zakura-halo2-proofs]
 opt-level = 3
 debug-assertions = false
 overflow-checks = false
 incremental = false
 codegen-units = 16
 
-[profile.dev.package.halo2_gadgets]
+[profile.dev.package.zakura-halo2-gadgets]
 opt-level = 3
 debug-assertions = false
 overflow-checks = false
 incremental = false
 codegen-units = 16
 
-[profile.dev.package.bls12_381]
+[profile.dev.package.zakura-bls12-381]
 opt-level = 3
 debug-assertions = false
 overflow-checks = false
@@ -272,7 +302,7 @@ overflow-checks = false
 incremental = false
 codegen-units = 16
 
-[profile.dev.package.zcash_proofs]
+[profile.dev.package.zakura-proofs]
 opt-level = 3
 debug-assertions = false
 overflow-checks = false
@@ -324,11 +354,11 @@ codegen-units = 16
 [profile.release]
 # See [profile.dev]: panic = "unwind" is required for peer-pipe panic containment
 # (security_requirements.md SR-1); do not set "abort". Enforced by a
-# compile_error guard in zebra-network.
+# compile_error guard in zakura-network.
 panic = "unwind"
 
 # Speed up release builds and sync tests using link-time optimization.
-# Some of Zebra's code is CPU-intensive, and needs extra optimizations for peak performance.
+# Some of Zakura's code is CPU-intensive, and needs extra optimizations for peak performance.
 #
 # TODO:
 # - add "-Clinker-plugin-lto" in .cargo/config.toml to speed up release builds
@@ -345,11 +375,18 @@ debug = "line-tables-only"
 # Disable debug info for dependencies to reduce binary size.
 debug = false
 
+[profile.ci-tests]
+inherits = "release"
+# Unit tests need optimized execution, but do not need the production profile's
+# most expensive code generation or cross-crate optimization.
+opt-level = 2
+lto = "off"
+
 [workspace.lints.rust]
 # The linter should ignore these expected config flags/values
 unexpected_cfgs = { level = "warn", check-cfg = [
     'cfg(tokio_unstable)', # Used by tokio-console
-    'cfg(zcash_unstable, values("zfuture", "nu6.1", "nu7"))', # Used in Zebra and librustzcash
+    'cfg(zcash_unstable, values("zfuture", "nu6.1", "nu7"))', # Used in Zakura and librustzcash
 ] }
 
 # High-risk code

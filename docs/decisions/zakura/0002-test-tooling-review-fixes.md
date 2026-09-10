@@ -2,6 +2,8 @@
 
 Plan: `/home/evan/src/valar/art/inbox/zakura_p2p/01.b_test_tooling.md`
 
+> **Status:** This tooling supports the experimental Zakura P2P v2 stack.
+
 ## Applied in This Fix
 
 - Inbound delivery now has one production path: stream workers send frames into

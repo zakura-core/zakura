@@ -1,0 +1,7 @@
+"status"="\x01"
+"get_headers"="\x02"
+"headers"="\x03"
+"headers_outcome"="\x04"
+"no_aux"="\x00"
+"schema_v1"="\x01"
+"max_range"="\xA0\x0F\x00\x00"

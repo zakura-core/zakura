@@ -1,0 +1,900 @@
+//! Download work source for Zakura block sync.
+//!
+//! The [`WorkQueue`] is the sole shared download-scheduling primitive: a sorted
+//! set of needed block heights the per-peer issuance path pulls from. It replaces
+//! the central `BlockRangeScheduler`'s eligibility/dedup/retry roles with a small
+//! API the caller drives from its own per-peer state (see the ):
+//!
+//! - a height is in **exactly one** of `{below-floor (gone), pending, in_flight}`;
+//! - [`take_in_range`](WorkQueue::take_in_range) moves a contiguous-ascending run
+//!   `pending → in_flight` (so one taken chunk maps to one `BlockRangeRequest`),
+//!   bounded only by the caller's servable range and a count cap — never by how
+//!   far above the download floor the heights already are;
+//! - only `return_items` (timeout/disconnect retry) and
+//!   [`reset_above`](WorkQueue::reset_above) move `in_flight → pending`;
+//! - [`advance_floor`](WorkQueue::advance_floor) is garbage collection only — the
+//!   download floor never throttles the fetch decision.
+//!
+//! Internals are a brief `std::sync::Mutex` whose critical sections are tiny map
+//! splices held **never across `.await`** (the anti-block rule). `estimated_bytes`
+//! on a [`WorkItem`] is the block's size *estimate* (not its worst-case
+//! reservation); it exists only to carry the `SizeMismatch` tolerance check
+//! through to the reactor's receive path and request budget.
+
+use std::sync::Mutex as StdMutex;
+
+use tokio::sync::Notify;
+use zakura_chain::block;
+
+use super::{request::BlockSizeEstimate, state::BlockBudgetLedger};
+
+/// Lower clamp on a body-size estimate.
+pub(super) const DEFAULT_BS_SIZE_FLOOR_BYTES: u64 = 1024;
+
+/// Per-height download metadata held in the [`WorkQueue`].
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) struct WorkItem {
+    /// Exact durable coordinates that authorized this body download.
+    pub(super) scope: zakura_header_chain::BodyWorkAuthority,
+    /// Exact active range request, set only while reserved in flight.
+    pub(super) owner: Option<zakura_header_chain::BodyWorkOwner>,
+    /// Expected hash of the block at this height (drives the response match).
+    pub(super) hash: block::Hash,
+    /// The block's size estimate. Used for request budget reservation and the
+    /// receive-path `SizeMismatch` tolerance check.
+    pub(super) estimated_bytes: u64,
+    /// Request reservation; received bodies use `Released`.
+    pub(super) budget: BlockBudgetLedger,
+}
+
+/// Diagnostics for an attempted `in_flight -> pending` retry transition.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct WorkReturnOutcome {
+    /// Reserved bytes released while moving items back to `pending`.
+    pub(super) released_bytes: u64,
+    /// Reserved items successfully moved back to `pending`.
+    pub(super) returned_count: u64,
+    /// Requested heights that were already back in `pending`.
+    pub(super) already_pending_count: u64,
+    /// Received items still present in `in_flight` with a `Released` ledger.
+    pub(super) released_count: u64,
+    /// Requested heights absent from both `pending` and `in_flight`.
+    pub(super) missing_count: u64,
+    /// Lowest height considered by the cleanup.
+    pub(super) min_height: Option<block::Height>,
+    /// Highest height considered by the cleanup.
+    pub(super) max_height: Option<block::Height>,
+}
+
+#[derive(Debug)]
+struct WorkQueueInner {
+    pending: std::collections::BTreeMap<block::Height, WorkItem>,
+    in_flight: std::collections::BTreeMap<block::Height, WorkItem>,
+    floor: block::Height,
+    current_authority: Option<zakura_header_chain::BodyWorkAuthority>,
+    /// Floor clamp for size estimates (overridable for tests).
+    floor_estimate_bytes: u64,
+    /// Running sum of `reserved_charge()` across every `pending` + `in_flight`
+    /// item, maintained incrementally at each ledger transition so
+    /// [`WorkQueue::reserved_bytes`]
+    reserved_bytes: u64,
+}
+
+impl WorkQueueInner {
+    fn estimate_bytes(&self, estimate: BlockSizeEstimate) -> u64 {
+        estimate_bytes_with(estimate, self.floor_estimate_bytes)
+    }
+}
+
+/// Compute a clamped body-size estimate from a [`BlockSizeEstimate`] hint.
+///
+/// `Confirmed`/`Advertised` use the hinted size; `Unknown` reserves the
+/// per-block worst case. The result is clamped to `[floor, MAX_BLOCK_BYTES]`.
+fn estimate_bytes_with(estimate: BlockSizeEstimate, floor: u64) -> u64 {
+    let hinted = match estimate {
+        BlockSizeEstimate::Confirmed(size) | BlockSizeEstimate::Advertised(size) => u64::from(size),
+        BlockSizeEstimate::Unknown => block::MAX_BLOCK_BYTES,
+    };
+    hinted.max(floor).min(block::MAX_BLOCK_BYTES)
+}
+
+/// The shared download work source. See the module docs for the invariants.
+#[derive(Debug)]
+pub(super) struct WorkQueue {
+    inner: StdMutex<WorkQueueInner>,
+    available: Notify,
+}
+
+impl WorkQueue {
+    pub(super) fn new(floor: block::Height) -> Self {
+        Self {
+            inner: StdMutex::new(WorkQueueInner {
+                pending: std::collections::BTreeMap::new(),
+                in_flight: std::collections::BTreeMap::new(),
+                floor,
+                current_authority: None,
+                floor_estimate_bytes: DEFAULT_BS_SIZE_FLOOR_BYTES,
+                reserved_bytes: 0,
+            }),
+            available: Notify::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_estimate_floor_for_tests(&self, floor: u64) {
+        let mut inner = self.lock();
+        inner.floor_estimate_bytes = floor.max(1);
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, WorkQueueInner> {
+        self.inner
+            .lock()
+            .expect("work queue mutex is never poisoned")
+    }
+
+    /// Add scoped `(height, hash, size)` items to `pending`.
+    /// Insert a height above `floor` only when no pending or in-flight item owns it.
+    /// Return the number of inserted heights.
+    /// Wake waiters after inserting any height.
+    pub(super) fn extend(
+        &self,
+        scope: zakura_header_chain::BodyWorkAuthority,
+        items: impl IntoIterator<Item = (block::Height, block::Hash, BlockSizeEstimate)>,
+    ) -> usize {
+        let mut inserted = 0usize;
+        {
+            let mut inner = self.lock();
+            inner.current_authority = Some(scope);
+            for (height, hash, size) in items {
+                if height <= inner.floor
+                    || inner.pending.contains_key(&height)
+                    || inner.in_flight.contains_key(&height)
+                {
+                    continue;
+                }
+                let estimated_bytes = inner.estimate_bytes(size);
+                inner.pending.insert(
+                    height,
+                    WorkItem {
+                        scope,
+                        owner: None,
+                        hash,
+                        estimated_bytes,
+                        budget: BlockBudgetLedger::Released,
+                    },
+                );
+                inserted += 1;
+            }
+        }
+        if inserted > 0 {
+            self.available.notify_waiters();
+        }
+        inserted
+    }
+
+    /// Reauthorize queued work while in-flight requests retain their registered owners.
+    pub(super) fn refresh_authority(&self, authority: zakura_header_chain::BodyWorkAuthority) {
+        let mut inner = self.lock();
+        inner.current_authority = Some(authority);
+        for item in inner.pending.values_mut() {
+            item.scope = authority;
+        }
+        self.available.notify_waiters();
+    }
+
+    /// Move up to `max` contiguous-ascending `pending` heights within
+    /// `low..=high` from `pending` to `in_flight`, returned in ascending order.
+    ///
+    /// "Contiguous-ascending" stops at the first gap, so the returned chunk maps
+    /// to a single `BlockRangeRequest`. `high` is the caller's `servable_high`
+    /// and is **NOT** clamped to the floor (the download floor is never an upper
+    /// bound on the fetch). Returns empty if nothing is eligible.
+    pub(super) fn take_in_range(
+        &self,
+        low: block::Height,
+        high: block::Height,
+        max: usize,
+    ) -> Vec<(block::Height, WorkItem)> {
+        if max == 0 || low > high {
+            return Vec::new();
+        }
+        let mut inner = self.lock();
+        let mut taken: Vec<(block::Height, WorkItem)> = Vec::new();
+        let mut next_expected: Option<block::Height> = None;
+        let mut scope = None;
+        for (height, item) in inner.pending.range(low..=high) {
+            if scope.is_some_and(|scope| scope != item.scope) {
+                break;
+            }
+            if let Some(expected) = next_expected {
+                if *height != expected {
+                    break;
+                }
+            }
+            taken.push((*height, *item));
+            scope = Some(item.scope);
+            if taken.len() >= max {
+                break;
+            }
+            // Stop the run at the end of the height space rather than overflowing.
+            match height.0.checked_add(1) {
+                Some(raw) => next_expected = Some(block::Height(raw)),
+                None => break,
+            }
+        }
+        if let Some(authority) = inner.current_authority {
+            for (_, item) in &mut taken {
+                item.scope = authority;
+            }
+        }
+        for (height, item) in &taken {
+            inner.pending.remove(height);
+            inner.in_flight.insert(*height, *item);
+        }
+        taken
+    }
+
+    /// Move up to `max_count` contiguous-ascending `pending` heights within
+    /// `low..=high` from `pending` to `in_flight`, also stopping before the
+    /// sum of stored size estimates would exceed `max_estimated_bytes`.
+    ///
+    /// The estimate cap bounds the request's summed byte reservation. To
+    /// guarantee progress, the first eligible item is always taken when
+    /// `max_count > 0`, even if its estimate alone exceeds the cap.
+    pub(super) fn take_in_range_budgeted(
+        &self,
+        low: block::Height,
+        high: block::Height,
+        max_count: usize,
+        max_estimated_bytes: u64,
+    ) -> Vec<(block::Height, WorkItem)> {
+        // An empty count or inverted range is a caller bug, not a real "nothing to
+        // take": every caller computes `low <= high` and a positive count before
+        // calling. Assert it in debug/test builds; still return empty in release so
+        // a miscomputation degrades to a no-op rather than panicking a live node.
+        debug_assert!(
+            max_count > 0 && low <= high,
+            "take_in_range_budgeted requires a positive count and low <= high, \
+             got max_count={max_count}, low={low:?}, high={high:?}"
+        );
+        if max_count == 0 || low > high {
+            return Vec::new();
+        }
+        let mut inner = self.lock();
+        let mut taken: Vec<(block::Height, WorkItem)> = Vec::new();
+        let mut estimated_bytes = 0u64;
+        let mut next_expected: Option<block::Height> = None;
+        let mut scope = None;
+        for (height, item) in inner.pending.range(low..=high) {
+            if scope.is_some_and(|scope| scope != item.scope) {
+                break;
+            }
+            if let Some(expected) = next_expected {
+                if *height != expected {
+                    break;
+                }
+            }
+
+            let next_estimated_bytes = estimated_bytes.saturating_add(item.estimated_bytes);
+            if !taken.is_empty() && next_estimated_bytes > max_estimated_bytes {
+                break;
+            }
+
+            taken.push((*height, *item));
+            scope = Some(item.scope);
+            estimated_bytes = next_estimated_bytes;
+            if taken.len() >= max_count {
+                break;
+            }
+            // Stop the run at the end of the height space rather than overflowing.
+            match height.0.checked_add(1) {
+                Some(raw) => next_expected = Some(block::Height(raw)),
+                None => break,
+            }
+        }
+        if let Some(authority) = inner.current_authority {
+            for (_, item) in &mut taken {
+                item.scope = authority;
+            }
+        }
+        for (height, item) in &taken {
+            inner.pending.remove(height);
+            inner.in_flight.insert(*height, *item);
+        }
+        taken
+    }
+
+    /// Move each given height `in_flight → pending`, preserving its stored
+    /// [`WorkItem`]. Heights not currently `in_flight` are skipped (idempotent).
+    /// Wakes waiters if anything moved.
+    #[cfg(test)]
+    pub(super) fn return_items(&self, heights: impl IntoIterator<Item = block::Height>) {
+        let mut moved = false;
+        {
+            let mut inner = self.lock();
+            for height in heights {
+                if let Some(mut item) = inner.in_flight.remove(&height) {
+                    item.owner = None;
+                    inner.pending.insert(height, item);
+                    moved = true;
+                }
+            }
+        }
+        if moved {
+            self.available.notify_waiters();
+        }
+    }
+
+    /// Like `return_items` but **does not** notify waiters.
+    ///
+    /// Used by a peer routine to put back a chunk it took but chose not to issue
+    /// (e.g. the heights are in its own short retry-avoid window after it just
+    /// failed them). Notifying here would re-wake the returning routine's own
+    /// freshly-registered `available` future and busy-loop the want-work arm
+    /// (a self-wake spin); other peers were already woken by the original failure
+    /// `return_items`, so suppressing the notify only affects the caller.
+    pub(super) fn return_items_quiet(&self, heights: impl IntoIterator<Item = block::Height>) {
+        let mut inner = self.lock();
+        for height in heights {
+            if let Some(mut item) = inner.in_flight.remove(&height) {
+                item.owner = None;
+                inner.pending.insert(height, item);
+            }
+        }
+    }
+
+    /// Mark already-taken heights as owning an estimated byte reservation.
+    ///
+    /// Returns the sum marked. The caller must have already admitted the same
+    /// byte total through [`ByteBudget`](crate::zakura::transport::ByteBudget).
+    #[cfg(test)]
+    pub(super) fn mark_reserved(&self, heights: impl IntoIterator<Item = block::Height>) -> u64 {
+        self.mark_reserved_matching(None, heights)
+    }
+
+    pub(super) fn mark_reserved_for_owner(
+        &self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        heights: impl IntoIterator<Item = block::Height>,
+    ) -> u64 {
+        self.mark_reserved_matching(Some(owner), heights)
+    }
+
+    fn mark_reserved_matching(
+        &self,
+        owner: Option<zakura_header_chain::BodyWorkOwner>,
+        heights: impl IntoIterator<Item = block::Height>,
+    ) -> u64 {
+        let mut marked = 0u64;
+        let mut inner = self.lock();
+        for height in heights {
+            let Some(item) = inner.in_flight.get_mut(&height) else {
+                continue;
+            };
+            if owner.is_some_and(|owner| item.scope != owner.authority()) {
+                continue;
+            }
+            if item.budget.is_reserved() {
+                continue;
+            }
+            item.budget = BlockBudgetLedger::reserved(item.estimated_bytes);
+            item.owner = owner;
+            marked = marked.saturating_add(item.estimated_bytes);
+        }
+        // Released (0) -> Reserved(estimate): the reserved total grows by exactly
+        // the bytes just marked.
+        inner.reserved_bytes = inner.reserved_bytes.saturating_add(marked);
+        marked
+    }
+
+    /// End an active request reservation at receipt.
+    #[cfg(test)]
+    pub(super) fn release_active_reserved_height(&self, height: block::Height) -> Option<u64> {
+        self.release_active_reserved_height_matching(None, height)
+    }
+
+    pub(super) fn release_active_reserved_height_for_owner(
+        &self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        height: block::Height,
+    ) -> Option<u64> {
+        self.release_active_reserved_height_matching(Some(owner), height)
+    }
+
+    fn release_active_reserved_height_matching(
+        &self,
+        owner: Option<zakura_header_chain::BodyWorkOwner>,
+        height: block::Height,
+    ) -> Option<u64> {
+        let mut inner = self.lock();
+        let released = {
+            let item = inner.in_flight.get_mut(&height)?;
+            if owner.is_some_and(|owner| item.owner != Some(owner)) {
+                return None;
+            }
+            if !item.budget.is_reserved() {
+                return None;
+            }
+            item.budget.release_reserved()
+        };
+        inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
+        Some(released)
+    }
+
+    /// Claim a received height and end any request reservation it owned.
+    #[cfg(test)]
+    pub(super) fn claim_received(&self, height: block::Height) -> u64 {
+        self.claim_received_matching(None, height)
+    }
+
+    pub(super) fn claim_received_for_owner(
+        &self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        height: block::Height,
+    ) -> u64 {
+        self.claim_received_matching(Some(owner), height)
+    }
+
+    fn claim_received_matching(
+        &self,
+        owner: Option<zakura_header_chain::BodyWorkOwner>,
+        height: block::Height,
+    ) -> u64 {
+        let mut inner = self.lock();
+        if let Some(item) = inner.in_flight.get_mut(&height) {
+            if owner.is_some_and(|owner| item.owner != Some(owner)) {
+                return 0;
+            }
+            let released = item.budget.release_reserved();
+            inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
+            return released;
+        }
+        if let Some(mut item) = inner.pending.remove(&height) {
+            if owner.is_some_and(|owner| item.owner != Some(owner)) {
+                inner.pending.insert(height, item);
+                return 0;
+            }
+            let released = item.budget.release_reserved();
+            inner.in_flight.insert(height, item);
+            inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
+            return released;
+        }
+        0
+    }
+
+    /// Release active request reservations, leaving received heights in place.
+    #[cfg(test)]
+    pub(super) fn release_reserved_heights(
+        &self,
+        heights: impl IntoIterator<Item = block::Height>,
+    ) -> u64 {
+        self.release_reserved_heights_matching(None, heights)
+    }
+
+    pub(super) fn release_reserved_heights_for_owner(
+        &self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        heights: impl IntoIterator<Item = block::Height>,
+    ) -> u64 {
+        self.release_reserved_heights_matching(Some(owner), heights)
+    }
+
+    fn release_reserved_heights_matching(
+        &self,
+        owner: Option<zakura_header_chain::BodyWorkOwner>,
+        heights: impl IntoIterator<Item = block::Height>,
+    ) -> u64 {
+        let mut released = 0u64;
+        let mut inner = self.lock();
+        for height in heights {
+            if let Some(item) = inner.in_flight.get_mut(&height) {
+                if owner.is_some_and(|owner| item.owner != Some(owner)) {
+                    continue;
+                }
+                released = released.saturating_add(item.budget.release_reserved());
+            } else if let Some(item) = inner.pending.get_mut(&height) {
+                if owner.is_some_and(|owner| item.owner != Some(owner)) {
+                    continue;
+                }
+                released = released.saturating_add(item.budget.release_reserved());
+            }
+        }
+        inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
+        released
+    }
+
+    /// Release and return heights, including received ones, in tests.
+    #[cfg(test)]
+    pub(super) fn release_and_return_items(
+        &self,
+        heights: impl IntoIterator<Item = block::Height>,
+    ) -> u64 {
+        let mut moved = false;
+        let mut released = 0u64;
+        {
+            let mut inner = self.lock();
+            for height in heights {
+                if let Some(mut item) = inner.in_flight.remove(&height) {
+                    released = released.saturating_add(item.budget.release_reserved());
+                    item.owner = None;
+                    inner.pending.insert(height, item);
+                    moved = true;
+                }
+            }
+            inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
+        }
+        if moved {
+            self.available.notify_waiters();
+        }
+        released
+    }
+
+    /// Release and return only unreceived heights.
+    #[cfg(test)]
+    pub(super) fn release_reserved_and_return_items(
+        &self,
+        heights: impl IntoIterator<Item = block::Height>,
+    ) -> u64 {
+        self.release_reserved_and_return_items_detailed(heights)
+            .released_bytes
+    }
+
+    /// Release and return still-reserved items, preserving the outcome of every
+    /// requested height for low-volume lifecycle tracing.
+    #[cfg(test)]
+    pub(super) fn release_reserved_and_return_items_detailed(
+        &self,
+        heights: impl IntoIterator<Item = block::Height>,
+    ) -> WorkReturnOutcome {
+        self.release_reserved_and_return_items_detailed_matching(None, heights)
+    }
+
+    pub(super) fn release_reserved_and_return_items_detailed_for_owner(
+        &self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        heights: impl IntoIterator<Item = block::Height>,
+    ) -> WorkReturnOutcome {
+        self.release_reserved_and_return_items_detailed_matching(Some(owner), heights)
+    }
+
+    fn release_reserved_and_return_items_detailed_matching(
+        &self,
+        owner: Option<zakura_header_chain::BodyWorkOwner>,
+        heights: impl IntoIterator<Item = block::Height>,
+    ) -> WorkReturnOutcome {
+        let mut moved = false;
+        let mut outcome = WorkReturnOutcome::default();
+        {
+            let mut inner = self.lock();
+            for height in heights {
+                outcome.min_height = Some(
+                    outcome
+                        .min_height
+                        .map_or(height, |current| current.min(height)),
+                );
+                outcome.max_height = Some(
+                    outcome
+                        .max_height
+                        .map_or(height, |current| current.max(height)),
+                );
+                let Some(item) = inner.in_flight.get(&height) else {
+                    if inner.pending.contains_key(&height) {
+                        outcome.already_pending_count =
+                            outcome.already_pending_count.saturating_add(1);
+                    } else {
+                        outcome.missing_count = outcome.missing_count.saturating_add(1);
+                    }
+                    continue;
+                };
+                if owner.is_some_and(|owner| item.owner != Some(owner)) {
+                    outcome.missing_count = outcome.missing_count.saturating_add(1);
+                    continue;
+                }
+                match item.budget {
+                    BlockBudgetLedger::Released => {
+                        outcome.released_count = outcome.released_count.saturating_add(1);
+                        continue;
+                    }
+                    BlockBudgetLedger::Reserved(_) => {}
+                }
+                let mut item = inner
+                    .in_flight
+                    .remove(&height)
+                    .expect("reserved item exists because it was just checked");
+                outcome.released_bytes = outcome
+                    .released_bytes
+                    .saturating_add(item.budget.release_reserved());
+                item.owner = None;
+                outcome.returned_count = outcome.returned_count.saturating_add(1);
+                inner.pending.insert(height, item);
+                moved = true;
+            }
+            inner.reserved_bytes = inner.reserved_bytes.saturating_sub(outcome.released_bytes);
+        }
+        if moved {
+            self.available.notify_waiters();
+        }
+        outcome
+    }
+
+    /// Garbage-collect committed heights: raise the floor to `max(self.floor,
+    /// floor)` and drop every `pending`/`in_flight` entry `<= floor`.
+    ///
+    /// Returns request-estimate bytes that were still reserved for unreceived
+    /// heights, so the caller returns them to the `ByteBudget`. Received bodies
+    /// carry no charge here; the Sequencer's buffers own them.
+    pub(super) fn advance_floor(&self, floor: block::Height) -> u64 {
+        let mut inner = self.lock();
+        inner.floor = inner.floor.max(floor);
+        let floor = inner.floor;
+        // Pop only the committed `<= floor` prefix from each map. `pending` can hold
+        // the entire header-ahead lag (100k+ heights), so a `retain` over the whole
+        // map on every floor advance is O(total) and serializes the work-queue lock;
+        // popping the prefix is O(removed · log n).
+        let mut released = 0u64;
+        while let Some((&height, _)) = inner.pending.first_key_value() {
+            if height > floor {
+                break;
+            }
+            let (_, mut item) = inner
+                .pending
+                .pop_first()
+                .expect("first_key_value returned Some");
+            released = released.saturating_add(item.budget.release_reserved());
+        }
+        while let Some((&height, _)) = inner.in_flight.first_key_value() {
+            if height > floor {
+                break;
+            }
+            let (_, mut item) = inner
+                .in_flight
+                .pop_first()
+                .expect("first_key_value returned Some");
+            released = released.saturating_add(item.budget.release_reserved());
+        }
+        inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
+        released
+    }
+
+    /// Frontier reset: pin the floor and drop every `pending`/`in_flight` entry
+    /// `> floor` (their buffers were dropped; the producer re-fills via the next
+    /// query).
+    ///
+    /// Returns request-estimate bytes still reserved for unreceived heights, as
+    /// in [`advance_floor`](Self::advance_floor).
+    pub(super) fn reset_above(&self, floor: block::Height) -> u64 {
+        let mut inner = self.lock();
+        inner.floor = floor;
+        // Pop only the `> floor` suffix from each map (O(removed · log n)); see the
+        // note in `advance_floor` on why a full-map `retain` is too expensive here.
+        let mut released = 0u64;
+        while let Some((&height, _)) = inner.pending.last_key_value() {
+            if height <= floor {
+                break;
+            }
+            let (_, mut item) = inner
+                .pending
+                .pop_last()
+                .expect("last_key_value returned Some");
+            released = released.saturating_add(item.budget.release_reserved());
+        }
+        while let Some((&height, _)) = inner.in_flight.last_key_value() {
+            if height <= floor {
+                break;
+            }
+            let (_, mut item) = inner
+                .in_flight
+                .pop_last()
+                .expect("last_key_value returned Some");
+            released = released.saturating_add(item.budget.release_reserved());
+        }
+        inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
+        released
+    }
+
+    /// The "work added" notifier (per-peer routines wake source).
+    #[allow(dead_code)]
+    pub(super) fn subscribe_available(&self) -> &Notify {
+        &self.available
+    }
+
+    // ---- diagnostics (trace + late-response classification) ----
+
+    pub(super) fn pending_len(&self) -> usize {
+        self.lock().pending.len()
+    }
+
+    pub(super) fn in_flight_len(&self) -> usize {
+        self.lock().in_flight.len()
+    }
+
+    pub(super) fn reserved_above(&self, floor: block::Height) -> (u64, u64) {
+        let inner = self.lock();
+        inner
+            .in_flight
+            .range((std::ops::Bound::Excluded(floor), std::ops::Bound::Unbounded))
+            .fold((0u64, 0u64), |(bytes, count), (_, item)| {
+                let charge = item.budget.reserved_charge();
+                if charge == 0 {
+                    (bytes, count)
+                } else {
+                    (bytes.saturating_add(charge), count.saturating_add(1))
+                }
+            })
+    }
+
+    /// Sum of reserved request-estimate bytes across `pending` + `in_flight`.
+    ///
+    /// O(1): returns the incrementally-maintained counter (see
+    /// [`WorkQueueInner::reserved_bytes`]). This is on the sequencer's hot path via
+    /// `publish_view`, so it must not scan the maps. `reserved_bytes_scanned` is
+    /// the O(n) ground-truth recomputation used by the audit / tests to catch drift.
+    pub(super) fn reserved_bytes(&self) -> u64 {
+        self.lock().reserved_bytes
+    }
+
+    /// Ground-truth O(pending + in_flight) recomputation of [`reserved_bytes`],
+    /// used by tests to assert the maintained counter never drifts.
+    #[cfg(test)]
+    pub(super) fn reserved_bytes_scanned(&self) -> u64 {
+        let inner = self.lock();
+        inner
+            .pending
+            .values()
+            .chain(inner.in_flight.values())
+            .map(|item| item.budget.reserved_charge())
+            .fold(0u64, u64::saturating_add)
+    }
+
+    /// Number of contiguous runs across `pending` (one queued range per maximal
+    /// contiguous run of heights).
+    pub(super) fn pending_run_count(&self) -> usize {
+        let inner = self.lock();
+        let mut runs = 0usize;
+        let mut previous: Option<block::Height> = None;
+        for height in inner.pending.keys() {
+            let contiguous =
+                previous.and_then(|previous| previous.0.checked_add(1)) == Some(height.0);
+            if !contiguous {
+                runs += 1;
+            }
+            previous = Some(*height);
+        }
+        runs
+    }
+
+    pub(super) fn min_pending(&self) -> Option<block::Height> {
+        self.lock().pending.keys().next().copied()
+    }
+
+    pub(super) fn first_pending_in_range(
+        &self,
+        low: block::Height,
+        high: block::Height,
+    ) -> Option<block::Height> {
+        if low > high {
+            return None;
+        }
+        self.lock()
+            .pending
+            .range(low..=high)
+            .next()
+            .map(|(height, _)| *height)
+    }
+
+    pub(super) fn max_in_flight(&self) -> Option<block::Height> {
+        self.lock().in_flight.keys().next_back().copied()
+    }
+
+    /// The lowest height above the floor that is in neither `pending` nor
+    /// `in_flight` — the producer's query cursor.
+    ///
+    /// Anchored to the floor rather than to the highest claimed height, so a
+    /// height that leaves the claimed set while higher heights stay claimed is
+    /// offered to the next query instead of being stranded below a forward-only
+    /// cursor. That happens whenever a destructive `reset_above` races an
+    /// unreceived request, and whenever a refill batch is filtered down but its
+    /// surviving heights still push `max_claimed` past the filtered one.
+    ///
+    /// `floor` is the caller's mirror of the download floor; the queue's own floor
+    /// wins when the mirror lags, since heights at or below it are already GC'd.
+    ///
+    /// O(1) in the gap-free case: `pending`/`in_flight` are disjoint, so once the
+    /// lowest claimed height is known to be `anchor + 1`, the claimed set spans
+    /// `(anchor, max_claimed]` contiguously exactly when its size equals that span.
+    /// Only a real gap pays for the merge walk, which stops at the first hole.
+    pub(super) fn first_unclaimed_above(&self, floor: block::Height) -> Option<block::Height> {
+        let inner = self.lock();
+        let anchor = inner.floor.max(floor);
+        let start = anchor.next().ok()?;
+
+        let max_claimed = inner
+            .pending
+            .keys()
+            .next_back()
+            .copied()
+            .max(inner.in_flight.keys().next_back().copied());
+        let Some(max_claimed) = max_claimed.filter(|max| *max >= start) else {
+            return Some(start);
+        };
+
+        // The length check only decides contiguity when *every* key is above the
+        // anchor, so it is gated on the lowest claimed height being `start` itself.
+        // Entries at or below the anchor otherwise inflate the count and make a
+        // sparse range look contiguous: a forward `reset_above` pins the floor and
+        // pops only the `> floor` suffix, so it leaves the whole
+        // `(old_floor, new_floor]` prefix claimed at or below the new floor. A
+        // lagging caller `floor` mirror is excluded the same way.
+        let min_claimed = match (
+            inner.pending.keys().next().copied(),
+            inner.in_flight.keys().next().copied(),
+        ) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (single, None) | (None, single) => single,
+        };
+        if min_claimed == Some(start) {
+            let span = u64::from(max_claimed.0 - anchor.0);
+            let claimed = inner.pending.len().saturating_add(inner.in_flight.len()) as u64;
+            if claimed == span {
+                return max_claimed.next().ok();
+            }
+        }
+
+        let mut pending = inner.pending.range(start..).peekable();
+        let mut in_flight = inner.in_flight.range(start..).peekable();
+        let mut expected = start;
+        loop {
+            let next = match (pending.peek(), in_flight.peek()) {
+                (None, None) => return Some(expected),
+                (Some((height, _)), None) | (None, Some((height, _))) => **height,
+                (Some((left, _)), Some((right, _))) => **left.min(right),
+            };
+            if next > expected {
+                return Some(expected);
+            }
+            pending.next_if(|(height, _)| **height == next);
+            in_flight.next_if(|(height, _)| **height == next);
+            expected = next.next().ok()?;
+        }
+    }
+
+    /// Expected hash for a height in `pending` or `in_flight` (late-response
+    /// recovery).
+    pub(super) fn hash_for_height(&self, height: block::Height) -> Option<block::Hash> {
+        let inner = self.lock();
+        inner
+            .pending
+            .get(&height)
+            .or_else(|| inner.in_flight.get(&height))
+            .map(|item| item.hash)
+    }
+
+    /// Active request owner for a height, if it is currently reserved.
+    pub(super) fn owner_for_height(
+        &self,
+        height: block::Height,
+    ) -> Option<zakura_header_chain::BodyWorkOwner> {
+        let inner = self.lock();
+        inner
+            .pending
+            .get(&height)
+            .or_else(|| inner.in_flight.get(&height))
+            .and_then(|item| item.owner)
+    }
+
+    pub(super) fn pending_contains(&self, height: block::Height) -> bool {
+        self.lock().pending.contains_key(&height)
+    }
+
+    pub(super) fn reserved_in_flight_charge(&self, height: block::Height) -> Option<u64> {
+        self.lock().in_flight.get(&height).and_then(|item| {
+            item.budget
+                .is_reserved()
+                .then(|| item.budget.reserved_charge())
+        })
+    }
+
+    pub(super) fn in_flight_contains(&self, height: block::Height) -> bool {
+        self.lock().in_flight.contains_key(&height)
+    }
+}

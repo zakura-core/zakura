@@ -1,0 +1,147 @@
+//! Native Zakura block-sync stream messages and service scaffold.
+//!
+//! New to this subsystem? Start in [`pipe`] — it is the "start here" map of how a
+//! peer's stream-6 frames flow through the per-peer routine, the work queue, the
+//! commit pipeline, the registry, and the reactor.
+
+use std::{
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    io::{self, Cursor, Read, Write},
+    sync::{Arc, Mutex as StdMutex},
+    time::{Duration, Instant},
+};
+
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinHandle,
+    time,
+};
+use tokio_util::sync::CancellationToken;
+use zakura_chain::{
+    block,
+    serialization::{SerializationError, ZcashDeserialize, ZcashSerialize},
+};
+
+use super::{
+    trace::block_sync_trace as bs_trace, Frame, ServicePeerDirection, ServicePeerLimits,
+    ZakuraPeerId, ZakuraTrace,
+};
+
+mod admission;
+mod bbr;
+#[cfg(feature = "internal-bench")]
+mod bench;
+mod config;
+mod error;
+mod events;
+mod peer_registry;
+mod peer_routine;
+mod pipe;
+mod reactor;
+mod reorder;
+mod request;
+mod sequencer;
+mod sequencer_task;
+mod service;
+mod state;
+#[cfg(test)]
+mod tests;
+mod trace;
+mod wire;
+mod work_queue;
+
+// The remaining consumers of these two internal constants are the same-crate
+// fuzz-testkit test modules; the re-exports only exist for test builds.
+#[cfg(test)]
+pub(crate) use admission::DESERIALIZED_MEM_FACTOR;
+#[cfg(feature = "internal-bench")]
+pub use bench::{
+    spawn_bench_sequencer, BenchBodyFeeder, BenchCommitter, BenchSequencerHandle, BenchSubmissions,
+    BenchSubmit, SequencerProgress,
+};
+#[cfg(test)]
+pub(crate) use config::MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;
+pub use config::{BlockSyncStatus, CwndUnit, ZakuraBlockSyncConfig, MAX_BS_RESPONSE_BYTES};
+pub use error::BlockSyncWireError;
+pub use events::{
+    BlockApplyOutcome, BlockApplyResult, BlockApplyToken, BlockSyncAction, BlockSyncBlockMeta,
+    BlockSyncEvent, BlockSyncMisbehavior,
+};
+pub use reactor::spawn_block_sync_reactor;
+pub use request::BlockSizeEstimate;
+#[cfg(test)]
+pub(crate) use service::block_sync_streams;
+pub use service::BlockSyncPeerSession;
+pub(crate) use service::BlockSyncService;
+#[cfg(test)]
+pub(crate) use service::MAX_BS_FRAME_BYTES;
+pub use state::{BlockSyncFrontiers, BlockSyncHandle, BlockSyncStartup};
+pub use wire::{
+    BlockSyncMessage, MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_MESSAGE_BYTES, MSG_BS_BLOCK,
+    MSG_BS_BLOCKS_DONE, MSG_BS_GET_BLOCKS, MSG_BS_RANGE_UNAVAILABLE, MSG_BS_STATUS,
+    ZAKURA_BLOCK_SYNC_STREAM_VERSION, ZAKURA_CAP_BLOCK_SYNC, ZAKURA_STREAM_BLOCK_SYNC,
+};
+
+#[cfg(test)]
+fn test_work_scope() -> zakura_header_chain::BodyWorkAuthority {
+    zakura_header_chain::BodyWorkAuthority {
+        header: zakura_header_chain::HeaderWorkAuthority {
+            header_generation: zakura_header_chain::HeaderGeneration::new(2),
+            branch: zakura_header_chain::BranchId::new(block::Hash([4; 32]), block::Hash([5; 32])),
+        },
+        verified_generation: zakura_header_chain::VerifiedGeneration::new(3),
+        body_work_epoch: zakura_header_chain::BodyWorkEpoch::default(),
+    }
+}
+
+#[cfg(test)]
+fn test_work_owner() -> zakura_header_chain::BodyWorkOwner {
+    test_work_scope().bind(6, std::num::NonZeroU64::new(7).expect("seven is nonzero"))
+}
+
+#[cfg(test)]
+pub(crate) fn test_block_apply_outcome(result: BlockApplyResult) -> BlockApplyOutcome {
+    let evidence = zakura_header_chain::EvidenceId::from_digest([0xa5; 32]);
+    let hash = zakura_chain::block::Hash([0x5a; 32]);
+    match result {
+        BlockApplyResult::Committed => {
+            BlockApplyOutcome::committed(zakura_header_chain::VerifiedBodyEvidence {
+                hash,
+                evidence,
+            })
+        }
+        BlockApplyResult::Duplicate => {
+            BlockApplyOutcome::duplicate(zakura_header_chain::VerifiedBodyEvidence {
+                hash,
+                evidence,
+            })
+        }
+        BlockApplyResult::Rejected => {
+            BlockApplyOutcome::consensus_invalid(zakura_header_chain::ConsensusBodyInvalid {
+                hash,
+                evidence,
+                rule: zakura_header_chain::BodyRuleId::new("test.consensus_invalid"),
+                source: zakura_header_chain::SourceId::from_digest([0x3c; 32]),
+            })
+        }
+        BlockApplyResult::Unavailable => {
+            BlockApplyOutcome::retryable(zakura_header_chain::TransientBodyFailure {
+                hash,
+                evidence,
+                kind: zakura_header_chain::TransientBodyFailureKind::VerifierUnavailable,
+                availability: zakura_header_chain::BodyUnavailableSummary::default(),
+            })
+        }
+        BlockApplyResult::TimedOut => {
+            BlockApplyOutcome::retryable(zakura_header_chain::TransientBodyFailure {
+                hash,
+                evidence,
+                kind: zakura_header_chain::TransientBodyFailureKind::Timeout,
+                availability: zakura_header_chain::BodyUnavailableSummary::default(),
+            })
+        }
+    }
+}

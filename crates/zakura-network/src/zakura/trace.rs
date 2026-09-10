@@ -1,0 +1,828 @@
+//! Structured JSONL trace helpers for Zakura P2P.
+//!
+//! `closed.punitive` is reserved in the schema until Zakura has a punitive close
+//! path and matching metric. `closed.neutral` carries a bounded `reason` label
+//! describing the teardown cause (for example `idle_timeout`, `accept_failed`,
+//! `outbound_closed`, `bad_response`, or `cancelled`). Connection admission
+//! rejects use `rejected.admission` with a bounded `reason` label rather than
+//! one event name per rejection metric, so readers should pivot by `event` plus
+//! `reason` for those rows.
+
+use std::sync::Arc;
+
+use blake2b_simd::Params as Blake2bParams;
+use serde_json::{Map, Number, Value};
+use zakura_jsonl_trace::{JsonlEventEmitter, JsonlTraceEvent, JsonlTracer};
+
+use super::{ZakuraPeerId, ZakuraRejectReason};
+
+mod first_block_source;
+
+pub(crate) use first_block_source::BlockBodySource;
+use first_block_source::FirstBlockSourceTracker;
+
+/// A Zakura JSONL trace table.
+pub type ZakuraTraceTable = zakura_jsonl_trace::JsonlTraceTable;
+
+/// Legacy upgrade and control-handshake transitions.
+pub const HANDSHAKE_TABLE: ZakuraTraceTable = ZakuraTraceTable::new("handshake", "handshake.jsonl");
+
+/// Connection admission and close transitions.
+pub const CONN_TABLE: ZakuraTraceTable = ZakuraTraceTable::new("conn", "conn.jsonl");
+
+/// Per-connection stream admission transitions.
+pub const STREAM_TABLE: ZakuraTraceTable = ZakuraTraceTable::new("stream", "stream.jsonl");
+
+/// Discovery dialer decisions and backoff classification.
+pub const DISCOVERY_TABLE: ZakuraTraceTable = ZakuraTraceTable::new("discovery", "discovery.jsonl");
+
+/// Frame and message rate-limit decisions.
+pub const RATELIMIT_TABLE: ZakuraTraceTable = ZakuraTraceTable::new("ratelimit", "ratelimit.jsonl");
+
+/// Header-sync policy, accounting, and frontier events.
+pub const HEADER_SYNC_TABLE: ZakuraTraceTable =
+    ZakuraTraceTable::new("header_sync", "header_sync.jsonl");
+
+/// Stable header-sync JSONL event and field names.
+#[allow(dead_code)]
+pub(crate) mod header_sync_trace {
+    pub(crate) const EVENT: &str = "event";
+    pub(crate) const PEER: &str = "peer";
+    pub(crate) const SESSION_ID: &str = "session_id";
+    pub(crate) const DIRECTION: &str = "direction";
+    pub(crate) const REASON: &str = "reason";
+    pub(crate) const BOUNDARY: &str = "boundary";
+    pub(crate) const DISPOSITION: &str = "disposition";
+    pub(crate) const STATE_VERSION: &str = "state_version";
+    pub(crate) const HEADER_GENERATION: &str = "header_generation";
+    pub(crate) const VERIFIED_GENERATION: &str = "verified_generation";
+    pub(crate) const BRANCH_ANCHOR: &str = "branch_anchor";
+    pub(crate) const BRANCH_TARGET: &str = "branch_target";
+    pub(crate) const REQUEST_ID: &str = "request_id";
+    pub(crate) const STREAM_VERSION: &str = "stream_version";
+    pub(crate) const TARGET_HASH: &str = "target_hash";
+    pub(crate) const COMMON_ANCESTOR_HEIGHT: &str = "common_ancestor_height";
+    pub(crate) const COMMON_ANCESTOR_HASH: &str = "common_ancestor_hash";
+    pub(crate) const LOCATOR_COUNT: &str = "locator_count";
+    pub(crate) const LOCATOR_HEAD: &str = "locator_head";
+    pub(crate) const HEADER_COUNT: &str = "header_count";
+    pub(crate) const COMPLETE: &str = "complete";
+    pub(crate) const TREE_AUX_SCHEMA: &str = "tree_aux_schema";
+    pub(crate) const OUTCOME: &str = "outcome";
+    pub(crate) const INBOUND_COUNT: &str = "inbound_count";
+    pub(crate) const OUTBOUND_COUNT: &str = "outbound_count";
+    pub(crate) const STAGE: &str = "stage";
+    pub(crate) const CATEGORY: &str = "category";
+    pub(crate) const ATTRIBUTION: &str = "attribution";
+    pub(crate) const CAUSE: &str = "cause";
+    pub(crate) const OPERATION: &str = "operation";
+    pub(crate) const WORK_ANCHOR_HEIGHT: &str = "work_anchor_height";
+    pub(crate) const WORK_ANCHOR_HASH: &str = "work_anchor_hash";
+    pub(crate) const SELECTED_TIP_HEIGHT: &str = "selected_tip_height";
+    pub(crate) const SELECTED_TIP_HASH: &str = "selected_tip_hash";
+    pub(crate) const MAX_HEADERS_PER_RESPONSE: &str = "max_headers_per_response";
+    pub(crate) const MAX_INFLIGHT_REQUESTS: &str = "max_inflight_requests";
+    pub(crate) const MAX_MESSAGE_BYTES: &str = "max_message_bytes";
+    pub(crate) const TREE_AUX_SCHEMA_MASK: &str = "tree_aux_schema_mask";
+    pub(crate) const OLD_SELECTED_HEIGHT: &str = "old_selected_height";
+    pub(crate) const OLD_SELECTED_HASH: &str = "old_selected_hash";
+    pub(crate) const NEW_SELECTED_HEIGHT: &str = "new_selected_height";
+    pub(crate) const NEW_SELECTED_HASH: &str = "new_selected_hash";
+    pub(crate) const HEIGHT: &str = "height";
+    pub(crate) const REPAIR_GENERATION: &str = "repair_generation";
+    pub(crate) const PHASE: &str = "phase";
+    pub(crate) const SUPPLIER_COUNT: &str = "supplier_count";
+    pub(crate) const PREDECESSOR_HEIGHT: &str = "predecessor_height";
+    pub(crate) const PEERS_CONSIDERED: &str = "peers_considered";
+    pub(crate) const REJECTED_HEIGHT: &str = "rejected_height";
+    pub(crate) const REJECTED_CAPACITY: &str = "rejected_capacity";
+    pub(crate) const REJECTED_SCHEMA: &str = "rejected_schema";
+    pub(crate) const REJECTED_BUSY: &str = "rejected_busy";
+    pub(crate) const REJECTED_TRIED: &str = "rejected_tried";
+    pub(crate) const BEST_PEER_HEIGHT: &str = "best_peer_height";
+    pub(crate) const BEST_PEER_HASH: &str = "best_peer_hash";
+
+    pub(crate) const HEADER_PEER_CONNECTED: &str = "header_peer_connected";
+    pub(crate) const HEADER_PEER_DISCONNECTED: &str = "header_peer_disconnected";
+    pub(crate) const HEADER_STATUS_SENT: &str = "header_status_sent";
+    pub(crate) const HEADER_STATUS_RECEIVED: &str = "header_status_received";
+    pub(crate) const HEADER_REQUEST_SENT: &str = "header_request_sent";
+    pub(crate) const HEADER_REQUEST_TERMINAL: &str = "header_request_terminal";
+    pub(crate) const HEADER_RESPONSE_RECEIVED: &str = "header_response_received";
+    pub(crate) const HEADER_RESPONSE_SERVED: &str = "header_response_served";
+    pub(crate) const HEADER_OUTCOME: &str = "header_outcome";
+    pub(crate) const HEADER_TARGET_ADMITTED: &str = "header_target_admitted";
+    pub(crate) const HEADER_TARGET_REJECTED: &str = "header_target_rejected";
+    pub(crate) const HEADER_PEER_VIOLATION: &str = "header_peer_violation";
+    pub(crate) const HEADER_SNAPSHOT_OBSERVED: &str = "header_snapshot_observed";
+    pub(crate) const HEADER_VCT_REPAIR_STATE: &str = "header_vct_repair_state";
+}
+
+/// Legacy compatibility request/response events.
+pub const LEGACY_REQUEST_TABLE: ZakuraTraceTable =
+    ZakuraTraceTable::new("legacy_request", "legacy_request.jsonl");
+
+/// Block-sync (stream-6) scheduling, download, submit, and commit events.
+pub const BLOCK_SYNC_TABLE: ZakuraTraceTable =
+    ZakuraTraceTable::new("block_sync", "block_sync.jsonl");
+
+/// Zakurad adapter boundary events for commits, state reads, and frontier mirrors.
+pub const COMMIT_STATE_TABLE: ZakuraTraceTable =
+    ZakuraTraceTable::new("commit_state", "commit_state.jsonl");
+
+/// Failed non-blocking outbound queue sends for Zakura wire messages.
+pub const QUEUE_SEND_TABLE: ZakuraTraceTable =
+    ZakuraTraceTable::new("queue_send", "queue_send.jsonl");
+
+/// Shared queue-send trace event names and field keys.
+#[allow(dead_code)] // Preserved as schema constants for compatible trace consumers.
+pub mod queue_send_trace {
+    /// Trace row event field.
+    pub const EVENT: &str = "event";
+    /// Queue send failure event.
+    pub const QUEUE_SEND_FAILED: &str = "queue_send_failed";
+    /// Service label field (`header_sync`, `block_sync`, etc.).
+    pub const SERVICE: &str = "service";
+    /// Wire message label field (`Status`, `GetBlocks`, etc.).
+    pub const MESSAGE: &str = "message";
+    /// Peer field.
+    pub const PEER: &str = "peer";
+    /// Bounded send error label (`full`, `closed`, or `encode`).
+    pub const ERROR: &str = "error";
+    /// Logical send reason field.
+    pub const REASON: &str = "reason";
+    /// Remaining outbound queue slots observed after the failed send.
+    pub const QUEUE_CAPACITY: &str = "queue_capacity";
+    /// Total outbound queue slots.
+    pub const QUEUE_MAX_CAPACITY: &str = "queue_max_capacity";
+    /// Range start height field.
+    pub const RANGE_START: &str = "range_start";
+    /// Range count field.
+    pub const RANGE_COUNT: &str = "range_count";
+    /// Ordered stream generation.
+    pub const SESSION_ID: &str = "session_id";
+    /// Correlated request identifier, when applicable.
+    pub const REQUEST_ID: &str = "request_id";
+}
+
+/// Shared block-sync trace event names and field keys.
+///
+/// The block-sync body pipeline has no `tracing`-macro coverage in release
+/// builds (the binary is compiled with `release_max_level_info`, which strips
+/// the `debug!` sites), so these JSONL rows are the only runtime visibility into
+/// scheduling, download, submit, and commit progress. The periodic
+/// [`BLOCK_SYNC_STATE`](block_sync_trace::BLOCK_SYNC_STATE) snapshot is the single most useful row for diagnosing a
+/// stall: it reports where the body floor, verified tip, and header tip are, how
+/// much is buffered/applying, and whether the byte budget or peer status is
+/// blocking new downloads.
+#[allow(dead_code)] // Preserved as schema constants for compatible trace consumers.
+pub mod block_sync_trace {
+    /// Trace row event field.
+    pub const EVENT: &str = "event";
+    /// Peer field.
+    pub const PEER: &str = "peer";
+    /// Action/event/message kind field.
+    pub const KIND: &str = "kind";
+    /// Height field.
+    pub const HEIGHT: &str = "height";
+    /// Hash field.
+    pub const HASH: &str = "hash";
+    /// Range start height field.
+    pub const RANGE_START: &str = "range_start";
+    /// Range count field.
+    pub const RANGE_COUNT: &str = "range_count";
+    /// Expected/requested count field.
+    pub const EXPECTED_COUNT: &str = "expected_count";
+    /// Estimated byte reservation for a requested range.
+    pub const ESTIMATED_BYTES: &str = "estimated_bytes";
+    /// Serialized byte size of a received body.
+    pub const SERIALIZED_BYTES: &str = "serialized_bytes";
+    /// Attributed decoded-memory size of a block body.
+    pub const DECODED_ATTRIBUTED_MEMORY_SIZE_BYTES: &str = "decoded_attributed_memory_size_bytes";
+    /// Decoded attributed-memory bytes queued at the Sequencer input.
+    pub const SEQUENCER_INPUT_DECODED_ATTRIBUTED_MEMORY_BYTES: &str =
+        "sequencer_input_decoded_attributed_memory_bytes";
+    /// Decoded attributed-memory bytes retained in the reorder buffer.
+    pub const REORDER_DECODED_ATTRIBUTED_MEMORY_BYTES: &str =
+        "reorder_decoded_attributed_memory_bytes";
+    /// Decoded attributed-memory bytes retained in applying entries.
+    pub const APPLYING_DECODED_ATTRIBUTED_MEMORY_BYTES: &str =
+        "applying_decoded_attributed_memory_bytes";
+    /// Aggregate decoded attributed-memory bytes in the active body pipeline.
+    pub const ACTIVE_PIPELINE_DECODED_ATTRIBUTED_MEMORY_BYTES: &str =
+        "active_pipeline_decoded_attributed_memory_bytes";
+    /// End-to-end elapsed milliseconds for a traced operation.
+    pub const ELAPSED_MS: &str = "elapsed_ms";
+    /// Elapsed milliseconds before response frames were ready to send.
+    pub const PREPARE_ELAPSED_MS: &str = "prepare_elapsed_ms";
+    /// Elapsed milliseconds spent enqueueing response frames.
+    pub const SEND_ELAPSED_MS: &str = "send_elapsed_ms";
+    /// Commit result label (`committed`, `duplicate`, `rejected`, `timed_out`).
+    pub const RESULT: &str = "result";
+    /// Bounded reason field.
+    pub const REASON: &str = "reason";
+    /// Error detail field.
+    pub const ERROR: &str = "error";
+    /// Block apply token field.
+    pub const APPLY_TOKEN: &str = "apply_token";
+    /// Scheduler/query lower bound for block body requests.
+    pub const REQUEST_FLOOR: &str = "request_floor";
+    /// Highest contiguous body height already submitted for apply.
+    pub const BODY_DOWNLOAD_FLOOR: &str = "body_download_floor";
+    /// First height not yet in the contiguous body-download floor.
+    pub const FLOOR_GAP_HEIGHT: &str = "floor_gap_height";
+    /// Reactor-local classification for the first missing body height.
+    pub const FLOOR_GAP_STATE: &str = "floor_gap_state";
+    /// Peers advertising the first missing body height.
+    pub const FLOOR_GAP_SERVABLE_PEERS: &str = "floor_gap_servable_peers";
+    /// Peers with free request slots that advertise the first missing body height.
+    pub const FLOOR_GAP_AVAILABLE_PEERS: &str = "floor_gap_available_peers";
+    /// Peers with outstanding requests that include the first missing body height.
+    pub const FLOOR_GAP_OUTSTANDING_PEERS: &str = "floor_gap_outstanding_peers";
+    /// Age in milliseconds of the oldest outstanding request for the first missing body height.
+    pub const FLOOR_GAP_OLDEST_OUTSTANDING_MS: &str = "floor_gap_oldest_outstanding_ms";
+    /// Remaining milliseconds until the next outstanding request deadline for the first missing body height.
+    pub const FLOOR_GAP_NEXT_DEADLINE_MS: &str = "floor_gap_next_deadline_ms";
+    /// Highest verified (committed) block-body height.
+    pub const VERIFIED_BLOCK_TIP: &str = "verified_block_tip";
+    /// Best header tip driving the body-download target.
+    pub const BEST_HEADER_TIP: &str = "best_header_tip";
+    /// Header tip minus verified body tip.
+    pub const BODY_LAG: &str = "body_lag";
+    /// Count of blocks submitted-but-not-yet-committed (held against budget).
+    pub const APPLYING: &str = "applying";
+    /// Count of applying blocks already submitted to the verifier driver.
+    pub const SUBMITTED_APPLIES: &str = "submitted_applies";
+    /// Count of out-of-order bodies buffered awaiting a contiguous prefix.
+    pub const REORDER: &str = "reorder";
+    /// Count of outstanding (in-flight) range requests across peers.
+    pub const OUTSTANDING: &str = "outstanding";
+    /// Remaining in-flight body byte budget.
+    pub const BUDGET_AVAILABLE: &str = "budget_available";
+    /// Reserved in-flight body byte budget.
+    pub const BUDGET_RESERVED: &str = "budget_reserved";
+    /// Reserved in-flight body byte budget observed at a single body event
+    /// (e.g. immediately after a receive-path shrink or a commit-path release).
+    pub const BUDGET_RESERVED_AFTER: &str = "budget_reserved_after";
+    /// Body bytes received off the wire per second (download throughput).
+    pub const RECEIVED_BYTES_PER_SEC: &str = "received_bytes_per_sec";
+    /// Bodies received off the wire per second (download throughput).
+    pub const RECEIVED_BLOCKS_PER_SEC: &str = "received_blocks_per_sec";
+    /// Body bytes committed to the chain per second (commit throughput).
+    pub const COMMITTED_BYTES_PER_SEC: &str = "committed_bytes_per_sec";
+    /// Bodies committed to the chain per second (commit throughput).
+    pub const COMMITTED_BLOCKS_PER_SEC: &str = "committed_blocks_per_sec";
+    /// 1 when at least one peer has free request slots but the byte budget is too
+    /// low to issue another worst-case block (download is budget-limited).
+    pub const DOWNLOAD_BLOCKED_ON_BUDGET: &str = "download_blocked_on_budget";
+    /// Peers with received status that currently have free outbound request slots.
+    pub const PEERS_WANTING_SLOTS: &str = "peers_wanting_slots";
+    /// Connected block-sync peers.
+    pub const PEERS: &str = "peers";
+    /// Active reactor service sessions after this event.
+    pub const ACTIVE_CONNECTIONS: &str = "active_connections";
+    /// Connected block-sync peers whose status we have received (schedulable).
+    pub const PEERS_WITH_STATUS: &str = "peers_with_status";
+    /// Lowest height still in the body-sync `needed` set (the gap to fetch next).
+    pub const NEEDED_MIN: &str = "needed_min";
+    /// Number of heights in the body-sync `needed` set after buffer filtering.
+    pub const NEEDED_COUNT: &str = "needed_count";
+    /// Number of ranges queued in the scheduler.
+    pub const QUEUE_LEN: &str = "queue_len";
+    /// Number of block heights queued in the scheduler.
+    pub const QUEUE_BLOCKS: &str = "queue_blocks";
+    /// Lowest start height across queued scheduler ranges.
+    pub const QUEUE_MIN_START: &str = "queue_min_start";
+    /// Number of distinct assigned range keys in the scheduler.
+    pub const ASSIGNED_LEN: &str = "assigned_len";
+    /// Count of locally queued, in-flight, buffered, or applying block bodies.
+    pub const LOCAL_BODY_WORK: &str = "local_body_work";
+    /// Local body work threshold below which the reactor refills from state.
+    pub const REFILL_LOW_WATER: &str = "refill_low_water";
+    /// Highest end height across the scheduler's covered intervals.
+    pub const COVERED_MAX_END: &str = "covered_max_end";
+
+    /// Peer status received (servable body range advertised by the peer).
+    pub const BLOCK_STATUS_RECEIVED: &str = "block_status_received";
+    /// Local peer status queued for transport.
+    pub const BLOCK_STATUS_SENT: &str = "block_status_sent";
+    /// Local peer status failed to queue for transport.
+    pub const BLOCK_STATUS_SEND_FAILED: &str = "block_status_send_failed";
+    /// Block-sync peer connected to the reactor.
+    pub const BLOCK_PEER_CONNECTED: &str = "block_peer_connected";
+    /// Block-sync peer disconnected from the reactor.
+    pub const BLOCK_PEER_DISCONNECTED: &str = "block_peer_disconnected";
+    /// Body range request sent to a peer.
+    pub const BLOCK_GET_BLOCKS_SENT: &str = "block_get_blocks_sent";
+    /// Reactor accepted an inbound event.
+    pub const BLOCK_EVENT_RECEIVED: &str = "block_event_received";
+    /// Reactor accepted a decoded inbound block-sync wire message.
+    pub const BLOCK_MESSAGE_RECEIVED: &str = "block_message_received";
+    /// Reactor queued an outbound block-sync wire message for transport.
+    pub const BLOCK_MESSAGE_SENT: &str = "block_message_sent";
+    /// Reactor queued an outbound driver action.
+    pub const BLOCK_ACTION_DISPATCHED: &str = "block_action_dispatched";
+    /// Body received from a peer.
+    pub const BLOCK_BODY_RECEIVED: &str = "block_body_received";
+    /// Body handed from a peer routine to the sequencer input channel.
+    pub const BLOCK_BODY_SEQUENCER_SENT: &str = "block_body_sequencer_sent";
+    /// A peer routine acquired body input capacity before decoding a body.
+    pub const BLOCK_BODY_DECODE_PERMIT: &str = "block_body_decode_permit";
+    /// Sequencer task accepted a received body from its input channel.
+    pub const BLOCK_BODY_ACCEPTED: &str = "block_body_accepted";
+    /// Reactor attempted or completed a control send to the Sequencer task.
+    pub const BLOCK_SEQUENCER_CONTROL_SENT: &str = "block_sequencer_control_sent";
+    /// Body submitted to the verifier for commit.
+    pub const BLOCK_BODY_SUBMITTED: &str = "block_body_submitted";
+    /// Verifier submission could not enter the shared action channel.
+    pub const BLOCK_BODY_SUBMISSION_RETRY_SCHEDULED: &str = "block_body_submission_retry_scheduled";
+    /// Verifier finished applying a submitted body.
+    pub const BLOCK_APPLY_FINISHED: &str = "block_apply_finished";
+    /// Peer reported a requested range as unavailable.
+    pub const BLOCK_RANGE_UNAVAILABLE: &str = "block_range_unavailable";
+    /// Local node queued a block range response for transport.
+    pub const BLOCK_RANGE_RESPONSE_SENT: &str = "block_range_response_sent";
+    /// Work-queue producer added needed heights to the pending set.
+    pub const BLOCK_WORK_EXTENDED: &str = "block_work_extended";
+    /// A peer claimed a contiguous chunk of pending work for issuance.
+    pub const BLOCK_WORK_TAKEN: &str = "block_work_taken";
+    /// A request cleanup found an anomalous outcome returning work to `pending`.
+    pub const BLOCK_WORK_RETURNED: &str = "block_work_returned";
+    /// The floor watchdog force-cancelled an expired request claim.
+    pub const BLOCK_FLOOR_WATCHDOG_CANCELLED: &str = "block_floor_watchdog_cancelled";
+    /// A `try_fill` pass ended having issued no request: the routine went idle this wake.
+    /// Carries [`FILL_STOP_REASON`] plus the slot/budget/work snapshot so a trace can
+    /// attribute carrier idle ("bubble") time to a cause rather than inferring it.
+    pub const BLOCK_FILL_STOP: &str = "block_fill_stop";
+    /// Why a `try_fill` pass stopped issuing requests (`no_status` / `cwnd_saturated` /
+    /// `no_work` / `lookahead_cap` / `retry_avoid` / `budget` / `outbound_full` /
+    /// `send_error` / `internal`).
+    pub const FILL_STOP_REASON: &str = "fill_stop_reason";
+    /// Requests this `try_fill` pass issued before stopping (0 = a candidate bubble).
+    pub const FILL_SENT: &str = "fill_sent";
+    /// Verified body frontier advanced from state.
+    pub const BLOCK_FRONTIERS_CHANGED: &str = "block_frontiers_changed";
+    /// Chain tip reset rolled the body frontier back.
+    pub const BLOCK_CHAIN_TIP_RESET: &str = "block_chain_tip_reset";
+    /// Sequencer classified a frontier reset as growth, preservation, or destructive.
+    pub const BLOCK_FRONTIER_RESET_CLASSIFIED: &str = "block_frontier_reset_classified";
+    /// Periodic reactor state snapshot (the key stall-diagnosis row).
+    pub const BLOCK_SYNC_STATE: &str = "block_sync_state";
+    /// Periodic per-peer BBR controller heartbeat, emitted on a fixed cadence even while
+    /// the peer is idle (unlike the per-delivery `block_body_received` row), so a trace can
+    /// tell a settled controller (cwnd stable, reliability ≈ 1.0) from an oscillating one.
+    pub const BLOCK_PEER_BBR: &str = "block_peer_bbr";
+    /// Block-sync service session locally parked for a liveness reason.
+    pub const BLOCK_PEER_PARKED: &str = "block_peer_parked";
+}
+
+/// Shared discovery trace event names and field keys.
+#[allow(dead_code)] // Preserved as schema constants for compatible trace consumers.
+pub mod discovery_trace {
+    /// Trace row event field.
+    pub const EVENT: &str = "event";
+    /// Peer field.
+    pub const PEER: &str = "peer";
+    /// Dial result label.
+    pub const RESULT: &str = "result";
+
+    /// A discovery dial worker completed and was classified for backoff.
+    pub const DISCOVERY_DIAL_RESULT: &str = "discovery_dial_result";
+}
+
+/// Shared commit/frontier adapter trace event names and field keys.
+pub mod commit_state_trace {
+    /// Trace row event field.
+    pub const EVENT: &str = "event";
+    /// Source driver/subsystem field.
+    pub const SOURCE: &str = "source";
+    /// Height field.
+    pub const HEIGHT: &str = "height";
+    /// Hash field.
+    pub const HASH: &str = "hash";
+    /// Range start height field.
+    pub const RANGE_START: &str = "range_start";
+    /// Range count field.
+    pub const RANGE_COUNT: &str = "range_count";
+    /// Number of header-carried tree-aux roots supplied to this commit.
+    pub const TREE_AUX_ROOTS_LEN: &str = "tree_aux_roots_len";
+    /// Result label field.
+    pub const RESULT: &str = "result";
+    /// Stable state error variant label field.
+    pub const ERROR_VARIANT: &str = "error_variant";
+    /// Debug-formatted state error field.
+    pub const ERROR_DEBUG: &str = "error_debug";
+    /// Bounded reason field.
+    pub const REASON: &str = "reason";
+    /// Reactor-local block apply token field.
+    pub const APPLY_TOKEN: &str = "apply_token";
+    /// Apply class field (`checkpoint` or `full`).
+    pub const APPLY_CLASS: &str = "apply_class";
+    /// Finalized height observed from state.
+    pub const FINALIZED_HEIGHT: &str = "finalized_height";
+    /// Verified full-block/body tip height.
+    pub const VERIFIED_BLOCK_TIP: &str = "verified_block_tip";
+    /// Verified full-block/body tip hash.
+    pub const VERIFIED_BLOCK_HASH: &str = "verified_block_hash";
+    /// Best header tip height.
+    pub const BEST_HEADER_TIP: &str = "best_header_tip";
+    /// Elapsed milliseconds field.
+    pub const ELAPSED_MS: &str = "elapsed_ms";
+    /// Diagnostic attribution of why a commit was still pending at the stall deadline
+    /// (see [`COMMIT_STALL_CONTIGUOUS_HEAD`] / [`COMMIT_STALL_BEHIND_PREFIX`]). Purely a
+    /// trace label — it never gates the commit.
+    pub const COMMIT_STALL_REASON: &str = "commit_stall_reason";
+    /// Highest contiguously-committed height the committer had reached at the stall.
+    pub const COMMITTED_MARKER: &str = "committed_marker";
+    /// Highest height the committer had fired a commit for at the stall (submission
+    /// high-water — lets analysis see whether the range above the stalled block was
+    /// even submitted to the verifier yet).
+    pub const FIRED_HIGH_WATER: &str = "fired_high_water";
+    /// Number of fired-but-unresolved commits at the stall (concurrency / batch depth).
+    pub const COMMITS_IN_FLIGHT: &str = "commits_in_flight";
+    /// Peer field.
+    pub const PEER: &str = "peer";
+    /// Queue length field.
+    pub const QUEUE_LEN: &str = "queue_len";
+    /// In-flight count field.
+    pub const IN_FLIGHT_COUNT: &str = "in_flight_count";
+    /// Action kind field.
+    pub const ACTION: &str = "action";
+
+    /// Driver received a reactor action.
+    pub const ACTION_RECEIVED: &str = "action_received";
+    /// State read started.
+    pub const STATE_READ_START: &str = "state_read_start";
+    /// State read completed successfully.
+    pub const STATE_READ_SUCCESS: &str = "state_read_success";
+    /// State read failed or returned an unexpected response.
+    pub const STATE_READ_ERROR: &str = "state_read_error";
+    /// State read timed out.
+    pub const STATE_READ_TIMEOUT: &str = "state_read_timeout";
+    /// Block submit was queued in the driver.
+    pub const BLOCK_SUBMIT_QUEUED: &str = "block_submit_queued";
+    /// Verifier commit started.
+    pub const COMMIT_START: &str = "commit_start";
+    /// Verifier commit exceeded the driver timeout but is still being awaited.
+    pub const COMMIT_STALLED: &str = "commit_stalled";
+    /// [`COMMIT_STALL_REASON`] value: the committed tip sat immediately below the stalled
+    /// block, so it was the contiguous head — the gate is downstream of submission (the
+    /// checkpoint batch above it is still filling in the verifier, or verify+persist on
+    /// the head is slow). This is the "make commit faster" signal.
+    pub const COMMIT_STALL_CONTIGUOUS_HEAD: &str = "contiguous_head";
+    /// [`COMMIT_STALL_REASON`] value: a lower contiguous block had not committed yet, so
+    /// the stalled block was blocked behind the un-committed prefix (floor / range
+    /// head-of-line).
+    pub const COMMIT_STALL_BEHIND_PREFIX: &str = "behind_committed_prefix";
+    /// Verifier commit finished.
+    pub const COMMIT_FINISH: &str = "commit_finish";
+    /// Driver sent an event back to a reactor.
+    pub const REACTOR_EVENT_SENT: &str = "reactor_event_sent";
+}
+
+/// Cloneable Zakura observability handle.
+#[derive(Clone, Debug)]
+pub struct ZakuraTrace {
+    emitter: JsonlEventEmitter,
+    first_block_source: FirstBlockSourceTracker,
+}
+
+impl ZakuraTrace {
+    /// Create a no-op trace emitter.
+    pub fn noop() -> Self {
+        Self::new(JsonlTracer::noop(), zakura_jsonl_trace::node_id())
+    }
+
+    /// Create a trace emitter with an explicit node label.
+    pub fn new(tracer: JsonlTracer, node: impl Into<Arc<str>>) -> Self {
+        Self {
+            emitter: JsonlEventEmitter::new(tracer, node),
+            first_block_source: FirstBlockSourceTracker::default(),
+        }
+    }
+
+    /// Record a complete block body received from a transport.
+    pub(crate) fn record_block_body_received(
+        &self,
+        hash: zakura_chain::block::Hash,
+        source: BlockBodySource,
+    ) {
+        if self.first_block_source.record(hash, source) {
+            metrics::counter!(
+                "sync.block.first_received.count",
+                "source" => source.as_str()
+            )
+            .increment(1);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn first_block_body_source(
+        &self,
+        hash: zakura_chain::block::Hash,
+    ) -> Option<BlockBodySource> {
+        self.first_block_source.source(hash)
+    }
+
+    /// Return the underlying JSONL tracer.
+    pub fn tracer(&self) -> &JsonlTracer {
+        self.emitter.tracer()
+    }
+
+    /// Return true when this emitter will attempt to write rows.
+    pub fn is_enabled(&self) -> bool {
+        self.emitter.is_enabled()
+    }
+
+    /// Emit one event row without awaiting or back-pressuring the caller.
+    pub fn emit(&self, table: ZakuraTraceTable, event: ZakuraTraceEvent<'_>) {
+        self.emit_with(table, |row| event.insert_into(row));
+    }
+
+    /// Lazily build and emit a typed event after reserving channel capacity.
+    pub fn emit_event<E>(&self, build: impl FnOnce() -> E)
+    where
+        E: JsonlTraceEvent,
+    {
+        self.emitter.emit_event(build);
+    }
+
+    /// Emit one event row, building the row only when a queue slot is reserved.
+    ///
+    /// Reserving the bounded channel slot first means the `build` closure and
+    /// serialization never run when the queue is full or the writer has closed,
+    /// keeping attacker-rate emit sites cheap once the writer falls behind.
+    pub fn emit_with(&self, table: ZakuraTraceTable, build: impl FnOnce(&mut Map<String, Value>)) {
+        self.emitter.emit_with(table, build);
+    }
+}
+
+impl Default for ZakuraTrace {
+    fn default() -> Self {
+        Self::noop()
+    }
+}
+
+/// A single Zakura trace event before serialization.
+#[derive(Clone, Debug)]
+pub struct ZakuraTraceEvent<'a> {
+    event: &'static str,
+    conn: Option<u64>,
+    stream: Option<u64>,
+    payload_len: Option<u64>,
+    frame_len: Option<u64>,
+    max_frame_bytes: Option<u64>,
+    peer: Option<&'a str>,
+    role: Option<&'static str>,
+    phase: Option<&'static str>,
+    reason: Option<&'static str>,
+    selected_protocol: Option<u16>,
+    direction: Option<&'static str>,
+    stream_kind: Option<&'static str>,
+    network: Option<&'static str>,
+}
+
+impl<'a> ZakuraTraceEvent<'a> {
+    /// Create an event row with the required dotted event name.
+    pub fn new(event: &'static str) -> Self {
+        Self {
+            event,
+            conn: None,
+            stream: None,
+            payload_len: None,
+            frame_len: None,
+            max_frame_bytes: None,
+            peer: None,
+            role: None,
+            phase: None,
+            reason: None,
+            selected_protocol: None,
+            direction: None,
+            stream_kind: None,
+            network: None,
+        }
+    }
+
+    /// Attach a local connection id.
+    pub fn conn(mut self, conn: u64) -> Self {
+        self.conn = Some(conn);
+        self
+    }
+
+    /// Attach a local stream id.
+    pub fn stream(mut self, stream: u64) -> Self {
+        self.stream = Some(stream);
+        self
+    }
+
+    /// Attach a declared frame payload length.
+    pub fn payload_len(mut self, payload_len: u64) -> Self {
+        self.payload_len = Some(payload_len);
+        self
+    }
+
+    /// Attach an encoded frame length.
+    pub fn frame_len(mut self, frame_len: u64) -> Self {
+        self.frame_len = Some(frame_len);
+        self
+    }
+
+    /// Attach the effective frame byte cap used by the receiver.
+    pub fn max_frame_bytes(mut self, max_frame_bytes: u64) -> Self {
+        self.max_frame_bytes = Some(max_frame_bytes);
+        self
+    }
+
+    /// Attach a bounded peer label.
+    pub fn peer(mut self, peer: &'a str) -> Self {
+        self.peer = Some(peer);
+        self
+    }
+
+    /// Attach a bounded peer label when one is available.
+    pub fn maybe_peer(mut self, peer: Option<&'a str>) -> Self {
+        self.peer = peer;
+        self
+    }
+
+    /// Attach a control role label.
+    pub fn role(mut self, role: &'static str) -> Self {
+        self.role = Some(role);
+        self
+    }
+
+    /// Attach a handshake phase label.
+    pub fn phase(mut self, phase: &'static str) -> Self {
+        self.phase = Some(phase);
+        self
+    }
+
+    /// Attach a bounded reason label.
+    pub fn reason(mut self, reason: &'static str) -> Self {
+        self.reason = Some(reason);
+        self
+    }
+
+    /// Attach the selected Zakura protocol version.
+    pub fn selected_protocol(mut self, selected_protocol: u16) -> Self {
+        self.selected_protocol = Some(selected_protocol);
+        self
+    }
+
+    /// Attach a connection direction label.
+    pub fn direction(mut self, direction: &'static str) -> Self {
+        self.direction = Some(direction);
+        self
+    }
+
+    /// Attach a stream kind label.
+    pub fn stream_kind(mut self, stream_kind: &'static str) -> Self {
+        self.stream_kind = Some(stream_kind);
+        self
+    }
+
+    /// Attach a network label.
+    pub fn network(mut self, network: &'static str) -> Self {
+        self.network = Some(network);
+        self
+    }
+
+    fn insert_into(self, row: &mut Map<String, Value>) {
+        row.insert("event".to_string(), Value::String(self.event.to_string()));
+        insert_optional_u64(row, "conn", self.conn);
+        insert_optional_u64(row, "stream", self.stream);
+        insert_optional_u64(row, "payload_len", self.payload_len);
+        insert_optional_u64(row, "frame_len", self.frame_len);
+        insert_optional_u64(row, "max_frame_bytes", self.max_frame_bytes);
+        insert_optional_str(row, "peer", self.peer);
+        insert_optional_str(row, "role", self.role);
+        insert_optional_str(row, "phase", self.phase);
+        insert_optional_str(row, "reason", self.reason);
+        insert_optional_u64(
+            row,
+            "selected_protocol",
+            self.selected_protocol.map(u64::from),
+        );
+        insert_optional_str(row, "direction", self.direction);
+        insert_optional_str(row, "stream_kind", self.stream_kind);
+        insert_optional_str(row, "network", self.network);
+    }
+}
+
+/// Return a stable, bounded label for a peer id.
+pub fn peer_label(peer_id: &ZakuraPeerId) -> String {
+    let hash = Blake2bParams::new()
+        .hash_length(8)
+        .personal(b"zakura-peer-lbl")
+        .hash(peer_id.as_bytes());
+    format!("peer:{}", hex::encode(hash.as_bytes()))
+}
+
+/// Return the low-cardinality trace label for a rejection reason.
+pub fn reject_reason_label(reason: ZakuraRejectReason) -> &'static str {
+    match reason {
+        ZakuraRejectReason::UnsupportedPreludeVersion => "unsupported_prelude_version",
+        ZakuraRejectReason::IncompatibleZakuraProtocol => "incompatible_zakura_protocol",
+        ZakuraRejectReason::WrongNetwork => "wrong_network",
+        ZakuraRejectReason::WrongChain => "wrong_chain",
+        ZakuraRejectReason::MissingRequiredCapability => "missing_required_capability",
+        ZakuraRejectReason::ResourceLimit => "resource_limit",
+        ZakuraRejectReason::AlreadyConnected => "already_connected",
+        ZakuraRejectReason::TemporaryUnavailable => "temporary_unavailable",
+    }
+}
+
+/// Return a stable, bounded label for non-blocking ordered-stream send errors.
+pub(crate) fn ordered_send_error_label(
+    error: &crate::zakura::transport::OrderedSendError,
+) -> &'static str {
+    match error {
+        crate::zakura::transport::OrderedSendError::Full => "full",
+        crate::zakura::transport::OrderedSendError::Closed => "closed",
+        crate::zakura::transport::OrderedSendError::Encode(_) => "encode",
+    }
+}
+
+fn insert_optional_str(row: &mut Map<String, Value>, key: &'static str, value: Option<&str>) {
+    row.insert(
+        key.to_string(),
+        value.map_or(Value::Null, |value| Value::String(value.to_string())),
+    );
+}
+
+fn insert_optional_u64(row: &mut Map<String, Value>, key: &'static str, value: Option<u64>) {
+    row.insert(
+        key.to_string(),
+        value.map_or(Value::Null, |value| Value::Number(Number::from(value))),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    use tokio::sync::mpsc;
+
+    use super::*;
+
+    #[test]
+    fn noop_trace_does_not_build_rows() {
+        let trace = ZakuraTrace::noop();
+        let called = Arc::new(AtomicBool::new(false));
+        let called_in_emit = called.clone();
+
+        trace.emit_with(CONN_TABLE, |_| {
+            called_in_emit.store(true, Ordering::SeqCst);
+        });
+
+        assert!(!called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn full_queue_does_not_build_rows() {
+        // Capacity 1, pre-filled so the next reserve fails with `Full`.
+        let (tx, _rx) = mpsc::channel(1);
+        let tracer = JsonlTracer::new(tx);
+        let trace = ZakuraTrace::new(tracer, "node-full");
+
+        trace.emit(CONN_TABLE, ZakuraTraceEvent::new("conn.fill"));
+
+        let called = Arc::new(AtomicBool::new(false));
+        let called_in_emit = called.clone();
+        trace.emit_with(CONN_TABLE, |_| {
+            called_in_emit.store(true, Ordering::SeqCst);
+        });
+
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "build closure must not run when the queue is full"
+        );
+    }
+
+    #[test]
+    fn closed_queue_does_not_build_rows() {
+        // Dropping the receiver closes the channel; reserve fails with `Closed`.
+        let (tx, rx) = mpsc::channel(1);
+        let tracer = JsonlTracer::new(tx);
+        let trace = ZakuraTrace::new(tracer, "node-closed");
+        drop(rx);
+
+        let called = Arc::new(AtomicBool::new(false));
+        let called_in_emit = called.clone();
+        trace.emit_with(CONN_TABLE, |_| {
+            called_in_emit.store(true, Ordering::SeqCst);
+        });
+
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "build closure must not run when the queue is closed"
+        );
+        assert!(
+            !trace.is_enabled(),
+            "trace must report disabled once the receiver is dropped"
+        );
+    }
+}

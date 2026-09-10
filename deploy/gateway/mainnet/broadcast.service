@@ -1,0 +1,19 @@
+[Unit]
+Description=Zakura mainnet public JSON-RPC broadcast gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/zakura-gateway-mainnet
+ExecStart=/usr/bin/python3 /opt/zakura-gateway-mainnet/broadcast.py \
+  --backends /opt/zakura-gateway-mainnet/backends.toml \
+  --host 127.0.0.1 \
+  --port 8092
+Restart=always
+RestartSec=5
+# Never inherit a shell that might dump request bodies into the journal.
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

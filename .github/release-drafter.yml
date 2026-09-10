@@ -1,4 +1,4 @@
-# Configuration for automatic Zebra CHANGELOGs and PR tagging
+# Configuration for automatic Zakura CHANGELOGs and PR tagging
 #
 # Based on:
 # https://github.com/marketplace/actions/release-drafter#example
@@ -41,7 +41,7 @@ autolabeler:
       - "/bug/i"
 
 # The release name, tag, and settings for the draft CHANGELOG.
-name-template: "Zebra $RESOLVED_VERSION"
+name-template: "Zakura $RESOLVED_VERSION"
 tag-template: "v$RESOLVED_VERSION"
 tag-prefix: "v"
 # Do not mark the draft release as a pre-release
@@ -74,7 +74,7 @@ categories:
     labels:
       - "C-deprecation"
       # TODO: when release drafter has per-category templates, add this to the Deprecated category template:
-      # 'These features might be removed in Zebra $NEXT_MINOR_VERSION'
+      # 'These features might be removed in Zakura $NEXT_MINOR_VERSION'
   - title: "Added"
     labels:
       - "C-feature"
@@ -94,7 +94,7 @@ categories:
 
 # The next release's $RESOLVED_VERSION, based on the labels of the PRs in the release.
 #
-# In Zebra, we use major versions for mainnet network upgrades,
+# In Zakura, we use major versions for mainnet network upgrades,
 # and minor versions for less significant breaking changes.
 version-resolver:
   # We increment the major release version manually
@@ -130,7 +130,7 @@ exclude-contributors:
 
 # The template for the draft CHANGELOG.
 template: |
-  ## [Zebra $RESOLVED_VERSION](https://github.com/valargroup/zebra/releases/tag/v$RESOLVED_VERSION) - *TODO*: date
+  ## [Zakura $RESOLVED_VERSION](https://github.com/zakura-core/zakura/releases/tag/v$RESOLVED_VERSION) - *TODO*: date
 
   This release *TODO*: a summary of the significant user-visible changes in the release
 
@@ -144,7 +144,7 @@ template: |
 
   ### Contributors
 
-  Thank you to everyone who contributed to this release, we couldn't make Zebra without you:
+  Thank you to everyone who contributed to this release, we couldn't make Zakura without you:
   $CONTRIBUTORS
 
 # the trailing newlines in the template are deliberate

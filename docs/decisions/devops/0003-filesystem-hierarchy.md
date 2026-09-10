@@ -1,14 +1,14 @@
 ---
 status: proposed
 date: 2025-02-28
-story: Standardize filesystem hierarchy for Zebra deployments
+story: Standardize filesystem hierarchy for Zakura deployments
 ---
 
 # Standardize Filesystem Hierarchy: FHS vs. XDG
 
 ## Context & Problem Statement
 
-Zebra currently has inconsistencies in its filesystem layout, particularly regarding where configuration, data, cache files, and binaries are stored. We need a standardized approach compatible with:
+Zakura currently has inconsistencies in its filesystem layout, particularly regarding where configuration, data, cache files, and binaries are stored. We need a standardized approach compatible with:
 
 1. Traditional Linux systems.
 2. Containerized deployments (Docker).
@@ -20,7 +20,7 @@ We previously considered using the Filesystem Hierarchy Standard (FHS) exclusive
 - Adopt XDG Base Directory Specification.
 - Use a hybrid approach, leveraging the strengths of both.
 
-The choice impacts how we structure our Docker images, where configuration files are located, and how users interact with Zebra in different environments.
+The choice impacts how we structure our Docker images, where configuration files are located, and how users interact with Zakura in different environments.
 
 ## Priorities & Constraints
 
@@ -35,30 +35,30 @@ The choice impacts how we structure our Docker images, where configuration files
 
 ### Option 1: FHS
 
-- Configuration: `/etc/zebrad/`
-- Data: `/var/lib/zebrad/`
-- Cache: `/var/cache/zebrad/`
-- Logs: `/var/log/zebrad/`
-- Binary: `/opt/zebra/bin/zebrad` or `/usr/local/bin/zebrad`
+- Configuration: `/etc/zakura/`
+- Data: `/var/lib/zakura/`
+- Cache: `/var/cache/zakura/`
+- Logs: `/var/log/zakura/`
+- Binary: `/opt/zakura/bin/zakurad` or `/usr/local/bin/zakurad`
 
 ### Option 2: XDG Base Directory Specification
 
-- Configuration: `$HOME/.config/zebrad/`
-- Data: `$HOME/.local/share/zebrad/`
-- Cache: `$HOME/.cache/zebrad/`
-- State: `$HOME/.local/state/zebrad/`
-- Binary: `$HOME/.local/bin/zebrad` or `/usr/local/bin/zebrad`
+- Configuration: `$HOME/.config/zakura/`
+- Data: `$HOME/.local/share/zakura/`
+- Cache: `$HOME/.cache/zakura/`
+- State: `$HOME/.local/state/zakura/`
+- Binary: `$HOME/.local/bin/zakurad` or `/usr/local/bin/zakurad`
 
 ### Option 3: Hybrid Approach (FHS for System-Wide, XDG for User-Specific)
 
-- System-wide configuration: `/etc/zebrad/`
-- User-specific configuration: `$XDG_CONFIG_HOME/zebrad/`
-- System-wide data (read-only, shared): `/usr/share/zebrad/` (e.g., checkpoints)
-- User-specific data: `$XDG_DATA_HOME/zebrad/`
-- Cache: `$XDG_CACHE_HOME/zebrad/`
-- State: `$XDG_STATE_HOME/zebrad/`
-- Runtime: `$XDG_RUNTIME_DIR/zebrad/`
-- Binary: `/opt/zebra/bin/zebrad` (system-wide) or `$HOME/.local/bin/zebrad` (user-specific)
+- System-wide configuration: `/etc/zakura/`
+- User-specific configuration: `$XDG_CONFIG_HOME/zakura/`
+- System-wide data (read-only, shared): `/usr/share/zakura/` (e.g., checkpoints)
+- User-specific data: `$XDG_DATA_HOME/zakura/`
+- Cache: `$XDG_CACHE_HOME/zakura/`
+- State: `$XDG_STATE_HOME/zakura/`
+- Runtime: `$XDG_RUNTIME_DIR/zakura/`
+- Binary: `/opt/zakura/bin/zakurad` (system-wide) or `$HOME/.local/bin/zakurad` (user-specific)
 
 ## Pros and Cons of the Options
 

@@ -1,0 +1,25 @@
+name: "Wait for droplet SSH"
+description: "Poll a freshly created droplet for up to 5 minutes until it accepts SSH, or fail."
+
+inputs:
+  ip:
+    description: "Droplet public IPv4"
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Wait for SSH
+      shell: bash
+      env:
+        IP: ${{ inputs.ip }}
+      run: |
+        set -euo pipefail
+        for _ in $(seq 1 30); do
+          if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+               -o ConnectTimeout=5 -i /tmp/do_ssh "root@${IP}" true 2>/dev/null; then
+            echo "SSH up"; exit 0
+          fi
+          sleep 10
+        done
+        echo "SSH did not come up in time"; exit 1

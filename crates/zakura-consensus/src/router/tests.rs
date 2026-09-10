@@ -1,0 +1,485 @@
+//! Tests for chain verification
+
+#![allow(clippy::unwrap_in_result)]
+
+use std::{sync::Arc, time::Duration};
+
+use color_eyre::eyre::Report;
+use once_cell::sync::Lazy;
+use tower::{layer::Layer, timeout::TimeoutLayer};
+
+use zakura_chain::{
+    block::Block,
+    serialization::{ZcashDeserialize, ZcashDeserializeInto},
+};
+use zakura_state as zs;
+use zakura_test::transcript::{ExpectedTranscriptError, Transcript};
+
+use super::*;
+
+#[tokio::test]
+async fn transaction_state_router_separates_reads_from_waiting_state_requests() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tower::service_fn;
+    use zakura_chain::{serialization::DateTime32, transaction, transparent};
+
+    let write_calls = Arc::new(AtomicUsize::new(0));
+    let write_state = service_fn({
+        let write_calls = write_calls.clone();
+        move |_request: zs::Request| {
+            write_calls.fetch_add(1, Ordering::SeqCst);
+            async move { Err::<zs::Response, BoxError>("write-state sentinel".into()) }
+        }
+    });
+
+    let read_calls = Arc::new(AtomicUsize::new(0));
+    let read_state = service_fn({
+        let read_calls = read_calls.clone();
+        move |request: zs::ReadRequest| {
+            read_calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                match request {
+                    zs::ReadRequest::BestChainNextMedianTimePast => Ok::<_, BoxError>(
+                        zs::ReadResponse::BestChainNextMedianTimePast(DateTime32::MIN),
+                    ),
+                    zs::ReadRequest::CheckBestChainTipNullifiersAndAnchors(_) => {
+                        Ok(zs::ReadResponse::ValidBestChainTipNullifiersAndAnchors)
+                    }
+                    zs::ReadRequest::UnspentBestChainUtxo(_) => {
+                        Ok(zs::ReadResponse::UnspentBestChainUtxo(None))
+                    }
+                    request => panic!("unexpected direct read request: {request:?}"),
+                }
+            }
+        }
+    });
+
+    let router = TransactionStateRouter::new(write_state, read_state);
+    let response = router
+        .clone()
+        .oneshot(zs::Request::BestChainNextMedianTimePast)
+        .await
+        .expect("the read service answers the direct query");
+    assert_eq!(
+        response,
+        zs::Response::BestChainNextMedianTimePast(DateTime32::MIN)
+    );
+
+    let block: Block = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("the genesis block is valid");
+    let transaction = transaction::UnminedTx::from(block.transactions[0].clone());
+    let response = router
+        .clone()
+        .oneshot(zs::Request::CheckBestChainTipNullifiersAndAnchors(
+            transaction,
+        ))
+        .await
+        .expect("the read service checks nullifiers and anchors");
+    assert_eq!(
+        response,
+        zs::Response::ValidBestChainTipNullifiersAndAnchors
+    );
+
+    let outpoint = transparent::OutPoint {
+        hash: transaction::Hash([0; 32]),
+        index: 0,
+    };
+    let response = router
+        .clone()
+        .oneshot(zs::Request::UnspentBestChainUtxo(outpoint))
+        .await
+        .expect("the read service checks the best-chain UTXO set");
+    assert_eq!(response, zs::Response::UnspentBestChainUtxo(None));
+
+    assert_eq!(read_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(write_calls.load(Ordering::SeqCst), 0);
+
+    let error = router
+        .oneshot(zs::Request::AwaitUtxo(outpoint))
+        .await
+        .expect_err("the write-state sentinel rejects the waiting query");
+    assert!(error.to_string().contains("write-state sentinel"));
+    assert_eq!(read_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(write_calls.load(Ordering::SeqCst), 1);
+}
+
+/// The timeout we apply to each verify future during testing.
+///
+/// The checkpoint verifier uses `tokio::sync::oneshot` channels as futures.
+/// If the verifier doesn't send a message on the channel, any tests that
+/// await the channel future will hang.
+///
+/// The block verifier waits for the previous block to reach the state service.
+/// If that never happens, the test can hang.
+///
+/// This value is set to a large value, to avoid spurious failures due to
+/// high system load.
+const VERIFY_TIMEOUT_SECONDS: u64 = 10;
+
+#[test]
+fn routed_body_failures_keep_payload_consensus_and_local_results_distinct() {
+    use zakura_header_chain::{
+        BodyCommitmentKind, BodyRuleId, BodyVerificationClass, TransientBodyFailureKind,
+    };
+
+    let payload = RouterError::Block {
+        source: Box::new(VerifyBlockError::Block {
+            source: crate::error::BlockError::BadMerkleRoot {
+                actual: zakura_chain::block::merkle::Root([0; 32]),
+                expected: zakura_chain::block::merkle::Root([1; 32]),
+            },
+        }),
+    };
+    assert_eq!(
+        payload.body_verification_class(),
+        BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::TransactionMerkleRoot)
+    );
+
+    let consensus = RouterError::Block {
+        source: Box::new(VerifyBlockError::Transaction(TransactionError::NoInputs)),
+    };
+    assert_eq!(
+        consensus.body_verification_class(),
+        BodyVerificationClass::ConsensusInvalid(BodyRuleId::new("transaction.no_inputs"))
+    );
+
+    let local = RouterError::Block {
+        source: Box::new(VerifyBlockError::StateService {
+            source: BoxError::from("state unavailable"),
+            hash: block::Hash([2; 32]),
+        }),
+    };
+    assert_eq!(
+        local.body_verification_class(),
+        BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
+    );
+
+    let checkpoint = RouterError::Checkpoint {
+        source: Box::new(VerifyCheckpointError::Dropped),
+    };
+    assert_eq!(
+        checkpoint.body_verification_class(),
+        BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
+    );
+}
+
+#[test]
+// DF-02: each representative full-state failure maps to the precise shared
+// body classification, covering retry, payload, and consensus-invalid paths.
+fn full_state_failure_classes_match_header_engine_contract() {
+    use zakura_header_chain::{
+        BodyCommitmentKind, BodyRuleId, BodyVerificationClass, TransientBodyFailureKind,
+    };
+
+    let cases = [
+        (
+            VerifyCheckpointError::CoinbaseHeight {
+                hash: block::Hash([1; 32]),
+            }
+            .body_verification_class(),
+            BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::Other(
+                "missing_coinbase_height",
+            )),
+        ),
+        (
+            VerifyCheckpointError::BadMerkleRoot {
+                actual: zakura_chain::block::merkle::Root([2; 32]),
+                expected: zakura_chain::block::merkle::Root([3; 32]),
+            }
+            .body_verification_class(),
+            BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::TransactionMerkleRoot),
+        ),
+        (
+            VerifyBlockError::Transaction(TransactionError::NoInputs).body_verification_class(),
+            BodyVerificationClass::ConsensusInvalid(BodyRuleId::new("transaction.no_inputs")),
+        ),
+        (
+            VerifyBlockError::Transaction(TransactionError::Script(
+                zakura_script::Error::ScriptInvalid,
+            ))
+            .body_verification_class(),
+            BodyVerificationClass::ConsensusInvalid(BodyRuleId::new("transaction.script")),
+        ),
+        (
+            VerifyBlockError::Transaction(TransactionError::SaplingVerificationFailed)
+                .body_verification_class(),
+            BodyVerificationClass::ConsensusInvalid(BodyRuleId::new(
+                "transaction.sapling_verification",
+            )),
+        ),
+        (
+            VerifyBlockError::Transaction(TransactionError::Halo2VerificationFailed)
+                .body_verification_class(),
+            BodyVerificationClass::ConsensusInvalid(BodyRuleId::new(
+                "transaction.halo2_verification",
+            )),
+        ),
+        (
+            VerifyBlockError::Transaction(TransactionError::Groth16("invalid proof".to_owned()))
+                .body_verification_class(),
+            BodyVerificationClass::ConsensusInvalid(BodyRuleId::new("transaction.groth16")),
+        ),
+        (
+            VerifyBlockError::Block {
+                source: crate::error::BlockError::MissingHeight(block::Hash([4; 32])),
+            }
+            .body_verification_class(),
+            BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable),
+        ),
+        (
+            VerifyCheckpointError::QueuedLimit.body_verification_class(),
+            BodyVerificationClass::Retryable(TransientBodyFailureKind::ResourceExhausted),
+        ),
+    ];
+
+    for (actual, expected) in cases {
+        assert_eq!(actual, expected);
+    }
+}
+
+/// Generate a block with no transactions (not even a coinbase transaction).
+///
+/// The generated block should fail validation.
+pub fn block_no_transactions() -> Block {
+    Block {
+        header: zakura_test::vectors::DUMMY_HEADER[..]
+            .zcash_deserialize_into()
+            .unwrap(),
+        transactions: Vec::new(),
+    }
+}
+
+/// Return a new chain verifier and state service,
+/// using the hard-coded checkpoint list for `network`.
+async fn verifiers_from_network(
+    network: Network,
+) -> (
+    impl Service<
+            Request,
+            Response = block::Hash,
+            Error = BoxError,
+            Future = impl Future<Output = Result<block::Hash, BoxError>>,
+        > + Send
+        + Clone
+        + 'static,
+    impl Service<
+            zs::Request,
+            Response = zs::Response,
+            Error = BoxError,
+            Future = impl Future<Output = Result<zs::Response, BoxError>>,
+        > + Send
+        + Clone
+        + 'static,
+) {
+    let state_service = zs::init_test(&network).await;
+    let (
+        block_verifier_router,
+        _transaction_verifier,
+        _groth16_download_handle,
+        _max_checkpoint_height,
+    ) = crate::router::init_test(Config::default(), &network, state_service.clone()).await;
+
+    // We can drop the download task handle here, because:
+    // - if the download task fails, the tests will panic, and
+    // - if the download task hangs, the tests will hang.
+
+    (block_verifier_router, state_service)
+}
+
+static BLOCK_VERIFY_TRANSCRIPT_GENESIS: Lazy<
+    Vec<(Request, Result<block::Hash, ExpectedTranscriptError>)>,
+> = Lazy::new(|| {
+    let block: Arc<_> =
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+            .unwrap()
+            .into();
+    let hash = Ok(block.hash());
+
+    vec![(Request::Commit(block), hash)]
+});
+
+static BLOCK_VERIFY_TRANSCRIPT_GENESIS_FAIL: Lazy<
+    Vec<(Request, Result<block::Hash, ExpectedTranscriptError>)>,
+> = Lazy::new(|| {
+    let block: Arc<_> =
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+            .unwrap()
+            .into();
+
+    vec![(Request::Commit(block), Err(ExpectedTranscriptError::Any))]
+});
+
+static NO_COINBASE_TRANSCRIPT: Lazy<Vec<(Request, Result<block::Hash, ExpectedTranscriptError>)>> =
+    Lazy::new(|| {
+        let block = block_no_transactions();
+
+        vec![(
+            Request::Commit(Arc::new(block)),
+            Err(ExpectedTranscriptError::Any),
+        )]
+    });
+
+static NO_COINBASE_STATE_TRANSCRIPT: Lazy<
+    Vec<(zs::Request, Result<zs::Response, ExpectedTranscriptError>)>,
+> = Lazy::new(|| {
+    let block = block_no_transactions();
+    let hash = block.hash();
+
+    vec![(
+        zs::Request::Block(hash.into()),
+        Ok(zs::Response::Block(None)),
+    )]
+});
+
+static STATE_VERIFY_TRANSCRIPT_GENESIS: Lazy<
+    Vec<(zs::Request, Result<zs::Response, ExpectedTranscriptError>)>,
+> = Lazy::new(|| {
+    let block: Arc<_> =
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+            .unwrap()
+            .into();
+    let hash = block.hash();
+
+    vec![(
+        zs::Request::Block(hash.into()),
+        Ok(zs::Response::Block(Some(block))),
+    )]
+});
+
+#[tokio::test(flavor = "multi_thread")]
+async fn verify_checkpoint_test() -> Result<(), Report> {
+    verify_checkpoint(Config {
+        checkpoint_sync: true,
+        vct_fast_sync: None,
+    })
+    .await?;
+    verify_checkpoint(Config {
+        checkpoint_sync: false,
+        vct_fast_sync: None,
+    })
+    .await?;
+
+    Ok(())
+}
+
+/// Test that checkpoint verifies work.
+///
+/// Also tests the `chain::init` function.
+#[spandoc::spandoc]
+async fn verify_checkpoint(config: Config) -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+
+    let network = Network::Mainnet;
+
+    // Test that the chain::init function works. Most of the other tests use
+    // init_from_verifiers.
+    //
+    // Download task panics and timeouts are propagated to the tests that use Groth16 verifiers.
+    let (
+        block_verifier_router,
+        _transaction_verifier,
+        _groth16_download_handle,
+        _max_checkpoint_height,
+    ) = super::init_test(config.clone(), &network, zs::init_test(&network).await).await;
+
+    // Add a timeout layer
+    let block_verifier_router =
+        TimeoutLayer::new(Duration::from_secs(VERIFY_TIMEOUT_SECONDS)).layer(block_verifier_router);
+
+    let transcript = Transcript::from(BLOCK_VERIFY_TRANSCRIPT_GENESIS.iter().cloned());
+    transcript.check(block_verifier_router).await.unwrap();
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn verify_fail_no_coinbase_test() -> Result<(), Report> {
+    verify_fail_no_coinbase().await
+}
+
+/// Test that blocks with no coinbase height are rejected by the BlockVerifierRouter
+///
+/// BlockVerifierRouter uses the block height to decide between the CheckpointVerifier
+/// and SemanticBlockVerifier. This is the error case, where there is no height.
+#[spandoc::spandoc]
+async fn verify_fail_no_coinbase() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+
+    let (router, state_service) = verifiers_from_network(Network::Mainnet).await;
+
+    // Add a timeout layer
+    let block_verifier_router =
+        TimeoutLayer::new(Duration::from_secs(VERIFY_TIMEOUT_SECONDS)).layer(router);
+
+    let transcript = Transcript::from(NO_COINBASE_TRANSCRIPT.iter().cloned());
+    transcript.check(block_verifier_router).await.unwrap();
+
+    let transcript = Transcript::from(NO_COINBASE_STATE_TRANSCRIPT.iter().cloned());
+    transcript.check(state_service).await.unwrap();
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn round_trip_checkpoint_test() -> Result<(), Report> {
+    round_trip_checkpoint().await
+}
+
+/// Test that state updates work
+#[spandoc::spandoc]
+async fn round_trip_checkpoint() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+
+    let (block_verifier_router, state_service) = verifiers_from_network(Network::Mainnet).await;
+
+    // Add a timeout layer
+    let block_verifier_router =
+        TimeoutLayer::new(Duration::from_secs(VERIFY_TIMEOUT_SECONDS)).layer(block_verifier_router);
+
+    let transcript = Transcript::from(BLOCK_VERIFY_TRANSCRIPT_GENESIS.iter().cloned());
+    transcript.check(block_verifier_router).await.unwrap();
+
+    let transcript = Transcript::from(STATE_VERIFY_TRANSCRIPT_GENESIS.iter().cloned());
+    transcript.check(state_service).await.unwrap();
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn verify_fail_add_block_checkpoint_test() -> Result<(), Report> {
+    verify_fail_add_block_checkpoint().await
+}
+
+/// Test that the state rejects duplicate block adds
+#[spandoc::spandoc]
+async fn verify_fail_add_block_checkpoint() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+
+    let (block_verifier_router, state_service) = verifiers_from_network(Network::Mainnet).await;
+
+    // Add a timeout layer
+    let block_verifier_router =
+        TimeoutLayer::new(Duration::from_secs(VERIFY_TIMEOUT_SECONDS)).layer(block_verifier_router);
+
+    let transcript = Transcript::from(BLOCK_VERIFY_TRANSCRIPT_GENESIS.iter().cloned());
+    transcript
+        .check(block_verifier_router.clone())
+        .await
+        .unwrap();
+
+    let transcript = Transcript::from(STATE_VERIFY_TRANSCRIPT_GENESIS.iter().cloned());
+    transcript.check(state_service.clone()).await.unwrap();
+
+    let transcript = Transcript::from(BLOCK_VERIFY_TRANSCRIPT_GENESIS_FAIL.iter().cloned());
+    transcript
+        .check(block_verifier_router.clone())
+        .await
+        .unwrap();
+
+    let transcript = Transcript::from(STATE_VERIFY_TRANSCRIPT_GENESIS.iter().cloned());
+    transcript.check(state_service.clone()).await.unwrap();
+
+    Ok(())
+}

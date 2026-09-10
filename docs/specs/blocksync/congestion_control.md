@@ -15,7 +15,8 @@ Throughput and responsiveness don't conflict: the smallest window that keeps a l
 is one **BDP** (delivery-rate × base round-trip) — pipe saturated, nothing queued. The
 window tracks `BDP × gain` and never grows past it; ProbeRtt periodically drains to
 re-measure the true round-trip, and the delay gradient trims the window as soon as a
-queue forms. Memory is bounded separately by a global byte budget and per-peer caps.
+queue forms. Memory is bounded separately by the global outstanding-request budget, the
+resident look-ahead gate, and per-peer caps.
 
 ## Glossary
 
@@ -110,8 +111,14 @@ slow carrier must not pin it.
 
 **Unbounded memory under attacker-controlled bodies or stalls.**
 
-- In-flight + reorder + applying bytes MUST stay within `max_inflight_block_bytes`
-  (6 GiB); concurrent reservations MUST NOT over-commit it.
+- Outstanding request reservations MUST stay within `max_inflight_block_bytes`
+  (6 GiB), apart from the single bounded floor overdraft; each reservation MUST be
+  released when its body arrives or the request otherwise terminates.
+- The resident look-ahead gate MUST be the sole authority for speculative bodies
+  retained by, or reserved to enter, the reorder, applying, and sequencer-input pools.
+  Serialized pools MUST be charged at wire size, while bounded decoded pools MUST also
+  pay the calibrated decoded-memory charge. Commit-window work remains exempt so a
+  checkpoint range can always assemble.
 - Every size estimate MUST be clamped to `[floor, MAX_BLOCK_BYTES]`; untrusted header
   hints MUST NOT exceed the per-block worst case.
 - The request-count cap (≤ `MAX_BS_INFLIGHT_REQUESTS = 32 768`) MUST bind even with byte

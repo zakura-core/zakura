@@ -3,7 +3,7 @@
   "source_ref": "main",
   "source_ref_sha": "upstream-main-fixture",
   "target_repo": "valargroup/zebra",
-  "target_ref": "ironwood-main",
+  "target_ref": "main",
   "target_ref_sha": "4d82758ce7297a38d8acd147558dd89629d553d0",
   "merge_base": "1e6519ea91e2d3035c20aadd4d9a40dcac2eed3a",
   "ahead_count": 80,

@@ -1,0 +1,444 @@
+# zcashd-compat Mode (`zakurad start --zcashd-compat`)
+
+zcashd-compat mode is for operators — typically exchanges and custodial
+services who want to migrate to Zakura while keeping the `zcashd` wallet and
+RPC surface their integration already depends on. Zakura faces the Zcash P2P
+network and is the consensus node; `zcashd` runs as a **P2P sidecar** that
+makes a single outbound peer connection to the local Zakura node and listens
+for nothing. zcashd never touches the public network directly.
+
+Your systems keep talking to `zcashd` exactly as before:
+
+| Provided by `zcashd`, unchanged          | Moved to Zakura                             |
+|------------------------------------------|---------------------------------------------|
+| Wallet RPC methods (transparent + Sapling) | Public P2P networking and peer selection    |
+| Local block files, chainstate, indexes   | Network-facing block and transaction relay  |
+| ZMQ notifications                        | Block templates for miners                  |
+| Local RPC response semantics             | DNS seeding and peer discovery              |
+
+```text
+Zcash network ═P2P (8233)═▶ zakurad ◀═P2P, internal only═ zcashd ◀─wallet RPC, ZMQ─ your systems
+                            (front)   connect=zakura:8233  (sidecar)
+```
+
+The whole topology is two lines of zcashd configuration:
+
+```text
+connect=<zakura-host>:8233  # one outbound peer: Zakura
+listen=0                    # no inbound P2P
+```
+
+`-connect` makes zcashd peer with the given address and _only_ that address:
+zcashd itself then disables DNS seeding, inbound listening, and peer
+discovery. zcashd syncs blocks and relays transactions over the standard
+Zcash P2P protocol, with Zakura as its entire network.
+
+There are two ways to run the pair:
+
+- **Externally managed (default):** you run `zcashd` yourself with
+  `connect=`/`listen=0` pointed at Zakura's legacy P2P listener.
+- **Supervised:** Zakura spawns and manages `zcashd` itself when
+  `[zcashd_compat].manage_zcashd = true`, passing the peer-pinning arguments
+  automatically.
+
+## Quick start: the installer
+
+The recommended way to set up either variant is the interactive installer:
+
+```console
+curl -fsSL https://zakura.com/install.sh | bash
+```
+
+Choose **2) With Zcashd compatibility** at the first prompt, then one of the
+zcashd-compat modes:
+
+| Mode                      | What it does                                                             |
+|---------------------------|--------------------------------------------------------------------------|
+| `split-binary` (default)  | Downloads `zakurad` and the sidecar `zcashd`; prints two start commands  |
+| `supervised`              | Downloads `zakurad`; Zakura downloads hash-pinned `zcashd` at startup and supervises it |
+| `docker-split-containers` | Pulls the Zakura and zcashd images; prints two `docker run` commands     |
+| `docker-supervised`       | Pulls the compat image; prints one supervised `docker run` command       |
+| `build-from-source`       | Validates source trees and toolchains; prints build and start commands   |
+
+The installer:
+
+1. runs the same hardware preflight as `zakurad` itself (see
+   [Hardware preflight](#hardware-preflight-linux)); `--unsafe-low-specs`
+   downgrades failures to warnings for test rigs;
+2. detects existing Zakura state directories and zcashd datadirs on mounted
+   filesystems and offers them as defaults, so a migration continues from
+   your synced data;
+3. downloads SHA256-pinned release binaries (or pulls pinned Docker images);
+4. bootstraps a minimal `zcash.conf` if none exists;
+5. for Docker modes, bind-mounts both the Zakura state cache and the
+   persistent iroh identity directory (`~/.zakura` by default, override with
+   `--zakura-identity-dir`) so NodeId secrets survive `--rm` containers,
+   and runs Zakura with `--network host` so the native QUIC/iroh endpoint
+   (`8234/udp`) and legacy Zcash TCP P2P listener bind on the host's real
+   addresses (bridge NAT would advertise an unreachable `172.17.0.x`);
+6. prints ready-to-copy start commands for the mode you chose.
+
+Every prompt has a matching flag for unattended runs, e.g.:
+
+```console
+install-zakura.sh --install-profile zcashd-compat --mode supervised \
+  --network Mainnet --zcashd-datadir /var/lib/zcashd --non-interactive
+```
+
+See `install-zakura.sh --help` for the full list, including `--dry-run`.
+
+## The sidecar zcashd build
+
+Use the sidecar `zcashd` build from
+[valargroup/zcashd](https://github.com/valargroup/zcashd). The installer and
+Zakura's embedded download both pin its release archives by SHA256. The
+split-container mode uses the
+[zakuracore/zcashd v1.1.0 image](https://hub.docker.com/r/zakuracore/zcashd/tags).
+It differs from stock `zcash/zcash` in three ways:
+
+1. **P2P sidecar mode is hard-locked.** The binary refuses to start unless
+   exactly one `-connect=<zakura-address>` peer is configured. It never opens a
+   P2P listener, refuses peer-expanding options such as `addnode`, `seednode`,
+   `bind`, and `whitebind`, and does not register the `addnode` RPC. This makes
+   Zakura the only possible P2P peer.
+2. **Miner RPCs are removed.** `getblocktemplate`, `submitblock`,
+   `getgenerate`, `setgenerate`, and `generate` are not registered and return
+   JSON-RPC `Method not found` (-32601). Zakura is the canonical source of
+   block templates (see [Mining](#mining-zakura-is-canonical)). Read-only
+   mining info RPCs (`getmininginfo`, `getnetworksolps`, `getblocksubsidy`,
+   `prioritisetransaction`) remain.
+3. **The upstream end-of-support halt is disabled.** Stock zcashd shuts
+   itself down at its deprecation height; the sidecar build logs a warning
+   and keeps serving its wallet/RPC surface. Consensus safety comes from
+   Zakura, which fully validates every block before relaying it to zcashd.
+
+Everything else — chainstate format, RPC semantics, ZMQ — matches stock
+zcashd. The wallet carries the Ironwood/Orchard shielded-pool limits from the
+sidecar baseline (see [Wallet shielded-pool support (Orchard &
+Ironwood)](#wallet-shielded-pool-support-orchard--ironwood)).
+
+## Running externally managed
+
+Run Zakura normally (with `zcashd_compat.enabled = true` if you want
+preflight checks and the RPC guardrails), then run zcashd yourself:
+
+```console
+zcashd -datadir=/var/lib/zcashd \
+       -connect=127.0.0.1:8233 -listen=0 -dnsseed=0 -listenonion=0 -discover=0 \
+       -printtoconsole
+```
+
+Or put the equivalent in `zcash.conf`:
+
+```text
+connect=127.0.0.1:8233
+listen=0
+```
+
+`make compat-zcashd-start-standalone` (see `scripts/make/zcashd-compat.mk`) wraps
+this command, and `make compat-zakurad-start-unsupervised` starts the
+matching front node.
+
+## Running supervised
+
+```console
+zakurad start --zcashd-compat
+```
+
+with a config like:
+
+```toml
+[zcashd_compat]
+enabled = true
+manage_zcashd = true
+zcashd_source = "embedded"
+zcashd_datadir = "/var/lib/zcashd"
+zcashd_extra_args = ["-rpcbind=127.0.0.1", "-rpcallowip=127.0.0.1"]
+```
+
+(`zcashd_source = "embedded"` downloads the SHA256-pinned sidecar build from
+Zakura's embedded release manifest; use `zcashd_source = "path"` plus
+`zcashd_path` to run a binary you provide.)
+
+On start, Zakura:
+
+1. runs Linux hardware and filesystem preflight checks (see
+   [Hardware preflight](#hardware-preflight-linux); `--unsafe-low-specs`
+   skips the minimums for test rigs);
+2. resolves the zcashd binary (embedded download or local path) and
+   bootstraps the zcashd datadir and a minimal `zcash.conf` if none exists;
+3. spawns `zcashd` pinned to Zakura's own legacy P2P listener:
+
+   ```text
+   zcashd -datadir=... [-testnet | -regtest -regtestacceptunvalidatedpow] \
+          -printtoconsole <your extra args> \
+          -connect=<zakura p2p addr> -listen=0 -dnsseed=0 -listenonion=0 -discover=0
+   ```
+
+   The network-selection flags follow Zakura's own configured network, and
+   `-printtoconsole` is always included so zcashd's output lands in Zakura's
+   logs. Zakura also passes each legacy wallet `-allowdeprecated` feature once,
+   preserving the full compatibility RPC surface by default. An
+   operator-supplied `-allowdeprecated=none` overrides that behavior; Zakura
+   then passes only `-allowdeprecated=none`.
+
+4. supervises it: restarts on unexpected exit with capped exponential
+   backoff, and shuts it down gracefully (SIGTERM, then a configurable grace
+   period) when Zakura stops.
+
+The forced peer-pinning arguments are placed _after_ `zcashd_extra_args`
+because zcashd takes the last occurrence of a single-valued command-line
+argument. Peer-selection options (`-connect`, `-addnode`, `-seednode`) in
+`zcashd_extra_args` are rejected at startup: the sidecar must peer with
+Zakura alone.
+
+By default the supervisor derives the `-connect` address from Zakura's own
+bound legacy P2P listener (`network.listen_addr`), substituting `127.0.0.1`
+when Zakura listens on an unspecified address. Set
+`zcashd_compat.p2p_connect_addr` when zcashd must reach Zakura through a
+different address (for example across containers).
+
+When `zcashd_compat.enabled = true`, Zakura always includes inbound sidecar
+peers in block inventory gossip, so zcashd does not depend on random peer
+sampling to learn about new blocks. If `block_gossip_peer_ips` is empty, Zakura
+defaults it to loopback addresses. For an externally managed sidecar that
+connects from another local or private IP, enable zcashd-compat without
+supervision and configure that address explicitly:
+
+```toml
+[zcashd_compat]
+enabled = true
+manage_zcashd = false
+block_gossip_peer_ips = ["127.0.0.1"]
+```
+
+zcashd only connects to Zakura using the legacy Zcash P2P protocol. The fronting
+Zakura must therefore use `network.p2p_stack = "legacy"` or `"dual"`; Zakura
+refuses to start zcashd-compat mode with the `"zakura"`-only setting. The
+`"dual"` setting also enables the experimental Zakura P2P v2 stack, but the
+zcashd sidecar still connects over Zakura's legacy listener.
+
+Pruned storage is supported for the fronting Zakura. When zcashd-compat is
+enabled, Zakura advertises `NODE_NETWORK` even in pruned mode so that the
+sidecar can sync. Pruning still limits which block bodies Zakura can serve:
+zcashd's current chainstate must be recent enough that every block it still
+needs is inside Zakura's configured retention window. The default and minimum
+retention on Mainnet and Testnet is 10,000 blocks, and operators can configure
+a larger `state.storage_mode.pruned.tx_retention`.
+
+A sidecar starting from genesis, restored from a stale snapshot, or returning
+after a long outage cannot sync from a pruned front if Zakura has already
+deleted a required block body. Restore zcashd from a newer snapshot that puts
+its tip inside the current retention window, or sync it against an archive
+Zakura node. When a configured sidecar address requests a known block whose
+body has been pruned, Zakura logs the block height, hash, and configured
+retention, rate limited to once per minute.
+
+For production deployments, archive storage remains recommended so that a
+sidecar can recover after an extended outage or resync from genesis. Changing
+an already-pruned Zakura database back to archive mode requires resyncing
+Zakura from genesis.
+
+> [!WARNING]
+> When the fronting Zakura runs in Docker with a published P2P port, all
+> connections arriving through `docker-proxy` (including a sidecar zcashd
+> connecting to `127.0.0.1:8233` on the host) share one source IP. Zakura's
+> `network.max_connections_per_ip` defaults to **1**, so the sidecar can lose
+> that single slot to a proxied public peer and silently never connect. Set
+> `ZAKURA_NETWORK__MAX_CONNECTIONS_PER_IP=8` (or similar) on a Dockerised
+> front — the installer's Docker modes do this for you — or attach the
+> sidecar to the container network directly.
+
+### Verify the integration
+
+Confirm zcashd is talking only to Zakura and exposes no P2P or mining
+surface:
+
+```console
+$ zcash-cli getpeerinfo
+# -> exactly ONE peer: the Zakura node ("subver": "/Zakura:.../", "inbound": false)
+
+$ zcash-cli getconnectioncount
+1
+
+$ zcash-cli getblocktemplate
+error code: -32601  # Method not found: miners must use Zakura
+
+$ ss -tlnp | grep 8233
+# -> only zakurad listening; zcashd has no P2P listener
+```
+
+Then confirm the tips converge: heights track each other and
+`getbestblockhash` matches on both nodes once the drift reaches zero.
+
+`deploy/zcashd-compat/sync-check.sh` and `make compat-status-sync` automate
+the process/peer-pinning/height-drift checks, and the deploy watchdog's
+`zcashd_compat_sync` check mirrors them for continuous monitoring.
+
+The shield (single peer, no listener, no miner RPCs) is in effect immediately
+on startup; you do not need a fully synced chain to verify it.
+
+## Mining: Zakura is canonical
+
+Miners and pools must request block templates from **Zakura's** RPC, not
+zcashd's. Enable Zakura's RPC listener and set a miner address:
+
+```toml
+[rpc]
+listen_addr = "127.0.0.1:8232"
+
+[mining]
+miner_address = "t1YourTransparentOrShieldedAddress"
+```
+
+Zakura's `getblocktemplate` and `submitblock` are always compiled in; no
+special build is needed. The sidecar zcashd returns `Method not found` for all
+template and submission RPCs, so a
+misconfigured miner fails loudly instead of building on a lagging view.
+
+## Chain tips: call Zakura, not the sidecar
+
+Both nodes register `getchaintips`. Send the call to Zakura. zcashd answers it
+by scanning its whole block index under `cs_main`. On Mainnet that scan costs
+seconds, and it blocks every other zcashd RPC for the same time, including the
+wallet calls your integration depends on. Zakura reads only the chains it holds
+in memory, so the cost is bounded by the number of tracked forks, not by the
+height of the chain.
+
+The two nodes report different tips. zcashd never prunes its block index, so it
+lists every stale tip it has ever seen. Zakura lists the tips that are still
+live: the best chain, the non-finalized forks, recently invalidated branches,
+and the selected header chain when some block bodies are unavailable. Zakura
+does not return zcashd's `valid-headers` or `unknown` statuses. Call the sidecar
+only if you need the full history of stale tips.
+
+## Wallet shielded-pool support (Orchard & Ironwood)
+
+Orchard and Ironwood are shielded pools, exercised through the unified `z_*` wallet RPCs
+(`z_sendmany`, and the rest). Those RPCs remain registered and callable. However, disabled. This is not the same mechanism as the removed miner RPCs:
+
+| | Miner RPCs (`getblocktemplate`, …) | Orchard / Ironwood |
+| --- | --- | --- |
+| Mechanism | Method not registered | Method registered; operation rejected at prep time |
+| Error | `-32601` Method not found | `RPC_INVALID_PARAMETER` (`-8`) with a descope message |
+| Scope | Always | Height-gated on NU6.3 activation |
+
+These limits are a property of the sidecar `zcashd` build itself (the
+Ironwood baseline), not the P2P sidecar layer. They apply identically whether
+zcashd is externally managed or supervised.
+
+- **Ironwood (the NU6.3 pool):** permanently unsupported. The zcashd wallet
+  never supports Ironwood — this is a permanent descope, not a "not yet
+  available" gate.
+- **Orchard:** rejected from NU6.3 onward. Once NU6.3 is active for the next
+  block, any Orchard involvement — spends of existing Orchard notes, Orchard
+  payments, or Orchard change — fails at transaction-preparation time. Before
+  NU6.3 activation, Orchard sends still work.
+- **Transparent and Sapling:** unaffected. Existing transparent and Sapling
+  wallet flows keep working.
+
+When a restricted operation is attempted, zcashd returns `RPC_INVALID_PARAMETER`
+(`-8`) with this message:
+
+```text
+zcashd does not support the Ironwood pool, and Orchard payments (including
+spends of existing Orchard notes) are unsupported from NU6.3. Use transparent
+or Sapling funds with zcashd, or a Z3-stack wallet for shielded payments.
+```
+
+For continued Orchard or Ironwood shielded support, migrate wallet flows to a
+[Z3-stack wallet](https://github.com/zcash/wallet) ([Zallet](https://github.com/zcash/wallet),
+[Zaino](https://github.com/zingolabs/zaino), or
+[librustzcash](https://github.com/zcash/librustzcash)). This aligns with the
+broader zcashd retirement path implied by the sidecar build's disabled
+end-of-support halt.
+
+> [!WARNING]
+> Exchange and custodial integrations that rely on Orchard sends from the
+> zcashd wallet must migrate those flows before NU6.3 activation on their
+> network. After activation, Orchard operations fail at prep time with the
+> message above — not with `Method not found`. Plan the migration alongside
+> other network-upgrade readiness work (for example, deploying an updated
+> sidecar build before each activation height).
+
+## Initial sync and existing datadirs
+
+The sidecar syncs through its single Zakura peer. An archive front can serve
+the whole chain, but initial block download through one peer is slow. A pruned
+front can serve only the block bodies in its retention window, so it cannot
+bootstrap a sidecar from genesis. For production migrations, **bring your
+existing synced zcashd datadir** and let the sidecar continue from its current
+height. If the front is pruned, verify that the datadir or snapshot is recent
+enough that every block zcashd still needs remains inside the front's current
+retention window.
+
+The chainstate and block files are the stock zcashd format; no conversion is
+needed. The installer searches mounted filesystems for existing Zakura state
+directories and zcashd datadirs and offers them as defaults; snapshots for
+both nodes are available from <https://zakura.com/snapshots>.
+
+zcashd still performs its own full validation of every block Zakura relays —
+the sidecar removes zcashd's _network exposure_, not its consensus checks.
+
+## Configuration reference
+
+```toml
+[zcashd_compat]
+# Master switch; also enabled by the `--zcashd-compat` CLI flag.
+enabled = true
+
+# Spawn and supervise zcashd (true) or run it yourself (false, default).
+manage_zcashd = true
+
+# "path" (default; use zcashd_path) or "embedded" (SHA256-pinned sidecar
+# download from the embedded release manifest). An explicit zcashd_path
+# always wins over this setting.
+zcashd_source = "embedded"
+# zcashd_path = "/usr/local/bin/zcashd"
+
+# zcashd datadir; defaults to a subdirectory of state.cache_dir.
+zcashd_datadir = "/var/lib/zcashd"
+
+# Extra zcashd arguments. Peer-selection options are rejected.
+zcashd_extra_args = ["-rpcbind=127.0.0.1", "-rpcallowip=127.0.0.1"]
+
+# Zakura P2P address zcashd connects to. Defaults to Zakura's own bound
+# legacy listener (loopback-substituted). Set for cross-container setups.
+# p2p_connect_addr = "10.0.0.2:8233"
+
+# Supervision lifecycle.
+startup_delay = "1s"
+restart_backoff = "2s"
+restart_backoff_max = "5m"
+restart_reset_after = "1h"
+shutdown_grace_period = "5m"
+```
+
+All values can also be set through environment variables with the `ZAKURA_`
+prefix, e.g. `ZAKURA_ZCASHD_COMPAT__ZCASHD_PATH=/usr/local/bin/zcashd`. (The
+old `ZEBRA_` prefix still works but is deprecated and logs a warning.)
+Because environment values cannot express TOML arrays, `zcashd_extra_args`
+also accepts a JSON array string:
+
+```console
+ZAKURA_ZCASHD_COMPAT__ZCASHD_EXTRA_ARGS='["-rpcbind=0.0.0.0","-rpcallowip=0.0.0.0/0"]'
+```
+
+## Hardware preflight (Linux)
+
+When `zcashd_compat.enabled` is set, Zakura checks at startup that the host
+meets the minimum hardware requirements for running both nodes. Startup fails
+below the minimums; `--unsafe-low-specs` overrides the failure for test
+environments. Warnings (not failures) are printed between the minimum and
+recommended tiers.
+
+| Resource            | Minimum                        | Recommended        |
+|---------------------|--------------------------------|--------------------|
+| Logical CPUs        | 4                              | 8                  |
+| Memory              | 16 GiB                         | 32 GiB             |
+| Disk (mainnet)      | 275 GiB per datadir mount      | 1 TiB combined     |
+| Disk (testnet)      | 30 GiB per datadir mount       | 100 GiB combined   |
+
+If the Zakura state and zcashd datadir share one mount, that mount needs the
+sum of both minimums (550 GiB on mainnet). The installer runs the same checks
+before anything is downloaded.

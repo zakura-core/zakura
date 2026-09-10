@@ -1,6 +1,6 @@
 ---
 name: "Upgrade zcashd dependencies"
-description: "Specific steps for upgrading dependencies shared with zcashd. Zebra developers only."
+description: "Specific steps for upgrading dependencies shared with zcashd. Zakura developers only."
 title: 'Upgrade dependencies for zcashd (version)'
 labels: [A-dependencies, A-script, S-needs-triage]
 body:
@@ -14,7 +14,7 @@ body:
         
         The upgrade steps are:
         - [ ] upgrade and release `zcash_script`
-        - [ ] upgrade Zebra's ECC and `zcash_script` dependencies in the same PR
+        - [ ] upgrade Zakura's ECC and `zcash_script` dependencies in the same PR
   - type: textarea
     id: versions
     attributes:

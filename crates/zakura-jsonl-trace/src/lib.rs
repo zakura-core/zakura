@@ -1,0 +1,1116 @@
+//! Shared non-blocking JSONL tracing support for Zebra components.
+
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    path::PathBuf,
+    sync::OnceLock,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use serde::Serialize;
+use serde_json::{Map, Value};
+use tokio::{
+    io::AsyncWriteExt,
+    runtime::Handle,
+    sync::mpsc::{self, error::TryRecvError, error::TrySendError},
+    task::JoinHandle,
+    time::{self, Instant, MissedTickBehavior},
+};
+use tokio_util::sync::CancellationToken;
+
+/// Default trace channel capacity.
+pub const DEFAULT_CHANNEL_CAPACITY: usize = 16_384;
+
+/// Default maximum number of events to drain into a single write batch.
+pub const DEFAULT_MAX_BATCH_EVENTS: usize = 256;
+
+/// Default amount of time the writer waits for more events after receiving the
+/// first event in a batch.
+pub const DEFAULT_BATCH_LINGER: Duration = Duration::from_millis(5);
+
+/// Default number of buffered bytes before the writer flushes to the file.
+pub const DEFAULT_BUFFER_FLUSH_BYTES: usize = 256 * 1024;
+
+/// Default interval between forced file flushes and syncs.
+///
+/// Kept short (1s) so a low-volume table's tail rows — e.g. the final
+/// `commit_finish` rows at the end of a sync, which never reach
+/// [`DEFAULT_BUFFER_FLUSH_BYTES`] — are durable within ~1s of being emitted. A
+/// long interval here is the root cause of the e2e trace-oracle "flush race":
+/// the oracle reads the JSONL only a few seconds after the final commits, so a
+/// 17s flush window left those rows unwritten and the oracle saw a `commit_start`
+/// with no matching `commit_finish` even though the node had committed (the live
+/// metrics show `applying = 0`). Tracing is opt-in (a `trace_dir` must be set),
+/// so the extra fsync cadence is negligible against the debuggability win.
+pub const DEFAULT_FILE_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Env var used to label every JSONL trace record with a stable node identifier.
+pub const NODE_ID_ENV: &str = "ZEBRA_NODE_ID";
+
+/// A logical JSONL trace table and its output file.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct JsonlTraceTable {
+    table: &'static str,
+    file_name: &'static str,
+}
+
+impl JsonlTraceTable {
+    /// Create a trace table definition.
+    pub const fn new(table: &'static str, file_name: &'static str) -> Self {
+        Self { table, file_name }
+    }
+
+    /// Return the logical table name used for diagnostics.
+    pub const fn table(self) -> &'static str {
+        self.table
+    }
+
+    /// Return the JSONL output file name.
+    pub const fn file_name(self) -> &'static str {
+        self.file_name
+    }
+}
+
+/// A serializable typed JSONL trace event.
+pub trait JsonlTraceEvent: Serialize {
+    /// The table that receives this event.
+    const TABLE: JsonlTraceTable;
+}
+
+/// A borrowed value serialized using its [`fmt::Display`] representation.
+///
+/// This adapter keeps hash and error formatting inside the lazy serialization
+/// path instead of allocating strings at trace call sites.
+#[derive(Copy, Clone, Debug)]
+pub struct JsonlDisplay<'a, T: ?Sized>(pub &'a T);
+
+impl<T> Serialize for JsonlDisplay<'_, T>
+where
+    T: fmt::Display + ?Sized,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_str(self.0)
+    }
+}
+
+/// Convert a platform-sized count to the stable trace integer type.
+pub fn saturating_count(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+/// Convert a duration to saturating whole milliseconds.
+pub fn saturating_millis(value: Duration) -> u64 {
+    u64::try_from(value.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Convert a duration to saturating whole microseconds.
+pub fn saturating_micros(value: Duration) -> u64 {
+    u64::try_from(value.as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Implement [`JsonlTraceEvent`] for an event type.
+#[macro_export]
+macro_rules! impl_jsonl_trace_event {
+    ($event:ty, $table:expr) => {
+        impl $crate::JsonlTraceEvent for $event {
+            const TABLE: $crate::JsonlTraceTable = $table;
+        }
+    };
+}
+
+/// A typed, non-blocking JSONL event emitter.
+#[derive(Clone, Debug)]
+pub struct JsonlEventEmitter {
+    tracer: JsonlTracer,
+    node: std::sync::Arc<str>,
+    started: Instant,
+}
+
+impl JsonlEventEmitter {
+    /// Create a no-op event emitter.
+    pub fn noop() -> Self {
+        Self::new(JsonlTracer::noop(), node_id())
+    }
+
+    /// Create an event emitter with an explicit node label.
+    pub fn new(tracer: JsonlTracer, node: impl Into<std::sync::Arc<str>>) -> Self {
+        Self {
+            tracer,
+            node: node.into(),
+            started: Instant::now(),
+        }
+    }
+
+    /// Return the underlying JSONL tracer.
+    pub fn tracer(&self) -> &JsonlTracer {
+        &self.tracer
+    }
+
+    /// Return true when this emitter can currently reserve output capacity.
+    pub fn is_enabled(&self) -> bool {
+        self.tracer.is_enabled()
+    }
+
+    /// Lazily build and emit a typed event.
+    ///
+    /// The queue slot is reserved before `build` is invoked, so domain
+    /// projections and serialization are skipped when tracing is disabled or
+    /// when the bounded channel is full or closed.
+    pub fn emit_event<E>(&self, build: impl FnOnce() -> E)
+    where
+        E: JsonlTraceEvent,
+    {
+        let Ok(permit) = self.tracer.try_reserve() else {
+            return;
+        };
+
+        let event = build();
+        let row = JsonlEventEnvelope {
+            ts: elapsed_micros(self.started.elapsed()),
+            node: &self.node,
+            process_trace_id: process_trace_id(),
+            event: &event,
+        };
+
+        if let Ok(line) = serde_json::to_vec(&row) {
+            permit.send(JsonlWriteEvent {
+                table: E::TABLE.table(),
+                file_name: E::TABLE.file_name(),
+                line,
+            });
+        }
+    }
+
+    /// Lazily build and emit a raw JSON object for compatibility callers.
+    pub fn emit_with(&self, table: JsonlTraceTable, build: impl FnOnce(&mut Map<String, Value>)) {
+        let Ok(permit) = self.tracer.try_reserve() else {
+            return;
+        };
+
+        let mut row = Map::new();
+        row.insert(
+            "ts".to_string(),
+            Value::from(elapsed_micros(self.started.elapsed())),
+        );
+        row.insert("node".to_string(), Value::String(self.node.to_string()));
+        row.insert(
+            "process_trace_id".to_string(),
+            Value::String(process_trace_id().to_string()),
+        );
+        build(&mut row);
+
+        if let Ok(line) = serde_json::to_vec(&Value::Object(row)) {
+            permit.send(JsonlWriteEvent {
+                table: table.table(),
+                file_name: table.file_name(),
+                line,
+            });
+        }
+    }
+}
+
+impl Default for JsonlEventEmitter {
+    fn default() -> Self {
+        Self::noop()
+    }
+}
+
+#[derive(Serialize)]
+struct JsonlEventEnvelope<'a, E> {
+    ts: u64,
+    node: &'a str,
+    process_trace_id: &'static str,
+    #[serde(flatten)]
+    event: &'a E,
+}
+
+fn elapsed_micros(elapsed: Duration) -> u64 {
+    saturating_micros(elapsed)
+}
+
+/// Returns the process-wide node identifier used to tag JSONL trace records.
+///
+/// Resolution order: `ZEBRA_NODE_ID`, `HOSTNAME`, `/etc/hostname`, then
+/// `"unknown"`. The value is resolved once on first call and cached for the
+/// lifetime of the process so every trace record from this node reports the
+/// same id.
+pub fn node_id() -> &'static str {
+    static NODE_ID: OnceLock<String> = OnceLock::new();
+    NODE_ID
+        .get_or_init(|| {
+            std::env::var(NODE_ID_ENV)
+                .ok()
+                .or_else(|| std::env::var("HOSTNAME").ok())
+                .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "unknown".to_string())
+        })
+        .as_str()
+}
+
+/// Returns an opaque identifier shared by every JSONL emitter in this process.
+///
+/// The identifier disambiguates appended trace rows across process restarts.
+/// Emitter-local monotonic timestamps restart from zero after each restart.
+/// The identifier provides only a correlation label.
+/// The identifier does not provide randomness or security identity.
+pub fn process_trace_id() -> &'static str {
+    static PROCESS_TRACE_ID: OnceLock<String> = OnceLock::new();
+    PROCESS_TRACE_ID
+        .get_or_init(|| {
+            let started = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            format!("{}-{started}", std::process::id())
+        })
+        .as_str()
+}
+
+/// A pre-serialized JSONL record to be written to a per-table file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JsonlWriteEvent {
+    /// Logical table name used for diagnostics.
+    pub table: &'static str,
+    /// Output file name for this table.
+    pub file_name: &'static str,
+    /// Pre-serialized JSON bytes for a single record, without a trailing newline.
+    pub line: Vec<u8>,
+}
+
+/// Settings for the background JSONL writer.
+#[derive(Clone, Debug)]
+pub struct JsonlTraceConfig {
+    /// Bounded queue capacity.
+    pub channel_capacity: usize,
+    /// Maximum number of events to write in a single batch.
+    pub max_batch_events: usize,
+    /// How long to wait for more events after receiving the first batch event.
+    pub batch_linger: Duration,
+    /// Buffered bytes threshold before flushing to the underlying file.
+    pub buffer_flush_bytes: usize,
+    /// Maximum time between forced file flushes and syncs.
+    pub file_flush_interval: Duration,
+}
+
+impl Default for JsonlTraceConfig {
+    fn default() -> Self {
+        Self {
+            channel_capacity: DEFAULT_CHANNEL_CAPACITY,
+            max_batch_events: DEFAULT_MAX_BATCH_EVENTS,
+            batch_linger: DEFAULT_BATCH_LINGER,
+            buffer_flush_bytes: DEFAULT_BUFFER_FLUSH_BYTES,
+            file_flush_interval: DEFAULT_FILE_FLUSH_INTERVAL,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TraceRuntime {
+    tx: mpsc::Sender<JsonlWriteEvent>,
+}
+
+/// A non-blocking handle for emitting JSONL trace records.
+#[derive(Clone)]
+pub struct JsonlTracer {
+    inner: TraceState,
+}
+
+#[derive(Clone)]
+enum TraceState {
+    Disabled,
+    Enabled(TraceRuntime),
+}
+
+/// A spawned JSONL writer plus its tracer.
+///
+/// Dropping this guard leaves the writer's normal channel-close shutdown
+/// behavior in place. Calling [`JsonlTraceGuard::shutdown`] explicitly asks the
+/// writer to stop accepting new rows, drain queued rows, flush all open files,
+/// and exit.
+pub struct JsonlTraceGuard {
+    tracer: JsonlTracer,
+    shutdown: CancellationToken,
+    writer: Option<JoinHandle<()>>,
+}
+
+/// Reserve errors for the bounded JSONL trace queue.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum JsonlTraceReserveError {
+    /// Tracing is disabled.
+    Disabled,
+    /// The queue is full.
+    Full,
+    /// The writer task has closed.
+    Closed,
+}
+
+/// Send errors for the bounded JSONL trace queue.
+#[derive(Debug)]
+pub enum JsonlTraceSendError {
+    /// Tracing is disabled.
+    Disabled(JsonlWriteEvent),
+    /// The queue is full.
+    Full(JsonlWriteEvent),
+    /// The writer task has closed.
+    Closed(JsonlWriteEvent),
+}
+
+/// A reserved queue slot for a trace record.
+#[derive(Debug)]
+pub struct JsonlTracePermit {
+    permit: mpsc::OwnedPermit<JsonlWriteEvent>,
+}
+
+impl JsonlTracePermit {
+    /// Send a record into the reserved queue slot.
+    pub fn send(self, event: JsonlWriteEvent) {
+        self.permit.send(event);
+    }
+}
+
+impl JsonlTracer {
+    /// Create a tracer backed by the supplied sender.
+    pub fn new(tx: mpsc::Sender<JsonlWriteEvent>) -> Self {
+        Self {
+            inner: TraceState::Enabled(TraceRuntime { tx }),
+        }
+    }
+
+    /// Create a no-op tracer.
+    pub fn noop() -> Self {
+        Self {
+            inner: TraceState::Disabled,
+        }
+    }
+
+    /// Spawn a background writer on the current Tokio runtime.
+    ///
+    /// If there is no current Tokio runtime, tracing is disabled and a no-op
+    /// tracer is returned.
+    pub fn spawn(trace_dir: PathBuf) -> Self {
+        Self::spawn_with_config(trace_dir, JsonlTraceConfig::default())
+    }
+
+    /// Spawn a background writer using `config` on the current Tokio runtime.
+    ///
+    /// If there is no current Tokio runtime, tracing is disabled and a no-op
+    /// tracer is returned.
+    pub fn spawn_with_config(trace_dir: PathBuf, config: JsonlTraceConfig) -> Self {
+        Self::spawn_guard_with_config(trace_dir, config).into_tracer()
+    }
+
+    /// Spawn a background writer and return a guard that can flush it
+    /// explicitly.
+    ///
+    /// If there is no current Tokio runtime, tracing is disabled and the guard
+    /// contains a no-op tracer.
+    pub fn spawn_guard(trace_dir: PathBuf) -> JsonlTraceGuard {
+        Self::spawn_guard_with_config(trace_dir, JsonlTraceConfig::default())
+    }
+
+    /// Spawn a guarded background writer using `config` on the current Tokio
+    /// runtime.
+    ///
+    /// If there is no current Tokio runtime, tracing is disabled and the guard
+    /// contains a no-op tracer.
+    pub fn spawn_guard_with_config(
+        trace_dir: PathBuf,
+        config: JsonlTraceConfig,
+    ) -> JsonlTraceGuard {
+        let Ok(handle) = Handle::try_current() else {
+            tracing::warn!(
+                ?trace_dir,
+                "JSONL tracing requested without an active Tokio runtime, disabling tracing"
+            );
+            return JsonlTraceGuard::disabled();
+        };
+
+        let (tx, rx) = mpsc::channel(config.channel_capacity);
+        let writer = TraceWriter::new(trace_dir.clone(), config);
+        let shutdown = CancellationToken::new();
+        let writer = handle.spawn(run_trace_writer(rx, writer, shutdown.clone()));
+        tracing::info!(?trace_dir, "JSONL tracing enabled");
+
+        JsonlTraceGuard {
+            tracer: Self::new(tx),
+            shutdown,
+            writer: Some(writer),
+        }
+    }
+
+    /// Returns `true` if this tracer will emit records.
+    ///
+    /// Reports `false` for a disabled tracer and also once the writer task has
+    /// closed the receiver, so callers stop building rows after writer death.
+    pub fn is_enabled(&self) -> bool {
+        match &self.inner {
+            TraceState::Disabled => false,
+            TraceState::Enabled(runtime) => !runtime.tx.is_closed(),
+        }
+    }
+
+    /// Returns the remaining queue capacity.
+    pub fn capacity(&self) -> usize {
+        let TraceState::Enabled(runtime) = &self.inner else {
+            return 0;
+        };
+
+        runtime.tx.capacity()
+    }
+
+    /// Try to reserve a queue slot for a trace record.
+    pub fn try_reserve(&self) -> Result<JsonlTracePermit, JsonlTraceReserveError> {
+        let TraceState::Enabled(runtime) = &self.inner else {
+            return Err(JsonlTraceReserveError::Disabled);
+        };
+
+        runtime
+            .tx
+            .clone()
+            .try_reserve_owned()
+            .map(|permit| JsonlTracePermit { permit })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => JsonlTraceReserveError::Full,
+                TrySendError::Closed(_) => JsonlTraceReserveError::Closed,
+            })
+    }
+
+    /// Try to send a trace record without blocking.
+    pub fn try_send(&self, event: JsonlWriteEvent) -> Result<(), JsonlTraceSendError> {
+        let TraceState::Enabled(runtime) = &self.inner else {
+            return Err(JsonlTraceSendError::Disabled(event));
+        };
+
+        runtime.tx.try_send(event).map_err(|error| match error {
+            TrySendError::Full(event) => JsonlTraceSendError::Full(event),
+            TrySendError::Closed(event) => JsonlTraceSendError::Closed(event),
+        })
+    }
+}
+
+impl JsonlTraceGuard {
+    fn disabled() -> Self {
+        Self {
+            tracer: JsonlTracer::noop(),
+            shutdown: CancellationToken::new(),
+            writer: None,
+        }
+    }
+
+    /// Return a cloneable tracer handle for this writer.
+    pub fn tracer(&self) -> JsonlTracer {
+        self.tracer.clone()
+    }
+
+    /// Consume the guard and return only its tracer handle.
+    ///
+    /// The writer keeps the original channel-close behavior: it flushes and
+    /// exits after all tracer clones have been dropped.
+    pub fn into_tracer(mut self) -> JsonlTracer {
+        self.writer.take();
+        self.tracer.clone()
+    }
+
+    /// Stop the writer, drain queued rows, flush all files, and wait for exit.
+    pub async fn shutdown(mut self) {
+        self.tracer = JsonlTracer::noop();
+        self.shutdown.cancel();
+
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.await;
+        }
+    }
+}
+
+impl std::fmt::Debug for JsonlTracer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JsonlTracer").finish()
+    }
+}
+
+struct TableWriter {
+    file: tokio::fs::File,
+    encode_buf: Vec<u8>,
+}
+
+impl TableWriter {
+    fn new(file: tokio::fs::File, buffer_flush_bytes: usize) -> Self {
+        Self {
+            file,
+            encode_buf: Vec::with_capacity(buffer_flush_bytes),
+        }
+    }
+
+    fn append_line(&mut self, line: &[u8]) {
+        self.encode_buf.extend_from_slice(line);
+        self.encode_buf.push(b'\n');
+    }
+
+    async fn flush_buffer(&mut self, sync_file: bool) -> std::io::Result<()> {
+        if !self.encode_buf.is_empty() {
+            self.file.write_all(&self.encode_buf).await?;
+            self.encode_buf.clear();
+            self.file.flush().await?;
+        }
+
+        if sync_file {
+            self.file.sync_data().await?;
+        }
+
+        Ok(())
+    }
+}
+
+struct TraceWriter {
+    trace_dir: PathBuf,
+    config: JsonlTraceConfig,
+    tables: HashMap<&'static str, TableWriter>,
+    disabled_tables: HashSet<&'static str>,
+    trace_dir_created: bool,
+    last_file_flush: Instant,
+}
+
+impl TraceWriter {
+    fn new(trace_dir: PathBuf, config: JsonlTraceConfig) -> Self {
+        Self {
+            trace_dir,
+            config,
+            tables: HashMap::new(),
+            disabled_tables: HashSet::new(),
+            trace_dir_created: false,
+            last_file_flush: Instant::now(),
+        }
+    }
+
+    fn has_open_files(&self) -> bool {
+        !self.tables.is_empty() || self.disabled_tables.is_empty()
+    }
+
+    async fn write_batch(&mut self, batch: Vec<JsonlWriteEvent>, force_flush: bool) {
+        for event in batch {
+            if self.disabled_tables.contains(event.table) {
+                continue;
+            }
+
+            let append_result = match self.table_writer_mut(event.table, event.file_name).await {
+                Some(table_writer) => {
+                    table_writer.append_line(&event.line);
+                    Ok(())
+                }
+                None => Err(()),
+            };
+
+            if append_result.is_err() {
+                self.disable_table(event.table);
+            }
+        }
+
+        let flush_file =
+            force_flush || self.last_file_flush.elapsed() >= self.config.file_flush_interval;
+        let mut failed_tables = Vec::new();
+
+        for (&table_name, table_writer) in &mut self.tables {
+            let should_flush_buffer =
+                table_writer.encode_buf.len() >= self.config.buffer_flush_bytes;
+
+            if !should_flush_buffer && !flush_file && !force_flush {
+                continue;
+            }
+
+            if let Err(error) = table_writer.flush_buffer(flush_file || force_flush).await {
+                tracing::warn!(
+                    ?error,
+                    table = table_name,
+                    trace_dir = ?self.trace_dir,
+                    "disabling trace table after write failure"
+                );
+                failed_tables.push(table_name);
+            }
+        }
+
+        if flush_file || force_flush {
+            self.last_file_flush = Instant::now();
+        }
+
+        for table in failed_tables {
+            self.disable_table(table);
+        }
+    }
+
+    async fn flush_all(&mut self) {
+        self.write_batch(Vec::new(), true).await;
+    }
+
+    fn disable_table(&mut self, table: &'static str) {
+        self.tables.remove(table);
+        self.disabled_tables.insert(table);
+    }
+
+    async fn table_writer_mut(
+        &mut self,
+        table: &'static str,
+        file_name: &'static str,
+    ) -> Option<&mut TableWriter> {
+        if self.disabled_tables.contains(table) {
+            return None;
+        }
+
+        if !self.tables.contains_key(table) {
+            if !self.trace_dir_created {
+                if let Err(error) = tokio::fs::create_dir_all(&self.trace_dir).await {
+                    tracing::warn!(
+                        ?error,
+                        trace_dir = ?self.trace_dir,
+                        "failed to create trace directory, disabling trace table"
+                    );
+                    self.disabled_tables.insert(table);
+                    return None;
+                }
+                self.trace_dir_created = true;
+            }
+
+            let file = match tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.trace_dir.join(file_name))
+                .await
+            {
+                Ok(file) => file,
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        table,
+                        trace_dir = ?self.trace_dir,
+                        "failed to open trace table, disabling trace table"
+                    );
+                    self.disabled_tables.insert(table);
+                    return None;
+                }
+            };
+
+            self.tables.insert(
+                table,
+                TableWriter::new(file, self.config.buffer_flush_bytes),
+            );
+        }
+
+        self.tables.get_mut(table)
+    }
+}
+
+async fn run_trace_writer(
+    mut rx: mpsc::Receiver<JsonlWriteEvent>,
+    mut writer: TraceWriter,
+    shutdown: CancellationToken,
+) {
+    let mut flush_tick = time::interval(writer.config.file_flush_interval);
+    flush_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    loop {
+        let mut batch = Vec::with_capacity(writer.config.max_batch_events);
+        let mut receiver_closed = false;
+        let mut force_flush = false;
+
+        tokio::select! {
+            maybe_event = rx.recv() => {
+                match maybe_event {
+                    Some(event) => batch.push(event),
+                    None => receiver_closed = true,
+                }
+            }
+            _ = flush_tick.tick(), if writer.has_open_files() => {
+                writer.flush_all().await;
+
+                if !writer.has_open_files() {
+                    tracing::warn!(trace_dir = ?writer.trace_dir, "all trace tables have been disabled");
+                    break;
+                }
+
+                continue;
+            }
+            _ = shutdown.cancelled() => {
+                rx.close();
+                receiver_closed = true;
+            }
+        }
+
+        if receiver_closed {
+            while let Ok(event) = rx.try_recv() {
+                batch.push(event);
+            }
+            writer.write_batch(batch, true).await;
+            break;
+        }
+
+        let deadline = Instant::now() + writer.config.batch_linger;
+        let sleep = time::sleep_until(deadline);
+        tokio::pin!(sleep);
+
+        while batch.len() < writer.config.max_batch_events {
+            match rx.try_recv() {
+                Ok(event) => {
+                    batch.push(event);
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    receiver_closed = true;
+                    break;
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+
+            tokio::select! {
+                maybe_event = rx.recv() => {
+                    match maybe_event {
+                        Some(event) => batch.push(event),
+                        None => {
+                            receiver_closed = true;
+                            break;
+                        }
+                    }
+                }
+                _ = flush_tick.tick(), if writer.has_open_files() => {
+                    force_flush = true;
+                    break;
+                }
+                _ = shutdown.cancelled() => {
+                    rx.close();
+                    receiver_closed = true;
+                    break;
+                }
+                _ = &mut sleep => break,
+            }
+        }
+
+        if receiver_closed {
+            while let Ok(event) = rx.try_recv() {
+                batch.push(event);
+            }
+        }
+
+        writer
+            .write_batch(batch, force_flush || receiver_closed)
+            .await;
+
+        if !writer.has_open_files() {
+            tracing::warn!(trace_dir = ?writer.trace_dir, "all trace tables have been disabled");
+            break;
+        }
+
+        if receiver_closed {
+            writer.flush_all().await;
+            break;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    use super::*;
+
+    const TEST_TABLE: JsonlTraceTable = JsonlTraceTable::new("typed", "typed.jsonl");
+
+    #[derive(Serialize)]
+    struct TestEvent {
+        event: &'static str,
+        value: u64,
+        optional: Option<u64>,
+    }
+
+    impl_jsonl_trace_event!(TestEvent, TEST_TABLE);
+
+    #[test]
+    fn common_adapters_use_display_and_saturating_numeric_forms() {
+        assert_eq!(
+            serde_json::to_value(JsonlDisplay(&"displayed")).expect("display adapter serializes"),
+            Value::String("displayed".to_string())
+        );
+        assert_eq!(saturating_count(7), 7);
+        assert_eq!(saturating_millis(Duration::from_millis(9)), 9);
+        assert_eq!(saturating_micros(Duration::from_micros(11)), 11);
+    }
+
+    #[test]
+    fn typed_emitter_serializes_the_event_envelope() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let emitter = JsonlEventEmitter::new(JsonlTracer::new(tx), "node-typed");
+
+        emitter.emit_event(|| TestEvent {
+            event: "typed_event",
+            value: 7,
+            optional: None,
+        });
+
+        let written = rx.try_recv().expect("typed event uses the reserved slot");
+        assert_eq!(written.table, "typed");
+        assert_eq!(written.file_name, "typed.jsonl");
+
+        let row: Value = serde_json::from_slice(&written.line).expect("valid typed event JSON");
+        assert_eq!(row["node"], "node-typed");
+        assert_eq!(row["process_trace_id"], process_trace_id());
+        assert_eq!(row["event"], "typed_event");
+        assert_eq!(row["value"], 7);
+        assert_eq!(row["optional"], Value::Null);
+        assert!(row["ts"].is_u64());
+    }
+
+    #[test]
+    fn compatibility_emitter_serializes_the_common_process_envelope() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let emitter = JsonlEventEmitter::new(JsonlTracer::new(tx), "node-raw");
+
+        emitter.emit_with(TEST_TABLE, |row| {
+            row.insert("event".to_string(), Value::String("raw_event".to_string()));
+        });
+
+        let written = rx.try_recv().expect("raw event uses the reserved slot");
+        let row: Value = serde_json::from_slice(&written.line).expect("valid raw event JSON");
+        assert_eq!(row["node"], "node-raw");
+        assert_eq!(row["process_trace_id"], process_trace_id());
+        assert_eq!(row["event"], "raw_event");
+        assert!(row["ts"].is_u64());
+    }
+
+    #[test]
+    fn typed_emitter_is_lazy_when_disabled_full_or_closed() {
+        fn assert_not_built(emitter: &JsonlEventEmitter) {
+            let called = Arc::new(AtomicBool::new(false));
+            let called_in_build = called.clone();
+
+            emitter.emit_event(|| {
+                called_in_build.store(true, Ordering::SeqCst);
+                TestEvent {
+                    event: "must_not_build",
+                    value: 0,
+                    optional: None,
+                }
+            });
+
+            assert!(!called.load(Ordering::SeqCst));
+        }
+
+        assert_not_built(&JsonlEventEmitter::noop());
+
+        let (full_tx, _full_rx) = mpsc::channel(1);
+        let full = JsonlEventEmitter::new(JsonlTracer::new(full_tx), "full");
+        full.emit_event(|| TestEvent {
+            event: "fills_queue",
+            value: 0,
+            optional: None,
+        });
+        assert_not_built(&full);
+
+        let (closed_tx, closed_rx) = mpsc::channel(1);
+        drop(closed_rx);
+        let closed = JsonlEventEmitter::new(JsonlTracer::new(closed_tx), "closed");
+        assert_not_built(&closed);
+    }
+
+    #[tokio::test]
+    async fn writer_task_produces_per_table_jsonl() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let trace_dir = dir.path().join("traces");
+
+        let (tx, rx) = mpsc::channel(16);
+        let writer = TraceWriter::new(trace_dir.clone(), JsonlTraceConfig::default());
+        let handle = tokio::spawn(run_trace_writer(rx, writer, CancellationToken::new()));
+
+        tx.send(JsonlWriteEvent {
+            table: "alpha",
+            file_name: "alpha.jsonl",
+            line: br#"{"value":1}"#.to_vec(),
+        })
+        .await
+        .expect("send should succeed");
+
+        tx.send(JsonlWriteEvent {
+            table: "beta",
+            file_name: "beta.jsonl",
+            line: br#"{"value":2}"#.to_vec(),
+        })
+        .await
+        .expect("send should succeed");
+
+        drop(tx);
+        handle.await.expect("writer task should complete");
+
+        let alpha = tokio::fs::read_to_string(trace_dir.join("alpha.jsonl"))
+            .await
+            .expect("alpha file");
+        let beta = tokio::fs::read_to_string(trace_dir.join("beta.jsonl"))
+            .await
+            .expect("beta file");
+
+        assert_eq!(alpha.trim(), "{\"value\":1}");
+        assert_eq!(beta.trim(), "{\"value\":2}");
+    }
+
+    #[tokio::test]
+    async fn writer_flushes_idle_buffers_on_timer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let trace_dir = dir.path().join("traces");
+
+        let config = JsonlTraceConfig {
+            batch_linger: Duration::from_millis(1),
+            buffer_flush_bytes: 1024,
+            file_flush_interval: Duration::from_millis(25),
+            ..JsonlTraceConfig::default()
+        };
+
+        let (tx, rx) = mpsc::channel(16);
+        let writer = TraceWriter::new(trace_dir.clone(), config);
+        let handle = tokio::spawn(run_trace_writer(rx, writer, CancellationToken::new()));
+
+        tx.send(JsonlWriteEvent {
+            table: "alpha",
+            file_name: "alpha.jsonl",
+            line: br#"{"value":1}"#.to_vec(),
+        })
+        .await
+        .expect("send should succeed");
+
+        time::sleep(Duration::from_millis(80)).await;
+
+        let alpha = tokio::fs::read_to_string(trace_dir.join("alpha.jsonl"))
+            .await
+            .expect("alpha file should be flushed while the writer is idle");
+
+        assert_eq!(alpha.trim(), "{\"value\":1}");
+
+        drop(tx);
+        handle.await.expect("writer task should complete");
+    }
+
+    #[test]
+    fn noop_tracer_returns_disabled_errors() {
+        let tracer = JsonlTracer::noop();
+
+        assert!(matches!(
+            tracer.try_reserve(),
+            Err(JsonlTraceReserveError::Disabled)
+        ));
+
+        let send_result = tracer.try_send(JsonlWriteEvent {
+            table: "alpha",
+            file_name: "alpha.jsonl",
+            line: br#"{"value":1}"#.to_vec(),
+        });
+
+        assert!(matches!(send_result, Err(JsonlTraceSendError::Disabled(_))));
+    }
+
+    #[tokio::test]
+    async fn guarded_shutdown_drains_queued_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let trace_dir = dir.path().join("traces");
+
+        let config = JsonlTraceConfig {
+            batch_linger: Duration::from_secs(60),
+            file_flush_interval: Duration::from_secs(60),
+            ..JsonlTraceConfig::default()
+        };
+        let guard = JsonlTracer::spawn_guard_with_config(trace_dir.clone(), config);
+        let tracer = guard.tracer();
+
+        tracer
+            .try_send(JsonlWriteEvent {
+                table: "alpha",
+                file_name: "alpha.jsonl",
+                line: br#"{"value":1}"#.to_vec(),
+            })
+            .expect("queued row");
+
+        guard.shutdown().await;
+
+        let alpha = tokio::fs::read_to_string(trace_dir.join("alpha.jsonl"))
+            .await
+            .expect("alpha file");
+        assert_eq!(alpha.trim(), "{\"value\":1}");
+    }
+
+    #[test]
+    fn is_enabled_false_after_receiver_dropped() {
+        let (tx, rx) = mpsc::channel(1);
+        let tracer = JsonlTracer::new(tx);
+        assert!(
+            tracer.is_enabled(),
+            "tracer is enabled while the receiver lives"
+        );
+
+        drop(rx);
+        assert!(
+            !tracer.is_enabled(),
+            "tracer reports disabled once the receiver is dropped"
+        );
+
+        assert!(matches!(
+            tracer.try_reserve(),
+            Err(JsonlTraceReserveError::Closed)
+        ));
+    }
+
+    #[test]
+    fn tracer_drops_rows_when_queue_is_full() {
+        let (tx, _rx) = mpsc::channel(1);
+        let tracer = JsonlTracer::new(tx);
+
+        tracer
+            .try_send(JsonlWriteEvent {
+                table: "alpha",
+                file_name: "alpha.jsonl",
+                line: br#"{"value":1}"#.to_vec(),
+            })
+            .expect("first row fits");
+        let full = tracer.try_send(JsonlWriteEvent {
+            table: "alpha",
+            file_name: "alpha.jsonl",
+            line: br#"{"value":2}"#.to_vec(),
+        });
+
+        assert!(matches!(full, Err(JsonlTraceSendError::Full(_))));
+    }
+
+    #[test]
+    fn tracer_drops_flood_without_blocking() {
+        let (tx, _rx) = mpsc::channel(1);
+        let tracer = JsonlTracer::new(tx);
+
+        tracer
+            .try_send(JsonlWriteEvent {
+                table: "alpha",
+                file_name: "alpha.jsonl",
+                line: br#"{"value":0}"#.to_vec(),
+            })
+            .expect("first row fits");
+
+        let start = Instant::now();
+        let mut full = 0;
+        for value in 0..10_000 {
+            let result = tracer.try_send(JsonlWriteEvent {
+                table: "alpha",
+                file_name: "alpha.jsonl",
+                line: format!(r#"{{"value":{value}}}"#).into_bytes(),
+            });
+            if matches!(result, Err(JsonlTraceSendError::Full(_))) {
+                full += 1;
+            }
+        }
+
+        assert_eq!(full, 10_000);
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "full queue path should not block the emitter"
+        );
+    }
+}

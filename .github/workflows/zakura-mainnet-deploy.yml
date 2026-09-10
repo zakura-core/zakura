@@ -1,0 +1,750 @@
+name: Deploy Zakura mainnet fleet
+
+# Manual fleet deploy for the Zakura mainnet nodes.
+#
+# Runs on a self-hosted Linux x86_64 runner, expected to be installed on
+# us-east-0 (159.65.183.89) with the `zakura-mainnet-deployer` label (see
+# deploy/deployer/mainnet/bootstrap-zakura-mainnet-runner.sh). The deployer
+# builds a native zakurad binary on that runner, then uses deploy/deployer/
+# deploy.py to scp/install it across the fleet.
+#
+# BINARY-ONLY DEPLOY. The mainnet nodes were provisioned by hand with rich,
+# per-node configs (external_addr, an inline zakura_node_secret_key that pins
+# each node's iroh identity, custom peers, and mempool/sync tuning) and their
+# state DB at /root/.cache/zebra. To avoid changing node identities or resyncing,
+# this deploy sets manage_config = false: it only swaps /usr/local/bin/zakurad and
+# restarts the existing `zakurad` service, leaving the config, unit, and cache
+# untouched. Rebuilding those configs into the deployer's managed model is
+# separate future work.
+#
+# After PR #21, hand configs should use network.p2p_stack (legacy|zakura|dual|
+# default) rather than the deprecated v2_p2p/legacy_p2p bools. This workflow does
+# not rewrite node configs; p2p_stack below is dashboard/metadata only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git branch, tag, or SHA to build and deploy"
+        required: true
+        type: string
+        default: main
+      force_rebuild:
+        description: "Rebuild even if a cached binary for this commit exists"
+        type: boolean
+        required: false
+        default: false
+      no_restart:
+        description: "Stage the binary without restarting the node"
+        type: boolean
+        required: false
+        default: false
+      node:
+        description: "Optional single deployer node name; blank deploys the whole fleet"
+        required: false
+        type: string
+        default: ""
+      validate_start:
+        description: "After a single-node restart, verify the deployed binary remains healthy"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zakura-mainnet-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: "Deploy Zakura mainnet ${{ inputs.ref }}"
+    runs-on: [self-hosted, "${{ vars.ZAKURA_MAINNET_RUNNER_LABEL || 'zakura-mainnet-deployer' }}"]
+    timeout-minutes: 180
+    environment: zakura-mainnet
+
+    # Persist Cargo build artifacts across runs, outside the checked-out workspace
+    # (which actions/checkout wipes). deploy.py builds each commit in a throwaway
+    # git worktree and honors CARGO_TARGET_DIR, so an unchanged commit relinks in
+    # seconds instead of a ~18-minute cold rebuild — essential for one-node-at-a-
+    # time fleet rollouts that all build the same tag.
+    env:
+      CARGO_TARGET_DIR: /root/.cache/zakura-deployer-target
+      ZAKURA_DEPLOYER_BUILD_CACHE_DIR: /root/.cache/zakura-deployer-binaries
+
+    steps:
+      - name: Validate deploy inputs
+        env:
+          REF: ${{ inputs.ref }}
+          NODE: ${{ inputs.node }}
+          NO_RESTART: ${{ inputs.no_restart }}
+          VALIDATE_START: ${{ inputs.validate_start }}
+        run: |
+          set -euo pipefail
+          if ! [[ "${REF}" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "invalid ref: allowed chars [A-Za-z0-9._/-]" >&2
+            exit 1
+          fi
+          if [ -n "${NODE}" ] && ! [[ "${NODE}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "invalid node: allowed chars [A-Za-z0-9._-]" >&2
+            exit 1
+          fi
+          if [ "${VALIDATE_START}" = "true" ] && [ -z "${NODE}" ]; then
+            echo "validate_start requires one explicit node." >&2
+            exit 1
+          fi
+          if [ "${VALIDATE_START}" = "true" ] && [ "${NO_RESTART}" = "true" ]; then
+            echo "validate_start cannot be combined with no_restart." >&2
+            exit 1
+          fi
+
+      - name: Checkout deploy ref
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref }}
+
+      - name: Verify deployer supports binary-only mode
+        # The checked-out deploy.py comes from `inputs.ref`; this fleet's config
+        # sets `manage_config = false`. If the checked-out deploy.py predates that
+        # support it would silently run a destructive config-managed deploy, so
+        # fail fast instead. deploy.py also now rejects unknown config keys.
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          if ! grep -q 'manage_config' deploy/deployer/deploy.py ||
+             ! grep -q 'container_name' deploy/deployer/deploy.py; then
+            echo "::error::deploy.py at ref '${REF}' lacks binary-only Docker support." \
+                 "Deploy from a ref whose deploy.py supports manage_config and container_name."
+            exit 1
+          fi
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: stable
+          cache: false
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get -qq update
+          sudo apt-get -qq install -y --no-install-recommends \
+            build-essential \
+            clang \
+            cmake \
+            git \
+            libclang-dev \
+            pkg-config \
+            protobuf-compiler \
+            python3
+
+      - name: Start SSH agent when deploy key is configured
+        env:
+          ZAKURA_MAINNET_DEPLOY_SSH_KEY: ${{ secrets.ZAKURA_MAINNET_DEPLOY_SSH_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ZAKURA_MAINNET_DEPLOY_SSH_KEY}" ]; then
+            echo "ZAKURA_MAINNET_DEPLOY_SSH_KEY is not set; using the runner's existing SSH identity."
+            exit 0
+          fi
+
+          ssh_agent_sock="$RUNNER_TEMP/ssh-agent.sock"
+          ssh-agent -a "$ssh_agent_sock" > "$RUNNER_TEMP/ssh-agent.env"
+          SSH_AUTH_SOCK="$ssh_agent_sock" ssh-add - <<< "$ZAKURA_MAINNET_DEPLOY_SSH_KEY"
+          echo "SSH_AUTH_SOCK=$ssh_agent_sock" >> "$GITHUB_ENV"
+
+      - name: Pin fleet host keys
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          : > ~/.ssh/known_hosts
+          for host in \
+            165.22.54.66 \
+            104.131.184.123 \
+            159.65.183.89 \
+            143.244.184.176 \
+            159.203.38.10 \
+            64.227.44.93 \
+            161.35.156.226 \
+            139.59.64.115 \
+            168.144.173.250 \
+            159.203.113.196 \
+            104.131.174.28; do
+            ssh-keyscan -T 30 -H "$host" >> ~/.ssh/known_hosts
+          done
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Generate deployer fleet config
+        working-directory: deploy/deployer
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+
+          cat > nodes.ci.toml <<EOF
+          [defaults]
+          # Binary-only: swap the binary and restart the existing service; leave
+          # the hand-tuned config, unit, and /root/.cache/zebra state untouched.
+          deploy_kind     = "systemd"
+          manage_config   = false
+          service_name    = "zakurad"
+          bin_path        = "/usr/local/bin/zakurad"
+          network         = "Mainnet"
+          # Dashboard/metadata only (manage_config = false does not render this).
+          # Mainnet binary default is zebra; dual/zakura must be set on-node.
+          p2p_stack       = "default"
+          # Read-only fields below: consumed by the status dashboard's SSH probe,
+          # not written to any node (manage_config = false).
+          rpc_listen_addr = "0.0.0.0:8232"
+          metrics_endpoint = "127.0.0.1:9999"
+          log_file        = "/root/logs/zakura-tracing.log"
+          # Verified on the fleet: the nine regional nodes keep state here, the
+          # compat host does not. Used only for the dashboard's disk probe.
+          state_cache_dir = "/mnt/data/zakura-cache"
+
+          # Public mainnet node ids (crates/zakura-network/src/zakura/handler.rs). Used by
+          # the dashboard to label each host; not deployed to the nodes.
+          [defaults.zakura]
+          bootstrap_peers = [
+              "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca@165.22.54.66:8234",
+              "fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618@104.131.184.123:8234",
+              "9ec67ad6834bc2ca0d659c240e042d3446c37cabcc092b527d459c87d938b4a4@159.65.183.89:8234",
+              "bd3dc5d2a3d44c6bf90e364bf446231dbf9737e38a562ccf9e91ea631ea59b22@143.244.184.176:8234",
+              "14ab98fa0c4b07d40119e1dbc9f3c36d20c8f226ae5ba4216218a2034f148e57@159.203.38.10:8234",
+              "681d21b18644cd82ec13256a97f92bec1fff815683ef6f65dc7c993f098a4fe5@64.227.44.93:8234",
+              "058b3f20dc9bef7bb447f94d7663d793cfbc036720f97e52d7f13661b21818e1@161.35.156.226:8234",
+              "291323d78eb7186c3fa225ef5e305e95363e0ef06d42dca91bd4ef0254aed1ae@139.59.64.115:8234",
+              "85e425233a68697d4be91dd5d542305a8a327cd06d992d53c0913cef2fa75084@168.144.173.250:8234",
+          ]
+
+          [[nodes]]
+          name       = "asia-0"
+          ssh_string = "root@165.22.54.66"
+          commit     = "${REF}"
+
+          [[nodes]]
+          name       = "us-0"
+          ssh_string = "root@104.131.184.123"
+          commit     = "${REF}"
+
+          [[nodes]]
+          name       = "us-east-0"
+          ssh_string = "root@159.65.183.89"
+          commit     = "${REF}"
+
+          [[nodes]]
+          name       = "us-west-0"
+          ssh_string = "root@143.244.184.176"
+          commit     = "${REF}"
+
+          [[nodes]]
+          name       = "canada-0"
+          ssh_string = "root@159.203.38.10"
+          commit     = "${REF}"
+
+          [[nodes]]
+          name       = "europe-west-0"
+          ssh_string = "root@64.227.44.93"
+          commit     = "${REF}"
+
+          [[nodes]]
+          name       = "europe-central-0"
+          ssh_string = "root@161.35.156.226"
+          commit     = "${REF}"
+
+          [[nodes]]
+          name       = "asia-south-0"
+          ssh_string = "root@139.59.64.115"
+          commit     = "${REF}"
+
+          [[nodes]]
+          name       = "asia-pacific-0"
+          ssh_string = "root@168.144.173.250"
+          commit     = "${REF}"
+
+          [[nodes]]
+          name       = "zakura-compat"
+          ssh_string = "root@159.203.113.196"
+          commit     = "${REF}"
+          service_name = "zakurad-compat"
+          log_file   = ""
+          rpc_listen_addr = "127.0.0.1:8232"
+          state_cache_dir = "/mnt/data/import-zebra"
+
+          # Legacy archive node: `vct_fast_sync = false`, so it holds per-height
+          # commitment trees everywhere and never fast-synced. That is what makes it
+          # the supported generator for the release-state historical frontier grid —
+          # entries come from reads instead of replaying an absent band. Binary-only
+          # like the rest of the fleet, so its `vct_fast_sync = false` config is not
+          # rewritten by a deploy; that setting is the whole point of the node.
+          [[nodes]]
+          name       = "archive-vct-off"
+          ssh_string = "root@104.131.174.28"
+          commit     = "${REF}"
+          rpc_listen_addr = "127.0.0.1:8232"
+          log_file   = "/var/log/zakura/zakura.log"
+          # Metadata only under manage_config = false, but it records why this node
+          # differs. On `dual` its body tip wedged: the v2 coordinator logged
+          # `accepted block apply lost terminal observation; apply lifecycle is
+          # failed` and the header chain ran ~6,000 blocks ahead of the verified
+          # tip. Switching the node to `legacy` cleared it immediately. Do not flip
+          # this host to config-managed without carrying that setting across.
+          p2p_stack  = "legacy"
+          EOF
+
+      - name: Build deployer binary
+        working-directory: deploy/deployer
+        env:
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+          NODE: ${{ inputs.node }}
+        run: |
+          set -euo pipefail
+
+          args=(--config nodes.ci.toml)
+          if [ "${FORCE_REBUILD}" = "true" ]; then
+            args+=(--force)
+          fi
+          if [ -n "${NODE}" ]; then
+            args+=(--node "${NODE}")
+          fi
+
+          python3 deploy.py build "${args[@]}"
+
+      - name: Suppress fleet watchdog alerts during deploy
+        if: ${{ !inputs.no_restart }}
+        run: |
+          set -euo pipefail
+
+          sudo install -d -m 755 /run/zakura-fleet-watchdog
+          printf '%s\n' "$(( $(date +%s) + 1200 ))" \
+            | sudo tee /run/zakura-fleet-watchdog/deploy-suppressed-until >/dev/null
+
+      - name: Suppress compatibility watchdog alerts during deploy
+        # This stays in workflow-owned code so rollback refs whose deployer
+        # predates suppression are still covered.
+        if: ${{ !inputs.no_restart && (inputs.node == '' || inputs.node == 'zakura-compat') }}
+        run: |
+          set -euo pipefail
+
+          if ! timeout --signal=TERM --kill-after=5s 60s \
+            ssh \
+              -o BatchMode=yes \
+              -o ConnectTimeout=20 \
+              -o ServerAliveInterval=10 \
+              -o ServerAliveCountMax=3 \
+              -o StrictHostKeyChecking=yes \
+              -- root@159.203.113.196 bash -s <<'REMOTE'; then
+          set -euo pipefail
+
+          marker=/run/zakura-watchdog/deployment-suppressed-until
+          mkdir -p -m 755 "$(dirname "$marker")"
+          marker_tmp="$(mktemp "${marker}.tmp.XXXXXX")"
+          cleanup() {
+            rm -f "$marker_tmp"
+          }
+          trap cleanup EXIT
+          printf '%s\n' "$(( $(date +%s) + 1200 ))" > "$marker_tmp"
+          chmod 644 "$marker_tmp"
+          mv -f "$marker_tmp" "$marker"
+          trap - EXIT
+          if systemctl is-active --quiet zakura-watchdog; then
+            systemctl restart zakura-watchdog
+          fi
+          REMOTE
+            echo "::warning::failed to suppress compatibility watchdog alerts; continuing deploy" >&2
+          fi
+
+      - name: Deploy fleet
+        working-directory: deploy/deployer
+        env:
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+          NO_RESTART: ${{ inputs.no_restart }}
+          NODE: ${{ inputs.node }}
+        run: |
+          set -euo pipefail
+
+          args=(--config nodes.ci.toml)
+          if [ "${FORCE_REBUILD}" = "true" ]; then
+            args+=(--force)
+          fi
+          if [ "${NO_RESTART}" = "true" ]; then
+            args+=(--no-restart)
+          fi
+          if [ -n "${NODE}" ]; then
+            args+=(--node "${NODE}")
+          fi
+
+          python3 deploy.py deploy "${args[@]}"
+
+      - name: Show fleet status
+        if: always()
+        working-directory: deploy/deployer
+        env:
+          NODE: ${{ inputs.node }}
+        run: |
+          set -euo pipefail
+
+          args=(--config nodes.ci.toml)
+          if [ -n "${NODE}" ]; then
+            args+=(--node "${NODE}")
+          fi
+
+          python3 deploy.py status "${args[@]}"
+
+      - name: Validate deployed node startup
+        if: ${{ inputs.validate_start && inputs.node != '' && !inputs.no_restart }}
+        env:
+          NODE: ${{ inputs.node }}
+        run: |
+          set -euo pipefail
+
+          eval "$(
+            python3 - "$NODE" <<'PY'
+          import shlex
+          import sys
+          import tomllib
+
+          with open("deploy/deployer/nodes.ci.toml", "rb") as config_file:
+              config = tomllib.load(config_file)
+
+          defaults = config["defaults"]
+          node_name = sys.argv[1]
+          node = next(
+              (candidate for candidate in config["nodes"] if candidate["name"] == node_name),
+              None,
+          )
+          if node is None:
+              raise SystemExit(f"unknown node: {node_name}")
+
+          values = {
+              "SSH_TARGET": node["ssh_string"],
+              "SERVICE_NAME": node.get("service_name", defaults["service_name"]),
+              "BIN_PATH": node.get("bin_path", defaults["bin_path"]),
+              "RPC_LISTEN_ADDR": node.get(
+                  "rpc_listen_addr", defaults["rpc_listen_addr"]
+              ),
+              "RPC_AUTH": "cookie" if node_name == "zakura-compat" else "",
+              "RPC_CONFIG_PATH": (
+                  "/root/.cache/zakura/.cookie"
+                  if node_name == "zakura-compat"
+                  else ""
+              ),
+          }
+          for key, value in values.items():
+              print(f"{key}={shlex.quote(str(value))}")
+          PY
+          )"
+
+          expected_commit="$(git rev-parse HEAD)"
+          ssh -o BatchMode=yes -o ConnectTimeout=20 -- "$SSH_TARGET" \
+            "SERVICE_NAME='$SERVICE_NAME' BIN_PATH='$BIN_PATH' \
+             RPC_LISTEN_ADDR='$RPC_LISTEN_ADDR' RPC_AUTH='$RPC_AUTH' \
+             RPC_CONFIG_PATH='$RPC_CONFIG_PATH' EXPECTED_COMMIT='$expected_commit' bash -s" <<'EOF'
+          set -euo pipefail
+
+          # How long the node may take to answer RPC after the restart, and the
+          # separate window it must then stay up for. Keeping them independent means a
+          # node that is slow to open RPC still gets a full settle observation.
+          readonly RPC_READY_TIMEOUT=90
+          readonly SETTLE_SECONDS=90
+
+          # deploy.py keeps the previous binary at ${BIN_PATH}.bak, but rolls back
+          # on its own only when the service dies within its ~3s post-start check.
+          # Everything this canary adds -- a wrong commit, RPC never answering, a
+          # crash-loop during the settle window -- surfaces after that check has
+          # already passed, so without this the node keeps running the binary we
+          # just proved bad. Restart sequence mirrors deploy.py.
+          restart_service() {
+            systemctl stop "$SERVICE_NAME" || true
+            # Let the old process release the state DB before starting again.
+            for _ in 1 2 3 4 5 6 7 8 9 10; do
+              systemctl is-active --quiet "$SERVICE_NAME" || break
+              sleep 1
+            done
+            systemctl start "$SERVICE_NAME"
+            sleep 3
+            systemctl is-active --quiet "$SERVICE_NAME"
+          }
+
+          rollback() {
+            if [ ! -x "${BIN_PATH}.bak" ]; then
+              echo "No ${BIN_PATH}.bak to roll back to; ${SERVICE_NAME} is still running the binary that failed validation." >&2
+              return
+            fi
+            echo "Rolling ${SERVICE_NAME} back to ${BIN_PATH}.bak" >&2
+            install -m 755 "${BIN_PATH}.bak" "$BIN_PATH"
+            if restart_service; then
+              echo "Rolled back to $("$BIN_PATH" --version)." >&2
+            else
+              echo "Rollback of ${SERVICE_NAME} failed; the node needs manual recovery." >&2
+            fi
+          }
+
+          # Roll back on any failure below, then re-raise the original status so
+          # the canary still reports failure. Clearing the trap first keeps the
+          # handler from re-entering through its own exit.
+          on_exit() {
+            status=$?
+            trap - EXIT
+            [ "$status" -eq 0 ] || rollback
+            exit "$status"
+          }
+          trap on_exit EXIT
+
+          expected_short="${EXPECTED_COMMIT:0:9}"
+          version="$("$BIN_PATH" --version)"
+          if [[ ! "$version" =~ \+([0-9]+\.)?g${expected_short} ]]; then
+            echo "deployed version does not match ${expected_short}: ${version}" >&2
+            exit 1
+          fi
+
+          # `systemctl is-active --quiet` says nothing on failure, and under `set -e` a
+          # bare call aborts the whole check silently -- worst in the case this canary
+          # exists to catch. Report the unit state instead.
+          require_active() {
+            local state
+            if ! systemctl is-active --quiet "$SERVICE_NAME"; then
+              state="$(systemctl is-active "$SERVICE_NAME" || true)"
+              echo "${SERVICE_NAME} is ${state:-unknown} after deploy, expected active." >&2
+              exit 1
+            fi
+          }
+
+          rpc_port="${RPC_LISTEN_ADDR##*:}"
+          rpc_url="http://127.0.0.1:${rpc_port}/"
+          rpc_payload='{"jsonrpc":"1.0","id":"release-start-canary","method":"getblockchaininfo","params":[]}'
+
+          # Held in a variable using double quotes only. Inlined after `python3 -c` it
+          # would need nested single quotes, which the enclosing shell strips out.
+          rpc_check_py='
+          import json
+          import sys
+
+          response = json.load(sys.stdin)
+          error = response.get("error")
+          if error is not None:
+              raise SystemExit(f"RPC error: {error}")
+          result = response.get("result")
+          if not isinstance(result, dict) or not isinstance(result.get("blocks"), int):
+              raise SystemExit("getblockchaininfo returned an invalid result")
+          '
+
+          # Pass `quiet` while polling a node that is still starting: otherwise every
+          # five-second attempt logs a connection error and a full Python traceback.
+          rpc_ready() {
+            local quiet="${1:-}"
+            local body
+            local curl_args=(
+              --fail
+              --silent
+              --show-error
+              --max-time 10
+              --header "content-type: application/json"
+              --data "$rpc_payload"
+            )
+            if [ "$RPC_AUTH" = "cookie" ]; then
+              curl_args+=(--user "$(tr -d '\n' < "$RPC_CONFIG_PATH")")
+            fi
+            if [ -n "$quiet" ]; then
+              body="$(curl "${curl_args[@]}" "$rpc_url" 2>/dev/null)" || return 1
+              printf '%s' "$body" | python3 -c "$rpc_check_py" 2>/dev/null
+            else
+              body="$(curl "${curl_args[@]}" "$rpc_url")" || return 1
+              printf '%s' "$body" | python3 -c "$rpc_check_py"
+            fi
+          }
+
+          ready_deadline="$(( $(date +%s) + RPC_READY_TIMEOUT ))"
+          while true; do
+            require_active
+            if rpc_ready quiet; then
+              break
+            fi
+            if [ "$(date +%s)" -ge "$ready_deadline" ]; then
+              echo "RPC did not become ready within ${RPC_READY_TIMEOUT} seconds:" >&2
+              rpc_ready || true
+              exit 1
+            fi
+            sleep 5
+          done
+
+          # Restart the clock here: the settle window measures uptime once the node is
+          # actually serving, not time already spent waiting for it to get there.
+          settle_deadline="$(( $(date +%s) + SETTLE_SECONDS ))"
+          while [ "$(date +%s)" -lt "$settle_deadline" ]; do
+            require_active
+            sleep 5
+          done
+
+          restart_count="$(systemctl show "$SERVICE_NAME" --property=NRestarts --value)"
+          if [ "${restart_count:-0}" != "0" ]; then
+            echo "${SERVICE_NAME} restarted ${restart_count} time(s) after deploy." >&2
+            exit 1
+          fi
+          require_active
+          rpc_ready
+          echo "${SERVICE_NAME} stayed active with working RPC and no restarts for ${SETTLE_SECONDS} seconds."
+          EOF
+
+      - name: Install cluster status dashboard
+        if: always()
+        run: |
+          set -euo pipefail
+
+          dashboard_dir="/opt/zakura-mainnet-dashboard"
+          sudo install -d -m 755 "$dashboard_dir"
+          sudo install -m 755 deploy/runner/zakura-cluster-status.py "$dashboard_dir/zakura-cluster-status.py"
+          cp deploy/deployer/nodes.ci.toml "$RUNNER_TEMP/dashboard.nodes.toml"
+          # Dashboard-only: deploy.py rejects these fields, so add cookie RPC
+          # auth for the compatibility node into this copy (not the deploy config).
+          awk '
+            { print }
+            $0 ~ /^name[[:space:]]*=[[:space:]]*"zakura-compat"/ { in_compat = 1 }
+            in_compat && $0 ~ /^rpc_listen_addr[[:space:]]*=[[:space:]]*"127\.0\.0\.1:8232"/ {
+              print "rpc_auth   = \"cookie\""
+              print "rpc_config_path = \"/root/.cache/zakura/.cookie\""
+              in_compat = 0
+            }
+          ' "$RUNNER_TEMP/dashboard.nodes.toml" > "$RUNNER_TEMP/dashboard.nodes.toml.tmp"
+          mv "$RUNNER_TEMP/dashboard.nodes.toml.tmp" "$RUNNER_TEMP/dashboard.nodes.toml"
+          cat >> "$RUNNER_TEMP/dashboard.nodes.toml" <<'EOF'
+
+          [[nodes]]
+          name       = "zcashd-compat"
+          ssh_string = "root@159.203.113.196"
+          probe_kind = "zcashd"
+          service_name = ""
+          metrics_endpoint = ""
+          # Managed/path install from zcashd-compat-manifest.json (v1.0.0-compat-rc0).
+          bin_path = "/mnt/data/import-zebra/zcashd-compat/bin/v1.0.0-compat-rc0/x86_64-pc-linux-gnu/zcashd"
+          log_file = ""
+          rpc_listen_addr = "[::1]:8232"
+          rpc_auth = "cookie"
+          rpc_config_path = "/mnt/data/runtime/zcashd/.cookie"
+          state_cache_dir = "/mnt/data/runtime/zcashd"
+          # P2P sidecar (post -zebra-compat): supervised with -connect=127.0.0.1:8233.
+          process_pattern = "zcashd .*-connect=127.0.0.1:8233"
+          EOF
+          sudo install -m 644 "$RUNNER_TEMP/dashboard.nodes.toml" "$dashboard_dir/nodes.toml"
+
+          sudo tee /etc/systemd/system/zakura-mainnet-dashboard.service >/dev/null <<'EOF'
+          [Unit]
+          Description=Zakura mainnet cluster status dashboard
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          WorkingDirectory=/opt/zakura-mainnet-dashboard
+          ExecStart=/usr/bin/python3 /opt/zakura-mainnet-dashboard/zakura-cluster-status.py --config /opt/zakura-mainnet-dashboard/nodes.toml --host 0.0.0.0 --port 8090 --network mainnet --interval 10 --stale-after 300 --state-file /var/lib/zakura-mainnet-dashboard/orphan-pairs.json
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          sudo systemctl daemon-reload
+          sudo systemctl enable zakura-mainnet-dashboard.service
+          sudo systemctl restart zakura-mainnet-dashboard.service
+          sudo systemctl --no-pager --full status zakura-mainnet-dashboard.service || true
+
+      - name: Install public broadcast gateway
+        if: always()
+        run: |
+          set -euo pipefail
+
+          gateway_dir="/opt/zakura-gateway-mainnet"
+          sudo install -d -m 755 "$gateway_dir"
+          sudo install -m 755 deploy/gateway/broadcast.py "$gateway_dir/broadcast.py"
+          sudo install -m 644 deploy/gateway/mainnet/backends.toml \
+            "$gateway_dir/backends.toml"
+          sudo install -m 644 deploy/gateway/mainnet/broadcast.service \
+            /etc/systemd/system/zakura-broadcast-mainnet.service
+
+          # Keep status hosts and the broadcast TLS front door in sync.
+          sudo install -m 644 deploy/gateway/mainnet/Caddyfile /etc/caddy/Caddyfile
+          sudo caddy validate --config /etc/caddy/Caddyfile
+          sudo systemctl reload caddy.service
+
+          # Remove transitional install paths if present.
+          if systemctl list-unit-files zakura-submit-gateway.service >/dev/null 2>&1; then
+            sudo systemctl disable --now zakura-submit-gateway.service || true
+            sudo rm -f /etc/systemd/system/zakura-submit-gateway.service
+          fi
+          sudo rm -rf /opt/zakura-submit-gateway /opt/zakura-broadcast-mainnet
+
+          sudo systemctl daemon-reload
+          sudo systemctl enable zakura-broadcast-mainnet.service
+          sudo systemctl restart zakura-broadcast-mainnet.service
+          sudo systemctl --no-pager --full status zakura-broadcast-mainnet.service || true
+          curl --retry 10 --retry-delay 1 --retry-connrefused \
+            --max-time 2 -fsS "http://127.0.0.1:8092/healthz"
+          echo
+
+      - name: Install fleet watchdog
+        if: always()
+        env:
+          SLACK_WEB_HOOK: ${{ secrets.SLACK_WEB_HOOK }}
+        run: |
+          set -euo pipefail
+
+          watchdog_dir="/opt/zakura-fleet-watchdog"
+          sudo install -d -m 755 "$watchdog_dir"
+          sudo install -d -m 755 /var/lib/zakura-fleet-watchdog
+          sudo install -d -m 755 /etc/zakura-fleet-watchdog
+          sudo install -m 755 deploy/runner/zakura-cluster-watchdog.py "$watchdog_dir/zakura-cluster-watchdog.py"
+          sudo install -m 644 deploy/runner/fleet-watchdog.toml "$watchdog_dir/fleets.toml"
+          sudo install -m 644 deploy/runner/zakura-fleet-watchdog.service /etc/systemd/system/zakura-fleet-watchdog.service
+
+          # Incoming webhook for #zakura-alerts.
+          tmp_env="$(mktemp)"
+          if [ -n "${SLACK_WEB_HOOK}" ]; then
+            printf 'SLACK_WEB_HOOK=%s\n' "${SLACK_WEB_HOOK}" > "$tmp_env"
+          elif sudo test -f /etc/zakura-fleet-watchdog/env; then
+            # Keep an existing webhook env across deploys that omit the secret.
+            sudo grep -E '^(SLACK_WEB_HOOK|SLACK_WEBHOOK_URL|SLACK_WEBHOOK)=' \
+              /etc/zakura-fleet-watchdog/env | tee "$tmp_env" >/dev/null || : > "$tmp_env"
+          else
+            : > "$tmp_env"
+          fi
+          if ! grep -qE '^(SLACK_WEB_HOOK|SLACK_WEBHOOK_URL|SLACK_WEBHOOK)=' "$tmp_env"; then
+            echo "::warning::SLACK_WEB_HOOK is not set; fleet watchdog cannot post to Slack"
+          fi
+          sudo install -m 600 "$tmp_env" /etc/zakura-fleet-watchdog/env
+          rm -f "$tmp_env"
+
+          sudo systemctl daemon-reload
+          sudo systemctl enable zakura-fleet-watchdog.service
+          sudo systemctl restart zakura-fleet-watchdog.service
+          sudo systemctl --no-pager --full status zakura-fleet-watchdog.service || true
+
+      - name: Fetch recent logs on failure
+        if: failure()
+        working-directory: deploy/deployer
+        env:
+          NODE: ${{ inputs.node }}
+        run: |
+          set -euo pipefail
+
+          args=(--config nodes.ci.toml --lines 300)
+          if [ -n "${NODE}" ]; then
+            args+=(--node "${NODE}")
+          fi
+
+          python3 deploy.py logs fetch "${args[@]}" || true
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        with:
+          name: zakura-mainnet-deploy-logs-${{ github.run_id }}
+          path: deploy/deployer/logs/
+          if-no-files-found: ignore
+          retention-days: 14

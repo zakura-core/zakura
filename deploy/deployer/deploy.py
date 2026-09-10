@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Deploy zebrad to a fleet of nodes and collect their logs.
+"""Deploy zakurad to a fleet of nodes and collect their logs.
 
 Stdlib only (Python 3.11+ for tomllib). No third-party dependencies.
 
 The tool reads a node config (name / ssh_string / commit per node), builds the
-zebrad binary from each node's commit (reusing a cache keyed on the resolved
+zakurad binary from each node's commit (reusing a cache keyed on the resolved
 commit SHA), distributes the binary, installs+restarts a systemd service that
 logs to a deterministic file, and pulls those logs back on demand.
 
@@ -26,7 +26,11 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = SCRIPT_DIR / "templates"
-BUILD_CACHE_DIR = SCRIPT_DIR / ".build-cache"
+DEFAULT_BUILD_CACHE_DIR = SCRIPT_DIR / ".build-cache"
+BUILD_CACHE_DIR_ENV = "ZAKURA_DEPLOYER_BUILD_CACHE_DIR"
+BUILD_CACHE_RETAIN_ENV = "ZAKURA_DEPLOYER_BUILD_CACHE_RETAIN"
+DEFAULT_BUILD_CACHE_RETAIN = 12
+DATA_MOUNT = Path("/mnt/data")
 
 # ssh/scp options shared by every remote call. BatchMode avoids interactive
 # password prompts hanging a parallel deploy; accept-new pins unknown host keys
@@ -39,29 +43,46 @@ SSH_COMMON_OPTS = [
 ]
 
 DEFAULTS = {
-    "service_name": "zebrad",
-    "bin_path": "/usr/local/bin/zebrad",
-    "config_path": "/etc/zebrad/zebrad.toml",
-    "log_file": "/var/log/zebrad/zebrad.log",
-    "state_cache_dir": "/var/lib/zebrad",
+    "deploy_kind": "systemd",
+    # When false (systemd deploys only): leave the node's config, unit, and state
+    # cache untouched — just swap the binary and restart the existing service.
+    # For fleets provisioned outside the deployer with hand-tuned configs.
+    "manage_config": True,
+    "service_name": "zakurad",
+    "bin_path": "/usr/local/bin/zakurad",
+    "config_path": "/etc/zakura/zakura.toml",
+    "log_file": "/var/log/zakura/zakura.log",
+    "state_cache_dir": "/var/lib/zakura",
     "network": "Mainnet",
     "listen_addr": "[::]:8233",
+    "identity_dir": "",     # e.g. "/root/.zakura" -> pins the iroh node_id; "" uses zakurad default
     "network_cache_dir": "",
     "rpc_listen_addr": "",  # empty -> RPC stays disabled
     "rpc_enable_cookie_auth": None,
     "port": None,           # ssh port; None -> ssh default
-    # Match zebrad's own defaults so existing fleets render unchanged.
+    # Match zakurad's own defaults so existing fleets render unchanged.
     "storage_mode": "archive",
-    "v2_p2p": True,
-    "legacy_p2p": True,
+    # One of: default | legacy | zakura | dual.
+    "p2p_stack": "dual",
     "metrics_endpoint": "",  # e.g. "127.0.0.1:9100" -> renders [metrics]; "" omits it
-    "tracing_filter": "",    # e.g. "info,zebra_network::zakura=debug"; "" uses zebrad default
+    # e.g. "127.0.0.1:8080" -> renders [health] (/healthy, /ready); "" omits it.
+    # Both endpoints are unauthenticated, so keep them on loopback.
+    "health_listen_addr": "",
+    "tracing_filter": "",    # e.g. "info,zakura_network::zakura=debug"; "" uses zakurad default
     "checkpoint_sync": True,
     # Setting this false keeps checkpoint sync on while selecting the legacy non-VCT path.
     "vct_fast_sync": True,
     # Optional fleet-wide [defaults.zakura] table -> rendered [network.zakura].
     # Keys: dev_network, listen_addr, bootstrap_peers. Absent -> no section.
     "zakura": None,
+    # Process deploys are for manually supervised nodes, like the testnet
+    # zcashd-compat Zakura sidecar, where systemd would fight the local runbook.
+    "working_dir": "",
+    "start_command": "",
+    "process_pattern": "",
+    # Docker deploys replace the binary in an existing container without
+    # recreating it, preserving its mounts, networking, and image configuration.
+    "container_name": "",
 }
 
 
@@ -74,6 +95,8 @@ class Node:
     name: str
     ssh_string: str
     commit: str
+    deploy_kind: str
+    manage_config: bool
     service_name: str
     bin_path: str
     config_path: str
@@ -81,17 +104,22 @@ class Node:
     state_cache_dir: str
     network: str
     listen_addr: str
+    identity_dir: str
     network_cache_dir: str
     rpc_listen_addr: str
     rpc_enable_cookie_auth: object
     storage_mode: str
-    v2_p2p: bool
-    legacy_p2p: bool
+    p2p_stack: str
     metrics_endpoint: str
+    health_listen_addr: str
     tracing_filter: str
     checkpoint_sync: bool
     vct_fast_sync: bool
     zakura: object  # dict | None: fleet-wide [network.zakura] settings
+    working_dir: str
+    start_command: str
+    process_pattern: str
+    container_name: str
     port: object = None
     # resolved at runtime
     sha: str = ""
@@ -122,14 +150,48 @@ class Node:
 # Config loading
 # --------------------------------------------------------------------------- #
 
+# Canonical names accepted by zakurad's network.p2p_stack.
+P2P_STACK_VALUES = {
+    "default",
+    "legacy",
+    "zakura",
+    "dual",
+}
+
+
+def normalize_p2p_stack(value: object, *, where: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise DeployError(f"{where}: p2p_stack must be a non-empty string")
+    stack = value.strip().lower()
+    if stack not in P2P_STACK_VALUES:
+        raise DeployError(
+            f"{where}: unknown p2p_stack {value!r}; "
+            f"expected one of: default, legacy, zakura, dual"
+        )
+    return stack
+
+
 def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
     if not config_path.is_file():
         raise DeployError(f"config not found: {config_path}")
     with config_path.open("rb") as fh:
         data = tomllib.load(fh)
 
+    # Reject unknown keys so an intent like `manage_config = false` can never be
+    # silently dropped by an older deploy.py — that once turned a preserve-config
+    # deploy into a destructive one. `name`/`ssh_string`/`commit` are per-node only.
+    known_default_keys = set(DEFAULTS)
+    known_node_keys = known_default_keys | {"name", "ssh_string", "commit"}
+    defaults_raw = data.get("defaults", {})
+    unknown_defaults = set(defaults_raw) - known_default_keys
+    if unknown_defaults:
+        raise DeployError(
+            f"unknown key(s) in [defaults]: {', '.join(sorted(unknown_defaults))} "
+            f"(this deploy.py may be older than the config)"
+        )
+
     defaults = dict(DEFAULTS)
-    defaults.update(data.get("defaults", {}))
+    defaults.update(defaults_raw)
 
     raw_nodes = data.get("nodes", [])
     if not raw_nodes:
@@ -141,6 +203,13 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
         for required in ("name", "ssh_string", "commit"):
             if required not in raw:
                 raise DeployError(f"node missing required field '{required}': {raw}")
+        unknown_node = set(raw) - known_node_keys
+        if unknown_node:
+            raise DeployError(
+                f"unknown key(s) in [[nodes]] {raw.get('name', '?')}: "
+                f"{', '.join(sorted(unknown_node))} "
+                f"(this deploy.py may be older than the config)"
+            )
         name = raw["name"]
         if name in seen:
             raise DeployError(f"duplicate node name: {name}")
@@ -151,6 +220,8 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             name=name,
             ssh_string=merged["ssh_string"],
             commit=merged["commit"],
+            deploy_kind=merged["deploy_kind"],
+            manage_config=merged["manage_config"],
             service_name=merged["service_name"],
             bin_path=merged["bin_path"],
             config_path=merged["config_path"],
@@ -158,17 +229,24 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             state_cache_dir=merged["state_cache_dir"],
             network=merged["network"],
             listen_addr=merged["listen_addr"],
+            identity_dir=merged["identity_dir"],
             network_cache_dir=merged["network_cache_dir"],
             rpc_listen_addr=merged["rpc_listen_addr"],
             rpc_enable_cookie_auth=merged["rpc_enable_cookie_auth"],
             storage_mode=merged["storage_mode"],
-            v2_p2p=merged["v2_p2p"],
-            legacy_p2p=merged["legacy_p2p"],
+            p2p_stack=normalize_p2p_stack(
+                merged["p2p_stack"], where=f"[[nodes]] {name}"
+            ),
             metrics_endpoint=merged["metrics_endpoint"],
+            health_listen_addr=merged["health_listen_addr"],
             tracing_filter=merged["tracing_filter"],
             checkpoint_sync=merged["checkpoint_sync"],
             vct_fast_sync=merged["vct_fast_sync"],
             zakura=merged.get("zakura"),
+            working_dir=merged["working_dir"],
+            start_command=merged["start_command"],
+            process_pattern=merged["process_pattern"],
+            container_name=merged["container_name"],
             port=merged["port"],
         ))
 
@@ -210,6 +288,45 @@ def repo_root() -> Path:
 # --------------------------------------------------------------------------- #
 # Build (cache keyed on resolved commit SHA)
 # --------------------------------------------------------------------------- #
+def build_cache_dir() -> Path:
+    return Path(os.environ.get(BUILD_CACHE_DIR_ENV, DEFAULT_BUILD_CACHE_DIR)).expanduser()
+
+
+def build_cache_retain() -> int:
+    raw = os.environ.get(BUILD_CACHE_RETAIN_ENV, str(DEFAULT_BUILD_CACHE_RETAIN))
+    try:
+        retain = int(raw)
+    except ValueError as exc:
+        raise DeployError(f"{BUILD_CACHE_RETAIN_ENV} must be an integer, got {raw!r}") from exc
+    if retain < 1:
+        raise DeployError(f"{BUILD_CACHE_RETAIN_ENV} must be at least 1")
+    return retain
+
+
+def path_requires_data_mount(path: Path) -> bool:
+    path = path.expanduser()
+    if not path.is_absolute():
+        return False
+    return path == DATA_MOUNT or DATA_MOUNT in path.parents
+
+
+def ensure_data_mount_for_path(path: Path, *, purpose: str) -> None:
+    if path_requires_data_mount(path) and not DATA_MOUNT.is_mount():
+        raise DeployError(
+            f"{purpose} uses {path}, but {DATA_MOUNT} is not a mounted filesystem"
+        )
+
+
+def prune_cached_binaries(cache_dir: Path, current_sha: str) -> None:
+    retain = build_cache_retain()
+    binaries = [
+        path for path in cache_dir.glob("zakurad-*")
+        if path.is_file() and path.name != f"zakurad-{current_sha}"
+    ]
+    binaries.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    for old_binary in binaries[max(0, retain - 1):]:
+        old_binary.unlink(missing_ok=True)
+
 
 def resolve_sha(root: Path, commit: str) -> str:
     """Resolve a branch/tag/SHA to a full commit SHA in the repo.
@@ -229,11 +346,11 @@ def resolve_sha(root: Path, commit: str) -> str:
 
 
 def cached_binary(sha: str) -> Path:
-    return BUILD_CACHE_DIR / f"zebrad-{sha}"
+    return build_cache_dir() / f"zakurad-{sha}"
 
 
 def binary_is_runnable(binary: Path) -> bool:
-    """Sanity-check that a cached binary is a valid, runnable zebrad.
+    """Sanity-check that a cached binary is a valid, runnable zakurad.
 
     We can't verify the commit from `--version` (it prints clean semver without
     the git SHA), so the cache key (the SHA-named filename) is what ties a cached
@@ -247,8 +364,10 @@ def binary_is_runnable(binary: Path) -> bool:
 
 
 def build_commit(root: Path, sha: str, *, force: bool = False) -> Path:
-    """Build zebrad at `sha` into the cache, or reuse an existing cached build."""
-    BUILD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    """Build zakurad at `sha` into the cache, or reuse an existing cached build."""
+    cache_dir = build_cache_dir()
+    ensure_data_mount_for_path(cache_dir, purpose="build cache")
+    cache_dir.mkdir(parents=True, exist_ok=True)
     target = cached_binary(sha)
     if target.exists() and not force:
         if binary_is_runnable(target):
@@ -258,19 +377,19 @@ def build_commit(root: Path, sha: str, *, force: bool = False) -> Path:
 
     # Build at the exact commit in a throwaway detached worktree so the caller's
     # working tree (which may be dirty) is never disturbed.
-    work = BUILD_CACHE_DIR / f"wt-{sha[:12]}"
+    work = cache_dir / f"wt-{sha[:12]}"
     if work.exists():
         run(["git", "worktree", "remove", "--force", str(work)], cwd=root, check=False)
         shutil.rmtree(work, ignore_errors=True)
     print(f"[build] checking out {sha[:9]} into {work.name}")
     run(["git", "worktree", "add", "--detach", str(work), sha], cwd=root)
     try:
-        print(f"[build] cargo build --release -p zebrad ({sha[:9]}) ...")
-        run(["cargo", "build", "--release", "--locked", "-p", "zebrad"], cwd=work)
+        print(f"[build] cargo build --release -p zakura ({sha[:9]}) ...")
+        run(["cargo", "build", "--release", "--locked", "-p", "zakura"], cwd=work)
         # Respect CARGO_TARGET_DIR (set per-worktree or shared) when locating the
         # output, falling back to the in-worktree target dir.
         target_dir = os.environ.get("CARGO_TARGET_DIR")
-        built = (Path(target_dir) if target_dir else work / "target") / "release" / "zebrad"
+        built = (Path(target_dir) if target_dir else work / "target") / "release" / "zakurad"
         if not built.is_file():
             raise DeployError(f"expected binary not found after build: {built}")
         tmp = target.with_suffix(".tmp")
@@ -278,6 +397,7 @@ def build_commit(root: Path, sha: str, *, force: bool = False) -> Path:
         os.chmod(tmp, 0o755)
         tmp.replace(target)
         print(f"[build] cached -> {target}")
+        prune_cached_binaries(cache_dir, sha)
     finally:
         run(["git", "worktree", "remove", "--force", str(work)], cwd=root, check=False)
         shutil.rmtree(work, ignore_errors=True)
@@ -345,20 +465,27 @@ def render_node_config(node: Node) -> str:
     else:
         rpc_block = "# listen_addr disabled"
     metrics_block = f'[metrics]\nendpoint_addr = "{node.metrics_endpoint}"\n' if node.metrics_endpoint else ""
-    filter_line = f'filter = "{node.tracing_filter}"' if node.tracing_filter else "# filter unset (zebrad default)"
-    network_cache_line = (
-        f'cache_dir = "{node.network_cache_dir}"' if node.network_cache_dir else "# cache_dir unset (zebrad default)"
+    health_block = (
+        f'[health]\nlisten_addr = "{node.health_listen_addr}"\n' if node.health_listen_addr else ""
     )
-    return render_template("zebrad.toml", {
+    filter_line = f'filter = "{node.tracing_filter}"' if node.tracing_filter else "# filter unset (zakurad default)"
+    network_cache_line = (
+        f'cache_dir = "{node.network_cache_dir}"' if node.network_cache_dir else "# cache_dir unset (zakurad default)"
+    )
+    identity_dir_line = (
+        f'identity_dir = "{node.identity_dir}"' if node.identity_dir else "# identity_dir unset (zakurad default)"
+    )
+    return render_template("zakura.toml", {
         "NETWORK": node.network,
         "LISTEN_ADDR": node.listen_addr,
+        "IDENTITY_DIR": identity_dir_line,
         "NETWORK_CACHE_DIR": network_cache_line,
         "STATE_CACHE_DIR": node.state_cache_dir,
         "STORAGE_MODE": node.storage_mode,
-        "V2_P2P": "true" if node.v2_p2p else "false",
-        "LEGACY_P2P": "true" if node.legacy_p2p else "false",
+        "P2P_STACK": node.p2p_stack,
         "ZAKURA_BLOCK": render_zakura_block(node.zakura),
         "METRICS_BLOCK": metrics_block,
+        "HEALTH_BLOCK": health_block,
         "TRACING_FILTER": filter_line,
         "LOG_FILE": node.log_file,
         "RPC_BLOCK": rpc_block,
@@ -368,11 +495,22 @@ def render_node_config(node: Node) -> str:
 
 
 def render_service(node: Node) -> str:
-    return render_template("zebrad.service", {
+    mount_lines = ""
+    if any(
+        path_requires_data_mount(Path(path))
+        for path in (node.state_cache_dir, node.network_cache_dir, node.log_file)
+        if path
+    ):
+        mount_lines = (
+            f"RequiresMountsFor={DATA_MOUNT}\n"
+            f"AssertPathIsMountPoint={DATA_MOUNT}\n"
+        )
+    return render_template("zakurad.service", {
         "SERVICE_NAME": node.service_name,
         "BIN_PATH": node.bin_path,
         "CONFIG_PATH": node.config_path,
         "LOG_FILE": node.log_file,
+        "MOUNT_LINES": mount_lines,
     })
 
 
@@ -386,31 +524,55 @@ set -euo pipefail
 BIN_PATH={bin_path}
 CONFIG_PATH={config_path}
 SERVICE={service}
+LEGACY_SERVICE=zebrad
 LOG_FILE={log_file}
 STATE_DIR={state_dir}
 NO_RESTART={no_restart}
 
-mkdir -p "$(dirname "$BIN_PATH")" "$(dirname "$CONFIG_PATH")" \
-         "$(dirname "$LOG_FILE")" "$STATE_DIR"
+require_data_mount_for() {{
+    case "$1" in
+        /mnt/data|/mnt/data/*)
+            if ! mountpoint -q /mnt/data; then
+                echo "required /mnt/data mount is absent for $1" >&2
+                exit 1
+            fi
+            ;;
+    esac
+}}
+
+require_data_mount_for "$STATE_DIR"
+require_data_mount_for "$(dirname "$LOG_FILE")"
+
+mkdir -p "$(dirname "$BIN_PATH")" "$(dirname "$CONFIG_PATH")" "$(dirname "$LOG_FILE")"
 
 # Stage uploaded artifacts (uploaded to /tmp by the deploy step).
-install -m 644 /tmp/zebrad-deploy.service "/etc/systemd/system/${{SERVICE}}.service"
-install -m 644 /tmp/zebrad-deploy.toml "$CONFIG_PATH"
+install -m 644 /tmp/zakurad-deploy.service "/etc/systemd/system/${{SERVICE}}.service"
+install -m 644 /tmp/zakurad-deploy.toml "$CONFIG_PATH"
 
 # Back up the currently installed binary before replacing it.
 if [ -x "$BIN_PATH" ]; then
     cp -a "$BIN_PATH" "${{BIN_PATH}}.bak"
 fi
-install -m 755 /tmp/zebrad-deploy.new "$BIN_PATH"
-rm -f /tmp/zebrad-deploy.new /tmp/zebrad-deploy.service /tmp/zebrad-deploy.toml
+install -m 755 /tmp/zakurad-deploy.new "$BIN_PATH"
+rm -f /tmp/zakurad-deploy.new /tmp/zakurad-deploy.service /tmp/zakurad-deploy.toml
 
 systemctl daemon-reload
-systemctl enable "$SERVICE" >/dev/null 2>&1 || true
 
 if [ "$NO_RESTART" = "1" ]; then
+    mkdir -p "$STATE_DIR"
     echo "installed (restart skipped)"
     exit 0
 fi
+
+# The Zakura rename is intentionally breaking: remove the obsolete unit so it
+# cannot be re-enabled or mistaken for the active node after deployment. Keep it
+# running during a no-restart deployment because that mode only stages changes.
+systemctl disable --now "$LEGACY_SERVICE.service" >/dev/null 2>&1 || true
+rm -f "/etc/systemd/system/$LEGACY_SERVICE.service"
+systemctl daemon-reload
+systemctl enable "$SERVICE" >/dev/null 2>&1 || true
+
+mkdir -p "$STATE_DIR"
 
 start_service() {{
     systemctl stop "$SERVICE" || true
@@ -444,6 +606,193 @@ fi
 sleep 2
 systemctl is-active "$SERVICE"
 "$BIN_PATH" --version || true
+"""
+
+
+PROCESS_INSTALL_SCRIPT = r"""
+set -euo pipefail
+
+BIN_PATH={bin_path}
+CONFIG_PATH={config_path}
+LOG_FILE={log_file}
+STATE_DIR={state_dir}
+WORKING_DIR={working_dir}
+START_COMMAND={start_command}
+PROCESS_PATTERN={process_pattern}
+NO_RESTART={no_restart}
+
+require_data_mount_for() {{
+    case "$1" in
+        /mnt/data|/mnt/data/*)
+            if ! mountpoint -q /mnt/data; then
+                echo "required /mnt/data mount is absent for $1" >&2
+                exit 1
+            fi
+            ;;
+    esac
+}}
+
+require_data_mount_for "$STATE_DIR"
+if [ -n "$LOG_FILE" ]; then
+    require_data_mount_for "$(dirname "$LOG_FILE")"
+fi
+
+mkdir -p "$(dirname "$BIN_PATH")" "$(dirname "$CONFIG_PATH")"
+if [ -n "$LOG_FILE" ]; then
+    mkdir -p "$(dirname "$LOG_FILE")"
+fi
+if [ -n "$WORKING_DIR" ]; then
+    mkdir -p "$WORKING_DIR"
+fi
+
+install -m 644 /tmp/zakurad-deploy.toml "$CONFIG_PATH"
+
+if [ -x "$BIN_PATH" ]; then
+    cp -a "$BIN_PATH" "${{BIN_PATH}}.bak"
+fi
+install -m 755 /tmp/zakurad-deploy.new "$BIN_PATH"
+rm -f /tmp/zakurad-deploy.new /tmp/zakurad-deploy.toml
+
+if [ "$NO_RESTART" = "1" ]; then
+    mkdir -p "$STATE_DIR"
+    echo "installed process binary/config (restart skipped)"
+    exit 0
+fi
+
+if [ -z "$START_COMMAND" ] || [ -z "$PROCESS_PATTERN" ]; then
+    echo "process deploy requires start_command and process_pattern" >&2
+    exit 1
+fi
+
+if pgrep -f "$PROCESS_PATTERN" >/dev/null 2>&1; then
+    pkill -TERM -f "$PROCESS_PATTERN" >/dev/null 2>&1 || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        if ! pgrep -f "$PROCESS_PATTERN" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+    pkill -KILL -f "$PROCESS_PATTERN" >/dev/null 2>&1 || true
+fi
+
+mkdir -p "$STATE_DIR"
+
+if [ -n "$WORKING_DIR" ]; then
+    cd "$WORKING_DIR"
+fi
+
+launcher_log="${{LOG_FILE:-/tmp/zakurad-process-deploy}}.launcher"
+nohup bash -lc "$START_COMMAND" >> "$launcher_log" 2>&1 &
+sleep 3
+
+if ! pgrep -f "$PROCESS_PATTERN" >/dev/null 2>&1; then
+    echo "process failed to start; rolling back to ${{BIN_PATH}}.bak" >&2
+    if [ -x "${{BIN_PATH}}.bak" ]; then
+        install -m 755 "${{BIN_PATH}}.bak" "$BIN_PATH"
+        nohup bash -lc "$START_COMMAND" >> "$launcher_log" 2>&1 &
+        sleep 3
+    fi
+    pgrep -f "$PROCESS_PATTERN" >/dev/null 2>&1
+fi
+
+"$BIN_PATH" --version || true
+"""
+
+
+# Binary-only deploy (manage_config = false): swap the binary in place and
+# restart the existing service, leaving the node's config, unit, and state cache
+# untouched. Used for fleets provisioned outside the deployer.
+BINARY_ONLY_INSTALL_SCRIPT = r"""
+set -euo pipefail
+
+BIN_PATH={bin_path}
+SERVICE={service}
+NO_RESTART={no_restart}
+
+mkdir -p "$(dirname "$BIN_PATH")"
+
+if [ -x "$BIN_PATH" ]; then
+    cp -a "$BIN_PATH" "${{BIN_PATH}}.bak"
+fi
+install -m 755 /tmp/zakurad-deploy.new "$BIN_PATH"
+rm -f /tmp/zakurad-deploy.new
+
+if [ "$NO_RESTART" = "1" ]; then
+    echo "installed binary (restart skipped)"
+    exit 0
+fi
+
+restart_service() {{
+    systemctl stop "$SERVICE" || true
+    # Wait for the old process to release the state DB before starting again.
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        systemctl is-active --quiet "$SERVICE" || break
+        sleep 1
+    done
+    systemctl start "$SERVICE"
+    sleep 3
+    systemctl is-active --quiet "$SERVICE"
+}}
+
+if ! restart_service; then
+    echo "service unhealthy after deploy; rolling back to ${{BIN_PATH}}.bak" >&2
+    if [ -x "${{BIN_PATH}}.bak" ]; then
+        install -m 755 "${{BIN_PATH}}.bak" "$BIN_PATH"
+        restart_service || true
+    fi
+    exit 1
+fi
+
+systemctl is-active "$SERVICE"
+"$BIN_PATH" --version || true
+"""
+
+
+# Binary-only deploy into an existing Docker container. The updated binary
+# remains in the container's writable layer, so Compose must not recreate the
+# container after this deploy unless its image has also been updated.
+DOCKER_BINARY_ONLY_INSTALL_SCRIPT = r"""
+set -euo pipefail
+
+CONTAINER={container}
+BIN_PATH={bin_path}
+NO_RESTART={no_restart}
+
+docker inspect "$CONTAINER" >/dev/null
+docker cp /tmp/zakurad-deploy.new "$CONTAINER:/tmp/zakurad-deploy.new"
+rm -f /tmp/zakurad-deploy.new
+
+docker exec --user 0 "$CONTAINER" sh -c \
+    'if [ -x "$1" ]; then cp -a "$1" "$1.bak"; fi
+     install -m 755 /tmp/zakurad-deploy.new "$1.new"
+     mv -f "$1.new" "$1"
+     rm -f /tmp/zakurad-deploy.new' sh "$BIN_PATH"
+
+if [ "$NO_RESTART" = "1" ]; then
+    echo "installed container binary (restart skipped)"
+    exit 0
+fi
+
+if ! docker restart "$CONTAINER" >/dev/null; then
+    restart_failed=1
+else
+    restart_failed=0
+    sleep 3
+fi
+
+if [ "$restart_failed" = "1" ] ||
+   ! docker inspect --format '{{{{.State.Running}}}}' "$CONTAINER" | grep -qx true; then
+    echo "container unhealthy after deploy; rolling back to $BIN_PATH.bak" >&2
+    docker stop "$CONTAINER" >/dev/null || true
+    if docker cp "$CONTAINER:$BIN_PATH.bak" /tmp/zakurad-deploy.rollback; then
+        docker cp /tmp/zakurad-deploy.rollback "$CONTAINER:$BIN_PATH"
+        rm -f /tmp/zakurad-deploy.rollback
+    fi
+    docker start "$CONTAINER" >/dev/null || true
+    exit 1
+fi
+
+docker exec "$CONTAINER" "$BIN_PATH" --version || true
 """
 
 
@@ -481,28 +830,75 @@ def cmd_deploy(args) -> int:
     def work(node: Node) -> tuple[str, bool, str]:
         binary = by_sha[node.sha]
         try:
+            if node.deploy_kind not in ("systemd", "process", "docker"):
+                return (node.name, False, f"unknown deploy_kind: {node.deploy_kind}")
+
+            # Binary-only: don't render or ship a config/unit; just swap the
+            # binary and restart the existing service or container.
+            if not node.manage_config:
+                if node.deploy_kind not in ("systemd", "docker"):
+                    return (
+                        node.name,
+                        False,
+                        "manage_config=false requires deploy_kind=systemd or docker",
+                    )
+                if node.deploy_kind == "docker" and not node.container_name:
+                    return (node.name, False, "docker deploy requires container_name")
+                run(node.scp_to(str(binary), "/tmp/zakurad-deploy.new"), capture=True)
+                if node.deploy_kind == "docker":
+                    script = DOCKER_BINARY_ONLY_INSTALL_SCRIPT.format(
+                        container=shlex.quote(node.container_name),
+                        bin_path=shlex.quote(node.bin_path),
+                        no_restart="1" if args.no_restart else "0",
+                    )
+                else:
+                    script = BINARY_ONLY_INSTALL_SCRIPT.format(
+                        bin_path=shlex.quote(node.bin_path),
+                        service=shlex.quote(node.service_name),
+                        no_restart="1" if args.no_restart else "0",
+                    )
+                proc = ssh_with_stdin(node, script)
+                if proc.returncode != 0:
+                    return (node.name, False, f"install/restart failed (rc={proc.returncode})")
+                return (node.name, True, f"deployed {node.sha[:9]} (binary-only)")
+
             cfg = render_node_config(node)
-            unit = render_service(node)
-            cfg_tmp = BUILD_CACHE_DIR / f".cfg-{node.name}.toml"
-            unit_tmp = BUILD_CACHE_DIR / f".unit-{node.name}.service"
+            cfg_tmp = build_cache_dir() / f".cfg-{node.name}.toml"
             cfg_tmp.write_text(cfg)
-            unit_tmp.write_text(unit)
             try:
-                run(node.scp_to(str(binary), "/tmp/zebrad-deploy.new"), capture=True)
-                run(node.scp_to(str(unit_tmp), "/tmp/zebrad-deploy.service"), capture=True)
-                run(node.scp_to(str(cfg_tmp), "/tmp/zebrad-deploy.toml"), capture=True)
+                run(node.scp_to(str(binary), "/tmp/zakurad-deploy.new"), capture=True)
+                run(node.scp_to(str(cfg_tmp), "/tmp/zakurad-deploy.toml"), capture=True)
+                if node.deploy_kind == "systemd":
+                    unit = render_service(node)
+                    unit_tmp = build_cache_dir() / f".unit-{node.name}.service"
+                    unit_tmp.write_text(unit)
+                    try:
+                        run(node.scp_to(str(unit_tmp), "/tmp/zakurad-deploy.service"), capture=True)
+                    finally:
+                        unit_tmp.unlink(missing_ok=True)
             finally:
                 cfg_tmp.unlink(missing_ok=True)
-                unit_tmp.unlink(missing_ok=True)
 
-            script = INSTALL_SCRIPT.format(
-                bin_path=shlex.quote(node.bin_path),
-                config_path=shlex.quote(node.config_path),
-                service=shlex.quote(node.service_name),
-                log_file=shlex.quote(node.log_file),
-                state_dir=shlex.quote(node.state_cache_dir),
-                no_restart="1" if args.no_restart else "0",
-            )
+            if node.deploy_kind == "systemd":
+                script = INSTALL_SCRIPT.format(
+                    bin_path=shlex.quote(node.bin_path),
+                    config_path=shlex.quote(node.config_path),
+                    service=shlex.quote(node.service_name),
+                    log_file=shlex.quote(node.log_file),
+                    state_dir=shlex.quote(node.state_cache_dir),
+                    no_restart="1" if args.no_restart else "0",
+                )
+            else:
+                script = PROCESS_INSTALL_SCRIPT.format(
+                    bin_path=shlex.quote(node.bin_path),
+                    config_path=shlex.quote(node.config_path),
+                    log_file=shlex.quote(node.log_file),
+                    state_dir=shlex.quote(node.state_cache_dir),
+                    working_dir=shlex.quote(node.working_dir),
+                    start_command=shlex.quote(node.start_command),
+                    process_pattern=shlex.quote(node.process_pattern),
+                    no_restart="1" if args.no_restart else "0",
+                )
             proc = ssh_with_stdin(node, script)
             if proc.returncode != 0:
                 return (node.name, False, f"install/restart failed (rc={proc.returncode})")
@@ -579,14 +975,39 @@ def cmd_status(args) -> int:
     nodes = load_nodes(Path(args.config), args.node)
 
     def work(node: Node) -> tuple[str, str]:
-        # `zebrad --version` prints clean semver (e.g. "zebrad 5.0.0-rc.3") with no
+        # `zakurad --version` prints clean semver (e.g. "zakurad 5.0.0-rc.3") with no
         # commit, so also read the running build's git commit from the startup
         # diagnostic line in the node's log (`git commit: <sha>`). The configured
         # ref is appended so requested-vs-running is visible at a glance.
-        probe = (
-            f"systemctl is-active {shlex.quote(node.service_name)} 2>/dev/null; "
-            f"{shlex.quote(node.bin_path)} --version 2>/dev/null | head -1; "
+        if node.deploy_kind == "docker":
+            service_probe = (
+                f"docker inspect --format '{{{{.State.Status}}}}' "
+                f"{shlex.quote(node.container_name)} 2>/dev/null"
+            )
+            version_probe = (
+                f"docker exec {shlex.quote(node.container_name)} "
+                f"{shlex.quote(node.bin_path)} --version 2>/dev/null | head -1"
+            )
+        elif node.service_name:
+            service_probe = f"systemctl is-active {shlex.quote(node.service_name)} 2>/dev/null"
+            version_probe = f"{shlex.quote(node.bin_path)} --version 2>/dev/null | head -1"
+        elif node.process_pattern:
+            service_probe = (
+                f"pgrep -f {shlex.quote(node.process_pattern)} >/dev/null 2>&1 "
+                "&& printf 'active\\n' || printf 'inactive\\n'"
+            )
+            version_probe = f"{shlex.quote(node.bin_path)} --version 2>/dev/null | head -1"
+        else:
+            service_probe = "printf 'unknown\\n'"
+            version_probe = f"{shlex.quote(node.bin_path)} --version 2>/dev/null | head -1"
+        log_probe = (
             f"grep -aoE 'git commit: [0-9a-f]+' {shlex.quote(node.log_file)} 2>/dev/null | tail -1"
+            if node.log_file else "true"
+        )
+        probe = (
+            f"{service_probe}; "
+            f"{version_probe}; "
+            f"{log_probe}"
         )
         proc = ssh_capture_script(node, probe)
         lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
@@ -609,7 +1030,7 @@ def cmd_status(args) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="deploy.py",
-        description="Build, deploy, and collect logs for a zebrad node fleet.",
+        description="Build, deploy, and collect logs for a Zakura node fleet.",
     )
     sub = p.add_subparsers(dest="command", required=True)
 

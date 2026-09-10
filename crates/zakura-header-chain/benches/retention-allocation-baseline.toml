@@ -1,0 +1,46 @@
+source_commit = "c6dc0e01687fa41fc90e12e3471f4270efaae7e6"
+captured_at = "2026-08-14T15:35:00-05:00"
+
+[ordinary.percent_25]
+upper_bound_ns = 28223
+allocations = 1
+current_upper_bound_ns = 12179
+
+[ordinary.percent_50]
+upper_bound_ns = 27835
+allocations = 1
+current_upper_bound_ns = 11729
+
+[ordinary.percent_90]
+upper_bound_ns = 28008
+allocations = 1
+current_upper_bound_ns = 12191
+
+[ordinary.percent_100]
+upper_bound_ns = 28645
+allocations = 1
+current_upper_bound_ns = 11835
+
+[protected_refusal.percent_25]
+upper_bound_ns = 2437800
+allocations = 20
+current_upper_bound_ns = 1549900
+current_allocations = 14
+
+[protected_refusal.percent_50]
+upper_bound_ns = 6328000
+allocations = 21
+current_upper_bound_ns = 3551200
+current_allocations = 15
+
+[protected_refusal.percent_90]
+upper_bound_ns = 18495000
+allocations = 22
+current_upper_bound_ns = 14036000
+current_allocations = 16
+
+[protected_refusal.percent_100]
+upper_bound_ns = 19677000
+allocations = 22
+current_upper_bound_ns = 15908000
+current_allocations = 16

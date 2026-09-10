@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e5e380ae5a918e056d1a684025dd54fec4be28c9ace0e9198dc1dc7b801321f8 # shrinks to offset = 1, corruption = AuthDataRoot
+cc 2a9a57bffd2f0814f0c1bc87cca7d315d39e823eb9f34107d57abede383eec19 # shrinks to offset = 11, corruption = PreActivationOrchardRoot

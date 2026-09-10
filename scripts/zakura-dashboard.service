@@ -1,0 +1,39 @@
+# Local replay helper for checkpoint-sync-bench artifacts.
+#
+# CI no longer runs a persistent host dashboard. Each benchmark uploads
+# `dashboard-runs/<run-id>/{meta.json,samples.jsonl}` in the workflow artifact.
+# Download the artifact and serve it locally:
+#
+#   python3 scripts/zakura-metrics-dashboard.py \
+#     --archive ./bench-out/dashboard-runs \
+#     --host 127.0.0.1 --port 8090
+#
+# This unit file is optional for operators who prefer systemd. It is not
+# installed by CI and must never bind a public interface on a shared host.
+#
+# Example local install:
+#   sudo mkdir -p /opt/zakura-bench/dashboard/runs
+#   sudo cp scripts/zakura-metrics-dashboard.py /opt/zakura-bench/dashboard/
+#   # point --archive at a directory of downloaded artifact runs
+#   sudo cp scripts/zakura-dashboard.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now zakura-dashboard
+
+[Unit]
+Description=Zakura sync observability dashboard (local artifact replay)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+# Bind loopback only. Edit --archive if your downloaded runs live elsewhere.
+ExecStart=/usr/bin/python3 /opt/zakura-bench/dashboard/zakura-metrics-dashboard.py \
+    --archive /opt/zakura-bench/dashboard/runs \
+    --host 127.0.0.1 --port 8090
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

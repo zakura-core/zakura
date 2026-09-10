@@ -1,0 +1,17 @@
+[Unit]
+Description=Zakura continuous genesis sync node
+After=network-online.target
+Wants=network-online.target
+AssertPathExists={{BIN_PATH}}
+
+[Service]
+Type=simple
+WorkingDirectory={{REPO_DIR}}
+ExecStart={{BIN_PATH}} --config {{CONFIG_PATH}} start
+Restart=no
+LimitNOFILE=1048576
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,871 @@
+//! The inbound service handles requests from Zebra's peers.
+//!
+//! It downloads and verifies gossiped blocks and mempool transactions,
+//! when Zebra is close to the chain tip.
+//!
+//! It also responds to peer requests for blocks, transactions, and peer addresses.
+
+use std::{
+    collections::HashSet,
+    future::Future,
+    net::IpAddr,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    task::{Context, Poll},
+    time::{Duration, Instant},
+};
+
+use futures::{
+    future::{FutureExt, TryFutureExt},
+    stream::{FuturesUnordered, Stream, StreamExt},
+};
+use tokio::sync::oneshot::{self, error::TryRecvError};
+use tower::{buffer::Buffer, timeout::Timeout, util::BoxService, Service, ServiceExt};
+
+use zakura_network::{self as zn, PeerSocketAddr};
+use zakura_state::{self as zs};
+
+use zakura_chain::{
+    block::{self, Block},
+    serialization::ZcashSerialize,
+    transaction::UnminedTxId,
+};
+use zakura_consensus::{router::RouterError, VerifyBlockError};
+use zakura_network::{AddressBook, InventoryResponse};
+use zakura_node_services::mempool;
+use zakura_rpc::PendingBlockRegistry;
+
+use crate::BoxError;
+
+// Re-use the syncer timeouts for consistency.
+use super::sync::{BLOCK_DOWNLOAD_TIMEOUT, BLOCK_VERIFY_TIMEOUT};
+
+use InventoryResponse::*;
+
+mod cached_peer_addr_response;
+pub(crate) mod downloads;
+
+use cached_peer_addr_response::CachedPeerAddrResponse;
+
+#[cfg(test)]
+mod tests;
+
+use downloads::{Downloads as BlockDownloads, GossipedTipChildHeightMismatch};
+
+/// The maximum response time for block-body requests that can wait for a mined-block commit.
+///
+/// If the response takes longer than this time, it will be cancelled,
+/// and the peer might be disconnected.
+///
+/// This constant must exceed the 15-second `PENDING_BLOCK_WAIT` in `zakura-rpc`, so that a peer
+/// waiting for an early-advertised block reaches that wait's own timeout first.
+pub const MAX_INBOUND_RESPONSE_TIME: Duration = Duration::from_secs(18);
+
+/// The maximum response time for requests that do not wait for a mined-block commit.
+const DEFAULT_INBOUND_RESPONSE_TIME: Duration = Duration::from_secs(5);
+
+/// The number of bytes the [`Inbound`] service will queue in response to a single block or
+/// transaction request, before ignoring any additional block or transaction IDs in that request.
+///
+/// This is the same as `zcashd`'s default send buffer limit:
+/// <https://github.com/zcash/zcash/blob/829dd94f9d253bb705f9e194f13cb8ca8e545e1e/src/net.h#L84>
+/// as used in `ProcessGetData()`:
+/// <https://github.com/zcash/zcash/blob/829dd94f9d253bb705f9e194f13cb8ca8e545e1e/src/main.cpp#L6410-L6412>
+pub const GETDATA_SENT_BYTES_LIMIT: usize = 1_000_000;
+
+/// The maximum number of blocks the [`Inbound`] service will queue in response to a block request,
+/// before ignoring any additional block IDs in that request.
+///
+/// This is the same as `zcashd`'s request limit:
+/// <https://github.com/zcash/zcash/blob/829dd94f9d253bb705f9e194f13cb8ca8e545e1e/src/main.h#L108>
+///
+/// (Zebra's request limit is one block in transit per peer, because it fans out block requests to
+/// many peers instead of just a few peers.)
+pub const GETDATA_MAX_BLOCK_COUNT: usize = 16;
+
+/// Minimum interval between zcashd-compat errors for requested pruned block bodies.
+const ZCASHD_COMPAT_PRUNED_BLOCK_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Actionable error emitted when a zcashd sidecar requests a pruned block body.
+pub(crate) const ZCASHD_COMPAT_PRUNED_BLOCK_ERROR: &str =
+    "zcashd_compat: cannot serve block because its body has been pruned; a zcashd sidecar \
+     requiring this block cannot continue syncing. Restore zcashd from a newer snapshot, or use \
+     archive storage on Zakura side https://zakura.com/snapshots/ .";
+
+type BlockDownloadPeerSet =
+    Buffer<BoxService<zn::Request, zn::Response, zn::BoxError>, zn::Request>;
+type State = Buffer<BoxService<zs::Request, zs::Response, zs::BoxError>, zs::Request>;
+type Mempool = Buffer<BoxService<mempool::Request, mempool::Response, BoxError>, mempool::Request>;
+type SemanticBlockVerifier = Buffer<
+    BoxService<zakura_consensus::Request, block::Hash, RouterError>,
+    zakura_consensus::Request,
+>;
+type GossipedBlockDownloads =
+    BlockDownloads<Timeout<BlockDownloadPeerSet>, Timeout<SemanticBlockVerifier>, State>;
+
+/// Returns the misbehavior update for a failed gossiped block download, if the advertising peer
+/// is known and the error is worth scoring.
+///
+/// # Correctness
+///
+/// [`SemanticBlockVerifier`] is a [`BlockVerifierRouter`](zakura_consensus::router), so its boxed
+/// errors are [`RouterError`]s, not [`VerifyBlockError`]s. Both concrete types are checked here,
+/// because tests and other verifier configurations can produce a bare [`VerifyBlockError`].
+fn block_misbehavior(
+    err: BoxError,
+    advertiser_addr: Option<PeerSocketAddr>,
+) -> Option<(PeerSocketAddr, u32)> {
+    let advertiser_addr = advertiser_addr?;
+    let score = if let Some(err) = err.downcast_ref::<RouterError>() {
+        err.misbehavior_score()
+    } else {
+        err.downcast_ref::<VerifyBlockError>()?.misbehavior_score()
+    };
+
+    (score != 0).then_some((advertiser_addr, score))
+}
+
+/// Rate-limits diagnostics for missing block bodies in pruned zcashd-compat mode.
+#[derive(Debug)]
+struct PrunedBlockNotFoundLogger {
+    tx_retention: Option<u32>,
+    peer_ips: HashSet<IpAddr>,
+    last_log: Mutex<Option<Instant>>,
+}
+
+impl PrunedBlockNotFoundLogger {
+    fn new(tx_retention: Option<u32>, peer_ips: Vec<IpAddr>) -> Self {
+        Self {
+            tx_retention,
+            peer_ips: peer_ips.into_iter().map(canonical_ip).collect(),
+            last_log: Mutex::new(None),
+        }
+    }
+
+    fn is_enabled_for(&self, source: Option<&zn::PeerSource>) -> bool {
+        let Some(zn::PeerSource::LegacySocket(addr)) = source else {
+            return false;
+        };
+        let source_ip = canonical_ip(addr.remove_socket_addr_privacy().ip());
+
+        self.tx_retention.is_some() && self.peer_ips.contains(&source_ip)
+    }
+
+    /// Reserves the current log interval and returns the configured retention.
+    fn reserve_log(&self) -> Option<u32> {
+        self.reserve_log_at(Instant::now())
+    }
+
+    fn reserve_log_at(&self, now: Instant) -> Option<u32> {
+        let tx_retention = self.tx_retention?;
+        let mut last_log = self
+            .last_log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        if last_log.is_some_and(|last| {
+            now.saturating_duration_since(last) < ZCASHD_COMPAT_PRUNED_BLOCK_LOG_INTERVAL
+        }) {
+            return None;
+        }
+
+        *last_log = Some(now);
+        Some(tx_retention)
+    }
+}
+
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(ip)),
+        ip => ip,
+    }
+}
+
+/// Returns the height when `hash` is a known canonical block with a retained header.
+///
+/// Diagnostic lookup errors are intentionally ignored so they never change the
+/// peer's ordinary `notfound` response.
+async fn retained_block_height(mut state: State, hash: block::Hash) -> Option<block::Height> {
+    let response = state
+        .ready()
+        .await
+        .ok()?
+        .call(zs::Request::BlockHeader(hash.into()))
+        .await
+        .ok()?;
+
+    match response {
+        zs::Response::BlockHeader { height, .. } => Some(height),
+        _ => None,
+    }
+}
+
+/// Returns a committed block from any active chain.
+async fn block_by_hash(
+    mut state: State,
+    hash: block::Hash,
+) -> Result<Option<Arc<Block>>, zn::BoxError> {
+    let response = state
+        .ready()
+        .await?
+        .call(zs::Request::AnyChainBlock(hash.into()))
+        .await?;
+
+    match response {
+        zs::Response::Block(Some(block)) => Ok(Some(block)),
+        zs::Response::Block(None) => Ok(None),
+        _ => unreachable!("wrong response from state"),
+    }
+}
+
+fn mempool_queue_source(source: zn::PeerSource) -> mempool::QueueSource {
+    match source {
+        zn::PeerSource::LegacySocket(addr) => mempool::QueueSource::LegacySocket(*addr),
+        zn::PeerSource::Zakura(peer_id) => {
+            mempool::QueueSource::Zakura(peer_id.as_bytes().to_vec())
+        }
+    }
+}
+
+/// The services used by the [`Inbound`] service.
+pub struct InboundSetupData {
+    /// A shared list of peer addresses.
+    pub address_book: Arc<std::sync::Mutex<AddressBook>>,
+
+    /// A service that can be used to download gossiped blocks.
+    pub block_download_peer_set: BlockDownloadPeerSet,
+
+    /// A service that verifies downloaded blocks.
+    ///
+    /// Given to `Inbound.block_downloads` after the required services are set up.
+    pub block_verifier: SemanticBlockVerifier,
+
+    /// A service that manages transactions in the memory pool.
+    pub mempool: Mempool,
+
+    /// A service that manages cached blockchain state.
+    pub state: State,
+
+    /// Allows efficient access to the best tip of the blockchain.
+    pub latest_chain_tip: zs::LatestChainTip,
+
+    /// A channel to send misbehavior reports to the [`AddressBook`].
+    pub misbehavior_sender: tokio::sync::mpsc::Sender<(PeerSocketAddr, u32)>,
+}
+
+/// Tracks the internal state of the [`Inbound`] service during setup.
+#[allow(clippy::large_enum_variant)]
+pub enum Setup {
+    /// Waiting for service setup to complete.
+    ///
+    /// All requests are ignored.
+    Pending {
+        // Configuration
+        //
+        /// The configured full verification concurrency limit.
+        full_verify_concurrency_limit: usize,
+
+        // Services
+        //
+        /// A oneshot channel used to receive required services,
+        /// after they are set up.
+        setup: oneshot::Receiver<InboundSetupData>,
+    },
+
+    /// Setup is complete.
+    ///
+    /// All requests are answered.
+    Initialized {
+        // Services
+        //
+        /// An owned partial list of peer addresses used as a `GetAddr` response, and
+        /// a shared list of peer addresses used to periodically refresh the partial list.
+        ///
+        /// Refreshed from the address book in `poll_ready` method
+        /// after [`CACHED_ADDRS_REFRESH_INTERVAL`](cached_peer_addr_response::CACHED_ADDRS_REFRESH_INTERVAL).
+        cached_peer_addr_response: CachedPeerAddrResponse,
+
+        /// A `futures::Stream` that downloads and verifies gossiped blocks.
+        block_downloads: Pin<Box<GossipedBlockDownloads>>,
+
+        /// A service that manages transactions in the memory pool.
+        mempool: Mempool,
+
+        /// A service that manages cached blockchain state.
+        state: State,
+
+        /// A channel to send misbehavior reports to the [`AddressBook`].
+        misbehavior_sender: tokio::sync::mpsc::Sender<(PeerSocketAddr, u32)>,
+    },
+
+    /// Temporary state used in the inbound service's internal initialization code.
+    ///
+    /// If this state occurs outside the service initialization code, the service panics.
+    FailedInit,
+
+    /// Setup failed, because the setup channel permanently failed.
+    /// The service keeps returning readiness errors for every request.
+    FailedRecv {
+        /// The original channel error.
+        error: SharedRecvError,
+    },
+}
+
+/// A wrapper around `Arc<TryRecvError>` that implements `Error`.
+#[derive(thiserror::Error, Debug, Clone)]
+#[error(transparent)]
+pub struct SharedRecvError(Arc<TryRecvError>);
+
+impl From<TryRecvError> for SharedRecvError {
+    fn from(source: TryRecvError) -> Self {
+        Self(Arc::new(source))
+    }
+}
+
+/// Uses the node state to respond to inbound peer requests.
+///
+/// This service, wrapped in appropriate middleware, is passed to
+/// `zakura_network::init` to respond to inbound peer requests.
+///
+/// The `Inbound` service is responsible for:
+///
+/// - supplying network data like peer addresses to other nodes;
+/// - supplying chain data like blocks to other nodes;
+/// - supplying mempool transactions to other nodes;
+/// - receiving gossiped transactions; and
+/// - receiving gossiped blocks.
+///
+/// Because the `Inbound` service is responsible for participating in the gossip
+/// protocols used for transaction and block diffusion, there is a potential
+/// overlap with the `ChainSync` and `Mempool` components.
+///
+/// The division of responsibility is that:
+///
+/// The `ChainSync` and `Mempool` components are *internally driven*,
+/// periodically polling the network to check for new blocks or transactions.
+///
+/// The `Inbound` service is *externally driven*, responding to block gossip
+/// by attempting to download and validate advertised blocks.
+///
+/// Gossiped transactions are forwarded to the mempool downloader,
+/// which unifies polled and gossiped transactions into a single download list.
+pub struct Inbound {
+    /// Provides service dependencies, if they are available.
+    ///
+    /// Some services are unavailable until Zebra has completed setup.
+    setup: Setup,
+
+    /// Whether legacy peer address labels in logs are unredacted.
+    expose_peer_addresses: bool,
+
+    /// Diagnostics for zcashd-compat requests that need pruned block bodies.
+    pruned_block_not_found_logger: Arc<PrunedBlockNotFoundLogger>,
+
+    /// Early-advertised mined blocks waiting for contextual commit.
+    pending_blocks: PendingBlockRegistry,
+}
+
+impl Inbound {
+    /// Create a new inbound service.
+    ///
+    /// Dependent services are sent via the `setup` channel after initialization.
+    pub fn new(
+        full_verify_concurrency_limit: usize,
+        expose_peer_addresses: bool,
+        zcashd_compat_pruning_retention: Option<u32>,
+        zcashd_compat_peer_ips: Vec<IpAddr>,
+        setup: oneshot::Receiver<InboundSetupData>,
+    ) -> Inbound {
+        Self::new_with_pending_blocks(
+            full_verify_concurrency_limit,
+            expose_peer_addresses,
+            zcashd_compat_pruning_retention,
+            zcashd_compat_peer_ips,
+            setup,
+            PendingBlockRegistry::default(),
+        )
+    }
+
+    /// Creates an inbound service with a pending-block registry shared with mining RPCs.
+    pub fn new_with_pending_blocks(
+        full_verify_concurrency_limit: usize,
+        expose_peer_addresses: bool,
+        zcashd_compat_pruning_retention: Option<u32>,
+        zcashd_compat_peer_ips: Vec<IpAddr>,
+        setup: oneshot::Receiver<InboundSetupData>,
+        pending_blocks: PendingBlockRegistry,
+    ) -> Inbound {
+        Inbound {
+            setup: Setup::Pending {
+                full_verify_concurrency_limit,
+                setup,
+            },
+            expose_peer_addresses,
+            pruned_block_not_found_logger: Arc::new(PrunedBlockNotFoundLogger::new(
+                zcashd_compat_pruning_retention,
+                zcashd_compat_peer_ips,
+            )),
+            pending_blocks,
+        }
+    }
+
+    /// Remove `self.setup`, temporarily replacing it with an invalid state.
+    fn take_setup(&mut self) -> Setup {
+        let mut setup = Setup::FailedInit;
+        std::mem::swap(&mut self.setup, &mut setup);
+        setup
+    }
+}
+
+impl Service<zn::Request> for Inbound {
+    type Response = zn::Response;
+    type Error = zn::BoxError;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // Check whether the setup is finished, but don't wait for it to
+        // become ready before reporting readiness. We expect to get it "soon",
+        // and reporting unreadiness might cause unwanted load-shedding, since
+        // the load-shed middleware is unable to distinguish being unready due
+        // to load from being unready while waiting on setup.
+
+        // Every setup variant handler must provide a result
+        let result;
+
+        self.setup = match self.take_setup() {
+            Setup::Pending {
+                full_verify_concurrency_limit,
+                mut setup,
+            } => match setup.try_recv() {
+                Ok(setup_data) => {
+                    let InboundSetupData {
+                        address_book,
+                        block_download_peer_set,
+                        block_verifier,
+                        mempool,
+                        state,
+                        latest_chain_tip,
+                        misbehavior_sender,
+                    } = setup_data;
+
+                    let cached_peer_addr_response = CachedPeerAddrResponse::new(address_book);
+
+                    let block_downloads = Box::pin(BlockDownloads::new(
+                        full_verify_concurrency_limit,
+                        self.expose_peer_addresses,
+                        Timeout::new(block_download_peer_set, BLOCK_DOWNLOAD_TIMEOUT),
+                        Timeout::new(block_verifier, BLOCK_VERIFY_TIMEOUT),
+                        state.clone(),
+                        latest_chain_tip,
+                    ));
+
+                    result = Ok(());
+                    Setup::Initialized {
+                        cached_peer_addr_response,
+                        block_downloads,
+                        mempool,
+                        state,
+                        misbehavior_sender,
+                    }
+                }
+                Err(TryRecvError::Empty) => {
+                    // There's no setup data yet, so keep waiting for it.
+                    //
+                    // We could use Future::poll() to get a waker and return Poll::Pending here.
+                    // But we want to drop excess requests during startup instead. Otherwise,
+                    // the inbound service gets overloaded, and starts disconnecting peers.
+                    result = Ok(());
+                    Setup::Pending {
+                        full_verify_concurrency_limit,
+                        setup,
+                    }
+                }
+                Err(error @ TryRecvError::Closed) => {
+                    // Mark the service as failed, because setup failed
+                    error!(?error, "inbound setup failed");
+                    let error: SharedRecvError = error.into();
+                    result = Err(error.clone().into());
+                    Setup::FailedRecv { error }
+                }
+            },
+            // Make sure previous setups were left in a valid state
+            Setup::FailedInit => unreachable!("incomplete previous Inbound initialization"),
+            // If setup failed, report service failure
+            Setup::FailedRecv { error } => {
+                result = Err(error.clone().into());
+                Setup::FailedRecv { error }
+            }
+            // Clean up completed download tasks, ignoring their results
+            Setup::Initialized {
+                cached_peer_addr_response,
+                mut block_downloads,
+                mempool,
+                state,
+                misbehavior_sender,
+            } => {
+                // # Correctness
+                //
+                // Clear the stream but ignore the final Pending return value.
+                // If we returned Pending here, and there were no waiting block downloads,
+                // then inbound requests would wait for the next block download, and hang forever.
+                while let Poll::Ready(Some(result)) = block_downloads.as_mut().poll_next(cx) {
+                    let Err((err, advertiser_addr)) = result else {
+                        continue;
+                    };
+
+                    // A rewritten coinbase height on a tip child is rejected before the block
+                    // reaches the verifier, so it is never a `RouterError` or a
+                    // `VerifyBlockError` and `block_misbehavior` cannot classify it. It is also
+                    // the one rejection that must re-request the block: the poisoned response
+                    // held the per-hash dedupe slot while it was outstanding, so honest peers'
+                    // `inv`s for the same hash were already dropped as `AlreadyQueued`. Without
+                    // the re-request the block waits for the syncer's next round, which is the
+                    // delay the attack is trying to cause.
+                    //
+                    // Scoring and re-requesting are kept together here rather than split across
+                    // `block_misbehavior`, because the re-request needs `block_downloads` and
+                    // the two decisions are the same decision.
+                    if let Some(mismatch) = err.downcast_ref::<GossipedTipChildHeightMismatch>() {
+                        if let Some(advertiser_addr) = advertiser_addr {
+                            let _ = misbehavior_sender.try_send((
+                                advertiser_addr,
+                                zn::constants::MAX_PEER_MISBEHAVIOR_SCORE,
+                            ));
+                        }
+
+                        // The outcome, including a replacement refused by the queue bounds, is
+                        // logged by `retry_poisoned` itself.
+                        let _ = block_downloads.retry_poisoned(mismatch.hash);
+                        continue;
+                    }
+
+                    if let Some(update) = block_misbehavior(err, advertiser_addr) {
+                        let _ = misbehavior_sender.try_send(update);
+                    }
+                }
+
+                result = Ok(());
+
+                Setup::Initialized {
+                    cached_peer_addr_response,
+                    block_downloads,
+                    mempool,
+                    state,
+                    misbehavior_sender,
+                }
+            }
+        };
+
+        // Make sure we're leaving the setup in a valid state
+        if matches!(self.setup, Setup::FailedInit) {
+            unreachable!("incomplete Inbound initialization after poll_ready state handling");
+        }
+
+        // TODO:
+        //  * do we want to propagate backpressure from the download queue or its outbound network?
+        //    currently, the download queue waits for the outbound network in the download future,
+        //    and drops new requests after it reaches a hard-coded limit. This is the
+        //    "load shed directly" pattern from #1618.
+        //  * currently, the state service is always ready, unless its buffer is full.
+        //    So we might also want to propagate backpressure from its buffer.
+        //  * poll_ready needs to be implemented carefully, to avoid hangs or deadlocks.
+        //    See #1593 for details.
+        Poll::Ready(result)
+    }
+
+    /// Call the inbound service.
+    ///
+    /// Errors indicate that the peer has done something wrong or unexpected,
+    /// and will cause callers to disconnect from the remote peer.
+    #[instrument(name = "inbound", skip(self, req))]
+    fn call(&mut self, req: zn::Request) -> Self::Future {
+        let pruned_block_not_found_logger = self.pruned_block_not_found_logger.clone();
+        let pending_blocks = self.pending_blocks.clone();
+        let (cached_peer_addr_response, block_downloads, mempool, state) = match &mut self.setup {
+            Setup::Initialized {
+                cached_peer_addr_response,
+                block_downloads,
+                mempool,
+                state,
+                misbehavior_sender: _,
+            } => (cached_peer_addr_response, block_downloads, mempool, state),
+            _ => {
+                debug!("ignoring request from remote peer during setup");
+                return async { Ok(zn::Response::Nil) }.boxed();
+            }
+        };
+
+        let response_timeout = if matches!(
+            &req,
+            zn::Request::BlocksByHash(_) | zn::Request::BlocksByHashFrom { .. }
+        ) {
+            MAX_INBOUND_RESPONSE_TIME
+        } else {
+            DEFAULT_INBOUND_RESPONSE_TIME
+        };
+
+        let response = match req {
+            zn::Request::Peers => {
+                // # Security
+                //
+                // We truncate the list to not reveal our entire peer set in one call.
+                // But we don't monitor repeated requests and the results are shuffled,
+                // a crawler could just send repeated queries and get the full list.
+                //
+                // # Correctness
+                //
+                // If the address book is busy, try again inside the future. If it can't be locked
+                // twice, ignore the request.
+                cached_peer_addr_response.try_refresh();
+                let response = cached_peer_addr_response.value();
+
+                async move {
+                    Ok(response)
+                }.boxed()
+            }
+            request @ (zn::Request::BlocksByHash(_)
+            | zn::Request::BlocksByHashFrom { .. }) => {
+                let (hashes, source) = match request {
+                    zn::Request::BlocksByHash(hashes) => (hashes, None),
+                    zn::Request::BlocksByHashFrom { hashes, source } => {
+                        (hashes, Some(source))
+                    }
+                    _ => unreachable!("matched block inventory request"),
+                };
+                let log_pruned_block =
+                    pruned_block_not_found_logger.is_enabled_for(source.as_ref());
+
+                // We return an available or missing response to each inventory request,
+                // unless the request is empty, or it reaches a response limit.
+                if hashes.is_empty() {
+                    return async { Ok(zn::Response::Nil) }.boxed();
+                }
+
+                let state = state.clone();
+
+                async move {
+                    let mut blocks: Vec<InventoryResponse<(Arc<Block>, Option<PeerSocketAddr>), block::Hash>> = Vec::new();
+                    let mut total_size = 0;
+                    let mut state_lookup_bytes = 0;
+                    let mut pending_lookups = FuturesUnordered::new();
+                    let mut lookup_results = Vec::new();
+
+                    for (index, &hash) in hashes.iter().take(GETDATA_MAX_BLOCK_COUNT).enumerate() {
+                        if state_lookup_bytes >= GETDATA_SENT_BYTES_LIMIT {
+                            break;
+                        }
+
+                        // Subscribe before the state lookup. A commit can remove the registry entry
+                        // while state answers this request.
+                        let pending_wait = pending_blocks.wait(hash);
+                        match block_by_hash(state.clone(), hash).await? {
+                            Some(block) => {
+                                state_lookup_bytes = state_lookup_bytes
+                                    .saturating_add(block.zcash_serialized_size());
+                                lookup_results.push((index, hash, Some(block)));
+                            }
+                            None => pending_lookups.push(async move {
+                                (index, hash, pending_wait.await)
+                            }),
+                        }
+                    }
+
+                    while let Some(result) = pending_lookups.next().await {
+                        lookup_results.push(result);
+                    }
+                    lookup_results.sort_unstable_by_key(|(index, _, _)| *index);
+
+                    for (_, hash, block) in lookup_results {
+                        if total_size >= GETDATA_SENT_BYTES_LIMIT {
+                            break;
+                        }
+
+                        // Add the block responses to the list, while updating the size limit.
+                        //
+                        // If there was a database error, return the error,
+                        // and stop processing further chunks.
+                        match block {
+                            Some(block) => {
+                                // If checking the serialized size of the block performs badly,
+                                // return the size from the state using a wrapper type.
+                                total_size += block.zcash_serialized_size();
+
+                                blocks.push(Available((block, None)))
+                            },
+                            // We don't need to limit the size of the missing block IDs list,
+                            // because it is already limited to the size of the getdata request
+                            // sent by the peer. (Their content and encodings are the same.)
+                            None => {
+                                // A retained canonical header with no block body identifies
+                                // history removed by pruning. Unknown hashes remain ordinary
+                                // `notfound` responses without reserving a log interval.
+                                if log_pruned_block {
+                                    if let Some(height) =
+                                        retained_block_height(state.clone(), hash).await
+                                    {
+                                        if let Some(tx_retention) =
+                                            pruned_block_not_found_logger.reserve_log()
+                                        {
+                                            error!(
+                                                ?hash,
+                                                ?height,
+                                                tx_retention,
+                                                "{ZCASHD_COMPAT_PRUNED_BLOCK_ERROR}"
+                                            );
+                                        }
+                                    }
+                                }
+
+                                blocks.push(Missing(hash))
+                            },
+                        }
+                    }
+
+                    // The network layer handles splitting this response into multiple `block`
+                    // messages, and a `notfound` message if needed.
+                    Ok(zn::Response::Blocks(blocks))
+                }.boxed()
+            }
+            zn::Request::TransactionsById(req_tx_ids)
+            | zn::Request::TransactionsByIdFrom {
+                ids: req_tx_ids, ..
+            } => {
+                // We return an available or missing response to each inventory request,
+                // unless the request is empty, or it reaches a response limit.
+                if req_tx_ids.is_empty() {
+                    return async { Ok(zn::Response::Nil) }.boxed();
+                }
+
+                let request = mempool::Request::TransactionsById(req_tx_ids.clone());
+                mempool.clone().oneshot(request).map_ok(move |resp| {
+                    let mut total_size = 0;
+
+                    let transactions = match resp {
+                        mempool::Response::Transactions(transactions) => transactions,
+                        _ => unreachable!("Mempool component should always respond to a `TransactionsById` request with a `Transactions` response"),
+                    };
+
+                    // Work out which transaction IDs were missing.
+                    let available_tx_ids: HashSet<UnminedTxId> =
+                        transactions.iter().map(|tx| tx.id()).collect();
+                    // We don't need to limit the size of the missing transaction IDs list,
+                    // because it is already limited to the size of the getdata request
+                    // sent by the peer. (Their content and encodings are the same.)
+                    let missing = req_tx_ids.into_iter().filter(|tx_id| !available_tx_ids.contains(tx_id)).map(Missing);
+
+                    // If we skip sending some transactions because the limit has been reached,
+                    // they aren't reported as missing. This matches `zcashd`'s behaviour:
+                    // <https://github.com/zcash/zcash/blob/829dd94f9d253bb705f9e194f13cb8ca8e545e1e/src/main.cpp#L6410-L6412>
+                    let available = transactions.into_iter().take_while(|tx| {
+                        // We check the limit after including the transaction,
+                        // so that we can send transactions greater than 1 MB
+                        // (but only one at a time)
+                        let within_limit = total_size < GETDATA_SENT_BYTES_LIMIT;
+
+                        total_size += tx.size();
+
+                        within_limit
+                    }).map(|tx| Available((tx, None)));
+
+                    // The network layer handles splitting this response into multiple `tx`
+                    // messages, and a `notfound` message if needed.
+                    zn::Response::Transactions(available.chain(missing).collect())
+                }).boxed()
+            }
+            // Find* responses are already size-limited by the state.
+            zn::Request::FindBlocks { known_blocks, stop } => {
+                let request = zs::Request::FindBlockHashes { known_blocks, stop };
+                state.clone().oneshot(request).map_ok(|resp| match resp {
+                    zs::Response::BlockHashes(hashes) if hashes.is_empty() => zn::Response::Nil,
+                    zs::Response::BlockHashes(hashes) => zn::Response::BlockHashes(hashes),
+                    _ => unreachable!("zakura-state should always respond to a `FindBlockHashes` request with a `BlockHashes` response"),
+                })
+                    .boxed()
+            }
+            zn::Request::FindHeaders { known_blocks, stop } => {
+                let request = zs::Request::FindBlockHeaders { known_blocks, stop };
+                state.clone().oneshot(request).map_ok(|resp| match resp {
+                    zs::Response::BlockHeaders(headers) if headers.is_empty() => zn::Response::Nil,
+                    zs::Response::BlockHeaders(headers) => zn::Response::BlockHeaders(headers),
+                    _ => unreachable!("zakura-state should always respond to a `FindBlockHeaders` request with a `BlockHeaders` response"),
+                })
+                    .boxed()
+            }
+            zn::Request::PushTransaction(transaction, advertiser) => {
+                let request = match advertiser {
+                    Some(source) => mempool::Request::QueueFromPeer {
+                        source: mempool_queue_source(source),
+                        transactions: vec![transaction.into()],
+                    },
+                    None => mempool::Request::Queue(vec![transaction.into()]),
+                };
+
+                mempool
+                    .clone()
+                    .oneshot(request)
+                    // The response just indicates if processing was queued or not; ignore it
+                    .map_ok(|_resp| zn::Response::Nil)
+                    .boxed()
+            }
+            zn::Request::AdvertiseTransactionIds(transactions, advertiser) => {
+                // Tag the advertised txids with the announcing peer so the
+                // mempool downloader can enforce a per-peer queue cap.
+                // See `GHSA-4fc2-h7jh-287c`.
+                let request = match advertiser {
+                    Some(source) => mempool::Request::QueueFromPeer {
+                        source: mempool_queue_source(source),
+                        transactions: transactions.into_iter().map(Into::into).collect(),
+                    },
+                    None => mempool::Request::Queue(
+                        transactions.into_iter().map(Into::into).collect(),
+                    ),
+                };
+                mempool
+                    .clone()
+                    .oneshot(request)
+                    // The response just indicates if processing was queued or not; ignore it
+                    .map_ok(|_resp| zn::Response::Nil)
+                    .boxed()
+            }
+            zn::Request::AdvertiseBlock(hash, Some(zn::PeerSource::Zakura(peer_id))) => {
+                debug!(
+                    ?hash,
+                    ?peer_id,
+                    "ignoring Zakura block advertisement because native block sync owns block bodies",
+                );
+                metrics::counter!("gossip.zakura.native_sync.block.hash.count").increment(1);
+                async { Ok(zn::Response::Nil) }.boxed()
+            }
+            zn::Request::AdvertiseBlock(hash, advertiser) => {
+                block_downloads.download_and_verify(hash, advertiser);
+                async { Ok(zn::Response::Nil) }.boxed()
+            }
+            // The size of this response is limited by the `Connection` state machine in the network layer
+            zn::Request::MempoolTransactionIds => {
+                mempool.clone().oneshot(mempool::Request::TransactionIds).map_ok(|resp| match resp {
+                    mempool::Response::TransactionIds(transaction_ids) if transaction_ids.is_empty() => zn::Response::Nil,
+                    mempool::Response::TransactionIds(transaction_ids) => zn::Response::TransactionIds(transaction_ids.into_iter().collect()),
+                    _ => unreachable!("Mempool component should always respond to a `TransactionIds` request with a `TransactionIds` response"),
+                })
+                    .boxed()
+            }
+            zn::Request::Ping(_) => {
+                unreachable!("ping requests are handled internally");
+            }
+
+            zn::Request::AdvertiseBlockToAll(_) => unreachable!("should always be decoded as `AdvertiseBlock` request")
+        };
+
+        async move {
+            match tokio::time::timeout(response_timeout, response).await {
+                Ok(response) => response,
+                Err(error) => Err(Box::new(error) as zn::BoxError),
+            }
+        }
+        .boxed()
+    }
+}

@@ -1,0 +1,8 @@
+---
+description: Use when the user mentions PR, pull request, open PR, draft PR, create PR, publish PR, or prepare PR
+alwaysApply: false
+---
+
+# Zakura Pull Requests
+
+Read and follow `.agents/skills/create-zakura-pr/SKILL.md`.

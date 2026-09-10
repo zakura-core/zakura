@@ -12,11 +12,6 @@ yanked = "deny"
 # Advisory ignores are for transitive dependencies with no immediate safe upgrade in this branch.
 # Remove each ignore entry as the dependency chain is upgraded.
 ignore = [
-    "RUSTSEC-2021-0139", # ansi_term — transitive via abscissa_core -> structopt
-    "RUSTSEC-2022-0104", # structopt (unmaintained) — transitive via abscissa_core and direct dep of zebra-utils
-    "RUSTSEC-2024-0375", # atty (unmaintained) — transitive via abscissa_core -> structopt
-    "RUSTSEC-2024-0370", # proc-macro-error — transitive via abscissa_core -> structopt
-    "RUSTSEC-2026-0173", # proc-macro-error2 (unmaintained) — transitive via getset
     "RUSTSEC-2025-0119", # number_prefix — transitive via indicatif
     "RUSTSEC-2025-0141", # bincode — direct dependency
     "RUSTSEC-2026-0118", # hickory-proto — transitive via iroh
@@ -24,13 +19,6 @@ ignore = [
     "RUSTSEC-2024-0384", # instant — transitive via iroh
     "RUSTSEC-2024-0436", # paste — transitive via iroh/netdev/stun-rs
     "RUSTSEC-2023-0089", # atomic-polyfill — transitive via iroh-metrics/postcard
-    "RUSTSEC-2025-0134", # rustls-pemfile (unmaintained) — transitive via zebra-rpc; also present on ironwood-main
-    # quick-xml (namespace-resolver unbounded alloc + O(n^2) duplicate-attribute scan on
-    # untrusted XML) — both transitive via inferno, only under the optional `flamegraph`
-    # dev/profiling feature (not in release binaries) and only over the node's own profiling
-    # output, not untrusted input; inferno 0.12 pins quick-xml ^0.39 so there is no upgrade yet.
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
 ]
 
 # This section is considered when running `cargo deny check licenses`.
@@ -101,7 +89,11 @@ deny = [
 #
 # Certain crates/versions that will be skipped when doing duplicate detection.
 skip = [
-
+    # The Zakura Common libraries use Rand 0.10, while the remaining ecosystem
+    # still resolves Rand 0.9. Remove these when the workspace converges.
+    { name = "chacha20", version = "=0.9.1" },
+    { name = "rand", version = "=0.9.4" },
+    { name = "rand_chacha", version = "=0.9.0" },
 ]
 
 # Similarly to `skip` allows you to skip certain crates during duplicate
@@ -116,20 +108,11 @@ skip-tree = [
     # wait for ordered-map to release a dependency fix
     { name = "ordered-map", version = "=0.4.2" },
 
-    # wait for structopt upgrade (or upgrade to clap 4)
-    { name = "clap", version = "=2.34.0" },
-
     # wait for abscissa_core to upgrade
     {name = "tracing-log", version = "=0.1.4" },
 
     # wait for abscissa_core to update toml
     { name = "toml", version = "=0.5.11" },
-
-    # wait for structopt-derive to update heck
-    { name = "heck", version = "=0.3.3" },
-
-    # wait for librocksdb-sys to update bindgen
-    { name = "bindgen", version = "=0.69.5" },
 
     # wait for halo2_gadgets and primitive-types to update uint
     { name = "uint", version = "=0.9.5" },
@@ -159,13 +142,9 @@ skip-tree = [
     # remove once ed25519-zebra updates hashbrown.
     { name = "hashbrown", version = "=0.16.1" },
 
-    # toml 0.9.x pulled by zebrad direct; 1.1.x by config 0.15 (also via zebrad).
-    # toml 1.x is the spec-1.1 line; remove once zebrad migrates its direct dep.
+    # toml 0.9.x pulled by zakurad direct; 1.1.x by config 0.15 (also via zakurad).
+    # toml 1.x is the spec-1.1 line; remove once zakurad migrates its direct dep.
     { name = "toml", version = "=0.9.12+spec-1.1.0" },
-
-    # winnow 0.7.x pulled by toml 0.9.x; 1.x by toml 1.x / config 0.15.
-    # resolved together with the toml entry above.
-    { name = "winnow", version = "=0.7.15" },
 
     # wait for abscissa_core to update synstructure
     { name = "synstructure", version = "=0.12.6" },
@@ -206,8 +185,11 @@ skip-tree = [
     { name = "hmac", version = "=0.12.1" },
     { name = "netdev", version = "=0.36.0" },
     { name = "netwatch", version = "=0.9.0" },
+    # OpenTelemetry 0.32 uses reqwest 0.13; iroh 0.92 remains on 0.12.
+    # Remove this once the iroh 1.x upgrade unifies Zakura on reqwest 0.13.
+    { name = "reqwest", version = "=0.12.28" },
     { name = "socket2", version = "=0.5.10" },
-    { name = "spin", version = "=0.10.0" },
+    { name = "spin", version = "=0.10.1" },
     { name = "webpki-roots", version = "=0.26.11" },
 ]
 
@@ -228,10 +210,7 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 
 # List of URLs for allowed Git repositories
-# TODO: Remove the URLs once the patch table in Cargo.toml is removed.
-allow-git = [
-    "https://github.com/zcash/librustzcash.git",
-]
+allow-git = []
 
 [sources.allow-org]
 github = [

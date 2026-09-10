@@ -1,0 +1,118 @@
+name: VCT handoff canary
+
+# Boots a Mainnet node from the newest retained state below the embedded VCT
+# frontier, forces the Zakura P2P/tree_aux path, and succeeds only after C is
+# finalized, the best chain reaches C+1, and VCT fast-path metrics increment.
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled]
+    paths:
+      - crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
+      - crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
+      - crates/zakura-state/src/service/finalized_state/vct/mainnet-subtrees.bin
+      # A frontier grid repin shows up as a lockfile change, not an artifact change.
+      - Cargo.lock
+  workflow_call:
+    inputs:
+      target_ref:
+        description: "Commit, branch, or tag to test"
+        required: false
+        type: string
+        default: main
+  workflow_dispatch:
+    inputs:
+      notify:
+        description: "Send failure alerts"
+        type: boolean
+        default: true
+      target_ref:
+        description: "Commit, branch, or tag to test"
+        required: false
+        default: main
+  schedule:
+    - cron: "0 12 * * *"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: zakura-vct-handoff-canary-${{ inputs.target_ref || github.event.pull_request.head.sha || 'main' }}
+  cancel-in-progress: false
+
+jobs:
+  handoff:
+    name: Cross Mainnet VCT handoff
+    # This job inherits fleet secrets, so PR execution is limited to the
+    # same-repository release-state PRs opened by the trusted update workflow.
+    if: >-
+      ${{
+        github.event_name != 'pull_request'
+        || (
+          github.event.pull_request.head.repo.full_name == github.repository
+          && contains(github.event.pull_request.labels.*.name, 'A-release-state')
+          && (github.event.action != 'labeled' || github.event.label.name == 'A-release-state')
+        )
+      }}
+    uses: ./.github/workflows/zakura-pr-node.yml
+    permissions:
+      contents: read
+      pull-requests: write
+    with:
+      ref: ${{ inputs.target_ref || github.event.pull_request.head.sha || 'main' }}
+      snapshot_mode: pre-checkpoint
+      network: mainnet
+      duration_minutes: "60"
+      droplet_size: c-8
+      teardown_after_run: true
+      p2p_stack: zakura
+    secrets:
+      DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+      DO_SSH_PRIVATE_KEY: ${{ secrets.DO_SSH_PRIVATE_KEY }}
+
+  alert:
+    name: Alert #zakura-alerts
+    needs: [handoff]
+    if: ${{ always() && contains(fromJSON('["failure","success"]'), needs.handoff.result) && (github.event_name != 'workflow_dispatch' || inputs.notify) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      SLACK_WEB_HOOK: ${{ secrets.SLACK_WEB_HOOK }}
+      TARGET_REF: ${{ inputs.target_ref || github.event.pull_request.head.sha || 'main' }}
+      FAILURE_PHASE: ${{ needs.handoff.outputs.failure_phase }}
+      TARGET_SHA: ${{ needs.handoff.outputs.target_sha }}
+      MAX_CHECKPOINT: ${{ needs.handoff.outputs.max_checkpoint }}
+      START_HEIGHT: ${{ needs.handoff.outputs.start_height }}
+      END_HEIGHT: ${{ needs.handoff.outputs.end_height }}
+      RESULT: ${{ needs.handoff.result }}
+      RUN_ID: ${{ github.run_id }}
+      RUN_ATTEMPT: ${{ github.run_attempt }}
+      EXECUTION_ATTEMPT: ${{ needs.handoff.outputs.execution_attempt }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Checkout notification code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+
+      - name: Restore this run's notification state
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .canary-notification
+          key: canary-notification-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            canary-notification-${{ github.run_id }}-
+
+      - name: Report canary transition
+        id: notify
+        run: python3 deploy/continuous-sync/canary-notify.py --state-file .canary-notification/state.json
+
+      - name: Save confirmed notification state
+        if: steps.notify.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
+        with:
+          path: .canary-notification
+          key: canary-notification-${{ github.run_id }}-${{ github.run_attempt }}

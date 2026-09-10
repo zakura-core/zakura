@@ -4,7 +4,7 @@ ARG UBUNTU_IMAGE=ubuntu:22.04
 FROM ${UBUNTU_IMAGE} AS build
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG RUST_VERSION=1.91
+ARG RUST_VERSION=1.97
 ARG FEATURES="default-release-binaries"
 
 RUN apt-get update && \
@@ -35,9 +35,9 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/workspace/target \
 #     RUSTFLAGS="${RUSTFLAGS}" \
-    cargo build --locked --release --features "${FEATURES}" --package zebrad --bin zebrad && \
-    install -D target/release/zebrad /out/zebrad
+    cargo build --locked --release --features "${FEATURES}" --package zakura --bin zakurad && \
+    install -D target/release/zakurad /out/zakurad
 
 FROM scratch AS artifact
 
-COPY --from=build /out/zebrad /zebrad
+COPY --from=build /out/zakurad /zakurad

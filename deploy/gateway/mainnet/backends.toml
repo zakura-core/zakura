@@ -1,0 +1,18 @@
+# Mainnet Zakura JSON-RPC backends for the public broadcast gateway.
+# North America only — reachable :8232 from us-east-0.
+
+[[backends]]
+name = "us-east-0"
+url = "http://127.0.0.1:8232/"
+
+[[backends]]
+name = "us-0"
+url = "http://104.131.184.123:8232/"
+
+[[backends]]
+name = "us-west-0"
+url = "http://143.244.184.176:8232/"
+
+[[backends]]
+name = "canada-0"
+url = "http://159.203.38.10:8232/"

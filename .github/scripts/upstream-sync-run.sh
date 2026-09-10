@@ -275,7 +275,7 @@ case "$COMMAND" in
 
     BRANCH="$(jq -r '.branch_name' "$RESULT_JSON")"
     TITLE="$(jq -r '.pr_title' "$RESULT_JSON")"
-    TARGET_REF="${UPSTREAM_SYNC_TARGET_REF:-ironwood-main}"
+    TARGET_REF="${UPSTREAM_SYNC_TARGET_REF:-main}"
     case "$BRANCH" in
       upstream-sync/pr-[0-9]*) ;;
       *)

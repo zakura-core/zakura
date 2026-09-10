@@ -1,0 +1,1273 @@
+//! Note Commitment Trees.
+//!
+//! A note commitment tree is an incremental Merkle tree of fixed depth
+//! used to store note commitments that Action
+//! transfers produce. Just as the unspent transaction output set (UTXO
+//! set) used in Bitcoin, it is used to express the existence of value and
+//! the capability to spend it. However, unlike the UTXO set, it is not
+//! the job of this tree to protect against double-spending, as it is
+//! append-only.
+//!
+//! A root of a note commitment tree is associated with each treestate.
+
+use std::{
+    default::Default,
+    fmt,
+    hash::{Hash, Hasher},
+    io,
+};
+
+use halo2::pasta::{group::ff::PrimeField, pallas};
+use hex::ToHex;
+use incrementalmerkletree::{
+    frontier::{Frontier, NonEmptyFrontier},
+    Hashable,
+};
+use lazy_static::lazy_static;
+use thiserror::Error;
+use zcash_primitives::merkle_tree::HashSer;
+
+use sinsemilla::{weighted::UncheckedFixedLengthHashDomain, HashDomain, K};
+
+use crate::{
+    serialization::{
+        serde_helpers, ReadZcashExt, SerializationError, ZcashDeserialize, ZcashSerialize,
+    },
+    subtree::{NoteCommitmentSubtreeIndex, TRACKED_SUBTREE_HEIGHT},
+    subtree_verify::{self, SubtreeRootsError},
+};
+
+pub mod legacy;
+use legacy::LegacyNoteCommitmentTree;
+
+/// The type that is used to update the note commitment tree.
+///
+/// Unfortunately, this is not the same as `orchard::NoteCommitment`.
+pub type NoteCommitmentUpdate = pallas::Base;
+
+pub(super) const MERKLE_DEPTH: u8 = 32;
+
+/// Bits in one Merkle child encoding: a 255-bit little-endian Pallas base
+/// field element (`l_MerkleOrchard` in the protocol spec).
+const L_ORCHARD_MERKLE: usize = 255;
+/// Bits in one `MerkleCRH^Orchard` message: the 10-bit layer prefix followed
+/// by the left and right child encodings.
+const MERKLE_CRH_BITS: usize = K + 2 * L_ORCHARD_MERKLE;
+/// `MerkleCRH^Orchard` inputs always fill this many Sinsemilla words exactly,
+/// which is what lets the fixed-length weighted evaluator apply.
+const MERKLE_CRH_WORDS: usize = MERKLE_CRH_BITS / K;
+const _: () = assert!(MERKLE_CRH_BITS.is_multiple_of(K));
+/// Complete Sinsemilla words in one 255-bit child encoding.
+const MERKLE_CRH_FULL_CHILD_WORDS: usize = L_ORCHARD_MERKLE / K;
+/// Bits left after decoding a child's complete Sinsemilla words.
+const MERKLE_CRH_CHILD_REMAINDER_BITS: usize = L_ORCHARD_MERKLE % K;
+/// Index of the word spanning the left and right child encodings.
+const MERKLE_CRH_CROSS_CHILD_WORD: usize = 1 + MERKLE_CRH_FULL_CHILD_WORDS;
+const SINSEMILLA_WORD_MASK: u16 = (1 << K) - 1;
+const CHILD_REMAINDER_MASK: u8 = (1 << MERKLE_CRH_CHILD_REMAINDER_BITS) - 1;
+const BYTE_BITS: usize = u8::BITS as usize;
+
+lazy_static! {
+    /// The position-weighted Sinsemilla evaluator for `MerkleCRH^Orchard`,
+    /// specialized to the fixed 52-word `l || left || right` message layout.
+    ///
+    /// Built once from the `"z.cash:Orchard-MerkleCRH"` [`HashDomain`]. Its
+    /// precomputed per-position generator table (a few MiB on the heap, see
+    /// [`UncheckedFixedLengthHashDomain::table_bytes`]) replaces the
+    /// doubling recurrence with table lookups and point additions, and omits
+    /// Sinsemilla's incomplete-addition exceptional-case checks. Omitting
+    /// them is sound because an input on which this evaluator differs from
+    /// [`HashDomain`] would exhibit a nontrivial discrete-log relation
+    /// between the independently generated Sinsemilla bases — the same
+    /// hardness assumption Orchard already rests on. See the security
+    /// argument in [`sinsemilla::weighted`].
+    static ref ORCHARD_MERKLE_CRH_DOMAIN: UncheckedFixedLengthHashDomain<MERKLE_CRH_WORDS> =
+        UncheckedFixedLengthHashDomain::new(&HashDomain::new("z.cash:Orchard-MerkleCRH"));
+}
+
+/// MerkleCRH^Orchard Hash Function
+///
+/// Used to hash incremental Merkle tree hash values for Orchard.
+///
+/// MerkleCRH^Orchard: {0..MerkleDepth^Orchard − 1} × P𝑥 × P𝑥 → P𝑥
+///
+/// MerkleCRH^Orchard(layer, left, right) := 0 if hash == ⊥; hash otherwise
+///
+/// where hash = SinsemillaHash("z.cash:Orchard-MerkleCRH", l || left || right),
+/// l = I2LEBSP_10(MerkleDepth^Orchard − 1 − layer),  and left, right, and
+/// the output are the x-coordinates of Pallas affine points.
+///
+/// <https://zips.z.cash/protocol/protocol.pdf#orchardmerklecrh>
+/// <https://zips.z.cash/protocol/protocol.pdf#constants>
+fn merkle_crh_orchard(layer: u8, left: pallas::Base, right: pallas::Base) -> pallas::Base {
+    ORCHARD_MERKLE_CRH_DOMAIN.hash_words(&merkle_crh_words(layer, left, right))
+}
+
+/// Packs a `MerkleCRH^Orchard` input into its 10-bit Sinsemilla words.
+///
+/// The message is `I2LEBSP_10(l) || left || right` with 255-bit little-endian
+/// child encodings, so the words are: the layer prefix `l`, 25 complete words
+/// of `left`, one word spanning `left`'s top 5 bits and `right`'s low 5 bits,
+/// and 25 words covering the remaining bits of `right`.
+fn merkle_crh_words(layer: u8, left: pallas::Base, right: pallas::Base) -> [u16; MERKLE_CRH_WORDS] {
+    // `u16::BITS as usize`: lossless, 16 always fits in usize.
+    const WINDOW_BITS: usize = u16::BITS as usize;
+
+    /// Reads the 10-bit little-endian word starting at `bit_offset`.
+    fn word_at(bytes: &[u8; 32], bit_offset: usize) -> u16 {
+        let byte_offset = bit_offset / BYTE_BITS;
+        let shift = bit_offset % BYTE_BITS;
+        let window =
+            u16::from(bytes[byte_offset]) | (u16::from(bytes[byte_offset + 1]) << BYTE_BITS);
+        let word = window >> shift;
+
+        if shift + K > WINDOW_BITS {
+            (word | (u16::from(bytes[byte_offset + 2]) << (WINDOW_BITS - shift)))
+                & SINSEMILLA_WORD_MASK
+        } else {
+            word & SINSEMILLA_WORD_MASK
+        }
+    }
+
+    let left = left.to_repr();
+    let right = right.to_repr();
+    let mut words = [0; MERKLE_CRH_WORDS];
+
+    // Prefix: l = I2LEBSP_10(MerkleDepth^Orchard − 1 − layer)
+    words[0] = u16::from(MERKLE_DEPTH - 1 - layer);
+    for (index, word) in words[1..MERKLE_CRH_CROSS_CHILD_WORD].iter_mut().enumerate() {
+        *word = word_at(&left, index * K);
+    }
+    let left_tail_offset = MERKLE_CRH_FULL_CHILD_WORDS * K;
+    words[MERKLE_CRH_CROSS_CHILD_WORD] = u16::from(
+        (left[left_tail_offset / BYTE_BITS] >> (left_tail_offset % BYTE_BITS))
+            & CHILD_REMAINDER_MASK,
+    ) | (u16::from(right[0] & CHILD_REMAINDER_MASK)
+        << MERKLE_CRH_CHILD_REMAINDER_BITS);
+    for (index, word) in words[MERKLE_CRH_CROSS_CHILD_WORD + 1..]
+        .iter_mut()
+        .enumerate()
+    {
+        *word = word_at(&right, MERKLE_CRH_CHILD_REMAINDER_BITS + index * K);
+    }
+
+    words
+}
+
+lazy_static! {
+    /// List of "empty" Orchard note commitment nodes, one for each layer.
+    ///
+    /// The list is indexed by the layer number (0: root; MERKLE_DEPTH: leaf).
+    ///
+    /// <https://zips.z.cash/protocol/protocol.pdf#constants>
+    pub(super) static ref EMPTY_ROOTS: Vec<pallas::Base> = {
+        // The empty leaf node. This is layer 32.
+        let mut v = vec![NoteCommitmentTree::uncommitted()];
+
+        // Starting with layer 31 (the first internal layer, after the leaves),
+        // generate the empty roots up to layer 0, the root.
+        for layer in (0..MERKLE_DEPTH).rev()
+        {
+            // The vector is generated from the end, pushing new nodes to its beginning.
+            // For this reason, the layer below is v[0].
+            let next = merkle_crh_orchard(layer, v[0], v[0]);
+            v.insert(0, next);
+        }
+
+        v
+
+    };
+}
+
+/// Orchard note commitment tree root node hash.
+///
+/// The root hash in LEBS2OSP256(rt) encoding of the Orchard note commitment
+/// tree corresponding to the final Orchard treestate of this block. A root of a
+/// note commitment tree is associated with each treestate.
+#[derive(Clone, Copy, Default, Eq, Serialize, Deserialize)]
+pub struct Root(#[serde(with = "serde_helpers::Base")] pub(crate) pallas::Base);
+
+impl Root {
+    /// Return the node bytes in big-endian byte order as required
+    /// by RPCs such as `z_gettreestate`. Note that this is opposite
+    /// to the Sapling root.
+    pub fn bytes_in_display_order(&self) -> [u8; 32] {
+        self.into()
+    }
+}
+
+impl fmt::Debug for Root {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_tuple("Root")
+            .field(&hex::encode(self.0.to_repr()))
+            .finish()
+    }
+}
+
+impl From<Root> for [u8; 32] {
+    fn from(root: Root) -> Self {
+        root.0.into()
+    }
+}
+
+impl From<&Root> for [u8; 32] {
+    fn from(root: &Root) -> Self {
+        (*root).into()
+    }
+}
+
+impl Hash for Root {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.to_repr().hash(state)
+    }
+}
+
+impl PartialEq for Root {
+    fn eq(&self, other: &Self) -> bool {
+        // TODO: should we compare canonical forms here using `.to_repr()`?
+        self.0 == other.0
+    }
+}
+
+impl TryFrom<[u8; 32]> for Root {
+    type Error = SerializationError;
+
+    fn try_from(bytes: [u8; 32]) -> Result<Self, Self::Error> {
+        let possible_point = pallas::Base::from_repr(bytes);
+
+        if possible_point.is_some().into() {
+            Ok(Self(possible_point.unwrap()))
+        } else {
+            Err(SerializationError::Parse(
+                "Invalid pallas::Base value for Orchard note commitment tree root",
+            ))
+        }
+    }
+}
+
+impl ZcashSerialize for Root {
+    fn zcash_serialize<W: io::Write>(&self, mut writer: W) -> Result<(), io::Error> {
+        writer.write_all(&<[u8; 32]>::from(*self)[..])?;
+
+        Ok(())
+    }
+}
+
+impl ZcashDeserialize for Root {
+    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+        Self::try_from(reader.read_32_bytes()?)
+    }
+}
+
+/// A node of the Orchard Incremental Note Commitment Tree.
+#[derive(Copy, Clone, Eq, PartialEq, Default)]
+pub struct Node(pallas::Base);
+
+impl Node {
+    /// Calls `to_repr()` on inner value.
+    pub fn to_repr(&self) -> [u8; 32] {
+        self.0.to_repr()
+    }
+
+    /// Return the node bytes in big-endian byte-order suitable for printing out byte by byte.
+    ///
+    /// `zcashd`'s `z_getsubtreesbyindex` does not reverse the byte order of subtree roots.
+    pub fn bytes_in_display_order(&self) -> [u8; 32] {
+        self.to_repr()
+    }
+}
+
+impl TryFrom<&[u8]> for Node {
+    type Error = &'static str;
+
+    fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+        <[u8; 32]>::try_from(bytes)
+            .map_err(|_| "wrong byte slice len")?
+            .try_into()
+    }
+}
+
+impl TryFrom<[u8; 32]> for Node {
+    type Error = &'static str;
+
+    fn try_from(bytes: [u8; 32]) -> Result<Self, Self::Error> {
+        Option::<pallas::Base>::from(pallas::Base::from_repr(bytes))
+            .map(Node)
+            .ok_or("invalid Pallas field element")
+    }
+}
+
+impl fmt::Display for Node {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(&self.encode_hex::<String>())
+    }
+}
+
+impl fmt::Debug for Node {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_tuple("orchard::Node")
+            .field(&self.encode_hex::<String>())
+            .finish()
+    }
+}
+
+impl ToHex for &Node {
+    fn encode_hex<T: FromIterator<char>>(&self) -> T {
+        self.bytes_in_display_order().encode_hex()
+    }
+
+    fn encode_hex_upper<T: FromIterator<char>>(&self) -> T {
+        self.bytes_in_display_order().encode_hex_upper()
+    }
+}
+
+impl ToHex for Node {
+    fn encode_hex<T: FromIterator<char>>(&self) -> T {
+        (&self).encode_hex()
+    }
+
+    fn encode_hex_upper<T: FromIterator<char>>(&self) -> T {
+        (&self).encode_hex_upper()
+    }
+}
+
+/// Required to serialize [`NoteCommitmentTree`]s in a format compatible with `zcashd`.
+///
+/// Zebra stores Orchard note commitment trees as [`Frontier`]s while the
+/// [`z_gettreestate`][2] RPC requires [`CommitmentTree`][3]s. Implementing
+/// [`HashSer`] for [`Node`]s allows the conversion.
+///
+/// [2]: https://zcash.github.io/rpc/z_gettreestate.html
+/// [3]: incrementalmerkletree::frontier::CommitmentTree
+impl HashSer for Node {
+    fn read<R: io::Read>(mut reader: R) -> io::Result<Self> {
+        let mut repr = [0u8; 32];
+        reader.read_exact(&mut repr)?;
+        let maybe_node = pallas::Base::from_repr(repr).map(Self);
+
+        <Option<_>>::from(maybe_node).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Non-canonical encoding of Pallas base field value.",
+            )
+        })
+    }
+
+    fn write<W: io::Write>(&self, mut writer: W) -> io::Result<()> {
+        writer.write_all(&self.0.to_repr())
+    }
+}
+
+impl Hashable for Node {
+    fn empty_leaf() -> Self {
+        Self(NoteCommitmentTree::uncommitted())
+    }
+
+    /// Combine two nodes to generate a new node in the given level.
+    /// Level 0 is the layer above the leaves (layer 31).
+    /// Level 31 is the root (layer 0).
+    fn combine(level: incrementalmerkletree::Level, a: &Self, b: &Self) -> Self {
+        let layer = MERKLE_DEPTH - 1 - u8::from(level);
+        Self(merkle_crh_orchard(layer, a.0, b.0))
+    }
+
+    /// Return the node for the level below the given level. (A quirk of the API)
+    fn empty_root(level: incrementalmerkletree::Level) -> Self {
+        let layer_below = usize::from(MERKLE_DEPTH) - usize::from(level);
+        Self(EMPTY_ROOTS[layer_below])
+    }
+}
+
+impl From<pallas::Base> for Node {
+    fn from(x: pallas::Base) -> Self {
+        Node(x)
+    }
+}
+
+impl serde::Serialize for Node {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.to_repr().serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Node {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let bytes = <[u8; 32]>::deserialize(deserializer)?;
+        Option::<pallas::Base>::from(pallas::Base::from_repr(bytes))
+            .map(Node)
+            .ok_or_else(|| serde::de::Error::custom("invalid Pallas field element"))
+    }
+}
+
+#[derive(Error, Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[allow(missing_docs)]
+pub enum NoteCommitmentTreeError {
+    #[error("The note commitment tree is full")]
+    FullTree,
+}
+
+/// Orchard Incremental Note Commitment Tree
+///
+/// Note that the default value of the [`Root`] type is `[0, 0, 0, 0]`. However, this value differs
+/// from the default value of the root of the default tree which is the hash of the root's child
+/// nodes. The default tree is the empty tree which has all leaves empty.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(into = "LegacyNoteCommitmentTree")]
+#[serde(from = "LegacyNoteCommitmentTree")]
+pub struct NoteCommitmentTree {
+    /// The tree represented as a Frontier.
+    ///
+    /// A Frontier is a subset of the tree that allows to fully specify it.
+    /// It consists of nodes along the rightmost (newer) branch of the tree that
+    /// has non-empty nodes. Upper (near root) empty nodes of the branch are not
+    /// stored.
+    ///
+    /// # Consensus
+    ///
+    /// > [NU5 onward] A block MUST NOT add Orchard note commitments that would result in the Orchard note
+    /// > commitment tree exceeding its capacity of 2^(MerkleDepth^Orchard) leaf nodes.
+    ///
+    /// <https://zips.z.cash/protocol/protocol.pdf#merkletree>
+    ///
+    /// Note: MerkleDepth^Orchard = MERKLE_DEPTH = 32.
+    inner: incrementalmerkletree::frontier::Frontier<Node, MERKLE_DEPTH>,
+
+    /// A cached root of the tree.
+    ///
+    /// Every time the root is computed by [`Self::root`] it is cached here,
+    /// and the cached value will be returned by [`Self::root`] until the tree is
+    /// changed by [`Self::append`]. This greatly increases performance
+    /// because it avoids recomputing the root when the tree does not change
+    /// between blocks. In the finalized state, the tree is read from
+    /// disk for every block processed, which would also require recomputing
+    /// the root even if it has not changed (note that the cached root is
+    /// serialized with the tree). This is particularly important since we decided
+    /// to instantiate the trees from the genesis block, for simplicity.
+    ///
+    /// We use a [`RwLock`](std::sync::RwLock) for this cache, because it is
+    /// only written once per tree update. Each tree has its own cached root, a
+    /// new lock is created for each clone.
+    cached_root: std::sync::RwLock<Option<Root>>,
+}
+
+impl NoteCommitmentTree {
+    /// Wraps an existing [`Frontier`] as a note commitment tree.
+    ///
+    /// # Correctness
+    ///
+    /// [`Frontier::from_parts`] validates only that the position and ommer
+    /// count are consistent and that the frontier fits within
+    /// `MERKLE_DEPTH`. It does not verify that the nodes were derived from
+    /// note commitments or that the root belongs to an authenticated chain
+    /// and shielded pool state.
+    ///
+    /// Callers must derive the frontier from validated commitments or
+    /// authenticate its root against the expected chain and shielded pool
+    /// state before treating the resulting tree as authoritative.
+    ///
+    /// The root cache starts empty and is recomputed on first use.
+    pub fn from_frontier(frontier: Frontier<Node, MERKLE_DEPTH>) -> Self {
+        Self {
+            inner: frontier,
+            cached_root: Default::default(),
+        }
+    }
+
+    /// Adds a note commitment x-coordinate to the tree.
+    ///
+    /// The leaves of the tree are actually a base field element, the
+    /// x-coordinate of the commitment, the data that is actually stored on the
+    /// chain and input into the proof.
+    ///
+    /// Returns an error if the tree is full.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn append(&mut self, cm_x: NoteCommitmentUpdate) -> Result<(), NoteCommitmentTreeError> {
+        if self.inner.append(cm_x.into()) {
+            // Invalidate cached root
+            let cached_root = self
+                .cached_root
+                .get_mut()
+                .expect("a thread that previously held exclusive lock access panicked");
+
+            *cached_root = None;
+
+            Ok(())
+        } else {
+            Err(NoteCommitmentTreeError::FullTree)
+        }
+    }
+
+    /// Appends one block's note commitments in parallel.
+    ///
+    /// Returns the [`TRACKED_SUBTREE_HEIGHT`] subtree completed by this block, if
+    /// any. This must match calling [`Self::append`] for each commitment in order.
+    ///
+    /// `note_commitments` must come from one block, so the batch can cross at
+    /// most one tracked-subtree boundary.
+    ///
+    /// Returns an error if the tree would overflow its capacity.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn append_batch(
+        &mut self,
+        note_commitments: &[NoteCommitmentUpdate],
+    ) -> Result<Option<(NoteCommitmentSubtreeIndex, Node)>, NoteCommitmentTreeError> {
+        use crate::parallel::batch_frontier::append_batch_with_subtree;
+
+        if note_commitments.is_empty() {
+            return Ok(None);
+        }
+
+        // nodes.len() fits in u64: consensus rules cap a block at 2^16 actions.
+        let nodes: Vec<Node> = note_commitments
+            .iter()
+            .map(|commitment_x| (*commitment_x).into())
+            .collect();
+
+        let (frontier, completed) = append_batch_with_subtree(self.inner.clone(), nodes)
+            .map_err(|_| NoteCommitmentTreeError::FullTree)?;
+
+        self.inner = frontier;
+        *self
+            .cached_root
+            .get_mut()
+            .expect("a thread that previously held exclusive lock access panicked") = None;
+
+        Ok(completed.map(|(index_value, root)| {
+            let index = NoteCommitmentSubtreeIndex(
+                index_value.try_into().expect("subtree index fits in u16"),
+            );
+            (index, root)
+        }))
+    }
+
+    /// Returns frontier of non-empty tree, or `None` if the tree is empty.
+    fn frontier(&self) -> Option<&NonEmptyFrontier<Node>> {
+        self.inner.value()
+    }
+
+    /// Returns the position of the most recently appended leaf in the tree.
+    ///
+    /// This method is used for debugging, use `incrementalmerkletree::Address` for tree operations.
+    pub fn position(&self) -> Option<u64> {
+        let Some(tree) = self.frontier() else {
+            // An empty tree doesn't have a previous leaf.
+            return None;
+        };
+
+        Some(tree.position().into())
+    }
+
+    /// Returns true if this tree has at least one new subtree, when compared with `prev_tree`.
+    pub fn contains_new_subtree(&self, prev_tree: &Self) -> bool {
+        // Use -1 for the index of the subtree with no notes, so the comparisons are valid.
+        let index = self.subtree_index().map_or(-1, |index| i32::from(index.0));
+        let prev_index = prev_tree
+            .subtree_index()
+            .map_or(-1, |index| i32::from(index.0));
+
+        // This calculation can't overflow, because we're using i32 for u16 values.
+        let index_difference = index - prev_index;
+
+        // There are 4 cases we need to handle:
+        // - lower index: never a new subtree
+        // - equal index: sometimes a new subtree
+        // - next index: sometimes a new subtree
+        // - greater than the next index: always a new subtree
+        //
+        // To simplify the function, we deal with the simple cases first.
+
+        // There can't be any new subtrees if the current index is strictly lower.
+        if index < prev_index {
+            return false;
+        }
+
+        // There is at least one new subtree, even if there is a spurious index difference.
+        if index_difference > 1 {
+            return true;
+        }
+
+        // If the indexes are equal, there can only be a new subtree if `self` just completed it.
+        if index == prev_index {
+            return self.is_complete_subtree();
+        }
+
+        // If `self` is the next index, check if the last note completed a subtree.
+        if self.is_complete_subtree() {
+            return true;
+        }
+
+        // Then check for spurious index differences.
+        //
+        // There is one new subtree somewhere in the trees. It is either:
+        // - a new subtree at the end of the previous tree, or
+        // - a new subtree in this tree (but not at the end).
+        //
+        // Spurious index differences happen because the subtree index only increases when the
+        // first note is added to the new subtree. So we need to exclude subtrees completed by the
+        // last note commitment in the previous tree.
+        //
+        // We also need to exclude empty previous subtrees, because the index changes to zero when
+        // the first note is added, but a subtree wasn't completed.
+        if prev_tree.is_complete_subtree() || prev_index == -1 {
+            return false;
+        }
+
+        // A new subtree was completed by a note commitment that isn't in the previous tree.
+        true
+    }
+
+    /// Returns true if the most recently appended leaf completes the subtree
+    pub fn is_complete_subtree(&self) -> bool {
+        let Some(tree) = self.frontier() else {
+            // An empty tree can't be a complete subtree.
+            return false;
+        };
+
+        tree.position()
+            .is_complete_subtree(TRACKED_SUBTREE_HEIGHT.into())
+    }
+
+    /// Returns the subtree index at [`TRACKED_SUBTREE_HEIGHT`].
+    /// This is the number of complete or incomplete subtrees that are currently in the tree.
+    /// Returns `None` if the tree is empty.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn subtree_index(&self) -> Option<NoteCommitmentSubtreeIndex> {
+        let tree = self.frontier()?;
+
+        let index = incrementalmerkletree::Address::above_position(
+            TRACKED_SUBTREE_HEIGHT.into(),
+            tree.position(),
+        )
+        .index()
+        .try_into()
+        .expect("fits in u16");
+
+        Some(index)
+    }
+
+    /// Returns the number of leaf nodes required to complete the subtree at
+    /// [`TRACKED_SUBTREE_HEIGHT`].
+    ///
+    /// Returns `2^TRACKED_SUBTREE_HEIGHT` if the tree is empty.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn remaining_subtree_leaf_nodes(&self) -> usize {
+        let remaining = match self.frontier() {
+            // If the subtree has at least one leaf node, the remaining number of nodes can be
+            // calculated using the maximum subtree position and the current position.
+            Some(tree) => {
+                let max_position = incrementalmerkletree::Address::above_position(
+                    TRACKED_SUBTREE_HEIGHT.into(),
+                    tree.position(),
+                )
+                .max_position();
+
+                max_position - tree.position().into()
+            }
+            // If the subtree has no nodes, the remaining number of nodes is the number of nodes in
+            // a subtree.
+            None => {
+                let subtree_address = incrementalmerkletree::Address::above_position(
+                    TRACKED_SUBTREE_HEIGHT.into(),
+                    // This position is guaranteed to be in the first subtree.
+                    0.into(),
+                );
+
+                assert_eq!(
+                    subtree_address.position_range_start(),
+                    0.into(),
+                    "address is not in the first subtree"
+                );
+
+                subtree_address.position_range_end()
+            }
+        };
+
+        u64::from(remaining).try_into().expect("fits in usize")
+    }
+
+    /// Returns subtree index and root if the most recently appended leaf completes the subtree
+    pub fn completed_subtree_index_and_root(&self) -> Option<(NoteCommitmentSubtreeIndex, Node)> {
+        if !self.is_complete_subtree() {
+            return None;
+        }
+
+        let index = self.subtree_index()?;
+        let root = self.frontier()?.root(Some(TRACKED_SUBTREE_HEIGHT.into()));
+
+        Some((index, root))
+    }
+
+    /// Checks `roots`, the completed subtree roots in index order, against this tree's frontier.
+    ///
+    /// Returns how many roots were checked. See
+    /// [`subtree_verify`](crate::subtree_verify) for what this proves.
+    ///
+    /// Ironwood re-exports this module, so this also serves Ironwood trees.
+    pub fn verify_completed_subtree_roots(
+        &self,
+        roots: &[Node],
+    ) -> Result<usize, SubtreeRootsError> {
+        subtree_verify::verify_completed_subtree_roots(self.frontier(), roots, MERKLE_DEPTH)
+    }
+
+    /// Returns the current root of the tree, used as an anchor in Orchard
+    /// shielded transactions.
+    pub fn root(&self) -> Root {
+        if let Some(root) = self.cached_root() {
+            // Return cached root.
+            return root;
+        }
+
+        // Get exclusive access, compute the root, and cache it.
+        let mut write_root = self
+            .cached_root
+            .write()
+            .expect("a thread that previously held exclusive lock access panicked");
+        let read_root = write_root.as_ref().cloned();
+        match read_root {
+            // Another thread got write access first, return cached root.
+            Some(root) => root,
+            None => {
+                // Compute root and cache it.
+                let root = self.recalculate_root();
+                *write_root = Some(root);
+                root
+            }
+        }
+    }
+
+    /// Returns the current root of the tree, if it has already been cached.
+    #[allow(clippy::unwrap_in_result)]
+    pub fn cached_root(&self) -> Option<Root> {
+        *self
+            .cached_root
+            .read()
+            .expect("a thread that previously held exclusive lock access panicked")
+    }
+
+    /// Calculates and returns the current root of the tree, ignoring any caching.
+    pub fn recalculate_root(&self) -> Root {
+        Root(self.inner.root().0)
+    }
+
+    /// Get the Pallas-based Sinsemilla hash / root node of this merkle tree of
+    /// note commitments.
+    pub fn hash(&self) -> [u8; 32] {
+        self.root().into()
+    }
+
+    /// An as-yet unused Orchard note commitment tree leaf node.
+    ///
+    /// Distinct for Orchard, a distinguished hash value of:
+    ///
+    /// Uncommitted^Orchard = I2LEBSP_l_MerkleOrchard(2)
+    pub fn uncommitted() -> pallas::Base {
+        pallas::Base::one().double()
+    }
+
+    /// Count of note commitments added to the tree.
+    ///
+    /// For Orchard, the tree is capped at 2^32.
+    pub fn count(&self) -> u64 {
+        self.inner
+            .value()
+            .map_or(0, |x| u64::from(x.position()) + 1)
+    }
+
+    /// Checks if the tree roots and inner data structures of `self` and `other` are equal.
+    ///
+    /// # Panics
+    ///
+    /// If they aren't equal, with a message explaining the differences.
+    ///
+    /// Only for use in tests.
+    #[cfg(any(test, feature = "proptest-impl"))]
+    pub fn assert_frontier_eq(&self, other: &Self) {
+        // It's technically ok for the cached root not to be preserved,
+        // but it can result in expensive cryptographic operations,
+        // so we fail the tests if it happens.
+        assert_eq!(self.cached_root(), other.cached_root());
+
+        // Check the data in the internal data structure
+        assert_eq!(self.inner, other.inner);
+
+        // Check the RPC serialization format (not the same as the Zebra database format)
+        assert_eq!(self.to_rpc_bytes(), other.to_rpc_bytes());
+    }
+
+    /// Serializes [`Self`] to a format compatible with `zcashd`'s RPCs.
+    pub fn to_rpc_bytes(&self) -> Vec<u8> {
+        // Convert the tree from [`Frontier`](incrementalmerkletree::frontier::Frontier) to
+        // [`CommitmentTree`](merkle_tree::CommitmentTree).
+        let tree = incrementalmerkletree::frontier::CommitmentTree::from_frontier(&self.inner);
+
+        let mut rpc_bytes = vec![];
+
+        zcash_primitives::merkle_tree::write_commitment_tree(&tree, &mut rpc_bytes)
+            .expect("serializable tree");
+
+        rpc_bytes
+    }
+}
+
+impl Clone for NoteCommitmentTree {
+    /// Clones the inner tree, and creates a new `RwLock` with the cloned root data.
+    fn clone(&self) -> Self {
+        let cached_root = self.cached_root();
+
+        Self {
+            inner: self.inner.clone(),
+            cached_root: std::sync::RwLock::new(cached_root),
+        }
+    }
+}
+
+impl Default for NoteCommitmentTree {
+    fn default() -> Self {
+        Self {
+            inner: incrementalmerkletree::frontier::Frontier::empty(),
+            cached_root: Default::default(),
+        }
+    }
+}
+
+impl Eq for NoteCommitmentTree {}
+
+impl PartialEq for NoteCommitmentTree {
+    fn eq(&self, other: &Self) -> bool {
+        if let (Some(root), Some(other_root)) = (self.cached_root(), other.cached_root()) {
+            // Use cached roots if available
+            root == other_root
+        } else {
+            // Avoid expensive root recalculations which use multiple cryptographic hashes
+            self.inner == other.inner
+        }
+    }
+}
+
+impl From<Vec<pallas::Base>> for NoteCommitmentTree {
+    /// Compute the tree from a whole bunch of note commitments at once.
+    fn from(values: Vec<pallas::Base>) -> Self {
+        let mut tree = Self::default();
+
+        if values.is_empty() {
+            return tree;
+        }
+
+        for cm_x in values {
+            let _ = tree.append(cm_x);
+        }
+
+        tree
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bitvec::prelude::*;
+    use incrementalmerkletree::{frontier::Frontier, Position};
+
+    use super::*;
+
+    fn node(value: u64) -> Node {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&value.to_le_bytes());
+        Node(
+            Option::<pallas::Base>::from(pallas::Base::from_repr(bytes))
+                .expect("small little-endian integers are canonical field elements"),
+        )
+    }
+
+    fn note_commitment(value: u64) -> NoteCommitmentUpdate {
+        let mut bytes = [0; 32];
+        bytes[..8].copy_from_slice(&value.to_le_bytes());
+
+        Option::<pallas::Base>::from(pallas::Base::from_repr(bytes))
+            .expect("small little-endian integers are canonical field elements")
+    }
+
+    /// A tree rebuilt from its own frontier answers exactly like the
+    /// original, and keeps appending identically.
+    #[test]
+    fn from_frontier_round_trips_root_position_and_appends() {
+        let mut original = NoteCommitmentTree::default();
+        for value in 0..37 {
+            original
+                .append(note_commitment(value))
+                .expect("small test tree is not full");
+        }
+
+        let live = original.frontier().expect("37 appends leave a leaf");
+        let frontier = incrementalmerkletree::frontier::Frontier::from_parts(
+            live.position(),
+            *live.leaf(),
+            live.ommers().to_vec(),
+        )
+        .expect("the parts of a live frontier are valid");
+
+        let mut rebuilt = NoteCommitmentTree::from_frontier(frontier);
+
+        assert_eq!(rebuilt.root(), original.root());
+        assert_eq!(rebuilt.count(), original.count());
+        assert_eq!(rebuilt.position(), original.position());
+
+        original
+            .append(note_commitment(37))
+            .expect("small test tree is not full");
+        rebuilt
+            .append(note_commitment(37))
+            .expect("small test tree is not full");
+
+        assert_eq!(rebuilt.root(), original.root());
+    }
+
+    /// Independent from-scratch `MerkleCRH^Orchard`: it builds the message
+    /// bit-by-bit and hashes it with this crate's own variable-length
+    /// Sinsemilla implementation, rebuilding the domain on every call. The
+    /// production `merkle_crh_orchard` (word packing plus the weighted
+    /// fixed-length evaluator) must stay byte-identical to this.
+    fn merkle_crh_orchard_uncached(
+        layer: u8,
+        left: pallas::Base,
+        right: pallas::Base,
+    ) -> pallas::Base {
+        let mut s = bitvec![u8, Lsb0;];
+
+        let l = MERKLE_DEPTH - 1 - layer;
+        s.extend_from_bitslice(&BitArray::<_, Lsb0>::from([l, 0])[0..10]);
+        s.extend_from_bitslice(&BitArray::<_, Lsb0>::from(left.to_repr())[0..255]);
+        s.extend_from_bitslice(&BitArray::<_, Lsb0>::from(right.to_repr())[0..255]);
+
+        match crate::orchard::sinsemilla::sinsemilla_hash(b"z.cash:Orchard-MerkleCRH", &s) {
+            Some(h) => h,
+            None => pallas::Base::zero(),
+        }
+    }
+
+    /// Field elements that exercise the full 255-bit width of `pallas::Base`,
+    /// which the small-integer `node(..)` helper never reaches (it only sets the
+    /// low 8 bytes). Real note-commitment x-coordinates are full-width, so the
+    /// cached domain must stay byte-identical on these too. `from_raw` reduces
+    /// mod the field modulus, so every value here is canonical.
+    fn full_width_field_elements() -> Vec<pallas::Base> {
+        vec![
+            // p - 1: the largest canonical field element.
+            pallas::Base::zero() - pallas::Base::one(),
+            // p - 2.
+            pallas::Base::zero() - pallas::Base::from(2),
+            // All bits set in the raw limbs, then reduced mod p.
+            pallas::Base::from_raw([u64::MAX, u64::MAX, u64::MAX, u64::MAX]),
+            // Only the high limb set.
+            pallas::Base::from_raw([0, 0, 0, u64::MAX]),
+            // A scattered full-width value.
+            pallas::Base::from_raw([
+                0x0123_4567_89ab_cdef,
+                0xfedc_ba98_7654_3210,
+                0xdead_beef_cafe_babe,
+                0x0f1e_2d3c_4b5a_6978,
+            ]),
+        ]
+    }
+
+    /// The weighted-evaluator `merkle_crh_orchard` must produce byte-identical
+    /// output to the from-scratch bit-level implementation, across all layers
+    /// and a spread of input values — small integers, edge cases, and
+    /// full-width field elements. The full-width values also exercise the word
+    /// packer's cross-child word and every remainder-bit alignment.
+    #[test]
+    fn weighted_merkle_crh_matches_fresh_domain() {
+        let mut values: Vec<pallas::Base> = [0u64, 1, 2, 7, 65_535, u64::MAX]
+            .iter()
+            .map(|&v| node(v).0)
+            .collect();
+        values.extend(full_width_field_elements());
+
+        for layer in 0..MERKLE_DEPTH {
+            for &left in &values {
+                for &right in &values {
+                    assert_eq!(
+                        merkle_crh_orchard(layer, left, right).to_repr(),
+                        merkle_crh_orchard_uncached(layer, left, right).to_repr(),
+                        "weighted evaluator must match fresh domain at layer {layer}",
+                    );
+                }
+            }
+        }
+    }
+
+    proptest::proptest! {
+        /// Randomized differential check: across random layers and random
+        /// full-width field elements (raw limbs reduced mod p), the weighted
+        /// evaluator must stay byte-identical to the from-scratch bit-level
+        /// implementation. This covers the whole input domain that the fixed
+        /// table above only samples.
+        #[test]
+        fn weighted_merkle_crh_matches_fresh_domain_random(
+            layer in 0u8..MERKLE_DEPTH,
+            left_limbs in proptest::prelude::any::<[u64; 4]>(),
+            right_limbs in proptest::prelude::any::<[u64; 4]>(),
+        ) {
+            let left = pallas::Base::from_raw(left_limbs);
+            let right = pallas::Base::from_raw(right_limbs);
+
+            proptest::prop_assert_eq!(
+                merkle_crh_orchard(layer, left, right).to_repr(),
+                merkle_crh_orchard_uncached(layer, left, right).to_repr(),
+                "weighted evaluator must match fresh domain at layer {}", layer
+            );
+        }
+    }
+
+    fn build_tree(prefix_len: u64) -> NoteCommitmentTree {
+        let mut tree = NoteCommitmentTree::default();
+
+        for value in 0..prefix_len {
+            tree.append(note_commitment(value))
+                .expect("small test tree is not full");
+        }
+
+        tree
+    }
+
+    fn pre_subtree_boundary_tree() -> NoteCommitmentTree {
+        let subtree_size = 1u64 << TRACKED_SUBTREE_HEIGHT;
+        let pre_boundary_pos = subtree_size - 2;
+        let leaf = node(1);
+        let ommers: Vec<Node> = (2..=16).map(node).collect();
+        let inner = Frontier::from_parts(Position::from(pre_boundary_pos), leaf, ommers)
+            .expect("frontier with 15 ommers at position 65534 is valid");
+
+        NoteCommitmentTree {
+            inner,
+            cached_root: Default::default(),
+        }
+    }
+
+    fn sequential_append_batch(
+        tree: &mut NoteCommitmentTree,
+        note_commitments: &[NoteCommitmentUpdate],
+    ) -> Result<Option<(NoteCommitmentSubtreeIndex, Node)>, NoteCommitmentTreeError> {
+        let mut completed_subtree = None;
+
+        for note_commitment in note_commitments {
+            tree.append(*note_commitment)?;
+
+            if let Some(subtree) = tree.completed_subtree_index_and_root() {
+                assert!(
+                    completed_subtree.is_none(),
+                    "test batches must cross at most one subtree boundary"
+                );
+                completed_subtree = Some(subtree);
+            }
+        }
+
+        Ok(completed_subtree)
+    }
+
+    #[test]
+    fn append_batch_matches_sequential_for_table_cases() {
+        let cases = [
+            ("empty tree, empty batch", 0, 0),
+            ("empty tree, one leaf", 0, 1),
+            ("empty tree, small batch", 0, 5),
+            ("one-leaf tree, empty batch", 1, 0),
+            ("one-leaf tree, one leaf", 1, 1),
+            ("odd tree, small batch", 3, 4),
+            ("power-of-two tree, small batch", 8, 7),
+            ("after power-of-two tree, empty batch", 9, 0),
+            ("after power-of-two tree, small batch", 9, 6),
+        ];
+
+        for (name, prefix_len, batch_len) in cases {
+            let start = build_tree(prefix_len);
+            let mut seq_tree = start.clone();
+            let mut batch_tree = start;
+            let note_commitments: Vec<_> = (0..batch_len)
+                .map(|value| note_commitment(1_000 + prefix_len + value))
+                .collect();
+
+            let _ = seq_tree.root();
+            let _ = batch_tree.root();
+            let seq_result = sequential_append_batch(&mut seq_tree, &note_commitments)
+                .expect("sequential append succeeds");
+            let batch_result = batch_tree
+                .append_batch(&note_commitments)
+                .expect("batch append succeeds");
+
+            assert_eq!(batch_result, seq_result, "{name}: subtree result mismatch");
+            batch_tree.assert_frontier_eq(&seq_tree);
+            assert_eq!(batch_tree.root(), seq_tree.root(), "{name}: root mismatch");
+        }
+    }
+
+    #[test]
+    fn append_batch_matches_sequential_near_subtree_boundary() {
+        let cases = [
+            ("before subtree boundary, empty batch", 0),
+            ("complete subtree boundary", 1),
+            ("complete and start next subtree", 2),
+            ("complete and keep appending", 3),
+        ];
+
+        for (name, batch_len) in cases {
+            let start = pre_subtree_boundary_tree();
+            let mut seq_tree = start.clone();
+            let mut batch_tree = start;
+            let note_commitments: Vec<_> = (0..batch_len)
+                .map(|value| note_commitment(10_000 + value))
+                .collect();
+
+            let _ = seq_tree.root();
+            let _ = batch_tree.root();
+            let seq_result = sequential_append_batch(&mut seq_tree, &note_commitments)
+                .expect("sequential append succeeds");
+            let batch_result = batch_tree
+                .append_batch(&note_commitments)
+                .expect("batch append succeeds");
+
+            assert_eq!(batch_result, seq_result, "{name}: subtree result mismatch");
+            batch_tree.assert_frontier_eq(&seq_tree);
+            assert_eq!(batch_tree.root(), seq_tree.root(), "{name}: root mismatch");
+        }
+    }
+
+    /// Verifies that `append_batch` returns the correct subtree index and root when
+    /// the batch crosses a `TRACKED_SUBTREE_HEIGHT` boundary, and that the resulting
+    /// frontier matches the sequential `append` path.
+    ///
+    /// Uses `Frontier::from_parts` to place the tree just before the first subtree
+    /// boundary (position 65534 = `2^16 - 2`) without executing 65534 real appends.
+    #[test]
+    fn append_batch_crosses_subtree_boundary() {
+        // position 65534 = 0xFFFE: bits 1–15 are set → 15 ommers required.
+        let subtree_size = 1u64 << TRACKED_SUBTREE_HEIGHT;
+        let pre_boundary_pos = subtree_size - 2; // = 65534
+        let leaf = node(1);
+        let ommers: Vec<Node> = (2..=16).map(node).collect();
+        let inner = Frontier::from_parts(Position::from(pre_boundary_pos), leaf, ommers)
+            .expect("frontier with 15 ommers at position 65534 is valid");
+        let tree = NoteCommitmentTree {
+            inner,
+            cached_root: Default::default(),
+        };
+
+        // note_commitments[0] fills position 65535, completing subtree 0.
+        // note_commitments[1] starts subtree 1.
+        let note_commitments = [note_commitment(100), note_commitment(200)];
+
+        // Sequential reference: append one at a time.
+        let mut seq_tree = tree.clone();
+        seq_tree
+            .append(note_commitments[0])
+            .expect("sequential first append");
+        let expected_subtree = seq_tree.completed_subtree_index_and_root();
+        seq_tree
+            .append(note_commitments[1])
+            .expect("sequential second append");
+
+        // Batch must return the same subtree result and produce the same final tree.
+        let mut batch_tree = tree;
+        let batch_result = batch_tree
+            .append_batch(&note_commitments)
+            .expect("batch append succeeds");
+
+        assert!(
+            batch_result.is_some(),
+            "batch crossing boundary must return a subtree"
+        );
+        assert_eq!(
+            batch_result.unwrap().0,
+            NoteCommitmentSubtreeIndex(0),
+            "first subtree index"
+        );
+        assert_eq!(
+            batch_result, expected_subtree,
+            "subtree result matches sequential"
+        );
+        batch_tree.assert_frontier_eq(&seq_tree);
+        assert_eq!(batch_tree.root(), seq_tree.root());
+    }
+
+    #[test]
+    fn append_batch_overflow_preserves_tree_and_cached_root() {
+        let max_position = (1u64 << MERKLE_DEPTH) - 1;
+        let leaf = Node(note_commitment(1));
+        let ommers = vec![Node(note_commitment(2)); usize::from(MERKLE_DEPTH)];
+        let inner = Frontier::from_parts(Position::from(max_position), leaf, ommers)
+            .expect("max-depth frontier is valid");
+        let mut tree = NoteCommitmentTree {
+            inner,
+            cached_root: Default::default(),
+        };
+
+        let _ = tree.root();
+        let original = tree.clone();
+
+        let result = tree.append_batch(&[note_commitment(3)]);
+
+        assert_eq!(result, Err(NoteCommitmentTreeError::FullTree));
+        tree.assert_frontier_eq(&original);
+        assert_eq!(tree.root(), original.root());
+    }
+
+    /// `append_batch` must match sequential appends when a batch exactly fills
+    /// the last two leaf positions of the tree, completing the final tracked
+    /// subtree (index `u16::MAX`) without reporting a spurious overflow.
+    #[test]
+    fn append_batch_matches_sequential_at_tree_capacity() {
+        let max_position = (1u64 << MERKLE_DEPTH) - 1;
+        let start_position = max_position - 2;
+        let leaf = node(1);
+        // A frontier at position `p` stores one ommer per set bit of `p`;
+        // `max_position - 2` has 31 of its 32 bits set.
+        let ommers: Vec<Node> = (2..=32).map(node).collect();
+        let inner = Frontier::from_parts(Position::from(start_position), leaf, ommers)
+            .expect("frontier two leaves below capacity is valid");
+        let start = NoteCommitmentTree {
+            inner,
+            cached_root: Default::default(),
+        };
+        let note_commitments = [note_commitment(100), note_commitment(200)];
+
+        let mut seq_tree = start.clone();
+        let seq_result = sequential_append_batch(&mut seq_tree, &note_commitments)
+            .expect("two sequential appends reach exact capacity");
+
+        let mut batch_tree = start;
+        let batch_result = batch_tree
+            .append_batch(&note_commitments)
+            .expect("batch append reaches exact capacity");
+
+        assert_eq!(batch_result, seq_result);
+        assert_eq!(
+            batch_result.map(|(index, _)| index),
+            Some(NoteCommitmentSubtreeIndex(u16::MAX)),
+        );
+        batch_tree.assert_frontier_eq(&seq_tree);
+        assert_eq!(batch_tree.root(), seq_tree.root());
+    }
+
+    #[test]
+    fn append_batch_multiple_subtrees_preserves_tree_and_cached_root() {
+        let mut tree = NoteCommitmentTree::default();
+        let _ = tree.root();
+        let original = tree.clone();
+
+        let subtree_size = 1usize << TRACKED_SUBTREE_HEIGHT;
+        let note_commitments: Vec<_> = (0..subtree_size * 2)
+            .map(|value| note_commitment(value as u64))
+            .collect();
+
+        let result = tree.append_batch(&note_commitments);
+
+        assert_eq!(result, Err(NoteCommitmentTreeError::FullTree));
+        tree.assert_frontier_eq(&original);
+        assert_eq!(tree.root(), original.root());
+    }
+}

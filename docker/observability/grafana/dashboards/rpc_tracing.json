@@ -11,7 +11,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -89,9 +89,9 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
-          "expr": "sum by (rpc_method) (rate(traces_spanmetrics_calls_total{service=\"zebra\", span_name=\"rpc_request\"}[1m]))",
+          "expr": "sum by (rpc_method) (rate(traces_spanmetrics_calls_total{service=\"zakura\", span_name=\"rpc_request\"}[1m]))",
           "legendFormat": "{{rpc_method}}",
           "refId": "A"
         }
@@ -100,7 +100,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -182,9 +182,9 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
-          "expr": "sum by (rpc_method) (rate(traces_spanmetrics_calls_total{service=\"zebra\", span_name=\"rpc_request\", otel_status_code=\"ERROR\"}[1m])) / sum by (rpc_method) (rate(traces_spanmetrics_calls_total{service=\"zebra\", span_name=\"rpc_request\"}[1m]))",
+          "expr": "sum by (rpc_method) (rate(traces_spanmetrics_calls_total{service=\"zakura\", span_name=\"rpc_request\", otel_status_code=\"ERROR\"}[1m])) / sum by (rpc_method) (rate(traces_spanmetrics_calls_total{service=\"zakura\", span_name=\"rpc_request\"}[1m]))",
           "legendFormat": "{{rpc_method}}",
           "refId": "A"
         }
@@ -193,7 +193,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -271,9 +271,9 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
-          "expr": "histogram_quantile(0.50, sum by (rpc_method, le) (rate(traces_spanmetrics_latency_bucket{service=\"zebra\", span_name=\"rpc_request\"}[1m])))",
+          "expr": "histogram_quantile(0.50, sum by (rpc_method, le) (rate(traces_spanmetrics_latency_bucket{service=\"zakura\", span_name=\"rpc_request\"}[1m])))",
           "legendFormat": "{{rpc_method}}",
           "refId": "A"
         }
@@ -282,7 +282,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -360,9 +360,9 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
-          "expr": "histogram_quantile(0.99, sum by (rpc_method, le) (rate(traces_spanmetrics_latency_bucket{service=\"zebra\", span_name=\"rpc_request\"}[1m])))",
+          "expr": "histogram_quantile(0.99, sum by (rpc_method, le) (rate(traces_spanmetrics_latency_bucket{service=\"zakura\", span_name=\"rpc_request\"}[1m])))",
           "legendFormat": "{{rpc_method}}",
           "refId": "A"
         }
@@ -371,7 +371,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -418,9 +418,9 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
-          "expr": "sum(increase(traces_spanmetrics_calls_total{service=\"zebra\", span_name=\"rpc_request\"}[1h]))",
+          "expr": "sum(increase(traces_spanmetrics_calls_total{service=\"zakura\", span_name=\"rpc_request\"}[1h]))",
           "legendFormat": "Total",
           "refId": "A"
         }
@@ -429,7 +429,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -480,9 +480,9 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
-          "expr": "sum(increase(traces_spanmetrics_calls_total{service=\"zebra\", span_name=\"rpc_request\", otel_status_code=\"ERROR\"}[1h]))",
+          "expr": "sum(increase(traces_spanmetrics_calls_total{service=\"zakura\", span_name=\"rpc_request\", otel_status_code=\"ERROR\"}[1h]))",
           "legendFormat": "Errors",
           "refId": "A"
         }
@@ -491,7 +491,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -546,9 +546,9 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
-          "expr": "sum(rate(traces_spanmetrics_latency_sum{service=\"zebra\", span_name=\"rpc_request\"}[5m])) / sum(rate(traces_spanmetrics_latency_count{service=\"zebra\", span_name=\"rpc_request\"}[5m]))",
+          "expr": "sum(rate(traces_spanmetrics_latency_sum{service=\"zakura\", span_name=\"rpc_request\"}[5m])) / sum(rate(traces_spanmetrics_latency_count{service=\"zakura\", span_name=\"rpc_request\"}[5m]))",
           "legendFormat": "Avg",
           "refId": "A"
         }
@@ -557,7 +557,7 @@
     {
       "datasource": {
         "type": "prometheus",
-        "uid": "zebra-prometheus"
+        "uid": "zakura-prometheus"
       },
       "fieldConfig": {
         "defaults": {
@@ -612,9 +612,9 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "zebra-prometheus"
+            "uid": "zakura-prometheus"
           },
-          "expr": "histogram_quantile(0.99, sum(rate(traces_spanmetrics_latency_bucket{service=\"zebra\", span_name=\"rpc_request\"}[5m])) by (le))",
+          "expr": "histogram_quantile(0.99, sum(rate(traces_spanmetrics_latency_bucket{service=\"zakura\", span_name=\"rpc_request\"}[5m])) by (le))",
           "legendFormat": "P99",
           "refId": "A"
         }
@@ -622,7 +622,7 @@
     }
   ],
   "schemaVersion": 39,
-  "tags": ["zebra", "rpc", "tracing"],
+  "tags": ["zakura", "rpc", "tracing"],
   "templating": {
     "list": []
   },
@@ -633,7 +633,7 @@
   "timepicker": {},
   "timezone": "browser",
   "title": "RPC Tracing",
-  "uid": "zebra-rpc-tracing",
+  "uid": "zakura-rpc-tracing",
   "version": 1,
   "weekStart": ""
 }

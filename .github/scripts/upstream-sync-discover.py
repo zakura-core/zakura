@@ -593,7 +593,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-repo", default="ZcashFoundation/zebra")
     parser.add_argument("--source-ref", default="main")
     parser.add_argument("--target-repo", default=os.environ.get("GITHUB_REPOSITORY", "valargroup/zebra"))
-    parser.add_argument("--target-ref", default="ironwood-main")
+    parser.add_argument("--target-ref", default="main")
     parser.add_argument("--candidate-pr", default="")
     parser.add_argument("--limit", type=int, default=MAX_LIMIT)
     parser.add_argument("--output-dir", type=Path, default=Path(".github/upstream-sync/work"))

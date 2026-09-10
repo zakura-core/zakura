@@ -1,0 +1,29 @@
+# Rendered by deploy/deployer/deploy.py — do not edit on the node by hand.
+# Placeholders ({{NAME}}) are substituted at deploy time from the node config.
+
+[network]
+network = "{{NETWORK}}"
+listen_addr = "{{LISTEN_ADDR}}"
+{{IDENTITY_DIR}}
+{{NETWORK_CACHE_DIR}}
+p2p_stack = "{{P2P_STACK}}"
+{{ZAKURA_BLOCK}}
+[state]
+cache_dir = "{{STATE_CACHE_DIR}}"
+storage_mode = "{{STORAGE_MODE}}"
+
+[rpc]
+{{RPC_BLOCK}}
+
+{{METRICS_BLOCK}}
+{{HEALTH_BLOCK}}
+[consensus]
+checkpoint_sync = {{CHECKPOINT_SYNC}}
+vct_fast_sync = {{VCT_FAST_SYNC}}
+
+[tracing]
+# Deterministic log file: the deploy tool reads exactly this path for
+# `logs fetch` / `logs follow`, so writer and reader share one source of truth.
+log_file = "{{LOG_FILE}}"
+use_color = false
+{{TRACING_FILTER}}

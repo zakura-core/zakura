@@ -1,0 +1,1063 @@
+//! Verification for supplied per-block commitment roots.
+//!
+//! Roman Akhtariev wrote this module for the ahead-of-body header-root authentication lane
+//! in zakura#346, #351, #352, and #455. That lane is gone, but the verification it relied on
+//! is unchanged: [`verify_supplied_roots_from_parts`] is still the single place a supplied
+//! root is proven against the successor header that commits to it.
+
+use std::sync::Arc;
+
+use thiserror::Error;
+
+use crate::{
+    block::{
+        self, merkle::AuthDataRoot, ChainHistoryBlockTxAuthCommitmentHash, Commitment,
+        CommitmentError, Header, Height,
+    },
+    history_tree::{HistoryTree, HistoryTreeBlockParts, HistoryTreeError},
+    ironwood, orchard,
+    parallel::commitment_aux::BlockCommitmentRoots,
+    parameters::{Network, NetworkUpgrade},
+    sapling,
+};
+
+/// Commitment roots authenticated by their successor headers.
+///
+/// The private fields make successful verification the only construction path.
+#[derive(Clone, Debug)]
+pub struct VerifiedHeaderCommitmentRoots {
+    confirmed_roots: Vec<BlockCommitmentRoots>,
+    confirmed_hashes: Vec<block::Hash>,
+    /// The final supplied header, present for every non-empty verified delivery.
+    ///
+    /// It is retained as the successor witness for the confirmed roots, including for a
+    /// one-item delivery that only recovers a missing witness and confirms no new roots.
+    header_witness: Option<HeaderWitness>,
+    history_tree: HistoryTree,
+}
+
+/// The final header's authenticated metadata retained for the one-block-lag handoff.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct HeaderWitness {
+    height: Height,
+    hash: block::Hash,
+    auth_data_root: AuthDataRoot,
+}
+
+impl HeaderWitness {
+    /// Constructs retained header witness metadata.
+    pub fn from_parts(height: Height, hash: block::Hash, auth_data_root: AuthDataRoot) -> Self {
+        Self {
+            height,
+            hash,
+            auth_data_root,
+        }
+    }
+
+    /// Returns the witness header's height.
+    pub fn height(&self) -> Height {
+        self.height
+    }
+
+    /// Returns the witness header's hash.
+    pub fn hash(&self) -> block::Hash {
+        self.hash
+    }
+
+    /// Returns the authorizing-data root authenticated by the witness header.
+    pub fn auth_data_root(&self) -> AuthDataRoot {
+        self.auth_data_root
+    }
+}
+
+impl VerifiedHeaderCommitmentRoots {
+    /// Returns the roots confirmed by this delivery, in ascending height order.
+    pub fn confirmed_roots(&self) -> &[BlockCommitmentRoots] {
+        &self.confirmed_roots
+    }
+
+    /// Returns the header hashes corresponding to the confirmed roots.
+    pub fn confirmed_hashes(&self) -> &[block::Hash] {
+        &self.confirmed_hashes
+    }
+
+    /// Returns the header hash at the confirmed tip, if any roots were confirmed.
+    pub fn confirmed_hash(&self) -> Option<block::Hash> {
+        self.confirmed_hashes.last().copied()
+    }
+
+    /// Returns the final header's authenticated witness metadata.
+    ///
+    /// The witness's note-commitment roots require a later successor and are not retained.
+    pub fn header_witness(&self) -> Option<HeaderWitness> {
+        self.header_witness
+    }
+
+    /// Returns the history tree after folding the confirmed roots.
+    pub fn history_tree(&self) -> &HistoryTree {
+        &self.history_tree
+    }
+}
+
+/// A supplied-root verification failure.
+#[derive(Debug, Error)]
+pub enum SuppliedRootsError {
+    /// A header commitment did not match its supplied auxiliary data.
+    #[error("invalid header commitment: {0}")]
+    InvalidHeaderCommitment(#[from] CommitmentError),
+
+    /// A header commitment requires a parent history tree, but the supplied tree is empty.
+    #[error("missing parent history tree root required by the header commitment")]
+    MissingHistoryTreeRoot,
+
+    /// The supplied auxiliary roots could not extend the history tree.
+    #[error("invalid history tree update: {0}")]
+    HistoryTree(#[from] Arc<HistoryTreeError>),
+}
+
+/// Verify supplied per-block roots against the checkpoint-committed header chain, folding them
+/// into the ZIP-221 MMR **from parts** (no block bodies).
+///
+/// `items` are `(header, roots)` in ascending, contiguous height order, each one height above
+/// `tree`'s current tip (`tree` is the running header-frontier history tree). Returns the
+/// advanced tree, or `(height, error)` for the first block whose header commitment rejects the
+/// roots folded so far.
+///
+/// A block's commitment binds the history tree as of its *parent*, so the root supplied for
+/// height `H` is confirmed when `H + 1` is processed. Over a contiguous range `[start..=end]`
+/// this confirms `[start..=end - 1]`; the next range's first header confirms `end`.
+/// Therefore the final item is header-checked but not folded, and the returned tree is positioned
+/// at the last confirmed entry.
+pub fn verify_supplied_roots_from_parts<'a, I>(
+    network: &Network,
+    mut tree: HistoryTree,
+    items: I,
+) -> Result<VerifiedHeaderCommitmentRoots, (Height, SuppliedRootsError)>
+where
+    I: IntoIterator<Item = (&'a Header, &'a BlockCommitmentRoots)>,
+{
+    let items = items.into_iter().collect::<Vec<_>>();
+    let mut confirmed_roots = Vec::with_capacity(items.len().saturating_sub(1));
+    let mut confirmed_hashes = Vec::with_capacity(items.len().saturating_sub(1));
+
+    for (index, (header, roots)) in items.iter().enumerate() {
+        let height = roots.height;
+
+        header_commitment_is_valid_for_chain_history(
+            header,
+            height,
+            network,
+            &tree,
+            roots.auth_data_root,
+        )
+        .map_err(|error| (height, error))?;
+
+        verify_supplied_sapling_root_below_heartwood_from_header(
+            network,
+            header,
+            height,
+            &roots.sapling_root,
+        )
+        .map_err(|error| (height, error))?;
+        verify_supplied_sapling_tx_below_sapling(network, height, roots.sapling_tx)
+            .map_err(|error| (height, error))?;
+        verify_supplied_orchard_root_below_nu5(network, height, &roots.orchard_root)
+            .map_err(|error| (height, error))?;
+        verify_supplied_orchard_tx_below_nu5(network, height, roots.orchard_tx)
+            .map_err(|error| (height, error))?;
+        verify_supplied_ironwood_root_below_nu6_3(network, height, &roots.ironwood_root)
+            .map_err(|error| (height, error))?;
+        verify_supplied_ironwood_tx_below_nu6_3(network, height, roots.ironwood_tx)
+            .map_err(|error| (height, error))?;
+
+        // Header H + 1 authenticates roots for H, so the final item is only a boundary check.
+        if index + 1 == items.len() {
+            continue;
+        }
+
+        tree.push_from_parts(
+            network,
+            HistoryTreeBlockParts {
+                header,
+                height,
+                sapling_root: &roots.sapling_root,
+                orchard_root: &roots.orchard_root,
+                ironwood_root: &roots.ironwood_root,
+                sapling_tx: roots.sapling_tx,
+                orchard_tx: roots.orchard_tx,
+                ironwood_tx: roots.ironwood_tx,
+            },
+        )
+        .map_err(Arc::new)
+        .map_err(SuppliedRootsError::from)
+        .map_err(|error| (height, error))?;
+        // Persist only header-authenticated (or pre-activation-pinned) field values under the
+        // verified banner. Body-verified-only fields are cleared to canonical empties so a peer
+        // cannot poison currently-dead or unauthenticated slots that are later re-served.
+        confirmed_roots.push(normalize_unauthenticated_commitment_fields(
+            network,
+            (*roots).clone(),
+        ));
+        confirmed_hashes.push(block::Hash::from(*header));
+    }
+
+    Ok(VerifiedHeaderCommitmentRoots {
+        confirmed_roots,
+        confirmed_hashes,
+        header_witness: items.last().map(|(header, roots)| {
+            HeaderWitness::from_parts(
+                roots.height,
+                block::Hash::from(*header),
+                roots.auth_data_root,
+            )
+        }),
+        history_tree: tree,
+    })
+}
+
+/// Header-driven commitment check against `history_tree`, the history tree as
+/// of the parent.
+pub fn header_commitment_is_valid_for_chain_history(
+    header: &block::Header,
+    height: block::Height,
+    network: &Network,
+    history_tree: &HistoryTree,
+    auth_data_root: AuthDataRoot,
+) -> Result<(), SuppliedRootsError> {
+    // Header-sync receives auxiliary roots alongside each header, but a
+    // header's chain-history commitment authenticates the history tree built
+    // from the *previous* block's auxiliary roots. So this function checks the
+    // current header against the tree already folded by the receive pipeline.
+    //
+    // In a contiguous range, header H + 1 confirms the supplied roots for H.
+    // The caller folds roots only after this check succeeds, which keeps
+    // unconfirmed roots out of the returned history tree.
+    match header.commitment(network, height)? {
+        Commitment::PreSaplingReserved(_)
+        | Commitment::FinalSaplingRoot(_)
+        | Commitment::ChainHistoryActivationReserved => Ok(()),
+        Commitment::ChainHistoryRoot(actual_history_tree_root) => {
+            // Heartwood through NU6_2 commits directly to the parent history
+            // tree root, so the current header confirms the roots that were
+            // folded into `history_tree` before this block.
+            let history_tree_root = history_tree
+                .hash()
+                .ok_or(SuppliedRootsError::MissingHistoryTreeRoot)?;
+            if actual_history_tree_root == history_tree_root {
+                Ok(())
+            } else {
+                Err(CommitmentError::InvalidChainHistoryRoot {
+                    actual: actual_history_tree_root.into(),
+                    expected: history_tree_root.into(),
+                }
+                .into())
+            }
+        }
+        Commitment::ChainHistoryBlockTxAuthCommitment(actual_hash_block_commitments) => {
+            // NU5 onward commits to both the parent history tree root and
+            // this block's auth data root. That still preserves the one-block
+            // lag for supplied note commitment roots: `history_tree` is the
+            // parent tree, while `auth_data_root` belongs to the current
+            // header's block.
+            let history_tree_root = history_tree
+                .hash()
+                .or_else(|| {
+                    (NetworkUpgrade::Heartwood.activation_height(network) == Some(height))
+                        .then_some(block::CHAIN_HISTORY_ACTIVATION_RESERVED.into())
+                })
+                .ok_or(SuppliedRootsError::MissingHistoryTreeRoot)?;
+            let hash_block_commitments = ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+                &history_tree_root,
+                &auth_data_root,
+            );
+
+            if actual_hash_block_commitments == hash_block_commitments {
+                Ok(())
+            } else {
+                Err(CommitmentError::InvalidChainHistoryBlockTxAuthCommitment {
+                    actual: actual_hash_block_commitments.into(),
+                    expected: hash_block_commitments.into(),
+                }
+                .into())
+            }
+        }
+    }
+}
+
+/// Verifies a supplied Sapling root for a *pre-Heartwood* block directly against the header.
+pub fn verify_supplied_sapling_root_below_heartwood_from_header(
+    network: &Network,
+    header: &Header,
+    height: Height,
+    sapling_root: &sapling::tree::Root,
+) -> Result<(), SuppliedRootsError> {
+    let expected = match header.commitment(network, height)? {
+        Commitment::FinalSaplingRoot(header_root) => header_root,
+        Commitment::PreSaplingReserved(_) => sapling::tree::NoteCommitmentTree::default().root(),
+        _ => return Ok(()),
+    };
+
+    if sapling_root != &expected {
+        return Err(CommitmentError::InvalidFinalSaplingRoot {
+            expected: <[u8; 32]>::from(expected),
+            actual: <[u8; 32]>::from(*sapling_root),
+        }
+        .into());
+    }
+
+    Ok(())
+}
+
+/// Verifies that a supplied Sapling transaction count is zero before Sapling.
+pub fn verify_supplied_sapling_tx_below_sapling(
+    network: &Network,
+    height: Height,
+    sapling_tx: u64,
+) -> Result<(), SuppliedRootsError> {
+    if let Some(sapling_height) = NetworkUpgrade::Sapling.activation_height(network) {
+        if height >= sapling_height {
+            return Ok(());
+        }
+    }
+
+    if sapling_tx != 0 {
+        return Err(CommitmentError::InvalidPreSaplingSaplingTxCount {
+            expected: 0,
+            actual: sapling_tx,
+        }
+        .into());
+    }
+
+    Ok(())
+}
+
+/// Clears body-verified-only fields so authenticated rows never persist peer-controlled bytes
+/// that the header layer does not bind.
+///
+/// - `sapling_tx` below Heartwood (ZIP-221 does not exist yet; pre-Sapling is also pinned to zero)
+/// - `auth_data_root` below NU5 (headers commit the chain-history root directly)
+///
+/// Heartwood+ `sapling_tx` and NU5+ `auth_data_root` are left intact: those values were checked
+/// against the applicable header commitment / history leaf before confirmation.
+pub fn normalize_unauthenticated_commitment_fields(
+    network: &Network,
+    mut roots: BlockCommitmentRoots,
+) -> BlockCommitmentRoots {
+    let below_heartwood = NetworkUpgrade::Heartwood
+        .activation_height(network)
+        .is_none_or(|heartwood| roots.height < heartwood);
+    if below_heartwood {
+        roots.sapling_tx = 0;
+    }
+
+    let below_nu5 = NetworkUpgrade::Nu5
+        .activation_height(network)
+        .is_none_or(|nu5| roots.height < nu5);
+    if below_nu5 {
+        roots.auth_data_root = AuthDataRoot::from([0u8; 32]);
+    }
+
+    roots
+}
+
+/// Verifies a supplied Orchard root for a pre-NU5 block.
+pub fn verify_supplied_orchard_root_below_nu5(
+    network: &Network,
+    height: Height,
+    orchard_root: &orchard::tree::Root,
+) -> Result<(), SuppliedRootsError> {
+    if let Some(nu5_height) = NetworkUpgrade::Nu5.activation_height(network) {
+        if height >= nu5_height {
+            return Ok(());
+        }
+    }
+
+    let expected = orchard::tree::NoteCommitmentTree::default().root();
+    if orchard_root != &expected {
+        return Err(CommitmentError::InvalidPreNu5OrchardRoot {
+            expected: <[u8; 32]>::from(expected),
+            actual: <[u8; 32]>::from(*orchard_root),
+        }
+        .into());
+    }
+
+    Ok(())
+}
+
+/// Verifies that a supplied Orchard transaction count is zero before NU5.
+pub fn verify_supplied_orchard_tx_below_nu5(
+    network: &Network,
+    height: Height,
+    orchard_tx: u64,
+) -> Result<(), SuppliedRootsError> {
+    if let Some(nu5_height) = NetworkUpgrade::Nu5.activation_height(network) {
+        if height >= nu5_height {
+            return Ok(());
+        }
+    }
+
+    if orchard_tx != 0 {
+        return Err(CommitmentError::InvalidPreNu5OrchardTxCount {
+            expected: 0,
+            actual: orchard_tx,
+        }
+        .into());
+    }
+
+    Ok(())
+}
+
+/// Verifies a supplied Ironwood root for a pre-Ironwood (pre-`Nu6_3`) block.
+pub fn verify_supplied_ironwood_root_below_nu6_3(
+    network: &Network,
+    height: Height,
+    ironwood_root: &ironwood::tree::Root,
+) -> Result<(), SuppliedRootsError> {
+    if let Some(nu6_3_height) = NetworkUpgrade::Nu6_3.activation_height(network) {
+        if height >= nu6_3_height {
+            return Ok(());
+        }
+    }
+
+    let expected = ironwood::tree::NoteCommitmentTree::default().root();
+    if ironwood_root != &expected {
+        return Err(CommitmentError::InvalidPreNu6_3IronwoodRoot {
+            expected: <[u8; 32]>::from(expected),
+            actual: <[u8; 32]>::from(*ironwood_root),
+        }
+        .into());
+    }
+
+    Ok(())
+}
+
+/// Verifies that a supplied Ironwood transaction count is zero before Nu6_3.
+pub fn verify_supplied_ironwood_tx_below_nu6_3(
+    network: &Network,
+    height: Height,
+    ironwood_tx: u64,
+) -> Result<(), SuppliedRootsError> {
+    if let Some(nu6_3_height) = NetworkUpgrade::Nu6_3.activation_height(network) {
+        if height >= nu6_3_height {
+            return Ok(());
+        }
+    }
+
+    if ironwood_tx != 0 {
+        return Err(CommitmentError::InvalidPreNu6_3IronwoodTxCount {
+            expected: 0,
+            actual: ironwood_tx,
+        }
+        .into());
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::{
+        block::Block,
+        parameters::{
+            testnet::{ConfiguredActivationHeights, RegtestParameters},
+            Network::Mainnet,
+        },
+        serialization::ZcashDeserializeInto,
+    };
+
+    /// Build an empty [`HistoryTree`] (the genesis block is pre-Heartwood).
+    fn empty_history_tree() -> HistoryTree {
+        let genesis = Arc::new(
+            zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+                .zcash_deserialize_into::<Block>()
+                .expect("genesis deserializes"),
+        );
+        HistoryTree::from_block(
+            &Mainnet,
+            genesis,
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        )
+        .expect("empty history tree for a pre-Heartwood block")
+    }
+
+    fn mainnet_block_at(height: u32) -> Arc<Block> {
+        let (blocks, _) = Mainnet.block_sapling_roots_map();
+        Arc::new(
+            blocks
+                .get(&height)
+                .expect("test vector block exists")
+                .zcash_deserialize_into::<Block>()
+                .expect("block deserializes"),
+        )
+    }
+
+    fn mainnet_sapling_root_at(height: u32) -> sapling::tree::Root {
+        let (_, sapling_roots) = Mainnet.block_sapling_roots_map();
+        sapling::tree::Root::try_from(**sapling_roots.get(&height).expect("root vector exists"))
+            .expect("valid root")
+    }
+
+    fn empty_ironwood_root() -> ironwood::tree::Root {
+        ironwood::tree::NoteCommitmentTree::default().root()
+    }
+
+    fn non_empty_orchard_root() -> orchard::tree::Root {
+        let empty = orchard::tree::NoteCommitmentTree::default().root();
+        let wrong = orchard::tree::Root::try_from([0u8; 32])
+            .expect("zero is a valid pallas base field element");
+        assert_ne!(
+            wrong, empty,
+            "the negative cases need a root distinct from the empty-tree root"
+        );
+        wrong
+    }
+
+    fn non_empty_ironwood_root() -> ironwood::tree::Root {
+        let empty = empty_ironwood_root();
+        let wrong = ironwood::tree::Root::try_from([0u8; 32])
+            .expect("zero is a valid pallas base field element");
+        assert_ne!(
+            wrong, empty,
+            "the negative cases need a root distinct from the empty-tree root"
+        );
+        wrong
+    }
+
+    fn roots_from_block(
+        block: &Block,
+        sapling_root: sapling::tree::Root,
+        orchard_root: orchard::tree::Root,
+    ) -> BlockCommitmentRoots {
+        let height = block
+            .coinbase_height()
+            .expect("test block has a coinbase height");
+        BlockCommitmentRoots {
+            height,
+            sapling_root,
+            orchard_root,
+            ironwood_root: empty_ironwood_root(),
+            sapling_tx: block.sapling_transactions_count(),
+            orchard_tx: block.orchard_transactions_count(),
+            ironwood_tx: block.ironwood_transactions_count(),
+            auth_data_root: block.auth_data_root(),
+        }
+    }
+
+    #[test]
+    fn pins_sapling_root_below_heartwood_to_header_or_empty() {
+        let empty = sapling::tree::NoteCommitmentTree::default().root();
+        let sapling_root = mainnet_sapling_root_at(419_200);
+        let different_sapling_root = mainnet_sapling_root_at(419_201);
+        assert_ne!(
+            empty, different_sapling_root,
+            "the pre-Sapling negative case needs a non-empty root"
+        );
+        assert_ne!(
+            sapling_root, different_sapling_root,
+            "the negative cases need two distinct roots"
+        );
+
+        let pre_sapling_block = mainnet_block_at(1);
+        verify_supplied_sapling_root_below_heartwood_from_header(
+            &Mainnet,
+            &pre_sapling_block.header,
+            Height(1),
+            &empty,
+        )
+        .expect("the empty-tree root is accepted before Sapling");
+        let error = verify_supplied_sapling_root_below_heartwood_from_header(
+            &Mainnet,
+            &pre_sapling_block.header,
+            Height(1),
+            &different_sapling_root,
+        )
+        .expect_err("a non-empty Sapling root must be rejected before Sapling");
+        assert!(
+            matches!(
+                error,
+                SuppliedRootsError::InvalidHeaderCommitment(
+                    CommitmentError::InvalidFinalSaplingRoot { .. }
+                )
+            ),
+            "rejection uses the final Sapling root error, got: {error:?}"
+        );
+
+        let sapling_block = mainnet_block_at(419_200);
+        verify_supplied_sapling_root_below_heartwood_from_header(
+            &Mainnet,
+            &sapling_block.header,
+            Height(419_200),
+            &sapling_root,
+        )
+        .expect("the header's final Sapling root is accepted before Heartwood");
+        let error = verify_supplied_sapling_root_below_heartwood_from_header(
+            &Mainnet,
+            &sapling_block.header,
+            Height(419_200),
+            &different_sapling_root,
+        )
+        .expect_err("a Sapling root different from the header root must be rejected");
+        assert!(
+            matches!(
+                error,
+                SuppliedRootsError::InvalidHeaderCommitment(
+                    CommitmentError::InvalidFinalSaplingRoot { .. }
+                )
+            ),
+            "rejection uses the final Sapling root error, got: {error:?}"
+        );
+
+        let heartwood_block = mainnet_block_at(903_000);
+        verify_supplied_sapling_root_below_heartwood_from_header(
+            &Mainnet,
+            &heartwood_block.header,
+            Height(903_000),
+            &different_sapling_root,
+        )
+        .expect("at Heartwood the root is authenticated by the MMR, not pinned here");
+    }
+
+    #[test]
+    fn pins_orchard_root_to_empty_below_nu5_and_defers_above() {
+        let nu5 = NetworkUpgrade::Nu5
+            .activation_height(&Mainnet)
+            .expect("mainnet has NU5");
+        let empty = orchard::tree::NoteCommitmentTree::default().root();
+        let wrong = non_empty_orchard_root();
+
+        let pre_nu5 = Height(nu5.0 - 1);
+        verify_supplied_orchard_root_below_nu5(&Mainnet, pre_nu5, &empty)
+            .expect("the empty-tree root is accepted below NU5");
+        let error = verify_supplied_orchard_root_below_nu5(&Mainnet, pre_nu5, &wrong)
+            .expect_err("a non-empty orchard root must be rejected below NU5");
+        assert!(
+            matches!(
+                error,
+                SuppliedRootsError::InvalidHeaderCommitment(
+                    CommitmentError::InvalidPreNu5OrchardRoot { .. }
+                )
+            ),
+            "rejection uses the dedicated pre-NU5 orchard error, got: {error:?}"
+        );
+
+        verify_supplied_orchard_root_below_nu5(&Mainnet, nu5, &wrong)
+            .expect("at NU5 the root is authenticated by the MMR, not pinned here");
+    }
+
+    #[test]
+    fn pins_orchard_root_to_empty_when_nu5_is_unconfigured() {
+        let network = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu5: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let empty = orchard::tree::NoteCommitmentTree::default().root();
+        let wrong = non_empty_orchard_root();
+
+        verify_supplied_orchard_root_below_nu5(&network, Height(1), &empty)
+            .expect("the empty-tree root is accepted when NU5 is unconfigured");
+        verify_supplied_orchard_root_below_nu5(&network, Height(1), &wrong)
+            .expect_err("a non-empty orchard root must be rejected when NU5 is unconfigured");
+    }
+
+    #[test]
+    fn pins_orchard_tx_to_zero_below_nu5_and_defers_above() {
+        let nu5 = NetworkUpgrade::Nu5
+            .activation_height(&Mainnet)
+            .expect("mainnet has NU5");
+        let pre_nu5 = Height(nu5.0 - 1);
+
+        verify_supplied_orchard_tx_below_nu5(&Mainnet, pre_nu5, 0)
+            .expect("a zero Orchard transaction count is accepted below NU5");
+        let error = verify_supplied_orchard_tx_below_nu5(&Mainnet, pre_nu5, 1)
+            .expect_err("a non-zero Orchard transaction count must be rejected below NU5");
+        assert!(
+            matches!(
+                error,
+                SuppliedRootsError::InvalidHeaderCommitment(
+                    CommitmentError::InvalidPreNu5OrchardTxCount { .. }
+                )
+            ),
+            "rejection uses the dedicated pre-NU5 Orchard count error, got: {error:?}"
+        );
+
+        verify_supplied_orchard_tx_below_nu5(&Mainnet, nu5, 1)
+            .expect("at NU5 the Orchard transaction count is authenticated by the MMR");
+    }
+
+    #[test]
+    fn pins_sapling_tx_to_zero_below_sapling_and_defers_above() {
+        let sapling = NetworkUpgrade::Sapling
+            .activation_height(&Mainnet)
+            .expect("mainnet has Sapling");
+        let pre_sapling = Height(sapling.0 - 1);
+
+        verify_supplied_sapling_tx_below_sapling(&Mainnet, pre_sapling, 0)
+            .expect("a zero Sapling transaction count is accepted below Sapling");
+        let error = verify_supplied_sapling_tx_below_sapling(&Mainnet, pre_sapling, 1)
+            .expect_err("a non-zero Sapling transaction count must be rejected below Sapling");
+        assert!(
+            matches!(
+                error,
+                SuppliedRootsError::InvalidHeaderCommitment(
+                    CommitmentError::InvalidPreSaplingSaplingTxCount { .. }
+                )
+            ),
+            "rejection uses the dedicated pre-Sapling Sapling count error, got: {error:?}"
+        );
+
+        verify_supplied_sapling_tx_below_sapling(&Mainnet, sapling, 1)
+            .expect("at Sapling the count is body-verified until Heartwood, not pinned here");
+    }
+
+    #[test]
+    fn clears_unauthenticated_fields_when_confirming_roots() {
+        let sapling = NetworkUpgrade::Sapling
+            .activation_height(&Mainnet)
+            .expect("mainnet has Sapling")
+            .0;
+        let heartwood = NetworkUpgrade::Heartwood
+            .activation_height(&Mainnet)
+            .expect("mainnet has Heartwood")
+            .0;
+        assert!(
+            sapling + 1 < heartwood,
+            "fixture needs a Sapling height strictly below Heartwood"
+        );
+
+        let mut pre_heartwood = roots_from_block(
+            &mainnet_block_at(sapling),
+            mainnet_sapling_root_at(sapling),
+            orchard::tree::NoteCommitmentTree::default().root(),
+        );
+        pre_heartwood.height = Height(sapling);
+        pre_heartwood.sapling_tx = 7;
+        pre_heartwood.auth_data_root = AuthDataRoot::from([0xAA; 32]);
+
+        let normalized =
+            normalize_unauthenticated_commitment_fields(&Mainnet, pre_heartwood.clone());
+        assert_eq!(
+            normalized.sapling_tx, 0,
+            "pre-Heartwood sapling_tx must not be persisted under the verified banner"
+        );
+        assert_eq!(
+            normalized.auth_data_root,
+            AuthDataRoot::from([0u8; 32]),
+            "pre-NU5 auth_data_root must not be persisted under the verified banner"
+        );
+
+        let mut heartwood_roots = roots_from_block(
+            &mainnet_block_at(heartwood),
+            mainnet_sapling_root_at(heartwood),
+            orchard::tree::NoteCommitmentTree::default().root(),
+        );
+        heartwood_roots.sapling_tx = 3;
+        heartwood_roots.auth_data_root = AuthDataRoot::from([0xBB; 32]);
+        let normalized_heartwood =
+            normalize_unauthenticated_commitment_fields(&Mainnet, heartwood_roots.clone());
+        assert_eq!(
+            normalized_heartwood.sapling_tx, 3,
+            "Heartwood+ sapling_tx is authenticated by the history leaf and must be kept"
+        );
+        assert_eq!(
+            normalized_heartwood.auth_data_root,
+            AuthDataRoot::from([0u8; 32]),
+            "Heartwood is still pre-NU5, so auth_data_root is cleared"
+        );
+    }
+
+    #[test]
+    fn pins_orchard_tx_to_zero_when_nu5_is_unconfigured() {
+        let network = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu5: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        verify_supplied_orchard_tx_below_nu5(&network, Height(1), 0)
+            .expect("a zero Orchard transaction count is accepted when NU5 is unconfigured");
+        verify_supplied_orchard_tx_below_nu5(&network, Height(1), 1)
+            .expect_err("a non-zero Orchard transaction count is rejected without NU5");
+    }
+
+    #[test]
+    fn pins_ironwood_root_to_empty_below_nu6_3_and_defers_above() {
+        let network = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu6_3: Some(1_000),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let empty = empty_ironwood_root();
+        let wrong = non_empty_ironwood_root();
+
+        let pre_nu6_3 = Height(999);
+        verify_supplied_ironwood_root_below_nu6_3(&network, pre_nu6_3, &empty)
+            .expect("the empty-tree root is accepted below Nu6_3");
+        let error = verify_supplied_ironwood_root_below_nu6_3(&network, pre_nu6_3, &wrong)
+            .expect_err("a non-empty ironwood root must be rejected below Nu6_3");
+        assert!(
+            matches!(
+                error,
+                SuppliedRootsError::InvalidHeaderCommitment(
+                    CommitmentError::InvalidPreNu6_3IronwoodRoot { .. }
+                )
+            ),
+            "rejection uses the dedicated pre-Nu6_3 ironwood error, got: {error:?}"
+        );
+
+        verify_supplied_ironwood_root_below_nu6_3(&network, Height(1_000), &wrong)
+            .expect("at Nu6_3 the root is authenticated by the MMR, not pinned here");
+    }
+
+    #[test]
+    fn pins_ironwood_tx_to_zero_below_nu6_3_and_defers_above() {
+        let network = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu6_3: Some(1_000),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        verify_supplied_ironwood_tx_below_nu6_3(&network, Height(999), 0)
+            .expect("a zero Ironwood transaction count is accepted below Nu6_3");
+        let error = verify_supplied_ironwood_tx_below_nu6_3(&network, Height(999), 1)
+            .expect_err("a non-zero Ironwood transaction count must be rejected below Nu6_3");
+        assert!(
+            matches!(
+                error,
+                SuppliedRootsError::InvalidHeaderCommitment(
+                    CommitmentError::InvalidPreNu6_3IronwoodTxCount { .. }
+                )
+            ),
+            "rejection uses the dedicated pre-Nu6_3 Ironwood count error, got: {error:?}"
+        );
+
+        verify_supplied_ironwood_tx_below_nu6_3(&network, Height(1_000), 1)
+            .expect("at Nu6_3 the Ironwood transaction count is authenticated by the MMR");
+    }
+
+    #[test]
+    fn pins_ironwood_tx_to_zero_when_nu6_3_is_unconfigured() {
+        let network = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu6_3: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        verify_supplied_ironwood_tx_below_nu6_3(&network, Height(1), 0)
+            .expect("a zero Ironwood transaction count is accepted when Nu6_3 is unconfigured");
+        verify_supplied_ironwood_tx_below_nu6_3(&network, Height(1), 1)
+            .expect_err("a non-zero Ironwood transaction count is rejected without Nu6_3");
+    }
+
+    #[test]
+    fn verifies_real_roots_and_reports_confirmed_tip_with_one_block_lag() {
+        let activation = NetworkUpgrade::Heartwood
+            .activation_height(&Mainnet)
+            .expect("mainnet has Heartwood")
+            .0;
+
+        let act_block = mainnet_block_at(activation);
+        let next_block = mainnet_block_at(activation + 1);
+        let act_root = mainnet_sapling_root_at(activation);
+        let next_root = mainnet_sapling_root_at(activation + 1);
+        let empty_orchard_root = orchard::tree::NoteCommitmentTree::default().root();
+
+        let act_roots = roots_from_block(&act_block, act_root, empty_orchard_root);
+        let next_roots = roots_from_block(&next_block, next_root, empty_orchard_root);
+        let items = vec![
+            (act_block.header.as_ref(), &act_roots),
+            (next_block.header.as_ref(), &next_roots),
+        ];
+
+        let verified = verify_supplied_roots_from_parts(&Mainnet, empty_history_tree(), items)
+            .expect("real roots verify against the headers");
+
+        let expected_confirmed =
+            normalize_unauthenticated_commitment_fields(&Mainnet, act_roots.clone());
+        assert_eq!(
+            verified.confirmed_roots(),
+            std::slice::from_ref(&expected_confirmed),
+            "a two-header range only confirms the first header's roots"
+        );
+        assert_eq!(
+            verified.confirmed_hash(),
+            Some(block::Hash::from(act_block.header.as_ref())),
+        );
+        assert_eq!(
+            verified.header_witness(),
+            Some(HeaderWitness {
+                height: next_roots.height,
+                hash: block::Hash::from(next_block.header.as_ref()),
+                auth_data_root: next_roots.auth_data_root,
+            }),
+            "only the final header's authenticated witness metadata is retained"
+        );
+        assert_eq!(
+            verified.history_tree().hash(),
+            HistoryTree::from_block(
+                &Mainnet,
+                act_block,
+                &act_root,
+                &empty_orchard_root,
+                &empty_ironwood_root(),
+            )
+            .expect("activation block builds a history tree")
+            .hash(),
+            "the returned tree is folded through the confirmed root tip"
+        );
+    }
+
+    #[test]
+    fn one_item_delivery_recovers_only_the_authenticated_header_witness() {
+        let network = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu5: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let parent = mainnet_block_at(1);
+        let witness_block = mainnet_block_at(2);
+        let empty_sapling_root = sapling::tree::NoteCommitmentTree::default().root();
+        let empty_orchard_root = orchard::tree::NoteCommitmentTree::default().root();
+        let parent_tree = HistoryTree::from_block(
+            &network,
+            parent,
+            &empty_sapling_root,
+            &empty_orchard_root,
+            &empty_ironwood_root(),
+        )
+        .expect("the parent history tree builds");
+        let witness_roots =
+            roots_from_block(&witness_block, empty_sapling_root, empty_orchard_root);
+        let mut witness_header = *witness_block.header;
+        witness_header.commitment_bytes =
+            <[u8; 32]>::from(ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+                &parent_tree.hash().expect("the parent tree has a root"),
+                &witness_roots.auth_data_root,
+            ))
+            .into();
+
+        let verified = verify_supplied_roots_from_parts(
+            &network,
+            parent_tree.clone(),
+            [(&witness_header, &witness_roots)],
+        )
+        .expect("the one-item witness verifies");
+
+        assert!(verified.confirmed_roots().is_empty());
+        assert!(verified.confirmed_hashes().is_empty());
+        assert_eq!(verified.history_tree(), &parent_tree);
+        assert_eq!(
+            verified.header_witness(),
+            Some(HeaderWitness::from_parts(
+                witness_roots.height,
+                block::Hash::from(&witness_header),
+                witness_roots.auth_data_root,
+            ))
+        );
+
+        let mut wrong_roots = witness_roots;
+        let mut wrong_auth_data_root = <[u8; 32]>::from(wrong_roots.auth_data_root);
+        wrong_auth_data_root[0] ^= 1;
+        wrong_roots.auth_data_root = AuthDataRoot::from(wrong_auth_data_root);
+        let error = verify_supplied_roots_from_parts(
+            &network,
+            parent_tree,
+            [(&witness_header, &wrong_roots)],
+        )
+        .expect_err("a wrong witness auth-data root is rejected");
+        assert_eq!(error.0, wrong_roots.height);
+        assert!(matches!(
+            error.1,
+            SuppliedRootsError::InvalidHeaderCommitment(
+                CommitmentError::InvalidChainHistoryBlockTxAuthCommitment { .. }
+            )
+        ));
+    }
+
+    #[test]
+    fn rejects_wrong_root_at_successor_height() {
+        let activation = NetworkUpgrade::Heartwood
+            .activation_height(&Mainnet)
+            .expect("mainnet has Heartwood")
+            .0;
+
+        let act_block = mainnet_block_at(activation);
+        let next_block = mainnet_block_at(activation + 1);
+        let act_root = mainnet_sapling_root_at(activation);
+        let next_root = mainnet_sapling_root_at(activation + 1);
+        let empty_orchard_root = orchard::tree::NoteCommitmentTree::default().root();
+        assert_ne!(act_root, next_root, "test needs two distinct roots");
+
+        let bad_act_roots = roots_from_block(&act_block, next_root, empty_orchard_root);
+        let next_roots = roots_from_block(&next_block, next_root, empty_orchard_root);
+        let items = vec![
+            (act_block.header.as_ref(), &bad_act_roots),
+            (next_block.header.as_ref(), &next_roots),
+        ];
+
+        let (fail_height, _error) =
+            verify_supplied_roots_from_parts(&Mainnet, empty_history_tree(), items)
+                .expect_err("a wrong root must be rejected");
+        assert_eq!(
+            fail_height,
+            Height(activation + 1),
+            "a wrong root at H is detected at H+1"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_history_tree_when_header_requires_parent_root() {
+        let heartwood_successor = NetworkUpgrade::Heartwood
+            .activation_height(&Mainnet)
+            .expect("mainnet has Heartwood")
+            .0
+            + 1;
+        let nu5_activation = NetworkUpgrade::Nu5
+            .activation_height(&Mainnet)
+            .expect("mainnet has NU5")
+            .0;
+        let block = mainnet_block_at(heartwood_successor);
+        let roots = roots_from_block(
+            &block,
+            mainnet_sapling_root_at(heartwood_successor),
+            orchard::tree::NoteCommitmentTree::default().root(),
+        );
+
+        for height in [heartwood_successor, nu5_activation] {
+            let roots = BlockCommitmentRoots {
+                height: Height(height),
+                ..roots.clone()
+            };
+
+            let error = verify_supplied_roots_from_parts(
+                &Mainnet,
+                empty_history_tree(),
+                [(block.header.as_ref(), &roots)],
+            )
+            .expect_err("an empty parent history tree must be rejected");
+
+            assert_eq!(error.0, Height(height));
+            assert!(
+                matches!(error.1, SuppliedRootsError::MissingHistoryTreeRoot),
+                "rejection uses the missing history tree error, got: {:?}",
+                error.1
+            );
+        }
+    }
+}

@@ -2,7 +2,7 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Debug zebrad with snapshot",
+      "name": "Debug zakurad with snapshot",
       "type": "lldb",
       "request": "launch",
       "cargo": {
@@ -11,10 +11,10 @@
           "--features",
           "prometheus",
           "--bin",
-          "zebrad"
+          "zakurad"
         ],
         "filter": {
-          "name": "zebrad",
+          "name": "zakurad",
           "kind": "bin"
         },
         "env": {
@@ -24,13 +24,13 @@
       "preLaunchTask": "Generate zebra bench debug config",
       "args": [
         "-c",
-        ".vscode/zebra-bench-debug.generated.toml",
+        ".vscode/zakura-bench-debug.generated.toml",
         "start"
       ],
       "cwd": "${workspaceFolder}",
       "env": {
         "RUST_BACKTRACE": "1",
-        "RUST_LOG": "info,zebra_network::zakura=debug,zebrad::commands::start=debug"
+        "RUST_LOG": "info,zakura_network::zakura=debug,zakurad::commands::start=debug"
       },
       "console": "integratedTerminal"
     }

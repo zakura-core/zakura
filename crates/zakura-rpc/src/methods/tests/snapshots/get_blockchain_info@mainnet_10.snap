@@ -1,0 +1,116 @@
+---
+source: zebra-rpc/src/methods/tests/snapshot.rs
+expression: info
+---
+{
+  "chain": "main",
+  "blocks": 10,
+  "headers": 10,
+  "difficulty": 1.0,
+  "verificationprogress": "[f64]",
+  "chainwork": 0,
+  "pruned": false,
+  "size_on_disk": 0,
+  "commitments": 0,
+  "bestblockhash": "00074c46a4aa8172df8ae2ad1848a2e084e1b6989b7d9e6132adc938bf835b36",
+  "estimatedheight": "[Height]",
+  "chainSupply": {
+    "chainValue": 0.034375,
+    "chainValueZat": 3437500,
+    "monitored": true
+  },
+  "valuePools": [
+    {
+      "id": "transparent",
+      "chainValue": 0.034375,
+      "chainValueZat": 3437500,
+      "monitored": true
+    },
+    {
+      "id": "sprout",
+      "chainValue": 0.0,
+      "chainValueZat": 0,
+      "monitored": false
+    },
+    {
+      "id": "sapling",
+      "chainValue": 0.0,
+      "chainValueZat": 0,
+      "monitored": false
+    },
+    {
+      "id": "orchard",
+      "chainValue": 0.0,
+      "chainValueZat": 0,
+      "monitored": false
+    },
+    {
+      "id": "lockbox",
+      "chainValue": 0.0,
+      "chainValueZat": 0,
+      "monitored": false
+    },
+    {
+      "id": "ironwood",
+      "chainValue": 0.0,
+      "chainValueZat": 0,
+      "monitored": false
+    }
+  ],
+  "upgrades": {
+    "5ba81b19": {
+      "name": "Overwinter",
+      "activationheight": 347500,
+      "status": "pending"
+    },
+    "76b809bb": {
+      "name": "Sapling",
+      "activationheight": 419200,
+      "status": "pending"
+    },
+    "2bb40e60": {
+      "name": "Blossom",
+      "activationheight": 653600,
+      "status": "pending"
+    },
+    "f5b9230b": {
+      "name": "Heartwood",
+      "activationheight": 903000,
+      "status": "pending"
+    },
+    "e9ff75a6": {
+      "name": "Canopy",
+      "activationheight": 1046400,
+      "status": "pending"
+    },
+    "c2d6d0b4": {
+      "name": "NU5",
+      "activationheight": 1687104,
+      "status": "pending"
+    },
+    "c8e71055": {
+      "name": "NU6",
+      "activationheight": 2726400,
+      "status": "pending"
+    },
+    "4dec4df0": {
+      "name": "NU6.1",
+      "activationheight": 3146400,
+      "status": "pending"
+    },
+    "5437f330": {
+      "name": "NU6.2",
+      "activationheight": 3364600,
+      "status": "pending"
+    },
+    "37a5165b": {
+      "name": "NU6.3",
+      "activationheight": 3428143,
+      "status": "pending"
+    }
+  },
+  "consensus": {
+    "chaintip": "00000000",
+    "nextblock": "00000000"
+  }
+}

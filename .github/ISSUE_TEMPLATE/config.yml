@@ -2,7 +2,7 @@ blank_issues_enabled: true
 contact_links:
   - name: 💬 Zcash Community Support
     url: https://forum.zcashcommunity.com/
-    about: You're invited to ask questions about the ecosystem, community and Zebra
-  - name: ❓ General Questions about Zebra
-    url: https://github.com/ZcashFoundation/zebra/discussions/categories/q-a
-    about: Please ask and answer questions about Zebra as a discussion threads
+    about: You're invited to ask questions about the ecosystem, community and Zakura
+  - name: ❓ General Questions about Zakura
+    url: https://github.com/zakura-core/zakura/discussions/categories/q-a
+    about: Please ask and answer questions about Zakura as a discussion threads

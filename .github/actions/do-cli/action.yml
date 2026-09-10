@@ -1,0 +1,50 @@
+name: "DigitalOcean CLI"
+description: "Install and authenticate doctl, and optionally write the fleet SSH key to /tmp/do_ssh."
+
+inputs:
+  token:
+    description: "DigitalOcean API token (secrets.DIGITALOCEAN_ACCESS_TOKEN)"
+    required: true
+  ssh_private_key:
+    description: "Optional SSH private key (secrets.DO_SSH_PRIVATE_KEY). Omit for API-only jobs like the reaper."
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # `doctl auth init` persists the token to the runner's doctl config, so
+    # later steps in the calling job get an authenticated doctl without
+    # re-exporting the secret into their own environment.
+    - name: Install doctl
+      shell: bash
+      env:
+        DIGITALOCEAN_ACCESS_TOKEN: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        DOCTL_VERSION=1.120.0
+        # From doctl-1.120.0-checksums.sha256 in the upstream release assets.
+        DOCTL_SHA256=4d6bddfa2480ff10a7704a26eddf5a9d1c568653fc50cc2eb033522486b9c7cd
+        tmp_dir="$(mktemp -d)"
+        archive="${tmp_dir}/doctl-${DOCTL_VERSION}-linux-amd64.tar.gz"
+        trap 'rm -rf "${tmp_dir}"' EXIT
+
+        curl --fail --silent --show-error --location \
+          "https://github.com/digitalocean/doctl/releases/download/v${DOCTL_VERSION}/doctl-${DOCTL_VERSION}-linux-amd64.tar.gz" \
+          --output "${archive}"
+        printf '%s  %s\n' "${DOCTL_SHA256}" "${archive}" | sha256sum --check --strict -
+        tar -xzf "${archive}" -C "${tmp_dir}" doctl
+        sudo install "${tmp_dir}/doctl" /usr/local/bin/doctl
+        doctl auth init -t "${DIGITALOCEAN_ACCESS_TOKEN}"
+
+    # /tmp/do_ssh is hardcoded here and in do-wait-ssh because every calling
+    # workflow's own scp/ssh steps use that path too.
+    - name: Write SSH key
+      if: inputs.ssh_private_key != ''
+      shell: bash
+      env:
+        DO_SSH_PRIVATE_KEY: ${{ inputs.ssh_private_key }}
+      run: |
+        set -euo pipefail
+        install -m 600 /dev/null /tmp/do_ssh
+        printf '%s\n' "${DO_SSH_PRIVATE_KEY}" > /tmp/do_ssh

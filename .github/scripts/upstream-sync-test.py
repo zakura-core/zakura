@@ -42,7 +42,7 @@ def result_for(
         "branch_name": branch_name or candidate["branch_name"],
         "pr_title": "fix(state): adapt upstream test fixes",
         "pr_body": body,
-        "files_changed": ["zebra-state/src/service/chain_tip.rs"],
+        "files_changed": ["crates/zakura-state/src/service/chain_tip.rs"],
         "validation": validation if validation is not None else [
             {
                 "command": "cargo fmt --all -- --check",
@@ -270,8 +270,6 @@ def main() -> int:
             "Carry the behavior into the fork.",
             "### Tests",
             "Fixture validation passed.",
-            "AI Disclosure",
-            "Codex was used to adapt this change.",
             "### Revert Plan",
             "Revert the generated PR.",
             upstream_pr_marker,
@@ -293,8 +291,6 @@ def main() -> int:
             "Skip this upstream change.",
             "### Tests",
             "Fixture validation passed.",
-            "AI Disclosure",
-            "Codex was used to triage this change.",
             "### Revert Plan",
             "No fork change was made.",
             second_pr_marker,

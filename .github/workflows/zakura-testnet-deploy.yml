@@ -4,7 +4,7 @@ name: Deploy Zakura testnet fleet
 #
 # Runs on a self-hosted Linux x86_64 runner, expected to be installed on
 # zakura-testnet-1 with the `zakura-testnet-deployer` label. The deployer builds
-# a native zebrad binary on that runner, then uses deploy/deployer/deploy.py to
+# a native zakurad binary on that runner, then uses deploy/deployer/deploy.py to
 # scp/install it across the fleet.
 
 on:
@@ -14,14 +14,25 @@ on:
         description: "Git branch, tag, or SHA to build and deploy"
         required: true
         type: string
-        default: ironwood-main
+        default: main
       force_rebuild:
         description: "Rebuild even if a cached binary for this commit exists"
         type: boolean
         required: false
         default: false
       no_restart:
-        description: "Stage binary/config/unit without restarting zebrad"
+        description: "Stage binary/config/unit without restarting zakurad"
+        type: boolean
+        required: false
+        default: false
+      p2p_stack:
+        description: "P2P stack override; auto preserves each node's fleet role"
+        type: choice
+        required: false
+        options: [auto, dual, zakura, legacy]
+        default: auto
+      header_sync_trace:
+        description: "Write structured header/block-sync traces to the data volume"
         type: boolean
         required: false
         default: false
@@ -44,24 +55,37 @@ jobs:
     runs-on: [self-hosted, "${{ vars.ZAKURA_TESTNET_RUNNER_LABEL || 'zakura-testnet-deployer' }}"]
     timeout-minutes: 180
     environment: zakura-testnet
+    env:
+      CARGO_TARGET_DIR: /mnt/data/zakura-deployer/cargo-target
+      ZAKURA_DEPLOYER_BUILD_CACHE_DIR: /mnt/data/zakura-deployer/binaries
 
     steps:
+      - name: Validate deploy inputs
+        env:
+          REF: ${{ inputs.ref }}
+          NODE: ${{ inputs.node }}
+        run: |
+          set -euo pipefail
+          if ! [[ "${REF}" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "invalid ref: allowed chars [A-Za-z0-9._/-]" >&2
+            exit 1
+          fi
+          if [ -n "${NODE}" ] && ! [[ "${NODE}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "invalid node: allowed chars [A-Za-z0-9._-]" >&2
+            exit 1
+          fi
+
       - name: Checkout deploy ref
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
           ref: ${{ inputs.ref }}
 
       - name: Set up Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           toolchain: stable
-          cache-on-failure: true
-
-      - name: Restore Rust cache
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          cache-on-failure: true
+          cache: false
 
       - name: Install build dependencies
         run: |
@@ -100,39 +124,68 @@ jobs:
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
           : > ~/.ssh/known_hosts
-          for host in 167.99.103.111 167.99.110.145 138.68.229.254 164.92.209.78 206.189.148.0; do
+          for host in \
+            167.99.103.111 \
+            164.92.209.78 \
+            206.189.148.0; do
             ssh-keyscan -T 30 -H "$host" >> ~/.ssh/known_hosts
           done
           chmod 600 ~/.ssh/known_hosts
 
       - name: Generate deployer fleet config
         working-directory: deploy/deployer
+        env:
+          HEADER_SYNC_TRACE: ${{ inputs.header_sync_trace }}
+          NODE: ${{ inputs.node }}
+          P2P_STACK: ${{ inputs.p2p_stack }}
+          REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
 
+          requested_p2p_stack="${P2P_STACK}"
+          default_p2p_stack="dual"
+
+          if [ "$requested_p2p_stack" != "auto" ]; then
+            if [ -z "${NODE}" ]; then
+              echo "p2p_stack overrides require one explicit node" >&2
+              exit 1
+            fi
+            default_p2p_stack="$requested_p2p_stack"
+          fi
+
+          if [ "${HEADER_SYNC_TRACE}" = "true" ] \
+            && [ -z "${NODE}" ]; then
+            echo "header_sync_trace requires one explicit node" >&2
+            exit 1
+          fi
+
+          zakura_trace_line=""
+          if [ "${HEADER_SYNC_TRACE}" = "true" ]; then
+            zakura_trace_line='trace_dir = "/mnt/data/traces/header-chain-canary"'
+          fi
+
           cat > nodes.ci.toml <<EOF
           [defaults]
-          service_name    = "zebrad"
-          bin_path        = "/usr/local/bin/zebrad"
-          config_path     = "/etc/zakura/zebrad.toml"
+          service_name    = "zakurad"
+          bin_path        = "/usr/local/bin/zakurad"
+          config_path     = "/etc/zakura/zakura.toml"
           network         = "Testnet"
           listen_addr     = "0.0.0.0:18233"
           rpc_listen_addr = "0.0.0.0:18232"
           rpc_enable_cookie_auth = false
           storage_mode    = "archive"
-          v2_p2p          = true
-          legacy_p2p      = true
+          p2p_stack       = "${default_p2p_stack}"
           metrics_endpoint = "127.0.0.1:9999"
-          tracing_filter  = "info,zebra_network::zakura=info"
+          health_listen_addr = "127.0.0.1:8080"
+          tracing_filter  = "info,zakura_network::zakura=info"
           checkpoint_sync = false
           vct_fast_sync   = false
 
           [defaults.zakura]
           listen_addr = "0.0.0.0:8234"
+          ${zakura_trace_line}
           bootstrap_peers = [
               "57ad39fad4f0bca46cf1ea831772a99d5027b372fef2be5a0ea68e1b5bb4da49@167.99.103.111:8234",
-              "4faac8f988a7820690d63b57a385cd6f833638b068e774550712c05e4b692426@167.99.110.145:8234",
-              "9ce6b95aa197d169399788fe01dd8a88140e81d23d00b4739aeeb1113c6247a2@138.68.229.254:8234",
               "2bbb907b5d90598ef49f2e637066586b311a64587479be6ed43e8388587fcd2a@164.92.209.78:8234",
               "50999835f48f4a048c0e9042e5332844c9673943d7fab1f7e993bae698c27ea3@206.189.148.0:8234",
           ]
@@ -140,73 +193,64 @@ jobs:
           [[nodes]]
           name       = "zakura-testnet-1"
           ssh_string = "root@167.99.103.111"
-          commit     = "${{ inputs.ref }}"
-          network_cache_dir = "/mnt/zakura-testnet-1-data/zebra-cache"
-          state_cache_dir = "/mnt/zakura-testnet-1-data/zebra-cache"
-          log_file = "/mnt/zakura-testnet-1-data/logs/zebrad.log"
-
-          [[nodes]]
-          name       = "zakura-testnet-2"
-          ssh_string = "root@167.99.110.145"
-          commit     = "${{ inputs.ref }}"
-          network_cache_dir = "/mnt/zakura-testnet-2-data/zebra-cache"
-          state_cache_dir = "/mnt/zakura-testnet-2-data/zebra-cache"
-          log_file = "/mnt/zakura-testnet-2-data/logs/zebrad.log"
-
-          [[nodes]]
-          name       = "zakura-testnet-3"
-          ssh_string = "root@138.68.229.254"
-          commit     = "${{ inputs.ref }}"
-          network_cache_dir = "/mnt/zakura-testnet-3-data/zebra-cache"
-          state_cache_dir = "/mnt/zakura-testnet-3-data/zebra-cache"
-          log_file = "/mnt/zakura-testnet-3-data/logs/zebrad.log"
+          commit     = "${REF}"
+          network_cache_dir = "/mnt/data/zakura-cache"
+          state_cache_dir = "/mnt/data/zakura-cache"
+          log_file = "/mnt/data/logs/zakura.log"
 
           [[nodes]]
           name       = "zakura-testnet-eu"
           ssh_string = "root@164.92.209.78"
-          commit     = "${{ inputs.ref }}"
-          network_cache_dir = "/mnt/zakura-testnet-eu-data/zebra-cache"
-          state_cache_dir = "/mnt/zakura-testnet-eu-data/zebra-cache"
-          log_file = "/mnt/zakura-testnet-eu-data/logs/zebrad.log"
+          commit     = "${REF}"
+          network_cache_dir = "/mnt/data/zakura-cache"
+          state_cache_dir = "/mnt/data/zakura-cache"
+          log_file = "/mnt/data/logs/zakura.log"
 
           [[nodes]]
           name       = "zakura-testnet-as"
           ssh_string = "root@206.189.148.0"
-          commit     = "${{ inputs.ref }}"
-          network_cache_dir = "/mnt/zakura-testnet-as-data/zebra-cache"
-          state_cache_dir = "/mnt/zakura-testnet-as-data/zebra-cache"
-          log_file = "/mnt/zakura-testnet-as-data/logs/zebrad.log"
+          commit     = "${REF}"
+          network_cache_dir = "/mnt/data/zakura-cache"
+          state_cache_dir = "/mnt/data/zakura-cache"
+          log_file = "/mnt/data/logs/zakura.log"
           EOF
 
       - name: Build deployer binary
         working-directory: deploy/deployer
+        env:
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+          NODE: ${{ inputs.node }}
         run: |
           set -euo pipefail
 
           args=(--config nodes.ci.toml)
-          if [ "${{ inputs.force_rebuild }}" = "true" ]; then
+          if [ "${FORCE_REBUILD}" = "true" ]; then
             args+=(--force)
           fi
-          if [ -n "${{ inputs.node }}" ]; then
-            args+=(--node "${{ inputs.node }}")
+          if [ -n "${NODE}" ]; then
+            args+=(--node "${NODE}")
           fi
 
           python3 deploy.py build "${args[@]}"
 
       - name: Deploy fleet
         working-directory: deploy/deployer
+        env:
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+          NO_RESTART: ${{ inputs.no_restart }}
+          NODE: ${{ inputs.node }}
         run: |
           set -euo pipefail
 
           args=(--config nodes.ci.toml)
-          if [ "${{ inputs.force_rebuild }}" = "true" ]; then
+          if [ "${FORCE_REBUILD}" = "true" ]; then
             args+=(--force)
           fi
-          if [ "${{ inputs.no_restart }}" = "true" ]; then
+          if [ "${NO_RESTART}" = "true" ]; then
             args+=(--no-restart)
           fi
-          if [ -n "${{ inputs.node }}" ]; then
-            args+=(--node "${{ inputs.node }}")
+          if [ -n "${NODE}" ]; then
+            args+=(--node "${NODE}")
           fi
 
           python3 deploy.py deploy "${args[@]}"
@@ -214,12 +258,14 @@ jobs:
       - name: Show fleet status
         if: always()
         working-directory: deploy/deployer
+        env:
+          NODE: ${{ inputs.node }}
         run: |
           set -euo pipefail
 
           args=(--config nodes.ci.toml)
-          if [ -n "${{ inputs.node }}" ]; then
-            args+=(--node "${{ inputs.node }}")
+          if [ -n "${NODE}" ]; then
+            args+=(--node "${NODE}")
           fi
 
           python3 deploy.py status "${args[@]}"
@@ -231,32 +277,8 @@ jobs:
 
           dashboard_dir="/opt/zakura-testnet-dashboard"
           sudo install -d -m 755 "$dashboard_dir"
-          sudo install -m 755 deploy/runner/zebra-cluster-status.py "$dashboard_dir/zebra-cluster-status.py"
-          cp deploy/deployer/nodes.ci.toml "$RUNNER_TEMP/dashboard.nodes.toml"
-          cat >> "$RUNNER_TEMP/dashboard.nodes.toml" <<'EOF'
-
-          [[nodes]]
-          name       = "zakura-compat"
-          ssh_string = "root@206.189.208.228"
-          service_name = ""
-          bin_path = "/root/unity/zakura/target/release/zebrad"
-          log_file = "/mnt/zakura-testnet-1-data/logs/zebrad.log"
-          rpc_listen_addr = "0.0.0.0:18232"
-          process_pattern = "zebrad -c /root/unity/zakura-testnet.toml start"
-
-          [[nodes]]
-          name       = "zcashd-compat"
-          ssh_string = "root@206.189.208.228"
-          probe_kind = "zcashd"
-          service_name = ""
-          bin_path = "/root/unity/zcash/src/zcashd"
-          log_file = ""
-          rpc_listen_addr = "127.0.0.1:18231"
-          rpc_auth = "zcash_conf"
-          rpc_config_path = "/root/unity/zcashd-testnet.toml"
-          process_pattern = "zcashd -conf=/root/unity/zcashd-testnet.toml"
-          EOF
-          sudo install -m 644 "$RUNNER_TEMP/dashboard.nodes.toml" "$dashboard_dir/nodes.toml"
+          sudo install -m 755 deploy/runner/zakura-cluster-status.py "$dashboard_dir/zakura-cluster-status.py"
+          sudo install -m 644 deploy/deployer/nodes.ci.toml "$dashboard_dir/nodes.toml"
 
           sudo tee /etc/systemd/system/zakura-testnet-dashboard.service >/dev/null <<'EOF'
           [Unit]
@@ -267,7 +289,7 @@ jobs:
           [Service]
           Type=simple
           WorkingDirectory=/opt/zakura-testnet-dashboard
-          ExecStart=/usr/bin/python3 /opt/zakura-testnet-dashboard/zebra-cluster-status.py --config /opt/zakura-testnet-dashboard/nodes.toml --host 0.0.0.0 --port 8090 --interval 10 --stale-after 300 --upgrade-height 4134000 --target-spacing 7.5
+          ExecStart=/usr/bin/python3 /opt/zakura-testnet-dashboard/zakura-cluster-status.py --config /opt/zakura-testnet-dashboard/nodes.toml --host 0.0.0.0 --port 8090 --network testnet --interval 10 --stale-after 300 --state-file /var/lib/zakura-testnet-dashboard/orphan-pairs.json
           Restart=always
           RestartSec=5
 
@@ -316,22 +338,52 @@ jobs:
           sudo systemctl restart zakura-testnet-snapshots.service
           sudo systemctl --no-pager --full status zakura-testnet-snapshots.service || true
 
+      - name: Install public broadcast gateway
+        if: always()
+        run: |
+          set -euo pipefail
+
+          gateway_dir="/opt/zakura-gateway-testnet"
+          sudo install -d -m 755 "$gateway_dir"
+          sudo install -m 755 deploy/gateway/broadcast.py "$gateway_dir/broadcast.py"
+          sudo install -m 644 deploy/gateway/testnet/backends.toml \
+            "$gateway_dir/backends.toml"
+          sudo install -m 644 deploy/gateway/testnet/broadcast.service \
+            /etc/systemd/system/zakura-broadcast-testnet.service
+
+          # Keep ironwood/status hosts and the broadcast TLS front door in sync.
+          sudo install -m 644 deploy/gateway/testnet/Caddyfile /etc/caddy/Caddyfile
+          sudo caddy validate --config /etc/caddy/Caddyfile
+          sudo systemctl reload caddy.service
+
+          sudo rm -rf /opt/zakura-broadcast-testnet
+
+          sudo systemctl daemon-reload
+          sudo systemctl enable zakura-broadcast-testnet.service
+          sudo systemctl restart zakura-broadcast-testnet.service
+          sudo systemctl --no-pager --full status zakura-broadcast-testnet.service || true
+          curl --retry 10 --retry-delay 1 --retry-connrefused \
+            --max-time 2 -fsS "http://127.0.0.1:8092/healthz"
+          echo
+
       - name: Fetch recent logs on failure
         if: failure()
         working-directory: deploy/deployer
+        env:
+          NODE: ${{ inputs.node }}
         run: |
           set -euo pipefail
 
           args=(--config nodes.ci.toml --lines 300)
-          if [ -n "${{ inputs.node }}" ]; then
-            args+=(--node "${{ inputs.node }}")
+          if [ -n "${NODE}" ]; then
+            args+=(--node "${NODE}")
           fi
 
           python3 deploy.py logs fetch "${args[@]}" || true
 
       - name: Upload failure logs
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
         with:
           name: zakura-testnet-deploy-logs-${{ github.run_id }}
           path: deploy/deployer/logs/

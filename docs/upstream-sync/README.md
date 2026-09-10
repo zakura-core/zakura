@@ -1,7 +1,7 @@
 # Upstream Triage
 
 This directory tracks upstream Zebra pull requests that the Valar fork has
-evaluated for `ironwood-main`.
+evaluated for `main`.
 
 The automation is intentionally conservative:
 
@@ -22,7 +22,7 @@ unless they carry an important production bug fix for this fork.
 
 Skipped and already-present triage decisions are recorded on the
 `upstream-sync/state` branch in `.github/upstream-sync/triage-ledger.jsonl`.
-This avoids churn on `ironwood-main` just to remember skipped upstream PRs.
+This avoids churn on `main` just to remember skipped upstream PRs.
 `needs_human` decisions open a draft PR with an empty commit and no file
 changes, so reviewers have a visible place to decide whether to close it, add a
 manual fix, or keep investigating.

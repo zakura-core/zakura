@@ -1,0 +1,123 @@
+name: "Create a baked-image droplet"
+description: >-
+  Resolve the newest baked PR-node image (and optionally a chain-state volume
+  snapshot), then create a tagged droplet from them.
+
+inputs:
+  policy:
+    description: "fixed preserves the requested size; correctness permits resource-compatible alternatives; bake requires a 100 GB root disk"
+    default: fixed
+  regions:
+    description: "Ordered regions; each must contain all requested artifacts"
+    default: nyc1,sfo3,nyc3
+  snapshot_mode:
+    description: "tip, sandblast, genesis, or pre-checkpoint"
+    default: tip
+  max_checkpoint:
+    description: "Exclusive upper state height for pre-checkpoint selection"
+    default: ""
+  name:
+    description: "Droplet name"
+    required: true
+  size:
+    description: "Droplet size slug (disk must be >= the baked image's disk)"
+    required: true
+  ssh_fingerprint:
+    description: "DigitalOcean SSH key fingerprint (vars.DO_SSH_KEY_FINGERPRINT)"
+    required: true
+  tag:
+    description: "Droplet tag. Must be one the reaper sweeps, and is applied at creation so a later failure cannot leak an untagged droplet."
+    required: true
+  image_id:
+    description: "Exact baked image ID. Empty resolves the newest zakura-pr-node-* image."
+    required: false
+    default: ""
+  state_network:
+    description: "Attach a clone of the newest zakura-pr-state-<network>-* snapshot (mainnet/testnet). Empty starts with no state volume."
+    required: false
+    default: ""
+  state_snapshot_id:
+    description: "Attach this exact volume snapshot instead of resolving the newest snapshot for state_network."
+    required: false
+    default: ""
+  volume_name:
+    description: "Name for the cloned state volume. Required with state_network or state_snapshot_id, and must start with zakura-pr- so the reaper sweeps it if it leaks."
+    required: false
+    default: ""
+
+outputs:
+  region:
+    description: "Selected region"
+    value: ${{ steps.create.outputs.region }}
+  snapshot_height:
+    description: "Height recorded in the selected snapshot name"
+    value: ${{ steps.create.outputs.snapshot_height }}
+  mainnet_vol:
+    description: "Bake Mainnet volume name"
+    value: ${{ steps.create.outputs.mainnet_vol }}
+  mainnet_vol_id:
+    description: "Bake Mainnet volume ID"
+    value: ${{ steps.create.outputs.mainnet_vol_id }}
+  testnet_vol:
+    description: "Bake Testnet volume name"
+    value: ${{ steps.create.outputs.testnet_vol }}
+  testnet_vol_id:
+    description: "Bake Testnet volume ID"
+    value: ${{ steps.create.outputs.testnet_vol_id }}
+  approach_vol:
+    description: "Bake approach volume name"
+    value: ${{ steps.create.outputs.approach_vol }}
+  approach_vol_id:
+    description: "Bake approach volume ID"
+    value: ${{ steps.create.outputs.approach_vol_id }}
+  id:
+    description: "Droplet ID"
+    value: ${{ steps.create.outputs.id }}
+  ip:
+    description: "Droplet public IPv4"
+    value: ${{ steps.create.outputs.ip }}
+  size:
+    description: "Droplet size selected after checking regional availability"
+    value: ${{ steps.create.outputs.size }}
+  image_id:
+    description: "Image the droplet was created from"
+    value: ${{ steps.create.outputs.image_id }}
+  state_snapshot_id:
+    description: "Volume snapshot the state clone was restored from, empty when no state is requested"
+    value: ${{ steps.create.outputs.state_snapshot_id }}
+  volume_id:
+    description: "Cloned state volume ID, empty when no state snapshot is requested"
+    value: ${{ steps.create.outputs.volume_id }}
+  volume_name:
+    description: "Cloned state volume name, empty when no state snapshot is requested"
+    value: ${{ steps.create.outputs.volume_name }}
+
+runs:
+  using: composite
+  steps:
+    - name: Plan and create compatible resources
+      id: create
+      shell: bash
+      env:
+        NAME: ${{ inputs.name }}
+        SIZE: ${{ inputs.size }}
+        POLICY: ${{ inputs.policy }}
+        REGIONS: ${{ inputs.regions }}
+        SSH_FINGERPRINT: ${{ inputs.ssh_fingerprint }}
+        TAG: ${{ inputs.tag }}
+        IMAGE_ID: ${{ inputs.image_id }}
+        SNAPSHOT_ID: ${{ inputs.state_snapshot_id }}
+        NETWORK: ${{ inputs.state_network }}
+        MODE: ${{ inputs.snapshot_mode }}
+        CHECKPOINT: ${{ inputs.max_checkpoint }}
+        VOLUME_NAME: ${{ inputs.volume_name }}
+      run: |
+        set -euo pipefail
+        ARGS=()
+        if [ -n "$CHECKPOINT" ]; then ARGS+=(--checkpoint "$CHECKPOINT"); fi
+        mkdir -p /tmp/out
+        python3 "$GITHUB_ACTION_PATH/../../workflows/scripts/do_provision.py" \
+          --name "$NAME" --size "$SIZE" --policy "$POLICY" --regions "$REGIONS" \
+          --ssh-fingerprint "$SSH_FINGERPRINT" --tag "$TAG" --image-id "$IMAGE_ID" \
+          --snapshot-id "$SNAPSHOT_ID" --network "$NETWORK" --mode "$MODE" \
+          --volume-name "$VOLUME_NAME" --metadata /tmp/out/provisioning.json "${ARGS[@]}"

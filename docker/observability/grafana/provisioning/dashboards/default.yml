@@ -1,10 +1,10 @@
 apiVersion: 1
 
 providers:
-  - name: 'Zebra Dashboards'
+  - name: 'Zakura Dashboards'
     orgId: 1
-    folder: 'Zebra'
-    folderUid: 'zebra-dashboards'
+    folder: 'Zakura'
+    folderUid: 'zakura-dashboards'
     type: file
     disableDeletion: false
     updateIntervalSeconds: 30

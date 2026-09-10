@@ -1,0 +1,12 @@
+/var/log/zakura/zebrad.log
+/var/log/zakura/monitor.log
+{
+    daily
+    maxsize 64M
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

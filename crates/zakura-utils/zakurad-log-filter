@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Reads stdin or the file $1, replacing hashes with block info
+#
+# Uses zakurad-hash-lookup, which uses zcash-cli.
+#
+# Usage:
+#   zakurad start | zakurad-log-filter
+#   ZCASH_CLI="zcash-cli -testnet" zakurad start | zakurad-log-filter
+
+HASH_REGEX='[0-9a-f]{64}'
+
+while IFS= read -r line; do
+    # Expand each hash in place, leaving the surrounding log text untouched
+    while [[ $line =~ $HASH_REGEX ]]; do
+        hash=${BASH_REMATCH[0]}
+
+        printf '%s\n' "${line%%"$hash"*}"
+        printf '%s\n' "$hash" | zakurad-hash-lookup
+
+        line=${line#*"$hash"}
+    done
+
+    printf '%s\n' "$line"
+done < "${1:-/dev/stdin}"

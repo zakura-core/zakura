@@ -25,7 +25,7 @@ on:
       target_ref:
         description: "Fork branch to target"
         type: string
-        default: ironwood-main
+        default: main
       candidate_pr:
         description: "Optional upstream PR number override for debugging"
         type: string
@@ -74,9 +74,9 @@ jobs:
           fi
 
       - name: Checkout target branch
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
-          ref: ${{ inputs.target_ref || 'ironwood-main' }}
+          ref: ${{ inputs.target_ref || 'main' }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -87,7 +87,7 @@ jobs:
           SOURCE_REPO: ${{ inputs.source_repo || 'ZcashFoundation/zebra' }}
           SOURCE_REF: ${{ inputs.source_ref || 'main' }}
           TARGET_REPO: ${{ github.repository }}
-          TARGET_REF: ${{ inputs.target_ref || 'ironwood-main' }}
+          TARGET_REF: ${{ inputs.target_ref || 'main' }}
           CANDIDATE_PR: ${{ inputs.candidate_pr || '' }}
           LIMIT: ${{ inputs.limit || '25' }}
         run: |
@@ -124,9 +124,9 @@ jobs:
       has_recordable_decisions: ${{ steps.collect.outputs.has_recordable_decisions }}
     steps:
       - name: Checkout target branch
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
-          ref: ${{ inputs.target_ref || 'ironwood-main' }}
+          ref: ${{ inputs.target_ref || 'main' }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -141,7 +141,7 @@ jobs:
 
       - name: Run Codex
         id: codex
-        uses: openai/codex-action@e0fdf01220eb9a88167c4898839d273e3f2609d1 #v1
+        uses: openai/codex-action@86365089eb2b84e0a8fb0717b304f8bdcb13b20e #v1.12
         with:
           openai-api-key: ${{ secrets.CODEX_API_KEY }}
           prompt-file: .github/upstream-sync/prompts/adapt-pr.md
@@ -186,9 +186,9 @@ jobs:
       contents: write
     steps:
       - name: Checkout target branch
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
-          ref: ${{ inputs.target_ref || 'ironwood-main' }}
+          ref: ${{ inputs.target_ref || 'main' }}
           fetch-depth: 0
           persist-credentials: true
 
@@ -213,9 +213,9 @@ jobs:
       pull-requests: write
     steps:
       - name: Checkout target branch
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
-          ref: ${{ inputs.target_ref || 'ironwood-main' }}
+          ref: ${{ inputs.target_ref || 'main' }}
           fetch-depth: 0
           persist-credentials: true
 
@@ -245,7 +245,7 @@ jobs:
         id: create-pr
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          UPSTREAM_SYNC_TARGET_REF: ${{ inputs.target_ref || 'ironwood-main' }}
+          UPSTREAM_SYNC_TARGET_REF: ${{ inputs.target_ref || 'main' }}
         run: .github/scripts/upstream-sync-run.sh create-human-review-pr
 
       - name: Verify PR state
@@ -270,9 +270,9 @@ jobs:
       pull-requests: write
     steps:
       - name: Checkout target branch
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
-          ref: ${{ inputs.target_ref || 'ironwood-main' }}
+          ref: ${{ inputs.target_ref || 'main' }}
           fetch-depth: 0
           persist-credentials: true
 
@@ -322,7 +322,7 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           branch: ${{ steps.pr-meta.outputs.branch }}
-          base: ${{ inputs.target_ref || 'ironwood-main' }}
+          base: ${{ inputs.target_ref || 'main' }}
           title: ${{ steps.pr-meta.outputs.title }}
           body-path: .github/upstream-sync/work/pr-body.md
           commit-message: ${{ steps.pr-meta.outputs.title }}

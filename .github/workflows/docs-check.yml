@@ -5,18 +5,16 @@ on:
     branches: [main]
     paths:
       - "**.md"
-      - "book/**"
-      - ".lychee.toml"
-      - ".codespellrc"
-      - ".trunk/configs/.markdownlint.yaml"
+      - ".github/lychee.toml"
+      - ".github/codespellrc"
+      - ".github/.markdownlint.yaml"
       - ".github/workflows/docs-check.yml"
   pull_request:
     paths:
       - "**.md"
-      - "book/**"
-      - ".lychee.toml"
-      - ".codespellrc"
-      - ".trunk/configs/.markdownlint.yaml"
+      - ".github/lychee.toml"
+      - ".github/codespellrc"
+      - ".github/.markdownlint.yaml"
       - ".github/workflows/docs-check.yml"
 
 # Ensures that only one workflow task will run at a time. Previous builds, if
@@ -31,39 +29,67 @@ permissions:
   pull-requests: read
 
 jobs:
-  # TODO: this always ends up failing due to random issues. Possibly move to a weekly job
-  # link-check:
-  #   name: link-check
-  #   permissions:
-  #     contents: read
-  #     pull-requests: read
-  #   runs-on: ubuntu-latest
-  #   timeout-minutes: 15
-  #   steps:
-  #     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
-  #       with:
-  #         persist-credentials: false
+  link-check:
+    name: link-check
+    permissions:
+      contents: read
+      pull-requests: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
 
-  #     - name: Restore lychee cache
-  #       uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae #v5.0.5
-  #       with:
-  #         path: .lycheecache
-  #         key: cache-lychee-${{ github.sha }}
-  #         restore-keys: cache-lychee-
+      - name: Restore lychee cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
+        with:
+          path: .lycheecache
+          key: cache-lychee-${{ github.sha }}
+          restore-keys: cache-lychee-
 
-  #     - name: Link Checker
-  #       uses: lycheeverse/lychee-action@8646ba30535128ac92d33dfc9133794bfdd9b411 #v2.8.0
-  #       with:
-  #         args: >-
-  #           --verbose
-  #           --no-progress
-  #           --cache
-  #           --max-cache-age 1d
-  #           --config .lychee.toml
-  #           "**/*.md"
-  #         fail: true
-  #       env:
-  #         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install Lychee
+        env:
+          LYCHEE_VERSION: 0.24.2
+          LYCHEE_SHA256: 1f4e0ef7f6554a6ed33dd7ac144fb2e1bbed98598e7af973042fc5cd43951c9a
+        run: |
+          set -euo pipefail
+
+          tmp_dir="$(mktemp -d)"
+          archive="${tmp_dir}/lychee.tar.gz"
+          trap 'rm -rf "${tmp_dir}"' EXIT
+
+          curl --fail --silent --show-error --location \
+            --retry 5 --retry-all-errors --retry-delay 2 \
+            --output "${archive}" \
+            "https://github.com/lycheeverse/lychee/releases/download/lychee-v${LYCHEE_VERSION}/lychee-x86_64-unknown-linux-gnu.tar.gz"
+          printf '%s  %s\n' "${LYCHEE_SHA256}" "${archive}" |
+            sha256sum --check --strict -
+          tar -xzf "${archive}" -C "${tmp_dir}"
+
+          lychee_bin="${tmp_dir}/lychee-x86_64-unknown-linux-gnu/lychee"
+          test -f "${lychee_bin}"
+          install -Dm755 "${lychee_bin}" "${RUNNER_TEMP}/lychee/bin/lychee"
+          echo "${RUNNER_TEMP}/lychee/bin" >> "${GITHUB_PATH}"
+
+      - name: Link Checker
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          lychee \
+            --verbose \
+            --no-progress \
+            --cache \
+            --max-cache-age 2d \
+            --config .github/lychee.toml \
+            "**/*.md"
+
+      - name: Save lychee cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 #v6.1.0
+        with:
+          path: .lycheecache
+          key: cache-lychee-${{ github.sha }}
 
   spell-check:
     name: spell-check
@@ -72,7 +98,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
 
@@ -80,7 +106,7 @@ jobs:
         run: pip install codespell
 
       - name: Run codespell
-        run: codespell --config .codespellrc
+        run: codespell --config .github/codespellrc
 
   markdown-lint:
     name: markdown-lint
@@ -89,17 +115,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e #v6.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 #v7.0.0
         with:
           node-version: "22"
 
       - name: Install markdownlint-cli
-        run: npm install -g markdownlint-cli
+        run: npm install -g markdownlint-cli # zizmor: ignore[adhoc-packages] -- markdown linter only; repo has no npm lockfile to install from, and the job is read-only with no credentials persisted
 
       - name: Run markdownlint
         run: |
@@ -107,19 +133,19 @@ jobs:
             --ignore node_modules \
             --ignore target \
             --ignore .git \
-            --config .trunk/configs/.markdownlint.yaml
+            --config .github/.markdownlint.yaml
 
   docs-check-success:
     name: docs check success
     runs-on: ubuntu-latest
     if: always()
     needs:
-      # - link-check
+      - link-check
       - spell-check
       - markdown-lint
     timeout-minutes: 5
     steps:
       - name: Decide whether the needed jobs succeeded or failed
-        uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe #v1.2.2
+        uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 #v1.3.0
         with:
           jobs: ${{ toJSON(needs) }}

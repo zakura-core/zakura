@@ -1,10 +1,32 @@
 .PHONY: help
 
-include make/zcashd-compat.mk
-include make/perf.mk
+include scripts/make/zcashd-compat.mk
+include scripts/make/perf.mk
+include scripts/make/zakura-dev.mk
+include scripts/make/treestate-audit.mk
+include scripts/make/release.mk
+include scripts/make/install.mk
 
 help:
 	@echo "Available targets:"
+	@echo ""
+	@echo "  Install:"
+	@echo "  BRANCH=<branch> make install-branch   Install zakurad from a Git branch (default: main)"
+	@echo ""
+	@echo "  Dev Zakura (local node):"
+	@echo "  zakura-build-dev                 Build release zakurad"
+	@echo "  zakura-dev-init                  Create ~/.local/zakura-dev config + dirs"
+	@echo "  zakura-start-dev                 Start local dev node (pruned, VCT, v2-only)"
+	@echo ""
+	@echo "  Historical treestate audit:"
+	@echo "  treestate-audit-inventory        Report the database's historical treestate inventory"
+	@echo "  treestate-audit-subtrees         Verify replay-derived subtree roots against stored rows"
+	@echo "  treestate-audit-walk             Derive and root-check the absent band"
+	@echo "  treestate-audit-samples          Measure cold replay and print per-height samples"
+	@echo "  treestate-audit-roots            Print derived roots for cross-node comparison"
+	@echo "  treestate-audit-differential     Compare derived roots with a legacy node over RPC"
+	@echo "    Variables: TREESTATE_CACHE_DIR, TREESTATE_NETWORK, TREESTATE_FROM,"
+	@echo "               TREESTATE_TO, TREESTATE_STEP, TREESTATE_RPC_URL"
 	@echo ""
 	@echo "  Perf harness (deterministic isolated-cohort bench):"
 	@echo "  perf-build-local                 Build the instrumented (commit-metrics) bench binary"
@@ -23,12 +45,18 @@ help:
 	@echo "  compat-docker-build              Build Docker zcashd-compat image"
 	@echo "  compat-zcashd-prepare            Fetch/verify zcashd-compat artifact for Docker build"
 	@echo "  compat-docker-start              Start Docker zcashd-compat with mounted snapshots"
-	@echo "  compat-zebrad-start-supervised   Start zebrad with zcashd supervision enabled"
-	@echo "  compat-zebrad-start-unsupervised Start zebrad with zcashd supervision disabled"
+	@echo "  compat-zakurad-start-supervised   Start zakurad with zcashd supervision enabled"
+	@echo "  compat-zakurad-start-unsupervised Start zakurad with zcashd supervision disabled"
 	@echo "  compat-zcashd-start-standalone   Start zcashd -zebra-compat as a standalone process"
-	@echo "  compat-zebrad-status             Check zebrad liveness and Zebra RPC health"
+	@echo "  compat-zakurad-status             Check zakurad liveness and Zakura RPC health"
 	@echo "  compat-zcashd-status             Check zcashd liveness and zebra-compat RPC health"
 	@echo "  compat-status-sync               Run both status checks and enforce max drift"
 	@echo "  compat-test-regtest              Run full zcashd-compat test suite (regtest, spawns processes)"
 	@echo "  compat-test-mainnet              Run read-only zcashd-compat tests against live mainnet"
 	@echo "  compat-test-testnet              Run read-only zcashd-compat tests against live testnet"
+	@echo ""
+	@echo "  Release:"
+	@echo "  prepare-release RELEASE_TAG=vX.Y.Z [BASE_TAG=vX.Y.Z] [NO_CRATES=1] [DRY_RUN=1]   Apply the mechanical release-prep steps (bumps, fixture, changelog)"
+	@echo "  prepare-release-changelog RELEASE_TAG=vX.Y.Z   Assemble and consume pending changelog fragments"
+	@echo "  pre-release RELEASE_TAG=vX.Y.Z BASE_TAG=vX.Y.Z   Verify committed changelog; fail if stale; run remaining release checks"
+	@echo "  sign-release TAG=vX.Y.Z          Sign a release's SHA256SUMS.txt with the maintainer minisign key (see docs/verify.md)"

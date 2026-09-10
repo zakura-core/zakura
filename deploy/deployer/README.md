@@ -1,19 +1,18 @@
-# zebrad deploy tool
+# zakurad deploy tool
 
-A small, dependency-free operator tool to build `zebrad` from a per-node commit,
+A small, dependency-free operator tool to build `zakurad` from a per-node commit,
 distribute it to a fleet over SSH, run it as a systemd service that logs to a
 deterministic file, and pull those logs back by node name.
 
-It reuses the build → scp → install-with-`.bak`-backup → `systemctl restart` →
-rollback pattern from `.github/workflows/deploy-zcashd-compat.yml`, generalized to
-a dynamic multi-node config.
+It uses a build → scp → install-with-`.bak`-backup → `systemctl restart` →
+rollback pattern generalized to a dynamic multi-node config.
 
 ## Requirements
 
 - Python 3.11+ (uses the stdlib `tomllib`; no third-party packages).
 - A working SSH key for every node's `ssh_string` (key-based auth; the tool runs
   ssh in `BatchMode`, so password prompts are not supported).
-- A local Rust toolchain + `protoc` to build `zebrad` (same as a normal workspace
+- A local Rust toolchain + `protoc` to build `zakurad` (same as a normal workspace
   build). Builds run on this host; the resulting binary is copied to every node,
   so nodes must share the build host's architecture and a compatible glibc
   (DigitalOcean Ubuntu x86_64 droplets do).
@@ -23,18 +22,30 @@ a dynamic multi-node config.
 Copy `nodes.example.toml` to `nodes.toml` and edit. Each `[[nodes]]` entry needs:
 
 - `name` — used for `--node` selection and `logs/<name>.log`.
-- `ssh_string` — the ssh/scp destination, e.g. `root@167.99.162.47`.
+- `ssh_string` — the ssh/scp destination, e.g. `root@203.0.113.10`.
 - `commit` — branch, tag, or SHA to build from (must be fetched locally).
 
 `[defaults]` supplies fleet-wide values (service name, paths, network, ssh
 `port`); any field can be overridden per node. `nodes.toml` is gitignored.
+
+Two optional keys turn on the node's observability endpoints, which the status
+dashboard reads over its own ssh probe:
+
+- `metrics_endpoint` — renders `[metrics] endpoint_addr`, the Prometheus
+  `/metrics` exporter.
+- `health_listen_addr` — renders `[health] listen_addr`, serving `/healthy` and
+  `/ready`.
+
+Both are unauthenticated, so bind them to loopback. `zakurad` panics if either
+address is already in use, so check the port on the node before enabling one.
+Neither is rendered on a fleet running `manage_config = false`.
 
 ## Commands
 
 ```bash
 cd deploy/deployer
 
-# Build each unique commit into .build-cache/zebrad-<sha> (reused if present).
+# Build each unique commit into .build-cache/zakurad-<sha> (reused if present).
 python3 deploy.py build  --config nodes.toml
 
 # Build-if-needed, distribute, install the unit, restart. Parallel; rolls back
@@ -47,23 +58,23 @@ python3 deploy.py deploy --config nodes.toml --no-restart    # stage only
 python3 deploy.py status --config nodes.toml
 
 # Pull logs (deterministic log_file from the rendered config).
-python3 deploy.py logs fetch  --config nodes.toml                 # -> logs/<name>.log
-python3 deploy.py logs fetch  --config nodes.toml --lines 2000    # last N lines only
-python3 deploy.py logs follow --config nodes.toml --node node-a   # live tail -F
+python3 deploy.py logs fetch  --config nodes.toml              # -> logs/<name>.log
+python3 deploy.py logs fetch  --config nodes.toml --lines 2000 # last N lines only
+python3 deploy.py logs follow --config nodes.toml --node node-a
 ```
 
 ## GitHub Actions testnet fleet deploy
 
 `.github/workflows/zakura-testnet-deploy.yml` runs this deployer on a Linux x86_64
 self-hosted runner, expected to be `zakura-testnet-1` with the
-`zakura-testnet-deployer` label. The runner builds the native `zebrad` binary and
+`zakura-testnet-deployer` label. The runner builds the native `zakurad` binary and
 then deploys it to:
 
 - `zakura-testnet-1` — `root@167.99.103.111`
-- `zakura-testnet-2` — `root@167.99.110.145`
-- `zakura-testnet-3` — `root@138.68.229.254`
 - `zakura-testnet-eu` — `root@164.92.209.78`
 - `zakura-testnet-as` — `root@206.189.148.0`
+
+All three nodes are systemd-managed `zakurad.service` nodes.
 
 One-time runner bootstrap from an operator machine with SSH access and CI
 credentials in `~/agents-env`:
@@ -83,17 +94,31 @@ RUNNER_SSH=root@167.99.103.111 ./testnet/bootstrap-zakura-testnet-runner.sh
 
 The workflow is manual (`workflow_dispatch`). Inputs:
 
-- `ref` — branch, tag, or SHA to build and deploy, default `ironwood-main`.
+- `ref` — branch, tag, or SHA to build and deploy, default `main`.
 - `force_rebuild` — pass `--force` to rebuild the cached binary.
 - `no_restart` — stage binary/config/unit without restarting, default `false`.
+- `p2p_stack` — optionally override the selected node with `dual`, `zakura`, or
+  `legacy`. The default `auto` preserves the fleet's dual-stack role.
+- `header_sync_trace` — write structured canary traces under
+  `/mnt/data/traces/header-chain-canary`; defaults to `false`.
 - `node` — optional deployer node name; blank deploys the whole fleet.
+
+Explicit `p2p_stack` overrides and `header_sync_trace = true` require an
+explicit `node`, preventing canary settings from being applied fleet-wide.
 
 The generated CI config uses Testnet ports, public RPC at `0.0.0.0:18232`, and
 explicitly sets `vct_fast_sync = false`, which keeps checkpoint sync available
-while forcing the legacy non-VCT path. It also writes `/etc/zakura/zebrad.toml`
-and uses each node's existing `/mnt/<node-name>-data/zebra-cache` snapshot
-directory, so CI restarts the current `zebrad.service` against the existing state
-instead of creating a fresh database.
+while forcing the legacy non-VCT path. Fleet nodes use `p2p_stack = "dual"`.
+Explicit per-node overrides remain available for staged experiments. The
+workflow also writes `/etc/zakura/zakura.toml` and uses each node's existing
+`/mnt/data/zakura-cache` snapshot directory, so CI restarts the current
+`zakurad.service` against the existing state instead of creating a fresh
+database. Volume-backed fleet hosts mount their attached DigitalOcean block
+volume at `/mnt/data`; legacy `/mnt/<node-name>-data` paths are compatibility
+symlinks only.
+
+The `"dual"` setting enables the experimental Zakura P2P v2 stack alongside the
+legacy stack.
 
 The workflow also refreshes a simple fleet status dashboard on
 `zakura-testnet-1`:
@@ -104,10 +129,27 @@ The workflow also refreshes a simple fleet status dashboard on
 
 The dashboard reads the generated deployer node config and polls each node over
 SSH. It shows the running commit from the node log, last restart time, current
-RPC height, whether the height advanced in the last five minutes, and an upgrade
-ETA for Ironwood testnet activation height `4134000`. The ETA uses observed
-cluster block movement when enough samples are available, otherwise it falls back
-to `--target-spacing 7.5`.
+RPC height, and whether the height advanced in the last five minutes. Node names
+link to `/node/<name>` for per-node host vitals, sync pipeline, and peer detail.
+
+The same service exposes the narrow public website API at
+`/ironwood-status.json` and its liveness check at `/healthz`. The public response
+selects one healthy node from the highest agreed tip and contains only the
+network, Ironwood activation and balance data, observation time, and source
+client metadata. It never proxies caller-supplied RPC requests.
+
+It also installs the public broadcast-only JSON-RPC gateway on
+`zakura-testnet-1` (see `deploy/gateway/`):
+
+- service: `zakura-broadcast-testnet.service`
+- public URL: `https://zakura-broadcast.testnet.valargroup.dev/`
+- origin: `http://127.0.0.1:8092/`
+- install dir: `/opt/zakura-gateway-testnet`
+- TLS front door: `/etc/caddy/Caddyfile` from `deploy/gateway/testnet/Caddyfile`
+
+The gateway allowlists `sendrawtransaction`, rate-limits at 30 req/min/IP, and
+load-balances across the testnet `:18232` backends listed in
+`deploy/gateway/testnet/backends.toml`.
 
 The workflow also refreshes a static Zakura Ironwood testnet snapshots website on
 `zakura-testnet-1`:
@@ -138,29 +180,229 @@ Optional display fields include `name`, `size`, `height`, `zebraVersion`, and
 Manual run from a host with SSH access to every node:
 
 ```bash
-python3 deploy/runner/zebra-cluster-status.py \
+python3 deploy/runner/zakura-cluster-status.py \
   --config deploy/deployer/nodes.toml \
   --host 0.0.0.0 \
   --port 8090 \
-  --upgrade-height 4134000 \
-  --target-spacing 7.5
+  --network testnet
 ```
+
+## GitHub Actions mainnet fleet deploy
+
+`.github/workflows/zakura-mainnet-deploy.yml` runs the same deployer for the
+mainnet fleet on a Linux x86_64 self-hosted runner, expected to be `us-east-0`
+with the `zakura-mainnet-deployer` label. It builds the native `zakurad` binary
+and deploys it to:
+
+- `asia-0` — `root@165.22.54.66`
+- `us-0` — `root@104.131.184.123`
+- `us-east-0` — `root@159.65.183.89`
+- `us-west-0` — `root@143.244.184.176`
+- `canada-0` — `root@159.203.38.10`
+- `europe-west-0` — `root@64.227.44.93`
+- `europe-central-0` — `root@161.35.156.226`
+- `asia-south-0` — `root@139.59.64.115`
+- `asia-pacific-0` — `root@168.144.173.250`
+- `zakura-compat` — `root@159.203.113.196`
+- `archive-vct-off` — `root@104.131.174.28`
+
+The first nine run a hand-provisioned `zakurad` systemd service.
+`zakura-compat` runs `zakurad-compat` alongside a native `zcashd` sidecar on the
+same host. `archive-vct-off` is a legacy archive node — `vct_fast_sync = false`,
+so it never fast-synced and holds per-height commitment trees at every height.
+That is what makes it the supported generator for the release-state historical
+frontier grid, whose entries then come from reads rather than from replaying a
+fast-synced node's absent band. It is not a public bootstrap peer and is
+deliberately absent from the node ids in `zakura-network`, and it runs
+`p2p_stack = "legacy"` rather than the fleet's `dual`: on `dual` its verified body
+tip wedged roughly 6,000 blocks behind its own header chain while the v2
+coordinator logged `accepted block apply lost terminal observation; apply
+lifecycle is failed`. The fleet is binary-only, so that setting lives in the
+node's own config; flipping this host to config-managed without carrying it
+across would silently reintroduce the stall.
+
+One fleet entry buys three things, because the dashboard and the alerting both
+derive from the same config. `zakura-mainnet-deploy.yml` copies the generated
+`nodes.ci.toml` into `/opt/zakura-mainnet-dashboard/nodes.toml`, so a node added
+here appears on the status dashboard; `zakura-cluster-watchdog.py` then reads
+that dashboard's `/data` and alerts `#zakura-alerts` when a node stays unhealthy.
+Nothing separate has to be registered for monitoring. Note that the dashboard
+step runs `if: always()` and rewrites the whole node list, so it picks up a new
+node even on a deploy scoped to one host with `--node`.
+
+A node only becomes deployable once the deployer runner can reach it. The fleet's
+deploy key is `zakura-mainnet-deployer@us-east-0`; it must be in the node's
+`~/.ssh/authorized_keys`, and the node's address must be in the workflow's
+host-key pin list. A host that is missing the key fails the deploy with
+`Permission denied (publickey)` at the scp step, after a successful build. One-time runner bootstrap from an operator machine with SSH access
+and CI credentials in `~/agents-env`:
+
+```bash
+cd deploy/deployer
+./mainnet/bootstrap-zakura-mainnet-runner.sh
+```
+
+The workflow is manual (`workflow_dispatch`) with the same inputs as testnet
+(`ref` defaults to `main`, plus `force_rebuild`, `no_restart`, `node`).
+
+**Binary-only deploy (`manage_config = false`).** The mainnet nodes were
+provisioned by hand with rich, per-node configs — `external_addr`, custom peers,
+mempool/sync tuning, and an inline `zakura_node_secret_key` that pins each node's
+iroh identity (the node ids hardcoded as bootstrap peers in
+`crates/zakura-network/src/zakura/handler.rs`) — and their state DB lives at
+`/root/.cache/zebra`. Rendering the deployer's managed config over that would
+change every node id and drop the tuning. So the generated CI config sets
+`manage_config = false`: the deployer swaps `/usr/local/bin/zakurad` and restarts
+the existing `zakurad` service, leaving the config, unit, and cache untouched. The
+`rpc_listen_addr` / `log_file` / `p2p_stack` /
+`[defaults.zakura] bootstrap_peers` in that config are read-only inputs for the
+dashboard's SSH probe, not deployed to nodes. On-node configs should use
+`network.p2p_stack` (not the deprecated `v2_p2p` /
+`legacy_p2p` bools). Reproducing these configs in the deployer's managed model
+is separate future work.
+
+The workflow refreshes a fleet status dashboard on `us-east-0`:
+
+- service: `zakura-mainnet-dashboard.service`
+- URL: `http://159.65.183.89:8090/`
+- install dir: `/opt/zakura-mainnet-dashboard`
+
+It also installs the public broadcast-only JSON-RPC gateway on the same host
+(see `deploy/gateway/`):
+
+- service: `zakura-broadcast-mainnet.service`
+- public URL: `https://zakura-broadcast.valargroup.dev/`
+- origin: `http://127.0.0.1:8092/`
+- install dir: `/opt/zakura-gateway-mainnet`
+- TLS front door: `/etc/caddy/Caddyfile` from `deploy/gateway/mainnet/Caddyfile`
+
+The gateway allowlists `sendrawtransaction`, rate-limits at 30 req/min/IP, and
+load-balances across the mainnet `:8232` backends listed in
+`deploy/gateway/mainnet/backends.toml`.
+
+It is the same `zakura-cluster-status.py` as testnet. Manual run:
+
+```bash
+python3 deploy/runner/zakura-cluster-status.py \
+  --config deploy/deployer/nodes.toml \
+  --host 0.0.0.0 \
+  --port 8090 \
+  --network mainnet
+```
+
+The mainnet workflow also installs a Slack watchdog on `us-east-0`:
+
+- service: `zakura-fleet-watchdog.service`
+- install dir: `/opt/zakura-fleet-watchdog`
+- state file: `/var/lib/zakura-fleet-watchdog/state.json`
+- env file: `/etc/zakura-fleet-watchdog/env`
+- suppression file: `/run/zakura-fleet-watchdog/deploy-suppressed-until`
+
+The watchdog polls the mainnet dashboard locally at
+`http://127.0.0.1:8090/data` and the testnet dashboard at
+`http://167.99.103.111:8090/data`. It posts transition alerts to Slack
+`#zakura-alerts` via an incoming webhook in `SLACK_WEB_HOOK`. A node alert fires
+when either of these conditions stays true for at least 10 minutes:
+
+- `health` is `down` or `rpc_error`
+- `seconds_since_advanced` is at least 600 seconds
+
+The watchdog waits 30 minutes and posts one fleet alert when every observable
+node shares the same height and block hash. The fleet must have at least two
+observable nodes. A missing or different block hash keeps the 10-minute node
+alerts. Down alerts take precedence over stalled alerts, so a node only produces
+one active alert at a time. The watchdog also alerts if a dashboard endpoint is
+unreachable, malformed, or serves a stale collector snapshot for at least 10
+minutes. It posts one recovery message when a node or dashboard recovers.
+Persistent failures do not post on every poll cycle.
+
+Restart deploys write a 20-minute suppression marker before touching the fleet.
+The mainnet workflow writes it locally on `us-east-0`; the testnet workflow
+refreshes it on `us-east-0` over SSH on a best-effort basis. While the marker is
+in the future, new failure alerts are logged but not posted to Slack.
+
+Restart deploys that include `zakura-compat` also refresh that host's node-local
+watchdog marker and restart the active watchdog before `zakurad-compat`. This
+suppresses expected Sentry transitions and stays in the workflow so rollback
+refs whose deployer predates the marker remain covered.
+
+Manual dry run from `us-east-0`:
+
+```bash
+python3 /opt/zakura-fleet-watchdog/zakura-cluster-watchdog.py \
+  --config /opt/zakura-fleet-watchdog/fleets.toml \
+  --state-file /tmp/zakura-fleet-watchdog-state.json \
+  --once \
+  --dry-run
+```
+
+Local status checks:
+
+```bash
+systemctl status zakura-fleet-watchdog
+journalctl -u zakura-fleet-watchdog -f
+```
+
+## Continuous genesis sync fleet
+
+The permanent seven-node genesis sync canary is managed separately under
+`deploy/continuous-sync/`. It repeatedly builds latest `origin/main`, wipes only
+its dedicated disposable state, syncs from genesis to tip, posts Slack
+completion/failure alerts through its codified monitor timer, and retains five
+days of logs and traces.
+
+See `deploy/continuous-sync/README.md` for the inventory, workflow, safety
+invariants, replacement-node bootstrap, and manual `status` / `resume` commands.
+
+## Ephemeral PR test nodes
+
+`.github/workflows/zakura-pr-node.yml` reuses this deployer on a throwaway
+DigitalOcean droplet to test a single PR against a real node for ~1 hour: the
+droplet image bakes a repo clone, a warm `CARGO_TARGET_DIR`, and a
+`root@localhost` SSH identity, so the workflow just writes a one-node config and
+runs `deploy.py build` / `deploy` / `status` on the droplet itself. See
+`docs/pr-node-do-setup.md`.
 
 ## How the build cache works
 
 `commit` is resolved to a full SHA (`git rev-parse`). The binary is cached at
-`.build-cache/zebrad-<sha>`. A cached binary is reused only if its embedded
-`zebrad --version` matches the SHA, otherwise it is rebuilt. Two nodes on the same
+`.build-cache/zakurad-<sha>` by default, or under
+`$ZAKURA_DEPLOYER_BUILD_CACHE_DIR/zakurad-<sha>` when that environment variable
+is set. A cached binary is reused only if `zakurad --version` runs successfully;
+the SHA-named cache file ties the binary to its commit. Two nodes on the same
 commit build once. Each build happens in a throwaway detached `git worktree`, so
-your dirty working tree is never touched. Use `--force` to rebuild unconditionally.
+your dirty working tree is never touched. Use `--force` to rebuild the exact-SHA
+binary unconditionally while still allowing Cargo to reuse `$CARGO_TARGET_DIR`.
+
+The GitHub Actions deploy workflows set persistent cache locations outside the
+checked-out workspace:
+
+- Testnet: `CARGO_TARGET_DIR=/mnt/data/zakura-deployer/cargo-target` and
+  `ZAKURA_DEPLOYER_BUILD_CACHE_DIR=/mnt/data/zakura-deployer/binaries`.
+- Mainnet: `CARGO_TARGET_DIR=/root/.cache/zakura-deployer-target` and
+  `ZAKURA_DEPLOYER_BUILD_CACHE_DIR=/root/.cache/zakura-deployer-binaries`.
+
+Old exact-SHA binaries are pruned after successful builds. The current binary is
+always kept, and `ZAKURA_DEPLOYER_BUILD_CACHE_RETAIN` controls total retained
+binaries (default `12`). Remove the cache directory manually only when no deploy
+job is running.
+
+When a cache path is under `/mnt/data`, the deployer verifies that `/mnt/data` is
+a real mount point before building. Managed `zakurad` units rendered by the
+deployer also require `/mnt/data` before starting, preventing a missing volume
+from creating chain state on the root disk.
+
+For new DigitalOcean volume-backed fleet hosts, format and mount the attached
+volume at `/mnt/data` in `/etc/fstab`; do not use droplet-specific mount names
+for new hosts.
 
 ## What gets installed on a node
 
-- Binary at `bin_path` (default `/usr/local/bin/zebrad`), previous kept as `.bak`.
-- Rendered config at `config_path` (default `/etc/zebrad/zebrad.toml`) with
+- Binary at `bin_path` (default `/usr/local/bin/zakurad`), previous kept as `.bak`.
+- Rendered config at `config_path` (default `/etc/zakura/zakura.toml`) with
   `[tracing] log_file` pointed at `log_file`.
 - Unit at `/etc/systemd/system/<service_name>.service` running
-  `zebrad -c <config_path> start` with `Restart=always`.
+  `zakurad -c <config_path> start` with `Restart=always`.
 
 The deterministic `log_file` is the single source of truth shared by the running
 node (writer) and `logs fetch`/`logs follow` (reader).

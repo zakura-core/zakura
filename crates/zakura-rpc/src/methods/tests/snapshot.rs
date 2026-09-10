@@ -870,8 +870,11 @@ fn snapshot_rpc_getblocktemplate(
         insta::assert_json_snapshot!(format!("get_block_template_{variant}"), block_template, {
             ".workid" => dynamic_redaction(|value, _path| {
                 let work_id = value.as_str().expect("workid must be a string");
-                assert_eq!(work_id.len(), 32, "workid must encode 16 bytes");
-                assert!(work_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+                let (namespace, template) = work_id.split_once(':').expect("workid includes its parent namespace");
+                for component in [namespace, template] {
+                    assert_eq!(component.len(), 32, "each workid component encodes 16 bytes");
+                    assert!(component.bytes().all(|byte| byte.is_ascii_hexdigit()));
+                }
                 "[WorkId]"
             }),
         })
@@ -1348,6 +1351,12 @@ pub async fn test_mining_rpcs<State, ReadState>(
     );
 
     let mut server_preparation_verifier = mock_block_verifier_router.clone();
+    let mut server_template = server_template;
+    let mut rejections = rpc_mock_state_verifier.gbt.template_rejections.subscribe();
+    let tracked = rpc_mock_state_verifier
+        .track_template_parent(fake_tip_hash, fake_tip_height, &mut rejections)
+        .expect("the snapshot fixture tracks its template parent");
+    server_template.work_id = tracked.scope_work_id(&hex::encode([0; 16]));
     rpc_mock_state_verifier.prepare_template_in_background(&server_template);
     server_preparation_verifier
         .expect_request_that(|request| {

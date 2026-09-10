@@ -26,156 +26,154 @@ use crate::config::mining::{default_miner_address, MinerAddressType};
 
 use super::{MinerParams, TemplatePreparationQueue};
 
-/// A rejection names one template, so it survives the chain leaving that template's parent.
-///
-/// Work IDs are drawn at random per response, so one names exactly one template on exactly one
-/// parent. Fallback and prepared work are policies about a single parent, so they follow the
-/// parent templates are built on now rather than the work.
 #[test]
 fn template_rejection_follows_the_work_across_parents() {
     let parent = zakura_chain::block::Hash([1; 32]);
     let next_parent = zakura_chain::block::Hash([2; 32]);
     let mut state = super::TemplateRejections::default();
-    assert!(state.track_parent(parent));
-    state.mark_prepared(parent, "new");
-    assert!(state.reject(parent, "old"));
-    assert!(state.contains("old"));
-    assert!(!state.contains("new"));
-    assert!(state.is_prepared("new"));
-    assert!(!state.is_prepared("unknown"));
-    assert!(!state.withdrawn("new"));
-    assert!(state.withdrawn("unknown"));
-    assert!(!state.reject(parent, "old"));
-    assert_eq!(state.revision, 1);
-    assert_eq!(state.current_revision(), 1);
-
-    // The chain leaves the parent. Its fallback and its prepared work go with it, but the work it
-    // condemned stays condemned, and a validation that only now finishes is still recorded.
-    assert!(state.track_parent(next_parent));
-    assert!(!state.needs_fallback());
-    assert_eq!(state.current_revision(), 0);
-    assert!(!state.is_prepared("new"));
-    assert!(state.withdrawn("old"));
-    assert!(!state.withdrawn("new"));
-    assert!(state.reject(parent, "late"));
-    assert_eq!(state.revision, 2);
-    assert_eq!(state.current_revision(), 0);
-    assert!(state.withdrawn("late"));
-
-    // The chain comes back. The parent knows everything it knew before.
-    assert!(state.track_parent(parent));
+    assert!(state.track_parent(parent, Height(1)));
+    let prepared = state.scope_work_id("prepared");
+    let rejected = state.scope_work_id("rejected");
+    let late = state.scope_work_id("late");
+    state.mark_prepared(parent, &prepared);
+    assert!(state.reject(parent, &rejected));
+    assert!(!state.reject(parent, &rejected));
+    assert!(state.withdrawn(&rejected));
+    assert!(!state.withdrawn(&prepared));
+    assert!(state.track_parent(next_parent, Height(2)));
+    let next_revision = state.current_revision();
+    let next_work = state.scope_work_id("next");
+    assert!(state.reject(parent, &late));
+    assert_eq!(state.current_revision(), next_revision);
+    assert!(state.withdrawn(&late));
+    assert!(!state.withdrawn(&next_work));
+    assert!(!state.withdrawn(&prepared));
+    assert!(state.track_parent(parent, Height(1)));
     assert!(state.needs_fallback());
-    assert_eq!(state.current_revision(), 2);
-    assert!(state.is_prepared("new"));
-    assert!(!state.withdrawn("new"));
-    assert!(state.withdrawn("old"));
-    assert!(!state.track_parent(parent));
+    assert!(state.is_prepared(&prepared));
+    assert!(state.withdrawn(&rejected));
+    assert!(!state.track_parent(parent, Height(1)));
 }
 
 #[test]
 fn template_rejection_storage_fails_closed_at_capacity() {
     let parent = zakura_chain::block::Hash([1; 32]);
     let mut state = super::TemplateRejections::default();
-    state.track_parent(parent);
+    state.track_parent(parent, Height(1));
     for id in 0..100 {
-        state.reject(parent, &id.to_string());
+        state.reject(parent, &state.scope_work_id(&id.to_string()));
     }
     assert_eq!(state.entry(parent).unwrap().rejected.len(), 64);
-    assert!(state.contains("unknown"));
+    assert!(state.contains(&state.scope_work_id("unknown")));
     assert!(state.needs_fallback());
 }
 
-/// One parent's saturation must not withdraw another parent's work.
-///
-/// Saturation says a parent stopped trusting its own templates. Reading it across parents would
-/// let a single unlucky parent withdraw every miner's work for as long as it is tracked.
 #[test]
 fn a_saturated_parent_does_not_withdraw_another_parents_work() {
     let saturated = zakura_chain::block::Hash([1; 32]);
     let current = zakura_chain::block::Hash([2; 32]);
     let mut state = super::TemplateRejections::default();
-    state.track_parent(saturated);
+    state.track_parent(saturated, Height(1));
+    let old_work = state.scope_work_id("old");
     for id in 0..=super::MAX_REJECTED_WORK_IDS {
-        state.reject(saturated, &id.to_string());
+        state.reject(saturated, &state.scope_work_id(&id.to_string()));
     }
     assert!(state.entry(saturated).unwrap().saturated);
-
-    state.track_parent(current);
-    state.mark_prepared(current, "work");
-    assert!(!state.withdrawn("work"));
-    assert!(!state.withdrawn("unrelated"));
-
-    // The parent that saturated still fails closed when the chain returns to it.
-    state.track_parent(saturated);
-    assert!(state.withdrawn("unrelated"));
+    state.track_parent(current, Height(2));
+    let work = state.scope_work_id("work");
+    assert!(!state.withdrawn(&work));
+    state.track_parent(saturated, Height(1));
+    assert!(state.withdrawn(&old_work));
+    assert!(!state.withdrawn(&work));
 }
 
 #[test]
-fn template_rejections_forget_the_least_recently_tracked_parent() {
+fn parent_eviction_retires_work_and_requires_recovery_on_return() {
     let first = zakura_chain::block::Hash([0; 32]);
     let mut state = super::TemplateRejections::default();
-    state.track_parent(first);
-    assert!(state.reject(first, "condemned"));
-
+    state.track_parent(first, Height(0));
+    let rejected = state.scope_work_id("condemned");
+    let late = state.scope_work_id("late");
+    assert!(state.reject(first, &rejected));
+    let old_revision = state.current_revision();
     for id in 1..=super::MAX_TRACKED_PARENTS {
-        state.track_parent(zakura_chain::block::Hash([id as u8; 32]));
+        state.track_parent(
+            zakura_chain::block::Hash([u8::try_from(id).unwrap(); 32]),
+            Height(u32::try_from(id).unwrap()),
+        );
     }
-
-    assert!(!state.withdrawn("condemned"));
-    assert_eq!(state.evicted_revision, 1);
-    assert!(
-        !state.reject(first, "late"),
-        "a forgotten parent records nothing",
-    );
+    assert!(state.withdrawn(&rejected));
+    assert!(state.withdrawn(&late));
+    assert!(!state.reject(first, &late));
+    state.track_parent(first, Height(0));
+    assert!(state.needs_fallback());
+    assert!(state.current_revision() > old_revision);
+    let revision = state.current_revision();
+    assert!(!state.reject(first, &late));
+    assert_eq!(state.current_revision(), revision);
+    let recovery = state.scope_work_id("recovery");
+    assert!(state.withdrawn(&recovery));
+    state.mark_prepared(first, &recovery);
+    assert!(!state.withdrawn(&recovery));
+    assert!(state.withdrawn(&rejected));
+    assert!(state.withdrawn(&late));
+    assert_eq!(state.parents.len(), super::MAX_TRACKED_PARENTS);
 }
 
 #[test]
-fn tracking_a_parent_again_keeps_it_from_being_forgotten() {
-    let first = zakura_chain::block::Hash([0; 32]);
+fn unrelated_eviction_preserves_retained_work() {
+    let retained = zakura_chain::block::Hash([0; 32]);
     let mut state = super::TemplateRejections::default();
-    state.track_parent(first);
-    assert!(state.reject(first, "condemned"));
-
-    for id in 1..super::MAX_TRACKED_PARENTS {
-        state.track_parent(zakura_chain::block::Hash([id as u8; 32]));
+    state.track_parent(retained, Height(0));
+    let work = state.scope_work_id("valid");
+    for id in 1..=super::MAX_TRACKED_PARENTS * 2 {
+        let parent = zakura_chain::block::Hash([u8::try_from(id).unwrap(); 32]);
+        state.track_parent(parent, Height(u32::try_from(id).unwrap()));
+        state.reject(parent, &state.scope_work_id("rejected"));
+        state.track_parent(retained, Height(0));
+        assert!(!state.withdrawn(&work));
     }
-    // Returning to the parent moves it back to the newest end of the eviction order, so the next
-    // parent forgets one of the others instead.
-    state.track_parent(first);
-    state.track_parent(zakura_chain::block::Hash([200; 32]));
-
-    assert!(state.withdrawn("condemned"));
-    assert_eq!(state.evicted_revision, 0);
+    assert_eq!(state.parents.len(), super::MAX_TRACKED_PARENTS);
 }
 
 #[test]
-fn prepared_template_tracking_keeps_new_recovery_work_at_capacity() {
+fn prepared_eviction_advances_the_withdrawal_revision() {
     let parent = zakura_chain::block::Hash([1; 32]);
     let mut state = super::TemplateRejections::default();
-    state.track_parent(parent);
-    state.reject(parent, "invalid");
-    for id in 0..100 {
-        state.mark_prepared(parent, &id.to_string());
+    state.track_parent(parent, Height(1));
+    state.reject(parent, &state.scope_work_id("invalid"));
+    let oldest = state.scope_work_id("0");
+    for id in 0..super::MAX_PREPARED_WORK_IDS {
+        assert!(!state.mark_prepared(parent, &state.scope_work_id(&id.to_string())));
     }
-    assert_eq!(state.entry(parent).unwrap().prepared.len(), 64);
-    assert!(!state.withdrawn("99"));
-    assert!(state.withdrawn("0"));
+    assert!(!state.withdrawn(&oldest));
+    let previous_revision = state.current_revision();
+    let newest = state.scope_work_id("newest");
+    assert!(state.mark_prepared(parent, &newest));
+    assert!(state.current_revision() > previous_revision);
+    assert_eq!(
+        state.entry(parent).unwrap().prepared.len(),
+        super::MAX_PREPARED_WORK_IDS
+    );
+    assert!(state.withdrawn(&oldest));
+    assert!(!state.withdrawn(&newest));
 }
 
 #[tokio::test]
 async fn template_rejection_retains_notifications_for_late_subscribers() {
     let parent = zakura_chain::block::Hash([1; 32]);
     let mut state = super::TemplateRejections::default();
-    state.track_parent(parent);
+    state.track_parent(parent, Height(1));
+    let work = state.scope_work_id("work");
     let sender = tokio::sync::watch::channel(state).0;
     let mut early = sender.subscribe();
-    sender.send_if_modified(|state| state.reject(parent, "work"));
+    sender.send_if_modified(|state| state.reject(parent, &work));
     tokio::time::timeout(std::time::Duration::from_secs(1), early.changed())
         .await
         .unwrap()
         .unwrap();
-    assert!(early.borrow_and_update().contains("work"));
-    assert!(sender.subscribe().borrow().contains("work"));
+    assert!(early.borrow_and_update().withdrawn(&work));
+    assert!(sender.subscribe().borrow().withdrawn(&work));
 }
 
 #[test]

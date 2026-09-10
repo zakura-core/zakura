@@ -1395,15 +1395,8 @@ where
             return std::future::pending().await;
         };
         let mut rejections = self.gbt.template_rejections.subscribe();
-        let revision = rejections.borrow().revision;
         loop {
-            let withdrawn = {
-                let state = rejections.borrow_and_update();
-                // Eviction can erase a rejection before this waiter observes it.
-                // Retained rejections use the predicate so other parents cannot cancel this work.
-                state.withdrawn(work_id)
-                    || (state.evicted_revision > revision && !state.is_prepared(work_id))
-            };
+            let withdrawn = rejections.borrow_and_update().withdrawn(work_id);
             if withdrawn {
                 return;
             }
@@ -1426,6 +1419,7 @@ where
     fn track_template_parent(
         &self,
         tip_hash: block::Hash,
+        tip_height: block::Height,
         rejections: &mut watch::Receiver<types::get_block_template::TemplateRejections>,
     ) -> Option<types::get_block_template::TemplateRejections> {
         let mut tip_is_current = true;
@@ -1439,7 +1433,7 @@ where
                 return false;
             }
 
-            state.track_parent(tip_hash)
+            state.track_parent(tip_hash, tip_height)
         });
 
         tip_is_current.then(|| rejections.borrow_and_update().clone())
@@ -1448,45 +1442,39 @@ where
     /// Returns the template to publish, recovering an empty one when this parent needs a fallback.
     async fn finish_mining_template(
         &self,
-        template: BlockTemplateResponse,
+        mut template: BlockTemplateResponse,
         chain_info: &zakura_state::GetBlockTemplateChainInfo,
         miner_params: &types::get_block_template::MinerParams,
     ) -> Result<GetBlockTemplateResponse> {
-        let mut state = self.gbt.template_rejections.borrow().clone();
-
-        // Transaction selection ran after the chain state was fetched, so re-check both the
-        // rejection state's parent and the chain tip itself: neither request retargets the other.
-        if state.parent != Some(chain_info.tip_hash)
-            || self
-                .latest_chain_tip
-                .best_tip_hash()
-                .is_some_and(|tip| tip != chain_info.tip_hash)
-        {
-            return Err(ErrorObject::owned(
-                0,
-                "template parent changed; retry",
-                None::<()>,
-            ));
-        }
-
-        if !state.needs_fallback() {
-            self.prepare_template_in_background(&template);
-            // A rejection can land between the snapshot above and this point, which would leave
-            // this brand-new work withdrawn the moment it reaches the miner. Recover instead.
-            state = self.gbt.template_rejections.borrow().clone();
+        let state = {
+            let state = self.gbt.template_rejections.borrow();
+            if state.parent != Some(chain_info.tip_hash)
+                || self
+                    .latest_chain_tip
+                    .best_tip_hash()
+                    .is_some_and(|tip| tip != chain_info.tip_hash)
+            {
+                return Err(ErrorObject::owned(
+                    0,
+                    "template parent changed; retry",
+                    None::<()>,
+                ));
+            }
+            template.work_id = state.scope_work_id(template.work_id());
             if !state.needs_fallback() {
+                // Keep the guard through publication so rejection cannot precede this decision.
+                self.prepare_template_in_background(&template);
                 return Ok(template.into());
             }
-        }
-
-        if state.saturated() {
-            return Err(ErrorObject::owned(
-                0,
-                "template rejection limit reached; wait for a new tip",
-                None::<()>,
-            ));
-        }
-
+            if state.saturated() {
+                return Err(ErrorObject::owned(
+                    0,
+                    "template rejection limit reached; wait for a new tip",
+                    None::<()>,
+                ));
+            }
+            state.clone()
+        };
         self.recover_template(template, chain_info, miner_params, &state)
             .await
     }
@@ -1511,7 +1499,7 @@ where
             template.submit_old
         };
         long_poll_id.revision = state.current_revision();
-        let template = BlockTemplateResponse::new_internal(
+        let mut template = BlockTemplateResponse::new_internal(
             &self.network,
             None,
             miner_params,
@@ -1520,6 +1508,8 @@ where
             vec![],
             submit_old,
         );
+
+        template.work_id = state.scope_work_id(template.work_id());
 
         match prepare_server_template(
             self.gbt.block_verifier_router(),
@@ -1556,32 +1546,39 @@ where
             }
         }
 
-        if self.recovery_context_changed(state, &template, chain_info.tip_hash) {
+        let mut context_changed = false;
+        self.gbt.template_rejections.send_if_modified(|current| {
+            if self.recovery_context_changed(current, state, &template, chain_info.tip_hash) {
+                context_changed = true;
+                return false;
+            }
+            let changed = current.mark_prepared(chain_info.tip_hash, template.work_id());
+            if template.long_poll_id.revision != current.current_revision() {
+                template.submit_old = Some(false);
+            }
+            template.long_poll_id.revision = current.current_revision();
+            changed
+        });
+        if context_changed {
             return Err(ErrorObject::owned(
                 0,
                 "template changed during recovery; retry",
                 None::<()>,
             ));
         }
-
-        self.gbt
-            .template_rejections
-            .send_if_modified(|state| state.mark_prepared(chain_info.tip_hash, template.work_id()));
-
         Ok(template.into())
     }
 
     /// Whether anything a recovered template was validated against has moved on since.
     fn recovery_context_changed(
         &self,
+        current: &types::get_block_template::TemplateRejections,
         state: &types::get_block_template::TemplateRejections,
         template: &BlockTemplateResponse,
         tip_hash: block::Hash,
     ) -> bool {
-        let current = self.gbt.template_rejections.borrow();
-
         // Another rejection landed on this parent, or withdrew this very work.
-        current.parent != state.parent
+        current.parent != Some(tip_hash)
             || current.current_revision() != state.current_revision()
             || current.contains(template.work_id())
             // The chain moved off the parent this template was built on.
@@ -3135,7 +3132,7 @@ where
             // Tracking this iteration's parent marks the rejection state it snapshots as seen:
             // this iteration's own parent update is not a reason to wake long polling again.
             let Some(rejection_state) =
-                self.track_template_parent(tip_hash, &mut template_rejections)
+                self.track_template_parent(tip_hash, tip_height, &mut template_rejections)
             else {
                 continue;
             };
@@ -3289,7 +3286,7 @@ where
                 precomputed_coinbase = wait_for_new_tip => {
                     let chain_info = fetch_chain_info(read_state.clone()).await?;
                     let Some(rejection_state) =
-                        self.track_template_parent(chain_info.tip_hash, &mut template_rejections)
+                        self.track_template_parent(chain_info.tip_hash, chain_info.tip_height, &mut template_rejections)
                     else {
                         continue;
                     };

@@ -7,6 +7,8 @@
 #
 # Config via /root/bake.env (sourced by the caller before exec):
 #   GH_REPO                  owner/name of this repository
+#   BAKE_SHA                 exact workflow revision to build
+#   BAKE_DOWNLOAD_DEADLINE   Unix deadline shared by all state downloads
 #   GH_CLONE_TOKEN           token used once for the clone; the remote URL is
 #                            reset token-free afterwards, nothing is baked
 #   MAINNET_VOLUME_NAME      DO volume that gets tip/ + sandblast/ mainnet state
@@ -18,6 +20,8 @@
 #   SANDBLAST_SHA256         its sha256
 #   TESTNET_SNAPSHOTS_BASE   testnet snapshots site (serves /snapshots.json)
 set -euo pipefail
+
+: "${BAKE_DOWNLOAD_DEADLINE:?bake workflow must provide the download deadline}"
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -69,6 +73,8 @@ git clone "https://x-access-token:${GH_CLONE_TOKEN}@github.com/${GH_REPO}.git" /
 git -C /root/zakura remote set-url origin "https://github.com/${GH_REPO}.git"
 rm -f /root/bake.env
 unset GH_CLONE_TOKEN
+git -C /root/zakura fetch --no-tags origin "${BAKE_SHA}"
+git -C /root/zakura checkout --detach "${BAKE_SHA}"
 
 # Warm the shared target dir that deploy.py's per-run worktree builds reuse.
 cd /root/zakura
@@ -148,10 +154,25 @@ fetch_state() {
   local tarball="${dest%/}.tar.zst"
   echo "Fetching ${url} -> ${dest}"
   df -h "$(dirname "$dest")"
-  # --retry-all-errors + -C - resumes interrupted multi-GB transfers instead of
-  # failing the whole bake (plain --retry does not cover mid-stream resets).
-  curl -fL --retry 8 --retry-delay 15 --retry-all-errors -C - \
-    -o "$tarball" "$url"
+  # Start a fresh curl for each retry so -C - rechecks the saved byte count.
+  # Curl's internal retries reset to the offset from its original invocation.
+  local remaining attempt_timeout
+  while true; do
+    remaining=$((BAKE_DOWNLOAD_DEADLINE - $(date +%s)))
+    if [ "$remaining" -le 0 ]; then
+      echo "state download deadline reached: $url" >&2
+      return 1
+    fi
+    attempt_timeout=$((remaining < 600 ? remaining : 600))
+    if curl -fL --connect-timeout 30 --speed-limit 1024 --speed-time 120 \
+      --max-time "$attempt_timeout" -C - -o "$tarball" "$url"; then
+      break
+    fi
+    remaining=$((BAKE_DOWNLOAD_DEADLINE - $(date +%s)))
+    if [ "$remaining" -gt 0 ]; then
+      sleep "$((remaining < 15 ? remaining : 15))"
+    fi
+  done
   if [ -n "$sha" ]; then
     echo "${sha}  ${tarball}" | sha256sum -c -
   fi
@@ -163,6 +184,29 @@ fetch_state() {
     return 1
   }
   echo "Restored $(ls -d "$dest"/state/v*/"$network")"
+}
+
+read_state_height() {
+  # Use the same offline, finalized-state view as the handoff canary. Publisher
+  # metadata can describe the live tip, including its non-finalized suffix.
+  local cache_dir="$1" network="$2" config output height
+  config=$(mktemp)
+  printf '[state]\nstorage_mode = "pruned"\n' > "$config"
+  if ! output=$(timeout 120 "${CARGO_TARGET_DIR}/release/zakurad" -c "$config" \
+    tip-height --cache-dir "$cache_dir" --network "$network" 2>&1); then
+    rm -f "$config"
+    printf 'could not read restored %s database height:\n%s\n' "$network" "$output" >&2
+    return 1
+  fi
+  rm -f "$config"
+  height=$(printf '%s\n' "$output" | awk '/^[0-9]+$/ { print }')
+  # tip-height can log a read error and still exit zero. Require exactly one
+  # numeric result; neither a log height nor publisher metadata is a fallback.
+  if [[ ! "$height" =~ ^[0-9]+$ ]]; then
+    printf 'restored %s database did not return one numeric height:\n%s\n' "$network" "$output" >&2
+    return 1
+  fi
+  printf '%s\n' "$height"
 }
 
 MAINNET_MNT=/mnt/bake-mainnet
@@ -222,30 +266,12 @@ TOML
     echo "approach sync exited unexpectedly with status $ZAKURAD_STATUS" >&2
     exit "$ZAKURAD_STATUS"
   fi
-  cat > /root/inspect-approach.toml <<TOML
-[state]
-storage_mode = "pruned"
-TOML
-  set +e
-  TIP_OUTPUT=$(
-    /root/cargo-target/release/zakurad -c /root/inspect-approach.toml tip-height \
-      --cache-dir "$APPROACH_MNT/tip" \
-      --network Mainnet 2>&1
-  )
-  TIP_STATUS=$?
-  set -e
-  VERIFIED_APPROACH_H=$(printf '%s\n' "$TIP_OUTPUT" |
-    awk '/^[0-9]+$/ { height=$1 } END { print height }')
-  if [ "$TIP_STATUS" -eq 0 ] && [ -n "$VERIFIED_APPROACH_H" ]; then
-    [ "$VERIFIED_APPROACH_H" = "$APPROACH_H" ] || {
-      echo "approach sync stopped at $VERIFIED_APPROACH_H, expected $APPROACH_H" >&2
-      exit 1
-    }
-  else
-    echo "::warning::tip-height could not reopen the flushed fixture; using the exact configured-stop log height"
-    printf '%s\n' "$TIP_OUTPUT" >&2
-  fi
-  echo "$APPROACH_H" > /root/mainnet-approach-height
+  VERIFIED_APPROACH_H=$(read_state_height "$APPROACH_MNT/tip" Mainnet)
+  [ "$VERIFIED_APPROACH_H" = "$APPROACH_H" ] || {
+    echo "approach sync stopped at $VERIFIED_APPROACH_H, expected $APPROACH_H" >&2
+    exit 1
+  }
+  echo "$VERIFIED_APPROACH_H" > /root/mainnet-approach-height
 else
   echo "Keeping the retained approach snapshot; dispatch with rebuild_approach_from_sandblast=true to replace it"
 
@@ -254,9 +280,9 @@ else
   TIP_URL=$(echo "$TIP_META" | jq -er '.url')
   TIP_SHA=$(echo "$TIP_META" | jq -er '.sha256')
   echo "Mainnet tip: $(echo "$TIP_META" | jq -r '"\(.filename) height=\(.height) db=\(.db_format_version)"')"
-  echo "$TIP_META" | jq -er '.height | select(type == "number" and floor == .)' \
-    > /root/mainnet-state-height
   fetch_state "$TIP_URL" "$TIP_SHA" "$MAINNET_MNT/tip" mainnet
+  read_state_height "$MAINNET_MNT/tip" Mainnet > /root/mainnet-state-height
+  echo "Verified Mainnet database height: $(cat /root/mainnet-state-height)"
 
   # Testnet tip: newest enabled pruned entry from the snapshots site metadata.
   TESTNET_META=$(curl -fsSL --retry 3 "$TESTNET_SNAPSHOTS_BASE/snapshots.json")
@@ -267,13 +293,13 @@ else
   TN_SHA=$(echo "$ENTRY" | jq -er '.sha256')
   TN_BASE=$(echo "$TESTNET_META" | jq -r '.siteBaseUrl // empty')
   echo "Testnet tip: $(echo "$ENTRY" | jq -r '"\(.file) height=\(.height) db=\(.dbFormat)"')"
-  echo "$ENTRY" | jq -er '.height | select(type == "number" and floor == .)' \
-    > /root/testnet-state-height
   if [ -n "$TN_BASE" ] && curl -fsIL --retry 2 "${TN_BASE}/files/${TN_FILE}" >/dev/null 2>&1; then
     fetch_state "${TN_BASE}/files/${TN_FILE}" "$TN_SHA" "$TESTNET_MNT/tip" testnet
   else
     fetch_state "${TESTNET_SNAPSHOTS_BASE}/files/${TN_FILE}" "$TN_SHA" "$TESTNET_MNT/tip" testnet
   fi
+  read_state_height "$TESTNET_MNT/tip" Testnet > /root/testnet-state-height
+  echo "Verified Testnet database height: $(cat /root/testnet-state-height)"
 fi
 
 sync

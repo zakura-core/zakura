@@ -4,6 +4,7 @@
 [network]
 network = "Mainnet"
 listen_addr = "0.0.0.0:8233"
+external_addr = "{{PUBLIC_IP}}:8233"
 cache_dir = "{{STATE_CACHE_DIR}}"
 p2p_stack = "{{P2P_STACK}}"
 
@@ -26,7 +27,7 @@ endpoint_addr = "127.0.0.1:9999"
 
 [health]
 listen_addr = "127.0.0.1:8080"
-min_connected_peers = 1
+min_connected_peers = {{HEALTH_MIN_CONNECTED_PEERS}}
 ready_max_blocks_behind = 2
 ready_max_tip_age = "5m"
 enforce_on_test_networks = true

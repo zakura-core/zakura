@@ -102,6 +102,22 @@ class AffectedSemverPackagesTest(unittest.TestCase):
 
         self.assertEqual(affected, [])
 
+    def test_registry_patch_selects_every_publishable_library(self):
+        packages = [
+            self.package("zakura-rpc"),
+            self.package("zakura-network"),
+            self.package("private", publish=[]),
+            self.package("zakura"),
+            self.package("zakura-header-chain"),
+        ]
+
+        affected = affected_semver_packages.affected_publishable_packages(
+            self.metadata(packages),
+            changed_files=[".github/workflows/scripts/patch_registry_for_semver.sh"],
+        )
+
+        self.assertEqual(affected, ["zakura-network", "zakura-rpc"])
+
     def test_package_manifest_selects_that_package(self):
         registry_dependency = {
             "name": "registry-package",

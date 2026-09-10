@@ -32,6 +32,10 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| `MAX_ARTIFACT_LEN` | `crates/zakura-chain/src/parameters/spentness_hints.rs` | new → `512 MiB` | [#961](https://github.com/zakura-core/zakura/pull/961) | Bound artifact reads and allocations before verification. |
+| `RANGE_BYTES`, `ArtifactService` serving limits | `crates/zakura-network/src/zakura/spentness.rs` | new → `256 KiB` ranges, `4` slots held for `250 ms` | [#961](https://github.com/zakura-core/zakura/pull/961) | Bound response memory and aggregate artifact serving at 4 MiB/s. |
+| Artifact acquisition limits | `crates/zakura-network/src/zakura/spentness.rs` | new → `30 s` per request, `60 s` bootstrap wait, `3` sources | [#961](https://github.com/zakura-core/zakura/pull/961) | Bound unavailable-source delays and retries. |
+| `TimeoutStartSec` | `deploy/release-state/zakura-release-state.service` | `6 h` → `7 d` | [#961](https://github.com/zakura-core/zakura/pull/961) | Allow initial exact-checkpoint archive replay and independent spentness verification. |
 | `MAX_CONCURRENT_UTXO_LOOKUPS` | `crates/zakura-consensus/src/transaction.rs` | serial (`1`) → `64` per block transaction | [#918](https://github.com/zakura-core/zakura/pull/918) | Overlap external UTXO waits while bounding pending lookups per transaction. Concurrent lookups start their six-minute timeout clocks together. |
 | `MAX_MINED_SUBMISSIONS` | `crates/zakura-rpc/src/methods/types/submit_block.rs` | unbounded → `16` submissions | [#748](https://github.com/zakura-core/zakura/pull/748) | Bound detached verification work across RPC cancellation. |
 | `non_finalized_write_slots` | `crates/zakura-state/src/service.rs` | unbounded → `1,000` contextual writes | [#748](https://github.com/zakura-core/zakura/pull/748) | Bound writer block bodies using the existing orphan queue capacity. |

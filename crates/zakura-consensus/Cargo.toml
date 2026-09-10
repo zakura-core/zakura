@@ -1,6 +1,6 @@
 [package]
 name = "zakura-consensus"
-version = "8.0.0"
+version = "8.1.0"
 authors.workspace = true
 description = "Implementation of Zcash consensus checks for the Zakura node. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -21,6 +21,9 @@ categories = ["asynchronous", "cryptography::cryptocurrencies"]
 
 [features]
 default = []
+
+# Experimental candidate NU7 consensus rules, dormant until NU7 activates.
+nu7-experimental = []
 
 # Production features that activate extra dependencies, or extra features in dependencies
 

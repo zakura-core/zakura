@@ -7,7 +7,7 @@ name = "zakura"
 # [package.metadata.release] below does it automatically, but only under the
 # full `cargo release` flow (`cargo release version` skips the replace step) -
 # keep the two in sync when bumping by hand.
-version = "1.4.0"
+version = "1.5.0"
 authors.workspace = true
 description = "Zakura, an independent, consensus-compatible implementation of a Zcash node"
 license.workspace = true
@@ -82,6 +82,11 @@ default-release-binaries = ["release_max_level_info", "progress-bar", "prometheu
 default = ["default-release-binaries"]
 
 # Production features that activate extra dependencies, or extra features in dependencies
+
+# Experimental candidate NU7 consensus rules, dormant until NU7 activates.
+nu7-experimental = [
+    "zakura-consensus/nu7-experimental",
+]
 
 # Indexer support
 indexer = ["zakura-state/indexer", "zakura-rpc/indexer"]

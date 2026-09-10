@@ -32,9 +32,9 @@ async fn bidirectional_transfers_exceed_flow_control_windows() -> Result<(), Box
     let remote = timeout(Duration::from_secs(5), connection_rx.recv())
         .await?
         .unwrap();
-    let (mut send_a, recv_a) = connection.open_bi().await?;
+    let (mut send_a, recv_a) = timeout(Duration::from_secs(5), connection.open_bi()).await??;
     // Make the stream visible to accept_bi before starting the bulk transfer.
-    send_a.write_all(&[42]).await?;
+    timeout(Duration::from_secs(5), send_a.write_all(&[42])).await??;
     let (mut send_b, recv_b) = timeout(Duration::from_secs(5), stream_rx.recv())
         .await?
         .unwrap();

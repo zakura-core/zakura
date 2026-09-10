@@ -85,6 +85,10 @@ impl BlockSyncPeerSession {
         self.cancel_token.clone()
     }
 
+    pub(super) fn request_sender(&self) -> FramedSend {
+        self.send.clone()
+    }
+
     /// Current free slots in this peer's bounded outbound stream queue.
     pub fn outbound_capacity(&self) -> usize {
         self.send.capacity()

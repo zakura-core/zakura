@@ -363,7 +363,10 @@ async fn paired_version_is_selected_without_a_test_override() {
     use crate::zakura::Service;
     let service = BlockSyncService::new(ZakuraBlockSyncConfig::default());
     assert_eq!(service.streams().len(), 2);
-    assert!(service.ordered_stream_pair(service.streams()[0]).is_some());
+    assert!(service.streams().iter().all(|stream| {
+        stream.mode == crate::zakura::StreamMode::Persistent
+            && stream.capability == service.streams()[0].capability
+    }));
     assert_eq!(service.streams()[0].version, 3);
     assert_eq!(service.streams()[0].capability, 1 << 6);
 }

@@ -418,7 +418,7 @@ impl PeerRoutine {
             () = cancel.cancelled() => Ok(()),
             result = self.run_inner() => result,
         };
-        // Transport cancels both roles when either fails. Settle the download
+        // Transport cancels the session when any member fails. Settle the download
         // policy even if cancellation interrupts a local capacity wait.
         if result.is_ok() {
             if let Some(failure) = self.recv.failure() {
@@ -1377,7 +1377,7 @@ impl PeerRoutine {
         Err(SinkReject::local(error))
     }
 
-    /// Retiring a failed pair must not erase unanswered download work.
+    /// Retiring a failed session must not erase unanswered download work.
     /// Request expiry can empty `outstanding` without disarming liveness, so
     /// that pending no-progress deadline must also survive stream replacement.
     fn handle_stream_failure(
@@ -1394,7 +1394,7 @@ impl PeerRoutine {
                 "block-sync peer closed the stream with its requests unanswered"
             }
             OrderedStreamFailure::WriteTimeout => {
-                "block-sync data write stalled with download requests unanswered"
+                "block-sync stream write stalled with download requests unanswered"
             }
         };
         self.no_progress_stall(now, error)
@@ -3162,21 +3162,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_pair_settles_peer_failures_before_reopening() {
+    async fn cancelled_session_settles_peer_failures_before_reopening() {
         for failure in [
             super::OrderedStreamFailure::RemoteClose,
             super::OrderedStreamFailure::WriteTimeout,
         ] {
-            check_cancelled_pair_policy(Some(failure), true, false, false).await;
-            check_cancelled_pair_policy(Some(failure), true, false, true).await;
-            check_cancelled_pair_policy(Some(failure), true, true, false).await;
+            check_cancelled_session_policy(Some(failure), true, false, false).await;
+            check_cancelled_session_policy(Some(failure), true, false, true).await;
+            check_cancelled_session_policy(Some(failure), true, true, false).await;
         }
     }
 
     #[tokio::test]
     async fn local_cancel_and_idle_write_timeout_do_not_park_peers() {
-        check_cancelled_pair_policy(None, true, false, false).await;
-        check_cancelled_pair_policy(
+        check_cancelled_session_policy(None, true, false, false).await;
+        check_cancelled_session_policy(
             Some(super::OrderedStreamFailure::WriteTimeout),
             false,
             false,
@@ -3185,7 +3185,7 @@ mod tests {
         .await;
     }
 
-    async fn check_cancelled_pair_policy(
+    async fn check_cancelled_session_policy(
         failure: Option<super::OrderedStreamFailure>,
         unanswered: bool,
         readmitted: bool,
@@ -3282,7 +3282,7 @@ mod tests {
         if let Some(failure) = failure {
             cause.record(failure);
         }
-        // The transport records the cause before cancelling both stream roles.
+        // The transport records the cause before cancelling the session.
         cancel.cancel();
         let result = timeout(Duration::from_secs(1), routine.run())
             .await

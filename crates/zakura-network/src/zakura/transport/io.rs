@@ -10,14 +10,14 @@ use tokio::sync::mpsc;
 use super::Frame;
 use std::sync::{Arc, OnceLock};
 
-/// Why a paired stream ended before local cancellation.
+/// Why a persistent stream ended before local cancellation.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum OrderedStreamFailure {
     RemoteClose,
     WriteTimeout,
 }
 
-/// Preserve the first transport failure before cancelling both roles of a pair.
+/// Preserve the first transport failure before cancelling the service session.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct OrderedStreamFailureCause(Arc<OnceLock<OrderedStreamFailure>>);
 
@@ -65,7 +65,7 @@ impl FramedRecv {
         self
     }
 
-    /// Failure of either role, retained through pair cancellation for service policy.
+    /// Failure of any member, retained through session cancellation for service policy.
     pub(crate) fn failure(&self) -> Option<OrderedStreamFailure> {
         self.failure_cause.as_ref().and_then(|cause| cause.get())
     }
@@ -94,7 +94,7 @@ impl FramedRecv {
 #[derive(Clone, Debug)]
 pub struct FramedSend {
     sender: FramedSender,
-    session_resources: Option<Arc<dyn super::service::OrderedSessionResources>>,
+    session_resources: Option<Arc<dyn super::service::SessionResources>>,
 }
 
 #[derive(Clone, Debug)]
@@ -122,7 +122,7 @@ impl FramedSend {
     /// Keep service admission charged while application senders still own the session.
     pub(crate) fn with_session_resources(
         mut self,
-        resources: Option<Arc<dyn super::service::OrderedSessionResources>>,
+        resources: Option<Arc<dyn super::service::SessionResources>>,
     ) -> Self {
         self.session_resources = resources;
         self

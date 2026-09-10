@@ -12,7 +12,7 @@ Review the incremental diffs in this order; the final draft also needs the integ
 | Draft | Boundary | Main audit question |
 | --- | --- | --- |
 | [#942](https://github.com/zakura-core/zakura/pull/942) | Owned storage reads | Do running jobs and undelivered results retain their charged resources? |
-| [#943](https://github.com/zakura-core/zakura/pull/943) | Generic transport and resource ownership | Are pair setup, queue ownership, cancellation, and sibling-service progress bounded? |
+| [#943](https://github.com/zakura-core/zakura/pull/943) | Generic transport and resource ownership | Are complete service sessions, queue ownership, cancellation, and sibling-service progress bounded? |
 | [#944](https://github.com/zakura-core/zakura/pull/944) | Outgoing request ownership and deadlines | Can publication, expiry, reset, or a partial write lose or double-release work? |
 | [#945](https://github.com/zakura-core/zakura/pull/945) | Serving migration and activation | Do negotiation, per-peer and node limits, storage, serving, and session retirement compose correctly? |
 
@@ -21,6 +21,16 @@ activates the paired layout and removes the previous serving path. Temporary
 compatibility methods and unused-API allowances in the intermediate chunks are
 removed by activation. The network API version bump belongs to the generic
 transport draft because that is where new public error variants first appear.
+
+The transport draft includes [#956](https://github.com/zakura-core/zakura/pull/956).
+Persistent streams with one capability form a complete service session. Block
+sync declares its one-slot request queue, cancellation-driven request writes,
+and 32-second data-write deadline through service hooks. The transport records
+remote closes and write timeouts before cancelling a session, so download policy
+still parks unanswered work and disconnects repeated stalls.
+
+The September 10 service-session update uses merge commits and normal pushes
+through #943, #944, and #945. Earlier commits remain in each branch's history.
 
 [PR #896](https://github.com/zakura-core/zakura/pull/896) remains a separate property
 coverage follow-up, still based on #892. It needs restacking before merging with
@@ -96,10 +106,10 @@ Nextest reported occasional process-cleanup warnings on otherwise passing tests.
 Those warnings are retained in the test evidence. The standalone long-running
 transport measurements are separate from the ordinary acceptance suite.
 
-The main Rust CI workflows only trigger automatically for PRs targeting `main`,
-`feat/**`, or `release/**`. Drafts #943 through #945 target `adam/**` predecessors,
-so their automatic documentation checks are not full Rust CI. Manual final-stack
-Rust validation is dispatched separately; these drafts are not merge approvals.
+Check CI coverage against each final head. Earlier stack revisions only received
+automatic documentation checks, while the September 10 service-session merge
+also triggered Rust checks. Neither passing CI nor local regression checks clear
+the combined transport qualification for #945.
 
 Matched block-download acceptance is one-way.
 

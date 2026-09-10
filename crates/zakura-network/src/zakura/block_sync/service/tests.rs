@@ -79,7 +79,7 @@ fn minimal_setup_limits_preserve_outbound_and_inbound_only_modes() {
 
 #[tokio::test]
 async fn pair_setup_and_retirement_keep_their_service_capacity() {
-    use crate::zakura::{OrderedSessionResources, ServicePeerLimits};
+    use crate::zakura::{ServicePeerLimits, SessionResources};
     let capacity = SessionCapacity::new(ServicePeerLimits {
         max_inbound_peers: 1,
         max_outbound_peers: 1,
@@ -98,7 +98,7 @@ async fn pair_setup_and_retirement_keep_their_service_capacity() {
     inbound.admitted();
     let (send, _recv) = crate::zakura::transport::worker_framed_channel(1);
     let send = send.with_session_resources(Some(pending.clone()));
-    let retiring_worker: Arc<dyn OrderedSessionResources> = pending.clone();
+    let retiring_worker: Arc<dyn SessionResources> = pending.clone();
     drop(pending);
     assert!(capacity.reserve(ServicePeerDirection::Outbound).is_err());
     drop(send);

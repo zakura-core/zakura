@@ -1,9 +1,9 @@
 use super::{config::*, peer_registry::SessionAdmission, wire::*, *};
 use crate::zakura::{
-    handle_pipe_exit, spawn_supervised_pipe, FramedRecv, FramedSend, OrderedSendError,
-    OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPair, OrderedStreamPolicy, Peer,
-    PeerStreamSession, Service, ServicePeerSnapshot, SinkReject, Stream, StreamMode,
-    ZakuraBlockSyncCandidateState, ZakuraConnId, ZakuraPeerId, FRAME_HEADER_BYTES,
+    handle_pipe_exit, spawn_supervised_pipe, FramedRecv, FramedSend, OrderedSendError, Peer,
+    PeerStreamSession, Service, ServicePeerSnapshot, SessionDemand, SessionOpening, SessionPolicy,
+    SinkReject, Stream, StreamMode, StreamWritePolicy, ZakuraBlockSyncCandidateState, ZakuraConnId,
+    ZakuraPeerId, FRAME_HEADER_BYTES,
 };
 use std::{
     sync::atomic::{AtomicU64, Ordering},
@@ -29,28 +29,26 @@ pub const MAX_BS_FRAME_BYTES: u32 = {
     (MAX_BS_MESSAGE_BYTES + FRAME_HEADER_BYTES) as u32
 };
 
-const BLOCK_SYNC_PAIR: OrderedStreamPair = OrderedStreamPair {
-    data: Stream {
-        kind: ZAKURA_STREAM_BLOCK_SYNC,
-        version: ZAKURA_BLOCK_SYNC_STREAM_VERSION,
-        capability: ZAKURA_CAP_BLOCK_SYNC,
-        frame_cap: MAX_BS_FRAME_BYTES,
-        mode: StreamMode::Ordered,
-    },
-    requests: Stream {
-        kind: ZAKURA_STREAM_BLOCK_REQUESTS,
-        version: 1,
-        // Nine payload bytes plus the fixed eight-byte frame header.
-        capability: ZAKURA_CAP_BLOCK_SYNC,
-        frame_cap: 17,
-        mode: StreamMode::Ordered,
-    },
+const BLOCK_SYNC_DATA: Stream = Stream {
+    kind: ZAKURA_STREAM_BLOCK_SYNC,
+    version: ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+    capability: ZAKURA_CAP_BLOCK_SYNC,
+    frame_cap: MAX_BS_FRAME_BYTES,
+    mode: StreamMode::Persistent,
 };
-const BLOCK_SYNC_PAIR_STREAMS: [Stream; 2] = [BLOCK_SYNC_PAIR.data, BLOCK_SYNC_PAIR.requests];
+const BLOCK_SYNC_REQUESTS: Stream = Stream {
+    kind: ZAKURA_STREAM_BLOCK_REQUESTS,
+    version: 1,
+    capability: ZAKURA_CAP_BLOCK_SYNC,
+    // Nine payload bytes plus the fixed eight-byte frame header.
+    frame_cap: 17,
+    mode: StreamMode::Persistent,
+};
+const BLOCK_SYNC_SERVICE_STREAMS: [Stream; 2] = [BLOCK_SYNC_DATA, BLOCK_SYNC_REQUESTS];
 
 /// Service-declared streams for native block sync.
 pub(crate) fn block_sync_streams() -> &'static [Stream] {
-    &BLOCK_SYNC_PAIR_STREAMS
+    &BLOCK_SYNC_SERVICE_STREAMS
 }
 
 /// Cloneable typed stream-6 sender.
@@ -423,24 +421,15 @@ impl Service for BlockSyncService {
         block_sync_streams()
     }
 
-    fn ordered_stream_pair(&self, stream: Stream) -> Option<OrderedStreamPair> {
-        BLOCK_SYNC_PAIR_STREAMS
-            .contains(&stream)
-            .then_some(BLOCK_SYNC_PAIR)
-    }
-
-    fn reserve_ordered_session(
+    fn reserve_session(
         &self,
         direction: ServicePeerDirection,
-    ) -> Result<
-        Option<Arc<dyn crate::zakura::OrderedSessionResources>>,
-        crate::zakura::OrderedSessionFull,
-    > {
+    ) -> Result<Option<Arc<dyn crate::zakura::SessionResources>>, crate::zakura::SessionFull> {
         self.inner.capacity.reserve(direction).map(Some)
     }
 
     fn stream_queue_depths(&self, stream: Stream) -> Option<(usize, usize)> {
-        if stream == BLOCK_SYNC_PAIR.requests {
+        if stream == BLOCK_SYNC_REQUESTS {
             Some((1, 1))
         } else {
             let limits = self.inner.config.peer_limits;
@@ -452,9 +441,9 @@ impl Service for BlockSyncService {
     }
 
     fn message_payload_limits(&self, stream: Stream) -> &'static [(u16, usize)] {
-        if stream == BLOCK_SYNC_PAIR.requests {
+        if stream == BLOCK_SYNC_REQUESTS {
             serving_regulation::message_payload_limits()
-        } else if stream == BLOCK_SYNC_PAIR.data {
+        } else if stream == BLOCK_SYNC_DATA {
             &[(1, 53), (4, 9), (5, 9)]
         } else {
             &[]
@@ -462,50 +451,59 @@ impl Service for BlockSyncService {
     }
 
     fn message_types(&self, stream: Stream) -> Option<&'static [u16]> {
-        Some(if stream == BLOCK_SYNC_PAIR.requests {
+        Some(if stream == BLOCK_SYNC_REQUESTS {
             &[2]
         } else {
             &[1, 3, 4, 5]
         })
     }
 
-    fn ordered_stream_policy(&self, _kind: u16) -> OrderedStreamPolicy {
-        OrderedStreamPolicy {
-            opening: OrderedStreamOpening::EitherSide,
+    fn stream_write_policy(&self, stream: Stream) -> StreamWritePolicy {
+        if stream == BLOCK_SYNC_REQUESTS {
+            // Download liveness owns the deadline while the peer drains serving work.
+            StreamWritePolicy::UntilCancelled
+        } else {
+            StreamWritePolicy::Timeout(Duration::from_secs(32))
+        }
+    }
+
+    fn session_policy(&self) -> SessionPolicy {
+        SessionPolicy {
+            opening: SessionOpening::EitherSide,
             reopen: true,
         }
     }
 
-    fn ordered_session_demand(
+    fn session_demand(
         &self,
         conn_id: ZakuraConnId,
         peer: &ZakuraPeerId,
         _negotiated: u64,
         direction: ServicePeerDirection,
-    ) -> OrderedSessionDemand {
+    ) -> SessionDemand {
         let mut capacity = self.inner.capacity.subscribe();
         if !self.inner.capacity.available(direction) {
-            return OrderedSessionDemand::WaitForChange(Box::pin(async move {
+            return SessionDemand::WaitForChange(Box::pin(async move {
                 let _ = capacity.changed().await;
             }));
         }
-        self.reserved_ordered_session_demand(conn_id, peer, _negotiated, direction)
+        self.reserved_session_demand(conn_id, peer, _negotiated, direction)
     }
 
-    fn reserved_ordered_session_demand(
+    fn reserved_session_demand(
         &self,
         conn_id: ZakuraConnId,
         peer: &ZakuraPeerId,
         _negotiated: u64,
         direction: ServicePeerDirection,
-    ) -> OrderedSessionDemand {
+    ) -> SessionDemand {
         if let Some(deadline) = self.peer_park_deadline(peer) {
-            return OrderedSessionDemand::RetryAt(deadline);
+            return SessionDemand::RetryAt(deadline);
         }
         let mut peer_snapshot = self.inner.peer_snapshot.clone();
         peer_snapshot.borrow_and_update();
         if !self.peer_slots_free(direction) {
-            return OrderedSessionDemand::WaitForChange(Box::pin(async move {
+            return SessionDemand::WaitForChange(Box::pin(async move {
                 if peer_snapshot.changed().await.is_err() {
                     std::future::pending::<()>().await;
                 }
@@ -528,7 +526,7 @@ impl Service for BlockSyncService {
                 .is_empty()
             {
                 let mut service_demand = self.service_demand.clone();
-                return OrderedSessionDemand::WaitForChange(Box::pin(async move {
+                return SessionDemand::WaitForChange(Box::pin(async move {
                     if let Some(demand) = service_demand.as_mut() {
                         tokio::select! {
                             changed = candidates.changed() => {
@@ -549,7 +547,7 @@ impl Service for BlockSyncService {
             }
         }
 
-        OrderedSessionDemand::OpenNow
+        SessionDemand::OpenNow
     }
 
     fn wants_peer(
@@ -579,8 +577,8 @@ impl Service for BlockSyncService {
                 peer.service_cancel_token().cancel();
                 return;
             };
-            if version != BLOCK_SYNC_PAIR.data.version
-                || request_version != BLOCK_SYNC_PAIR.requests.version
+            if version != BLOCK_SYNC_DATA.version
+                || request_version != BLOCK_SYNC_REQUESTS.version
                 || request_session_id != data_session_id
             {
                 peer.service_cancel_token().cancel();
@@ -858,8 +856,8 @@ impl Service for BlockSyncService {
             return false;
         };
         matches!(
-            self.ordered_session_demand(conn_id, peer, ZAKURA_CAP_BLOCK_SYNC, direction),
-            OrderedSessionDemand::OpenNow
+            self.session_demand(conn_id, peer, ZAKURA_CAP_BLOCK_SYNC, direction),
+            SessionDemand::OpenNow
         )
     }
 

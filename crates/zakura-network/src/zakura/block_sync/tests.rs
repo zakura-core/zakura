@@ -32,7 +32,7 @@ use crate::zakura::{
     framed_channel,
     testkit::{await_until, DownloadOnlyPeer as Peer, TraceCapture, TraceValue},
     trace::BlockBodySource,
-    FramedRecv, FramedSend, OrderedSessionDemand, Service, ServicePeerSnapshot, ServiceRegistry,
+    FramedRecv, FramedSend, Service, ServicePeerSnapshot, ServiceRegistry, SessionDemand,
     StreamMode, ZakuraBlockSyncCandidateState,
 };
 use zakura_chain::{
@@ -6238,7 +6238,7 @@ fn block_sync_stream_declares_kind_capability_version_and_frame_cap() {
     assert_eq!(stream.kind, ZAKURA_STREAM_BLOCK_SYNC);
     assert_eq!(stream.version, ZAKURA_BLOCK_SYNC_STREAM_VERSION);
     assert_eq!(stream.capability, ZAKURA_CAP_BLOCK_SYNC);
-    assert_eq!(stream.mode, StreamMode::Ordered);
+    assert_eq!(stream.mode, StreamMode::Persistent);
     assert_eq!(stream.frame_cap, MAX_BS_FRAME_BYTES);
 }
 
@@ -6261,23 +6261,25 @@ async fn service_registry_routes_block_sync_by_exact_capability_and_version() {
         .is_none());
     assert_eq!(
         registry
-            .ordered_streams_for_negotiated(ZAKURA_CAP_BLOCK_SYNC)
+            .persistent_streams_for_negotiated(ZAKURA_CAP_BLOCK_SYNC)
             .iter()
             .map(|stream| stream.kind)
             .collect::<Vec<_>>(),
         vec![ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_BLOCK_REQUESTS]
     );
-    assert!(registry.ordered_streams_for_negotiated(0).is_empty());
-    assert!(registry.ordered_streams_for_negotiated(1 << 3).is_empty());
+    assert!(registry.persistent_streams_for_negotiated(0).is_empty());
+    assert!(registry
+        .persistent_streams_for_negotiated(1 << 3)
+        .is_empty());
     assert!(registry
         .capability_for_stream(ZAKURA_STREAM_BLOCK_SYNC, 2)
         .is_none());
     assert_eq!(
-        registry.ordered_streams_for_negotiated((1 << 3) | ZAKURA_CAP_BLOCK_SYNC),
-        registry.ordered_streams_for_negotiated(ZAKURA_CAP_BLOCK_SYNC),
+        registry.persistent_streams_for_negotiated((1 << 3) | ZAKURA_CAP_BLOCK_SYNC),
+        registry.persistent_streams_for_negotiated(ZAKURA_CAP_BLOCK_SYNC),
         "a mixed advertisement selects only the complete new layout"
     );
-    assert!(registry.wants_ordered_stream(
+    assert!(registry.wants_session(
         ZAKURA_STREAM_BLOCK_SYNC,
         ZAKURA_CAP_BLOCK_SYNC,
         &peer,
@@ -14866,24 +14868,24 @@ async fn parked_connection_cleanup_allows_a_fresh_connection_after_cooldown() {
     handle.park_session_for_test(&peer, old_conn_id, Duration::ZERO);
 
     assert!(matches!(
-        service.ordered_session_demand(
+        service.session_demand(
             old_conn_id,
             &peer,
             ZAKURA_CAP_BLOCK_SYNC,
             ServicePeerDirection::Outbound,
         ),
-        OrderedSessionDemand::WaitForChange(_),
+        SessionDemand::WaitForChange(_),
     ));
 
     service.remove_peer(&peer, old_conn_id);
     assert!(matches!(
-        service.ordered_session_demand(
+        service.session_demand(
             new_conn_id,
             &peer,
             ZAKURA_CAP_BLOCK_SYNC,
             ServicePeerDirection::Outbound,
         ),
-        OrderedSessionDemand::OpenNow
+        SessionDemand::OpenNow
     ));
     reactor_task.abort();
 }
@@ -14908,13 +14910,13 @@ async fn same_connection_block_sync_session_waits_at_tip_then_reopens_for_new_wo
     let conn_id = 17;
     handle.park_session_for_test(&peer, conn_id, Duration::ZERO);
 
-    let demand = service.ordered_session_demand(
+    let demand = service.session_demand(
         conn_id,
         &peer,
         ZAKURA_CAP_BLOCK_SYNC,
         ServicePeerDirection::Outbound,
     );
-    let OrderedSessionDemand::WaitForChange(changed) = demand else {
+    let SessionDemand::WaitForChange(changed) = demand else {
         panic!("a locally parked session must stay absent while block sync is at tip");
     };
 
@@ -14930,13 +14932,13 @@ async fn same_connection_block_sync_session_waits_at_tip_then_reopens_for_new_wo
         .expect("new block work wakes the parked session demand");
 
     assert!(matches!(
-        service.ordered_session_demand(
+        service.session_demand(
             conn_id,
             &peer,
             ZAKURA_CAP_BLOCK_SYNC,
             ServicePeerDirection::Outbound,
         ),
-        OrderedSessionDemand::OpenNow,
+        SessionDemand::OpenNow,
     ));
     reactor_task.abort();
 }
@@ -14975,7 +14977,7 @@ async fn serving_only_coordinator_demand_keeps_block_session_available_during_fa
     let conn_id = 18;
     handle.park_session_for_test(&peer, conn_id, Duration::ZERO);
 
-    let OrderedSessionDemand::WaitForChange(changed) = service.ordered_session_demand(
+    let SessionDemand::WaitForChange(changed) = service.session_demand(
         conn_id,
         &peer,
         ZAKURA_CAP_BLOCK_SYNC,
@@ -14995,13 +14997,13 @@ async fn serving_only_coordinator_demand_keeps_block_session_available_during_fa
         .await
         .expect("fallback service demand wakes the parked ordered session");
     assert!(matches!(
-        service.ordered_session_demand(
+        service.session_demand(
             conn_id,
             &peer,
             ZAKURA_CAP_BLOCK_SYNC,
             ServicePeerDirection::Outbound,
         ),
-        OrderedSessionDemand::OpenNow,
+        SessionDemand::OpenNow,
     ));
     reactor_task.abort();
 }

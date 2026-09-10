@@ -10,7 +10,7 @@
 //! workers or send handles finishing cleanup.
 
 use super::*;
-use crate::zakura::{OrderedSessionFull, OrderedSessionResources, ServicePeerLimits};
+use crate::zakura::{ServicePeerLimits, SessionFull, SessionResources};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Limits session counts by connection direction and bounds incomplete pairs.
@@ -76,19 +76,19 @@ impl SessionCapacity {
 
     /// Take one session slot for `direction` and one temporary setup slot.
     ///
-    /// Returns [`OrderedSessionFull`] immediately if either limit is reached;
+    /// Returns [`SessionFull`] immediately if either limit is reached;
     /// an error leaves no slots held by this call. Both streams share the returned
     /// reservation, so opening the second stream must reuse it.
     pub(super) fn reserve(
         &self,
         direction: ServicePeerDirection,
-    ) -> Result<Arc<dyn OrderedSessionResources>, OrderedSessionFull> {
+    ) -> Result<Arc<dyn SessionResources>, SessionFull> {
         let inbound = if direction == ServicePeerDirection::Inbound {
             Some(
                 self.inbound_pending
                     .clone()
                     .try_acquire_owned()
-                    .map_err(|_| OrderedSessionFull)?,
+                    .map_err(|_| SessionFull)?,
             )
         } else {
             None
@@ -103,7 +103,7 @@ impl SessionCapacity {
                     drop(inbound);
                     self.changed.send_replace(());
                 }
-                return Err(OrderedSessionFull);
+                return Err(SessionFull);
             }
         };
         let session = match self.pool(direction).clone().try_acquire_owned() {
@@ -112,7 +112,7 @@ impl SessionCapacity {
                 // Wake callers that may have seen the setup slot occupied.
                 drop(pending);
                 self.changed.send_replace(());
-                return Err(OrderedSessionFull);
+                return Err(SessionFull);
             }
         };
         let reserved =
@@ -120,7 +120,7 @@ impl SessionCapacity {
         let pending_count = metrics::gauge!("sync.block.sessions.pending");
         reserved.increment(1.0);
         pending_count.increment(1.0);
-        Ok(Arc::new(SessionResources {
+        Ok(Arc::new(SessionReservation {
             reserved,
             pending_count,
             session: Some(session),
@@ -142,7 +142,7 @@ struct PendingSessionSlots {
 /// Each owner retains an `Arc` to this value. The session slot stays occupied
 /// after cancellation until the last owner drops its reference.
 #[derive(Debug)]
-struct SessionResources {
+struct SessionReservation {
     reserved: metrics::Gauge,
     pending_count: metrics::Gauge,
     session: Option<OwnedSemaphorePermit>,
@@ -150,7 +150,7 @@ struct SessionResources {
     changed: watch::Sender<()>,
 }
 
-impl OrderedSessionResources for SessionResources {
+impl SessionResources for SessionReservation {
     /// Release the temporary setup slot once both streams are ready.
     /// The session slot stays reserved; repeated calls cannot release setup twice.
     fn admitted(&self) {
@@ -167,7 +167,7 @@ impl OrderedSessionResources for SessionResources {
     }
 }
 
-impl Drop for SessionResources {
+impl Drop for SessionReservation {
     /// Return the session slot and any setup slot left by an incomplete pair,
     /// then wake callers waiting to open a session.
     fn drop(&mut self) {

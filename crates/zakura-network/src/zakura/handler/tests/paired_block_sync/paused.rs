@@ -21,7 +21,7 @@ impl PausedService {
                 version: 1,
                 frame_cap: FRAME_BYTES,
                 capability: 1 << 17,
-                mode: StreamMode::Ordered,
+                mode: StreamMode::Persistent,
             })
             .collect();
         (Arc::new(Self { streams, sessions }), receiver)

@@ -6,6 +6,30 @@ deployment combines the activation draft with that upgrade and requires validati
 of the combined code and dependencies.
 Historical measurements and their exact dependency context are retained below.
 
+## Service-session merge
+
+On September 10, 2026, #956 was merged into #943 at `f327e9b66`. Commit
+`018ab9d3b` brings the download failure-policy fix forward. The transport records
+a remote close or write timeout before cancelling the session, and block sync
+settles unanswered work even when cancellation wins over receiving EOF. Local
+cancellation remains neutral. Merge commits carry these changes through #944
+and #945 without rewriting existing history.
+
+The activation uses the generic service-session hooks for its two persistent
+streams. Its request queue remains one slot, request writes follow download
+liveness, and data writes retain the approved 32-second deadline. The protected
+outbound setup slot and exact-generation registry cleanup remain in place.
+
+- #943 passes 361 focused tests and all-target network Clippy.
+- #944 passes 302 block-sync tests and all-target network Clippy.
+- The combined activation passes 546 handler, block-sync, transport, regulation,
+  owned-state-read, and node-driver tests without retries. One passing node test
+  reports a nextest process-cleanup warning.
+
+These checks use this stack's existing Iroh 0.92 dependency. They do not update
+the older Iroh 1.1 measurements below. The final combined dependency set still
+needs transport qualification before #945 is merged.
+
 ## Iroh integration
 
 On September 9, 2026, an isolated local checkout combined the corrected activation

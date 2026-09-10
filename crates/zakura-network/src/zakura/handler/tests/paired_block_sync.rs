@@ -760,13 +760,14 @@ async fn reset_during_a_frame_is_stream_local_but_truncated_fin_is_invalid() -> 
 #[tokio::test]
 async fn paired_roles_reject_wrong_messages_before_reading_payloads() -> Result<(), BoxError> {
     let service = Arc::new(BlockSyncService::new(ZakuraBlockSyncConfig::default()));
-    let pair = service.ordered_stream_pair(service.streams()[0]).unwrap();
+    let data = service.streams()[0];
+    let requests = service.streams()[1];
     let registry = ServiceRegistry::new(vec![service.clone()])?;
-    assert_eq!(registry.message_payload_limits(pair.requests), &[(2, 9)]);
+    assert_eq!(registry.message_payload_limits(requests), &[(2, 9)]);
     assert!(registry
         .message_payload_limits(Stream {
-            version: pair.requests.version + 1,
-            ..pair.requests
+            version: requests.version + 1,
+            ..requests
         })
         .is_empty());
     let server = LocalEndpointFactory::new().endpoint(94103).await?;
@@ -783,12 +784,7 @@ async fn paired_roles_reject_wrong_messages_before_reading_payloads() -> Result<
         .spawn();
     let client = LocalEndpointFactory::new().endpoint(94104).await?;
     let address = LocalEndpointFactory::node_addr(router.endpoint()).await;
-    for (role, message) in [
-        (pair.requests, 1u16),
-        (pair.requests, 3),
-        (pair.data, 2),
-        (pair.data, 99),
-    ] {
+    for (role, message) in [(requests, 1u16), (requests, 3), (data, 2), (data, 99)] {
         let connection = timeout(DEADLINE, client.connect(address.clone(), ALPN)).await??;
         let (mut send, _recv) = connection.open_bi().await?;
         let mut header = Vec::new();

@@ -21,6 +21,7 @@
 
 use std::{collections::BTreeMap, num::NonZeroU64, ops::Range};
 
+use futures::FutureExt;
 use tokio::sync::{futures::Notified, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -269,6 +270,8 @@ pub(super) struct PeerRoutine {
     /// This peer's ordered stream-6 frame reader. Decoded in the routine's own
     /// task; inbound never flows through the reactor (per-peer routines inverted data flow).
     recv: FramedRecv,
+    /// A received frame may be waiting for local body capacity when cancelled.
+    inbound_frame_pending: bool,
 
     // ---- per-peer download state (moved out of `PeerBlockState`) ----
     window: DownloadWindow,
@@ -380,6 +383,7 @@ impl PeerRoutine {
             config,
             allow_no_progress_park,
             recv,
+            inbound_frame_pending: false,
             window,
             received_status: false,
             servable_low: block::Height::MIN,
@@ -413,22 +417,34 @@ impl PeerRoutine {
     /// pipe tears the whole connection down.
     pub(super) async fn run(mut self) -> Result<(), SinkReject> {
         let cancel = self.cancel.clone();
+        let mut guard = block_sync_guard();
         let result = tokio::select! {
             biased;
             () = cancel.cancelled() => Ok(()),
-            result = self.run_inner() => result,
+            result = self.run_inner(&mut guard) => result,
         };
-        // Transport cancels the session when any member fails. Settle the download
-        // policy even if cancellation interrupts a local capacity wait.
-        if result.is_ok() {
+        // A transport failure can cancel the session before its queued responses
+        // reach us. Process ready frames before scoring unanswered work. A frame
+        // blocked on local capacity cannot establish a peer stall.
+        if result.is_ok() && !self.inbound_frame_pending {
             if let Some(failure) = self.recv.failure() {
+                self.recv.close();
+                while let Ok(frame) = self.recv.try_recv() {
+                    match self.handle_frame(&mut guard, frame).now_or_never() {
+                        Some(result) => result?,
+                        None => return Ok(()),
+                    }
+                }
                 return self.handle_stream_failure(Instant::now(), failure);
             }
         }
         result
     }
 
-    async fn run_inner(&mut self) -> Result<(), SinkReject> {
+    async fn run_inner(
+        &mut self,
+        guard: &mut crate::zakura::SessionGuard,
+    ) -> Result<(), SinkReject> {
         // Local clones so the `Notified` futures below borrow these handles, not
         // `self` — `self.try_fill()` needs `&mut self` while the notifications are
         // pinned. The clones share the same underlying `Arc`, so the wakes still
@@ -436,8 +452,6 @@ impl PeerRoutine {
         // `self.work`.
         let budget = self.budget.clone();
         let work = self.work.clone();
-        // The per-connection oversize guard applied to inbound frames at ingress.
-        let mut guard = block_sync_guard();
         // Per-peer BBR heartbeat cadence. `Skip` so a routine busy past a tick emits one
         // fresh sample rather than a catch-up burst. Observability only.
         let mut bbr_trace_ticks = time::interval(BBR_TRACE_INTERVAL);
@@ -487,7 +501,12 @@ impl PeerRoutine {
                         // in this same task. A protocol reject propagates out so
                         // the supervised pipe cancels the connection; the `Drop`
                         // guard returns unreceived work on the way out.
-                        Some(frame) => self.handle_frame(&mut guard, frame).await?,
+                        Some(frame) => {
+                            self.inbound_frame_pending = true;
+                            let result = self.handle_frame(guard, frame).await;
+                            self.inbound_frame_pending = false;
+                            result?;
+                        }
                         // Stream closed by the peer. With no outstanding work this
                         // is a clean exit; with unanswered requests it is a
                         // no-progress stall (park or disconnect). `Drop` returns
@@ -3198,10 +3217,85 @@ mod tests {
         readmitted: bool,
         expired: bool,
     ) {
+        check_cancelled_session_with_buffered_response(
+            failure,
+            unanswered,
+            readmitted,
+            expired,
+            BufferedResponse::None,
+        )
+        .await;
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum BufferedResponse {
+        None,
+        Complete,
+        CompleteWhileOutboundFull,
+        StatusOnly,
+        Malformed,
+        Backpressured,
+        AlreadyProcessing,
+    }
+
+    #[tokio::test]
+    async fn buffered_responses_are_considered_before_stream_failure() {
+        for failure in [
+            super::OrderedStreamFailure::RemoteClose,
+            super::OrderedStreamFailure::WriteTimeout,
+        ] {
+            for readmitted in [false, true] {
+                for buffered in [
+                    BufferedResponse::Complete,
+                    BufferedResponse::CompleteWhileOutboundFull,
+                    BufferedResponse::StatusOnly,
+                    BufferedResponse::Malformed,
+                    BufferedResponse::Backpressured,
+                ] {
+                    check_cancelled_session_with_buffered_response(
+                        Some(failure),
+                        true,
+                        readmitted,
+                        false,
+                        buffered,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_local_body_backpressure_does_not_charge_a_stall() {
+        for readmitted in [false, true] {
+            check_cancelled_session_with_buffered_response(
+                Some(super::OrderedStreamFailure::RemoteClose),
+                true,
+                readmitted,
+                false,
+                BufferedResponse::AlreadyProcessing,
+            )
+            .await;
+        }
+    }
+
+    async fn check_cancelled_session_with_buffered_response(
+        failure: Option<super::OrderedStreamFailure>,
+        unanswered: bool,
+        readmitted: bool,
+        expired: bool,
+        buffered: BufferedResponse,
+    ) {
         use super::super::peer_registry::SessionAdmission;
         use crate::zakura::transport::OrderedStreamFailureCause;
         use crate::zakura::{ServicePeerDirection, SinkReject};
 
+        use zakura_chain::serialization::ZcashDeserializeInto;
+        let body: Arc<block::Block> = Arc::new(
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+                .zcash_deserialize_into()
+                .unwrap(),
+        );
         let config = ZakuraBlockSyncConfig::default();
         let budget = ByteBudget::new(1_000_000);
         let work = Arc::new(WorkQueue::new(block::Height(0)));
@@ -3211,8 +3305,10 @@ mod tests {
                 super::super::test_work_scope(),
                 [(
                     block::Height(1),
-                    block::Hash([1; 32]),
-                    BlockSizeEstimate::Confirmed(1_000),
+                    body.hash(),
+                    BlockSizeEstimate::Confirmed(
+                        u32::try_from(zakura_test::vectors::BLOCK_MAINNET_1_BYTES.len()).unwrap(),
+                    ),
                 )],
             );
         }
@@ -3231,10 +3327,20 @@ mod tests {
         }
         let cancel = CancellationToken::new();
         let (out_send, mut out_recv) = crate::zakura::transport::worker_framed_channel(4);
-        let (_in_send, in_recv) = framed_channel(4);
+        let fill_outbound = out_send.clone();
+        let (in_send, in_recv) = framed_channel(4);
         let cause = OrderedStreamFailureCause::default();
         let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
-        let (sequencer_input, _sequencer_recv) = mpsc::channel(4);
+        let (sequencer_input, mut sequencer_recv) = mpsc::channel(4);
+        let mut held_capacity = Vec::new();
+        if matches!(
+            buffered,
+            BufferedResponse::Backpressured | BufferedResponse::AlreadyProcessing
+        ) {
+            for _ in 0..4 {
+                held_capacity.push(sequencer_input.clone().try_reserve_owned().unwrap());
+            }
+        }
         let (reactor_input, _reactor_recv) = mpsc::channel(4);
         let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
             finalized_height: block::Height(0),
@@ -3286,15 +3392,87 @@ mod tests {
                 assert!(routine.window.block_liveness_deadline.is_some());
             }
         }
+        match buffered {
+            BufferedResponse::Complete
+            | BufferedResponse::CompleteWhileOutboundFull
+            | BufferedResponse::Backpressured
+            | BufferedResponse::AlreadyProcessing => {
+                in_send
+                    .send(
+                        super::BlockSyncMessage::Block(body.clone())
+                            .encode_frame()
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                in_send
+                    .send(
+                        super::BlockSyncMessage::BlocksDone {
+                            start_height: block::Height(1),
+                            returned: 1,
+                        }
+                        .encode_frame()
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            BufferedResponse::StatusOnly => {
+                in_send
+                    .send(
+                        super::BlockSyncMessage::Status(super::BlockSyncStatus::default())
+                            .encode_frame()
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            BufferedResponse::Malformed => {
+                in_send
+                    .send(crate::zakura::Frame {
+                        message_type: u16::MAX,
+                        flags: 0,
+                        payload: vec![],
+                    })
+                    .await
+                    .unwrap();
+            }
+            BufferedResponse::None => {}
+        }
+        if buffered == BufferedResponse::CompleteWhileOutboundFull {
+            for _ in 0..4 {
+                fill_outbound
+                    .try_send(
+                        super::BlockSyncMessage::Status(super::BlockSyncStatus::default())
+                            .encode_frame()
+                            .unwrap(),
+                    )
+                    .unwrap();
+            }
+            assert_eq!(routine.session.outbound_capacity(), 0);
+        }
+        let mut running = Box::pin(routine.run());
+        if buffered == BufferedResponse::AlreadyProcessing {
+            // Poll until the body leaves the frame queue and waits for local
+            // capacity. Cancellation must not turn that wait into a peer fault.
+            assert!(futures::poll!(running.as_mut()).is_pending());
+            assert_eq!(in_send.capacity(), 3);
+        }
         if let Some(failure) = failure {
             cause.record(failure);
         }
-        // The transport records the cause before cancelling the session.
         cancel.cancel();
-        let result = timeout(Duration::from_secs(1), routine.run())
-            .await
-            .unwrap();
-        if failure.is_some() && unanswered {
+        let result = timeout(Duration::from_secs(1), running).await.unwrap();
+        if buffered == BufferedResponse::Malformed {
+            assert!(matches!(result, Err(SinkReject::Protocol(_))), "{result:?}");
+            assert!(!registry.is_peer_parked(&peer, Instant::now()));
+        } else if failure.is_some()
+            && unanswered
+            && matches!(
+                buffered,
+                BufferedResponse::None | BufferedResponse::StatusOnly
+            )
+        {
             if readmitted {
                 assert!(matches!(result, Err(SinkReject::Protocol(_))), "{result:?}");
             } else {
@@ -3325,7 +3503,17 @@ mod tests {
             assert!(!registry.is_peer_parked(&peer, Instant::now()));
         }
         assert_eq!(budget.reserved(), 0);
-        assert_eq!(work.pending_contains(block::Height(1)), unanswered);
+        let received = matches!(
+            buffered,
+            BufferedResponse::Complete | BufferedResponse::CompleteWhileOutboundFull
+        );
+        assert_eq!(
+            work.pending_contains(block::Height(1)),
+            unanswered && !received
+        );
+        assert_eq!(work.in_flight_contains(block::Height(1)), received);
+        assert_eq!(sequencer_recv.try_recv().is_ok(), received);
+        assert!(sequencer_recv.try_recv().is_err());
     }
 
     #[test]

@@ -7607,7 +7607,7 @@ checksum = "2164e798d9e3d84ee2c91139ace54638059a3b23e361f5c11781c2c6459bde0f"
 
 [[package]]
 name = "zakura"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "abscissa_core",
  "bytes",
@@ -8166,7 +8166,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rpc"
-version = "10.0.0"
+version = "10.0.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

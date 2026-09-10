@@ -95,6 +95,10 @@ pub enum Response {
     /// Response to [`Request::UnspentBestChainUtxo`] with the UTXO
     UnspentBestChainUtxo(Option<transparent::Utxo>),
 
+    /// A missing external input proven against the requested committed parent.
+    /// `None` also covers an unavailable or changed parent context.
+    BestTipMissingInput(Option<transparent::OutPoint>),
+
     /// Response to [`Request::Block`] with the specified block.
     Block(Option<Arc<Block>>),
 
@@ -539,6 +543,10 @@ pub enum ReadResponse {
     /// _best_ non-finalized chain, or the finalized chain.
     UnspentBestChainUtxo(Option<transparent::Utxo>),
 
+    /// A missing external input proven against the requested committed parent.
+    /// `None` also covers an unavailable or changed parent context.
+    BestTipMissingInput(Option<transparent::OutPoint>),
+
     /// The response to an `AnyChainUtxo` request, from verified blocks in
     /// _any_ non-finalized chain, or the finalized chain.
     ///
@@ -703,6 +711,7 @@ impl TryFrom<ReadResponse> for Response {
                 Err("there is no corresponding Response for this ReadResponse")
             }
             ReadResponse::UnspentBestChainUtxo(utxo) => Ok(Response::UnspentBestChainUtxo(utxo)),
+            ReadResponse::BestTipMissingInput(outpoint) => Ok(Response::BestTipMissingInput(outpoint)),
 
 
             ReadResponse::AnyChainUtxo(_) => Err("ReadService does not track pending UTXOs. \

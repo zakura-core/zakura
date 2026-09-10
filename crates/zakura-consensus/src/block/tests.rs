@@ -145,6 +145,9 @@ fn prepared_test_verifier(
                     .then_some(zs::KnownBlock::Finalized),
             ),
             zs::Request::CheckBlockProposalValidity(_) => zs::Response::ValidBlockProposal,
+            zs::Request::CheckBestTipMissingInputs { .. } => {
+                zs::Response::BestTipMissingInput(None)
+            }
             _ => panic!("prepared-path test received an unexpected state request: {request:?}"),
         };
         Ok::<_, BoxError>(response)
@@ -153,6 +156,78 @@ fn prepared_test_verifier(
         service_fn(|request| async move { Ok::<_, BoxError>(accept_block_transaction(request)) });
 
     SemanticBlockVerifier::new(network, state, transaction)
+}
+
+#[tokio::test(start_paused = true)]
+async fn missing_input_requires_committed_parent_evidence() {
+    let _init_guard = zakura_test::init();
+    let block = Arc::new(
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_347499_BYTES[..])
+            .expect("the test block deserializes"),
+    );
+    let outpoint = block
+        .transactions
+        .iter()
+        .flat_map(|tx| tx.inputs())
+        .find_map(transparent::Input::outpoint)
+        .expect("the test block spends an external output");
+    #[derive(Clone, Copy)]
+    enum ContextRead {
+        Missing,
+        Unknown,
+        Failed,
+        TimedOut,
+    }
+    for context_read in [
+        ContextRead::Missing,
+        ContextRead::Unknown,
+        ContextRead::Failed,
+        ContextRead::TimedOut,
+    ] {
+        let confirms_missing = matches!(context_read, ContextRead::Missing);
+        let state = service_fn(move |request: zs::Request| async move {
+            Ok::<_, BoxError>(match request {
+                zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+                zs::Request::CheckBestTipMissingInputs { parent, outpoints } => {
+                    assert!(outpoints.contains(&outpoint));
+                    assert_ne!(parent, block::Hash([0; 32]));
+                    match context_read {
+                        ContextRead::Failed => {
+                            return Err(std::io::Error::other("state unavailable").into())
+                        }
+                        ContextRead::TimedOut => return std::future::pending().await,
+                        ContextRead::Missing | ContextRead::Unknown => {}
+                    }
+                    zs::Response::BestTipMissingInput(confirms_missing.then_some(outpoint))
+                }
+                _ => panic!("unexpected state request: {request:?}"),
+            })
+        });
+        let transaction = service_fn(move |_: tx::Request| async move {
+            assert!(
+                !confirms_missing,
+                "proven missing inputs must fail before transaction checks"
+            );
+            Err::<tx::Response, BoxError>(TransactionError::TransparentInputNotFound.into())
+        });
+        let error = SemanticBlockVerifier::new(&Network::Mainnet, state, transaction)
+            .oneshot(Request::Commit(block.clone()))
+            .await
+            .expect_err("the input cannot be resolved");
+        if confirms_missing {
+            assert!(matches!(
+                error,
+                VerifyBlockError::MissingTransparentInput { .. }
+            ));
+            assert_eq!(error.misbehavior_score(), 100);
+        } else {
+            assert!(matches!(
+                error,
+                VerifyBlockError::Transaction(TransactionError::TransparentInputNotFound)
+            ));
+            assert_eq!(error.misbehavior_score(), 0);
+        }
+    }
 }
 
 fn accept_block_transaction(request: tx::Request) -> tx::Response {
@@ -462,6 +537,9 @@ async fn proposal_validation_succeeds_when_cache_insertion_conflicts() {
                     .then_some(zs::KnownBlock::Finalized),
             ),
             zs::Request::CheckBlockProposalValidity(_) => zs::Response::ValidBlockProposal,
+            zs::Request::CheckBestTipMissingInputs { .. } => {
+                zs::Response::BestTipMissingInput(None)
+            }
             zs::Request::CommitSemanticallyVerifiedBlockWithAdmission { block, .. } => {
                 zs::Response::Committed(block.hash)
             }

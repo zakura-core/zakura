@@ -2509,6 +2509,37 @@ async fn utxo_timeout_preserves_parent_commit_in_sync_round() -> Result<(), crat
     Ok(())
 }
 
+#[tokio::test]
+async fn proven_missing_input_scores_supplier_without_timeout_retries() {
+    let (mut chain_sync, _, _, mut peers, _, _) = setup_chain_sync();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    chain_sync.misbehavior_sender = sender;
+    let supplier: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+    let hash = block::Hash([0xCC; 32]);
+    let error = BlockDownloadVerifyError::Invalid {
+        error: RouterError::Block {
+            source: Box::new(VerifyBlockError::MissingTransparentInput {
+                parent: block::Hash([0xAA; 32]),
+                outpoint: zakura_chain::transparent::OutPoint {
+                    hash: zakura_chain::transaction::Hash([0xBB; 32]),
+                    index: 0,
+                },
+            }),
+        },
+        height: Height(42),
+        hash,
+        advertiser_addr: Some(supplier),
+    };
+    assert!(chain_sync
+        .handle_block_response_with_missing_retry(Err(error))
+        .await
+        .is_err());
+    assert_eq!(receiver.try_recv(), Ok((supplier, 100)));
+    assert!(chain_sync.verify_timeout_retry_counts.is_empty());
+    assert_eq!(chain_sync.utxo_race_drops, 0);
+    peers.expect_no_requests().await;
+}
+
 fn utxo_lookup_timeout(hash: block::Hash) -> BlockDownloadVerifyError {
     BlockDownloadVerifyError::Invalid {
         error: RouterError::Block {

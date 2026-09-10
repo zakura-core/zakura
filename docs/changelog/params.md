@@ -33,6 +33,7 @@ Keep entries **newest-first**. Each row records:
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
 | `BLOCK_VERIFY_TIMEOUT_RETRY_LIMIT` | `crates/zakurad/src/components/sync.rs` | immediate restart → `3` retries per hash per sync round | [#940](https://github.com/zakura-core/zakura/pull/940) | Preserve parent commits during transient verification timeouts while bounding retries. |
+| `BEST_TIP_INPUT_CHECK_TIMEOUT` | `crates/zakura-consensus/src/block.rs` | new → `5 s` | [#940](https://github.com/zakura-core/zakura/pull/940) | Bound the optional committed-parent input check; lack of a result preserves ordinary verification. |
 | `MIN_UTXO_RACE_DROPS_BEFORE_RESTART` | `crates/zakurad/src/components/sync.rs` | immediate restart → `max(full_verify_concurrency_limit, 4)` UTXO lookup timeouts without a verified block | [#940](https://github.com/zakura-core/zakura/pull/940) | Allow isolated UTXO races to resolve while restarting sync after a full wave makes no progress. |
 | `MAX_CONCURRENT_UTXO_LOOKUPS` | `crates/zakura-consensus/src/transaction.rs` | serial (`1`) → `64` per block transaction | [#918](https://github.com/zakura-core/zakura/pull/918) | Overlap external UTXO waits while bounding pending lookups per transaction. Concurrent lookups start their six-minute timeout clocks together. |
 | `MAX_MINED_SUBMISSIONS` | `crates/zakura-rpc/src/methods/types/submit_block.rs` | unbounded → `16` submissions | [#748](https://github.com/zakura-core/zakura/pull/748) | Bound detached verification work across RPC cancellation. |

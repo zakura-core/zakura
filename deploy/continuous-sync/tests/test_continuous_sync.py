@@ -39,6 +39,46 @@ alert_status = load_module("continuous_sync_alert_status", ALERT_STATUS_PATH)
 
 
 class ContinuousSyncTests(unittest.TestCase):
+    def test_archive_requires_expiration_and_preserves_traces(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(Path(tmp), policy=sync.Policy(archive_traces=True))
+            run_dir = Path(tmp) / "run"
+            traces = run_dir / "traces"
+            traces.mkdir(parents=True)
+            (traces / "events.jsonl").write_text('{"event":"test"}\n')
+            with patch.dict(os.environ, {"ZAKURA_TRACE_SPACE": "test",
+                                        "ZAKURA_TRACE_ENDPOINT": "https://nyc3.digitaloceanspaces.com"}), patch.object(
+                    sync, "run", return_value=subprocess.CompletedProcess([], 0, '{"Rules":[]}')):
+                with self.assertRaisesRegex(sync.ControllerError, "seven-day"):
+                    sync.archive_traces(config, run_dir, {})
+            self.assertTrue((traces / "events.jsonl").exists())
+
+    def test_archive_streams_compressed_traces_and_records_link(self):
+        import gzip
+        import tarfile
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(Path(tmp), policy=sync.Policy(archive_traces=True, hostname="host"))
+            run_dir = Path(tmp) / "run"
+            (run_dir / "traces").mkdir(parents=True)
+            (run_dir / "traces" / "events.csv").write_text("event\ntest\n")
+            uploaded = []
+            def upload(cmd, **kwargs):
+                uploaded.append(kwargs["stdin"].read())
+                return subprocess.CompletedProcess(cmd, 0)
+            state = {}
+            lifecycle = '{"Rules":[{"Status":"Enabled","Prefix":"sync-traces/","Expiration":{"Days":7}}]}'
+            with patch.dict(os.environ, {"ZAKURA_TRACE_SPACE": "test",
+                                        "ZAKURA_TRACE_ENDPOINT": "https://nyc3.digitaloceanspaces.com"}), patch.object(
+                    sync, "run", side_effect=[subprocess.CompletedProcess([], 0, lifecycle),
+                                               subprocess.CompletedProcess([], 0, "https://download")]), patch.object(
+                    sync.subprocess, "run", side_effect=upload):
+                sync.archive_traces(config, run_dir, state)
+            with tarfile.open(fileobj=io.BytesIO(gzip.decompress(uploaded[0]))) as archive:
+                self.assertEqual(archive.extractfile("traces/events.csv").read(), b"event\ntest\n")
+            self.assertEqual(state["trace_archive_url"], "https://download")
+            self.assertIn("https://download", deploy.completion_run_text(state))
+            self.assertTrue((run_dir / "traces" / "events.csv").exists())
+
     def test_metric_value_accepts_dotted_and_prometheus_names(self):
         metrics = "\n".join(
             [
@@ -1944,6 +1984,7 @@ class NotificationTests(unittest.TestCase):
                     self.assertEqual(history[-1], {
                         "number": 261, "run_id": state["current_run"], "duration": 0,
                         "end_height": 3469999,
+                        "trace_archive_url": None,
                     })
                     self.assertEqual(state["last_success_end_height"], 3469999)
                     self.assertEqual(state["completion_digest_start_runs"], 260)

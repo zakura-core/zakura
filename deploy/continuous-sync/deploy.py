@@ -775,13 +775,15 @@ def completion_run_text(item: dict[str, Any]) -> str:
     valid_duration = type(duration) is int and duration >= 0
     timing = (f"{duration // 3600}h {duration % 3600 // 60:02d}m"
               if valid_duration else "duration unavailable")
+    url = item.get("trace_archive_url")
+    download = f" · <{url}|Download traces (7 days)>" if url else ""
     height = item.get("end_height")
     if type(height) is not int or not 0 <= height <= 0xFFFFFFFF:
-        return f"{timing} · BPS unavailable"
+        return f"{timing} · BPS unavailable{download}"
     # Every cycle starts from empty chain state; height zero is genesis.
     blocks = height + 1
     rate = f"{blocks / duration:.0f} blocks/sec" if valid_duration and duration > 0 else "BPS unavailable"
-    return f"{timing} · {rate}"
+    return f"{timing} · {rate}{download}"
 
 
 def completion_updates(
@@ -818,6 +820,7 @@ def completion_updates(
         history[total] = {
             "run_id": run_id, "duration": controller.get("last_success_duration_seconds"),
             "end_height": controller.get("last_success_end_height"),
+            "trace_archive_url": controller.get("last_success_trace_archive_url"),
         }
         details = completion_details(old) + [history[number] for number in sorted(history)]
         records[name] = {
@@ -826,6 +829,7 @@ def completion_updates(
             "sha": controller.get("last_success_sha", "unknown"),
             "duration": controller.get("last_success_duration_seconds"),
             "end_height": controller.get("last_success_end_height"),
+            "trace_archive_url": controller.get("last_success_trace_archive_url"),
             "pending": old.get("pending", 0) + delta,
             "details": details[-COMPLETION_DETAIL_LIMIT:],
         }

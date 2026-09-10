@@ -75,6 +75,7 @@ class Policy:
     ready_samples: int = 6
     ready_sample_interval_seconds: int = 30
     min_free_bytes: int = 10 * 1024 * 1024 * 1024
+    archive_traces: bool = False
     retention_runs: int = 10
     retention_bytes: int = 20 * 1024**3
     trace_file_bytes: int = 128 * 1024**2
@@ -607,6 +608,62 @@ def wait_for_completion(
             time.sleep(config.policy.poll_interval_seconds)
 
 
+def archive_traces(config: Config, run_dir: Path, run_state: dict[str, Any]) -> None:
+    """Upload stopped-node traces before the controller can start another run."""
+    if not config.policy.archive_traces or run_state.get("trace_archive_url"):
+        return
+    traces = run_dir / "traces"
+    if not traces.exists():
+        return
+    bucket = os.environ.get("ZAKURA_TRACE_SPACE", "")
+    endpoint = os.environ.get("ZAKURA_TRACE_ENDPOINT", "")
+    if not bucket or not re.fullmatch(r"https://[a-z0-9-]+\.digitaloceanspaces\.com", endpoint):
+        raise ControllerError("set ZAKURA_TRACE_SPACE and ZAKURA_TRACE_ENDPOINT")
+    aws = ["aws", "--endpoint-url", endpoint, "--cli-connect-timeout", "30",
+           "--cli-read-timeout", "120"]
+    lifecycle = json.loads(run(aws + ["s3api", "get-bucket-lifecycle-configuration",
+                                    "--bucket", bucket], capture=True, timeout=180).stdout)
+    if not any(rule.get("Status") == "Enabled"
+               and rule.get("Expiration", {}).get("Days") == 7
+               and (rule.get("Prefix") == "sync-traces/"
+                    or rule.get("Filter") == {"Prefix": "sync-traces/"})
+               for rule in lifecycle.get("Rules", [])):
+        raise ControllerError("Space requires a seven-day sync-traces/ expiration rule")
+    host = re.sub(r"[^A-Za-z0-9_.-]", "_", config.policy.hostname)
+    key = f"sync-traces/{host}/{run_dir.name}.tar.gz"
+    uri = f"s3://{bucket}/{key}"
+    size = sum(path.stat().st_size for path in traces.rglob("*")
+               if path.is_file() and not path.is_symlink())
+    # Streaming avoids a second trace-sized allocation on the sync disk.
+    with subprocess.Popen(["tar", "-czf", "-", "-C", str(run_dir), "traces"],
+                          stdout=subprocess.PIPE) as compressor:
+        try:
+            result = subprocess.run(
+                aws + ["s3", "cp", "-", uri, "--only-show-errors", "--expected-size",
+                       str(size + size // 100 + 1024 * 1024)],
+                stdin=compressor.stdout, capture_output=True, timeout=21600,
+            )
+            compressor.stdout.close()
+            code = compressor.wait(timeout=120)
+            if result.returncode or code:
+                raise ControllerError("trace compression or upload failed; local traces retained")
+        finally:
+            if compressor.poll() is None:
+                compressor.kill()
+                compressor.wait()
+    url = run(aws + ["s3", "presign", uri, "--expires-in", "604800"],
+              capture=True, timeout=180).stdout.strip()
+    if not url.startswith("https://"):
+        raise ControllerError("Space returned an invalid download URL")
+    run_state.update(trace_archive_url=url, trace_archive_key=key)
+    write_run_json(run_dir, run_state)
+
+
+def trace_download_text(run_state: dict[str, Any]) -> str:
+    url = run_state.get("trace_archive_url")
+    return f" | <{url}|Download traces (7 days)>" if url else ""
+
+
 def cleanup_retention(
     config: Config, active_run: Path | None = None, *, recovery: bool = False
 ) -> None:
@@ -640,6 +697,8 @@ def cleanup_retention(
             continue
         if not isinstance(data, dict):
             continue
+        if child != active_run:
+            archive_traces(config, child, data)
         size = sum(path.stat().st_size for path in child.rglob("*")
                    if not path.is_symlink() and path.is_file())
         runs.append((data.get("phase"), str(data.get("started_at", "")), child, size))
@@ -674,7 +733,7 @@ def failure_text(config: Config, run_state: dict[str, Any], reason: str) -> str:
     return (
         f":rotating_light: Zakura failed: {p.hostname} | {policy_mode(p)} | "
         f"{ssh_target(p)} | time to failure: {duration} | height: {height_text} | "
-        f"reason: {short_reason(reason)}{run_text}"
+        f"reason: {short_reason(reason)}{run_text}{trace_download_text(run_state)}"
     )
 
 
@@ -777,6 +836,7 @@ def one_cycle(config: Config, state_path: Path, state: dict[str, Any]) -> dict[s
         }
     )
     write_run_json(run_dir, run_state)
+    archive_traces(config, run_dir, run_state)
     completion_history = state.get("completion_history", [])
     if not isinstance(completion_history, list):
         # Optional reporting history must not turn a successful sync into a halt.
@@ -790,12 +850,14 @@ def one_cycle(config: Config, state_path: Path, state: dict[str, Any]) -> dict[s
             "last_success_run": run_id,
             "last_success_duration_seconds": run_state["sync_duration_seconds"],
             "last_success_end_height": run_state.get("end_height"),
+            "last_success_trace_archive_url": run_state.get("trace_archive_url"),
             # Keep timings independently of run-log retention and audit cadence.
             "completion_history": (completion_history + [{
                 "number": int(state.get("runs", 0)) + 1,
                 "run_id": run_id,
                 "duration": run_state["sync_duration_seconds"],
                 "end_height": run_state.get("end_height"),
+                "trace_archive_url": run_state.get("trace_archive_url"),
             }])[-COMPLETION_HISTORY_LIMIT:],
             "completion_digest": True,
             "completion_digest_start_runs": state.get(
@@ -827,6 +889,11 @@ def halt(config: Config, state_path: Path, state: dict[str, Any], run_state: dic
     )
     run_dir = Path(str(run_state.get("run_dir") or config.paths.runs_dir / "unknown"))
     if run_dir.exists():
+        try:
+            archive_traces(config, run_dir, run_state)
+        except Exception as error:
+            run_state["trace_archive_error"] = str(error)
+            reason += f"; trace archive failed: {error}"
         write_run_json(run_dir, run_state)
     state.update(
         {

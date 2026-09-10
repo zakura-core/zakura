@@ -455,3 +455,34 @@ For a fresh Ubuntu x86_64 host:
   restarts.
 - Secrets are read from host env files or GitHub secrets and are never written to
   repository-managed templates.
+
+## Trace archives
+
+New controller deployments enable `policy.archive_traces`. Install the AWS CLI
+on each sync host. Set these values in `/etc/zakura-traces.env` (mode 0600):
+
+```sh
+ZAKURA_TRACE_SPACE=YOUR_SPACE
+ZAKURA_TRACE_ENDPOINT=https://YOUR_REGION.digitaloceanspaces.com
+AWS_DEFAULT_REGION=YOUR_REGION
+AWS_ACCESS_KEY_ID=YOUR_SPACES_KEY
+AWS_SECRET_ACCESS_KEY=YOUR_SPACES_SECRET
+```
+
+Apply `spaces-lifecycle.json` to a dedicated trace Space before enabling the
+controller. The following command replaces the Space's lifecycle configuration.
+For a shared Space, merge the supplied rule with its existing rules first.
+
+```sh
+aws --endpoint-url https://YOUR_REGION.digitaloceanspaces.com s3api put-bucket-lifecycle-configuration --bucket YOUR_SPACE --lifecycle-configuration file://deploy/continuous-sync/spaces-lifecycle.json
+```
+
+The controller verifies seven-day expiration before uploading. It streams gzip
+compressed tar archives into `sync-traces/<hostname>/<run-id>.tar.gz` after the
+node stops. Upload failures halt the next run and preserve local traces.
+Completion digests and failure alerts include private download links valid for
+seven days. Existing stopped runs are archived before retention can remove them.
+The lifecycle rule also removes abandoned multipart uploads after one day.
+
+See [Spaces lifecycle rules](https://docs.digitalocean.com/products/spaces/how-to/configure-lifecycle-rules/)
+and [private download links](https://docs.digitalocean.com/products/spaces/how-to/set-file-permissions/).

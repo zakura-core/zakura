@@ -512,6 +512,16 @@ where
                         }
                     };
 
+                    // The Zakura codec does not check that a response only holds
+                    // requested transactions. `poll_next` releases this task's
+                    // cancel handle and peer slot under the verified transaction's
+                    // ID, so a substituted transaction would leak them.
+                    if tx.id() != txid {
+                        return Err(TransactionDownloadVerifyError::DownloadFailed(
+                            BoxError::from("peer responded with an unrequested transaction").into(),
+                        ));
+                    }
+
                     metrics::counter!(
                         "mempool.downloaded.transactions.total",
                         "version" => format!("{}",tx.transaction().version()),
@@ -965,6 +975,53 @@ mod tests {
                 if error.0 == txid
                     && matches!(error.1, TransactionDownloadVerifyError::DownloadFailed(_))
         ));
+    }
+
+    /// A response that holds a different transaction is a download failure. The
+    /// requested ID's cancel handle and peer slot are released.
+    #[tokio::test]
+    async fn unrequested_transaction_response_is_download_failure() {
+        let requested = tx_id(7);
+        let source = QueueSource::Zakura(vec![7; 32]);
+        let mut downloads = Downloads::new(
+            BoxCloneService::new(service_fn(|_request| async move {
+                Ok::<_, BoxError>(zn::Response::Transactions(vec![
+                    zn::InventoryResponse::Available((empty_v5_transaction(1), None)),
+                ]))
+            })),
+            BoxCloneService::new(service_fn(|_request| async move {
+                panic!("unrequested transactions must not be verified");
+            })),
+            BoxCloneService::new(service_fn(|request| async move {
+                match request {
+                    zs::ReadRequest::Transaction(_) => Ok(zs::ReadResponse::Transaction(None)),
+                    zs::ReadRequest::Tip => Ok(zs::ReadResponse::Tip(None)),
+                    request => Err(format!("unexpected state request: {request:?}").into()),
+                }
+            })),
+            false,
+            u64::MAX,
+            PeerCooldowns::default(),
+        );
+
+        downloads
+            .download_if_needed_and_verify(Gossip::Id(requested), Some(source.clone()), None)
+            .expect("download is queued");
+
+        let result = tokio::time::timeout(Duration::from_secs(1), downloads.next())
+            .await
+            .expect("unrequested transaction response should complete")
+            .expect("download stream should yield an item")
+            .expect("unrequested transaction response should not time out");
+
+        assert!(matches!(
+            result,
+            Err(error)
+                if error.0 == requested
+                    && matches!(error.1, TransactionDownloadVerifyError::DownloadFailed(_))
+        ));
+        assert!(downloads.cancel_handles.is_empty());
+        assert!(!downloads.pending_per_peer.contains_key(&source));
     }
 
     #[tokio::test]

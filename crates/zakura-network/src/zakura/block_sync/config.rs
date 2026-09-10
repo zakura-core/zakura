@@ -75,12 +75,9 @@ pub const BS_CHECKPOINT_RANGE_BYTE_FLOOR: u64 =
     MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES as u64 * BS_PER_BLOCK_WORST_CASE_BYTES;
 /// Default block-sync request timeout.
 pub const DEFAULT_BS_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
-/// Default short leash on a floor (lowest-missing-height) request.
-///
-/// A floor request that has not been served within this window is rescued to a
-/// faster carrier (returned to the queue + the peer retry-avoided), never letting
-/// the contiguous download floor wait on a slow peer. Far tighter than the base
-/// `request_timeout`, which governs patient above-floor speculation instead.
+/// Base floor-rescue deadline after a fresh delivery-rate measurement. Estimated
+/// transfer time is added for this response and earlier unreceived responses.
+/// Unmeasured peers use the normal request timeout for their initial probe.
 pub const DEFAULT_BS_FLOOR_RESCUE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Request-timeout windows allowed before block-progress liveness parks a session.
 const BLOCK_PROGRESS_TIMEOUT_REQUESTS: u32 = 4;
@@ -102,6 +99,11 @@ pub const DEFAULT_BS_SIZE_DEVIATION_TOLERANCE: u32 = 200;
 /// remains independently bounded by `MAX_BS_MESSAGE_BYTES`. This aggregate cap
 /// only controls how many bounded body frames a server sends before `BlocksDone`.
 pub const MAX_BS_RESPONSE_BYTES: u32 = DEFAULT_BS_MAX_RESPONSE_BYTES;
+
+/// Encoded payload bytes in either terminal GetBlocks response message.
+pub const GET_BLOCKS_TERMINAL_PAYLOAD_BYTES: u64 = 9;
+
+const DEFAULT_GET_BLOCKS_NODE_ACTIVE_REQUESTS: usize = 64;
 
 /// Default steady-state cwnd gain, percent of the bandwidth-delay product. 300% ramps a
 /// proven peer up as `1 → 3 → 9 …`; the reliability discount and delay-gradient ceiling
@@ -233,7 +235,9 @@ pub struct ZakuraBlockSyncConfig {
     /// Initial per-peer BBR cwnd (cold-start point), in blocks; converges to the
     /// BDP-derived target once the first delivery is measured.
     pub initial_inflight_requests: u32,
-    /// Maximum total response bytes this node advertises per `GetBlocks` response.
+    /// Maximum serialized block bytes this node advertises per `GetBlocks` response.
+    /// Must be at least [`block::MAX_BLOCK_BYTES`] so any single valid block fits.
+    /// Message discriminators and the response terminator are reserved separately.
     pub max_response_bytes: u32,
     /// Maximum estimated bytes reserved for outstanding block-body requests: a
     /// DoS/pacing bound on in-flight wire data, released at receipt. Received
@@ -253,8 +257,10 @@ pub struct ZakuraBlockSyncConfig {
     /// Timeout for an outstanding block-body range request.
     #[serde(with = "humantime_serde")]
     pub request_timeout: Duration,
-    /// Short leash on a floor request before its height is rescued to a faster
-    /// carrier. Clamped positive and never above `request_timeout`.
+    /// Base deadline for a floor request when the peer has a fresh delivery-rate
+    /// measurement. Unmeasured peers use `request_timeout` to let their initial
+    /// probe finish. Both deadlines add estimated transfer time. Clamped positive
+    /// and never above `request_timeout`.
     #[serde(with = "humantime_serde")]
     pub floor_rescue_timeout: Duration,
     /// How long to withhold a block-sync session after it makes no accepted block progress.
@@ -316,6 +322,27 @@ pub struct ZakuraBlockSyncConfig {
     pub floor_bypass_slots: u32,
     /// Block-sync peer caps and queue limits owned by this service.
     pub peer_limits: ServicePeerLimits,
+    /// Resource policy for serving inbound `GetBlocks` requests.
+    pub get_blocks_regulation: GetBlocksRegulationConfig,
+}
+
+/// Node and peer bounds applied before GetBlocks state work starts.
+///
+/// Each session has one response producer, held through state work and transport
+/// writes. Node capacity returns when the last query, result, or frame owner drops.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct GetBlocksRegulationConfig {
+    /// State queries and responses that may remain active across all peers.
+    pub node_active_requests: usize,
+}
+
+impl Default for GetBlocksRegulationConfig {
+    fn default() -> Self {
+        Self {
+            node_active_requests: DEFAULT_GET_BLOCKS_NODE_ACTIVE_REQUESTS,
+        }
+    }
 }
 
 fn deserialize_ignored_replace_legacy_syncer<'de, D>(deserializer: D) -> Result<bool, D::Error>
@@ -359,6 +386,7 @@ impl Default for ZakuraBlockSyncConfig {
             bbr_cwnd_unit: CwndUnit::Bytes,
             floor_bypass_slots: DEFAULT_BS_FLOOR_BYPASS_SLOTS,
             peer_limits: ServicePeerLimits::default(),
+            get_blocks_regulation: GetBlocksRegulationConfig::default(),
         }
     }
 }
@@ -465,6 +493,7 @@ impl ZakuraBlockSyncConfig {
         if self.bbr_probe_rtt_interval <= self.bbr_probe_rtt_duration {
             return Err("bbr_probe_rtt_interval must exceed bbr_probe_rtt_duration");
         }
+        super::serving_regulation::validate_config(self)?;
         Ok(())
     }
 

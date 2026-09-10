@@ -4,8 +4,8 @@
 //! peer's `FramedRecv`. The task decodes each stream-6 frame and runs the download
 //! logic directly. The reactor does not demultiplex inbound frames or create a
 //! per-peer `PeerInput` channel. The routine sends only shared concerns to the
-//! reactor through [`RoutineToReactor`]. These concerns include `GetBlocks`
-//! serving, status advertisements, producer re-query pings, and serving-side
+//! reactor through [`RoutineToReactor`]. These concerns include
+//! status advertisements, producer re-query pings, and
 //! misbehavior. The routine owns its `BlockSyncPeerSession`, outstanding requests,
 //! adaptive outbound window, timeout-recovery slots, servable caps, and fill loop.
 //!
@@ -315,9 +315,9 @@ pub(super) struct PeerRoutine {
     sequencer_input: mpsc::Sender<SequencedBody>,
     sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
     sequencer_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
-    /// Shared routine-to-reactor channel for serving, status, re-query, and misbehavior events.
-    /// Bounded `try_send` prevents a busy reactor from stalling the transport decode loop.
+    /// Shared status, re-query, and misbehavior notifications use `try_send`.
     routine_to_reactor: mpsc::Sender<RoutineToReactor>,
+    /// Current download frontiers and reset authority.
     sequencer_view: watch::Receiver<SequencerView>,
     /// Last `reset_epoch` that this routine processed.
     /// A `view.changed()` event uses the epoch to distinguish a reset from an advance.
@@ -411,6 +411,22 @@ impl PeerRoutine {
     /// reject. A reject returns `Err(SinkReject::protocol(..))` so the supervised
     /// pipe tears the whole connection down.
     pub(super) async fn run(mut self) -> Result<(), SinkReject> {
+        let cancel = self.cancel.clone();
+        let result = tokio::select! {
+            biased;
+            () = cancel.cancelled() => Ok(()),
+            result = self.run_inner() => result,
+        };
+        // Transport cancels both roles when either closes. Settle the download
+        // policy even if cancellation interrupts a local capacity wait.
+        if result.is_ok() && self.recv.remotely_closed() {
+            self.handle_remote_stream_closed(Instant::now())
+        } else {
+            result
+        }
+    }
+
+    async fn run_inner(&mut self) -> Result<(), SinkReject> {
         // Local clones so the `Notified` futures below borrow these handles, not
         // `self` — `self.try_fill()` needs `&mut self` while the notifications are
         // pinned. The clones share the same underlying `Arc`, so the wakes still
@@ -463,7 +479,7 @@ impl PeerRoutine {
             tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => return Ok(()),
-                frame = self.recv.recv(), if outbound_queue_has_capacity => {
+                frame = self.recv.recv() => {
                     match frame {
                         // Decode the frame and run the download/serving dispatch
                         // in this same task. A protocol reject propagates out so
@@ -555,19 +571,11 @@ impl PeerRoutine {
 
         match msg {
             BlockSyncMessage::Status(status) => self.handle_status(status),
-            BlockSyncMessage::GetBlocks {
-                start_height,
-                count,
-            } => {
-                // Serving is reactor-owned (state query + driver). Forward the
-                // request; the reactor serves via the session clone it holds.
-                let _ = self
-                    .routine_to_reactor
-                    .try_send(RoutineToReactor::ServeGetBlocks {
-                        peer: self.peer.clone(),
-                        start_height,
-                        count,
-                    });
+            BlockSyncMessage::GetBlocks { .. } => {
+                return Err(SinkReject::protocol(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "GetBlocks belongs on the request stream",
+                )));
             }
             BlockSyncMessage::Block(block) => {
                 self.trace_wake("own_body");
@@ -646,6 +654,7 @@ impl PeerRoutine {
         // the remote's later Status retry arriving after this meter reopens.
         let send_reply = self.status_reply_meter.try_take(now);
         self.received_status = true;
+        self.session.mark_status_received();
         self.servable_low = status.servable_low;
         self.servable_high = status.servable_high;
         self.max_blocks_per_response =
@@ -1322,14 +1331,9 @@ impl PeerRoutine {
                     self.config.request_timeout,
                 ) =>
             {
-                // Outbound full but *only just* filled (< one `request_timeout` of
-                // continuous backpressure): plausibly transient local write congestion, not
-                // a dead peer. While outbound is full the select loop does not drain inbound
-                // frames (`if outbound_queue_has_capacity`), so a block the peer already sent
-                // may be waiting behind our write side. Grant one short, BOUNDED grace. This
-                // is the *only* liveness extension: a peer that stopped reading holds outbound
-                // full past `request_timeout`, falls through to the park arm, and is
-                // parked at the liveness deadline — it cannot dodge the timer.
+                // A briefly full outbound queue may mean our request has not
+                // reached the peer yet. Keep the existing bounded write grace;
+                // responses are read independently of that queue.
                 self.window
                     .extend_liveness_deadline(now, self.config.request_timeout);
                 Ok(())
@@ -1381,8 +1385,8 @@ impl PeerRoutine {
     /// regardless of `outstanding`, so parking here only moves the already
     /// scheduled outcome earlier. Frames are processed in-order in this task, so
     /// at EOF everything the peer sent has already been counted. The liveness
-    /// grace does not apply: it waits for in-flight frames stuck behind our full
-    /// outbound queue, and a closed stream has none.
+    /// grace does not apply: the peer closed its stream without answering the
+    /// requests we still own.
     fn handle_remote_stream_closed(&mut self, now: Instant) -> Result<(), SinkReject> {
         self.gc_skipped_outstanding();
         if self.window.outstanding.is_empty() && self.window.block_liveness_deadline.is_none() {

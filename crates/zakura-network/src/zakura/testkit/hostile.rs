@@ -1,6 +1,9 @@
 //! Raw peer harness for adversarial Zakura tests.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use iroh::endpoint::{Connection, Endpoint, RecvStream, SendStream, VarInt};
@@ -14,8 +17,8 @@ use crate::{
         ZakuraLocalLimits, ZakuraPeerId, FRAME_HEADER_BYTES, LEGACY_GOSSIP_VERSION, P2P_V2_ALPN,
         STREAM_PRELUDE_MAGIC, ZAKURA_BLOCK_SYNC_STREAM_VERSION, ZAKURA_CAP_HEADER_SYNC,
         ZAKURA_CAP_LEGACY_GOSSIP, ZAKURA_DISCOVERY_STREAM_VERSION,
-        ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_STREAM_DISCOVERY,
-        ZAKURA_STREAM_HEADER_SYNC,
+        ZAKURA_HEADER_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_REQUESTS, ZAKURA_STREAM_BLOCK_SYNC,
+        ZAKURA_STREAM_DISCOVERY, ZAKURA_STREAM_HEADER_SYNC,
     },
     BoxError, Config,
 };
@@ -26,6 +29,8 @@ pub struct HostilePeer {
     endpoint: Endpoint,
     connection: Connection,
     limits: ZakuraLocalLimits,
+    opens_block_pair: bool,
+    next_pair_id: AtomicU64,
     held_streams: Vec<SendStream>,
     ordered_streams: Mutex<HashMap<(u16, u16), (SendStream, RecvStream)>>,
 }
@@ -52,6 +57,7 @@ impl HostilePeer {
             .endpoint(seed)
             .await?;
         let victim_addr = victim.node_addr().await;
+        let opens_block_pair = endpoint.node_id() < victim_addr.node_id;
         endpoint.add_node_addr(victim_addr.clone())?;
         let connection = endpoint.connect(victim_addr, P2P_V2_ALPN).await?;
         let mut config = ZakuraHandshakeConfig::for_network(&Config::default().network);
@@ -63,6 +69,8 @@ impl HostilePeer {
             endpoint,
             connection,
             limits,
+            opens_block_pair,
+            next_pair_id: AtomicU64::new(1),
             held_streams: Vec::new(),
             ordered_streams: Mutex::new(HashMap::new()),
         })
@@ -128,6 +136,7 @@ impl HostilePeer {
                 | ZAKURA_STREAM_DISCOVERY
                 | ZAKURA_STREAM_HEADER_SYNC
                 | ZAKURA_STREAM_BLOCK_SYNC
+                | ZAKURA_STREAM_BLOCK_REQUESTS
         ) {
             return self.send_ordered_raw_frame(stream_kind, frame).await;
         }
@@ -157,6 +166,9 @@ impl HostilePeer {
         frame: Frame,
     ) -> Result<(), BoxError> {
         let mut streams = self.ordered_streams.lock().await;
+        if Self::is_block_pair_role(stream_kind, stream_version) {
+            self.ensure_block_pair(&mut streams).await?;
+        }
         let (send, _recv) = match streams.entry((stream_kind, stream_version)) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
@@ -184,6 +196,9 @@ impl HostilePeer {
         stream_version: u16,
     ) -> Result<Frame, BoxError> {
         let mut streams = self.ordered_streams.lock().await;
+        if Self::is_block_pair_role(stream_kind, stream_version) {
+            self.ensure_block_pair(&mut streams).await?;
+        }
         let (_send, recv) = match streams.entry((stream_kind, stream_version)) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
@@ -196,57 +211,113 @@ impl HostilePeer {
         Self::read_frame(recv, self.limits.max_frame_bytes).await
     }
 
-    /// Gracefully finish and forget one persistent ordered stream generation.
-    pub async fn finish_ordered_stream(
-        &self,
-        stream_kind: u16,
-        stream_version: u16,
-    ) -> Result<(), BoxError> {
-        let Some((mut send, _recv)) = self
-            .ordered_streams
-            .lock()
-            .await
-            .remove(&(stream_kind, stream_version))
-        else {
-            return Ok(());
-        };
-        send.finish()?;
-        Ok(())
+    fn is_block_pair_role(kind: u16, version: u16) -> bool {
+        (kind == ZAKURA_STREAM_BLOCK_SYNC && version == ZAKURA_BLOCK_SYNC_STREAM_VERSION)
+            || (kind == ZAKURA_STREAM_BLOCK_REQUESTS && version == 1)
     }
 
-    /// Reset and forget one persistent ordered stream generation.
-    pub async fn reset_ordered_stream(
+    // Use the same node-id opener as production. Raw fixtures do not run the
+    // handler's collision-selection loop, so only one endpoint offers a pair.
+    async fn ensure_block_pair(
         &self,
-        stream_kind: u16,
-        stream_version: u16,
+        streams: &mut HashMap<(u16, u16), (SendStream, RecvStream)>,
     ) -> Result<(), BoxError> {
-        let Some((mut send, mut recv)) = self
-            .ordered_streams
-            .lock()
-            .await
-            .remove(&(stream_kind, stream_version))
-        else {
+        let data = (ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_BLOCK_SYNC_STREAM_VERSION);
+        let requests = (ZAKURA_STREAM_BLOCK_REQUESTS, 1);
+        if streams.contains_key(&data) && streams.contains_key(&requests) {
             return Ok(());
-        };
-        let code = VarInt::from_u32(0);
-        send.reset(code)?;
-        recv.stop(code)?;
-        Ok(())
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            if self.opens_block_pair {
+                let pair_id = self.next_pair_id.fetch_add(1, Ordering::Relaxed);
+                for role in [data, requests] {
+                    let (mut send, recv) = self.connection.open_bi().await?;
+                    self.write_prelude_with_version(&mut send, role.0, role.1)
+                        .await?;
+                    send.write_all(&pair_id.to_le_bytes()).await?;
+                    streams.insert(role, (send, recv));
+                }
+                return Ok(());
+            }
+            let mut pair_id = None;
+            for _ in 0..16 {
+                let (mut send, mut recv) = self.connection.accept_bi().await?;
+                let prelude = Self::read_prelude(&mut recv).await?;
+                let role = (prelude.stream_kind, prelude.stream_version);
+                if role != data && role != requests {
+                    send.reset(0u32.into())?;
+                    recv.stop(0u32.into())?;
+                    continue;
+                }
+                let mut id = [0; 8];
+                recv.read_exact(&mut id).await?;
+                let id = u64::from_le_bytes(id);
+                if id == 0
+                    || pair_id.is_some_and(|previous| previous != id)
+                    || streams.contains_key(&role)
+                {
+                    return Err("victim opened an invalid block-sync pair".into());
+                }
+                pair_id = Some(id);
+                streams.insert(role, (send, recv));
+                if streams.contains_key(&data) && streams.contains_key(&requests) {
+                    return Ok(());
+                }
+            }
+            Err("victim did not open both block-sync roles".into())
+        })
+        .await?
     }
 
-    /// Replace one persistent ordered stream with a fresh physical generation.
-    pub async fn reopen_ordered_stream(
+    /// Finish a persistent stream, or both roles of its block-sync pair.
+    pub async fn finish_ordered_stream(&self, kind: u16, version: u16) -> Result<(), BoxError> {
+        self.retire_ordered_stream(kind, version, false).await
+    }
+
+    /// Reset a persistent stream, or both roles of its block-sync pair.
+    pub async fn reset_ordered_stream(&self, kind: u16, version: u16) -> Result<(), BoxError> {
+        self.retire_ordered_stream(kind, version, true).await
+    }
+
+    async fn retire_ordered_stream(
         &self,
-        stream_kind: u16,
-        stream_version: u16,
+        kind: u16,
+        version: u16,
+        reset: bool,
     ) -> Result<(), BoxError> {
-        self.reset_ordered_stream(stream_kind, stream_version)
-            .await?;
         let mut streams = self.ordered_streams.lock().await;
+        let roles = if Self::is_block_pair_role(kind, version) {
+            vec![
+                (ZAKURA_STREAM_BLOCK_SYNC, ZAKURA_BLOCK_SYNC_STREAM_VERSION),
+                (ZAKURA_STREAM_BLOCK_REQUESTS, 1),
+            ]
+        } else {
+            vec![(kind, version)]
+        };
+        for role in roles {
+            if let Some((mut send, mut recv)) = streams.remove(&role) {
+                if reset {
+                    send.reset(0u32.into())?;
+                    recv.stop(0u32.into())?;
+                } else {
+                    send.finish()?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Replace a persistent stream or pair with a fresh physical generation.
+    pub async fn reopen_ordered_stream(&self, kind: u16, version: u16) -> Result<(), BoxError> {
+        self.reset_ordered_stream(kind, version).await?;
+        let mut streams = self.ordered_streams.lock().await;
+        if Self::is_block_pair_role(kind, version) {
+            return self.ensure_block_pair(&mut streams).await;
+        }
         let (mut send, recv) = self.connection.open_bi().await?;
-        self.write_prelude_with_version(&mut send, stream_kind, stream_version)
+        self.write_prelude_with_version(&mut send, kind, version)
             .await?;
-        streams.insert((stream_kind, stream_version), (send, recv));
+        streams.insert((kind, version), (send, recv));
         Ok(())
     }
 
@@ -422,6 +493,20 @@ impl HostilePeer {
         stream_kind: u16,
         declared_payload_len: u32,
     ) -> Result<(), BoxError> {
+        if stream_kind == ZAKURA_STREAM_BLOCK_SYNC {
+            let mut streams = self.ordered_streams.lock().await;
+            self.ensure_block_pair(&mut streams).await?;
+            let (send, _) = streams
+                .get_mut(&(stream_kind, Self::stream_version(stream_kind)))
+                .unwrap();
+            let mut header = Vec::with_capacity(FRAME_HEADER_BYTES);
+            WriteBytesExt::write_u16::<LittleEndian>(&mut header, 3)?;
+            WriteBytesExt::write_u16::<LittleEndian>(&mut header, 0)?;
+            WriteBytesExt::write_u32::<LittleEndian>(&mut header, declared_payload_len)?;
+            send.write_all(&header).await?;
+            send.finish()?;
+            return Ok(());
+        }
         let (mut send, _recv) = self.connection.open_bi().await?;
         self.write_prelude(&mut send, stream_kind).await?;
         let mut header = Vec::with_capacity(FRAME_HEADER_BYTES);
@@ -486,6 +571,7 @@ impl HostilePeer {
             ZAKURA_STREAM_DISCOVERY => ZAKURA_DISCOVERY_STREAM_VERSION,
             ZAKURA_STREAM_HEADER_SYNC => ZAKURA_HEADER_SYNC_STREAM_VERSION,
             ZAKURA_STREAM_BLOCK_SYNC => ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+            ZAKURA_STREAM_BLOCK_REQUESTS => 1,
             _ => 1,
         }
     }

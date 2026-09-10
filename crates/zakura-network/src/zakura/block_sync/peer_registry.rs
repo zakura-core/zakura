@@ -595,9 +595,35 @@ impl PeerRegistry {
         }
     }
 
-    /// Remove a peer's entry entirely (disconnect/teardown/admission-reject).
+    /// Remove a peer only if this session is still current.
+    ///
+    /// For example, if session 10 disconnects after the peer reconnects as
+    /// session 11, cleanup for session 10 must leave session 11 in the registry.
+    pub(super) fn remove_session(&self, peer: &ZakuraPeerId, session_id: u64) {
+        let mut peers = self.lock();
+        if peers
+            .get(peer)
+            .is_some_and(|entry| entry.generation == session_id)
+        {
+            peers.remove(peer);
+        }
+    }
+
+    /// Remove a unit-test peer injected without a session ID.
+    #[cfg(test)]
     pub(super) fn remove(&self, peer: &ZakuraPeerId) {
         self.lock().remove(peer);
+    }
+
+    /// Check whether this is still the peer's current session.
+    ///
+    /// A generation is the session ID assigned when a peer joins the registry.
+    /// Serving checks it before accepting work, so a request from an old session
+    /// cannot be accepted through a newer connection to the same peer.
+    pub(super) fn owns_generation(&self, peer: &ZakuraPeerId, generation: u64) -> bool {
+        self.lock()
+            .get(peer)
+            .is_some_and(|entry| entry.generation == generation)
     }
 
     /// Publish a freshly-applied `Status` (routine-side, inverted inbound flow): grow

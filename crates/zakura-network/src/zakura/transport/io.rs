@@ -5,8 +5,6 @@
 //! per-kind message-rate buckets, and idle freshness updates in its stream workers
 //! before frames reach these handles.
 
-#![allow(dead_code)] // guarded producers are activated by the next chunks
-
 use tokio::sync::mpsc;
 
 use super::Frame;

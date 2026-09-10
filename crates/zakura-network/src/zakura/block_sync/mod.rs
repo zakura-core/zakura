@@ -5,7 +5,7 @@
 //! commit pipeline, the registry, and the reactor.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet},
     io::{self, Cursor, Read, Write},
     sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
@@ -46,6 +46,8 @@ mod request;
 mod sequencer;
 mod sequencer_task;
 mod service;
+mod serving;
+mod serving_regulation;
 mod state;
 #[cfg(test)]
 mod tests;
@@ -64,7 +66,10 @@ pub use bench::{
 };
 #[cfg(test)]
 pub(crate) use config::MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;
-pub use config::{BlockSyncStatus, CwndUnit, ZakuraBlockSyncConfig, MAX_BS_RESPONSE_BYTES};
+pub use config::{
+    BlockSyncStatus, CwndUnit, GetBlocksRegulationConfig, ZakuraBlockSyncConfig,
+    MAX_BS_RESPONSE_BYTES,
+};
 pub use error::BlockSyncWireError;
 pub use events::{
     BlockApplyOutcome, BlockApplyResult, BlockApplyToken, BlockSyncAction, BlockSyncBlockMeta,
@@ -78,11 +83,13 @@ pub use service::BlockSyncPeerSession;
 pub(crate) use service::BlockSyncService;
 #[cfg(test)]
 pub(crate) use service::MAX_BS_FRAME_BYTES;
+pub use serving::{BlockRangeRead, BlockRangeReadResult, BlockRangeSource};
 pub use state::{BlockSyncFrontiers, BlockSyncHandle, BlockSyncStartup};
 pub use wire::{
     BlockSyncMessage, MAX_BS_BLOCKS_PER_REQUEST, MAX_BS_MESSAGE_BYTES, MSG_BS_BLOCK,
     MSG_BS_BLOCKS_DONE, MSG_BS_GET_BLOCKS, MSG_BS_RANGE_UNAVAILABLE, MSG_BS_STATUS,
-    ZAKURA_BLOCK_SYNC_STREAM_VERSION, ZAKURA_CAP_BLOCK_SYNC, ZAKURA_STREAM_BLOCK_SYNC,
+    ZAKURA_BLOCK_SYNC_STREAM_VERSION, ZAKURA_CAP_BLOCK_SYNC, ZAKURA_STREAM_BLOCK_REQUESTS,
+    ZAKURA_STREAM_BLOCK_SYNC,
 };
 
 #[cfg(test)]
@@ -145,3 +152,5 @@ pub(crate) fn test_block_apply_outcome(result: BlockApplyResult) -> BlockApplyOu
         }
     }
 }
+
+pub use serving_regulation::BlockRangeReadLease;

@@ -5,6 +5,8 @@ mod block_sync_peer;
 mod blocksync_fuzz;
 mod clock;
 mod cluster;
+#[cfg(test)]
+mod download_peer;
 mod endpoint;
 mod gossip;
 mod hostile;
@@ -21,6 +23,8 @@ mod wait;
 pub use block_sync_peer::{SyntheticBlockSyncPeer, SyntheticBlockSyncPeers};
 pub use clock::{Clock, RealClock, TestClock};
 pub use cluster::{ClusterTopology, ZakuraTestCluster};
+#[cfg(test)]
+pub(crate) use download_peer::DownloadOnlyPeer;
 pub use endpoint::LocalEndpointFactory;
 pub use gossip::GossipNode;
 pub use hostile::HostilePeer;

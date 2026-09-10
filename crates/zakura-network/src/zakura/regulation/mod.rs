@@ -1,5 +1,3 @@
-#![allow(dead_code, unused_imports)] // activated by the serving migration
-
 //! Shared admission and ownership for native Zakura message policies.
 //!
 //! Finite request policies supply their codec and response bound. The shared

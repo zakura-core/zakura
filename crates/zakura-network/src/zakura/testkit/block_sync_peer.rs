@@ -9,9 +9,10 @@ use tokio::time::{timeout, Duration};
 use tokio_util::sync::CancellationToken;
 
 use crate::zakura::{
-    framed_channel, BlockSyncHandle, BlockSyncMessage, BlockSyncService, BlockSyncStatus,
-    FramedRecv, FramedSend, Peer, Service, ServicePeerDirection, ZakuraBlockSyncConfig,
-    ZakuraPeerId, ZAKURA_CAP_BLOCK_SYNC, ZAKURA_STREAM_BLOCK_SYNC,
+    framed_channel, transport::ServiceStream, BlockSyncHandle, BlockSyncMessage, BlockSyncService,
+    BlockSyncStatus, CloseCause, FramedRecv, FramedSend, Peer, Service, ServicePeerDirection,
+    ZakuraBlockSyncConfig, ZakuraPeerId, ZAKURA_BLOCK_SYNC_STREAM_VERSION, ZAKURA_CAP_BLOCK_SYNC,
+    ZAKURA_STREAM_BLOCK_REQUESTS, ZAKURA_STREAM_BLOCK_SYNC,
 };
 
 /// A connected synthetic block-sync peer backed by in-memory stream channels.
@@ -19,7 +20,9 @@ use crate::zakura::{
 pub struct SyntheticBlockSyncPeer {
     peer_id: ZakuraPeerId,
     inbound: FramedSend,
+    requests: FramedSend,
     outbound: FramedRecv,
+    outgoing_requests: FramedRecv,
     cancel: CancellationToken,
 }
 
@@ -32,13 +35,22 @@ impl SyntheticBlockSyncPeer {
     /// Queue a real stream-6 message as inbound peer traffic to the node.
     pub async fn send(&self, msg: BlockSyncMessage) -> Result<(), crate::BoxError> {
         let frame = msg.encode_frame()?;
-        self.inbound.send(frame).await?;
+        let sender = if matches!(msg, BlockSyncMessage::GetBlocks { .. }) {
+            &self.requests
+        } else {
+            &self.inbound
+        };
+        sender.send(frame).await?;
         Ok(())
     }
 
     /// Receive the next real stream-6 message sent by the node to this peer.
     pub async fn recv(&mut self) -> Result<Option<BlockSyncMessage>, crate::BoxError> {
-        let Some(frame) = self.outbound.recv().await else {
+        let frame = tokio::select! {
+            frame = self.outbound.recv() => frame,
+            frame = self.outgoing_requests.recv() => frame,
+        };
+        let Some(frame) = frame else {
             return Ok(None);
         };
         Ok(Some(BlockSyncMessage::decode_frame(frame)?))
@@ -85,22 +97,46 @@ impl SyntheticBlockSyncPeers {
     ) -> Result<SyntheticBlockSyncPeer, crate::BoxError> {
         let (inbound_tx, inbound_rx) = framed_channel(self.queue_depth);
         let (outbound_tx, outbound_rx) = framed_channel(self.queue_depth);
+        // These channels also stand in for QUIC's receive buffering. Real QUIC
+        // gates separately check the one-frame application request queues.
+        let (requests, request_recv) = framed_channel(self.queue_depth);
+        let (request_send, outgoing_requests) = framed_channel(self.queue_depth);
         let cancel = CancellationToken::new();
-        let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
+        let session_cancel = cancel.child_token();
+        let streams = HashMap::from([
+            (
+                ZAKURA_STREAM_BLOCK_SYNC,
+                ServiceStream::new(
+                    0,
+                    ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+                    inbound_rx,
+                    outbound_tx,
+                    session_cancel.clone(),
+                ),
+            ),
+            (
+                ZAKURA_STREAM_BLOCK_REQUESTS,
+                ServiceStream::new(0, 1, request_recv, request_send, session_cancel),
+            ),
+        ]);
 
-        self.service.add_peer(Peer::new_with_direction(
+        self.service.add_peer(Peer::new_with_service_streams(
+            0,
             peer_id.clone(),
             None,
             ZAKURA_CAP_BLOCK_SYNC,
             ServicePeerDirection::Outbound,
             streams,
             cancel.clone(),
+            CloseCause::new(),
         ));
 
         let peer = SyntheticBlockSyncPeer {
             peer_id,
             inbound: inbound_tx,
+            requests,
             outbound: outbound_rx,
+            outgoing_requests,
             cancel,
         };
         peer.send(BlockSyncMessage::Status(status)).await?;

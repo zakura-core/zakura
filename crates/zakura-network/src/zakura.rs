@@ -88,17 +88,21 @@ pub struct ServicePeerLimits {
     pub max_inbound_peers: usize,
     /// Maximum outbound peers this service admits.
     pub max_outbound_peers: usize,
-    /// Inbound queue depth reserved for this service.
+    /// Maximum inbound frames queued on each service stream.
     ///
-    /// Reserved for future transport queue wiring; not enforced in this phase.
+    /// Block sync applies this limit alongside the negotiated transport limit.
+    /// Its paired request stream always uses a single queue slot.
     pub inbound_queue_depth: usize,
-    /// Outbound queue depth reserved for this service.
+    /// Maximum outbound frames queued on each service stream.
     ///
-    /// Reserved for future transport queue wiring; not enforced in this phase.
+    /// Block sync applies this limit alongside the transport limit. Its paired
+    /// request stream always uses a single queue slot.
     pub outbound_queue_depth: usize,
-    /// Maximum service escalations that may be pending admission.
+    /// Maximum paired service sessions that may be establishing at once.
     ///
-    /// Reserved for future lazy service escalation; not enforced in this phase.
+    /// Paired block sync reserves this allowance until both roles arrive or
+    /// setup ends. Zero disables new paired sessions. Other services currently
+    /// use their existing admission policy.
     pub max_pending_escalations: usize,
 }
 

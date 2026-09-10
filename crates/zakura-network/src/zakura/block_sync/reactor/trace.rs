@@ -303,24 +303,6 @@ impl BlockSyncReactor {
         });
     }
 
-    pub(super) fn trace_range_response_sent(
-        &self,
-        peer: &ZakuraPeerId,
-        response: RangeResponseTrace,
-    ) {
-        self.emit_block(bs_trace::BLOCK_RANGE_RESPONSE_SENT, |row| {
-            row.peer = Some(super::super::trace::peer(peer));
-            row.range_start = Some(height(response.start_height));
-            row.range_count = Some(u64::from(response.sent_count));
-            row.expected_count = Some(u64::from(response.requested_count));
-            row.serialized_bytes = Some(response.sent_bytes);
-            row.reason = Some(response.reason);
-            row.prepare_elapsed_ms = response.prepare_elapsed.map(elapsed_ms);
-            row.send_elapsed_ms = Some(elapsed_ms(response.send_elapsed));
-            row.elapsed_ms = response.total_elapsed.map(elapsed_ms);
-        });
-    }
-
     /// Trace a WorkQueue producer extend (heights newly added to `pending`).
     pub(super) fn trace_work_extended(&self, inserted: usize) {
         if !self.startup.trace.is_enabled() {

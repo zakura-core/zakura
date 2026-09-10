@@ -20,6 +20,7 @@ Subcommands:
              (cumulative per-stage duration histograms).
 """
 
+import csv
 import argparse
 import csv
 import json
@@ -366,7 +367,7 @@ def nearest_rank(sorted_values, quantile):
 
 
 def parse_commit_trace(trace_path, min_height=None):
-    """Parse commit_state.jsonl into block, header-range, and stall records.
+    """Parse a JSONL or CSV commit trace into block, header-range, and stall records.
 
     The trace table is shared by two drivers: the block-sync driver (per-block
     `block_submit_queued`/`commit_start`/`commit_finish` rows keyed by height,
@@ -380,10 +381,24 @@ def parse_commit_trace(trace_path, min_height=None):
     headers = []
     stalls = defaultdict(int)
     non_committed = defaultdict(int)
-    with open(trace_path, encoding="utf-8", errors="replace") as trace:
-        for line in trace:
+    with open(trace_path, encoding="utf-8", errors="replace", newline="") as trace:
+        is_csv = Path(trace_path).suffix == ".csv"
+        records = csv.DictReader(trace) if is_csv else trace
+        for line in records:
             try:
-                row = json.loads(line)
+                if is_csv:
+                    row = {}
+                    for key, value in line.items():
+                        if not value:
+                            continue
+                        if key == "extra":
+                            row.update(json.loads(value))
+                        else:
+                            row[key] = json.loads(value) if key in {
+                                "ts", "height", "range_start", "range_count", "elapsed_ms"
+                            } else value
+                else:
+                    row = json.loads(line)
             except ValueError:
                 continue
             event = row.get("event")
@@ -459,7 +474,9 @@ def cmd_latency(args):
     if observed_blocks is not None:
         report["observed_blocks"] = observed_blocks
 
-    trace_path = Path(args.traces, "commit_state.jsonl") if args.traces else None
+    trace_path = Path(args.traces, "commit_state.csv") if args.traces else None
+    if trace_path is not None and not trace_path.exists():
+        trace_path = trace_path.with_suffix(".jsonl")
     if trace_path and trace_path.is_file():
         queued_ts, start_ts, finishes, headers, stalls, non_committed = (
             parse_commit_trace(trace_path, getattr(args, "min_height", None))
@@ -720,7 +737,7 @@ def main():
     stat.add_argument("--title", default="CPU")
 
     latency = sub.add_parser("latency", help="markdown block-latency digest")
-    latency.add_argument("--traces", default="", help="dir with commit_state.jsonl")
+    latency.add_argument("--traces", default="", help="dir with commit_state.csv or commit_state.jsonl")
     latency.add_argument("--metrics", default="", help="final /metrics text snapshot")
     latency.add_argument("--metrics-baseline", default="", help="optional starting /metrics snapshot")
     latency.add_argument("--min-height", type=int, help="ignore trace rows below this height")

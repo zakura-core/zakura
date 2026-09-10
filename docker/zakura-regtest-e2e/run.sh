@@ -270,13 +270,13 @@ trace_dir_has_jsonl() {
 assert_trace_layout() {
   local missing=0
   for file in \
-    node1/commit_state.jsonl \
+    node1/commit_state.csv \
     node1/block_sync.jsonl \
     node1/header_sync.jsonl \
-    node2/commit_state.jsonl \
+    node2/commit_state.csv \
     node2/block_sync.jsonl \
     node2/header_sync.jsonl \
-    node4/commit_state.jsonl \
+    node4/commit_state.csv \
     node4/block_sync.jsonl \
     node4/header_sync.jsonl
   do
@@ -296,7 +296,7 @@ assert_trace_layout() {
 # them. The writer (zakura-jsonl-trace) flushes on a ~17s timer / 256 KiB, and
 # production zakurad never flushes on shutdown, so a trace read right after the
 # final commits has a buffered tail. We require two things to be on disk:
-#   1. commit_state.jsonl: every commit_start has a matching commit_finish
+#   1. commit_state.csv: every commit_start has a matching commit_finish
 #      (guards commit_start_has_finish / checkpoint_to_full_handoff_observed).
 #   2. block_sync.jsonl: the last block_sync_state row is drained, i.e.
 #      applying+budget_reserved+reorder+outstanding == 0 (guards
@@ -311,7 +311,7 @@ wait_for_trace_flush() {
   while (( SECONDS < deadline )); do
     pending=0
     for node in node1 node2 node4; do
-      file="${ZAKURA_E2E_TRACE_DIR}/${node}/commit_state.jsonl"
+      file="${ZAKURA_E2E_TRACE_DIR}/${node}/commit_state.csv"
       if [[ -s "${file}" ]]; then
         starts=$(grep -c 'commit_start' "${file}" 2>/dev/null || true)
         finishes=$(grep -c 'commit_finish' "${file}" 2>/dev/null || true)
@@ -344,7 +344,7 @@ wait_for_trace_flush() {
 
 wait_for_commit_trace_balance() {
   local node="$1" label="$2"
-  local file="${ZAKURA_E2E_TRACE_DIR}/${node}/commit_state.jsonl"
+  local file="${ZAKURA_E2E_TRACE_DIR}/${node}/commit_state.csv"
   local deadline=$((SECONDS + TRACE_FLUSH_TIMEOUT)) starts finishes
 
   [[ -s "${file}" ]] || fail "${label} commit trace is missing"

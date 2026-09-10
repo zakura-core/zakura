@@ -1,3 +1,4 @@
+import csv
 import importlib.util
 import io
 import json
@@ -240,6 +241,23 @@ class LatencyTests(unittest.TestCase):
 
     def write_trace(self, tmp, rows):
         (Path(tmp) / "commit_state.jsonl").write_text("\n".join(rows) + "\n")
+
+    def test_csv_trace_matches_jsonl(self):
+        rows = block_lifecycle(1707211, queued_ts=100, start_ts=300,
+                               finish_ts=1000000, elapsed_ms=1000)
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_trace(tmp, rows)
+            path = Path(tmp) / "commit_state.jsonl"
+            expected = digest.parse_commit_trace(path)
+            with path.with_suffix(".csv").open("w", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=["ts", "event", "height", "extra"])
+                writer.writeheader()
+                for line in rows:
+                    value = json.loads(line)
+                    record = {key: value.pop(key) for key in writer.fieldnames[:-1] if key in value}
+                    record["extra"] = json.dumps(value)
+                    writer.writerow(record)
+            self.assertEqual(digest.parse_commit_trace(path.with_suffix(".csv")), expected)
 
     def test_checkpoint_residence_with_takeaway_and_header_ranges(self):
         rows = []

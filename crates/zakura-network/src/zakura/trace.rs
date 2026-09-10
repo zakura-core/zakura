@@ -127,8 +127,30 @@ pub const BLOCK_SYNC_TABLE: ZakuraTraceTable =
     ZakuraTraceTable::new("block_sync", "block_sync.jsonl");
 
 /// Zakurad adapter boundary events for commits, state reads, and frontier mirrors.
-pub const COMMIT_STATE_TABLE: ZakuraTraceTable =
-    ZakuraTraceTable::new("commit_state", "commit_state.jsonl");
+pub const COMMIT_STATE_TABLE: ZakuraTraceTable = ZakuraTraceTable::csv(
+    "commit_state",
+    "commit_state.csv",
+    &[
+        "event",
+        "source",
+        "action",
+        "peer",
+        "reason",
+        "range_start",
+        "range_count",
+        "height",
+        "hash",
+        "apply_token",
+        "best_header_tip",
+        "elapsed_ms",
+        "result",
+        "requested_count",
+        "apply_class",
+        "local_frontier",
+        "queue_len",
+        "in_flight_count",
+    ],
+);
 
 /// Failed non-blocking outbound queue sends for Zakura wire messages.
 pub const QUEUE_SEND_TABLE: ZakuraTraceTable =

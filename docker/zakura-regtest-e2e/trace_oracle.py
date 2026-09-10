@@ -15,6 +15,7 @@ standard library so it can run from CI failure traps.
 
 from __future__ import annotations
 
+import csv
 import argparse
 import json
 import sys
@@ -257,6 +258,24 @@ def compact_row(row: TraceRow | None) -> dict[str, Any] | None:
 
 
 def read_jsonl(path: Path, node: str, table: str) -> list[TraceRow]:
+    csv_path = path.with_suffix(".csv")
+    if csv_path.exists():
+        rows = []
+        numeric = {"ts", "range_start", "range_count", "height", "apply_token",
+                   "best_header_tip", "elapsed_ms", "requested_count", "local_frontier",
+                   "queue_len", "in_flight_count"}
+        with csv_path.open(newline="", encoding="utf-8") as handle:
+            for index, record in enumerate(csv.DictReader(handle), start=1):
+                value = {}
+                for key, field in record.items():
+                    if not field:
+                        continue
+                    if key == "extra":
+                        value.update(json.loads(field))
+                    else:
+                        value[key] = json.loads(field) if key in numeric else field
+                rows.append(TraceRow(node, table, index, value))
+        return rows
     if not path.exists():
         return []
 
@@ -318,6 +337,7 @@ def load_traces(root: Path) -> list[NodeTrace]:
 
 
 def trace_files() -> Iterable[str]:
+    yield "commit_state.csv"
     yield "commit_state.jsonl"
     yield "block_sync.jsonl"
     yield "header_sync.jsonl"
@@ -1705,6 +1725,21 @@ def run_self_test() -> None:
             f.invariant == "final_block_sync_state_has_no_leaks"
             for f in run_oracle(root / "optional_lag_leak", OracleOptions(optional_lag_nodes=("node4",)))
         )
+
+        # The same commit fixture must produce the same oracle result in CSV.
+        jsonl_path = good / "commit_state.jsonl"
+        original = read_jsonl(jsonl_path, "node1", "commit_state")
+        with jsonl_path.with_suffix(".csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=["ts", "event", "height", "hash", "extra"])
+            writer.writeheader()
+            for row in original:
+                values = dict(row.row)
+                record = {key: values.pop(key) for key in writer.fieldnames[:-1] if key in values}
+                record["extra"] = json.dumps(values)
+                writer.writerow(record)
+        csv_rows = read_jsonl(jsonl_path, "node1", "commit_state")
+        assert [row.row for row in csv_rows] == [row.row for row in original]
+        assert not run_oracle(root / "good")
 
     print("trace_oracle self-test: PASS")
 

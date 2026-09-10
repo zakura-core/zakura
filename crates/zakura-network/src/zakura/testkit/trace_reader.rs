@@ -1,4 +1,4 @@
-//! Post-flush JSONL trace reader for Zakura tests.
+//! Post-flush JSONL and CSV trace reader for Zakura tests.
 
 use std::{
     fs,
@@ -43,7 +43,7 @@ pub enum TraceValue<'a> {
 }
 
 impl TraceReader {
-    /// Load all `*.jsonl` files in `path` and one level of per-node
+    /// Load all `*.jsonl` and `*.csv` files in `path` and one level of per-node
     /// subdirectories.
     pub fn load(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref();
@@ -95,7 +95,10 @@ impl TraceReader {
         for entry in files {
             let path = entry.path();
             if !entry.file_type()?.is_file()
-                || path.extension().and_then(|ext| ext.to_str()) != Some("jsonl")
+                || !matches!(
+                    path.extension().and_then(|ext| ext.to_str()),
+                    Some("jsonl" | "csv")
+                )
             {
                 continue;
             }
@@ -112,6 +115,60 @@ impl TraceReader {
             .and_then(|name| name.to_str())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid trace file name"))?
             .to_string();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("csv") {
+            let mut reader = csv::Reader::from_path(path)?;
+            let headers = reader.headers()?.clone();
+            for record in reader.records() {
+                let record = record?;
+                let mut row = serde_json::Map::new();
+                for (column, value) in headers.iter().zip(record.iter()) {
+                    if value.is_empty() {
+                        continue;
+                    }
+                    if column == "extra" {
+                        let extra: serde_json::Map<String, Value> = serde_json::from_str(value)
+                            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                        row.extend(extra);
+                    } else {
+                        // CSV carries no type metadata. Keep identity and label columns textual.
+                        let value = if matches!(
+                            column,
+                            "ts" | "request_id"
+                                | "peer_id"
+                                | "peer_start_height"
+                                | "local_tip_height"
+                                | "elapsed_ms"
+                                | "hash_count"
+                                | "inferred_start_height"
+                                | "inferred_end_height"
+                                | "returned_height"
+                                | "range_start"
+                                | "range_count"
+                                | "height"
+                                | "apply_token"
+                                | "best_header_tip"
+                                | "requested_count"
+                                | "local_frontier"
+                                | "queue_len"
+                                | "in_flight_count"
+                        ) {
+                            serde_json::from_str(value).map_err(|error| {
+                                io::Error::new(io::ErrorKind::InvalidData, error)
+                            })?
+                        } else {
+                            Value::String(value.to_owned())
+                        };
+                        row.insert(column.to_owned(), value);
+                    }
+                }
+                self.rows.push(TraceRow {
+                    table: table.clone(),
+                    source_node: source_node.clone(),
+                    row: Value::Object(row),
+                });
+            }
+            return Ok(());
+        }
         let file = fs::File::open(path)?;
 
         for line in io::BufReader::new(file).lines() {
@@ -256,6 +313,38 @@ fn source_node_from_dir(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reader_loads_csv_numbers_labels_and_quoted_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut writer =
+            csv::Writer::from_path(dir.path().join("commit_state.csv")).expect("CSV file");
+        writer
+            .write_record(["node", "event", "height", "hash", "reason", "extra"])
+            .expect("header");
+        writer
+            .write_record([
+                "01",
+                "commit_finish",
+                "42",
+                "1234",
+                "error, with\na newline",
+                r#"{"new_count":7}"#,
+            ])
+            .expect("row");
+        writer.flush().expect("flush");
+        let reader = TraceReader::load(dir.path()).expect("CSV reader");
+        reader.table("commit_state").assert_row(
+            "commit_finish",
+            &[
+                ("node", TraceValue::Str("01")),
+                ("height", TraceValue::U64(42)),
+                ("hash", TraceValue::Str("1234")),
+                ("reason", TraceValue::Str("error, with\na newline")),
+                ("new_count", TraceValue::U64(7)),
+            ],
+        );
+    }
 
     #[test]
     fn reader_counts_and_matches_subsequences_within_a_table() {

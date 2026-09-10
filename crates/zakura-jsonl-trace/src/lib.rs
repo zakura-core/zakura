@@ -49,7 +49,7 @@ pub const DEFAULT_FILE_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 pub const NODE_ID_ENV: &str = "ZEBRA_NODE_ID";
 
 /// Envelope columns written for every trace row, in output order.
-pub const ENVELOPE_COLUMNS: &[&str] = &["ts", "wall_ts", "node"];
+pub const ENVELOPE_COLUMNS: &[&str] = &["ts", "wall_ts", "node", "process_trace_id"];
 
 /// Trailing CSV column carrying any fields missing from a table's declared header.
 ///
@@ -1219,14 +1219,18 @@ mod tests {
         let fields = csv_fields(&line);
         let header = String::from_utf8(render_csv_header(CSV_TABLE.header())).expect("utf-8");
 
-        assert_eq!(header, "ts,wall_ts,node,event,value,optional,extra");
+        assert_eq!(
+            header,
+            "ts,wall_ts,node,process_trace_id,event,value,optional,extra"
+        );
         assert_eq!(fields.len(), csv_fields(&header).len());
         assert_eq!(fields[2], "node-csv");
-        assert_eq!(fields[3], "csv_event");
-        assert_eq!(fields[4], "7");
+        assert_eq!(fields[3], process_trace_id());
+        assert_eq!(fields[4], "csv_event");
+        assert_eq!(fields[5], "7");
         // `None` renders as an empty field, which DuckDB and pandas read as null.
-        assert_eq!(fields[5], "");
         assert_eq!(fields[6], "");
+        assert_eq!(fields[7], "");
     }
 
     #[test]
@@ -1248,9 +1252,9 @@ mod tests {
         let fields = csv_fields(&line);
 
         assert_eq!(fields[2], "n1");
-        assert_eq!(fields[3], "7");
-        assert_eq!(fields[4], "2");
-        assert_eq!(fields[5], "", "no undeclared fields remain");
+        assert_eq!(fields[4], "7");
+        assert_eq!(fields[5], "2");
+        assert_eq!(fields[6], "", "no undeclared fields remain");
     }
 
     #[test]
@@ -1264,9 +1268,9 @@ mod tests {
         let line = String::from_utf8(render_csv_row(TABLE.header(), row)).expect("utf-8");
         let fields = csv_fields(&line);
 
-        assert_eq!(fields[3], "known");
+        assert_eq!(fields[4], "known");
         assert_eq!(
-            serde_json::from_str::<Value>(&fields[4]).expect("extra holds a JSON object"),
+            serde_json::from_str::<Value>(&fields[5]).expect("extra holds a JSON object"),
             serde_json::json!({"added_later": 9}),
             "a field the header does not name must survive, not vanish"
         );
@@ -1299,10 +1303,10 @@ mod tests {
         );
 
         let fields = csv_fields(&line);
-        assert_eq!(fields[3], "peer:1");
-        assert_eq!(fields[4], "a,b");
-        assert_eq!(fields[5], "say \"hi\"");
-        assert_eq!(fields[6], "[1,2]", "arrays are stored as embedded JSON");
+        assert_eq!(fields[4], "peer:1");
+        assert_eq!(fields[5], "a,b");
+        assert_eq!(fields[6], "say \"hi\"");
+        assert_eq!(fields[7], "[1,2]", "arrays are stored as embedded JSON");
     }
 
     #[tokio::test]
@@ -1336,7 +1340,7 @@ mod tests {
         let lines: Vec<_> = written.lines().collect();
 
         assert_eq!(lines.len(), 3, "one header plus two rows: {written}");
-        assert_eq!(lines[0], "ts,wall_ts,node,event,extra");
+        assert_eq!(lines[0], "ts,wall_ts,node,process_trace_id,event,extra");
         assert_eq!(lines[1], "1,t,n,run0,");
         assert_eq!(
             lines[2], "1,t,n,run1,",

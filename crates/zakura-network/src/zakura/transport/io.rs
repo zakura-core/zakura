@@ -4,6 +4,10 @@
 //! stream frames. The transport applies each stream's declared `Stream::frame_cap`,
 //! per-kind message-rate buckets, and idle freshness updates in its stream workers
 //! before frames reach these handles.
+//!
+//! A persistent service session closes after every application stream handle is
+//! dropped and each member's queued writes finish. A retained receiver or sender
+//! clone keeps the session alive. Transport failures still cancel all members.
 
 use tokio::sync::mpsc;
 

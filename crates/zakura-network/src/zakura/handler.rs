@@ -4130,6 +4130,7 @@ async fn persistent_stream_worker(
         outbound_rx,
         queue_depth_limit,
         None,
+        None,
     )
     .await;
 }
@@ -4144,6 +4145,7 @@ async fn persistent_stream_worker_with_policy(
     outbound_rx: FramedWorkerRecv,
     queue_depth_limit: usize,
     failure_cause: Option<OrderedStreamFailureCause>,
+    application_drain: Option<Arc<tokio::sync::Barrier>>,
 ) {
     let context = Arc::new(context);
     let stream_kind = prelude.stream_kind;
@@ -4258,10 +4260,17 @@ async fn persistent_stream_worker_with_policy(
             _ = context.connection_token.cancelled() => break,
             _ = context.stream_token.cancelled() => break,
             _ = inbound_closed.closed(), if outbound_rx.is_none() => {
-                // Both application halves are gone and every queued write
-                // finished. A FIN preserves those writes in QUIC's send buffer.
-                let _ = send.finish();
                 drained = true;
+                // An idle member must not cancel another member's queued writes
+                // or retained application handles. Faults still interrupt draining.
+                if let Some(barrier) = &application_drain {
+                    tokio::select! {
+                        biased;
+                        _ = context.connection_token.cancelled() => {},
+                        _ = context.stream_token.cancelled() => {},
+                        _ = barrier.wait() => {},
+                    }
+                }
                 break;
             }
             outbound = async {
@@ -4349,7 +4358,10 @@ async fn persistent_stream_worker_with_policy(
     }
 
     // Never leave a partial frame followed by a graceful FIN.
-    if !drained {
+    if drained {
+        // A FIN preserves completed writes in QUIC's send buffer.
+        let _ = send.finish();
+    } else {
         let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_NEUTRAL));
     }
     context.stream_token.cancel();

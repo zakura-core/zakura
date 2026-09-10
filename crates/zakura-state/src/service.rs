@@ -72,6 +72,7 @@ use crate::{
 };
 
 pub mod block_iter;
+mod block_range;
 pub mod chain_tip;
 pub mod watch_receiver;
 
@@ -91,6 +92,7 @@ pub mod arbitrary;
 #[cfg(test)]
 mod tests;
 
+pub use block_range::OwnedBlockRange;
 pub use finalized_state::{OutputLocation, TransactionIndex, TransactionLocation};
 use write::NonFinalizedWriteMessage;
 pub use write::{VctRootRepairState, VctRootRepairStatus};

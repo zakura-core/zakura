@@ -1,0 +1,14 @@
+[Unit]
+Description=Deliver the Zakura daily mainnet sync summary
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=/etc/zakura-alerts.env
+ExecStart=/usr/bin/python3 /opt/zakura-sync-summary/daily_summary.py run
+StateDirectory=zakura-sync-summary
+StateDirectoryMode=0700
+UMask=0077
+TimeoutStartSec=90

@@ -584,9 +584,11 @@ impl ChainTipChange {
         Some(tip_action)
     }
 
-    /// Sets the `last_change_hash` as the provided hash.
+    /// Marks delivery only while the hash remains the current tip.
     pub fn mark_last_change_hash(&mut self, hash: block::Hash) {
-        self.last_change_hash = Some(hash);
+        if self.latest_chain_tip.best_tip_hash() == Some(hash) {
+            self.last_change_hash = Some(hash);
+        }
     }
 
     /// Clone this monitor for another async task in the same long-running service.

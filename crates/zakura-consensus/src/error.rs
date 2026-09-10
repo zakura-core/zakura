@@ -546,9 +546,15 @@ impl TransactionError {
             | OrchardProofSize
             | IronwoodProofSize
             | WrongConsensusBranchId
-            | MissingConsensusBranchId
-            | LockedUntilAfterBlockHeight(_)
-            | LockedUntilAfterBlockTime(_) => 100,
+            | MissingConsensusBranchId => 100,
+
+            // Lock-time finality is checked against the local next-block height
+            // and median-time-past, so a transaction that is final for the
+            // sender can be non-final on a node whose tip or chain time lags
+            // slightly behind. Like zcashd, treat non-final transactions as
+            // premature rather than malicious: reject them without a peer
+            // penalty.
+            LockedUntilAfterBlockHeight(_) | LockedUntilAfterBlockTime(_) => 0,
 
             // NU6.2 mempool transactions are invalid under NU6.3 rules, but
             // honest peers can relay them briefly while their chain tips converge.
@@ -618,6 +624,20 @@ mod tests {
             TransactionError::RedPallas(zakura_chain::primitives::reddsa::Error::InvalidSignature),
         ] {
             assert_eq!(error.mempool_misbehavior_score(), 100);
+        }
+    }
+
+    /// Non-final lock times depend on the local tip height and chain time, so
+    /// they are not evidence of peer misconduct.
+    #[test]
+    fn lock_time_errors_have_no_misbehavior_score() {
+        for error in [
+            TransactionError::LockedUntilAfterBlockHeight(block::Height(1_000_000)),
+            TransactionError::LockedUntilAfterBlockTime(
+                DateTime::from_timestamp(1_000_000_000, 0).expect("timestamp is valid"),
+            ),
+        ] {
+            assert_eq!(error.mempool_misbehavior_score(), 0);
         }
     }
 

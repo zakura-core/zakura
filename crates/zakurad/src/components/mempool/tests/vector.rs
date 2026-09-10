@@ -61,6 +61,27 @@ fn policy_rejection_has_no_misbehavior_score() {
     );
 }
 
+/// Non-final lock-time rejections depend on the local tip height and chain
+/// time, so they must not add a misbehavior score to the sending peer.
+#[test]
+fn nonfinal_lock_time_rejections_have_no_misbehavior_score() {
+    let advertiser_addr = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
+
+    for consensus_error in [
+        TransactionError::LockedUntilAfterBlockHeight(zakura_chain::block::Height(1_000_000)),
+        TransactionError::LockedUntilAfterBlockTime(
+            chrono::DateTime::from_timestamp(1_000_000_000, 0).expect("timestamp is valid"),
+        ),
+    ] {
+        let invalid_error = TransactionDownloadVerifyError::Invalid {
+            error: consensus_error,
+            advertiser_addr: Some(advertiser_addr),
+        };
+
+        assert_eq!(transaction_misbehavior(&invalid_error), None);
+    }
+}
+
 #[test]
 fn invalid_shielded_proof_sizes_ban_mempool_peers() {
     let advertiser_addr = PeerSocketAddr::from(([203, 0, 113, 7], 8233));

@@ -29,7 +29,7 @@ use std::{
     collections::{HashMap, HashSet},
     pin::Pin,
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use futures::{
@@ -59,7 +59,10 @@ use crate::components::{
     sync::{BLOCK_DOWNLOAD_TIMEOUT, BLOCK_VERIFY_TIMEOUT},
 };
 
-use super::{queue_source_log_label, storage::NonStandardTransactionError, MempoolError};
+use super::{
+    peer_cooldown::PeerCooldowns, queue_source_log_label, storage::NonStandardTransactionError,
+    MempoolError,
+};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -165,6 +168,9 @@ pub enum TransactionDownloadVerifyError {
         error: zakura_consensus::error::TransactionError,
         advertiser_addr: Option<PeerSocketAddr>,
     },
+
+    #[error("transaction was served by a peer in a transaction cooldown")]
+    PeerCoolingDown,
 }
 
 /// Represents a [`Stream`] of download and verification tasks.
@@ -198,6 +204,9 @@ where
 
     /// The maximum serialized size of a transaction accepted into the mempool.
     max_transaction_bytes: u64,
+
+    /// Peers whose transactions are not verified, shared with the mempool.
+    peer_cooldowns: PeerCooldowns,
 
     // Internal downloads state
     /// A list of pending transaction download and verify tasks.
@@ -340,6 +349,7 @@ where
     /// `state` is used to check if transactions are already in the state.
     /// `expose_peer_addresses` controls whether legacy peer labels are unredacted.
     /// `max_transaction_bytes` limits the serialized size of accepted transactions.
+    /// `peer_cooldowns` lists the peers whose transactions are not verified.
     ///
     /// The [`Downloads`] stream is agnostic to the network policy, so retry and
     /// timeout limits should be applied to the `network` service passed into
@@ -350,6 +360,7 @@ where
         state: ZS,
         expose_peer_addresses: bool,
         max_transaction_bytes: u64,
+        peer_cooldowns: PeerCooldowns,
     ) -> Self {
         Self {
             network,
@@ -357,6 +368,7 @@ where
             state,
             expose_peer_addresses,
             max_transaction_bytes,
+            peer_cooldowns,
             pending: FuturesUnordered::new(),
             cancel_handles: HashMap::new(),
             pending_per_peer: HashMap::new(),
@@ -439,6 +451,7 @@ where
         let download_source = source.as_ref().and_then(peer_source_from_queue_source);
         let pushed_advertiser_addr = source.as_ref().and_then(advertiser_addr_from_queue_source);
         let max_transaction_bytes = self.max_transaction_bytes;
+        let peer_cooldowns = self.peer_cooldowns.clone();
 
         let gossiped_tx_req = gossiped_tx.clone();
 
@@ -516,6 +529,14 @@ where
             };
 
             trace!(?txid, "got tx");
+
+            // A peer can enter a cooldown after this download was queued, and
+            // the crawler queues downloads without checking the cooldowns.
+            let is_cooling_down = advertiser_addr
+                .is_some_and(|addr| peer_cooldowns.is_cooling_down(addr.ip(), Instant::now()));
+            if is_cooling_down {
+                return Err(TransactionDownloadVerifyError::PeerCoolingDown);
+            }
 
             let result = verifier
                 .oneshot(tx::Request::Mempool {
@@ -804,6 +825,7 @@ mod tests {
             })),
             false,
             u64::MAX,
+            PeerCooldowns::default(),
         )
     }
 
@@ -873,6 +895,7 @@ mod tests {
             })),
             false,
             u64::MAX,
+            PeerCooldowns::default(),
         );
 
         downloads
@@ -923,6 +946,7 @@ mod tests {
             })),
             false,
             u64::MAX,
+            PeerCooldowns::default(),
         );
 
         downloads
@@ -982,6 +1006,7 @@ mod tests {
             })),
             false,
             max_transaction_bytes,
+            PeerCooldowns::default(),
         );
 
         downloads
@@ -1035,6 +1060,7 @@ mod tests {
             })),
             false,
             max_bytes,
+            PeerCooldowns::default(),
         );
 
         downloads
@@ -1118,6 +1144,7 @@ mod tests {
             })),
             false,
             max_bytes,
+            PeerCooldowns::default(),
         );
 
         downloads
@@ -1174,6 +1201,7 @@ mod tests {
             })),
             false,
             u64::MAX,
+            PeerCooldowns::default(),
         );
 
         downloads
@@ -1204,6 +1232,67 @@ mod tests {
                 } if addr == peer_addr
             ),
             "expected the pushed transaction failure to carry the peer address, got {error:?}"
+        );
+    }
+
+    /// A transaction served by a peer in a cooldown must not be verified, even
+    /// when the crawler queued it without a peer source, and even when the
+    /// cooldown started after the download was queued.
+    #[tokio::test]
+    async fn transaction_served_by_cooling_down_peer_is_not_verified() {
+        let peer_addr = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
+        let transaction = empty_v5_transaction(1);
+        let txid = transaction.id();
+        let peer_cooldowns = PeerCooldowns::default();
+
+        let served_transaction = transaction.clone();
+        let mut downloads = Downloads::new(
+            BoxCloneService::new(service_fn(move |request| {
+                let transaction = served_transaction.clone();
+                async move {
+                    assert!(
+                        matches!(request, zn::Request::TransactionsById(_)),
+                        "unexpected network request: {request:?}"
+                    );
+                    Ok::<_, BoxError>(zn::Response::Transactions(vec![
+                        zn::InventoryResponse::Available((transaction, Some(peer_addr))),
+                    ]))
+                }
+            })),
+            BoxCloneService::new(service_fn(|_request| async move {
+                panic!("transactions from a cooling down peer must not be verified");
+            })),
+            BoxCloneService::new(service_fn(|request| async move {
+                match request {
+                    zs::ReadRequest::Transaction(_) => Ok(zs::ReadResponse::Transaction(None)),
+                    zs::ReadRequest::Tip => Ok(zs::ReadResponse::Tip(None)),
+                    request => Err(format!("unexpected state request: {request:?}").into()),
+                }
+            })),
+            false,
+            u64::MAX,
+            peer_cooldowns.clone(),
+        );
+
+        downloads
+            .download_if_needed_and_verify(Gossip::Id(txid), None, None)
+            .expect("download is queued");
+
+        // The current-thread runtime has not run the download task yet.
+        peer_cooldowns.record_invalid_transaction(peer_addr.ip(), Instant::now());
+
+        let result = tokio::time::timeout(Duration::from_secs(1), downloads.next())
+            .await
+            .expect("download should complete")
+            .expect("download stream should yield an item")
+            .expect("download should not time out");
+
+        let error = result
+            .expect_err("a transaction from a cooling down peer should not be accepted")
+            .1;
+        assert!(
+            matches!(error, TransactionDownloadVerifyError::PeerCoolingDown),
+            "expected a peer cooldown error, got {error:?}"
         );
     }
 }

@@ -5,8 +5,8 @@ use tower::ServiceExt;
 
 use super::{
     downloads::TransactionDownloadVerifyError, error::MempoolError, queue_source_log_label,
-    storage::Storage, transaction_error_peer_log_label, ActiveState, InboundTxDownloads, Mempool,
-    Request,
+    storage::Storage, transaction_cooldown_peer, transaction_error_peer_log_label, ActiveState,
+    InboundTxDownloads, Mempool, Request,
 };
 use crate::{
     components::sync::{RecentSyncLengths, SyncStatus},
@@ -52,6 +52,91 @@ fn transaction_error_peer_log_labels_require_explicit_opt_in() {
     assert_eq!(
         transaction_error_peer_log_label(&error, true).as_deref(),
         Some("legacy:192.0.2.1:8233")
+    );
+}
+
+#[test]
+fn lock_time_and_maturity_failures_start_no_cooldown() {
+    use std::{collections::HashMap, sync::Arc};
+
+    use chrono::{TimeZone, Utc};
+    use zakura_chain::{
+        block::Height,
+        parameters::{Network, NetworkUpgrade},
+        transaction::{Hash, LockTime},
+    };
+    use zakura_consensus::{error::TransactionError, transaction::check};
+
+    let peer = "192.0.2.1:8233".parse().expect("valid test socket");
+    let invalid = |error| TransactionDownloadVerifyError::Invalid {
+        error,
+        advertiser_addr: Some(peer),
+    };
+
+    assert_eq!(
+        transaction_cooldown_peer(&invalid(TransactionError::WrongVersion)),
+        Some(peer)
+    );
+
+    // A spend of a coinbase output created at height 1, one block later.
+    let outpoint = transparent::OutPoint::from_usize(Hash([0; 32]), 0);
+    let spend = Arc::new(Transaction::V5 {
+        network_upgrade: NetworkUpgrade::Nu5,
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height(0),
+        inputs: vec![transparent::Input::PrevOut {
+            outpoint,
+            unlock_script: transparent::Script::new(&[]),
+            sequence: 0,
+        }],
+        outputs: Vec::new(),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+    });
+    let coinbase_utxo = transparent::Utxo::new(
+        transparent::Output::new(Amount::zero(), transparent::Script::new(&[])),
+        Height(1),
+        true,
+    );
+    let immature_spend = check::tx_transparent_coinbase_spends_maturity(
+        &Network::Mainnet,
+        spend,
+        Height(2),
+        Arc::new(HashMap::new()),
+        &HashMap::from([(outpoint, coinbase_utxo)]),
+    )
+    .expect_err("the coinbase output is immature at height 2");
+    assert_eq!(
+        transaction_cooldown_peer(&invalid(immature_spend.clone())),
+        None,
+        "{immature_spend:?}"
+    );
+
+    // Checked against this node's tip, which can lag the peer's tip.
+    let lock_times = [
+        TransactionError::LockedUntilAfterBlockHeight(Height(100)),
+        TransactionError::LockedUntilAfterBlockTime(
+            Utc.timestamp_opt(1_700_000_000, 0)
+                .single()
+                .expect("valid test timestamp"),
+        ),
+    ];
+    for error in lock_times {
+        assert_ne!(error.mempool_misbehavior_score(), 0, "{error:?}");
+        assert_eq!(
+            transaction_cooldown_peer(&invalid(error.clone())),
+            None,
+            "{error:?}"
+        );
+    }
+
+    // Unattributed failures start nothing.
+    assert_eq!(
+        transaction_cooldown_peer(&TransactionDownloadVerifyError::Invalid {
+            error: TransactionError::WrongVersion,
+            advertiser_addr: None,
+        }),
+        None
     );
 }
 

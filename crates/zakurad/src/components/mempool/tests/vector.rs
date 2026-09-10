@@ -254,6 +254,93 @@ async fn invalid_peer_transaction_starts_a_cooldown_instead_of_a_ban() -> Result
     Ok(())
 }
 
+/// The crawler queues transactions without a peer source, and the peer set
+/// routes their downloads to the peer that listed them. The mempool must not
+/// verify a transaction that a cooling down peer serves, and must not reject
+/// it, so another peer can still relay it.
+#[tokio::test(flavor = "multi_thread")]
+async fn crawled_transaction_from_cooling_down_peer_is_not_verified() -> Result<(), Report> {
+    let network = Network::Mainnet;
+    let transaction = network
+        .unmined_transactions_in_blocks(1..=1)
+        .next()
+        .expect("mainnet test vectors contain an unmined transaction")
+        .transaction
+        .clone();
+    let transaction_id = transaction.id();
+    let cooling_down_peer = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
+    let other_peer = PeerSocketAddr::from(([198, 51, 100, 9], 8233));
+
+    let (
+        mut mempool,
+        mut peer_set,
+        _state_service,
+        _chain_tip_change,
+        mut tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup(&network, u64::MAX, true).await;
+    mempool.enable(&mut recent_syncs).await;
+    mempool
+        .peer_cooldowns
+        .record_invalid_transaction(cooling_down_peer.ip(), std::time::Instant::now());
+
+    for (serving_peer, is_verified) in [(cooling_down_peer, false), (other_peer, true)] {
+        mempool
+            .ready()
+            .await
+            .expect("mempool service becomes ready")
+            .call(Request::Queue(vec![transaction_id.into()]))
+            .await
+            .expect("mempool service queues the crawled transaction");
+
+        peer_set
+            .expect_request_that(|request| {
+                matches!(request, zn::Request::TransactionsById(ids) if ids.contains(&transaction_id))
+            })
+            .await
+            .respond(zn::Response::Transactions(vec![
+                zn::InventoryResponse::Available((transaction.clone(), Some(serving_peer))),
+            ]));
+
+        if is_verified {
+            tx_verifier
+                .expect_request_that(|request| {
+                    matches!(
+                        request,
+                        tx::Request::Mempool { transaction, .. } if transaction.id() == transaction_id
+                    )
+                })
+                .await
+                .respond(Err(TransactionError::WrongVersion));
+        }
+
+        timeout(Duration::from_secs(3), async {
+            while mempool
+                .tx_downloads()
+                .transaction_requests()
+                .any(|request| request.id() == transaction_id)
+            {
+                mempool.dummy_call().await;
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("crawled transaction download should finish");
+
+        if !is_verified {
+            tx_verifier.expect_no_requests().await;
+        }
+        assert_eq!(
+            mempool.storage().contains_rejected(&transaction_id),
+            is_verified,
+            "only a verified transaction reaches the rejection cache"
+        );
+    }
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn cached_size_policy_rejection_is_a_transaction_result() -> Result<(), Report> {
     let network = Network::Mainnet;
@@ -2780,6 +2867,7 @@ async fn cancel_handles_drained_after_verification_timeout() {
     use crate::components::mempool::{
         crawler::RATE_LIMIT_DELAY,
         downloads::{Downloads, TRANSACTION_DOWNLOAD_TIMEOUT, TRANSACTION_VERIFY_TIMEOUT},
+        peer_cooldown::PeerCooldowns,
     };
 
     let _init_guard = zakura_test::init();
@@ -2795,6 +2883,7 @@ async fn cancel_handles_drained_after_verification_timeout() {
         state,
         false,
         u64::MAX,
+        PeerCooldowns::default(),
     ));
 
     let mut iter = Network::Mainnet.unmined_transactions_in_blocks(1..=10);

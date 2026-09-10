@@ -4,15 +4,23 @@
 //! chain: its tip can lag the relaying peer's tip, or sit on the other side of a
 //! network upgrade activation. The failure is then not evidence that the peer
 //! misbehaved. So the mempool never bans a peer for an invalid transaction.
-//! Instead, it ignores that peer's transaction advertisements for a while.
+//! Instead, it ignores that peer's transactions for a while. Lock time and
+//! coinbase maturity failures only depend on the tip, so they start no
+//! cooldown.
 //!
-//! A cooldown still bounds the verification work a malicious peer can cause: each
-//! IP address gets roughly one invalid transaction verified per cooldown, plus the
-//! transactions it already had in flight. Repeated failures double the cooldown.
+//! A cooldown still bounds the verification work a malicious peer can cause.
+//! During a cooldown, the mempool ignores the peer's advertisements, and the
+//! download tasks do not verify transactions the peer serves, including
+//! transactions the crawler requested. Only the peer's transactions that were
+//! already in verification when the cooldown started still get verified. That
+//! is up to `MAX_INBOUND_CONCURRENCY_PER_PEER` advertised or pushed
+//! transactions, or up to `MAX_INBOUND_CONCURRENCY` transactions the crawler
+//! requested. Repeated failures double the cooldown.
 
 use std::{
     collections::HashMap,
     net::IpAddr,
+    sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 
@@ -35,9 +43,12 @@ pub const MAX_COOLDOWN: Duration = Duration::from_secs(2 * 60 * 60);
 pub const MAX_COOLDOWN_PEERS: usize = 20_000;
 
 /// Per-IP transaction cooldowns.
-#[derive(Debug, Default)]
+///
+/// Clones share the same cooldowns, so the mempool and its download tasks see
+/// the same state.
+#[derive(Clone, Debug, Default)]
 pub struct PeerCooldowns {
-    peers: HashMap<IpAddr, Cooldown>,
+    peers: Arc<Mutex<HashMap<IpAddr, Cooldown>>>,
 }
 
 /// One IP address's cooldown history.
@@ -58,9 +69,9 @@ impl Cooldown {
 }
 
 impl PeerCooldowns {
-    /// Returns true if transaction advertisements from `ip` should be ignored at `now`.
+    /// Returns true if transactions from `ip` should be ignored at `now`.
     pub fn is_cooling_down(&self, ip: IpAddr, now: Instant) -> bool {
-        self.peers
+        self.peers()
             .get(&ip.to_canonical())
             .is_some_and(|cooldown| now < cooldown.until)
     }
@@ -70,14 +81,15 @@ impl PeerCooldowns {
     /// Returns the length of the cooldown this failure started, or `None` if
     /// `ip` was already cooling down. Failures during a cooldown come from
     /// transactions queued before it started, so they do not add strikes.
-    pub fn record_invalid_transaction(&mut self, ip: IpAddr, now: Instant) -> Option<Duration> {
+    pub fn record_invalid_transaction(&self, ip: IpAddr, now: Instant) -> Option<Duration> {
         let ip = ip.to_canonical();
+        let mut peers = self.peers();
 
-        if !self.peers.contains_key(&ip) && self.peers.len() >= MAX_COOLDOWN_PEERS {
-            self.evict(now);
+        if !peers.contains_key(&ip) && peers.len() >= MAX_COOLDOWN_PEERS {
+            evict(&mut peers, now);
         }
 
-        let cooldown = self.peers.entry(ip).or_insert(Cooldown {
+        let cooldown = peers.entry(ip).or_insert(Cooldown {
             until: now,
             strikes: 0,
         });
@@ -97,32 +109,37 @@ impl PeerCooldowns {
         Some(length)
     }
 
-    /// Makes room for one new IP address.
-    ///
-    /// Drops forgotten histories first. If the map is still full, drops the
-    /// history whose cooldown ended earliest.
-    fn evict(&mut self, now: Instant) {
-        self.peers
-            .retain(|_ip, cooldown| !cooldown.is_forgotten(now));
-
-        if self.peers.len() < MAX_COOLDOWN_PEERS {
-            return;
-        }
-
-        if let Some(earliest) = self
-            .peers
-            .iter()
-            .min_by_key(|(_ip, cooldown)| cooldown.until)
-            .map(|(ip, _cooldown)| *ip)
-        {
-            self.peers.remove(&earliest);
-        }
-    }
-
     /// Returns the number of IP addresses with a cooldown history.
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.peers.len()
+        self.peers().len()
+    }
+
+    /// Locks the cooldowns.
+    fn peers(&self) -> MutexGuard<'_, HashMap<IpAddr, Cooldown>> {
+        self.peers
+            .lock()
+            .expect("no code panics while holding the peer cooldowns lock")
+    }
+}
+
+/// Makes room in `peers` for one new IP address.
+///
+/// Drops forgotten histories first. If the map is still full, drops the
+/// history whose cooldown ended earliest.
+fn evict(peers: &mut HashMap<IpAddr, Cooldown>, now: Instant) {
+    peers.retain(|_ip, cooldown| !cooldown.is_forgotten(now));
+
+    if peers.len() < MAX_COOLDOWN_PEERS {
+        return;
+    }
+
+    if let Some(earliest) = peers
+        .iter()
+        .min_by_key(|(_ip, cooldown)| cooldown.until)
+        .map(|(ip, _cooldown)| *ip)
+    {
+        peers.remove(&earliest);
     }
 }
 

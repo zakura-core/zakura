@@ -127,8 +127,8 @@ type InboundTxDownloads = TxDownloads<Timeout<Outbound>, Timeout<TxVerifier>, Re
 /// Returns the peer to put in a transaction cooldown for `error`, if any.
 ///
 /// Only consensus failures that would otherwise count as peer misbehavior
-/// start a cooldown. Policy rejections, duplicate spends, and failures without
-/// a legacy advertiser address do not.
+/// start a cooldown. Policy rejections, duplicate spends, lock time failures,
+/// and failures without a legacy advertiser address do not.
 fn transaction_cooldown_peer(error: &TransactionDownloadVerifyError) -> Option<PeerSocketAddr> {
     let TransactionDownloadVerifyError::Invalid {
         error,
@@ -138,7 +138,16 @@ fn transaction_cooldown_peer(error: &TransactionDownloadVerifyError) -> Option<P
         return None;
     };
 
-    (error.mempool_misbehavior_score() != 0).then_some(*advertiser_addr)
+    // Lock times are checked against this node's tip, which can lag the relaying
+    // peer's tip. The verifier checks them before any proof or script, so a peer
+    // that triggers them costs little.
+    let is_lock_time = matches!(
+        error,
+        TransactionError::LockedUntilAfterBlockHeight(_)
+            | TransactionError::LockedUntilAfterBlockTime(_)
+    );
+
+    (!is_lock_time && error.mempool_misbehavior_score() != 0).then_some(*advertiser_addr)
 }
 
 /// The state of the mempool.
@@ -312,8 +321,9 @@ pub struct Mempool {
     /// Used to broadcast transaction ids to peers.
     transaction_sender: broadcast::Sender<MempoolChange>,
 
-    /// Peers whose transaction advertisements are ignored after they relayed
-    /// invalid transactions. Kept across mempool resets and deactivations.
+    /// Peers whose transactions are ignored after they relayed invalid
+    /// transactions. Shared with the download tasks, and kept across mempool
+    /// resets and deactivations.
     peer_cooldowns: peer_cooldown::PeerCooldowns,
 
     // Diagnostics
@@ -442,6 +452,7 @@ impl Mempool {
             self.read_state.clone(),
             self.expose_peer_addresses,
             self.config.max_transaction_bytes,
+            self.peer_cooldowns.clone(),
         ));
         self.active_state = ActiveState::Enabled {
             storage: storage::Storage::new(&self.config),
@@ -791,6 +802,10 @@ impl Service<Request> for Mempool {
                             ) => metrics::counter!(
                                 "mempool.rejected.transactions.total",
                                 "reason" => "transaction_too_large"
+                            )
+                            .increment(1),
+                            TransactionDownloadVerifyError::PeerCoolingDown => metrics::counter!(
+                                "mempool.peer_cooldown.ignored.transactions.total"
                             )
                             .increment(1),
                             _ => metrics::counter!(

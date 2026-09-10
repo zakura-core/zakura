@@ -14,6 +14,8 @@ import unittest
 from pathlib import Path
 from typing import Any
 
+import spentness_release
+
 CHECKPOINTS = Path("crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt")
 FRONTIER = Path("crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin")
 PROVENANCE = Path("crates/zakura-state/src/service/finalized_state/vct/mainnet-vct-manifest.json")
@@ -310,6 +312,19 @@ def import_bundle(
     subtree_bytes = _prepare_subtree_import(repo_root, bundle, bundle_height)
     grid_bytes = _prepare_frontier_grid_import(previous_frontier_grid, bundle, bundle_height)
 
+    spentness = None
+    meta_path = bundle / "meta.json"
+    if meta_path.exists():
+        meta_bytes = meta_path.read_bytes()
+        if hashlib.sha256(meta_bytes).hexdigest() != resolution["meta_sha256"]:
+            raise BundleImportError("bundle metadata differs from resolution digest")
+        meta = json.loads(meta_bytes)
+        if meta.get("schema_version") == 2:
+            try:
+                spentness = spentness_release.prepare_import(repo_root, bundle, meta)
+            except (ValueError, OSError) as error:
+                raise BundleImportError(f"cannot import spentness descriptor: {error}") from error
+
     checkpoint_path.write_bytes(bundle_checkpoints)
     frontier_path.write_bytes(bundle_frontier)
     subtree_path.parent.mkdir(parents=True, exist_ok=True)
@@ -317,6 +332,11 @@ def import_bundle(
     print("imported subtree-root artifact")
     # The grid itself is published to crates.io by the workflow, not written into the tree.
     print("imported frontier grid")
+    if spentness is not None:
+        manifest, compiled = spentness
+        (repo_root / spentness_release.MANIFEST).parent.mkdir(parents=True, exist_ok=True)
+        _write_json(repo_root / spentness_release.MANIFEST, manifest)
+        (repo_root / spentness_release.COMPILED).write_text(compiled)
 
     _write_json(
         provenance_path,
@@ -336,6 +356,7 @@ def import_bundle(
             "frontier_grid_size": len(grid_bytes),
             "frontier_grid_entries": FRONTIER_GRID_HEADER_PREFIX.unpack_from(grid_bytes)[5],
             "meta_sha256": resolution["meta_sha256"],
+            **({"spentness_sha256": bytes(spentness[0]["artifacts"][-1]["commitment"]["sha256"]).hex()} if spentness else {}),
         },
     )
 

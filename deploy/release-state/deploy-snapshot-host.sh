@@ -44,9 +44,9 @@ REPOSITORY=https://github.com/zakura-core/zakura.git
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SOURCE_ROOT=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)
 EXPORTER_REVISION=$(git -C "$SOURCE_ROOT" rev-parse HEAD)
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/zakura-release-state-deploy.XXXXXX")
+WORK=$(mktemp -d "${TMPDIR:-$HOME/.tmp}/zakura-release-state-deploy.XXXXXX")
 BUILD_TARGET=${ZAKURA_RELEASE_STATE_BUILD_TARGET:-"$HOME/.cache/zakura-release-state-target"}
-REMOTE_STAGE="/tmp/zakura-release-state-deploy-$$"
+REMOTE_STAGE="/opt/zakura-release-state/.deploy-$$"
 trap 'rm -rf "$WORK"; ssh -o BatchMode=yes "$TARGET" "rm -rf \"$REMOTE_STAGE\"" >/dev/null 2>&1 || true' EXIT
 
 die() {
@@ -82,11 +82,13 @@ git -C "$WORK/source" merge-base --is-ancestor "$EXPORTER_REVISION" origin/main 
 git -C "$WORK/source" checkout --quiet --detach "$EXPORTER_REVISION"
 CARGO_TARGET_DIR="$BUILD_TARGET" cargo build --locked --release \
     --manifest-path "$WORK/source/Cargo.toml" \
-    -p zakura-utils --features zakura-checkpoints-offline --bin zakura-checkpoints
+    -p zakura-utils --features zakura-spentness --bin zakura-checkpoints --bin zakura-spentness
 
 install -d "$WORK/stage/bin" "$WORK/stage/systemd"
 install -m 0755 "$BUILD_TARGET/release/zakura-checkpoints" \
     "$WORK/stage/bin/zakura-checkpoints"
+install -m 0755 "$BUILD_TARGET/release/zakura-spentness" \
+    "$WORK/stage/bin/zakura-spentness"
 install -m 0755 "$WORK/source/deploy/release-state/publish-release-state.sh" \
     "$WORK/stage/bin/publish-release-state.sh"
 install -m 0755 "$WORK/source/deploy/release-state/publish-from-archive-host.sh" \
@@ -118,6 +120,8 @@ ssh -o BatchMode=yes "$TARGET" "
     install -d -m 0755 /opt/zakura-release-state/bin
     install -m 0755 '$REMOTE_STAGE/bin/zakura-checkpoints' \
         /opt/zakura-release-state/bin/zakura-checkpoints
+    install -m 0755 '$REMOTE_STAGE/bin/zakura-spentness' \
+        /opt/zakura-release-state/bin/zakura-spentness
     install -m 0755 '$REMOTE_STAGE/bin/publish-release-state.sh' \
         /opt/zakura-release-state/bin/publish-release-state.sh
     install -m 0755 '$REMOTE_STAGE/bin/publish-from-archive-host.sh' \

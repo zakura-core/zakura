@@ -138,6 +138,15 @@ pub struct Args {
     #[arg(long)]
     pub mainnet_frontier_output: Option<PathBuf>,
 
+    /// Generate a spentness artifact and JSON sidecars at the same terminal checkpoint.
+    /// Requires all treestate outputs and a separate ordinary replay cache.
+    #[arg(long)]
+    pub mainnet_spentness_output: Option<PathBuf>,
+
+    /// Persistent exact-checkpoint archive replay cache for spentness generation.
+    #[arg(long)]
+    pub spentness_replay_cache: Option<PathBuf>,
+
     /// Offline mode: write the completed-subtree artifact for the last emitted
     /// checkpoint height to this path.
     ///
@@ -215,6 +224,21 @@ impl Args {
     /// Offline and RPC modes are mutually exclusive, and the full-list output
     /// only makes sense when extending the embedded checkpoint list.
     pub fn validate_mode(&self) -> Result<(), String> {
+        if self.mainnet_spentness_output.is_some() != self.spentness_replay_cache.is_some() {
+            return Err(
+                "--mainnet-spentness-output requires --spentness-replay-cache and vice versa"
+                    .to_string(),
+            );
+        }
+        if self.mainnet_spentness_output.is_some()
+            && (self.state_cache_dir.is_none()
+                || self.mainnet_frontier_output.is_none()
+                || self.mainnet_frontier_grid_checkpoint.is_some())
+        {
+            return Err(
+                "spentness generation requires a coupled offline release-state export".to_string(),
+            );
+        }
         if self.mainnet_frontier_grid_output.is_none()
             && (self.frontier_grid_spacing.is_some() || self.frontier_grid_target_cost_ms.is_some())
         {
@@ -363,7 +387,19 @@ impl Args {
     /// bundle expects two.
     fn reject_aliased_artifact_outputs(&self) -> Result<(), String> {
         let mut resolved: Vec<(&'static str, PathBuf)> = Vec::new();
-        for (flag, path) in self.artifact_outputs() {
+        let sidecar_commitment = self
+            .mainnet_spentness_output
+            .as_ref()
+            .map(|path| path.with_extension("commitment.json"));
+        let sidecar_verification = self
+            .mainnet_spentness_output
+            .as_ref()
+            .map(|path| path.with_extension("verification.json"));
+        for (flag, path) in self.artifact_outputs().into_iter().chain([
+            ("--mainnet-spentness-output", &self.mainnet_spentness_output),
+            ("spentness commitment sidecar", &sidecar_commitment),
+            ("spentness verification sidecar", &sidecar_verification),
+        ]) {
             let Some(path) = path else { continue };
             let destination = resolved_output_destination(path)?;
             if let Some((earlier, _)) = resolved
@@ -435,6 +471,8 @@ mod tests {
             last_checkpoint: None,
             state_cache_dir: None,
             mainnet_frontier_output: None,
+            mainnet_spentness_output: None,
+            spentness_replay_cache: None,
             mainnet_subtree_output: None,
             mainnet_frontier_grid_output: None,
             mainnet_frontier_grid_input: None,

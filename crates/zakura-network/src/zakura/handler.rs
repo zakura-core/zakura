@@ -297,6 +297,9 @@ pub struct ZakuraConfig {
     /// this directory. Legacy peer fields in `legacy_sync.jsonl` follow
     /// [`Config::expose_peer_addresses`](crate::config::Config::expose_peer_addresses).
     pub trace_dir: Option<PathBuf>,
+    /// Optional cache for release-pinned spentness artifacts downloaded and served over peers.
+    /// This enables artifact distribution only; it does not enable hinted state writes.
+    pub spentness_cache_dir: Option<PathBuf>,
     /// Native header-sync wire settings.
     pub header_sync: ZakuraHeaderSyncConfig,
     /// Native stream-6 block-sync wire, scheduling, serving, and rollout settings.
@@ -330,6 +333,7 @@ impl Default for ZakuraConfig {
             stream_open_rate_per_second: DEFAULT_ZAKURA_STREAM_OPEN_RATE_PER_SECOND,
             message_rate_per_second: DEFAULT_ZAKURA_MESSAGE_RATE_PER_SECOND,
             trace_dir: None,
+            spentness_cache_dir: None,
             header_sync: ZakuraHeaderSyncConfig::default(),
             block_sync: ZakuraBlockSyncConfig::default(),
             dev_network: None,
@@ -1033,6 +1037,7 @@ struct ZakuraPeerConnectionEntry {
     disconnect_token: CancellationToken,
     registered_at: Instant,
     remote_ip: Option<IpAddr>,
+    accepted_capabilities: u64,
 }
 
 impl ZakuraSupervisorState {
@@ -1188,10 +1193,19 @@ impl ZakuraSupervisorHandle {
 
     /// Returns queue-backed handles for peers currently able to accept outbound work.
     pub async fn outbound_peer_handles(&self) -> Vec<ZakuraPeerHandle> {
+        self.outbound_peer_handles_for_capability(0).await
+    }
+
+    /// Return available peers that negotiated every bit in `capability`.
+    pub async fn outbound_peer_handles_for_capability(
+        &self,
+        capability: u64,
+    ) -> Vec<ZakuraPeerHandle> {
         let state = self.inner.lock().await;
         state
             .active_by_peer
             .values()
+            .filter(|entry| entry.accepted_capabilities & capability == capability)
             .map(|entry| &entry.outbound_handle)
             .filter(|handle| handle.has_outbound_capacity())
             .cloned()
@@ -1262,7 +1276,7 @@ impl ZakuraSupervisorHandle {
         transcript_hash: [u8; TRANSCRIPT_HASH_BYTES],
         outbound_handle: ZakuraPeerHandle,
         disconnect_token: CancellationToken,
-        _accepted_capabilities: u64,
+        accepted_capabilities: u64,
     ) -> ZakuraRegistration {
         let remote_ip = remote_ip.map(canonical_ip);
         let mut state = self.inner.lock().await;
@@ -1313,6 +1327,7 @@ impl ZakuraSupervisorHandle {
                     disconnect_token,
                     registered_at: Instant::now(),
                     remote_ip,
+                    accepted_capabilities,
                 };
                 if let Some(old_entry) = state.active_by_peer.insert(peer_id.clone(), entry) {
                     state.decrement_ip(old_entry.remote_ip);
@@ -4544,11 +4559,13 @@ async fn write_outbound_request_frame_inner(
     payload: Vec<u8>,
 ) -> Result<Vec<Frame>, OutboundRequestError> {
     // The legacy request stream validates responses with a legacy-message-specific budget.
-    let mut legacy_state = LegacyResponseReadState::new(LegacyResponseBudget::from_request(
-        message_type,
-        &payload,
-        limits,
-    )?);
+    let mut legacy_state = if stream.kind == super::spentness::STREAM_KIND {
+        None
+    } else {
+        Some(LegacyResponseReadState::new(
+            LegacyResponseBudget::from_request(message_type, &payload, limits)?,
+        ))
+    };
     let (mut send, mut recv) = timeout(OUTBOUND_STREAM_WRITE_TIMEOUT, connection.open_bi())
         .await
         .map_err(|_| -> BoxError { "Zakura outbound request stream open timed out".into() })
@@ -4600,11 +4617,27 @@ async fn write_outbound_request_frame_inner(
         .await
         {
             Ok(frame) => {
-                legacy_state.validate_frame(request_id, &frame)?;
+                if let Some(state) = &mut legacy_state {
+                    state.validate_frame(request_id, &frame)?;
+                } else {
+                    if !frames.is_empty() {
+                        return Err(OutboundRequestError::Fatal(
+                            "multiple spentness response frames".into(),
+                        ));
+                    }
+                    super::spentness::validate_response(&frame)
+                        .map_err(OutboundRequestError::Fatal)?;
+                }
                 frames.push(frame);
             }
             Err(ZakuraHandlerError::Closed) => {
-                legacy_state.finish()?;
+                if let Some(state) = legacy_state {
+                    state.finish()?;
+                } else if frames.len() != 1 {
+                    return Err(OutboundRequestError::Fatal(
+                        "missing spentness response frame".into(),
+                    ));
+                }
                 return Ok(frames);
             }
             Err(ZakuraHandlerError::Timeout(_)) => {

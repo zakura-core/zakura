@@ -29,8 +29,9 @@ host with none.
   runs the offline export and uploads one immutable bundle
   (`meta.json`, `main-checkpoints.txt`, `mainnet-frontier.bin`,
   `mainnet-treestate-subtrees.bin`, and `mainnet-frontier-grid.bin`),
-  then atomically replaces `release-state/latest.json`. Bundles are retained
-  newest-4 by default (`RELEASE_STATE_KEEP`).
+  then atomically replaces `release-state/latest.json`. Schema 2 adds spentness
+  artifacts and retains its bundles for recovery. Legacy schema 1 bundles use
+  newest-4 retention by default (`RELEASE_STATE_KEEP`).
 - **GitHub (repository):** the workflow resolves `latest.json` over a pinned
   HTTPS host, verifies every digest, publishes the bundle's frontier grid to
   crates.io, and opens a draft PR that imports the other three artifacts and
@@ -82,7 +83,7 @@ deploying the same day over leaving it red for a week.
 1. Install the export tool from the release the fleet runs:
 
    ```sh
-   cargo install --locked --features zakura-checkpoints-offline \
+   cargo install --locked --features zakura-spentness \
      --git https://github.com/zakura-core/zakura zakura-utils
    ```
 
@@ -98,6 +99,9 @@ deploying the same day over leaving it red for a week.
    ```sh
    RELEASE_STATE_R2_REMOTE=r2:zakura-artifacts \
    RELEASE_STATE_PUBLIC_BASE=https://zakura-release.valargroup.dev/release-state \
+   RELEASE_STATE_ORACLE_SOURCE=/var/lib/zakura/independent-archive \
+   RELEASE_STATE_ORACLE_ID='independent archive and validation software revision' \
+   RELEASE_STATE_GENERATOR_REVISION="$REVISION" \
    /opt/zakura/publish-release-state.sh /var/lib/zakura/archive-cache
    ```
 
@@ -144,3 +148,23 @@ deploying the same day over leaving it red for a week.
   (or the bucket was tampered with) — investigate before deleting anything.
 - `another release-state publisher is already running`: wait for the active
   timer or manual publication to finish before retrying.
+## Spentness artifacts
+
+The publisher now writes schema 2 bundles with external spentness artifacts.
+Deploy the updated fetcher/importer before enabling the publisher. Build and install
+`zakura-spentness` alongside `zakura-checkpoints` with feature `zakura-spentness`.
+
+Set `RELEASE_STATE_ORACLE_SOURCE` to a separately synchronized archive cache.
+Set `RELEASE_STATE_ORACLE_ID` to identify that source and its validation software.
+Set `RELEASE_STATE_GENERATOR_REVISION` to the tool's full git revision; the host
+wrapper reads the installed `EXPORTER_REVISION`. `RELEASE_STATE_DATA_DIR` holds
+two ordinary archive replay states at the selected checkpoint. The publisher
+never rolls back the live node. Version 2 bundles remain available for recovery.
+
+Provision reviewed artifacts on seeds with `provision-spentness-seed.sh`.
+The seed's `zakura-spentness install` command requires a compiled commitment.
+Configure `network.zakura.spentness_cache_dir` and restart the seed before testing
+a cold client against only those seeds. Nodes download from peers.
+
+See [the spentness design](../../docs/design/spentness-hints.md) for commands,
+trust boundaries, verification evidence, and disk requirements.

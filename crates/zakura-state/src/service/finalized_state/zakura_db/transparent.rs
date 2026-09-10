@@ -84,6 +84,30 @@ pub type TransactionLocationBySpentOutputLocationCf<'cf> =
     TypedColumnFamily<'cf, OutputLocation, TransactionLocation>;
 
 impl ZakuraDb {
+    /// Iterate the complete finalized UTXO set in canonical output-location order.
+    ///
+    /// Offline artifact generation must use an immutable database at its exact boundary.
+    pub fn utxos_by_location(
+        &self,
+    ) -> impl Iterator<Item = (OutputLocation, transparent::OrderedUtxo)> + '_ {
+        let cf = self
+            .db
+            .cf_handle("utxo_by_out_loc")
+            .expect("the state schema contains utxo_by_out_loc");
+        self.db.zs_forward_range_iter(&cf, ..).map(
+            |(location, output): (OutputLocation, transparent::Output)| {
+                (
+                    location,
+                    transparent::OrderedUtxo::new(
+                        output,
+                        location.height(),
+                        location.transaction_index().as_usize(),
+                    ),
+                )
+            },
+        )
+    }
+
     // Column family convenience methods
 
     /// Returns a typed handle to the transaction location by spent output location column family.

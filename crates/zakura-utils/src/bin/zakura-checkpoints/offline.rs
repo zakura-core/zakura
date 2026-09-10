@@ -257,6 +257,60 @@ pub fn run_offline(args: &Args) -> Result<()> {
     }
 
     // Lock stdout once: the full list is ~14k lines and per-line locking is slow.
+    if let (Some(output), Some(replay)) =
+        (&args.mainnet_spentness_output, &args.spentness_replay_cache)
+    {
+        let executable =
+            std::env::var_os("ZAKURA_SPENTNESS_BIN").unwrap_or_else(|| "zakura-spentness".into());
+        let height = last_height.0.to_string();
+        let hash = last_hash.to_string();
+        let commitment = output.with_extension("commitment.json");
+        let report = output.with_extension("verification.json");
+        let source = args
+            .state_cache_dir
+            .as_ref()
+            .expect("offline mode requires a state cache");
+        for arguments in [
+            vec![
+                "replay".as_ref(),
+                "--source".as_ref(),
+                source.as_os_str(),
+                "--destination".as_ref(),
+                replay.as_os_str(),
+                "--height".as_ref(),
+                height.as_ref(),
+                "--block-hash".as_ref(),
+                hash.as_ref(),
+            ],
+            vec![
+                "generate".as_ref(),
+                "--state".as_ref(),
+                replay.as_os_str(),
+                "--height".as_ref(),
+                height.as_ref(),
+                "--block-hash".as_ref(),
+                hash.as_ref(),
+                "--output".as_ref(),
+                output.as_os_str(),
+                "--commitment".as_ref(),
+                commitment.as_os_str(),
+            ],
+            vec![
+                "verify".as_ref(),
+                "--state".as_ref(),
+                replay.as_os_str(),
+                "--artifact".as_ref(),
+                output.as_os_str(),
+                "--commitment".as_ref(),
+                commitment.as_os_str(),
+                "--report".as_ref(),
+                report.as_os_str(),
+            ],
+        ] {
+            run_spentness(&executable, &arguments)?;
+        }
+    }
+
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
     if args.full_list {
@@ -276,6 +330,36 @@ pub fn run_offline(args: &Args) -> Result<()> {
     );
 
     Ok(())
+}
+
+fn run_spentness(executable: &std::ffi::OsStr, arguments: &[&std::ffi::OsStr]) -> Result<()> {
+    use std::{
+        process::{Command, Stdio},
+        thread,
+        time::Duration,
+    };
+    let mut child = Command::new(executable)
+        .args(arguments)
+        .stdout(Stdio::null())
+        .spawn()
+        .wrap_err(
+            "starting zakura-spentness; build and install it with --features zakura-spentness",
+        )?;
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            ensure!(status.success(), "zakura-spentness failed with {status}");
+            return Ok(());
+        }
+        if started.elapsed() > Duration::from_secs(48 * 60 * 60) {
+            child.kill()?;
+            child.wait()?;
+            return Err(eyre!(
+                "zakura-spentness exceeded its 48-hour generation deadline"
+            ));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// Generate only the frontier grid, for a checkpoint the binary already ships.

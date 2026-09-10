@@ -331,7 +331,7 @@ impl StartCmd {
     pub(crate) async fn start(
         &self,
         config: Arc<ZakuradConfig>,
-        custom_services: Vec<zakura_network::zakura::CustomService>,
+        mut custom_services: Vec<zakura_network::zakura::CustomService>,
         ready: Option<tokio::sync::oneshot::Sender<crate::node::NodeServices>>,
         shutdown: CancellationToken,
         shutdown_cleanup_required: CancellationToken,
@@ -541,6 +541,24 @@ impl StartCmd {
 
         let advertised_services = Self::advertised_services(&config);
 
+        let spentness = if let Some(cache) = &config.network.zakura.spentness_cache_dir {
+            if config.network.network != zakura_chain::parameters::Network::Mainnet {
+                return Err(eyre!(
+                    "spentness distribution currently requires reviewed Mainnet commitments"
+                ));
+            }
+            let (service, custom) = zakura_network::zakura::spentness::prepare(
+                cache.clone(),
+                zakura_chain::parameters::spentness_hints::MAINNET_COMMITMENTS,
+            )
+            .await
+            .map_err(|error| eyre!(error))?;
+            custom_services.push(custom);
+            Some((cache.clone(), service))
+        } else {
+            None
+        };
+
         let (peer_set, address_book, misbehavior_sender, zakura_endpoint) =
             zakura_network::init_with_zakura(
                 config.network.clone(),
@@ -560,6 +578,15 @@ impl StartCmd {
             None => None,
         };
         let mut block_sync_fatal_events = None;
+        if let (Some((cache, service)), Some(endpoint)) = (spentness, &zakura_endpoint) {
+            let task = tokio::spawn(zakura_network::zakura::spentness::download_missing(
+                cache,
+                zakura_chain::parameters::spentness_hints::MAINNET_COMMITMENTS,
+                service,
+                endpoint.supervisor(),
+            ));
+            node_tasks.track(&task);
+        }
 
         // Not added to node_tasks, because it must outlive start() being dropped to shutdown the
         // endpoint

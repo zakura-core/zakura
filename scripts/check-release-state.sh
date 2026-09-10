@@ -57,7 +57,7 @@ FRONTIER_GRID_KEYS = {
     "frontier_grid_size",
     "frontier_grid_entries",
 }
-OPTIONAL_KEYS = {"meta_sha256"} | FRONTIER_GRID_KEYS
+OPTIONAL_KEYS = {"meta_sha256", "spentness_sha256"} | FRONTIER_GRID_KEYS
 STALE_WARNING = timedelta(days=14)
 # NetworkUpgrade::Nu6_3 (Ironwood) activation on Mainnet; kept in sync with
 # crates/zakura-chain/src/parameters/constants.rs. Frontiers at or above activation
@@ -320,4 +320,21 @@ print(
     f"committed Mainnet release state is coupled at height {height} "
     f"({provenance['finalized_hash']}, source {source})"
 )
+sys.path.insert(0, ".github/scripts")
+import spentness_release
+try:
+    manifest = json.loads(spentness_release.MANIFEST.read_text())
+    if spentness_release.COMPILED.read_text() != spentness_release.render_commitments(manifest):
+        fail("compiled spentness commitments differ from reviewed manifest")
+    entries = manifest["artifacts"]
+    if entries or "spentness_sha256" in provenance:
+        if not entries:
+            fail("new-format provenance lacks a spentness commitment")
+        pin = entries[-1]["commitment"]
+        if pin["terminal_height"] != height or bytes(pin["terminal_block_hash"])[::-1].hex() != provenance["finalized_hash"]:
+            fail("spentness commitment differs from release-state boundary")
+        if bytes(pin["sha256"]).hex() != provenance.get("spentness_sha256"):
+            fail("release-state provenance lacks its spentness digest")
+except (OSError, ValueError, KeyError, TypeError) as error:
+    fail(f"invalid spentness release state: {error}")
 PY

@@ -1,5 +1,8 @@
 //! Exercise metadata availability through the production checkpoint write queue.
 
+// Every height-to-usize cast below indexes the fixed fixture through TOP (24),
+// so the values fit in usize on every supported target.
+
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};

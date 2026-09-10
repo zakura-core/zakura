@@ -46,6 +46,7 @@ fn transaction_error_peer_log_labels_require_explicit_opt_in() {
     let error = TransactionDownloadVerifyError::Invalid {
         error: zakura_consensus::error::TransactionError::WrongVersion,
         advertiser_addr: Some("192.0.2.1:8233".parse().expect("valid test socket")),
+        tip_height: None,
     };
 
     assert_eq!(
@@ -99,7 +100,10 @@ impl Mempool {
             ChainTipSender::new(None, network);
         chain_tip_sender.set_finalized_tip(Some(ChainTipBlock {
             hash: block::Hash([1; 32]),
-            height: Height(3_000_000),
+            height: self
+                .chain_tip_change
+                .best_tip_height()
+                .expect("test state has a tip"),
             time: Utc::now(),
             transactions: Vec::new(),
             transaction_hashes: Arc::new([]),

@@ -45,7 +45,7 @@ fn policy_rejection_has_no_misbehavior_score() {
             max_bytes: 250_000,
         },
     );
-    assert_eq!(transaction_misbehavior(&policy_error), None);
+    assert_eq!(transaction_misbehavior(&policy_error, None), None);
 
     let advertiser_addr = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
     let consensus_error = zakura_consensus::error::TransactionError::WrongVersion;
@@ -54,11 +54,51 @@ fn policy_rejection_has_no_misbehavior_score() {
     let invalid_error = TransactionDownloadVerifyError::Invalid {
         error: consensus_error,
         advertiser_addr: Some(advertiser_addr),
+        tip_height: Some(block::Height(100)),
     };
     assert_eq!(
-        transaction_misbehavior(&invalid_error),
+        transaction_misbehavior(&invalid_error, Some(block::Height(100))),
         Some((advertiser_addr, expected_score))
     );
+}
+
+#[test]
+fn stale_verification_failures_do_not_score_peers() {
+    let peer = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
+    let error = TransactionDownloadVerifyError::Invalid {
+        error: TransactionError::WrongVersion,
+        advertiser_addr: Some(peer),
+        tip_height: Some(block::Height(100)),
+    };
+
+    assert_eq!(
+        transaction_misbehavior(&error, Some(block::Height(101))),
+        None
+    );
+    assert_eq!(transaction_misbehavior(&error, None), None);
+    assert_eq!(
+        transaction_misbehavior(&error, Some(block::Height(100))),
+        Some((peer, 100))
+    );
+}
+
+#[test]
+fn context_dependent_failures_do_not_score_current_peers() {
+    for error in [
+        TransactionError::WrongConsensusBranchId,
+        TransactionError::LockedUntilAfterBlockHeight(block::Height(101)),
+        TransactionError::LockedUntilAfterBlockTime(chrono::Utc::now()),
+    ] {
+        let error = TransactionDownloadVerifyError::Invalid {
+            error,
+            advertiser_addr: Some(PeerSocketAddr::from(([203, 0, 113, 7], 8233))),
+            tip_height: Some(block::Height(100)),
+        };
+        assert_eq!(
+            transaction_misbehavior(&error, Some(block::Height(100))),
+            None
+        );
+    }
 }
 
 #[test]
@@ -72,10 +112,11 @@ fn invalid_shielded_proof_sizes_ban_mempool_peers() {
         let invalid_error = TransactionDownloadVerifyError::Invalid {
             error: consensus_error,
             advertiser_addr: Some(advertiser_addr),
+            tip_height: Some(block::Height(100)),
         };
 
         assert_eq!(
-            transaction_misbehavior(&invalid_error),
+            transaction_misbehavior(&invalid_error, Some(block::Height(100))),
             Some((advertiser_addr, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE)),
         );
     }
@@ -90,6 +131,34 @@ fn invalid_shielded_proof_sizes_ban_mempool_peers() {
 #[tokio::test(flavor = "multi_thread")]
 async fn stale_mempool_rejects_invalid_peer_transaction_without_misbehavior() -> Result<(), Report>
 {
+    assert_peer_error_is_not_scored(None, false, TransactionError::WrongVersion).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn future_dated_tip_does_not_score_branch_mismatch() -> Result<(), Report> {
+    assert_peer_error_is_not_scored(
+        Some(chrono::Utc::now() + chrono::Duration::minutes(90)),
+        false,
+        TransactionError::WrongConsensusBranchId,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn caught_up_mempool_does_not_score_stale_verification() -> Result<(), Report> {
+    assert_peer_error_is_not_scored(
+        Some(chrono::Utc::now() - chrono::Duration::minutes(300)),
+        true,
+        TransactionError::WrongVersion,
+    )
+    .await
+}
+
+async fn assert_peer_error_is_not_scored(
+    tip_time: Option<chrono::DateTime<chrono::Utc>>,
+    catch_up: bool,
+    error: TransactionError,
+) -> Result<(), Report> {
     let network = Network::Mainnet;
     let transaction = network
         .unmined_transactions_in_blocks(2..)
@@ -115,9 +184,23 @@ async fn stale_mempool_rejects_invalid_peer_transaction_without_misbehavior() ->
         misbehavior_tx,
     )
     .await;
-    // The state tip is the genesis block, so the mempool is only active
-    // because `enable()` sets `debug_enable_at_height`.
+    let mut tip_sender = tip_time.map(|time| {
+        let mut sender = mempool.use_current_chain_tip(&network);
+        sender.set_finalized_tip(Some(zs::ChainTipBlock {
+            hash: block::Hash([3; 32]),
+            height: block::Height(0),
+            time,
+            transactions: Vec::new(),
+            transaction_hashes: Arc::new([]),
+            previous_block_hash: block::Hash([0; 32]),
+        }));
+        sender
+    });
     mempool.enable(&mut recent_syncs).await;
+    assert_eq!(
+        mempool.is_current_enough_for_mempool(),
+        tip_time.is_some() && !catch_up
+    );
 
     let transaction_id = transaction.id();
     let response = mempool
@@ -140,30 +223,39 @@ async fn stale_mempool_rejects_invalid_peer_transaction_without_misbehavior() ->
         .respond(zn::Response::Transactions(vec![
             zn::InventoryResponse::Available((transaction, Some(peer_addr))),
         ]));
-    tx_verifier
+    let verification = tx_verifier
         .expect_request_that(|request| {
             matches!(
                 request,
                 tx::Request::Mempool { transaction, .. } if transaction.id() == transaction_id
             )
         })
-        .await
-        .respond(Err(TransactionError::WrongConsensusBranchId));
+        .await;
+    if catch_up {
+        tip_sender
+            .as_mut()
+            .expect("catch-up test has a tip sender")
+            .set_finalized_tip(Some(zs::ChainTipBlock {
+                hash: block::Hash([4; 32]),
+                height: block::Height(1),
+                time: chrono::Utc::now(),
+                transactions: Vec::new(),
+                transaction_hashes: Arc::new([]),
+                previous_block_hash: block::Hash([3; 32]),
+            }));
+        assert!(mempool.is_current_enough_for_mempool());
+    }
+    verification.respond(Err(error));
 
     timeout(Duration::from_secs(3), async {
-        while !mempool.storage().contains_rejected(&transaction_id) {
+        while mempool.tx_downloads().in_flight() != 0 {
             mempool.dummy_call().await;
             time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("invalid transaction should reach the rejection cache");
+    .expect("invalid transaction verification should finish");
 
-    assert_ne!(
-        TransactionError::WrongConsensusBranchId.mempool_misbehavior_score(),
-        0,
-        "a current mempool would score this error"
-    );
     assert!(matches!(
         misbehavior_rx.try_recv(),
         Err(tokio::sync::mpsc::error::TryRecvError::Empty)

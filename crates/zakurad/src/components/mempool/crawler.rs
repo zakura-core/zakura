@@ -163,9 +163,10 @@ where
             }
 
             let mut sync_status = self.sync_status.clone();
+            let wait_for_sync = mempool::is_estimated_close_to_network_tip(&self.chain_tip_change);
 
             tokio::select! {
-                result = sync_status.wait_until_close_to_tip() => result?,
+                result = sync_status.wait_until_close_to_tip(), if wait_for_sync => result?,
                 result = self.chain_tip_change.wait_for_tip_change() => {
                     result?;
                 }

@@ -4,6 +4,7 @@
 
 use std::{env, fmt, sync::Arc};
 
+use proptest::strategy::ValueTree;
 use proptest::{collection::vec, prelude::*};
 use proptest_derive::Arbitrary;
 
@@ -348,6 +349,87 @@ fn genesis_chain_tip() -> Option<ChainTipBlock> {
         .map(CheckpointVerifiedBlock::from)
         .map(ChainTipBlock::from)
         .ok()
+}
+
+#[tokio::test]
+async fn sparse_testnet_mempool_stays_enabled() {
+    for network in [
+        Network::new_default_testnet(),
+        Network::new_regtest(Default::default()),
+    ] {
+        let (mut mempool, _peers, _state, _guard, _verifier, mut syncs, _tip_sender) =
+            setup(&network);
+        SyncStatus::sync_close_to_tip(&mut syncs);
+        mempool.dummy_call().await;
+        assert!(
+            mempool.is_enabled(),
+            "an old testnet tip must allow activation"
+        );
+        SyncStatus::sync_far_from_tip(&mut syncs);
+        mempool.dummy_call().await;
+        assert!(
+            mempool.is_enabled(),
+            "an old testnet tip must not disable the mempool"
+        );
+    }
+}
+
+#[tokio::test]
+async fn activation_uses_the_decision_that_consumed_the_tip() {
+    let network = Network::Mainnet;
+    let (mut mempool, _peers, _state, _guard, _verifier, mut syncs, mut tip_sender) =
+        setup(&network);
+    tip_sender.set_finalized_tip(Some(chain_tip_with_estimated_distance(&network, 0, 1)));
+    SyncStatus::sync_close_to_tip(&mut syncs);
+    let should_start = mempool.is_caught_up_to_start();
+    assert!(should_start);
+    let action = mempool.chain_tip_change.last_tip_change();
+    SyncStatus::sync_far_from_tip(&mut syncs);
+    assert!(mempool.update_state(action.as_ref(), should_start));
+    assert!(mempool.is_enabled());
+    SyncStatus::sync_close_to_tip(&mut syncs);
+    mempool.dummy_call().await;
+    assert!(mempool.is_enabled());
+}
+
+#[tokio::test]
+async fn disabling_mempool_notifies_subscribers() {
+    let network = Network::Mainnet;
+    let (mut mempool, _peers, _state, _guard, _verifier, mut syncs, mut tip_sender) =
+        setup(&network);
+    tip_sender.set_finalized_tip(Some(chain_tip_with_estimated_distance(&network, 0, 1)));
+    SyncStatus::sync_close_to_tip(&mut syncs);
+    mempool.dummy_call().await;
+
+    let mut runner = proptest::test_runner::TestRunner::deterministic();
+    let transaction = standard_verified_unmined_tx_strategy()
+        .new_tree(&mut runner)
+        .expect("test transaction can be generated")
+        .current();
+    let tx_id = transaction.transaction.id();
+    mempool
+        .storage()
+        .insert(transaction, Vec::new(), None)
+        .expect("test transaction is accepted");
+    let mut subscriber = mempool.transaction_sender.subscribe();
+    tip_sender.set_finalized_tip(Some(chain_tip_with_estimated_distance(
+        &network,
+        i64::from(zs::MAX_BLOCK_REORG_HEIGHT) + 1,
+        2,
+    )));
+    mempool.dummy_call().await;
+    assert!(!mempool.is_enabled());
+    assert_eq!(
+        subscriber
+            .try_recv()
+            .expect("disable emits an invalidation"),
+        zakura_node_services::mempool::MempoolChange::invalidated([tx_id].into())
+    );
+    mempool.dummy_call().await;
+    assert!(
+        subscriber.try_recv().is_err(),
+        "disable emits only one invalidation"
+    );
 }
 
 fn chain_tip_with_estimated_distance(

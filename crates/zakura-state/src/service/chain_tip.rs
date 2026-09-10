@@ -608,6 +608,11 @@ impl ChainTipChange {
         self.latest_chain_tip.best_tip_height()
     }
 
+    /// Returns the network used to interpret the chain tip.
+    pub fn network(&self) -> &Network {
+        &self.network
+    }
+
     /// Estimates the distance from the best chain tip to the network tip.
     ///
     /// This estimate uses the best tip timestamp, the local clock, and network

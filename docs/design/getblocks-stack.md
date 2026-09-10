@@ -6,10 +6,10 @@ the reference until the replacement stack has been audited.
 
 ## Audit order
 
-The storage draft targets `main`; each later draft targets its predecessor.
+The storage PR targets `main`; each later PR targets its predecessor.
 Review the incremental diffs in this order; the final draft also needs the integration review across all layers.
 
-| Draft | Boundary | Main audit question |
+| PR | Boundary | Main audit question |
 | --- | --- | --- |
 | [#942](https://github.com/zakura-core/zakura/pull/942) | Owned storage reads | Do running jobs and undelivered results retain their charged resources? |
 | [#943](https://github.com/zakura-core/zakura/pull/943) | Generic transport and resource ownership | Are complete service sessions, queue ownership, cancellation, and sibling-service progress bounded? |
@@ -69,8 +69,9 @@ failures log their peer, generation, and error. Intermediate transport fixtures
 no longer assume that the final BlockSync layout is active.
 
 The latest feedback pass records write errors before a failed request owner can
-cancel the session. Application closure drains every session member before
-retiring shared capacity, while retained receivers and sender clones keep the
+cancel the session. Block sync processes buffered responses before charging a
+stall and keeps local body backpressure neutral. Application closure drains every
+session member before retiring shared capacity, while retained receivers and sender clones keep the
 session alive. A queued request that expires returns all its remaining unsent
 heights immediately. Received bodies and replacement owners survive cleanup,
 and committed heights are discarded. Publication failures now include peer,
@@ -124,8 +125,9 @@ Matched block-download acceptance is one-way.
 
 ## Merge handling
 
-These remain drafts for individual audits. Merge in dependency order and update
-each child's base as its predecessor is merged. The final integration result
+Review each PR individually. Keep #945 draft until combined qualification passes.
+Merge in dependency order and update each child's base as its predecessor is
+merged. The final integration result
 must still be verified after any substantive review changes. A clean comparison
 proves that splitting preserved the reference; it does not replace review of
 the reference behavior.

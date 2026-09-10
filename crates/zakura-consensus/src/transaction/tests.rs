@@ -4477,7 +4477,7 @@ fn v4_deprecation_boundary() {
 
     let expected = if cfg!(feature = "nu7-experimental") {
         Err(TransactionError::UnsupportedByNetworkUpgrade(
-            4,
+            transaction.version(),
             NetworkUpgrade::Nu7,
         ))
     } else {
@@ -4489,7 +4489,11 @@ fn v4_deprecation_boundary() {
         "V4 deprecation must match the experimental build at NU7",
     );
     assert_eq!(
-        verify_v4_at(&network, &transaction, Height(nu7.0 + 1)),
+        verify_v4_at(
+            &network,
+            &transaction,
+            nu7.next().expect("NU7 is below the maximum height"),
+        ),
         expected,
         "V4 deprecation must match the experimental build after NU7",
     );

@@ -1,5 +1,6 @@
-use std::pin::Pin;
+use std::{pin::Pin, sync::Arc};
 
+use chrono::Utc;
 use proptest::prelude::*;
 use tower::ServiceExt;
 
@@ -14,12 +15,13 @@ use crate::{
 };
 use zakura_chain::{
     amount::{Amount, NonNegative},
-    block::Height,
-    parameters::NetworkKind,
+    block::{self, Height},
+    parameters::{Network, NetworkKind},
     transaction::{Transaction, UnminedTx, VerifiedUnminedTx},
     transparent::{self, Address},
 };
 use zakura_node_services::mempool::QueueSource;
+use zakura_state::{ChainTipBlock, ChainTipSender};
 
 mod prop;
 mod vector;
@@ -85,6 +87,29 @@ impl Mempool {
         SyncStatus::sync_close_to_tip(recent_syncs);
         // Make a dummy request to poll the mempool and make it enable itself
         self.dummy_call().await;
+    }
+
+    /// Replace the mempool's chain tip with a tip whose block time is now.
+    ///
+    /// The mempool only scores peer misbehavior while the estimated distance to
+    /// the network tip is small, and the old fixed chain vectors are always far
+    /// behind. Keep the returned sender alive for as long as the mempool runs.
+    pub fn use_current_chain_tip(&mut self, network: &Network) -> ChainTipSender {
+        let (mut chain_tip_sender, latest_chain_tip, chain_tip_change) =
+            ChainTipSender::new(None, network);
+        chain_tip_sender.set_finalized_tip(Some(ChainTipBlock {
+            hash: block::Hash([1; 32]),
+            height: Height(3_000_000),
+            time: Utc::now(),
+            transactions: Vec::new(),
+            transaction_hashes: Arc::new([]),
+            previous_block_hash: block::Hash([0; 32]),
+        }));
+
+        self.latest_chain_tip = latest_chain_tip;
+        self.chain_tip_change = chain_tip_change;
+
+        chain_tip_sender
     }
 
     /// Pretend the synchronization is far from the tip and poll the mempool.

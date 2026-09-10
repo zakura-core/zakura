@@ -81,6 +81,97 @@ fn invalid_shielded_proof_sizes_ban_mempool_peers() {
     }
 }
 
+/// Check that a mempool far behind the network tip rejects invalid peer
+/// transactions without scoring the peer.
+///
+/// Regression test: a debug-enabled mempool on a node syncing from scratch
+/// verified current network transactions against stale consensus rules and
+/// banned every honest peer that relayed them.
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_mempool_rejects_invalid_peer_transaction_without_misbehavior() -> Result<(), Report>
+{
+    let network = Network::Mainnet;
+    let transaction = network
+        .unmined_transactions_in_blocks(2..)
+        .next()
+        .expect("mainnet test vectors contain an unmined transaction")
+        .transaction
+        .clone();
+    let peer_addr = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
+    let (misbehavior_tx, mut misbehavior_rx) = tokio::sync::mpsc::channel(1);
+
+    let (
+        mut mempool,
+        mut peer_set,
+        _state_service,
+        _chain_tip_change,
+        mut tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup_with_mempool_config_and_misbehavior_sender(
+        &network,
+        mempool::Config::default(),
+        true,
+        misbehavior_tx,
+    )
+    .await;
+    // The state tip is the genesis block, so the mempool is only active
+    // because `enable()` sets `debug_enable_at_height`.
+    mempool.enable(&mut recent_syncs).await;
+
+    let transaction_id = transaction.id();
+    let response = mempool
+        .ready()
+        .await
+        .expect("mempool service becomes ready")
+        .call(Request::QueueFromPeer {
+            transactions: vec![transaction_id.into()],
+            source: QueueSource::LegacySocket(peer_addr.remove_socket_addr_privacy()),
+        })
+        .await
+        .expect("mempool service queues the peer transaction");
+    assert!(matches!(response, Response::Queued(results) if results.is_empty()));
+
+    peer_set
+        .expect_request_that(|request| {
+            matches!(request, zn::Request::TransactionsById(ids) if ids.contains(&transaction_id))
+        })
+        .await
+        .respond(zn::Response::Transactions(vec![
+            zn::InventoryResponse::Available((transaction, Some(peer_addr))),
+        ]));
+    tx_verifier
+        .expect_request_that(|request| {
+            matches!(
+                request,
+                tx::Request::Mempool { transaction, .. } if transaction.id() == transaction_id
+            )
+        })
+        .await
+        .respond(Err(TransactionError::WrongConsensusBranchId));
+
+    timeout(Duration::from_secs(3), async {
+        while !mempool.storage().contains_rejected(&transaction_id) {
+            mempool.dummy_call().await;
+            time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("invalid transaction should reach the rejection cache");
+
+    assert_ne!(
+        TransactionError::WrongConsensusBranchId.mempool_misbehavior_score(),
+        0,
+        "a current mempool would score this error"
+    );
+    assert!(matches!(
+        misbehavior_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn oversized_peer_transaction_is_rejected_without_misbehavior() -> Result<(), Report> {
     let network = Network::Mainnet;
@@ -128,6 +219,8 @@ async fn oversized_peer_transaction_is_rejected_without_misbehavior() -> Result<
         misbehavior_tx,
     )
     .await;
+    // Peer misbehavior is only scored when the mempool's validation context is current.
+    let _chain_tip_sender = mempool.use_current_chain_tip(&network);
     mempool.enable(&mut recent_syncs).await;
 
     let oversized_id = oversized_transaction.id();

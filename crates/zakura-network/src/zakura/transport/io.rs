@@ -76,19 +76,35 @@ impl FramedRecv {
         self.failure_cause.as_ref().and_then(|cause| cause.get())
     }
 
+    /// Stop new ingress while preserving frames already in the bounded queue.
+    pub(crate) fn close(&mut self) {
+        match &mut self.receiver {
+            FramedReceiver::Plain(receiver) => receiver.close(),
+            FramedReceiver::Queued(receiver) => receiver.close(),
+        }
+    }
+
+    /// Receive an already queued frame without waiting for transport progress.
+    pub(crate) fn try_recv(&mut self) -> Result<Frame, mpsc::error::TryRecvError> {
+        match &mut self.receiver {
+            FramedReceiver::Plain(receiver) => receiver.try_recv(),
+            FramedReceiver::Queued(receiver) => loop {
+                if let Some(frame) = receiver.try_recv()?.receive() {
+                    return Ok(frame);
+                }
+            },
+        }
+    }
+
     /// Receive the next admitted frame, or `None` after the transport closes the stream.
     pub async fn recv(&mut self) -> Option<Frame> {
         match &mut self.receiver {
             FramedReceiver::Plain(receiver) => receiver.recv().await,
             FramedReceiver::Queued(receiver) => {
                 while let Some(queued) = receiver.recv().await {
-                    if let Some(claim) = &queued.claim {
-                        if !claim.try_start() {
-                            continue;
-                        }
-                        claim.written();
+                    if let Some(frame) = queued.receive() {
+                        return Some(frame);
                     }
-                    return Some(queued.frame);
                 }
                 None
             }
@@ -274,6 +290,17 @@ pub(crate) struct QueuedFrame {
 }
 
 impl QueuedFrame {
+    /// Complete an in-process channel delivery if its claim can still start.
+    fn receive(self) -> Option<Frame> {
+        if let Some(claim) = &self.claim {
+            if !claim.try_start() {
+                return None;
+            }
+            claim.written();
+        }
+        Some(self.frame)
+    }
+
     fn plain(frame: Frame) -> Self {
         Self {
             frame,

@@ -1477,3 +1477,144 @@ async fn failed_write_records_cause_before_claim_cancels_session() -> Result<(),
     timeout(TEST_TIMEOUT, router.shutdown()).await??;
     Ok(())
 }
+
+#[tokio::test]
+async fn abandoned_application_session_releases_capacity_and_preserves_sibling(
+) -> Result<(), BoxError> {
+    for streams in [&[DATA][..], &[DATA, REQUESTS][..]] {
+        let mut fixture =
+            RawFixture::start_with_streams(1, Duration::from_secs(3), streams).await?;
+        let (mut sibling_send, _sibling_recv) = fixture.offer(SIBLING, None).await?;
+        let mut sibling = timeout(TEST_TIMEOUT, fixture.siblings.recv())
+            .await?
+            .ok_or("no sibling")?;
+        let (mut sibling_recv, _sibling_send) = sibling.take_stream(SIBLING.kind).unwrap();
+        let mut remote_handles = Vec::new();
+        for stream in streams {
+            remote_handles.push(
+                fixture
+                    .offer(*stream, (streams.len() > 1).then_some(71))
+                    .await?,
+            );
+        }
+        let peer = timeout(TEST_TIMEOUT, fixture.sessions.recv())
+            .await?
+            .ok_or("no session")?;
+        let cancel = peer.service_cancel_token();
+        drop(peer);
+        timeout(TEST_TIMEOUT, cancel.cancelled()).await?;
+        fixture.wait_for_slots(1, TEST_TIMEOUT).await?;
+        // A late duplicate cancellation cannot release the reservation twice.
+        cancel.cancel();
+        let ping = frame(1, 19, 8);
+        sibling_send
+            .write_all(&ping.encode(SIBLING.frame_cap)?)
+            .await?;
+        assert_eq!(
+            timeout(TEST_TIMEOUT, sibling_recv.recv()).await?,
+            Some(ping)
+        );
+        assert_eq!(fixture.capacity().available_permits(), 1);
+        assert!(!sibling.cancel_token().is_cancelled());
+        fixture.close().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn application_receive_half_or_sender_clone_keeps_session_alive() -> Result<(), BoxError> {
+    for keep_receiver in [true, false] {
+        let mut fixture =
+            RawFixture::start_with_streams(1, Duration::from_secs(3), &[DATA]).await?;
+        let (mut peer_send, mut peer_recv) = fixture.offer(DATA, None).await?;
+        let mut peer = timeout(TEST_TIMEOUT, fixture.sessions.recv())
+            .await?
+            .ok_or("no session")?;
+        let cancel = peer.service_cancel_token();
+        let (mut recv, send) = peer.take_stream(DATA.kind).unwrap();
+        drop(peer);
+        let ping = frame(1, 19, 8);
+        if keep_receiver {
+            drop(send);
+            assert!(timeout(Duration::from_millis(100), cancel.cancelled())
+                .await
+                .is_err());
+            peer_send.write_all(&ping.encode(DATA.frame_cap)?).await?;
+            assert_eq!(timeout(TEST_TIMEOUT, recv.recv()).await?, Some(ping));
+            assert!(recv.failure().is_none());
+            assert_eq!(fixture.capacity().available_permits(), 0);
+            drop(recv);
+        } else {
+            let clone = send.clone();
+            drop(send);
+            drop(recv);
+            assert!(timeout(Duration::from_millis(100), cancel.cancelled())
+                .await
+                .is_err());
+            timeout(TEST_TIMEOUT, clone.send(ping.clone())).await??;
+            assert_eq!(
+                read_frame(
+                    &mut peer_recv,
+                    DATA.frame_cap,
+                    &[],
+                    None,
+                    TEST_TIMEOUT,
+                    Some(TEST_TIMEOUT)
+                )
+                .await?,
+                ping
+            );
+            assert_eq!(fixture.capacity().available_permits(), 0);
+            drop(clone);
+        }
+        timeout(TEST_TIMEOUT, cancel.cancelled()).await?;
+        fixture.wait_for_slots(1, TEST_TIMEOUT).await?;
+        fixture.close().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn abandoned_application_drains_queued_writes_before_retirement() -> Result<(), BoxError> {
+    let mut fixture = RawFixture::start_with_streams(1, Duration::from_secs(3), &[DATA]).await?;
+    let (_peer_send, mut peer_recv) = fixture.offer(DATA, None).await?;
+    let mut peer = timeout(TEST_TIMEOUT, fixture.sessions.recv())
+        .await?
+        .ok_or("no session")?;
+    let cancel = peer.service_cancel_token();
+    let (recv, send) = peer.take_stream(DATA.kind).unwrap();
+    drop(peer);
+    drop(recv);
+    let first = frame(1, 19, 1024 * 1024);
+    let second = frame(1, 20, 1024 * 1024);
+    timeout(TEST_TIMEOUT, send.send(first.clone())).await??;
+    // A second enqueue proves the first frame left the bounded application queue.
+    timeout(TEST_TIMEOUT, send.send(second.clone())).await??;
+    drop(send);
+    assert!(timeout(Duration::from_millis(100), cancel.cancelled())
+        .await
+        .is_err());
+    assert_eq!(fixture.capacity().available_permits(), 0);
+    for expected in [first, second] {
+        assert_eq!(
+            read_frame(
+                &mut peer_recv,
+                DATA.frame_cap,
+                &[],
+                None,
+                TEST_TIMEOUT,
+                Some(TEST_TIMEOUT)
+            )
+            .await?,
+            expected
+        );
+    }
+    timeout(TEST_TIMEOUT, cancel.cancelled()).await?;
+    fixture.wait_for_slots(1, TEST_TIMEOUT).await?;
+    assert_eq!(
+        timeout(TEST_TIMEOUT, peer_recv.read(&mut [0; 1])).await??,
+        None
+    );
+    assert!(fixture.connection.close_reason().is_none());
+    fixture.close().await
+}

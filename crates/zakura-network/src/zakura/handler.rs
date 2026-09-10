@@ -4124,6 +4124,7 @@ async fn persistent_stream_worker_with_policy(
     // so waiting for inbound channel space cannot stall an outgoing response.
     // A dedicated reader also preserves partial frame reads across outbound writes.
     let (error_tx, mut error_rx) = mpsc::channel::<ZakuraHandlerError>(1);
+    let inbound_closed = inbound_tx.clone();
     let reader_context = Arc::clone(&context);
     let reader_failure_cause = failure_cause.clone();
     let reader = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
@@ -4222,11 +4223,19 @@ async fn persistent_stream_worker_with_policy(
     }));
 
     let mut outbound_rx = Some(outbound_rx);
+    let mut drained = false;
     loop {
         tokio::select! {
             biased;
             _ = context.connection_token.cancelled() => break,
             _ = context.stream_token.cancelled() => break,
+            _ = inbound_closed.closed(), if outbound_rx.is_none() => {
+                // Both application halves are gone and every queued write
+                // finished. A FIN preserves those writes in QUIC's send buffer.
+                let _ = send.finish();
+                drained = true;
+                break;
+            }
             outbound = async {
                 match outbound_rx.as_mut() {
                     Some(outbound_rx) => outbound_rx.recv().await,
@@ -4312,7 +4321,9 @@ async fn persistent_stream_worker_with_policy(
     }
 
     // Never leave a partial frame followed by a graceful FIN.
-    let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_NEUTRAL));
+    if !drained {
+        let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_NEUTRAL));
+    }
     context.stream_token.cancel();
     reader.abort();
     // Keep the stream permit until the reader has actually dropped its buffers.

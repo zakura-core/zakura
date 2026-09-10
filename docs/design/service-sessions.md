@@ -99,6 +99,11 @@ unfinished writes before a replacement can send frames. A write deadline retires
 the session without closing unrelated services on the connection. Protocol
 violations can still close the connection.
 
+The transport records the first remote close or write timeout before cancelling
+its session. Block sync settles that failure against unanswered download work,
+including when cancellation wins over receiving EOF. Local cancellation alone
+does not charge the peer for a stall.
+
 The transport reports session exit after every worker and reader finishes.
 Reopening follows the service's policy and demand. Ephemeral request completion
 does not cancel the persistent session.

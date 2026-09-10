@@ -1,6 +1,7 @@
 {
-  "source_revision": "9e6cbf251d2edd6304c2d9799fc29bf39788d305",
+  "source_revision": "80e2ec271469f478d2d46388254be71341b50015",
   "criteria": "safe-to-deploy",
   "failures": [],
-  "suggestions": []
+  "suggestions": [],
+  "package_version": "1.1.0-rc.0"
 }

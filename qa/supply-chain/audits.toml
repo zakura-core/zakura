@@ -4434,6 +4434,18 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "1.0.0-beta.38 -> 1.0.0-beta.39"
 
+[[audits.zakura-iroh-base]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.1.0-rc.0"
+notes = "Registry packaging review for source revision 80e2ec271469f478d2d46388254be71341b50015: compared all 4 upstream 1.1.0 Rust files with the prepared archive; all are byte-identical. Checked normalized manifests, library names and exact sibling package aliases. The prior audits.iroh-base/iroh-dns 1.1.0 source review and recorded compatibility delta apply to these unchanged files. The only added Rust file contains the two Dalek authentication regressions; both pass, along with 15 unit tests and one doctest, using the published Dalek 2.2 and Curve25519-Dalek 4.1.3 dependencies. Prior source-review scope and limitations: Reviewed all production Rust source and package manifest: key/signature conversion and strict signature verification, owned endpoint/address collections, bounded custom-address decoding and relay URL parsing. Public keys are validated through Dalek constructors; secret debug output is redacted and key generation delegates to the random source. No unsafe, build script, or ambient I/O in this package. Callers must bound externally supplied address collections and URL lengths and must not treat parsing as authorization. This registry-baseline record is separate from the recorded stable-Dalek fork delta. Source review; no new runtime tests in this pass."
+
+[[audits.zakura-iroh-dns]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.1.0-rc.0"
+notes = "Registry packaging review for source revision 80e2ec271469f478d2d46388254be71341b50015: compared all 7 upstream 1.1.0 Rust files with the prepared archive; all are byte-identical. Checked normalized manifests, library names and exact sibling package aliases. The prior audits.iroh-base/iroh-dns 1.1.0 source review and recorded compatibility delta apply to these unchanged files. The archive rebuilt successfully. No new Android or live DNS execution was performed. Prior source-review scope and limitations: Reviewed production Rust source, manifest and build script, including signed-packet bounds/signature-before-DNS parsing, endpoint metadata, resolver configuration/reset, retries and Android initialization. DNS/network operations and system resolver configuration access are explicit; build script only declares cfg names. Android unsafe initialization forwards the documented process-lifetime VM/context precondition to ndk_context. Audit discretion: caller-supplied retry delays of 1 or 2 ms panic in jitter calculation; use zero or at least 3 ms and bound retry counts. Iroh uses 200-3000 ms. Resolver resets can extend a request deadline, so callers needing an overall deadline must enforce it. No Android or live DNS tests in this pass; separate parser/resolver dependency audits remain required."
+
 [[audits.zakura-network]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"

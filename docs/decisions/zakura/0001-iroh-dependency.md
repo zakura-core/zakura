@@ -7,18 +7,21 @@ Plan: `/home/evan/src/valar/art/inbox/zakura_p2p/00.0_iroh_dependency.md`
 
 ## Decision
 
-Zakura pins `iroh = "=1.1.0"` in the workspace with `default-features = false`
-and the explicit `tls-ring` backend. Root `[patch.crates-io]` entries pin
-`iroh`, `iroh-base`, `iroh-relay`, and `iroh-dns` to one revision of
-`https://github.com/zakura-core/iroh`. `Cargo.lock` records that revision and
-upstream noq 1.2.0. The dependency is wired into `zakura-network`'s native
-protocol, endpoint service, handshake, and discovery.
+Zakura pins `iroh = { package = "zakura-iroh", version = "=1.1.0-rc.0" }`
+in the workspace with `default-features = false` and the explicit `tls-ring`
+backend. The four registry packages (`zakura-iroh`, `zakura-iroh-base`,
+`zakura-iroh-dns`, and `zakura-iroh-relay`) retain the original Rust library
+names and pin their sibling dependencies to the same release candidate.
+`Cargo.lock` records registry checksums and upstream noq 1.2.0. The dependency
+is wired into `zakura-network`'s native protocol, endpoint service, handshake,
+and discovery. Consumers do not need workspace source patches.
 
-The compatibility source starts from upstream Iroh 1.1.0 and changes three
-manifest requirements. Iroh and Iroh-base retain published ed25519-dalek 2.2;
-Iroh-base retains curve25519-dalek 4.1.3. The fork changes no production Rust
-source. BIP32, the Zcash cryptographic packages, and their digest requirements
-remain unchanged. The Iroh fork's `FORK.md` records its consumption and
+The compatibility source starts from upstream Iroh 1.1.0 and retains three
+compatibility manifest requirements. Iroh and Iroh-base retain published
+ed25519-dalek 2.2; Iroh-base retains curve25519-dalek 4.1.3. The fork changes no production Rust
+source. Its relay manifest pins LRU to 0.18.3 so fresh consumers cannot select
+0.18.4's faulty `retain` implementation. BIP32, the Zcash cryptographic packages,
+and their digest requirements remain unchanged. The Iroh fork's `FORK.md` records its consumption and
 maintenance policy.
 
 Unmodified Iroh 1.1 requires stable SHA-2 through its newer Dalek dependencies.
@@ -194,25 +197,22 @@ comparison or proof of long-term memory stability under hostile load. An
 authorized long-duration deployment soak remains a separate release gate; no
 deployment has been performed.
 
-Root Cargo patches are not inherited by library consumers and are not a
-registry distribution strategy. The existing crate publish-graph and release
-checks must remain intact. This branch is for source/binary integration only:
-no packages are created or published to crates.io. A registry-compatible
-upstream release or separately approved publication strategy is required before
-release readiness. Retire the fork when the upstream dependency graph resolves
-and passes the same interoperability checks.
+The compatibility family is distributed as registry packages at `1.1.0-rc.0`,
+prepared from the committed fork using `scripts/prepare-zakura-packages.py`.
+The preparation manifest records the source revision and hashes every Rust
+file; package verification checks the renamed manifests and registry contents.
+The existing crate packaging, publish-graph, semver and supply-chain gates
+remain enabled. No Git patch or semver-specific Iroh source override is needed.
+The LRU pin is part of the published relay manifest because consumers do not
+inherit Zakura's lockfile or deny policy.
 
-The proposed registry family is `zakura-iroh`, `zakura-iroh-base`,
-`zakura-iroh-relay` and `zakura-iroh-dns` at `1.1.0-rc.1`. The fork's
-`PUBLICATION.md` and generated `zakura-consumer.toml` describe the switch.
-Prepared archives and a consumer workspace passed local checks with temporary
-source patches; this does not prove crates.io resolution. Published contents
-need matching audit records, and the registry graph must retain the reviewed
-LRU version because consumers do not inherit Zakura's lockfile or deny policy.
+Audit records cover the renamed base and DNS packages using their reviewed
+source and compatibility deltas. Exact-version exemptions preserve the
+recorded Iroh and relay defects and their existing disposition; renaming the
+packages does not fix those defects. Retire the fork when upstream's dependency
+graph resolves and passes the same interoperability checks.
 
-The Git source has explicit cargo-vet policy and reviewed compatibility deltas,
-and the upstream baseline and dependency graph are covered by audit records and
-documented exemptions. Zakura accepts Iroh 1.1's mapped-address retention of
+Zakura accepts Iroh 1.1's mapped-address retention of
 roughly 100–200 bytes per distinct authenticated identity until endpoint shutdown,
 with no public eviction API. Track this growth under sustained identity churn
 and adopt the upstream fix when released. No additional fork patch is planned.

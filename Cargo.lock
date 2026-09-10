@@ -2681,96 +2681,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "iroh"
-version = "1.1.0"
-source = "git+https://github.com/zakura-core/iroh?rev=9e6cbf251d2edd6304c2d9799fc29bf39788d305#9e6cbf251d2edd6304c2d9799fc29bf39788d305"
-dependencies = [
- "backon",
- "blake3",
- "bytes",
- "cfg_aliases",
- "ctutils",
- "data-encoding",
- "derive_more",
- "ed25519-dalek",
- "futures-util",
- "getrandom 0.4.3",
- "hickory-resolver",
- "http",
- "ipnet",
- "iroh-base",
- "iroh-dns",
- "iroh-metrics",
- "iroh-relay",
- "n0-error",
- "n0-future",
- "n0-watcher",
- "netwatch",
- "noq",
- "noq-proto",
- "noq-udp",
- "papaya",
- "pin-project",
- "portable-atomic",
- "rand 0.10.2",
- "reqwest 0.13.4",
- "rustc-hash",
- "rustls",
- "rustls-pki-types",
- "serde",
- "smallvec",
- "strum 0.28.0",
- "time",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tracing",
- "url",
- "wasm-bindgen-futures",
-]
-
-[[package]]
-name = "iroh-base"
-version = "1.1.0"
-source = "git+https://github.com/zakura-core/iroh?rev=9e6cbf251d2edd6304c2d9799fc29bf39788d305#9e6cbf251d2edd6304c2d9799fc29bf39788d305"
-dependencies = [
- "curve25519-dalek",
- "data-encoding",
- "data-encoding-macro",
- "derive_more",
- "ed25519-dalek",
- "getrandom 0.4.3",
- "n0-error",
- "rand 0.10.2",
- "serde",
- "url",
- "zeroize",
-]
-
-[[package]]
-name = "iroh-dns"
-version = "1.1.0"
-source = "git+https://github.com/zakura-core/iroh?rev=9e6cbf251d2edd6304c2d9799fc29bf39788d305#9e6cbf251d2edd6304c2d9799fc29bf39788d305"
-dependencies = [
- "arc-swap",
- "cfg_aliases",
- "derive_more",
- "hickory-resolver",
- "iroh-base",
- "n0-error",
- "n0-future",
- "ndk-context",
- "portable-atomic",
- "rand 0.10.2",
- "rustls",
- "simple-dns",
- "strum 0.28.0",
- "tokio",
- "tracing",
- "url",
-]
-
-[[package]]
 name = "iroh-metrics"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2795,50 +2705,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
-]
-
-[[package]]
-name = "iroh-relay"
-version = "1.1.0"
-source = "git+https://github.com/zakura-core/iroh?rev=9e6cbf251d2edd6304c2d9799fc29bf39788d305#9e6cbf251d2edd6304c2d9799fc29bf39788d305"
-dependencies = [
- "blake3",
- "bytes",
- "cfg_aliases",
- "data-encoding",
- "derive_more",
- "getrandom 0.4.3",
- "hickory-resolver",
- "http",
- "http-body-util",
- "hyper",
- "hyper-util",
- "iroh-base",
- "iroh-dns",
- "iroh-metrics",
- "lru",
- "n0-error",
- "n0-future",
- "noq",
- "noq-proto",
- "num_enum",
- "pin-project",
- "postcard",
- "rand 0.10.2",
- "reqwest 0.13.4",
- "rustls",
- "rustls-pki-types",
- "serde",
- "serde_bytes",
- "strum 0.28.0",
- "tokio",
- "tokio-rustls",
- "tokio-util",
- "tokio-websockets",
- "tracing",
- "url",
- "webpki-roots",
- "ws_stream_wasm",
 ]
 
 [[package]]
@@ -7753,6 +7619,144 @@ dependencies = [
 ]
 
 [[package]]
+name = "zakura-iroh"
+version = "1.1.0-rc.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac6fec6c66b110158cfce2908bb5d7bf8c76d8c241304ee2917f14ec33ce78a1"
+dependencies = [
+ "backon",
+ "blake3",
+ "bytes",
+ "cfg_aliases",
+ "ctutils",
+ "data-encoding",
+ "derive_more",
+ "ed25519-dalek",
+ "futures-util",
+ "getrandom 0.4.3",
+ "hickory-resolver",
+ "http",
+ "ipnet",
+ "iroh-metrics",
+ "n0-error",
+ "n0-future",
+ "n0-watcher",
+ "netwatch",
+ "noq",
+ "noq-proto",
+ "noq-udp",
+ "papaya",
+ "pin-project",
+ "portable-atomic",
+ "rand 0.10.2",
+ "reqwest 0.13.4",
+ "rustc-hash",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "smallvec",
+ "strum 0.28.0",
+ "time",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+ "url",
+ "wasm-bindgen-futures",
+ "zakura-iroh-base",
+ "zakura-iroh-dns",
+ "zakura-iroh-relay",
+]
+
+[[package]]
+name = "zakura-iroh-base"
+version = "1.1.0-rc.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "99e54869bce612c0e4fe2cd0a1056809aa8486f04e01a113722182ac5ac971f3"
+dependencies = [
+ "curve25519-dalek",
+ "data-encoding",
+ "data-encoding-macro",
+ "derive_more",
+ "ed25519-dalek",
+ "getrandom 0.4.3",
+ "n0-error",
+ "rand 0.10.2",
+ "serde",
+ "url",
+ "zeroize",
+]
+
+[[package]]
+name = "zakura-iroh-dns"
+version = "1.1.0-rc.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "80258351d6fb3a6f66a55d83861764d27c14a183355a2d2bff3489f6d69cbf22"
+dependencies = [
+ "arc-swap",
+ "cfg_aliases",
+ "derive_more",
+ "hickory-resolver",
+ "n0-error",
+ "n0-future",
+ "ndk-context",
+ "portable-atomic",
+ "rand 0.10.2",
+ "rustls",
+ "simple-dns",
+ "strum 0.28.0",
+ "tokio",
+ "tracing",
+ "url",
+ "zakura-iroh-base",
+]
+
+[[package]]
+name = "zakura-iroh-relay"
+version = "1.1.0-rc.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c188f66d3eea54830dab8fd68c5fc62706dd130a3ca16f1b522603bcc44c054c"
+dependencies = [
+ "blake3",
+ "bytes",
+ "cfg_aliases",
+ "data-encoding",
+ "derive_more",
+ "getrandom 0.4.3",
+ "hickory-resolver",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "iroh-metrics",
+ "lru",
+ "n0-error",
+ "n0-future",
+ "noq",
+ "noq-proto",
+ "num_enum",
+ "pin-project",
+ "postcard",
+ "rand 0.10.2",
+ "reqwest 0.13.4",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_bytes",
+ "strum 0.28.0",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tokio-websockets",
+ "tracing",
+ "url",
+ "webpki-roots",
+ "ws_stream_wasm",
+ "zakura-iroh-base",
+ "zakura-iroh-dns",
+]
+
+[[package]]
 name = "zakura-jsonl-trace"
 version = "1.2.0"
 dependencies = [
@@ -7819,7 +7823,6 @@ dependencies = [
  "howudoin",
  "humantime-serde",
  "indexmap 2.14.0",
- "iroh",
  "itertools 0.14.0",
  "lazy_static",
  "metrics",
@@ -7844,6 +7847,7 @@ dependencies = [
  "tracing-subscriber",
  "zakura-chain",
  "zakura-header-chain",
+ "zakura-iroh",
  "zakura-jsonl-trace",
  "zakura-node-services",
  "zakura-test",

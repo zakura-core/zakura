@@ -80,7 +80,7 @@ impl FramedRecv {
 #[derive(Clone, Debug)]
 pub struct FramedSend {
     sender: FramedSender,
-    session_resources: Option<Arc<dyn super::service::OrderedSessionResources>>,
+    session_resources: Option<Arc<dyn super::service::SessionResources>>,
 }
 
 #[derive(Clone, Debug)]
@@ -108,7 +108,7 @@ impl FramedSend {
     /// Keep service admission charged while application senders still own the session.
     pub(crate) fn with_session_resources(
         mut self,
-        resources: Option<Arc<dyn super::service::OrderedSessionResources>>,
+        resources: Option<Arc<dyn super::service::SessionResources>>,
     ) -> Self {
         self.session_resources = resources;
         self

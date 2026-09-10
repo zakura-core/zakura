@@ -11,9 +11,9 @@ impl ZakuraProtocolHandler {
         recv: RecvStream,
         admission: &mut StreamAdmission<'_>,
         queue_depth: usize,
-        exits: mpsc::UnboundedSender<OrderedSessionExit>,
-        pending: &mut PendingOrderedPairs,
-    ) -> Option<AdmittedOrderedSession> {
+        exits: mpsc::UnboundedSender<SessionExit>,
+        pending: &mut PendingSessions,
+    ) -> Option<AdmittedSession> {
         let incoming = self.begin_bi_stream_setup(send, recv, admission)?.await?;
         self.finish_bi_stream_setup(incoming, admission, queue_depth, exits, pending)
     }

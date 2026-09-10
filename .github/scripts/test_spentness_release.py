@@ -193,6 +193,18 @@ class SpentnessReleaseTests(unittest.TestCase):
         }
         fetcher.resolve_bundle(**kwargs)
         self.assertTrue((kwargs["output_dir"] / hints.ARTIFACT).exists())
+        fetcher.resolve_pinned_bundle(
+            latest["meta_url"],
+            latest["meta_sha256"],
+            self.root / "pinned",
+            self.root / "pinned-resolution.json",
+            fetch=fetch,
+            now=kwargs["now"],
+        )
+        self.assertEqual(
+            (self.root / "pinned" / hints.ARTIFACT).read_bytes(),
+            (kwargs["output_dir"] / hints.ARTIFACT).read_bytes(),
+        )
         del self.meta["files"][hints.ARTIFACT]
         meta_bytes = json.dumps(self.meta).encode()
         latest["meta_sha256"] = hashlib.sha256(meta_bytes).hexdigest()

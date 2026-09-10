@@ -4240,28 +4240,32 @@ async fn persistent_stream_worker_with_policy(
                             biased;
                             _ = context.connection_token.cancelled() => break,
                             _ = context.stream_token.cancelled() => break,
-                            result = queued_frame.write_with(|frame| write_ordered_frame_with_policy(
-                                &mut send, frame, context.limits,
-                                context.outbound_frame_cap, context.write_policy,
-                            )) => result,
+                            result = queued_frame.write_with(|frame| async {
+                                let result = write_ordered_frame_with_policy(
+                                    &mut send, frame, context.limits,
+                                    context.outbound_frame_cap, context.write_policy,
+                                ).await;
+                                // A failed request claim can cancel the session on
+                                // drop. Record the cause while it is still alive.
+                                if !context.stream_token.is_cancelled() {
+                                    if let (Err(error), Some(cause)) = (&result, &failure_cause) {
+                                        if error.is::<OrderedFrameWriteTimeout>() {
+                                            cause.record(OrderedStreamFailure::WriteTimeout);
+                                        } else if ordered_stream_write_was_stopped(error) {
+                                            cause.record(OrderedStreamFailure::RemoteClose);
+                                        }
+                                    }
+                                }
+                                result
+                            }) => result,
                         };
                         if let Err(error) = result {
                             if error.is::<OrderedFrameWriteTimeout>() {
-                                if !context.stream_token.is_cancelled() {
-                                    if let Some(cause) = &failure_cause {
-                                        cause.record(OrderedStreamFailure::WriteTimeout);
-                                    }
-                                }
                                 debug!(stream_kind, stream_id = context.stream_id,
                                     "retiring Zakura service session after stream write timeout");
                                 break;
                             }
                             if ordered_stream_write_was_stopped(&error) {
-                                if !context.stream_token.is_cancelled() {
-                                    if let Some(cause) = &failure_cause {
-                                        cause.record(OrderedStreamFailure::RemoteClose);
-                                    }
-                                }
                                 debug!(?error, "closing Zakura ordered stream after peer stopped receiving");
                                 break;
                             }

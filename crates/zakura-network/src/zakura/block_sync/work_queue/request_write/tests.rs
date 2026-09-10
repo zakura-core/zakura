@@ -550,3 +550,39 @@ fn expiry_after_forward_reset_discards_committed_heights() {
         assert!(!f.cancel.is_cancelled());
     }
 }
+
+#[tokio::test]
+async fn request_write_cleanup_preserves_the_recorded_transport_failure() {
+    use crate::zakura::transport::{OrderedStreamFailure, OrderedStreamFailureCause};
+
+    for failure in [
+        OrderedStreamFailure::RemoteClose,
+        OrderedStreamFailure::WriteTimeout,
+    ] {
+        let mut f = Fixture::new();
+        let (sender, mut receiver) = worker_framed_channel(1);
+        let claim = f.take(1);
+        publish(&claim, &sender);
+        drop(claim);
+        let cause = OrderedStreamFailureCause::default();
+        let result = receiver
+            .recv()
+            .await
+            .unwrap()
+            .write_with(|_| async {
+                assert!(!f.cancel.is_cancelled());
+                assert_eq!(f.budget.reserved(), 200);
+                // The transport records the error while the real request owner is
+                // still alive. Its destructor must retain that cause through cleanup.
+                cause.record(failure);
+                Err::<(), _>("write failed")
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(f.cancel.is_cancelled());
+        assert_eq!(cause.get(), Some(failure));
+        assert_eq!(f.work.pending_len(), 2);
+        assert_eq!(f.work.reserved_bytes(), 0);
+        assert_eq!(f.budget.reserved(), 0);
+    }
+}

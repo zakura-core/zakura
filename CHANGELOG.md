@@ -24,27 +24,20 @@ independently.
 
 - Raised the minimum supported Rust version to 1.97 for `zakurad` and the
   internal crates ([#903](https://github.com/zakura-core/zakura/pull/903)).
-- Shortened the end-of-support window to 24 days so v1.4.0-rc0 halts at block
-  3,504,731 — the same halt block and date (~2026-10-03) as v1.3.2
-  ([#915](https://github.com/zakura-core/zakura/pull/915)).
 - Updated the Zakura Common (`zakura-core/common`) crates from `1.1.0` to
   `1.2.0`
   ([#925](https://github.com/zakura-core/zakura/pull/925)).
-- Shortened the end-of-support window to 22 days so v1.4.0-rc1 halts at block
-  3,504,731 — the same halt block and date (~2026-10-03) as v1.4.0-rc0 and
-  v1.3.2
-  ([#927](https://github.com/zakura-core/zakura/pull/927)).
 - Shortened the end-of-support window to 21 days so v1.4.0 halts at block
-  3,504,731 — the same halt block and date (~2026-10-03) as the v1.4.0
-  release candidates and v1.3.2
-  ([#952](https://github.com/zakura-core/zakura/pull/952)).
+  3,504,731 — the same halt block and date (~2026-10-03) as v1.3.2
+  ([#915](https://github.com/zakura-core/zakura/pull/915),
+  [#927](https://github.com/zakura-core/zakura/pull/927),
+  [#952](https://github.com/zakura-core/zakura/pull/952)).
 
 ### Fixed
 
 - Zakura withdraws rejected mining templates, stops affected internal mining work, and
   validates empty-template recovery before returning a replacement
   ([#748](https://github.com/zakura-core/zakura/pull/748)).
-
 - Zakura bounds mined submissions and contextual writes, and returns `inconclusive` when a mined
   block must wait for its parent or verification capacity
   ([#748](https://github.com/zakura-core/zakura/pull/748)).
@@ -69,7 +62,9 @@ independently.
   ([#893](https://github.com/zakura-core/zakura/pull/893)).
 - Added a check on the combined chain value-pool balance as defence in depth
   ([#911](https://github.com/zakura-core/zakura/pull/911)).
-- Fixed serial UTXO lookup delays during block verification of transactions with many transparent inputs. The verifier overlaps up to 64 responses per transaction and admits one lookup at a time to preserve state responsiveness
+- Fixed serial UTXO lookup delays during block verification of transactions
+  with many transparent inputs. The verifier overlaps up to 64 responses per
+  transaction and admits one lookup at a time to preserve state responsiveness
   ([#918](https://github.com/zakura-core/zakura/pull/918)).
 
 ## [1.3.2] - 2026-09-05

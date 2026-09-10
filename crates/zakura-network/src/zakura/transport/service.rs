@@ -90,6 +90,33 @@ pub struct Stream {
     pub mode: StreamMode,
 }
 
+/// Two persistent ordered streams selected and retired as one service session.
+///
+/// Both roles belong to the same service and capability. The data stream is the
+/// session's transport identity; the request stream shares its cancellation and
+/// message budget. Each role carries the same nonzero eight-byte pair identifier
+/// immediately after its ordinary prelude, scoped to its connection and opener.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct OrderedStreamPair {
+    /// Stream carrying responses and control messages, with bounded writes.
+    pub data: Stream,
+    /// Stream whose writes may wait while the session remains valid.
+    pub requests: Stream,
+}
+
+/// A service slot held from paired-stream setup through the last transport and
+/// application sender owner. The service can release its setup allowance once
+/// both roles are ready, while retaining its session allowance through teardown.
+pub trait OrderedSessionResources: fmt::Debug + Send + Sync {
+    /// Both roles have completed setup. Called once for a successfully built pair.
+    fn admitted(&self);
+}
+
+/// The service has no capacity for another establishing or retiring session.
+#[derive(Debug, Error)]
+#[error("ordered service session capacity is full")]
+pub struct OrderedSessionFull;
+
 /// Transport state for one ordered service stream.
 #[derive(Debug)]
 pub(crate) struct ServiceStream {
@@ -367,6 +394,44 @@ pub trait Service: fmt::Debug + Send + Sync + 'static {
     /// Streams this service owns.
     fn streams(&self) -> &[Stream];
 
+    /// Payload size limits for this stream, as `(message_type, maximum_bytes)` pairs.
+    ///
+    /// The reader checks these limits before allocating a payload. Limits exclude
+    /// the frame header and may only tighten the stream's existing cap. Unlisted
+    /// message types keep that cap; message validity is checked by the codec.
+    fn message_payload_limits(&self, _stream: Stream) -> &'static [(u16, usize)] {
+        &[]
+    }
+
+    /// Optional message types accepted on this role. The transport rejects an
+    /// unlisted type from its header, before allocating or reading its payload.
+    fn message_types(&self, _stream: Stream) -> Option<&'static [u16]> {
+        None
+    }
+
+    /// Optional per-stream inbound and outbound application queue limits.
+    /// The transport also applies its connection-wide inbound queue allowance.
+    fn stream_queue_depths(&self, _stream: Stream) -> Option<(usize, usize)> {
+        None
+    }
+
+    /// Reserve service capacity before starting a stream pair. The returned
+    /// owner lives through incomplete setup and both workers' eventual teardown.
+    fn reserve_ordered_session(
+        &self,
+        _direction: ServicePeerDirection,
+    ) -> Result<Option<std::sync::Arc<dyn OrderedSessionResources>>, OrderedSessionFull> {
+        Ok(None)
+    }
+
+    /// Return the complete pair containing `stream`, if this version uses one.
+    ///
+    /// Both declarations must be present in [`Service::streams`] with the same
+    /// capability and opening policy. Ordinary ordered streams return `None`.
+    fn ordered_stream_pair(&self, _stream: Stream) -> Option<OrderedStreamPair> {
+        None
+    }
+
     /// Return the transport-owned opening and re-admission policy for `kind`.
     ///
     /// The default preserves the legacy one-shot initiator-opens behavior.
@@ -392,6 +457,21 @@ pub trait Service: fmt::Debug + Send + Sync + 'static {
         } else {
             OrderedSessionDemand::Retire
         }
+    }
+
+    /// Recheck demand for a complete pair that already owns its setup reservation.
+    ///
+    /// Services with session reservations must retain cooldown and usefulness
+    /// checks here without requiring capacity for a second reservation. The
+    /// default preserves ordinary demand checks for services without reservations.
+    fn reserved_ordered_session_demand(
+        &self,
+        conn_id: ZakuraConnId,
+        peer: &ZakuraPeerId,
+        negotiated: u64,
+        direction: ServicePeerDirection,
+    ) -> OrderedSessionDemand {
+        self.ordered_session_demand(conn_id, peer, negotiated, direction)
     }
 
     /// Return whether this service currently wants a new session for `peer`.

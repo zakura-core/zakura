@@ -36,6 +36,8 @@ fn reset_drops_unaffected_last_claim_after_unlocking() {
         assert_eq!(f.work.reset_above(block::Height(2)), 0);
         assert_eq!(f.budget.reserved(), 0);
         assert_eq!(f.work.reserved_bytes(), 0);
+        assert_eq!(f.work.pending_len(), 0);
+        assert_eq!(f.work.in_flight_len(), 0);
         assert!(!f.cancel.is_cancelled());
         done_tx.send(()).unwrap();
     });
@@ -507,6 +509,43 @@ fn queued_expiry_racing_reset_settles_each_reservation_once() {
         assert_eq!(f.work.in_flight_len(), 0);
         drop(receiver);
         drop(claim);
+        assert_eq!(f.budget.reserved(), 0);
+        assert!(!f.cancel.is_cancelled());
+    }
+}
+
+#[test]
+fn expiry_after_forward_reset_discards_committed_heights() {
+    for received in [false, true] {
+        let mut f = Fixture::new();
+        let (sender, receiver) = worker_framed_channel(1);
+        let claim = f.take(1);
+        publish(&claim, &sender);
+        if received {
+            f.budget.release(
+                f.work
+                    .release_active_reserved_height_for_owner(claim.owner(), block::Height(1))
+                    .unwrap(),
+            );
+        }
+        // Reset retains heights at or below its new floor. Cleanup must discard
+        // that prefix instead of offering already-committed work to another peer.
+        f.budget.release(f.work.reset_above(block::Height(2)));
+        let outcome = f.work.release_reserved_and_return_items_detailed_for_owner(
+            claim.owner(),
+            [block::Height(1)],
+        );
+        assert_eq!(outcome.committed_count, 2);
+        assert_eq!(outcome.returned_count, 0);
+        assert_eq!(outcome.released_bytes, if received { 100 } else { 200 });
+        f.budget.release(outcome.released_bytes);
+        assert_eq!(f.work.pending_len(), 0);
+        assert_eq!(f.work.in_flight_len(), 0);
+        assert_eq!(f.work.reserved_bytes(), 0);
+        assert_eq!(f.budget.reserved(), 0);
+        drop(receiver);
+        drop(claim);
+        assert_eq!(f.work.pending_len(), 0);
         assert_eq!(f.budget.reserved(), 0);
         assert!(!f.cancel.is_cancelled());
     }

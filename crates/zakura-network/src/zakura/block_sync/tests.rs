@@ -1118,6 +1118,8 @@ fn window_request(height: u32) -> OutstandingBlockRange {
     let byte = u8::try_from(height).expect("test heights fit in u8");
     let now = Instant::now();
     OutstandingBlockRange {
+        write_status: work_queue::RequestWriteStatus::written_for_tests(),
+        charged_for_liveness: true,
         request: BlockRangeRequest {
             owner: test_work_owner(),
             start_height: block::Height(height),
@@ -1142,6 +1144,8 @@ fn window_request_range(start: u32, count: u32) -> OutstandingBlockRange {
     let byte = u8::try_from(start).expect("test heights fit in u8");
     let now = Instant::now();
     OutstandingBlockRange {
+        write_status: work_queue::RequestWriteStatus::written_for_tests(),
+        charged_for_liveness: true,
         request: BlockRangeRequest {
             owner: test_work_owner(),
             start_height: block::Height(start),
@@ -1371,7 +1375,7 @@ fn view_reset_reclears_probe_streak_so_unproven_peer_can_reprobe() {
     // A destructive reset returns the peer's outstanding to the queue on our
     // initiative, then runs the reset hook.
     window.outstanding.clear();
-    window.note_view_reset();
+    window.note_locally_returned_requests();
 
     // The peer can probe again (streak below the cap) and is not left as a zombie
     // (liveness cleared, so `check_liveness` is `Ok`, and proof state is untouched).
@@ -1409,7 +1413,7 @@ fn view_reset_preserves_proof_but_reclears_streak() {
     assert_eq!(window.no_progress_request_cap(), 8);
 
     window.outstanding.clear();
-    window.note_view_reset();
+    window.note_locally_returned_requests();
 
     assert_eq!(window.requests_without_block_progress, 0);
     assert!(
@@ -4067,8 +4071,15 @@ async fn block_liveness_parks_silent_peer_and_traces_reason() {
 
 #[tokio::test]
 async fn late_unowned_body_is_rejected_and_the_session_is_parked() {
-    // A body cannot count as progress after its request ownership expires.
-    // Verify both the missing submission and the local park.
+    check_cold_probe_deadline(true).await;
+}
+
+#[tokio::test]
+async fn cold_probe_can_finish_after_the_short_floor_rescue_deadline() {
+    check_cold_probe_deadline(false).await;
+}
+
+async fn check_cold_probe_deadline(expired: bool) {
     let mut config = immediate_body_download_config();
     // Short request/floor-rescue leash so the probe times out fast; the liveness
     // deadline (request_timeout * 4 = 1.2s) is what a false disconnect would trip.
@@ -4138,12 +4149,10 @@ async fn late_unowned_body_is_rejected_and_the_session_is_parked() {
     assert_eq!(start_height, block::Height(1));
     assert_eq!(count, 1);
 
-    // Let that probe time out on the floor-rescue leash: height 1 returns to the
-    // queue and, being unproven, the peer is now gated at its one-probe cap.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // An unmeasured peer gets the normal deadline for its only probe. Deliver
+    // after the short rescue deadline, or after the normal deadline has expired.
+    tokio::time::sleep(Duration::from_millis(if expired { 500 } else { 200 })).await;
 
-    // The body arrives after retirement of its request owner.
-    // Do not submit it to the verifier or count it as timely progress.
     inbound_tx
         .send(
             BlockSyncMessage::Block(blocks[0].clone())
@@ -4153,20 +4162,27 @@ async fn late_unowned_body_is_rejected_and_the_session_is_parked() {
         .await
         .expect("late block frame queues");
 
-    assert!(
-        tokio::time::timeout(Duration::from_millis(200), async {
-            loop {
-                if matches!(
-                    next_action(&mut actions).await,
-                    BlockSyncAction::SubmitBlock { .. }
-                ) {
-                    break;
-                }
+    let submitted = tokio::time::timeout(Duration::from_millis(200), async {
+        loop {
+            if matches!(
+                next_action(&mut actions).await,
+                BlockSyncAction::SubmitBlock { .. }
+            ) {
+                break;
             }
-        })
-        .await
-        .is_err(),
-        "a completion whose request owner retired must not reach the verifier",
+        }
+    })
+    .await;
+    if !expired {
+        submitted.expect("the still-owned cold probe must reach the verifier");
+        assert_eq!(handle.peer_snapshot().outbound_peers, 1);
+        assert!(!connection_cancel.is_cancelled());
+        reactor_task.abort();
+        return;
+    }
+    assert!(
+        submitted.is_err(),
+        "a retired owner cannot reach the verifier"
     );
     await_until(
         "late unowned body does not prevent the session park",
@@ -5788,6 +5804,8 @@ fn outstanding_three_block_range(budget: &mut ByteBudget) -> OutstandingBlockRan
     assert!(budget.try_reserve(request.estimated_bytes));
     let now = Instant::now();
     OutstandingBlockRange {
+        write_status: work_queue::RequestWriteStatus::written_for_tests(),
+        charged_for_liveness: true,
         request,
         queued_at: now,
         deadline: now,
@@ -6184,6 +6202,8 @@ fn underestimated_body_is_buffered_and_releases_only_its_estimate() {
     assert!(budget.try_reserve(request.estimated_bytes));
     let now = Instant::now();
     let mut outstanding = OutstandingBlockRange {
+        write_status: work_queue::RequestWriteStatus::written_for_tests(),
+        charged_for_liveness: true,
         request,
         queued_at: now,
         deadline: now,

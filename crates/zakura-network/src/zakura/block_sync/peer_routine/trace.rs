@@ -1,6 +1,6 @@
 use super::super::trace::{
     block_sync_message_label, elapsed_us, height as trace_height, peer as trace_peer,
-    saturating_usize, BlockTraceEvent, BlockTraceFields, BoolOrU64, QueueSendFailedEvent,
+    saturating_usize, BlockTraceEvent, BlockTraceFields, BoolOrU64,
 };
 use super::*;
 use crate::zakura::trace::block_sync_trace as bs_trace;
@@ -106,18 +106,6 @@ impl PeerRoutine {
             row.budget_available = Some(self.budget.available());
             row.pending_work = Some(saturating_usize(self.work.pending_len()));
             row.received_status = Some(BoolOrU64::U64(u64::from(self.received_status)));
-        });
-    }
-
-    pub(super) fn trace_queue_send_failed(&self, msg: &BlockSyncMessage, error: &OrderedSendError) {
-        self.trace.emit_event(|| {
-            QueueSendFailedEvent::peer_routine(
-                &self.peer,
-                msg,
-                error,
-                self.session.outbound_capacity(),
-                self.session.outbound_max_capacity(),
-            )
         });
     }
 

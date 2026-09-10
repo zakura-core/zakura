@@ -46,6 +46,9 @@ use crate::{
 
 use super::super::TypedColumnFamily;
 
+#[cfg(test)]
+mod contention;
+
 /// The name of the transaction hash by spent outpoints column family.
 pub const TX_LOC_BY_SPENT_OUT_LOC: &str = "tx_loc_by_spent_out_loc";
 

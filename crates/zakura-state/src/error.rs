@@ -275,8 +275,12 @@ pub enum CommitBlockError {
         error: String,
     },
 
-    /// The orphan queue reached its memory bound.
-    #[error("too many blocks are waiting for unavailable parents")]
+    /// A mined submission cannot wait in the orphan queue.
+    #[error("mined block parent is unavailable")]
+    MissingMinedParent,
+
+    /// The orphan queue or contextual writer reached its memory bound.
+    #[error("too many blocks are waiting for contextual verification")]
     QueueFull,
 
     /// The write task exited (likely during shutdown).
@@ -342,6 +346,9 @@ impl CommitBlockError {
             Self::ValidateContextError(error) => error.body_verification_class(),
             Self::HeaderChainError { .. } => {
                 BodyVerificationClass::Retryable(TransientBodyFailureKind::Storage)
+            }
+            Self::MissingMinedParent => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::MissingContext)
             }
             Self::QueueFull => {
                 BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
@@ -1015,10 +1022,9 @@ impl ValidateContextError {
     ///
     /// The query returns the subset of [`Self::vct_retryable_height`] where the supplied root is
     /// missing. The peer either omitted the root from its header range or supplied a root that
-    /// verification later evicted. Only a later delivery of the same header range can fill the
-    /// missing root. Header sync does not request individual roots. An await-successor stall
-    /// ([`Self::vct_retryable_height`] but not this method) already has its root
-    /// and only waits for the next header to be stored.
+    /// verification later evicted. Header sync requests a bounded selected range that starts at
+    /// the missing height. An await-successor stall ([`Self::vct_retryable_height`] but not this
+    /// method) already has its root and only waits for the next header to be stored.
     pub fn vct_supplied_root_unavailable_height(&self) -> Option<block::Height> {
         match self {
             ValidateContextError::VctSuppliedRootUnavailable { height } => Some(*height),
@@ -1029,8 +1035,8 @@ impl ValidateContextError {
     /// Returns the height for any retryable VCT root stall: either an absent/evicted supplied
     /// root ([`Self::VctSuppliedRootUnavailable`]) or one not yet verifiable because no successor
     /// is buffered to confirm it ([`Self::VctSuppliedRootAwaitingSuccessor`]). The write loop
-    /// parks and retries the same block for both; the former polls slower because nothing is
-    /// actively fetching a replacement root.
+    /// parks and retries the same block for both. A header insertion wakes a missing-root stall.
+    /// A short bounded delay wakes an await-successor stall.
     pub fn vct_retryable_height(&self) -> Option<block::Height> {
         match self {
             ValidateContextError::VctSuppliedRootUnavailable { height }

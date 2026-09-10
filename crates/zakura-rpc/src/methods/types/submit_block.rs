@@ -1,7 +1,7 @@
 //! Parameter, response, and lifecycle types for mined-block RPCs.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
@@ -50,6 +50,50 @@ pub struct SubmitSolutionParameters {
 }
 
 const MAX_PENDING_BLOCKS: usize = 16;
+const MAX_MINED_SUBMISSIONS: usize = 16;
+
+/// Bounds detached mined submissions before they reach verification or the writer.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MinedSubmissions(Arc<Mutex<HashSet<block::Hash>>>);
+
+/// Holds submission capacity until verification and contextual commit finish.
+pub(crate) struct MinedSubmission {
+    submissions: MinedSubmissions,
+    hash: block::Hash,
+}
+
+impl MinedSubmissions {
+    pub(crate) fn reserve(
+        &self,
+        hash: block::Hash,
+    ) -> Result<MinedSubmission, SubmitBlockErrorResponse> {
+        let mut entries = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if entries.contains(&hash) {
+            return Err(SubmitBlockErrorResponse::DuplicateInconclusive);
+        }
+        if entries.len() >= MAX_MINED_SUBMISSIONS {
+            return Err(SubmitBlockErrorResponse::Inconclusive);
+        }
+        entries.insert(hash);
+        Ok(MinedSubmission {
+            submissions: self.clone(),
+            hash,
+        })
+    }
+}
+
+impl Drop for MinedSubmission {
+    fn drop(&mut self) {
+        self.submissions
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.hash);
+    }
+}
 
 /// The RPC path that admitted a mined block.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -177,7 +221,7 @@ pub enum SubmitBlockErrorResponse {
     Duplicate,
     /// Block was already added to the state queue or channel, but not yet committed to the non-finalized state
     DuplicateInconclusive,
-    /// Block was already committed to the non-finalized state, but not on the best chain
+    /// The node could not establish acceptance, so the caller can retry.
     Inconclusive,
     /// Block rejected as invalid
     Rejected,
@@ -215,7 +259,7 @@ pub enum SubmitSolutionErrorResponse {
     Duplicate,
     /// The block was already queued but has not committed.
     DuplicateInconclusive,
-    /// The block committed to a side chain.
+    /// The node could not establish acceptance, so the caller can retry.
     Inconclusive,
     /// Consensus rejected the block.
     Rejected,
@@ -298,6 +342,31 @@ mod tests {
         zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
             .zcash_deserialize_into()
             .expect("the genesis test vector is valid")
+    }
+
+    #[test]
+    fn mined_submissions_bound_and_release_verification_ownership() {
+        let submissions = MinedSubmissions::default();
+        let hash = block::Hash([0; 32]);
+        let first = submissions.reserve(hash).unwrap();
+        assert!(matches!(
+            submissions.reserve(hash),
+            Err(SubmitBlockErrorResponse::DuplicateInconclusive)
+        ));
+        let mut guards = vec![first];
+        for n in 1..MAX_MINED_SUBMISSIONS {
+            guards.push(
+                submissions
+                    .reserve(block::Hash([u8::try_from(n).unwrap(); 32]))
+                    .unwrap(),
+            );
+        }
+        assert!(matches!(
+            submissions.reserve(block::Hash([255; 32])),
+            Err(SubmitBlockErrorResponse::Inconclusive)
+        ));
+        drop(guards);
+        assert!(submissions.reserve(hash).is_ok());
     }
 
     #[test]

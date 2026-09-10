@@ -15,7 +15,7 @@
 //!   chain tip changes.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{hash_map, BTreeMap, HashMap},
     future::Future,
     ops::Bound,
     path::PathBuf,
@@ -181,8 +181,27 @@ pub(crate) struct StateService {
     /// Hashes of blocks below the finalized tip height are periodically pruned.
     non_finalized_block_write_sent_hashes: SentHashes,
 
-    /// Parents targeted by operator invalidation cannot authorize optimistic relay.
-    optimistic_relay_blocked_parents: HashSet<block::Hash>,
+    /// Parents whose one optimistic relay slot a mined candidate already reserved, keyed by
+    /// parent hash and holding the height of the candidate that took the slot.
+    ///
+    /// A reservation only matters while its parent is still the best tip, so entries are pruned
+    /// once the reserving height is finalized, alongside the other per-block maps.
+    optimistic_relay_reserved_parents: HashMap<block::Hash, block::Height>,
+
+    /// Capacity held until the writer publishes each contextual or reconsideration result.
+    non_finalized_write_slots: Arc<tokio::sync::Semaphore>,
+
+    /// Parents targeted by operator invalidation cannot authorize optimistic relay, counted by
+    /// how many invalidations are outstanding for each hash.
+    ///
+    /// `send_invalidate_block` increments a hash before the writer sees the invalidation, so a
+    /// candidate queued afterwards cannot advertise against a parent that is about to disappear.
+    /// A confirmed reconsideration decrements it, which releases a hash that is valid again while
+    /// leaving a later invalidation of the same hash in force.
+    ///
+    /// This is shared because the confirmation arrives in the detached `ReconsiderBlock` response
+    /// future, which has no access to the service.
+    optimistic_relay_invalidated_parents: Arc<Mutex<HashMap<block::Hash, usize>>>,
 
     /// Recent local write failures used to complete descendants that arrive after the failure.
     non_finalized_failed_ancestors:
@@ -247,6 +266,9 @@ pub struct ReadStateService {
     //
     /// The configured Zcash network.
     network: Network,
+
+    /// Highest height where checkpoint sync can require VCT repair.
+    max_checkpoint_height: block::Height,
 
     // Shared Concurrently Readable State
     //
@@ -550,7 +572,8 @@ impl StateService {
                 reader: header_chain_reader_receiver,
             },
             historical_trees,
-        );
+        )
+        .with_max_checkpoint_height(max_checkpoint_height);
 
         let full_verifier_utxo_lookahead = max_checkpoint_height
             - HeightDiff::try_from(checkpoint_verify_concurrency_limit)
@@ -574,7 +597,11 @@ impl StateService {
             block_write_sender,
             finalized_block_write_last_sent_hash,
             non_finalized_block_write_sent_hashes,
-            optimistic_relay_blocked_parents: HashSet::new(),
+            optimistic_relay_reserved_parents: HashMap::new(),
+            non_finalized_write_slots: Arc::new(tokio::sync::Semaphore::new(
+                queued_blocks::MAX_QUEUED_BLOCKS,
+            )),
+            optimistic_relay_invalidated_parents: Arc::new(Mutex::new(HashMap::new())),
             non_finalized_failed_ancestors: IndexMap::new(),
             invalid_block_write_reset_receiver,
             non_finalized_rejected_receiver,
@@ -1043,6 +1070,15 @@ impl StateService {
             return rsp_rx;
         }
 
+        if let Some(admission) = &admission {
+            if !self.drains_the_non_finalized_queue_now(&parent_hash) {
+                admission.reject();
+                let (rsp_tx, rsp_rx) = oneshot::channel();
+                let _ = rsp_tx.send(Err(CommitBlockError::MissingMinedParent.into()));
+                return rsp_rx;
+            }
+        }
+
         // [`Request::CommitSemanticallyVerifiedBlock`] contract: a request to commit a block which
         // has been queued but not yet committed to the state fails the older request and replaces
         // it with the newer request.
@@ -1067,19 +1103,14 @@ impl StateService {
             .into()));
             rsp_rx
         } else if self.non_finalized_state_queued_blocks.is_full()
-            && !self.can_fork_chain_at(&parent_hash)
+            && !self.drains_the_non_finalized_queue_now(&parent_hash)
         {
             // The bound only applies to blocks that must wait for a parent this state does not
-            // have. A block that can extend a chain now is admitted even when the queue is full,
-            // because the drain below walks forward from `parent_hash`: a block the queue refused
+            // have. A block that this call goes on to drain is admitted even when the queue is
+            // full, because the drain walks forward from `parent_hash`: a block the queue refused
             // is never the parent that releases its own queued descendants, and nothing else
             // empties the queue while the chain is stalled, so rejecting it here would strand
             // them permanently.
-            //
-            // Admitting one costs at most a transient overshoot. In the common case the drain
-            // below removes it in this same call. While the write task still commits checkpoint
-            // blocks it can stay queued, but only a child of the finalized tip qualifies then,
-            // and queuing one is itself a handoff trigger.
             if let Some(admission) = admission {
                 admission.reject();
             }
@@ -1118,9 +1149,39 @@ impl StateService {
 
             self.non_finalized_block_write_sent_hashes
                 .prune_by_height(finalized_tip_height);
+
+            self.prune_optimistic_relay_reservations(finalized_tip_height);
         }
 
         rsp_rx
+    }
+
+    /// Returns whether queueing a block with this parent lets the rest of this call drain it
+    /// again, so admitting it past the queue bound overshoots by one entry and no more.
+    ///
+    /// Only a block the queue releases immediately may bypass the bound. Anything that stays
+    /// queued has to be rejected, or a caller could grow the queue without limit by choosing
+    /// parents that pass a liveness check but that nothing goes on to drain.
+    fn drains_the_non_finalized_queue_now(&self, parent_hash: &block::Hash) -> bool {
+        if self.block_write_sender.finalized.is_some() {
+            // The write task is still committing checkpoint blocks, so `send_ready_non_finalized_queued`
+            // does not run for this parent and only the handoff empties the queue. The handoff
+            // needs the last hash we sent to be durably written, and it needs a queued child of
+            // that same hash. A block meeting both is drained by `try_handoff_to_non_finalized_write`
+            // below, and it fires at most once in the life of the node.
+            //
+            // The durable finalized tip is not enough on its own. It lags the last hash we sent
+            // for as long as checkpoint writes are in flight, and a block naming the lagging tip
+            // neither completes the handoff condition nor gets reached by the eventual handoff
+            // traversal, which walks forward from the last hash we sent.
+            return self.read_service.db.finalized_tip_hash()
+                == self.finalized_block_write_last_sent_hash
+                && *parent_hash == self.finalized_block_write_last_sent_hash;
+        }
+
+        // The queue is live: `send_ready_non_finalized_queued` walks forward from this parent
+        // later in this same call.
+        self.can_fork_chain_at(parent_hash)
     }
 
     /// Returns `true` if `hash` is a valid previous block hash for new non-finalized blocks.
@@ -1155,6 +1216,14 @@ impl StateService {
                     .dequeue_children(parent_hash);
 
                 for queued_child in queued_children {
+                    let Ok(write_slot) = self.non_finalized_write_slots.clone().try_acquire_owned()
+                    else {
+                        Self::send_semantically_verified_block_error(
+                            queued_child,
+                            CommitBlockError::QueueFull,
+                        );
+                        continue;
+                    };
                     let (SemanticallyVerifiedBlock { hash, .. }, _, _) = &queued_child;
                     let hash = *hash;
 
@@ -1165,6 +1234,8 @@ impl StateService {
                     let optimistic_relay_still_authorized = admission
                         .as_ref()
                         .is_some_and(BlockAdmission::optimistic_relay_authorized)
+                        && self.non_finalized_write_slots.available_permits()
+                            == queued_blocks::MAX_QUEUED_BLOCKS - 1
                         && self
                             .best_tip()
                             .is_some_and(|(_, tip_hash)| tip_hash == candidate_parent)
@@ -1173,15 +1244,21 @@ impl StateService {
                             .contains(&candidate_parent)
                             || self.read_service.db.finalized_tip_hash() == candidate_parent)
                         && !self
-                            .optimistic_relay_blocked_parents
-                            .contains(&candidate_parent);
+                            .optimistic_relay_reserved_parents
+                            .contains_key(&candidate_parent)
+                        && !self.optimistic_relay_is_blocked_by_invalidation();
                     if optimistic_relay_still_authorized {
                         // Only the first server candidate can reserve early relay for this parent.
                         // Siblings receive the normal committed relay after contextual validation.
-                        self.optimistic_relay_blocked_parents
-                            .insert(candidate_parent);
+                        self.optimistic_relay_reserved_parents
+                            .insert(candidate_parent, queued_child.0.height);
                     }
-                    let send_result = non_finalized_block_write_sender.send(queued_child.into());
+                    let send_result =
+                        non_finalized_block_write_sender.send(NonFinalizedWriteMessage::Commit {
+                            queued: queued_child,
+                            queued_at: Instant::now(),
+                            write_slot,
+                        });
 
                     if let Err(SendError(NonFinalizedWriteMessage::Commit { queued, .. })) =
                         send_result
@@ -1214,6 +1291,46 @@ impl StateService {
         self.read_service.best_tip()
     }
 
+    /// Drops optimistic relay reservations that can never be consulted again.
+    ///
+    /// A reservation is only read while its parent is the best tip. Once the candidate that took
+    /// the slot is finalized its parent is buried, so the entry is dead and would otherwise be
+    /// retained for the lifetime of the process.
+    fn prune_optimistic_relay_reservations(&mut self, finalized_tip_height: block::Height) {
+        self.optimistic_relay_reserved_parents
+            .retain(|_, height| *height > finalized_tip_height);
+    }
+
+    /// Any outstanding invalidation can remove an ancestor of the published tip.
+    fn optimistic_relay_is_blocked_by_invalidation(&self) -> bool {
+        !self
+            .optimistic_relay_invalidated_parents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    }
+
+    /// Releases one outstanding invalidation of `hash`, after the writer confirmed that it was
+    /// reconsidered.
+    ///
+    /// Counting rather than clearing keeps an invalidation issued after this reconsideration was
+    /// requested in force, because that later invalidation raised the count again.
+    fn release_optimistic_relay_invalidation(
+        invalidated_parents: &Mutex<HashMap<block::Hash, usize>>,
+        hash: block::Hash,
+    ) {
+        let mut invalidated_parents = invalidated_parents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let hash_map::Entry::Occupied(mut entry) = invalidated_parents.entry(hash) else {
+            return;
+        };
+        *entry.get_mut() -= 1;
+        if *entry.get() == 0 {
+            entry.remove();
+        }
+    }
+
     fn send_invalidate_block(
         &mut self,
         hash: block::Hash,
@@ -1227,7 +1344,12 @@ impl StateService {
 
         // Block optimistic relay before the writer processes the invalidation. The write channel
         // preserves request order, so a later candidate cannot advertise using this stale parent.
-        self.optimistic_relay_blocked_parents.insert(hash);
+        *self
+            .optimistic_relay_invalidated_parents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(hash)
+            .or_default() += 1;
 
         if let Err(tokio::sync::mpsc::error::SendError(error)) =
             sender.send(NonFinalizedWriteMessage::Invalidate { hash, rsp_tx })
@@ -1253,8 +1375,16 @@ impl StateService {
             return rsp_rx;
         };
 
+        let Ok(write_slot) = self.non_finalized_write_slots.clone().try_acquire_owned() else {
+            let _ = rsp_tx.send(Err(ReconsiderError::ReconsiderSendFailed));
+            return rsp_rx;
+        };
         if let Err(tokio::sync::mpsc::error::SendError(error)) =
-            sender.send(NonFinalizedWriteMessage::Reconsider { hash, rsp_tx })
+            sender.send(NonFinalizedWriteMessage::Reconsider {
+                hash,
+                rsp_tx,
+                write_slot,
+            })
         {
             let NonFinalizedWriteMessage::Reconsider { rsp_tx, .. } = error else {
                 unreachable!("should return the same Reconsider message could not be sent");
@@ -1409,6 +1539,7 @@ impl ReadStateService {
 
         let read_service = Self {
             network: finalized_state.network(),
+            max_checkpoint_height: block::Height::MAX,
             db: finalized_state.db.clone(),
             non_finalized_state_receiver,
             block_write_task,
@@ -1425,6 +1556,12 @@ impl ReadStateService {
         tracing::debug!("created new read-only state service");
 
         read_service
+    }
+
+    /// Bound VCT repair reads at the final checkpoint.
+    fn with_max_checkpoint_height(mut self, max_checkpoint_height: block::Height) -> Self {
+        self.max_checkpoint_height = max_checkpoint_height;
+        self
     }
 
     /// Return the tip of the current best chain.
@@ -1909,6 +2046,7 @@ impl Service<Request> for StateService {
 
             // The expected error type for this request is `ReconsiderError`
             Request::ReconsiderBlock(block_hash) => {
+                let invalidated_parents = self.optimistic_relay_invalidated_parents.clone();
                 let rsp_rx = tokio::task::block_in_place(move || {
                     span.in_scope(|| self.send_reconsider_block(block_hash))
                 });
@@ -1918,10 +2056,21 @@ impl Service<Request> for StateService {
                 // Then flatten the nested Result and convert any errors to a BoxError.
                 let span = Span::current();
                 async move {
-                    rsp_rx
+                    let reconsidered = rsp_rx
                         .await
                         .map_err(|_recv_error| ReconsiderError::ReconsiderResponseDropped)
-                        .and_then(|result| result)
+                        .and_then(|result| result);
+
+                    // Only a confirmed reconsideration releases the parent for optimistic relay.
+                    // A failed one leaves the block invalidated, so it must stay blocked.
+                    if reconsidered.is_ok() {
+                        StateService::release_optimistic_relay_invalidation(
+                            &invalidated_parents,
+                            block_hash,
+                        );
+                    }
+
+                    reconsidered
                         .map_err(BoxError::from)
                         .map(Response::Reconsidered)
                 }
@@ -2784,7 +2933,13 @@ impl Service<ReadRequest> for ReadStateService {
             ReadRequest::VctRepairContext { owner, height } => {
                 let reader = state.header_chain_reader_receiver.borrow().clone();
                 let context = reader
-                    .map(|reader| reader.vct_repair_context(owner, height))
+                    .map(|reader| {
+                        reader.vct_repair_context_bounded(
+                            owner,
+                            height,
+                            state.max_checkpoint_height,
+                        )
+                    })
                     .transpose()?
                     .flatten();
                 Ok(ReadResponse::VctRepairContext(context))

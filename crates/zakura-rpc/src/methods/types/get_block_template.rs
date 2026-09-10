@@ -9,6 +9,7 @@ pub mod zip317;
 mod tests;
 
 use std::{
+    collections::{HashSet, VecDeque},
     fmt::{self},
     sync::{Arc, Mutex},
 };
@@ -18,7 +19,7 @@ use derive_new::new;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee_types::{ErrorCode, ErrorObject};
 use rand::{rngs::OsRng, RngCore};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tower::{Service, ServiceExt};
 use zcash_keys::address::Address;
 use zcash_protocol::memo::MemoBytes;
@@ -66,6 +67,68 @@ pub use parameters::{
     GetBlockTemplateCapability, GetBlockTemplateParameters, GetBlockTemplateRequestMode,
 };
 pub use proposal::{BlockProposalResponse, BlockTemplateTimeSource};
+
+/// Rejections for the current template parent. Overflow fails closed until the tip changes.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TemplateRejections {
+    pub(crate) parent: Option<block::Hash>,
+    pub(crate) revision: u64,
+    rejected: HashSet<String>,
+    prepared: VecDeque<String>,
+    pub(crate) saturated: bool,
+}
+
+impl TemplateRejections {
+    pub(crate) fn set_parent(&mut self, parent: block::Hash) {
+        if self.parent != Some(parent) {
+            self.parent = Some(parent);
+            self.rejected.clear();
+            self.prepared.clear();
+            self.saturated = false;
+        }
+    }
+
+    pub(crate) fn reject(&mut self, parent: block::Hash, work_id: &str) -> bool {
+        if self.parent != Some(parent) || self.contains(work_id) {
+            return false;
+        }
+        if self.rejected.len() == 64 {
+            self.saturated = true;
+        } else {
+            self.rejected.insert(work_id.to_owned());
+        }
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .expect("template revision cannot exhaust u64");
+        true
+    }
+
+    pub(crate) fn contains(&self, work_id: &str) -> bool {
+        self.saturated || self.rejected.contains(work_id)
+    }
+
+    pub(crate) fn needs_fallback(&self) -> bool {
+        self.saturated || !self.rejected.is_empty()
+    }
+
+    pub(crate) fn mark_prepared(&mut self, parent: block::Hash, work_id: &str) {
+        if self.parent == Some(parent) && !self.prepared.iter().any(|id| id == work_id) {
+            if self.prepared.len() == 64 {
+                self.prepared.pop_front();
+            }
+            self.prepared.push_back(work_id.to_owned());
+        }
+    }
+
+    pub(crate) fn is_prepared(&self, work_id: &str) -> bool {
+        self.prepared.iter().any(|id| id == work_id) && !self.contains(work_id)
+    }
+
+    pub(crate) fn withdrawn(&self, work_id: &str) -> bool {
+        self.contains(work_id) || (self.needs_fallback() && !self.is_prepared(work_id))
+    }
+}
 
 #[derive(Clone, Debug)]
 struct TemplatePreparationQueue<T>(Arc<Mutex<TemplatePreparationState<T>>>);
@@ -626,11 +689,17 @@ where
     /// Blocks whose hashes were advertised before contextual commit completed.
     pending_blocks: PendingBlockRegistry,
 
+    /// Detached submissions that still own verification or contextual commit work.
+    mined_submissions: super::submit_block::MinedSubmissions,
+
     /// Whether state admission can trigger an early inventory.
     optimistic_block_inventory: bool,
 
     /// Coalesces detached template preparation work to the newest template.
     template_preparation_queue: TemplatePreparationQueue<BlockTemplateResponse>,
+
+    /// Retains failures so late subscribers cannot miss template withdrawal.
+    pub(crate) template_rejections: watch::Sender<TemplateRejections>,
 }
 
 impl<BlockVerifierRouter, SyncStatus> GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>
@@ -658,9 +727,19 @@ where
             mined_block_sender: mined_block_sender
                 .unwrap_or(SubmitBlockChannel::default().sender()),
             pending_blocks,
+            mined_submissions: Default::default(),
             optimistic_block_inventory,
             template_preparation_queue: TemplatePreparationQueue::default(),
+            template_rejections: watch::channel(TemplateRejections::default()).0,
         }
+    }
+
+    pub(crate) fn reserve_mined_submission(
+        &self,
+        hash: block::Hash,
+    ) -> Result<super::submit_block::MinedSubmission, super::submit_block::SubmitBlockErrorResponse>
+    {
+        self.mined_submissions.reserve(hash)
     }
 
     /// Returns the miner parameters, including the address, data, and memo.

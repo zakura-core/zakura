@@ -14,6 +14,9 @@ set -euo pipefail
 #   build script panics with "a `libclang` shared library is not loaded on this
 #   thread". The workspace enables `bindgen-runtime`, but published baselines
 #   cannot change, so give the crate's bindgen build-dependency the feature.
+# - stun-rs 0.1.11 uses precis-core 0.1 traits, but precis-profiles 0.1.14
+#   switched to precis-core 0.2. Pin its profiles dependency to the compatible
+#   version in our workspace lock file.
 readonly original_cargo_home="${CARGO_HOME:-$HOME/.cargo}"
 patch_root=$(mktemp -d "$RUNNER_TEMP/semver-registry.XXXXXX")
 readonly patch_root
@@ -65,6 +68,18 @@ fi
 sed -i '/^\[build-dependencies\.bindgen\]$/,/^default-features = false$/ s/^default-features = false$/default-features = false\nfeatures = ["runtime"]/' \
   "$librocksdb_sys_manifest"
 
+readonly stun_rs_version=0.1.11
+stun_rs_source=$(copy_registry_source stun-rs "$stun_rs_version")
+readonly stun_rs_source
+readonly stun_rs_manifest="$stun_rs_source/Cargo.toml"
+expected_profiles_block=$'[dependencies.precis-profiles]\nversion = "0.1.12"'
+if [[ "$(grep -Fx -A1 '[dependencies.precis-profiles]' "$stun_rs_manifest")" != "$expected_profiles_block" ]]; then
+  echo "stun-rs $stun_rs_version no longer matches the expected precis-profiles dependency" >&2
+  exit 1
+fi
+sed -i '/^\[dependencies\.precis-profiles\]$/,/^version = / s/^version = "0.1.12"$/version = "=0.1.13"/' \
+  "$stun_rs_manifest"
+
 mkdir -p "$patched_cargo_home"
 ln -s "$original_cargo_home/registry" "$patched_cargo_home/registry"
 if [[ -d "$original_cargo_home/git" ]]; then
@@ -74,6 +89,7 @@ cat > "$patched_cargo_home/config.toml" <<EOF
 [patch.crates-io]
 tinyvec = { path = "$tinyvec_source" }
 librocksdb-sys = { path = "$librocksdb_sys_source" }
+stun-rs = { path = "$stun_rs_source" }
 EOF
 
 echo "CARGO_HOME=$patched_cargo_home" >> "$GITHUB_ENV"

@@ -3081,6 +3081,184 @@ async fn getblocktemplate() {
     gbt_with(net, addr).await;
 }
 
+#[tokio::test]
+async fn template_rejection_wakes_long_poll_and_validates_recovery() {
+    check_template_rejection_recovery(false).await;
+}
+
+#[tokio::test]
+async fn template_rejection_before_long_poll_is_not_lost() {
+    check_template_rejection_recovery(true).await;
+}
+
+async fn check_template_rejection_recovery(reject_before_poll: bool) {
+    let _init_guard = zakura_test::init();
+    let parent = Hash([1; 32]);
+    let (tip, tip_sender) = MockChainTip::new();
+    let height = NetworkUpgrade::Nu5.activation_height(&Mainnet).unwrap();
+    tip_sender.send_best_tip_height(height);
+    tip_sender.send_best_tip_hash(parent);
+    tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    let mut sync = MockSyncStatus::default();
+    sync.set_is_close_to_tip(true);
+    let (mempool_calls, mut calls) = tokio::sync::watch::channel(0);
+    let mempool = tower::service_fn(move |_| {
+        mempool_calls.send_modify(|calls| *calls += 1);
+        async move {
+            Ok::<_, BoxError>(mempool::Response::FullTransactions {
+                transactions: vec![],
+                transaction_dependencies: Default::default(),
+                last_seen_tip_hash: parent,
+            })
+        }
+    });
+    let chain_info = GetBlockTemplateChainInfo {
+        expected_difficulty: CompactDifficulty::from(ExpandedDifficulty::from(U256::one())),
+        tip_height: height,
+        tip_hash: parent,
+        cur_time: 1654008617.into(),
+        min_time: 1654008606.into(),
+        max_time: 1654008728.into(),
+        chain_history_root: fake_history_tree(&Mainnet).hash(),
+    };
+    let read_state = tower::service_fn(move |request| {
+        let chain_info = chain_info.clone();
+        async move {
+            assert!(matches!(request, ReadRequest::ChainInfo));
+            Ok::<_, BoxError>(ReadResponse::ChainInfo(chain_info))
+        }
+    });
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut verifier: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, queue) = RpcImpl::new(
+        Mainnet,
+        mining::Config {
+            miner_address: Some(ZcashAddress::from_transparent_p2pkh(
+                NetworkType::Main,
+                [0x7e; 20],
+            )),
+            ..Default::default()
+        },
+        false,
+        "0.0.1",
+        "withdrawal test",
+        Buffer::new(mempool, 1),
+        Buffer::new(state, 1),
+        Buffer::new(read_state, 1),
+        Buffer::new(verifier.clone(), 1),
+        sync,
+        tip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+    let initial = rpc
+        .get_block_template(None)
+        .await
+        .unwrap()
+        .try_into_template()
+        .unwrap();
+    let preparation = verifier
+        .expect_request_that(|request| matches!(request, zakura_consensus::Request::Prepare { .. }))
+        .await;
+    preparation.respond_error("verifier temporarily unavailable".into());
+    let retry = rpc
+        .get_block_template(None)
+        .await
+        .unwrap()
+        .try_into_template()
+        .unwrap();
+    let preparation = verifier
+        .expect_request_that(|request| matches!(request, zakura_consensus::Request::Prepare { .. }))
+        .await;
+    assert!(!rpc.mining_template_rejected(&initial.work_id));
+    assert_eq!(retry.long_poll_id, initial.long_poll_id);
+    let initial = retry;
+    let mut preparation = Some(preparation);
+    let old_id = initial.long_poll_id;
+    let work_id = initial.work_id.clone();
+    let rejection = || {
+        Box::new(RouterError::Block {
+            source: Box::new(zakura_consensus::BlockError::DuplicateTransaction.into()),
+        }) as BoxError
+    };
+    if reject_before_poll {
+        preparation.take().unwrap().respond_error(rejection());
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            rpc.wait_for_mining_template_rejection(&work_id),
+        )
+        .await
+        .unwrap();
+    }
+    let long_poll = tokio::spawn({
+        let rpc = rpc.clone();
+        async move {
+            rpc.get_block_template(Some(GetBlockTemplateParameters::new(
+                GetBlockTemplateRequestMode::Template,
+                None,
+                vec![],
+                Some(old_id),
+                None,
+            )))
+            .await
+        }
+    });
+    if !reject_before_poll {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while *calls.borrow_and_update() < 3 {
+                calls.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        preparation.take().unwrap().respond_error(rejection());
+    }
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        rpc.wait_for_mining_template_rejection(&work_id),
+    )
+    .await
+    .unwrap();
+    assert!(rpc.mining_template_rejected(&work_id));
+    assert!(!rpc.mining_template_rejected("newer-work"));
+    let fallback = verifier.expect_request_that(|request| {
+        matches!(request, zakura_consensus::Request::Prepare { block, .. } if block.transactions.len() == 1)
+    }).await;
+    assert!(
+        !long_poll.is_finished(),
+        "recovery must wait for validation"
+    );
+    fallback.respond(Hash([2; 32]));
+    let replacement = tokio::time::timeout(Duration::from_secs(1), long_poll)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .try_into_template()
+        .unwrap();
+    assert_eq!(replacement.submit_old, Some(false));
+    assert_ne!(replacement.long_poll_id, old_id);
+    assert!(replacement.transactions.is_empty());
+
+    // A failed fallback must never reach a miner.
+    let recovery = tokio::spawn({
+        let rpc = rpc.clone();
+        async move { rpc.get_block_template(None).await }
+    });
+    verifier
+        .expect_request_that(|request| matches!(request, zakura_consensus::Request::Prepare { .. }))
+        .await
+        .respond_error("fallback unavailable".into());
+    assert!(tokio::time::timeout(Duration::from_secs(1), recovery)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_err());
+    queue.abort();
+}
+
 async fn gbt_with(net: Network, addr: ZcashAddress) {
     let mut mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
@@ -3376,6 +3554,78 @@ async fn gbt_with(net: Network, addr: ZcashAddress) {
     assert!(get_block_template.transactions.is_empty());
 
     mempool.expect_no_requests().await;
+}
+
+#[tokio::test]
+async fn rpc_submitblock_cancellation_keeps_verification_ownership() {
+    let _init_guard = zakura_test::init();
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut verifier: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (mined_tx, mut mined_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (rpc, queue_task) = RpcImpl::new(
+        Mainnet,
+        Default::default(),
+        false,
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool, 1),
+        Buffer::new(state, 1),
+        Buffer::new(read_state, 1),
+        verifier.clone(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        Some(mined_tx),
+    );
+    let rpc = Arc::new(rpc);
+    let bytes = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.to_vec();
+    let request = tokio::spawn({
+        let rpc = rpc.clone();
+        let bytes = bytes.clone();
+        async move { rpc.submit_block(HexData(bytes), None).await }
+    });
+    let response = verifier
+        .expect_request_that(|request| {
+            matches!(request, zakura_consensus::Request::CommitMined { .. })
+        })
+        .await;
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        rpc.submit_block(HexData(bytes.clone()), None)
+            .await
+            .unwrap(),
+        SubmitBlockErrorResponse::DuplicateInconclusive.into()
+    );
+    response.respond(Mainnet.genesis_hash());
+    assert!(matches!(
+        mined_rx.recv().await,
+        Some(MinedBlockEvent::Committed { .. })
+    ));
+
+    let request = tokio::spawn({
+        let rpc = rpc.clone();
+        async move { rpc.submit_block(HexData(bytes), None).await }
+    });
+    verifier
+        .expect_request_that(|request| {
+            matches!(request, zakura_consensus::Request::CommitMined { .. })
+        })
+        .await
+        .respond(Err(Box::new(RouterError::Block {
+            source: Box::new(zakura_consensus::VerifyBlockError::Commit(
+                zakura_state::CommitBlockError::MissingMinedParent,
+            )),
+        }) as BoxError));
+    assert_eq!(
+        request.await.unwrap().unwrap(),
+        SubmitBlockErrorResponse::Inconclusive.into()
+    );
+    queue_task.abort();
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -41,7 +41,7 @@ use crate::{
 const LAST_BLOCK_HEIGHT: u32 = 10;
 
 #[test]
-fn queued_duplicate_replaces_the_old_admission() {
+fn mined_orphans_finish_without_entering_the_sync_queue() {
     let _init_guard = zakura_test::init();
     let network = Network::Mainnet;
     let runtime = Runtime::new().expect("the Tokio runtime starts");
@@ -60,23 +60,30 @@ fn queued_duplicate_replaces_the_old_admission() {
     )
     .prepare();
 
-    let old_admission = BlockAdmission::pending();
-    let old_response = state_service
-        .queue_and_commit_to_non_finalized_state(block.clone(), Some(old_admission.clone()));
-    let new_admission = BlockAdmission::pending();
-    let _new_response = state_service
-        .queue_and_commit_to_non_finalized_state(block.clone(), Some(new_admission.clone()));
+    for _ in 0..2 {
+        let admission = BlockAdmission::pending();
+        let response = state_service
+            .queue_and_commit_to_non_finalized_state(block.clone(), Some(admission.clone()));
+        assert!(!runtime.block_on(admission.wait()));
+        assert!(response
+            .blocking_recv()
+            .expect("state responds immediately")
+            .is_err());
+        assert!(state_service
+            .non_finalized_state_queued_blocks
+            .get_mut(&block.hash)
+            .is_none());
+    }
 
-    assert!(!runtime.block_on(old_admission.wait()));
-    assert!(old_response
-        .blocking_recv()
-        .expect("the replaced request receives a response")
-        .is_err());
-    let queued = state_service
+    let mut response = state_service.queue_and_commit_to_non_finalized_state(block.clone(), None);
+    assert!(matches!(
+        response.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    assert!(state_service
         .non_finalized_state_queued_blocks
         .get_mut(&block.hash)
-        .expect("the newer request remains queued");
-    assert_eq!(queued.2.as_ref(), Some(&new_admission));
+        .is_some());
 }
 
 fn prepared_relay_test_state() -> (
@@ -1951,4 +1958,260 @@ fn read_only_open_with_malformed_version_returns_typed_error() {
         Err(other) => panic!("expected DatabaseFormatVersion, got: {other:?}"),
         Ok(_) => panic!("expected malformed state version to fail closed"),
     }
+}
+
+/// Optimistic relay reservations must not accumulate for the lifetime of the process.
+///
+/// Every optimistically relayed block reserves its parent's slot. A reservation is only read
+/// while its parent is the best tip, so once the reserving candidate is finalized the entry is
+/// unreachable and has to go.
+#[tokio::test(flavor = "multi_thread")]
+async fn finalized_optimistic_relay_reservations_are_pruned() {
+    let network = Network::Mainnet;
+    let (mut state, _read, _tip, _height) =
+        StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
+            .await
+            .expect("an ephemeral state service is created");
+
+    let buried = block::Hash([1; 32]);
+    let at_the_tip = block::Hash([2; 32]);
+    let above_the_tip = block::Hash([3; 32]);
+
+    state
+        .optimistic_relay_reserved_parents
+        .insert(buried, Height(9));
+    state
+        .optimistic_relay_reserved_parents
+        .insert(at_the_tip, Height(10));
+    state
+        .optimistic_relay_reserved_parents
+        .insert(above_the_tip, Height(11));
+
+    state.prune_optimistic_relay_reservations(Height(10));
+
+    assert_eq!(
+        state
+            .optimistic_relay_reserved_parents
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![above_the_tip],
+        "only a reservation above the finalized tip can still be consulted",
+    );
+}
+
+/// An invalidated parent stays ineligible for optimistic relay until the writer confirms that
+/// the same invalidation was reconsidered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reconsidered_parent_becomes_eligible_for_optimistic_relay_again() {
+    let network = Network::Mainnet;
+    let (state, _read, _tip, _height) =
+        StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
+            .await
+            .expect("an ephemeral state service is created");
+
+    let parent = block::Hash([7; 32]);
+    let invalidated = state.optimistic_relay_invalidated_parents.clone();
+
+    assert!(
+        !state.optimistic_relay_is_blocked_by_invalidation(),
+        "a parent nobody invalidated can authorize optimistic relay",
+    );
+
+    *invalidated
+        .lock()
+        .expect("the invalidation map is not poisoned")
+        .entry(parent)
+        .or_default() += 1;
+    assert!(
+        state.optimistic_relay_is_blocked_by_invalidation(),
+        "an invalidated parent cannot authorize optimistic relay",
+    );
+
+    StateService::release_optimistic_relay_invalidation(&invalidated, parent);
+    assert!(
+        !state.optimistic_relay_is_blocked_by_invalidation(),
+        "a confirmed reconsideration releases the parent",
+    );
+    assert!(
+        invalidated
+            .lock()
+            .expect("the invalidation map is not poisoned")
+            .is_empty(),
+        "a released parent leaves no entry behind",
+    );
+
+    // A reconsideration that the writer never confirmed, or one for a hash this service never
+    // invalidated, must not underflow or resurrect an entry.
+    StateService::release_optimistic_relay_invalidation(&invalidated, parent);
+    assert!(!state.optimistic_relay_is_blocked_by_invalidation());
+
+    // An invalidation issued while a reconsideration is in flight stays in force when that
+    // reconsideration is confirmed.
+    let mut invalidated_parents = invalidated
+        .lock()
+        .expect("the invalidation map is not poisoned");
+    *invalidated_parents.entry(parent).or_default() += 1;
+    *invalidated_parents.entry(parent).or_default() += 1;
+    drop(invalidated_parents);
+
+    StateService::release_optimistic_relay_invalidation(&invalidated, parent);
+    assert!(
+        state.optimistic_relay_is_blocked_by_invalidation(),
+        "the later invalidation outlives the reconsideration it raced",
+    );
+}
+
+/// While checkpoint writes are in flight the queue bound is hard, even for a block that names
+/// the durable finalized tip.
+///
+/// The durable tip lags the last hash sent to the write task for as long as checkpoint writes are
+/// outstanding. Nothing drains a block queued under the lagging tip: it does not complete the
+/// handoff condition, and the eventual handoff walks forward from the last hash sent, not from
+/// the tip that was durable when the block arrived. Admitting it past the bound would let a
+/// caller grow the queue without limit for the length of the checkpoint sync.
+#[tokio::test(flavor = "multi_thread")]
+async fn checkpoint_write_lag_does_not_open_the_orphan_queue_bound() {
+    let network = Network::Mainnet;
+    let (mut state, _read, _tip, _height) =
+        StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
+            .await
+            .expect("an ephemeral state service is created");
+
+    assert!(
+        state.block_write_sender.finalized.is_some(),
+        "the test starts while the write task still commits checkpoint blocks",
+    );
+
+    let durable_tip = state.read_service.db.finalized_tip_hash();
+
+    // The write task has been sent a later checkpoint block that is not durable yet.
+    state.finalized_block_write_last_sent_hash = block::Hash([9; 32]);
+
+    assert!(
+        !state.drains_the_non_finalized_queue_now(&durable_tip),
+        "a block naming the lagging durable tip is not drained, so the bound must reject it",
+    );
+    assert!(
+        !state.drains_the_non_finalized_queue_now(&block::Hash([9; 32])),
+        "a child of the last hash sent is not drained either until that write is durable",
+    );
+
+    // Once the write task catches up, a child of the last hash sent completes the handoff
+    // condition, and the handoff drains it on the same call.
+    state.finalized_block_write_last_sent_hash = durable_tip;
+    assert!(
+        state.drains_the_non_finalized_queue_now(&durable_tip),
+        "a child of a durably written last sent hash is drained by the handoff",
+    );
+    assert!(
+        !state.drains_the_non_finalized_queue_now(&block::Hash([9; 32])),
+        "any other parent is still not drained",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unpublished_writer_transitions_block_optimistic_relay_and_bound_bodies() {
+    let _init_guard = zakura_test::init();
+    let (mut state, _, _, _) =
+        StateService::new(Config::ephemeral(), &Network::Mainnet, Height::MAX, 0)
+            .await
+            .expect("ephemeral state opens");
+    let genesis: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    state
+        .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(genesis))
+        .await
+        .unwrap()
+        .unwrap();
+    let (sender, mut writer) = tokio::sync::mpsc::unbounded_channel();
+    state.block_write_sender.non_finalized = Some(sender);
+
+    let candidate: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let parent = candidate.header.previous_block_hash;
+    let queue = |state: &mut StateService, nonce: u8, optimistic: bool| {
+        let mut block = (*candidate).clone();
+        Arc::make_mut(&mut block.header).nonce.0[0] = nonce;
+        let admission = BlockAdmission::pending();
+        if optimistic {
+            admission.authorize_optimistic_relay();
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        state.non_finalized_state_queued_blocks.queue((
+            Arc::new(block).prepare(),
+            tx,
+            Some(admission.clone()),
+        ));
+        state.send_ready_non_finalized_queued(parent);
+        (admission, rx)
+    };
+
+    let (_, _first_response) = queue(&mut state, 1, false);
+    let first = writer.try_recv().unwrap();
+    let (sibling, _response) = queue(&mut state, 2, true);
+    assert!(sibling.wait().await);
+    assert!(
+        !sibling.optimistic_relay_authorized(),
+        "an ordinary earlier write can change the selected tip"
+    );
+    drop(first);
+    drop(writer.try_recv().unwrap());
+
+    let _reconsider_response = state.send_reconsider_block(block::Hash([99; 32]));
+    let reconsider = writer.try_recv().unwrap();
+    let (sibling, _response) = queue(&mut state, 3, true);
+    assert!(sibling.wait().await);
+    assert!(
+        !sibling.optimistic_relay_authorized(),
+        "reconsideration can restore a different best chain"
+    );
+    drop(reconsider);
+    drop(writer.try_recv().unwrap());
+
+    state
+        .optimistic_relay_invalidated_parents
+        .lock()
+        .unwrap()
+        .insert(block::Hash([99; 32]), 1);
+    let (sibling, _response) = queue(&mut state, 4, true);
+    assert!(sibling.wait().await);
+    assert!(
+        !sibling.optimistic_relay_authorized(),
+        "invalidation need not name the immediate parent"
+    );
+    drop(writer.try_recv().unwrap());
+    state
+        .optimistic_relay_invalidated_parents
+        .lock()
+        .unwrap()
+        .clear();
+
+    let capacity = state
+        .non_finalized_write_slots
+        .clone()
+        .try_acquire_many_owned(u32::try_from(super::queued_blocks::MAX_QUEUED_BLOCKS).unwrap())
+        .unwrap();
+    let (rejected, response) = queue(&mut state, 5, true);
+    assert!(!rejected.wait().await);
+    assert!(response.await.unwrap().is_err());
+    assert!(
+        writer.try_recv().is_err(),
+        "a full writer cannot retain another block body"
+    );
+    drop(capacity);
+
+    let (admitted, _response) = queue(&mut state, 6, true);
+    assert!(admitted.wait().await);
+    assert!(
+        admitted.optimistic_relay_authorized(),
+        "an idle writer and live selected parent permit relay"
+    );
+    drop(writer.try_recv().unwrap());
+    assert_eq!(
+        state.non_finalized_write_slots.available_permits(),
+        super::queued_blocks::MAX_QUEUED_BLOCKS
+    );
 }

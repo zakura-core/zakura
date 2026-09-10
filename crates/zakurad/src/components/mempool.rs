@@ -122,6 +122,23 @@ type TxVerifier = Buffer<
 >;
 type InboundTxDownloads = TxDownloads<Timeout<Outbound>, Timeout<TxVerifier>, ReadState>;
 
+/// The maximum estimated distance to the network tip, in blocks, at which the
+/// mempool and its crawler activate, and at which the mempool scores peer
+/// misbehavior.
+///
+/// This matches `getblocktemplate`'s `MAX_ESTIMATED_DISTANCE_TO_NETWORK_CHAIN_TIP`.
+/// An active mempool only disables beyond [`zs::MAX_BLOCK_REORG_HEIGHT`], so
+/// the gap between the two thresholds keeps the mempool from flapping.
+const MAX_ESTIMATED_DISTANCE_TO_ENABLE: block::HeightDiff = 100;
+
+/// Returns true when the local-clock estimate puts the best chain tip within
+/// [`MAX_ESTIMATED_DISTANCE_TO_ENABLE`] blocks of the network tip.
+pub(crate) fn is_estimated_close_to_network_tip(chain_tip_change: &ChainTipChange) -> bool {
+    chain_tip_change
+        .estimate_distance_to_network_chain_tip()
+        .is_some_and(|(distance, _height)| distance <= MAX_ESTIMATED_DISTANCE_TO_ENABLE)
+}
+
 fn transaction_misbehavior(
     error: &TransactionDownloadVerifyError,
 ) -> Option<(PeerSocketAddr, u32)> {
@@ -424,7 +441,8 @@ impl Mempool {
     /// Returns true when transaction verification failures can be attributed to
     /// peers rather than to this node's stale validation context.
     fn is_current_enough_for_mempool(&self) -> bool {
-        self.sync_status.is_close_to_tip() && self.chain_tip_change.is_close_to_network_tip()
+        self.sync_status.is_close_to_tip()
+            && is_estimated_close_to_network_tip(&self.chain_tip_change)
     }
 
     /// Returns the estimated distance to the network tip, if a state tip exists.

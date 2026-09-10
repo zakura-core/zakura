@@ -149,7 +149,8 @@ where
 
     /// Returns true when the crawler can safely request mempool transaction IDs.
     fn is_caught_up_to_start(&self) -> bool {
-        self.sync_status.is_close_to_tip() && self.chain_tip_change.is_close_to_network_tip()
+        self.sync_status.is_close_to_tip()
+            && mempool::is_estimated_close_to_network_tip(&self.chain_tip_change)
     }
 
     /// Waits until the mempool crawler is enabled.

@@ -29,7 +29,7 @@ use zs::CheckpointVerifiedBlock;
 
 use crate::components::{
     mempool::tests::standard_verified_unmined_tx_strategy,
-    mempool::{config::Config, Mempool},
+    mempool::{config::Config, Mempool, MAX_ESTIMATED_DISTANCE_TO_ENABLE},
     sync::{RecentSyncLengths, SyncStatus},
 };
 
@@ -271,7 +271,7 @@ async fn mempool_waits_for_estimated_tip_distance_when_sync_lengths_are_small() 
 
     chain_tip_sender.set_finalized_tip(Some(chain_tip_with_estimated_distance(
         &network,
-        i64::from(zs::MAX_BLOCK_REORG_HEIGHT) + 1,
+        MAX_ESTIMATED_DISTANCE_TO_ENABLE + 1,
         1,
     )));
 
@@ -296,6 +296,8 @@ async fn mempool_enables_and_disables_using_estimated_tip_distance_hysteresis() 
         mut recent_syncs,
         mut chain_tip_sender,
     ) = setup(&network);
+    let between_thresholds = MAX_ESTIMATED_DISTANCE_TO_ENABLE + 1;
+    let beyond_disable_threshold = i64::from(zs::MAX_BLOCK_REORG_HEIGHT) + 1;
 
     chain_tip_sender.set_finalized_tip(Some(chain_tip_with_estimated_distance(&network, 0, 1)));
 
@@ -305,14 +307,38 @@ async fn mempool_enables_and_disables_using_estimated_tip_distance_hysteresis() 
 
     chain_tip_sender.set_finalized_tip(Some(chain_tip_with_estimated_distance(
         &network,
-        i64::from(zs::MAX_BLOCK_REORG_HEIGHT) + 1,
+        between_thresholds,
         2,
+    )));
+
+    mempool.dummy_call().await;
+    assert!(
+        mempool.is_enabled(),
+        "an active mempool must stay enabled until the estimate exceeds the reorg window"
+    );
+
+    chain_tip_sender.set_finalized_tip(Some(chain_tip_with_estimated_distance(
+        &network,
+        beyond_disable_threshold,
+        3,
     )));
 
     mempool.dummy_call().await;
     assert!(
         !mempool.is_enabled(),
         "mempool must disable after the estimated tip distance exceeds the reorg window"
+    );
+
+    chain_tip_sender.set_finalized_tip(Some(chain_tip_with_estimated_distance(
+        &network,
+        between_thresholds,
+        4,
+    )));
+
+    mempool.dummy_call().await;
+    assert!(
+        !mempool.is_enabled(),
+        "a disabled mempool must stay disabled until the estimate is within the enable threshold"
     );
 }
 

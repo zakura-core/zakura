@@ -177,7 +177,7 @@ use zakura_rpc::{
     methods::{RpcImpl, RpcServer},
     proposal_block_from_template,
     server::OPENED_RPC_ENDPOINT_MSG,
-    MinerParams, SubmitBlockChannel,
+    MinedBlockEvent, MinerParams, SubmitBlockChannel,
 };
 use zakura_state::{constants::LOCK_FILE_ERROR, state_database_format_version_in_code};
 use zakura_test::{
@@ -3822,14 +3822,12 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
     // Check that the submitblock channel received the submitted block
     let mut submit_block_receiver = submitblock_channel.receiver();
     let submit_block_channel_data = submit_block_receiver.recv().await.expect("channel is open");
-    assert_eq!(
-        submit_block_channel_data,
-        (
-            proposal_block.hash(),
-            proposal_block.coinbase_height().unwrap()
-        ),
-        "submitblock channel should receive the submitted block"
-    );
+    let (submitted_hash, submitted_height) = match submit_block_channel_data {
+        MinedBlockEvent::Early { hash, height, .. }
+        | MinedBlockEvent::Committed { hash, height } => (hash, height),
+    };
+    assert_eq!(submitted_hash, proposal_block.hash());
+    assert_eq!(submitted_height, proposal_block.coinbase_height().unwrap());
 
     // Use an invalid coinbase transaction (with an output value greater than the `block_subsidy + miner_fees - expected_lockbox_funding_stream`)
 
@@ -3908,6 +3906,7 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
         block_template.bits(),
         block_template.height(),
         block_template.max_time(),
+        block_template.work_id().clone(),
         block_template.submit_old(),
     );
 
@@ -3973,6 +3972,7 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
         block_template.bits(),
         block_template.height(),
         block_template.max_time(),
+        block_template.work_id().clone(),
         block_template.submit_old(),
     );
 

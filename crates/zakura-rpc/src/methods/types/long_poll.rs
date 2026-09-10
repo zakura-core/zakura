@@ -19,7 +19,7 @@ use zakura_node_services::BoxError;
 #[cfg(test)]
 mod tests;
 
-/// The length of a serialized [`LongPollId`] string.
+/// The length of a legacy serialized [`LongPollId`] without a withdrawal revision.
 ///
 /// This is an internal Zebra implementation detail, which does not need to match `zcashd`.
 pub const LONG_POLL_ID_LENGTH: usize = 46;
@@ -114,6 +114,7 @@ impl LongPollInput {
             mempool_transaction_count: self.mempool_transaction_mined_ids.len() as u32,
 
             mempool_transaction_content_checksum,
+            revision: 0,
         }
     }
 }
@@ -121,12 +122,15 @@ impl LongPollInput {
 /// The encoded long poll ID, generated from the [`LongPollInput`].
 ///
 /// `zcashd` IDs are currently 69 hex/decimal digits long.
-/// Since Zebra's IDs are only 46 hex/decimal digits, mining pools should be able to handle them.
+/// IDs use 46 hex/decimal digits, or 62 after the first template withdrawal.
 #[derive(
     Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Getters, new, schemars::JsonSchema,
 )]
 #[serde(try_from = "String", into = "String")]
 pub struct LongPollId {
+    /// Template withdrawal generation. Zero preserves the legacy wire format.
+    #[new(default)]
+    pub(crate) revision: u64,
     // Fields that invalidate old work:
     //
     /// The tip height used to generate the template containing this long poll ID.
@@ -209,6 +213,12 @@ impl LongPollId {
     /// But if the chain tip has changed, the block header has changed, so old shares are invalid.
     /// (And if the max time has changed on testnet, the block header has changed.)
     pub fn submit_old(&self, old_long_poll_id: &LongPollId) -> bool {
+        self.same_work_context(old_long_poll_id) && self.revision == old_long_poll_id.revision
+    }
+
+    /// Returns whether the IDs share the parent and time limit, ignoring withdrawals.
+    /// Internal miners use exact work IDs to decide which withdrawn work to cancel.
+    pub fn same_work_context(&self, old_long_poll_id: &LongPollId) -> bool {
         self.tip_height == old_long_poll_id.tip_height
             && self.tip_hash_checksum == old_long_poll_id.tip_hash_checksum
             && self.max_timestamp == old_long_poll_id.max_timestamp
@@ -246,6 +256,7 @@ impl std::fmt::Display for LongPollId {
             max_timestamp,
             mempool_transaction_count,
             mempool_transaction_content_checksum,
+            revision,
         } = self;
 
         // We can't do this using `serde`, because it names each field,
@@ -261,7 +272,11 @@ impl std::fmt::Display for LongPollId {
              {max_timestamp:010}\
              {mempool_transaction_count:010}\
              {mempool_transaction_content_checksum:08x}"
-        )
+        )?;
+        if *revision != 0 {
+            write!(f, "{revision:016x}")?;
+        }
+        Ok(())
     }
 }
 
@@ -270,18 +285,26 @@ impl FromStr for LongPollId {
 
     /// Exact conversion from a string to LongPollId.
     fn from_str(long_poll_id: &str) -> Result<Self, Self::Err> {
-        // A well-formed `LongPollId` is exactly `LONG_POLL_ID_LENGTH` ASCII digits/hex
-        // characters (see `Display` above). Requiring ASCII here means each field's byte
+        // A withdrawal revision adds 16 hex digits to the legacy ID.
+        // Requiring ASCII here means each field's byte
         // range is also a valid UTF-8 char boundary, so the slices below cannot panic on
         // attacker-controlled input containing multibyte characters.
-        if long_poll_id.len() != LONG_POLL_ID_LENGTH || !long_poll_id.is_ascii() {
+        if ![LONG_POLL_ID_LENGTH, LONG_POLL_ID_LENGTH + 16].contains(&long_poll_id.len())
+            || !long_poll_id.is_ascii()
+        {
             return Err(format!(
-                "invalid long poll id, must be {LONG_POLL_ID_LENGTH} ASCII digits / hex chars"
+                "invalid long poll id, must be {LONG_POLL_ID_LENGTH} or {} ASCII digits / hex chars",
+                LONG_POLL_ID_LENGTH + 16,
             )
             .into());
         }
 
         Ok(Self {
+            revision: if long_poll_id.len() == LONG_POLL_ID_LENGTH {
+                0
+            } else {
+                u64::from_str_radix(&long_poll_id[LONG_POLL_ID_LENGTH..], 16)?
+            },
             tip_height: long_poll_id[0..10].parse()?,
             tip_hash_checksum: u32::from_str_radix(&long_poll_id[10..18], 16)?,
             max_timestamp: long_poll_id[18..28].parse()?,

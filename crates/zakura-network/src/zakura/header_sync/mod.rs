@@ -39,7 +39,9 @@ pub use scheduler::retry::{
 pub(crate) use service::drive_header_sync_actions;
 pub use service::PeerSession;
 pub(crate) use service::{HeaderSyncPassthroughService, HeaderSyncService};
-pub(crate) use wire::{headers_response_bytes, headers_response_capacity};
+#[cfg(test)]
+pub(crate) use wire::headers_response_bytes;
+pub(crate) use wire::headers_response_capacity;
 pub use wire::{
     AuxSchema, GetHeaders, HeaderEntry, HeaderServingLimits, HeaderSyncCodec,
     HeaderSyncDecodeContext, HeaderSyncMessage, HeaderSyncWireError, Headers, HeadersOutcome,

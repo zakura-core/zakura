@@ -590,6 +590,11 @@ class TipAgreementTests(unittest.TestCase):
         )
         self.assertEqual(lagging["status"], "lagging")
         self.assertFalse(lagging["split"])
+        lagging_group = next(
+            group for group in lagging["tip_groups"] if group["height"] == 99
+        )
+        self.assertEqual(lagging_group["fork_depth"], 1)
+        self.assertEqual(lagging_group["fork_depth_label"], "1 behind")
 
         split = status.compute_chain_summary(
             [
@@ -631,6 +636,11 @@ class TipAgreementTests(unittest.TestCase):
             {row["name"]: row["chain_role"] for row in ahead_rows},
             {"a": "majority", "b": "majority", "c": "ahead"},
         )
+        ahead_group = next(
+            group for group in ahead_chain["tip_groups"] if group["height"] == 101
+        )
+        self.assertEqual(ahead_group["fork_depth"], 1)
+        self.assertEqual(ahead_group["fork_depth_label"], "1 ahead")
 
     def test_row_for_records_reorg_and_headers(self):
         subject = collector()
@@ -844,6 +854,19 @@ class ViewSwitchingTests(unittest.TestCase):
     def test_both_views_are_present_in_one_template(self):
         self.assertIn('data-view="fleet"', self.markup)
         self.assertIn('data-view="node"', self.markup)
+
+    def test_tip_group_badges_use_the_height_relationship(self):
+        self.assertIn(
+            "if (group.height === chain.majority_height) return 'fork';",
+            self.page,
+        )
+        self.assertIn(
+            "if (group.height > chain.majority_height) return 'ahead';", self.page
+        )
+        self.assertIn("return 'behind';", self.page)
+        self.assertIn("badge(role, tone(CHAIN_TONE, role))", self.page)
+        self.assertNotIn("badge(isMajority ? 'majority' : 'fork'", self.page)
+        self.assertIn("lagging: 'Nodes report different tip heights.'", self.page)
 
 
 class NodeDetailTests(unittest.TestCase):

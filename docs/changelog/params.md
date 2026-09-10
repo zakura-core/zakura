@@ -32,7 +32,6 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
-| `PAIRED_DATA_WRITE_TIMEOUT` | `crates/zakura-network/src/zakura/handler.rs` | new → `32 s` | [#943](https://github.com/zakura-core/zakura/pull/943) | Allow healthy writes to wait for shared connection credit on lossy links with a paused service. |
 | `DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW` | `crates/zakura-network/src/zakura/handler.rs` | `32 MiB` → `16 MiB` | [#943](https://github.com/zakura-core/zakura/pull/943) | Leave connection receive credit for another service while one stream's application reads are paused. |
 | `MAX_CONCURRENT_UTXO_LOOKUPS` | `crates/zakura-consensus/src/transaction.rs` | serial (`1`) → `64` per block transaction | [#918](https://github.com/zakura-core/zakura/pull/918) | Overlap external UTXO waits while bounding pending lookups per transaction. Concurrent lookups start their six-minute timeout clocks together. |
 | `MAX_MINED_SUBMISSIONS` | `crates/zakura-rpc/src/methods/types/submit_block.rs` | unbounded → `16` submissions | [#748](https://github.com/zakura-core/zakura/pull/748) | Bound detached verification work across RPC cancellation. |

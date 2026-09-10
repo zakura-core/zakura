@@ -4152,6 +4152,7 @@ async fn persistent_stream_worker_with_policy(
     // so waiting for inbound channel space cannot stall an outgoing response.
     // A dedicated reader also preserves partial frame reads across outbound writes.
     let (error_tx, mut error_rx) = mpsc::channel::<ZakuraHandlerError>(1);
+    let inbound_closed = inbound_tx.clone();
     let reader_context = Arc::clone(&context);
     let reader_failure_cause = failure_cause.clone();
     let reader = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
@@ -4250,11 +4251,19 @@ async fn persistent_stream_worker_with_policy(
     }));
 
     let mut outbound_rx = Some(outbound_rx);
+    let mut drained = false;
     loop {
         tokio::select! {
             biased;
             _ = context.connection_token.cancelled() => break,
             _ = context.stream_token.cancelled() => break,
+            _ = inbound_closed.closed(), if outbound_rx.is_none() => {
+                // Both application halves are gone and every queued write
+                // finished. A FIN preserves those writes in QUIC's send buffer.
+                let _ = send.finish();
+                drained = true;
+                break;
+            }
             outbound = async {
                 match outbound_rx.as_mut() {
                     Some(outbound_rx) => outbound_rx.recv().await,
@@ -4268,28 +4277,32 @@ async fn persistent_stream_worker_with_policy(
                             biased;
                             _ = context.connection_token.cancelled() => break,
                             _ = context.stream_token.cancelled() => break,
-                            result = queued_frame.write_with(|frame| write_ordered_frame_with_policy(
-                                &mut send, frame, context.limits,
-                                context.outbound_frame_cap, context.write_policy,
-                            )) => result,
+                            result = queued_frame.write_with(|frame| async {
+                                let result = write_ordered_frame_with_policy(
+                                    &mut send, frame, context.limits,
+                                    context.outbound_frame_cap, context.write_policy,
+                                ).await;
+                                // A failed request claim can cancel the session on
+                                // drop. Record the cause while it is still alive.
+                                if !context.stream_token.is_cancelled() {
+                                    if let (Err(error), Some(cause)) = (&result, &failure_cause) {
+                                        if error.is::<OrderedFrameWriteTimeout>() {
+                                            cause.record(OrderedStreamFailure::WriteTimeout);
+                                        } else if ordered_stream_write_was_stopped(error) {
+                                            cause.record(OrderedStreamFailure::RemoteClose);
+                                        }
+                                    }
+                                }
+                                result
+                            }) => result,
                         };
                         if let Err(error) = result {
                             if error.is::<OrderedFrameWriteTimeout>() {
-                                if !context.stream_token.is_cancelled() {
-                                    if let Some(cause) = &failure_cause {
-                                        cause.record(OrderedStreamFailure::WriteTimeout);
-                                    }
-                                }
                                 debug!(stream_kind, stream_id = context.stream_id,
                                     "retiring Zakura service session after stream write timeout");
                                 break;
                             }
                             if ordered_stream_write_was_stopped(&error) {
-                                if !context.stream_token.is_cancelled() {
-                                    if let Some(cause) = &failure_cause {
-                                        cause.record(OrderedStreamFailure::RemoteClose);
-                                    }
-                                }
                                 debug!(?error, "closing Zakura ordered stream after peer stopped receiving");
                                 break;
                             }
@@ -4336,7 +4349,9 @@ async fn persistent_stream_worker_with_policy(
     }
 
     // Never leave a partial frame followed by a graceful FIN.
-    let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_NEUTRAL));
+    if !drained {
+        let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_NEUTRAL));
+    }
     context.stream_token.cancel();
     reader.abort();
     // Keep the stream permit until the reader has actually dropped its buffers.

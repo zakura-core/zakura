@@ -46,7 +46,10 @@ use zakura_chain::{
 use self::trace::ZakuraConnTrace;
 use super::discovery::{self, native_dial_supervised, spawn_native_bootstrap_dialer, RedialPolicy};
 use super::trace::{reject_reason_label, ZakuraTrace};
-use super::transport::{worker_framed_channel, FramedWorkerRecv, QueuedFrame};
+use super::transport::{
+    worker_framed_channel, FramedWorkerRecv, OrderedStreamFailure, OrderedStreamFailureCause,
+    QueuedFrame,
+};
 #[cfg(any(test, feature = "zakura-testkit"))]
 use crate::zakura::drive_header_sync_actions;
 #[cfg(any(test, feature = "zakura-testkit"))]
@@ -4253,7 +4256,7 @@ async fn persistent_stream_worker_with_policy(
     outbound_rx: FramedWorkerRecv,
     queue_depth_limit: usize,
     write_policy: OrderedWritePolicy,
-    remote_close: Option<CancellationToken>,
+    failure_cause: Option<OrderedStreamFailureCause>,
 ) {
     let context = Arc::new(context);
     let stream_kind = prelude.stream_kind;
@@ -4263,7 +4266,7 @@ async fn persistent_stream_worker_with_policy(
     // A dedicated reader also preserves partial frame reads across outbound writes.
     let (error_tx, mut error_rx) = mpsc::channel::<ZakuraHandlerError>(1);
     let reader_context = Arc::clone(&context);
-    let reader_remote_close = remote_close.clone();
+    let reader_failure_cause = failure_cause.clone();
     let reader = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
         // Pair teardown must interrupt a blocked writer without waiting for it
         // to poll the reader's terminal event. Preserve the close cause first.
@@ -4345,10 +4348,10 @@ async fn persistent_stream_worker_with_policy(
             // down for a stopped outbound write before processing it.
             let must_disconnect = !matches!(error, ZakuraHandlerError::Closed);
             if !must_disconnect && !reader_context.stream_token.is_cancelled() {
-                if let Some(closed) = &reader_remote_close {
+                if let Some(cause) = &reader_failure_cause {
                     // Publish the cause before waking either the service EOF or
                     // the sibling worker's cancellation path.
-                    closed.cancel();
+                    cause.record(OrderedStreamFailure::RemoteClose);
                 }
             }
             let _ = error_tx.send(error).await;
@@ -4398,14 +4401,19 @@ async fn persistent_stream_worker_with_policy(
                             if write_policy == OrderedWritePolicy::PairData
                                 && error.is::<OrderedFrameWriteTimeout>()
                             {
+                                if !context.stream_token.is_cancelled() {
+                                    if let Some(cause) = &failure_cause {
+                                        cause.record(OrderedStreamFailure::WriteTimeout);
+                                    }
+                                }
                                 debug!(stream_kind, stream_id = context.stream_id,
                                     "retiring Zakura stream pair after data write timeout");
                                 break;
                             }
                             if ordered_stream_write_was_stopped(&error) {
                                 if !context.stream_token.is_cancelled() {
-                                    if let Some(closed) = &remote_close {
-                                        closed.cancel();
+                                    if let Some(cause) = &failure_cause {
+                                        cause.record(OrderedStreamFailure::RemoteClose);
                                     }
                                 }
                                 debug!(?error, "closing Zakura ordered stream after peer stopped receiving");

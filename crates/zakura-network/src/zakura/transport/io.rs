@@ -8,13 +8,34 @@
 use tokio::sync::mpsc;
 
 use super::Frame;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+/// Why a paired stream ended before local cancellation.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum OrderedStreamFailure {
+    RemoteClose,
+    WriteTimeout,
+}
+
+/// Preserve the first transport failure before cancelling both roles of a pair.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct OrderedStreamFailureCause(Arc<OnceLock<OrderedStreamFailure>>);
+
+impl OrderedStreamFailureCause {
+    pub(crate) fn record(&self, failure: OrderedStreamFailure) {
+        let _ = self.0.set(failure);
+    }
+
+    pub(crate) fn get(&self) -> Option<OrderedStreamFailure> {
+        self.0.get().copied()
+    }
+}
 
 /// Receive half for bounded, rate-admitted Zakura frames.
 #[derive(Debug)]
 pub struct FramedRecv {
     receiver: FramedReceiver,
-    remote_close: Option<tokio_util::sync::CancellationToken>,
+    failure_cause: Option<OrderedStreamFailureCause>,
 }
 
 #[derive(Debug)]
@@ -28,30 +49,25 @@ impl FramedRecv {
     pub fn new(receiver: mpsc::Receiver<Frame>) -> Self {
         Self {
             receiver: FramedReceiver::Plain(receiver),
-            remote_close: None,
+            failure_cause: None,
         }
     }
 
     fn queued(receiver: mpsc::Receiver<QueuedFrame>) -> Self {
         Self {
             receiver: FramedReceiver::Queued(receiver),
-            remote_close: None,
+            failure_cause: None,
         }
     }
 
-    pub(crate) fn with_remote_close(
-        mut self,
-        remote_close: tokio_util::sync::CancellationToken,
-    ) -> Self {
-        self.remote_close = Some(remote_close);
+    pub(crate) fn with_failure_cause(mut self, failure_cause: OrderedStreamFailureCause) -> Self {
+        self.failure_cause = Some(failure_cause);
         self
     }
 
-    /// Whether the peer closed either role of this pair before local cancellation.
-    pub(crate) fn remotely_closed(&self) -> bool {
-        self.remote_close
-            .as_ref()
-            .is_some_and(|closed| closed.is_cancelled())
+    /// Failure of either role, retained through pair cancellation for service policy.
+    pub(crate) fn failure(&self) -> Option<OrderedStreamFailure> {
+        self.failure_cause.as_ref().and_then(|cause| cause.get())
     }
 
     /// Receive the next admitted frame, or `None` after the transport closes the stream.

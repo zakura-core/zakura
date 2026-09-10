@@ -83,8 +83,10 @@ Request writes have no independent write timeout. The data stream has a bounded
 shared-credit waits on slow links while other services are paused. Cancellation
 can still interrupt a data write. Stream resets during a payload remain local to
 the stream pair. A data-write timeout also resets only the pair, preserving
-unrelated services on the connection while block sync reopens. A graceful end
-with a truncated frame payload remains invalid.
+unrelated services on the connection. If downloads remain unanswered, teardown
+applies the existing no-progress cooldown and repeated-stall disconnect before
+readmission. A timeout with no download obligation does not penalize the peer.
+A graceful end with a truncated frame payload remains invalid.
 
 ## Flow control
 

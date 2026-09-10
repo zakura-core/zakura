@@ -334,6 +334,10 @@ async fn paired_data_timeout_preserves_sibling_and_reopens_pair() -> Result<(), 
     .await
     .expect("the paired data writer retires its session at the write deadline")?;
     assert!(started.elapsed() >= PAIRED_DATA_WRITE_TIMEOUT);
+    assert_eq!(
+        client.data_recv.failure(),
+        Some(OrderedStreamFailure::WriteTimeout)
+    );
     timeout(TEST_TIMEOUT, server.cancel.cancelled()).await?;
     assert!(!client.connection_cancel.is_cancelled());
     assert!(!server.connection_cancel.is_cancelled());
@@ -787,7 +791,7 @@ async fn paired_request_reader_close_interrupts_a_blocked_write() -> Result<(), 
         let context = raw_worker_context(&client, slots.clone());
         let connection_cancel = context.connection_token.clone();
         let pair_cancel = context.stream_token.clone();
-        let remote_close = CancellationToken::new();
+        let failure_cause = OrderedStreamFailureCause::default();
         let prelude = StreamPrelude {
             magic: STREAM_PRELUDE_MAGIC,
             stream_kind: REQUESTS.kind,
@@ -807,7 +811,7 @@ async fn paired_request_reader_close_interrupts_a_blocked_write() -> Result<(), 
                 outbound_rx,
                 1,
                 OrderedWritePolicy::PairRequests,
-                Some(remote_close.clone()),
+                Some(failure_cause.clone()),
             )));
         assert_eq!(
             timeout(TEST_TIMEOUT, inbound_rx.recv()).await?,
@@ -830,7 +834,7 @@ async fn paired_request_reader_close_interrupts_a_blocked_write() -> Result<(), 
         timeout(Duration::from_secs(2), &mut worker)
             .await
             .expect("closing the reader interrupts a flow-controlled request write")?;
-        assert!(remote_close.is_cancelled());
+        assert_eq!(failure_cause.get(), Some(OrderedStreamFailure::RemoteClose));
         assert!(pair_cancel.is_cancelled());
         assert!(!connection_cancel.is_cancelled());
         assert_eq!(slots.available_permits(), 1);

@@ -790,7 +790,7 @@ impl Service for BlockSyncService {
                                     source, wiring.trace,
                                 ) => {
                                     // Do not drop unanswered downloads before their
-                                    // remote-close policy has been applied.
+                                    // stream-failure policy has been applied.
                                     run_cancel.cancel();
                                     match (result, download.await) {
                                         (Err(error @ SinkReject::Protocol(_)), _)

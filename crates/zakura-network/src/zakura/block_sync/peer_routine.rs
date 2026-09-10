@@ -45,6 +45,7 @@ use super::{
     BlockSyncMessage, BlockSyncMisbehavior, BlockSyncPeerSession, BlockSyncStatus,
     ZakuraBlockSyncConfig, ZakuraPeerId, ZakuraTrace, MSG_BS_BLOCK,
 };
+use crate::zakura::transport::OrderedStreamFailure;
 use crate::zakura::{trace::BlockBodySource, Admit, FramedRecv, SinkReject, ZakuraConnId};
 use std::{sync::Arc, time::Duration, time::Instant};
 use tokio::time;
@@ -417,13 +418,14 @@ impl PeerRoutine {
             () = cancel.cancelled() => Ok(()),
             result = self.run_inner() => result,
         };
-        // Transport cancels both roles when either closes. Settle the download
+        // Transport cancels both roles when either fails. Settle the download
         // policy even if cancellation interrupts a local capacity wait.
-        if result.is_ok() && self.recv.remotely_closed() {
-            self.handle_remote_stream_closed(Instant::now())
-        } else {
-            result
+        if result.is_ok() {
+            if let Some(failure) = self.recv.failure() {
+                return self.handle_stream_failure(Instant::now(), failure);
+            }
         }
+        result
     }
 
     async fn run_inner(&mut self) -> Result<(), SinkReject> {
@@ -490,7 +492,10 @@ impl PeerRoutine {
                         // is a clean exit; with unanswered requests it is a
                         // no-progress stall (park or disconnect). `Drop` returns
                         // unreceived outstanding heights and releases their budget.
-                        None => return self.handle_remote_stream_closed(Instant::now()),
+                        None => return self.handle_stream_failure(
+                            Instant::now(),
+                            self.recv.failure().unwrap_or(OrderedStreamFailure::RemoteClose),
+                        ),
                     }
                 }
                 changed = self.sequencer_view.changed() => {
@@ -1372,30 +1377,27 @@ impl PeerRoutine {
         Err(SinkReject::local(error))
     }
 
-    /// Handle the peer closing its send side of the stream. Honest peers close
-    /// *connections*, not lone streams; a stream-only EOF while block-progress
-    /// liveness is still armed is the same signal as the liveness stall and must
-    /// not reset the park/second-stall state machine — otherwise a peer could
-    /// take work, deliver nothing, let its requests time out (which drains
-    /// `outstanding` without disarming liveness), EOF before the liveness
-    /// deadline, and be readmitted fresh forever. An armed deadline with empty
-    /// `outstanding` can only mean charged requests were consumed without
-    /// accepted progress — every answered-everything path disarms it — and
-    /// `DownloadWindow::check_liveness` parks at that deadline
-    /// regardless of `outstanding`, so parking here only moves the already
-    /// scheduled outcome earlier. Frames are processed in-order in this task, so
-    /// at EOF everything the peer sent has already been counted. The liveness
-    /// grace does not apply: the peer closed its stream without answering the
-    /// requests we still own.
-    fn handle_remote_stream_closed(&mut self, now: Instant) -> Result<(), SinkReject> {
+    /// Retiring a failed pair must not erase unanswered download work.
+    /// Request expiry can empty `outstanding` without disarming liveness, so
+    /// that pending no-progress deadline must also survive stream replacement.
+    fn handle_stream_failure(
+        &mut self,
+        now: Instant,
+        failure: OrderedStreamFailure,
+    ) -> Result<(), SinkReject> {
         self.gc_skipped_outstanding();
         if self.window.outstanding.is_empty() && self.window.block_liveness_deadline.is_none() {
             return Ok(());
         }
-        self.no_progress_stall(
-            now,
-            "block-sync peer closed the stream with its requests unanswered",
-        )
+        let error = match failure {
+            OrderedStreamFailure::RemoteClose => {
+                "block-sync peer closed the stream with its requests unanswered"
+            }
+            OrderedStreamFailure::WriteTimeout => {
+                "block-sync data write stalled with download requests unanswered"
+            }
+        };
+        self.no_progress_stall(now, error)
     }
 
     /// Drop this routine's outstanding requests whose whole range is at or below
@@ -3157,6 +3159,166 @@ mod tests {
             now,
             request_timeout
         ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_pair_settles_peer_failures_before_reopening() {
+        for failure in [
+            super::OrderedStreamFailure::RemoteClose,
+            super::OrderedStreamFailure::WriteTimeout,
+        ] {
+            check_cancelled_pair_policy(Some(failure), true, false, false).await;
+            check_cancelled_pair_policy(Some(failure), true, false, true).await;
+            check_cancelled_pair_policy(Some(failure), true, true, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn local_cancel_and_idle_write_timeout_do_not_park_peers() {
+        check_cancelled_pair_policy(None, true, false, false).await;
+        check_cancelled_pair_policy(
+            Some(super::OrderedStreamFailure::WriteTimeout),
+            false,
+            false,
+            false,
+        )
+        .await;
+    }
+
+    async fn check_cancelled_pair_policy(
+        failure: Option<super::OrderedStreamFailure>,
+        unanswered: bool,
+        readmitted: bool,
+        expired: bool,
+    ) {
+        use super::super::peer_registry::SessionAdmission;
+        use crate::zakura::transport::OrderedStreamFailureCause;
+        use crate::zakura::{ServicePeerDirection, SinkReject};
+
+        let config = ZakuraBlockSyncConfig::default();
+        let budget = ByteBudget::new(1_000_000);
+        let work = Arc::new(WorkQueue::new(block::Height(0)));
+        work.set_estimate_floor_for_tests(1);
+        if unanswered {
+            work.extend(
+                super::super::test_work_scope(),
+                [(
+                    block::Height(1),
+                    block::Hash([1; 32]),
+                    BlockSizeEstimate::Confirmed(1_000),
+                )],
+            );
+        }
+        let peer = ZakuraPeerId::new(vec![19; 32]).unwrap();
+        let registry = Arc::new(PeerRegistry::new());
+        let now = Instant::now();
+        let mut generation = registry
+            .admit_session(&peer, ServicePeerDirection::Outbound, &config, 0, now)
+            .generation();
+        if readmitted {
+            assert!(registry.park_session(&peer, 0, generation, now));
+            let admission =
+                registry.admit_session(&peer, ServicePeerDirection::Outbound, &config, 0, now);
+            assert!(matches!(admission, SessionAdmission::Readmitted { .. }));
+            generation = admission.generation();
+        }
+        let cancel = CancellationToken::new();
+        let (out_send, mut out_recv) = crate::zakura::transport::worker_framed_channel(4);
+        let (_in_send, in_recv) = framed_channel(4);
+        let cause = OrderedStreamFailureCause::default();
+        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
+        let (sequencer_input, _sequencer_recv) = mpsc::channel(4);
+        let (reactor_input, _reactor_recv) = mpsc::channel(4);
+        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        }));
+        let mut routine = PeerRoutine::new(
+            peer.clone(),
+            0,
+            session,
+            in_recv.with_failure_cause(cause.clone()),
+            config.clone(),
+            !readmitted,
+            generation,
+            budget.clone(),
+            work.clone(),
+            registry.clone(),
+            Arc::new(Mutex::new(ThroughputMeter::new(now))),
+            sequencer_input,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            reactor_input,
+            view_rx,
+            cancel.clone(),
+            ZakuraTrace::noop(),
+        );
+        if unanswered {
+            routine.handle_status(super::BlockSyncStatus {
+                servable_low: block::Height(1),
+                servable_high: block::Height(1),
+                max_blocks_per_response: 1,
+                ..super::BlockSyncStatus::default()
+            });
+            routine.try_fill().await;
+            assert_eq!(routine.window.outstanding.len(), 1);
+            timeout(Duration::from_secs(1), out_recv.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .write_with(|_| async { Ok::<_, std::convert::Infallible>(()) })
+                .await
+                .unwrap();
+            assert!(work.in_flight_contains(block::Height(1)));
+            if expired {
+                let after_deadline =
+                    routine.window.outstanding[0].deadline + Duration::from_millis(1);
+                routine.expire_due_timeouts(after_deadline);
+                assert!(routine.window.outstanding.is_empty());
+                assert!(routine.window.block_liveness_deadline.is_some());
+            }
+        }
+        if let Some(failure) = failure {
+            cause.record(failure);
+        }
+        // The transport records the cause before cancelling both stream roles.
+        cancel.cancel();
+        let result = timeout(Duration::from_secs(1), routine.run())
+            .await
+            .unwrap();
+        if failure.is_some() && unanswered {
+            if readmitted {
+                assert!(matches!(result, Err(SinkReject::Protocol(_))), "{result:?}");
+            } else {
+                assert!(matches!(result, Err(SinkReject::Local(_))), "{result:?}");
+                assert!(matches!(
+                    registry.admit_session(
+                        &peer,
+                        ServicePeerDirection::Outbound,
+                        &config,
+                        0,
+                        Instant::now()
+                    ),
+                    SessionAdmission::Parked,
+                ));
+                assert!(matches!(
+                    registry.admit_session(
+                        &peer,
+                        ServicePeerDirection::Outbound,
+                        &config,
+                        0,
+                        Instant::now() + config.effective_no_progress_peer_cooldown()
+                    ),
+                    SessionAdmission::Readmitted { .. },
+                ));
+            }
+        } else {
+            assert!(result.is_ok(), "{result:?}");
+            assert!(!registry.is_peer_parked(&peer, Instant::now()));
+        }
+        assert_eq!(budget.reserved(), 0);
+        assert_eq!(work.pending_contains(block::Height(1)), unanswered);
     }
 
     #[test]

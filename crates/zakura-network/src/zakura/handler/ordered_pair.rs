@@ -250,8 +250,8 @@ pub(super) fn spawn_ordered_pair(
         resources.admitted();
     }
     let cancel = data.context.connection_token.child_token();
-    // Let the service distinguish peer closure from locally initiated cancellation.
-    let remote_close = CancellationToken::new();
+    // Let the service distinguish transport failures from local cancellation.
+    let failure_cause = OrderedStreamFailureCause::default();
     data.context.stream_token = cancel.clone();
     requests.context.stream_token = cancel.clone();
     let (inbound_depth, outbound_depth) =
@@ -269,13 +269,13 @@ pub(super) fn spawn_ordered_pair(
         kind: data.stream.kind,
         version: data.stream.version,
         session_id: data.context.stream_id,
-        recv: FramedRecv::new(data_rx).with_remote_close(remote_close.clone()),
+        recv: FramedRecv::new(data_rx).with_failure_cause(failure_cause.clone()),
         send: data_send.with_session_resources(data.context.session_resources.clone()),
         cancel_token: cancel.clone(),
         companion: Some(ServiceStreamRole {
             kind: requests.stream.kind,
             version: requests.stream.version,
-            recv: FramedRecv::new(request_rx).with_remote_close(remote_close.clone()),
+            recv: FramedRecv::new(request_rx).with_failure_cause(failure_cause.clone()),
             send: request_send.with_session_resources(requests.context.session_resources.clone()),
         }),
     };
@@ -302,7 +302,7 @@ pub(super) fn spawn_ordered_pair(
                     data_out,
                     inbound_depth,
                     OrderedWritePolicy::PairData,
-                    Some(remote_close.clone()),
+                    Some(failure_cause.clone()),
                 )
                 .await;
                 cancel.cancel();
@@ -317,7 +317,7 @@ pub(super) fn spawn_ordered_pair(
                     request_out,
                     1,
                     OrderedWritePolicy::PairRequests,
-                    Some(remote_close.clone()),
+                    Some(failure_cause.clone()),
                 )
                 .await;
                 cancel.cancel();

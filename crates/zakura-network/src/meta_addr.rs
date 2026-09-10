@@ -1175,7 +1175,9 @@ impl MetaAddrChange {
                 last_attempt: None,
                 last_failure: None,
                 last_connection_state: self.peer_addr_state(),
-                misbehavior_score: previous.misbehavior_score + self.misbehavior_score(),
+                misbehavior_score: previous
+                    .misbehavior_score
+                    .saturating_add(self.misbehavior_score()),
                 is_inbound: previous.is_inbound || self.is_inbound(),
             })
         } else {
@@ -1201,7 +1203,9 @@ impl MetaAddrChange {
                 last_failure: self.last_failure(instant_now).or(previous.last_failure),
                 // Replace the state with the updated state.
                 last_connection_state: self.peer_addr_state(),
-                misbehavior_score: previous.misbehavior_score + self.misbehavior_score(),
+                misbehavior_score: previous
+                    .misbehavior_score
+                    .saturating_add(self.misbehavior_score()),
                 is_inbound: previous.is_inbound || self.is_inbound(),
             })
         }

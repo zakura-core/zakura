@@ -95,10 +95,12 @@ async fn batch_misbehavior_reports(
     loop {
         tokio::select! {
             msg = misbehavior_rx.recv() => match msg {
-                Some((peer_addr, score_increment)) => *misbehaviors
-                    .entry(peer_addr)
-                    .or_default()
-                    += score_increment,
+                Some((peer_addr, score_increment)) => {
+                    let score = misbehaviors.entry(peer_addr).or_default();
+                    // Saturate so accumulated reports can't wrap a peer's score
+                    // back below the ban threshold.
+                    *score = score.saturating_add(score_increment);
+                }
                 None => break,
             },
 

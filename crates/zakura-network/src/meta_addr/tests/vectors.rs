@@ -569,3 +569,48 @@ fn new_misbehavior_canonicalizes_ipv4_mapped_addr() {
     assert_eq!(updated.addr(), canonical_addr);
     assert_eq!(updated.misbehavior(), 100);
 }
+
+/// Misbehavior updates must saturate at `u32::MAX` instead of overflowing and
+/// wrapping the accumulated score back below the ban threshold.
+#[test]
+fn misbehavior_score_accumulation_saturates() {
+    let _init_guard = zakura_test::init();
+
+    let instant_now = Instant::now();
+    let chrono_now = Utc::now();
+
+    let addr: PeerSocketAddr = "127.0.0.1:8233".parse().unwrap();
+
+    // A never-attempted entry that is already near the maximum score.
+    let never_attempted = MetaAddr {
+        addr,
+        services: Default::default(),
+        untrusted_last_seen: None,
+        last_response: None,
+        rtt: None,
+        ping_sent_at: None,
+        last_attempt: None,
+        last_failure: None,
+        last_connection_state: Default::default(),
+        misbehavior_score: u32::MAX - 1,
+        is_inbound: false,
+    };
+
+    let updated = MetaAddr::new_misbehavior(addr, u32::MAX)
+        .apply_to_meta_addr(never_attempted, instant_now, chrono_now)
+        .expect("misbehavior updates apply to never-attempted entries");
+    assert_eq!(updated.misbehavior(), u32::MAX);
+
+    // An attempted (connected) entry near the maximum score.
+    let mut connected = MetaAddr::new_connected(addr, &PeerServices::NODE_NETWORK, false)
+        .into_new_meta_addr(
+            instant_now,
+            chrono_now.try_into().expect("will succeed until 2038"),
+        );
+    connected.misbehavior_score = u32::MAX - 1;
+
+    let updated = MetaAddr::new_misbehavior(addr, u32::MAX)
+        .apply_to_meta_addr(connected, instant_now, chrono_now)
+        .expect("misbehavior updates apply to attempted entries");
+    assert_eq!(updated.misbehavior(), u32::MAX);
+}

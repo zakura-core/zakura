@@ -32,7 +32,6 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
-| `PAIRED_DATA_WRITE_TIMEOUT` | `crates/zakura-network/src/zakura/handler.rs` | new → `32 s` | [#943](https://github.com/zakura-core/zakura/pull/943) | Allow healthy writes to wait for shared connection credit on lossy links with a paused service. |
 | `DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW` | `crates/zakura-network/src/zakura/handler.rs` | `32 MiB` → `16 MiB` | [#943](https://github.com/zakura-core/zakura/pull/943) | Leave connection receive credit for another service while one stream's application reads are paused. |
 | `get_blocks_regulation.*` defaults | `crates/zakura-network/src/zakura/block_sync/config.rs` | new → one response per authenticated identity; `64` per node | [#892](https://github.com/zakura-core/zakura/pull/892) | Hold capacity through storage jobs, results, and application writes, including across reconnects. |
 | `MAX_CONCURRENT_UTXO_LOOKUPS` | `crates/zakura-consensus/src/transaction.rs` | serial (`1`) → `64` per block transaction | [#918](https://github.com/zakura-core/zakura/pull/918) | Overlap external UTXO waits while bounding pending lookups per transaction. Concurrent lookups start their six-minute timeout clocks together. |

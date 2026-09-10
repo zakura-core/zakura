@@ -36,6 +36,8 @@ fn reset_drops_unaffected_last_claim_after_unlocking() {
         assert_eq!(f.work.reset_above(block::Height(2)), 0);
         assert_eq!(f.budget.reserved(), 0);
         assert_eq!(f.work.reserved_bytes(), 0);
+        assert_eq!(f.work.pending_len(), 0);
+        assert_eq!(f.work.in_flight_len(), 0);
         assert!(!f.cancel.is_cancelled());
         done_tx.send(()).unwrap();
     });
@@ -360,4 +362,227 @@ fn reset_cannot_interleave_outstanding_publication_and_enqueue() {
     drop(claim);
     assert_eq!(f.budget.reserved(), 0);
     assert_eq!(f.work.reserved_bytes(), 0);
+}
+
+#[tokio::test]
+async fn partial_queued_expiry_returns_the_whole_request_before_queue_drain() {
+    for heights in [
+        vec![block::Height(1)],
+        vec![block::Height(2)],
+        vec![block::Height(1), block::Height(2)],
+    ] {
+        let mut f = Fixture::new();
+        let (sender, mut receiver) = worker_framed_channel(2);
+        let claim = f.take(1);
+        let owner = claim.owner();
+        let status = claim.status();
+        publish(&claim, &sender);
+        drop(claim);
+        let outcome = f
+            .work
+            .release_reserved_and_return_items_detailed_for_owner(owner, heights);
+        f.budget.release(outcome.released_bytes);
+        assert!(status.was_skipped());
+        assert_eq!(outcome.returned_count, 2);
+        assert_eq!(outcome.min_height, Some(block::Height(1)));
+        assert_eq!(outcome.max_height, Some(block::Height(2)));
+        assert_eq!(outcome.released_bytes, 200);
+        assert_eq!(f.work.pending_len(), 2);
+        assert_eq!(f.work.in_flight_len(), 0);
+        assert_eq!(f.budget.reserved(), 0);
+        assert_eq!(f.work.reserved_bytes(), 0);
+
+        let replacement = f.take(2);
+        publish(&replacement, &sender);
+        let stale = f
+            .work
+            .release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(1)]);
+        assert_eq!(stale.released_bytes, 0);
+        assert_eq!(stale.missing_count, 2);
+        receiver
+            .recv()
+            .await
+            .unwrap()
+            .write_with(|_| async {
+                panic!("the expired request cannot reach the transport");
+                #[allow(unreachable_code)]
+                Ok::<(), ()>(())
+            })
+            .await
+            .unwrap();
+        for height in [block::Height(1), block::Height(2)] {
+            assert_eq!(f.work.owner_for_height(height), Some(replacement.owner()));
+        }
+        assert_eq!(f.budget.reserved(), 200);
+        assert_eq!(f.work.reserved_bytes(), 200);
+        assert!(!f.cancel.is_cancelled());
+        drop(receiver);
+        drop(replacement);
+        assert_eq!(f.budget.reserved(), 0);
+    }
+}
+
+#[test]
+fn partial_started_expiry_keeps_the_other_height_reserved() {
+    let mut f = Fixture::new();
+    let (sender, receiver) = worker_framed_channel(1);
+    let claim = f.take(1);
+    publish(&claim, &sender);
+    assert!(claim.try_start());
+    let outcome = f
+        .work
+        .release_reserved_and_return_items_detailed_for_owner(claim.owner(), [block::Height(1)]);
+    f.budget.release(outcome.released_bytes);
+    assert!(!claim.status().was_skipped());
+    assert_eq!(outcome.returned_count, 1);
+    assert_eq!(outcome.released_bytes, 100);
+    assert_eq!(f.work.pending_len(), 1);
+    assert_eq!(
+        f.work.owner_for_height(block::Height(2)),
+        Some(claim.owner())
+    );
+    assert_eq!(f.budget.reserved(), 100);
+    assert_eq!(f.work.reserved_bytes(), 100);
+    assert!(!f.cancel.is_cancelled());
+    claim.written();
+    f.expire(claim.owner());
+    drop(receiver);
+    drop(claim);
+    assert!(!f.cancel.is_cancelled());
+    assert_eq!(f.budget.reserved(), 0);
+}
+
+#[test]
+fn whole_queued_expiry_preserves_already_received_heights() {
+    let mut f = Fixture::new();
+    let (sender, receiver) = worker_framed_channel(1);
+    let claim = f.take(1);
+    publish(&claim, &sender);
+    f.budget.release(
+        f.work
+            .release_active_reserved_height_for_owner(claim.owner(), block::Height(1))
+            .unwrap(),
+    );
+    let outcome = f
+        .work
+        .release_reserved_and_return_items_detailed_for_owner(claim.owner(), [block::Height(2)]);
+    f.budget.release(outcome.released_bytes);
+    assert_eq!(outcome.returned_count, 1);
+    assert_eq!(outcome.released_count, 1);
+    assert_eq!(outcome.released_bytes, 100);
+    assert_eq!(f.work.in_flight_len(), 1);
+    assert!(!f.work.pending_contains(block::Height(1)));
+    assert!(f.work.pending_contains(block::Height(2)));
+    assert_eq!(f.budget.reserved(), 0);
+    drop(receiver);
+    drop(claim);
+    assert_eq!(f.budget.reserved(), 0);
+    assert_eq!(f.work.in_flight_len(), 1);
+}
+
+#[test]
+fn queued_expiry_racing_reset_settles_each_reservation_once() {
+    for _ in 0..8 {
+        let mut f = Fixture::new();
+        let (sender, receiver) = worker_framed_channel(1);
+        let claim = f.take(1);
+        publish(&claim, &sender);
+        let owner = claim.owner();
+        let barrier = std::sync::Barrier::new(2);
+        let work = f.work.clone();
+        std::thread::scope(|scope| {
+            let barrier = &barrier;
+            let mut budget = f.budget.clone();
+            scope.spawn(move || {
+                barrier.wait();
+                budget.release(work.reset_above(block::Height(0)));
+            });
+            barrier.wait();
+            let outcome = f
+                .work
+                .release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(1)]);
+            f.budget.release(outcome.released_bytes);
+        });
+        assert_eq!(f.budget.reserved(), 0);
+        assert_eq!(f.work.reserved_bytes(), 0);
+        assert_eq!(f.work.pending_len(), 0);
+        assert_eq!(f.work.in_flight_len(), 0);
+        drop(receiver);
+        drop(claim);
+        assert_eq!(f.budget.reserved(), 0);
+        assert!(!f.cancel.is_cancelled());
+    }
+}
+
+#[test]
+fn expiry_after_forward_reset_discards_committed_heights() {
+    for received in [false, true] {
+        let mut f = Fixture::new();
+        let (sender, receiver) = worker_framed_channel(1);
+        let claim = f.take(1);
+        publish(&claim, &sender);
+        if received {
+            f.budget.release(
+                f.work
+                    .release_active_reserved_height_for_owner(claim.owner(), block::Height(1))
+                    .unwrap(),
+            );
+        }
+        // Reset retains heights at or below its new floor. Cleanup must discard
+        // that prefix instead of offering already-committed work to another peer.
+        f.budget.release(f.work.reset_above(block::Height(2)));
+        let outcome = f.work.release_reserved_and_return_items_detailed_for_owner(
+            claim.owner(),
+            [block::Height(1)],
+        );
+        assert_eq!(outcome.committed_count, 2);
+        assert_eq!(outcome.returned_count, 0);
+        assert_eq!(outcome.released_bytes, if received { 100 } else { 200 });
+        f.budget.release(outcome.released_bytes);
+        assert_eq!(f.work.pending_len(), 0);
+        assert_eq!(f.work.in_flight_len(), 0);
+        assert_eq!(f.work.reserved_bytes(), 0);
+        assert_eq!(f.budget.reserved(), 0);
+        drop(receiver);
+        drop(claim);
+        assert_eq!(f.work.pending_len(), 0);
+        assert_eq!(f.budget.reserved(), 0);
+        assert!(!f.cancel.is_cancelled());
+    }
+}
+
+#[tokio::test]
+async fn request_write_cleanup_preserves_the_recorded_transport_failure() {
+    use crate::zakura::transport::{OrderedStreamFailure, OrderedStreamFailureCause};
+
+    for failure in [
+        OrderedStreamFailure::RemoteClose,
+        OrderedStreamFailure::WriteTimeout,
+    ] {
+        let mut f = Fixture::new();
+        let (sender, mut receiver) = worker_framed_channel(1);
+        let claim = f.take(1);
+        publish(&claim, &sender);
+        drop(claim);
+        let cause = OrderedStreamFailureCause::default();
+        let result = receiver
+            .recv()
+            .await
+            .unwrap()
+            .write_with(|_| async {
+                assert!(!f.cancel.is_cancelled());
+                assert_eq!(f.budget.reserved(), 200);
+                // The transport records the error while the real request owner is
+                // still alive. Its destructor must retain that cause through cleanup.
+                cause.record(failure);
+                Err::<(), _>("write failed")
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(f.cancel.is_cancelled());
+        assert_eq!(cause.get(), Some(failure));
+        assert_eq!(f.work.pending_len(), 2);
+        assert_eq!(f.work.reserved_bytes(), 0);
+        assert_eq!(f.budget.reserved(), 0);
+    }
 }

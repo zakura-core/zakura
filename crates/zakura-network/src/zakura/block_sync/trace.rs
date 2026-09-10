@@ -160,6 +160,8 @@ pub(super) struct BlockTraceFields {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub returned_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub committed_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub already_pending_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub released_count: Option<u64>,

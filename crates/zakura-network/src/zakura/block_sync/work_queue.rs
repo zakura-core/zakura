@@ -58,10 +58,12 @@ pub(super) struct WorkItem {
 /// Diagnostics for an attempted `in_flight -> pending` retry transition.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct WorkReturnOutcome {
-    /// Reserved bytes released while moving items back to `pending`.
+    /// Reserved bytes released while returning or discarding items.
     pub(super) released_bytes: u64,
     /// Reserved items successfully moved back to `pending`.
     pub(super) returned_count: u64,
+    /// Owned heights discarded because they are already committed.
+    pub(super) committed_count: u64,
     /// Requested heights that were already back in `pending`.
     pub(super) already_pending_count: u64,
     /// Received items still present in `in_flight` with a `Released` ledger.
@@ -608,6 +610,8 @@ impl WorkQueue {
         self.release_reserved_and_return_items_detailed_matching(None, heights)
     }
 
+    /// Return this owner's unreceived heights. Expiring a queued frame also
+    /// returns every other unsent height owned by that request under the same lock.
     pub(super) fn release_reserved_and_return_items_detailed_for_owner(
         &self,
         owner: zakura_header_chain::BodyWorkOwner,
@@ -623,6 +627,7 @@ impl WorkQueue {
     ) -> WorkReturnOutcome {
         let mut moved = false;
         let mut outcome = WorkReturnOutcome::default();
+        let mut heights: std::collections::BTreeSet<_> = heights.into_iter().collect();
         let claim;
         {
             let mut inner = self.lock();
@@ -632,6 +637,11 @@ impl WorkQueue {
                 // The writer claims under this same lock. Expiry skips an
                 // unwritten frame; an already-started frame must finish.
                 claim.expire_unwritten();
+                if claim.status().was_skipped() {
+                    // Skipping an unsent frame retires its whole request. Return
+                    // every remaining reservation without waiting for queue drain.
+                    heights.extend(claim.heights());
+                }
             }
             for height in heights {
                 outcome.min_height = Some(
@@ -655,6 +665,17 @@ impl WorkQueue {
                 };
                 if owner.is_some_and(|owner| item.owner != Some(owner)) {
                     outcome.missing_count = outcome.missing_count.saturating_add(1);
+                    continue;
+                }
+                if height <= inner.floor {
+                    let mut item = inner
+                        .in_flight
+                        .remove(&height)
+                        .expect("owned item exists because it was just checked");
+                    outcome.released_bytes = outcome
+                        .released_bytes
+                        .saturating_add(item.budget.release_reserved());
+                    outcome.committed_count = outcome.committed_count.saturating_add(1);
                     continue;
                 }
                 match item.budget {

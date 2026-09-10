@@ -67,6 +67,7 @@ impl PeerRoutine {
         let unreceived_count = u64::try_from(unreceived_count).unwrap_or(u64::MAX);
         if outcome.missing_count == 0
             && outcome.released_count == 0
+            && outcome.committed_count == 0
             && outcome.returned_count == unreceived_count
         {
             return;
@@ -276,6 +277,7 @@ impl PeerRoutine {
 fn insert_work_return_outcome(row: &mut BlockTraceFields, outcome: WorkReturnOutcome) {
     row.released_bytes = Some(outcome.released_bytes);
     row.returned_count = Some(outcome.returned_count);
+    row.committed_count = Some(outcome.committed_count);
     row.already_pending_count = Some(outcome.already_pending_count);
     row.released_count = Some(outcome.released_count);
     row.missing_count = Some(outcome.missing_count);

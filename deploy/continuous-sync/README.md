@@ -486,3 +486,9 @@ The lifecycle rule also removes abandoned multipart uploads after one day.
 
 See [Spaces lifecycle rules](https://docs.digitalocean.com/products/spaces/how-to/configure-lifecycle-rules/)
 and [private download links](https://docs.digitalocean.com/products/spaces/how-to/set-file-permissions/).
+
+The controller deletes each local `traces` directory after persisting the archive
+URL in `run.json`. It keeps run metadata and logs under the existing retention
+policy. Cleanup also removes trace payloads from previously archived runs,
+including the protected latest failed run. A failed upload preserves the traces.
+Cleanup retries after a controller restart if deletion did not finish.

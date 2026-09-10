@@ -613,7 +613,10 @@ def wait_for_completion(
 
 def archive_traces(config: Config, run_dir: Path, run_state: dict[str, Any]) -> None:
     """Upload stopped-node traces before the controller can start another run."""
-    if not config.policy.archive_traces or run_state.get("trace_archive_url"):
+    if not config.policy.archive_traces:
+        return
+    if run_state.get("trace_archive_url"):
+        clear_archived_traces(run_dir)
         return
     traces = run_dir / "traces"
     if traces.is_symlink():
@@ -663,6 +666,16 @@ def archive_traces(config: Config, run_dir: Path, run_state: dict[str, Any]) -> 
     archived_state = dict(run_state, trace_archive_url=url, trace_archive_key=key)
     write_run_json(run_dir, archived_state)
     run_state.update(archived_state)
+    clear_archived_traces(run_dir)
+
+
+def clear_archived_traces(run_dir: Path) -> None:
+    """Remove trace payloads after their archive metadata reaches disk."""
+    traces = run_dir / "traces"
+    if traces.is_symlink():
+        raise ControllerError(f"refusing to remove symlinked traces: {traces}")
+    if traces.exists():
+        shutil.rmtree(traces)
 
 
 def trace_download_text(run_state: dict[str, Any]) -> str:

@@ -1,5 +1,5 @@
 ---
-source: zebra-rpc/src/methods/tests/snapshot.rs
+source: crates/zakura-rpc/src/methods/tests/snapshot.rs
 expression: block_template
 ---
 {
@@ -27,7 +27,7 @@ expression: block_template
     "sigops": 0,
     "required": true
   },
-  "longpollid": "00018424203eab7f731654008728000000000000000000",
+  "longpollid": "00018424203eab7f7316540087280000000000000000000000000000000001",
   "target": "0555540000000000000000000000000000000000000000000000000000000000",
   "mintime": 1654008606,
   "mutable": [

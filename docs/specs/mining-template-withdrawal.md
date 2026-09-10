@@ -34,66 +34,55 @@ The cases above describe possible triggers, not observed production incidents.
 
 ## Implementation
 
-1. Retain rejected server work IDs in a watch channel scoped to the current parent.
-   Retained state covers failures before subscription and between checking and waiting.
-   Ignore late results for another parent.
-   Bound rejection storage at 64 IDs; stop issuing templates on overflow until the
-   parent changes.
-2. Classify concrete consensus and contextual errors.
-   Unwrap the consensus router error before classification.
-   Keep missing-context, stale-parent, timeout, and service failures retryable.
-   Withdraw a server template that cannot form a proposal.
-3. Let internal template generation watch the active work ID during RPC requests and
-   refresh delays.
-   Clear the active template on rejection.
-   The existing solver callback observes the cleared template and stops at its next
-   cancellation check.
-   Preserve internal work that already passed validation when another candidate fails
-   on the same parent. Cancel unvalidated work conservatively.
-4. Increment the long-poll withdrawal revision on rejection.
-   Wake long polls even when the parent and mempool stay unchanged.
-   Accept legacy 46-character IDs; append 16 hex digits after a withdrawal.
-   External miners receive a replacement with `submitold: false`.
-   External miners must cooperate; RPC cannot force them to stop.
-5. Enter empty-template recovery for the affected parent.
-   Validate the empty template before returning it.
-   Return an error if validation fails or exceeds 30 seconds.
-   Recheck the recovery context before publication.
-   Do not issue further speculative transaction sets until the parent changes.
-   This conservative recovery avoids an unbounded candidate fingerprint blacklist.
-6. Discard queued speculative preparation during recovery.
-   Drop the preparation future when its parent becomes stale or after 30 seconds.
-   Keep solved-block verification and commit outside this cancellation path.
+The server retains eight parent entries in least-recently-used order.
+Each entry owns a random work-ID namespace, up to 64 rejected IDs, and up to 64
+prepared IDs. A work ID identifies one template within that namespace.
+A rejection applies to its own parent even when validation finishes after a tip change.
+Saturation withdraws that parent's work and stops publication on that parent.
+
+Evicting an entry retires its namespace. A withdrawal waiter checks the namespace
+and current result together, so it detects retirement even when it subscribes after
+the rejection and eviction. Another parent's retirement cannot withdraw retained work.
+A late validation result cannot mutate a replacement entry for the same parent hash.
+
+Each new parent entry receives a fresh long-poll revision. The tracker retains the
+greatest parent height it has observed. A new entry at that height or below requires
+foreground empty-template recovery. This rule covers forgotten-parent returns with
+bounded memory. A new forward height can still use speculative preparation.
+Returning to a retained parent preserves its existing policy and results.
+
+A concrete rejection or prepared-ID eviction advances the affected parent's revision.
+Long polls wake even when the parent and mempool stay unchanged. The server accepts
+legacy long-poll IDs. New parent entries and withdrawal events use the revision suffix.
+A response that replaces an older revision sets `submitold: false`.
+External miners must cooperate with withdrawal.
+
+The server holds the rejection-state guard through the fast publication decision.
+Recovery validates an empty template, then checks the live parent and revision,
+registers the prepared ID, and sets the response revision in one write closure.
+Recovery returns an error if validation fails, times out, or loses its context.
+A later rejection can still withdraw work that was valid at publication.
+
+The background queue retains one running computation and one newest pending template.
+A deadline classifies its cost; it does not release ownership of work still computing.
+A late rejection still counts. Queued speculative work on a recovery parent is discarded.
+Solved-block verification and commit use separate ownership.
 
 ## Tests
 
-- `zakura-consensus`: `template_rejection_distinguishes_expiry_from_service_failure`
-  separates a real transaction-expiry rejection from a service failure.
-- `zakura-rpc`: `template_rejection_wakes_long_poll_and_validates_recovery` and
-  `template_rejection_before_long_poll_is_not_lost` cover withdrawal, validated
-  recovery, and a rejection that precedes the long poll it must wake.
-- `zakura-rpc`: `template_rejection_targets_work_and_ignores_old_parents`,
-  `template_rejection_storage_fails_closed_at_capacity`,
-  `prepared_template_tracking_keeps_new_recovery_work_at_capacity`, and
-  `template_rejection_retains_notifications_for_late_subscribers` cover the
-  rejection state itself.
-- `zakura-rpc`: `long_poll_withdrawal_changes_id_and_disallows_old_work` checks that a
-  withdrawal disallows old shares and that the revised ID round-trips.
-- `zakurad`: `template_rejection_cancels_during_rpc_wait` and
-  `template_rejection_cancels_during_refresh_delay` cover the internal miner's two
-  cancellation points.
+The RPC suite covers parent ABA, late rejection, parent retirement before waiter
+subscription, unrelated parent eviction, and prepared-ID eviction. The long-poll
+regression fills the prepared bound with real recovery responses and confirms that
+eviction wakes a waiting client with `submitold: false` and the current revision.
+A concurrent rejection prevents recovery publication.
+The internal miner tests cover cancellation during RPC waits and refresh delays.
 
-## Limits and follow-up measurements
+## Limits
 
-Dropping an async preparation future does not preempt cryptographic work that a
-buffered service, batch verifier, or blocking thread already owns.
-The block verifier already returns on the first transaction error it observes.
-This change does not claim that every submitted proof check stops at that instant.
-Fine-grained proof-task cancellation requires a separate ownership audit.
+Revisiting a forgotten height requires foreground empty-template recovery even when
+that particular parent has never failed validation. This conservative policy avoids
+an unbounded parent blacklist. Normal forward heights retain speculative preparation.
 
-Recovery may repeat empty-template validation for concurrent requests.
-Candidate deduplication and preparation scheduling remain performance follow-ups;
-they do not gate withdrawal correctness.
-Measure preparation CPU, cache-hit rate, solved-block latency, and rejection-to-solver
-stop latency before selecting a preparation rate limit.
-The implementation counts rejected, cancelled, and timed-out preparations.
+Recovery can repeat validation for concurrent requests. Candidate deduplication and
+recovery admission remain performance follow-ups. Background preparation remains
+bounded independently of RPC cancellation and validation latency.

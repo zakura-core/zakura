@@ -3242,6 +3242,90 @@ async fn check_template_rejection_recovery(reject_before_poll: bool) {
     assert_ne!(replacement.long_poll_id, old_id);
     assert!(replacement.transactions.is_empty());
 
+    if !reject_before_poll {
+        // Fill the prepared-work bound with real recovery responses.
+        for _ in 1..64 {
+            let recovery = tokio::spawn({
+                let rpc = rpc.clone();
+                async move { rpc.get_block_template(None).await }
+            });
+            verifier
+                .expect_request_that(|request| {
+                    matches!(request, zakura_consensus::Request::Prepare { .. })
+                })
+                .await
+                .respond(Hash([2; 32]));
+            let recovered = recovery
+                .await
+                .unwrap()
+                .unwrap()
+                .try_into_template()
+                .unwrap();
+            assert_eq!(recovered.long_poll_id, replacement.long_poll_id);
+        }
+        assert!(!rpc.mining_template_withdrawn(&replacement.work_id));
+        let old_id = replacement.long_poll_id;
+        let long_poll = tokio::spawn({
+            let rpc = rpc.clone();
+            async move {
+                rpc.get_block_template(Some(GetBlockTemplateParameters::new(
+                    GetBlockTemplateRequestMode::Template,
+                    None,
+                    vec![],
+                    Some(old_id),
+                    None,
+                )))
+                .await
+            }
+        });
+        let previous_calls = *calls.borrow_and_update();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while *calls.borrow_and_update() <= previous_calls {
+                calls.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!long_poll.is_finished());
+        let eviction = tokio::spawn({
+            let rpc = rpc.clone();
+            async move { rpc.get_block_template(None).await }
+        });
+        verifier
+            .expect_request_that(|request| {
+                matches!(request, zakura_consensus::Request::Prepare { .. })
+            })
+            .await
+            .respond(Hash([2; 32]));
+        let eviction = eviction
+            .await
+            .unwrap()
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        assert!(rpc.mining_template_withdrawn(&replacement.work_id));
+        assert!(eviction.long_poll_id.revision > old_id.revision);
+        assert_eq!(eviction.submit_old, Some(false));
+        verifier
+            .expect_request_that(|request| {
+                matches!(request, zakura_consensus::Request::Prepare { .. })
+            })
+            .await
+            .respond(Hash([2; 32]));
+        let awakened = tokio::time::timeout(Duration::from_secs(1), long_poll)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        assert_eq!(awakened.submit_old, Some(false));
+        assert_eq!(
+            awakened.long_poll_id.revision,
+            rpc.gbt.template_rejections.borrow().current_revision()
+        );
+    }
+
     // A failed fallback must never reach a miner.
     let recovery = tokio::spawn({
         let rpc = rpc.clone();
@@ -3256,6 +3340,21 @@ async fn check_template_rejection_recovery(reject_before_poll: bool) {
         .unwrap()
         .unwrap()
         .is_err());
+    let recovery = tokio::spawn({
+        let rpc = rpc.clone();
+        async move { rpc.get_block_template(None).await }
+    });
+    let pending = verifier
+        .expect_request_that(|request| matches!(request, zakura_consensus::Request::Prepare { .. }))
+        .await;
+    rpc.gbt.template_rejections.send_if_modified(|state| {
+        state.reject(parent, &state.scope_work_id("concurrent-rejection"))
+    });
+    pending.respond(Hash([2; 32]));
+    assert!(
+        recovery.await.unwrap().is_err(),
+        "recovery cannot publish across a changed rejection revision"
+    );
     queue.abort();
 }
 
@@ -4646,12 +4745,12 @@ fn speculative_test_template(parent: Hash) -> BlockTemplateResponse {
     )
 }
 
-/// A request whose tip went stale must not erase the current parent's withdrawals.
+/// A request whose tip went stale must not retarget the parent templates are built on.
 ///
-/// `set_parent` clears every rejection recorded for the parent it replaces, so a request that no
-/// longer agrees with the chain tip must return without writing anything.
+/// The request would otherwise publish a template on a parent the chain has already left, and
+/// hand the miner a long poll ID built from that parent's state.
 #[tokio::test]
-async fn a_stale_request_does_not_erase_the_current_parent_withdrawals() {
+async fn a_stale_request_does_not_retarget_the_template_parent() {
     let _init_guard = zakura_test::init();
     let current = Hash([1; 32]);
     let stale = Hash([2; 32]);
@@ -4688,38 +4787,59 @@ async fn a_stale_request_does_not_erase_the_current_parent_withdrawals() {
     );
 
     let mut rejections = rpc.gbt.template_rejections.subscribe();
-    rpc.track_template_parent(current, &mut rejections)
+    rpc.track_template_parent(current, Height(1), &mut rejections)
         .expect("the current tip is tracked");
-    let withdrawal = rpc.wait_for_mining_template_withdrawal(Some("work"));
+    let work = rpc.gbt.template_rejections.borrow().scope_work_id("work");
+    let withdrawal = rpc.wait_for_mining_template_withdrawal(Some(&work));
     tokio::pin!(withdrawal);
     assert!(futures::poll!(&mut withdrawal).is_pending());
     rpc.gbt
         .template_rejections
-        .send_if_modified(|state| state.reject(current, "work"));
+        .send_if_modified(|state| state.reject(current, &work));
 
     assert!(
-        rpc.track_template_parent(stale, &mut rejections).is_none(),
+        rpc.track_template_parent(stale, Height(2), &mut rejections)
+            .is_none(),
         "a request built on a parent the chain has left is told to fetch the tip again",
     );
     assert!(
-        rpc.mining_template_withdrawn("work"),
+        rpc.mining_template_withdrawn(&work),
         "the stale request must not clear the current parent's rejections",
     );
 
     let tracked = rpc
-        .track_template_parent(current, &mut rejections)
+        .track_template_parent(current, Height(1), &mut rejections)
         .expect("the current tip is still tracked");
     assert_eq!(tracked.parent, Some(current));
-    assert!(tracked.contains("work"));
+    assert!(tracked.contains(&work));
 
+    tip_sender.send_best_tip_height(Height(2));
     tip_sender.send_best_tip_hash(stale);
-    rpc.track_template_parent(stale, &mut rejections)
+    rpc.track_template_parent(stale, Height(2), &mut rejections)
         .expect("the new tip is tracked");
-    assert!(!rpc.mining_template_withdrawn("work"));
+    assert!(
+        rpc.mining_template_withdrawn(&work),
+        "a rejection names one template, so a parent change does not revive it",
+    );
+    // Eight more parents evict the rejection before the waiter reads its notification.
+    for byte in 3..=10 {
+        let parent = Hash([byte; 32]);
+        tip_sender.send_best_tip_height(Height(u32::from(byte)));
+        tip_sender.send_best_tip_hash(parent);
+        rpc.track_template_parent(parent, Height(u32::from(byte)), &mut rejections)
+            .expect("the new tip is tracked");
+    }
+    assert!(rpc.mining_template_withdrawn(&work));
     assert!(
         futures::poll!(&mut withdrawal).is_ready(),
-        "a parent change must not erase a rejection the waiter has not read",
+        "eviction must not erase a rejection the waiter has not read",
     );
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        rpc.wait_for_mining_template_withdrawal(Some(&work)),
+    )
+    .await
+    .expect("a re-armed waiter must observe retired work immediately");
 }
 
 /// A preparation deadline classifies the cost; it does not stop the computation.
@@ -4872,6 +4992,156 @@ async fn a_rejection_that_arrives_after_the_deadline_still_withdraws_the_templat
     );
 }
 
+/// A rejection is recorded on the parent it was validating, not on the current one.
+///
+/// A reorg away from a parent and back, or `invalidateblock` followed by `reconsiderblock`, can
+/// leave a validation legitimately finishing while templates are built on another parent. The
+/// answer still condemns the template it ran on, and the parent it was recorded under still has
+/// it when the chain returns.
+#[tokio::test]
+async fn a_rejection_is_recorded_on_the_parent_it_validated() {
+    let _init_guard = zakura_test::init();
+    let parent = Hash([1; 32]);
+    let sibling = Hash([2; 32]);
+    let (tip, tip_sender) = MockChainTip::new();
+    let height = NetworkUpgrade::Nu5.activation_height(&Mainnet).unwrap();
+    tip_sender.send_best_tip_height(height);
+    tip_sender.send_best_tip_hash(parent);
+    tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    let mut sync = MockSyncStatus::default();
+    sync.set_is_close_to_tip(true);
+    let mempool = tower::service_fn(move |_| async move {
+        Ok::<_, BoxError>(mempool::Response::FullTransactions {
+            transactions: vec![],
+            transaction_dependencies: Default::default(),
+            last_seen_tip_hash: parent,
+        })
+    });
+    let chain_info = GetBlockTemplateChainInfo {
+        expected_difficulty: CompactDifficulty::from(ExpandedDifficulty::from(U256::one())),
+        tip_height: height,
+        tip_hash: parent,
+        cur_time: 1654008617.into(),
+        min_time: 1654008606.into(),
+        max_time: 1654008728.into(),
+        chain_history_root: fake_history_tree(&Mainnet).hash(),
+    };
+    let read_tip = tip.clone();
+    let read_state = tower::service_fn(move |request| {
+        let mut chain_info = chain_info.clone();
+        chain_info.tip_hash = read_tip.best_tip_hash().expect("the test sets a tip");
+        chain_info.tip_height = read_tip.best_tip_height().expect("the test sets a height");
+        async move {
+            assert!(matches!(request, ReadRequest::ChainInfo));
+            Ok::<_, BoxError>(ReadResponse::ChainInfo(chain_info))
+        }
+    });
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut verifier: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _queue) = RpcImpl::new(
+        Mainnet,
+        mining::Config {
+            miner_address: Some(ZcashAddress::from_transparent_p2pkh(
+                NetworkType::Main,
+                [0x7e; 20],
+            )),
+            ..Default::default()
+        },
+        false,
+        "0.0.1",
+        "parent ABA test",
+        Buffer::new(mempool, 1),
+        Buffer::new(state, 1),
+        Buffer::new(read_state, 1),
+        Buffer::new(verifier.clone(), 1),
+        sync,
+        tip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    let template = rpc
+        .get_block_template(None)
+        .await
+        .expect("the first template is returned");
+    let work_id = match &template {
+        GetBlockTemplateResponse::TemplateMode(template) => template.work_id().clone(),
+        GetBlockTemplateResponse::ProposalMode(_) => unreachable!("template mode was requested"),
+    };
+    let preparation = verifier
+        .expect_request_that(|request| matches!(request, zakura_consensus::Request::Prepare { .. }))
+        .await;
+
+    // The chain leaves the parent while its template is still being validated.
+    let mut rejections = rpc.gbt.template_rejections.subscribe();
+    tip_sender.send_best_tip_height((height + 1).unwrap());
+    tip_sender.send_best_tip_hash(sibling);
+    let sibling_state = rpc
+        .track_template_parent(sibling, (height + 1).unwrap(), &mut rejections)
+        .expect("the sibling is tracked");
+
+    let sibling_work = sibling_state.scope_work_id("sibling-work");
+    let sibling_withdrawal = rpc.wait_for_mining_template_withdrawal(Some(&sibling_work));
+    tokio::pin!(sibling_withdrawal);
+    assert!(futures::poll!(&mut sibling_withdrawal).is_pending());
+
+    preparation.respond(Err::<Hash, _>(zakura_consensus::BoxError::from(
+        zakura_consensus::VerifyBlockError::Block {
+            source: zakura_consensus::error::BlockError::MissingHeight(Hash([3; 32])),
+        },
+    )));
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    assert!(
+        rpc.mining_template_withdrawn(&work_id),
+        "a rejection recorded while the chain was elsewhere still withdraws its own work",
+    );
+    assert!(
+        !rpc.mining_template_withdrawn(&sibling_work),
+        "the parent the chain moved to is not put into fallback by another parent's rejection",
+    );
+    assert!(
+        futures::poll!(&mut sibling_withdrawal).is_pending(),
+        "another parent's rejection must not interrupt the sibling's solver",
+    );
+
+    assert!(
+        !rpc.recovery_context_changed(
+            &rpc.gbt.template_rejections.borrow(),
+            &sibling_state,
+            &speculative_test_template(sibling),
+            sibling,
+        ),
+        "another parent's rejection must not abort the sibling's recovery",
+    );
+    let sibling_template = rpc
+        .get_block_template(None)
+        .await
+        .expect("the sibling can still publish work")
+        .try_into_template()
+        .expect("template mode was requested");
+    assert_eq!(sibling_template.previous_block_hash, sibling);
+    assert_eq!(
+        sibling_template.long_poll_id.revision,
+        sibling_state.current_revision(),
+        "another parent's rejection must not change the sibling's long-poll ID",
+    );
+
+    // The chain comes back to the parent, which still knows what it rejected there.
+    tip_sender.send_best_tip_height(height);
+    tip_sender.send_best_tip_hash(parent);
+    rpc.track_template_parent(parent, height, &mut rejections)
+        .expect("the original parent is tracked again");
+    assert!(rpc.mining_template_rejected(&work_id));
+    assert!(
+        rpc.mining_template_withdrawn("older-work"),
+        "the parent returns to fallback, so it hands out only work it has validated",
+    );
+}
+
 /// One missed deadline stops speculation for that parent, and only for that parent.
 #[test]
 fn a_missed_deadline_stops_speculation_until_the_parent_changes() {
@@ -4938,7 +5208,11 @@ async fn a_stale_preparation_holds_the_worker_until_it_finishes() {
             assert!(matches!(request, ReadRequest::ChainInfo));
             Ok::<_, BoxError>(ReadResponse::ChainInfo(GetBlockTemplateChainInfo {
                 expected_difficulty: CompactDifficulty::from(ExpandedDifficulty::from(U256::one())),
-                tip_height: height,
+                tip_height: if tip_hash == first_parent {
+                    height
+                } else {
+                    (height + 1).unwrap()
+                },
                 tip_hash,
                 cur_time: 1654008617.into(),
                 min_time: 1654008606.into(),
@@ -4984,6 +5258,7 @@ async fn a_stale_preparation_holds_the_worker_until_it_finishes() {
     // The chain moves on. The node stops waiting for a preparation built on the old parent, but
     // that verification is still computing.
     state_tip.send_replace(second_parent);
+    tip_sender.send_best_tip_height((height + 1).unwrap());
     tip_sender.send_best_tip_hash(second_parent);
     tokio::task::yield_now().await;
 

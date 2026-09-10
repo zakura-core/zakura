@@ -74,74 +74,211 @@ const MAX_REJECTED_WORK_IDS: usize = 64;
 /// holding very old work loses its withdrawal exemption rather than growing this queue.
 const MAX_PREPARED_WORK_IDS: usize = 64;
 
-/// Rejections for the current template parent. Overflow fails closed until the tip changes.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct TemplateRejections {
-    pub(crate) parent: Option<block::Hash>,
-    pub(crate) revision: u64,
+/// How many parents retain what they recorded. The least recently tracked parent is forgotten
+/// first.
+const MAX_TRACKED_PARENTS: usize = 8;
+
+/// Retains one parent's validation results and work-ID namespace.
+#[derive(Clone, Debug)]
+struct ParentRejections {
+    revision: u64,
+    namespace: String,
     rejected: HashSet<String>,
     prepared: VecDeque<String>,
-    pub(crate) saturated: bool,
+    requires_recovery: bool,
+    saturated: bool,
+}
+
+impl ParentRejections {
+    fn owns(&self, work_id: &str) -> bool {
+        work_id
+            .split_once(':')
+            .is_some_and(|(namespace, _)| namespace == self.namespace)
+    }
+
+    fn contains(&self, work_id: &str) -> bool {
+        self.owns(work_id) && (self.saturated || self.rejected.contains(work_id))
+    }
+
+    fn needs_fallback(&self) -> bool {
+        self.requires_recovery || self.saturated || !self.rejected.is_empty()
+    }
+
+    fn is_prepared(&self, work_id: &str) -> bool {
+        self.prepared.iter().any(|id| id == work_id) && !self.contains(work_id)
+    }
+}
+
+/// Retains bounded parent state. Eviction retires that entry's work-ID namespace.
+/// A recreated parent gets a fresh revision and requires recovery at an observed height.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TemplateRejections {
+    /// The parent used for new templates.
+    pub(crate) parent: Option<block::Hash>,
+    /// Assigns revisions to new parent entries and withdrawal events.
+    pub(crate) revision: u64,
+    /// Allows new forward heights to speculate without forgetting trust loss on older parents.
+    max_parent_height: Option<block::Height>,
+    /// Least recently tracked first. Snapshots share each parent's work sets.
+    parents: VecDeque<(block::Hash, Arc<ParentRejections>)>,
 }
 
 impl TemplateRejections {
-    pub(crate) fn set_parent(&mut self, parent: block::Hash) {
-        if self.parent != Some(parent) {
-            self.parent = Some(parent);
-            self.rejected.clear();
-            self.prepared.clear();
-            self.saturated = false;
+    /// Tracks the current parent. A retained entry keeps its validation results.
+    pub(crate) fn track_parent(&mut self, parent: block::Hash, height: block::Height) -> bool {
+        let moved = self.parent != Some(parent);
+        self.parent = Some(parent);
+        let entry = match self.position(parent) {
+            Some(position) => self
+                .parents
+                .remove(position)
+                .expect("position is in bounds"),
+            None => {
+                self.revision = self
+                    .revision
+                    .checked_add(1)
+                    .expect("template revision cannot exhaust u64");
+                let requires_recovery = self
+                    .max_parent_height
+                    .is_some_and(|maximum| height <= maximum);
+                self.max_parent_height = Some(
+                    self.max_parent_height
+                        .map_or(height, |maximum| maximum.max(height)),
+                );
+                (
+                    parent,
+                    Arc::new(ParentRejections {
+                        revision: self.revision,
+                        namespace: new_work_id(),
+                        rejected: HashSet::new(),
+                        prepared: VecDeque::new(),
+                        requires_recovery,
+                        saturated: false,
+                    }),
+                )
+            }
+        };
+        self.parents.push_back(entry);
+        if self.parents.len() > MAX_TRACKED_PARENTS {
+            self.parents.pop_front();
         }
+        moved
     }
 
+    /// Binds a fresh template ID to the retained parent entry that owns it.
+    pub(crate) fn scope_work_id(&self, work_id: &str) -> String {
+        let entry = self
+            .current()
+            .expect("template publication tracks its parent first");
+        format!("{}:{work_id}", entry.namespace)
+    }
+
+    /// Records a rejection only while the work's parent namespace remains retained.
+    /// A retired namespace already withdraws all its work, including late results.
     pub(crate) fn reject(&mut self, parent: block::Hash, work_id: &str) -> bool {
-        if self.parent != Some(parent) || self.contains(work_id) {
+        let revision = self.revision;
+        let Some(entry) = self.entry_mut(parent) else {
+            return false;
+        };
+        if !entry.owns(work_id) || entry.contains(work_id) {
             return false;
         }
-        if self.rejected.len() == MAX_REJECTED_WORK_IDS {
-            self.saturated = true;
+        if entry.rejected.len() == MAX_REJECTED_WORK_IDS {
+            entry.saturated = true;
         } else {
-            self.rejected.insert(work_id.to_owned());
+            entry.rejected.insert(work_id.to_owned());
         }
-        self.revision = self
-            .revision
+        entry.revision = revision
             .checked_add(1)
             .expect("template revision cannot exhaust u64");
+        self.revision = entry.revision;
         true
     }
 
-    pub(crate) fn contains(&self, work_id: &str) -> bool {
-        self.saturated || self.rejected.contains(work_id)
-    }
-
-    pub(crate) fn needs_fallback(&self) -> bool {
-        self.saturated || !self.rejected.is_empty()
-    }
-
-    /// Records that `work_id` passed validation on `parent`.
-    ///
-    /// Returns whether this withdrew any other work: the oldest prepared ID is forgotten when the
-    /// queue is full, and during fallback losing that exemption withdraws it. Waiters observe
-    /// withdrawal through the watch channel, so the caller must publish that change.
+    /// Records prepared work and advances the revision if eviction withdraws another ID.
     pub(crate) fn mark_prepared(&mut self, parent: block::Hash, work_id: &str) -> bool {
-        if self.parent != Some(parent) || self.prepared.iter().any(|id| id == work_id) {
+        let revision = self.revision;
+        let Some(entry) = self.entry_mut(parent) else {
+            return false;
+        };
+        if !entry.owns(work_id)
+            || entry.contains(work_id)
+            || entry.prepared.iter().any(|id| id == work_id)
+        {
             return false;
         }
-        let evicted = if self.prepared.len() == MAX_PREPARED_WORK_IDS {
-            self.prepared.pop_front().is_some()
+        let evicted = entry.prepared.len() == MAX_PREPARED_WORK_IDS;
+        if evicted {
+            entry.prepared.pop_front();
+        }
+        entry.prepared.push_back(work_id.to_owned());
+        if evicted && entry.needs_fallback() {
+            entry.revision = revision
+                .checked_add(1)
+                .expect("template revision cannot exhaust u64");
+            self.revision = entry.revision;
+            true
         } else {
             false
-        };
-        self.prepared.push_back(work_id.to_owned());
-        evicted && self.needs_fallback()
+        }
     }
 
+    /// Whether the current parent condemned this work.
+    pub(crate) fn contains(&self, work_id: &str) -> bool {
+        self.current().is_some_and(|entry| entry.contains(work_id))
+    }
+
+    /// Whether the current parent requires foreground recovery.
+    pub(crate) fn needs_fallback(&self) -> bool {
+        self.current().is_some_and(ParentRejections::needs_fallback)
+    }
+
+    /// The current parent's publication/withdrawal revision.
+    pub(crate) fn current_revision(&self) -> u64 {
+        self.current().map_or(0, |entry| entry.revision)
+    }
+
+    /// Whether speculative work on this parent must stop.
+    pub(crate) fn needs_fallback_on(&self, parent: block::Hash) -> bool {
+        self.entry(parent)
+            .is_none_or(ParentRejections::needs_fallback)
+    }
+
+    /// Whether the current parent has exhausted its rejection budget.
+    pub(crate) fn saturated(&self) -> bool {
+        self.current().is_some_and(|entry| entry.saturated)
+    }
+
+    /// Whether the current parent validated this work.
     pub(crate) fn is_prepared(&self, work_id: &str) -> bool {
-        self.prepared.iter().any(|id| id == work_id) && !self.contains(work_id)
+        self.current()
+            .is_some_and(|entry| entry.is_prepared(work_id))
     }
 
+    /// Whether this work was rejected, lost its exemption, or belongs to a retired namespace.
     pub(crate) fn withdrawn(&self, work_id: &str) -> bool {
-        self.contains(work_id) || (self.needs_fallback() && !self.is_prepared(work_id))
+        let Some((_, entry)) = self.parents.iter().find(|(_, entry)| entry.owns(work_id)) else {
+            return true;
+        };
+        entry.contains(work_id) || (entry.needs_fallback() && !entry.is_prepared(work_id))
+    }
+
+    fn current(&self) -> Option<&ParentRejections> {
+        self.entry(self.parent?)
+    }
+
+    fn entry(&self, parent: block::Hash) -> Option<&ParentRejections> {
+        self.position(parent)
+            .map(|position| &*self.parents[position].1)
+    }
+
+    fn entry_mut(&mut self, parent: block::Hash) -> Option<&mut ParentRejections> {
+        let position = self.position(parent)?;
+        Some(Arc::make_mut(&mut self.parents[position].1))
+    }
+
+    fn position(&self, parent: block::Hash) -> Option<usize> {
+        self.parents.iter().position(|(hash, _)| *hash == parent)
     }
 }
 

@@ -39,11 +39,13 @@ pub(crate) fn verify_aux<G: HeaderGraphView>(
         })
         .collect();
     for (header_hash, delivery_id) in &deletes {
-        let exists = engine_before_commit
+        let existing = engine_before_commit
             .aux_deliveries(*header_hash)
             .iter()
-            .any(|delivery| delivery.delivery_id == *delivery_id);
-        if !exists {
+            .find(|delivery| delivery.delivery_id == *delivery_id);
+        if existing.is_none_or(|delivery| {
+            graph.view_header_node(*header_hash).is_some() && delivery.is_authenticated()
+        }) {
             return Err(InvariantViolation::Auxiliary(*header_hash));
         }
     }
@@ -70,6 +72,48 @@ pub(crate) fn verify_aux<G: HeaderGraphView>(
         );
     if projected_aux_count > plan.limits.max_aux_deliveries_total.get() {
         return Err(InvariantViolation::Limits);
+    }
+    let window_capacity = plan
+        .limits
+        .max_aux_deliveries_per_header
+        .get()
+        .saturating_mul(3);
+    if plan.change_set.metadata.mode == crate::EngineMode::Integrated
+        && projected_aux_count.saturating_add(window_capacity)
+            > plan.limits.max_aux_deliveries_total.get()
+    {
+        let frontiers = plan.change_set.metadata.frontiers;
+        let mut occupied = 0usize;
+        for offset in 0..3 {
+            let Some(height) = frontiers
+                .finalized
+                .height
+                .0
+                .checked_add(offset)
+                .map(zakura_chain::block::Height)
+            else {
+                break;
+            };
+            if height > frontiers.header_best.height {
+                break;
+            }
+            let frontier = graph
+                .view_header_ancestor(frontiers.header_best.hash, height)
+                .map_err(|_| InvariantViolation::Limits)?
+                .ok_or(InvariantViolation::Limits)?;
+            occupied = occupied.saturating_add(
+                graph
+                    .view_header_node(frontier.hash)
+                    .ok_or(InvariantViolation::Auxiliary(frontier.hash))?
+                    .aux_delivery_ids
+                    .len(),
+            );
+        }
+        if projected_aux_count.saturating_add(window_capacity.saturating_sub(occupied))
+            > plan.limits.max_aux_deliveries_total.get()
+        {
+            return Err(InvariantViolation::Limits);
+        }
     }
     let mut nodes: Vec<&HeaderNode> = match mode {
         #[cfg(any(test, feature = "fuzz-impl"))]
@@ -180,6 +224,31 @@ mod tests {
             verify_aux(&fixture.engine, &graph, plan, VerificationMode::Production),
             verify_aux(&fixture.engine, &graph, plan, VerificationMode::Exhaustive),
         ]
+    }
+
+    #[test]
+    fn projected_commit_reserve_includes_missing_successors() {
+        let fixture = fixture(EngineMode::Integrated);
+        let anchor = fixture.engine.graph().finalized_frontier();
+        let mut overlay = GraphOverlay::new(fixture.engine.graph());
+        let mut deliveries = Vec::new();
+        for (hash, marker) in [(anchor.hash, 0x79), (fixture.child.hash, 0x7a)] {
+            let delivery = delivery(&fixture.engine, hash, EvidenceId::from_digest([marker; 32]));
+            overlay
+                .record_auxiliary_evidence_delivery(hash, delivery.delivery_id)
+                .unwrap();
+            deliveries.push(AuxDelta::Put(Box::new(delivery)));
+        }
+        let mut plan = candidate_with_delta(&fixture.engine, overlay.delta());
+        plan.change_set.aux_changes = deliveries;
+        plan.limits.max_aux_deliveries_per_header = NonZeroUsize::new(1).unwrap();
+        plan.limits.max_aux_deliveries_total = NonZeroUsize::new(2).unwrap();
+        assert_eq!(
+            verify_in_both_modes(&fixture, &plan),
+            [Err(InvariantViolation::Limits); 2]
+        );
+        plan.limits.max_aux_deliveries_total = NonZeroUsize::new(3).unwrap();
+        assert_eq!(verify_in_both_modes(&fixture, &plan), [Ok(()); 2]);
     }
 
     #[test]

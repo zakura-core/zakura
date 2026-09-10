@@ -158,17 +158,23 @@ Keep these three resource-limit outcomes separate:
 
 ## Recovery audit
 
-Integrated admission reserves auxiliary capacity for the finalized header and its two selected
-successors. Each header receives up to the per-header limit within the existing aggregate limit.
-The planner charges new deliveries outside that window against the remaining capacity after
-retention. The planner refuses speculative admission that would consume the reserve.
+Every integrated transition reserves auxiliary capacity for the finalized header and its two
+selected successors. Retention reclaims unprotected branches when a fork change would consume
+the new window's reserve. The planner and independent verifier check the post-retention bound.
+The planner refuses admission when protected evidence prevents reserve recovery.
 Finality releases old deliveries through the existing retention rules.
 
-The reserve is an admission policy, so recovery can still open an older database that meets the
-hard limits but has consumed the reserve. The policy never deletes protected evidence to make
-room. Header sync reports a fatal capacity failure after a continuous thirty-minute state wait.
-Context rechecks preserve the deadline until capacity recovers or the repair generation retires.
-A restart does not itself repair a saturated database.
+At a full per-header bucket, admission can replace rejected or disputed input. A selected repair
+can also replace unchecked input, including recovered rows whose outcome claims recovery
+has discarded. The row and header index change atomically. Authenticated input on a retained
+header cannot be deleted. Input replacement grants no header validity or root authority.
+
+Startup settlement applies the same retention policy to an older saturated database. It cannot
+reconstruct inconsistent authoritative data or discard protected paths. Header sync starts its
+absolute capacity deadline on blockage. Failed context reads preserve the deadline. A positive
+capacity result clears it before assignment. A new blockage starts a new deadline. Expiry reports
+one fatal event after thirty continuous minutes. The sweep withdraws speculative requests when
+only the commit reserve remains.
 
 Recovery reads a coherent durable snapshot and audits every authoritative row. It fails closed on contradictions in
 node identity, ancestry, work, validation, body authority, trust pins, eligibility roots, auxiliary provenance,

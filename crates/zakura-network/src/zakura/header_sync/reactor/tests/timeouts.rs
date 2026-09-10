@@ -605,6 +605,193 @@ async fn pending_vct_prepare_and_apply_emit_one_fatal_event_at_thirty_minutes() 
 }
 
 #[tokio::test(start_paused = true)]
+async fn capacity_deadline_survives_continuous_peer_lifecycle_events() {
+    let mut fixture = ReadyVctRepairFixture::new();
+    fixture.schedule();
+    fixture.reactor.vct_repair.current_mut().unwrap().state = RepairPolicyState::QueryingContext {
+        deadline: Instant::now() + std::time::Duration::from_secs(5),
+        retry_at: Instant::now() + std::time::Duration::from_secs(10),
+    };
+    let mut blocked = fixture.context.clone();
+    blocked.admission_capacity_available = false;
+    fixture
+        .reactor
+        .handle_vct_repair_context_ready(fixture.owner, VctRepairContextResult::Resolved(blocked));
+    let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel();
+    fixture.reactor.startup.fatal_events = Some(fatal_tx);
+    let shutdown = fixture.reactor.startup.shutdown.clone();
+    let task = tokio::spawn(fixture.reactor.run());
+    tokio::task::yield_now().await;
+    for session_id in 1..=60 {
+        let (send, _outbound) = framed_channel(8);
+        fixture
+            ._handle
+            .send_lifecycle(Event::PeerConnected(
+                PeerSession::from_parts_with_session_id(
+                    peer(),
+                    session_id,
+                    send,
+                    CancellationToken::new(),
+                ),
+            ))
+            .unwrap();
+        tokio::task::yield_now().await;
+        fixture
+            ._handle
+            .send_lifecycle(Event::PeerDisconnected {
+                peer: peer(),
+                session_id,
+                reason: "capacity deadline churn regression",
+            })
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(fatal_rx.try_recv().is_err());
+        time::advance(std::time::Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+    }
+    let event = fatal_rx
+        .try_recv()
+        .expect("lifecycle churn cannot postpone the capacity deadline");
+    assert_eq!(event.phase, "auxiliary_capacity");
+    assert_eq!(event.elapsed, VCT_LOCAL_OPERATION_FATAL_AFTER);
+    shutdown.cancel();
+    task.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn recovered_capacity_starts_a_new_deadline_after_immediate_assignment() {
+    let mut fixture = ReadyVctRepairFixture::new();
+    fixture.schedule();
+    fixture.reactor.vct_repair.current_mut().unwrap().state = RepairPolicyState::QueryingContext {
+        deadline: Instant::now() + std::time::Duration::from_secs(5),
+        retry_at: Instant::now() + std::time::Duration::from_secs(10),
+    };
+    let mut blocked = fixture.context.clone();
+    blocked.admission_capacity_available = false;
+    fixture
+        .reactor
+        .handle_vct_repair_context_ready(fixture.owner, VctRepairContextResult::Resolved(blocked));
+    let (peers, _outbounds) = fixture.connect(&[0x73], 7);
+    fixture.advertise(&peers, 7);
+    time::advance(VCT_LOCAL_OPERATION_FATAL_AFTER - std::time::Duration::from_secs(1)).await;
+    let version = fixture.snapshot.state_version.checked_next().unwrap();
+    let repair = fixture.reactor.vct_repair.current_mut().unwrap();
+    repair.observe_state_change(version);
+    repair
+        .mark_context_requested(
+            Instant::now() + std::time::Duration::from_secs(5),
+            Instant::now() + std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+    let mut available = fixture.context.clone();
+    available.state_version = version;
+    fixture.reactor.handle_vct_repair_context_ready(
+        fixture.owner,
+        VctRepairContextResult::Resolved(available),
+    );
+    assert!(
+        fixture.reactor.vct_capacity_wait.is_none(),
+        "the positive context clears the wait before assignment"
+    );
+    let active = fixture
+        .reactor
+        .peer_work_queue
+        .active_mut(&peers[0])
+        .expect("the positive context immediately assigns a supplier");
+    active.phase = HeaderTargetPhase::Applying;
+    let owner = active.owner;
+    fixture.reactor.handle_header_target_admission_ready(
+        peers[0].clone(),
+        source_id_from_peer(&peers[0]),
+        owner,
+        HeaderTargetAdmissionResult::Failed(Arc::new(
+            zakura_header_chain::HeaderChainError::auxiliary_capacity(None),
+        )),
+    );
+    let started = fixture
+        .reactor
+        .vct_capacity_wait
+        .expect("the new refusal starts a new wait")
+        .since;
+    assert_eq!(started, Instant::now());
+    let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel();
+    fixture.reactor.startup.fatal_events = Some(fatal_tx);
+    let shutdown = fixture.reactor.startup.shutdown.clone();
+    let task = tokio::spawn(fixture.reactor.run());
+    tokio::task::yield_now().await;
+    time::advance(std::time::Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        fatal_rx.try_recv().is_err(),
+        "the old deadline cannot terminate the recovered repair"
+    );
+    time::advance(VCT_LOCAL_OPERATION_FATAL_AFTER - std::time::Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    let event = fatal_rx
+        .try_recv()
+        .expect("the second continuous blockage reaches its own deadline");
+    assert_eq!(event.elapsed, VCT_LOCAL_OPERATION_FATAL_AFTER);
+    shutdown.cancel();
+    task.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn capacity_deadline_survives_failed_context_reads() {
+    let mut fixture = ReadyVctRepairFixture::new();
+    fixture.reactor.startup.header_chain_port = PendingVctLocalPort::pending(true);
+    fixture.reactor.startup.use_direct_port();
+    fixture.schedule();
+    fixture.reactor.vct_repair_status = zakura_header_chain::VctRootRepairStatus {
+        state: zakura_header_chain::VctRootRepairState::Unavailable {
+            height: fixture.target.height,
+        },
+        generation: 11,
+    };
+    fixture.reactor.vct_repair.current_mut().unwrap().state = RepairPolicyState::QueryingContext {
+        deadline: Instant::now() + std::time::Duration::from_secs(5),
+        retry_at: Instant::now() + std::time::Duration::from_secs(10),
+    };
+    let mut blocked = fixture.context.clone();
+    blocked.admission_capacity_available = false;
+    fixture
+        .reactor
+        .handle_vct_repair_context_ready(fixture.owner, VctRepairContextResult::Resolved(blocked));
+    let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel();
+    fixture.reactor.startup.fatal_events = Some(fatal_tx);
+    let mut advanced = fixture.snapshot.clone();
+    advanced.state_version = advanced.state_version.checked_next().unwrap();
+    let (snapshots_tx, snapshots_rx) = watch::channel(Some(fixture.snapshot));
+    fixture.reactor.startup.committed_snapshots = Some(snapshots_rx);
+    let shutdown = fixture.reactor.startup.shutdown.clone();
+    let task = tokio::spawn(fixture.reactor.run());
+    tokio::task::yield_now().await;
+    snapshots_tx.send_replace(Some(advanced.clone()));
+    tokio::task::yield_now().await;
+    // Each direct context read returns Unavailable. Exercise repeated reads and backoff
+    // across the original absolute deadline without ever resolving a positive context.
+    for step in 0..60 {
+        if step == 59 {
+            advanced.state_version = advanced.state_version.checked_next().unwrap();
+            snapshots_tx.send_replace(Some(advanced.clone()));
+        }
+        assert!(fatal_rx.try_recv().is_err());
+        time::advance(std::time::Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+    }
+    let event = fatal_rx
+        .try_recv()
+        .expect("failed context reads cannot suspend the capacity deadline");
+    assert_eq!(event.phase, "auxiliary_capacity");
+    assert_eq!(event.elapsed, VCT_LOCAL_OPERATION_FATAL_AFTER);
+    assert!(
+        fatal_rx.try_recv().is_err(),
+        "snapshot replay cannot emit a second fatal event"
+    );
+    shutdown.cancel();
+    task.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
 async fn reactor_run_wakes_for_each_vct_local_operation_hard_deadline() {
     for phase in [HeaderTargetPhase::Preparing, HeaderTargetPhase::Applying] {
         let mut fixture = VctLocalFixture::new(PendingVctLocalPort::pending(true), phase);
@@ -677,7 +864,10 @@ async fn capacity_deadline_wakes_the_reactor_and_observes_a_simultaneous_state_c
                 zakura_header_chain::HeaderChainError::auxiliary_capacity(None),
             )),
         );
-        assert!(!reactor.report_fatal_vct_capacity_wait(Instant::now()));
+        assert!(
+            reactor.vct_capacity_wait.is_some(),
+            "blockage starts its deadline immediately"
+        );
         let task = tokio::spawn(reactor.run());
         tokio::task::yield_now().await;
         time::advance(VCT_LOCAL_OPERATION_FATAL_AFTER - std::time::Duration::from_millis(1)).await;
@@ -700,7 +890,7 @@ async fn capacity_deadline_wakes_the_reactor_and_observes_a_simultaneous_state_c
         if capacity_changed {
             assert!(
                 fatal_rx.try_recv().is_err(),
-                "new committed state wins over the capacity deadline"
+                "a replacement repair branch starts a new wait"
             );
             let actions: Vec<_> = std::iter::from_fn(|| actions.try_recv().ok()).collect();
             assert!(
@@ -1206,9 +1396,11 @@ fn vct_auxiliary_capacity_refusal_resumes_only_after_state_changes() {
     assert!(task.next_deadline().is_none());
     assert!(reactor.peer_work_queue.active(&peer).is_none());
 
-    let now = Instant::now();
+    let now = reactor
+        .vct_capacity_wait
+        .expect("blockage starts the timer")
+        .since;
     assert!(!reactor.report_fatal_vct_capacity_wait(now));
-    assert!(reactor.vct_capacity_wait.is_some());
 
     reactor.vct_repair_status = zakura_header_chain::VctRootRepairStatus {
         state: zakura_header_chain::VctRootRepairState::Unavailable {
@@ -1319,7 +1511,9 @@ fn saturated_vct_repair_reports_one_fatal_event_without_retrying() {
             now + VCT_LOCAL_OPERATION_FATAL_AFTER + std::time::Duration::from_secs(10),
         )
         .unwrap();
-        assert!(!reactor.report_fatal_vct_capacity_wait(now + VCT_LOCAL_OPERATION_FATAL_AFTER));
+        assert!(!reactor.report_fatal_vct_capacity_wait(
+            now + VCT_LOCAL_OPERATION_FATAL_AFTER - std::time::Duration::from_secs(1)
+        ));
         let mut rechecked = context.clone();
         rechecked.state_version = version;
         rechecked.admission_capacity_available = false;

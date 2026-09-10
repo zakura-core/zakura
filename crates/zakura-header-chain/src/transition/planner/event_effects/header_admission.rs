@@ -285,6 +285,15 @@ pub(super) fn admit_prepared_headers(
         if semantic_payload_exists || rooted_source_exists {
             continue;
         }
+        projected.make_aux_delivery_room(
+            engine,
+            delivery.header_hash,
+            context.config.limits,
+            matches!(
+                event.completion,
+                TargetCompletion::SelectedAuxiliaryRepair { .. }
+            ),
+        )?;
         projected.record_aux_delivery(*delivery)?;
         admitted_semantic_payloads.insert((delivery.header_hash, semantic_fingerprint));
         if delivery.tree_aux.is_some() {

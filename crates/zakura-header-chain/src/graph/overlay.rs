@@ -1018,6 +1018,17 @@ impl<'a> GraphOverlay<'a> {
         Ok(true)
     }
 
+    pub(crate) fn remove_auxiliary_evidence_delivery(
+        &mut self,
+        hash: block::Hash,
+        delivery_id: EvidenceId,
+    ) -> Result<(), GraphError> {
+        self.stage_header_node(hash)?
+            .aux_delivery_ids
+            .retain(|id| *id != delivery_id);
+        Ok(())
+    }
+
     pub(crate) fn rebase_work_coordinates_to_finalized_frontier(
         &mut self,
     ) -> Result<(), GraphError> {

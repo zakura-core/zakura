@@ -29,8 +29,25 @@ pub(super) struct RetentionWork {
     pub(super) candidate_nodes_scanned: usize,
     /// Retained nodes removed by deterministic eviction.
     pub(super) evicted_nodes: usize,
+    /// Auxiliary rows removed with their unprotected headers.
+    pub(super) evicted_auxiliary_deliveries: usize,
     /// Graph-sized workspaces allocated by retention.
     pub(super) graph_workspaces: usize,
+}
+
+/// Projected auxiliary occupancy and its limit after reserving the selected commit window.
+#[derive(Copy, Clone, Debug)]
+pub(super) struct AuxiliaryRetentionBudget {
+    pub(super) retained: usize,
+    pub(super) maximum: usize,
+}
+
+impl AuxiliaryRetentionBudget {
+    fn exceeded(self, work: RetentionWork) -> bool {
+        self.retained
+            .saturating_sub(work.evicted_auxiliary_deliveries)
+            > self.maximum
+    }
 }
 
 /// Enforce deterministic retention while protecting selected, verified, and context paths.
@@ -40,11 +57,15 @@ pub(super) fn enforce_retention<G: HeaderGraphEdit>(
     verified_header_tip: Frontier,
     validation_context_references: impl IntoIterator<Item = block::Hash>,
     limits: EngineLimits,
+    auxiliary_budget: Option<AuxiliaryRetentionBudget>,
 ) -> Result<RetentionPlan, GraphError> {
     let over_tip_limit = store.view_eligible_header_tip_count() > limits.max_candidate_tips.get();
     let over_node_limit =
         store.view_header_node_count().saturating_sub(1) > limits.max_non_finalized_nodes.get();
-    if !over_tip_limit && !over_node_limit {
+    if !over_tip_limit
+        && !over_node_limit
+        && !auxiliary_budget.is_some_and(|budget| budget.exceeded(RetentionWork::default()))
+    {
         return Ok(RetentionPlan::default());
     }
 
@@ -85,6 +106,7 @@ pub(super) fn enforce_retention<G: HeaderGraphEdit>(
     )?;
     if store.view_eligible_header_tip_count() <= limits.max_candidate_tips.get()
         && store.view_header_node_count().saturating_sub(1) <= limits.max_non_finalized_nodes.get()
+        && !auxiliary_budget.is_some_and(|budget| budget.exceeded(plan.work))
     {
         return Ok(plan);
     }
@@ -134,6 +156,24 @@ pub(super) fn enforce_retention<G: HeaderGraphEdit>(
         }
     }
 
+    while auxiliary_budget.is_some_and(|budget| budget.exceeded(plan.work)) {
+        let Some(score) = candidates.header_leaves.pop_first() else {
+            // The planner's final auxiliary check refuses admission when protected
+            // evidence prevents reserve recovery. Retention never removes that evidence.
+            break;
+        };
+        if protected_header_hashes.contains(&score.tip_hash) {
+            continue;
+        }
+        if store.view_header_node(score.tip_hash).is_some() {
+            evict_tip_branch(
+                store,
+                score.tip_hash,
+                &protected_header_hashes,
+                &mut plan.work,
+            )?;
+        }
+    }
     Ok(plan)
 }
 
@@ -239,6 +279,12 @@ fn evict_permanently_ineligible<G: HeaderGraphEdit>(
         retention_work.graph_workspaces = retention_work.graph_workspaces.saturating_add(1);
         let mut descendants = subtree_postorder(store, root);
         for hash in descendants.drain(..) {
+            retention_work.evicted_auxiliary_deliveries =
+                retention_work.evicted_auxiliary_deliveries.saturating_add(
+                    store
+                        .view_header_node(hash)
+                        .map_or(0, |node| node.aux_delivery_ids.len()),
+                );
             store.edit_remove_header_leaf(hash)?;
             retention_work.evicted_nodes = retention_work.evicted_nodes.saturating_add(1);
             evicted = true;
@@ -284,6 +330,12 @@ fn evict_tip_branch<G: HeaderGraphEdit>(
         .parent_hash;
     retention_work.graph_workspaces = retention_work.graph_workspaces.saturating_add(1);
     for descendant in subtree_postorder(store, branch_tip_hash) {
+        retention_work.evicted_auxiliary_deliveries =
+            retention_work.evicted_auxiliary_deliveries.saturating_add(
+                store
+                    .view_header_node(descendant)
+                    .map_or(0, |node| node.aux_delivery_ids.len()),
+            );
         store.edit_remove_header_leaf(descendant)?;
         retention_work.evicted_nodes = retention_work.evicted_nodes.saturating_add(1);
     }
@@ -299,6 +351,9 @@ fn evict_tip_branch<G: HeaderGraphEdit>(
             return Ok(());
         }
         let parent = node.parent_hash;
+        retention_work.evicted_auxiliary_deliveries = retention_work
+            .evicted_auxiliary_deliveries
+            .saturating_add(node.aux_delivery_ids.len());
         store.edit_remove_header_leaf(hash)?;
         retention_work.evicted_nodes = retention_work.evicted_nodes.saturating_add(1);
         if store.view_header_children(parent).is_empty() {

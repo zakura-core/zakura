@@ -902,6 +902,7 @@ def halt(config: Config, state_path: Path, state: dict[str, Any], run_state: dic
             "failed_at": failed_at,
             "phase": "failed",
             "last_failed_sha": run_state.get("sha"),
+            "last_failed_trace_archive_url": run_state.get("trace_archive_url"),
             "last_failed_run": run_state.get("run_id") or f"preflight-{time.time_ns()}",
         }
     )

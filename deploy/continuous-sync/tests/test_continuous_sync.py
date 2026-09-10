@@ -79,6 +79,13 @@ class ContinuousSyncTests(unittest.TestCase):
             self.assertIn("https://download", deploy.completion_run_text(state))
             self.assertTrue((run_dir / "traces" / "events.csv").exists())
 
+    def test_failure_audit_preserves_archive_link(self):
+        problem = deploy.audit_problem({"controller_state": {
+            "failed": True, "failure": "stalled", "last_failed_run": "run-1",
+            "last_failed_trace_archive_url": "https://download",
+        }}, 3600)
+        self.assertIn("https://download", problem.detail)
+
     def test_metric_value_accepts_dotted_and_prometheus_names(self):
         metrics = "\n".join(
             [

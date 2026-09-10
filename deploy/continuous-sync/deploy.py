@@ -512,6 +512,8 @@ def audit_problem(
         detail = f"controller halted: {failure}"
         if run_id:
             detail += f" (run {run_id})"
+        if url := state.get("last_failed_trace_archive_url"):
+            detail += f" | <{url}|Download traces (7 days)>"
         return Problem(
             f"controller-halted:{failure}", detail,
             incident_id, delivered_at,

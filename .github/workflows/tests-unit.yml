@@ -6,7 +6,7 @@ on:
   # that touch no test-relevant files. This keeps the `test success` required
   # check reporting on every PR instead of sitting in "Expected" forever.
   pull_request:
-    branches: [main, "feat/**", "release/**"]
+    branches: [main, "feat/**", "release/**", "adam/**"]
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
   push:

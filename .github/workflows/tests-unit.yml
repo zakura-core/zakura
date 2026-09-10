@@ -227,7 +227,7 @@ jobs:
           cache-shared-key: ${{ github.event_name == 'pull_request' && 'zakura-drb-debug' || (github.event_name == 'schedule' && 'unit-tests-release' || 'unit-tests-ci-tests') }}
           cache-on-failure: true
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 #v2.86.8
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b #v2.87.4
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -283,7 +283,7 @@ jobs:
           toolchain: ${{ matrix.rust-version }}
           # Nothing is compiled in this job, so there is no build cache to keep.
           cache: false
-      - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 #v2.86.8
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b #v2.87.4
         with:
           tool: cargo-nextest
       # RocksDB is dynamically linked, so the prebuilt test binaries still need
@@ -324,7 +324,7 @@ jobs:
           toolchain: stable
           # The test binaries come from build-tests, so this job does not compile.
           cache: false
-      - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 #v2.86.8
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b #v2.87.4
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -356,12 +356,13 @@ jobs:
         with:
           toolchain: stable
       - uses: ./.github/actions/setup-zakura-build
-      - name: Test the crates that ZIP 218 changes
+      - name: Test experimental NU7 builds
         run: |
           cargo test --locked --features zakura-chain/nu7-experimental \
             -p zakura-chain -p zakura-header-chain --lib
           cargo test --locked --features nu7-experimental \
             -p zakura-consensus -p zakura-rpc --lib
+          cargo check --locked -p zakura --features nu7-experimental
 
   network-dependent:
     name: network-dependent acceptance tests
@@ -385,7 +386,7 @@ jobs:
           cache-shared-key: zakura-drb-debug
           cache-on-failure: true
           cache-save-if: false
-      - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 #v2.86.8
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b #v2.87.4
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -414,7 +415,7 @@ jobs:
           # If this job is removed or stops compiling, move cache ownership to
           # network-dependent or a dedicated main-branch debug build job.
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 #v2.86.8
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b #v2.87.4
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -439,7 +440,7 @@ jobs:
           toolchain: stable
           cache-on-failure: true
           cache-save-if: false
-      - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 #v2.86.8
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b #v2.87.4
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build

@@ -6,6 +6,43 @@ deployment combines the activation draft with that upgrade and requires validati
 of the combined code and dependencies.
 Historical measurements and their exact dependency context are retained below.
 
+## Review feedback corrections
+
+On September 10, 2026, the follow-up fixes were merged through the stack,
+with existing history preserved. The final code is at `e5ccd8efa`.
+
+The transport records write failures before a request claim can cancel the
+session on drop. When application handles close, every member drains its queued
+writes before the session retires. Real QUIC tests cover one and multiple
+streams, retained receivers and sender clones, sibling progress, remote closes,
+write timeouts, and local cancellation. The multi-stream drain control failed
+with early member retirement and passes with coordinated draining.
+
+Queued request expiry now returns all remaining unsent heights immediately,
+without waiting for a stale frame to drain. Request-owner tests cover received
+bodies, replacement owners, started writes, reset races, and destruction after
+unlocking. Cleanup discards committed heights, and publication failures log the
+peer, generation, and range. The parameter ledger records the 32-second data
+policy at its activation boundary in #945.
+
+- #944 passes all 308 block-sync tests without retries and all-target network
+  Clippy. The final transport controls also pass on #943.
+- The final stack passes all 578 selected tests without retries: 556 handler,
+  block-sync, transport, regulation, owned-state-read, and node-driver tests,
+  plus all 22 ordinary cluster tests. No process-cleanup warnings occurred in
+  this final run.
+- Network and node Clippy pass with all targets and warnings denied. Formatting,
+  Markdown lint, and per-PR changelog checks pass.
+
+An intermediate transport run exposed the existing three-second cooldown test
+assumption on both the original and updated #943 heads. The fixture correction
+already in #945 was moved into #943, where it passes. Production cooldowns are
+unchanged. The existing macOS compact-unwind linker warning remains.
+
+These checks still use Iroh 0.92. They do not clear the final combined transport
+qualification with #935, so #945 remains draft and unmerged. The inherited
+queue-split finding remains a separate follow-up.
+
 ## Service-session merge
 
 On September 10, 2026, #956 was merged into #943 at `f327e9b66`. Commit

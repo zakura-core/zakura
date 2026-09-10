@@ -68,6 +68,15 @@ floor rescue in both byte-count and block-count modes; guarded reservation
 failures log their peer, generation, and error. Intermediate transport fixtures
 no longer assume that the final BlockSync layout is active.
 
+The latest feedback pass records write errors before a failed request owner can
+cancel the session. Application closure drains every session member before
+retiring shared capacity, while retained receivers and sender clones keep the
+session alive. A queued request that expires returns all its remaining unsent
+heights immediately. Received bodies and replacement owners survive cleanup,
+and committed heights are discarded. Publication failures now include peer,
+generation, and range context. The parameter ledger attributes the 32-second
+data-write override to #945's service policy.
+
 The serving-query timeout remains removed. The concrete read service is always
 ready, and a running database job intentionally retains its serving permit until
 that job finishes.

@@ -128,6 +128,114 @@ fn same_transition_auxiliary_eviction_has_no_generation_effect() {
 }
 
 #[test]
+fn auxiliary_limit_uses_the_post_retention_delivery_set() {
+    use zakura_chain::work::difficulty::{ExpandedDifficulty, U256};
+
+    let (mut store, mut config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let anchor = store.graph.finalized_frontier();
+    let easy = store
+        .graph
+        .header_node(anchor.hash)
+        .expect("the anchor exists")
+        .header
+        .difficulty_threshold;
+    let easy_target: U256 = easy.to_expanded().expect("the target expands").into();
+    let hard = ExpandedDifficulty::from(easy_target >> 3).into();
+    let selected = insert_verified_branch(&mut store.graph, anchor, 1, hard, 0xa1);
+    let evicted = insert_verified_branch(&mut store.graph, anchor, 1, easy, 0xa2);
+    synchronize_fixture(&mut store, selected);
+    assert_eq!(store.metadata.frontiers.header_best, selected);
+
+    config.limits.max_non_finalized_nodes = std::num::NonZeroUsize::new(2).expect("two is nonzero");
+    config.limits.max_aux_deliveries_per_header =
+        std::num::NonZeroUsize::new(1).expect("one is nonzero");
+    config.limits.max_aux_deliveries_total =
+        std::num::NonZeroUsize::new(1).expect("one is nonzero");
+
+    let mut request = insertion(&store, 1, EvidenceId::from_digest([0xa3; 32]));
+    let TransitionEvent::InsertHeaders(insert) = &mut request.event else {
+        unreachable!("the fixture constructs a header insertion")
+    };
+    let incoming = unauthenticated_delivery(insert, EvidenceId::from_digest([0xa4; 32]));
+    let retained = crate::AuxDelivery::new(
+        EvidenceId::from_digest([0xa5; 32]),
+        evicted.hash,
+        insert.source,
+        insert.owner,
+        crate::BodySizeHint::Unknown,
+        None,
+    );
+    store
+        .graph
+        .record_auxiliary_evidence_delivery(retained.header_hash, retained.delivery_id)
+        .expect("the losing branch remains retained before projection");
+    store.aux.push(retained);
+    insert.aux.push(incoming);
+
+    let plan = apply_transition(&store, request, &context(&config, &clock, None))
+        .expect("retention frees aggregate auxiliary capacity for the incoming delivery");
+
+    assert!(plan.change_set.delete_nodes.contains(&evicted.hash));
+    assert!(plan.change_set.aux_changes.contains(&AuxDelta::Delete {
+        header_hash: evicted.hash,
+        delivery_id: retained.delivery_id,
+    }));
+    assert!(plan
+        .change_set
+        .aux_changes
+        .contains(&AuxDelta::Put(Box::new(incoming))));
+}
+
+#[test]
+fn aggregate_auxiliary_saturation_without_eviction_is_rejected() {
+    let (mut store, mut config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let anchor = store.graph.finalized_frontier();
+    let difficulty = store
+        .graph
+        .header_node(anchor.hash)
+        .expect("the anchor exists")
+        .header
+        .difficulty_threshold;
+    let target = insert_verified_branch(&mut store.graph, anchor, 1, difficulty, 0xa6);
+    synchronize_fixture(&mut store, target);
+    config.limits.max_aux_deliveries_per_header =
+        std::num::NonZeroUsize::new(1).expect("one is nonzero");
+    config.limits.max_aux_deliveries_total =
+        std::num::NonZeroUsize::new(1).expect("one is nonzero");
+
+    let mut request = insertion(&store, 1, EvidenceId::from_digest([0xa7; 32]));
+    let TransitionEvent::InsertHeaders(insert) = &mut request.event else {
+        unreachable!("the fixture constructs a header insertion")
+    };
+    let retained = crate::AuxDelivery::new(
+        EvidenceId::from_digest([0xa8; 32]),
+        target.hash,
+        insert.source,
+        insert.owner,
+        crate::BodySizeHint::Unknown,
+        None,
+    );
+    store
+        .graph
+        .record_auxiliary_evidence_delivery(retained.header_hash, retained.delivery_id)
+        .expect("the selected header accepts the retained delivery identity");
+    store.aux.push(retained);
+    insert.aux.push(unauthenticated_delivery(
+        insert,
+        EvidenceId::from_digest([0xa9; 32]),
+    ));
+
+    assert!(matches!(
+        apply_transition(&store, request, &context(&config, &clock, None)),
+        Err(TransitionFailure::AuxiliaryLimitExceeded)
+    ));
+    assert!(!store.metadata.alarms.resource_stalled);
+    assert_eq!(store.aux, vec![retained]);
+}
+
+#[test]
 fn auxiliary_deletes_for_evicted_headers_are_sorted_by_hash_and_delivery_id() {
     use zakura_chain::work::difficulty::{ExpandedDifficulty, U256};
 
@@ -362,6 +470,123 @@ fn selected_auxiliary_repair_adds_only_one_exact_provenance_record() {
 }
 
 #[test]
+fn auxiliary_admission_preserves_semantic_diversity_under_duplicate_delivery_pressure() {
+    let (mut store, config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let anchor = store.metadata.frontiers.finalized;
+    let initial = insertion(&store, 2, EvidenceId::from_digest([0x40; 32]));
+    let TransitionEvent::InsertHeaders(insert) = &initial.event else {
+        panic!("the fixture constructs a header insertion");
+    };
+    let repaired = insert.batch.headers()[0].clone();
+    let selected_target = Frontier::new(repaired.height, repaired.hash);
+    let inserted = apply_transition(&store, initial, &context(&config, &clock, None))
+        .expect("the selected fixture branch inserts");
+    store.commit(&inserted);
+
+    let make_repair = |store: &TestStore,
+                       source_marker: u8,
+                       request_id: u64,
+                       delivery_marker: u8,
+                       payload_marker: u8| {
+        let owner = body_owner(&store.snapshot(), u64::from(source_marker), request_id);
+        let source = SourceId::from_digest([source_marker; 32]);
+        let delivery = crate::AuxDelivery::new(
+            EvidenceId::from_digest([delivery_marker; 32]),
+            repaired.hash,
+            source,
+            owner.into(),
+            crate::BodySizeHint::Unknown,
+            Some(crate::TreeAuxRecordV1 {
+                height: repaired.height,
+                sapling_root: zakura_chain::sapling::tree::Root::default(),
+                orchard_root: zakura_chain::orchard::tree::Root::default(),
+                ironwood_root: zakura_chain::ironwood::tree::Root::default(),
+                sapling_tx_count: 1,
+                orchard_tx_count: 2,
+                ironwood_tx_count: 3,
+                auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from(
+                    [payload_marker; 32],
+                ),
+            }),
+        );
+        TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: TransitionEvent::InsertHeaders(Box::new(crate::InsertHeaders {
+                owner: owner.into(),
+                source,
+                parent_hash: anchor.hash,
+                target_tip_hash: repaired.hash,
+                completion: TargetCompletion::SelectedAuxiliaryRepair {
+                    common_ancestor: anchor,
+                    selected_target,
+                },
+                batch: PreparedHeaderBatch::new(
+                    vec![repaired.clone()],
+                    anchor,
+                    store.lease.network().clone(),
+                    store.lease.trust_anchor_digest,
+                    EvidenceId::from_digest([delivery_marker.wrapping_add(1); 32]),
+                )
+                .expect("the repair batch is nonempty"),
+                aux: vec![delivery],
+            })),
+        }
+    };
+
+    store.lease.parent = anchor;
+    let first = apply_transition(
+        &store,
+        make_repair(&store, 0x41, 1, 0x42, 0x43),
+        &context(&config, &clock, None),
+    )
+    .expect("the first semantic payload is admitted");
+    store.commit(&first);
+
+    store.lease.parent = anchor;
+    let duplicate = apply_transition(
+        &store,
+        make_repair(&store, 0x44, 2, 0x45, 0x43),
+        &context(&config, &clock, None),
+    )
+    .expect("another supplier's duplicate payload is an idempotent success");
+    assert!(duplicate.is_no_change());
+    assert!(duplicate.change_set.aux_changes.is_empty());
+
+    store.lease.parent = anchor;
+    let distinct = apply_transition(
+        &store,
+        make_repair(&store, 0x46, 3, 0x47, 0x48),
+        &context(&config, &clock, None),
+    )
+    .expect("a different supplier's distinct payload is admitted");
+    store.commit(&distinct);
+
+    store.lease.parent = anchor;
+    let same_supplier = apply_transition(
+        &store,
+        make_repair(&store, 0x46, 4, 0x49, 0x4a),
+        &context(&config, &clock, None),
+    )
+    .expect("one supplier cannot consume another rooted payload slot");
+    assert!(same_supplier.is_no_change());
+    assert_eq!(store.aux.len(), 2);
+    assert_eq!(
+        store
+            .graph
+            .header_node(repaired.hash)
+            .expect("the repaired header remains retained")
+            .aux_delivery_ids
+            .len(),
+        2
+    );
+    assert!(store
+        .aux
+        .iter()
+        .all(|delivery| delivery.source != SourceId::from_digest([0x44; 32])));
+}
+
+#[test]
 fn auxiliary_delivery_is_batch_hash_scoped_and_selection_neutral() {
     let (store, config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());
@@ -528,12 +753,8 @@ fn auxiliary_outcomes_derive_from_exact_owned_observations() {
         crate::BodySizeHint::Unknown,
         Some(tree_aux(2, 0xc2)),
     );
-    let mut third_delivery = delivery;
-    third_delivery.delivery_id = EvidenceId::from_digest([0xc3; 32]);
     insert_event.source = delivery.source;
-    insert_event
-        .aux
-        .extend([delivery, second_delivery, third_delivery]);
+    insert_event.aux.extend([delivery, second_delivery]);
     let inserted = apply_transition(&store, insert, &context(&config, &clock, None))
         .expect("the target and unauthenticated delivery insert atomically");
     store.commit(&inserted);
@@ -587,7 +808,7 @@ fn auxiliary_outcomes_derive_from_exact_owned_observations() {
         TransitionRequest {
             expected_version: store.metadata.state_version,
             event: observed(
-                vec![third_delivery, second_delivery],
+                vec![delivery, second_delivery],
                 crate::AuxVerificationFactV1::ambiguous_deliveries_failed(2),
                 Some([0xb7; 32].into()),
             ),

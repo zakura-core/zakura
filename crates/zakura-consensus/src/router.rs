@@ -92,6 +92,136 @@ where
     block: SemanticBlockVerifier<S, V>,
 }
 
+/// Routes transaction-verifier reads around the serialized read-write state buffer.
+#[derive(Clone, Debug)]
+struct TransactionStateRouter<S, R> {
+    state: S,
+    read_state: R,
+}
+
+impl<S, R> TransactionStateRouter<S, R> {
+    fn new(state: S, read_state: R) -> Self {
+        Self { state, read_state }
+    }
+}
+
+impl<S, R> Service<zs::Request> for TransactionStateRouter<S, R>
+where
+    S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    S::Future: Send + 'static,
+    R: Service<zs::ReadRequest, Response = zs::ReadResponse, Error = BoxError>
+        + Send
+        + Clone
+        + 'static,
+    R::Future: Send + 'static,
+{
+    type Response = zs::Response;
+    type Error = BoxError;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // `call` selects the backing service from the request. Each selected service applies its
+        // own readiness and backpressure inside the returned future.
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: zs::Request) -> Self::Future {
+        let read_request = match request {
+            zs::Request::CheckBestChainTipNullifiersAndAnchors(transaction) => {
+                zs::ReadRequest::CheckBestChainTipNullifiersAndAnchors(transaction)
+            }
+            zs::Request::BestChainNextMedianTimePast => {
+                zs::ReadRequest::BestChainNextMedianTimePast
+            }
+            zs::Request::UnspentBestChainUtxo(outpoint) => {
+                zs::ReadRequest::UnspentBestChainUtxo(outpoint)
+            }
+            request => return self.state.clone().oneshot(request).boxed(),
+        };
+
+        let read_state = self.read_state.clone();
+        async move {
+            let response = read_state.oneshot(read_request).await?;
+            response.try_into().map_err(BoxError::from)
+        }
+        .boxed()
+    }
+}
+
+/// Measures the unloaded latency of a read through the old buffered route and
+/// the direct transaction-state route.
+///
+/// This helper is public only so the `state_read_routing` benchmark can use the
+/// production router without exposing its implementation type.
+#[cfg(feature = "internal-bench")]
+#[doc(hidden)]
+pub async fn benchmark_transaction_state_read_routing(
+    requests: usize,
+    buffered_first: bool,
+) -> (std::time::Duration, std::time::Duration) {
+    use zakura_chain::serialization::DateTime32;
+
+    assert!(requests > 0, "the benchmark needs at least one request");
+
+    let write_state = tower::service_fn(|request: zs::Request| async move {
+        Err::<zs::Response, BoxError>(
+            format!("unexpected write-state benchmark request: {request:?}").into(),
+        )
+    });
+    let read_state = tower::service_fn(|request: zs::ReadRequest| async move {
+        match request {
+            zs::ReadRequest::BestChainNextMedianTimePast => Ok::<_, BoxError>(
+                zs::ReadResponse::BestChainNextMedianTimePast(DateTime32::MIN),
+            ),
+            request => Err(format!("unexpected read-state benchmark request: {request:?}").into()),
+        }
+    });
+
+    let direct = TransactionStateRouter::new(write_state, read_state);
+    let buffered = Buffer::new(BoxService::new(direct.clone()), 1);
+
+    direct
+        .clone()
+        .oneshot(zs::Request::BestChainNextMedianTimePast)
+        .await
+        .expect("the direct benchmark warmup succeeds");
+    buffered
+        .clone()
+        .oneshot(zs::Request::BestChainNextMedianTimePast)
+        .await
+        .expect("the buffered benchmark warmup succeeds");
+
+    async fn measure<S>(mut service: S, requests: usize) -> std::time::Duration
+    where
+        S: Service<zs::Request, Response = zs::Response, Error = BoxError>,
+        S::Future: Send,
+    {
+        let start = std::time::Instant::now();
+        for _ in 0..requests {
+            let response = service
+                .ready()
+                .await
+                .expect("the benchmark route becomes ready")
+                .call(zs::Request::BestChainNextMedianTimePast)
+                .await
+                .expect("the benchmark route answers the read request");
+            std::hint::black_box(response);
+        }
+        start.elapsed()
+    }
+
+    if buffered_first {
+        let buffered_elapsed = measure(buffered, requests).await;
+        let direct_elapsed = measure(direct, requests).await;
+        (buffered_elapsed, direct_elapsed)
+    } else {
+        let direct_elapsed = measure(direct, requests).await;
+        let buffered_elapsed = measure(buffered, requests).await;
+        (buffered_elapsed, direct_elapsed)
+    }
+}
+
 /// An error while semantically verifying a block.
 //
 // One or both of these error variants are at least 140 bytes
@@ -258,11 +388,12 @@ where
 /// Block and transaction verification requests should be wrapped in a timeout,
 /// so that out-of-order and invalid requests do not hang indefinitely.
 /// See the [`router`](`crate::router`) module documentation for details.
-#[instrument(skip(state_service, mempool))]
-pub async fn init<S, Mempool>(
+#[instrument(skip(state_service, transaction_state, mempool))]
+async fn init_with_transaction_state<S, TransactionState, Mempool>(
     config: Config,
     network: &Network,
     mut state_service: S,
+    transaction_state: TransactionState,
     mempool: oneshot::Receiver<Mempool>,
 ) -> (
     Buffer<BoxService<Request, block::Hash, RouterError>, Request>,
@@ -276,6 +407,9 @@ pub async fn init<S, Mempool>(
 where
     S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
     S::Future: Send + 'static,
+    TransactionState:
+        Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    TransactionState::Future: Send + 'static,
     Mempool: Service<mempool::Request, Response = mempool::Response, Error = BoxError>
         + Send
         + Clone
@@ -367,7 +501,7 @@ where
 
     // transaction verification
 
-    let transaction = transaction::Verifier::new(network, state_service.clone(), mempool);
+    let transaction = transaction::Verifier::new(network, transaction_state, mempool);
     let transaction = Buffer::new(BoxService::new(transaction), VERIFIER_BUFFER_BOUND);
 
     // block verification
@@ -405,6 +539,70 @@ where
     };
 
     (router, transaction, task_handles, max_checkpoint_height)
+}
+
+/// Initializes block and transaction verification with one shared state service.
+///
+/// Use [`init_with_read_state`] when a separate read service is available.
+pub async fn init<S, Mempool>(
+    config: Config,
+    network: &Network,
+    state_service: S,
+    mempool: oneshot::Receiver<Mempool>,
+) -> (
+    Buffer<BoxService<Request, block::Hash, RouterError>, Request>,
+    Buffer<
+        BoxService<transaction::Request, transaction::Response, TransactionError>,
+        transaction::Request,
+    >,
+    BackgroundTaskHandles,
+    Height,
+)
+where
+    S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    S::Future: Send + 'static,
+    Mempool: Service<mempool::Request, Response = mempool::Response, Error = BoxError>
+        + Send
+        + Clone
+        + 'static,
+    Mempool::Future: Send + 'static,
+{
+    let transaction_state = state_service.clone();
+    init_with_transaction_state(config, network, state_service, transaction_state, mempool).await
+}
+
+/// Initializes verification and routes transaction read-only queries through `read_state_service`.
+pub async fn init_with_read_state<S, R, Mempool>(
+    config: Config,
+    network: &Network,
+    state_service: S,
+    read_state_service: R,
+    mempool: oneshot::Receiver<Mempool>,
+) -> (
+    Buffer<BoxService<Request, block::Hash, RouterError>, Request>,
+    Buffer<
+        BoxService<transaction::Request, transaction::Response, TransactionError>,
+        transaction::Request,
+    >,
+    BackgroundTaskHandles,
+    Height,
+)
+where
+    S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    S::Future: Send + 'static,
+    R: Service<zs::ReadRequest, Response = zs::ReadResponse, Error = BoxError>
+        + Send
+        + Clone
+        + 'static,
+    R::Future: Send + 'static,
+    Mempool: Service<mempool::Request, Response = mempool::Response, Error = BoxError>
+        + Send
+        + Clone
+        + 'static,
+    Mempool::Future: Send + 'static,
+{
+    let transaction_state = TransactionStateRouter::new(state_service.clone(), read_state_service);
+    init_with_transaction_state(config, network, state_service, transaction_state, mempool).await
 }
 
 /// Parses the checkpoint list for `network` and `config`.

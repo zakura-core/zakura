@@ -24,6 +24,7 @@ use super::redial::ZAKURA_REDIAL_HEALTHY_CONNECTION;
 use super::trace::DiscoveryDialResultEvent;
 use crate::zakura::{
     canonical_ip, ZakuraEndpoint, ZakuraHandlerError, ZakuraLocalLimits, ZakuraPeerId,
+    ZakuraServiceId,
 };
 
 /// How often the discovery dialer wakes to look for new candidates.
@@ -80,8 +81,14 @@ pub(crate) fn spawn_native_discovery_dialer(
     endpoint: ZakuraEndpoint,
     discovery: ZakuraDiscoveryHandle,
     limits: ZakuraLocalLimits,
+    sought_services: Vec<ZakuraServiceId>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(run_native_discovery_dialer(endpoint, discovery, limits))
+    tokio::spawn(run_native_discovery_dialer(
+        endpoint,
+        discovery,
+        limits,
+        sought_services,
+    ))
 }
 
 /// Seed the discovery book with the configured bootstrap peers as trusted static
@@ -109,6 +116,7 @@ pub(crate) async fn run_native_discovery_dialer(
     endpoint: ZakuraEndpoint,
     discovery: ZakuraDiscoveryHandle,
     limits: ZakuraLocalLimits,
+    sought_services: Vec<ZakuraServiceId>,
 ) {
     let shutdown = endpoint.background_shutdown_token();
     let trace = endpoint.trace();
@@ -133,6 +141,7 @@ pub(crate) async fn run_native_discovery_dialer(
             &mut in_flight_by_ip,
             &dial_backoff_by_node_ip,
             &mut workers,
+            &sought_services,
         )
         .await;
 
@@ -182,6 +191,7 @@ pub(crate) async fn run_native_discovery_dialer(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn spawn_discovery_dial_candidates(
     endpoint: &ZakuraEndpoint,
     discovery: &ZakuraDiscoveryHandle,
@@ -190,13 +200,18 @@ async fn spawn_discovery_dial_candidates(
     in_flight_by_ip: &mut HashMap<IpAddr, usize>,
     dial_backoff_by_node_ip: &HashMap<(NodeId, IpAddr), DiscoveryIpBackoff>,
     workers: &mut JoinSet<DiscoveryDialWorkerResult>,
+    sought_services: &[ZakuraServiceId],
 ) {
     if !endpoint.has_native_admission_capacity() {
         return;
     }
 
     let in_flight_node_ids: Vec<_> = in_flight.iter().copied().collect();
-    for candidate in discovery.dial_candidates(&[], &in_flight_node_ids).await {
+    let candidates = discovery
+        .dial_candidates_preferring_any_service(sought_services, &in_flight_node_ids)
+        .await;
+
+    for candidate in candidates {
         if !endpoint.has_native_admission_capacity() {
             return;
         }

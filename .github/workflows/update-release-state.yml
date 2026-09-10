@@ -1,9 +1,14 @@
 # Refresh the embedded Mainnet checkpoint list, VCT frontier, and subtree roots from one
 # immutable, digest-verified R2 bundle produced by the release-state publisher
-# (deploy/release-state/), and open a draft PR for human review. Checkpoints
-# are consensus-critical: nothing merges or ships from this workflow directly,
-# and release creation never consults the moving R2 pointer.
+# (deploy/release-state/), publish that bundle's historical frontier grid to crates.io, and
+# open a draft PR for human review. Checkpoints are consensus-critical: nothing merges or
+# ships from this workflow directly, and release creation never consults the moving R2 pointer.
 # See docs/design/verified-commitment-trees.md, section 16.
+#
+# The frontier grid is not committed. Cargo can only resolve a version that already exists, so
+# the grid is published before the pull request that pins it is opened, and a candidate the
+# reviewer rejects is a yanked, unreferenced version. Only the publish job holds an OIDC token,
+# and its environment carries no other secrets.
 name: Update Mainnet release state
 
 on:
@@ -14,7 +19,7 @@ on:
         required: false
         default: "48"
   schedule:
-    # Weekly refresh; the publisher exports daily alongside the snapshot job.
+    # Weekly refresh; the publisher exports daily on its own timer.
     - cron: "0 6 * * 1"
 
 permissions: {}
@@ -24,13 +29,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  update:
-    name: Import Mainnet release state
+  resolve:
+    name: Resolve one immutable release-state bundle
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: release-automation
     permissions:
       contents: read
+    outputs:
+      has_changes: ${{ steps.advance.outputs.has_changes }}
+      height: ${{ steps.advance.outputs.height }}
+      meta_url: ${{ steps.advance.outputs.meta_url }}
+      meta_sha256: ${{ steps.advance.outputs.meta_sha256 }}
     steps:
       - name: Checkout main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
@@ -42,6 +52,7 @@ jobs:
         run: |
           python3 .github/scripts/fetch-release-state.py --self-test
           python3 .github/scripts/import-release-state.py --self-test
+          python3 scripts/pack-assets-crate.py --self-test
 
       - name: Fetch one immutable bundle
         env:
@@ -58,6 +69,147 @@ jobs:
             --metadata-out "$RUNNER_TEMP/release-state-resolution.json" \
             --max-age-hours "$MAX_AGE_HOURS"
 
+      # A cheap advance check so a no-op run neither publishes a crate version nor spends a build.
+      # The importer enforces the real invariant, byte-for-byte, in the open-pr job.
+      - name: Decide whether the bundle advances the committed list
+        id: advance
+        env:
+          RESOLUTION: ${{ runner.temp }}/release-state-resolution.json
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, sys
+          resolution = json.load(open(os.environ["RESOLUTION"], encoding="utf-8"))
+          checkpoints = "crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt"
+          with open(checkpoints, encoding="utf-8") as handle:
+              committed = int(handle.read().rstrip("\n").rsplit("\n", 1)[-1].split()[0])
+          print(f"has_changes={str(resolution['height'] > committed).lower()}")
+          print(f"height={resolution['height']}")
+          print(f"meta_url={resolution['meta_url']}")
+          print(f"meta_sha256={resolution['meta_sha256']}")
+          print(f"committed height {committed}, bundle height {resolution['height']}", file=sys.stderr)
+          PY
+
+  publish-assets:
+    name: Publish the frontier grid to crates.io
+    needs: [resolve]
+    # The repository guard matches publish-crates.yml: a staging fork must never reach the real
+    # registry, and failing before the OIDC exchange keeps its logs honest.
+    if: needs.resolve.outputs.has_changes == 'true' && github.repository == 'zakura-core/zakura'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: crates-io-assets
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      crate_name: ${{ steps.pack.outputs.name }}
+      crate_version: ${{ steps.pack.outputs.version }}
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+          ref: main
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+        with:
+          toolchain: stable
+          # This job packages one dependency-free crate and never builds the workspace.
+          cache: false
+
+      # Resolved by digest rather than through the moving pointer, so the bytes uploaded here are
+      # derived independently from the same immutable object the resolve job validated.
+      - name: Re-resolve the pinned bundle
+        env:
+          META_URL: ${{ needs.resolve.outputs.meta_url }}
+          META_SHA256: ${{ needs.resolve.outputs.meta_sha256 }}
+        run: |
+          python3 .github/scripts/fetch-release-state.py \
+            --meta-url "$META_URL" \
+            --meta-sha256 "$META_SHA256" \
+            --output-dir "$RUNNER_TEMP/release-state-bundle" \
+            --metadata-out "$RUNNER_TEMP/release-state-resolution.json"
+
+      - name: Pack the asset crate
+        id: pack
+        env:
+          BUNDLE: ${{ runner.temp }}/release-state-bundle
+        run: |
+          set -euo pipefail
+          python3 scripts/pack-assets-crate.py \
+            --grid "$BUNDLE/mainnet-frontier-grid.bin" \
+            --result-out "$RUNNER_TEMP/asset-crate.json"
+          jq -r '"name=\(.name)", "version=\(.version)", "sha256=\(.sha256)"' \
+            "$RUNNER_TEMP/asset-crate.json" >> "$GITHUB_OUTPUT"
+
+      # Idempotent: a rerun after a partial failure must not fail, and a version that already
+      # exists with different bytes is a hard error rather than something to paper over.
+      - name: Skip or refuse an already-published version
+        id: existing
+        env:
+          NAME: ${{ steps.pack.outputs.name }}
+          VERSION: ${{ steps.pack.outputs.version }}
+          EXPECTED: ${{ steps.pack.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          STATUS=$(curl -sS -o "$RUNNER_TEMP/version.json" -w '%{http_code}' \
+            -H 'User-Agent: zakura-release-automation' \
+            "https://crates.io/api/v1/crates/${NAME}/${VERSION}")
+          if [ "$STATUS" = "404" ]; then
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$STATUS" != "200" ]; then
+            echo "crates.io returned ${STATUS} for ${NAME} ${VERSION}." >&2
+            exit 1
+          fi
+          curl -sSL -o "$RUNNER_TEMP/existing.crate" \
+            -H 'User-Agent: zakura-release-automation' \
+            "https://static.crates.io/crates/${NAME}/${NAME}-${VERSION}.crate"
+          ACTUAL=$(tar xzOf "$RUNNER_TEMP/existing.crate" \
+            "${NAME}-${VERSION}/src/mainnet-frontier-grid.bin" | sha256sum | cut -d' ' -f1)
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "${NAME} ${VERSION} is already published with a different frontier grid." >&2
+            echo "published ${ACTUAL}, bundle ${EXPECTED}" >&2
+            exit 1
+          fi
+          echo "${NAME} ${VERSION} is already published with these bytes; nothing to upload."
+          echo "published=true" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate with crates.io
+        id: auth
+        if: steps.existing.outputs.published == 'false'
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      # The token is scoped to this step alone and revoked when the job ends. The payload is
+      # gitignored, so --allow-dirty is what lets cargo package the generated files that the
+      # crate's explicit `include` list names.
+      - name: Publish to crates.io
+        if: steps.existing.outputs.published == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          cargo publish \
+            --manifest-path crates/zakura-assets/Cargo.toml \
+            --allow-dirty \
+            --no-verify
+
+  open-pr:
+    name: Import the release state and open the draft pull request
+    needs: [resolve, publish-assets]
+    if: needs.resolve.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    environment: release-automation
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+          ref: main
+
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
         with:
           toolchain: stable
@@ -65,9 +217,22 @@ jobs:
 
       - uses: ./.github/actions/setup-zakura-build
 
+      - name: Re-resolve the pinned bundle
+        env:
+          META_URL: ${{ needs.resolve.outputs.meta_url }}
+          META_SHA256: ${{ needs.resolve.outputs.meta_sha256 }}
+        run: |
+          python3 .github/scripts/fetch-release-state.py \
+            --meta-url "$META_URL" \
+            --meta-sha256 "$META_SHA256" \
+            --output-dir "$RUNNER_TEMP/release-state-bundle" \
+            --metadata-out "$RUNNER_TEMP/release-state-resolution.json"
+
       # Subtree roots are interior tree nodes, so framing and append-only checks cannot prove their
       # values. Prove every required subtree artifact against its matching bundle frontier before
-      # importing either file.
+      # importing either file. The frontier grid needs no such proof — a node root-checks every
+      # entry before using one — but it is checked here for framing and for covering the same
+      # checkpoint as the rest of the bundle.
       - name: Prove the bundle's subtree roots against its own frontier
         env:
           BUNDLE: ${{ runner.temp }}/release-state-bundle
@@ -77,18 +242,43 @@ jobs:
             verify-historical-treestates \
             --network Mainnet \
             --subtree-input "$BUNDLE/mainnet-treestate-subtrees.bin" \
-            --frontier-input "$BUNDLE/mainnet-frontier.bin"
+            --frontier-input "$BUNDLE/mainnet-frontier.bin" \
+            --frontier-grid-input "$BUNDLE/mainnet-frontier-grid.bin"
+
+      # The append-only check compares against the grid this repository currently pins, which
+      # lives in the registry rather than the tree, so it has to be materialised first.
+      - name: Materialise the currently pinned frontier grid
+        id: pinned
+        env:
+          NAME: ${{ needs.publish-assets.outputs.crate_name }}
+        run: |
+          set -euo pipefail
+          cargo fetch --locked
+          MANIFEST=$(cargo metadata --format-version 1 --locked \
+            | jq -r --arg n "$NAME" 'first(.packages[] | select(.name == $n) | .manifest_path)')
+          if [ -z "$MANIFEST" ] || [ "$MANIFEST" = "null" ]; then
+            echo "path=" >> "$GITHUB_OUTPUT"
+            echo "No pinned ${NAME} to extend; importing without an append-only comparison."
+            exit 0
+          fi
+          echo "path=$(dirname "$MANIFEST")/src/mainnet-frontier-grid.bin" >> "$GITHUB_OUTPUT"
 
       - name: Import checkpoints, frontier, subtrees, and provenance
         id: import
         env:
           BUNDLE: ${{ runner.temp }}/release-state-bundle
           RESOLUTION: ${{ runner.temp }}/release-state-resolution.json
+          PREVIOUS_GRID: ${{ steps.pinned.outputs.path }}
         run: |
           set -euo pipefail
+          PREVIOUS_ARGS=()
+          if [ -n "$PREVIOUS_GRID" ]; then
+            PREVIOUS_ARGS=(--previous-frontier-grid "$PREVIOUS_GRID")
+          fi
           python3 .github/scripts/import-release-state.py \
             --bundle "$BUNDLE" \
             --resolution "$RESOLUTION" \
+            ${PREVIOUS_ARGS[@]+"${PREVIOUS_ARGS[@]}"} \
             --result-out "$RUNNER_TEMP/release-state-import.json"
           jq -r '
             "has_changes=\(.has_changes)",
@@ -96,8 +286,32 @@ jobs:
             "block_hash=\(.block_hash)",
             "generated_at=\(.generated_at)",
             "meta_url=\(.meta_url)",
-            "meta_sha256=\(.meta_sha256)"
+            "meta_sha256=\(.meta_sha256)",
+            "frontier_grid_sha256=\(.frontier_grid_sha256)",
+            "frontier_grid_entries=\(.frontier_grid_entries)"
           ' "$RUNNER_TEMP/release-state-import.json" >> "$GITHUB_OUTPUT"
+
+      # `--precise` is surgical: it moves this one package and leaves the rest of the resolution
+      # alone, which a bare `cargo update` would not.
+      - name: Pin the published frontier grid
+        if: steps.import.outputs.has_changes == 'true'
+        env:
+          NAME: ${{ needs.publish-assets.outputs.crate_name }}
+          VERSION: ${{ needs.publish-assets.outputs.crate_version }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, re, pathlib
+          version = os.environ["VERSION"]
+          path = pathlib.Path("Cargo.toml")
+          text = path.read_text(encoding="utf-8")
+          pattern = re.compile(r'^(zakura-assets = \{[^}]*version = ")=[^"]+(")', re.MULTILINE)
+          text, count = pattern.subn(rf'\g<1>={version}\g<2>', text, count=1)
+          if count != 1:
+              raise SystemExit("Cargo.toml does not carry a zakura-assets pin to bump")
+          path.write_text(text, encoding="utf-8")
+          PY
+          cargo update -p "$NAME" --precise "$VERSION"
 
       - name: Validate the imported release state
         if: steps.import.outputs.has_changes == 'true'
@@ -121,6 +335,8 @@ jobs:
             git ls-files --others --exclude-standard
           } | sort -u > "$RUNNER_TEMP/actual-files"
           sort > "$RUNNER_TEMP/allowed-files" <<'EOF'
+          Cargo.lock
+          Cargo.toml
           crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt
           crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin
           crates/zakura-state/src/service/finalized_state/vct/mainnet-vct-manifest.json
@@ -141,6 +357,16 @@ jobs:
             echo "Checkpoint update removed ${REMOVED} committed lines; refusing." >&2
             exit 1
           fi
+
+          # The pin bump must move one package. A wider lockfile churn means the resolution
+          # drifted for reasons this workflow is not reviewing.
+          LOCK_PACKAGES=$(git diff -U0 HEAD -- Cargo.lock | grep -c '^[+-]name = ' || true)
+          if [ "${LOCK_PACKAGES}" -gt 2 ]; then
+            echo "Cargo.lock changed ${LOCK_PACKAGES} package names; expected one pin bump." >&2
+            git diff HEAD -- Cargo.lock >&2
+            exit 1
+          fi
+
           git diff --stat HEAD
 
       - name: Create release GitHub App token
@@ -167,15 +393,16 @@ jobs:
           base: main
           title: "chore(chain): update Mainnet release state"
           body: |
-            Updates the embedded Mainnet checkpoint list, matching VCT frontier, subtree roots, and provenance record from one immutable release-state bundle. It also floors the end-of-support estimate.
+            Updates the embedded Mainnet checkpoint list, matching VCT frontier, subtree roots, and provenance record from one immutable release-state bundle, and repins the published historical frontier grid. It also floors the end-of-support estimate.
 
             - Finalized height: `${{ steps.import.outputs.height }}`
             - Finalized hash: `${{ steps.import.outputs.block_hash }}`
             - Generated at: `${{ steps.import.outputs.generated_at }}`
             - Bundle meta: `${{ steps.import.outputs.meta_url }}`
             - Meta SHA-256: `${{ steps.import.outputs.meta_sha256 }}`
+            - Frontier grid: `${{ needs.publish-assets.outputs.crate_name }} ${{ needs.publish-assets.outputs.crate_version }}`, ${{ steps.import.outputs.frontier_grid_entries }} entries, SHA-256 `${{ steps.import.outputs.frontier_grid_sha256 }}`
 
-            The checkpoint diff is append-only over the committed list, and CI re-derives the provenance digests from the embedded data on every PR. Review before merging: checkpoints are consensus-critical, so spot-check a few new heights and the terminal hash against an independent node or explorer.
+            The checkpoint diff is append-only over the committed list, the frontier grid extends the previously published one byte for byte, and CI re-derives the provenance digests from the embedded data on every PR. Review before merging: checkpoints are consensus-critical, so spot-check a few new heights and the terminal hash against an independent node or explorer.
           # `A-release-state` marks this as an automated release-state refresh rather than the
           # release PR itself, so the changelog gate does not require it to consume every
           # pending fragment. `A-release` stays for the release CI paths.

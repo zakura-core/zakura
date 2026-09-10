@@ -17,7 +17,7 @@ use std::{
     ops::RangeBounds,
     path::Path,
     sync::{
-        atomic::{self, AtomicBool},
+        atomic::{self, AtomicBool, AtomicU64},
         Arc,
     },
 };
@@ -46,6 +46,33 @@ use super::{TypedColumnFamily, WriteTypedBatch};
 // These helpers expose the raw RocksDB handle, so they must remain test-only.
 #[cfg(test)]
 mod tests;
+
+/// Decimal byte units used by database size logs.
+const DECIMAL_BYTE_UNITS: [&str; 7] = ["B", "KB", "MB", "GB", "TB", "PB", "EB"];
+
+/// Formats an integer byte count with one optional decimal digit.
+fn format_bytes(bytes: u64) -> String {
+    const UNIT_SCALE: u64 = 1_000;
+
+    let mut unit_index = 0;
+    let mut unit_size = 1;
+    while unit_index + 1 < DECIMAL_BYTE_UNITS.len() && bytes >= unit_size * UNIT_SCALE {
+        unit_index += 1;
+        unit_size *= UNIT_SCALE;
+    }
+
+    let rounded_tenths =
+        (u128::from(bytes) * 10 + u128::from(unit_size) / 2) / u128::from(unit_size);
+    let whole_units = rounded_tenths / 10;
+    let fractional_tenth = rounded_tenths % 10;
+    let unit = DECIMAL_BYTE_UNITS[unit_index];
+
+    if fractional_tenth == 0 {
+        format!("{whole_units} {unit}")
+    } else {
+        format!("{whole_units}.{fractional_tenth} {unit}")
+    }
+}
 
 /// The [`rocksdb::ThreadMode`] used by the database.
 pub type DBThreadMode = rocksdb::SingleThreaded;
@@ -109,6 +136,9 @@ pub struct DiskDb {
     //
     // Everything contained in this state must be shared by all clones, or read-only.
     //
+    /// Database startup and each metrics export update this cached disk size.
+    cached_size: Arc<AtomicU64>,
+
     /// The shared inner RocksDB database.
     ///
     /// RocksDB allows reads and writes via a shared reference.
@@ -645,8 +675,8 @@ impl DiskDb {
                 column_families_log_string,
                 "{} (Disk: {}, Memory: {})",
                 cf_name,
-                human_bytes::human_bytes(cf_disk_size as f64),
-                human_bytes::human_bytes(mem_table_size.unwrap_or(0) as f64)
+                format_bytes(cf_disk_size),
+                format_bytes(mem_table_size.unwrap_or(0))
             )
             .unwrap();
         }
@@ -654,15 +684,15 @@ impl DiskDb {
         debug!("{}", column_families_log_string);
         info!(
             "Total Database Disk Size: {}",
-            human_bytes::human_bytes(total_size_on_disk as f64)
+            format_bytes(total_size_on_disk)
         );
         info!(
             "Total Live Data Disk Size: {}",
-            human_bytes::human_bytes(total_live_size_on_disk as f64)
+            format_bytes(total_live_size_on_disk)
         );
         info!(
             "Total Database Memory Size: {}",
-            human_bytes::human_bytes(total_size_in_mem as f64)
+            format_bytes(total_size_in_mem)
         );
     }
 
@@ -678,15 +708,21 @@ impl DiskDb {
         let mut total_disk: u64 = 0;
         let mut total_live: u64 = 0;
         let mut total_mem: u64 = 0;
+        let mut measured_column_family = false;
+        let mut complete_disk_measurement = true;
 
         for cf_descriptor in column_families {
             let cf_name = cf_descriptor.name().to_string();
             if let Some(cf_handle) = db.cf_handle(&cf_name) {
-                let disk = db
-                    .property_int_value_cf(cf_handle, "rocksdb.total-sst-files-size")
-                    .ok()
-                    .flatten()
-                    .unwrap_or(0);
+                measured_column_family = true;
+                let disk = match db.property_int_value_cf(cf_handle, "rocksdb.total-sst-files-size")
+                {
+                    Ok(Some(disk)) => disk,
+                    _ => {
+                        complete_disk_measurement = false;
+                        0
+                    }
+                };
                 let live = db
                     .property_int_value_cf(cf_handle, "rocksdb.estimate-live-data-size")
                     .ok()
@@ -706,10 +742,16 @@ impl DiskDb {
                     .set(disk as f64);
                 metrics::gauge!("zakura.state.rocksdb.cf_memory_size_bytes", "cf" => cf_name)
                     .set(mem as f64);
+            } else {
+                complete_disk_measurement = false;
             }
         }
 
         metrics::gauge!("zakura.state.rocksdb.total_disk_size_bytes").set(total_disk as f64);
+        if measured_column_family && complete_disk_measurement {
+            self.cached_size
+                .store(total_disk, atomic::Ordering::Relaxed);
+        }
         metrics::gauge!("zakura.state.rocksdb.live_data_size_bytes").set(total_live as f64);
         metrics::gauge!("zakura.state.rocksdb.total_memory_size_bytes").set(total_mem as f64);
 
@@ -738,23 +780,43 @@ impl DiskDb {
 
     /// Returns the estimated total disk space usage of the database.
     pub fn size(&self) -> u64 {
+        self.measure_size().0
+    }
+
+    /// Returns the most recently cached disk space estimate.
+    pub(crate) fn cached_size(&self) -> u64 {
+        self.cached_size.load(atomic::Ordering::Relaxed)
+    }
+
+    /// Refreshes the cached estimate of the database's disk usage.
+    fn refresh_cached_size(&self) {
+        let (size, complete) = self.measure_size();
+        if complete {
+            self.cached_size.store(size, atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Measures the estimated disk usage and reports whether every property was available.
+    fn measure_size(&self) -> (u64, bool) {
         let db: &Arc<DB> = &self.db;
         let db_options = DiskDb::options();
         let mut total_size_on_disk = 0;
+        let mut measured_column_family = false;
+        let mut complete = true;
         for cf_descriptor in DiskDb::construct_column_families(db_options, db.path(), [], false) {
             let cf_name = &cf_descriptor.name();
             let cf_handle = db
                 .cf_handle(cf_name)
-                .expect("Column family handle must exist");
+                .expect("column family handle exists because RocksDB opened every descriptor");
+            measured_column_family = true;
 
-            total_size_on_disk += db
-                .property_int_value_cf(cf_handle, "rocksdb.total-sst-files-size")
-                .ok()
-                .flatten()
-                .unwrap_or(0);
+            match db.property_int_value_cf(cf_handle, "rocksdb.total-sst-files-size") {
+                Ok(Some(size)) => total_size_on_disk += size,
+                _ => complete = false,
+            }
         }
 
-        total_size_on_disk
+        (total_size_on_disk, measured_column_family && complete)
     }
 
     /// Sets `finished_format_upgrades` to true to indicate that Zebra has
@@ -1150,9 +1212,11 @@ impl DiskDb {
                     db: Arc::new(db),
                     _secondary_dir: secondary_dir,
                     finished_format_upgrades: Arc::new(AtomicBool::new(false)),
+                    cached_size: Arc::new(AtomicU64::new(0)),
                 };
 
                 db.assert_default_cf_is_empty();
+                db.refresh_cached_size();
 
                 Ok(db)
             }

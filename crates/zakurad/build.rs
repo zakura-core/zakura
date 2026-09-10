@@ -6,74 +6,20 @@
 //! When compiling the `lightwalletd` gRPC tests, also builds a gRPC client
 //! Rust API for `lightwalletd`.
 
-use vergen_gitcl::{CargoBuilder, Emitter, GitclBuilder, RustcBuilder};
+#[path = "build/metadata.rs"]
+mod metadata;
 
-/// Process entry point for `zakurad`'s build script
-#[allow(clippy::print_stderr)]
+#[cfg(feature = "lightwalletd-grpc-tests")]
+#[path = "build/lightwalletd.rs"]
+mod lightwalletd;
+
+/// Process entry point for `zakurad`'s build script.
 fn main() {
-    let mut emitter = Emitter::default();
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=build");
 
-    // Configures an [`Emitter`] for everything except for `git` env vars.
-    // This builder fails the build on error.
-    //
-    // The cargo instructions are listed explicitly instead of using
-    // `all_cargo()`: its `dependencies` instruction (whose output nothing
-    // consumes) runs `cargo metadata` at compile time, which resolves the
-    // dependency graph against the registry index — that fails in the
-    // `cargo package`/`cargo publish` verify build of the packaged crate
-    // (before the zakura-* dependencies are published) and in offline builds.
-    let cargo_instructions = CargoBuilder::default()
-        .debug(true)
-        .features(true)
-        .opt_level(true)
-        .target_triple(true)
-        .build()
-        .expect("cargo instruction builder should build successfully");
-
-    emitter
-        .fail_on_error()
-        .add_instructions(&cargo_instructions)
-        .expect("adding cargo instructions should succeed")
-        .add_instructions(
-            &RustcBuilder::all_rustc().expect("all_rustc() should build successfully"),
-        )
-        .expect("adding all_rustc() instructions should succeed");
-
-    // Get git information. This is used by e.g. ZakuradApp::register_components()
-    // to log the commit hash
-    let all_git = GitclBuilder::default()
-        .branch(true)
-        .commit_author_email(true)
-        .commit_author_name(true)
-        .commit_count(true)
-        .commit_date(true)
-        .commit_message(true)
-        .commit_timestamp(true)
-        .describe(false, false, None)
-        .sha(true)
-        .dirty(false)
-        .describe(true, true, Some("v*.*.*"))
-        .build()
-        .expect("all_git + describe + sha should build successfully");
-
-    if let Err(e) = emitter.add_instructions(&all_git) {
-        // The most common failure here is due to a missing `.git` directory,
-        // e.g., when building from `cargo install zakurad`. We simply
-        // proceed with the build.
-        // Note that this won't be printed unless in cargo very verbose mode (-vv).
-        // We could emit a build warning, but that might scare users.
-        eprintln!("git error in vergen build script: skipping git env vars: {e:?}",);
-    }
-
-    emitter.emit().expect("base emit should succeed");
+    metadata::emit();
 
     #[cfg(feature = "lightwalletd-grpc-tests")]
-    tonic_prost_build::configure()
-        .build_client(true)
-        .build_server(false)
-        .compile_protos(
-            &["tests/common/lightwalletd/proto/service.proto"],
-            &["tests/common/lightwalletd/proto"],
-        )
-        .expect("Failed to generate lightwalletd gRPC files");
+    lightwalletd::generate_client();
 }

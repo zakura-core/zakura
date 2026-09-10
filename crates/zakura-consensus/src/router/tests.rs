@@ -17,6 +17,94 @@ use zakura_test::transcript::{ExpectedTranscriptError, Transcript};
 
 use super::*;
 
+#[tokio::test]
+async fn transaction_state_router_separates_reads_from_waiting_state_requests() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tower::service_fn;
+    use zakura_chain::{serialization::DateTime32, transaction, transparent};
+
+    let write_calls = Arc::new(AtomicUsize::new(0));
+    let write_state = service_fn({
+        let write_calls = write_calls.clone();
+        move |_request: zs::Request| {
+            write_calls.fetch_add(1, Ordering::SeqCst);
+            async move { Err::<zs::Response, BoxError>("write-state sentinel".into()) }
+        }
+    });
+
+    let read_calls = Arc::new(AtomicUsize::new(0));
+    let read_state = service_fn({
+        let read_calls = read_calls.clone();
+        move |request: zs::ReadRequest| {
+            read_calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                match request {
+                    zs::ReadRequest::BestChainNextMedianTimePast => Ok::<_, BoxError>(
+                        zs::ReadResponse::BestChainNextMedianTimePast(DateTime32::MIN),
+                    ),
+                    zs::ReadRequest::CheckBestChainTipNullifiersAndAnchors(_) => {
+                        Ok(zs::ReadResponse::ValidBestChainTipNullifiersAndAnchors)
+                    }
+                    zs::ReadRequest::UnspentBestChainUtxo(_) => {
+                        Ok(zs::ReadResponse::UnspentBestChainUtxo(None))
+                    }
+                    request => panic!("unexpected direct read request: {request:?}"),
+                }
+            }
+        }
+    });
+
+    let router = TransactionStateRouter::new(write_state, read_state);
+    let response = router
+        .clone()
+        .oneshot(zs::Request::BestChainNextMedianTimePast)
+        .await
+        .expect("the read service answers the direct query");
+    assert_eq!(
+        response,
+        zs::Response::BestChainNextMedianTimePast(DateTime32::MIN)
+    );
+
+    let block: Block = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("the genesis block is valid");
+    let transaction = transaction::UnminedTx::from(block.transactions[0].clone());
+    let response = router
+        .clone()
+        .oneshot(zs::Request::CheckBestChainTipNullifiersAndAnchors(
+            transaction,
+        ))
+        .await
+        .expect("the read service checks nullifiers and anchors");
+    assert_eq!(
+        response,
+        zs::Response::ValidBestChainTipNullifiersAndAnchors
+    );
+
+    let outpoint = transparent::OutPoint {
+        hash: transaction::Hash([0; 32]),
+        index: 0,
+    };
+    let response = router
+        .clone()
+        .oneshot(zs::Request::UnspentBestChainUtxo(outpoint))
+        .await
+        .expect("the read service checks the best-chain UTXO set");
+    assert_eq!(response, zs::Response::UnspentBestChainUtxo(None));
+
+    assert_eq!(read_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(write_calls.load(Ordering::SeqCst), 0);
+
+    let error = router
+        .oneshot(zs::Request::AwaitUtxo(outpoint))
+        .await
+        .expect_err("the write-state sentinel rejects the waiting query");
+    assert!(error.to_string().contains("write-state sentinel"));
+    assert_eq!(read_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(write_calls.load(Ordering::SeqCst), 1);
+}
+
 /// The timeout we apply to each verify future during testing.
 ///
 /// The checkpoint verifier uses `tokio::sync::oneshot` channels as futures.

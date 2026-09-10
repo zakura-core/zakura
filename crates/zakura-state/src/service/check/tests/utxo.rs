@@ -222,6 +222,12 @@ proptest! {
             prop_assert!(!chain.unspent_utxos().contains_key(&expected_outpoint));
             prop_assert!(chain.created_utxos.contains_key(&expected_outpoint));
             prop_assert!(chain.spent_utxos.contains_key(&expected_outpoint));
+            prop_assert!(chain
+                .blocks
+                .get(&Height(1))
+                .expect("the committed block is stored at height 1")
+                .spent_outputs
+                .contains_key(&expected_outpoint));
 
             // the finalized state does not have the UTXO
             prop_assert!(finalized_state.utxo(&expected_outpoint).is_none());

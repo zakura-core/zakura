@@ -16,6 +16,7 @@ import argparse
 import concurrent.futures
 import ipaddress
 import json
+import math
 import re
 import shlex
 import subprocess
@@ -84,6 +85,38 @@ NODE_DETAIL_KEYS = (
     "mempool_bytes",
     "node_errors",
     "node_errors_at",
+)
+# Fixed numeric fields copied into each fleet row for stall alerts. The
+# watchdog gets these fields from the same collector snapshot as the node
+# condition, so it never needs to fetch the larger per-node detail payload.
+ALERT_DIAGNOSTIC_METRICS = (
+    "sync_estimated_distance_to_tip",
+    "sync_estimated_network_tip_height",
+    "checkpoint_processing_next_height",
+    "checkpoint_verified_height",
+    "state_finalized_block_height",
+    "sync_header_chain_frontier_header_best_height",
+    "sync_header_chain_frontier_verified_best_height",
+    "sync_header_chain_frontier_finalized_height",
+    "sync_header_work_last_progress_age_seconds",
+    "sync_header_work_oldest_missing_height",
+    "sync_header_work_in_flight_count",
+    "sync_block_applying",
+    "sync_block_best_header_tip_height",
+    "sync_block_verified_tip_height",
+    "sync_block_fill_stop",
+    "sync_block_outstanding",
+    "sync_block_missing_bodies",
+    "state_vct_root_stalled_height",
+    "state_vct_root_repair_requested",
+    "state_vct_root_retry_count",
+    "state_vct_aux_sweep_frontier_height",
+    "sync_header_vct_repair_requested_total",
+    "sync_header_vct_repair_scheduled_total",
+    "sync_header_vct_repair_admitted_total",
+    "sync_header_vct_repair_context_unavailable_total",
+    "sync_header_vct_repair_timed_out_total",
+    "sync_header_vct_repair_resource_stalled_total",
 )
 RECENT_REORG_LIMIT = 40
 # Sampled best-chain ancestor offsets used to estimate fork depth between tips.
@@ -283,6 +316,13 @@ out = {
 WANTED_METRICS = frozenset((
     "sync_estimated_distance_to_tip",
     "sync_estimated_network_tip_height",
+    "checkpoint_processing_next_height",
+    "checkpoint_verified_height",
+    "state_finalized_block_height",
+    "state_vct_root_stalled_height",
+    "state_vct_root_repair_requested",
+    "state_vct_root_retry_count",
+    "state_vct_aux_sweep_frontier_height",
     "sync_downloads_in_flight",
     "sync_downloaded_block_count",
     "sync_verified_block_count",
@@ -307,6 +347,12 @@ WANTED_METRICS = frozenset((
     "sync_header_root_auth_work_pending_batches",
     "sync_header_peer_violation",
     "sync_header_fill_stop",
+    "sync_header_vct_repair_requested_total",
+    "sync_header_vct_repair_scheduled_total",
+    "sync_header_vct_repair_admitted_total",
+    "sync_header_vct_repair_context_unavailable_total",
+    "sync_header_vct_repair_timed_out_total",
+    "sync_header_vct_repair_resource_stalled_total",
     "sync_block_applying",
     "sync_block_outstanding",
     "sync_block_backlog_at_cap",
@@ -347,7 +393,6 @@ WANTED_METRICS = frozenset((
     "candidate_set_pending",
     "candidate_set_failed",
     "candidate_set_disconnected",
-    "state_finalized_block_height",
     "zakura_state_rocksdb_total_disk_size_bytes",
     "zcash_chain_verified_block_total",
     "zcash_mempool_size_transactions",
@@ -1270,15 +1315,16 @@ class ClusterCollector:
         if probe.get("metrics_skipped"):
             metrics_snapshot = self.last_metrics.get(node.name, {})
         else:
+            probe_error = probe.get("error")
             metrics_snapshot = {
                 "metrics": probe.get("metrics") or {},
-                "metrics_error": probe.get("metrics_error"),
+                "metrics_error": probe.get("metrics_error") or probe_error,
                 "metrics_version": probe.get("metrics_version") or "",
                 "metrics_bytes": coerce_int(probe.get("metrics_bytes")),
                 "metrics_series": coerce_int(probe.get("metrics_series")),
                 "metrics_scrape_seconds": probe.get("metrics_scrape_seconds"),
                 "peer_user_agents": probe.get("peer_user_agents") or [],
-                "metrics_at": now,
+                "metrics_at": None if probe_error else now,
             }
             self.last_metrics[node.name] = metrics_snapshot
 
@@ -1357,7 +1403,7 @@ class ClusterCollector:
         """
         with self.lock:
             rows = [
-                {key: value for key, value in row.items() if key not in NODE_DETAIL_KEYS}
+                fleet_row(row, self.last_poll)
                 for row in self.rows
             ]
             last_poll = self.last_poll
@@ -1517,6 +1563,43 @@ def coerce_int(value) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def finite_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        return value if math.isfinite(value) else None
+    except OverflowError:
+        return None
+
+
+def alert_diagnostics(row: dict, last_poll: float | None) -> dict:
+    metrics = row.get("metrics")
+    metrics_at = finite_number(row.get("metrics_at"))
+    selected = {}
+    if isinstance(metrics, dict):
+        for name in ALERT_DIAGNOSTIC_METRICS:
+            value = finite_number(metrics.get(name))
+            if value is not None:
+                selected[name] = value
+
+    return {
+        "last_poll": finite_number(last_poll),
+        "metrics_at": metrics_at,
+        "metrics_available": isinstance(metrics, dict)
+        and metrics_at is not None
+        and not bool(row.get("metrics_error")),
+        "metrics": selected,
+    }
+
+
+def fleet_row(row: dict, last_poll: float | None) -> dict:
+    summary = {
+        key: value for key, value in row.items() if key not in NODE_DETAIL_KEYS
+    }
+    summary["alert_diagnostics"] = alert_diagnostics(row, last_poll)
+    return summary
 
 
 def empty_chain_summary() -> dict:

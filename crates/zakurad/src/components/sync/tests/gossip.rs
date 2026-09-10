@@ -38,7 +38,9 @@ async fn setup_gossip_test() -> GossipTestSetup {
     let network = Mainnet;
     let state_config = StateConfig::ephemeral();
     let (state, _read_only_state, _latest_chain_tip, mut chain_tip_change) =
-        zakura_state::init(state_config, &network, Height::MAX, 0).await;
+        zakura_state::init(state_config, &network, Height::MAX, 0)
+            .await
+            .expect("ephemeral state initialization succeeds");
 
     let mut state_service = ServiceBuilder::new().buffer(1).service(state);
 

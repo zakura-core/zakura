@@ -289,7 +289,8 @@ fn deferred_reevaluation_evicts_excess_candidate_tips_deterministically() {
     let deadline = Utc::now();
     let insertion_clock = ManualClock(deadline - chrono::Duration::seconds(1));
     let mut tips = Vec::new();
-    for nonce_seed in 1..=11 {
+    for index in 0..=config.limits.max_candidate_tips.get() {
+        let nonce_seed = u8::try_from(index + 1).expect("the compact fixture count fits in u8");
         tips.extend(insert_deferred_chain(
             &mut store,
             &config,

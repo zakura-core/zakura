@@ -87,9 +87,11 @@ impl HeaderChainStore {
                 "legacy network policy does not match the configured policy",
             ));
         }
-        if metadata.mode != config.mode
-            || metadata.anchor_manifest_digest != config.trust_anchor_digest()
-        {
+        // Mode must match: Integrated and HeadersOnly authenticate migration
+        // differently. Trust-anchor digest may differ (for example when a release
+        // extends the checkpoint list). Keep the durable digest for now; post-migration
+        // startup audits with `allow_trust_anchor_update` and rebinds it atomically.
+        if metadata.mode != config.mode {
             return Err(HeaderChainStoreError::Incoherent(
                 "legacy metadata does not match the configured engine policy",
             ));

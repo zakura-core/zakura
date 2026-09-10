@@ -82,7 +82,7 @@ fn ironwood_action_decrypts_successfully<A>(act: &orchard::Action<A>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use group::{ff::PrimeField, prime::PrimeCurveAffine, GroupEncoding};
+    use group::{ff::PrimeField, CurveAffine, GroupEncoding};
     use halo2::pasta::pallas;
     use orchard::{
         note::{

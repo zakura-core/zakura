@@ -81,14 +81,10 @@ pub fn replay_recovery_rows_bytes(data: &[u8]) -> RecoveryRowsReplaySummary {
     let mut rows = logical_dump(&store);
     let mut mutations = 0;
     let mut mode_operations = Vec::new();
-    for operation in data[..data.len().min(MAX_INPUT_BYTES)].chunks_exact(4) {
+    for operation in data[..data.len().min(MAX_INPUT_BYTES)].as_chunks::<4>().0 {
         if recovery_opcode(operation[0]) == 8 {
             if mode_operations.len() < 2 {
-                mode_operations.push(
-                    operation
-                        .try_into()
-                        .expect("chunks_exact yields four-byte operations"),
-                );
+                mode_operations.push(*operation);
             }
             continue;
         }

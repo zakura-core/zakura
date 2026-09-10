@@ -17,26 +17,62 @@ This command generates a list of zebra checkpoints, and writes them to standard 
 #### Offline Mainnet export (release-state pipeline)
 
 Mainnet checkpoint updates flow through the release-state pipeline: the publisher host runs
-offline mode against a quiesced copy of a synced Mainnet state database. The same run produces
-the matching VCT frontier and completed-subtree artifacts for the last emitted checkpoint. Build
-with the offline feature and run:
+offline mode against a synced Mainnet **archive** state database. One run produces the whole
+coupled release state for the last emitted checkpoint — the checkpoint list, the VCT frontier,
+the completed-subtree roots, and the historical frontier grid. Build with the offline feature
+and run:
 
 ```sh
 cargo install --locked --features zakura-checkpoints-offline --git https://github.com/zakura-core/zakura zakura-utils
 
 zakura-checkpoints \
-  --state-cache-dir /path/to/quiesced-zakura-cache \
+  --state-cache-dir /path/to/archive-zakura-cache \
   --full-list \
   --mainnet-frontier-output /out/mainnet-frontier.bin \
   --mainnet-subtree-output /out/mainnet-treestate-subtrees.bin \
+  --mainnet-frontier-grid-output /out/mainnet-frontier-grid.bin \
   > /out/main-checkpoints.txt
 ```
 
 Offline mode reads canonical hashes and `BlockInfo` sizes straight from the finalized
-database, so it works on pruned state and needs no running node. `--full-list` prints the
-embedded checkpoint list before the new entries, making stdout a complete replacement
-`main-checkpoints.txt`. The subtree export keeps the roots already embedded in the binary and
-adds later roots retained by the database, so it works with the production pruned VCT state.
+database, which it opens as a read-only RocksDB secondary, so the node does not have to be
+stopped. `--full-list` prints the embedded checkpoint list before the new entries, making
+stdout a complete replacement `main-checkpoints.txt`. The subtree export keeps the roots
+already embedded in the binary and adds later roots retained by the database.
+
+The three artifact output flags are one set: supply all of them or none, so a replacement
+checkpoint list can never ship without its coupled state. Checkpoints, the frontier, and the
+subtree roots come out of pruned state too, but the frontier grid covers the heights below the
+checkpoint, which a pruned database no longer holds — hence the archive requirement. A legacy
+archive node generates the grid entirely from stored trees; a fast-synced one replays its
+absent band instead, which takes hours on Mainnet. Either way the default cost-weighted
+spacing reads every block body once to place its entries, so expect a long batch run: the
+first full Mainnet run took 81 minutes on a legacy archive node and produced 5,472 entries
+in 4.8 MB, without replaying a single block. `--frontier-grid-target-cost-ms` tunes the
+grid's per-entry cost budget (default 2000); `--frontier-grid-spacing` produces a uniform grid
+and is not recommended.
+
+`--mainnet-frontier-grid-input <path>` resumes from a previously published grid instead of
+rebuilding it. Its entries are re-checked against the database and then carried forward verbatim,
+so the run scans only the blocks above the last carried entry and the output is a prefix-extension
+of the input by construction. Use it for every run after the first: a full walk stays O(chain)
+forever, while a resumed run costs only the new tail.
+
+To produce a grid for a checkpoint the binary already ships — backfilling the one artifact a
+committed release state is missing, without advancing the checkpoint list — run the grid
+alone:
+
+```sh
+zakura-checkpoints \
+  --state-cache-dir /path/to/archive-zakura-cache \
+  --mainnet-frontier-grid-output /out/mainnet-frontier-grid.bin \
+  --mainnet-frontier-grid-checkpoint <embedded checkpoint height>
+```
+
+That mode emits no checkpoints and refuses the other artifact outputs, which only exist for a
+newly selected checkpoint. The height must be one of the embedded checkpoints, and the database
+must agree with the embedded list at it.
+
 Do not hand-append RPC-mode output to the Mainnet list: pipeline
 updates must stay on the deterministic selection grid (see
 `docs/design/verified-commitment-trees.md`, "Mainnet release-state pipeline").

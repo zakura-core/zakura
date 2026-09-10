@@ -1189,6 +1189,104 @@ fn version_three_integrated_migration_authenticates_the_full_state_frontier() {
 }
 
 #[test]
+fn version_three_migration_allows_an_extended_checkpoint_manifest() {
+    let db_config = Config::ephemeral();
+    let (engine_config, anchor, metadata) = mainnet_fixture();
+    let frontier = metadata.frontiers.finalized;
+    let previous_digest = metadata.anchor_manifest_digest;
+    let extended_config = EngineConfig::new(
+        engine_config.mode,
+        engine_config.network().clone(),
+        engine_config.bootstrap_anchor().clone(),
+        CheckpointSet::new([Frontier::new(block::Height(10), block::Hash([0x93; 32]))])
+            .expect("the extension checkpoint is unique"),
+    )
+    .expect("the extended engine configuration is coherent");
+    assert_ne!(previous_digest, extended_config.trust_anchor_digest());
+
+    let db = open(&db_config, engine_config.network());
+    let store = HeaderChainStore::new(db.clone());
+    store
+        .initialize(metadata.clone(), anchor)
+        .expect("the current fixture initializes");
+    let mut batch = DiskWriteBatch::new();
+    store
+        .put_raw(
+            &mut batch,
+            HEADER_ENGINE_META,
+            METADATA_KEY,
+            mark_metadata_as_v3(&metadata),
+        )
+        .expect("the version-three metadata stages");
+    stage_full_state_canonical_hash(&store, &mut batch, frontier);
+    store.db.write(batch).expect("the legacy fixture commits");
+
+    assert!(store
+        .migrate_to_current(&extended_config)
+        .expect("migration tolerates an extended checkpoint manifest"));
+    let migrated = store.metadata().expect("the migrated metadata is readable");
+    assert_eq!(migrated.disk_format, HeaderChainDiskVersion::CURRENT);
+    assert_eq!(migrated.anchor_manifest_digest, previous_digest);
+
+    let (_, report) = HeaderChainStore::new(db.clone())
+        .startup(&extended_config)
+        .expect("startup rebinds the extended checkpoint manifest");
+    assert_eq!(
+        report.repairs,
+        BTreeSet::from([RecoveryRepair::TrustAnchorConfiguration])
+    );
+    assert!(report.publication_allowed);
+    assert_eq!(
+        HeaderChainStore::new(db)
+            .metadata()
+            .expect("the rebound metadata is readable")
+            .anchor_manifest_digest,
+        extended_config.trust_anchor_digest()
+    );
+}
+
+#[test]
+fn version_three_migration_rejects_a_mode_mismatch_atomically() {
+    let db_config = Config::ephemeral();
+    let (engine_config, anchor, metadata) = mainnet_fixture();
+    let metadata_value = mark_metadata_as_v3(&metadata);
+    let mut headers_only_config = engine_config.clone();
+    headers_only_config.mode = EngineMode::HeadersOnly;
+    let db = open(&db_config, engine_config.network());
+    let store = HeaderChainStore::new(db);
+    store
+        .initialize(metadata, anchor)
+        .expect("the current fixture initializes");
+    let mut batch = DiskWriteBatch::new();
+    store
+        .put_raw(
+            &mut batch,
+            HEADER_ENGINE_META,
+            METADATA_KEY,
+            &metadata_value,
+        )
+        .expect("the version-three metadata stages");
+    store.db.write(batch).expect("the legacy fixture commits");
+
+    assert!(matches!(
+        store.migrate_to_current(&headers_only_config),
+        Err(HeaderChainStoreError::Incoherent(
+            "legacy metadata does not match the configured engine policy"
+        ))
+    ));
+    let metadata_cf = store
+        .cf(HEADER_ENGINE_META)
+        .expect("the metadata column family exists");
+    assert_eq!(
+        store
+            .db
+            .raw_get_cf(&metadata_cf, METADATA_KEY)
+            .expect("the metadata remains readable"),
+        Some(metadata_value)
+    );
+}
+
+#[test]
 fn a_newer_header_chain_disk_format_does_not_classify_as_initialized() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = mainnet_fixture();

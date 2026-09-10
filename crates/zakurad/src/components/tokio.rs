@@ -70,24 +70,25 @@ impl RuntimeRun for Runtime {
         F: Future<Output = Result<(), Report>>,
     {
         let shutdown_token = CancellationToken::new();
-        let cleanup_ready = CancellationToken::new();
-        let fut = run(shutdown_token.clone(), cleanup_ready.clone());
+        // cancelled means shutdown must await the root future's cleanup.
+        let shutdown_cleanup_required = CancellationToken::new();
+        let fut = run(shutdown_token.clone(), shutdown_cleanup_required.clone());
         let result = self.block_on(run_until_shutdown(
             fut,
             shutdown(),
             shutdown_token,
-            cleanup_ready,
+            shutdown_cleanup_required,
         ));
 
         finish_runtime(self, result);
     }
 }
 
-async fn run_until_shutdown(
+pub(crate) async fn run_until_shutdown(
     fut: impl Future<Output = Result<(), Report>>,
     shutdown_signal: impl Future<Output = ()>,
     shutdown_token: CancellationToken,
-    cleanup_ready: CancellationToken,
+    shutdown_cleanup_required: CancellationToken,
 ) -> Result<(), Report> {
     tokio::pin!(fut);
     tokio::pin!(shutdown_signal);
@@ -96,7 +97,7 @@ async fn run_until_shutdown(
         biased;
         _ = &mut shutdown_signal => {
             shutdown_token.cancel();
-            if cleanup_ready.is_cancelled() {
+            if shutdown_cleanup_required.is_cancelled() {
                 fut.await
             } else {
                 Ok(())
@@ -137,8 +138,8 @@ mod tests {
     async fn graceful_shutdown_waits_for_root_future_cleanup() {
         let shutdown = CancellationToken::new();
         let future_shutdown = shutdown.clone();
-        let cleanup_ready = CancellationToken::new();
-        cleanup_ready.cancel();
+        let shutdown_cleanup_required = CancellationToken::new();
+        shutdown_cleanup_required.cancel();
         let (cleanup_tx, cleanup_rx) = oneshot::channel();
 
         let fut = async move {
@@ -147,7 +148,7 @@ mod tests {
             Ok(())
         };
 
-        run_until_shutdown(fut, future::ready(()), shutdown, cleanup_ready)
+        run_until_shutdown(fut, future::ready(()), shutdown, shutdown_cleanup_required)
             .await
             .expect("shutdown should succeed");
         cleanup_rx.await.expect("root future ran cleanup");
@@ -156,13 +157,13 @@ mod tests {
     #[tokio::test]
     async fn shutdown_during_startup_does_not_wait_for_root_future() {
         let shutdown = CancellationToken::new();
-        let cleanup_ready = CancellationToken::new();
+        let shutdown_cleanup_required = CancellationToken::new();
 
         run_until_shutdown(
             future::pending(),
             future::ready(()),
             shutdown.clone(),
-            cleanup_ready,
+            shutdown_cleanup_required,
         )
         .await
         .expect("shutdown should succeed");

@@ -44,6 +44,11 @@ on:
         required: false
         type: string
         default: ""
+      validate_start:
+        description: "After a single-node restart, verify the deployed binary remains healthy"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -73,6 +78,8 @@ jobs:
         env:
           REF: ${{ inputs.ref }}
           NODE: ${{ inputs.node }}
+          NO_RESTART: ${{ inputs.no_restart }}
+          VALIDATE_START: ${{ inputs.validate_start }}
         run: |
           set -euo pipefail
           if ! [[ "${REF}" =~ ^[A-Za-z0-9._/-]+$ ]]; then
@@ -81,6 +88,14 @@ jobs:
           fi
           if [ -n "${NODE}" ] && ! [[ "${NODE}" =~ ^[A-Za-z0-9._-]+$ ]]; then
             echo "invalid node: allowed chars [A-Za-z0-9._-]" >&2
+            exit 1
+          fi
+          if [ "${VALIDATE_START}" = "true" ] && [ -z "${NODE}" ]; then
+            echo "validate_start requires one explicit node." >&2
+            exit 1
+          fi
+          if [ "${VALIDATE_START}" = "true" ] && [ "${NO_RESTART}" = "true" ]; then
+            echo "validate_start cannot be combined with no_restart." >&2
             exit 1
           fi
 
@@ -159,7 +174,8 @@ jobs:
             161.35.156.226 \
             139.59.64.115 \
             168.144.173.250 \
-            159.203.113.196; do
+            159.203.113.196 \
+            104.131.174.28; do
             ssh-keyscan -T 30 -H "$host" >> ~/.ssh/known_hosts
           done
           chmod 600 ~/.ssh/known_hosts
@@ -186,6 +202,7 @@ jobs:
           # Read-only fields below: consumed by the status dashboard's SSH probe,
           # not written to any node (manage_config = false).
           rpc_listen_addr = "0.0.0.0:8232"
+          metrics_endpoint = "127.0.0.1:9999"
           log_file        = "/root/logs/zakura-tracing.log"
           # Verified on the fleet: the nine regional nodes keep state here, the
           # compat host does not. Used only for the dashboard's disk probe.
@@ -259,6 +276,26 @@ jobs:
           log_file   = ""
           rpc_listen_addr = "127.0.0.1:8232"
           state_cache_dir = "/mnt/data/import-zebra"
+
+          # Legacy archive node: `vct_fast_sync = false`, so it holds per-height
+          # commitment trees everywhere and never fast-synced. That is what makes it
+          # the supported generator for the release-state historical frontier grid —
+          # entries come from reads instead of replaying an absent band. Binary-only
+          # like the rest of the fleet, so its `vct_fast_sync = false` config is not
+          # rewritten by a deploy; that setting is the whole point of the node.
+          [[nodes]]
+          name       = "archive-vct-off"
+          ssh_string = "root@104.131.174.28"
+          commit     = "${REF}"
+          rpc_listen_addr = "127.0.0.1:8232"
+          log_file   = "/var/log/zakura/zakura.log"
+          # Metadata only under manage_config = false, but it records why this node
+          # differs. On `dual` its body tip wedged: the v2 coordinator logged
+          # `accepted block apply lost terminal observation; apply lifecycle is
+          # failed` and the header chain ran ~6,000 blocks ahead of the verified
+          # tip. Switching the node to `legacy` cleared it immediately. Do not flip
+          # this host to config-managed without carrying that setting across.
+          p2p_stack  = "legacy"
           EOF
 
       - name: Build deployer binary
@@ -287,6 +324,41 @@ jobs:
           sudo install -d -m 755 /run/zakura-fleet-watchdog
           printf '%s\n' "$(( $(date +%s) + 1200 ))" \
             | sudo tee /run/zakura-fleet-watchdog/deploy-suppressed-until >/dev/null
+
+      - name: Suppress compatibility watchdog alerts during deploy
+        # This stays in workflow-owned code so rollback refs whose deployer
+        # predates suppression are still covered.
+        if: ${{ !inputs.no_restart && (inputs.node == '' || inputs.node == 'zakura-compat') }}
+        run: |
+          set -euo pipefail
+
+          if ! timeout --signal=TERM --kill-after=5s 60s \
+            ssh \
+              -o BatchMode=yes \
+              -o ConnectTimeout=20 \
+              -o ServerAliveInterval=10 \
+              -o ServerAliveCountMax=3 \
+              -o StrictHostKeyChecking=yes \
+              -- root@159.203.113.196 bash -s <<'REMOTE'; then
+          set -euo pipefail
+
+          marker=/run/zakura-watchdog/deployment-suppressed-until
+          mkdir -p -m 755 "$(dirname "$marker")"
+          marker_tmp="$(mktemp "${marker}.tmp.XXXXXX")"
+          cleanup() {
+            rm -f "$marker_tmp"
+          }
+          trap cleanup EXIT
+          printf '%s\n' "$(( $(date +%s) + 1200 ))" > "$marker_tmp"
+          chmod 644 "$marker_tmp"
+          mv -f "$marker_tmp" "$marker"
+          trap - EXIT
+          if systemctl is-active --quiet zakura-watchdog; then
+            systemctl restart zakura-watchdog
+          fi
+          REMOTE
+            echo "::warning::failed to suppress compatibility watchdog alerts; continuing deploy" >&2
+          fi
 
       - name: Deploy fleet
         working-directory: deploy/deployer
@@ -325,6 +397,201 @@ jobs:
 
           python3 deploy.py status "${args[@]}"
 
+      - name: Validate deployed node startup
+        if: ${{ inputs.validate_start && inputs.node != '' && !inputs.no_restart }}
+        env:
+          NODE: ${{ inputs.node }}
+        run: |
+          set -euo pipefail
+
+          eval "$(
+            python3 - "$NODE" <<'PY'
+          import shlex
+          import sys
+          import tomllib
+
+          with open("deploy/deployer/nodes.ci.toml", "rb") as config_file:
+              config = tomllib.load(config_file)
+
+          defaults = config["defaults"]
+          node_name = sys.argv[1]
+          node = next(
+              (candidate for candidate in config["nodes"] if candidate["name"] == node_name),
+              None,
+          )
+          if node is None:
+              raise SystemExit(f"unknown node: {node_name}")
+
+          values = {
+              "SSH_TARGET": node["ssh_string"],
+              "SERVICE_NAME": node.get("service_name", defaults["service_name"]),
+              "BIN_PATH": node.get("bin_path", defaults["bin_path"]),
+              "RPC_LISTEN_ADDR": node.get(
+                  "rpc_listen_addr", defaults["rpc_listen_addr"]
+              ),
+              "RPC_AUTH": "cookie" if node_name == "zakura-compat" else "",
+              "RPC_CONFIG_PATH": (
+                  "/root/.cache/zakura/.cookie"
+                  if node_name == "zakura-compat"
+                  else ""
+              ),
+          }
+          for key, value in values.items():
+              print(f"{key}={shlex.quote(str(value))}")
+          PY
+          )"
+
+          expected_commit="$(git rev-parse HEAD)"
+          ssh -o BatchMode=yes -o ConnectTimeout=20 -- "$SSH_TARGET" \
+            "SERVICE_NAME='$SERVICE_NAME' BIN_PATH='$BIN_PATH' \
+             RPC_LISTEN_ADDR='$RPC_LISTEN_ADDR' RPC_AUTH='$RPC_AUTH' \
+             RPC_CONFIG_PATH='$RPC_CONFIG_PATH' EXPECTED_COMMIT='$expected_commit' bash -s" <<'EOF'
+          set -euo pipefail
+
+          # How long the node may take to answer RPC after the restart, and the
+          # separate window it must then stay up for. Keeping them independent means a
+          # node that is slow to open RPC still gets a full settle observation.
+          readonly RPC_READY_TIMEOUT=90
+          readonly SETTLE_SECONDS=90
+
+          # deploy.py keeps the previous binary at ${BIN_PATH}.bak, but rolls back
+          # on its own only when the service dies within its ~3s post-start check.
+          # Everything this canary adds -- a wrong commit, RPC never answering, a
+          # crash-loop during the settle window -- surfaces after that check has
+          # already passed, so without this the node keeps running the binary we
+          # just proved bad. Restart sequence mirrors deploy.py.
+          restart_service() {
+            systemctl stop "$SERVICE_NAME" || true
+            # Let the old process release the state DB before starting again.
+            for _ in 1 2 3 4 5 6 7 8 9 10; do
+              systemctl is-active --quiet "$SERVICE_NAME" || break
+              sleep 1
+            done
+            systemctl start "$SERVICE_NAME"
+            sleep 3
+            systemctl is-active --quiet "$SERVICE_NAME"
+          }
+
+          rollback() {
+            if [ ! -x "${BIN_PATH}.bak" ]; then
+              echo "No ${BIN_PATH}.bak to roll back to; ${SERVICE_NAME} is still running the binary that failed validation." >&2
+              return
+            fi
+            echo "Rolling ${SERVICE_NAME} back to ${BIN_PATH}.bak" >&2
+            install -m 755 "${BIN_PATH}.bak" "$BIN_PATH"
+            if restart_service; then
+              echo "Rolled back to $("$BIN_PATH" --version)." >&2
+            else
+              echo "Rollback of ${SERVICE_NAME} failed; the node needs manual recovery." >&2
+            fi
+          }
+
+          # Roll back on any failure below, then re-raise the original status so
+          # the canary still reports failure. Clearing the trap first keeps the
+          # handler from re-entering through its own exit.
+          on_exit() {
+            status=$?
+            trap - EXIT
+            [ "$status" -eq 0 ] || rollback
+            exit "$status"
+          }
+          trap on_exit EXIT
+
+          expected_short="${EXPECTED_COMMIT:0:9}"
+          version="$("$BIN_PATH" --version)"
+          if [[ ! "$version" =~ \+([0-9]+\.)?g${expected_short} ]]; then
+            echo "deployed version does not match ${expected_short}: ${version}" >&2
+            exit 1
+          fi
+
+          # `systemctl is-active --quiet` says nothing on failure, and under `set -e` a
+          # bare call aborts the whole check silently -- worst in the case this canary
+          # exists to catch. Report the unit state instead.
+          require_active() {
+            local state
+            if ! systemctl is-active --quiet "$SERVICE_NAME"; then
+              state="$(systemctl is-active "$SERVICE_NAME" || true)"
+              echo "${SERVICE_NAME} is ${state:-unknown} after deploy, expected active." >&2
+              exit 1
+            fi
+          }
+
+          rpc_port="${RPC_LISTEN_ADDR##*:}"
+          rpc_url="http://127.0.0.1:${rpc_port}/"
+          rpc_payload='{"jsonrpc":"1.0","id":"release-start-canary","method":"getblockchaininfo","params":[]}'
+
+          # Held in a variable using double quotes only. Inlined after `python3 -c` it
+          # would need nested single quotes, which the enclosing shell strips out.
+          rpc_check_py='
+          import json
+          import sys
+
+          response = json.load(sys.stdin)
+          error = response.get("error")
+          if error is not None:
+              raise SystemExit(f"RPC error: {error}")
+          result = response.get("result")
+          if not isinstance(result, dict) or not isinstance(result.get("blocks"), int):
+              raise SystemExit("getblockchaininfo returned an invalid result")
+          '
+
+          # Pass `quiet` while polling a node that is still starting: otherwise every
+          # five-second attempt logs a connection error and a full Python traceback.
+          rpc_ready() {
+            local quiet="${1:-}"
+            local body
+            local curl_args=(
+              --fail
+              --silent
+              --show-error
+              --max-time 10
+              --header "content-type: application/json"
+              --data "$rpc_payload"
+            )
+            if [ "$RPC_AUTH" = "cookie" ]; then
+              curl_args+=(--user "$(tr -d '\n' < "$RPC_CONFIG_PATH")")
+            fi
+            if [ -n "$quiet" ]; then
+              body="$(curl "${curl_args[@]}" "$rpc_url" 2>/dev/null)" || return 1
+              printf '%s' "$body" | python3 -c "$rpc_check_py" 2>/dev/null
+            else
+              body="$(curl "${curl_args[@]}" "$rpc_url")" || return 1
+              printf '%s' "$body" | python3 -c "$rpc_check_py"
+            fi
+          }
+
+          ready_deadline="$(( $(date +%s) + RPC_READY_TIMEOUT ))"
+          while true; do
+            require_active
+            if rpc_ready quiet; then
+              break
+            fi
+            if [ "$(date +%s)" -ge "$ready_deadline" ]; then
+              echo "RPC did not become ready within ${RPC_READY_TIMEOUT} seconds:" >&2
+              rpc_ready || true
+              exit 1
+            fi
+            sleep 5
+          done
+
+          # Restart the clock here: the settle window measures uptime once the node is
+          # actually serving, not time already spent waiting for it to get there.
+          settle_deadline="$(( $(date +%s) + SETTLE_SECONDS ))"
+          while [ "$(date +%s)" -lt "$settle_deadline" ]; do
+            require_active
+            sleep 5
+          done
+
+          restart_count="$(systemctl show "$SERVICE_NAME" --property=NRestarts --value)"
+          if [ "${restart_count:-0}" != "0" ]; then
+            echo "${SERVICE_NAME} restarted ${restart_count} time(s) after deploy." >&2
+            exit 1
+          fi
+          require_active
+          rpc_ready
+          echo "${SERVICE_NAME} stayed active with working RPC and no restarts for ${SETTLE_SECONDS} seconds."
+          EOF
+
       - name: Install cluster status dashboard
         if: always()
         run: |
@@ -353,6 +620,7 @@ jobs:
           ssh_string = "root@159.203.113.196"
           probe_kind = "zcashd"
           service_name = ""
+          metrics_endpoint = ""
           # Managed/path install from zcashd-compat-manifest.json (v1.0.0-compat-rc0).
           bin_path = "/mnt/data/import-zebra/zcashd-compat/bin/v1.0.0-compat-rc0/x86_64-pc-linux-gnu/zcashd"
           log_file = ""

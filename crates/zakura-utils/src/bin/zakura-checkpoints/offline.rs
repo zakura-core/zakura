@@ -1,17 +1,24 @@
-//! Offline checkpoint and VCT-frontier export from a quiesced Zakura state.
+//! Offline release-state export from a Zakura state database.
 //!
 //! Reads canonical block hashes and `BlockInfo` sizes straight from a finalized
-//! state database, so it works on pruned databases and needs no running node.
-//! The emitted checkpoints continue the deterministic selection sequence started
-//! at the embedded Mainnet checkpoint list. The optional frontier and completed-subtree
-//! artifacts are produced together at the last emitted checkpoint height. See the
-//! "Mainnet release-state" section of `docs/design/verified-commitment-trees.md`.
+//! state database, so it needs no running node: the database is opened as a
+//! read-only RocksDB secondary. The emitted checkpoints continue the
+//! deterministic selection sequence started at the embedded Mainnet checkpoint
+//! list. The optional frontier, completed-subtree, and historical frontier grid
+//! artifacts are produced together at the last emitted checkpoint height, so one
+//! run yields one coupled release state. See the "Mainnet release-state" section
+//! of `docs/design/verified-commitment-trees.md`.
+//!
+//! Checkpoints, the final frontier, and the subtree roots come out of a pruned
+//! database too. The frontier grid does not: it covers the heights below the
+//! checkpoint, which a pruned database no longer holds. Generate from an archive
+//! database.
 
 // This is a CLI module: checkpoint lines go to stdout, status goes to stderr,
 // and argument invariants established by `Args::validate_mode` use `expect`.
 #![allow(clippy::print_stdout, clippy::print_stderr, clippy::unwrap_in_result)]
 
-use std::{io::Write, path::Path};
+use std::{fs, io::Write, path::Path, time::Instant};
 
 use color_eyre::eyre::{ensure, eyre, Context, Result};
 
@@ -23,6 +30,15 @@ use zakura_chain::{
 use zakura_node_services::constants::{MAX_CHECKPOINT_BYTE_COUNT, MAX_CHECKPOINT_HEIGHT_GAP};
 
 use crate::args::Args;
+
+/// Default per-entry replay budget for the cost-weighted frontier grid.
+///
+/// Matches the 2 s budget measured in the historical-treestate serving design: a uniform
+/// 50,000-block grid leaves a cold request that runs into minutes.
+const DEFAULT_FRONTIER_GRID_TARGET_COST_MS: u64 = 2_000;
+
+/// How often a long grid run reports progress, in entries.
+const FRONTIER_GRID_PROGRESS_INTERVAL: u64 = 100;
 
 /// One candidate block row read from the finalized state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,9 +119,10 @@ fn validate_header_link(
 /// Run the offline export selected by `--state-cache-dir`.
 ///
 /// Prints checkpoint lines to stdout (optionally prefixed with the embedded
-/// Mainnet list under `--full-list`) and writes the frontier and completed-subtree
-/// artifacts for the last emitted checkpoint when their output paths are supplied.
-/// All status output goes to stderr so stdout stays a clean checkpoint list.
+/// Mainnet list under `--full-list`) and writes the frontier, completed-subtree,
+/// and frontier grid artifacts for the last emitted checkpoint when their output
+/// paths are supplied. All status output goes to stderr so stdout stays a clean
+/// checkpoint list.
 pub fn run_offline(args: &Args) -> Result<()> {
     let state_cache_dir = args
         .state_cache_dir
@@ -128,6 +145,10 @@ pub fn run_offline(args: &Args) -> Result<()> {
     let (_read_state, db, _non_finalized_sender) =
         zakura_state::init_read_only(state_config, &network)
             .wrap_err("opening the Mainnet state database read-only")?;
+
+    if let Some(checkpoint) = args.mainnet_frontier_grid_checkpoint {
+        return backfill_frontier_grid(args, &db, &network, checkpoint);
+    }
 
     let (tip_height, tip_hash) = db
         .tip()
@@ -216,12 +237,23 @@ pub fn run_offline(args: &Args) -> Result<()> {
         .last()
         .expect("selection was checked to be non-empty");
 
-    // Produce and persist both artifacts before any checkpoint output. A failure must not leave a
+    // Produce and persist every artifact before any checkpoint output. A failure must not leave a
     // caller's redirected stdout holding an advanced list without its coupled release state.
-    if let (Some(frontier_path), Some(subtree_path)) =
-        (&args.mainnet_frontier_output, &args.mainnet_subtree_output)
-    {
-        write_release_treestate_artifacts(&db, last_height, frontier_path, subtree_path)?;
+    if let (Some(frontier_path), Some(subtree_path), Some(grid_path)) = (
+        &args.mainnet_frontier_output,
+        &args.mainnet_subtree_output,
+        &args.mainnet_frontier_grid_output,
+    ) {
+        write_release_treestate_artifacts(
+            &db,
+            &network,
+            last_height,
+            frontier_path,
+            subtree_path,
+            grid_path,
+            args.mainnet_frontier_grid_input.as_deref(),
+            frontier_grid_spacing(args),
+        )?;
     }
 
     // Lock stdout once: the full list is ~14k lines and per-line locking is slow.
@@ -246,12 +278,98 @@ pub fn run_offline(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// Generate only the frontier grid, for a checkpoint the binary already ships.
+///
+/// The normal export pins every artifact to a checkpoint it selects above the embedded list.
+/// That is right for an advancing release, and wrong for backfilling the one artifact a
+/// committed release state is missing: it would advance `main-checkpoints.txt` as a side effect
+/// of producing a file for a checkpoint already reviewed and merged.
+fn backfill_frontier_grid(
+    args: &Args,
+    db: &zakura_state::ZakuraDb,
+    network: &Network,
+    checkpoint: Height,
+) -> Result<()> {
+    let grid_path = args
+        .mainnet_frontier_grid_output
+        .as_ref()
+        .expect("backfill mode is only entered with --mainnet-frontier-grid-output");
+
+    // Only an embedded checkpoint can be backfilled. A height off the reviewed list would
+    // produce an artifact no committed release state can be coupled to.
+    let embedded_hash = network.checkpoint_list().hash(checkpoint).ok_or_else(|| {
+        eyre!(
+            "{} is not an embedded Mainnet checkpoint; backfill targets a checkpoint this \
+             binary already ships",
+            checkpoint.0,
+        )
+    })?;
+
+    let (tip_height, tip_hash) = db
+        .tip()
+        .ok_or_else(|| eyre!("Mainnet state database has no finalized tip"))?;
+    ensure!(
+        tip_height >= checkpoint,
+        "state tip {} is below checkpoint {}; sync further before backfilling",
+        tip_height.0,
+        checkpoint.0,
+    );
+
+    // Same anchor check as the checkpoint export: a database that disagrees with the embedded
+    // list at this height is a different chain, and its grid would be silently wrong.
+    let database_hash = db
+        .hash(checkpoint)
+        .ok_or_else(|| eyre!("state database has no block at checkpoint {}", checkpoint.0))?;
+    ensure!(
+        database_hash == embedded_hash,
+        "state database hash at checkpoint {} is {database_hash}, but the embedded checkpoint \
+         list has {embedded_hash}; refusing to export from a mismatched chain",
+        checkpoint.0,
+    );
+
+    eprintln!(
+        "backfilling the frontier grid for embedded checkpoint {} from finalized tip {} \
+         ({tip_hash}); no checkpoints are emitted",
+        checkpoint.0, tip_height.0,
+    );
+
+    write_frontier_grid(
+        db,
+        network,
+        checkpoint,
+        grid_path,
+        args.mainnet_frontier_grid_input.as_deref(),
+        frontier_grid_spacing(args),
+    )
+}
+
+/// Chooses the frontier grid layout from the CLI flags.
+///
+/// Cost-weighted at [`DEFAULT_FRONTIER_GRID_TARGET_COST_MS`] is the default: a uniform grid
+/// cannot bound the worst-case cold request at a sane artifact size.
+fn frontier_grid_spacing(args: &Args) -> zakura_state::GridSpacing {
+    match args.frontier_grid_spacing {
+        Some(blocks) => zakura_state::GridSpacing::Uniform { blocks },
+        None => zakura_state::GridSpacing::Adaptive {
+            budget_us: args
+                .frontier_grid_target_cost_ms
+                .unwrap_or(DEFAULT_FRONTIER_GRID_TARGET_COST_MS)
+                .saturating_mul(1000),
+        },
+    }
+}
+
 /// Produce and atomically write the coupled treestate artifacts for `height`.
+#[allow(clippy::too_many_arguments)]
 fn write_release_treestate_artifacts(
     db: &zakura_state::ZakuraDb,
+    network: &Network,
     height: Height,
     frontier_path: &Path,
     subtree_path: &Path,
+    grid_path: &Path,
+    grid_resume_path: Option<&Path>,
+    grid_spacing: zakura_state::GridSpacing,
 ) -> Result<()> {
     let artifacts = zakura_state::produce_release_treestate_artifacts(db, height)
         .wrap_err("producing the Mainnet release treestate artifacts")?;
@@ -278,6 +396,105 @@ fn write_release_treestate_artifacts(
         artifacts.added_subtree_roots,
         artifacts.verified_subtree_roots,
     );
+
+    write_frontier_grid(
+        db,
+        network,
+        height,
+        grid_path,
+        grid_resume_path,
+        grid_spacing,
+    )?;
+
+    Ok(())
+}
+
+/// Produce and atomically write the historical frontier grid covering `[0, height)`.
+///
+/// Generated for the checkpoint the other two artifacts describe, so all three files pin one
+/// release state. A consuming node refuses to start when its own fast-sync handoff is above the
+/// grid's checkpoint, which is why the coupling has to hold rather than merely usually hold.
+fn write_frontier_grid(
+    db: &zakura_state::ZakuraDb,
+    network: &Network,
+    height: Height,
+    grid_path: &Path,
+    resume_path: Option<&Path>,
+    spacing: zakura_state::GridSpacing,
+) -> Result<()> {
+    match spacing {
+        zakura_state::GridSpacing::Adaptive { budget_us } => eprintln!(
+            "generating the frontier grid below checkpoint {}, cost-weighted at {} ms per entry",
+            height.0,
+            budget_us / 1000,
+        ),
+        zakura_state::GridSpacing::Uniform { blocks } => eprintln!(
+            "generating the frontier grid below checkpoint {}, uniform spacing {blocks}",
+            height.0,
+        ),
+    }
+
+    // Resuming carries a published grid's entries forward, so a run scans only the blocks above
+    // its last entry. Every carried entry is re-checked against this database before it is
+    // accepted, so the file supplies work already done, never trust.
+    let resume_from = match resume_path {
+        Some(path) => {
+            let bytes = fs::read(path).wrap_err_with(|| format!("reading {}", path.display()))?;
+            let grid = zakura_state::FrontierArtifact::decode(&bytes, network)
+                .map_err(|error| eyre!("reading {}: {error}", path.display()))?;
+            eprintln!(
+                "resuming from {}: {} entries through height {}",
+                path.display(),
+                grid.entries.len(),
+                grid.entries.last().map_or(0, |entry| entry.height.0),
+            );
+            Some(grid)
+        }
+        None => None,
+    };
+
+    // Time each grid step. One step is exactly the replay a serving node performs for a cold
+    // request at this spacing, so the run doubles as the measurement that sizes the grid.
+    let mut entries = 0u64;
+    let mut previous = Instant::now();
+    let export = zakura_state::export_frontier_grid_to(
+        db,
+        height,
+        spacing,
+        resume_from.as_ref(),
+        |entry, blocks| {
+            let step = previous.elapsed();
+            previous = Instant::now();
+            entries += 1;
+
+            if entries.is_multiple_of(FRONTIER_GRID_PROGRESS_INTERVAL) {
+                eprintln!(
+                    "  entry {entries:>7}  height {:>9}  {blocks:>9} blocks replayed  \
+                     last step {:>8.1}ms",
+                    entry.0,
+                    step.as_secs_f64() * 1e3,
+                );
+            }
+        },
+    )
+    .map_err(|error| eyre!("producing the Mainnet historical frontier grid: {error}"))?;
+
+    let grid_bytes = export.frontiers.encode(network);
+    atomic_write(grid_path.to_path_buf(), &grid_bytes)
+        .wrap_err_with(|| format!("writing {}", grid_path.display()))?
+        .wrap_err_with(|| format!("persisting {}", grid_path.display()))?;
+
+    eprintln!(
+        "wrote {}-byte frontier grid to {}: {} entries below checkpoint {}, {} blocks replayed \
+         in {:.1}s",
+        grid_bytes.len(),
+        grid_path.display(),
+        export.frontiers.entries.len(),
+        height.0,
+        export.replayed_blocks,
+        export.elapsed.as_secs_f64(),
+    );
+
     Ok(())
 }
 

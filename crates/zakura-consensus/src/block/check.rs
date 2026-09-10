@@ -4,7 +4,6 @@ use std::{collections::HashSet, sync::Arc};
 
 use chrono::{DateTime, Utc};
 
-use mset::MultiSet;
 use zakura_chain::{
     amount::{
         Amount, DeferredPoolBalanceChange, Error as AmountError, NegativeAllowed, NonNegative,
@@ -24,6 +23,32 @@ use zakura_chain::{
 use zakura_header_chain::{CompactTargetError, PowPolicy};
 
 use crate::{error::*, funding_stream_address};
+
+/// Coinbase outputs that have not yet matched a required subsidy payment.
+///
+/// The source transaction bounds this vector through its serialized size limit.
+struct UnmatchedCoinbaseOutputs {
+    outputs: Vec<Output>,
+}
+
+impl UnmatchedCoinbaseOutputs {
+    /// Copies the bounded outputs from a coinbase transaction.
+    fn new(outputs: &[Output]) -> Self {
+        Self {
+            outputs: outputs.to_vec(),
+        }
+    }
+
+    /// Removes one matching output, preserving duplicate output multiplicity.
+    fn remove(&mut self, expected: &Output) -> bool {
+        let Some(index) = self.outputs.iter().position(|output| output == expected) else {
+            return false;
+        };
+
+        self.outputs.remove(index);
+        true
+    }
+}
 
 /// Checks if there is exactly one coinbase transaction in `Block`,
 /// and if that coinbase transaction is the first transaction in the block.
@@ -155,14 +180,13 @@ pub fn subsidy_is_valid(
 
     let height = block.coinbase_height().ok_or(SubsidyError::NoCoinbase)?;
 
-    let mut coinbase_outputs: MultiSet<Output> = block
-        .transactions
-        .first()
-        .ok_or(SubsidyError::NoCoinbase)?
-        .outputs()
-        .iter()
-        .cloned()
-        .collect();
+    let mut coinbase_outputs = UnmatchedCoinbaseOutputs::new(
+        block
+            .transactions
+            .first()
+            .ok_or(SubsidyError::NoCoinbase)?
+            .outputs(),
+    );
 
     let mut has_amount = |addr: &Address, amount| {
         assert!(addr.is_script_hash(), "address must be P2SH");
@@ -439,4 +463,35 @@ pub fn merkle_root_validity(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use zakura_chain::{
+        amount::{Amount, NonNegative},
+        transparent::{Output, Script},
+    };
+
+    use super::UnmatchedCoinbaseOutputs;
+
+    fn output(value: u64) -> Output {
+        let value = Amount::<NonNegative>::try_from(value).expect("test value is a valid amount");
+        Output::new(value, Script::new(&[]))
+    }
+
+    #[test]
+    fn unmatched_coinbase_outputs_remove_one_duplicate_at_a_time() {
+        let repeated_output = output(1);
+        let distinct_output = output(2);
+        let mut outputs = UnmatchedCoinbaseOutputs::new(&[
+            repeated_output.clone(),
+            repeated_output.clone(),
+            distinct_output.clone(),
+        ]);
+
+        assert!(outputs.remove(&repeated_output));
+        assert!(outputs.remove(&repeated_output));
+        assert!(!outputs.remove(&repeated_output));
+        assert!(outputs.remove(&distinct_output));
+    }
 }

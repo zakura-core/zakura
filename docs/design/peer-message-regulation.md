@@ -1,226 +1,164 @@
 # Zakura peer message regulation: design
 
-> **Status: first draft.** Companion to the
-> [peer message regulation specification](../specs/peer-message-regulation.md), which states the
-> rules. This document gives the reasons and the shape of the implementation. Scope is the three
-> Zakura native reactors: discovery, header sync, block sync.
+> **Status: first draft.** The [specification](../specs/peer-message-regulation.md) states the
+> rules for discovery, header sync, and block sync. This document explains their implementation scope.
 
-## Problem
+## Resource bounds and service policy
 
-Zakura must fully utilize each p2p connection without letting a peer overwhelm the node. Zakura
-bounds attacker-controlled CPU, memory, disk, lock, and response work. It maps those costs to
-cadence, response-byte, concurrency, and reservation bounds for each message role.
+Zakura must use available p2p capacity while bounding peer-controlled work. Regulation bounds frame
+sizes, decoded allocations, verification, active storage work, retained results, buffered output,
+and response authorization. Node-wide bounds limit aggregate commitments across admitted peers.
 
-Before Zakura handles an inbound message, it applies every filter required by that message's role:
+Announcements and discovery requests exchange metadata at a limited cadence. Keep that restriction
+even though block requests intentionally support continuous traffic. A relevance check cannot
+replace frequency control: a peer can continually change fields without providing useful data.
 
-1. **Safe** — Frame checks precede allocation, and bounded decoding precedes expensive verification.
-2. **Authorized** — Each response matches a live reservation created by a request Zakura sent.
-3. **Useful** — The message can affect a receiver decision.
-4. **Budgeted** — The message fits the work bound for its role.
+A conformant block requester can consume service indefinitely. Per-peer byte-rate buckets cannot
+prevent an attacker from creating more identities. Prioritization and peer-slot selection will
+decide which peers receive service. This work bounds resources independently of those future
+policies. Connection admission must bound aggregate connection state.
 
-Only bounded announcement metadata may arrive without a reservation, and a strict cadence limits
-it. Requests pay for the work needed to answer them. Responses consume one-shot, range, or
-subscription reservations. A subscription allows several responses within header and byte credit
-issued by the subscriber. Legal but useless messages consume their cadence token, reservation, or
-drop budget before Zakura drops them.
+This design adds no response-byte charges, fixed request overhead, refunds, or serving-rate refill
+timers. A future rate limit needs a measured resource cost that existing bounds cannot control.
+Repeated unavailable-range lookups and subscription control updates need measurement because small
+responses can still cause CPU or storage work.
 
-A gate disconnects a peer only for behavior that a conformant sender cannot produce. Each inbound
-rule therefore has a matching outbound obligation with a safety margin. Local scheduling decisions
-do not create peer violations.
+## Message checks and handler policy
 
-These message rules do not address a peer that follows the protocol but wastes a connection slot.
-Peer-set policy handles that case separately.
+The implementation may use existing codecs, handlers, and validators. It need not introduce a
+declaration builder, universal filter framework, or one ingress call site per data type.
 
-## Design
+Frame checks precede allocation. Cadence checks precede expensive metadata handling. Reservation
+prechecks supply request-selected decode bounds. Exact response matching precedes expensive
+verification. Worker and buffer admission precede the work that consumes those resources.
 
-The implementation has two layers: message declarations and peer routines.
+Handlers own sequence, expiry, empty-response, and target-selection policy. Keep cheap no-op checks
+where they save work. A separate lock-free relevance snapshot is not required. Local staleness must
+not turn a legal message into a protocol violation. Matched responses still consume authorization
+and reach their handler.
 
-Each message declaration builds an admission path from reusable filters and message-specific
-configuration. The declaration selects the message role, the applicable filters, and their bounds
-and keys. The filters implement the shared admission behavior. The declaration contains the policy
-that differs between messages.
+Ordinary local failures release resources whose work has ended and return affected work to the
+scheduler. They do not count as peer violations. Universal panic recovery belongs to separate
+runtime work. Bounded decoder tests still check that untrusted payloads cannot cause a panic.
 
-Each peer routine creates the configured admission paths and owns their filter state for one
-connection. It passes each inbound message to its admission path before it calls the message
-handler. `admit` applies the configured filters and returns `Continue`, `Drop`, `Delay`,
-`Disconnect`, or `LocalFault`. The peer routine dispatches only `Continue` messages and handles
-every other result at the connection boundary.
+## Capacity admission and QUIC backpressure
 
-```text
-message declaration
-  → filters and message-specific configuration
-  → peer routine with per-connection filter state
-  → admit inbound message
-  → handler or connection action
-```
+The receiver starts response work only when worker capacity and bounded output capacity are
+available. When capacity is unavailable, it stops draining the affected request stream. Capacity
+release resumes eligible processing. Local capacity exhaustion is not a peer violation.
 
-An illustrative API could keep both layers small:
+The receive or serving loop owns this wait. It needs no mandatory admission verdict, second
+delayed-request scheduler, or byte-refill timer. Bound any retained request prefix or decoded request.
 
-```rust
-let headers = MessageDeclaration::response::<Headers>()
-    .with(Frame::max_bytes(MAX_HEADERS_BYTES))
-    .with(Decode::bounded())
-    .with(Reservation::subscription())
-    .with(Verify::using(prepare_headers));
+Stopping application reads must stop draining the QUIC receive buffer. Once the peer consumes its
+existing stream credit, it cannot send more data on that stream. Already authorized bytes still
+count toward the resource bound. Account for both stream and connection credit.
+See [QUIC flow control](https://www.rfc-editor.org/rfc/rfc9000.html#section-4.1).
 
-let mut admission = Admission::new(Declarations::new().with(headers));
+Pausing request intake must not trap responses or control messages needed to finish active work.
+A mixed ordered stream can create that dependency even when every queue is bounded. The concrete
+stream layout must demonstrate simultaneous bidirectional serving and control progress before
+deployment. Connection credit must preserve room for required independent streams.
 
-while let Some(frame) = peer.recv().await? {
-    match admission.admit(frame).await {
-        Continue(message) => handlers.dispatch(message).await?,
-        result => handle_result(peer, result).await?,
-    }
-}
-```
+Bound application read-ahead, decoded objects, retained storage results, verification workers,
+and queued output. QUIC cannot bound resources after the application removes bytes from its receive
+buffer. Reserve output capacity before generating retained results or encoded frames.
 
-This sketch shows the division of responsibility, not a proposed API.
+Protocol inflight limits count outstanding commitments. Execution slots count running operations.
+A node can advertise more inflight requests than workers if it bounds the retained commitments.
 
-The admission path applies each filter before the work that it bounds. The exact filters and their
-order depend on the message role. The specification defines that order and each filter's
-configuration.
+Each operation owns its execution slot until it actually finishes. Disconnecting a peer or dropping
+a waiter does not stop an underlying blocking database read. Keep the slot until that read ends.
+A separate serving query-result timer is unnecessary for this ownership rule. Cancel future work
+where possible and release finished resources exactly once.
 
-`Delay` does not require another request scheduler. The peer routine keeps the current request at
-the admission boundary and stops reading further frames from that peer's ordered stream until Work
-becomes available. The existing bounded application and QUIC queues then apply flow control to the
-peer. This may delay later messages on the same ordered stream, but it does not block another peer
-or service stream.
+Bound the control or empty-response work performed before yielding shared execution. A tiny response
+may never fill the output buffer. This path still needs bounded execution and progress opportunities
+for other runnable work.
 
-A one-shot reservation has this lifecycle:
+## Discovery cadence and state
 
-```mermaid
-sequenceDiagram
-    participant R as Requester
-    participant P as Responder
-    R->>R: Create local reservation
-    R->>P: Request
-    Note over R: Work may be reassigned<br/>Reservation remains live
-    P->>R: Response
-    R->>R: Match and consume reservation
-    R->>R: Run handler
-```
+A discovery-only connection can complete one exchange and close. A connection shared with another
+service can remain open and repeat exchanges. Hello is not limited to one or two messages over
+the lifetime of every connection.
 
-Header sync demonstrates every message role:
+The reviewed [discovery source][discovery-source] sends Hello, GetPeers, and GetServices in each
+exchange. Its default interval is 15 seconds because service summaries have a 30-second default
+validity period. The source can reuse an unchanged signed Hello record until it needs renewal.
 
-| Message | Role | Filters | Result when a filter stops it |
-| --- | --- | --- | --- |
-| `Status` | Announcement | Frame, Decode, Relevant, Cadence | Disconnect on a broken cadence; drop a status that cannot affect a receiver decision |
-| `SubscribeHeaders` | Request | Frame, Decode, Reservation, Work | Disconnect an invalid subscription update; delay a credit grant when the work budget is empty |
-| `Headers` | Response | Frame, Decode, Reservation, Verify | Disconnect a page outside its subscription |
-| `HeadersOutcome` | Response | Frame, Decode, Reservation | Disconnect an unsolicited or invalid outcome |
+Keep Hello cadence. Replace discovery request byte accounting with explicit GetPeers and GetServices
+cadence. The draft permits one initial message and later messages at least 15 seconds apart.
+A requester also waits for its previous response before sending another request of that type.
+Configurable refreshes must obey the protocol minimum. Validate renewal under scheduling jitter
+before enforcing candidate values.
 
-Header sync uses a credit-based subscription to make pushed headers authorized and bounded. The
-subscriber selects an advertised target, supplies a locator, and grants header and byte credit. The
-subscription first authorizes the path to that target. It then authorizes direct descendants as the
-publisher's selected chain grows. Only the subscriber can add credit.
+An unchanged Hello still counts toward cadence. It can satisfy initial-exchange progress when the
+receiver already knows the record. The import handler applies sequence and expiry policy.
 
-The peer routine creates or updates the subscription reservation before it sends an open or grant
-message. The reservation supplies the response identity, decode bounds, accepted cursor, and
-remaining credit. A bounded cursor history lets the publisher validate later acknowledgements
-without retaining unbounded state.
+Peers and Services each consume a one-shot reservation. They need no separate response cadence.
+The requester controls how often it creates those reservations. Keep validation and bounded import
+state. An otherwise valid relayed record with an incompatible protocol range is an import-policy
+rejection. A malformed range remains invalid.
 
-Outstanding credit remains valid until the publisher consumes it or the subscription ends.
-Scheduler reassignment, another peer's response, finality, or a reorganization does not revoke that
-credit. The subscriber admits a matching in-flight page and stops granting credit when it no longer
-wants more work.
+Equal service values can renew validity. An empty Services list clears live service state.
+A generic relevance predicate must not discard either effect.
 
-The publisher must advance an eligible subscription within the protocol deadline. It sends a
-terminal outcome when the subscription closes or its selected chain stops extending the accepted
-cursor. Locators and acknowledgements authorize work; they do not prove application state. Per-peer
-work budgets bound dishonest claims, while peer-set policy handles peers that make no useful
-progress.
+Receiver cadence must tolerate buffered arrivals after stalls and intentional read pauses.
+A rate margin alone does not prove burst tolerance. Establish that the timing and buffering policy
+cannot disconnect a conformant sender. Ambiguous bursts still consume bounded execution capacity.
 
-A subscription renews the reservation and drains in-flight responses before it closes:
+## Reservations and header push
 
-```mermaid
-sequenceDiagram
-    participant S as Subscriber
-    participant P as Publisher
-    S->>S: Create local reservation and add credit
-    S->>P: Open with credit
-    P->>P: Validate open and record credit
-    loop For each authorized response
-        P->>P: Consume send credit
-        P->>S: Response
-        S->>S: Consume local credit and run handler
-        opt Renew from accepted progress
-            S->>S: Add credit locally
-            S->>P: Acknowledge and grant credit
-            P->>P: Validate update and add credit
-        end
-    end
-    opt Close
-        S->>P: Close
-        P->>P: Stop new responses
-        opt A response is already queued
-            P-->>S: Response
-            S->>S: Consume existing credit and run handler
-        end
-        P->>S: Terminal response
-        S->>S: Close local reservation
-    end
-```
+The requester creates a reservation before sending a request. A response consumes exactly one
+reservation or one unconsumed range part. Local work reassignment does not revoke authorization.
 
-Block sync currently destroys reservations when it retires work. Its unmatched-response exceptions
-compensate for that error. Preserving reservations removes those exceptions and makes
-unsolicited-response handling unconditional.
+Header push remains in scope. SubscribeHeaders grants bounded header and byte credit. The
+subscription identifies the initial target, locator, schema, cursor, and authorized descendants.
+QUIC byte credit cannot replace that identity or object authorization.
 
-Budgets bound inbound work; the outbound direction needs its own bound. The work refund and refill
-regenerate admission tokens, not delivery, so a peer that requests responses and never reads them
-would grow the send buffer without limit. The receiver therefore bounds unsent response bytes per
-peer, blocks only that peer's path at the bound, and may disconnect a peer that stops draining.
+Keep bounded acknowledgement history, update ordering, and terminal tombstones. These rules handle
+crossing messages independently of worker admission. The subscriber records credit before sending
+Open or Grant. Both sides consume the corresponding credit when they send or admit a page.
 
-## Testing and introspection
+Close stops new pages and follows queued pages with a terminal outcome. Close processing must not
+wait for a serving worker or data-output capacity. Reserve bounded terminal-output capacity
+independently of header and byte credit. Control updates remain bounded and yield shared execution.
 
-Six test categories keep declarations, codecs, gate state, and runtime behavior aligned:
+Remove the mandatory push deadline. The publisher produces eligible pages when credit, chain data,
+and capacity are available. The subscriber can track progress and select another peer under local
+policy. Slow progress alone is not a protocol violation. Idle subscription state stays bounded.
 
-| Category | Required properties |
-| --- | --- |
-| **Declaration tests** | The closed message inventory has one declaration, one exhaustive handler arm, one exhaustive reference-model arm, legal boundary values, and an explicit state effect for every wire message. |
-| **Property tests** | Encoded legal messages decode to the same value and fit their declared caps. Decoders reject noncanonical encodings. Generated conformant actions satisfy sender preconditions. Production transitions preserve reservation, budget, and state-size invariants. A conformant sender never produces `Disconnect`. |
-| **Fuzz tests** | Fuzz targets search arbitrary frames for decoder panics, trailing-byte acceptance, and allocation-bound violations. |
-| **Panic isolation** | A panic in a decoder, handler, or port operation is caught at its boundary. The process survives, other peers keep running, and the work returns to the scheduler. |
-| **Trace tests** | Each response key consumes at most one reservation part. Honest regtest nodes never produce a `Disconnect` verdict. |
-| **Bounded model exploration** | A finite two-peer block-sync model visits every reachable state within its declared bounds and checks reservation, Work, queue, cleanup, isolation, and bounded-progress invariants. |
+Block sync retains version-2 correlation rules. Live ranges cannot overlap on one connection because
+the wire format lacks a request ID. BlocksDone and RangeUnavailable close the matching range once.
+A separate successor protocol can improve correlation later.
 
-Each gate emits a structured decision to `regulation.jsonl`. Production records non-`Continue`
-decisions. The regtest harness records every decision. The `trace_oracle.py` script checks each
-recorded decision against the expected regtest behavior.
+## Tests and diagnostics
 
-Reservation handling uses a model-based property test. A generator opens, grants, and closes
-subscriptions. It also reassigns work, advances finality, delivers responses and duplicates, and
-closes connections. The generator uses reference-model state to select actions whose sender
-preconditions hold. It does not construct the production invariants that the test checks.
+Use existing tests for frame/allocation bounds, cadence, reservations, subscription races,
+capacity ownership, and transport progress. Test initial and periodic discovery, buffered bursts,
+blocked storage, connection churn, continuous serving, and repeated unavailable-range lookups.
 
-The property test compares the model and production observations after every action. It checks that
-each admitted response consumes live header and byte credit. It also checks that local scheduler
-actions never remove reservations and that subscription state never exceeds its declared bounds.
-The Proptest strategy interprets shrunk choices from reference-model state and retains the original
-conformant or adversarial class.
+Diagnostics identify protocol violations and local failures with bounded logging and storage cost.
+Sampling or aggregation is allowed. Complete per-decision traces are optional test/debug output.
+No particular file name or schema is required.
 
-The [property-testing design](property-testing.md) defines claim strength, stepwise observations,
-the compiler-enforced message addition contract, regression scenarios, and CI profiles. The
-[`GetBlocks` property-testing infrastructure](property-testing-block-sync-infrastructure.md) defines
-the initial two-peer bounded model and identifies the existing test infrastructure that it reuses.
-
-Each message verifier has no I/O, locks, or shared state. This makes every verifier an independent
-fuzz target. The regtest corpus provides the initial fuzz inputs.
+A new exhaustive model explorer, compiler-enforced declaration framework, and universal
+panic-recovery suite are deferred. The [testing design](property-testing.md) and
+[GetBlocks plan](property-testing-block-sync-infrastructure.md) describe the initial checks.
 
 ## Adoption order
 
-Implement the design in five steps:
+1. Check frame, allocation, validation, and response-correlation bounds for every supported message.
+2. Preserve reservations across reassignment and remove unmatched-response exceptions.
+3. Implement bounded execution and output ownership with transport backpressure and bidirectional
+   progress tests. Keep the underlying operation's permit through cancellation.
+4. Add discovery request cadence alongside announcement cadence. Validate sender configuration
+   and buffered-arrival tolerance before enforcing candidate receiver thresholds.
+5. Add header subscriptions with bounded authorization, credit, control processing, and closure.
+   Apply capacity admission without a byte-rate bucket or mandatory push deadline.
 
-1. Define the closed inventory for every current message. Add compile-time declaration closure,
-   deterministic property-coverage checks, and replace `PipeShape`.
-2. Build one cadence budget per `(peer, message type)` from the message declarations.
-3. Preserve block-sync reservations until a response arrives or the connection ends. Then remove
-   the unmatched-response exceptions.
-4. Give each peer an independent processing path. Add Work and `Delay` for discovery and block-sync
-   requests only after that path exists.
-5. Replace `GetHeaders` with `SubscribeHeaders`. Price each credit grant by its byte credit and add
-   the subscription reservation and header-sync Work bound.
+Prioritization, peer-slot policy, exhaustive model exploration, and universal panic recovery remain
+separate work. Stream layout can have its own design, but admission must demonstrate the progress
+requirements above.
 
-Only the final step adds header push and a work bound that Zakura lacks today. The earlier steps
-create the structure needed to enforce both safely.
-
-Message priority and stream layout remain out of scope. They require a separate specification and
-design.
+[discovery-source]: https://github.com/zakura-core/zakura/blob/fbf466b07dbc0e86c3ad1e8ae33c2f9e94f8a647/crates/zakura-network/src/zakura/discovery/service.rs#L851

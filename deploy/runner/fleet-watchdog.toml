@@ -7,3 +7,13 @@ dashboard_url = "http://167.99.103.111:8090/"
 name = "mainnet"
 url = "http://127.0.0.1:8090/data"
 dashboard_url = "http://159.65.183.89:8090/"
+
+# The Mainnet release-state pipeline. Watching the published pointer rather than the
+# generator's unit is deliberate: it catches a timer that silently stopped firing and
+# a host that vanished, neither of which a systemd OnFailure would report. The
+# generator exports daily, and the 48h default window matches
+# fetch-release-state.py's --max-age-hours, so an alert fires before the weekly
+# import would refuse the bundle rather than after.
+[[release_state]]
+name = "mainnet"
+url = "https://zakura-release.valargroup.dev/release-state/latest.json"

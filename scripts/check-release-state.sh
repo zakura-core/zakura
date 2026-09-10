@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Verify the committed Mainnet release state without cargo: the checkpoint
 # list, VCT frontier, historical subtree roots, and manifest must identify the
-# same finalized block. Used by `make pre-release-state` and the update-release-state
+# same finalized block, and the pinned frontier grid dependency must name the
+# same checkpoint. Used by `make pre-release-state` and the update-release-state
 # workflow; the cargo-side twin is the `embedded_mainnet_final_frontiers_parse`
 # unit test. See docs/design/verified-commitment-trees.md, section 16.3.
 #
@@ -19,6 +20,7 @@ ZAKURA_ALLOW_BOOTSTRAP_RELEASE_STATE="${ZAKURA_ALLOW_BOOTSTRAP_RELEASE_STATE:-0}
 import hashlib
 import json
 import os
+import re
 import struct
 import sys
 from datetime import datetime, timedelta, timezone
@@ -26,7 +28,15 @@ from datetime import datetime, timedelta, timezone
 CHECKPOINTS = "crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt"
 FRONTIER = "crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin"
 SUBTREES = "crates/zakura-state/src/service/finalized_state/vct/mainnet-subtrees.bin"
+FRONTIER_GRID = (
+    "crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier-grid.bin"
+)
 PROVENANCE = "crates/zakura-state/src/service/finalized_state/vct/mainnet-vct-manifest.json"
+WORKSPACE_MANIFEST = "Cargo.toml"
+LOCKFILE = "Cargo.lock"
+# The workspace dependency key, which is renamed: the published package name is read out of the
+# pin so this script never has to know it.
+ASSETS_DEPENDENCY = "zakura-assets"
 REQUIRED_KEYS = {
     "schema_version",
     "network",
@@ -40,7 +50,14 @@ REQUIRED_KEYS = {
     "subtrees_sha256",
     "subtrees_size",
 }
-OPTIONAL_KEYS = {"meta_sha256"}
+# The frontier grid joined the bundle after the other three artifacts, so a manifest
+# without it is a valid older one. Half a record, or a record without its file, is not.
+FRONTIER_GRID_KEYS = {
+    "frontier_grid_sha256",
+    "frontier_grid_size",
+    "frontier_grid_entries",
+}
+OPTIONAL_KEYS = {"meta_sha256"} | FRONTIER_GRID_KEYS
 STALE_WARNING = timedelta(days=14)
 # NetworkUpgrade::Nu6_3 (Ironwood) activation on Mainnet; kept in sync with
 # crates/zakura-chain/src/parameters/constants.rs. Frontiers at or above activation
@@ -168,6 +185,103 @@ if (
     != subtrees[subtree_prefix.size:subtree_header_len]
 ):
     fail(f"{SUBTREES} digest does not match its header")
+
+grid_keys = FRONTIER_GRID_KEYS & set(provenance)
+if grid_keys and grid_keys != FRONTIER_GRID_KEYS:
+    fail(
+        "provenance has a partial frontier grid record, missing "
+        f"{', '.join(sorted(FRONTIER_GRID_KEYS - grid_keys))}"
+    )
+# The grid is published as a crates.io package rather than committed, so what this script can
+# check without cargo is that the pin and the provenance record describe the same checkpoint.
+# The bytes themselves are bound to the manifest by the `embedded_mainnet_final_frontiers_parse`
+# unit test, which has the pinned dependency in hand; their framing is checked by
+# `FrontierArtifact::decode`, by `scripts/pack-assets-crate.py` before publication, and by
+# `zakurad verify-historical-treestates` before import.
+if os.path.exists(FRONTIER_GRID):
+    fail(
+        f"{FRONTIER_GRID} is committed; the frontier grid ships as the pinned "
+        f"{ASSETS_DEPENDENCY} dependency so it never enters git history"
+    )
+
+try:
+    workspace_manifest = open(WORKSPACE_MANIFEST, encoding="utf-8").read()
+except OSError as error:
+    fail(f"cannot read {WORKSPACE_MANIFEST}: {error}")
+
+pin = re.search(
+    rf'^{re.escape(ASSETS_DEPENDENCY)} = \{{(?P<body>[^}}]*)\}}$',
+    workspace_manifest,
+    re.MULTILINE,
+)
+if not grid_keys:
+    if pin is not None:
+        fail(
+            f"{WORKSPACE_MANIFEST} pins {ASSETS_DEPENDENCY} but the provenance record does not "
+            "describe a frontier grid"
+        )
+else:
+    if pin is None:
+        fail(
+            f"provenance describes a frontier grid but {WORKSPACE_MANIFEST} does not pin "
+            f"{ASSETS_DEPENDENCY}"
+        )
+    requirement = re.search(r'version = "(?P<requirement>[^"]+)"', pin.group("body"))
+    if requirement is None:
+        fail(f"{ASSETS_DEPENDENCY} must pin a version")
+    requirement = requirement.group("requirement")
+    # Reviewed bytes, not a compatible range: a caret or wildcard requirement would let a
+    # different artifact satisfy the same pin.
+    if not requirement.startswith("="):
+        fail(f"{ASSETS_DEPENDENCY} must pin an exact version, found {requirement!r}")
+    pinned_version = requirement[1:]
+
+    published = re.search(r'package = "(?P<package>[^"]+)"', pin.group("body"))
+    published_name = published.group("package") if published else ASSETS_DEPENDENCY
+
+    # The version is `0.<last_checkpoint>.<revision>`, so the pin itself states which checkpoint
+    # the payload covers. This is what makes a pin bump without a manifest bump, or the reverse,
+    # a failure rather than a silent divergence.
+    parts = pinned_version.split(".")
+    if len(parts) != 3 or parts[0] != "0" or not parts[1].isdigit() or not parts[2].isdigit():
+        fail(
+            f"{ASSETS_DEPENDENCY} version {pinned_version!r} is not "
+            "0.<last_checkpoint>.<revision>"
+        )
+    if int(parts[1]) != height:
+        fail(
+            f"{ASSETS_DEPENDENCY} pins checkpoint {parts[1]}, not provenance finalized_height "
+            f"{height}"
+        )
+
+    try:
+        lock = open(LOCKFILE, encoding="utf-8").read()
+    except OSError as error:
+        fail(f"cannot read {LOCKFILE}: {error}")
+    # `rest` stops at the blank line that ends a lockfile package block. Letting it run past
+    # that would find some later package's source and checksum and pass on anything.
+    locked = re.search(
+        r'^\[\[package\]\]\nname = "'
+        + re.escape(published_name)
+        + r'"\nversion = "(?P<version>[^"]+)"\n(?P<rest>(?:[^\[\n].*\n)*)',
+        lock,
+        re.MULTILINE,
+    )
+    if locked is None:
+        fail(f"{LOCKFILE} does not lock {published_name}")
+    if locked.group("version") != pinned_version:
+        fail(
+            f"{LOCKFILE} locks {published_name} {locked.group('version')}, but "
+            f"{WORKSPACE_MANIFEST} pins {pinned_version}"
+        )
+    # A path or git override resolves without a registry checksum, which would drop the strongest
+    # byte-level pin the lockfile provides. Local overrides belong in `--config`, not in a commit.
+    if 'source = "registry+https://github.com/rust-lang/crates.io-index"' not in locked.group(
+        "rest"
+    ):
+        fail(f"{LOCKFILE} must resolve {published_name} from crates.io")
+    if "checksum = " not in locked.group("rest"):
+        fail(f"{LOCKFILE} must carry a registry checksum for {published_name}")
 
 source = provenance["source"]
 meta_sha256 = provenance.get("meta_sha256")

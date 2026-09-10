@@ -1379,3 +1379,101 @@ async fn single_stream_retirement_preserves_remote_cause_and_local_neutrality(
     }
     Ok(())
 }
+
+/// Model the request owner's partial-write abort contract at the worker boundary.
+#[derive(Debug)]
+struct CancellingWriteClaim {
+    cancel: CancellationToken,
+    failure: OrderedStreamFailureCause,
+    expected: Option<OrderedStreamFailure>,
+}
+
+impl crate::zakura::FrameWriteClaim for CancellingWriteClaim {
+    fn try_start(&self) -> bool {
+        true
+    }
+
+    fn written(&self) {
+        panic!("the peer cannot accept this frame within its receive window");
+    }
+}
+
+impl Drop for CancellingWriteClaim {
+    fn drop(&mut self) {
+        assert_eq!(self.failure.get(), self.expected);
+        self.cancel.cancel();
+    }
+}
+
+#[tokio::test]
+async fn failed_write_records_cause_before_claim_cancels_session() -> Result<(), BoxError> {
+    let _guard = zakura_test::init();
+    let (router, client, connection, remote) = raw_connection().await?;
+    for expected in [
+        Some(OrderedStreamFailure::RemoteClose),
+        Some(OrderedStreamFailure::WriteTimeout),
+        None,
+    ] {
+        let (mut peer_send, mut peer_recv) = connection.open_bi().await?;
+        peer_send
+            .write_all(&frame(1, 0, 0).encode(DATA.frame_cap)?)
+            .await?;
+        let (send, recv) = timeout(TEST_TIMEOUT, remote.accept_bi()).await??;
+        let slots = Arc::new(Semaphore::new(1));
+        let mut context = raw_worker_context(&client, slots.clone());
+        if expected == Some(OrderedStreamFailure::WriteTimeout) {
+            context.write_policy = StreamWritePolicy::Timeout(Duration::from_millis(250));
+        }
+        let connection_cancel = context.connection_token.clone();
+        let cancel = context.stream_token.clone();
+        let failure = OrderedStreamFailureCause::default();
+        let prelude = StreamPrelude {
+            magic: STREAM_PRELUDE_MAGIC,
+            stream_kind: REQUESTS.kind,
+            stream_version: REQUESTS.version,
+            request_id: None,
+            max_frame_bytes: DATA.frame_cap,
+        };
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
+        let (outbound_tx, outbound_rx) = worker_framed_channel(1);
+        let worker = AbortOnDropHandle::new(tokio::spawn(persistent_stream_worker_with_policy(
+            send,
+            recv,
+            prelude,
+            context,
+            inbound_tx,
+            outbound_rx,
+            1,
+            Some(failure.clone()),
+        )));
+        assert_eq!(
+            timeout(TEST_TIMEOUT, inbound_rx.recv()).await?,
+            Some(frame(1, 0, 0))
+        );
+        assert!(outbound_tx.try_reserve_guarded().unwrap().send_request(
+            frame(1, 17, 1024 * 1024),
+            Arc::new(CancellingWriteClaim {
+                cancel: cancel.clone(),
+                failure: failure.clone(),
+                expected
+            }),
+        ));
+        // Partial bytes prove the claim started. Withhold the remaining QUIC
+        // credit so every case exercises a failed or cancelled partial write.
+        timeout(TEST_TIMEOUT, peer_recv.read_exact(&mut [0; 1])).await??;
+        match expected {
+            Some(OrderedStreamFailure::RemoteClose) => peer_recv.stop(0u32.into())?,
+            Some(OrderedStreamFailure::WriteTimeout) => {}
+            None => cancel.cancel(),
+        }
+        timeout(TEST_TIMEOUT, cancel.cancelled()).await?;
+        assert_eq!(failure.get(), expected);
+        timeout(TEST_TIMEOUT, worker).await??;
+        assert_eq!(slots.available_permits(), 1);
+        assert!(!connection_cancel.is_cancelled());
+    }
+    connection.close(0u32.into(), b"done");
+    timeout(TEST_TIMEOUT, client.close()).await?;
+    timeout(TEST_TIMEOUT, router.shutdown()).await??;
+    Ok(())
+}

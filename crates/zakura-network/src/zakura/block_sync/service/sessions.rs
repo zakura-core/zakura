@@ -17,23 +17,28 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 ///
 /// Inbound means the peer connected to us; outbound means we connected to the
 /// peer. Each pair takes one slot from its direction and one temporary setup slot
-/// from the allowance shared across both directions. A semaphore permit represents
-/// one occupied slot.
+/// from the allowance shared across both directions. When outbound sessions are
+/// enabled, inbound setup cannot take the final pending slot. This lets an
+/// outbound session start even while inbound peers withhold their second role.
 #[derive(Debug)]
 pub(super) struct SessionCapacity {
     inbound: Arc<Semaphore>,
     outbound: Arc<Semaphore>,
     pending: Arc<Semaphore>,
+    inbound_pending: Arc<Semaphore>,
     changed: watch::Sender<()>,
 }
 
 impl SessionCapacity {
     pub(super) fn new(limits: ServicePeerLimits) -> Self {
         let pool = |count: usize| Arc::new(Semaphore::new(count.min(Semaphore::MAX_PERMITS)));
+        let pending = limits.max_pending_escalations.min(Semaphore::MAX_PERMITS);
+        let inbound_pending = pending.saturating_sub(usize::from(limits.max_outbound_peers > 0));
         Self {
             inbound: pool(limits.max_inbound_peers),
             outbound: pool(limits.max_outbound_peers),
-            pending: pool(limits.max_pending_escalations),
+            pending: pool(pending),
+            inbound_pending: pool(inbound_pending),
             changed: watch::channel(()).0,
         }
     }
@@ -54,7 +59,10 @@ impl SessionCapacity {
     /// Check whether setup could start now, without taking any slots.
     /// Another task can claim them before [`Self::reserve`], so this is only a hint.
     pub(super) fn available(&self, direction: ServicePeerDirection) -> bool {
-        self.pool(direction).available_permits() > 0 && self.pending.available_permits() > 0
+        self.pool(direction).available_permits() > 0
+            && self.pending.available_permits() > 0
+            && (direction == ServicePeerDirection::Outbound
+                || self.inbound_pending.available_permits() > 0)
     }
 
     #[cfg(test)]
@@ -75,11 +83,29 @@ impl SessionCapacity {
         &self,
         direction: ServicePeerDirection,
     ) -> Result<Arc<dyn OrderedSessionResources>, OrderedSessionFull> {
-        let pending = self
-            .pending
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| OrderedSessionFull)?;
+        let inbound = if direction == ServicePeerDirection::Inbound {
+            Some(
+                self.inbound_pending
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| OrderedSessionFull)?,
+            )
+        } else {
+            None
+        };
+        let pending = match self.pending.clone().try_acquire_owned() {
+            Ok(node) => PendingSessionSlots {
+                _node: node,
+                _inbound: inbound,
+            },
+            Err(_) => {
+                if inbound.is_some() {
+                    drop(inbound);
+                    self.changed.send_replace(());
+                }
+                return Err(OrderedSessionFull);
+            }
+        };
         let session = match self.pool(direction).clone().try_acquire_owned() {
             Ok(session) => session,
             Err(_) => {
@@ -104,6 +130,13 @@ impl SessionCapacity {
     }
 }
 
+/// One pending pair, charged to the node and to the inbound cap when applicable.
+#[derive(Debug)]
+struct PendingSessionSlots {
+    _node: OwnedSemaphorePermit,
+    _inbound: Option<OwnedSemaphorePermit>,
+}
+
 /// Holds a pair's session and setup slots on behalf of its workers and send handles.
 ///
 /// Each owner retains an `Arc` to this value. The session slot stays occupied
@@ -113,7 +146,7 @@ struct SessionResources {
     reserved: metrics::Gauge,
     pending_count: metrics::Gauge,
     session: Option<OwnedSemaphorePermit>,
-    pending: StdMutex<Option<OwnedSemaphorePermit>>,
+    pending: StdMutex<Option<PendingSessionSlots>>,
     changed: watch::Sender<()>,
 }
 

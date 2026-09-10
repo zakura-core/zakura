@@ -128,6 +128,9 @@ one setup interval so waiting sessions can claim the released capacity. A comple
 replacement that races old-worker cleanup is rejected locally and can retry through
 the existing reopen backoff; it must not disconnect unrelated services. Retiring
 workers and senders keep their permits until they actually release their resources.
+Protect one pending setup slot from inbound pairs whenever outbound sessions are
+enabled. Incomplete inbound pairs can occupy at most 31 of the default 32 slots,
+so outbound setup can still start without increasing the node's total allowance.
 
 #### Current session tracking
 

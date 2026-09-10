@@ -44,6 +44,12 @@ arrive within the configured prelude deadline, three seconds by default.
 Setup holds the service's pending and directional session permits. Admission
 releases the pending permit; transport tasks and application senders retain the
 session permit through teardown.
+The pending allowance is shared across directions, with one slot protected from
+inbound setup whenever outbound sessions are enabled. At the default limit of
+32, at most 31 incomplete inbound pairs can reserve setup capacity. Outbound
+setup can use the remaining slot, and all setup together stays capped at 32.
+With a limit of one, only outbound setup is possible unless outbound sessions
+are disabled.
 The demand check for a complete incoming pair reuses that reservation, so the
 last available slot can admit a session. It still honors parks and useful-work
 policy; opening another pair requires a new reservation.

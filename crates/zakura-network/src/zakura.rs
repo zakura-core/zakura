@@ -101,8 +101,9 @@ pub struct ServicePeerLimits {
     /// Maximum paired service sessions that may be establishing at once.
     ///
     /// Paired block sync reserves this allowance until both roles arrive or
-    /// setup ends. Zero disables new paired sessions. Other services currently
-    /// use their existing admission policy.
+    /// setup ends. If outbound sessions are enabled, one slot is protected from
+    /// inbound setup. A limit of one then permits only outbound setup; zero
+    /// disables new paired sessions. Other services use their existing policy.
     pub max_pending_escalations: usize,
 }
 

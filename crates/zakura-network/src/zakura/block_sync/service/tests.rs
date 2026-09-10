@@ -1,23 +1,100 @@
 use super::*;
 
+#[test]
+fn inbound_half_pairs_leave_an_outbound_setup_slot() {
+    let limits = ServicePeerLimits::default();
+    assert_eq!(limits.max_pending_escalations, 32);
+    let capacity = SessionCapacity::new(limits);
+    let mut inbound: Vec<_> = (0..31)
+        .map(|_| capacity.reserve(ServicePeerDirection::Inbound).unwrap())
+        .collect();
+    for _ in 0..20 {
+        assert!(!capacity.available(ServicePeerDirection::Inbound));
+        assert!(capacity.reserve(ServicePeerDirection::Inbound).is_err());
+        assert!(capacity.available(ServicePeerDirection::Outbound));
+        let outbound = capacity.reserve(ServicePeerDirection::Outbound).unwrap();
+        assert_eq!(capacity.available_counts().2, 0);
+        assert!(capacity.reserve(ServicePeerDirection::Outbound).is_err());
+        outbound.admitted();
+        assert_eq!(capacity.available_counts().2, 1);
+        assert!(!capacity.available(ServicePeerDirection::Inbound));
+        drop(outbound);
+        // Churning one half-pair must neither steal nor leak the protected slot.
+        drop(inbound.pop());
+        inbound.push(capacity.reserve(ServicePeerDirection::Inbound).unwrap());
+    }
+    drop(inbound);
+    assert_eq!(capacity.available_counts(), (256, 256, 32));
+}
+
+#[test]
+fn failed_pending_admission_returns_inbound_capacity() {
+    let limits = ServicePeerLimits::default();
+    let capacity = SessionCapacity::new(limits);
+    let outbound: Vec<_> = (0..32)
+        .map(|_| capacity.reserve(ServicePeerDirection::Outbound).unwrap())
+        .collect();
+    for _ in 0..64 {
+        assert!(capacity.reserve(ServicePeerDirection::Inbound).is_err());
+    }
+    drop(outbound);
+    let inbound: Vec<_> = (0..31)
+        .map(|_| capacity.reserve(ServicePeerDirection::Inbound).unwrap())
+        .collect();
+    assert!(capacity.reserve(ServicePeerDirection::Outbound).is_ok());
+    drop(inbound);
+    assert_eq!(capacity.available_counts(), (256, 256, 32));
+}
+
+#[test]
+fn minimal_setup_limits_preserve_outbound_and_inbound_only_modes() {
+    for (pending, inbound_limit, outbound_limit, inbound_ok, outbound_ok) in [
+        (0, 1, 1, false, false),
+        (1, 1, 1, false, true),
+        (1, 1, 0, true, false),
+        (2, 0, 1, false, true),
+        (2, 1, 1, true, true),
+    ] {
+        let capacity = SessionCapacity::new(ServicePeerLimits {
+            max_pending_escalations: pending,
+            max_inbound_peers: inbound_limit,
+            max_outbound_peers: outbound_limit,
+            ..ServicePeerLimits::default()
+        });
+        for (direction, available) in [
+            (ServicePeerDirection::Inbound, inbound_ok),
+            (ServicePeerDirection::Outbound, outbound_ok),
+        ] {
+            assert_eq!(capacity.available(direction), available);
+            let reservation = capacity.reserve(direction);
+            assert_eq!(reservation.is_ok(), available);
+            drop(reservation);
+            assert_eq!(
+                capacity.available_counts(),
+                (inbound_limit, outbound_limit, pending)
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn pair_setup_and_retirement_keep_their_service_capacity() {
     use crate::zakura::{OrderedSessionResources, ServicePeerLimits};
     let capacity = SessionCapacity::new(ServicePeerLimits {
         max_inbound_peers: 1,
         max_outbound_peers: 1,
-        max_pending_escalations: 1,
+        max_pending_escalations: 2,
         ..ServicePeerLimits::default()
     });
     let mut changed = capacity.subscribe();
     let pending = capacity.reserve(ServicePeerDirection::Outbound).unwrap();
+    let inbound = capacity.reserve(ServicePeerDirection::Inbound).unwrap();
     assert!(
         capacity.reserve(ServicePeerDirection::Inbound).is_err(),
         "setup allowance is shared across directions"
     );
     pending.admitted();
     changed.changed().await.unwrap();
-    let inbound = capacity.reserve(ServicePeerDirection::Inbound).unwrap();
     inbound.admitted();
     let (send, _recv) = crate::zakura::transport::worker_framed_channel(1);
     let send = send.with_session_resources(Some(pending.clone()));
@@ -39,12 +116,13 @@ async fn pair_setup_and_retirement_keep_their_service_capacity() {
 async fn abandoned_pair_setup_returns_capacity_and_wakes_demand() {
     use crate::zakura::ServicePeerLimits;
     let capacity = SessionCapacity::new(ServicePeerLimits {
-        max_pending_escalations: 1,
+        max_pending_escalations: 2,
         ..ServicePeerLimits::default()
     });
     let mut changed = capacity.subscribe();
-    let pending = capacity.reserve(ServicePeerDirection::Outbound).unwrap();
+    let pending = capacity.reserve(ServicePeerDirection::Inbound).unwrap();
     assert!(!capacity.available(ServicePeerDirection::Inbound));
+    assert!(capacity.available(ServicePeerDirection::Outbound));
     drop(pending);
     time::timeout(Duration::from_secs(1), changed.changed())
         .await

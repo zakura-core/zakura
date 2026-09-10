@@ -120,6 +120,10 @@ impl RequestWrite {
         self.owner
     }
 
+    pub(super) fn heights(&self) -> impl Iterator<Item = block::Height> + '_ {
+        self.items.iter().map(|(height, _)| *height)
+    }
+
     /// A reserved queue slot lost its receiver during publication. Settle the
     /// ledger now even if that closed channel retains a copy of this claim.
     pub(in crate::zakura::block_sync) fn delivery_failed(&self) {

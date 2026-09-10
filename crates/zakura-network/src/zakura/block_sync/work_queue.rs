@@ -608,6 +608,8 @@ impl WorkQueue {
         self.release_reserved_and_return_items_detailed_matching(None, heights)
     }
 
+    /// Return this owner's unreceived heights. Expiring a queued frame also
+    /// returns every other unsent height owned by that request under the same lock.
     pub(super) fn release_reserved_and_return_items_detailed_for_owner(
         &self,
         owner: zakura_header_chain::BodyWorkOwner,
@@ -623,6 +625,7 @@ impl WorkQueue {
     ) -> WorkReturnOutcome {
         let mut moved = false;
         let mut outcome = WorkReturnOutcome::default();
+        let mut heights: std::collections::BTreeSet<_> = heights.into_iter().collect();
         let claim;
         {
             let mut inner = self.lock();
@@ -632,6 +635,11 @@ impl WorkQueue {
                 // The writer claims under this same lock. Expiry skips an
                 // unwritten frame; an already-started frame must finish.
                 claim.expire_unwritten();
+                if claim.status().was_skipped() {
+                    // Skipping an unsent frame retires its whole request. Return
+                    // every remaining reservation without waiting for queue drain.
+                    heights.extend(claim.heights());
+                }
             }
             for height in heights {
                 outcome.min_height = Some(

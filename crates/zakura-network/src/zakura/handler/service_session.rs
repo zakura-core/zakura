@@ -205,6 +205,7 @@ pub(super) fn spawn_service_session(
         opened_locally,
     };
     let mut running = futures::stream::FuturesUnordered::new();
+    let application_drain = Arc::new(tokio::sync::Barrier::new(streams.len()));
     for mut prepared in streams {
         prepared.context.stream_token = cancel.clone();
         let (inbound_depth, outbound_depth) =
@@ -218,6 +219,7 @@ pub(super) fn spawn_service_session(
             send: sender.with_session_resources(prepared.context.session_resources.clone()),
         });
         let failure_cause = failure_cause.clone();
+        let application_drain = application_drain.clone();
         running.push(async move {
             let (send, recv) = prepared.io.take();
             persistent_stream_worker_with_policy(
@@ -229,6 +231,7 @@ pub(super) fn spawn_service_session(
                 outbound_rx,
                 inbound_depth,
                 Some(failure_cause),
+                Some(application_drain),
             )
             .await;
         });

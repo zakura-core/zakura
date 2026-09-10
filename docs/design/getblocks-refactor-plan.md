@@ -141,6 +141,9 @@ so outbound setup can still start without increasing the node's total allowance.
 **Example:** B's session 7 is replaced by session 8 while the reactor is busy. Both designs cancel session 7 directly. Today the reactor processes queued lifecycle events; after the change, it reads session 8 from the current table and reconciles its state. Repeated replacements must not accumulate a queue of obsolete events.
 
 Preserve readiness signals, download cleanup, and peer counts, including changes arriving during reconciliation. Keep the existing session-identity checks: delayed requests, results, or cleanup from session 7 must never affect session 8.
+Service teardown removes its exact registry generation even if admission and
+removal coalesce before the reactor observes either. Cleanup of session 7 must
+still leave session 8's registry entry intact.
 
 #### Resource limits
 

@@ -866,18 +866,15 @@ impl BlockSyncReactor {
             self.registry.remove_session(&peer, session_id);
             return;
         }
-        let received_status = self.registry_received_status(&peer);
-        if self.state.peers.remove(&peer).is_some() {
+        if let Some(removed) = self.state.peers.remove(&peer) {
+            // Service teardown may already have removed the registry generation.
+            let received_status = *removed.session.subscribe_remote_status().borrow();
             set_block_reactor_active_connection_gauge(self.state.peers.len());
             self.trace_peer_disconnected(&peer, received_status, self.state.peers.len());
         }
         self.registry.remove_session(&peer, session_id);
         self.publish_peer_snapshot();
         self.publish_candidate_state();
-    }
-
-    fn registry_received_status(&self, peer: &ZakuraPeerId) -> bool {
-        self.registry.has_received_status(peer)
     }
 
     async fn handle_header_tip_changed(&mut self, height: block::Height, hash: block::Hash) {

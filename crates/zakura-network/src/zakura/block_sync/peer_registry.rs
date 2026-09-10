@@ -794,9 +794,8 @@ impl PeerRegistry {
         })
     }
 
-    /// Whether the peer has sent a `Status` (the reactor's serving-admission and
-    /// disconnect-trace read). The routine owns the rest of the serving caps
-    /// locally now (inverted inbound flow); only `received_status` is read reactor-side.
+    /// Whether a test peer's `Status` has reached the shared registry.
+    #[cfg(test)]
     pub(super) fn has_received_status(&self, peer: &ZakuraPeerId) -> bool {
         let peers = self.lock();
         peers.get(peer).is_some_and(|entry| entry.received_status)

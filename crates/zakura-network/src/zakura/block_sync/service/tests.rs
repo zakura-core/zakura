@@ -176,6 +176,98 @@ async fn session_churn_coalesces_and_changes_during_reconciliation_remain_visibl
     assert!(current.snapshot().is_empty());
 }
 
+#[tokio::test]
+async fn teardown_before_reconciliation_removes_registry_generations() {
+    let config = ZakuraBlockSyncConfig::default();
+    let (handle, _actions, reactor_task) =
+        spawn_block_sync_reactor(BlockSyncStartup::inert(config.clone()));
+    // Neither admission nor removal can be observed by the reactor in this test.
+    reactor_task.abort();
+    let registry = handle.routine_wiring.as_ref().unwrap().registry.clone();
+    let service = BlockSyncService::new_with_handle(config, handle);
+    let current = service.current_sessions_for_test();
+    for close_connection in [true, false] {
+        for identity in 32..64 {
+            let peer = ZakuraPeerId::new(vec![identity; 32]).unwrap();
+            let conn_id = u64::from(identity);
+            let (session, _input, _output) = admit_unobserved_peer(&service, peer.clone(), conn_id);
+            assert!(registry.owns_generation(&peer, session.session_id()));
+            let mut changed = current.subscribe();
+            if close_connection {
+                service.remove_peer(&peer, conn_id);
+                assert!(!registry.owns_generation(&peer, session.session_id()));
+            } else {
+                session.cancel_token().cancel();
+            }
+            time::timeout(Duration::from_secs(1), async {
+                while !current.snapshot().is_empty() {
+                    changed.changed().await.unwrap();
+                }
+            })
+            .await
+            .expect("teardown completes without reactor readiness");
+            assert!(!registry.owns_generation(&peer, session.session_id()));
+            assert!(session.cancel_token().is_cancelled());
+        }
+    }
+}
+
+#[tokio::test]
+async fn stale_teardown_cannot_remove_an_unobserved_replacement() {
+    let config = ZakuraBlockSyncConfig::default();
+    let (handle, _actions, reactor_task) =
+        spawn_block_sync_reactor(BlockSyncStartup::inert(config.clone()));
+    reactor_task.abort();
+    let registry = handle.routine_wiring.as_ref().unwrap().registry.clone();
+    let service = BlockSyncService::new_with_handle(config, handle);
+    let peer = ZakuraPeerId::new(vec![91; 32]).unwrap();
+    let (old, _old_input, _old_output) = admit_unobserved_peer(&service, peer.clone(), 1);
+    let (new, _new_input, _new_output) = admit_unobserved_peer(&service, peer.clone(), 2);
+    assert_ne!(old.session_id(), new.session_id());
+    assert!(!service.inner.finish_session(&peer, 1, old.session_id()));
+    service.remove_peer(&peer, 1);
+    assert!(registry.owns_generation(&peer, new.session_id()));
+    assert!(!new.cancel_token().is_cancelled());
+    assert_eq!(
+        service.current_sessions_for_test().snapshot()[&peer].session_id(),
+        new.session_id()
+    );
+
+    let current = service.current_sessions_for_test();
+    let mut changed = current.subscribe();
+    new.cancel_token().cancel();
+    time::timeout(Duration::from_secs(1), async {
+        while !current.snapshot().is_empty() {
+            changed.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("the replacement's own teardown completes");
+    assert!(!registry.owns_generation(&peer, new.session_id()));
+}
+
+fn admit_unobserved_peer(
+    service: &BlockSyncService,
+    peer: ZakuraPeerId,
+    conn_id: ZakuraConnId,
+) -> (BlockSyncPeerSession, FramedSend, FramedRecv) {
+    let (input, recv) = crate::zakura::framed_channel(4);
+    let (send, output) = crate::zakura::framed_channel(4);
+    service.add_peer(
+        crate::zakura::testkit::DownloadOnlyPeer::create_with_conn_id_and_direction(
+            conn_id,
+            peer.clone(),
+            None,
+            ZAKURA_CAP_BLOCK_SYNC,
+            ServicePeerDirection::Outbound,
+            HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (recv, send))]),
+            CancellationToken::new(),
+        ),
+    );
+    let session = service.current_sessions_for_test().snapshot()[&peer].clone();
+    (session, input, output)
+}
+
 impl BlockSyncService {
     pub(crate) fn available_session_slots_for_test(&self) -> (usize, usize, usize) {
         self.inner.capacity.available_counts()

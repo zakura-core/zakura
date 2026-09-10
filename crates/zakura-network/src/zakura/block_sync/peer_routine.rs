@@ -2270,8 +2270,8 @@ impl Drop for PeerRoutine {
     /// a fresh one) while the peer stays connected, so its servable/caps must
     /// survive. If the guard removed the entry, an old routine's async Drop could
     /// race *after* the respawned routine re-inserted and nuke the live entry.
-    /// The reactor owns entry insert (on connect) and remove (on disconnect/
-    /// admission-reject); see `handle_peer_disconnected`.
+    /// Service teardown and reactor rejection remove only their exact session's
+    /// entry, including sessions that end before the reactor observes them.
     fn drop(&mut self) {
         self.return_unreceived_requests("peer_routine_drop");
     }

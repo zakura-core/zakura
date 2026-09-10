@@ -263,6 +263,11 @@ impl BlockSyncServiceInner {
         let removed = active_peers
             .remove(peer)
             .expect("record exists because the ownership check just matched it");
+        // A coalesced notification can hide this session from the reactor.
+        // Its owner must remove the registry generation even in that case.
+        if let Some(wiring) = &self.routine_wiring {
+            wiring.registry.remove_session(peer, session_id);
+        }
 
         // The connection may outlive this session while the transport backs off
         // before reopening the stream; remember the claim so ownership checks
@@ -896,6 +901,9 @@ impl Service for BlockSyncService {
             return;
         };
 
+        if let Some(wiring) = &self.inner.routine_wiring {
+            wiring.registry.remove_session(peer, record.session_id);
+        }
         record.cancel_token.cancel();
         self.inner.sessions.notify();
     }

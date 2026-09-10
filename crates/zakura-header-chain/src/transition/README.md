@@ -167,6 +167,7 @@ Finality releases old deliveries through the existing retention rules.
 The reserve is an admission policy, so recovery can still open an older database that meets the
 hard limits but has consumed the reserve. The policy never deletes protected evidence to make
 room. Header sync reports a fatal capacity failure after a continuous thirty-minute state wait.
+Context rechecks preserve the deadline until capacity recovers or the repair generation retires.
 A restart does not itself repair a saturated database.
 
 Recovery reads a coherent durable snapshot and audits every authoritative row. It fails closed on contradictions in

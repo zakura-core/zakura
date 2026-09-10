@@ -2406,6 +2406,7 @@ impl HeaderSyncReactor {
 
     fn retire_vct_repair(&mut self) {
         self.vct_repair_stall = None;
+        self.vct_capacity_wait = None;
         if let Some(task) = self.vct_repair.take() {
             if let Some(peer) = self
                 .peer_work_queue
@@ -3647,7 +3648,12 @@ impl HeaderSyncReactor {
             .chain(self.vct_repair_stall.map(VctRepairStall::next_deadline))
             .chain(
                 self.vct_capacity_wait
-                    .filter(|wait| !wait.fatal_sent)
+                    .filter(|wait| {
+                        !wait.fatal_sent
+                            && self.vct_repair.current().is_some_and(|task| {
+                                matches!(task.state, RepairPolicyState::StateBlocked { .. })
+                            })
+                    })
                     .map(|wait| wait.since + VCT_LOCAL_OPERATION_FATAL_AFTER),
             )
             .chain(
@@ -3680,22 +3686,31 @@ impl HeaderSyncReactor {
             self.vct_capacity_wait = None;
             return false;
         };
-        let RepairPolicyState::StateBlocked { context, .. } = &task.state else {
+        if self
+            .vct_capacity_wait
+            .is_some_and(|wait| wait.generation != task.repair_generation)
+        {
             self.vct_capacity_wait = None;
-            return false;
+        }
+        let context = match &task.state {
+            RepairPolicyState::StateBlocked { context, .. } => context,
+            // A context recheck does not prove that capacity has recovered.
+            RepairPolicyState::NeedsContext
+            | RepairPolicyState::QueryingContext { .. }
+            | RepairPolicyState::ContextBackoff { .. } => return false,
+            RepairPolicyState::Ready { .. }
+            | RepairPolicyState::LocalBackoff { .. }
+            | RepairPolicyState::Assigned { .. }
+            | RepairPolicyState::Completed => {
+                self.vct_capacity_wait = None;
+                return false;
+            }
         };
         let wait = self.vct_capacity_wait.get_or_insert(VctCapacityWait {
             generation: task.repair_generation,
             since: now,
             fatal_sent: false,
         });
-        if wait.generation != task.repair_generation {
-            *wait = VctCapacityWait {
-                generation: task.repair_generation,
-                since: now,
-                fatal_sent: false,
-            };
-        }
         if wait.fatal_sent {
             return true;
         }
@@ -3710,6 +3725,16 @@ impl HeaderSyncReactor {
             target: context.target,
             elapsed,
         };
+        let latest_repair = self
+            .startup
+            .vct_root_repairs
+            .as_ref()
+            .map(|repairs| *repairs.borrow())
+            .filter(|status| *status != self.vct_repair_status);
+        if let Some(status) = latest_repair {
+            self.observe_vct_root_repair(status);
+            return false;
+        }
         // A committed capacity change can arrive in the same turn as the deadline.
         let latest = self
             .startup
@@ -3723,7 +3748,6 @@ impl HeaderSyncReactor {
             });
         if let Some(snapshot) = latest {
             self.observe_latest_committed_snapshot(snapshot);
-            self.vct_capacity_wait = None;
             return false;
         }
         self.vct_capacity_wait

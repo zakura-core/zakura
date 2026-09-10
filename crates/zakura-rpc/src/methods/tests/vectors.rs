@@ -3709,9 +3709,11 @@ async fn check_invalid_pow_submissions(network: Network, invalid_equihash: bool)
     .await
     .expect("invalid blocks are rejected without waiting for the verifier");
     for response in responses {
-        assert_eq!(
-            response.unwrap().unwrap(),
-            SubmitBlockErrorResponse::Rejected.into()
+        let response = response.unwrap().unwrap();
+        assert!(
+            response == SubmitBlockErrorResponse::Rejected.into()
+                || response == SubmitBlockErrorResponse::Inconclusive.into(),
+            "invalid blocks either fail PoW or exceed the bounded precheck capacity"
         );
     }
     verifier.expect_no_requests().await;
@@ -3733,6 +3735,92 @@ async fn check_invalid_pow_submissions(network: Network, invalid_equihash: bool)
         SubmitBlockResponse::Accepted
     );
     queue_task.abort();
+}
+
+#[test]
+fn rpc_submitblock_cancellation_retains_queued_pow_capacity() {
+    let _init_guard = zakura_test::init();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("the test runtime starts");
+    runtime.block_on(async {
+        let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+        let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+        let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+        let mut verifier: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        let (rpc, queue_task) = RpcImpl::new(
+            Mainnet,
+            Default::default(),
+            false,
+            "0.0.1",
+            "RPC test",
+            Buffer::new(mempool, 1),
+            Buffer::new(state, 1),
+            Buffer::new(read_state, 1),
+            verifier.clone(),
+            MockSyncStatus::default(),
+            NoChainTip,
+            MockAddressBookPeers::default(),
+            rx,
+            None,
+        );
+        let rpc = Arc::new(rpc);
+        let (release, gate) = std::sync::mpsc::channel();
+        let (started, running) = tokio::sync::oneshot::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            started.send(()).expect("the test waits for the blocker");
+            gate.recv().expect("the test releases the blocker");
+        });
+        running.await.expect("the blocker starts");
+        let submission = tokio::spawn({
+            let rpc = rpc.clone();
+            async move {
+                rpc.submit_block(
+                    HexData(zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.to_vec()),
+                    None,
+                )
+                .await
+            }
+        });
+        let hash = Mainnet.genesis_hash();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    rpc.gbt.mined_pow_checks.reserve(hash),
+                    Err(SubmitBlockErrorResponse::DuplicateInconclusive)
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the RPC reserves capacity before queueing proof verification");
+        submission.abort();
+        assert!(submission.await.unwrap_err().is_cancelled());
+        assert!(matches!(
+            rpc.gbt.mined_pow_checks.reserve(hash),
+            Err(SubmitBlockErrorResponse::DuplicateInconclusive)
+        ));
+        release.send(()).expect("the blocker is waiting");
+        blocker.await.expect("the blocker exits");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if rpc.gbt.mined_pow_checks.reserve(hash).is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("finishing the proof check releases capacity");
+        verifier.expect_no_requests().await;
+        queue_task.abort();
+    });
 }
 
 #[tokio::test]

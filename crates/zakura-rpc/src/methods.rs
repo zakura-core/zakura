@@ -3163,14 +3163,26 @@ where
             .ok_or_error(0, "coinbase height not found")?;
         let block_hash = block.hash();
 
-        // Reject invalid proof of work before reserving a submission slot.
-        // The verifier repeats this check under the same network policy.
-        if let Err(error) = zakura_consensus::proof_of_work_is_valid(
-            &block.header,
-            &self.network,
-            &height,
-            &block_hash,
-        ) {
+        let pow_check = match self.gbt.mined_pow_checks.reserve(block_hash) {
+            Ok(permit) => permit,
+            Err(response) => return Ok(response.into()),
+        };
+        let block = Arc::new(block);
+        let pow_block = block.clone();
+        let network = self.network.clone();
+        // The blocking task owns capacity even if the RPC caller disconnects.
+        let pow_result = tokio::task::spawn_blocking(move || {
+            let _permit = pow_check;
+            zakura_consensus::proof_of_work_is_valid(
+                &pow_block.header,
+                &network,
+                &height,
+                &block_hash,
+            )
+        })
+        .await
+        .map_err(|error| ErrorObject::owned(0, error.to_string(), None::<()>))?;
+        if let Err(error) = pow_result {
             tracing::info!(
                 ?error,
                 ?block_hash,
@@ -3184,7 +3196,6 @@ where
             Ok(submission) => submission,
             Err(response) => return Ok(response.into()),
         };
-        let block = Arc::new(block);
         let work_id = parameters.and_then(|parameters| parameters.work_id);
         let admission = zakura_state::BlockAdmission::pending();
         let request = zakura_consensus::Request::CommitMined {

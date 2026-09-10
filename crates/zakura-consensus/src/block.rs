@@ -345,6 +345,7 @@ where
             // <https://en.bitcoin.it/wiki/BIP_0023#Block_Proposal>
             if request.is_proposal() {
                 zakura_header_chain::PowPolicy::for_network(&network)?;
+                block.header.solution.validate_shape(&network)?;
                 check::difficulty_threshold_is_valid(&block.header, &network, &height, &hash)?;
             } else {
                 // Do the difficulty checks first, to raise the threshold for

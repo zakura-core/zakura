@@ -6,8 +6,8 @@ One sequential task serves each session. Waiting for serving capacity pauses
 request intake while the data reader continues processing downloads.
 
 The [stream specification](../specs/blocksync/stream-pair.md) defines negotiation,
-framing, and retirement. The [execution results](getblocks-refactor-results.md)
-record the transport gate, including its memory and throughput limits.
+framing, and retirement. The [qualification criteria](#qualification) below
+define the transport's completion, memory, and throughput checks.
 
 ## Request flow
 
@@ -73,6 +73,12 @@ not hold the old producer while waiting for all old owners to disappear.
 | Initial Status | Ten seconds |
 | Incomplete stream pair | Prelude deadline, three seconds by default |
 
+The 32-second data-write deadline allows time to regain shared connection credit.
+In the packet-loss fixture with a paused sibling service, healthy writes took
+about 14 seconds while earlier blocks were still arriving. The generic ten-second
+deadline interrupted those downloads. The longer deadline remains bounded, and
+cancellation, request expiry, and block-progress liveness still apply.
+
 Outgoing requests reserve queue space before publishing outstanding work. The
 same ownership lock orders publication, reset, enqueue failure, and the writer's
 initial claim. If expiry wins before that claim, no bytes are written. If the
@@ -118,6 +124,35 @@ This bound does not measure decoded blocks, encoding temporaries, total RSS, or
 QUIC buffers. Connection limits and existing decode bounds still matter. The
 512 MiB gate envelope applies to the documented local fixture, not every possible
 configuration or node workload.
+
+## Qualification
+
+Qualify the final combined code and transport dependencies before enabling this
+layout. Results from earlier revisions and ordinary CI do not clear this gate.
+The `blocksync-transport-gate` nextest profile selects the long-running checks,
+which are excluded from the ordinary suite.
+
+The local fixture uses two real QUIC endpoints in one process. A downloads
+32 synthetic blocks of about 1.9 MB each from B. Storage and consensus validation
+are fixtures. Only A's blocks and ending messages matched to its actual requests
+count as a completed download. B's extra requests supply serving pressure.
+
+| Workload | Required result |
+| --- | --- |
+| Ordinary download, serving pressure, and a paused sibling | Complete within 30 seconds, including when A's serving slots are occupied, B sends 32,000 requests, and one sibling retains a full 16 MiB window |
+| 50 ms RTT and 1% packet loss, including pressure and a paused sibling | Complete within 240 seconds |
+| Throughput comparison | Five-run median useful throughput at least 90% of the original serving path with the same policy fixes |
+| Process memory | Peak resident memory (RSS) at most 512 MiB, including both endpoints |
+| Reopening | Twenty replacements on the same connection, including loss, with each new session completing within its applicable deadline |
+| Temporary saturation | Resuming the paused consumer before liveness expires lets the original pair complete without a reset |
+| Sustained saturation | Bounded cleanup returns unreceived work, a usable peer completes the retry within 30 seconds, and twenty cycles stay within memory and session bounds |
+
+Download deadlines start when that round's work is submitted. Whole-test time
+also includes setup, pressure injection, reopen backoff, and cleanup. Run
+throughput comparisons separately on the same hardware, build profile, and link
+conditions. Verify that traffic actually traverses the impaired path. Fix
+thresholds before measuring and record exact code and dependency revisions with
+the evidence in the activation PR. These are local engineering thresholds.
 
 ## Shared policy and scope
 

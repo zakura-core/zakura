@@ -1,8 +1,8 @@
 # Block-sync stream pair
 
 Native block sync uses two persistent bidirectional QUIC streams on one
-authenticated connection. The [acceptance gate](../../design/getblocks-refactor-results.md)
-passed before this layout was activated.
+authenticated connection. The [serving design](../../design/getblocks-regulation.md)
+describes resource ownership, local policy, and the required transport qualification.
 
 ## Negotiation
 

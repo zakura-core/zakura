@@ -1154,6 +1154,13 @@ impl PeerRoutine {
                 break FillStop::Internal;
             }
             if !delivered {
+                tracing::debug!(
+                    peer = ?self.peer,
+                    generation = self.generation,
+                    start_height = ?request_start_height,
+                    count = request_count,
+                    "block request transport closed during publication"
+                );
                 claim.delivery_failed();
                 break FillStop::SendError;
             }

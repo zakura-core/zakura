@@ -3,13 +3,14 @@
 
 The controller repeatedly builds the configured ref, starts `zakurad` from an
 empty allowlisted state directory, waits until the node is stably ready at tip,
-posts a Slack completion, and starts over. Any failure writes a durable halt
-marker and exits non-zero; operators must explicitly run `resume`.
+records a completion for the audit digest, and starts over. Any failure writes a
+durable halt marker. Disk pressure retries after cleanup; other failures require `resume`.
 """
 
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -26,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 STATE_VERSION = 1
+COMPLETION_HISTORY_LIMIT = 256
 
 # These gauges track the best committed tip. Finalized and verifier-only gauges
 # can trail or lead that tip, so they remain diagnostics.
@@ -63,6 +65,10 @@ DIAGNOSTIC_METRICS = (
 
 class ControllerError(Exception):
     """Operator-facing failure that should halt the sync loop."""
+
+
+class DiskPressure(ControllerError):
+    """Disposable artifacts may be reclaimed before retrying a fresh sync."""
 
 
 @dataclass(frozen=True)
@@ -103,7 +109,9 @@ class Policy:
     ready_samples: int = 6
     ready_sample_interval_seconds: int = 30
     min_free_bytes: int = 10 * 1024 * 1024 * 1024
-    retention_runs: int = 3
+    retention_runs: int = 10
+    retention_bytes: int = 20 * 1024**3
+    trace_file_bytes: int = 128 * 1024**2
     cooldown_seconds: int = 60
     wipe_entries: tuple[str, ...] = ("state", "non_finalized_state")
     preserve_entries: tuple[str, ...] = ("network",)
@@ -391,8 +399,8 @@ def build_binary(config: Config, sha: str) -> Path:
     if worktree.exists():
         run(["git", "worktree", "remove", "--force", str(worktree)], cwd=config.paths.repo_dir, check=False)
         shutil.rmtree(worktree, ignore_errors=True)
-    run(["git", "worktree", "add", "--detach", str(worktree), sha], cwd=config.paths.repo_dir)
     try:
+        run(["git", "worktree", "add", "--detach", str(worktree), sha], cwd=config.paths.repo_dir)
         run(["cargo", "build", "--release", "--locked", "-p", "zakura"], cwd=worktree)
         built = worktree / "target" / "release" / "zakurad"
         if not built.is_file():
@@ -416,7 +424,12 @@ def build_binary(config: Config, sha: str) -> Path:
             encoding="utf-8",
         )
         meta_tmp.replace(meta)
+    except ControllerError:
+        # Classify an exhausted build volume before finally removes its worktree.
+        check_free_space(config)
+        raise
     finally:
+        target.with_suffix(".tmp").unlink(missing_ok=True)
         run(["git", "worktree", "remove", "--force", str(worktree)], cwd=config.paths.repo_dir, check=False)
         shutil.rmtree(worktree, ignore_errors=True)
     return target
@@ -433,16 +446,19 @@ def install_binary(config: Config, binary: Path) -> None:
     tmp.replace(target)
 
 
-def check_free_space(config: Config) -> None:
-    usage = shutil.disk_usage(config.paths.chain_state_dir)
-    if usage.free < config.policy.min_free_bytes:
-        raise ControllerError(
-            f"free disk {usage.free} bytes below minimum {config.policy.min_free_bytes}"
-        )
+def check_free_space(config: Config, *, recovery: bool = False) -> None:
+    minimum = config.policy.min_free_bytes + (5 * 1024**3 if recovery else 0)
+    for path in (config.paths.chain_state_dir, config.paths.runs_dir, config.paths.build_cache_dir):
+        # A fresh installation may not have created the cache yet.
+        while not path.exists():
+            path = path.parent
+        free = shutil.disk_usage(path).free
+        if free < minimum:
+            raise DiskPressure(f"free disk {free} bytes below minimum {minimum} at {path}")
 
 
 def preflight(config: Config) -> None:
-    for command in ("cargo", "git", "systemctl"):
+    for command in ("cargo", "git", "systemctl", "logrotate"):
         if shutil.which(command) is None:
             raise ControllerError(f"required command is unavailable: {command}")
     for path, description in (
@@ -484,7 +500,7 @@ def render_config(config: Config, run_dir: Path) -> None:
     trace_dir.mkdir(parents=True, exist_ok=True)
     substitutions = {
         "TRACE_DIR": str(trace_dir),
-        "LOG_FILE": str(config.paths.log_file),
+        "LOG_FILE": str(run_dir / "zebrad.log"),
         "STATE_CACHE_DIR": str(config.paths.chain_state_dir),
         "P2P_STACK": config.policy.p2p_stack,
         "TRACING_FILTER": config.policy.tracing_filter,
@@ -497,6 +513,8 @@ def render_config(config: Config, run_dir: Path) -> None:
     tmp.write_text(rendered, encoding="utf-8")
     tmp.replace(config.paths.zakurad_config)
     relink(config.paths.trace_link, trace_dir)
+    (run_dir / "zebrad.log").touch()
+    relink(config.paths.log_file, run_dir / "zebrad.log")
 
 
 def relink(link: Path, target: Path) -> None:
@@ -528,7 +546,11 @@ def start_service(config: Config) -> None:
 
 
 def stop_service(config: Config) -> None:
-    run(["systemctl", "stop", config.policy.service_name], check=False)
+    run(["systemctl", "stop", config.policy.service_name])
+    if service_active(config):
+        raise ControllerError(
+            f"service remained active after stop: {config.policy.service_name}"
+        )
 
 
 def service_active(config: Config) -> bool:
@@ -653,7 +675,24 @@ def sample_status(config: Config) -> dict[str, Any]:
     return status
 
 
-def wait_for_completion(config: Config, run_dir: Path, run_state: dict[str, Any]) -> None:
+def rotate_run_logs(config: Config, run_dir: Path) -> None:
+    """Keep trace and node-log rotations inside the run that produced them."""
+    rotation_config = run_dir / ".trace-logrotate.conf"
+    rotation_config.write_text(
+        f'{json.dumps(str(run_dir / "traces" / "*.jsonl"))} {{\n'
+        f"    size {config.policy.trace_file_bytes}\n"
+        "    rotate 2\n    missingok\n    notifempty\n    copytruncate\n    nocompress\n}\n"
+        f'{json.dumps(str(run_dir / "zebrad.log"))} {{\n'
+        "    size 64M\n    rotate 1\n    missingok\n    notifempty\n    copytruncate\n    nocompress\n}\n",
+        encoding="utf-8",
+    )
+    run(["logrotate", "--state", str(run_dir / ".trace-logrotate.state"),
+         str(rotation_config)], timeout=60)
+
+
+def wait_for_completion(
+    config: Config, run_dir: Path, run_state: dict[str, Any], state: dict[str, Any]
+) -> None:
     started = now()
     progress = SyncProgress(started)
     ready_samples = 0
@@ -663,10 +702,15 @@ def wait_for_completion(config: Config, run_dir: Path, run_state: dict[str, Any]
         ts = now()
         if ts - started > config.policy.max_run_seconds:
             raise ControllerError(f"run exceeded max duration {config.policy.max_run_seconds}s")
+        check_free_space(config)
         if not service_active(config):
             raise ControllerError(f"{config.policy.service_name} exited before sync completion")
-        check_free_space(config)
 
+        recovered_run = state.get("disk_recovery_run")
+        if recovered_run and post_slack(config, f"{resumed_text(config)} | recovered run: {recovered_run}"):
+            state.pop("disk_recovery_run")
+            save_state(config.paths.state_dir / "state.json", state)
+        rotate_run_logs(config, run_dir)
         sample = sample_status(config)
         sample["time"] = utc_stamp(ts)
         progressed, failure = progress.observe(sample, config.policy, ts)
@@ -691,6 +735,12 @@ def wait_for_completion(config: Config, run_dir: Path, run_state: dict[str, Any]
         if sample.get("ready") is True:
             ready_samples += 1
             if ready_samples >= config.policy.ready_samples:
+                # Use the final readiness sample, not a stale progress height or
+                # an estimated network tip. This gauge follows committed blocks.
+                height = sample.get("zcash_chain_verified_block_height")
+                run_state["end_height"] = (
+                    height if type(height) is int and 0 <= height <= 0xFFFFFFFF else None
+                )
                 return
             time.sleep(config.policy.ready_sample_interval_seconds)
         else:
@@ -698,49 +748,62 @@ def wait_for_completion(config: Config, run_dir: Path, run_state: dict[str, Any]
             time.sleep(config.policy.poll_interval_seconds)
 
 
-def archive_run_log(config: Config, run_dir: Path) -> None:
-    if not config.paths.log_file.exists():
-        return
-    dest = run_dir / "zebrad.log"
-    shutil.copy2(config.paths.log_file, dest)
-    config.paths.log_file.write_text("", encoding="utf-8")
+def cleanup_retention(
+    config: Config, active_run: Path | None = None, *, recovery: bool = False
+) -> None:
+    """Call with the node/build stopped. Preserve the active and latest failed runs."""
+    cache = config.paths.build_cache_dir
+    binaries = []
+    for child in cache.iterdir() if cache.exists() else []:
+        if child.is_symlink():
+            continue
+        if re.fullmatch(r"worktree-[0-9a-f]{12}", child.name) and child.is_dir():
+            run(["git", "worktree", "remove", "--force", str(child)],
+                cwd=config.paths.repo_dir, check=False)
+            if child.exists():
+                shutil.rmtree(child)
+        elif re.fullmatch(r"zakurad-[0-9a-f]{40}\.tmp", child.name) and child.is_file():
+            child.unlink()
+        elif re.fullmatch(r"zakurad-[0-9a-f]{40}", child.name) and child.is_file():
+            binaries.append(child)
+    for binary in sorted(binaries, key=lambda path: path.stat().st_mtime, reverse=True)[2:]:
+        binary.unlink()
+        binary.with_suffix(".json").unlink(missing_ok=True)
 
-
-def cleanup_retention(config: Config, active_run: Path | None = None) -> None:
     runs = []
     for child in config.paths.runs_dir.iterdir() if config.paths.runs_dir.exists() else []:
-        if not child.is_dir():
-            continue
-        run_json = child / "run.json"
-        if not run_json.exists():
+        if (child.is_symlink() or not child.is_dir()
+                or not re.fullmatch(r"\d{8}T\d{6}Z-[0-9a-f]{12}", child.name)):
             continue
         try:
-            data = json.loads(run_json.read_text(encoding="utf-8"))
-        except Exception:
+            data = json.loads((child / "run.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
             continue
-        runs.append((str(data.get("started_at", "")), child))
+        if not isinstance(data, dict):
+            continue
+        size = sum(path.stat().st_size for path in child.rglob("*")
+                   if not path.is_symlink() and path.is_file())
+        runs.append((data.get("phase"), str(data.get("started_at", "")), child, size))
 
-    runs.sort(key=lambda run: (run[0], run[1].name), reverse=True)
-    keep_count = max(config.policy.retention_runs, 1 if active_run else 0)
-    keep = {child for _, child in runs[:keep_count]}
-    if active_run is not None and active_run not in keep:
-        keep.add(active_run)
-        if len(keep) > keep_count:
-            oldest_kept = next(child for _, child in reversed(runs) if child in keep and child != active_run)
-            keep.remove(oldest_kept)
-
-    for _, child in runs:
-        if child not in keep:
-            shutil.rmtree(child, ignore_errors=True)
-
-
-def completion_text(config: Config, run_state: dict[str, Any]) -> str:
-    p = config.policy
-    duration = format_duration(int(run_state["sync_duration_seconds"]))
-    return (
-        f":white_check_mark: Zakura sync complete: {p.hostname} | {policy_mode(p)} | "
-        f"{ssh_target(p)} | sync time: {duration}"
-    )
+    failed = [entry for entry in runs if entry[0] == "failed"]
+    protected = {active_run}
+    if failed:
+        protected.add(max(failed, key=lambda entry: (entry[1], entry[2]))[2])
+    total, count = sum(entry[3] for entry in runs), len(runs)
+    # Successful runs are expendable first; discard the oldest within each group.
+    for _, _, child, size in sorted(runs, key=lambda entry: (entry[0] != "complete", entry[1], entry[2])):
+        if child in protected:
+            continue
+        needs_space = False
+        if recovery:
+            try:
+                check_free_space(config, recovery=True)
+            except DiskPressure:
+                needs_space = True
+        if count > config.policy.retention_runs or total > config.policy.retention_bytes or needs_space:
+            shutil.rmtree(child)
+            total -= size
+            count -= 1
 
 
 def failure_text(config: Config, run_state: dict[str, Any], reason: str) -> str:
@@ -748,10 +811,11 @@ def failure_text(config: Config, run_state: dict[str, Any], reason: str) -> str:
     duration = format_duration(int(run_state["time_to_failure_seconds"]))
     height = run_state.get("height")
     height_text = str(height) if isinstance(height, int) else "unknown"
+    run_text = f" | run: {run_state['run_id']}" if run_state.get("run_id") else ""
     return (
         f":rotating_light: Zakura failed: {p.hostname} | {policy_mode(p)} | "
         f"{ssh_target(p)} | time to failure: {duration} | height: {height_text} | "
-        f"reason: {short_reason(reason)}"
+        f"reason: {short_reason(reason)}{run_text}"
     )
 
 
@@ -783,6 +847,11 @@ def short_reason(reason: str, limit: int = 96) -> str:
 
 
 def one_cycle(config: Config, state_path: Path, state: dict[str, Any]) -> dict[str, Any]:
+    state.pop("current_run", None)
+    state["phase"] = "preflight"
+    save_state(state_path, state)
+    stop_service(config)
+    cleanup_retention(config)
     preflight(config)
     sha = resolve_sha(config)
     started_at = now()
@@ -815,7 +884,6 @@ def one_cycle(config: Config, state_path: Path, state: dict[str, Any]) -> dict[s
     stop_service(config)
     safe_wipe_state(config)
     render_config(config, run_dir)
-    config.paths.log_file.write_text("", encoding="utf-8")
 
     sync_started_at = now()
     run_state.update(
@@ -830,10 +898,14 @@ def one_cycle(config: Config, state_path: Path, state: dict[str, Any]) -> dict[s
     save_state(state_path, state)
     try:
         start_service(config)
-        wait_for_completion(config, run_dir, run_state)
+        wait_for_completion(config, run_dir, run_state, state)
     finally:
-        stop_service(config)
-        archive_run_log(config, run_dir)
+        state["phase"] = "stopping"
+        try:
+            save_state(state_path, state)
+        finally:
+            stop_service(config)
+    rotate_run_logs(config, run_dir)
 
     completed_at_epoch = now()
     completed_at = utc_stamp(completed_at_epoch)
@@ -846,18 +918,35 @@ def one_cycle(config: Config, state_path: Path, state: dict[str, Any]) -> dict[s
         }
     )
     write_run_json(run_dir, run_state)
+    completion_history = state.get("completion_history", [])
+    if not isinstance(completion_history, list):
+        # Optional reporting history must not turn a successful sync into a halt.
+        print("invalid completion history; preserving counts and starting new history", file=sys.stderr)
+        completion_history = []
     state.update(
         {
             "failed": False,
             "last_success_sha": sha,
             "last_success_at": completed_at,
             "last_success_run": run_id,
+            "last_success_duration_seconds": run_state["sync_duration_seconds"],
+            "last_success_end_height": run_state.get("end_height"),
+            # Keep timings independently of run-log retention and audit cadence.
+            "completion_history": (completion_history + [{
+                "number": int(state.get("runs", 0)) + 1,
+                "run_id": run_id,
+                "duration": run_state["sync_duration_seconds"],
+                "end_height": run_state.get("end_height"),
+            }])[-COMPLETION_HISTORY_LIMIT:],
+            "completion_digest": True,
+            "completion_digest_start_runs": state.get(
+                "completion_digest_start_runs", int(state.get("runs", 0))
+            ),
             "phase": "complete",
             "runs": int(state.get("runs", 0)) + 1,
         }
     )
     save_state(state_path, state)
-    post_slack(config, completion_text(config, run_state))
     cleanup_retention(config)
     return state
 
@@ -887,11 +976,22 @@ def halt(config: Config, state_path: Path, state: dict[str, Any], run_state: dic
             "failed_at": failed_at,
             "phase": "failed",
             "last_failed_sha": run_state.get("sha"),
-            "last_failed_run": run_state.get("run_id"),
+            "last_failed_run": run_state.get("run_id") or f"preflight-{time.time_ns()}",
         }
     )
+    state.pop("disk_recovery_run", None)
+    state.pop("failure_notification", None)
     save_state(state_path, state)
-    post_slack(config, failure_text(config, run_state, reason))
+    if post_slack(config, failure_text(config, run_state, reason)):
+        # Only confirmed delivery to the same destination can silence the audit.
+        state["failure_notification"] = {
+            "run_id": state.get("last_failed_run"),
+            "failed_at": failed_at,
+            "reason": reason,
+            "sent_at": now(),
+            "destination": hashlib.sha256(slack_webhook_url().encode()).hexdigest(),
+        }
+        save_state(state_path, state)
     log(config, f"halted reason={reason}")
 
 
@@ -900,15 +1000,32 @@ def run_loop(config: Config, config_path: Path) -> int:
     config.paths.state_dir.mkdir(parents=True, exist_ok=True)
     config.paths.runs_dir.mkdir(parents=True, exist_ok=True)
     state = load_state(state_path)
-    if state.get("failed"):
-        print(f"controller halted: {state.get('failure')}", file=sys.stderr)
-        return 2
-
     while True:
+        if state.get("failed"):
+            reason = str(state.get("failure", ""))
+            # Also recover the exact disk-space halt emitted by older controllers.
+            if not reason.startswith(("DiskPressure:", "ControllerError: free disk ")):
+                print(f"controller halted: {reason}", file=sys.stderr)
+                return 2
+            stop_service(config)
+            safe_wipe_state(config)
+            cleanup_retention(config, recovery=True)
+            try:
+                check_free_space(config, recovery=True)
+            except DiskPressure:
+                time.sleep(max(60, config.policy.cooldown_seconds))
+                continue
+            state.update({"failed": False, "phase": "resumed", "resumed_at": utc_stamp(),
+                          "disk_recovery_run": state.get("last_failed_run") or "unknown"})
+            state.pop("failure", None)
+            save_state(state_path, state)
+            log(config, "disk-pressure-recovered; starting a fresh sync")
         run_state: dict[str, Any] = {}
         try:
             state = one_cycle(config, state_path, state)
         except Exception as error:
+            if isinstance(error, OSError) and error.errno == errno.ENOSPC:
+                error = DiskPressure(str(error))
             reason = f"{type(error).__name__}: {error}"
             current_run = state.get("current_run")
             if current_run:
@@ -918,8 +1035,13 @@ def run_loop(config: Config, config_path: Path) -> int:
                         run_state = json.loads(run_json.read_text(encoding="utf-8"))
                     except json.JSONDecodeError:
                         run_state = {}
+            stop_service(config)
+            run_dir = config.paths.runs_dir / str(current_run) if current_run else None
+            if isinstance(error, DiskPressure):
+                cleanup_retention(config, active_run=run_dir, recovery=True)
             halt(config, state_path, state, run_state or state, reason)
-            return 1
+            if not isinstance(error, DiskPressure):
+                return 1
         time.sleep(config.policy.cooldown_seconds)
 
 

@@ -109,3 +109,20 @@ fn empty_non_finalized_state_returns_tip_publication_to_finalized() {
     assert_eq!(latest.best_tip_height(), Some(finalized.height));
     assert_eq!(latest.best_tip_hash(), Some(finalized.hash));
 }
+
+#[test]
+fn late_broadcast_completion_does_not_rewind_the_tip_cursor() {
+    let (mut sender, _, mut changes) = ChainTipSender::new(None, &Mainnet);
+    sender.set_best_non_finalized_tip(Some(tip(2, 2, 1)));
+    changes.mark_last_change_hash(block::Hash([2; 32]));
+    changes.mark_last_change_hash(block::Hash([1; 32]));
+    assert_eq!(changes.last_tip_change(), None);
+    sender.set_best_non_finalized_tip(Some(tip(3, 3, 2)));
+    assert_eq!(
+        changes
+            .last_tip_change()
+            .unwrap()
+            .best_tip_hash_and_height(),
+        (block::Hash([3; 32]), block::Height(3))
+    );
+}

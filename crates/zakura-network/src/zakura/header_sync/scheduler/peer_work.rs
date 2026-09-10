@@ -304,7 +304,7 @@ pub struct ActiveHeaderRequest {
 pub enum HeaderTargetPurpose {
     /// Admit a complete parent-linked branch target.
     Normal,
-    /// Redeliver auxiliary metadata for one exact selected header.
+    /// Redeliver auxiliary metadata for an exact selected range.
     SelectedAuxiliaryRepair {
         /// Selected target fixed by the durable repair context.
         selected_target: Frontier,
@@ -315,11 +315,10 @@ pub enum HeaderTargetPurpose {
 
 impl HeaderTargetPurpose {
     /// Return the target purpose's exact response-count requirement, when fixed.
-    pub fn exact_header_count(&self) -> Option<usize> {
-        match self {
-            Self::Normal => None,
-            Self::SelectedAuxiliaryRepair { .. } => Some(1),
-        }
+    ///
+    /// Selected auxiliary repairs can cover a negotiated range, so they have no fixed count.
+    pub const fn exact_header_count(&self) -> Option<usize> {
+        None
     }
 
     /// Return the selected target fixed by an auxiliary repair.
@@ -440,6 +439,7 @@ pub(in crate::zakura::header_sync) enum QueueWorkResult {
 #[derive(Clone, Debug, Default)]
 pub(in crate::zakura::header_sync) struct PeerWorkQueue {
     work_by_peer: HashMap<ZakuraPeerId, PeerWorkState>,
+    repair_episodes: HashMap<HeaderSyncWorkOwner, zakura_header_chain::AuxiliaryRequirementEpisode>,
     budget: HeaderChunkBudget,
     request_reservations: HashMap<ZakuraPeerId, HeaderCountReservation>,
     staged_capacity: HashMap<ZakuraPeerId, Vec<HeaderCapacityLease>>,
@@ -645,6 +645,47 @@ impl PeerWorkQueue {
         }
     }
 
+    /// Start one repair request and bind its durable evidence episode to its private queue state.
+    pub(in crate::zakura::header_sync) fn start_repair(
+        &mut self,
+        request: ActiveHeaderRequest,
+        episode: zakura_header_chain::AuxiliaryRequirementEpisode,
+    ) -> bool {
+        if !matches!(
+            request.purpose,
+            HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
+        ) {
+            return false;
+        }
+        let owner = request.owner;
+        if !self.start(request) {
+            return false;
+        }
+        assert!(
+            self.repair_episodes.insert(owner, episode).is_none(),
+            "an active repair owner binds exactly one evidence episode"
+        );
+        true
+    }
+
+    /// Return the durable evidence episode bound to one active repair request.
+    pub(in crate::zakura::header_sync) fn repair_episode(
+        &self,
+        owner: HeaderSyncWorkOwner,
+    ) -> Option<zakura_header_chain::AuxiliaryRequirementEpisode> {
+        self.repair_episodes.get(&owner).copied()
+    }
+
+    #[cfg(test)]
+    pub(in crate::zakura::header_sync) fn bind_repair_episode_for_test(
+        &mut self,
+        owner: HeaderSyncWorkOwner,
+        episode: zakura_header_chain::AuxiliaryRequirementEpisode,
+    ) {
+        assert!(self.active_owner(owner).is_some());
+        self.repair_episodes.insert(owner, episode);
+    }
+
     pub(in crate::zakura::header_sync) fn remove(
         &mut self,
         peer: &ZakuraPeerId,
@@ -652,7 +693,10 @@ impl PeerWorkQueue {
         self.request_reservations.remove(peer);
         self.staged_capacity.remove(peer);
         match self.work_by_peer.remove(peer) {
-            Some(PeerWorkState::Active(request)) => Some(*request),
+            Some(PeerWorkState::Active(request)) => {
+                self.repair_episodes.remove(&request.owner);
+                Some(*request)
+            }
             Some(PeerWorkState::AwaitingLocator { .. }) | None => None,
         }
     }
@@ -714,7 +758,9 @@ impl PeerWorkQueue {
     fn remove_all(&mut self, peer: &ZakuraPeerId) {
         self.request_reservations.remove(peer);
         self.staged_capacity.remove(peer);
-        self.work_by_peer.remove(peer);
+        if let Some(PeerWorkState::Active(request)) = self.work_by_peer.remove(peer) {
+            self.repair_episodes.remove(&request.owner);
+        }
     }
 
     /// Bound one request by its fair share and currently unowned capacity.
@@ -726,6 +772,16 @@ impl PeerWorkQueue {
                 .min(self.budget.remaining()),
         )
         .expect("the header budget capacity fits u32")
+    }
+
+    /// Bound one VCT repair request by all currently unowned aggregate capacity.
+    pub(in crate::zakura::header_sync) fn reservable_repair_header_count(
+        &self,
+        desired: u32,
+    ) -> u32 {
+        let desired = usize::try_from(desired).unwrap_or(usize::MAX);
+        u32::try_from(desired.min(self.budget.remaining()))
+            .expect("the header budget capacity fits u32")
     }
 
     /// Reserve capacity before publishing one wire request.
@@ -741,6 +797,23 @@ impl PeerWorkQueue {
         if count > MAX_HEADER_CHUNK_RESERVATION_V1 {
             return false;
         }
+        let Some(reservation) = self.budget.reserve(count) else {
+            return false;
+        };
+        self.request_reservations.insert(peer.clone(), reservation);
+        true
+    }
+
+    /// Reserve aggregate capacity for one selected auxiliary repair range.
+    pub(in crate::zakura::header_sync) fn reserve_repair_request(
+        &mut self,
+        peer: &ZakuraPeerId,
+        count: u32,
+    ) -> bool {
+        if self.request_reservations.contains_key(peer) {
+            return false;
+        }
+        let count = usize::try_from(count).unwrap_or(usize::MAX);
         let Some(reservation) = self.budget.reserve(count) else {
             return false;
         };
@@ -1406,15 +1479,49 @@ mod tests {
     }
 
     #[test]
-    fn selected_auxiliary_repair_is_an_exact_one_header_target_purpose() {
+    fn repair_episode_follows_private_active_queue_ownership() {
+        let local = snapshot();
+        let target = advertisement(1);
+        let selected_target = Frontier::new(
+            target.status.selected_tip_height,
+            target.status.selected_tip_hash,
+        );
+        let context = zakura_header_chain::VctRepairContext::unconstrained(
+            selected_target,
+            zakura_header_chain::HeaderLocator::for_continuation(local.frontiers.finalized),
+            None,
+        );
+        let mut request = active_request(1, target.clone(), &local, Vec::new());
+        request.purpose = HeaderTargetPurpose::SelectedAuxiliaryRepair {
+            selected_target,
+            repair_generation: 7,
+        };
+        let owner = request.owner;
+        let mut queue = PeerWorkQueue::default();
+
+        assert_eq!(
+            queue.stage(peer(1), target, PeerWorkPriority::Normal),
+            QueueWorkResult::NeedsLocator
+        );
+        assert!(queue.reserve_request(&peer(1), 1));
+        assert!(queue.start_repair(request, context.episode));
+        assert_eq!(queue.repair_episode(owner), Some(context.episode));
+
+        assert!(queue.remove(&peer(1)).is_some());
+        assert_eq!(queue.repair_episode(owner), None);
+    }
+
+    #[test]
+    fn selected_auxiliary_repair_keeps_its_selected_target() {
         let selected_target = Frontier::new(zakura_chain::block::Height(11), hash(11));
         let purpose = HeaderTargetPurpose::SelectedAuxiliaryRepair {
             selected_target,
             repair_generation: 7,
         };
 
-        assert_eq!(purpose.exact_header_count(), Some(1));
+        assert_eq!(purpose.exact_header_count(), None);
         assert_eq!(purpose.selected_repair_target(), Some(selected_target));
         assert_eq!(HeaderTargetPurpose::Normal.exact_header_count(), None);
+        assert_eq!(HeaderTargetPurpose::Normal.selected_repair_target(), None);
     }
 }

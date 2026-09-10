@@ -11,6 +11,122 @@ independently.
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-09-10
+
+### Added
+
+- Zakura now advertises prepared mined blocks after expected-work validation and state admission
+  ([#748](https://github.com/zakura-core/zakura/pull/748)).
+- Zakura now reuses prepared mining candidates through `workid`
+  ([#748](https://github.com/zakura-core/zakura/pull/748)).
+
+### Changed
+
+- Raised the minimum supported Rust version to 1.97 for `zakurad` and the
+  internal crates ([#903](https://github.com/zakura-core/zakura/pull/903)).
+- Updated the Zakura Common (`zakura-core/common`) crates from `1.1.0` to
+  `1.2.0`
+  ([#925](https://github.com/zakura-core/zakura/pull/925)).
+- Shortened the end-of-support window to 21 days so v1.4.0 halts at block
+  3,504,731 — the same halt block and date (~2026-10-03) as v1.3.2
+  ([#915](https://github.com/zakura-core/zakura/pull/915),
+  [#927](https://github.com/zakura-core/zakura/pull/927),
+  [#952](https://github.com/zakura-core/zakura/pull/952)).
+
+### Fixed
+
+- Zakura withdraws rejected mining templates, stops affected internal mining work, and
+  validates empty-template recovery before returning a replacement
+  ([#748](https://github.com/zakura-core/zakura/pull/748)).
+- Zakura bounds mined submissions and contextual writes, and returns `inconclusive` when a mined
+  block must wait for its parent or verification capacity
+  ([#748](https://github.com/zakura-core/zakura/pull/748)).
+- Zakura blocks optimistic relay while earlier contextual writes or operator changes can move
+  the selected tip ([#748](https://github.com/zakura-core/zakura/pull/748)).
+- Zakura avoids duplicate all-peer inventory delivery
+  ([#748](https://github.com/zakura-core/zakura/pull/748)).
+- Header sync now repairs contiguous ranges of missing VCT roots in one
+  request. Checkpoint commits now resume immediately after a header-chain
+  commit instead of polling every 500 ms. A parked checkpoint also clears a
+  resource-stall alarm itself, so it can no longer wait for an insertion that
+  the alarm would refuse. These changes improve checkpoint catch-up for
+  retained states with large missing-root gaps
+  ([#893](https://github.com/zakura-core/zakura/pull/893)).
+- The stalled-height diagnostic now measures the parked block's complete wait,
+  so a changing missing height no longer postpones the operator error or clears
+  the gauge before the block commits
+  ([#893](https://github.com/zakura-core/zakura/pull/893)).
+- A repair supplier that refuses or withholds its response no longer ends the
+  scheduling round for the remaining candidates, and an unresponsive supplier
+  is now charged like any other timed-out peer
+  ([#893](https://github.com/zakura-core/zakura/pull/893)).
+- Added a check on the combined chain value-pool balance as defence in depth
+  ([#911](https://github.com/zakura-core/zakura/pull/911)).
+- Fixed serial UTXO lookup delays during block verification of transactions
+  with many transparent inputs. The verifier overlaps up to 64 responses per
+  transaction and admits one lookup at a time to preserve state responsiveness
+  ([#918](https://github.com/zakura-core/zakura/pull/918)).
+
+## [1.3.2] - 2026-09-05
+
+### Added
+
+- Added metrics, dashboard visibility, and alerts for the existing Mainnet
+  end-of-support schedule
+  ([#867](https://github.com/zakura-core/zakura/pull/867)).
+
+<!-- release-readiness: allow-patch; reason: The added metrics are backwards compatible, and the Changed entry is an internal dependency update with no operator-facing behavior change. -->
+- Added the `sync.block.first_received.count` metric, whose `source` label
+  reports whether Zakura or legacy TCP first delivers each complete block body
+  ([#882](https://github.com/zakura-core/zakura/pull/882)).
+
+### Changed
+
+- Updated the Zakura Common (`zakura-core/common`) crates from `1.0.1` to
+  `1.1.0`
+  ([#885](https://github.com/zakura-core/zakura/pull/885)).
+
+### Fixed
+
+- Fixed header-chain auxiliary admission so retention can free aggregate
+  capacity before the planner enforces retained delivery limits. The engine
+  retains one copy of each semantic payload and one rooted payload per supplier.
+  The per-header semantic-payload limit increases from 16 to 32. Event-local
+  bounds still protect projection work
+  ([#845](https://github.com/zakura-core/zakura/pull/845)).
+- Prevented header sync from admitting VCT auxiliary input that durable state
+  already retains or has rejected or disputed. Each repair now claims the exact
+  durable episode. Header sync rotates suppliers after peer-attributed failures.
+  It does not retry a failed supplier while that supplier remains connected.
+  It releases disconnected supplier identities so connection churn cannot
+  exhaust the supplier history. Durable state continues to exclude rejected or
+  disputed input after a supplier disconnects. Header sync waits when no
+  eligible supplier remains. An auxiliary-capacity refusal waits until state
+  reports available capacity
+  ([#847](https://github.com/zakura-core/zakura/pull/847)).
+- Prevented peer serving and misbehavior-report traffic from consuming the
+  block-sync action capacity reserved for needed-body refill recovery
+  ([#849](https://github.com/zakura-core/zakura/pull/849)).
+- Preserved deterministic invalid-body evidence and retry state until the
+  block-sync driver accepts each persistence action
+  ([#850](https://github.com/zakura-core/zakura/pull/850)).
+- Retried failed block-sync needed-body state queries through action-queue
+  contention without letting stale failures cancel newer query ownership
+  ([#852](https://github.com/zakura-core/zakura/pull/852)).
+- Stopped the node when the critical block-sync driver exits unexpectedly
+  instead of leaving native services running without block application
+  ([#853](https://github.com/zakura-core/zakura/pull/853)).
+- Legacy synchronization now preserves checkpoint work across temporary tip refresh timeouts
+  ([#884](https://github.com/zakura-core/zakura/pull/884)).
+
+### Security
+
+- Restricted administrative RPC methods to authenticated Mainnet and Testnet
+  listeners while keeping them available through an optional
+  `rpc.admin_listen_addr` loopback listener. The unauthenticated listener
+  remains intended for protected downstream connectivity, not arbitrary
+  Internet traffic ([#876](https://github.com/zakura-core/zakura/pull/876)).
+
 ## [1.3.1] - 2026-09-02
 
 ### Changed

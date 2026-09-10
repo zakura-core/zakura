@@ -44,6 +44,7 @@ use zakura_chain::{
 use self::trace::ZakuraConnTrace;
 use super::discovery::{self, native_dial_supervised, spawn_native_bootstrap_dialer, RedialPolicy};
 use super::trace::{reject_reason_label, ZakuraTrace};
+use super::transport::{worker_framed_channel, FramedWorkerRecv, QueuedFrame};
 #[cfg(any(test, feature = "zakura-testkit"))]
 use crate::zakura::drive_header_sync_actions;
 #[cfg(any(test, feature = "zakura-testkit"))]
@@ -3980,13 +3981,13 @@ fn spawn_persistent_stream_worker(
     ordered_session_exit_tx: mpsc::UnboundedSender<OrderedSessionExit>,
 ) -> AdmittedOrderedSession {
     let (to_service_tx, to_service_rx) = mpsc::channel(queue_depth);
-    let (from_service_tx, from_service_rx) = mpsc::channel(queue_depth);
+    let (from_service_tx, from_service_rx) = worker_framed_channel(queue_depth);
     let admitted = AdmittedOrderedSession {
         kind: prelude.stream_kind,
         version: prelude.stream_version,
         session_id: context.stream_id,
         recv: FramedRecv::new(to_service_rx),
-        send: FramedSend::new(from_service_tx),
+        send: from_service_tx,
         cancel_token: context.stream_token.clone(),
     };
 
@@ -4018,7 +4019,7 @@ async fn persistent_stream_worker(
     prelude: StreamPrelude,
     context: StreamWorkerContext,
     inbound_tx: mpsc::Sender<Frame>,
-    outbound_rx: mpsc::Receiver<Frame>,
+    outbound_rx: FramedWorkerRecv,
     queue_depth_limit: usize,
 ) {
     let context = Arc::new(context);
@@ -4124,10 +4125,10 @@ async fn persistent_stream_worker(
                 }
             } => {
                 match outbound {
-                    Some(frame) => {
-                        if let Err(error) = write_ordered_frame(
+                    Some(queued_frame) => {
+                        if let Err(error) = write_queued_ordered_frame(
                             &mut send,
-                            frame,
+                            queued_frame,
                             context.limits,
                             context.outbound_frame_cap,
                         ).await {
@@ -4522,6 +4523,21 @@ async fn write_ordered_frame(
         .await
         .map_err(|_| -> BoxError { "Zakura outbound frame write timed out".into() })??;
     Ok(())
+}
+
+/// Write one queued frame while retaining its byte-accounting lease.
+///
+/// The lease remains owned until the QUIC write succeeds, fails, times out, or
+/// this future is dropped with the worker.
+async fn write_queued_ordered_frame(
+    send: &mut SendStream,
+    queued_frame: QueuedFrame,
+    limits: ZakuraConnectionLimits,
+    max_frame_bytes: u32,
+) -> Result<(), BoxError> {
+    queued_frame
+        .write_with(|frame| write_ordered_frame(send, frame, limits, max_frame_bytes))
+        .await
 }
 
 async fn write_outbound_request_frame(
@@ -8070,7 +8086,7 @@ mod tests {
             // read frame to a full service channel (which would itself stop the
             // reader and confound the test). The outbound side is unused here.
             let (inbound_tx, mut inbound_rx) = mpsc::channel(16);
-            let (_outbound_tx, outbound_rx) = mpsc::channel(1);
+            let (_outbound_tx, outbound_rx) = worker_framed_channel(1);
             tokio::spawn(async move { while inbound_rx.recv().await.is_some() {} });
             tokio::spawn(persistent_stream_worker(
                 send,

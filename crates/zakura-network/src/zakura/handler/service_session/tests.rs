@@ -372,6 +372,14 @@ async fn paired_data_timeout_preserves_sibling_and_reopens_pair() -> Result<(), 
     .await
     .expect("the paired data writer retires its session at the write deadline")?;
     assert!(started.elapsed() >= TEST_DATA_WRITE_TIMEOUT);
+    assert_eq!(
+        client.data_recv.failure(),
+        Some(OrderedStreamFailure::WriteTimeout)
+    );
+    assert_eq!(
+        client.request_recv.failure(),
+        Some(OrderedStreamFailure::WriteTimeout)
+    );
     timeout(TEST_TIMEOUT, server.cancel.cancelled()).await?;
     assert!(!client.connection_cancel.is_cancelled());
     assert!(!server.connection_cancel.is_cancelled());
@@ -1006,7 +1014,7 @@ async fn paired_request_reader_close_interrupts_a_blocked_write() -> Result<(), 
         let context = raw_worker_context(&client, slots.clone());
         let connection_cancel = context.connection_token.clone();
         let pair_cancel = context.stream_token.clone();
-        let remote_close = CancellationToken::new();
+        let failure_cause = OrderedStreamFailureCause::default();
         let prelude = StreamPrelude {
             magic: STREAM_PRELUDE_MAGIC,
             stream_kind: REQUESTS.kind,
@@ -1025,7 +1033,7 @@ async fn paired_request_reader_close_interrupts_a_blocked_write() -> Result<(), 
                 inbound_tx,
                 outbound_rx,
                 1,
-                Some(remote_close.clone()),
+                Some(failure_cause.clone()),
             )));
         assert_eq!(
             timeout(TEST_TIMEOUT, inbound_rx.recv()).await?,
@@ -1048,7 +1056,7 @@ async fn paired_request_reader_close_interrupts_a_blocked_write() -> Result<(), 
         timeout(Duration::from_secs(2), &mut worker)
             .await
             .expect("closing the reader interrupts a flow-controlled request write")?;
-        assert!(remote_close.is_cancelled());
+        assert_eq!(failure_cause.get(), Some(OrderedStreamFailure::RemoteClose));
         assert!(pair_cancel.is_cancelled());
         assert!(!connection_cancel.is_cancelled());
         assert_eq!(slots.available_permits(), 1);
@@ -1341,4 +1349,33 @@ async fn initial_pair_capacity_race_preserves_the_connection() -> Result<(), Box
     exchange(&mut client, &mut server).await?;
     assert!(fixture.connection.close_reason().is_none());
     fixture.close().await
+}
+
+#[tokio::test]
+async fn single_stream_retirement_preserves_remote_cause_and_local_neutrality(
+) -> Result<(), BoxError> {
+    for local in [false, true] {
+        let mut fixture =
+            RawFixture::start_with_streams(1, Duration::from_secs(3), &[DATA]).await?;
+        let (mut peer_send, _peer_recv) = fixture.offer(DATA, None).await?;
+        let mut peer = timeout(TEST_TIMEOUT, fixture.sessions.recv())
+            .await?
+            .ok_or("missing session")?;
+        let cancel = peer.service_cancel_token();
+        let (mut recv, _send) = peer.take_stream(DATA.kind).unwrap();
+        if local {
+            cancel.cancel();
+        } else {
+            peer_send.finish()?;
+        }
+        timeout(TEST_TIMEOUT, cancel.cancelled()).await?;
+        assert!(timeout(TEST_TIMEOUT, recv.recv()).await?.is_none());
+        assert_eq!(
+            recv.failure(),
+            (!local).then_some(OrderedStreamFailure::RemoteClose)
+        );
+        assert!(!peer.cancel_token().is_cancelled());
+        fixture.close().await?;
+    }
+    Ok(())
 }

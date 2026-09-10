@@ -192,7 +192,7 @@ pub(super) fn spawn_service_session(
         resources.admitted();
     }
     let cancel = primary.context.connection_token.child_token();
-    let remote_close = CancellationToken::new();
+    let failure_cause = OrderedStreamFailureCause::default();
     let mut admitted = AdmittedSession {
         kind: primary.stream.kind,
         session_id: primary.context.stream_id,
@@ -214,10 +214,10 @@ pub(super) fn spawn_service_session(
         admitted.streams.push(ServiceStreamRole {
             kind: prepared.stream.kind,
             version: prepared.stream.version,
-            recv: FramedRecv::new(inbound_rx).with_remote_close(remote_close.clone()),
+            recv: FramedRecv::new(inbound_rx).with_failure_cause(failure_cause.clone()),
             send: sender.with_session_resources(prepared.context.session_resources.clone()),
         });
-        let remote_close = remote_close.clone();
+        let failure_cause = failure_cause.clone();
         running.push(async move {
             let (send, recv) = prepared.io.take();
             persistent_stream_worker_with_policy(
@@ -228,7 +228,7 @@ pub(super) fn spawn_service_session(
                 inbound_tx,
                 outbound_rx,
                 inbound_depth,
-                Some(remote_close),
+                Some(failure_cause),
             )
             .await;
         });

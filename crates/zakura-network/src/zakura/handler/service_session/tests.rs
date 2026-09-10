@@ -7,24 +7,28 @@ const DATA: Stream = Stream {
     version: 1,
     frame_cap: 2 * 1024 * 1024,
     capability: 1 << 16,
-    mode: StreamMode::Ordered,
+    mode: StreamMode::Persistent,
 };
 const REQUESTS: Stream = Stream { kind: 65, ..DATA };
+const EVENTS: Stream = Stream { kind: 67, ..DATA };
+const ONE_SHOT: Stream = Stream {
+    kind: 68,
+    mode: StreamMode::RequestResponse,
+    ..DATA
+};
 const SIBLING: Stream = Stream {
     kind: 66,
     capability: 1 << 17,
     ..DATA
 };
-const PAIR: OrderedStreamPair = OrderedStreamPair {
-    data: DATA,
-    requests: REQUESTS,
-};
 const ALPN: &[u8] = b"/zakura/test/ordered-pair/1";
+const TEST_DATA_WRITE_TIMEOUT: Duration = Duration::from_secs(32);
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
-struct PairService {
-    opening: OrderedStreamOpening,
+struct SessionService {
+    streams: &'static [Stream],
+    opening: SessionOpening,
     fail_first_reservation: std::sync::atomic::AtomicBool,
     capacity: Option<Arc<Semaphore>>,
     sessions: mpsc::Sender<Peer>,
@@ -35,7 +39,7 @@ struct SessionSlot {
     _permit: OwnedSemaphorePermit,
 }
 
-impl crate::zakura::OrderedSessionResources for SessionSlot {
+impl crate::zakura::SessionResources for SessionSlot {
     fn admitted(&self) {}
 }
 
@@ -64,23 +68,20 @@ impl Service for SiblingService {
     fn remove_peer(&self, _: &ZakuraPeerId, _: ZakuraConnId) {}
 }
 
-impl Service for PairService {
-    fn reserve_ordered_session(
+impl Service for SessionService {
+    fn reserve_session(
         &self,
         _: ServicePeerDirection,
-    ) -> Result<
-        Option<Arc<dyn crate::zakura::OrderedSessionResources>>,
-        crate::zakura::OrderedSessionFull,
-    > {
+    ) -> Result<Option<Arc<dyn crate::zakura::SessionResources>>, crate::zakura::SessionFull> {
         // Inject the outcome of another connection taking the final slot after
         // this connection's advisory OpenNow check. A retry can succeed.
         if self.fail_first_reservation.swap(false, Ordering::SeqCst) {
-            Err(crate::zakura::OrderedSessionFull)
+            Err(crate::zakura::SessionFull)
         } else if let Some(capacity) = &self.capacity {
             let permit = capacity
                 .clone()
                 .try_acquire_owned()
-                .map_err(|_| crate::zakura::OrderedSessionFull)?;
+                .map_err(|_| crate::zakura::SessionFull)?;
             Ok(Some(Arc::new(SessionSlot { _permit: permit })))
         } else {
             Ok(None)
@@ -90,16 +91,23 @@ impl Service for PairService {
         "test-pair"
     }
     fn streams(&self) -> &[Stream] {
-        &[DATA, REQUESTS]
+        self.streams
     }
-    fn ordered_stream_pair(&self, stream: Stream) -> Option<OrderedStreamPair> {
-        [DATA, REQUESTS].contains(&stream).then_some(PAIR)
+    fn stream_write_policy(&self, stream: Stream) -> StreamWritePolicy {
+        if stream == REQUESTS {
+            StreamWritePolicy::UntilCancelled
+        } else {
+            StreamWritePolicy::Timeout(TEST_DATA_WRITE_TIMEOUT)
+        }
     }
-    fn stream_queue_depths(&self, _: Stream) -> Option<(usize, usize)> {
-        Some((1, 1))
+    fn stream_queue_depths(&self, stream: Stream) -> Option<(usize, usize)> {
+        Some(if stream == EVENTS { (3, 3) } else { (1, 1) })
     }
-    fn ordered_stream_policy(&self, _: u16) -> OrderedStreamPolicy {
-        OrderedStreamPolicy {
+    fn as_request_response(&self) -> Option<&dyn crate::zakura::RequestResponseService> {
+        Some(self)
+    }
+    fn session_policy(&self) -> SessionPolicy {
+        SessionPolicy {
             opening: self.opening,
             reopen: true,
         }
@@ -111,6 +119,20 @@ impl Service for PairService {
         }
     }
     fn remove_peer(&self, _: &ZakuraPeerId, _: ZakuraConnId) {}
+}
+
+impl crate::zakura::RequestResponseService for SessionService {
+    fn request_frame<'a>(
+        &'a self,
+        _: ZakuraPeerId,
+        _: u16,
+        _: u64,
+        _: u32,
+        _: u32,
+        frame: Frame,
+    ) -> BoxRunFuture<'a, Result<Vec<Frame>, SinkReject>> {
+        Box::pin(async move { Ok(vec![frame]) })
+    }
 }
 
 struct Session {
@@ -177,6 +199,21 @@ impl Fixture {
         max_open_streams: Option<u16>,
         retired_sibling: bool,
     ) -> Result<Self, BoxError> {
+        Self::start_with_streams(
+            fail_first_reservation,
+            max_open_streams,
+            retired_sibling,
+            &[DATA, REQUESTS],
+        )
+        .await
+    }
+
+    async fn start_with_streams(
+        fail_first_reservation: bool,
+        max_open_streams: Option<u16>,
+        retired_sibling: bool,
+        streams: &'static [Stream],
+    ) -> Result<Self, BoxError> {
         let mut local = ZakuraLocalLimits::from_config(&Config::default());
         if let Some(max_open_streams) = max_open_streams {
             local.max_open_streams = max_open_streams;
@@ -199,9 +236,10 @@ impl Fixture {
                 local.clone(),
                 Arc::new(
                     ServiceRegistry::new(vec![
-                        Arc::new(PairService {
+                        Arc::new(SessionService {
+                            streams,
                             capacity: None,
-                            opening: OrderedStreamOpening::EitherSide,
+                            opening: SessionOpening::EitherSide,
                             sessions,
                             fail_first_reservation: std::sync::atomic::AtomicBool::new(
                                 fail_reservation,
@@ -319,7 +357,7 @@ async fn paired_data_timeout_preserves_sibling_and_reopens_pair() -> Result<(), 
         }
         Ok::<_, BoxError>(())
     }));
-    timeout(PAIRED_DATA_WRITE_TIMEOUT + Duration::from_secs(10), async {
+    timeout(TEST_DATA_WRITE_TIMEOUT + Duration::from_secs(10), async {
         loop {
             let ping = frame(1, 17, 64);
             sibling_send.send(ping.clone()).await?;
@@ -333,7 +371,15 @@ async fn paired_data_timeout_preserves_sibling_and_reopens_pair() -> Result<(), 
     })
     .await
     .expect("the paired data writer retires its session at the write deadline")?;
-    assert!(started.elapsed() >= PAIRED_DATA_WRITE_TIMEOUT);
+    assert!(started.elapsed() >= TEST_DATA_WRITE_TIMEOUT);
+    assert_eq!(
+        client.data_recv.failure(),
+        Some(OrderedStreamFailure::WriteTimeout)
+    );
+    assert_eq!(
+        client.request_recv.failure(),
+        Some(OrderedStreamFailure::WriteTimeout)
+    );
     timeout(TEST_TIMEOUT, server.cancel.cancelled()).await?;
     assert!(!client.connection_cancel.is_cancelled());
     assert!(!server.connection_cancel.is_cancelled());
@@ -500,19 +546,89 @@ struct RawFixture {
     connection: Connection,
     serving: AbortOnDropHandle<Result<(), ZakuraHandlerError>>,
     shutdown: CancellationToken,
-    service: Arc<PairService>,
+    service: Arc<SessionService>,
     sessions: mpsc::Receiver<Peer>,
     siblings: mpsc::Receiver<Peer>,
 }
 
+#[tokio::test]
+async fn three_stream_session_reopens_at_the_exact_stream_limit() -> Result<(), BoxError> {
+    let mut fixture =
+        Fixture::start_with_streams(false, Some(3), true, &[DATA, REQUESTS, EVENTS]).await?;
+    let mut previous_id = None;
+    for _ in 0..2 {
+        let mut client = timeout(TEST_TIMEOUT, fixture.client_sessions.recv())
+            .await?
+            .ok_or("missing client session")?;
+        let mut server = timeout(TEST_TIMEOUT, fixture.server_sessions.recv())
+            .await?
+            .ok_or("missing server session")?;
+        let mut client_streams = Vec::new();
+        let mut server_streams = Vec::new();
+        for stream in [DATA, REQUESTS, EVENTS] {
+            client_streams.push(client.take_stream_with_session_id(stream.kind).unwrap());
+            server_streams.push(server.take_stream_with_session_id(stream.kind).unwrap());
+        }
+        let client_id = client_streams[0].0;
+        let server_id = server_streams[0].0;
+        assert_ne!(previous_id, Some(client_id));
+        previous_id = Some(client_id);
+        for ((id, _, send), (remote_id, recv, _)) in
+            client_streams.iter().zip(server_streams.iter_mut())
+        {
+            assert_eq!(*id, client_id);
+            assert_eq!(*remote_id, server_id);
+            let message = frame(1, 21, 8);
+            timeout(TEST_TIMEOUT, send.send(message.clone())).await??;
+            assert_eq!(timeout(TEST_TIMEOUT, recv.recv()).await?, Some(message));
+        }
+        client.service_cancel_token().cancel();
+        timeout(TEST_TIMEOUT, server.service_cancel_token().cancelled()).await?;
+        assert!(!client.cancel_token().is_cancelled());
+    }
+    fixture.close().await
+}
+
+#[tokio::test]
+async fn invalid_third_member_releases_the_entire_pending_session() -> Result<(), BoxError> {
+    for (stream, id) in [(REQUESTS, 9), (EVENTS, 10), (EVENTS, 0)] {
+        let mut fixture =
+            RawFixture::start_with_streams(1, Duration::from_secs(3), &[DATA, REQUESTS, EVENTS])
+                .await?;
+        let _data = fixture.offer(DATA, Some(9)).await?;
+        let _requests = fixture.offer(REQUESTS, Some(9)).await?;
+        fixture.wait_for_slots(0, TEST_TIMEOUT).await?;
+        let _invalid = fixture.offer(stream, Some(id)).await?;
+        fixture.wait_for_slots(1, Duration::from_secs(1)).await?;
+        timeout(Duration::from_secs(1), async {
+            while !fixture.serving.is_finished() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        assert!(fixture.sessions.try_recv().is_err());
+        fixture.close().await?;
+    }
+    Ok(())
+}
+
 impl RawFixture {
     async fn start(slots: usize, setup_timeout: Duration) -> Result<Self, BoxError> {
+        Self::start_with_streams(slots, setup_timeout, &[DATA, REQUESTS]).await
+    }
+
+    async fn start_with_streams(
+        slots: usize,
+        setup_timeout: Duration,
+        streams: &'static [Stream],
+    ) -> Result<Self, BoxError> {
         let (router, client, connection, remote) = raw_connection().await?;
         let local = ZakuraLocalLimits::from_config(&Config::default());
         let (sessions_tx, sessions) = mpsc::channel(2);
         let (siblings_tx, siblings) = mpsc::channel(1);
-        let service = Arc::new(PairService {
-            opening: OrderedStreamOpening::InitiatorOnly,
+        let service = Arc::new(SessionService {
+            streams,
+            opening: SessionOpening::InitiatorOnly,
             fail_first_reservation: std::sync::atomic::AtomicBool::new(false),
             capacity: Some(Arc::new(Semaphore::new(slots))),
             sessions: sessions_tx,
@@ -615,6 +731,116 @@ impl RawFixture {
 }
 
 #[tokio::test]
+async fn three_stream_session_waits_for_every_member_and_leaves_requests_independent(
+) -> Result<(), BoxError> {
+    let mut fixture = RawFixture::start_with_streams(
+        1,
+        Duration::from_secs(3),
+        &[EVENTS, ONE_SHOT, REQUESTS, DATA],
+    )
+    .await?;
+    let (mut sibling_send, _sibling_recv) = fixture.offer(SIBLING, None).await?;
+    let mut sibling = timeout(TEST_TIMEOUT, fixture.siblings.recv())
+        .await?
+        .ok_or("missing sibling")?;
+    let (mut sibling_recv, _sibling_sender) = sibling.take_stream(SIBLING.kind).unwrap();
+
+    let mut events = fixture.offer(EVENTS, Some(42)).await?;
+    let mut requests = fixture.offer(REQUESTS, Some(42)).await?;
+    let event = frame(3, 11, 8);
+    let request = frame(1, 12, 8);
+    events.0.write_all(&event.encode(EVENTS.frame_cap)?).await?;
+    requests
+        .0
+        .write_all(&request.encode(REQUESTS.frame_cap)?)
+        .await?;
+    fixture.wait_for_slots(0, TEST_TIMEOUT).await?;
+    assert!(
+        timeout(Duration::from_millis(100), fixture.sessions.recv())
+            .await
+            .is_err(),
+        "two of three required streams cannot start the service"
+    );
+
+    let _data = fixture.offer(DATA, Some(42)).await?;
+    let mut peer = timeout(TEST_TIMEOUT, fixture.sessions.recv())
+        .await?
+        .ok_or("missing session")?;
+    let cancel = peer.service_cancel_token();
+    let (data_id, mut data_recv, _data_send) = peer.take_stream_with_session_id(DATA.kind).unwrap();
+    let (request_id, mut request_recv, _request_send) =
+        peer.take_stream_with_session_id(REQUESTS.kind).unwrap();
+    let (event_id, mut event_recv, event_send) =
+        peer.take_stream_with_session_id(EVENTS.kind).unwrap();
+    assert_eq!((data_id, data_id), (request_id, event_id));
+    assert_eq!(
+        event_send.max_capacity(),
+        3,
+        "the service controls each stream's queue"
+    );
+    assert_eq!(timeout(TEST_TIMEOUT, event_recv.recv()).await?, Some(event));
+    assert_eq!(
+        timeout(TEST_TIMEOUT, request_recv.recv()).await?,
+        Some(request)
+    );
+    assert!(peer.take_stream(ONE_SHOT.kind).is_none());
+
+    // A per-request stream carries no session identifier and completes independently.
+    let (mut send, mut recv) = fixture.connection.open_bi().await?;
+    let mut bytes = StreamPrelude {
+        magic: STREAM_PRELUDE_MAGIC,
+        stream_kind: ONE_SHOT.kind,
+        stream_version: ONE_SHOT.version,
+        request_id: Some(99),
+        max_frame_bytes: ONE_SHOT.frame_cap,
+    }
+    .encode()?;
+    let echo = frame(4, 13, 8).encode(ONE_SHOT.frame_cap)?;
+    bytes.extend_from_slice(&echo);
+    timeout(TEST_TIMEOUT, send.write_all(&bytes)).await??;
+    send.finish()?;
+    assert_eq!(timeout(TEST_TIMEOUT, recv.read_to_end(1024)).await??, echo);
+    assert!(!cancel.is_cancelled());
+
+    events.0.reset(0u32.into())?;
+    events.1.stop(0u32.into())?;
+    timeout(TEST_TIMEOUT, cancel.cancelled()).await?;
+    assert!(timeout(TEST_TIMEOUT, data_recv.recv()).await?.is_none());
+    assert!(timeout(TEST_TIMEOUT, request_recv.recv()).await?.is_none());
+    assert!(timeout(TEST_TIMEOUT, event_recv.recv()).await?.is_none());
+    assert!(!peer.cancel_token().is_cancelled());
+    let ping = frame(2, 14, 8);
+    sibling_send
+        .write_all(&ping.encode(SIBLING.frame_cap)?)
+        .await?;
+    assert_eq!(
+        timeout(TEST_TIMEOUT, sibling_recv.recv()).await?,
+        Some(ping)
+    );
+    fixture.close().await
+}
+
+#[tokio::test]
+async fn incomplete_three_stream_session_releases_all_arrivals_on_expiry() -> Result<(), BoxError> {
+    let mut fixture =
+        RawFixture::start_with_streams(1, Duration::from_millis(300), &[DATA, REQUESTS, EVENTS])
+            .await?;
+    let (_request_send, mut request_recv) = fixture.offer(REQUESTS, Some(1)).await?;
+    let (_event_send, mut event_recv) = fixture.offer(EVENTS, Some(1)).await?;
+    fixture.wait_for_slots(0, TEST_TIMEOUT).await?;
+    fixture.wait_for_slots(1, TEST_TIMEOUT).await?;
+    assert!(fixture.sessions.try_recv().is_err());
+    assert!(timeout(TEST_TIMEOUT, request_recv.read_exact(&mut [0; 1]))
+        .await?
+        .is_err());
+    assert!(timeout(TEST_TIMEOUT, event_recv.read_exact(&mut [0; 1]))
+        .await?
+        .is_err());
+    assert!(fixture.connection.close_reason().is_none());
+    fixture.close().await
+}
+
+#[tokio::test]
 async fn withheld_pair_id_does_not_reserve_service_capacity() -> Result<(), BoxError> {
     let fixture = RawFixture::start(1, Duration::from_secs(2)).await?;
     let (mut send, _recv) = fixture.offer(DATA, None).await?;
@@ -622,7 +848,7 @@ async fn withheld_pair_id_does_not_reserve_service_capacity() -> Result<(), BoxE
     assert_eq!(fixture.capacity().available_permits(), 1);
     let outbound = fixture
         .service
-        .reserve_ordered_session(ServicePeerDirection::Outbound)?;
+        .reserve_session(ServicePeerDirection::Outbound)?;
     drop(outbound);
     send.write_all(&1u64.to_le_bytes()).await?;
     fixture.wait_for_slots(0, TEST_TIMEOUT).await?;
@@ -660,7 +886,7 @@ async fn expired_pair_cannot_reclaim_capacity_before_an_outgoing_session() -> Re
     }
     let outbound = fixture
         .service
-        .reserve_ordered_session(ServicePeerDirection::Outbound)?;
+        .reserve_session(ServicePeerDirection::Outbound)?;
     assert_eq!(fixture.capacity().available_permits(), 0);
     drop(outbound);
     fixture.close().await
@@ -763,6 +989,7 @@ fn raw_worker_context(client: &Endpoint, slots: Arc<Semaphore>) -> StreamWorkerC
         message_payload_limits: &[],
         message_types: None,
         queue_depths: None,
+        write_policy: StreamWritePolicy::UntilCancelled,
         session_resources: None,
         outbound_frame_cap: DATA.frame_cap,
         message_bucket: Arc::new(std::sync::Mutex::new(TokenBucket::new(128))),
@@ -787,7 +1014,7 @@ async fn paired_request_reader_close_interrupts_a_blocked_write() -> Result<(), 
         let context = raw_worker_context(&client, slots.clone());
         let connection_cancel = context.connection_token.clone();
         let pair_cancel = context.stream_token.clone();
-        let remote_close = CancellationToken::new();
+        let failure_cause = OrderedStreamFailureCause::default();
         let prelude = StreamPrelude {
             magic: STREAM_PRELUDE_MAGIC,
             stream_kind: REQUESTS.kind,
@@ -806,8 +1033,7 @@ async fn paired_request_reader_close_interrupts_a_blocked_write() -> Result<(), 
                 inbound_tx,
                 outbound_rx,
                 1,
-                OrderedWritePolicy::PairRequests,
-                Some(remote_close.clone()),
+                Some(failure_cause.clone()),
             )));
         assert_eq!(
             timeout(TEST_TIMEOUT, inbound_rx.recv()).await?,
@@ -830,7 +1056,7 @@ async fn paired_request_reader_close_interrupts_a_blocked_write() -> Result<(), 
         timeout(Duration::from_secs(2), &mut worker)
             .await
             .expect("closing the reader interrupts a flow-controlled request write")?;
-        assert!(remote_close.is_cancelled());
+        assert_eq!(failure_cause.get(), Some(OrderedStreamFailure::RemoteClose));
         assert!(pair_cancel.is_cancelled());
         assert!(!connection_cancel.is_cancelled());
         assert_eq!(slots.available_permits(), 1);
@@ -938,9 +1164,10 @@ async fn incomplete_pairs_expire_and_mismatched_roles_release_stream_permits(
         Network::Mainnet,
         ZakuraHandshakeConfig::for_network(&Network::Mainnet),
         local.clone(),
-        Arc::new(ServiceRegistry::new(vec![Arc::new(PairService {
+        Arc::new(ServiceRegistry::new(vec![Arc::new(SessionService {
+            streams: &[DATA, REQUESTS],
             capacity: None,
-            opening: OrderedStreamOpening::EitherSide,
+            opening: SessionOpening::EitherSide,
             fail_first_reservation: std::sync::atomic::AtomicBool::new(false),
             sessions,
         })])?),
@@ -950,7 +1177,7 @@ async fn incomplete_pairs_expire_and_mismatched_roles_release_stream_permits(
     let peer = ZakuraPeerId::new(client.node_id().as_bytes().to_vec())?;
     let (freshness, _freshness_rx) = watch::channel(Instant::now());
     let cancel = CancellationToken::new();
-    let mut pending = PendingOrderedPairs::default();
+    let mut pending = PendingSessions::default();
     let mut workers = JoinSet::new();
     let mut buckets = MessageRateBuckets::new();
     let mut open_limiter = TokenBucket::new(100);
@@ -1005,7 +1232,11 @@ async fn incomplete_pairs_expire_and_mismatched_roles_release_stream_permits(
                 "incomplete setup is retired locally"
             );
             assert!(pending
-                .reserve_or_share(PAIR, &handler.registry, ServicePeerDirection::Inbound)
+                .reserve_or_share(
+                    &handler.registry.session_layout(DATA).unwrap(),
+                    &handler.registry,
+                    ServicePeerDirection::Inbound
+                )
                 .is_err());
             tokio::time::sleep(limits.prelude_timeout).await;
         }
@@ -1032,9 +1263,10 @@ async fn ineligible_pair_opener_is_rejected_before_service_reservation() -> Resu
     let _guard = zakura_test::init();
     let (router, client, connection, remote) = raw_connection().await?;
     let (sessions, _sessions_rx) = mpsc::channel(1);
-    let service = Arc::new(PairService {
+    let service = Arc::new(SessionService {
+        streams: &[DATA, REQUESTS],
         capacity: None,
-        opening: OrderedStreamOpening::InitiatorOnly,
+        opening: SessionOpening::InitiatorOnly,
         fail_first_reservation: std::sync::atomic::AtomicBool::new(true),
         sessions,
     });
@@ -1051,7 +1283,7 @@ async fn ineligible_pair_opener_is_rejected_before_service_reservation() -> Resu
     let mut workers = JoinSet::new();
     let mut open_limiter = TokenBucket::new(100);
     let mut buckets = MessageRateBuckets::new();
-    let mut pending = PendingOrderedPairs::default();
+    let mut pending = PendingSessions::default();
     let (exits, _exit_rx) = mpsc::unbounded_channel();
     let mut admission = StreamAdmission {
         is_initiator: true,
@@ -1117,4 +1349,33 @@ async fn initial_pair_capacity_race_preserves_the_connection() -> Result<(), Box
     exchange(&mut client, &mut server).await?;
     assert!(fixture.connection.close_reason().is_none());
     fixture.close().await
+}
+
+#[tokio::test]
+async fn single_stream_retirement_preserves_remote_cause_and_local_neutrality(
+) -> Result<(), BoxError> {
+    for local in [false, true] {
+        let mut fixture =
+            RawFixture::start_with_streams(1, Duration::from_secs(3), &[DATA]).await?;
+        let (mut peer_send, _peer_recv) = fixture.offer(DATA, None).await?;
+        let mut peer = timeout(TEST_TIMEOUT, fixture.sessions.recv())
+            .await?
+            .ok_or("missing session")?;
+        let cancel = peer.service_cancel_token();
+        let (mut recv, _send) = peer.take_stream(DATA.kind).unwrap();
+        if local {
+            cancel.cancel();
+        } else {
+            peer_send.finish()?;
+        }
+        timeout(TEST_TIMEOUT, cancel.cancelled()).await?;
+        assert!(timeout(TEST_TIMEOUT, recv.recv()).await?.is_none());
+        assert_eq!(
+            recv.failure(),
+            (!local).then_some(OrderedStreamFailure::RemoteClose)
+        );
+        assert!(!peer.cancel_token().is_cancelled());
+        fixture.close().await?;
+    }
+    Ok(())
 }

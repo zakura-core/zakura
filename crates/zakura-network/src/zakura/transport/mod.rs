@@ -23,17 +23,18 @@ pub use io::{framed_channel, FramedRecv, FramedSend};
 #[allow(unused_imports)] // guarded producers are activated by the next chunks
 pub(crate) use io::{
     worker_framed_channel, FrameGuard, FrameWriteClaim, FramedWorkerRecv, GuardedReserveError,
-    QueuedFrame,
+    OrderedStreamFailure, OrderedStreamFailureCause, QueuedFrame,
 };
 pub(crate) use pipe::{
     handle_pipe_exit, spawn_supervised_peer_task, spawn_supervised_pipe, CloseCause, Edge, Flow,
     Node, NodeKind, Pipe, PipeCx, PipeShape,
 };
+pub(crate) use registry::SessionLayout;
 pub use registry::{RegistryError, ServiceRegistry};
 pub(crate) use service::ServiceStream;
 pub use service::{
-    BoxRunFuture, OrderedSessionDemand, OrderedSessionFull, OrderedSessionResources,
-    OrderedStreamOpening, OrderedStreamPair, OrderedStreamPolicy, Peer, RequestResponseService,
-    Service, Sink, SinkReject, Source, Stream, StreamMode,
+    BoxRunFuture, Peer, RequestResponseService, Service, SessionDemand, SessionFull,
+    SessionOpening, SessionPolicy, SessionResources, Sink, SinkReject, Source, Stream, StreamMode,
+    StreamWritePolicy,
 };
 pub use session::{OrderedSendError, PeerStreamSession};

@@ -17,9 +17,7 @@ use crate::{
     arbitrary::Prepare,
     service::{
         non_finalized_state::{Chain, NonFinalizedState},
-        queued_blocks::{
-            QueuedBlocks, QueuedSemanticallyVerified, SentHashes, MAX_QUEUED_BLOCKS,
-        },
+        queued_blocks::{QueuedBlocks, QueuedSemanticallyVerified, SentHashes, MAX_QUEUED_BLOCKS},
     },
     tests::FakeChainHelper,
     CheckpointVerifiedBlock, CommitBlockError, CommitSemanticallyVerifiedError,
@@ -638,6 +636,72 @@ fn same_hash_replacement_keeps_the_new_body() -> Result<()> {
 }
 
 #[test]
+fn same_hash_replacement_preserves_other_utxo_providers() -> Result<()> {
+    let _init_guard = zakura_test::init();
+
+    for replace_lower in [true, false] {
+        let providers = shared_utxo_providers()?;
+        let (original, other) = if replace_lower {
+            (&providers.lower, &providers.higher)
+        } else {
+            (&providers.higher, &providers.lower)
+        };
+        let replacement_outpoint = transparent::OutPoint {
+            hash: transaction::Hash([0x51; 32]),
+            index: 0,
+        };
+        let replacement_output = original.new_outputs[&providers.outpoint].clone();
+        let mut replacement = original.clone();
+        replacement.new_outputs.clear();
+        replacement
+            .new_outputs
+            .insert(replacement_outpoint, replacement_output.clone());
+
+        let mut queue = QueuedBlocks::default();
+        queue.queue(original.clone().into_queued());
+        queue.queue(other.clone().into_queued());
+        let old = queue.replace(original.hash, replacement.into_queued());
+
+        assert_eq!(old.0, *original);
+        assert_eq!(queue.blocks.len(), 2);
+        assert_eq!(queue.by_parent.len(), 2);
+        assert_eq!(queue.by_height.len(), 2);
+        assert_eq!(
+            queue.utxo(&providers.outpoint),
+            Some(other.new_outputs[&providers.outpoint].utxo.clone())
+        );
+        for outpoint in original.new_outputs.keys() {
+            if !other.new_outputs.contains_key(outpoint) {
+                assert_eq!(queue.utxo(outpoint), None);
+            }
+        }
+        assert_eq!(
+            queue.utxo(&replacement_outpoint),
+            Some(replacement_output.utxo.clone())
+        );
+
+        let removed = queue.dequeue_children(other.block.header.previous_block_hash);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].0.hash, other.hash);
+        assert_eq!(queue.utxo(&providers.outpoint), None);
+        assert_eq!(
+            queue.utxo(&replacement_outpoint),
+            Some(replacement_output.utxo)
+        );
+
+        let removed = queue.dequeue_children(original.block.header.previous_block_hash);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].0.hash, original.hash);
+        assert!(queue.blocks.is_empty());
+        assert!(queue.by_parent.is_empty());
+        assert!(queue.by_height.is_empty());
+        assert!(queue.known_utxos.is_empty());
+    }
+
+    Ok(())
+}
+
+#[test]
 fn orphan_queue_has_a_fixed_entry_bound() -> Result<()> {
     let block: Arc<Block> =
         zakura_test::vectors::BLOCK_MAINNET_419200_BYTES.zcash_deserialize_into()?;
@@ -846,9 +910,9 @@ fn fail_descendants_preserves_shared_utxo_from_live_branch_until_removed() -> Re
 
     let mut queue = QueuedBlocks::default();
     let (lower_response, mut lower_receiver) = oneshot::channel();
-    queue.queue((providers.lower.clone(), lower_response));
+    queue.queue((providers.lower.clone(), lower_response, None));
     let (grandchild_response, mut grandchild_receiver) = oneshot::channel();
-    queue.queue((failed_grandchild, grandchild_response));
+    queue.queue((failed_grandchild, grandchild_response, None));
     queue.queue(providers.higher.clone().into_queued());
 
     let error = CommitSemanticallyVerifiedError::from(CommitBlockError::HeaderChainError {

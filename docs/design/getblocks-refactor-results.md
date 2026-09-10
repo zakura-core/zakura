@@ -24,7 +24,11 @@ outbound setup slot and exact-generation registry cleanup remain in place.
 - #944 passes 302 block-sync tests and all-target network Clippy.
 - The combined activation passes 546 handler, block-sync, transport, regulation,
   owned-state-read, and node-driver tests without retries. One passing node test
-  reports a nextest process-cleanup warning.
+  reports a nextest process-cleanup warning and passes cleanly on a targeted rerun.
+- All 22 ordinary cluster tests pass without retries. One passing discovery test
+  reports a nextest process-cleanup warning. Network and node Clippy pass with
+  all targets and warnings denied. Formatting, Markdown lint, and each PR's
+  changelog check pass.
 
 These checks use this stack's existing Iroh 0.92 dependency. They do not update
 the older Iroh 1.1 measurements below. The final combined dependency set still

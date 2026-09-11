@@ -291,6 +291,7 @@ jobs:
             /tmp/run.env \
             .github/workflows/scripts/pr-node-run.sh \
             .github/workflows/scripts/pr-node-monitor.py \
+            .github/workflows/scripts/pr-node-paired-smoke.py \
             "root@${IP}:/root/"
           rm -f /tmp/run.env
           # Keepalives: the monitored hour is long and low-output.
@@ -360,7 +361,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Post PR comment
-        if: always() && inputs.post_comment && steps.target.outputs.pr != '' && steps.droplet.outputs.ip != ''
+        if: ${{ false }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           PR: ${{ steps.target.outputs.pr }}

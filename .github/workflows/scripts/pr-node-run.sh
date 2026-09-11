@@ -56,6 +56,22 @@ else
   df -h /mnt/snapshots
 fi
 
+# This branch is a disposable harness. The binaries still come from the exact PR head.
+[ "$SHA" = "343dec5790b9318528bed191243ed91af75cbf7d" ] || { echo "wrong PR head" >&2; exit 1; }
+[ "$MODE" = "tip" ] && [ "$NETWORK" = "mainnet" ] && [ "$P2P_STACK" = "dual" ] || {
+  echo "paired smoke requires tip/mainnet/dual for the seed" >&2; exit 1;
+}
+PAIRED_STATE_CACHE_DIR=/mnt/snapshots/paired-client
+[ ! -e "$PAIRED_STATE_CACHE_DIR" ] || { echo "paired fixture already exists" >&2; exit 1; }
+TASK_COPY_BYTES=$(du -sb "$STATE_CACHE_DIR" | cut -f1)
+TASK_FREE_BYTES=$(df -B1 --output=avail /mnt/snapshots | tail -1 | tr -d ' ')
+[ "$TASK_FREE_BYTES" -gt "$(( TASK_COPY_BYTES + 10 * 1024 * 1024 * 1024 ))" ] || {
+  echo "not enough free space for a separate downloader snapshot" >&2; exit 1;
+}
+# The primary snapshot has not been opened by the node yet. Never copy a live DB.
+cp -a --reflink=auto "$STATE_CACHE_DIR" "$PAIRED_STATE_CACHE_DIR"
+note "Copied the unopened snapshot for a separate native-only downloader."
+
 # ---------------------------------------------------------------------------- #
 # Source: fetch the PR ref into the baked clone
 # ---------------------------------------------------------------------------- #
@@ -130,6 +146,12 @@ vct_fast_sync = true
 rpc_listen_addr = "127.0.0.1:8232"
 rpc_enable_cookie_auth = false
 metrics_endpoint = "127.0.0.1:9999"
+
+[nodes.zakura]
+listen_addr = "127.0.0.1:8234"
+bootstrap_peers = []
+dev_network = "pr945-mainnet-smoke-20260911"
+trace_dir = "/var/log/zakura/seed-traces"
 TOML
 
 export CARGO_TARGET_DIR=/root/cargo-target
@@ -195,6 +217,10 @@ python3 deploy/deployer/deploy.py status --config /root/fleet.toml || true
 # Monitor for the requested duration, then package outputs
 # ---------------------------------------------------------------------------- #
 
+PAIR_RC=0
+python3 -u /root/pr-node-paired-smoke.py \
+  --state "$PAIRED_STATE_CACHE_DIR" --duration-minutes "$DURATION_MINUTES" &
+PAIR_PID=$!
 MONITOR_RC=0
 python3 /root/pr-node-monitor.py \
   --duration-minutes "${DURATION_MINUTES}" \
@@ -207,6 +233,28 @@ python3 /root/pr-node-monitor.py \
   --meta "mode=${MODE},network=${NETWORK},sha=${SHA}" \
   "${MONITOR_CROSSING_ARGS[@]}" \
   --out "$OUT_DIR" || MONITOR_RC=$?
+
+wait "$PAIR_PID" || PAIR_RC=$?
+cp -a /var/log/zakura/seed-traces "$OUT_DIR/seed-traces" 2>/dev/null || true
+python3 - <<'PAIR_SUMMARY'
+import json
+from pathlib import Path
+root=Path('/root/out')
+pair=json.loads((root/'paired/summary.json').read_text())
+summary=json.loads((root/'summary.json').read_text())
+summary['paired_smoke']=pair
+if not pair['pass']:
+    summary['verdict']='failed'
+(root/'summary.json').write_text(json.dumps(summary,indent=2)+'\n')
+with (root/'summary.md').open('a') as f:
+    f.write('\n## Paired mainnet smoke\n\n')
+    f.write('Two full nodes on one disposable host. The seed follows public mainnet over legacy P2P. The downloader uses only the PR 945 native protocol over QUIC.\n\n')
+    f.write('Result: '+('PASS' if pair['pass'] else 'FAIL')+'\n\n')
+    for phase in pair['phases']:
+        f.write(f"- {phase['phase']}: height {phase['start_height'] if 'start_height' in phase else pair['start_height']} to {phase['height']}, {phase['native_bodies']} native bodies, matching block hash {phase['block_hash']}\n")
+    if pair.get('error'): f.write(pair['error']+'\n')
+PAIR_SUMMARY
+if [ "$PAIR_RC" -ne 0 ]; then MONITOR_RC=$PAIR_RC; fi
 
 tail -n 2000 /var/log/zakura/zakura.log > "$OUT_DIR/zakura-tail.log" 2>/dev/null || true
 zstd -T0 -q -f /var/log/zakura/zakura.log -o "$OUT_DIR/zakura-full.log.zst" 2>/dev/null || true

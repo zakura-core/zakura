@@ -2,7 +2,7 @@ import json
 import subprocess
 import urllib.request
 import tomllib
-from collections import deque
+from collections import deque, Counter
 from pathlib import Path
 
 
@@ -60,9 +60,11 @@ p=Path('/var/log/zakura/zakura.log')
 if p.exists():
     reasons=[]
     connection_failures=[]
+    handshake_errors=Counter()
     tail=deque(maxlen=6)
     for line in p.open(errors='replace'):
         tail.append(line)
         if 'header serving reproduction:' in line: reasons.append(line)
+        if 'error=' in line and ('handshake' in line.lower() or 'outbound connection' in line): handshake_errors[line.split('error=',1)[1].strip()] += 1
         if 'ZakuradConfig' not in line and ('failed to make outbound connection' in line or 'handshake' in line.lower()): connection_failures.append(line)
-    emit('storage_refusals',count=len(reasons),last=reasons[-10:],connection_failures=connection_failures[-12:],log_tail=list(tail))
+    emit('storage_refusals',count=len(reasons),last=reasons[-10:],handshake_errors=handshake_errors.most_common(12),connection_failures=connection_failures[-12:],log_tail=list(tail))

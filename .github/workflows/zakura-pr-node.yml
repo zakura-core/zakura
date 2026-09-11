@@ -1,4 +1,4 @@
-name: Header serving upstream diagnosis
+name: Header serving reproduction inspection
 on:
   workflow_dispatch:
 permissions:
@@ -39,4 +39,4 @@ jobs:
           print(next(n['ip_address'] for n in d['networks']['v4'] if n['type']=='public'))
           PY
           )
-          ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -i /tmp/do_ssh "root@$IP" python3 - < .github/workflows/scripts/header-serving-upstream-debug.py
+          ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -i /tmp/do_ssh "root@$IP" python3 - < .github/workflows/scripts/header-serving-inspect.py

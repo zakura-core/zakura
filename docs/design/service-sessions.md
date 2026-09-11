@@ -88,6 +88,11 @@ that deadline. Duplicate members, mismatched identifiers, and invalid declaratio
 cannot complete a session. Expiry releases every arrived member and defers another
 offer through the existing cooldown.
 
+A different identifier can be a retry racing an abandoned offer's reset. The
+transport discards both offers and applies the same cooldown, keeping unrelated
+services connected. Offers during the cooldown cannot reserve service capacity
+or extend the cooldown.
+
 `reserve_session()` charges service capacity once during setup.
 `SessionResources::admitted()` signals complete setup.
 The workers and application senders retain the shared resource owner until they

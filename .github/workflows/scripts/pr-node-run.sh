@@ -150,7 +150,6 @@ metrics_endpoint = "127.0.0.1:9999"
 
 [nodes.zakura]
 listen_addr = "0.0.0.0:8234"
-bootstrap_peers = []
 trace_dir = "/var/log/zakura/seed-traces"
 TOML
 

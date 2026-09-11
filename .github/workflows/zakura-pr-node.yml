@@ -1,4 +1,4 @@
-name: Disposable checkpoint handoff stimulus
+name: Classify disposable handoff diagnostic
 on:
   workflow_dispatch:
 permissions:
@@ -15,7 +15,7 @@ jobs:
         with:
           token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
           ssh_private_key: ${{ secrets.DO_SSH_PRIVATE_KEY }}
-      - name: Probe only this test's disposable handoff
+      - name: Classify only this test's diagnostic result
         env:
           OWNER_RUN: '34658397744'
         run: |
@@ -35,5 +35,5 @@ jobs:
           CHECK
           if [ -f /tmp/owned-ip ]; then
             IP=$(cat /tmp/owned-ip)
-            ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -i /tmp/do_ssh "root@$IP" python3 - < .github/workflows/scripts/header-serving-handoff-probe.py
+            ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -i /tmp/do_ssh "root@$IP" python3 - < .github/workflows/scripts/header-serving-classify-probe.py
           fi

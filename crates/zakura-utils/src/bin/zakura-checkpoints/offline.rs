@@ -360,7 +360,10 @@ fn write_spentness_artifacts(
 /// Run one `zakura-spentness` subcommand, killing it after the generation deadline.
 fn run_spentness(helper: &OsStr, subcommand: &str, flags: &[(&str, &OsStr)]) -> Result<()> {
     let mut command = Command::new(helper);
-    command.arg(subcommand).stdout(Stdio::null());
+    // Preserve helper summaries without mixing them into checkpoint stdout.
+    command
+        .arg(subcommand)
+        .stdout(Stdio::from(std::io::stderr()));
     for (flag, value) in flags {
         command.arg(flag).arg(value);
     }

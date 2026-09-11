@@ -12,7 +12,8 @@ use crate::{zakura::Frame, BoxError};
 pub const RANGE_BYTES: u32 = 256 * 1024;
 /// Request message type: digest, offset, and length.
 pub const GET_RANGE: u16 = 1;
-/// Response message type. Status 0 is unavailable; status 1 includes a range.
+/// Response message type: absent (0), available (1), busy (2), cap too small (3),
+/// or range outside the artifact (4).
 pub const RANGE: u16 = 2;
 
 pub(super) const DIGEST_LEN: usize = 32;
@@ -21,6 +22,9 @@ pub(super) const REQUEST_LEN: usize = DIGEST_LEN + size_of::<u64>() + size_of::<
 pub(super) const RESPONSE_HEADER_LEN: usize = size_of::<u8>() + REQUEST_LEN;
 const UNAVAILABLE: u8 = 0;
 const AVAILABLE: u8 = 1;
+const BUSY: u8 = 2;
+const TOO_LARGE: u8 = 3;
+const OUT_OF_RANGE: u8 = 4;
 
 /// One bounded byte range of an artifact identified by its digest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,8 +81,14 @@ impl RangeRequest {
 /// A decoded response that borrows its range bytes from the frame.
 #[derive(Debug, Eq, PartialEq)]
 pub(super) enum RangeResponse<'a> {
-    /// The server lacks the artifact, is busy, or cannot fit the range in a frame.
+    /// The server lacks the artifact.
     Unavailable(RangeRequest),
+    /// All serving slots are occupied.
+    Busy(RangeRequest),
+    /// The negotiated response cap cannot fit the requested range.
+    TooLarge(RangeRequest),
+    /// The requested range extends beyond this artifact.
+    OutOfRange(RangeRequest),
     /// The exact requested range.
     Available {
         request: RangeRequest,
@@ -100,8 +110,14 @@ impl<'a> RangeResponse<'a> {
             .ok_or("truncated spentness response header")?;
         let request = RangeRequest::parse_payload(request)?;
 
-        if *status == UNAVAILABLE && request.length == 0 && bytes.is_empty() {
-            return Ok(Self::Unavailable(request));
+        if request.length == 0 && bytes.is_empty() {
+            match *status {
+                UNAVAILABLE => return Ok(Self::Unavailable(request)),
+                BUSY => return Ok(Self::Busy(request)),
+                TOO_LARGE => return Ok(Self::TooLarge(request)),
+                OUT_OF_RANGE => return Ok(Self::OutOfRange(request)),
+                _ => {}
+            }
         }
         if *status != AVAILABLE || bytes.len() != usize::try_from(request.length)? {
             return Err("invalid spentness response status or length".into());
@@ -112,11 +128,27 @@ impl<'a> RangeResponse<'a> {
 
     /// Encode an unavailable response. The echoed request carries length zero.
     pub(super) fn unavailable(request: RangeRequest) -> Frame {
+        Self::negative(UNAVAILABLE, request)
+    }
+
+    pub(super) fn busy(request: RangeRequest) -> Frame {
+        Self::negative(BUSY, request)
+    }
+
+    pub(super) fn too_large(request: RangeRequest) -> Frame {
+        Self::negative(TOO_LARGE, request)
+    }
+
+    pub(super) fn out_of_range(request: RangeRequest) -> Frame {
+        Self::negative(OUT_OF_RANGE, request)
+    }
+
+    fn negative(status: u8, request: RangeRequest) -> Frame {
         let request = RangeRequest {
             length: 0,
             ..request
         };
-        Self::frame(UNAVAILABLE, request, &[])
+        Self::frame(status, request, &[])
     }
 
     pub(super) fn available(request: RangeRequest, bytes: &[u8]) -> Frame {
@@ -187,5 +219,16 @@ mod tests {
             RangeResponse::parse(&unavailable).unwrap(),
             RangeResponse::Unavailable(_)
         ));
+        for frame in [
+            RangeResponse::busy(request),
+            RangeResponse::too_large(request),
+            RangeResponse::out_of_range(request),
+        ] {
+            assert_eq!(frame.payload.len(), RESPONSE_HEADER_LEN);
+            assert!(RangeResponse::parse(&frame).is_ok());
+        }
+        let mut invalid = unavailable;
+        invalid.payload[0] = 255;
+        assert!(RangeResponse::parse(&invalid).is_err());
     }
 }

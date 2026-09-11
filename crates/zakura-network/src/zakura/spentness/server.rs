@@ -84,17 +84,19 @@ impl ArtifactService {
     /// Answer one range request.
     ///
     /// Busy, missing, or oversized responses are availability failures, not peer faults.
-    /// Only a range past the artifact end is a protocol violation.
+    /// A bounded request past the artifact end is also an availability failure.
     async fn serve(&self, request: RangeRequest, response_cap: usize) -> Result<Frame, SinkReject> {
         let Ok(_permit) = self.serving.try_acquire() else {
-            return Ok(RangeResponse::unavailable(request));
+            return Ok(RangeResponse::busy(request));
         };
         let Some(artifact) = self.get(&request.digest) else {
             return Ok(RangeResponse::unavailable(request));
         };
-        let range = artifact_range(&artifact, request)?;
+        let Some(range) = artifact_range(&artifact, request)? else {
+            return Ok(RangeResponse::out_of_range(request));
+        };
         if RESPONSE_HEADER_LEN + range.len() > response_cap {
-            return Ok(RangeResponse::unavailable(request));
+            return Ok(RangeResponse::too_large(request));
         }
 
         let response = RangeResponse::available(request, &artifact.bytes()[range]);
@@ -107,16 +109,14 @@ impl ArtifactService {
 fn artifact_range(
     artifact: &VerifiedArtifact,
     request: RangeRequest,
-) -> Result<Range<usize>, SinkReject> {
+) -> Result<Option<Range<usize>>, SinkReject> {
     let end = request.checked_end().map_err(SinkReject::protocol)?;
     if end > artifact.commitment().byte_len {
-        return Err(SinkReject::protocol(
-            "spentness range exceeds artifact length",
-        ));
+        return Ok(None);
     }
     let start = usize::try_from(request.offset).map_err(SinkReject::protocol)?;
     let end = usize::try_from(end).map_err(SinkReject::protocol)?;
-    Ok(start..end)
+    Ok(Some(start..end))
 }
 
 /// Largest response payload the negotiated frame and message limits allow.
@@ -201,18 +201,19 @@ mod tests {
         let response = call(FRAME_CAP, FRAME_CAP, request_frame(request)).await?;
         assert!(matches!(
             RangeResponse::parse(&response[0])?,
-            RangeResponse::Unavailable(_)
+            RangeResponse::Busy(_)
         ));
         drop(permit);
 
-        // A range past the artifact end is a protocol violation.
+        // A bounded range past the artifact end does not blame the peer.
         let past_end = RangeRequest {
             offset: commitment.byte_len,
             ..request
         };
+        let response = call(FRAME_CAP, FRAME_CAP, request_frame(past_end)).await?;
         assert!(matches!(
-            call(FRAME_CAP, FRAME_CAP, request_frame(past_end)).await,
-            Err(SinkReject::Protocol(_))
+            RangeResponse::parse(&response[0])?,
+            RangeResponse::OutOfRange(_)
         ));
 
         // A frame cap that fits only the header yields an unavailable response.
@@ -226,7 +227,7 @@ mod tests {
         assert_eq!(response[0].payload.len(), RESPONSE_HEADER_LEN);
         assert!(matches!(
             RangeResponse::parse(&response[0])?,
-            RangeResponse::Unavailable(_)
+            RangeResponse::TooLarge(_)
         ));
         Ok(())
     }

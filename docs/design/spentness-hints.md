@@ -80,6 +80,9 @@ Record the second source's validation software and identity in the bundle.
 Stream kind 8, version 1, uses capability bit 6. Each request carries the digest,
 offset, and requested length. A response carries availability status, digest,
 offset, length, and at most 256 KiB. The capability advertises protocol support.
+Status values distinguish absent (0), available (1), busy (2), insufficient
+response capacity (3), and a range outside the artifact (4). Negative responses
+echo the digest and offset with length zero. These statuses do not penalize peers.
 The discovery service advertises availability only when startup loaded a verified
 artifact. Nodes can serve newly verified bytes immediately; they advertise those
 new cache entries after restart.
@@ -90,7 +93,9 @@ The transport also applies its stream, frame, message, and connection limits.
 Unavailable or busy servers return availability failure without a peer penalty.
 
 The downloader selects peers that negotiated the capability. It tries at most
-three sources, one source at a time. It retains interrupted progress under names
+three sources per round, one source at a time. It rotates sources between rounds.
+It reduces the requested range when the peer reports insufficient response capacity.
+It retains interrupted progress under names
 that bind the expected digest and peer identity. It checks every returned range
 and verifies the complete file before durable cache publication. A whole-file
 mismatch discards that source's partial file. It does not attribute a whole-file
@@ -104,7 +109,9 @@ spentness_cache_dir = "/data/zakura/spentness"
 ```
 
 The startup task waits up to 60 seconds for a capable peer, then makes bounded
-acquisition attempts. An unavailable artifact does not block ordinary sync.
+acquisition attempts. It retries missing artifacts after a 60-second pause until
+acquisition succeeds or the endpoint shuts down. Each source has a ten-minute
+deadline. An unavailable artifact does not block ordinary sync.
 Supported historical cache entries also remain available for serving.
 
 For offline or seed provisioning, use a binary that contains the reviewed pin:

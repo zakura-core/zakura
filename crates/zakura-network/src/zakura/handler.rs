@@ -1217,6 +1217,11 @@ impl ZakuraSupervisorHandle {
         self.peer_set_tx.subscribe()
     }
 
+    /// Cancellation shared by endpoint-owned background acquisition tasks.
+    pub(crate) fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown.clone()
+    }
+
     /// Start an atomic wait for the next connection generation of `peer_id`.
     ///
     /// The returned wait observes registrations that occur after this call.

@@ -414,6 +414,30 @@ impl Args {
             resolved.push((flag, destination));
         }
 
+        if let Some(replay) = &self.spentness_replay_cache {
+            // Appending a component makes the resolver canonicalize the cache itself.
+            let replay = resolved_output_destination(&replay.join(".path-check"))?
+                .parent()
+                .expect("resolved path has a parent")
+                .to_path_buf();
+            if let Some(state) = &self.state_cache_dir {
+                let state = resolved_output_destination(&state.join(".path-check"))?
+                    .parent()
+                    .expect("resolved path has a parent")
+                    .to_path_buf();
+                if replay.starts_with(&state) || state.starts_with(&replay) {
+                    return Err(
+                        "--spentness-replay-cache must not overlap --state-cache-dir".into(),
+                    );
+                }
+            }
+            for (flag, destination) in &resolved {
+                if destination.starts_with(&replay) || replay.starts_with(destination) {
+                    return Err(format!("{flag} must not overlap --spentness-replay-cache"));
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -689,6 +713,42 @@ mod tests {
         resume_without_full_list.full_list = false;
         resume_without_full_list.last_checkpoint = Some(Height(100));
         assert_eq!(resume_without_full_list.validate_mode(), Ok(()));
+    }
+
+    #[test]
+    fn rejects_spentness_cache_output_aliases() {
+        let mut args = offline_args();
+        args.mainnet_spentness_output = Some("spentness.bin".into());
+        args.spentness_replay_cache = Some("replay".into());
+        assert!(args.validate_mode().is_ok());
+        for replay in [
+            "frontier.bin",
+            "spentness.commitment.json",
+            "state",
+            "state/replay",
+            ".",
+        ] {
+            args.spentness_replay_cache = Some(replay.into());
+            assert!(args.validate_mode().is_err(), "accepted {replay}");
+        }
+        args.spentness_replay_cache = Some("replay".into());
+        args.mainnet_frontier_output = Some("replay/frontier.bin".into());
+        assert!(args.validate_mode().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_spentness_cache_symlink_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let mut args = offline_args();
+        args.mainnet_spentness_output = Some("spentness.bin".into());
+        args.spentness_replay_cache = Some(alias);
+        args.mainnet_frontier_output = Some(real.join("frontier.bin"));
+        assert!(args.validate_mode().is_err());
     }
 
     #[test]

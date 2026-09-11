@@ -44,6 +44,7 @@ REPOSITORY=https://github.com/zakura-core/zakura.git
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SOURCE_ROOT=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)
 EXPORTER_REVISION=$(git -C "$SOURCE_ROOT" rev-parse HEAD)
+mkdir -p "${TMPDIR:-$HOME/.tmp}"
 WORK=$(mktemp -d "${TMPDIR:-$HOME/.tmp}/zakura-release-state-deploy.XXXXXX")
 BUILD_TARGET=${ZAKURA_RELEASE_STATE_BUILD_TARGET:-"$HOME/.cache/zakura-release-state-target"}
 REMOTE_STAGE="/opt/zakura-release-state/.deploy-$$"

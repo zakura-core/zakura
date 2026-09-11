@@ -421,6 +421,29 @@ else: sys.exit(12)
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         self.assertEqual((published / "meta.json").read_bytes(), metadata)
 
+    def test_publisher_rejects_invalid_revision_and_oversized_sidecars(self):
+        source, pointer, old, env = self.publisher_environment()
+        original = pointer.read_bytes()
+        script = Path(__file__).resolve().parents[2] / "deploy/release-state/publish-release-state.sh"
+
+        def reject(environment):
+            result = subprocess.run(["bash", str(script), str(source)], env=environment,
+                                    capture_output=True, timeout=30, check=False)
+            self.assertNotEqual(result.returncode, 0, result.stderr.decode())
+            self.assertEqual(pointer.read_bytes(), original)
+            self.assertTrue(old.exists())
+            self.assertFalse((pointer.parent / "v2/10").exists())
+            return result.stderr.decode()
+
+        self.assertIn("generator revision", reject({**env, "RELEASE_STATE_GENERATOR_REVISION": "not-a-revision"}))
+        for name, limit in ((hints.COMMITMENT, 16 * 1024), (hints.VERIFICATION, 32 * 1024)):
+            path = self.bundle / name
+            contents = path.read_bytes()
+            path.write_bytes(contents + b" " * limit)
+            self.assertIn(name, reject(env))
+            path.write_bytes(contents)
+        self.assertIn("meta.json", reject({**env, "RELEASE_STATE_ORACLE_ID": "x" * (65 * 1024)}))
+
 
 if __name__ == "__main__":
     unittest.main()

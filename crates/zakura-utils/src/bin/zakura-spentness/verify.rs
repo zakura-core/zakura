@@ -61,7 +61,12 @@ pub(super) fn verify(db: &ZakuraDb, artifact: &VerifiedArtifact) -> Result<u64> 
             audit.check_transaction(height, tx_index, tx)?;
         }
     }
-    audit.finish()
+    let survivors = audit.finish()?;
+    ensure!(
+        exact_boundary(db, commitment.terminal_height, terminal_hash)? == genesis,
+        "archive changed during verification"
+    );
+    Ok(survivors)
 }
 
 /// Verify an artifact file and optionally write machine-readable evidence.

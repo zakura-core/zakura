@@ -24,6 +24,7 @@ Type=oneshot
 EnvironmentFile=/etc/zakura-release-state.env
 ExecStart=/opt/zakura-release-state/bin/publish-from-archive-host.sh
 # Initial generation replays two ordinary archive states and audits transparent state.
-TimeoutStartSec=7d
+# Six helpers can each consume 48 hours; leave two days for export and upload.
+TimeoutStartSec=14d
 Nice=10
 IOSchedulingClass=idle

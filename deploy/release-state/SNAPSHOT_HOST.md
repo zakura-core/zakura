@@ -239,6 +239,9 @@ Preserve the service journal.
 
 # Spentness generation
 
+The service allows 14 days for a run. Six helpers can each consume their 48-hour
+deadline. The remaining two days cover export and upload work.
+
 The schema 2 publisher requires a second independently synchronized archive source.
 Configure `RELEASE_STATE_ORACLE_SOURCE` and `RELEASE_STATE_ORACLE_ID` in the host
 environment before enabling the timer. The deployment script installs both

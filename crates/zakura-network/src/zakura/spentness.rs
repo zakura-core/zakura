@@ -140,14 +140,14 @@ mod tests {
         .ok_or("server endpoint missing")?;
         let server_addr = server.node_addr().await;
         let direct = server_addr
-            .direct_addresses()
+            .ip_addrs()
             .copied()
             .find(|addr| addr.ip().is_loopback())
             .ok_or("server has no loopback address")?;
 
         let mut client_config = server_config;
         client_config.identity_dir = client_identity.path().to_owned();
-        client_config.zakura.bootstrap_peers = vec![format!("{}@{direct}", server_addr.node_id)];
+        client_config.zakura.bootstrap_peers = vec![format!("{}@{direct}", server_addr.id)];
         let client_service = Arc::new(ArtifactService::new([]));
         let client = spawn_zakura_endpoint_with_services(
             &client_config,

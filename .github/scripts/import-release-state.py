@@ -115,6 +115,7 @@ def _install_artifacts(repo_root: Path, artifacts: dict[Path, bytes]) -> None:
             json.dump(journal, output)
             output.flush()
             os.fsync(output.fileno())
+        (staging / "ready").touch()
         _sync_directory(staging)
         _sync_directory(repo_root)
         installing = True
@@ -148,7 +149,7 @@ def _sync_directory(path: Path) -> None:
 
 def _recover_import(repo_root: Path, staging: Path) -> None:
     journal_path = staging / "journal.json"
-    if journal_path.exists() and not (staging / "committed").exists():
+    if (staging / "ready").exists() and not (staging / "committed").exists():
         allowed = {CHECKPOINTS, FRONTIER, SUBTREES, PROVENANCE, EOS_FILE,
                    spentness_release.MANIFEST, spentness_release.COMPILED}
         journal = json.loads(journal_path.read_text())
@@ -655,6 +656,17 @@ def _self_test() -> int:
                 import_bundle(self.root, self.bundle, self.resolution)
             self.assertEqual(self.snapshot(), before)
             self.assertFalse(list(self.root.glob(".release-state-import-*")))
+
+        def test_interrupted_staging_does_not_require_a_complete_journal(self) -> None:
+            before = self.snapshot()
+            staging = self.root / ".release-state-import-incomplete"
+            staging.mkdir()
+            (staging / "journal.json").write_text("[{\"path\":")
+            (self.bundle / "meta.json").unlink()
+            with self.assertRaisesRegex(BundleImportError, "metadata is required"):
+                import_bundle(self.root, self.bundle, self.resolution)
+            self.assertEqual(self.snapshot(), before)
+            self.assertFalse(staging.exists())
 
         def test_import_and_no_op(self) -> None:
             result = import_bundle(self.root, self.bundle, self.resolution)

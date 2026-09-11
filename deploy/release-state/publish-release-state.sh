@@ -67,6 +67,10 @@ SPENTNESS_TIMEOUT=${RELEASE_STATE_SPENTNESS_TIMEOUT:-48h}
 : "${RELEASE_STATE_ORACLE_SOURCE:?set RELEASE_STATE_ORACLE_SOURCE to an independently synchronized archive cache}"
 : "${RELEASE_STATE_ORACLE_ID:?identify the independently synchronized source and its validation software}"
 : "${RELEASE_STATE_GENERATOR_REVISION:?set RELEASE_STATE_GENERATOR_REVISION to the generator git revision}"
+if ! [[ "$RELEASE_STATE_GENERATOR_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "spentness generator revision must contain 40 lowercase hexadecimal characters" >&2
+    exit 1
+fi
 if [ "$(realpath "$STATE_DIR")" = "$(realpath "$RELEASE_STATE_ORACLE_SOURCE")" ]; then
     echo "spentness reproduction requires a separate independently synchronized source" >&2
     exit 1
@@ -220,10 +224,24 @@ HEIGHT="$HEIGHT" BLOCK_HASH="$BLOCK_HASH" GENERATED_AT="$GENERATED_AT" \
 import hashlib, json, os, sys
 
 stage, *bundle_files = sys.argv[1:]
+limits = {
+    "main-checkpoints.txt": 4 * 1024 * 1024,
+    "mainnet-frontier.bin": 1024 * 1024,
+    "mainnet-treestate-subtrees.bin": 8 * 1024 * 1024,
+    "mainnet-frontier-grid.bin": 32 * 1024 * 1024,
+    "mainnet-spentness-hints.bin": 512 * 1024 * 1024,
+    "mainnet-spentness-hints.commitment.json": 16 * 1024,
+    "mainnet-spentness-hints.verification.json": 32 * 1024,
+}
 files = {}
 for name in bundle_files:
-    data = open(os.path.join(stage, name), "rb").read()
-    files[name] = {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+    path = os.path.join(stage, name)
+    size = os.path.getsize(path)
+    if not 0 < size <= limits[name]:
+        raise SystemExit(f"{name} exceeds the release fetcher's size limit")
+    with open(path, "rb") as source:
+        digest = hashlib.file_digest(source, "sha256").hexdigest()
+    files[name] = {"size": size, "sha256": digest}
 
 meta = {
     "schema_version": int(os.environ["BUNDLE_SCHEMA"]),
@@ -240,9 +258,11 @@ meta = {
         "reproduced_sha256": files[os.environ["SPENTNESS_ARTIFACT"]]["sha256"],
     },
 }
-with open(os.path.join(stage, "meta.json"), "w", encoding="utf-8") as out:
-    json.dump(meta, out, indent=2)
-    out.write("\n")
+encoded = (json.dumps(meta, indent=2) + "\n").encode()
+if len(encoded) > 64 * 1024:
+    raise SystemExit("meta.json exceeds the release fetcher's size limit")
+with open(os.path.join(stage, "meta.json"), "wb") as out:
+    out.write(encoded)
 PY
 
 # Immutability with idempotence: a bundle directory is written once. A

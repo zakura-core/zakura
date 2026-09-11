@@ -56,6 +56,10 @@ pub(super) fn generate(db: &ZakuraDb, height: u32, hash: block::Hash) -> Result<
 
     let bytes = encoder.finish();
     let commitment = ParsedArtifact::read(bytes.as_slice())?.commitment().clone();
+    ensure!(
+        exact_boundary(db, height, hash)? == genesis,
+        "archive changed during generation"
+    );
     Ok(Generated {
         bytes,
         commitment,

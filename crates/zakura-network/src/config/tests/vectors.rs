@@ -809,12 +809,12 @@ fn max_block_time_start_height_serialization_roundtrip() {
 
 /// With no `zakura_node_secret_key` and a writable identity directory, the
 /// generated Zakura iroh identity must be persisted on first use and reused on
-/// every later startup, so the node's `NodeId` is stable across restarts.
+/// every later startup, so the node's `EndpointId` is stable across restarts.
 ///
 /// This is the regression test for `claude-ephemeral-node-secret-on-restart`:
 /// before the fix, `Config::zakura_secret_key` generated a fresh ephemeral key on
 /// every call and never wrote the reserved identity key file, so two startups
-/// produced different `NodeId`s and no key file existed.
+/// produced different `EndpointId`s and no key file existed.
 #[test]
 fn zakura_secret_key_is_persisted_and_stable_across_restarts() {
     let _init_guard = zakura_test::init();
@@ -850,7 +850,7 @@ fn zakura_secret_key_is_persisted_and_stable_across_restarts() {
     }
 
     // Second startup reading the same key file (simulating a process restart)
-    // must reuse the persisted key, yielding the same `NodeId`.
+    // must reuse the persisted key, yielding the same `EndpointId`.
     let after_restart = load_or_generate_zakura_secret_key(&key_file);
 
     assert_eq!(

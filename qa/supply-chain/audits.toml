@@ -4424,18 +4424,6 @@ criteria = "safe-to-deploy"
 version = "1.3.0"
 notes = "Reviewed all packaged source and manifest. The zero-dependency z-base-32 encoder and decoder use input-bounded loops. The sole unsafe String::from_utf8_unchecked is sound because every output byte is selected from a fixed ASCII alphabet. No build script, I/O, or ambient capabilities. All 6 unit tests and 2 doctests passed."
 
-[[audits.zakura-bellman]]
-who = "OpenAI Codex <noreply@openai.com>"
-criteria = "safe-to-deploy"
-delta = "1.0.0-rc.2 -> 1.0.0-rc.3"
-notes = "Reviewed the complete packaged delta. It changes only the declared package version, the pairing dependency version and the development bls12-381 dependency version, matching lockfile data, release documentation, and source commit metadata. Rust source, features, and build behavior are unchanged."
-
-[[audits.zakura-bls12-381]]
-who = "OpenAI Codex <noreply@openai.com>"
-criteria = "safe-to-deploy"
-delta = "1.0.0-rc.2 -> 1.0.0-rc.3"
-notes = "Reviewed the complete packaged delta. It changes only the declared package version, the pairing dependency version, matching lockfile data, release documentation, and source commit metadata. Rust source, features, and build behavior are unchanged."
-
 [[audits.zakura-chain]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -4445,30 +4433,6 @@ delta = "1.0.0-beta.38 -> 1.0.0-beta.39"
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "1.0.0-beta.38 -> 1.0.0-beta.39"
-
-[[audits.zakura-halo2-gadgets]]
-who = "OpenAI Codex <noreply@openai.com>"
-criteria = "safe-to-deploy"
-delta = "1.0.0-rc.2 -> 1.0.0-rc.3"
-notes = "Reviewed the complete packaged delta. It changes only the declared package version, Zakura dependency versions, matching lockfile data, release documentation, and source commit metadata. Rust source, features, and build behavior are unchanged."
-
-[[audits.zakura-halo2-legacy-pdqsort]]
-who = "OpenAI Codex <noreply@openai.com>"
-criteria = "safe-to-deploy"
-delta = "1.0.0-rc.2 -> 1.0.0-rc.3"
-notes = "Reviewed the complete packaged delta. It changes only the declared package version, Cargo.lock self-version, release note, and source commit metadata. Rust source, features, dependencies, and build behavior are unchanged."
-
-[[audits.zakura-halo2-poseidon]]
-who = "OpenAI Codex <noreply@openai.com>"
-criteria = "safe-to-deploy"
-delta = "1.0.0-rc.2 -> 1.0.0-rc.3"
-notes = "Reviewed the complete packaged delta. It changes only the declared package version, the pasta-curves dependency version, matching lockfile data, release note, and source commit metadata. Rust source, features, and build behavior are unchanged."
-
-[[audits.zakura-halo2-proofs]]
-who = "OpenAI Codex <noreply@openai.com>"
-criteria = "safe-to-deploy"
-delta = "1.0.0-rc.2 -> 1.0.0-rc.3"
-notes = "Reviewed the complete packaged delta. The two-lane batch inversion matches Montgomery inversion, skips zeros, handles odd tails, and has direct equality tests against ff::BatchInvert. Its prover inputs are challenge-blinded, and the dependency's inversion is already variable-time. Moving public inverse-FFT normalization to the affine inputs preserves the linear transform. The evaluator reuses cache slots only when the prior slot's last load precedes the new store, and the lower cache threshold changes only the plan workspace. All 76 executable all-feature tests pass. The no-default library target compiles; the no-default integration command fails because its existing plonk_api test imports the default-only BatchVerifier."
 
 [[audits.zakura-iroh-base]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -4482,18 +4446,6 @@ criteria = "safe-to-deploy"
 version = "1.1.0-rc.0"
 notes = "Registry packaging review for source revision 80e2ec271469f478d2d46388254be71341b50015: compared all 7 upstream 1.1.0 Rust files with the prepared archive; all are byte-identical. Checked normalized manifests, library names and exact sibling package aliases. The prior audits.iroh-base/iroh-dns 1.1.0 source review and recorded compatibility delta apply to these unchanged files. The archive rebuilt successfully. No new Android or live DNS execution was performed. Prior source-review scope and limitations: Reviewed production Rust source, manifest and build script, including signed-packet bounds/signature-before-DNS parsing, endpoint metadata, resolver configuration/reset, retries and Android initialization. DNS/network operations and system resolver configuration access are explicit; build script only declares cfg names. Android unsafe initialization forwards the documented process-lifetime VM/context precondition to ndk_context. Audit discretion: caller-supplied retry delays of 1 or 2 ms panic in jitter calculation; use zero or at least 3 ms and bound retry counts. Iroh uses 200-3000 ms. Resolver resets can extend a request deadline, so callers needing an overall deadline must enforce it. No Android or live DNS tests in this pass; separate parser/resolver dependency audits remain required."
 
-[[audits.zakura-jubjub]]
-who = "OpenAI Codex <noreply@openai.com>"
-criteria = "safe-to-deploy"
-delta = "1.0.0-rc.2 -> 1.0.0-rc.3"
-notes = "Reviewed the complete packaged delta. It changes only the declared package version, the bls12-381 dependency version, matching lockfile data, release documentation, and source commit metadata. Rust source, features, and build behavior are unchanged."
-
-[[audits.zakura-keys]]
-who = "OpenAI Codex <noreply@openai.com>"
-criteria = "safe-to-deploy"
-delta = "1.0.0-rc.2 -> 1.0.0-rc.3"
-notes = "Reviewed the complete packaged delta. It changes only the declared package version, Zakura dependency versions, matching lockfile data, release documentation, and source commit metadata. Rust source, features, and build behavior are unchanged."
-
 [[audits.zakura-network]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -4504,57 +4456,15 @@ who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "1.0.0-beta.38 -> 1.0.0-beta.39"
 
-[[audits.zakura-pairing]]
-who = "OpenAI Codex <noreply@openai.com>"
-criteria = "safe-to-deploy"
-delta = "1.0.0-rc.2 -> 1.0.0-rc.3"
-notes = "Reviewed the complete packaged delta. It changes only the declared package version, Cargo.lock self-version, release note, and README dependency example. Rust source, features, dependencies, and build behavior are unchanged."
-
-[[audits.zakura-primitives]]
-who = "OpenAI Codex <noreply@openai.com>"
-criteria = "safe-to-deploy"
-delta = "1.0.0-rc.2 -> 1.0.0-rc.3"
-notes = "Reviewed the complete packaged delta. The source change replaces chunks_exact(33), remainder(), and slice conversion with the equivalent fixed-size as_chunks::<33>() iteration. It preserves chunk order, reverse traversal, remainder handling, decoding, and error propagation. Other changes update package and Zakura dependency versions, matching lockfile data, the release note, and source commit metadata."
-
-[[audits.zakura-proofs]]
-who = "OpenAI Codex <noreply@openai.com>"
-criteria = "safe-to-deploy"
-delta = "1.0.0-rc.2 -> 1.0.0-rc.3"
-notes = "Reviewed the complete packaged delta. It changes only the declared package version, Zakura dependency versions, matching lockfile data, release documentation, and source commit metadata. Rust source, features, and build behavior are unchanged."
-
-[[audits.zakura-reddsa]]
-who = "OpenAI Codex <noreply@openai.com>"
-criteria = "safe-to-deploy"
-delta = "1.0.0-rc.2 -> 1.0.0-rc.3"
-notes = "Reviewed the complete packaged delta. It changes only the declared package version, Zakura dependency versions, matching lockfile data, release note, and source commit metadata. Rust source, features, and build behavior are unchanged."
-
-[[audits.zakura-redjubjub]]
-who = "OpenAI Codex <noreply@openai.com>"
-criteria = "safe-to-deploy"
-delta = "1.0.0-rc.2 -> 1.0.0-rc.3"
-notes = "Reviewed the complete packaged delta. It changes only the declared package version, the reddsa dependency version, matching lockfile data, release note, and source commit metadata. Rust source, features, and build behavior are unchanged."
-
 [[audits.zakura-rpc]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "1.0.0-beta.38 -> 1.0.0-beta.39"
 
-[[audits.zakura-sapling-crypto]]
-who = "OpenAI Codex <noreply@openai.com>"
-criteria = "safe-to-deploy"
-delta = "1.0.0-rc.2 -> 1.0.0-rc.3"
-notes = "Reviewed the complete packaged delta. The source change replaces chunks_exact(8) plus a checked slice-to-array conversion with equivalent fixed-size as_chunks::<8>() iteration. It preserves the processed limbs, ignored remainder, little-endian decoding, and accumulator behavior. Other changes update package and Zakura dependency versions, matching lockfile data, the release note, and source commit metadata."
-
 [[audits.zakura-script]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "1.0.0-beta.38 -> 1.0.0-beta.39"
-
-[[audits.zakura-sinsemilla]]
-who = "OpenAI Codex <noreply@openai.com>"
-criteria = "safe-to-deploy"
-delta = "1.0.0-rc.2 -> 1.0.0-rc.3"
-notes = "Reviewed the complete packaged delta. Streaming MessageWords preserves padding and length rejection. Batch extraction applies Montgomery inversion while skipping identity points. The two-lane nonzero inversion is algebraically equivalent to independent Montgomery inversions. The affine batch path applies the standard chord formula and retains the weighted evaluator's documented discrete-logarithm assumption for exceptional inputs. Word bounds precede table indexing, allocation remains input-bounded, and batch tests compare both execution paths with individual evaluation. All 16 tests pass with all features and with no default features."
 
 [[audits.zakura-state]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"

@@ -420,6 +420,13 @@ pub trait Service: fmt::Debug + Send + Sync + 'static {
         None
     }
 
+    /// Flag bits accepted by this stream's codec. The reader rejects other bits
+    /// before allocating or reading the payload. Native services return zero.
+    /// Custom services retain unrestricted flags unless they declare a mask.
+    fn allowed_frame_flags(&self, _stream: Stream) -> u16 {
+        u16::MAX
+    }
+
     /// Optional per-stream inbound and outbound application queue limits.
     /// The transport also applies its connection-wide inbound queue allowance.
     fn stream_queue_depths(&self, _stream: Stream) -> Option<(usize, usize)> {

@@ -1906,6 +1906,51 @@ fn frame_decode_rejects_mismatched_unknown_flags_and_trailing_payload() {
 }
 
 #[test]
+fn frame_tag_mismatch_precedes_block_deserialization() {
+    let frame = Frame {
+        message_type: u16::from(MSG_BS_BLOCKS_DONE),
+        flags: 0,
+        // There are no body bytes. Attempting Block decoding would return EOF.
+        payload: vec![MSG_BS_BLOCK],
+    };
+    assert!(matches!(
+        BlockSyncMessage::decode_frame(frame),
+        Err(BlockSyncWireError::MismatchedFrameMessageType {
+            frame: 4,
+            payload: 3,
+        })
+    ));
+}
+
+#[test]
+fn terminal_codecs_agree_on_height_boundaries() {
+    for height in [block::Height::MAX.0, block::Height::MAX.0 + 1, u32::MAX] {
+        for message in [
+            BlockSyncMessage::BlocksDone {
+                start_height: block::Height(height),
+                returned: 1,
+            },
+            BlockSyncMessage::RangeUnavailable {
+                start_height: block::Height(height),
+                count: 1,
+            },
+        ] {
+            if height > block::Height::MAX.0 {
+                assert!(matches!(
+                    message.encode(),
+                    Err(BlockSyncWireError::HeightOutOfRange(value)) if value == height
+                ));
+            } else {
+                assert_eq!(
+                    BlockSyncMessage::decode(&message.encode().unwrap()).unwrap(),
+                    message
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn status_decode_clamps_peer_capacity_advertisements() {
     let mut payload = Vec::new();
     payload.push(MSG_BS_STATUS);

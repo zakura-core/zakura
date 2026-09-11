@@ -25,13 +25,15 @@ pub const MSG_BS_RANGE_UNAVAILABLE: u8 = 5;
 pub const MAX_BS_BLOCKS_PER_REQUEST: u32 = 128;
 /// Maximum encoded stream-6 message bytes.
 ///
-/// This cap is intentionally larger than Zebra's consensus block-size limit so
-/// stream-6 can read and classify slightly oversized or future-expanded frames
-/// in the block-sync codec instead of dropping them at the raw transport gate.
-/// Decoded `Block` messages are still bounded by [`block::MAX_BLOCK_BYTES`].
+/// Individual message limits tighten this stream cap before payload allocation.
+/// A Block payload contains its discriminator and at most [`block::MAX_BLOCK_BYTES`].
 pub const MAX_BS_MESSAGE_BYTES: usize = 3 * 1024 * 1024;
 
 pub(super) const BLOCK_SYNC_MESSAGE_TYPE_BYTES: usize = 1;
+
+// The two-million-byte protocol block limit fits usize on all supported targets.
+pub(super) const MAX_BS_BLOCK_PAYLOAD_BYTES: usize =
+    block::MAX_BLOCK_BYTES as usize + BLOCK_SYNC_MESSAGE_TYPE_BYTES;
 
 const _: () = assert!(MAX_BS_MESSAGE_BYTES < 4 * 1024 * 1024);
 const _: () = assert!(MAX_BS_MESSAGE_BYTES > block::MAX_BLOCK_BYTES as usize);
@@ -138,6 +140,7 @@ impl BlockSyncMessage {
             MSG_BS_BLOCK => {
                 let block_start = usize::try_from(reader.position())
                     .map_err(|_| BlockSyncWireError::NumericOverflow("block payload offset"))?;
+                validate_encoded_block_len(bytes.len().saturating_sub(block_start))?;
                 let block = Arc::new(block::Block::zcash_deserialize(&mut reader)?);
                 let block_end = usize::try_from(reader.position())
                     .map_err(|_| BlockSyncWireError::NumericOverflow("block payload end"))?;
@@ -196,10 +199,24 @@ impl BlockSyncMessage {
         }
         let frame_message_type = u8::try_from(frame.message_type)
             .map_err(|_| BlockSyncWireError::UnknownFrameMessageType(frame.message_type))?;
+        validate_payload_len(frame.payload.len())?;
+        let payload_message_type = frame.payload.as_slice().read_u8()?;
+        if frame_message_type != payload_message_type {
+            return Err(BlockSyncWireError::MismatchedFrameMessageType {
+                frame: frame.message_type,
+                payload: payload_message_type,
+            });
+        }
 
         // If this is a block message, keep the original raw block payload as well;
         // it can be stored in compact form in the reorder backlog.
         let (message, raw_block_payload) = if frame_message_type == MSG_BS_BLOCK {
+            validate_encoded_block_len(
+                frame
+                    .payload
+                    .len()
+                    .saturating_sub(BLOCK_SYNC_MESSAGE_TYPE_BYTES),
+            )?;
             let raw_block_payload = Arc::<[u8]>::from(frame.payload.into_boxed_slice());
             let message = Self::decode(&raw_block_payload)?;
             (message, Some(raw_block_payload))
@@ -207,12 +224,6 @@ impl BlockSyncMessage {
             (Self::decode(&frame.payload)?, None)
         };
 
-        if frame_message_type != message.message_type() {
-            return Err(BlockSyncWireError::MismatchedFrameMessageType {
-                frame: frame.message_type,
-                payload: message.message_type(),
-            });
-        }
         Ok((message, raw_block_payload))
     }
 
@@ -287,6 +298,9 @@ pub(super) fn write_height<W: Write>(
     writer: &mut W,
     height: block::Height,
 ) -> Result<(), BlockSyncWireError> {
+    if height > block::Height::MAX {
+        return Err(BlockSyncWireError::HeightOutOfRange(height.0));
+    }
     writer.write_u32::<LittleEndian>(height.0)?;
     Ok(())
 }

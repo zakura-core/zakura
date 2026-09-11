@@ -20,10 +20,8 @@ mod tests;
 
 /// Maximum frame bytes for one stream-6 body frame plus protocol framing.
 ///
-/// A block body is still decoded and validated against Zebra's
-/// `MAX_BLOCK_BYTES`; this frame cap has extra slack so stream-6 can classify
-/// oversized or incompatible block-sync payloads in the codec instead of
-/// dropping them at the raw transport gate.
+/// Per-message payload caps tighten this negotiated stream ceiling before
+/// allocation. The Block cap includes its discriminator and `MAX_BLOCK_BYTES`.
 pub const MAX_BS_FRAME_BYTES: u32 = {
     // This cast is safe: MAX_BS_MESSAGE_BYTES is asserted below 4 MiB.
     (MAX_BS_MESSAGE_BYTES + FRAME_HEADER_BYTES) as u32
@@ -444,7 +442,7 @@ impl Service for BlockSyncService {
         if stream == BLOCK_SYNC_REQUESTS {
             serving_regulation::message_payload_limits()
         } else if stream == BLOCK_SYNC_DATA {
-            &[(1, 53), (4, 9), (5, 9)]
+            &[(1, 53), (3, MAX_BS_BLOCK_PAYLOAD_BYTES), (4, 9), (5, 9)]
         } else {
             &[]
         }
@@ -456,6 +454,10 @@ impl Service for BlockSyncService {
         } else {
             &[1, 3, 4, 5]
         })
+    }
+
+    fn allowed_frame_flags(&self, _stream: Stream) -> u16 {
+        0
     }
 
     fn stream_write_policy(&self, stream: Stream) -> StreamWritePolicy {

@@ -3847,6 +3847,7 @@ impl HeaderSyncReactor {
             .min(MAX_HS_RANGE)
     }
 
+    #[track_caller]
     fn send_headers_outcome(
         &self,
         peer: &ZakuraPeerId,
@@ -3854,6 +3855,7 @@ impl HeaderSyncReactor {
         target_tip_hash: block::Hash,
         outcome: HeadersOutcomeCode,
     ) {
+        let origin = std::panic::Location::caller();
         let Some(state) = self.peer_state.get(peer) else {
             return;
         };
@@ -3877,6 +3879,8 @@ impl HeaderSyncReactor {
             let direction = state.session.direction();
             self.startup.trace.emit_with(HEADER_SYNC_TABLE, |row| {
                 row.insert(hs_trace::EVENT.into(), hs_trace::HEADER_OUTCOME.into());
+                row.insert("origin_file".into(), origin.file().into());
+                row.insert("origin_line".into(), origin.line().into());
                 row.insert(hs_trace::PEER.into(), trace_peer_label(peer).into());
                 row.insert(hs_trace::SESSION_ID.into(), session_id.into());
                 row.insert(

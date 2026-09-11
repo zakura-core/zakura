@@ -1924,6 +1924,17 @@ impl HeaderChainReader {
         if current_snapshot.state_version != base_state_version
             || spec.scope != HeaderWorkAuthority::for_target(&current_snapshot, spec.target.hash)
         {
+            tracing::info!(
+                reason = "lease_commit_state_changed",
+                peer = ?spec.peer,
+                session_id = spec.session_id,
+                target = ?spec.target,
+                expected_version = ?base_state_version,
+                actual_version = ?current_snapshot.state_version,
+                expected_scope = ?spec.scope,
+                actual_scope = ?HeaderWorkAuthority::for_target(&current_snapshot, spec.target.hash),
+                "header serving reproduction: lease refused"
+            );
             return Ok(RetainedPathLeaseOutcome::Busy);
         }
         reservation.commit(spec, Instant::now())
@@ -2056,6 +2067,15 @@ impl HeaderChainReader {
                 .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
             let snapshot = engine.snapshot();
             if scope != HeaderWorkAuthority::for_target(&snapshot, target_tip_hash) {
+                tracing::info!(
+                    reason = "lease_acquire_scope_changed",
+                    ?peer,
+                    session_id,
+                    target = ?target_tip_hash,
+                    expected_scope = ?scope,
+                    actual_scope = ?HeaderWorkAuthority::for_target(&snapshot, target_tip_hash),
+                    "header serving reproduction: lease refused"
+                );
                 return Ok(RetainedPathLeaseOutcome::Busy);
             }
             match engine.graph().header_node(target_tip_hash) {
@@ -2302,6 +2322,16 @@ impl HeaderChainReader {
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
         let current_version = self.store.snapshot()?.state_version;
         if current_version != read_version {
+            tracing::info!(
+                reason = "page_read_state_changed",
+                ?peer,
+                session_id,
+                lease_id,
+                target = ?lease.target,
+                expected_version = ?read_version,
+                actual_version = ?current_version,
+                "header serving reproduction: page refused"
+            );
             return Ok(RetainedPathReadOutcome::Unavailable);
         }
         let complete = page_result?;

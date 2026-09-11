@@ -209,7 +209,7 @@ jobs:
   test-docker-config-success:
     name: Test Docker Config Success
     runs-on: ubuntu-latest
-    if: always()
+    if: ${{ !cancelled() }}
     needs:
       - test-docker-image
     timeout-minutes: 30

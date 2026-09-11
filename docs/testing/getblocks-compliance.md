@@ -18,12 +18,18 @@ older layout text.
 ## Compliance branch results
 
 On 2026-09-11, the expanded 95-test profile ran locally over compliance
-implementation `78a9f19a0` in [#971](https://github.com/zakura-core/zakura/pull/971),
+implementation `8abca3e9c` in [#971](https://github.com/zakura-core/zakura/pull/971),
 using Rust 1.97.0, 64 generated cases, seed 896, and four load rounds. It reported
 **57 passed and 38 failed**. Framing fixes resolved four original witnesses.
 Bounded nested decoding now also resolves the missing-transaction allocation
 witness. All four newly added generated tests pass, with no new failure relative
-to the earlier 39-failure baseline.
+to the earlier 39-failure baseline. The subsequent local connection-close change
+retains the same 38-failure set.
+
+Repeated no-progress stalls now use a shared local connection-close outcome
+without a protocol-fault cause. Ordinary local delivery failures keep the
+connection open. Twenty focused transport and buffered-response regressions pass.
+This change does not yet preserve all outstanding response authorizations.
 
 The shared slice decoder carries actual input bounds through transactions,
 scripts, proof byte strings, and external-count arrays. The added properties
@@ -31,9 +37,10 @@ measure allocations before incomplete collection rejection, exercise capacity
 growth edges, and compare complete generated transactions against streaming
 results. The allocation minima are encoded independently in the tests.
 
-The generated profile reports 30 passed and three failed across 33 tests. The
-fixed profile reports 145 passed and seven failed across 152 tests, unchanged
-from the framing baseline. Those failures are the five known ending-consumption
+The generated profile last reported 30 passed and three failed across 33 tests
+after the bounded-decoder change. It was not rerun for the local-close change.
+The fixed profile now includes the local-close classification regressions and
+reports 152 passed and seven failed across 159 tests. Those failures are the five known ending-consumption
 regressions plus the T01 and T02 transport witnesses. Network/test all-target
 Clippy with warnings denied passes. The production branch also passes 159
 selected chain regressions and six serialization doc tests.

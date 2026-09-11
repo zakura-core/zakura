@@ -9430,10 +9430,10 @@ mod tests {
         ];
         let services = streams
             .into_iter()
-            .map(|stream| {
+            .map(|stream| -> Arc<dyn Service> {
                 Arc::new(DeclaredStreamService {
                     streams: vec![stream],
-                }) as Arc<dyn Service>
+                })
             })
             .collect();
         let registry =

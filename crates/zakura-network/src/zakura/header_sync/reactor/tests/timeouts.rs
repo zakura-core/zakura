@@ -453,6 +453,16 @@ impl ReadyVctRepairFixture {
     }
 
     fn with_trace(trace: Option<crate::zakura::ZakuraTrace>) -> Self {
+        Self::with_selected_tip(
+            trace,
+            zakura_header_chain::Frontier::new(block::Height(2), block::Hash([0x42; 32])),
+        )
+    }
+
+    fn with_selected_tip(
+        trace: Option<crate::zakura::ZakuraTrace>,
+        selected_tip: zakura_header_chain::Frontier,
+    ) -> Self {
         let mut startup = startup(CancellationToken::new());
         if let Some(trace) = trace {
             startup.trace = trace;
@@ -460,8 +470,7 @@ impl ReadyVctRepairFixture {
         let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
         let mut snapshot = committed_snapshot(anchor);
         let target = zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0x41; 32]));
-        snapshot.frontiers.header_best =
-            zakura_header_chain::Frontier::new(block::Height(2), block::Hash([0x42; 32]));
+        snapshot.frontiers.header_best = selected_tip;
         let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
         startup.committed_snapshots = Some(snapshots_rx);
         let (handle, _actions, reactor) =
@@ -1630,6 +1639,74 @@ async fn busy_suppliers_give_a_smaller_repair_supplier_its_turn() {
         .peer_state
         .values()
         .all(|peer| peer.unproductive_requests == 0));
+}
+
+#[test]
+fn successful_supplier_gives_the_next_repair_to_a_waiting_supplier() {
+    let selected = [
+        zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0x41; 32])),
+        zakura_header_chain::Frontier::new(block::Height(2), block::Hash([0x42; 32])),
+        zakura_header_chain::Frontier::new(block::Height(3), block::Hash([0x43; 32])),
+    ];
+    let mut fixture = ReadyVctRepairFixture::with_selected_tip(None, selected[2]);
+    fixture.context = fixture
+        .context
+        .extend_empty_selected_range(&selected[1..], None)
+        .expect("the first repair covers all three headers");
+    let (peers, _outbounds) = fixture.connect(&[0x71, 0x72], 7);
+    fixture.schedule();
+    let mut small_status = fixture.status();
+    small_status.max_headers_per_response = 1;
+    fixture.reactor.handle_wire_message(
+        peers[0].clone(),
+        7,
+        HeaderSyncMessage::Status(small_status),
+    );
+    fixture.advertise(&peers[1..], 8);
+
+    let first = fixture
+        .reactor
+        .peer_work_queue
+        .active(&peers[0])
+        .expect("the first supplier receives its one-header request")
+        .clone();
+    assert_eq!(first.max_header_count, 1);
+    fixture
+        .reactor
+        .peer_work_queue
+        .active_mut(&peers[0])
+        .unwrap()
+        .phase = HeaderTargetPhase::Applying;
+    fixture.reactor.handle_header_target_admission_ready(
+        peers[0].clone(),
+        first.source,
+        first.owner,
+        HeaderTargetAdmissionResult::Applied,
+    );
+    assert!(matches!(
+        fixture.reactor.vct_repair.current().unwrap().state,
+        RepairPolicyState::Completed
+    ));
+
+    fixture.target = selected[1];
+    fixture.context = zakura_header_chain::VctRepairContext::unconstrained(
+        fixture.target,
+        zakura_header_chain::HeaderLocator::for_continuation(selected[0]),
+        Some(selected[2].hash),
+    )
+    .extend_empty_selected_range(&selected[2..], None)
+    .expect("the next repair covers the remaining two headers");
+    fixture.schedule();
+    fixture.reactor.try_assign_vct_repair();
+
+    let next = fixture
+        .reactor
+        .peer_work_queue
+        .active(&peers[1])
+        .expect("the waiting supplier gets the next repair after the first succeeds");
+    assert_eq!(next.max_header_count, 2);
+    assert_eq!(next.target.status.selected_tip_hash, selected[2].hash);
+    assert!(fixture.reactor.peer_work_queue.active(&peers[0]).is_none());
 }
 
 #[tokio::test(start_paused = true)]

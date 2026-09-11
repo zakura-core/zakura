@@ -1874,6 +1874,7 @@ impl HeaderSyncReactor {
                         .get_mut(repair_owner)
                         .expect("the admitted repair remains owned by its active request")
                         .complete();
+                    self.rotate_vct_supplier(source);
                     if let Some(task) = self.vct_repair.get(repair_owner) {
                         self.emit_vct_repair_state(task, "admission", Some("applied"));
                     }

@@ -601,12 +601,17 @@ async fn invalid_third_member_releases_the_entire_pending_session() -> Result<()
         fixture.wait_for_slots(0, TEST_TIMEOUT).await?;
         let _invalid = fixture.offer(stream, Some(id)).await?;
         fixture.wait_for_slots(1, Duration::from_secs(1)).await?;
-        timeout(Duration::from_secs(1), async {
-            while !fixture.serving.is_finished() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await?;
+        if id == 10 {
+            assert!(fixture.connection.close_reason().is_none());
+            assert!(!fixture.serving.is_finished());
+        } else {
+            timeout(Duration::from_secs(1), async {
+                while !fixture.serving.is_finished() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await?;
+        }
         assert!(fixture.sessions.try_recv().is_err());
         fixture.close().await?;
     }
@@ -855,6 +860,73 @@ async fn withheld_pair_id_does_not_reserve_service_capacity() -> Result<(), BoxE
     send.write_all(&1u64.to_le_bytes()).await?;
     fixture.wait_for_slots(0, TEST_TIMEOUT).await?;
     fixture.close().await
+}
+
+#[tokio::test]
+async fn abandoned_half_pair_retry_preserves_the_connection() -> Result<(), BoxError> {
+    // Also cover a reset arriving after the retry, since QUIC streams can reorder.
+    for reset_before_retry in [true, false] {
+        let setup_timeout = Duration::from_secs(1);
+        let mut fixture = RawFixture::start(1, setup_timeout).await?;
+        let (mut sibling_send, _sibling_recv) = fixture.offer(SIBLING, None).await?;
+        let mut sibling = timeout(TEST_TIMEOUT, fixture.siblings.recv())
+            .await?
+            .ok_or("missing sibling")?;
+        let (mut sibling_recv, _sibling_send) = sibling.take_stream(SIBLING.kind).unwrap();
+        let (send, recv) = fixture.offer(DATA, Some(1)).await?;
+        let mut abandoned = Some(SetupIo::new(send, recv));
+        fixture.wait_for_slots(0, TEST_TIMEOUT).await?;
+        if reset_before_retry {
+            drop(abandoned.take());
+        }
+
+        let (_retry_send, mut retry_recv) = fixture.offer(DATA, Some(2)).await?;
+        assert!(timeout(TEST_TIMEOUT, retry_recv.read_exact(&mut [0; 1]))
+            .await?
+            .is_err());
+        fixture.wait_for_slots(1, TEST_TIMEOUT).await?;
+        drop(abandoned);
+        assert!(
+            !sibling.cancel_token().is_cancelled(),
+            "retrying an abandoned half pair must preserve sibling services"
+        );
+        assert!(fixture.sessions.try_recv().is_err());
+        let ping = frame(2, 14, 8);
+        sibling_send
+            .write_all(&ping.encode(SIBLING.frame_cap)?)
+            .await?;
+        assert_eq!(
+            timeout(TEST_TIMEOUT, sibling_recv.recv()).await?,
+            Some(ping)
+        );
+
+        let (_early_send, mut early_recv) = fixture.offer(DATA, Some(3)).await?;
+        assert!(timeout(TEST_TIMEOUT, early_recv.read_exact(&mut [0; 1]))
+            .await?
+            .is_err());
+        assert_eq!(fixture.capacity().available_permits(), 1);
+        let outbound = fixture
+            .service
+            .reserve_session(ServicePeerDirection::Outbound)?;
+        drop(outbound);
+
+        tokio::time::sleep(setup_timeout).await;
+        let _data = fixture.offer(DATA, Some(4)).await?;
+        let (mut requests_send, _requests_recv) = fixture.offer(REQUESTS, Some(4)).await?;
+        let mut replacement = Session::receive(&mut fixture.sessions).await?;
+        let request = frame(1, 7, 8);
+        requests_send
+            .write_all(&request.encode(REQUESTS.frame_cap)?)
+            .await?;
+        assert_eq!(
+            timeout(TEST_TIMEOUT, replacement.request_recv.recv()).await?,
+            Some(request)
+        );
+        assert_eq!(fixture.capacity().available_permits(), 0);
+        assert!(!sibling.cancel_token().is_cancelled());
+        fixture.close().await?;
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -1254,9 +1326,16 @@ async fn incomplete_pairs_expire_and_mismatched_roles_release_stream_permits(
         }
     }
     assert!(
-        cancel.is_cancelled(),
-        "different pair identifiers cannot be combined"
+        !cancel.is_cancelled(),
+        "different pair identifiers retire only the incomplete session"
     );
+    assert!(pending
+        .reserve_or_share(
+            &handler.registry.session_layout(DATA).unwrap(),
+            &handler.registry,
+            ServicePeerDirection::Inbound
+        )
+        .is_err());
     assert_eq!(permits.available_permits(), 2);
     assert!(pending.deadline().is_none());
     assert!(

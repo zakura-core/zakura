@@ -158,8 +158,16 @@ impl PendingSessions {
             streams: Vec::with_capacity(layout.streams.len()),
             deadline: Instant::now() + incoming.context.limits.prelude_timeout,
         });
-        if pending.id != id
-            || Instant::now() >= pending.deadline
+        if pending.id != id {
+            // A retry can arrive before the abandoned offer's reset. Reject both
+            // offers and back off without closing unrelated service sessions.
+            self.retry_after.insert(
+                kind,
+                Instant::now() + incoming.context.limits.prelude_timeout,
+            );
+            return Ok(None);
+        }
+        if Instant::now() >= pending.deadline
             || pending.streams.iter().any(|s| {
                 s.stream.kind == incoming.stream.kind || !layout.streams.contains(&s.stream)
             })

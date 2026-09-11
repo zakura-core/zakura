@@ -149,7 +149,7 @@ rpc_enable_cookie_auth = false
 metrics_endpoint = "127.0.0.1:9999"
 
 [nodes.zakura]
-listen_addr = "127.0.0.1:8234"
+listen_addr = "0.0.0.0:8234"
 bootstrap_peers = []
 trace_dir = "/var/log/zakura/seed-traces"
 TOML
@@ -163,6 +163,26 @@ assert s.count('[network]') == 1
 s = s.replace('[network]', '[network]\ninitial_mainnet_peers = ["138.197.11.145:8233", "209.38.85.70:8233", "159.65.183.89:8233", "104.131.184.123:8233", "dnsseed.z.cash:8233", "dnsseed.str4d.xyz:8233"]\npeerset_initial_target_size = 25')
 p.write_text(s)
 PIN_ARCHIVE_PEER
+
+# Reuse the exact binary built by run 34653015599. Verify its identity before
+# making it available to the deployer's commit-addressed binary cache.
+export ZAKURA_DEPLOYER_BUILD_CACHE_DIR=/root/serving-tested-build-cache
+python3 - <<'VERIFY_TESTED_BINARY'
+import hashlib,json,os,subprocess
+from pathlib import Path
+sha='0e6398c22f0705b9ccf7a071a5229e743dd1572b'
+expected_hash='9cb709adf0340d22636d9fc5e93286c307f799c3d393f2a4cf05315541c93955'
+meta=json.loads(Path('/root/metadata.json').read_text())
+assert meta == {'sha':sha,'binary_sha256':expected_hash,'source_run':34653015599}
+cache=Path(os.environ['ZAKURA_DEPLOYER_BUILD_CACHE_DIR']);cache.mkdir()
+binary=cache/('zakurad-'+sha)
+subprocess.run(['zstd','-q','-d','/root/zakurad.zst','-o',str(binary)],check=True)
+assert hashlib.sha256(binary.read_bytes()).hexdigest()==expected_hash
+binary.chmod(0o755)
+subprocess.run([str(binary),'--version'],check=True)
+Path('/root/out/reused-binary.json').write_text(json.dumps(meta,indent=2)+'\n')
+VERIFY_TESTED_BINARY
+note "Reusing the checksum-verified final-candidate binary from run 34653015599."
 
 export CARGO_TARGET_DIR=/root/cargo-target
 BUILD_START=$(date +%s)
@@ -253,7 +273,7 @@ assert 'p2p_stack = "legacy"' in s
 p.write_text(s.replace('p2p_stack = "legacy"', 'p2p_stack = "dual"'))
 ENABLE_NATIVE_SEED
 python3 deploy/deployer/deploy.py deploy --config /root/fleet.toml
-note "Seed priming passed. Restarted the same seed binary with the isolated native endpoint enabled."
+note "Seed priming passed. Restarted the same seed binary with native traffic bound to all interfaces."
 
 PAIR_RC=0
 python3 -u /root/pr-node-paired-smoke.py \

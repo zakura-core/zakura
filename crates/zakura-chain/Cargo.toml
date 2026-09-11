@@ -1,6 +1,6 @@
 [package]
 name = "zakura-chain"
-version = "7.0.1"
+version = "8.0.0"
 authors.workspace = true
 description = "Core Zcash data structures for the Zakura node. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -21,8 +21,8 @@ default = []
 # Production features that activate extra functionality
 
 # Experimental candidate NU7 consensus rules, currently including ZIP 218's
-# shorter target spacing, wider difficulty averaging window, reduced subsidy by
-# the spacing ratio, and per-block shielded action limits.
+# block timing and shielded action limits, ZIP 2003's version 4 transaction
+# deprecation, and ZIP 234's halving-preserving reissuance.
 #
 # The rules stay dormant until NU7 has an activation height on the configured
 # network, so this feature only changes consensus on a network that configures

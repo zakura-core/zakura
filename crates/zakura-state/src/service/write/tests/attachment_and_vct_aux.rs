@@ -42,6 +42,7 @@ fn attachment_failure_exits_with_a_typed_error_before_publication() {
         _invalid_reset_receiver,
         _rejected_receiver,
         _vct_repair_receiver,
+        _block_commit_receiver,
         task_failure,
         task,
     ) = BlockWriteSender::spawn_with_header_chain(

@@ -34,7 +34,7 @@ impl RunningWriter {
             epoch: LifecycleEpoch::INITIAL,
             reason: HeaderRuntimeDetachedReason::AttachmentPending,
         });
-        let (senders, invalid_resets, _, _, _, task) = BlockWriteSender::spawn_with_header_chain(
+        let (senders, invalid_resets, _, _, _, _, task) = BlockWriteSender::spawn_with_header_chain(
             fixture.finalized_state.clone(),
             live,
             tip_sender,

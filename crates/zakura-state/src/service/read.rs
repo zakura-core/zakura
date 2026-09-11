@@ -31,8 +31,8 @@ pub use address::{
     utxo::{address_utxos, AddressUtxos},
 };
 pub use block::{
-    any_block, any_transaction, any_utxo, block, block_and_size, block_header, block_info,
-    block_size_hints, mined_transaction, transaction_hashes_for_any_block,
+    any_block, any_block_info, any_transaction, any_utxo, block, block_and_size, block_header,
+    block_info, block_size_hints, mined_transaction, transaction_hashes_for_any_block,
     transaction_hashes_for_block, unspent_utxo,
 };
 

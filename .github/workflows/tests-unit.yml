@@ -361,7 +361,7 @@ jobs:
           cargo test --locked --features zakura-chain/nu7-experimental \
             -p zakura-chain -p zakura-header-chain --lib
           cargo test --locked --features nu7-experimental \
-            -p zakura-consensus -p zakura-rpc --lib
+            -p zakura-consensus -p zakura-rpc -p zakura-state --lib
           cargo check --locked -p zakura --features nu7-experimental
 
   network-dependent:

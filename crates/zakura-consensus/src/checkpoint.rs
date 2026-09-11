@@ -28,11 +28,14 @@ use tower::{Service, ServiceExt};
 use tracing::instrument;
 
 use zakura_chain::{
-    amount::{self, DeferredPoolBalanceChange},
+    amount::{self, Amount, DeferredPoolBalanceChange, NonNegative},
     block::{self, Block},
     parameters::{
         checkpoint::list::CheckpointList,
-        subsidy::{block_subsidy, funding_stream_values, FundingStreamReceiver, SubsidyError},
+        subsidy::{
+            block_subsidy, funding_stream_values, is_zip234_active, FundingStreamReceiver,
+            SubsidyError,
+        },
         Network, NetworkUpgrade, GENESIS_PREVIOUS_BLOCK_HASH,
     },
     work::equihash,
@@ -111,6 +114,25 @@ struct CheckpointReset {
 /// downloads. When the verifier services process blocks, they reduce memory
 /// usage by committing blocks to the disk state. (Or dropping invalid blocks.)
 pub const MAX_QUEUED_BLOCKS_PER_HEIGHT: usize = 4;
+
+/// Returns the deferred pool balance change for a checkpoint block.
+fn deferred_pool_balance_change(
+    height: block::Height,
+    network: &Network,
+    money_reserve: Option<Amount<NonNegative>>,
+) -> Result<Option<DeferredPoolBalanceChange>, VerifyCheckpointError> {
+    let expected_deferred_amount = funding_stream_values(
+        height,
+        network,
+        block_subsidy(height, network, money_reserve)?,
+    )?
+    .remove(&FundingStreamReceiver::Deferred);
+
+    Ok(expected_deferred_amount
+        .unwrap_or_default()
+        .checked_sub(network.lockbox_disbursement_total_amount(height))
+        .map(DeferredPoolBalanceChange::new))
+}
 
 /// Convert a tip into its hash and matching progress.
 fn progress_from_tip(
@@ -673,15 +695,12 @@ where
             crate::block::check::equihash_solution_is_valid(&block.header, &self.network)?;
         }
 
-        // See [ZIP-1015](https://zips.z.cash/zip-1015).
-        let expected_deferred_amount =
-            funding_stream_values(height, &self.network, block_subsidy(height, &self.network)?)?
-                .remove(&FundingStreamReceiver::Deferred);
-
-        let deferred_pool_balance_change = expected_deferred_amount
-            .unwrap_or_default()
-            .checked_sub(self.network.lockbox_disbursement_total_amount(height))
-            .map(DeferredPoolBalanceChange::new);
+        // The commit task calculates this value after the parent commits at ZIP 234 heights.
+        let deferred_pool_balance_change = if is_zip234_active(&self.network, height) {
+            None
+        } else {
+            deferred_pool_balance_change(height, &self.network, None)?
+        };
 
         // don't do precalculation until the block passes basic difficulty checks
         let block = CheckpointVerifiedBlock::new(block, Some(hash), deferred_pool_balance_change);
@@ -1275,6 +1294,29 @@ where
 
             let result: Result<block::Hash, VerifyCheckpointError> = async move {
                 let hash = queued_result.result?;
+
+                if is_zip234_active(&network, req_block.block.height) {
+                    let parent_hash = req_block.block.block.header.previous_block_hash;
+                    let response = state_service
+                        .clone()
+                        .oneshot(zs::Request::AwaitBlockInfo(parent_hash))
+                        .map_err(VerifyCheckpointError::CommitCheckpointVerified)
+                        .await?;
+                    let zs::Response::BlockInfo(parent_info) = response else {
+                        unreachable!("wrong response to Request::AwaitBlockInfo");
+                    };
+                    let parent_info = parent_info
+                        .expect("AwaitBlockInfo only returns after the parent block commits");
+                    let money_reserve = Some(parent_info.value_pools().money_reserve());
+                    let deferred_pool_balance_change = deferred_pool_balance_change(
+                        req_block.block.height,
+                        &network,
+                        money_reserve,
+                    )?;
+                    req_block.block = req_block
+                        .block
+                        .with_deferred_pool_balance_change(deferred_pool_balance_change);
+                }
 
                 if req_block.block.auth_data_root.is_none()
                     && NetworkUpgrade::current(&network, req_block.block.height)

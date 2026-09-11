@@ -98,6 +98,10 @@ pub enum Response {
     /// Response to [`Request::Block`] with the specified block.
     Block(Option<Arc<Block>>),
 
+    /// Response to [`Request::BlockInfo`] or [`Request::AwaitBlockInfo`] with the specified
+    /// block's chain value pools.
+    BlockInfo(Option<BlockInfo>),
+
     /// The response to a `BlockHeader` request.
     BlockHeader {
         /// The header of the requested block
@@ -663,6 +667,12 @@ pub struct GetBlockTemplateChainInfo {
     /// The maximum time the miner can use in this block.
     /// Depends on the `tip_hash`, and the local clock on testnet.
     pub max_time: DateTime32,
+
+    /// The chain value pools as of the end of the chain tip block.
+    ///
+    /// The candidate block's ZIP 234 subsidy is derived from the money reserve after its
+    /// parent, which is this tip. Depends on the `tip_hash`.
+    pub value_pools: ValueBalance<NonNegative>,
 }
 
 /// Conversion from read-only [`ReadResponse`]s to read-write [`Response`]s.
@@ -682,6 +692,7 @@ impl TryFrom<ReadResponse> for Response {
             ReadResponse::BlockHash(hash) => Ok(Response::BlockHash(hash)),
 
             ReadResponse::Block(block) => Ok(Response::Block(block)),
+            ReadResponse::BlockInfo(block_info) => Ok(Response::BlockInfo(block_info)),
             ReadResponse::BlockAndSize(_) => {
                 Err("there is no corresponding Response for this ReadResponse")
             }
@@ -721,7 +732,6 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::PruningInfo { .. }
             | ReadResponse::BlockRoots(_)
             | ReadResponse::TipPoolValues { .. }
-            | ReadResponse::BlockInfo(_)
             | ReadResponse::TransactionIdsForBlock(_)
             | ReadResponse::AnyChainTransactionIdsForBlock(_)
             | ReadResponse::SaplingTree(_)

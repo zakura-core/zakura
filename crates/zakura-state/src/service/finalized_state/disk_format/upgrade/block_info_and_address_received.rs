@@ -185,7 +185,7 @@ impl DiskFormatUpgrade for Upgrade {
                 let deferred_pool_balance_change = funding_stream_values(
                     height,
                     &network,
-                    block_subsidy(height, &network).unwrap_or_default(),
+                    block_subsidy(height, &network, None).unwrap_or_default(),
                 )
                 .expect("should have valid funding stream values")
                 .remove(&FundingStreamReceiver::Deferred)

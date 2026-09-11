@@ -353,14 +353,27 @@ pub fn block_info<C>(
 where
     C: AsRef<Chain>,
 {
+    any_block_info(chain.iter(), db, hash_or_height)
+}
+
+/// Returns the [`BlockInfo`] of the block with [`block::Hash`] or [`Height`], if it
+/// exists in any of the non-finalized `chains` or in the finalized `db`.
+///
+/// A block verifier looks up its parent, which can be on a chain other than the best one,
+/// so this searches every non-finalized chain. Heights still resolve on the best chain
+/// first, because `chains` yields it first.
+pub fn any_block_info<'a, C: AsRef<Chain> + 'a>(
+    mut chains: impl Iterator<Item = &'a C>,
+    db: &ZakuraDb,
+    hash_or_height: HashOrHeight,
+) -> Option<BlockInfo> {
     // # Correctness
     //
     // Since blocks are the same in the finalized and non-finalized state, we
-    // check the most efficient alternative first. (`chain` is always in memory,
+    // check the most efficient alternative first. (the chains are always in memory,
     // but `db` stores blocks on disk, with a memory cache.)
-    chain
-        .as_ref()
-        .and_then(|chain| chain.as_ref().block_info(hash_or_height))
+    chains
+        .find_map(|chain| chain.as_ref().block_info(hash_or_height))
         .or_else(|| db.block_info(hash_or_height))
 }
 

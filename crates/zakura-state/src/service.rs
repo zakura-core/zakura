@@ -224,6 +224,9 @@ pub(crate) struct StateService {
     non_finalized_rejected_receiver:
         tokio::sync::mpsc::UnboundedReceiver<write::NonFinalizedWriteFailure>,
 
+    /// Receives a notification after each successful block commit.
+    block_commit_receiver: tokio::sync::watch::Receiver<u64>,
+
     // Pending UTXO Request Tracking
     //
     /// The set of outpoints with pending requests for their associated transparent::Output.
@@ -542,6 +545,7 @@ impl StateService {
             invalid_block_write_reset_receiver,
             non_finalized_rejected_receiver,
             vct_root_repair_receiver,
+            block_commit_receiver,
             block_write_failure,
             block_write_task,
         ) = write::BlockWriteSender::spawn(
@@ -605,6 +609,7 @@ impl StateService {
             non_finalized_failed_ancestors: IndexMap::new(),
             invalid_block_write_reset_receiver,
             non_finalized_rejected_receiver,
+            block_commit_receiver,
             pending_utxos,
             last_prune: Instant::now(),
             read_service: read_service.clone(),
@@ -1992,6 +1997,34 @@ impl Service<Request> for StateService {
                 .boxed()
             }
 
+            // Wait for a parent block to commit before a contextual consensus calculation.
+            Request::AwaitBlockInfo(hash) => {
+                let mut block_commit_receiver = self.block_commit_receiver.clone();
+                let read_service = self.read_service.clone();
+
+                async move {
+                    loop {
+                        let response = read_service
+                            .clone()
+                            .oneshot(ReadRequest::BlockInfo(hash.into()))
+                            .await?;
+                        let ReadResponse::BlockInfo(block_info) = response else {
+                            unreachable!("wrong response to ReadRequest::BlockInfo");
+                        };
+
+                        if block_info.is_some() {
+                            return Ok(Response::BlockInfo(block_info));
+                        }
+
+                        block_commit_receiver
+                            .changed()
+                            .await
+                            .map_err(BoxError::from)?;
+                    }
+                }
+                .boxed()
+            }
+
             // Used by sync, inbound, and block verifier to check if a block is already in the state
             // before downloading or validating it.
             Request::KnownBlock(hash) => {
@@ -2088,6 +2121,7 @@ impl Service<Request> for StateService {
             | Request::Transaction(_)
             | Request::UnspentBestChainUtxo(_)
             | Request::Block(_)
+            | Request::BlockInfo(_)
             | Request::AnyChainBlock(_)
             | Request::BlockHeader(_)
             | Request::FindBlockHashes { .. }
@@ -2769,9 +2803,13 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             // Used by getblock
-            ReadRequest::BlockInfo(hash_or_height) => Ok(ReadResponse::BlockInfo(
-                read::block_info(state.latest_best_chain(), &state.db, hash_or_height),
-            )),
+            ReadRequest::BlockInfo(hash_or_height) => {
+                Ok(ReadResponse::BlockInfo(read::any_block_info(
+                    state.latest_non_finalized_state().chain_iter(),
+                    &state.db,
+                    hash_or_height,
+                )))
+            }
 
             // Used by the StateService.
             ReadRequest::Depth(hash) => Ok(ReadResponse::Depth(read::depth(

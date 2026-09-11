@@ -225,6 +225,7 @@ async fn rpc_getinfo() {
         .await;
     response_handler.respond(zakura_state::ReadResponse::ChainInfo(
         GetBlockTemplateChainInfo {
+            value_pools: Default::default(),
             tip_hash: Mainnet.genesis_hash(),
             tip_height: Height::MIN,
             chain_history_root: HistoryTree::default().hash(),
@@ -3115,6 +3116,7 @@ async fn check_template_rejection_recovery(reject_before_poll: bool) {
         }
     });
     let chain_info = GetBlockTemplateChainInfo {
+        value_pools: Default::default(),
         expected_difficulty: CompactDifficulty::from(ExpandedDifficulty::from(U256::one())),
         tip_height: height,
         tip_hash: parent,
@@ -3325,6 +3327,7 @@ async fn gbt_with(net: Network, addr: ZcashAddress) {
                 .expect_request_that(|req| matches!(req, ReadRequest::ChainInfo))
                 .await
                 .respond(ReadResponse::ChainInfo(GetBlockTemplateChainInfo {
+                    value_pools: Default::default(),
                     expected_difficulty: fake_difficulty,
                     tip_height: fake_tip_height,
                     tip_hash: fake_tip_hash,
@@ -4085,6 +4088,7 @@ async fn rpc_getdifficulty() {
             .expect_request_that(|req| matches!(req, ReadRequest::ChainInfo))
             .await
             .respond(ReadResponse::ChainInfo(GetBlockTemplateChainInfo {
+                value_pools: Default::default(),
                 expected_difficulty: fake_difficulty,
                 tip_height: fake_tip_height,
                 tip_hash: fake_tip_hash,
@@ -4111,6 +4115,7 @@ async fn rpc_getdifficulty() {
             .expect_request_that(|req| matches!(req, ReadRequest::ChainInfo))
             .await
             .respond(ReadResponse::ChainInfo(GetBlockTemplateChainInfo {
+                value_pools: Default::default(),
                 expected_difficulty: fake_difficulty,
                 tip_height: fake_tip_height,
                 tip_hash: fake_tip_hash,
@@ -4134,6 +4139,7 @@ async fn rpc_getdifficulty() {
             .expect_request_that(|req| matches!(req, ReadRequest::ChainInfo))
             .await
             .respond(ReadResponse::ChainInfo(GetBlockTemplateChainInfo {
+                value_pools: Default::default(),
                 expected_difficulty: fake_difficulty.into(),
                 tip_height: fake_tip_height,
                 tip_hash: fake_tip_hash,
@@ -4157,6 +4163,7 @@ async fn rpc_getdifficulty() {
             .expect_request_that(|req| matches!(req, ReadRequest::ChainInfo))
             .await
             .respond(ReadResponse::ChainInfo(GetBlockTemplateChainInfo {
+                value_pools: Default::default(),
                 expected_difficulty: fake_difficulty.into(),
                 tip_height: fake_tip_height,
                 tip_hash: fake_tip_hash,

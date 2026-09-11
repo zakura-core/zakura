@@ -910,6 +910,7 @@ mod tests {
             assert!(matches!(request, zakura_state::ReadRequest::ChainInfo));
             Ok::<_, zakura_state::BoxError>(zakura_state::ReadResponse::ChainInfo(
                 zakura_state::GetBlockTemplateChainInfo {
+                    value_pools: Default::default(),
                     expected_difficulty: difficulty,
                     tip_height: height,
                     tip_hash: parent,

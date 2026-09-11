@@ -1,4 +1,4 @@
-name: PR 966 checkpoint restart diagnostic
+name: PR 966 test cleanup verification
 on:
   workflow_dispatch:
 permissions:
@@ -6,10 +6,7 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    env:
-      IP: "147.182.182.56"
-      EXPECTED_NAME: "zakura-pr-e3328340aa040971681ed222-34572860726"
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -17,25 +14,9 @@ jobs:
       - uses: ./.github/actions/do-cli
         with:
           token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
-          ssh_private_key: ${{ secrets.DO_SSH_PRIVATE_KEY }}
-      - name: Finish sync on the exact task-owned node
+      - name: Verify both task-owned droplets and volumes were deleted
         run: |
           set -euo pipefail
-          doctl compute droplet list --tag-name zakura-pr-node -o json | jq -e --arg name "$EXPECTED_NAME" --arg ip "$IP" '[.[] | select(.name == $name and any(.networks.v4[]; .ip_address == $ip))] | length == 1' > /dev/null
-          mkdir -p /tmp/evidence
-          scp -i /tmp/do_ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new .github/workflows/scripts/pr966-sync-followthrough.py "root@$IP:/root/"
-          ssh -i /tmp/do_ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 -o StrictHostKeyChecking=accept-new "root@$IP" 'python3 -u /root/pr966-sync-followthrough.py' | tee /tmp/evidence/followthrough.log
-      - name: Collect bounded sync evidence
-        if: always()
-        run: |
-          mkdir -p /tmp/evidence
-          scp -r -i /tmp/do_ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "root@$IP:/root/out/native-followthrough" /tmp/evidence/ || true
-          scp -i /tmp/do_ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "root@$IP:/root/out/paired/summary.json" /tmp/evidence/initial-sync-restart.json || true
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        if: always()
-        with:
-          name: pr966-native-followthrough-${{ github.run_id }}
-          path: /tmp/evidence/
-      - name: Remove temporary runner key
-        if: always()
-        run: rm -f /tmp/do_ssh
+          doctl compute droplet list -o json | jq -e '[.[] | select(.id == 599561515 or .id == 599567186 or .name == "zakura-pr-e3328340aa040971681ed222-34570859516" or .name == "zakura-pr-e3328340aa040971681ed222-34572860726")] | length == 0'
+          doctl compute volume list -o json | jq -e '[.[] | select(.id == "9111088e-adab-11f1-8db9-6afac2c46685" or .id == "5c2ecf57-adaf-11f1-9fb3-0ef0b0171da1" or .name == "zakura-pr-vol-34570859516-nyc1" or .name == "zakura-pr-vol-34572860726-nyc1")] | length == 0'
+          echo "Both disposable test droplets and their cloned state volumes are deleted."

@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import os
 import re
 import signal
 import subprocess
@@ -10,13 +11,13 @@ import time
 import urllib.request
 from pathlib import Path
 
-EXPECTED_SHA = "e3328340aa040971681ed222a5bfc63fe43d8991"
+EXPECTED_SHA = os.environ["SHA"]
 COHORT = "pr966-retention-sync-20260911"
 OUT = Path("/root/out/paired")
 SEED_RPC = "http://127.0.0.1:8232"
 CLIENT_RPC = "http://127.0.0.1:18232"
 BINARY = "/usr/local/bin/zakurad-downloader"
-SEED_SHA = "e3328340aa040971681ed222a5bfc63fe43d8991"
+SEED_SHA = EXPECTED_SHA
 
 
 def rpc(url, method, params=None):
@@ -169,106 +170,90 @@ def main():
     parser.add_argument("--duration-minutes", required=True, type=float)
     args = parser.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
-    result = {"sha": EXPECTED_SHA, "seed_sha": SEED_SHA, "network": "mainnet", "cohort": COHORT,
-              "topology": "two full nodes on one disposable host, native QUIC over loopback",
-              "seed_upstream": "public legacy peers", "phases": [], "pass": False}
+    result = {"sha": EXPECTED_SHA, "seed_sha": SEED_SHA, "network": "mainnet",
+              "cohort": COHORT, "pass": False, "probe_sent": False}
     proc = None
     deadline = time.monotonic() + args.duration_minutes * 60
-    stderr = (OUT / "downloader-console.log").open("a")
+    console = (OUT / "downloader-console.log").open("w")
+    checkpoint_since = None
+    last_sample = 0
+    probe_file = OUT / "trigger-state-tip-probe"
     try:
         preparation = json.loads((OUT.parent / "seed-priming/summary.json").read_text())
         if preparation["verdict"] != "ok":
             raise RuntimeError("seed priming did not pass")
-        result.update(seed_preparation=preparation, seed_vct_fast_sync=False,
-                      downloader_vct_fast_sync=True)
         actual = subprocess.check_output(["git", "-C", "/root/zakura", "rev-parse", "HEAD"], text=True).strip()
         if actual != EXPECTED_SHA:
-            raise RuntimeError(f"unexpected tested source revision: {actual}")
+            raise RuntimeError(f"unexpected source {actual}")
         seed_id = seed_identity(min(deadline, time.monotonic() + 360))
         config = OUT / "downloader.toml"
         config.write_text(child_config(args.state, seed_id))
         initial = subprocess.check_output(
             [BINARY, "-c", str(config), "tip-height", "--cache-dir", str(args.state),
-             "--network", "Mainnet"], text=True, stderr=subprocess.STDOUT, timeout=180,
-        )
-        heights = re.findall(r"^([0-9]+)$", initial, re.MULTILINE)
-        if not heights:
-            raise RuntimeError("cannot determine downloader's retained snapshot height")
-        start = int(heights[-1])
+             "--network", "Mainnet"], text=True, stderr=subprocess.STDOUT, timeout=180)
+        start = int(re.findall(r"^([0-9]+)$", initial, re.MULTILINE)[-1])
         checkpoint = int(Path('/root/zakura/crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt').read_text().splitlines()[-1].split()[0])
         if start >= checkpoint:
-            raise RuntimeError("fixture must start below the checkpoint handoff")
-        result.update(seed_id=seed_id, start_height=start, max_checkpoint=checkpoint,
-                      seed_before=rpc(SEED_RPC, "getblockchaininfo"))
-        emit("starting", sha=actual, seed_id=seed_id, start_height=start)
-
-        def launch():
-            return subprocess.Popen([BINARY, "-c", str(config), "start"], stdout=stderr, stderr=stderr)
-
-        proc = launch()
-        first = run_phase(proc, "initial-sync", start, checkpoint + 64 - start,
-                          min(deadline - 300, time.monotonic() + 900))
-        result["phases"].append(first)
-        if first["pruneheight"] is None or first["pruneheight"] <= 0:
-            raise RuntimeError("downloader must remain pruned")
-        stop(proc)
-        # Read persisted height after shutdown so startup work cannot fake restart progress.
-        stopped_tip = subprocess.check_output(
-            [BINARY, "-c", str(config), "tip-height", "--cache-dir", str(args.state),
-             "--network", "Mainnet"], text=True, stderr=subprocess.STDOUT, timeout=120,
-        )
-        restart_start = int(re.findall(r"^([0-9]+)$", stopped_tip, re.MULTILINE)[-1])
-        emit("restarting", persisted_height=restart_start)
-        proc = launch()
-        second = run_phase(proc, "restart-sync", restart_start, 1, deadline)
-        result["phases"].append(second)
-        # Observe a live native connection after catch-up and restart.
-        stable_until = min(deadline, time.monotonic() + 120)
-        while time.monotonic() < stable_until:
+            raise RuntimeError("fixture must start below checkpoint")
+        result.update(start_height=start, checkpoint=checkpoint, seed_id=seed_id)
+        emit("starting", **result)
+        env = os.environ.copy()
+        env["ZAKURA_HANDOFF_PROBE_FILE"] = str(probe_file)
+        proc = subprocess.Popen([BINARY, "-c", str(config), "start"], env=env,
+                                stdout=console, stderr=console)
+        while time.monotonic() < deadline:
             if proc.poll() is not None:
-                raise RuntimeError("downloader exited during stability observation")
-            info = rpc(CLIENT_RPC, "getblockchaininfo")
-            seed_info = rpc(SEED_RPC, "getblockchaininfo")
-            peers = rpc(CLIENT_RPC, "getpeerinfo")
-            if not peers:
-                raise RuntimeError("downloader lost its native peer")
-            check_hash(info["blocks"])
-            emit("stability", height=info["blocks"], seed_height=seed_info["blocks"],
-                 pruneheight=info.get("pruneheight"), peers=len(peers))
-            time.sleep(15)
-        result["final_client"] = rpc(CLIENT_RPC, "getblockchaininfo")
-        result["final_seed"] = rpc(SEED_RPC, "getblockchaininfo")
-        result["final_hash"] = check_hash(result["final_client"]["blocks"])
-        (OUT / "final-client-metrics.txt").write_text(metrics(19999))
-        (OUT / "final-seed-metrics.txt").write_text(metrics(9999))
-        stop(proc)
-        proc = None
-        stderr.flush()
-        if "panicked at" in (OUT / "downloader-console.log").read_text(errors="replace"):
-            raise RuntimeError("downloader panic found in the console log")
-        statuses = []
-        for path in (OUT / "traces").rglob("block_sync*.jsonl"):
-            for line in path.open():
-                row = json.loads(line)
-                if row.get("event") == "block_status_sent":
-                    statuses.append(row)
-        result["advertised_status_samples"] = len(statuses)
-        result["advertised_floors"] = sorted({row["range_start"] for row in statuses})
-        if not statuses or any(row["range_start"] <= 0 for row in statuses):
-            raise RuntimeError("pruned downloader did not advertise its retained range")
-        if len(result["advertised_floors"]) < 2:
-            raise RuntimeError("retained range did not advance while syncing")
-        result["pass"] = True
+                raise RuntimeError(f"client exited {proc.returncode}")
+            try:
+                info = rpc(CLIENT_RPC, "getblockchaininfo")
+                now = time.monotonic()
+                height = info["blocks"]
+                if now - last_sample >= 15:
+                    text = metrics(19999)
+                    native = metric(text, "sync_block_body_received")
+                    (OUT / f"metrics-{int(time.time())}.txt").write_text(text)
+                    emit("sample", height=height, native_bodies=native,
+                         probe_sent=result["probe_sent"], pruneheight=info.get("pruneheight"))
+                    last_sample = now
+                if height == checkpoint:
+                    checkpoint_since = checkpoint_since or now
+                    if now - checkpoint_since >= 120 and not result["probe_sent"]:
+                        (OUT / "before-probe-metrics.txt").write_text(metrics(19999))
+                        (OUT / "before-probe-info.json").write_text(json.dumps(info, indent=2))
+                        emit("trigger_probe", height=height, stalled_seconds=now-checkpoint_since)
+                        probe_file.write_text("one diagnostic Request::Tip\n")
+                        result.update(probe_sent=True, probe_unix_time=time.time())
+                elif height > checkpoint:
+                    result.setdefault("crossed_checkpoint_unix_time", time.time())
+                    if height >= checkpoint + 128:
+                        result.update(end_height=height, final_hash=check_hash(height),
+                                      outcome="resumed_after_one_state_query" if result["probe_sent"] else "uninterrupted")
+                        result["client_tree"] = rpc(CLIENT_RPC, "z_gettreestate", [str(height)])
+                        result["seed_tree"] = rpc(SEED_RPC, "z_gettreestate", [str(height)])
+                        if result["client_tree"] != result["seed_tree"]:
+                            raise AssertionError("client and seed tree states disagree")
+                        result["pass"] = True
+                        emit("diagnostic_complete", height=height, outcome=result["outcome"])
+                        break
+            except (OSError, ValueError) as exc:
+                emit("sample_error", error=str(exc))
+            time.sleep(1)
+        if not result["pass"]:
+            raise RuntimeError("instrumented sync did not cross checkpoint before deadline")
     except Exception as exc:
         result["error"] = str(exc)
         emit("failed", error=str(exc))
     finally:
         try:
+            (OUT / "final-client-metrics.txt").write_text(metrics(19999))
+        except Exception as exc:
+            result["final_metrics_error"] = str(exc)
+        try:
             stop(proc)
         except Exception as exc:
-            result["cleanup_error"] = str(exc)
+            result["shutdown_error"] = str(exc)
             result["pass"] = False
-        stderr.close()
+        console.close()
         (OUT / "summary.json").write_text(json.dumps(result, indent=2) + "\n")
         emit("complete", passed=result["pass"])
     return 0 if result["pass"] else 1

@@ -2114,6 +2114,7 @@ impl WriteBlockWorkerTask {
             header_chain_observers,
         } = &mut self;
 
+        let mut diagnostic_last_idle = std::time::Instant::now();
         let mut prev_finalized_note_commitment_trees: Option<NoteCommitmentTrees> = None;
         let mut deferred_non_finalized_messages = VecDeque::new();
         let deadline_runtime = tokio::runtime::Builder::new_current_thread()
@@ -2159,6 +2160,12 @@ impl WriteBlockWorkerTask {
                 None => match finalized_block_write_receiver.try_recv() {
                     Ok(block) => block,
                     Err(TryRecvError::Empty) => {
+                        if diagnostic_last_idle.elapsed() >= Duration::from_secs(10) {
+                            tracing::warn!(target: "handoff_diagnostic", stage = "checkpoint_writer_idle",
+                                durable_tip = ?finalized_state.db.finalized_tip_height(),
+                                deferred = deferred_non_finalized_messages.len());
+                            diagnostic_last_idle = std::time::Instant::now();
+                        }
                         // The sweep runs after both block queues become empty.
                         // The sweep yields when finalized block work arrives.
                         if let Some(writer) = header_chain.as_ref() {
@@ -2572,6 +2579,8 @@ impl WriteBlockWorkerTask {
             return BlockWriteTaskExit::HeaderChainAttachmentFailed(error);
         }
 
+        tracing::warn!(target: "handoff_diagnostic", stage = "writer_entered_full_mode",
+            durable_tip = ?finalized_state.db.finalized_tip_height(), deferred = deferred_non_finalized_messages.len());
         // Track rejected ancestors so queued descendants can be rejected without
         // attributing the ancestor's validation failure to the descendant's peer.
         let mut rejected_ancestor_map: IndexMap<block::Hash, block::Hash> = IndexMap::new();
@@ -2684,7 +2693,11 @@ impl WriteBlockWorkerTask {
                     queued,
                     queued_at,
                     write_slot,
-                } => Some((queued, queued_at, write_slot)),
+                } => {
+                    tracing::info!(target: "handoff_diagnostic", stage = "writer_full_block",
+                        height = ?queued.0.height, hash = ?queued.0.hash);
+                    Some((queued, queued_at, write_slot))
+                }
                 NonFinalizedWriteMessage::Invalidate { hash, rsp_tx } => {
                     tracing::info!(?hash, "invalidating a block in the non-finalized state");
                     let result = if let Some(writer) = header_chain.as_ref() {

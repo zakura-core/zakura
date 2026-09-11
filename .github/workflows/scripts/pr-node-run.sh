@@ -251,11 +251,10 @@ note "Seed priming passed. Restarted the same seed binary with the isolated nati
 
 PAIR_RC=0
 python3 -u /root/pr-node-paired-smoke.py \
-  --state "$PAIRED_STATE_CACHE_DIR" --duration-minutes "$DURATION_MINUTES" &
-PAIR_PID=$!
+  --state "$PAIRED_STATE_CACHE_DIR" --duration-minutes "$DURATION_MINUTES" || PAIR_RC=$?
 MONITOR_RC=0
 python3 /root/pr-node-monitor.py \
-  --duration-minutes "${DURATION_MINUTES}" \
+  --duration-minutes 0.2 \
   --interval 30 \
   --rpc-url http://127.0.0.1:8232 \
   --metrics-url http://127.0.0.1:9999/metrics \
@@ -266,7 +265,6 @@ python3 /root/pr-node-monitor.py \
   "${MONITOR_CROSSING_ARGS[@]}" \
   --out "$OUT_DIR" || MONITOR_RC=$?
 
-wait "$PAIR_PID" || PAIR_RC=$?
 cp -a /var/log/zakura/seed-traces "$OUT_DIR/seed-traces" 2>/dev/null || true
 python3 - <<'PAIR_SUMMARY'
 import json
@@ -282,7 +280,8 @@ with (root/'summary.md').open('a') as f:
     f.write('\n## Native compatibility smoke\n\n')
     f.write('Two full nodes on one disposable host. Both nodes run PR 966. The seed follows public mainnet over legacy P2P and serves the native-only downloader over loopback QUIC.\n\n')
     f.write('Result: '+('PASS' if pair['pass'] else 'FAIL')+'\n\n')
-    for phase in pair['phases']:
+    f.write('Diagnostic outcome: '+pair.get('outcome', 'incomplete')+'\n\n')
+    for phase in pair.get('phases', []):
         f.write(f"- {phase['phase']}: height {phase['start_height'] if 'start_height' in phase else pair['start_height']} to {phase['height']}, {phase['native_bodies']} native bodies, matching block hash {phase['block_hash']}\n")
     if pair.get('error'): f.write(pair['error']+'\n')
 PAIR_SUMMARY

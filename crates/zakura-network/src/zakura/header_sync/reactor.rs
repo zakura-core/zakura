@@ -3528,60 +3528,8 @@ impl HeaderSyncReactor {
 
     fn retire_obsolete_work(&mut self, snapshot: &zakura_header_chain::EngineSnapshot) {
         self.peer_work_queue.retire_obsolete_unstarted(snapshot);
-        let obsolete_served_paths: Vec<_> = self
-            .served_paths
-            .iter()
-            .filter_map(|(peer, state)| {
-                let (target_tip_hash, scope) = match state {
-                    ServedPathState::Acquiring {
-                        target_tip_hash,
-                        scope,
-                        ..
-                    } => (*target_tip_hash, *scope),
-                    ServedPathState::Active { target, scope, .. } => (target.hash, *scope),
-                };
-                (scope
-                    != zakura_header_chain::HeaderWorkAuthority::for_target(
-                        snapshot,
-                        target_tip_hash,
-                    ))
-                .then(|| peer.clone())
-            })
-            .collect();
-        for peer in obsolete_served_paths {
-            self.served_path_deadlines.remove(&peer);
-            match self.served_paths.remove(&peer) {
-                Some(ServedPathState::Active {
-                    session_id,
-                    lease_id,
-                    target,
-                    scope,
-                    pending_request,
-                    ..
-                }) => {
-                    if let Some(pending) = pending_request {
-                        self.send_headers_outcome(
-                            &peer,
-                            pending.request_id.get(),
-                            target.hash,
-                            HeadersOutcomeCode::Busy,
-                        );
-                    }
-                    self.release_lease(peer, session_id, lease_id, scope);
-                }
-                Some(ServedPathState::Acquiring {
-                    request_id,
-                    target_tip_hash,
-                    ..
-                }) => self.send_headers_outcome(
-                    &peer,
-                    request_id.get(),
-                    target_tip_hash,
-                    HeadersOutcomeCode::Busy,
-                ),
-                None => {}
-            }
-        }
+        // Serving owns an exact retained path. A new local tip does not change the
+        // requested hashes or retire its session, lease, or pending response.
         if let Some(task) = self.vct_repair.retain_current(snapshot) {
             if let Some(peer) = self
                 .peer_work_queue

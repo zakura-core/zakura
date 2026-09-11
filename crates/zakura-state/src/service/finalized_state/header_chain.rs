@@ -50,11 +50,10 @@ use super::{
         FallibleDiskValue, FromDisk, IntoDisk, RawBytes,
     },
     zakura_db::block::ZAKURA_HEADER_HASH_BY_HEIGHT,
-    DiskDb, DiskWriteBatch, ReadDisk, WriteDisk, HEADER_AUX_DELIVERY,
-    HEADER_BODY_EVIDENCE_AUTHORITY, HEADER_CHILD, HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE,
-    HEADER_DEFERRED, HEADER_ELIGIBILITY_ROOT, HEADER_ENGINE_META, HEADER_FINALITY_HISTORY,
-    HEADER_FINALITY_WITNESS, HEADER_NODE_BY_HASH, HEADER_SELECTED, HEADER_VALIDATION_CONTEXT,
-    HEADER_VERIFIED,
+    DiskDb, DiskWriteBatch, WriteDisk, HEADER_AUX_DELIVERY, HEADER_BODY_EVIDENCE_AUTHORITY,
+    HEADER_CHILD, HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE, HEADER_DEFERRED,
+    HEADER_ELIGIBILITY_ROOT, HEADER_ENGINE_META, HEADER_FINALITY_HISTORY, HEADER_FINALITY_WITNESS,
+    HEADER_NODE_BY_HASH, HEADER_SELECTED, HEADER_VALIDATION_CONTEXT, HEADER_VERIFIED,
 };
 
 const METADATA_KEY: &[u8] = b"";
@@ -360,6 +359,7 @@ mod coherence;
 #[cfg(any(test, feature = "header-fuzz"))]
 mod fuzz;
 pub(in crate::service) mod migration;
+mod serving_snapshot;
 #[cfg(any(test, feature = "header-fuzz"))]
 pub use fuzz::{replay_recovery_rows_bytes, RecoveryRowsReplaySummary};
 
@@ -1261,65 +1261,6 @@ impl HeaderChainReader {
         Ok(deliveries)
     }
 
-    fn retained_path_node(
-        &self,
-        hash: block::Hash,
-    ) -> Result<Option<HeaderNodeDisk>, HeaderChainStoreError> {
-        let Some(node) = self
-            .store
-            .get_value::<HeaderNodeDisk>(HEADER_NODE_BY_HASH, hash.0)?
-        else {
-            return Ok(None);
-        };
-        if node.hash != hash
-            || node.header.hash() != hash
-            || node.header.previous_block_hash != node.parent_hash
-        {
-            return Err(HeaderChainStoreError::Incoherent(
-                "retained path node key and header fields disagree",
-            ));
-        }
-        Ok(Some(node))
-    }
-
-    fn finalized_frontier(
-        &self,
-        hash: block::Hash,
-    ) -> Result<Option<Frontier>, HeaderChainStoreError> {
-        let height_by_hash = self.store.cf("height_by_hash")?;
-        let height: Option<block::Height> = self.store.db.zs_get(&height_by_hash, &hash);
-        let Some(height) = height else {
-            return Ok(None);
-        };
-        let hash_by_height = self.store.cf("hash_by_height")?;
-        let canonical_hash: Option<block::Hash> = self.store.db.zs_get(&hash_by_height, &height);
-        if canonical_hash != Some(hash) {
-            return Err(StoreError::Incoherent("finalized height/hash indexes disagree").into());
-        }
-        Ok(Some(Frontier::new(height, hash)))
-    }
-
-    fn finalized_header(
-        &self,
-        frontier: Frontier,
-    ) -> Result<Arc<block::Header>, HeaderChainStoreError> {
-        let block_header_by_height = self.store.cf("block_header_by_height")?;
-        let header: Option<Arc<block::Header>> = self
-            .store
-            .db
-            .zs_get(&block_header_by_height, &frontier.height);
-        let header = header.ok_or(StoreError::Incoherent(
-            "finalized header path has a missing header",
-        ))?;
-        if header.hash() != frontier.hash {
-            return Err(StoreError::Incoherent(
-                "finalized header disagrees with its canonical hash index",
-            )
-            .into());
-        }
-        Ok(header)
-    }
-
     fn selected_aux_delivery(
         &self,
         node: &HeaderNode,
@@ -1899,16 +1840,10 @@ impl HeaderChainReader {
         Ok(Some(context))
     }
 
-    /// Commit a lease only if the branch has not moved since the caller read its snapshot.
-    ///
-    /// The caller derives the path from a snapshot it holds no lock over. Taking the writer lock
-    /// and re-reading the transition engine closes that window: an unchanged state version and an
-    /// unchanged work authority for the target together mean the derived path is still canonical.
-    /// A branch that moved yields `Busy`, and the dropped reservation frees the peer's slot.
-    fn commit_lease_if_branch_unchanged(
+    /// Pin the exact path before a writer can remove it, without requiring a quiet chain.
+    fn commit_path_lease(
         &self,
         reservation: RetainedPathReservation,
-        base_state_version: zakura_header_chain::StateVersion,
         spec: RetainedPathLeaseSpec,
     ) -> Result<RetainedPathLeaseOutcome, HeaderChainStoreError> {
         let _writer = self
@@ -1916,16 +1851,24 @@ impl HeaderChainReader {
             .writer
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-        let current_snapshot = self
+        let retained = self
             .transition_engine
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
-            .snapshot();
-        if current_snapshot.state_version != base_state_version
-            || spec.scope != HeaderWorkAuthority::for_target(&current_snapshot, spec.target.hash)
+            .graph()
+            .header_node(spec.target.hash)
+            .map(|node| Frontier::new(node.height, node.hash));
+        if retained != Some(spec.target)
+            && self
+                .store
+                .audit_snapshot()?
+                .finalized_frontier(spec.target.hash)?
+                != Some(spec.target)
         {
-            return Ok(RetainedPathLeaseOutcome::Busy);
+            return Ok(RetainedPathLeaseOutcome::TargetNotRetained);
         }
+        // Hash ancestry is immutable. A retained target protects the same suffix,
+        // and any prefix finalized since capture is now in immutable canonical storage.
         reservation.commit(spec, Instant::now())
     }
 
@@ -1945,7 +1888,8 @@ impl HeaderChainReader {
         snapshot: &EngineSnapshot,
     ) -> Result<RetainedPathLeaseOutcome, HeaderChainStoreError> {
         let peer = reservation.peer;
-        let Some(target) = self.finalized_frontier(target_tip_hash)? else {
+        let read = self.store.audit_snapshot()?;
+        let Some(target) = read.finalized_frontier(target_tip_hash)? else {
             return Ok(RetainedPathLeaseOutcome::TargetNotRetained);
         };
         if target.height >= snapshot.frontiers.finalized.height {
@@ -1958,7 +1902,7 @@ impl HeaderChainReader {
         // complete protocol range it never needed.
         let mut common_ancestor: Option<Frontier> = None;
         for locator_hash in locator_hashes {
-            if let Some(frontier) = self.finalized_frontier(*locator_hash)? {
+            if let Some(frontier) = read.finalized_frontier(*locator_hash)? {
                 let distance = target.height.0.checked_sub(frontier.height.0);
                 if distance.is_some_and(|distance| {
                     distance > 0 && distance <= crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE
@@ -1974,9 +1918,8 @@ impl HeaderChainReader {
         let next = common_ancestor.height.next().map_err(|_| {
             StoreError::Incoherent("canonical header cursor start height overflowed")
         })?;
-        self.commit_lease_if_branch_unchanged(
+        self.commit_path_lease(
             reservation,
-            snapshot.state_version,
             RetainedPathLeaseSpec {
                 peer,
                 session_id,
@@ -2003,7 +1946,7 @@ impl HeaderChainReader {
     /// Returns `TargetNotRetained` when neither band holds the target, `NoLocatorIntersection`
     /// when no locator hash is a canonical ancestor of it, `HistoryPruned` when the retained
     /// path no longer reaches the finalized frontier, and `Busy` when the peer already holds a
-    /// lease or the branch moved under the request. On success the peer owns one lease until it
+    /// lease or capacity is unavailable. On success the peer owns one lease until it
     /// releases the lease or the idle deadline expires. The finalized fallback limits the
     /// complete historical path to one protocol range.
     pub(crate) fn acquire_retained_path(
@@ -2021,6 +1964,15 @@ impl HeaderChainReader {
                 "retained path locator count is outside protocol bounds",
             )));
         }
+        // Capture the bounded in-memory path and disk view under one commit barrier.
+        // Locator disk reads run after releasing it. Lease installation rechecks only
+        // the exact target's availability, not unrelated generation changes.
+        let _writer = self
+            .store
+            .writer
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        let read = self.store.audit_snapshot()?;
         // General paths may occupy all but one registry slot. A target outside the retained graph
         // may use the final slot only when it resolves to the bounded finalized fallback below.
         let capacity = if self
@@ -2055,7 +2007,11 @@ impl HeaderChainReader {
                 .lock()
                 .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
             let snapshot = engine.snapshot();
-            if scope != HeaderWorkAuthority::for_target(&snapshot, target_tip_hash) {
+            // Serving reads an exact hash, not the selected branch. The captured scope
+            // correlates this lease with its requester and may predate normal head progress.
+            if scope.branch.target_tip_hash != target_tip_hash
+                || scope.header_generation > snapshot.header_generation
+            {
                 return Ok(RetainedPathLeaseOutcome::Busy);
             }
             match engine.graph().header_node(target_tip_hash) {
@@ -2080,6 +2036,7 @@ impl HeaderChainReader {
                 }
             }
         };
+        drop(_writer);
         let Some((target, mut reverse_path)) = retained_target else {
             // The header graph holds only the retained suffix. A VCT repair can ask for a bounded
             // range that every peer past it has finalized. The target is absent here but present
@@ -2111,7 +2068,7 @@ impl HeaderChainReader {
                 ));
                 break;
             }
-            if let Some(frontier) = self.finalized_frontier(*locator_hash)? {
+            if let Some(frontier) = read.finalized_frontier(*locator_hash)? {
                 if frontier.height < snapshot.frontiers.finalized.height {
                     let next = frontier.height.next().map_err(|_| {
                         StoreError::Incoherent("canonical header cursor start height overflowed")
@@ -2142,9 +2099,8 @@ impl HeaderChainReader {
         {
             position = CanonicalHeaderPathPosition::Complete;
         }
-        self.commit_lease_if_branch_unchanged(
+        self.commit_path_lease(
             reservation,
-            snapshot.state_version,
             RetainedPathLeaseSpec {
                 peer,
                 session_id,
@@ -2156,88 +2112,6 @@ impl HeaderChainReader {
                 retained_path,
             },
         )
-    }
-
-    fn next_canonical_path_item(
-        &self,
-        cursor: &CanonicalHeaderPathCursor,
-        position: &mut CanonicalHeaderPathPosition,
-        previous: Frontier,
-    ) -> Result<Option<(Frontier, Arc<block::Header>, Vec<AuxDelivery>)>, HeaderChainStoreError>
-    {
-        match *position {
-            CanonicalHeaderPathPosition::Complete => Ok(None),
-            CanonicalHeaderPathPosition::Finalized { next, end } => {
-                if next > end || previous.height.next().ok() != Some(next) {
-                    return Err(StoreError::Incoherent(
-                        "finalized canonical header cursor has a non-contiguous height",
-                    )
-                    .into());
-                }
-                let hash_by_height = self.store.cf("hash_by_height")?;
-                let hash: Option<block::Hash> = self.store.db.zs_get(&hash_by_height, &next);
-                let hash = hash.ok_or(StoreError::Incoherent(
-                    "finalized canonical header cursor has a missing hash",
-                ))?;
-                let frontier = Frontier::new(next, hash);
-                let header = self.finalized_header(frontier)?;
-                if header.previous_block_hash != previous.hash {
-                    return Err(StoreError::Incoherent(
-                        "finalized canonical header cursor has a non-contiguous parent",
-                    )
-                    .into());
-                }
-                *position = if next == end {
-                    if cursor.retained_path.is_empty() {
-                        CanonicalHeaderPathPosition::Complete
-                    } else {
-                        CanonicalHeaderPathPosition::Retained { next: 0 }
-                    }
-                } else {
-                    CanonicalHeaderPathPosition::Finalized {
-                        next: next.next().map_err(|_| {
-                            StoreError::Incoherent(
-                                "finalized canonical header cursor height overflowed",
-                            )
-                        })?,
-                        end,
-                    }
-                };
-                Ok(Some((frontier, header, Vec::new())))
-            }
-            CanonicalHeaderPathPosition::Retained { next } => {
-                let Some(hash) = cursor.retained_path.get(next).copied() else {
-                    return Err(StoreError::Incoherent(
-                        "retained canonical header cursor exceeded its immutable suffix",
-                    )
-                    .into());
-                };
-                let node = self
-                    .retained_path_node(hash)?
-                    .ok_or(StoreError::Incoherent(
-                        "active canonical header cursor node is absent",
-                    ))?;
-                if previous.height.next().ok() != Some(node.height)
-                    || node.parent_hash != previous.hash
-                {
-                    return Err(StoreError::Incoherent(
-                        "retained canonical header cursor has a non-contiguous item",
-                    )
-                    .into());
-                }
-                let deliveries =
-                    self.coherent_aux_deliveries_for(node.hash, &node.aux_delivery_ids)?;
-                let frontier = Frontier::new(node.height, node.hash);
-                *position = if next.saturating_add(1) == cursor.retained_path.len() {
-                    CanonicalHeaderPathPosition::Complete
-                } else {
-                    CanonicalHeaderPathPosition::Retained {
-                        next: next.saturating_add(1),
-                    }
-                };
-                Ok(Some((frontier, node.header, deliveries)))
-            }
-        }
     }
 
     pub(crate) fn read_retained_path(
@@ -2268,43 +2142,10 @@ impl HeaderChainReader {
         if after_hash != lease.last_frontier.hash {
             return Ok(RetainedPathReadOutcome::Unavailable);
         }
-        let read_version = self.store.snapshot()?.state_version;
-        let page_ancestor = lease.last_frontier;
-        let count = usize::try_from(max_count).unwrap_or(usize::MAX);
-        let mut headers = Vec::with_capacity(count.min(usize::from(u16::MAX)));
-        let mut aux_deliveries = Vec::with_capacity(headers.capacity());
-        let mut previous = page_ancestor;
-        let mut position = lease.position;
-        let page_result: Result<bool, HeaderChainStoreError> = (|| {
-            while headers.len() < count {
-                let Some((frontier, header, deliveries)) =
-                    self.next_canonical_path_item(&lease, &mut position, previous)?
-                else {
-                    break;
-                };
-                previous = frontier;
-                headers.push(header);
-                aux_deliveries.push(deliveries);
-            }
-            let complete = matches!(position, CanonicalHeaderPathPosition::Complete);
-            if complete && previous != lease.target {
-                return Err(StoreError::Incoherent(
-                    "canonical header cursor completed before its exact target",
-                )
-                .into());
-            }
-            Ok(complete)
-        })();
-        let _writer = self
-            .store
-            .writer
-            .lock()
-            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-        let current_version = self.store.snapshot()?.state_version;
-        if current_version != read_version {
+        let read = self.capture_path_read(&lease, max_count)?;
+        let Some((page, position, last_frontier)) = read.read_page(&lease, max_count)? else {
             return Ok(RetainedPathReadOutcome::Unavailable);
-        }
-        let complete = page_result?;
+        };
         let advanced = self
             .leases
             .lock()
@@ -2314,24 +2155,16 @@ impl HeaderChainReader {
                 session_id,
                 lease_id,
                 CanonicalHeaderPathAdvance {
-                    expected_after: page_ancestor,
+                    expected_after: lease.last_frontier,
                     position,
-                    last_frontier: previous,
+                    last_frontier,
                     now: Instant::now(),
                 },
             );
         if !advanced {
             return Ok(RetainedPathReadOutcome::Unavailable);
         }
-        Ok(RetainedPathReadOutcome::Page(Box::new(RetainedPathPage {
-            lease_id,
-            common_ancestor: page_ancestor,
-            target: lease.target,
-            scope: lease.scope,
-            headers,
-            aux_deliveries,
-            complete,
-        })))
+        Ok(RetainedPathReadOutcome::Page(Box::new(page)))
     }
 
     pub(crate) fn release_retained_path(

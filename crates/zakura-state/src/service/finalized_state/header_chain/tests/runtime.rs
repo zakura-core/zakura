@@ -1221,6 +1221,24 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
         "the opaque cursor advances exactly once and cannot be rewound",
     );
 
+    let cursor = runtime
+        .leases
+        .lock()
+        .expect("the lease registry is available")
+        .get(owner, 7, lease.lease_id, Instant::now())
+        .expect("the lease remains active");
+    let captured_read = reader
+        .capture_path_read(&cursor, 1)
+        .expect("the page captures a coherent read view");
+    assert!(
+        reader.store.writer.try_lock().is_ok(),
+        "page I/O does not hold the writer"
+    );
+    assert!(
+        reader.transition_engine.try_lock().is_ok(),
+        "page I/O does not hold the engine"
+    );
+
     let before = runtime.publisher().snapshot();
     let evidence = EvidenceId::from_digest([3; 32]);
     let id = zakura_header_chain::OperatorInvalidationId::new([3; 16]);
@@ -1255,6 +1273,31 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
         runtime.publisher().snapshot().frontiers.header_best,
         anchor_frontier
     );
+
+    let (captured_page, _, _) = captured_read
+        .read_page(&cursor, 1)
+        .expect("the old snapshot remains coherent after the branch changes")
+        .expect("the captured path remains readable");
+    assert_eq!(captured_page.headers[0].hash(), grandchild.hash);
+    assert!(captured_page.complete);
+
+    let stale_source = SourceId::from_digest([0xed; 32]);
+    let RetainedPathLeaseOutcome::Acquired(stale_lease) = reader
+        .acquire_retained_path(
+            stale_source,
+            7,
+            grandchild.hash,
+            &[anchor.hash],
+            lease_scope,
+        )
+        .expect("a request queued before the head changed can still acquire its exact path")
+    else {
+        panic!("head changes do not invalidate an exact retained target");
+    };
+    assert_eq!(stale_lease.scope, lease_scope);
+    assert!(reader
+        .release_retained_path(stale_source, 7, stale_lease.lease_id, lease_scope)
+        .unwrap());
 
     let RetainedPathReadOutcome::Page(continuation) = reader
         .read_retained_path(owner, 7, lease.lease_id, lease_scope, child.hash, 1)
@@ -1593,4 +1636,106 @@ async fn retained_path_serves_a_bounded_finalized_range_below_the_header_frontie
             .expect("the unknown target lookup is coherent"),
         RetainedPathLeaseOutcome::TargetNotRetained
     ));
+}
+
+#[test]
+fn retained_path_survives_finalization_during_and_between_page_reads() {
+    let (runtime, db, _, path) = reconciled_store_with_finalized_prefix(6);
+    let reader = runtime.reader();
+    let target = Frontier::new(path[3].height, path[3].hash);
+    let source = SourceId::from_digest([0xa1; 32]);
+    let before = runtime.publisher().snapshot();
+    let scope = HeaderWorkAuthority::for_target(&before, target.hash);
+    let RetainedPathLeaseOutcome::Acquired(lease) = reader
+        .acquire_retained_path(source, 7, target.hash, &[path[2].hash], scope)
+        .expect("the retained target can be leased")
+    else {
+        panic!("the retained target has capacity");
+    };
+    let cursor = runtime
+        .leases
+        .lock()
+        .unwrap()
+        .get(source, 7, lease.lease_id, Instant::now())
+        .unwrap();
+    let captured = reader.capture_path_read(&cursor, 1).unwrap();
+    let finalized = Frontier::new(path[4].height, path[4].hash);
+    let proof: Vec<_> = runtime
+        .verified_projection()
+        .unwrap()
+        .into_iter()
+        .take_while(|frontier| frontier.height <= finalized.height)
+        .map(|frontier| frontier.hash)
+        .collect();
+    let evidence =
+        zakura_header_chain::full_state_finality_evidence(before.state_version, finalized, &proof);
+    let authority = Authority(evidence);
+    let mut batch = DiskWriteBatch::new();
+    for header in &path[3..5] {
+        batch.zs_insert(
+            &db.cf_handle("hash_by_height").unwrap(),
+            header.height,
+            header.hash,
+        );
+        batch.zs_insert(
+            &db.cf_handle("height_by_hash").unwrap(),
+            header.hash,
+            header.height,
+        );
+        batch.zs_insert(
+            &db.cf_handle("block_header_by_height").unwrap(),
+            header.height,
+            header.header.as_ref(),
+        );
+    }
+    runtime
+        .apply_combined(
+            TransitionRequest {
+                expected_version: before.state_version,
+                event: TransitionEvent::FullStateFinalized(FullStateFinalized {
+                    full_state_transition_id: evidence,
+                    new_finalized: finalized,
+                    verified_path_proof: proof,
+                }),
+            },
+            &TransitionContext {
+                config: &runtime.config,
+                clock: &SystemClock,
+                full_state_authority: Some(&authority),
+                retention_references: &[],
+            },
+            batch,
+            || {},
+        )
+        .expect("finality advances while the page snapshot is held");
+    assert!(runtime.publisher().snapshot().header_generation > before.header_generation);
+    assert!(
+        runtime.store.header_node(target.hash).unwrap().is_none(),
+        "finality removes the old retained row"
+    );
+    let (page, _, _) = captured.read_page(&cursor, 1).unwrap().unwrap();
+    assert_eq!(page.headers[0].hash(), target.hash);
+    assert!(page.complete);
+    let RetainedPathReadOutcome::Page(page) = reader
+        .read_retained_path(source, 7, lease.lease_id, scope, path[2].hash, 1)
+        .unwrap()
+    else {
+        panic!("a fresh page reads the same hash from finalized storage");
+    };
+    assert_eq!(page.headers[0].hash(), target.hash);
+    assert!(page.complete);
+    let RetainedPathLeaseOutcome::Acquired(fresh) = reader
+        .acquire_retained_path(
+            SourceId::from_digest([0xa2; 32]),
+            7,
+            target.hash,
+            &[path[2].hash],
+            scope,
+        )
+        .unwrap()
+    else {
+        panic!("an acquisition queued before finality can still serve the exact hash");
+    };
+    assert_eq!(fresh.target, target);
+    assert_eq!(fresh.scope, scope);
 }

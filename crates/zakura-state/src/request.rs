@@ -1842,7 +1842,7 @@ pub enum ReadRequest {
         session_id: u64,
         /// Exact target named by the peer's status.
         target_tip_hash: block::Hash,
-        /// Exact generation and branch captured before the state read.
+        /// Request correlation scope. Head progress does not stale this read-only lease.
         scope: zakura_header_chain::HeaderWorkAuthority,
         /// Locator hashes in requester order.
         locator_hashes: Vec<block::Hash>,

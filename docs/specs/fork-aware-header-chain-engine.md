@@ -180,7 +180,7 @@ The durable metadata contains monotonically increasing unsigned counters. Counte
 
 **LC-GEN-03 [LS] — Branch-scoped work identity.** Every branch-sensitive network request, staged target, buffer, coverage interval, pending commit, retry/avoidance record, body task, auxiliary repair, and completion event MUST carry the relevant generation and an explicit branch identity. A branch identity is at least `(anchor_hash, target_tip_hash)`; height alone is never sufficient.
 
-**LC-GEN-04 [LS] — Stale-result rejection.** Before any effect, completion handling MUST compare generation, branch identity, request identity, and pending owner. A stale or unowned result MUST have no frontier, coverage, retry, repair, scheduling, publication, body-task, or peer-score effect.
+**LC-GEN-04 [LS] — Stale-result rejection.** Before any effect, completion handling MUST compare generation, branch identity, request identity, and pending owner. A stale or unowned result MUST have no frontier, coverage, retry, repair, scheduling, publication, body-task, or peer-score effect. Snapshot-bound read-only serving follows LC-WIRE-06. Its captured scope correlates the accepted request and does not authorize a state mutation.
 
 **LC-GEN-05 [ZW] — Single frontier publisher.** The header engine MUST be the sole publisher of accepted header-frontier transitions. A driver or state-response task MUST NOT independently publish the raw result of a range commit.
 
@@ -517,7 +517,7 @@ Each schema-1 height must equal its parallel header’s inferred height. Root de
 
 **LC-WIRE-05 [ZW] — Snapshot-bound path serving.** On accepting a request, the server MUST acquire a retained-path snapshot for the exact target hash. It MUST select the first locator entry, in requester order, that lies on that target’s ancestor path, and serve only the contiguous path after that ancestor toward that target.
 
-**LC-WIRE-06 [ZW] — No target substitution.** The accepted target MUST remain snapshot-bound even if the server’s selected tip changes concurrently. The server MUST either complete that exact path through one or more responses/continuations or return one explicit `HeadersOutcome`; it MUST NOT silently substitute its new selected path.
+**LC-WIRE-06 [ZW] — No target substitution.** The accepted target MUST remain snapshot-bound even if the server’s selected tip changes concurrently. The server MUST either complete that exact path through one or more responses/continuations or return one explicit `HeadersOutcome`; it MUST NOT silently substitute its new selected path. A local generation or finality advance alone MUST NOT cancel acquisition or serving of an unchanged exact path. Path acquisition MUST install retention ownership atomically with path selection. Page reads MUST use a coherent bounded snapshot without requiring an unchanged global state version. Session, lease, request, cursor, expiry, and capacity checks still apply. Finalized auxiliary records looked up by height MUST match the served path by hash before attachment.
 
 **LC-WIRE-07 [ZW] — Explicit response outcomes.** If the target is not retained, no locator intersects, required history was pruned, or resources are temporarily unavailable, the server MUST return the corresponding explicit outcome and no partial ambiguous success.
 

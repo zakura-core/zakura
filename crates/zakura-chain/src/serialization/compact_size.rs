@@ -72,7 +72,7 @@ use proptest_derive::Arbitrary;
 /// # Deserialization Examples
 ///
 /// ```
-/// use zakura_chain::serialization::{CompactSizeMessage, MAX_PROTOCOL_MESSAGE_LEN};
+/// use zakura_chain::serialization::{CompactSizeMessage, ZcashDeserializeInto, MAX_PROTOCOL_MESSAGE_LEN};
 /// use std::{convert::{TryFrom, TryInto}, io::Cursor};
 ///
 /// assert_eq!(
@@ -168,7 +168,7 @@ pub struct CompactSizeMessage(
 /// # Deserialization Examples
 ///
 /// ```
-/// use zakura_chain::serialization::{CompactSize64, MAX_PROTOCOL_MESSAGE_LEN};
+/// use zakura_chain::serialization::{CompactSize64, ZcashDeserializeInto, MAX_PROTOCOL_MESSAGE_LEN};
 /// use std::{convert::TryFrom, io::Cursor};
 ///
 /// assert_eq!(

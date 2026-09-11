@@ -8,7 +8,7 @@ for line in processes.splitlines():
     if any(name in line for name in ["cargo", "rustc", "zakurad", "clang", "cc1", "lld", "cp ", "cloud-init", "git", "python3"]):
         print(line)
 print("filesystems", subprocess.check_output(["df", "-h"], text=True))
-for name in ["/root/out/notes.md","/root/out/seed-priming/summary.json","/root/out/paired/summary.json"]:
+for name in ["/root/out/notes.md","/root/out/seed-priming/summary.json","/root/out/paired/summary.json","/root/out/paired/downloader-console.log","/root/out/paired/downloader.log"]:
     p=Path(name)
     if p.exists():
         if name.endswith('/paired/summary.json'):

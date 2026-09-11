@@ -143,6 +143,7 @@ storage_mode = "${STORAGE_MODE}"
 p2p_stack = "legacy"
 checkpoint_sync = true
 vct_fast_sync = false
+network_cache_dir = "/root/reproduction-seed-peer-cache"
 rpc_listen_addr = "127.0.0.1:8232"
 rpc_enable_cookie_auth = false
 metrics_endpoint = "127.0.0.1:9999"
@@ -153,6 +154,16 @@ bootstrap_peers = []
 dev_network = "header-serving-repro-20260911"
 trace_dir = "/var/log/zakura/seed-traces"
 TOML
+
+# Keep the fixture supplied by the archive node instead of random cached peers.
+python3 - <<'PIN_ARCHIVE_PEER'
+from pathlib import Path
+p = Path('deploy/deployer/templates/zakura.toml')
+s = p.read_text()
+assert s.count('[network]') == 1
+s = s.replace('[network]', '[network]\ninitial_mainnet_peers = ["104.131.174.28:8233"]\npeerset_initial_target_size = 1')
+p.write_text(s)
+PIN_ARCHIVE_PEER
 
 export CARGO_TARGET_DIR=/root/cargo-target
 BUILD_START=$(date +%s)

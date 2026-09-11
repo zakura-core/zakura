@@ -200,19 +200,7 @@ impl BlockSyncMessage {
     pub(super) fn decode_frame_with_raw_block_payload(
         frame: Frame,
     ) -> Result<(Self, Option<Arc<[u8]>>), BlockSyncWireError> {
-        if frame.flags != 0 {
-            return Err(BlockSyncWireError::UnsupportedFlags(frame.flags));
-        }
-        let frame_message_type = u8::try_from(frame.message_type)
-            .map_err(|_| BlockSyncWireError::UnknownFrameMessageType(frame.message_type))?;
-        validate_payload_len(frame.payload.len())?;
-        let payload_message_type = frame.payload.as_slice().read_u8()?;
-        if frame_message_type != payload_message_type {
-            return Err(BlockSyncWireError::MismatchedFrameMessageType {
-                frame: frame.message_type,
-                payload: payload_message_type,
-            });
-        }
+        let frame_message_type = Self::checked_frame_type(&frame)?;
 
         // If this is a block message, keep the original raw block payload as well;
         // it can be stored in compact form in the reorder backlog.
@@ -231,6 +219,33 @@ impl BlockSyncMessage {
         };
 
         Ok((message, raw_block_payload))
+    }
+
+    /// Validate frame declarations before any body allocation or capacity wait.
+    pub(super) fn checked_frame_type(frame: &Frame) -> Result<u8, BlockSyncWireError> {
+        if frame.flags != 0 {
+            return Err(BlockSyncWireError::UnsupportedFlags(frame.flags));
+        }
+        let frame_message_type = u8::try_from(frame.message_type)
+            .map_err(|_| BlockSyncWireError::UnknownFrameMessageType(frame.message_type))?;
+        validate_payload_len(frame.payload.len())?;
+        let payload_message_type = frame.payload.as_slice().read_u8()?;
+        if frame_message_type != payload_message_type {
+            return Err(BlockSyncWireError::MismatchedFrameMessageType {
+                frame: frame.message_type,
+                payload: payload_message_type,
+            });
+        }
+
+        if frame_message_type == MSG_BS_BLOCK {
+            validate_encoded_block_len(
+                frame
+                    .payload
+                    .len()
+                    .saturating_sub(BLOCK_SYNC_MESSAGE_TYPE_BYTES),
+            )?;
+        }
+        Ok(frame_message_type)
     }
 
     /// Exact serialized length of a `Block` body, derived from the frame payload

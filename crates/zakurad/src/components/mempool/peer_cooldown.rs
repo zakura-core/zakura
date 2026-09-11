@@ -103,10 +103,9 @@ impl PeerCooldowns {
         let mut state = self.peers();
 
         if !state.peers.contains_key(&ip) && state.peers.len() >= MAX_COOLDOWN_PEERS {
-            let &(until, oldest) = state
-                .expirations
-                .first()
-                .expect("each cooldown has one expiration");
+            // Each cooldown has one expiration, so a full history has a first
+            // expiration.
+            let &(until, oldest) = state.expirations.first()?;
             if now < until {
                 return None;
             }

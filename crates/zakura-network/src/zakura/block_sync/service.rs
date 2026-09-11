@@ -806,9 +806,9 @@ impl Service for BlockSyncService {
                                     // Otherwise settle downloads before closing the pair.
                                     run_cancel.cancel();
                                     match result {
-                                        Err(error @ SinkReject::Protocol(_)) => Err(error),
+                                        Err(error) if error.closes_connection() => Err(error),
                                         serving => match download.await {
-                                            Err(error @ SinkReject::Protocol(_)) => Err(error),
+                                            Err(error) if error.closes_connection() => Err(error),
                                             download => serving.and(download),
                                         },
                                     }

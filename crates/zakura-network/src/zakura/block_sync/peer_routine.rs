@@ -1385,7 +1385,7 @@ impl PeerRoutine {
                 outstanding = self.window.outstanding.len(),
                 "disconnecting Zakura block-sync peer after repeated no-progress stall"
             );
-            return Err(SinkReject::protocol(error));
+            return Err(SinkReject::local_connection(error));
         }
         self.registry.park_session(
             &self.peer,
@@ -3599,7 +3599,10 @@ mod tests {
             )
         {
             if readmitted {
-                assert!(matches!(result, Err(SinkReject::Protocol(_))), "{result:?}");
+                assert!(
+                    matches!(result, Err(SinkReject::Connection(_))),
+                    "{result:?}"
+                );
             } else {
                 assert!(matches!(result, Err(SinkReject::Local(_))), "{result:?}");
                 assert!(matches!(

@@ -2679,6 +2679,16 @@ impl ZakuraService for LegacyGossipSink {
                             debug!(?error, ?peer_id, "legacy gossip inbound queue closed");
                             return;
                         }
+                        Err(SinkReject::Connection(error)) => {
+                            debug!(
+                                ?error,
+                                ?peer_id,
+                                "legacy gossip requires local connection closure"
+                            );
+                            cancel_token.cancel();
+                            outbound.finish_session(&peer_id, conn_id, session_id, false);
+                            return;
+                        }
                     }
                 }
             },

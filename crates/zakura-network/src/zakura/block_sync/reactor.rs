@@ -575,13 +575,6 @@ impl BlockSyncReactor {
             ) {
                 continue;
             }
-            if servable_peers > 2 {
-                self.registry.avoid_floor_height_until(
-                    &claim.peer,
-                    claim.height,
-                    now + self.startup.config.effective_floor_peer_avoid_cooldown(),
-                );
-            }
             let released = self
                 .state
                 .work_queue
@@ -590,6 +583,16 @@ impl BlockSyncReactor {
                     [claim.height],
                 );
             self.state.budget.release(released.released_bytes);
+            // Settlement arbitrates against writer startup. Skipped frames and
+            // already-settled work must not count against the peer.
+            if servable_peers > 2 && released.returned_count > 0 && !released.request_was_unwritten
+            {
+                self.registry.avoid_floor_height_until(
+                    &claim.peer,
+                    claim.height,
+                    now + self.startup.config.effective_floor_peer_avoid_cooldown(),
+                );
+            }
             self.trace_floor_watchdog_cancelled(&claim, released);
             metrics::counter!("sync.block.floor_watchdog.cancelled").increment(1);
             tracing::debug!(

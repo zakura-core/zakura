@@ -32,6 +32,8 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| `network.zakura.nat_traversal` | `crates/zakura-network/src/zakura/handler.rs` | always disabled → configurable, default `false`; `true` allows up to 32 remote candidate addresses with the pinned Iroh defaults | [#968](https://github.com/zakura-core/zakura/pull/968) | Let operators opt in to QUIC candidate exchange and probes while preserving the default behavior. |
+| `DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW` | `crates/zakura-network/src/zakura/handler.rs` | `32 MiB` → `16 MiB` | [#943](https://github.com/zakura-core/zakura/pull/943) | Leave connection receive credit for another service while one stream's application reads are paused. |
 | `BLOCK_VERIFY_TIMEOUT_RETRY_LIMIT` | `crates/zakurad/src/components/sync.rs` | immediate restart → `3` retries per hash per sync round | [#940](https://github.com/zakura-core/zakura/pull/940) | Preserve parent commits during transient verification timeouts while bounding retries. |
 | `BEST_TIP_INPUT_CHECK_TIMEOUT` | `crates/zakura-consensus/src/block.rs` | new → `5 s` | [#940](https://github.com/zakura-core/zakura/pull/940) | Bound the optional committed-parent input check; lack of a result preserves ordinary verification. |
 | `MIN_UTXO_RACE_DROPS_BEFORE_RESTART` | `crates/zakurad/src/components/sync.rs` | immediate restart → `max(full_verify_concurrency_limit, 4)` UTXO lookup timeouts without a verified block | [#940](https://github.com/zakura-core/zakura/pull/940) | Allow isolated UTXO races to resolve while restarting sync after a full wave makes no progress. |

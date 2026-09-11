@@ -11,7 +11,7 @@ use std::{
 use serde::Serialize;
 use serde_json::{Map, Value};
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     runtime::Handle,
     sync::mpsc::{self, error::TryRecvError, error::TrySendError},
     task::JoinHandle,
@@ -920,9 +920,10 @@ impl TraceWriter {
                 self.trace_dir_created = true;
             }
 
-            let file = match tokio::fs::OpenOptions::new()
+            let mut file = match tokio::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
+                .read(format == TraceFormat::Csv)
                 .open(self.trace_dir.join(file_name))
                 .await
             {
@@ -939,20 +940,40 @@ impl TraceWriter {
                 }
             };
 
-            // A CSV file carries its header on the first line. The file is
-            // opened in append mode, so only write it when the file is new —
-            // a node restarting into an existing trace dir must not interleave
-            // a second header into the middle of the table.
-            let write_header = format == TraceFormat::Csv
-                && file
-                    .metadata()
-                    .await
-                    .map(|metadata| metadata.len() == 0)
-                    .unwrap_or(false);
+            let mut csv_header = render_csv_header(header);
+            csv_header.push(b'\n');
+            let write_header = if format == TraceFormat::Csv {
+                let validation = async {
+                    if file.metadata().await?.len() == 0 {
+                        return Ok(true);
+                    }
+                    // Bound the read to the expected header, even for a malformed file.
+                    let mut existing = vec![0; csv_header.len()];
+                    file.read_exact(&mut existing).await?;
+                    if existing != csv_header {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "CSV trace header differs from the current schema",
+                        ));
+                    }
+                    Ok(false)
+                }
+                .await;
+                match validation {
+                    Ok(write_header) => write_header,
+                    Err(error) => {
+                        tracing::warn!(?error, table, "invalid CSV header, disabling trace table");
+                        self.disabled_tables.insert(table);
+                        return None;
+                    }
+                }
+            } else {
+                false
+            };
 
             let mut table_writer = TableWriter::new(file, self.config.buffer_flush_bytes);
             if write_header {
-                table_writer.append_line(&render_csv_header(header));
+                table_writer.append_line(&csv_header[..csv_header.len() - 1]);
             }
 
             self.tables.insert(table, table_writer);
@@ -1307,6 +1328,38 @@ mod tests {
         assert_eq!(fields[5], "a,b");
         assert_eq!(fields[6], "say \"hi\"");
         assert_eq!(fields[7], "[1,2]", "arrays are stored as embedded JSON");
+    }
+
+    #[tokio::test]
+    async fn writer_preserves_existing_csv_with_a_different_or_partial_header() {
+        for existing in [
+            "ts,wall_ts,node,process_trace_id,old_field,extra\n1,t,n,p,old,\n",
+            "ts,wall_ts,node",
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("csv.csv");
+            tokio::fs::write(&path, existing)
+                .await
+                .expect("existing CSV");
+            let mut writer = TraceWriter::new(dir.path().to_owned(), JsonlTraceConfig::default());
+            writer
+                .write_batch(
+                    vec![JsonlWriteEvent {
+                        table: "csv",
+                        file_name: "csv.csv",
+                        format: TraceFormat::Csv,
+                        header: &["event"],
+                        line: b"1,t,n,p,new,".to_vec(),
+                    }],
+                    true,
+                )
+                .await;
+            assert!(writer.disabled_tables.contains("csv"));
+            assert_eq!(
+                tokio::fs::read_to_string(path).await.expect("CSV"),
+                existing
+            );
+        }
     }
 
     #[tokio::test]

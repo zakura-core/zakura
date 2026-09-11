@@ -21,3 +21,7 @@ event adds fields. Identity fields such as hashes and node labels remain strings
 The Rust test reader, regtest oracle, and benchmark digest accept the migrated
 CSV files and historical JSONL files. External scripts that read the migrated
 tables must use a CSV parser and the new file extensions.
+
+When a node restarts, the writer checks each existing CSV header against the
+current schema. A mismatched or incomplete header disables that table and emits
+a warning. Use a new trace directory after changing a CSV schema.

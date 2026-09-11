@@ -264,17 +264,28 @@ def read_jsonl(path: Path, node: str, table: str) -> list[TraceRow]:
         numeric = {"ts", "range_start", "range_count", "height", "apply_token",
                    "best_header_tip", "elapsed_ms", "requested_count", "local_frontier",
                    "queue_len", "in_flight_count"}
-        with csv_path.open(newline="", encoding="utf-8") as handle:
-            for index, record in enumerate(csv.DictReader(handle), start=1):
-                value = {}
-                for key, field in record.items():
-                    if not field:
-                        continue
-                    if key == "extra":
-                        value.update(json.loads(field))
-                    else:
-                        value[key] = json.loads(field) if key in numeric else field
-                rows.append(TraceRow(node, table, index, value))
+        index = 0
+        try:
+            with csv_path.open(newline="", encoding="utf-8") as handle:
+                for index, record in enumerate(csv.DictReader(handle, strict=True), start=1):
+                    if None in record or None in record.values():
+                        raise ValueError("CSV row has a different field count from its header")
+                    value = {}
+                    for key, field in record.items():
+                        if not field:
+                            continue
+                        if key == "extra":
+                            extra = json.loads(field)
+                            if not isinstance(extra, dict):
+                                raise ValueError("CSV extra field must contain a JSON object")
+                            value.update(extra)
+                        else:
+                            value[key] = json.loads(field) if key in numeric else field
+                    rows.append(TraceRow(node, table, index, value))
+        except (csv.Error, ValueError) as error:
+            rows.append(TraceRow(node, table, index + 1, {
+                "event": "csv_decode_error", "path": str(csv_path), "error": str(error),
+            }))
         return rows
     if not path.exists():
         return []
@@ -886,6 +897,8 @@ def run_oracle(root: Path, options: OracleOptions = OracleOptions()) -> list[Fai
         for row in node.rows:
             if row.event == "json_decode_error":
                 failures.append(failure(node, "trace_jsonl_is_valid", row, {}))
+            elif row.event == "csv_decode_error":
+                failures.append(failure(node, "trace_csv_is_valid", row, {}))
         failures.extend(check_commit_pairs(node, options))
         failures.extend(check_frontiers(node))
         failures.extend(check_block_sync_activity(node, options))
@@ -1740,6 +1753,14 @@ def run_self_test() -> None:
         csv_rows = read_jsonl(jsonl_path, "node1", "commit_state")
         assert [row.row for row in csv_rows] == [row.row for row in original]
         assert not run_oracle(root / "good")
+
+        malformed = root / "malformed_csv" / "node1"
+        malformed.mkdir(parents=True)
+        for record in ('1,commit_start', 'bad,commit_start,42,', '1,commit_start,42,"unterminated'):
+            (malformed / "commit_state.csv").write_text(
+                "ts,event,height,extra\n" + record + "\n", encoding="utf-8",
+            )
+            assert any(f.invariant == "trace_csv_is_valid" for f in run_oracle(root / "malformed_csv"))
 
     print("trace_oracle self-test: PASS")
 

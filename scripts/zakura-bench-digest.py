@@ -20,7 +20,6 @@ Subcommands:
              (cumulative per-stage duration histograms).
 """
 
-import csv
 import argparse
 import csv
 import json

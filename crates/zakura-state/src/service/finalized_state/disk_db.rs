@@ -27,7 +27,9 @@ use rlimit::increase_nofile_limit;
 
 use rocksdb::{ColumnFamilyDescriptor, ErrorKind, Options, ReadOptions};
 use semver::Version;
-use zakura_chain::{parameters::Network, primitives::byte_array::increment_big_endian};
+use zakura_chain::{
+    block::Height, parameters::Network, primitives::byte_array::increment_big_endian,
+};
 
 use crate::{
     database_format_version_on_disk,
@@ -138,6 +140,9 @@ pub struct DiskDb {
     //
     /// Database startup and each metrics export update this cached disk size.
     cached_size: Arc<AtomicU64>,
+
+    /// Durable body floor, published before a successful write returns to its caller.
+    retained_block_height: tokio::sync::watch::Sender<Height>,
 
     /// The shared inner RocksDB database.
     ///
@@ -834,7 +839,9 @@ impl DiskDb {
 
     /// When called with a secondary DB instance, tries to catch up with the primary DB instance
     pub fn try_catch_up_with_primary(&self) -> Result<(), rocksdb::Error> {
-        self.db.try_catch_up_with_primary()
+        self.db.try_catch_up_with_primary()?;
+        self.publish_retained_block_height();
+        Ok(())
     }
 
     /// Compact the given key range in `cf`, including `from` and excluding
@@ -1213,8 +1220,10 @@ impl DiskDb {
                     _secondary_dir: secondary_dir,
                     finished_format_upgrades: Arc::new(AtomicBool::new(false)),
                     cached_size: Arc::new(AtomicU64::new(0)),
+                    retained_block_height: tokio::sync::watch::channel(Height::MIN).0,
                 };
 
+                db.publish_retained_block_height();
                 db.assert_default_cf_is_empty();
                 db.refresh_cached_size();
 
@@ -1395,7 +1404,33 @@ impl DiskDb {
 
     /// Writes `batch` to the database.
     pub(crate) fn write(&self, batch: DiskWriteBatch) -> Result<(), rocksdb::Error> {
-        self.db.write(batch.batch)
+        self.db.write(batch.batch)?;
+        // Header/full-state callers publish their new tip after this returns.
+        // Publishing the floor first prevents a new tip using the previous floor.
+        self.publish_retained_block_height();
+        Ok(())
+    }
+
+    pub(super) fn lowest_retained_height(&self) -> Option<Height> {
+        let metadata = self.cf_handle(super::PRUNING_METADATA)?;
+        self.zs_get(&metadata, &())
+    }
+
+    pub(super) fn subscribe_retained_block_height(&self) -> tokio::sync::watch::Receiver<Height> {
+        self.retained_block_height.subscribe()
+    }
+
+    fn publish_retained_block_height(&self) {
+        // Read under the publication lock so concurrent writers cannot publish
+        // an older observation after a newer one.
+        self.retained_block_height.send_if_modified(|current| {
+            let retained = self.lowest_retained_height().unwrap_or(Height::MIN);
+            if *current == retained {
+                return false;
+            }
+            *current = retained;
+            true
+        });
     }
 
     /// Flushes pending writes to SST files.

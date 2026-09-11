@@ -1,4 +1,4 @@
-name: Header serving reproduction inspection
+name: Header serving seed peer correction
 on:
   workflow_dispatch:
 permissions:
@@ -23,7 +23,7 @@ jobs:
         with:
           token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
           ssh_private_key: ${{ secrets.DO_SSH_PRIVATE_KEY }}
-      - name: Inspect only the owned disposable test node
+      - name: Correct peers only on owned disposable test seeds
         env:
           DROPLET_ID: ${{ matrix.droplet }}
           OWNER_RUN: ${{ matrix.owner_run }}
@@ -39,4 +39,4 @@ jobs:
           print(next(n['ip_address'] for n in d['networks']['v4'] if n['type']=='public'))
           PY
           )
-          ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -i /tmp/do_ssh "root@$IP" python3 - < .github/workflows/scripts/header-serving-inspect.py
+          ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -i /tmp/do_ssh "root@$IP" python3 - < .github/workflows/scripts/header-serving-peer-correction.py

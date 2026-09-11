@@ -57,7 +57,7 @@ for filename in ["events.jsonl", "traces/block_sync.jsonl", "traces/commit_state
 try:
     with urllib.request.urlopen('http://127.0.0.1:19999/metrics',timeout=5) as r:
         for line in r.read().decode().splitlines():
-            if not line.startswith('#') and any(s in line for s in ['state_vct','sync_block','sync_zakura','checkpoint_']):
+            if not line.startswith('#') and any(s in line for s in ['state_vct','sync_block','sync_zakura','checkpoint_','state_requests','utxo']):
                 print('client_metric',line)
 except Exception as e:
     print('client_metrics_unavailable',str(e))

@@ -93,6 +93,10 @@ transport discards both offers and applies the same cooldown, keeping unrelated
 services connected. Offers during the cooldown cannot reserve service capacity
 or extend the cooldown.
 
+While a remote session is active or its workers are retiring, additional offers
+for that service are reset before reserving service capacity. The existing session
+and unrelated services stay connected. A new offer can proceed after cleanup.
+
 `reserve_session()` charges service capacity once during setup.
 `SessionResources::admitted()` signals complete setup.
 The workers and application senders retain the shared resource owner until they

@@ -360,7 +360,7 @@ jobs:
   lint-success:
     name: lint success
     runs-on: ubuntu-latest
-    if: always()
+    if: ${{ !cancelled() }}
     needs:
       - rust-checks
       - msrv

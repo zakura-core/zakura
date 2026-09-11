@@ -56,11 +56,63 @@ impl SyntheticBlockShape {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct SyntheticBlockCorpus {
     blocks: Arc<Vec<Arc<block::Block>>>,
     sizes: Arc<Vec<usize>>,
     by_hash: Arc<HashMap<block::Hash, block::Height>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct CorpusRangeSource {
+    pub(crate) corpus: SyntheticBlockCorpus,
+    stats: Option<ThroughputStats>,
+}
+
+impl CorpusRangeSource {
+    pub(crate) fn new(corpus: SyntheticBlockCorpus) -> Self {
+        Self {
+            corpus,
+            stats: None,
+        }
+    }
+}
+
+impl crate::zakura::BlockRangeSource for CorpusRangeSource {
+    fn read_range(
+        &self,
+        request: crate::zakura::BlockRangeRead,
+    ) -> futures::future::BoxFuture<'static, Result<crate::zakura::BlockRangeReadResult, BoxError>>
+    {
+        let corpus = self.corpus.clone();
+        let stats = self.stats.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let (start, count, cap, lease) = request.into_parts();
+                let mut blocks = Vec::new();
+                let mut bytes = 0usize;
+                if lease.try_start() {
+                    for (height, block, size) in
+                        corpus.blocks_in_range(start, count, corpus.target_height())
+                    {
+                        if lease.is_cancelled()
+                            || bytes.saturating_add(size) > usize::try_from(cap).unwrap()
+                        {
+                            break;
+                        }
+                        bytes += size;
+                        blocks.push((height, block, size));
+                    }
+                }
+                if let Some(stats) = stats {
+                    stats.record_request(blocks.len(), bytes);
+                }
+                crate::zakura::BlockRangeReadResult::new(blocks, lease)
+            })
+            .await
+            .map_err(Into::into)
+        })
+    }
 }
 
 impl SyntheticBlockCorpus {
@@ -295,11 +347,12 @@ impl MockApplyFrontier {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 struct ThroughputStats {
     inner: Arc<StdMutex<ThroughputStatsState>>,
 }
 
+#[derive(Debug)]
 struct ThroughputStatsState {
     started: Instant,
     committed_blocks: u64,
@@ -501,6 +554,7 @@ async fn spawn_mock_node(
     corpus: &SyntheticBlockCorpus,
     config: &HarnessConfig,
     trace: &mut HarnessTrace,
+    stats: ThroughputStats,
 ) -> Result<usize, BoxError> {
     let anchor = (block::Height(0), mainnet_genesis_hash());
     let builder = ZakuraTestNode::builder(seed)
@@ -517,7 +571,11 @@ async fn spawn_mock_node(
             },
             Some((corpus.target_height(), corpus.tip_hash())),
         )
-        .block_sync_config(config.block_sync_config());
+        .block_sync_config(config.block_sync_config())
+        .block_range_source(Arc::new(CorpusRangeSource {
+            corpus: corpus.clone(),
+            stats: Some(stats),
+        }));
 
     cluster.spawn_node_with_builder(builder).await
 }
@@ -535,7 +593,6 @@ async fn drive_mock_block_sync_actions(
     node: &ZakuraTestNode,
     corpus: SyntheticBlockCorpus,
     apply: Option<MockApplyFrontier>,
-    servable_high: block::Height,
     stats: ThroughputStats,
     mut needed_blocks_gate: Option<watch::Receiver<bool>>,
 ) -> JoinHandle<()> {
@@ -599,21 +656,6 @@ async fn drive_mock_block_sync_actions(
                                 },
                             ),
                             blocks: metas,
-                        })
-                        .await;
-                }
-                BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
-                    let blocks = corpus.blocks_in_range(start, count, servable_high);
-                    let response_bytes = blocks
-                        .iter()
-                        .fold(0usize, |sum, (_, _, size)| sum.saturating_add(*size));
-                    stats.record_request(blocks.len(), response_bytes);
-                    let _ = handle
-                        .send(BlockSyncEvent::BlockRangeResponseReady {
-                            peer,
-                            start_height: start,
-                            requested_count: count,
-                            blocks,
                         })
                         .await;
                 }
@@ -1069,6 +1111,7 @@ async fn zakura_mock_blocksync_throughput() -> Result<(), BoxError> {
             &corpus,
             &config,
             &mut trace,
+            stats.clone(),
         )
         .await?;
         tasks.push(drain_header_sync_actions(cluster.node(index)).await);
@@ -1077,7 +1120,6 @@ async fn zakura_mock_blocksync_throughput() -> Result<(), BoxError> {
                 cluster.node(index),
                 corpus.clone(),
                 None,
-                corpus.target_height(),
                 stats.clone(),
                 None,
             )
@@ -1101,6 +1143,7 @@ async fn zakura_mock_blocksync_throughput() -> Result<(), BoxError> {
         &corpus,
         &config,
         &mut trace,
+        stats.clone(),
     )
     .await?;
     tasks.push(drain_header_sync_actions(cluster.node(leecher_index)).await);
@@ -1109,7 +1152,6 @@ async fn zakura_mock_blocksync_throughput() -> Result<(), BoxError> {
             cluster.node(leecher_index),
             corpus.clone(),
             Some(apply),
-            block::Height(0),
             stats.clone(),
             Some(needed_blocks_gate_rx),
         )

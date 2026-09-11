@@ -121,8 +121,11 @@ impl BlockSyncStartup {
 /// action/routine-to-reactor channels the reactor created.
 #[derive(Clone, Debug)]
 pub struct BlockSyncHandle {
+    pub(super) range_source: Option<Arc<dyn super::BlockRangeSource>>,
     pub(super) events: mpsc::Sender<BlockSyncEvent>,
     pub(super) lifecycle: mpsc::UnboundedSender<BlockSyncEvent>,
+    /// Current service admissions, reconciled through a coalescing watch.
+    pub(super) current_sessions: Arc<super::service::CurrentSessions>,
     pub(super) needed_query_failures: mpsc::UnboundedSender<NeededBlocksQueryFailure>,
     pub(super) peers: watch::Receiver<ServicePeerSnapshot>,
     pub(super) status: watch::Receiver<BlockSyncStatus>,
@@ -149,11 +152,18 @@ pub(super) struct RoutineWiring {
     #[cfg(test)]
     pub(super) actions: mpsc::Sender<BlockSyncAction>,
     pub(super) routine_to_reactor: mpsc::Sender<super::events::RoutineToReactor>,
+    /// Node-wide GetBlocks resources shared by every peer session.
+    pub(super) serving_regulator: super::serving_regulation::GetBlocksServingRegulator,
     pub(super) view: watch::Receiver<super::sequencer_task::SequencerView>,
     pub(super) trace: ZakuraTrace,
 }
 
 impl BlockSyncHandle {
+    pub(crate) fn with_range_source(mut self, source: Arc<dyn super::BlockRangeSource>) -> Self {
+        self.range_source = Some(source);
+        self
+    }
+
     /// Send a fact/event to the block-sync reactor.
     pub async fn send(
         &self,
@@ -281,7 +291,6 @@ pub(super) struct BlockSyncState {
     /// (per-peer routines); the cross-peer facts the reactor/producer need live in the
     /// [`PeerRegistry`](super::peer_registry).
     pub(super) peers: HashMap<ZakuraPeerId, PeerBlockState>,
-    pub(super) parked_peers: HashSet<ZakuraPeerId>,
     /// Sorted set of needed download heights. Replaces the central
     /// `BlockRangeScheduler`: the per-peer issuance path pulls work in its own
     /// servable range, dedup/covered are `in_flight`, and the floor is GC only.
@@ -319,7 +328,6 @@ impl BlockSyncState {
             best_header_tip: startup.best_header_tip.0,
             best_header_hash: startup.best_header_tip.1,
             peers: HashMap::new(),
-            parked_peers: HashSet::new(),
             work_queue: Arc::new(WorkQueue::new(startup.frontiers.verified_block_tip)),
             budget: ByteBudget::new(startup.config.max_inflight_block_bytes),
             needed_heights: Vec::new(),
@@ -841,8 +849,6 @@ pub(super) struct PeerBlockState {
     /// `status_reply_meter`; this half stays reactor-side because the reactor owns
     /// serving-tip advertisement.
     pub(super) refresh_meter: RateMeter,
-    pub(super) served_blocks_inflight: u32,
-    pub(super) served_block_requests: VecDeque<(block::Height, Instant)>,
 }
 
 impl PeerBlockState {
@@ -851,41 +857,7 @@ impl PeerBlockState {
             direction: session.direction(),
             session,
             refresh_meter: RateMeter::new(config.status_refresh_interval),
-            served_blocks_inflight: 0,
-            served_block_requests: VecDeque::new(),
         }
-    }
-
-    pub(super) fn try_start_serving_blocks(
-        &mut self,
-        local_inflight_cap: u32,
-        start_height: block::Height,
-    ) -> bool {
-        if self.served_blocks_inflight >= local_inflight_cap {
-            return false;
-        }
-        self.served_blocks_inflight = self.served_blocks_inflight.saturating_add(1);
-        self.served_block_requests
-            .push_back((start_height, Instant::now()));
-        true
-    }
-
-    pub(super) fn serving_blocks_elapsed(&self, start_height: block::Height) -> Option<Duration> {
-        self.served_block_requests
-            .iter()
-            .find_map(|(start, started)| (*start == start_height).then(|| started.elapsed()))
-    }
-
-    pub(super) fn finish_serving_blocks(
-        &mut self,
-        start_height: block::Height,
-    ) -> Option<Duration> {
-        self.served_blocks_inflight = self.served_blocks_inflight.saturating_sub(1);
-        self.served_block_requests
-            .iter()
-            .position(|(start, _)| *start == start_height)
-            .and_then(|index| self.served_block_requests.remove(index))
-            .map(|(_, started)| started.elapsed())
     }
 }
 

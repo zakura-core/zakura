@@ -864,16 +864,6 @@ mod tests {
                             }))
                             .await;
                     }
-                    BlockSyncAction::QueryBlocksByHeightRange { peer, start, count } => {
-                        let _ = handle
-                            .send(BlockSyncEvent::BlockRangeResponseFinished {
-                                peer,
-                                start_height: start,
-                                requested_count: count,
-                                returned_count: 0,
-                            })
-                            .await;
-                    }
                     BlockSyncAction::RecordBodyUnavailable { .. }
                     | BlockSyncAction::RecordBodyInvalid { .. }
                     | BlockSyncAction::RestartBodyAvailability { .. }
@@ -1199,7 +1189,9 @@ mod tests {
 
         let (start_height, count) = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let frame = hostile.recv_ordered_frame(ZAKURA_STREAM_BLOCK_SYNC).await?;
+                let frame = hostile
+                    .recv_ordered_frame(crate::zakura::ZAKURA_STREAM_BLOCK_REQUESTS)
+                    .await?;
                 match BlockSyncMessage::decode_frame(frame)
                     .map_err(|error| -> BoxError { Box::new(error) })?
                 {
@@ -1216,7 +1208,7 @@ mod tests {
         })
         .await
         .map_err(|_| -> BoxError {
-            "timed out waiting for physical stream-6 GetBlocks frame".into()
+            "timed out waiting for physical request-stream GetBlocks frame".into()
         })??;
 
         assert_eq!(start_height, block::Height(1));
@@ -1227,7 +1219,7 @@ mod tests {
                 .expect("submitted list mutex is not poisoned")
                 .is_empty(),
             "the test-side responder must not send bodies or trigger submissions before it has \
-             physically read GetBlocks from stream 6"
+             physically read GetBlocks from the request stream"
         );
 
         let end_height = start_height
@@ -1517,6 +1509,39 @@ mod tests {
             .encode()
             .expect("empty GetPeers encodes"),
         }
+    }
+
+    #[tokio::test]
+    async fn retired_block_sync_layout_keeps_other_negotiated_services_usable(
+    ) -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let mut cluster = ZakuraTestCluster::new();
+        let victim_idx = cluster.spawn_node(70).await?;
+        let victim = cluster.node(victim_idx);
+        for (seed, capabilities) in [(71, 1 << 3), (72, (1 << 3) | ZAKURA_CAP_BLOCK_SYNC)] {
+            let hostile = HostilePeer::connect_native_with_capabilities(
+                victim,
+                seed,
+                capabilities | ZAKURA_CAP_LEGACY_GOSSIP,
+            )
+            .await?;
+            hostile
+                .send_frame_with_version(
+                    ZAKURA_STREAM_BLOCK_SYNC,
+                    2,
+                    b"retired single-stream layout".to_vec(),
+                )
+                .await?;
+            let good = format!("gossip-after-old-block-stream-{seed}").into_bytes();
+            hostile.send_frame(2, good.clone()).await?;
+            await_until("gossip remains usable", Duration::from_secs(5), || {
+                victim.recorder().contains_payload(2, &good)
+            })
+            .await?;
+            hostile.shutdown().await;
+        }
+        cluster.shutdown().await;
+        Ok(())
     }
 
     #[tokio::test]

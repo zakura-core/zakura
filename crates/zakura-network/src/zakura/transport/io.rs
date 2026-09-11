@@ -11,8 +11,6 @@
 //! After an application receiver closes, incoming frames still pass transport
 //! checks and are discarded until the session retires.
 
-#![allow(dead_code)] // guarded producers are activated by the next chunks
-
 use tokio::sync::mpsc;
 
 use super::Frame;

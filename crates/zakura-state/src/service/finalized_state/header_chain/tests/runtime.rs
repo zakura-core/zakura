@@ -1659,7 +1659,160 @@ fn retained_path_survives_finalization_during_and_between_page_reads() {
         .get(source, 7, lease.lease_id, Instant::now())
         .unwrap();
     let captured = reader.capture_path_read(&cursor, 1).unwrap();
-    let finalized = Frontier::new(path[4].height, path[4].hash);
+    finalize_serving_test_path(&runtime, &db, &path[3..5]);
+    assert!(runtime.publisher().snapshot().header_generation > before.header_generation);
+    assert!(
+        runtime.store.header_node(target.hash).unwrap().is_none(),
+        "finality removes the old retained row"
+    );
+    let (page, _, _) = captured.read_page(&cursor, 1).unwrap().unwrap();
+    assert_eq!(page.headers[0].hash(), target.hash);
+    assert!(page.complete);
+    let RetainedPathReadOutcome::Page(page) = reader
+        .read_retained_path(source, 7, lease.lease_id, scope, path[2].hash, 1)
+        .unwrap()
+    else {
+        panic!("a fresh page reads the same hash from finalized storage");
+    };
+    assert_eq!(page.headers[0].hash(), target.hash);
+    assert!(page.complete);
+    let RetainedPathLeaseOutcome::Acquired(fresh) = reader
+        .acquire_retained_path(
+            SourceId::from_digest([0xa2; 32]),
+            7,
+            target.hash,
+            &[path[2].hash],
+            scope,
+        )
+        .unwrap()
+    else {
+        panic!("an acquisition queued before finality can still serve the exact hash");
+    };
+    assert_eq!(fresh.target, target);
+    assert_eq!(fresh.scope, scope);
+}
+
+#[test]
+fn retained_path_rejects_a_target_pruned_before_lease_commit_or_page_capture() {
+    let (runtime, db, _, path) = reconciled_store_with_finalized_prefix(6);
+    let reader = runtime.reader();
+    let source = SourceId::from_digest([0xb1; 32]);
+    let target = Frontier::new(path[3].height, path[3].hash);
+    let before = runtime.publisher().snapshot();
+    let scope = HeaderWorkAuthority::for_target(&before, target.hash);
+    let RetainedPathLeaseOutcome::Acquired(lease) = reader
+        .acquire_retained_path(source, 7, target.hash, &[path[2].hash], scope)
+        .unwrap()
+    else {
+        panic!("the original target is retained");
+    };
+    let cursor = runtime
+        .leases
+        .lock()
+        .unwrap()
+        .get(source, 7, lease.lease_id, Instant::now())
+        .unwrap();
+    let captured = reader.capture_path_read(&cursor, 1).unwrap();
+
+    let pending_source = SourceId::from_digest([0xb2; 32]);
+    let reservation_id = runtime
+        .leases
+        .lock()
+        .unwrap()
+        .reserve(
+            pending_source,
+            Instant::now(),
+            RetainedPathCapacity::General,
+        )
+        .unwrap();
+    let reservation = RetainedPathReservation {
+        leases: runtime.leases.clone(),
+        peer: pending_source,
+        reservation_id,
+        active: true,
+    };
+    let pending = RetainedPathLeaseSpec {
+        peer: pending_source,
+        session_id: 8,
+        target,
+        common_ancestor: cursor.common_ancestor,
+        scope,
+        position: cursor.position,
+        retained_ancestor: cursor.retained_ancestor,
+        retained_path: cursor.retained_path.clone(),
+    };
+
+    let mut parent = path[2].clone();
+    let mut fork = Vec::new();
+    for _ in 0..3 {
+        let mut header = *parent.header;
+        header.previous_block_hash = parent.hash;
+        header.time += chrono::Duration::seconds(10);
+        let header = Arc::new(header);
+        parent = VerifiedHeaderRef {
+            height: parent.height.next().unwrap(),
+            hash: header.hash(),
+            header,
+        };
+        fork.push(parent.clone());
+    }
+    let evidence = EvidenceId::from_digest([0xb3; 32]);
+    let authority = Authority(evidence);
+    runtime
+        .apply(
+            TransitionRequest {
+                expected_version: before.state_version,
+                event: TransitionEvent::VerifiedChainChanged(VerifiedChainChanged {
+                    full_state_transition_id: evidence,
+                    old_tip: before.frontiers.verified_best,
+                    new_path: fork.clone(),
+                    cause: VerifiedChangeCause::Reset,
+                }),
+            },
+            &TransitionContext {
+                config: &runtime.config,
+                clock: &SystemClock,
+                full_state_authority: Some(&authority),
+                retention_references: &[],
+            },
+        )
+        .expect("full state can select the competing verified path");
+    finalize_serving_test_path(&runtime, &db, &fork[..2]);
+    assert!(runtime.store.header_node(target.hash).unwrap().is_none());
+    assert!(reader
+        .store
+        .audit_snapshot()
+        .unwrap()
+        .finalized_frontier(target.hash)
+        .unwrap()
+        .is_none());
+
+    let (page, _, _) = captured.read_page(&cursor, 1).unwrap().unwrap();
+    assert_eq!(page.headers[0].hash(), target.hash);
+    assert!(page.complete);
+    assert_eq!(
+        reader
+            .read_retained_path(source, 7, lease.lease_id, scope, path[2].hash, 1)
+            .unwrap(),
+        RetainedPathReadOutcome::Unavailable
+    );
+    assert!(matches!(
+        reader.commit_path_lease(reservation, pending).unwrap(),
+        RetainedPathLeaseOutcome::TargetNotRetained
+    ));
+    let leases = runtime.leases.lock().unwrap();
+    assert!(!leases.reservations.contains_key(&pending_source));
+    assert!(!leases.by_peer.contains_key(&pending_source));
+}
+
+fn finalize_serving_test_path(
+    runtime: &HeaderChainRuntime,
+    db: &DiskDb,
+    rows: &[VerifiedHeaderRef],
+) {
+    let before = runtime.publisher().snapshot();
+    let last = rows.last().expect("the test finalizes a nonempty range");
+    let finalized = Frontier::new(last.height, last.hash);
     let proof: Vec<_> = runtime
         .verified_projection()
         .unwrap()
@@ -1671,7 +1824,7 @@ fn retained_path_survives_finalization_during_and_between_page_reads() {
         zakura_header_chain::full_state_finality_evidence(before.state_version, finalized, &proof);
     let authority = Authority(evidence);
     let mut batch = DiskWriteBatch::new();
-    for header in &path[3..5] {
+    for header in rows {
         batch.zs_insert(
             &db.cf_handle("hash_by_height").unwrap(),
             header.height,
@@ -1707,35 +1860,5 @@ fn retained_path_survives_finalization_during_and_between_page_reads() {
             batch,
             || {},
         )
-        .expect("finality advances while the page snapshot is held");
-    assert!(runtime.publisher().snapshot().header_generation > before.header_generation);
-    assert!(
-        runtime.store.header_node(target.hash).unwrap().is_none(),
-        "finality removes the old retained row"
-    );
-    let (page, _, _) = captured.read_page(&cursor, 1).unwrap().unwrap();
-    assert_eq!(page.headers[0].hash(), target.hash);
-    assert!(page.complete);
-    let RetainedPathReadOutcome::Page(page) = reader
-        .read_retained_path(source, 7, lease.lease_id, scope, path[2].hash, 1)
-        .unwrap()
-    else {
-        panic!("a fresh page reads the same hash from finalized storage");
-    };
-    assert_eq!(page.headers[0].hash(), target.hash);
-    assert!(page.complete);
-    let RetainedPathLeaseOutcome::Acquired(fresh) = reader
-        .acquire_retained_path(
-            SourceId::from_digest([0xa2; 32]),
-            7,
-            target.hash,
-            &[path[2].hash],
-            scope,
-        )
-        .unwrap()
-    else {
-        panic!("an acquisition queued before finality can still serve the exact hash");
-    };
-    assert_eq!(fresh.target, target);
-    assert_eq!(fresh.scope, scope);
+        .expect("the authoritative test path finalizes");
 }

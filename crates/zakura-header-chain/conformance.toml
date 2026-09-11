@@ -822,7 +822,7 @@ id = "LC-WIRE-05"
 name = "Snapshot-bound path serving"
 status = "implemented"
 owner = "zakura_state::RetainedPathLease"
-tests = ["PW-03::retained_path_leases_are_exact_bounded_session_scoped_and_expiring", "PW-03::retained_path_pages_keep_one_target_and_release_after_completion", "PW-03::serving_finishes_through_repeated_head_and_finality_updates", "PW-03::retained_path_survives_finalization_during_and_between_page_reads", "PW-03::finalized_metadata_is_not_attached_to_a_losing_path"]
+tests = ["PW-03::retained_path_leases_are_exact_bounded_session_scoped_and_expiring", "PW-03::retained_path_pages_keep_one_target_and_release_after_completion", "PW-03::serving_finishes_through_repeated_head_and_finality_updates", "PW-03::retained_path_survives_finalization_during_and_between_page_reads", "PW-03::retained_path_rejects_a_target_pruned_before_lease_commit_or_page_capture", "PW-03::finalized_metadata_is_not_attached_to_a_losing_path"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -830,7 +830,7 @@ id = "LC-WIRE-06"
 name = "No target substitution"
 status = "implemented"
 owner = "zakura_network::HeaderPathLease"
-tests = ["PW-03::retained_path_leases_are_exact_bounded_session_scoped_and_expiring", "PW-03::retained_path_pages_keep_one_target_and_release_after_completion", "PW-03::serving_finishes_through_repeated_head_and_finality_updates", "PW-03::retained_path_survives_finalization_during_and_between_page_reads", "PW-03::finalized_metadata_is_not_attached_to_a_losing_path"]
+tests = ["PW-03::retained_path_leases_are_exact_bounded_session_scoped_and_expiring", "PW-03::retained_path_pages_keep_one_target_and_release_after_completion", "PW-03::serving_finishes_through_repeated_head_and_finality_updates", "PW-03::retained_path_survives_finalization_during_and_between_page_reads", "PW-03::retained_path_rejects_a_target_pruned_before_lease_commit_or_page_capture", "PW-03::finalized_metadata_is_not_attached_to_a_losing_path"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -854,7 +854,7 @@ id = "LC-WIRE-09"
 name = "Continuation target integrity"
 status = "implemented"
 owner = "zakura_network::zakura::header_sync::ActiveHeaderRequest::continuation_locator"
-tests = ["PW-03::requester_stages_all_pages_before_one_exact_admission", "PW-03::complete_target_is_independent_of_page_partition", "PW-03::retained_path_pages_keep_one_target_and_release_after_completion", "PW-03::serving_finishes_through_repeated_head_and_finality_updates", "PW-03::retained_path_survives_finalization_during_and_between_page_reads", "PW-03::finalized_metadata_is_not_attached_to_a_losing_path"]
+tests = ["PW-03::requester_stages_all_pages_before_one_exact_admission", "PW-03::complete_target_is_independent_of_page_partition", "PW-03::retained_path_pages_keep_one_target_and_release_after_completion", "PW-03::serving_finishes_through_repeated_head_and_finality_updates", "PW-03::retained_path_survives_finalization_during_and_between_page_reads", "PW-03::retained_path_rejects_a_target_pruned_before_lease_commit_or_page_capture", "PW-03::finalized_metadata_is_not_attached_to_a_losing_path"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]

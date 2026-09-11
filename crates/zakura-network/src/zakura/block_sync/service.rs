@@ -59,6 +59,8 @@ pub struct BlockSyncPeerSession {
     requests: FramedSend,
     remote_status: watch::Sender<bool>,
     cancel_token: CancellationToken,
+    connection_cancel: CancellationToken,
+    close_cause: crate::zakura::CloseCause,
     /// One stored wake released after the reactor installs this serving handle.
     reactor_ready: Arc<Notify>,
 }
@@ -69,6 +71,8 @@ impl BlockSyncPeerSession {
         session_id: u64,
         direction: ServicePeerDirection,
         requests: FramedSend,
+        connection_cancel: CancellationToken,
+        close_cause: crate::zakura::CloseCause,
     ) -> Self {
         Self {
             peer_id: session.peer_id().clone(),
@@ -78,6 +82,8 @@ impl BlockSyncPeerSession {
             requests,
             remote_status: watch::channel(false).0,
             cancel_token: session.cancel_token(),
+            connection_cancel,
+            close_cause,
             reactor_ready: Arc::new(Notify::new()),
         }
     }
@@ -110,6 +116,8 @@ impl BlockSyncPeerSession {
             send,
             remote_status: watch::channel(false).0,
             cancel_token,
+            connection_cancel: CancellationToken::new(),
+            close_cause: crate::zakura::CloseCause::new(),
             reactor_ready: Arc::new(Notify::new()),
         }
     }
@@ -132,6 +140,13 @@ impl BlockSyncPeerSession {
     /// Peer disconnect/local shutdown cancellation token.
     pub fn cancel_token(&self) -> CancellationToken {
         self.cancel_token.clone()
+    }
+
+    /// End the connection before dropping response authorization that cannot be drained.
+    pub(super) fn close_connection(&self, reason: &'static str) {
+        self.close_cause.record(reason);
+        self.connection_cancel.cancel();
+        self.cancel_token.cancel();
     }
 
     /// Wait until the reactor has installed or rejected this exact session.
@@ -675,8 +690,14 @@ impl Service for BlockSyncService {
             // Handle-less tests use the service-local fallback.
             let session_id = routine_generation
                 .unwrap_or_else(|| self.inner.next_session_id.fetch_add(1, Ordering::Relaxed));
-            let block_sync_session =
-                BlockSyncPeerSession::new(&session, session_id, peer.direction, request_sender);
+            let block_sync_session = BlockSyncPeerSession::new(
+                &session,
+                session_id,
+                peer.direction,
+                request_sender,
+                connection_cancel_token.clone(),
+                close_cause.clone(),
+            );
             let old_record = active_peers.insert(
                 peer_id.clone(),
                 BlockSyncPeerRecord {

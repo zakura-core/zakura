@@ -89,18 +89,38 @@ abandoned partial frame.
 Request writes have no independent write timeout. The data stream has a bounded
 32-second write deadline, including control and ending messages. This allows
 shared-credit waits on slow links while other services are paused. Cancellation
-can still interrupt a data write. Stream resets during a payload remain local to
-the stream pair. A data-write timeout also resets only the pair, preserving
-unrelated services on the connection. If downloads remain unanswered, teardown
-applies the existing no-progress cooldown and repeated-stall disconnect before
-readmission. A timeout with no download obligation does not penalize the peer.
-A graceful end with a truncated frame payload remains invalid.
+can still interrupt a data write. If a session retires with a started outgoing request whose response cannot be
+drained, close the connection locally before releasing its authorization. A
+session with no unfinished exchange may still reopen on the same connection.
+A graceful end with a truncated frame payload remains invalid. Local closure
+uses `SinkReject::Connection`, distinct from a protocol rejection.
 
-A repeated no-progress disconnect is a local liveness decision. It uses the
-shared `SinkReject::Connection` outcome and a local connection-close cause,
-without recording protocol misconduct. `SinkReject::Local` still leaves the
-connection open for ordinary delivery failures. `SinkReject::Protocol` closes
-the connection for invalid peer data.
+## Response authorization
+
+Before an outgoing write can start, retain its original range, expected hashes,
+object count, and actual response-byte ceiling. Local work deadlines, reorgs,
+finality, and reassignment can release scheduling ownership, but cannot remove
+this authorization. A queued request proven skipped can be removed. A started
+request remains authorized until its legal ending or connection closure.
+
+A body must match the next unconsumed hash of exactly one range. Check the
+bounded header and remaining credit before waiting for full-body decode
+capacity. Consume its object and actual serialized body bytes before local
+handling, including when the data has become obsolete. Tags and endings do not
+spend body-byte credit. Size estimates remain local scheduling inputs.
+
+The last body leaves the range pending its ending and keeps its protocol slot.
+`BlocksDone` must report exactly the consumed nonempty prefix.
+`RangeUnavailable` must match the original count with no consumed bodies.
+Different ranges may interleave, but each range is ordered. A retry on the same
+connection cannot overlap a range still awaiting its ending.
+
+Numeric Status ceilings stay fixed for a connection in this wire version.
+The two streams carry no limit generation or acknowledgement to correlate a
+changed ceiling with crossing requests. Receiving a changed numeric ceiling
+therefore closes the connection as a local policy decision, without a protocol
+fault. Reconnect to use new ceilings. Servable ranges may change normally.
+Production advertisements obtain their numeric ceilings from immutable config.
 
 ## Flow control
 

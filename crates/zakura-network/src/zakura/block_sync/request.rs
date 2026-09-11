@@ -61,16 +61,4 @@ impl BlockRangeRequest {
             .then(|| height.0.checked_sub(self.start_height.0))
             .flatten()
     }
-
-    pub(super) fn expected_hash(&self, height: block::Height) -> Option<block::Hash> {
-        self.expected_blocks
-            .iter()
-            .find_map(|expected| (expected.height == height).then_some(expected.hash))
-    }
-
-    pub(super) fn estimated_bytes_for_height(&self, height: block::Height) -> Option<u64> {
-        self.expected_blocks
-            .iter()
-            .find_map(|expected| (expected.height == height).then_some(expected.estimated_bytes))
-    }
 }

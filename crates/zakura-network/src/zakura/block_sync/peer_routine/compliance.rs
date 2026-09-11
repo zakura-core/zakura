@@ -232,7 +232,15 @@ impl Fixture {
         );
         for (index, body) in self.blocks.iter().enumerate() {
             let height = body.coinbase_height().unwrap();
-            assert_eq!(range.request.expected_hash(height), Some(body.hash()));
+            assert_eq!(
+                range
+                    .request
+                    .expected_blocks
+                    .iter()
+                    .find(|part| part.height == height)
+                    .map(|part| part.hash),
+                Some(body.hash())
+            );
             assert_eq!(range.has_received(height), index < received);
         }
     }

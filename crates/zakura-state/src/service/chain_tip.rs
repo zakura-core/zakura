@@ -584,9 +584,11 @@ impl ChainTipChange {
         Some(tip_action)
     }
 
-    /// Sets the `last_change_hash` as the provided hash.
+    /// Marks delivery only while the hash remains the current tip.
     pub fn mark_last_change_hash(&mut self, hash: block::Hash) {
-        self.last_change_hash = Some(hash);
+        if self.latest_chain_tip.best_tip_hash() == Some(hash) {
+            self.last_change_hash = Some(hash);
+        }
     }
 
     /// Clone this monitor for another async task in the same long-running service.
@@ -599,6 +601,29 @@ impl ChainTipChange {
             last_change_hash: self.last_change_hash,
             network: self.network.clone(),
         }
+    }
+
+    /// Returns the height of the best chain tip without consuming a tip change.
+    pub fn best_tip_height(&self) -> Option<block::Height> {
+        self.latest_chain_tip.best_tip_height()
+    }
+
+    /// Returns the network used to interpret the chain tip.
+    pub fn network(&self) -> &Network {
+        &self.network
+    }
+
+    /// Estimates the distance from the best chain tip to the network tip.
+    ///
+    /// This estimate uses the best tip timestamp, the local clock, and network
+    /// target spacing. It does not depend on any peer responding to sync
+    /// requests, so it remains useful when peer discovery or block sync is
+    /// starved.
+    pub fn estimate_distance_to_network_chain_tip(
+        &self,
+    ) -> Option<(block::HeightDiff, block::Height)> {
+        self.latest_chain_tip
+            .estimate_distance_to_network_chain_tip(&self.network)
     }
 
     /// Return an action based on `block` and the last change we returned.

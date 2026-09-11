@@ -7,7 +7,7 @@
 //! See the full list of
 //! [Differences between JSON-RPC 1.0 and 2.0.](https://www.simple-is-better.org/rpc/#differences-between-1-0-and-2-0)
 
-use std::{fmt, fs::File, io::Read, panic, path::Path, sync::Arc};
+use std::{collections::BTreeSet, fmt, fs::File, io::Read, panic, path::Path, sync::Arc};
 
 use chrono::{TimeZone, Utc};
 use cookie::Cookie;
@@ -32,7 +32,9 @@ use zakura_state::{ReadState as ReadStateService, State as StateService};
 
 use crate::{
     config,
-    methods::{RpcImpl, RpcServer as _},
+    methods::{
+        rpc_method_access, RpcAccess, RpcImpl, RpcServer as _, RpcSurface, RPC_METHOD_ACCESS,
+    },
     server::{
         http_request_compatibility::HttpRequestMiddlewareLayer,
         rpc_call_compatibility::FixRpcResponseMiddleware, rpc_metrics::RpcMetricsMiddleware,
@@ -84,16 +86,17 @@ impl fmt::Debug for RpcServer {
 /// The message to log when logging the RPC server's listen address
 pub const OPENED_RPC_ENDPOINT_MSG: &str = "Opened RPC endpoint at ";
 
+/// The message to log when logging the admin RPC server's listen address.
+pub const OPENED_ADMIN_RPC_ENDPOINT_MSG: &str = "Opened admin RPC endpoint at ";
+
 type ServerTask = JoinHandle<Result<(), tower::BoxError>>;
 
 impl RpcServer {
-    /// Starts the RPC server.
+    /// Starts the primary RPC server.
     ///
-    /// `build_version` and `user_agent` are version strings for the application,
-    /// which are used in RPC responses.
-    ///
-    /// Returns [`JoinHandle`]s for the RPC server and `sendrawtransaction` queue tasks,
-    /// and a [`RpcServer`] handle, which can be used to shut down the RPC server task.
+    /// Authenticated listeners and Regtest listeners expose the full method
+    /// set. Unauthenticated Mainnet and Testnet listeners expose only the
+    /// restricted compatibility method set.
     ///
     /// # Panics
     ///
@@ -123,9 +126,83 @@ impl RpcServer {
         BlockVerifierRouter: BlockVerifierService,
         SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
     {
+        conf.validate().map_err(std::io::Error::other)?;
+
+        let surface = primary_rpc_surface(rpc.network(), conf.enable_cookie_auth);
+
+        Self::start_inner(rpc, conf, surface, OPENED_RPC_ENDPOINT_MSG).await
+    }
+
+    /// Starts the loopback-only, cookie-authenticated admin RPC server.
+    ///
+    /// # Panics
+    ///
+    /// - If [`Config::admin_listen_addr`](config::rpc::Config::admin_listen_addr) is `None`.
+    pub async fn start_admin<
+        Mempool,
+        State,
+        ReadState,
+        Tip,
+        BlockVerifierRouter,
+        SyncStatus,
+        AddressBook,
+    >(
+        rpc: RpcImpl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>,
+        mut conf: config::rpc::Config,
+    ) -> Result<ServerTask, tower::BoxError>
+    where
+        Mempool: MempoolService,
+        State: StateService,
+        ReadState: ReadStateService,
+        Tip: ChainTip + Clone + Send + Sync + 'static,
+        AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
+        BlockVerifierRouter: BlockVerifierService,
+        SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
+    {
+        conf.validate().map_err(std::io::Error::other)?;
+
+        conf.listen_addr = Some(
+            conf.admin_listen_addr
+                .expect("caller should make sure admin_listen_addr is set"),
+        );
+        conf.admin_listen_addr = None;
+        conf.enable_cookie_auth = true;
+        conf.tls = None;
+
+        Self::start_inner(rpc, conf, RpcSurface::Full, OPENED_ADMIN_RPC_ENDPOINT_MSG).await
+    }
+
+    /// Starts one RPC listener with the selected method surface.
+    async fn start_inner<
+        Mempool,
+        State,
+        ReadState,
+        Tip,
+        BlockVerifierRouter,
+        SyncStatus,
+        AddressBook,
+    >(
+        rpc: RpcImpl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>,
+        conf: config::rpc::Config,
+        surface: RpcSurface,
+        opened_endpoint_msg: &'static str,
+    ) -> Result<ServerTask, tower::BoxError>
+    where
+        Mempool: MempoolService,
+        State: StateService,
+        ReadState: ReadStateService,
+        Tip: ChainTip + Clone + Send + Sync + 'static,
+        AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
+        BlockVerifierRouter: BlockVerifierService,
+        SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
+    {
         let listen_addr = conf
             .listen_addr
             .expect("caller should make sure listen_addr is set");
+
+        let rpc = rpc.with_rpc_surface(surface);
+        let mut methods = rpc.into_rpc();
+        configure_rpc_methods(&mut methods, surface)?;
 
         // The largest RPC request is submitblock, which sends a full block
         // as a hex string (2x MAX_BLOCK_BYTES) plus a small JSON-RPC wrapper.
@@ -163,10 +240,9 @@ impl RpcServer {
                         .expect("should be valid"),
                 )
                 .to_service_builder();
-            let methods = rpc.into_rpc();
             let (stop_handle, server_handle) = stop_channel();
 
-            info!("{OPENED_RPC_ENDPOINT_MSG}{local_addr}");
+            info!("{opened_endpoint_msg}{local_addr}");
 
             return Ok(tokio::spawn(async move {
                 loop {
@@ -225,10 +301,10 @@ impl RpcServer {
             .build(listen_addr)
             .await?;
 
-        info!("{OPENED_RPC_ENDPOINT_MSG}{}", server.local_addr()?);
+        info!("{opened_endpoint_msg}{}", server.local_addr()?);
 
         Ok(tokio::spawn(async move {
-            server.start(rpc.into_rpc()).stopped().await;
+            server.start(methods).stopped().await;
             Ok(())
         }))
     }
@@ -287,6 +363,55 @@ impl RpcServer {
             Ok(()) => (),
             Err(panic_object) => panic::resume_unwind(panic_object),
         })
+    }
+}
+
+/// Validates the RPC method classification and removes methods that are not
+/// available on restricted unauthenticated listeners.
+fn configure_rpc_methods<Context>(
+    methods: &mut jsonrpsee::RpcModule<Context>,
+    surface: RpcSurface,
+) -> Result<(), std::io::Error>
+where
+    Context: Send + Sync + 'static,
+{
+    let registered: BTreeSet<_> = methods.method_names().collect();
+    let classified: BTreeSet<_> = RPC_METHOD_ACCESS.iter().map(|(name, _)| *name).collect();
+
+    if classified.len() != RPC_METHOD_ACCESS.len() {
+        return Err(std::io::Error::other(
+            "RPC method access classifications contain duplicate method names",
+        ));
+    }
+
+    if registered != classified {
+        let unclassified: Vec<_> = registered.difference(&classified).copied().collect();
+        let unregistered: Vec<_> = classified.difference(&registered).copied().collect();
+
+        return Err(std::io::Error::other(format!(
+            "RPC method access classification mismatch; unclassified registered methods: {unclassified:?}; classified but unregistered methods: {unregistered:?}"
+        )));
+    }
+
+    if surface == RpcSurface::Restricted {
+        for method_name in registered {
+            if rpc_method_access(method_name) != Some(RpcAccess::Unauthenticated) {
+                methods
+                    .remove_method(method_name)
+                    .expect("method exists because it came from method_names");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Selects the primary listener's method surface.
+fn primary_rpc_surface(network: &Network, enable_cookie_auth: bool) -> RpcSurface {
+    if enable_cookie_auth || network.is_regtest() {
+        RpcSurface::Full
+    } else {
+        RpcSurface::Restricted
     }
 }
 

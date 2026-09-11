@@ -5,6 +5,8 @@
 //! The fixture commits a body prefix.
 //! The fixture admits the remaining headers with auxiliary deliveries.
 
+mod writer_fallback;
+
 use std::{num::NonZeroU64, sync::Arc};
 
 use proptest::prelude::*;
@@ -497,12 +499,19 @@ impl Fixture {
             &SystemClock,
         )
         .expect("the replacement header passes production validation");
-        let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
-            .bind(
-                u64::from(marker),
-                NonZeroU64::new(1).expect("one is nonzero"),
-            )
-            .into();
+        let repair_owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot).bind(
+            u64::from(marker),
+            NonZeroU64::new(1).expect("one is nonzero"),
+        );
+        let repair_episode = self
+            .writer
+            .runtime
+            .reader()
+            .vct_repair_context(repair_owner, height)
+            .expect("the replacement repair context is coherent")
+            .expect("the replacement target remains selected")
+            .episode;
+        let owner = repair_owner.into();
         let source = SourceId::from_digest([marker; 32]);
         let mut record = zakura_header_chain::TreeAuxRecordV1 {
             height,
@@ -544,6 +553,7 @@ impl Fixture {
                                 parent.hash(),
                             ),
                             selected_target: Frontier::new(height, target.hash()),
+                            episode: repair_episode,
                         },
                         batch,
                         aux: vec![delivery],

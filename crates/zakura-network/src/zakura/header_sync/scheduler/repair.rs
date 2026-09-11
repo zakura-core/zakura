@@ -7,9 +7,6 @@ use tokio::time::Instant;
 use zakura_chain::block;
 use zakura_header_chain::{BodyWorkOwner, EngineSnapshot, SourceId, VctRepairContext};
 
-/// Maximum distinct suppliers retained and tried before one repair backoff cycle.
-pub(in crate::zakura::header_sync) const MAX_SUPPLIERS_PER_CYCLE: usize = 3;
-
 /// Structurally complete state of one auxiliary repair task.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::zakura::header_sync) enum RepairPolicyState {
@@ -32,19 +29,19 @@ pub(in crate::zakura::header_sync) enum RepairPolicyState {
         /// Exact selected request context.
         context: VctRepairContext,
     },
-    /// A resolved repair exhausted one supplier cycle.
-    SupplierBackoff {
-        /// Exact selected request context.
-        context: VctRepairContext,
-        /// Earliest time another full supplier cycle may begin.
-        retry_at: Instant,
-    },
-    /// A local failure paused the repair without completing its supplier cycle.
+    /// A local failure paused the repair without changing its authoritative coordinates.
     LocalBackoff {
         /// Exact selected request context.
         context: VctRepairContext,
         /// Earliest time local scheduling may resume.
         retry_at: Instant,
+    },
+    /// A committed resource refusal requires a newer state before another attempt.
+    StateBlocked {
+        /// Exact selected request context.
+        context: VctRepairContext,
+        /// State version that committed the resource refusal.
+        state_version: zakura_header_chain::StateVersion,
     },
     /// A shared active target owns supplier, wire, preparation, and admission progress.
     Assigned {
@@ -61,8 +58,8 @@ pub(in crate::zakura::header_sync) enum RepairPolicyError {
     /// A wire owner changed the durable repair scope.
     #[error("wire assignment changed the VCT repair scope")]
     ScopeMismatch,
-    /// The resolved target is outside the exact one-height repair range.
-    #[error("resolved VCT repair target is outside its exact range")]
+    /// The resolved target is outside the selected repair range.
+    #[error("resolved VCT repair target is outside its selected range")]
     TargetMismatch,
     /// The requested edge is not part of the repair state machine.
     #[error("illegal VCT repair state transition")]
@@ -82,8 +79,11 @@ pub(in crate::zakura::header_sync) struct RepairRequirement {
     pub state: RepairPolicyState,
     /// Failed or abandoned on-wire attempts, saturated only for diagnostics.
     pub attempts: u64,
-    /// Suppliers already tried in the current cycle.
+    /// Connected suppliers already tried in the current durable episode.
+    /// The configured inbound and outbound peer limits bound this set.
     pub tried_sources: HashSet<SourceId>,
+    /// Connected suppliers that returned input excluded by this durable episode.
+    pub excluded_input_sources: HashSet<SourceId>,
 }
 
 impl RepairRequirement {
@@ -96,6 +96,7 @@ impl RepairRequirement {
             state: RepairPolicyState::NeedsContext,
             attempts: 0,
             tried_sources: HashSet::new(),
+            excluded_input_sources: HashSet::new(),
         }
     }
 
@@ -120,7 +121,14 @@ impl RepairRequirement {
         if context.target.height != self.height {
             return Err(RepairPolicyError::TargetMismatch);
         }
-        self.state = RepairPolicyState::Ready { context };
+        self.state = if context.admission_capacity_available {
+            RepairPolicyState::Ready { context }
+        } else {
+            RepairPolicyState::StateBlocked {
+                state_version: context.state_version,
+                context,
+            }
+        };
         Ok(())
     }
 
@@ -134,16 +142,27 @@ impl RepairRequirement {
     }
 
     /// Bind a resolved task to the actual canonical stream request.
-    pub fn assign(&mut self, owner: BodyWorkOwner) -> Result<(), RepairPolicyError> {
+    pub fn assign(
+        &mut self,
+        owner: BodyWorkOwner,
+        selected_context: VctRepairContext,
+    ) -> Result<(), RepairPolicyError> {
         if owner.header_authority() != self.owner.header_authority() {
             return Err(RepairPolicyError::ScopeMismatch);
         }
         let RepairPolicyState::Ready { context } = &self.state else {
             return Err(RepairPolicyError::IllegalState);
         };
+        if context
+            .bounded_prefix(selected_context.selected_header_count())
+            .as_ref()
+            != Some(&selected_context)
+        {
+            return Err(RepairPolicyError::TargetMismatch);
+        }
         self.owner = owner;
         self.state = RepairPolicyState::Assigned {
-            context: context.clone(),
+            context: selected_context,
         };
         Ok(())
     }
@@ -164,10 +183,15 @@ impl RepairRequirement {
             _ => return Err(RepairPolicyError::IllegalState),
         };
         self.attempts = self.attempts.saturating_add(1);
-        if self.tried_sources.len() < MAX_SUPPLIERS_PER_CYCLE {
-            self.tried_sources.insert(source);
-        }
+        self.tried_sources.insert(source);
         self.state = RepairPolicyState::Ready { context };
+        Ok(())
+    }
+
+    /// Rotate away from a supplier that returned semantic input excluded by durable state.
+    pub fn exclude_input(&mut self, source: SourceId) -> Result<(), RepairPolicyError> {
+        self.retry(source)?;
+        self.excluded_input_sources.insert(source);
         Ok(())
     }
 
@@ -177,10 +201,20 @@ impl RepairRequirement {
             return Err(RepairPolicyError::IllegalState);
         }
         self.attempts = self.attempts.saturating_add(1);
-        if self.tried_sources.len() < MAX_SUPPLIERS_PER_CYCLE {
-            self.tried_sources.insert(source);
-        }
+        self.tried_sources.insert(source);
         Ok(())
+    }
+
+    /// Forget supplier identities that no longer have a live session.
+    ///
+    /// Durable state retains rejected and disputed semantic input. The reactor only needs the
+    /// identity sets to prevent repeated requests to a supplier while that supplier stays
+    /// connected.
+    pub fn retain_connected_sources(&mut self, connected_sources: &HashSet<SourceId>) {
+        self.tried_sources
+            .retain(|source| connected_sources.contains(source));
+        self.excluded_input_sources
+            .retain(|source| connected_sources.contains(source));
     }
 
     /// Back off ready or assigned repair work after a local failure.
@@ -196,25 +230,34 @@ impl RepairRequirement {
         Ok(())
     }
 
-    /// Whether this repair must pause before trying another supplier.
-    pub fn supplier_cycle_exhausted(&self) -> bool {
-        self.tried_sources.len() >= MAX_SUPPLIERS_PER_CYCLE
-    }
-
-    /// Pause after a complete or bounded supplier cycle, then make every supplier eligible again.
-    pub fn defer_retry_until(&mut self, deadline: Instant) -> Result<(), RepairPolicyError> {
-        let RepairPolicyState::Ready { context } = &self.state else {
+    /// Wait for state to supersede one committed resource refusal.
+    pub fn wait_for_state_change(
+        &mut self,
+        state_version: zakura_header_chain::StateVersion,
+    ) -> Result<(), RepairPolicyError> {
+        let RepairPolicyState::Assigned { context } = &self.state else {
             return Err(RepairPolicyError::IllegalState);
         };
-        self.state = RepairPolicyState::SupplierBackoff {
+        self.attempts = self.attempts.saturating_add(1);
+        self.state = RepairPolicyState::StateBlocked {
             context: context.clone(),
-            retry_at: deadline,
+            state_version,
         };
         Ok(())
     }
 
-    /// Resume a deferred context or supplier cycle once its backoff has elapsed.
-    pub fn resume_retry_cycle(&mut self, now: Instant) {
+    /// Request fresh context after committed state supersedes a resource refusal.
+    pub fn observe_state_change(&mut self, current: zakura_header_chain::StateVersion) {
+        if matches!(
+            self.state,
+            RepairPolicyState::StateBlocked { state_version, .. } if current > state_version
+        ) {
+            self.state = RepairPolicyState::NeedsContext;
+        }
+    }
+
+    /// Resume a deferred context or local retry once its backoff has elapsed.
+    pub fn resume_retry(&mut self, now: Instant) {
         match &self.state {
             RepairPolicyState::QueryingContext { deadline, retry_at } if *deadline <= now => {
                 self.state = RepairPolicyState::ContextBackoff {
@@ -223,12 +266,6 @@ impl RepairRequirement {
             }
             RepairPolicyState::ContextBackoff { retry_at } if *retry_at <= now => {
                 self.state = RepairPolicyState::NeedsContext;
-            }
-            RepairPolicyState::SupplierBackoff { context, retry_at } if *retry_at <= now => {
-                self.state = RepairPolicyState::Ready {
-                    context: context.clone(),
-                };
-                self.tried_sources.clear();
             }
             RepairPolicyState::LocalBackoff { context, retry_at } if *retry_at <= now => {
                 self.state = RepairPolicyState::Ready {
@@ -244,7 +281,6 @@ impl RepairRequirement {
         match self.state {
             RepairPolicyState::QueryingContext { deadline, .. } => Some(deadline),
             RepairPolicyState::ContextBackoff { retry_at }
-            | RepairPolicyState::SupplierBackoff { retry_at, .. }
             | RepairPolicyState::LocalBackoff { retry_at, .. } => Some(retry_at),
             _ => None,
         }
@@ -300,10 +336,11 @@ impl RepairRequirementSlot {
         &mut self,
         scheduled_owner: BodyWorkOwner,
         wire_owner: BodyWorkOwner,
+        selected_context: VctRepairContext,
     ) -> Result<(), RepairPolicyError> {
         self.get_mut(scheduled_owner)
             .ok_or(RepairPolicyError::IllegalState)?
-            .assign(wire_owner)
+            .assign(wire_owner, selected_context)
     }
 
     /// Retire one completed, stale, or canceled task.
@@ -393,13 +430,14 @@ mod tests {
     }
 
     fn context() -> VctRepairContext {
-        VctRepairContext {
-            target: Frontier::new(block::Height(19), hash(5)),
-            locator: zakura_header_chain::HeaderLocator::for_continuation(Frontier::new(
+        VctRepairContext::unconstrained(
+            Frontier::new(block::Height(19), hash(5)),
+            zakura_header_chain::HeaderLocator::for_continuation(Frontier::new(
                 block::Height(18),
                 hash(4),
             )),
-        }
+            None,
+        )
     }
 
     #[test]
@@ -411,7 +449,8 @@ mod tests {
         mark_context_requested(&mut task);
         task.resolve(context.clone())
             .expect("the exact context can resolve");
-        task.assign(task.owner).expect("ready work can go on wire");
+        task.assign(task.owner, context.clone())
+            .expect("ready work can go on wire");
         assert_eq!(task.retry(source), Ok(()));
         assert_eq!(
             task.state,
@@ -422,7 +461,7 @@ mod tests {
         assert_eq!(task.attempts, 1);
         assert!(task.tried_sources.contains(&source));
 
-        task.assign(task.owner)
+        task.assign(task.owner, context.clone())
             .expect("retried work can go on wire");
         task.complete()
             .expect("a matching state admission completes the task");
@@ -432,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_cycle_rotates_sources_and_resumes_after_backoff() {
+    fn supplier_failures_remain_excluded_until_the_episode_changes() {
         let mut task = task(&snapshot());
         let first = SourceId::from_digest([8; 32]);
         let second = SourceId::from_digest([9; 32]);
@@ -440,56 +479,183 @@ mod tests {
         mark_context_requested(&mut task);
         task.resolve(context.clone())
             .expect("the exact context resolves");
-        task.assign(task.owner)
+        task.assign(task.owner, context.clone())
             .expect("the first supplier goes on wire");
         task.retry(first).expect("the first supplier can fail");
-        task.assign(task.owner)
+        task.assign(task.owner, context.clone())
             .expect("the second supplier goes on wire");
         task.retry(second).expect("the second supplier can fail");
-        let deadline = Instant::now() + std::time::Duration::from_secs(1);
-        task.defer_retry_until(deadline)
-            .expect("a complete supplier cycle backs off");
+        task.resume_retry(Instant::now() + std::time::Duration::from_secs(1));
 
-        task.resume_retry_cycle(deadline);
-
-        assert!(task.tried_sources.is_empty());
-        assert_eq!(task.state, RepairPolicyState::Ready { context });
+        assert_eq!(task.tried_sources, [first, second].into_iter().collect());
+        assert_eq!(
+            task.state,
+            RepairPolicyState::Ready {
+                context: context.clone()
+            }
+        );
         assert_eq!(task.attempts, 2);
+
+        let replacement = RepairRequirement::new(task.owner, task.height, 12);
+        assert!(replacement.tried_sources.is_empty());
     }
 
     #[test]
-    fn supplier_cycle_bounds_identity_churn() {
+    fn supplier_history_tracks_each_distinct_source_without_repeating() {
         let mut task = task(&snapshot());
         let context = context();
         mark_context_requested(&mut task);
         task.resolve(context.clone())
             .expect("the exact context resolves");
 
-        for byte in [1_u8, 2, 3] {
-            task.assign(task.owner).expect("ready work can go on wire");
+        for byte in 1_u8..=64 {
+            task.assign(task.owner, context.clone())
+                .expect("ready work can go on wire");
             task.retry(SourceId::from_digest([byte; 32]))
                 .expect("each distinct supplier can fail");
         }
-        assert!(task.supplier_cycle_exhausted());
-        assert_eq!(task.tried_sources.len(), 3);
-        assert_eq!(task.attempts, 3);
-
-        for byte in 4_u8..=64 {
-            task.record_failed_source(SourceId::from_digest([byte; 32]))
-                .expect("late churn cannot enlarge an exhausted cycle");
-        }
-        assert!(task.supplier_cycle_exhausted());
-        assert_eq!(task.tried_sources.len(), 3);
-        assert!(!task.tried_sources.contains(&SourceId::from_digest([4; 32])));
+        assert_eq!(task.tried_sources.len(), 64);
+        assert!(task.tried_sources.contains(&SourceId::from_digest([4; 32])));
         assert_eq!(task.attempts, 64);
 
-        let deadline = Instant::now() + std::time::Duration::from_secs(1);
-        task.defer_retry_until(deadline)
-            .expect("a bounded supplier cycle backs off");
-        task.resume_retry_cycle(deadline);
-        assert!(!task.supplier_cycle_exhausted());
-        assert!(task.tried_sources.is_empty());
+        task.resume_retry(Instant::now() + std::time::Duration::from_secs(1));
+        assert_eq!(task.tried_sources.len(), 64);
         assert_eq!(task.state, RepairPolicyState::Ready { context });
+    }
+
+    #[test]
+    fn supplier_history_releases_disconnected_sources_without_clearing_the_episode() {
+        let mut task = task(&snapshot());
+        let context = context();
+        mark_context_requested(&mut task);
+        task.resolve(context.clone())
+            .expect("the exact context resolves");
+        let source = |index: usize| {
+            let bytes = u64::try_from(index)
+                .expect("the fixture index fits in u64")
+                .to_le_bytes()
+                .repeat(4)
+                .try_into()
+                .expect("four u64 values fill one source digest");
+            SourceId::from_digest(bytes)
+        };
+        let previous_default_capacity = crate::zakura::DEFAULT_SERVICE_MAX_PEERS * 2;
+        for index in 0..previous_default_capacity {
+            task.record_failed_source(source(index))
+                .expect("ready work can record each supplier");
+        }
+        let retained = source(previous_default_capacity - 1);
+        task.excluded_input_sources.insert(retained);
+
+        let connected_sources = [retained].into_iter().collect();
+        task.retain_connected_sources(&connected_sources);
+
+        assert_eq!(task.tried_sources, connected_sources);
+        assert_eq!(task.excluded_input_sources, connected_sources);
+        assert_eq!(task.state, RepairPolicyState::Ready { context });
+    }
+
+    #[test]
+    fn committed_resource_refusal_waits_for_a_newer_state() {
+        let mut task = task(&snapshot());
+        let context = context();
+        mark_context_requested(&mut task);
+        task.resolve(context.clone())
+            .expect("the exact context resolves");
+        task.assign(task.owner, context.clone())
+            .expect("ready work can go on wire");
+        let blocked_at = StateVersion::new(3);
+        task.wait_for_state_change(blocked_at)
+            .expect("a committed resource refusal blocks the assigned repair");
+
+        task.observe_state_change(blocked_at);
+        assert_eq!(
+            task.state,
+            RepairPolicyState::StateBlocked {
+                context,
+                state_version: blocked_at,
+            }
+        );
+        assert_eq!(task.attempts, 1);
+        assert!(task.tried_sources.is_empty());
+
+        task.observe_state_change(StateVersion::new(4));
+        assert_eq!(task.state, RepairPolicyState::NeedsContext);
+    }
+
+    #[test]
+    fn context_without_admission_capacity_waits_without_a_wire_attempt() {
+        let mut task = task(&snapshot());
+        let available = context();
+        let blocked = VctRepairContext::from_durable_rows(
+            available.target,
+            available.locator,
+            StateVersion::new(3),
+            available.boundary_hash,
+            false,
+            &[],
+        )
+        .expect("an empty durable input set is coherent");
+        mark_context_requested(&mut task);
+        task.resolve(blocked.clone())
+            .expect("the exact context resolves into a state wait");
+
+        assert_eq!(
+            task.state,
+            RepairPolicyState::StateBlocked {
+                context: blocked,
+                state_version: StateVersion::new(3),
+            }
+        );
+        assert_eq!(task.attempts, 0);
+        assert!(task.tried_sources.is_empty());
+        assert!(task.next_deadline().is_none());
+    }
+
+    #[test]
+    fn excluded_input_source_survives_until_a_new_task_replaces_the_episode() {
+        let snapshot = snapshot();
+        let mut task = task(&snapshot);
+        let context = context();
+        mark_context_requested(&mut task);
+        task.resolve(context.clone())
+            .expect("the exact context resolves");
+        let excluded_sources: Vec<_> = (1_u8..=3)
+            .map(|byte| SourceId::from_digest([byte; 32]))
+            .collect();
+        for source in &excluded_sources {
+            task.assign(task.owner, context.clone())
+                .expect("ready work can go on wire");
+            task.exclude_input(*source)
+                .expect("durably excluded input rotates its supplier");
+        }
+        task.resume_retry(Instant::now() + std::time::Duration::from_secs(1));
+
+        assert_eq!(
+            task.excluded_input_sources,
+            excluded_sources.iter().copied().collect()
+        );
+        assert_eq!(
+            task.tried_sources,
+            excluded_sources.iter().copied().collect()
+        );
+        assert_eq!(
+            task.state,
+            RepairPolicyState::Ready {
+                context: context.clone()
+            }
+        );
+
+        let fourth = SourceId::from_digest([4; 32]);
+        task.assign(task.owner, context.clone())
+            .expect("a later supplier can own the same episode");
+        task.exclude_input(fourth)
+            .expect("the later supplier remains attributable");
+        assert!(task.excluded_input_sources.contains(&fourth));
+
+        let replacement = RepairRequirement::new(task.owner, task.height, 12);
+        assert!(replacement.excluded_input_sources.is_empty());
+        assert!(replacement.tried_sources.is_empty());
     }
 
     #[test]
@@ -502,11 +668,12 @@ mod tests {
                 .expect("the exact context resolves");
             let failed_source = SourceId::from_digest([1; 32]);
             if assigned {
-                task.assign(task.owner).expect("ready work can go on wire");
+                task.assign(task.owner, context.clone())
+                    .expect("ready work can go on wire");
                 task.retry(failed_source)
-                    .expect("one supplier failure starts the current cycle");
-                task.assign(task.owner)
-                    .expect("another supplier can own the current cycle");
+                    .expect("one supplier failure updates the current episode");
+                task.assign(task.owner, context.clone())
+                    .expect("another supplier can own the current episode");
             } else {
                 task.tried_sources.insert(failed_source);
             }
@@ -530,7 +697,7 @@ mod tests {
                 },
                 "assigned={assigned}"
             );
-            task.resume_retry_cycle(retry_at);
+            task.resume_retry(retry_at);
             assert_eq!(
                 task.tried_sources,
                 [failed_source].into_iter().collect(),
@@ -552,12 +719,12 @@ mod tests {
         task.context_unavailable(deadline)
             .expect("an unavailable query enters context backoff");
 
-        task.resume_retry_cycle(deadline - std::time::Duration::from_millis(1));
+        task.resume_retry(deadline - std::time::Duration::from_millis(1));
         assert_eq!(
             task.state,
             RepairPolicyState::ContextBackoff { retry_at: deadline }
         );
-        task.resume_retry_cycle(deadline);
+        task.resume_retry(deadline);
         assert_eq!(task.state, RepairPolicyState::NeedsContext);
     }
 
@@ -569,9 +736,9 @@ mod tests {
         task.mark_context_requested(deadline, retry_at)
             .expect("needed context can be queried");
 
-        task.resume_retry_cycle(deadline);
+        task.resume_retry(deadline);
         assert_eq!(task.state, RepairPolicyState::ContextBackoff { retry_at });
-        task.resume_retry_cycle(retry_at);
+        task.resume_retry(retry_at);
         assert_eq!(task.state, RepairPolicyState::NeedsContext);
     }
 
@@ -592,13 +759,13 @@ mod tests {
             RepairPolicyState::Ready {
                 context: context.clone(),
             },
-            RepairPolicyState::SupplierBackoff {
-                context: context.clone(),
-                retry_at: deadline,
-            },
             RepairPolicyState::LocalBackoff {
                 context: context.clone(),
                 retry_at: deadline,
+            },
+            RepairPolicyState::StateBlocked {
+                context: context.clone(),
+                state_version: snapshot.state_version,
             },
             RepairPolicyState::Assigned { context },
             RepairPolicyState::Completed,

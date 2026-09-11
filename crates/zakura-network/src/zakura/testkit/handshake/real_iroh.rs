@@ -6,7 +6,6 @@ use std::{
 use iroh::{
     endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler, Router},
-    Watcher as _,
 };
 use tokio::sync::{oneshot, Notify};
 
@@ -38,7 +37,7 @@ struct Responder {
 impl ProtocolHandler for Responder {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let result = async {
-            let remote = connection.remote_node_id()?;
+            let remote = connection.remote_id();
             let remote = ZakuraPeerId::new(remote.as_bytes().to_vec())?;
             let (mut send, mut recv) = connection.accept_bi().await?;
             run_native_responder_control(
@@ -93,10 +92,7 @@ pub(super) async fn run_real_iroh(scenario: &HandshakeScenario) -> RunReport {
         .endpoint(9_301)
         .await
         .expect("the real-Iroh initiator endpoint binds");
-    let server_address = router.endpoint().node_addr().initialized().await;
-    client
-        .add_node_addr(server_address.clone())
-        .expect("the real-Iroh initiator learns the responder address");
+    let server_address = router.endpoint().addr();
     let connection = tokio::time::timeout(
         Duration::from_secs(5),
         client.connect(server_address, TEST_ALPN),
@@ -104,7 +100,7 @@ pub(super) async fn run_real_iroh(scenario: &HandshakeScenario) -> RunReport {
     .await
     .expect("the real-Iroh connection completes before its deadline")
     .expect("the real-Iroh initiator connects");
-    let local_id = ZakuraPeerId::new(client.node_id().as_bytes().to_vec())
+    let local_id = ZakuraPeerId::new(client.id().as_bytes().to_vec())
         .expect("the real Iroh node id is a valid peer id");
     let (mut send, mut recv) = tokio::time::timeout(Duration::from_secs(5), connection.open_bi())
         .await
@@ -154,15 +150,12 @@ pub(super) async fn check_pending_handshake_isolation() {
     let router = Router::builder(server)
         .accept(P2P_V2_ALPN, handler.clone())
         .spawn();
-    let server_address = router.endpoint().node_addr().initialized().await;
+    let server_address = router.endpoint().addr();
 
     let stalled = LocalEndpointFactory::with_transport_config(limits.transport_config())
         .endpoint(9_401)
         .await
         .expect("the stalled initiator binds");
-    stalled
-        .add_node_addr(server_address.clone())
-        .expect("the stalled initiator learns the responder address");
     let stalled_connection = stalled
         .connect(server_address.clone(), P2P_V2_ALPN)
         .await
@@ -177,9 +170,6 @@ pub(super) async fn check_pending_handshake_isolation() {
         .endpoint(9_402)
         .await
         .expect("the healthy initiator binds");
-    healthy
-        .add_node_addr(server_address.clone())
-        .expect("the healthy initiator learns the responder address");
     let healthy_connection = healthy
         .connect(server_address, P2P_V2_ALPN)
         .await
@@ -188,7 +178,7 @@ pub(super) async fn check_pending_handshake_isolation() {
         .open_bi()
         .await
         .expect("the healthy initiator opens a control stream");
-    let healthy_id = ZakuraPeerId::new(healthy.node_id().as_bytes().to_vec())
+    let healthy_id = ZakuraPeerId::new(healthy.id().as_bytes().to_vec())
         .expect("the healthy Iroh identity is a valid peer id");
     let negotiated = run_native_initiator_control(
         &mut send,

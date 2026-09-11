@@ -9,7 +9,7 @@ use super::{
     control_payload_length_is_admissible, ZakuraAcceptedLimits, ZakuraControlAck,
     ZakuraControlHello, ZakuraControlRole, ZakuraControlValidation, ZakuraHandshakeConfig,
     ZakuraHandshakePath, ZakuraInitialLimits, ZakuraLimits, ZakuraLocalLimits, ZakuraPeerId,
-    CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC, CONTROL_VERSION, ZAKURA_PROTOCOL_VERSION_1,
+    CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC, CONTROL_VERSION, ZAKURA_PROTOCOL_VERSION_CURRENT,
 };
 use crate::zakura::ZakuraHandlerError;
 
@@ -194,7 +194,7 @@ pub(crate) fn native_control_hello(
     ZakuraControlHello {
         magic: CONTROL_HELLO_MAGIC,
         control_version: CONTROL_VERSION,
-        selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_1,
+        selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_CURRENT,
         handshake_path: ZakuraHandshakePath::Native,
         role: ZakuraControlRole::Initiator,
         network_id: handshake_config.network_id,
@@ -263,7 +263,7 @@ pub(crate) async fn run_native_initiator_control<S: ControlWrite, R: ControlRead
     .await?;
     let ack = ZakuraControlAck::decode(&ack_bytes)?;
     ack.validate(
-        ZAKURA_PROTOCOL_VERSION_1,
+        ZAKURA_PROTOCOL_VERSION_CURRENT,
         local_nonce,
         ack.peer_nonce,
         &limits.initial_limits(),
@@ -304,7 +304,7 @@ pub(crate) async fn run_native_responder_control<S: ControlWrite, R: ControlRead
     hello.validate(&ZakuraControlValidation {
         local: handshake_config,
         authenticated_remote_id: remote_peer_id.as_bytes(),
-        selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_1,
+        selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_CURRENT,
         handshake_path: ZakuraHandshakePath::Native,
         remote_role: ZakuraControlRole::Initiator,
         initiator_upgrade_nonce: [0; 32],

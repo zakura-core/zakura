@@ -130,7 +130,6 @@ fn classify(error: &ZakuraHandlerError) -> HandshakeOutcome {
         | ZakuraHandlerError::Io(_)
         | ZakuraHandlerError::IrohConnection(_)
         | ZakuraHandlerError::IrohConnect(_)
-        | ZakuraHandlerError::IrohRemoteId(_)
         | ZakuraHandlerError::IrohWrite(_)
         | ZakuraHandlerError::IrohRead(_)
         | ZakuraHandlerError::IrohClosedStream(_) => HandshakeOutcome::LocalFault("transport"),

@@ -2671,6 +2671,15 @@ impl ZakuraProtocolHandler {
                 }, if incoming_setup.is_some() => {
                     incoming_setup = None;
                     let Some(setup) = setup else { continue; };
+                    // Active and retiring remote sessions still own their slot.
+                    // Reject duplicates before reserving capacity for any member.
+                    if setup.session.as_ref().is_some_and(|(layout, _)| {
+                        service_sessions
+                            .get(&layout.primary().kind)
+                            .is_some_and(|session| session.remote_session_id.is_some())
+                    }) {
+                        continue;
+                    }
                     let mut admission = StreamAdmission {
                         is_initiator: context.is_initiator,
                         direction: context.direction,
@@ -2718,13 +2727,6 @@ impl ZakuraProtocolHandler {
                             continue;
                         }
 
-                        // The old remote generation remains tracked until its
-                        // workers have finished.
-                        if service_sessions[&kind].remote_session_id.is_some() {
-                            // A replacement can arrive before the retiring workers finish.
-                            admitted.cancel_token.cancel();
-                            continue;
-                        }
                         service_sessions
                             .get_mut(&kind)
                             .expect("accepted ordered stream has negotiated session state")

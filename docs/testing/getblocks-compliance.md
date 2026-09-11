@@ -24,6 +24,14 @@ and 39 failed**. The early Block cap, header flags, terminal height boundaries,
 and discriminator-before-allocation witnesses now pass. Every remaining failure
 was also present in the initial run below.
 
+The generated property profile reports 26 passed and three failed across 29
+tests. After the regression selection update in `69a6ca1b4`, all 152 fixed-profile
+tests ran, with 145 passed and seven failed. Those failures are the five known
+terminal-consumption regressions plus the T01 and T02 transport compliance
+witnesses also selected by this profile. Network/test all-target Clippy passes
+with warnings denied. These runs disable retries and fail-fast. The long
+transport qualification and 64-round load gates have not been rerun.
+
 The terminal-field generator mixes valid counts with arbitrary counts so that
 invalid heights are exercised independently of count rejection. The tests still
 require the full specification. Authorization, nested allocation, response-byte,

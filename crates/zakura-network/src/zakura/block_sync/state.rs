@@ -2,7 +2,7 @@ use super::{
     bbr::{rounded_usize, BbrState},
     config::*,
     request::*,
-    work_queue::WorkQueue,
+    work_queue::{RequestWriteStatus, WorkQueue},
     *,
 };
 use crate::zakura::{ServicePeerDirection, ServicePeerSnapshot, ZakuraBlockSyncCandidateState};
@@ -692,7 +692,7 @@ impl DownloadWindow {
     /// Bytes reserved across this peer's in-flight requests (the per-request size
     /// estimates of heights not yet received). Recomputed on demand — the byte unit is
     /// experimental; a hot path would maintain a running counter instead.
-    fn outstanding_reserved_bytes(&self) -> u64 {
+    pub(super) fn outstanding_reserved_bytes(&self) -> u64 {
         self.outstanding.iter().fold(0u64, |acc, range| {
             acc.saturating_add(range.reserved_bytes())
         })
@@ -745,6 +745,9 @@ impl DownloadWindow {
     }
 
     pub(super) fn arm_liveness(&mut self, now: Instant, timeout: Duration) {
+        if let Some(outstanding) = self.outstanding.last_mut() {
+            outstanding.charged_for_liveness = true;
+        }
         self.last_request_at = Some(now);
         self.requests_without_block_progress =
             self.requests_without_block_progress.saturating_add(1);
@@ -756,6 +759,9 @@ impl DownloadWindow {
     pub(super) fn note_block_progress(&mut self, now: Instant, timeout: Duration) {
         self.last_block_at = Some(now);
         self.requests_without_block_progress = 0;
+        for outstanding in &mut self.outstanding {
+            outstanding.charged_for_liveness = false;
+        }
         self.block_liveness_deadline = if self.outstanding.is_empty() {
             None
         } else {
@@ -780,21 +786,47 @@ impl DownloadWindow {
         }
     }
 
-    /// Reset per-view no-progress accounting after a destructive view reset. The reset
-    /// returned this peer's outstanding to the queue on *our* initiative (a reorg/rollback,
-    /// not the peer's fault), so the in-flight probe streak must not stay charged against
-    /// it: clearing `requests_without_block_progress` lets an unproven peer probe again
-    /// instead of wedging at its one-probe cap forever (the reset also cleared its liveness
-    /// deadline, so nothing would disconnect it). Proof state (`last_block_at`) is preserved.
-    pub(super) fn note_view_reset(&mut self) {
+    /// Clear the probe streak after we return requests on our own initiative,
+    /// such as a view reset. Keep proof of earlier
+    /// progress, but let even an unproven peer receive work again when we resume.
+    pub(super) fn note_locally_returned_requests(&mut self) {
         self.requests_without_block_progress = 0;
         self.clear_liveness_if_idle();
     }
 
-    /// Push the block-liveness deadline out by `timeout` when a would-be park is
-    /// attributable to *local* outbound backpressure, not the peer: while our outbound queue
-    /// is full the routine stops draining inbound, so a useful body may be sitting unread.
-    /// Avoids punishing the peer for our own write-side congestion.
+    /// Retire attempts that never reached the wire, refunding only their own
+    /// probe charges. Keep unanswered requests from this peer accountable.
+    pub(super) fn discard_skipped_requests(&mut self) -> bool {
+        let mut removed = false;
+        let mut index = 0;
+        while index < self.outstanding.len() {
+            if self.outstanding[index].write_status.was_skipped() {
+                self.retire_locally(index);
+                removed = true;
+            } else {
+                index += 1;
+            }
+        }
+        removed
+    }
+
+    /// End a locally retired obligation before discarding its write status. If
+    /// transport has not started, it must skip the frame and refund this probe.
+    pub(super) fn retire_locally(&mut self, index: usize) -> OutstandingBlockRange {
+        let outstanding = self.outstanding.remove(index);
+        outstanding.write_status.expire_unwritten();
+        if outstanding.write_status.was_skipped() && outstanding.charged_for_liveness {
+            self.requests_without_block_progress =
+                self.requests_without_block_progress.saturating_sub(1);
+        }
+        if self.requests_without_block_progress == 0 {
+            self.clear_liveness_if_idle();
+        }
+        outstanding
+    }
+
+    /// Give a briefly congested writer time to deliver our queued request before
+    /// parking the peer for not answering it. The caller bounds this grace.
     pub(super) fn extend_liveness_deadline(&mut self, now: Instant, timeout: Duration) {
         self.block_liveness_deadline = Some(now + timeout);
     }
@@ -900,6 +932,9 @@ impl PeerBlockState {
 #[derive(Clone, Debug)]
 pub(super) struct OutstandingBlockRange {
     pub(super) request: BlockRangeRequest,
+    pub(super) write_status: RequestWriteStatus,
+    /// Whether this attempt still contributes to the no-progress probe streak.
+    pub(super) charged_for_liveness: bool,
     pub(super) queued_at: Instant,
     pub(super) deadline: Instant,
     pub(super) delivery_snapshot: DeliverySnapshot,
@@ -1015,12 +1050,12 @@ const _: () = assert!(MAX_BS_BLOCKS_PER_REQUEST <= RECEIVED_TRACKER_OFFSET_CAPAC
 #[derive(Clone, Debug, Default)]
 pub(super) struct ReceivedBlockTracker {
     bits: u128,
-    count: usize,
 }
 
 impl ReceivedBlockTracker {
     pub(super) fn len(&self) -> usize {
-        self.count
+        // At most 128 set bits fit in usize on every supported target.
+        self.bits.count_ones() as usize
     }
 
     fn contains_offset(&self, offset: u32) -> bool {
@@ -1035,7 +1070,6 @@ impl ReceivedBlockTracker {
             return false;
         }
         self.bits |= bit;
-        self.count = self.count.saturating_add(1);
         true
     }
 

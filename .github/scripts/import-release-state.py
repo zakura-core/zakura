@@ -107,6 +107,15 @@ def _install_artifacts(repo_root: Path, artifacts: dict[Path, bytes]) -> None:
                 os.fsync(output.fileno())
             staged.chmod(target.stat().st_mode & 0o777 if target.exists() else 0o644)
             prepared.append((target, staged, backup))
+        # Persist newly created artifact directories before committing their files.
+        directories = {repo_root}
+        for target, _staged, _backup in prepared:
+            parent = target.parent
+            while parent != repo_root:
+                directories.add(parent)
+                parent = parent.parent
+        for directory in sorted(directories, key=lambda path: len(path.parts), reverse=True):
+            _sync_directory(directory)
         journal = [
             {"path": str(target.relative_to(repo_root)), "backup": backup.name if backup else None}
             for target, _staged, backup in prepared
@@ -148,6 +157,12 @@ def _sync_directory(path: Path) -> None:
 
 
 def _recover_import(repo_root: Path, staging: Path) -> None:
+    if staging.is_symlink() or not staging.is_dir():
+        raise BundleImportError(f"unexpected recovery path: {staging}")
+    for entry in staging.iterdir():
+        if (entry.is_symlink() or not entry.is_file()
+                or not re.fullmatch(r"(?:[0-9]+\.(?:new|old)|journal\.json|ready|committed|restore)", entry.name)):
+            raise BundleImportError(f"unexpected recovery file; preserve {staging}")
     journal_path = staging / "journal.json"
     if (staging / "ready").exists() and not (staging / "committed").exists():
         allowed = {CHECKPOINTS, FRONTIER, SUBTREES, PROVENANCE, EOS_FILE,

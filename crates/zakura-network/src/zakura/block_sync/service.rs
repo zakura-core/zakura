@@ -150,7 +150,7 @@ impl BlockSyncPeerSession {
     }
 
     #[cfg(test)]
-    pub(super) fn connection_is_closed_for_test(&self) -> bool {
+    pub(crate) fn connection_is_closed_for_test(&self) -> bool {
         self.connection_cancel.is_cancelled()
     }
 

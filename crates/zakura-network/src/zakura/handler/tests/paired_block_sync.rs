@@ -831,8 +831,15 @@ impl BlockRangeSource for StalledSource {
 }
 
 #[tokio::test]
-async fn remote_pair_reset_with_unanswered_work_preserves_no_progress_policy(
-) -> Result<(), BoxError> {
+async fn unfinished_pair_retirement_closes_connection_without_readmission() -> Result<(), BoxError>
+{
+    for remote_reset in [false, true] {
+        check_unfinished_pair_retirement(remote_reset).await?;
+    }
+    Ok(())
+}
+
+async fn check_unfinished_pair_retirement(remote_reset: bool) -> Result<(), BoxError> {
     let blocks = blocks();
     let downloader = Node::with_range_source(
         blocks.clone(),
@@ -903,55 +910,37 @@ async fn remote_pair_reset_with_unanswered_work_preserves_no_progress_policy(
         .await
         .expect("server sees initial request");
     assert!(downloader.handle.outstanding_requests_for_test() > 0);
-    // Local retirement returns work without charging the remote peer a stall.
-    downloader
+    let download_session = downloader
         .service
         .sessions_for_transport_test()
         .pop()
         .unwrap()
-        .1
-        .cancel_token()
-        .cancel();
-    timeout(DEADLINE, seen.notified())
-        .await
-        .expect("local cancellation permits another request");
-    assert!(!downloader.service.is_peer_parked_for_test(&remote_peer));
-    assert!(downloader.handle.outstanding_requests_for_test() > 0);
-    server_node
-        .service
-        .sessions_for_transport_test()
-        .pop()
-        .unwrap()
-        .1
-        .cancel_token()
-        .cancel();
-    await_until("remote reset parks unanswered download", DEADLINE, || {
-        downloader.service.is_peer_parked_for_test(&remote_peer)
-    })
-    .await?;
-    assert!(transport.connection.close_reason().is_none());
-    assert!(
-        timeout(Duration::from_secs(1), seen.notified())
-            .await
-            .is_err(),
-        "cooldown must prevent new requests"
-    );
-    timeout(DEADLINE, seen.notified())
-        .await
-        .expect("cooldown permits one readmission");
-    server_node
-        .service
-        .sessions_for_transport_test()
-        .pop()
-        .unwrap()
-        .1
-        .cancel_token()
-        .cancel();
-    // This fixture keeps a QUIC clone after register_and_serve returns. The
-    // production caller closes it when the cancelled connection handler exits.
+        .1;
+    if remote_reset {
+        server_node
+            .service
+            .sessions_for_transport_test()
+            .pop()
+            .unwrap()
+            .1
+            .cancel_token()
+            .cancel();
+    } else {
+        download_session.cancel_token().cancel();
+    }
+    // Keeping a QUIC clone in this fixture prevents automatic socket close, so
+    // observe the production connection token and handler exit directly.
     timeout(DEADLINE, &mut transport._task)
         .await
-        .expect("repeated remote reset ends the connection handler")??;
+        .expect("unfinished authorization requires connection closure")??;
+    assert!(download_session.connection_is_closed_for_test());
+    assert!(!downloader.service.is_peer_parked_for_test(&remote_peer));
+    assert!(
+        timeout(Duration::from_millis(100), seen.notified())
+            .await
+            .is_err(),
+        "retirement must not readmit unanswered work on the old connection"
+    );
     assert_eq!(downloader.service.peer_count(), 0);
     assert_eq!(*downloader.received.borrow(), 0);
     drop(transport);

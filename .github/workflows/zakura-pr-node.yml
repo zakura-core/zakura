@@ -1,4 +1,4 @@
-name: Header serving reproduction inspection
+name: Stable header serving inspection
 on:
   workflow_dispatch:
 permissions:
@@ -7,14 +7,6 @@ jobs:
   inspect:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - droplet: '599702107'
-            owner_run: '34627879665'
-          - droplet: '599702290'
-            owner_run: '34627881215'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -23,20 +15,25 @@ jobs:
         with:
           token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
           ssh_private_key: ${{ secrets.DO_SSH_PRIVATE_KEY }}
-      - name: Inspect only the owned disposable test node
+      - name: Inspect only this test's disposable resources
         env:
-          DROPLET_ID: ${{ matrix.droplet }}
-          OWNER_RUN: ${{ matrix.owner_run }}
+          OWNER_RUN: '34648485529'
         run: |
           set -euo pipefail
-          doctl compute droplet get "$DROPLET_ID" -o json > /tmp/owned-droplet.json
-          IP=$(python3 - <<'PY'
-          import json, os
-          d=json.load(open('/tmp/owned-droplet.json'))[0]
-          assert str(d['id']) == os.environ['DROPLET_ID']
-          assert d['name'].startswith('zakura-pr-adam-header-serving-')
-          assert d['name'].endswith('-'+os.environ['OWNER_RUN'])
-          print(next(n['ip_address'] for n in d['networks']['v4'] if n['type']=='public'))
-          PY
-          )
-          ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -i /tmp/do_ssh "root@$IP" python3 - < .github/workflows/scripts/header-serving-inspect.py
+          doctl compute droplet list --tag-name zakura-pr-node -o json > /tmp/droplets.json
+          doctl compute volume list -o json > /tmp/volumes.json
+          python3 - <<'CHECK'
+          import json,os
+          from pathlib import Path
+          owner=os.environ['OWNER_RUN']
+          nodes=[d for d in json.load(open('/tmp/droplets.json')) if d['name'].startswith('zakura-pr-adam-header-serving-') and d['name'].endswith('-'+owner)]
+          volumes=[v for v in json.load(open('/tmp/volumes.json')) if v['name']=='zakura-pr-vol-'+owner]
+          assert len(nodes)<=1
+          print(json.dumps({'owner_run':owner,'nodes':[{'id':d['id'],'name':d['name']} for d in nodes],'volumes':[{'id':v['id'],'name':v['name']} for v in volumes]}))
+          if nodes:
+              Path('/tmp/owned-ip').write_text(next(n['ip_address'] for n in nodes[0]['networks']['v4'] if n['type']=='public'))
+          CHECK
+          if [ -f /tmp/owned-ip ]; then
+            IP=$(cat /tmp/owned-ip)
+            ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -i /tmp/do_ssh "root@$IP" python3 - < .github/workflows/scripts/header-serving-inspect.py
+          fi

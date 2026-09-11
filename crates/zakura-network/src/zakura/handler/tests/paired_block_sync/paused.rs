@@ -13,8 +13,11 @@ pub(super) struct PausedService {
 
 impl PausedService {
     pub(super) fn new(count: u16) -> (Arc<Self>, mpsc::Receiver<PausedSession>) {
-        assert!(count <= 2);
-        let (sessions, receiver) = mpsc::channel(2);
+        assert!(
+            count <= 3,
+            "two paused streams and one independent progress probe"
+        );
+        let (sessions, receiver) = mpsc::channel(3);
         let streams = (0..count)
             .map(|index| Stream {
                 kind: FIRST_KIND + index,
@@ -71,6 +74,25 @@ pub(super) struct PausedSession {
 }
 
 impl PausedSession {
+    pub(super) async fn send_probe(&self) -> Result<(), BoxError> {
+        self.send
+            .send(Frame {
+                message_type: 1,
+                flags: 0,
+                payload: vec![42],
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub(super) async fn receive_probe(&mut self) -> Result<(), BoxError> {
+        let frame = timeout(Duration::from_secs(3), self.recv.recv())
+            .await?
+            .ok_or("independent service closed before receiving its probe")?;
+        assert_eq!(frame.payload, [42]);
+        Ok(())
+    }
+
     pub(super) async fn receive(receiver: &mut mpsc::Receiver<Self>) -> Result<Self, BoxError> {
         let session = timeout(DEADLINE, receiver.recv())
             .await?

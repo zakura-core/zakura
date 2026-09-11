@@ -131,6 +131,11 @@
 // them into type aliases would not make the code clearer.
 #![allow(clippy::type_complexity)]
 
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOCATOR: zakura_test::allocations::TrackingAllocator =
+    zakura_test::allocations::TrackingAllocator;
+
 #[macro_use]
 extern crate pin_project;
 #[macro_use]

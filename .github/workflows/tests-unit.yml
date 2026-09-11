@@ -305,12 +305,30 @@ jobs:
         env:
           FULL_COVERAGE: ${{ github.event_name != 'pull_request' }}
 
+      - name: Run regulation compliance witnesses
+        if: ${{ !cancelled() }}
+        env:
+          PROPTEST_CASES: "64"
+          PROPTEST_RNG_SEED: ${{ github.run_id }}
+          ZAKURA_REGULATION_LOAD_ROUNDS: "4"
+        run: cargo nextest run --profile regulation-compliance --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst" --partition "hash:${{ matrix.partition }}/3"
+
       - name: Explore regulation histories
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
         env:
           PROPTEST_CASES: "2048"
           PROPTEST_RNG_SEED: ${{ github.run_id }}
         run: cargo nextest run --profile regulation-properties --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst" --partition "hash:${{ matrix.partition }}/3"
+
+      - name: Qualify regulation workloads
+        if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+        env:
+          ZAKURA_REGULATION_LOAD_ROUNDS: "64"
+          PROPTEST_RNG_SEED: ${{ github.run_id }}
+        run: |
+          git rev-parse HEAD
+          rustc --version
+          cargo nextest run --profile regulation-load --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst" --partition "hash:${{ matrix.partition }}/3"
 
   zakura-config:
     name: zakura config compatibility

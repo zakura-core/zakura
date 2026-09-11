@@ -22,6 +22,7 @@ const COUNT: u32 = 32;
 const DEADLINE: Duration = Duration::from_secs(30);
 const LOSS_DEADLINE: Duration = Duration::from_secs(240);
 
+mod compliance;
 mod gate;
 mod link;
 mod paused;
@@ -118,6 +119,7 @@ struct Node {
     _tip: watch::Sender<(block::Height, block::Hash)>,
     received: watch::Receiver<u32>,
     _capture: Option<crate::zakura::testkit::TraceCapture>,
+    _serving_status: Option<watch::Sender<crate::zakura::block_sync::BlockSyncStatus>>,
 }
 
 impl Node {
@@ -140,6 +142,17 @@ impl Node {
         source: Option<Arc<dyn BlockRangeSource>>,
         cooldown: Option<Duration>,
     ) -> Self {
+        Self::with_download_mode(blocks, serving, peer_limit, source, cooldown, false)
+    }
+
+    fn with_download_mode(
+        blocks: Arc<Vec<Arc<Block>>>,
+        serving: bool,
+        peer_limit: Option<usize>,
+        source: Option<Arc<dyn BlockRangeSource>>,
+        cooldown: Option<Duration>,
+        duplex: bool,
+    ) -> Self {
         let genesis = Block::zcash_deserialize(&BLOCK_MAINNET_GENESIS_BYTES[..])
             .unwrap()
             .hash();
@@ -156,6 +169,12 @@ impl Node {
         }
         config.peer_limits.inbound_queue_depth = 8;
         config.peer_limits.outbound_queue_depth = 8;
+        if duplex {
+            config.initial_inflight_requests = COUNT;
+            config.initial_block_probe_requests = COUNT;
+            config.bbr_min_cwnd = COUNT;
+            config.bbr_min_cwnd_bytes = 128 * 1024 * 1024;
+        }
         if let Some(limit) = peer_limit {
             config.peer_limits.max_inbound_peers = limit;
             config.peer_limits.max_outbound_peers = limit;
@@ -189,7 +208,11 @@ impl Node {
         let (handle, mut actions, reactor) = spawn_block_sync_reactor(startup);
         let handle = handle
             .with_range_source(source.unwrap_or_else(|| Arc::new(MemorySource(blocks.clone()))));
-        let service = BlockSyncService::new_with_handle(config, handle.clone());
+        let mut service = BlockSyncService::new_with_handle(config, handle.clone());
+        // The transport fixture has an independently populated serving cache.
+        // Both verification pipelines still begin at genesis and need bodies.
+        let serving_status =
+            duplex.then(|| service.with_serving_status_for_test(compliance::cache_status()));
         let (progress_tx, received) = watch::channel(0);
         let driver_handle = handle.clone();
         let driver = tokio::spawn(async move {
@@ -247,6 +270,7 @@ impl Node {
             _tip: tip_tx,
             received,
             _capture: capture,
+            _serving_status: serving_status,
         }
     }
 }
@@ -320,7 +344,9 @@ async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
     let mut serving_service = server_node.service.clone();
     let mut limits = ZakuraLocalLimits::from_config(&Config::default());
     // Let the declared request burst test serving pressure, not rate rejection.
-    limits.message_rate_per_second = 40_000;
+    if pressure {
+        limits.message_rate_per_second = 40_000;
+    }
     let server = LocalEndpointFactory::with_transport_config(limits.transport_config())
         .endpoint(94101)
         .await?;
@@ -577,8 +603,11 @@ async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
         })??;
         await_until(
             "all matched requests consume their ending",
-            DEADLINE,
-            || downloader.handle.outstanding_requests_for_test() == 0,
+            Duration::from_secs(3),
+            || {
+                let (published, ended) = downloader.handle.exchange_counts_for_test();
+                published > 0 && ended == published
+            },
         )
         .await?;
         let elapsed = start.elapsed();

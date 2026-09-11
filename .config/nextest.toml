@@ -262,6 +262,27 @@ failure-output = "immediate"
 
 # Generated contracts and fixed model witnesses. Do not retry counterexamples.
 [profile.regulation-properties]
-default-filter = 'test(~regulation::properties::) or test(~regulation::request::properties::) or test(~serving_regulation::properties::) or test(~serving_regulation::policy::properties::) or test(~block_sync::serving::tests::properties::) or test(~service::block_range::tests::properties::)'
+fail-fast = false
+default-filter = 'test(~regulation::properties::) or test(~regulation::request::properties::) or test(~serving_regulation::properties::) or test(~serving_regulation::policy::properties::) or test(~block_sync::serving::tests::properties::) or test(~service::block_range::tests::properties::) or (test(~::compliance::) and (test(~_generated_) or test(~f02_bounded_response_payloads)))'
 retries = 0
 slow-timeout = { period = "60s", terminate-after = 1 }
+
+# Executable PR 747 requirements may be red while the implementation catches up.
+# Run every witness. Do not hide failures with retries or expected-failure markers.
+[profile.regulation-compliance]
+default-filter = 'test(~::compliance::) or test(~::compliance_frames::) or (package(zakura-test) and test(~allocations::tests::))'
+fail-fast = false
+retries = 0
+test-threads = 4
+slow-timeout = { period = "90s", terminate-after = 1 }
+failure-output = "immediate"
+
+# Same bounded tests with more rounds on scheduled/manual jobs.
+[profile.regulation-load]
+default-filter = 'test(~serving::tests::compliance::load::) or test(~handler::tests::paired_block_sync::compliance::) or test(~serving::tests::compliance::c05_)'
+fail-fast = false
+retries = 0
+test-threads = 1
+slow-timeout = { period = "10m", terminate-after = 1 }
+success-output = "immediate"
+failure-output = "immediate"

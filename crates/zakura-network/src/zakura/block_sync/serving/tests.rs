@@ -145,18 +145,38 @@ impl Fixture {
             max_blocks_per_response: 2,
             ..ZakuraBlockSyncConfig::default()
         };
-        let registry = Arc::new(PeerRegistry::new());
-        let peer = ZakuraPeerId::new(vec![111; 32]).unwrap();
-        let SessionAdmission::Fresh { generation } = registry.admit_session(
+        let regulator = GetBlocksServingRegulator::new(config.clone());
+        Self::with_resources(
+            source,
+            depth,
+            config,
+            regulator,
+            Arc::new(PeerRegistry::new()),
+            111,
+        )
+    }
+
+    fn with_resources(
+        source: Arc<dyn BlockRangeSource>,
+        depth: usize,
+        config: ZakuraBlockSyncConfig,
+        regulator: GetBlocksServingRegulator,
+        registry: Arc<PeerRegistry>,
+        peer_byte: u8,
+    ) -> Self {
+        let peer = ZakuraPeerId::new(vec![peer_byte; 32]).unwrap();
+        let admitted = registry.admit_session(
             &peer,
             ServicePeerDirection::Inbound,
             &config,
             1,
             Instant::now(),
-        ) else {
-            panic!("fresh fixture")
-        };
-        let regulator = GetBlocksServingRegulator::new(config.clone());
+        );
+        assert!(matches!(
+            admitted,
+            SessionAdmission::Fresh { .. } | SessionAdmission::Readmitted { .. }
+        ));
+        let generation = admitted.generation();
         let admission = regulator.session(peer.clone());
         let (send, data) = worker_framed_channel(depth);
         let session = BlockSyncPeerSession::for_test_with_session_id(
@@ -504,3 +524,5 @@ async fn cancellation_during_storage_suppresses_old_output_and_retains_the_job()
 }
 
 mod properties;
+
+mod compliance;

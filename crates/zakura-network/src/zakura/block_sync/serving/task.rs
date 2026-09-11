@@ -137,11 +137,30 @@ pub(in crate::zakura::block_sync) async fn send_response(
     // Its returned frame and lease are dropped together if delivery disappears.
     let is_block = matches!(&message, BlockSyncMessage::Block(_));
     let lease = permit.work_lease();
+    #[cfg(test)]
+    let probe = permit.encode_probe.clone();
     let (frame, _lease) = tokio::task::spawn_blocking(move || {
         if lease.is_cancelled() {
             return Err(local_error("block-sync serving cancelled"));
         }
-        let frame = message.encode_frame().map_err(SinkReject::local)?;
+        #[cfg(test)]
+        let operation = probe.as_ref().map(|probe| probe.start());
+        #[cfg(test)]
+        let encoded = if let Some(probe) = &probe {
+            let (encoded, allocations) =
+                zakura_test::allocations::measure(|| message.encode_frame());
+            probe.allocations(allocations);
+            encoded
+        } else {
+            message.encode_frame()
+        };
+        #[cfg(not(test))]
+        let encoded = message.encode_frame();
+        let frame = encoded.map_err(SinkReject::local)?;
+        #[cfg(test)]
+        if let Some(operation) = operation {
+            operation.finish();
+        }
         Ok((frame, lease))
     })
     .await

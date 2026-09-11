@@ -18,6 +18,7 @@ async fn check_request_burst(
     f.session.mark_status_received();
     let sender = f.requests.clone();
     let counts = requests.clone();
+    let (ended, mut endings) = tokio::sync::mpsc::channel(1);
     let mut burst = AbortOnDropHandle::new(tokio::spawn(async move {
         for count in counts {
             let request = BlockSyncMessage::GetBlocks {
@@ -29,6 +30,11 @@ async fn check_request_burst(
             time::timeout(Duration::from_secs(2), sender.send(request))
                 .await
                 .unwrap()?;
+            // Reusing this range is conformant only after its preceding ending
+            // has been written. Disjoint pipelining has separate pressure tests.
+            if endings.recv().await.is_none() {
+                break;
+            }
         }
         Ok::<_, tokio::sync::mpsc::error::SendError<crate::zakura::Frame>>(())
     }));
@@ -131,6 +137,7 @@ async fn check_request_burst(
             write.await.unwrap();
             written += 1;
         }
+        ended.send(()).await.unwrap();
     }
     time::timeout(Duration::from_secs(2), &mut burst)
         .await

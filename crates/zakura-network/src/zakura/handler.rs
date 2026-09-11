@@ -5698,6 +5698,7 @@ impl ZakuraHandlerError {
 
 #[cfg(test)]
 mod tests {
+    mod compliance_frames;
     pub(super) mod connection;
     mod paired_block_sync;
     mod serving_progress;

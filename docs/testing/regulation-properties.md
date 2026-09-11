@@ -39,7 +39,7 @@ and do not keep work alive.
 | Wire request | Legal round trips, canonical bytes, tags, flags, exact consumption, count and height bounds, arbitrary short payloads | `GetBlocksPolicy` and `BlockSyncMessage` codecs |
 | Admission | Peer and node limits, waiting, FIFO grants, cancellation, reconnects, provisional rollback | Shared request admission from #943 |
 | Response ownership | Single execution, cloned leases, response cap, queued frames, pending writes, reconnects | Serving regulator and transport writer |
-| Sequential serving | Request bursts, response prefixes, hashes, order, terminal counts, output depths, cancellation during a write | Serving task activated by #945 |
+| Sequential serving | Sequential legal requests, response prefixes, hashes, order, terminal counts, output depths, cancellation during a write | Serving task activated by #945 |
 | Storage | Contiguous prefixes, missing blocks, byte caps, integer overflow, cancellation between lookups, retained results | Bounded collector and owned blocking read from #942 |
 
 Required boundaries also have fixed examples, so random sampling does not decide
@@ -53,22 +53,29 @@ A separate encode can still be running or holding an undelivered result, so an
 immediate zero-capacity assertion would contradict the ownership contract. The
 concrete input from the old failing CI run remains a fixed regression.
 
-## Coverage boundaries
+## Compliance witnesses
 
-The [serving design](../design/getblocks-regulation.md) is the implemented
-contract. The broader regulation draft still proposes additional behavior.
+The [GetBlocks compliance suite](getblocks-compliance.md) now executes the missing
+requirements from #747, including rules the #942–#945 stack does not yet satisfy.
+A failing requirement is an ordinary failing test. It is not ignored, inverted,
+or retried until green. The implemented [serving design](../design/getblocks-regulation.md)
+remains distinct from the intended requirements being tested.
 
-| Area | Current evidence and next step |
-| --- | --- |
-| Outgoing request publication and expiry | #944 retains fixed production tests for queued versus started writes, partial expiry, resets, received bodies, and replacement owners. Generated scheduler and response histories are a separate extension. |
-| Response authorization | This suite does not claim the draft's full authorization lifetime, overlapping-range rejection, duplicate-terminal rejection, or terminal correlation. The serving design explicitly leaves overlapping live ranges to existing reassignment and late-response rules. Add receiver properties when that contract is implemented. |
-| Frame allocation | Fixed transport tests reject the oversized GetBlocks header before reading its payload. Decode properties start with a bounded buffer and make no allocation measurement claim. |
-| QUIC and node load | Existing real-transport tests and the separate transport gate cover the exercised buffering and progress workloads. In-memory histories do not establish connection-credit headroom, process memory, Sybil fairness, or throughput. |
-| Other messages | GetPeers demonstrates reuse of finite-request admission. Discovery cadence, announcements, header subscriptions, and their authorization remain separate implementations and properties. |
+Receiver tests observe exact requested hashes, consumed parts, and terminal state.
+Generated local histories combine response prefixes with deadlines, finality,
+reorganizations, and loss of local interest. Wire tests measure actual allocation
+requests. Real serving jobs and encoders can pause before returning their results.
+QUIC tests require useful work in both directions and independent service progress.
+The node composition test uses the real checkpoint verifier before state commit.
 
-Keep the fixed database-abort, encoding, partial-write, and completed-download
-tests. Generated models supplement those tests. They do not replace integration
-coverage or permit enabling the paired transport before its qualification gate.
+The reusable allocation, execution, process-usage, and lock probes live in
+`zakura-test`. GetBlocks fields and response expectations stay in its test adapters.
+The admission models still run with both GetBlocks and GetPeers. Other messages'
+cadence, announcements, subscriptions, and authorization remain separate work.
+
+Keep the fixed database-abort, request-write, encoding, and partial-write tests.
+The completed-download fixture now observes consumed endings. Zero remaining body
+work alone cannot establish that an exchange finished.
 
 ## Adding a message
 
@@ -98,8 +105,11 @@ PROPTEST_CASES=256 PROPTEST_RNG_SEED=0 cargo nextest run --locked \
   -p zakura-network -p zakura-state --lib --profile regulation-properties
 ```
 
-The profile also selects fixed model witnesses, with no retries. Scheduled and
-manually dispatched unit-test workflows run 2,048 cases with the run ID as seed.
+The profile also selects fixed model witnesses and the new generated compliance
+cases, with no retries. Scheduled and manually dispatched workflows run 2,048
+cases with the run ID as seed. PR jobs run `regulation-compliance` even after a
+unit-test failure, so every compliance family reports its result. Scheduled jobs
+also run `regulation-load` with 64 rounds. See the compliance guide for bounds.
 `blocksync-regression` selects fixed checks separately. Long real QUIC measurements
 use `blocksync-transport-gate`, whose conditions are in the serving design.
 

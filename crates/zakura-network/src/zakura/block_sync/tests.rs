@@ -90,7 +90,7 @@ fn fake_sequential_blocks(count: u32) -> Vec<Arc<block::Block>> {
         .collect()
 }
 
-fn fake_blocks_in_range(start: u32, end: u32) -> Vec<Arc<block::Block>> {
+pub(super) fn fake_blocks_in_range(start: u32, end: u32) -> Vec<Arc<block::Block>> {
     let template = mainnet_block(&BLOCK_MAINNET_1_BYTES);
     (start..=end)
         .map(|height| fake_block_at_height(&template, block::Height(height)))

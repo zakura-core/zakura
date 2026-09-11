@@ -237,6 +237,15 @@ jobs:
     needs: select-packages
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # rustdoc on nightly 2026-09-07 and later hits a next-trait-solver ICE
+      # ("did not expect successful goal when collecting ambiguity errors",
+      # rust-lang/rust#124834) on the tower-batch-control `Service` impls in
+      # zakura-consensus, zakura-network, and zakura-state. Pin the last good
+      # nightly, and drop the pin once a current nightly documents these
+      # crates again. cargo-public-api has no toolchain option, so the rustup
+      # `+` shim selects the toolchain for its rustdoc builds.
+      PUBLIC_API_NIGHTLY: nightly-2026-09-06
     strategy:
       fail-fast: false
       matrix:
@@ -260,16 +269,17 @@ jobs:
       - name: Patch registry crates for semver rustdoc builds
         run: .github/workflows/scripts/patch_registry_for_semver.sh
 
-      - name: Install nightly rustdoc toolchain
-        run: rustup toolchain install nightly --profile minimal
+      - name: Install pinned nightly rustdoc toolchain
+        run: rustup toolchain install "$PUBLIC_API_NIGHTLY" --profile minimal
 
       - name: Diff against the latest published API
         env:
           PACKAGE: ${{ matrix.package }}
         run: |
           # cargo-public-api builds both the current and published crate with
-          # nightly. Nightly-only warnings are evidence, not the lint gate.
-          RUSTFLAGS='' cargo public-api diff latest -p "$PACKAGE" -sss
+          # the pinned nightly. Nightly-only warnings are evidence, not the
+          # lint gate.
+          RUSTFLAGS='' cargo "+$PUBLIC_API_NIGHTLY" public-api diff latest -p "$PACKAGE" -sss
 
   warm-baselines:
     name: Warm semver baselines

@@ -6784,6 +6784,148 @@ async fn add_peer_decode_failure_reports_malformed_and_cancels_connection() {
 }
 
 #[tokio::test]
+async fn add_peer_connection_shutdown_cancels_pending_block_validation() {
+    assert_pending_block_validation_cancellation(PendingValidationExit::ConnectionShutdown).await;
+}
+
+#[tokio::test]
+async fn add_peer_request_protocol_reject_cancels_pending_block_validation() {
+    assert_pending_block_validation_cancellation(PendingValidationExit::RequestReject).await;
+}
+
+#[tokio::test]
+async fn add_peer_startup_failure_preserves_pending_block_validation() {
+    assert_pending_block_validation_cancellation(PendingValidationExit::StartupFailure).await;
+}
+
+enum PendingValidationExit {
+    ConnectionShutdown,
+    RequestReject,
+    StartupFailure,
+}
+
+async fn assert_pending_block_validation_cancellation(exit: PendingValidationExit) {
+    use crate::zakura::{
+        transport::{OrderedStreamFailure, OrderedStreamFailureCause, ServiceStream},
+        CloseCause, ZAKURA_BLOCK_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_REQUESTS,
+    };
+
+    let config = ZakuraBlockSyncConfig::default();
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, _actions, _reactor_task) = spawn_block_sync_reactor(startup);
+    let input = &handle.routine_wiring.as_ref().unwrap().sequencer_input;
+    let held_capacity: Vec<_> = (0..input.max_capacity())
+        .map(|_| input.clone().try_reserve_owned().unwrap())
+        .collect();
+    let mut held_capacity = Some(held_capacity);
+    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let (inbound_tx, inbound_rx) = framed_channel(4);
+    let (outbound_tx, _outbound_rx) = framed_channel(4);
+    let (request_tx, request_rx) = framed_channel(1);
+    let (request_send, _requests) = framed_channel(1);
+    let cause = OrderedStreamFailureCause::default();
+    let connection_cancel = CancellationToken::new();
+    let session_cancel = connection_cancel.child_token();
+    let streams = HashMap::from([
+        (
+            ZAKURA_STREAM_BLOCK_SYNC,
+            ServiceStream::new(
+                0,
+                ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+                inbound_rx.with_failure_cause(cause.clone()),
+                outbound_tx,
+                session_cancel.clone(),
+            ),
+        ),
+        (
+            ZAKURA_STREAM_BLOCK_REQUESTS,
+            ServiceStream::new(0, 1, request_rx, request_send, session_cancel.clone()),
+        ),
+    ]);
+    let remote = crate::zakura::Peer::new_with_service_streams(
+        0,
+        peer(3),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC,
+        ServicePeerDirection::Inbound,
+        streams,
+        connection_cancel.clone(),
+        CloseCause::new(),
+    );
+    inbound_tx
+        .send(Frame {
+            message_type: u16::from(MSG_BS_BLOCK),
+            flags: 0,
+            payload: vec![MSG_BS_BLOCK],
+        })
+        .await
+        .unwrap();
+    if matches!(exit, PendingValidationExit::StartupFailure) {
+        cause.record(OrderedStreamFailure::RemoteClose);
+        session_cancel.cancel();
+    }
+    service.add_peer(remote);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while inbound_tx.capacity() != inbound_tx.max_capacity() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the ready session takes its pending frame for validation");
+    cause.record(OrderedStreamFailure::RemoteClose);
+    assert_eq!(service.peer_count(), 1, "validation still owns the session");
+    assert!(!connection_cancel.is_cancelled());
+
+    if matches!(exit, PendingValidationExit::RequestReject) {
+        request_tx
+            .send(Frame {
+                message_type: u16::from(MSG_BS_STATUS),
+                flags: 0,
+                payload: Vec::new(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), connection_cancel.cancelled())
+            .await
+            .expect("a request protocol reject interrupts pending block validation");
+    } else if matches!(exit, PendingValidationExit::StartupFailure) {
+        drop(held_capacity.take());
+        tokio::time::timeout(Duration::from_secs(1), connection_cancel.cancelled())
+            .await
+            .expect("a frame queued before startup is validated after stream failure");
+    } else {
+        session_cancel.cancel();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            service.peer_count(),
+            1,
+            "validation survives session failure"
+        );
+        connection_cancel.cancel();
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while service.peer_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("connection shutdown releases the session without decode capacity");
+    if held_capacity.is_some() {
+        assert_eq!(input.capacity(), 0);
+    }
+}
+
+#[tokio::test]
 async fn registry_add_peer_requires_negotiated_block_sync_capability() {
     let service = BlockSyncService::new_for_test(ZakuraBlockSyncConfig::default());
     let current = service.current_sessions_for_test();

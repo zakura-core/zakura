@@ -18,7 +18,7 @@ struct Client {
 }
 
 async fn connect_raw(
-    address: NodeAddr,
+    address: EndpointAddr,
     seed: u64,
 ) -> Result<(Endpoint, ConnectedPeer, ClientSession), BoxError> {
     let limits = ZakuraLocalLimits::from_config(&Config::default());

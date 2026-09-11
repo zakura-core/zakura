@@ -112,11 +112,11 @@ impl ZakuraTestCluster {
     pub async fn await_all_connected(&self, timeout: Duration) -> Result<(), BoxError> {
         let mut ids = Vec::with_capacity(self.nodes.len());
         for node in &self.nodes {
-            ids.push(node.node_addr().await.node_id.as_bytes().to_vec());
+            ids.push(node.node_addr().await.id.as_bytes().to_vec());
         }
 
         for node in &self.nodes {
-            let own_id = node.node_addr().await.node_id.as_bytes().to_vec();
+            let own_id = node.node_addr().await.id.as_bytes().to_vec();
             let expected_peers: Vec<Vec<u8>> =
                 ids.iter().filter(|id| **id != own_id).cloned().collect();
             let registered = node.supervisor().subscribe();
@@ -1354,8 +1354,8 @@ mod tests {
             .supported_capabilities(CUSTOM_FRAME_CAP_CAPABILITY)
             .spawn()
             .await?;
-        let peer_a = ZakuraPeerId::new(node_a.node_addr().await.node_id.as_bytes().to_vec())?;
-        let peer_b = ZakuraPeerId::new(node_b.node_addr().await.node_id.as_bytes().to_vec())?;
+        let peer_a = ZakuraPeerId::new(node_a.node_addr().await.id.as_bytes().to_vec())?;
+        let peer_b = ZakuraPeerId::new(node_b.node_addr().await.id.as_bytes().to_vec())?;
 
         node_a
             .connect_native(&node_b, Duration::from_secs(5))
@@ -1641,7 +1641,7 @@ mod tests {
     {
         let _guard = zakura_test::init();
         let victim = ZakuraTestNode::builder(26).spawn().await?;
-        let victim_node_id = victim.node_addr().await.node_id;
+        let victim_node_id = victim.node_addr().await.id;
 
         // A peer that did not negotiate the discovery capability cannot open a
         // discovery stream and receives no service response.
@@ -1749,7 +1749,7 @@ mod tests {
             .discovery_direct_addrs(vec![addr_b])
             .spawn()
             .await?;
-        let b_id = b.node_addr().await.node_id;
+        let b_id = b.node_addr().await.id;
 
         a.connect_native(&b, Duration::from_secs(5)).await?;
 

@@ -88,6 +88,15 @@ that deadline. Duplicate members, mismatched identifiers, and invalid declaratio
 cannot complete a session. Expiry releases every arrived member and defers another
 offer through the existing cooldown.
 
+A different identifier can be a retry racing an abandoned offer's reset. The
+transport discards both offers and applies the same cooldown, keeping unrelated
+services connected. Offers during the cooldown cannot reserve service capacity
+or extend the cooldown.
+
+While a remote session is active or its workers are retiring, additional offers
+for that service are reset before reserving service capacity. The existing session
+and unrelated services stay connected. A new offer can proceed after cleanup.
+
 `reserve_session()` charges service capacity once during setup.
 `SessionResources::admitted()` signals complete setup.
 The workers and application senders retain the shared resource owner until they
@@ -108,6 +117,12 @@ The transport records the first remote close or write timeout before cancelling
 its session. Block sync settles that failure against unanswered download work,
 including when cancellation wins over receiving EOF. Local cancellation alone
 does not charge the peer for a stall.
+
+Buffered block responses retain their bounded raw frames until decode capacity
+is available, even after a remote session failure. Block sync validates those
+responses before settling unanswered work, so malformed payloads cannot bypass
+peer rejection during local backpressure. Connection shutdown still cancels the
+pending validation and releases the session.
 
 The transport reports session exit after every worker and reader finishes.
 Reopening follows the service's policy and demand. Ephemeral request completion

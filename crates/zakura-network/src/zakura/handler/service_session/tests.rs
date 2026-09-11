@@ -255,7 +255,7 @@ impl Fixture {
             )
             .with_endpoint(endpoint)
         };
-        let server_opens = i_open_collision_winner(&server.node_id(), &client.node_id());
+        let server_opens = i_open_collision_winner(&server.id(), &client.id());
         let server_handler = handler(
             server_tx,
             server_sibling_tx,
@@ -509,11 +509,12 @@ impl ProtocolHandler for RawConnection {
 async fn raw_connection() -> Result<(Router, Endpoint, Connection, Connection), BoxError> {
     let local = ZakuraLocalLimits::from_config(&Config::default());
     let transport = || {
-        let mut transport = local.transport_config();
-        transport.stream_receive_window(64_000u32.into());
-        transport.receive_window(128_000u32.into());
-        transport.send_window(64_000);
-        transport
+        local
+            .transport_config_builder()
+            .stream_receive_window(64_000u32.into())
+            .receive_window(128_000u32.into())
+            .send_window(64_000)
+            .build()
     };
     let server = LocalEndpointFactory::with_transport_config(transport())
         .endpoint(93201)
@@ -600,12 +601,17 @@ async fn invalid_third_member_releases_the_entire_pending_session() -> Result<()
         fixture.wait_for_slots(0, TEST_TIMEOUT).await?;
         let _invalid = fixture.offer(stream, Some(id)).await?;
         fixture.wait_for_slots(1, Duration::from_secs(1)).await?;
-        timeout(Duration::from_secs(1), async {
-            while !fixture.serving.is_finished() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await?;
+        if id == 10 {
+            assert!(fixture.connection.close_reason().is_none());
+            assert!(!fixture.serving.is_finished());
+        } else {
+            timeout(Duration::from_secs(1), async {
+                while !fixture.serving.is_finished() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await?;
+        }
         assert!(fixture.sessions.try_recv().is_err());
         fixture.close().await?;
     }
@@ -649,18 +655,19 @@ impl RawFixture {
         let shutdown = handler.shutdown.clone();
         let mut limits = local.clamp(&local.initial_limits());
         limits.prelude_timeout = setup_timeout;
-        let peer_id = ZakuraPeerId::new(client.node_id().as_bytes().to_vec())?;
+        let peer_id = ZakuraPeerId::new(client.id().as_bytes().to_vec())?;
         let transcript_hash = native_connection_transcript_hash(
             ServicePeerDirection::Inbound,
-            &router.endpoint().node_id(),
-            &client.node_id(),
+            &router.endpoint().id(),
+            &client.id(),
         );
+        let remote_ip = confirmed_remote_ip(&remote);
         let serving = AbortOnDropHandle::new(tokio::spawn(async move {
             handler
                 .register_and_serve(
                     remote,
                     peer_id,
-                    None,
+                    remote_ip,
                     ConnectionServeContext {
                         limits,
                         accepted_capabilities: DATA.capability | SIBLING.capability,
@@ -856,6 +863,73 @@ async fn withheld_pair_id_does_not_reserve_service_capacity() -> Result<(), BoxE
 }
 
 #[tokio::test]
+async fn abandoned_half_pair_retry_preserves_the_connection() -> Result<(), BoxError> {
+    // Also cover a reset arriving after the retry, since QUIC streams can reorder.
+    for reset_before_retry in [true, false] {
+        let setup_timeout = Duration::from_secs(1);
+        let mut fixture = RawFixture::start(1, setup_timeout).await?;
+        let (mut sibling_send, _sibling_recv) = fixture.offer(SIBLING, None).await?;
+        let mut sibling = timeout(TEST_TIMEOUT, fixture.siblings.recv())
+            .await?
+            .ok_or("missing sibling")?;
+        let (mut sibling_recv, _sibling_send) = sibling.take_stream(SIBLING.kind).unwrap();
+        let (send, recv) = fixture.offer(DATA, Some(1)).await?;
+        let mut abandoned = Some(SetupIo::new(send, recv));
+        fixture.wait_for_slots(0, TEST_TIMEOUT).await?;
+        if reset_before_retry {
+            drop(abandoned.take());
+        }
+
+        let (_retry_send, mut retry_recv) = fixture.offer(DATA, Some(2)).await?;
+        assert!(timeout(TEST_TIMEOUT, retry_recv.read_exact(&mut [0; 1]))
+            .await?
+            .is_err());
+        fixture.wait_for_slots(1, TEST_TIMEOUT).await?;
+        drop(abandoned);
+        assert!(
+            !sibling.cancel_token().is_cancelled(),
+            "retrying an abandoned half pair must preserve sibling services"
+        );
+        assert!(fixture.sessions.try_recv().is_err());
+        let ping = frame(2, 14, 8);
+        sibling_send
+            .write_all(&ping.encode(SIBLING.frame_cap)?)
+            .await?;
+        assert_eq!(
+            timeout(TEST_TIMEOUT, sibling_recv.recv()).await?,
+            Some(ping)
+        );
+
+        let (_early_send, mut early_recv) = fixture.offer(DATA, Some(3)).await?;
+        assert!(timeout(TEST_TIMEOUT, early_recv.read_exact(&mut [0; 1]))
+            .await?
+            .is_err());
+        assert_eq!(fixture.capacity().available_permits(), 1);
+        let outbound = fixture
+            .service
+            .reserve_session(ServicePeerDirection::Outbound)?;
+        drop(outbound);
+
+        tokio::time::sleep(setup_timeout).await;
+        let _data = fixture.offer(DATA, Some(4)).await?;
+        let (mut requests_send, _requests_recv) = fixture.offer(REQUESTS, Some(4)).await?;
+        let mut replacement = Session::receive(&mut fixture.sessions).await?;
+        let request = frame(1, 7, 8);
+        requests_send
+            .write_all(&request.encode(REQUESTS.frame_cap)?)
+            .await?;
+        assert_eq!(
+            timeout(TEST_TIMEOUT, replacement.request_recv.recv()).await?,
+            Some(request)
+        );
+        assert_eq!(fixture.capacity().available_permits(), 0);
+        assert!(!sibling.cancel_token().is_cancelled());
+        fixture.close().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn slow_pair_setup_does_not_delay_expiry_or_shutdown() -> Result<(), BoxError> {
     let fixture = RawFixture::start(1, Duration::from_secs(2)).await?;
     let _first = fixture.offer(DATA, Some(1)).await?;
@@ -893,6 +967,73 @@ async fn expired_pair_cannot_reclaim_capacity_before_an_outgoing_session() -> Re
 }
 
 #[tokio::test]
+async fn duplicate_pair_offers_leave_capacity_for_other_peers() -> Result<(), BoxError> {
+    let mut fixture = RawFixture::start(2, TEST_TIMEOUT).await?;
+    let (mut sibling_send, _sibling_recv) = fixture.offer(SIBLING, None).await?;
+    let mut sibling = timeout(TEST_TIMEOUT, fixture.siblings.recv())
+        .await?
+        .ok_or("missing sibling")?;
+    let (mut sibling_recv, _sibling_send) = sibling.take_stream(SIBLING.kind).unwrap();
+    let (_data_send, mut data_recv) = fixture.offer(DATA, Some(1)).await?;
+    let (mut request_send, _request_recv) = fixture.offer(REQUESTS, Some(1)).await?;
+    let mut active = Session::receive(&mut fixture.sessions).await?;
+    assert_eq!(fixture.capacity().available_permits(), 1);
+
+    // Either role can arrive first, but neither may reserve a second session.
+    for stream in [DATA, REQUESTS] {
+        let (_duplicate_send, mut duplicate_recv) = fixture.offer(stream, Some(2)).await?;
+        assert!(timeout(
+            Duration::from_secs(2),
+            duplicate_recv.read_exact(&mut [0; 1])
+        )
+        .await
+        .expect("duplicate offers must be rejected before the setup deadline")
+        .is_err());
+        assert_eq!(fixture.capacity().available_permits(), 1);
+        let other_peer = fixture
+            .service
+            .reserve_session(ServicePeerDirection::Inbound)?;
+        assert_eq!(fixture.capacity().available_permits(), 0);
+        drop(other_peer);
+
+        let request = frame(1, 7, 8);
+        request_send
+            .write_all(&request.encode(REQUESTS.frame_cap)?)
+            .await?;
+        assert_eq!(
+            timeout(TEST_TIMEOUT, active.request_recv.recv()).await?,
+            Some(request)
+        );
+        let response = frame(2, 8, 64);
+        timeout(TEST_TIMEOUT, active.data_send.send(response.clone())).await??;
+        assert_eq!(
+            read_frame(
+                &mut data_recv,
+                DATA.frame_cap,
+                &[],
+                None,
+                TEST_TIMEOUT,
+                Some(TEST_TIMEOUT),
+            )
+            .await?,
+            response
+        );
+        let ping = frame(3, 9, 8);
+        sibling_send
+            .write_all(&ping.encode(SIBLING.frame_cap)?)
+            .await?;
+        assert_eq!(
+            timeout(TEST_TIMEOUT, sibling_recv.recv()).await?,
+            Some(ping)
+        );
+        assert!(!active.cancel.is_cancelled());
+        assert!(!sibling.cancel_token().is_cancelled());
+        assert!(fixture.sessions.try_recv().is_err());
+    }
+    fixture.close().await
+}
+
+#[tokio::test]
 async fn paired_replacement_during_cleanup_preserves_the_connection() -> Result<(), BoxError> {
     let mut fixture = RawFixture::start(2, Duration::from_secs(3)).await?;
     let (mut sibling_send, _sibling_recv) = fixture.offer(SIBLING, None).await?;
@@ -905,39 +1046,28 @@ async fn paired_replacement_during_cleanup_preserves_the_connection() -> Result<
     let old = Session::receive(&mut fixture.sessions).await?;
 
     let (mut _new_data_send, mut new_data_recv) = fixture.offer(DATA, Some(2)).await?;
-    fixture.wait_for_slots(0, TEST_TIMEOUT).await?;
-    let (mut new_requests_send, mut _new_requests_recv) = fixture.offer(REQUESTS, None).await?;
+    assert!(timeout(
+        Duration::from_secs(1),
+        new_data_recv.read_exact(&mut [0; 1])
+    )
+    .await?
+    .is_err());
+    assert_eq!(fixture.capacity().available_permits(), 1);
+    let (mut new_requests_send, _new_requests_recv) = fixture.offer(REQUESTS, None).await?;
     // Keep the new setup read pending while the old pair's workers exit.
     tokio::time::sleep(Duration::from_millis(200)).await;
     old_data.0.reset(0u32.into())?;
     old_data.1.stop(0u32.into())?;
     old_requests.0.reset(0u32.into())?;
     old_requests.1.stop(0u32.into())?;
-    new_requests_send.write_all(&2u64.to_le_bytes()).await?;
     timeout(TEST_TIMEOUT, old.cancel.cancelled()).await?;
     let old_id = old.id;
     drop(old);
-    let mut byte = [0; 1];
-    let first_offer = tokio::select! {
-        session = Session::receive(&mut fixture.sessions) => Some(session?),
-        closed = new_data_recv.read_exact(&mut byte) => {
-            assert!(closed.is_err());
-            None
-        }
-    };
-    let mut replacement = match first_offer {
-        Some(session) => session,
-        None => {
-            assert!(
-                !sibling.cancel_token().is_cancelled(),
-                "a raced offer must not close the connection"
-            );
-            fixture.wait_for_slots(2, TEST_TIMEOUT).await?;
-            (_new_data_send, new_data_recv) = fixture.offer(DATA, Some(3)).await?;
-            (new_requests_send, _new_requests_recv) = fixture.offer(REQUESTS, Some(3)).await?;
-            Session::receive(&mut fixture.sessions).await?
-        }
-    };
+    fixture.wait_for_slots(2, TEST_TIMEOUT).await?;
+    new_requests_send.write_all(&2u64.to_le_bytes()).await?;
+    fixture.wait_for_slots(1, TEST_TIMEOUT).await?;
+    (_new_data_send, new_data_recv) = fixture.offer(DATA, Some(2)).await?;
+    let mut replacement = Session::receive(&mut fixture.sessions).await?;
     assert_ne!(replacement.id, old_id);
 
     let request = frame(1, 7, 8);
@@ -981,7 +1111,7 @@ fn raw_worker_context(client: &Endpoint, slots: Arc<Semaphore>) -> StreamWorkerC
     let (freshness_tx, _freshness_rx) = watch::channel(Instant::now());
     StreamWorkerContext {
         conn: ZakuraConnTrace::without_peer(1),
-        peer_id: ZakuraPeerId::new(client.node_id().as_bytes().to_vec()).unwrap(),
+        peer_id: ZakuraPeerId::new(client.id().as_bytes().to_vec()).unwrap(),
         stream_id: 1,
         _permit: slots.try_acquire_owned().unwrap(),
         limits: local.clamp(&local.initial_limits()),
@@ -1184,7 +1314,7 @@ async fn incomplete_pairs_expire_and_mismatched_roles_release_stream_permits(
     );
     let mut limits = local.clamp(&local.initial_limits());
     limits.prelude_timeout = Duration::from_millis(100);
-    let peer = ZakuraPeerId::new(client.node_id().as_bytes().to_vec())?;
+    let peer = ZakuraPeerId::new(client.id().as_bytes().to_vec())?;
     let (freshness, _freshness_rx) = watch::channel(Instant::now());
     let cancel = CancellationToken::new();
     let mut pending = PendingSessions::default();
@@ -1252,9 +1382,16 @@ async fn incomplete_pairs_expire_and_mismatched_roles_release_stream_permits(
         }
     }
     assert!(
-        cancel.is_cancelled(),
-        "different pair identifiers cannot be combined"
+        !cancel.is_cancelled(),
+        "different pair identifiers retire only the incomplete session"
     );
+    assert!(pending
+        .reserve_or_share(
+            &handler.registry.session_layout(DATA).unwrap(),
+            &handler.registry,
+            ServicePeerDirection::Inbound
+        )
+        .is_err());
     assert_eq!(permits.available_permits(), 2);
     assert!(pending.deadline().is_none());
     assert!(

@@ -3,6 +3,9 @@
 
 use super::*;
 
+// The initial download precedes twenty session replacements.
+const REOPEN_DOWNLOAD_ROUNDS: u32 = 21;
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "standalone 240-second impaired-link activation gate"]
 async fn paired_download_completes_with_request_pressure_and_packet_loss() -> Result<(), BoxError> {
@@ -65,23 +68,23 @@ async fn twenty_saturated_connections_release_capacity_and_complete_retries() ->
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "transport acceptance gate: twenty matched downloads and real reopen backoff"]
+#[ignore = "transport acceptance gate: twenty pair replacements and real reopen backoff"]
 async fn twenty_pair_reopens_complete_matched_downloads_under_request_pressure(
 ) -> Result<(), BoxError> {
     eprintln!(
-        "twenty matched downloads under request pressure: {:?}",
-        download_rounds(true, false, 20).await?
+        "initial download and twenty replacements under request pressure: {:?}",
+        download_rounds(true, false, REOPEN_DOWNLOAD_ROUNDS).await?
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "standalone twenty-round impaired-link activation gate"]
+#[ignore = "standalone twenty-replacement impaired-link activation gate"]
 async fn twenty_pair_reopens_complete_matched_downloads_under_request_pressure_and_loss(
 ) -> Result<(), BoxError> {
     eprintln!(
-        "twenty matched downloads under request pressure and loss: {:?}",
-        download_rounds(true, true, 20).await?
+        "initial download and twenty replacements under request pressure and loss: {:?}",
+        download_rounds(true, true, REOPEN_DOWNLOAD_ROUNDS).await?
     );
     Ok(())
 }

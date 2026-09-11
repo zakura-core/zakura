@@ -754,7 +754,9 @@ impl Service for BlockSyncService {
                 } else {
                     true
                 };
-                let result = if !reactor_ready || run_cancel.is_cancelled() {
+                let result = if (!reactor_ready || run_cancel.is_cancelled())
+                    && recv.failure().is_none()
+                {
                     Ok(())
                 } else {
                     match routine_wiring {
@@ -783,7 +785,13 @@ impl Service for BlockSyncService {
                                 run_cancel.clone(),
                                 wiring.trace.clone(),
                             );
-                            let download = routine.run();
+                            let download = async {
+                                tokio::select! {
+                                    biased;
+                                    () = connection_cancel_token.cancelled() => Ok(()),
+                                    result = routine.run() => result,
+                                }
+                            };
                             tokio::pin!(download);
                             let result = tokio::select! {
                                 result = &mut download => result,
@@ -792,13 +800,15 @@ impl Service for BlockSyncService {
                                     local_status.expect("paired serving has a local status watch"),
                                     source, wiring.trace,
                                 ) => {
-                                    // Do not drop unanswered downloads before their
-                                    // stream-failure policy has been applied.
+                                    // A fatal request reject ends the connection.
+                                    // Otherwise settle downloads before closing the pair.
                                     run_cancel.cancel();
-                                    match (result, download.await) {
-                                        (Err(error @ SinkReject::Protocol(_)), _)
-                                        | (_, Err(error @ SinkReject::Protocol(_))) => Err(error),
-                                        (serving, download) => serving.and(download),
+                                    match result {
+                                        Err(error @ SinkReject::Protocol(_)) => Err(error),
+                                        serving => match download.await {
+                                            Err(error @ SinkReject::Protocol(_)) => Err(error),
+                                            download => serving.and(download),
+                                        },
                                     }
                                 },
                             };

@@ -969,6 +969,7 @@ async fn setup(
     let state_service = ServiceBuilder::new().buffer(10).service(state_service);
 
     // Network
+    let identity_dir = tempfile::tempdir().expect("temporary network identity directory");
     let network_config = NetworkConfig {
         network: network.clone(),
         listen_addr: config_listen_addr,
@@ -977,10 +978,16 @@ async fn setup(
         initial_mainnet_peers: IndexSet::new(),
         initial_testnet_peers: IndexSet::new(),
         cache_dir: CacheDir::disabled(),
+        identity_dir: identity_dir.path().to_path_buf(),
 
         // Optionally run the Zakura P2P-v2 endpoint alongside the legacy TCP
         // stack so the dual-stack wiring is exercised (coexistence tests).
         p2p_stack,
+        zakura: zakura_network::zakura::ZakuraConfig {
+            listen_addr: Some(config_listen_addr),
+            bootstrap_peers: Vec::new(),
+            ..Default::default()
+        },
 
         ..NetworkConfig::default()
     };

@@ -2,7 +2,7 @@
 
 use std::{fmt, net::SocketAddr, sync::Arc, time::Duration};
 
-use iroh::{endpoint::TransportConfig, protocol::Router, NodeAddr, NodeId};
+use iroh::{endpoint::QuicTransportConfig, protocol::Router, EndpointAddr, EndpointId};
 use tokio::{
     sync::{mpsc, Mutex},
     task::JoinHandle,
@@ -49,7 +49,7 @@ impl ZakuraTestNode {
     }
 
     /// Current Iroh node address.
-    pub async fn node_addr(&self) -> NodeAddr {
+    pub async fn node_addr(&self) -> EndpointAddr {
         self.endpoint.node_addr().await
     }
 
@@ -118,10 +118,10 @@ impl ZakuraTestNode {
     pub async fn insert_static_discovery_candidate(
         &self,
         peer: &ZakuraTestNode,
-    ) -> Result<NodeId, BoxError> {
+    ) -> Result<EndpointId, BoxError> {
         let node_addr = peer.node_addr().await;
-        let node_id = node_addr.node_id;
-        self.endpoint.add_node_addr(node_addr.clone())?;
+        let node_id = node_addr.id;
+
         self.discovery.insert_static_candidate(node_addr).await?;
         Ok(node_id)
     }
@@ -136,17 +136,16 @@ impl ZakuraTestNode {
         self.connect_native_to_addr(peer_addr, timeout).await
     }
 
-    /// Start a native dial to an explicit [`NodeAddr`] and wait until this node
+    /// Start a native dial to an explicit [`EndpointAddr`] and wait until this node
     /// registers it. Lets tests advertise a specific direct-address list (for
     /// example a decoy address ahead of the reachable one).
     pub async fn connect_native_to_addr(
         &self,
-        peer_addr: NodeAddr,
+        peer_addr: EndpointAddr,
         timeout: Duration,
     ) -> Result<(), BoxError> {
-        self.endpoint.add_node_addr(peer_addr.clone())?;
         let mut handle = self.endpoint.spawn_native_dial(peer_addr.clone());
-        let peer_id = peer_addr.node_id.as_bytes().to_vec();
+        let peer_id = peer_addr.id.as_bytes().to_vec();
         let mut peer_set_rx = self.supervisor().subscribe();
 
         let result = tokio::time::timeout(timeout, async {
@@ -216,7 +215,7 @@ pub struct ZakuraTestNodeBuilder {
     seed: u64,
     limits: ZakuraLocalLimits,
     max_connections_per_ip: usize,
-    transport_config: Option<TransportConfig>,
+    transport_config: Option<QuicTransportConfig>,
     legacy_upgrade: bool,
     tracer: JsonlTracer,
     service: Option<Arc<dyn Service>>,
@@ -317,10 +316,8 @@ impl ZakuraTestNodeBuilder {
         self
     }
 
-    /// Mutate the transport configuration used by the endpoint factory.
-    pub fn transport(mut self, configure: impl FnOnce(&mut TransportConfig)) -> Self {
-        let mut transport = self.limits.transport_config();
-        configure(&mut transport);
+    /// Set the complete transport configuration used by the endpoint factory.
+    pub fn transport(mut self, transport: QuicTransportConfig) -> Self {
         self.transport_config = Some(transport);
         self
     }
@@ -684,15 +681,16 @@ mod tests {
 
     // Pin a peer's advertised addresses to its IPv4 loopback path so same-host
     // dials share one source IP (test nodes also bind an IPv6 loopback socket).
-    fn ipv4_loopback_addr(peer_addr: &NodeAddr) -> NodeAddr {
-        let addr = NodeAddr::new(peer_addr.node_id).with_direct_addresses(
-            peer_addr
-                .direct_addresses()
+    fn ipv4_loopback_addr(peer_addr: &EndpointAddr) -> EndpointAddr {
+        let addr = EndpointAddr::new(peer_addr.id).with_addrs(
+            (peer_addr
+                .ip_addrs()
                 .copied()
-                .filter(|addr| addr.is_ipv4() && addr.ip().is_loopback()),
+                .filter(|addr| addr.is_ipv4() && addr.ip().is_loopback()))
+            .map(iroh::TransportAddr::Ip),
         );
         assert!(
-            addr.direct_addresses().next().is_some(),
+            addr.ip_addrs().next().is_some(),
             "test peer must advertise an IPv4 loopback direct address",
         );
         addr
@@ -718,16 +716,18 @@ mod tests {
         // Advertise an unreachable address before peer1's loopback address.
         // Charge the confirmed loopback path instead of the advertised address.
         //
-        // `NodeAddr::direct_addresses` stores addresses in a `BTreeSet`.
+        // `EndpointAddr::direct_addresses` stores addresses in a `BTreeSet`.
         // The decoy must sort below 127.0.0.1 to expose the previous behavior.
         // RFC 6598 shared address space meets that requirement and is not routable.
         let peer1_loopback = ipv4_loopback_addr(&peer1.node_addr().await);
         let decoy = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)), 1);
-        let decoy_first = NodeAddr::new(peer1_loopback.node_id).with_direct_addresses(
-            std::iter::once(decoy).chain(peer1_loopback.direct_addresses().copied()),
+        let decoy_first = EndpointAddr::new(peer1_loopback.id).with_addrs(
+            std::iter::once(decoy)
+                .chain(peer1_loopback.ip_addrs().copied())
+                .map(iroh::TransportAddr::Ip),
         );
         assert_eq!(
-            decoy_first.direct_addresses().next(),
+            decoy_first.ip_addrs().next(),
             Some(&decoy),
             "the decoy must sort first, or this test cannot discriminate",
         );

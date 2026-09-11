@@ -79,15 +79,15 @@ notes = "Introduced by the Zakura Common fork migration; retain this exact-versi
 version = "0.21.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.aes-gcm]]
+version = "0.10.3"
+criteria = "safe-to-deploy"
+notes = "Audit hold: the documented plaintext bound of 2^36 bytes exceeds the 2^36 - 32 byte limit of NIST SP 800-38D section 5.2.1.1, and the cipher 0.4.4 counter helper checks remaining blocks with remainder instead of division, so oversized GCM input can wrap the counter. noq-proto uses this crate only for QUIC Retry integrity tags over empty plaintext, which cannot reach that bound. Upstream has corrected the length bound but no 0.10.x patch release exists as of 2026-09-08. Retain the exemption until a fixed release is adopted or the restricted use is certified explicitly."
+
 [[exemptions.async_io_stream]]
 version = "0.3.3"
 criteria = "safe-to-deploy"
 notes = "Audit held: AsyncBufRead::poll_fill_buf accepts an empty chunk from the wrapped TryStream but leaves its internal state unset, then reaches unreachable!(). A valid empty stream item can therefore panic safe callers; retain this exemption pending an upstream fix or replacement."
-
-[[exemptions.bounded-integer]]
-version = "0.5.8"
-criteria = "safe-to-deploy"
-notes = "Audit hold: the optional bytemuck1 feature implements unsafe Contiguous for every const MIN and MAX without enforcing MIN <= MAX. Bounded<5, 4> therefore violates Bytemuck's explicit inhabited-range contract. Zakura enables only the types feature, so this path is not currently deployed; retain the exemption pending an upstream bound or feature-scoped audit policy."
 
 [[exemptions.canonical-path]]
 version = "2.0.2"
@@ -112,11 +112,6 @@ version = "0.2.0-rc.1"
 criteria = "safe-to-deploy"
 notes = "Audit deferred: hazmat::SerializableState uses an 8-byte element width for [u128; N], causing serialize() to panic; reproduced with [u128; 1]."
 
-[[exemptions.crypto_box]]
-version = "0.9.1"
-criteria = "safe-to-deploy"
-notes = "Audit held: the high-level CryptoBox constructor accepts any 32-byte peer public key and derives a key without rejecting a non-contributory X25519 result. A low-order peer key can therefore produce a predictable all-zero shared secret; retain the exemption until the API enforces contributory behavior or clearly delegates that validation to callers."
-
 [[exemptions.data-encoding]]
 version = "2.11.0"
 criteria = "safe-to-deploy"
@@ -126,6 +121,11 @@ notes = "Audit hold: the doc-hidden Encoding tuple field and Encoding::internal_
 version = "0.2.3"
 criteria = "safe-to-deploy"
 notes = "Audit deferred: the safe single-sink wrappers preserve the documented exclusivity contract and ordinary tests pass, but the crate's core is a custom unsafe lock-free two-slot Waker state machine. Its published higher-bound Loom slot-reuse exploration did not complete within the batch review window; retain the exemption pending a dedicated concurrency review or completed model run."
+
+[[exemptions.dlopen2]]
+version = "0.8.2"
+criteria = "safe-to-deploy"
+notes = "Audit hold: the safe Library::open_with_flags forwards an arbitrary OsStr to the Unix helper, which builds the path with CStr::from_bytes_with_nul_unchecked without rejecting interior NUL bytes (src/raw/common.rs, src/raw/unix.rs), so a safe caller can violate that precondition and dlopen observes only the prefix; the accepted 0.5.0 base reaches the same helper through Library::open. The new into_raw methods return borrowed handles while the owner keeps Drop responsibility without documenting that the caller must not close them. netdev passes only fixed platform library names, so peer input cannot reach either path. Three unit tests, 18 doctests and nine targeted macOS loader checks pass; Windows, Linux and Android paths were source-reviewed only. Retain the exemption until upstream validates paths with CString or an equivalent checked conversion."
 
 [[exemptions.ff]]
 version = "0.14.0"
@@ -168,11 +168,6 @@ version = "0.25.2"
 criteria = "safe-to-deploy"
 notes = "Audit hold: two RustSec advisories are open against this version and cargo audit reports both for this workspace. RUSTSEC-2026-0119 is CPU exhaustion during message encoding from O(n squared) name compression, fixed in 0.26.1; RUSTSEC-2026-0118 is an unbounded loop in NSEC3 closest-encloser proof validation on cross-zone responses, for which no fixed release is listed. Both are reachable from untrusted DNS responses. The crate reaches this tree through hickory-resolver under iroh and iroh-relay, so clearing the exemption means moving past the Iroh 0.92 pin to hickory 0.26 or later. Retain the exemption until then."
 
-[[exemptions.hmac-sha256]]
-version = "1.1.14"
-criteria = "safe-to-deploy"
-notes = "Audit held: HKDF::expand documents a maximum of 8160 output bytes, but rejects exactly 8160 and increments a u8 counter after the final block, which panics with overflow checks for supported lengths 8129 through 8159. A version-wide safe-to-deploy certification is deferred pending an upstream fix."
-
 [[exemptions.icu_normalizer_data]]
 version = "2.2.0"
 criteria = "safe-to-deploy"
@@ -186,11 +181,6 @@ notes = "Audit held: the generated data package embeds 249 unsafe unchecked zero
 [[exemptions.indicatif]]
 version = "0.17.11"
 criteria = "safe-to-deploy"
-
-[[exemptions.iroh-metrics]]
-version = "0.35.0"
-criteria = "safe-to-deploy"
-notes = "Audit held: start_metrics_exporter unwraps reading the body of any non-success response from the remote exporter endpoint. A network/body read failure can therefore panic the exporter task; retain the exemption pending fallible error propagation."
 
 [[exemptions.libm]]
 version = "0.2.16"
@@ -212,10 +202,20 @@ version = "0.7.0"
 criteria = "safe-to-deploy"
 notes = "Audit held: without the optional getrandom dependency, constructors ignore the success result from direct system-entropy calls; Linux also treats a short getrandom read as success, and Windows reports RtlGenRandom success as false. The public rdseed helper additionally writes full eight-byte chunks into arbitrary output lengths and can panic on a non-multiple-of-eight slice. Zakura currently enables the getrandom feature, but retain the version-wide exemption pending upstream fixes."
 
-[[exemptions.netlink-packet-utils]]
-version = "0.5.2"
+[[exemptions.netdev]]
+version = "0.45.1"
 criteria = "safe-to-deploy"
-notes = "Audit held: the public Nla trait permits value_len values above u16::MAX, but Emitable truncates value_len to u16 before constructing the value slice. A large safe custom Nla can therefore panic during emit or produce a truncated header; retain this exemption pending an enforced length bound."
+notes = "Audit hold: the Windows address conversion forms a SOCKADDR_INET reference from every non-null SOCKET_ADDRESS without checking iSockaddrLength (src/os/windows/interface.rs), so an IPv4 entry supplied in the shorter SOCKADDR_IN form is an out-of-bounds typed read before the family match narrows the access. netwatch 0.19.3 selects this line only for Windows targets and 0.46.x elsewhere; 0.46.2 replaces the view with length-checked unaligned copies and carries a delta audit from this version. Seventeen unit tests and one live macOS enumeration pass. Retain the exemption until netwatch requires the fixed line on Windows."
+
+[[exemptions.netlink-packet-route]]
+version = "0.31.0"
+criteria = "safe-to-deploy"
+notes = "Audit hold: the delta from the audited 0.24.0 introduces two panics reachable from parsed messages: IFLA_WIRELESS attribute values shorter than the wireless event header index past the payload (src/link/wireless.rs), and RouteIp6Tunnel::value_len returns the Rust struct size instead of the payload length, so re-emitting a route whose IPv6 tunnel nest holds an unknown sub-attribute panics in netlink-packet-core (src/route/lwtunnel.rs). The crate still has no unsafe, FFI, build script or ambient capability, and a 2,052,741-case harness over seeded, truncated, mutated and structured messages attributed exactly these sites to the delta. Route and link messages reach netdev and netwatch only from the Linux kernel over rtnetlink, so peers cannot supply them, and the crate's own tests only build on Linux. Retain the exemption until upstream adds the wireless length check, already present in 0.33.0, and fixes the tunnel value length."
+
+[[exemptions.netlink-packet-route]]
+version = "0.33.0"
+criteria = "safe-to-deploy"
+notes = "Audit hold: this release fixes every parse panic carried by 0.31.0, including the wireless header check, realm, seg6 and cache-info buffers, and its 58 new zerocopy buffer types are packed, unaligned and parsed with fallible prefix reads, but the new bareudp link-info parser copies IFLA_BAREUDP_SRCPORT_MIN into a two-byte array without a length check (src/link/link_info/bareudp.rs), so a link message with a bareudp kind and any other payload length panics; the inherited RouteIp6Tunnel::value_len defect also remains (src/route/lwtunnel.rs). The crate has no unsafe, FFI, build script or ambient capability, and the same 2,052,741-case harness attributed all remaining panics to that one site. Messages reach netdev only from the Linux kernel over rtnetlink, so peers cannot supply them; the crate's tests only build on Linux and the zerocopy dependency is covered by its own records. Retain the exemption until upstream guards the bareudp copy and fixes the tunnel value length."
 
 [[exemptions.netlink-proto]]
 version = "0.11.5"
@@ -227,19 +227,19 @@ version = "0.8.8"
 criteria = "safe-to-deploy"
 notes = "Audit hold: the public Socket derives Clone over a bare owned RawFd while every clone closes that descriptor in Drop. Safe cloning can therefore double-close the descriptor and, after descriptor reuse, close an unrelated resource. Retain the exemption pending a dup-based Clone implementation, shared ownership, or removal of Clone."
 
-[[exemptions.ntimestamp]]
-version = "1.0.0"
+[[exemptions.objc2-system-configuration]]
+version = "0.3.2"
 criteria = "safe-to-deploy"
-notes = "Audit held: with the base32 feature disabled, TryFrom<String> slices malformed input and can panic instead of returning InvalidEncoding. Zakura currently enables base32 through pkarr, but a version-wide safe-to-deploy certification is deferred pending an upstream fix."
+notes = "Audit hold: the generated media_sub_types, media_sub_type_options and set_media_options wrappers are declared safe but accept any CFArray although the framework requires the array produced by CopyMediaOptions (src/generated/SCNetworkConfiguration.rs), so fully safe code can hand the framework objects of a different dynamic type; the crate's own translation configuration marks these functions for an unsafe or typed fix. The remaining 468 unsafe blocks are direct framework calls and Core Foundation ownership conversions consistent with Create, Copy and Get rules, and no other safe function takes a raw pointer. netdev and netwatch call only SCDynamicStore, SCPreferences and SCNetworkInterface::all, so the mismatched-array path is not reachable from the node. Retain the exemption until upstream makes the three array APIs unsafe or typed."
 
 [[exemptions.object]]
 version = "0.36.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.os_info]]
-version = "3.15.0"
+[[exemptions.papaya]]
+version = "0.2.5"
 criteria = "safe-to-deploy"
-notes = "Audit hold: the Windows get_proc_address helper wraps GetProcAddress's nullable FARPROC in another Some, so a missing optional API is treated as present and then transmuted from a null Option<fn> into a non-null callable function pointer. Safe os_info::get() can therefore reach undefined behavior on affected Windows versions. Retain the exemption until the inner FARPROC is flattened and checked."
+notes = "Audit hold: HashMapBuilder::shared_collector shares an Arc<Collector> across maps, but the raw map's Drop unconditionally calls the unsafe Collector::reclaim_all as if the collector were unique (src/map.rs, src/raw/mod.rs); a probe that retired an entry while holding a guarded reference and then dropped an empty sibling map observed the entry's destructor before the guard was released, so the shared-collector configuration can free memory still reachable through a safe guard. The HashSet Sync implementation also requires K: Sync but not K: Send although concurrent removal can drop a key on another thread (src/set.rs). iroh 1.1 uses only Arc<papaya::HashMap> with per-map default collectors and no HashSet, so neither path is reachable from the node. The table layout, guard-protected dereferences and resize protocol were traced, and 132 default-feature and 134 all-feature tests pass. Retain the exemption until upstream drops the uniqueness assumption in Drop and bounds Sync by K: Send."
 
 [[exemptions.pest]]
 version = "2.8.7"
@@ -260,6 +260,21 @@ notes = "Audit hold: code generation can emit ParserState::repeat around PEEK_AL
 version = "2.8.7"
 criteria = "safe-to-deploy"
 notes = "Audit hold: validator.rs explicitly notes that empty-stack PEEK_ALL is non-progressing but classifies it as progressing. Repetitions such as PEEK_ALL* can pass validation and generate a parser that hangs indefinitely. Retain the exemption pending complete progress analysis."
+
+[[exemptions.plist]]
+version = "1.10.1"
+criteria = "safe-to-deploy"
+notes = "Audit hold: binary-plist dates below roughly -6.3e10 seconds pass the range guard but panic in Date::to_xml_format when RFC 3339 formatting rejects the negative year (src/date.rs), and that formatting runs during ordinary serde deserialization, XML writing and Debug output; 128 of 200,000 random date payloads reproduced it. An acyclic object graph in which each array references the next object twice passes the recursion check, which only rejects objects already on the stack, so a 123-byte file materializes 2^21 values and a 299-byte file is unbounded (src/stream/binary_reader.rs). Serde deserialization recurses without a depth limit and Value's drop glue is recursive, so 35,000 nesting levels abort the process with a stack overflow. There is no unsafe, FFI or build script, XML parsing resolves only the five predefined entities, declared lengths are bounded by file size, and a 200,000-iteration mutation sweep found no other panic. netdev reads only local system network configuration through this crate on macOS, so peer input does not reach it. Retain the exemption until upstream bounds the date range, rejects shared sub-objects or caps materialized size, and limits nesting depth."
+
+[[exemptions.polyval]]
+version = "0.6.2"
+criteria = "safe-to-deploy"
+notes = "Audit hold: the software-32, software-64 and ARM backends produce different tags when initialized with a nonzero starting value, and the autodetect wrapper keeps its backend in ManuallyDrop without a destructor, which bypasses optional clearing when an unfinished value is dropped. The GHASH constructor used by AES-GCM initializes with zero, where all backends agree, so the divergence was not found reachable from noq-proto. No later 0.6 patch release exists as of 2026-09-08. Retain the exemption pending an upstream fix or an explicit review of the restricted use."
+
+[[exemptions.prefix-trie]]
+version = "0.8.4"
+criteria = "safe-to-deploy"
+notes = "Audit hold: Table implements Sync whenever P and T are Sync, and the mutable handles IterMut and TrieViewMut hold only a shared Table reference, so they auto-implement Send without requiring T: Send while handing out &mut T and moving T out (src/inner.rs, src/map/iter.rs, src/trieview/mod.rs). A compile probe sent such a view holding a MutexGuard across threads, which bypasses the guard's thread affinity. hickory-proto stores only Ipv4Net and Ipv6Net keys in prefix sets, so the hole is not reachable from peer input. The remaining raw-pointer accesses are bounds checked, recursion is bounded by prefix length, and 209 unit and 185 doc tests pass. Retain the exemption until upstream adds T: Send bounds to the mutable handles."
 
 [[exemptions.r-efi]]
 version = "5.2.0"
@@ -286,10 +301,10 @@ criteria = "safe-to-deploy"
 suggest = false
 notes = "Sentry 0.47 upgrade. Audit held: on Unix, IntoRawFd for a standard-stream Handle removes the File and then Drop unconditionally unwraps the now-empty Option, so the safe consuming conversion panics. A version-wide safe-to-deploy certification is deferred pending an upstream fix."
 
-[[exemptions.self_cell]]
-version = "1.2.2"
+[[exemptions.seize]]
+version = "0.5.1"
 criteria = "safe-to-deploy"
-notes = "Audit hold: the optional old_rust feature deliberately uses a pre-1.51 field-pointer projection that the crate documents as technically undefined behavior. Zakura's MSRV does not execute that branch, but retain the version-wide exemption until the legacy UB path is removed or excluded by feature-scoped policy."
+notes = "Audit hold: ThreadGuard::drop returns the global thread ID without knowing whether a LocalGuard for that thread is still alive in another thread-local destructor (src/raw/tls/thread_id.rs); when a user thread-local holder is initialized before Collector::enter, the destructor order frees the ID first, a new thread can reuse it, and ThreadLocal::load_or returns the same reservation while the old guard remains live (src/raw/tls/mod.rs, src/guard.rs), so two threads can touch one reservation without a lock and reclaim early. A targeted probe observed the shared reservation in 101 of 101 executions. The race needs a guard held inside a thread-local destructor during thread teardown, a pattern absent from iroh's reviewed papaya call sites (src/socket/concurrent_read_map.rs). Barrier, reservation and reclaimer contracts were traced and 28 tests pass with and without all features; Linux membarrier and Windows paths were source-reviewed only. Retain the exemption until upstream ties thread-ID release to the last live guard."
 
 [[exemptions.sentry]]
 version = "0.47.0"
@@ -318,17 +333,6 @@ version = "0.2.31"
 criteria = "safe-to-deploy"
 notes = "Audit held: timestamp parsing rounds arbitrary fractional precision to nanoseconds before calling Timestamp::__new_unchecked. timestamp!(0.9999999999) reproducibly produces 1_000_000_000 nanoseconds and fails the ranged-integer invariant during compilation instead of yielding a valid value or a normal macro diagnostic. Retain the exemption pending explicit carry or truncation handling."
 
-[[exemptions.vergen-gitcl]]
-version = "9.1.0"
-criteria = "safe-to-deploy"
-suggest = false
-notes = "Audit deferred in #691: the crate executes the shell and Git selected from the ambient build environment, and Git operations can invoke configured helpers such as core.fsmonitor. PR #619 keeps a fixed describe pattern and writes Git errors to stderr rather than Cargo directives, but that does not remove the broader SHELL, PATH, and Git-configuration authority. Retain this exemption until #691 chooses and verifies a constrained CLI backend, a patched git2 backend, or a reasonably auditable gix backend."
-
-[[exemptions.vergen-lib]]
-version = "9.1.0"
-criteria = "safe-to-deploy"
-notes = "Audit held: the optional emit_and_set feature exposes a safe method that calls unsafe process-environment mutation without requiring callers to guarantee that no other thread reads or writes the environment. Zakura does not enable that feature, but a version-wide safe-to-deploy certification is deferred pending an unsafe API boundary or internal synchronization."
-
 [[exemptions.wait-timeout]]
 version = "0.2.0"
 criteria = "safe-to-deploy"
@@ -353,11 +357,6 @@ notes = "Audit hold: the package is 1416 prebuilt binary import libraries totall
 version = "0.60.2"
 criteria = "safe-to-deploy"
 notes = "Audit hold: #[implement] generates a safe into_outer method in the caller's module even though the crate states safe code must never own the generated COM outer type. Same-module code can create a stack outer, obtain an owned interface through ComObjectInterface::as_interface_ref(...).to_owned(), then drop or move the outer and leave the interface pointing at dead storage. Retain the exemption until outer construction is inaccessible or pinned behind a lifetime-safe wrapper."
-
-[[exemptions.windows-threading]]
-version = "0.1.0"
-criteria = "safe-to-deploy"
-notes = "Audit held: Pool::submit binds a non-'static closure to a freely inferred temporary borrow of &self, then submits it asynchronously. Safe code can therefore let captured borrowed data expire while the pool and callback remain live. Version 0.2.1 replaces this API with 'static submission plus an invariant scoped API that joins before borrowed data can expire."
 
 [[exemptions.windows_aarch64_gnullvm]]
 version = "0.52.5"
@@ -420,6 +419,16 @@ notes = "Coordinated Zakura fork release; retain this exact-version exemption pe
 version = "1.2.0"
 criteria = "safe-to-deploy"
 notes = "Coordinated Zakura fork release; retain this exact-version exemption pending direct package audit."
+
+[[exemptions.zakura-iroh]]
+version = "1.1.0-rc.1"
+criteria = "safe-to-deploy"
+notes = "Exact-version exemption for known upstream defects: the 0.92.0 to 1.1.0 delta removed the inactive-node bound that the certified base enforced (MAX_INACTIVE_NODES and prune_inactive in the old node map survive only as a commented-out constant in src/socket/remote_map.rs), and the mapped-address tables in src/socket/mapped_addrs.rs offer insert-on-miss lookups with no removal path, while every completed handshake, inbound included, inserts an entry for the remote EndpointId that outlives the retired per-remote actor. An internet-exposed acceptor therefore retains roughly 100 to 200 bytes per distinct authenticated identity for the life of the endpoint, identities are free to generate, and the consumer cannot evict entries through the public API, so this is a remotely driven memory-exhaustion vector. The delta also retries failed path opens from an uncapped, undeduplicated pending_open_paths queue (src/socket/remote_map/remote_state.rs) that a remote can grow geometrically when the local node holds two or more client connections to it. The prior review covered: no unsafe code, TLS 1.3 raw-public-key identity binding with Ed25519 verify_strict and mandatory client authentication, peer-facing datagram handling bounded by noq-owned lengths, bounded channels and pruned path lists; 120 unit, 26 doc and one integration test pass, and loopback probes with junk datagrams, wrong-identity dials, certificate-less clients and 150 fresh identities completed cleanly. Zakura accepts and will track the retained-address growth under sustained identity churn, then adopt the upstream fix when released. No mapped-address retention patch is planned. Zakura deduplicates pending dials and evicts duplicate connections, keeping one connection per identity, so no path-open retry change is planned for this integration. Retain this exact-version exemption while the upstream defects remain; the published compatibility package preserves the reviewed Rust source. Registry migration: the 1.1.0-rc.0 archive preserves every upstream Rust file byte for byte, renames sibling packages with exact version requirements, retains the reviewed Dalek versions, and pins relay LRU to 0.18.3. Existing defects and acceptance conditions remain unchanged. Rc1 review: the main Iroh package additionally accepts zero to disable QUIC NAT traversal and tests bilateral opt-out with direct data transfer; its other production source is unchanged. The relay production source is unchanged. Known upstream defects and their existing acceptance conditions remain."
+
+[[exemptions.zakura-iroh-relay]]
+version = "1.1.0-rc.1"
+criteria = "safe-to-deploy"
+notes = "Audit hold: the 0.92.0 to 1.1.0 delta adds derived Debug output that includes relay bearer tokens on ServerConfig, ClientBuilder and RelayConfig (src/main.rs, src/client.rs, src/relay_map.rs), and a probe with debug logging enabled printed a configured token, so ordinary debug logs can leak a live relay credential. The server also replaces shutdown on a duplicate identity with an uncapped inactive-client list (src/server/clients.rs), so an authorized endpoint can hold arbitrarily many same-key connections. Frame decoding is bounded at 1 MiB per WebSocket message and 64 KiB per payload, fixed-width fields are length-checked, and the key cache is bounded by its configured capacity. Zakura runs with relays disabled and without the server feature, so neither path is reachable in the node; 82 all-feature tests and 20,000 malformed-frame property cases pass. Retain the exemption until upstream redacts tokens from Debug output and bounds the inactive list; the published compatibility package preserves the reviewed Rust source. Registry migration: the 1.1.0-rc.0 archive preserves every upstream Rust file byte for byte, renames sibling packages with exact version requirements, retains the reviewed Dalek versions, and pins relay LRU to 0.18.3. Existing defects and acceptance conditions remain unchanged. Rc1 review: the main Iroh package additionally accepts zero to disable QUIC NAT traversal and tests bilateral opt-out with direct data transfer; its other production source is unchanged. The relay production source is unchanged. Known upstream defects and their existing acceptance conditions remain."
 
 [[exemptions.zakura-jubjub]]
 version = "1.2.0"

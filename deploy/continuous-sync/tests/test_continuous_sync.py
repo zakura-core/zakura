@@ -39,6 +39,165 @@ alert_status = load_module("continuous_sync_alert_status", ALERT_STATUS_PATH)
 
 
 class ContinuousSyncTests(unittest.TestCase):
+    def test_retention_archive_failure_reports_halt_during_disk_recovery(self):
+        for restarting in (False, True):
+            with self.subTest(restarting=restarting), tempfile.TemporaryDirectory() as tmp:
+                config = make_config(Path(tmp), policy=sync.Policy(archive_traces=True))
+                state_path = config.paths.state_dir / "state.json"
+                if restarting:
+                    sync.save_state(state_path, {"failed": True, "failure": "DiskPressure: low"})
+                with (
+                    patch.object(sync, "one_cycle", side_effect=sync.DiskPressure("low")),
+                    patch.object(sync, "stop_service"),
+                    patch.object(sync, "safe_wipe_state"),
+                    patch.object(sync, "cleanup_retention", side_effect=sync.ControllerError("upload failed")),
+                    patch.object(sync, "post_slack", return_value=False) as post,
+                ):
+                    self.assertEqual(sync.run_loop(config, Path("unused")), 1)
+                self.assertTrue(sync.load_state(state_path)["failed"])
+                self.assertIn("upload failed", sync.load_state(state_path)["failure"])
+                post.assert_called_once()
+
+    def test_archive_preflight_rejects_missing_configuration_and_expiration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(Path(tmp), policy=sync.Policy(archive_traces=True))
+            config.paths.repo_dir.mkdir()
+            config.paths.config_template.write_text("")
+            config.paths.wipe_sentinel.write_text("")
+            with patch.object(sync.shutil, "which", return_value="/usr/bin/tool"), patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(sync.ControllerError, "ZAKURA_TRACE_SPACE"):
+                    sync.preflight(config)
+                with patch.dict(os.environ, {"ZAKURA_TRACE_SPACE": "test",
+                                            "ZAKURA_TRACE_ENDPOINT": "https://nyc3.digitaloceanspaces.com"}), patch.object(
+                        sync, "run", return_value=subprocess.CompletedProcess([], 0, '{"Rules":[]}')):
+                    with self.assertRaisesRegex(sync.ControllerError, "seven-day"):
+                        sync.preflight(config)
+
+    def test_archive_rejects_symlink_before_upload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "run"
+            run_dir.mkdir()
+            (run_dir / "traces").symlink_to(root / "missing")
+            config = make_config(root, policy=sync.Policy(archive_traces=True))
+            with self.assertRaisesRegex(sync.ControllerError, "symlink"):
+                sync.archive_traces(config, run_dir, {})
+
+    def test_archive_requires_expiration_and_preserves_traces(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(Path(tmp), policy=sync.Policy(archive_traces=True))
+            run_dir = Path(tmp) / "run"
+            traces = run_dir / "traces"
+            traces.mkdir(parents=True)
+            (traces / "events.jsonl").write_text('{"event":"test"}\n')
+            with patch.dict(os.environ, {"ZAKURA_TRACE_SPACE": "test",
+                                        "ZAKURA_TRACE_ENDPOINT": "https://nyc3.digitaloceanspaces.com"}), patch.object(
+                    sync, "run", return_value=subprocess.CompletedProcess([], 0, '{"Rules":[]}')):
+                with self.assertRaisesRegex(sync.ControllerError, "seven-day"):
+                    sync.archive_traces(config, run_dir, {})
+            self.assertTrue((traces / "events.jsonl").exists())
+
+    def test_archive_streams_compressed_traces_and_records_link(self):
+        import gzip
+        import tarfile
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(Path(tmp), policy=sync.Policy(archive_traces=True, hostname="host"))
+            run_dir = Path(tmp) / "run"
+            (run_dir / "traces").mkdir(parents=True)
+            (run_dir / "traces" / "events.csv").write_text("event\ntest\n")
+            uploaded = []
+            def upload(cmd, **kwargs):
+                uploaded.append(kwargs["stdin"].read())
+                return subprocess.CompletedProcess(cmd, 0)
+            state = {}
+            lifecycle = '{"Rules":[{"Status":"Enabled","Prefix":"sync-traces/","Expiration":{"Days":7}}]}'
+            with patch.dict(os.environ, {"ZAKURA_TRACE_SPACE": "test",
+                                        "ZAKURA_TRACE_ENDPOINT": "https://nyc3.digitaloceanspaces.com"}), patch.object(
+                    sync, "run", side_effect=[subprocess.CompletedProcess([], 0, lifecycle),
+                                               subprocess.CompletedProcess([], 0, "https://download")]), patch.object(
+                    sync.subprocess, "run", side_effect=upload):
+                sync.archive_traces(config, run_dir, state)
+            with tarfile.open(fileobj=io.BytesIO(gzip.decompress(uploaded[0]))) as archive:
+                self.assertEqual(archive.extractfile("traces/events.csv").read(), b"event\ntest\n")
+            self.assertEqual(state["trace_archive_url"], "https://download")
+            self.assertIn("https://download", deploy.completion_run_text(state))
+            self.assertFalse((run_dir / "traces").exists())
+
+    def test_archive_failures_preserve_payload_and_allow_retry(self):
+        lifecycle = '{"Rules":[{"Status":"Enabled","Prefix":"sync-traces/","Expiration":{"Days":7}}]}'
+        for failure in ("upload", "metadata", "fsync", "delete"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                config = make_config(root, policy=sync.Policy(archive_traces=True))
+                run_dir = root / "run"
+                traces = run_dir / "traces"
+                traces.mkdir(parents=True)
+                (traces / "events.csv").write_text("event\ntest\n")
+                state = {}
+                def upload(cmd, **kwargs):
+                    kwargs["stdin"].read()
+                    return subprocess.CompletedProcess(cmd, 1 if failure == "upload" else 0)
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(patch.dict(os.environ, {
+                        "ZAKURA_TRACE_SPACE": "test",
+                        "ZAKURA_TRACE_ENDPOINT": "https://nyc3.digitaloceanspaces.com",
+                    }))
+                    stack.enter_context(patch.object(sync, "run", side_effect=[
+                        subprocess.CompletedProcess([], 0, lifecycle),
+                        subprocess.CompletedProcess([], 0, "https://download"),
+                    ]))
+                    stack.enter_context(patch.object(sync.subprocess, "run", side_effect=upload))
+                    if failure == "metadata":
+                        stack.enter_context(patch.object(sync, "write_run_json", side_effect=OSError("write failed")))
+                    elif failure == "fsync":
+                        stack.enter_context(patch.object(sync.os, "fsync", side_effect=OSError("sync failed")))
+                    elif failure == "delete":
+                        stack.enter_context(patch.object(sync.shutil, "rmtree", side_effect=OSError("delete failed")))
+                    with self.assertRaises((OSError, sync.ControllerError)):
+                        sync.archive_traces(config, run_dir, state)
+                self.assertTrue((traces / "events.csv").exists())
+                if failure in ("upload", "metadata"):
+                    self.assertNotIn("trace_archive_url", state)
+                else:
+                    persisted = json.loads((run_dir / "run.json").read_text())
+                    self.assertEqual(persisted["trace_archive_url"], "https://download")
+                    with patch.object(sync, "run") as command:
+                        sync.archive_traces(config, run_dir, persisted)
+                        command.assert_not_called()
+                    self.assertFalse(traces.exists())
+
+    def test_archived_trace_cleanup_retries_without_uploading(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(Path(tmp), policy=sync.Policy(archive_traces=True))
+            run_dir = Path(tmp) / "run"
+            (run_dir / "traces").mkdir(parents=True)
+            (run_dir / "traces" / "old.csv").write_text("old data")
+            (run_dir / "run.json").write_text("{}")
+            with patch.object(sync, "run") as command:
+                sync.archive_traces(config, run_dir, {"trace_archive_url": "https://download"})
+                command.assert_not_called()
+            self.assertFalse((run_dir / "traces").exists())
+            self.assertTrue((run_dir / "run.json").exists())
+
+    def test_trace_cleanup_rejects_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "run"
+            run_dir.mkdir()
+            target = root / "unrelated"
+            target.mkdir()
+            (run_dir / "traces").symlink_to(target)
+            with self.assertRaisesRegex(sync.ControllerError, "symlink"):
+                sync.clear_archived_traces(run_dir)
+            self.assertTrue(target.exists())
+
+    def test_failure_audit_preserves_archive_link(self):
+        problem = deploy.audit_problem({"controller_state": {
+            "failed": True, "failure": "stalled", "last_failed_run": "run-1",
+            "last_failed_trace_archive_url": "https://download",
+        }}, 3600)
+        self.assertIn("https://download", problem.detail)
+
     def test_metric_value_accepts_dotted_and_prometheus_names(self):
         metrics = "\n".join(
             [
@@ -1944,6 +2103,7 @@ class NotificationTests(unittest.TestCase):
                     self.assertEqual(history[-1], {
                         "number": 261, "run_id": state["current_run"], "duration": 0,
                         "end_height": 3469999,
+                        "trace_archive_url": None,
                     })
                     self.assertEqual(state["last_success_end_height"], 3469999)
                     self.assertEqual(state["completion_digest_start_runs"], 260)

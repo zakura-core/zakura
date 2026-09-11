@@ -165,7 +165,7 @@ PIN_ARCHIVE_PEER
 
 # Reuse the exact binary built by run 34653015599. Verify its identity before
 # making it available to the deployer's commit-addressed binary cache.
-export ZAKURA_DEPLOYER_BUILD_CACHE_DIR=/root/serving-tested-build-cache
+export HEADER_SERVING_BUILD_CACHE_DIR=/root/serving-tested-build-cache
 python3 - <<'VERIFY_TESTED_BINARY'
 import hashlib,json,os,subprocess
 from pathlib import Path
@@ -173,7 +173,7 @@ sha='0e6398c22f0705b9ccf7a071a5229e743dd1572b'
 expected_hash='9cb709adf0340d22636d9fc5e93286c307f799c3d393f2a4cf05315541c93955'
 meta=json.loads(Path('/root/metadata.json').read_text())
 assert meta == {'sha':sha,'binary_sha256':expected_hash,'source_run':34653015599}
-cache=Path(os.environ['ZAKURA_DEPLOYER_BUILD_CACHE_DIR']);cache.mkdir()
+cache=Path(os.environ['HEADER_SERVING_BUILD_CACHE_DIR']);cache.mkdir()
 binary=cache/('zakurad-'+sha)
 subprocess.run(['zstd','-q','-d','/root/zakurad.zst','-o',str(binary)],check=True)
 assert hashlib.sha256(binary.read_bytes()).hexdigest()==expected_hash
@@ -185,7 +185,7 @@ note "Reusing the checksum-verified final-candidate binary from run 34653015599.
 
 export CARGO_TARGET_DIR=/root/cargo-target
 BUILD_START=$(date +%s)
-python3 deploy/deployer/deploy.py build --config /root/fleet.toml
+ZAKURA_DEPLOYER_BUILD_CACHE_DIR="$HEADER_SERVING_BUILD_CACHE_DIR" python3 deploy/deployer/deploy.py build --config /root/fleet.toml
 note "Incremental build took $(( $(date +%s) - BUILD_START ))s (warm baked cache)."
 
 # Read the restored DB directly before networking starts. Snapshot names are a
@@ -239,7 +239,7 @@ TOML
   note "pre-checkpoint: verified database height ${VERIFIED_START_HEIGHT} is $((MAX_CKPT - VERIFIED_START_HEIGHT)) blocks below max checkpoint ${MAX_CKPT}."
 fi
 
-python3 deploy/deployer/deploy.py deploy --config /root/fleet.toml
+ZAKURA_DEPLOYER_BUILD_CACHE_DIR="$HEADER_SERVING_BUILD_CACHE_DIR" python3 deploy/deployer/deploy.py deploy --config /root/fleet.toml
 python3 deploy/deployer/deploy.py status --config /root/fleet.toml || true
 
 # ---------------------------------------------------------------------------- #
@@ -271,7 +271,7 @@ s=p.read_text()
 assert 'p2p_stack = "legacy"' in s
 p.write_text(s.replace('p2p_stack = "legacy"', 'p2p_stack = "dual"'))
 ENABLE_NATIVE_SEED
-python3 deploy/deployer/deploy.py deploy --config /root/fleet.toml
+ZAKURA_DEPLOYER_BUILD_CACHE_DIR="$HEADER_SERVING_BUILD_CACHE_DIR" python3 deploy/deployer/deploy.py deploy --config /root/fleet.toml
 note "Seed priming passed. Restarted the same seed binary with native traffic bound to all interfaces."
 
 PAIR_RC=0

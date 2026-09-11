@@ -2,6 +2,11 @@
 import json,subprocess,urllib.request
 from pathlib import Path
 from collections import Counter
+processes=subprocess.check_output(["ps","-eo","pid,comm,etime,pcpu,rss"],text=True)
+print("build_and_node_processes")
+for line in processes.splitlines():
+    if any(name in line for name in ["cargo", "rustc", "zakurad", "clang", "cc1", "lld"]):
+        print(line)
 for name in ["/root/out/notes.md","/root/out/seed-priming/summary.json","/root/out/paired/summary.json"]:
     p=Path(name)
     if p.exists(): print(name, p.read_text()[-12000:])

@@ -12,6 +12,101 @@ The local worktree is `zakura.dogwood-experiments`, alongside the docs worktree.
 Its `docs/experiments/dogwood` directory retains the September 5 experiments
 and adds the scripts and result directories named below.
 
+## Feedback-driven standing routes
+
+`feedback_routes.py` changes standing mask subscriptions between concurrent
+bodies. It compares static two-supplier routes, adaptation without probes, and
+adaptation with probes. All policies start with the same routes and seed plan.
+The receiver compares verified arrival times for the same part. It uses no
+sender timestamps or knowledge of configured link rates.
+
+Every 250 ms, the candidate checks up to 16 recent paired observations per
+receiver, mask bit, and supplier pair. Observations expire after one second.
+Four observations, an 80% win fraction, and a 20% median advantage permit a
+route change. The change takes effect after 20 ms and applies to future bodies.
+The candidate removes the losing supplier and adds the winner if needed.
+This can reduce two suppliers to one. Already released bodies retain their
+assignments and consume the same shared queues during the transition.
+
+The probe policy adds one temporary mask subscription per receiver every eight
+bodies. It prefers peers with no standing assignments, then considers other
+unassigned peer/mask pairs. Probe transfers share upload, ingress, and CPU queues
+with ordinary traffic. Each probe requests two or three 64 KiB parts in this
+fixed-size workload, at most about 1.2% of body bytes over eight releases.
+The experiment records probe authorization separately from actual transmitted
+bytes. It counts control bytes but models control delivery as a fixed delay.
+
+The receiver observes each body after 200 ms. A missing contender supplies only
+a censored comparison, bounded by the observation horizon or completion plus
+cancellation delay. It does not supply a measured rate or a congestion failure.
+Upstream availability and receiver CPU delay can affect the comparison.
+
+The capacity follow-up holds source upload at 1,250 Mbps and receiver ingress at
+2,500 Mbps. It offers 819.2 Mbps of body data across 16 relays. Each run releases
+320 bodies of 2 MiB with 25% parity. Three seeds per policy produce 15,360
+receiver/body targets for each row. All traffic, including repair and probes,
+consumes the shared data queues. CPU costs remain the earlier model assumptions.
+
+| Relay upload | Policy | Complete within 400 ms | Mean run p95, completed bodies | Wire/body ratio |
+| --- | --- | --- | --- | --- |
+| 1,250 Mbps | Static two suppliers | 12.53% | 980.8 ms | 1.708 |
+| 1,250 Mbps | Adaptive, no probes | 100% | 240.5 ms | 1.467 |
+| 1,250 Mbps | Adaptive, probes | 100% | 246.4 ms | 1.465 |
+| 1,750 Mbps | Static two suppliers | 100% | 192.1 ms | 2.061 |
+| 1,750 Mbps | Adaptive, no probes | 100% | 112.4 ms | 1.671 |
+| 1,750 Mbps | Adaptive, probes | 100% | 114.4 ms | 1.683 |
+
+At 1,250 Mbps, static routes also leave 620 targets unfinished after 1,200 ms.
+Both adaptive policies complete all targets. At 1,750 Mbps, adaptation with
+probes reduces traffic by 18.3% while preserving normal completion. The wire/body
+ratio includes source and relay upload divided by released receiver/body bytes;
+it does not normalize by successful delivery. Failed static deliveries therefore
+make the 1,250 Mbps traffic comparison less useful than the completion result.
+The probes reach peers with no standing assignments 751 times at 1,250 Mbps
+and 715 times at 1,750 Mbps across the three seeds. These trials demonstrate
+that inactive peers receive opportunities; they do not show a steady-load
+advantage over adaptation without probes.
+
+The 54-run feedback matrix also tests 2,500 Mbps relay upload at full and half
+body load. The upload-drop scenario reduces four relays to one eighth of their
+upload rate from 2,000 to 4,000 ms, then restores service. Other scenarios use
+steady or heterogeneous upload. Each combination runs three seeds.
+
+| Body load during upload-drop test | Policy | Complete within 400 ms | Complete within 1,200 ms |
+| --- | --- | --- | --- |
+| 819.2 Mbps | Static | 73.96% | 15,195 / 15,360 |
+| 819.2 Mbps | Adaptive, no probes | 75.27% | 15,300 / 15,360 |
+| 819.2 Mbps | Adaptive, probes | 76.64% | 15,223 / 15,360 |
+| 409.6 Mbps | Static | 93.45% | 15,360 / 15,360 |
+| 409.6 Mbps | Adaptive, no probes | 97.03% | 15,360 / 15,360 |
+| 409.6 Mbps | Adaptive, probes | 96.93% | 15,360 / 15,360 |
+
+Probes improve the full-load normal-completion fraction slightly, but leave
+more targets unfinished at 1,200 ms than adaptation without probes. Half-load
+results show no consistent probe advantage. During the full-load drop, the
+probe policy makes four supplier additions across three seeds; most route
+changes still remove duplicate assignments. All policies complete every target
+normally in steady and heterogeneous service. At full steady load, adaptation
+with probes reduces the wire/body ratio from 2.360 to 1.790, about 24.2%.
+
+Together, the 72 runs support testing feedback-driven pruning further. They
+demonstrate occasional probes of inactive peers, but do not establish a robust
+probe policy or sustained recovery under changing capacity. The archives are
+`2026-09-10-feedback-routes-final` and `2026-09-10-route-capacity` in the local
+experiment tree. `summarize_routes.py` checks target counts and queue bounds and
+produces the comparison tables. The local suite passes 82 tests, including
+delayed route activation, unchanged assignments for existing bodies, stale
+evidence rejection, idle-peer probing, and static-baseline equivalence.
+
+This candidate does not implement the complete specification controller. It
+does not preserve single-supplier-loss coverage after pruning, fund probes from
+validated completions, limit aggregate migrations per epoch, or adapt connection
+credit. A serialization model supplies contention and queue limits; it does not
+run TCP, Reed–Solomon, or consensus validation. FullBlock repair remains a
+separate fallback after 400 ms. The experiment stops each body after 1,200 ms.
+These limits prevent treating traffic savings as a production congestion-control
+result.
+
 ## Burst capacity calculation
 
 `capacity_budget.py` records the arithmetic behind the design's example burst

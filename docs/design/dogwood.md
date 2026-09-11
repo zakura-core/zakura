@@ -362,9 +362,14 @@ latency. The learned budget guides allocation; finite grants and queue limits
 bound resource use.
 
 [Section 7 of the spec](../specs/dogwood.md#7-redundancy-and-route-control)
-defines the measurements and update rules. We still need simulation to test
-the full feedback loop. The reduced controller experiments do not consistently
-improve on static allocation, so the learned budget remains experimental.
+defines the measurements and update rules. The
+[standing-route experiment](dogwood-experiments.md#feedback-driven-standing-routes)
+now tests paired route changes and occasional probes of unassigned peers.
+At 1,250 Mbps relay upload and 819.2 Mbps body load, adaptation raises completion
+within 400 ms from 12.53% to 100% in the tested traces. It does so partly by
+removing duplicate routes, which reduces failure coverage. The experiment does
+not implement the shared connection-budget controller. That controller and
+coverage-preserving route changes still need an integrated test.
 
 ## Proposer subscriptions and seeding
 

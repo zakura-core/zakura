@@ -32,6 +32,7 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| VCT busy-supplier retry backoff | `crates/zakura-network/src/zakura/header_sync/scheduler/repair.rs` | no retry in the same episode → 1 s, doubling to 30 s | [#970](https://github.com/zakura-core/zakura/pull/970) | Recover from temporary refusal without requiring chain progress, while bounding repeated requests to each supplier. |
 | `MAX_CONCURRENT_UTXO_LOOKUPS` | `crates/zakura-consensus/src/transaction.rs` | serial (`1`) → `64` per block transaction | [#918](https://github.com/zakura-core/zakura/pull/918) | Overlap external UTXO waits while bounding pending lookups per transaction. Concurrent lookups start their six-minute timeout clocks together. |
 | `MAX_MINED_SUBMISSIONS` | `crates/zakura-rpc/src/methods/types/submit_block.rs` | unbounded → `16` submissions | [#748](https://github.com/zakura-core/zakura/pull/748) | Bound detached verification work across RPC cancellation. |
 | `non_finalized_write_slots` | `crates/zakura-state/src/service.rs` | unbounded → `1,000` contextual writes | [#748](https://github.com/zakura-core/zakura/pull/748) | Bound writer block bodies using the existing orphan queue capacity. |

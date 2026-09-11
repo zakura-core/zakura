@@ -9,7 +9,16 @@ for line in processes.splitlines():
         print(line)
 for name in ["/root/out/notes.md","/root/out/seed-priming/summary.json","/root/out/paired/summary.json"]:
     p=Path(name)
-    if p.exists(): print(name, p.read_text()[-12000:])
+    if p.exists():
+        if name.endswith('/paired/summary.json'):
+            summary=json.loads(p.read_text())
+            evidence=summary.get('serving_evidence',{})
+            spanning=evidence.get('successful_responses_across_generation_changes',[])
+            evidence['spanning_response_count']=len(spanning)
+            evidence['successful_responses_across_generation_changes']=spanning[:5]
+            print(name,json.dumps(summary))
+        else:
+            print(name,p.read_text()[-12000:])
 for port in [8232,18232]:
     try:
         req=urllib.request.Request(f"http://127.0.0.1:{port}",data=json.dumps({"jsonrpc":"2.0","id":"inspect","method":"getblockcount","params":[]}).encode(),headers={"Content-Type":"application/json"})

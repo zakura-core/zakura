@@ -17,7 +17,7 @@ jobs:
           ssh_private_key: ${{ secrets.DO_SSH_PRIVATE_KEY }}
       - name: Inspect only this test's disposable resources
         env:
-          OWNER_RUN: '34648485529'
+          OWNER_RUN: '34653015599'
         run: |
           set -euo pipefail
           doctl compute droplet list --tag-name zakura-pr-node -o json > /tmp/droplets.json

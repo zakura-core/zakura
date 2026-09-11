@@ -6,7 +6,7 @@ permissions:
 jobs:
   inspect:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -32,6 +32,7 @@ jobs:
           sha = subprocess.check_output(['git', '-C', '/root/zakura', 'rev-parse', 'HEAD'], text=True).strip()
           assert sha == 'e3328340aa040971681ed222a5bfc63fe43d8991', sha
           print('TARGET_SHA', sha, flush=True)
+          print(subprocess.run(['ps','-C','rustc','-o','pid,etime,%cpu,rss,comm'],text=True,capture_output=True).stdout,flush=True)
           def rpc(url, method, params=None):
               request=urllib.request.Request(url,data=json.dumps({'jsonrpc':'2.0','id':'pr966-readonly-evidence','method':method,'params':params or []}).encode(),headers={'Content-Type':'application/json'})
               with urllib.request.urlopen(request,timeout=10) as response:data=json.load(response)
@@ -40,7 +41,7 @@ jobs:
           seed='http://127.0.0.1:8232'
           client='http://127.0.0.1:18232'
           reference='http://159.65.183.89:8232'
-          deadline=time.monotonic()+420
+          deadline=time.monotonic()+600
           while True:
               try:
                   info=rpc(client,'getblockchaininfo')

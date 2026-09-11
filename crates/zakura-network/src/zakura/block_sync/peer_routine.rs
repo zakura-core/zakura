@@ -2186,29 +2186,34 @@ impl PeerRoutine {
     /// `work.in_flight` instead — the producer's `!in_flight_contains` clause
     /// already keeps them out of `pending`.
     fn publish_outstanding(&self) {
-        let mut map: BTreeMap<block::Height, super::peer_registry::OutstandingMeta> =
-            BTreeMap::new();
+        let mut unreceived = Vec::new();
         for outstanding in &self.window.outstanding {
             for expected in &outstanding.request.expected_blocks {
-                // A scheduler or reset may retire a height while this routine
-                // waits. Publish only work that still belongs to this request.
-                if !outstanding.has_received(expected.height)
-                    && self.work.owner_for_height(expected.height)
-                        == Some(outstanding.request.owner)
-                {
-                    map.insert(
-                        expected.height,
-                        super::peer_registry::OutstandingMeta {
-                            owner: outstanding.request.owner,
-                            hash: expected.hash,
-                            estimated_bytes: expected.estimated_bytes,
-                            queued_at: outstanding.queued_at,
-                            deadline: outstanding.deadline,
-                        },
-                    );
+                if !outstanding.has_received(expected.height) {
+                    unreceived.push((expected.height, (outstanding, expected)));
                 }
             }
         }
+        // Filter before combining overlapping heights so a stale request cannot
+        // hide the current owner's metadata.
+        self.work.retain_owned(&mut unreceived, |(outstanding, _)| {
+            outstanding.request.owner
+        });
+        let map = unreceived
+            .into_iter()
+            .map(|(height, (outstanding, expected))| {
+                (
+                    height,
+                    super::peer_registry::OutstandingMeta {
+                        owner: outstanding.request.owner,
+                        hash: expected.hash,
+                        estimated_bytes: expected.estimated_bytes,
+                        queued_at: outstanding.queued_at,
+                        deadline: outstanding.deadline,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         if map.is_empty() {
             self.registry.clear_outstanding(&self.peer, self.generation);
         } else {

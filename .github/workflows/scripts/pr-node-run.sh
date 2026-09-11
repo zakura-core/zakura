@@ -140,9 +140,9 @@ commit = "${SHA}"
 network = "${NET_TOML}"
 state_cache_dir = "${STATE_CACHE_DIR}"
 storage_mode = "${STORAGE_MODE}"
-p2p_stack = "${P2P_STACK}"
+p2p_stack = "legacy"
 checkpoint_sync = true
-vct_fast_sync = true
+vct_fast_sync = false
 rpc_listen_addr = "127.0.0.1:8232"
 rpc_enable_cookie_auth = false
 metrics_endpoint = "127.0.0.1:9999"
@@ -229,6 +229,34 @@ sha256sum /usr/local/bin/zakurad /usr/local/bin/zakurad-downloader > "$OUT_DIR/b
 # ---------------------------------------------------------------------------- #
 # Monitor for the requested duration, then package outputs
 # ---------------------------------------------------------------------------- #
+
+# Give the native downloader a supplier with complete blocks and tree roots.
+# The untouched secondary snapshot remains at its original height.
+SEED_CKPT=$(tail -1 crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt | cut -d' ' -f1)
+[[ "$SEED_CKPT" =~ ^[0-9]+$ ]] || { echo "cannot read seed checkpoint" >&2; exit 1; }
+SEED_READY_HEIGHT=$((SEED_CKPT + 200))
+note "Priming the seed over legacy P2P with VCT fast sync disabled, through height ${SEED_READY_HEIGHT}. The native downloader keeps VCT fast sync enabled."
+PRIME_RC=0
+python3 /root/pr-node-monitor.py \
+  --duration-minutes 15 --interval 10 \
+  --rpc-url http://127.0.0.1:8232 --metrics-url http://127.0.0.1:9999/metrics \
+  --service zakurad --log-file /var/log/zakura/zakura.log \
+  --stop-after-height "$SEED_READY_HEIGHT" \
+  --required-finalized-at-least "$SEED_CKPT" \
+  --meta "mode=seed-priming,network=${NETWORK},vct_fast_sync=false,p2p_stack=legacy" \
+  --out "$OUT_DIR/seed-priming" || PRIME_RC=$?
+systemctl stop zakurad
+cp /var/log/zakura/zakura.log "$OUT_DIR/seed-priming/zakura.log"
+[ "$PRIME_RC" -eq 0 ] || exit "$PRIME_RC"
+python3 - <<'ENABLE_NATIVE_SEED'
+from pathlib import Path
+p=Path('/root/fleet.toml')
+s=p.read_text()
+assert 'p2p_stack = "legacy"' in s
+p.write_text(s.replace('p2p_stack = "legacy"', 'p2p_stack = "dual"'))
+ENABLE_NATIVE_SEED
+python3 deploy/deployer/deploy.py deploy --config /root/fleet.toml
+note "Seed priming passed. Restarted the same seed binary with the isolated native endpoint enabled."
 
 PAIR_RC=0
 python3 -u /root/pr-node-paired-smoke.py \

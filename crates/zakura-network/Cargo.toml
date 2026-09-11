@@ -88,7 +88,6 @@ zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.2.0" }
 zakura-node-services = { path = "../zakura-node-services", version = "3.2.4" }
 
 [dev-dependencies]
-anyhow = { workspace = true }
 commonware-runtime = { workspace = true }
 proptest = { workspace = true }
 proptest-derive = { workspace = true }

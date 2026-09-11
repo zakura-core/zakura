@@ -8665,7 +8665,6 @@ dependencies = [
 name = "zakura-network"
 version = "8.0.0"
 dependencies = [
- "anyhow",
  "bitflags",
  "blake2b_simd",
  "byteorder",

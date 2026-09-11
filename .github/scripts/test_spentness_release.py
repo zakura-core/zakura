@@ -52,6 +52,7 @@ class SpentnessReleaseTests(unittest.TestCase):
         )
         self.pin["sha256"] = list(hashlib.sha256(data).digest())
         (self.bundle / hints.ARTIFACT).write_bytes(data)
+        (self.bundle / "mainnet-frontier.bin").write_bytes(b"current frontier")
         (self.bundle / hints.COMMITMENT).write_text(json.dumps(self.pin))
         (self.bundle / "main-checkpoints.txt").write_text(
             "0 " + bytes(self.pin["chain_identity"])[::-1].hex()
@@ -88,8 +89,16 @@ class SpentnessReleaseTests(unittest.TestCase):
         manifest_path.parent.mkdir(parents=True)
         old = copy.deepcopy(self.pin)
         old["terminal_height"] = 5
+        old["sha256"][0] ^= 1
+        old_entry = {
+            "commitment": old,
+            "frontier_sha256": hashlib.sha256(b"old frontier").hexdigest(),
+        }
+        retained = self.root / hints.frontier_path(old_entry)
+        retained.parent.mkdir(parents=True)
+        retained.write_bytes(b"old frontier")
         manifest_path.write_text(
-            json.dumps({"schema_version": 1, "artifacts": [{"commitment": old}]})
+            json.dumps({"schema_version": 1, "artifacts": [old_entry]})
         )
         manifest, compiled = hints.prepare_import(self.root, self.bundle, self.meta)
         self.assertEqual(
@@ -99,6 +108,16 @@ class SpentnessReleaseTests(unittest.TestCase):
         self.assertIn("terminal_height: 5", compiled)
         self.assertIn("terminal_height: 10", compiled)
         self.assertNotIn("include_bytes", compiled)
+        self.assertEqual(retained.read_bytes(), b"old frontier")
+        registry = hints.render_frontiers(manifest)
+        self.assertEqual(registry.count("include_bytes!"), 2)
+        self.assertEqual(
+            manifest["artifacts"][-1]["frontier_sha256"],
+            hashlib.sha256(b"current frontier").hexdigest(),
+        )
+        retained.write_bytes(b"corrupt frontier")
+        with self.assertRaisesRegex(ValueError, "retained spentness handoff"):
+            hints.prepare_import(self.root, self.bundle, self.meta)
 
     def test_resealed_genesis_and_padding_fail_the_named_checks(self):
         path = self.bundle / hints.ARTIFACT

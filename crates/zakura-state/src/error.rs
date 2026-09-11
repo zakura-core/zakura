@@ -132,6 +132,9 @@ pub enum HistoricalSubtreeUnavailableReason {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum StateInitError {
+    /// Spentness construction cannot safely open or resume.
+    #[error(transparent)]
+    Spentness(#[from] crate::SpentnessError),
     /// The configured historical frontier artifact could not be read or decoded.
     ///
     /// Only nodes that derive historical trees reach this. A node that does not derive ignores an
@@ -407,6 +410,7 @@ pub struct CommitCheckpointVerifiedError {
     #[source]
     inner: CommitBlockError,
     vct_failure: Option<VctCommitFailure>,
+    spentness_failure: Option<String>,
 }
 
 /// Exact VCT verification input implicated by a failed checkpoint commit.
@@ -449,6 +453,20 @@ impl CommitCheckpointVerifiedError {
     pub(crate) fn vct_failure(&self) -> Option<VctCommitFailure> {
         self.vct_failure
     }
+
+    pub(crate) fn from_spentness(error: crate::SpentnessError) -> Self {
+        let diagnostic = error.to_string();
+        tracing::error!(%diagnostic, "spentness block commit failed");
+        Self {
+            inner: CommitBlockError::WriteTaskExited,
+            vct_failure: None,
+            spentness_failure: Some(diagnostic),
+        }
+    }
+
+    pub(crate) fn spentness_failure(&self) -> Option<&str> {
+        self.spentness_failure.as_deref()
+    }
 }
 
 impl From<CommitBlockError> for CommitCheckpointVerifiedError {
@@ -456,6 +474,7 @@ impl From<CommitBlockError> for CommitCheckpointVerifiedError {
         Self {
             inner,
             vct_failure: None,
+            spentness_failure: None,
         }
     }
 }

@@ -51,6 +51,7 @@ pub struct SemanticBlockVerifier<S, V> {
     state_service: S,
     transaction_verifier: V,
     prepared_candidates: prepared::PreparedCandidateCache,
+    spentness_status: Option<tokio::sync::watch::Receiver<zs::SpentnessStatus>>,
 }
 
 /// Block verification errors.
@@ -274,7 +275,16 @@ where
             state_service,
             transaction_verifier,
             prepared_candidates: Default::default(),
+            spentness_status: None,
         }
+    }
+
+    pub(crate) fn with_spentness_status(
+        mut self,
+        status: Option<tokio::sync::watch::Receiver<zs::SpentnessStatus>>,
+    ) -> Self {
+        self.spentness_status = status;
+        self
     }
 }
 
@@ -302,6 +312,7 @@ where
         let mut transaction_verifier = self.transaction_verifier.clone();
         let network = self.network.clone();
         let prepared_candidates = self.prepared_candidates.clone();
+        let mut spentness_status = self.spentness_status.clone();
 
         let block = request.block();
 
@@ -311,6 +322,15 @@ where
         async move {
             let hash = zakura_header_chain::validate_encoding_version_hash(&block.header)
                 .map_err(BlockError::from)?;
+            // Semantic verification reads monetary state, so it waits for construction to finish.
+            if let Some(status) = &mut spentness_status {
+                zs::wait_for_spentness(status, |status| status == zs::SpentnessStatus::Usable)
+                    .await
+                    .map_err(|error| VerifyBlockError::StateService {
+                        source: error.into(),
+                        hash,
+                    })?;
+            }
             let preparation_start = request.should_cache().then(std::time::Instant::now);
             // Check that this block is actually a new block.
             tracing::trace!("checking that block is not already in state");

@@ -311,8 +311,21 @@ impl DiskWriteBatch {
                 height: Some(finalized.height),
             })?;
 
+        self.prepare_value_pool_records(db, finalized, new_value_pool);
+        Ok(())
+    }
+
+    /// Persist the current pool and per-height metadata after the caller computes accounting.
+    pub(crate) fn prepare_value_pool_records(
+        &mut self,
+        db: &ZakuraDb,
+        finalized: &FinalizedBlock,
+        new_value_pool: ValueBalance<NonNegative>,
+    ) {
         // Update value pool metrics for observability (ZIP-209 compliance monitoring)
-        value_pool_metrics(&new_value_pool);
+        if !db.spentness_incomplete() {
+            value_pool_metrics(&new_value_pool);
+        }
 
         let _ = db
             .chain_value_pools_cf()
@@ -356,7 +369,5 @@ impl DiskWriteBatch {
             &finalized.height,
             &BlockInfo::new(new_value_pool, block_size as u32),
         );
-
-        Ok(())
     }
 }

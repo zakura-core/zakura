@@ -166,10 +166,14 @@ def _recover_import(repo_root: Path, staging: Path) -> None:
     journal_path = staging / "journal.json"
     if (staging / "ready").exists() and not (staging / "committed").exists():
         allowed = {CHECKPOINTS, FRONTIER, SUBTREES, PROVENANCE, EOS_FILE,
-                   spentness_release.MANIFEST, spentness_release.COMPILED}
+                   spentness_release.MANIFEST, spentness_release.COMPILED,
+                   spentness_release.FRONTIER_REGISTRY}
         journal = json.loads(journal_path.read_text())
         for index, entry in enumerate(journal):
-            if Path(entry["path"]) not in allowed or entry["backup"] not in (None, f"{index}.old"):
+            relative = Path(entry["path"])
+            retained = (relative.parent == spentness_release.FRONTIER_DIRECTORY
+                        and re.fullmatch(r"[0-9a-f]{64}\.bin", relative.name))
+            if (relative not in allowed and not retained) or entry["backup"] not in (None, f"{index}.old"):
                 raise BundleImportError(f"invalid recovery journal in {staging}")
         for entry in reversed(journal):
             target = repo_root / entry["path"]
@@ -465,6 +469,8 @@ def _import_bundle(
         manifest, compiled = spentness
         artifacts[spentness_release.MANIFEST] = (json.dumps(manifest, indent=2) + "\n").encode()
         artifacts[spentness_release.COMPILED] = compiled.encode()
+        artifacts[spentness_release.frontier_path(manifest["artifacts"][-1])] = bundle_frontier
+        artifacts[spentness_release.FRONTIER_REGISTRY] = spentness_release.render_frontiers(manifest).encode()
 
     provenance = {
         "schema_version": 1,

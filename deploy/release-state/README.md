@@ -162,9 +162,15 @@ wrapper reads the installed `EXPORTER_REVISION`. `RELEASE_STATE_DATA_DIR` holds
 two ordinary archive replay states at the selected checkpoint. The publisher
 never rolls back the live node. Version 2 bundles remain available for recovery.
 
+The importer retains each reviewed commitment and its matching VCT handoff
+frontier. It hashes retained frontier files before importing a later commitment.
+Keep supported artifacts available on peers so Applying runs can resume their
+original commitment after a release change. Rebuilding runs need retained bodies
+but no bitmap.
+
 Provision reviewed artifacts on seeds with `provision-spentness-seed.sh`.
 The seed's `zakura-spentness install` command requires a compiled commitment.
-Configure `network.zakura.spentness_cache_dir` and restart the seed before testing
+Configure `spentness.cache_dir` and restart the seed before testing
 a cold client against only those seeds. Nodes download from peers.
 
 See [the spentness design](../../docs/design/spentness-hints.md) for commands,

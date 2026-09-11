@@ -225,6 +225,14 @@ fn attribute_vct_auxiliary_failure(
 /// Embedded verified final note-commitment frontiers for Mainnet.
 const MAINNET_FINAL_FRONTIERS: &[u8] = include_bytes!("vct/mainnet-frontier.bin");
 
+#[path = "vct/spentness_frontiers.rs"]
+mod spentness_frontiers;
+
+/// Reviewed handoff frontiers for older supported spentness commitments, by artifact digest.
+pub(super) fn retained_spentness_frontiers() -> &'static [([u8; 32], &'static [u8])] {
+    spentness_frontiers::FRONTIERS
+}
+
 /// Errors validating serialized VCT final-frontier bytes.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum FinalFrontiersValidationError {
@@ -297,6 +305,17 @@ fn select_source_mode(
 }
 
 impl VctState {
+    /// Committer state for a spentness run, authenticated by its reviewed handoff frontiers.
+    pub(super) fn for_spentness(handoff_frontiers: FinalFrontiers) -> Arc<Self> {
+        Arc::new(Self {
+            enabled: true,
+            source: Box::new(EmbeddedFrontierSource::new(handoff_frontiers)),
+            requires_verified_successor: true,
+            vct_count: AtomicU64::new(0),
+            prevalidated_count: AtomicU64::new(0),
+        })
+    }
+
     /// Builds committer state from `checkpoint_sync` and `vct_fast_sync`.
     /// `checkpoint_sync` mirrors `consensus.checkpoint_sync`.
     /// Mainnet checkpoint sync defaults to the peer `tree_aux` source.

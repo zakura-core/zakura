@@ -52,6 +52,10 @@ pub enum PruneFinalizedStateError {
     #[error("invalid pruning configuration")]
     InvalidConfig(#[source] BoxError),
 
+    /// The state database could not be opened, for example during incomplete spentness construction.
+    #[error("cannot open the state database for pruning: {0}")]
+    Open(#[source] Box<crate::StateInitError>),
+
     /// The on-disk state database format does not match the running code.
     #[error(
         "state database format mismatch: on disk {on_disk:?}, running code {in_code}; \
@@ -99,7 +103,7 @@ pub fn preview_prune_finalized_state(
     let config = pruning_config(config, network, options.tx_retention)?;
     check_format_version(&config, network)?;
 
-    let db = open_pruning_db(&config, network, true);
+    let db = open_pruning_db(&config, network, true)?;
     pruning_summary(&db, &options)
 }
 
@@ -112,7 +116,7 @@ pub fn prune_finalized_state(
     let config = pruning_config(config, network, options.tx_retention)?;
     check_format_version(&config, network)?;
 
-    let db = open_pruning_db(&config, network, false);
+    let db = open_pruning_db(&config, network, false)?;
     let summary = pruning_summary(&db, &options)?;
 
     let needs_marker_update =
@@ -167,7 +171,11 @@ fn check_format_version(
     Ok(())
 }
 
-fn open_pruning_db(config: &Config, network: &Network, read_only: bool) -> ZakuraDb {
+fn open_pruning_db(
+    config: &Config,
+    network: &Network,
+    read_only: bool,
+) -> Result<ZakuraDb, PruneFinalizedStateError> {
     ZakuraDb::new(
         config,
         STATE_DATABASE_KIND,
@@ -179,7 +187,8 @@ fn open_pruning_db(config: &Config, network: &Network, read_only: bool) -> Zakur
             .iter()
             .map(ToString::to_string),
         read_only,
-    ).expect("opening the finalized state database failed; the configured cache directory must contain a readable Zakura database")
+    )
+    .map_err(|error| PruneFinalizedStateError::Open(Box::new(error)))
 }
 
 fn pruning_summary(

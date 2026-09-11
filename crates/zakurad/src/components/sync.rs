@@ -936,6 +936,9 @@ where
 
     /// Structured diagnostics for the legacy sync pipeline.
     trace: LegacySyncTrace,
+
+    /// Local rebuild progress pauses body work and its stall timers.
+    spentness_status: Option<watch::Receiver<zs::SpentnessStatus>>,
 }
 
 /// Polls the network to determine whether further blocks are available and
@@ -1077,9 +1080,26 @@ where
             past_lookahead_limit_receiver,
             misbehavior_sender,
             trace,
+            spentness_status: None,
         };
 
         (new_syncer, sync_status)
+    }
+
+    /// Pause body verification before verifier deadlines during local construction.
+    pub fn set_spentness_status(&mut self, status: watch::Receiver<zs::SpentnessStatus>) {
+        self.downloads.as_mut().set_spentness_status(status.clone());
+        self.spentness_status = Some(status);
+    }
+
+    /// Wait while the writer rebuilds spentness indexes. Returns whether it waited.
+    async fn wait_for_spentness_rebuild(&mut self) -> Result<bool, Report> {
+        let Some(status) = &mut self.spentness_status else {
+            return Ok(false);
+        };
+        let waited = *status.borrow() == zs::SpentnessStatus::Rebuilding;
+        zs::wait_for_spentness(status, |status| status != zs::SpentnessStatus::Rebuilding).await?;
+        Ok(waited)
     }
 
     /// Runs the syncer to synchronize the chain and keep it synchronized.
@@ -1223,6 +1243,15 @@ where
             sleep(ZAKURA_BODY_SYNC_STALL_POLL).await;
 
             let verified_height = self.latest_chain_tip.best_tip_height();
+            if self
+                .spentness_status
+                .as_ref()
+                .is_some_and(|status| *status.borrow() == zs::SpentnessStatus::Rebuilding)
+            {
+                tracker = ZakuraStallTracker::new(verified_height);
+                legacy_probe = ZakuraLegacyProbe::new(verified_height);
+                continue;
+            }
             let header_tip_height = best_header_tip_height(&mut read_state).await;
             if let Some(sync_length) = zakura_sync_status_length(verified_height, header_tip_height)
             {
@@ -1522,6 +1551,9 @@ where
         let mut last_progress = Instant::now();
 
         'sync_round: loop {
+            if self.wait_for_spentness_rebuild().await? {
+                last_progress = Instant::now();
+            }
             if header_runtime_status
                 .as_ref()
                 .is_some_and(|status| status.borrow().is_ready())
@@ -1666,6 +1698,10 @@ where
                     // out. Loop around and re-check rather than relying on that.
                     Ok(None) => {}
                     Err(_) => {
+                        if self.wait_for_spentness_rebuild().await? {
+                            last_progress = Instant::now();
+                            continue 'sync_round;
+                        }
                         if last_progress.elapsed() >= BLOCK_VERIFY_TIMEOUT {
                             return Err(eyre!(
                                 "sync round stalled: no block completed or tips extended within timeout"
@@ -1808,6 +1844,10 @@ where
             match step {
                 Ok(result) => result?,
                 Err(_elapsed) => {
+                    if self.wait_for_spentness_rebuild().await? {
+                        last_progress = Instant::now();
+                        continue 'sync_round;
+                    }
                     if last_progress.elapsed() >= BLOCK_VERIFY_TIMEOUT {
                         self.trace_sync_snapshot("round_stalled", reserve.len());
                         return Err(eyre!(

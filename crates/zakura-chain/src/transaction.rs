@@ -1713,6 +1713,16 @@ impl Transaction {
         ValueBalance::from_ironwood_amount(ironwood_value_balance)
     }
 
+    /// Return shielded transaction balances without resolving transparent inputs.
+    pub fn shielded_value_balance(
+        &self,
+    ) -> Result<ValueBalance<NegativeAllowed>, ValueBalanceError> {
+        self.sprout_value_balance()?
+            + self.sapling_value_balance()
+            + self.orchard_value_balance()
+            + self.ironwood_value_balance()
+    }
+
     /// Returns the value balances for this transaction using the provided transparent outputs.
     #[cfg(any(test, feature = "proptest-impl"))]
     pub(crate) fn value_balance_from_outputs(

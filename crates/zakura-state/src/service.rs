@@ -57,7 +57,7 @@ use crate::{
         check::difficulty::POW_ADJUSTMENT_BLOCK_SPAN,
         finalized_state::{
             header_chain::{HeaderChainStore, HeaderChainStoreError},
-            FinalizedState, ZakuraDb,
+            FinalizedState, SpentnessSetup, ZakuraDb,
         },
         non_finalized_state::{Chain, NonFinalizedState},
         pending_utxos::PendingUtxos,
@@ -393,7 +393,10 @@ impl Drop for ReadStateService {
                     Ok(write::BlockWriteTaskExit::HeaderChainAttachmentFailed(error)) => {
                         tracing::error!(?error, "block write task stopped during header attachment")
                     }
-                    Ok(write::BlockWriteTaskExit::HeaderChainRuntimeFailed(error)) => {
+                    Ok(
+                        write::BlockWriteTaskExit::HeaderChainRuntimeFailed(error)
+                        | write::BlockWriteTaskExit::SpentnessFailed(error),
+                    ) => {
                         tracing::error!(?error, "block write task stopped after a runtime failure")
                     }
                     Ok(write::BlockWriteTaskExit::Completed) => {
@@ -433,6 +436,24 @@ impl StateService {
         max_checkpoint_height: block::Height,
         checkpoint_verify_concurrency_limit: usize,
     ) -> Result<(Self, ReadStateService, LatestChainTip, ChainTipChange), StateInitError> {
+        Self::new_with_spentness(
+            config,
+            network,
+            max_checkpoint_height,
+            checkpoint_verify_concurrency_limit,
+            SpentnessSetup::ordinary(network),
+        )
+        .await
+    }
+
+    /// Like [`Self::new`], with spentness construction settings and release authority.
+    pub(crate) async fn new_with_spentness(
+        config: Config,
+        network: &Network,
+        max_checkpoint_height: block::Height,
+        checkpoint_verify_concurrency_limit: usize,
+        spentness: SpentnessSetup,
+    ) -> Result<(Self, ReadStateService, LatestChainTip, ChainTipChange), StateInitError> {
         let (finalized_state, finalized_tip, historical_trees, timer) = {
             let config = config.clone();
             let network = network.clone();
@@ -440,20 +461,21 @@ impl StateService {
                 let timer = CodeTimer::start();
                 // `expect` would format the error with `Debug`, which drops the actionable
                 // guidance each `StateInitError` carries in its `Display` message.
-                let finalized_state = FinalizedState::new(&config, &network)
-                    .unwrap_or_else(|error| match error {
-                        // This database cannot be repaired, and the generic hint below would
-                        // send the operator looking at permissions and disk space instead.
-                        error @ StateInitError::VctSproutHistoryUnrepairable => {
-                            panic!("{error}")
-                        }
-                        error => panic!(
-                            "opening the read-write finalized state database failed: {error}; \
+                let finalized_state =
+                    FinalizedState::new_with_spentness(&config, &network, spentness)
+                        .unwrap_or_else(|error| match error {
+                            // This database cannot be repaired, and the generic hint below would
+                            // send the operator looking at permissions and disk space instead.
+                            error @ StateInitError::VctSproutHistoryUnrepairable => {
+                                panic!("{error}")
+                            }
+                            error => panic!(
+                                "opening the read-write finalized state database failed: {error}; \
                              check that the state cache directory is writable and not locked by \
                              another Zakura instance, and that there is free disk space"
-                        ),
-                    })
-                    .with_checkpoint_raw_tx_retention(max_checkpoint_height, &config);
+                            ),
+                        })
+                        .with_checkpoint_raw_tx_retention(max_checkpoint_height, &config);
                 timer.finish_desc("opening finalized state database");
 
                 let timer = CodeTimer::start();
@@ -1520,6 +1542,13 @@ impl StateService {
 }
 
 impl ReadStateService {
+    /// Subscribe to construction progress without querying incomplete monetary state.
+    pub fn spentness_status_receiver(
+        &self,
+    ) -> tokio::sync::watch::Receiver<crate::SpentnessStatus> {
+        self.db.subscribe_spentness()
+    }
+
     /// Creates a new read-only state service, using the provided finalized state and
     /// block write task handle.
     ///
@@ -1722,6 +1751,10 @@ impl Service<Request> for StateService {
         req.count_metric();
         let span = Span::current();
 
+        if self.read_service.db.spentness_incomplete() && !req.available_during_spentness() {
+            return async { Err(BoxError::from(crate::SpentnessError::Incomplete)) }.boxed();
+        }
+
         match req {
             Request::ApplyHeaderChainInsert { prepared } => {
                 let rsp_rx = self.send_header_chain_insert(prepared);
@@ -1886,8 +1919,10 @@ impl Service<Request> for StateService {
                 //
                 // (Checkpoint block UTXOs are verified using block hash checkpoints
                 // and transaction merkle tree block header commitments.)
-                self.pending_utxos
-                    .check_against_ordered(&finalized.new_outputs);
+                if !self.read_service.db.spentness_incomplete() {
+                    self.pending_utxos
+                        .check_against_ordered(&finalized.new_outputs);
+                }
 
                 // # Performance
                 //
@@ -2688,7 +2723,10 @@ impl Service<ReadRequest> for ReadStateService {
                             Ok(write::BlockWriteTaskExit::HeaderChainAttachmentFailed(error)) => {
                                 return Poll::Ready(Err(Box::new(error)));
                             }
-                            Ok(write::BlockWriteTaskExit::HeaderChainRuntimeFailed(error)) => {
+                            Ok(
+                                write::BlockWriteTaskExit::HeaderChainRuntimeFailed(error)
+                                | write::BlockWriteTaskExit::SpentnessFailed(error),
+                            ) => {
                                 return Poll::Ready(Err(Box::new(error)));
                             }
                             Ok(write::BlockWriteTaskExit::Completed) => {}
@@ -2716,6 +2754,9 @@ impl Service<ReadRequest> for ReadStateService {
     #[instrument(name = "read_state", skip(self, req))]
     fn call(&mut self, req: ReadRequest) -> Self::Future {
         req.count_metric();
+        if self.db.spentness_incomplete() && !req.available_during_spentness() {
+            return async { Err(BoxError::from(crate::SpentnessError::Incomplete)) }.boxed();
+        }
         let timer = CodeTimer::start_desc(req.variant_name());
         let span = Span::current();
         let timed_span = TimedSpan::new(timer, span);
@@ -3631,12 +3672,15 @@ pub async fn init(
 /// Initialize state and return the separate capability used to seal completion-gated body
 /// evidence before it enters the general-purpose state request service.
 ///
+/// `spentness` selects local hinted construction. The default builds ordinary state.
+///
 /// # Errors
 ///
-/// Returns a [`StateInitError`] if historical tree derivation is misconfigured or its frontier
-/// artifact cannot be loaded.
+/// Returns a [`StateInitError`] if historical tree derivation is misconfigured, its frontier
+/// artifact cannot be loaded, or spentness construction cannot safely open or resume.
 pub async fn init_with_header_chain_body_evidence(
     config: Config,
+    spentness: crate::SpentnessConfig,
     network: &Network,
     max_checkpoint_height: block::Height,
     checkpoint_verify_concurrency_limit: usize,
@@ -3650,15 +3694,16 @@ pub async fn init_with_header_chain_body_evidence(
     ),
     StateInitError,
 > {
-    let (state, read_state, latest_chain_tip, chain_tip_change) = init(
+    let (state, read_state, latest_chain_tip, chain_tip_change) = StateService::new_with_spentness(
         config,
         network,
         max_checkpoint_height,
         checkpoint_verify_concurrency_limit,
+        SpentnessSetup::new(spentness, network),
     )
     .await?;
     Ok((
-        state,
+        BoxService::new(state),
         read_state,
         latest_chain_tip,
         chain_tip_change,

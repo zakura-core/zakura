@@ -27,6 +27,22 @@ pub const FORMAT_VERSION: u16 = 1;
 mod commitments;
 pub use commitments::MAINNET_COMMITMENTS;
 
+/// Operator policy for initial checkpoint construction with spentness hints.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    /// Use ordinary state writes and reject unfinished hinted construction.
+    #[default]
+    Off,
+    /// Try hints on an empty database, with ordinary fallback before the first write.
+    Auto,
+    /// Require compatible hints before starting an empty database.
+    Require,
+}
+
+/// Revoked artifact digests. Recognition never overrides revocation.
+pub const REVOKED_COMMITMENTS: &[[u8; 32]] = &[];
+
 /// Release-reviewed commitments for `network`, oldest first.
 ///
 /// Only Mainnet has reviewed artifacts. Other networks always build ordinary state.

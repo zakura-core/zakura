@@ -52,6 +52,12 @@ mod contention;
 /// The name of the transaction hash by spent outpoints column family.
 pub const TX_LOC_BY_SPENT_OUT_LOC: &str = "tx_loc_by_spent_out_loc";
 
+/// The name of the unspent transparent output column family.
+pub const UTXO_BY_OUT_LOC: &str = "utxo_by_out_loc";
+
+/// The name of the address UTXO index column family.
+pub const UTXO_LOC_BY_TRANSPARENT_ADDR_LOC: &str = "utxo_loc_by_transparent_addr_loc";
+
 /// The name of the [balance](AddressBalanceLocation) by transparent address column family.
 pub const BALANCE_BY_TRANSPARENT_ADDR: &str = "balance_by_transparent_addr";
 
@@ -92,7 +98,7 @@ impl ZakuraDb {
     ) -> impl Iterator<Item = (OutputLocation, transparent::OrderedUtxo)> + '_ {
         let cf = self
             .db
-            .cf_handle("utxo_by_out_loc")
+            .cf_handle(UTXO_BY_OUT_LOC)
             .expect("the state schema contains utxo_by_out_loc");
         self.db.zs_forward_range_iter(&cf, ..).map(
             |(location, output): (OutputLocation, transparent::Output)| {
@@ -456,10 +462,42 @@ impl DiskWriteBatch {
             transparent::OutPoint,
             OutputLocation,
         >,
+        address_balances: AddressBalanceLocationUpdates,
+    ) {
+        self.prepare_created_utxos(&zakura_db.db, new_outputs_by_out_loc);
+        self.prepare_spent_utxos(&zakura_db.db, spent_utxos_by_out_loc);
+        self.prepare_transparent_indexes_batch(
+            zakura_db,
+            network,
+            &finalized.block,
+            finalized.height,
+            new_outputs_by_out_loc,
+            spent_utxos_by_outpoint,
+            spent_utxos_by_out_loc,
+            #[cfg(feature = "indexer")]
+            out_loc_by_outpoint,
+            address_balances,
+        );
+    }
+
+    /// Prepare derived transparent indexes without modifying consensus UTXOs.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_transparent_indexes_batch(
+        &mut self,
+        zakura_db: &ZakuraDb,
+        network: &Network,
+        block: &zakura_chain::block::Block,
+        height: Height,
+        new_outputs_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
+        spent_utxos_by_outpoint: &HashMap<transparent::OutPoint, transparent::Utxo>,
+        spent_utxos_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
+        #[cfg(feature = "indexer")] out_loc_by_outpoint: &HashMap<
+            transparent::OutPoint,
+            OutputLocation,
+        >,
         mut address_balances: AddressBalanceLocationUpdates,
     ) {
         let db = &zakura_db.db;
-        let FinalizedBlock { block, height, .. } = finalized;
 
         // Update the in-memory `address_balances` transaction-by-transaction, debiting inputs
         // before crediting outputs within each transaction. This ordering keeps every
@@ -468,7 +506,7 @@ impl DiskWriteBatch {
         // intermediate balance would otherwise exceed MAX_MONEY.
         Self::prepare_transparent_address_balance_updates(
             network,
-            *height,
+            height,
             &block.transactions,
             spent_utxos_by_outpoint,
             &mut address_balances,
@@ -476,13 +514,13 @@ impl DiskWriteBatch {
 
         // Write the new and spent transparent output index entries. These passes no longer
         // touch `address_balances`; they only read each entry's `address_location()`.
-        self.prepare_new_transparent_outputs_batch(
+        self.prepare_new_transparent_indexes_batch(
             db,
             network,
             new_outputs_by_out_loc,
             &address_balances,
         );
-        self.prepare_spent_transparent_outputs_batch(
+        self.prepare_spent_transparent_indexes_batch(
             db,
             network,
             spent_utxos_by_out_loc,
@@ -491,7 +529,7 @@ impl DiskWriteBatch {
 
         // Index the transparent addresses that spent in each transaction
         for (tx_index, transaction) in block.transactions.iter().enumerate() {
-            let spending_tx_location = TransactionLocation::from_usize(*height, tx_index);
+            let spending_tx_location = TransactionLocation::from_usize(height, tx_index);
 
             self.prepare_spending_transparent_tx_ids_batch(
                 zakura_db,
@@ -519,8 +557,8 @@ impl DiskWriteBatch {
     /// `AddressBalanceLocationUpdates` variant.
     ///
     /// This function does not touch the RocksDB batch; index writes are still handled by
-    /// [`Self::prepare_new_transparent_outputs_batch`] and
-    /// [`Self::prepare_spent_transparent_outputs_batch`], which read but no longer mutate
+    /// [`Self::prepare_new_transparent_indexes_batch`] and
+    /// [`Self::prepare_spent_transparent_indexes_batch`], which read but no longer mutate
     /// `address_balances`.
     fn prepare_transparent_address_balance_updates(
         network: &Network,
@@ -619,7 +657,52 @@ impl DiskWriteBatch {
         new_outputs_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
         address_balances: &AddressBalanceLocationUpdates,
     ) {
-        let utxo_by_out_loc = db.cf_handle("utxo_by_out_loc").unwrap();
+        self.prepare_new_transparent_indexes_batch(
+            db,
+            network,
+            new_outputs_by_out_loc,
+            address_balances,
+        );
+        self.prepare_created_utxos(db, new_outputs_by_out_loc);
+    }
+
+    /// Insert created UTXOs, without touching derived indexes.
+    pub(crate) fn prepare_created_utxos(
+        &mut self,
+        db: &DiskDb,
+        created: &BTreeMap<OutputLocation, transparent::Utxo>,
+    ) {
+        let utxos = db
+            .cf_handle(UTXO_BY_OUT_LOC)
+            .expect("UTXO column family is declared");
+        for (location, utxo) in created {
+            self.zs_insert(&utxos, location, &utxo.output);
+        }
+    }
+
+    /// Delete spent UTXOs, without touching derived indexes.
+    fn prepare_spent_utxos(
+        &mut self,
+        db: &DiskDb,
+        spent: &BTreeMap<OutputLocation, transparent::Utxo>,
+    ) {
+        let utxos = db
+            .cf_handle(UTXO_BY_OUT_LOC)
+            .expect("UTXO column family is declared");
+        for location in spent.keys() {
+            self.zs_delete(&utxos, location);
+        }
+    }
+
+    /// Insert address UTXO and address transaction index entries for new outputs.
+    #[allow(clippy::unwrap_in_result)]
+    fn prepare_new_transparent_indexes_batch(
+        &mut self,
+        db: &DiskDb,
+        network: &Network,
+        new_outputs_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
+        address_balances: &AddressBalanceLocationUpdates,
+    ) {
         let utxo_loc_by_transparent_addr_loc =
             db.cf_handle("utxo_loc_by_transparent_addr_loc").unwrap();
         let tx_loc_by_transparent_addr_loc =
@@ -659,11 +742,6 @@ impl DiskWriteBatch {
                 );
                 self.zs_insert(&tx_loc_by_transparent_addr_loc, address_transaction, ());
             }
-
-            // Use the OutputLocation to store a copy of the new Output in the database.
-            // (For performance reasons, we don't want to deserialize the whole transaction
-            // to get an output.)
-            self.zs_insert(&utxo_by_out_loc, new_output_location, unspent_output);
         }
     }
 
@@ -691,7 +769,24 @@ impl DiskWriteBatch {
         spent_utxos_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
         address_balances: &AddressBalanceLocationUpdates,
     ) {
-        let utxo_by_out_loc = db.cf_handle("utxo_by_out_loc").unwrap();
+        self.prepare_spent_transparent_indexes_batch(
+            db,
+            network,
+            spent_utxos_by_out_loc,
+            address_balances,
+        );
+        self.prepare_spent_utxos(db, spent_utxos_by_out_loc);
+    }
+
+    /// Delete address UTXO index entries for spent outputs.
+    #[allow(clippy::unwrap_in_result)]
+    fn prepare_spent_transparent_indexes_batch(
+        &mut self,
+        db: &DiskDb,
+        network: &Network,
+        spent_utxos_by_out_loc: &BTreeMap<OutputLocation, transparent::Utxo>,
+        address_balances: &AddressBalanceLocationUpdates,
+    ) {
         let utxo_loc_by_transparent_addr_loc =
             db.cf_handle("utxo_loc_by_transparent_addr_loc").unwrap();
 
@@ -721,9 +816,6 @@ impl DiskWriteBatch {
 
                 self.zs_delete(&utxo_loc_by_transparent_addr_loc, address_spent_output);
             }
-
-            // Delete the OutputLocation, and the copy of the spent Output in the database.
-            self.zs_delete(&utxo_by_out_loc, spent_output_location);
         }
     }
 

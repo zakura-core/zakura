@@ -297,9 +297,6 @@ pub struct ZakuraConfig {
     /// this directory. Legacy peer fields in `legacy_sync.jsonl` follow
     /// [`Config::expose_peer_addresses`](crate::config::Config::expose_peer_addresses).
     pub trace_dir: Option<PathBuf>,
-    /// Optional cache for release-pinned spentness artifacts downloaded and served over peers.
-    /// This enables artifact distribution only; it does not enable hinted state writes.
-    pub spentness_cache_dir: Option<PathBuf>,
     /// Native header-sync wire settings.
     pub header_sync: ZakuraHeaderSyncConfig,
     /// Native stream-6 block-sync wire, scheduling, serving, and rollout settings.
@@ -333,7 +330,6 @@ impl Default for ZakuraConfig {
             stream_open_rate_per_second: DEFAULT_ZAKURA_STREAM_OPEN_RATE_PER_SECOND,
             message_rate_per_second: DEFAULT_ZAKURA_MESSAGE_RATE_PER_SECOND,
             trace_dir: None,
-            spentness_cache_dir: None,
             header_sync: ZakuraHeaderSyncConfig::default(),
             block_sync: ZakuraBlockSyncConfig::default(),
             dev_network: None,

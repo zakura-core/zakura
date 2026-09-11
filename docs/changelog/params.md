@@ -32,6 +32,10 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| `spentness.mode`, `spentness.artifact_file`, `spentness.cache_dir` | `crates/zakurad/src/config.rs` | new → `off`, unset, unset | [#962](https://github.com/zakura-core/zakura/pull/962) | Configure artifact construction and distribution in one node section. |
+| Spentness replay transaction cache | `crates/zakura-state/src/service/finalized_state/zakura_db/spentness/rebuild.rs` | new → `64` creating transactions | [#962](https://github.com/zakura-core/zakura/pull/962) | Bound memory while resolving historical inputs. |
+| Spentness metadata record limit | `crates/zakura-state/src/service/finalized_state/zakura_db/spentness.rs` | new → `4 KiB` | [#962](https://github.com/zakura-core/zakura/pull/962) | Bound recovery record decoding. |
+| Spentness bootstrap endpoint shutdown timeout | `crates/zakura-network/src/zakura/spentness.rs` | new → `10 s` | [#962](https://github.com/zakura-core/zakura/pull/962) | Bound shutdown of the temporary artifact acquisition endpoint. |
 | `MAX_ARTIFACT_LEN` | `crates/zakura-chain/src/parameters/spentness_hints.rs` | new → `512 MiB` | [#961](https://github.com/zakura-core/zakura/pull/961) | Bound artifact reads and allocations before verification. |
 | `RANGE_BYTES`, `ArtifactService` serving limits | `crates/zakura-network/src/zakura/spentness.rs` | new → `256 KiB` ranges, `4` slots held for `250 ms` | [#961](https://github.com/zakura-core/zakura/pull/961) | Bound response memory and aggregate artifact serving at 4 MiB/s. |
 | Artifact acquisition limits | `crates/zakura-network/src/zakura/spentness.rs` | new → `30 s` per request, `60 s` bootstrap wait, `3` sources | [#961](https://github.com/zakura-core/zakura/pull/961) | Bound unavailable-source delays and retries. |

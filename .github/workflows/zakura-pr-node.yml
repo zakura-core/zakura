@@ -1,4 +1,4 @@
-name: PR node
+name: PR 966 instrumented checkpoint diagnosis
 
 # Ephemeral 1-hour real-node test for a PR (or any ref) on DigitalOcean.
 #
@@ -144,7 +144,6 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
 
 concurrency:
   group: zakura-pr-node-${{ inputs.pr_number || inputs.ref }}
@@ -291,6 +290,7 @@ jobs:
             /tmp/run.env \
             .github/workflows/scripts/pr-node-run.sh \
             .github/workflows/scripts/pr-node-monitor.py \
+            .github/workflows/scripts/pr-node-paired-smoke.py \
             "root@${IP}:/root/"
           rm -f /tmp/run.env
           # Keepalives: the monitored hour is long and low-output.
@@ -358,55 +358,6 @@ jobs:
               echo "**Inspect the node:** \`ssh root@${IP}\` (deleted by the reaper ~24h after creation)."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Post PR comment
-        if: always() && inputs.post_comment && steps.target.outputs.pr != '' && steps.droplet.outputs.ip != ''
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        env:
-          PR: ${{ steps.target.outputs.pr }}
-          MODE: ${{ inputs.snapshot_mode }}
-          NETWORK: ${{ inputs.network }}
-          IP: ${{ steps.droplet.outputs.ip }}
-          TEARDOWN: ${{ inputs.teardown_after_run }}
-        with:
-          script: |
-            const fs = require('fs');
-            const marker = `<!-- zakura-pr-node:${process.env.MODE}:${process.env.NETWORK} -->`;
-            let summary;
-            try {
-              summary = fs.readFileSync('/tmp/out/summary.md', 'utf8');
-            } catch {
-              summary = '## Zakura PR node run\n\nNo summary was produced — see the workflow log.';
-            }
-            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
-            const footer = process.env.TEARDOWN === 'true'
-              ? '_Droplet deleted after the run._'
-              : `**Inspect the node:** \`ssh root@${process.env.IP}\` (deleted by the reaper ~24h after creation).`;
-            const body = `${marker}\n${summary}\n\n${footer}\n\n[Workflow run](${runUrl})`;
-            const issue_number = Number(process.env.PR);
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number,
-            });
-            const existing = comments.find(c =>
-              c.user.type === 'Bot' && c.body.startsWith(marker)
-            );
-            if (existing) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: existing.id,
-                body,
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number,
-                body,
-              });
-            }
 
       - name: Upload artifacts
         if: always() && steps.droplet.outputs.ip != ''

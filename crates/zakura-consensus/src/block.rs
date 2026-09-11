@@ -311,6 +311,8 @@ where
         async move {
             let hash = zakura_header_chain::validate_encoding_version_hash(&block.header)
                 .map_err(BlockError::from)?;
+            tracing::info!(target: "handoff_diagnostic", stage = "full_verifier_enter",
+                height = ?block.coinbase_height(), ?hash);
             let preparation_start = request.should_cache().then(std::time::Instant::now);
             // Check that this block is actually a new block.
             tracing::trace!("checking that block is not already in state");
@@ -329,6 +331,8 @@ where
                 _ => unreachable!("wrong response to Request::KnownBlock"),
             }
 
+            tracing::info!(target: "handoff_diagnostic", stage = "known_block_check_done",
+                height = ?block.coinbase_height(), ?hash);
             tracing::trace!("performing block checks");
             let height = block
                 .coinbase_height()
@@ -482,6 +486,8 @@ where
                     });
                 async_checks.push(rsp);
             }
+            tracing::info!(target: "handoff_diagnostic", stage = "transaction_checks_queued",
+                ?height, ?hash, count = async_checks.len());
             tracing::trace!(len = async_checks.len(), "built async tx checks");
 
             // Get the transaction results back from the transaction verifier.
@@ -511,6 +517,7 @@ where
                 }
             }
 
+            tracing::info!(target: "handoff_diagnostic", stage = "transaction_checks_done", ?height, ?hash);
             // Check the summed block totals
 
             if sigops > MAX_BLOCK_SIGOPS {
@@ -652,7 +659,9 @@ where
         },
         None => zs::Request::CommitSemanticallyVerifiedBlock(prepared_block),
     };
+    tracing::info!(target: "handoff_diagnostic", stage = "semantic_commit_submit", ?hash);
     let response = ready_state_service.call(request).await;
+    tracing::info!(target: "handoff_diagnostic", stage = "semantic_commit_return", ?hash, success = response.is_ok());
     if is_mined_commit {
         metrics::histogram!("mining.contextual_commit.duration_seconds")
             .record(commit_start.elapsed().as_secs_f64());

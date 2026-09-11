@@ -963,6 +963,13 @@ impl StateService {
     /// handoff has happened, `block_write_sender.finalized` is `None`, so the cheap first check
     /// short-circuits and the database is not read again.
     fn try_handoff_to_non_finalized_write(&mut self) -> bool {
+        if self.block_write_sender.finalized.is_some() {
+            tracing::info!(target: "handoff_diagnostic", stage = "handoff_check",
+                durable_tip = ?self.read_service.db.finalized_tip_height(),
+                durable_hash = ?self.read_service.db.finalized_tip_hash(),
+                last_sent = ?self.finalized_block_write_last_sent_hash,
+                queued_child = self.non_finalized_state_queued_blocks.has_queued_children(self.finalized_block_write_last_sent_hash));
+        }
         // The database tip is only read while we are still committing checkpoint verified blocks, so
         // the cheap `is_some()` check short-circuits this for the rest of the node's life.
         if self.block_write_sender.finalized.is_some()
@@ -980,6 +987,8 @@ impl StateService {
             // Tell the block write task to stop committing checkpoint verified blocks to the
             // finalized state, and move on to committing semantically verified blocks to the
             // non-finalized state.
+            tracing::warn!(target: "handoff_diagnostic", stage = "handoff_fired",
+                durable_tip = ?self.read_service.db.finalized_tip_height());
             std::mem::drop(self.block_write_sender.finalized.take());
             // Remove any checkpoint-verified block hashes from `non_finalized_block_write_sent_hashes`.
             self.non_finalized_block_write_sent_hashes = SentHashes::default();
@@ -1798,6 +1807,8 @@ impl Service<Request> for StateService {
             // The expected error type for this request is `CommitSemanticallyVerifiedError`.
             Request::CommitSemanticallyVerifiedBlock(semantically_verified) => {
                 let timer = CodeTimer::start();
+                tracing::info!(target: "handoff_diagnostic", stage = "semantic_state_request",
+                    height = ?semantically_verified.height, hash = ?semantically_verified.hash);
                 self.assert_block_can_be_validated(&semantically_verified);
 
                 self.pending_utxos

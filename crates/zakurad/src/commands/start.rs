@@ -471,6 +471,27 @@ impl StartCmd {
             .buffer(Self::state_buffer_bound(&config))
             .service(state_service);
 
+        // Temporary, explicitly armed diagnostic. The task does not poll state until the file exists.
+        if let Some(probe_file) = std::env::var_os("ZAKURA_HANDOFF_PROBE_FILE") {
+            let probe_state = state.clone();
+            tokio::spawn(async move {
+                let probe_path = std::path::PathBuf::from(probe_file);
+                for _ in 0..1800 {
+                    if probe_path.exists() {
+                        tracing::warn!(target: "handoff_diagnostic", stage = "probe_tip_request");
+                        let result = tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            probe_state.oneshot(zakura_state::Request::Tip),
+                        )
+                        .await;
+                        tracing::warn!(target: "handoff_diagnostic", stage = "probe_tip_result", ?result);
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            });
+        }
+
         let zakura_bootstrap_snapshots = config
             .network
             .v2_p2p()

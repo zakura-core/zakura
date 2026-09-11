@@ -56,6 +56,22 @@ else
   df -h /mnt/snapshots
 fi
 
+# This branch is a disposable harness. The binaries still come from the exact PR head.
+[ "$SHA" = "e3328340aa040971681ed222a5bfc63fe43d8991" ] || { echo "wrong PR head" >&2; exit 1; }
+[ "$MODE" = "tip" ] && [ "$NETWORK" = "mainnet" ] && [ "$P2P_STACK" = "dual" ] || {
+  echo "paired smoke requires tip/mainnet/dual for the seed" >&2; exit 1;
+}
+PAIRED_STATE_CACHE_DIR=/mnt/snapshots/paired-client
+[ ! -e "$PAIRED_STATE_CACHE_DIR" ] || { echo "paired fixture already exists" >&2; exit 1; }
+TASK_COPY_BYTES=$(du -sb "$STATE_CACHE_DIR" | cut -f1)
+TASK_FREE_BYTES=$(df -B1 --output=avail /mnt/snapshots | tail -1 | tr -d ' ')
+[ "$TASK_FREE_BYTES" -gt "$(( TASK_COPY_BYTES + 10 * 1024 * 1024 * 1024 ))" ] || {
+  echo "not enough free space for a separate downloader snapshot" >&2; exit 1;
+}
+# The primary snapshot has not been opened by the node yet. Never copy a live DB.
+cp -a --reflink=auto "$STATE_CACHE_DIR" "$PAIRED_STATE_CACHE_DIR"
+note "Copied the unopened snapshot for a separate native-only downloader."
+
 # ---------------------------------------------------------------------------- #
 # Source: fetch the PR ref into the baked clone
 # ---------------------------------------------------------------------------- #
@@ -124,12 +140,18 @@ commit = "${SHA}"
 network = "${NET_TOML}"
 state_cache_dir = "${STATE_CACHE_DIR}"
 storage_mode = "${STORAGE_MODE}"
-p2p_stack = "${P2P_STACK}"
+p2p_stack = "legacy"
 checkpoint_sync = true
-vct_fast_sync = true
+vct_fast_sync = false
 rpc_listen_addr = "127.0.0.1:8232"
 rpc_enable_cookie_auth = false
 metrics_endpoint = "127.0.0.1:9999"
+
+[nodes.zakura]
+listen_addr = "127.0.0.1:8234"
+bootstrap_peers = []
+dev_network = "pr966-retention-sync-20260911"
+trace_dir = "/var/log/zakura/seed-traces"
 TOML
 
 export CARGO_TARGET_DIR=/root/cargo-target
@@ -188,25 +210,82 @@ TOML
   note "pre-checkpoint: verified database height ${VERIFIED_START_HEIGHT} is $((MAX_CKPT - VERIFIED_START_HEIGHT)) blocks below max checkpoint ${MAX_CKPT}."
 fi
 
+# Both isolated nodes run the exact PR binary.
+install -m 755 "/root/zakura/deploy/deployer/.build-cache/zakurad-${SHA}" /usr/local/bin/zakurad-downloader
 python3 deploy/deployer/deploy.py deploy --config /root/fleet.toml
 python3 deploy/deployer/deploy.py status --config /root/fleet.toml || true
+cmp /usr/local/bin/zakurad /usr/local/bin/zakurad-downloader
+sha256sum /usr/local/bin/zakurad /usr/local/bin/zakurad-downloader > "$OUT_DIR/binary-sha256.txt"
 
 # ---------------------------------------------------------------------------- #
 # Monitor for the requested duration, then package outputs
 # ---------------------------------------------------------------------------- #
 
+# Give the native downloader a supplier with complete blocks and tree roots.
+# The untouched secondary snapshot remains at its original height.
+SEED_CKPT=$(tail -1 crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt | cut -d' ' -f1)
+[[ "$SEED_CKPT" =~ ^[0-9]+$ ]] || { echo "cannot read seed checkpoint" >&2; exit 1; }
+SEED_READY_HEIGHT=$((SEED_CKPT + 512))
+note "Priming the seed over legacy P2P with VCT fast sync disabled, through height ${SEED_READY_HEIGHT}. The native downloader keeps VCT fast sync enabled."
+PRIME_RC=0
+python3 /root/pr-node-monitor.py \
+  --duration-minutes 15 --interval 10 \
+  --rpc-url http://127.0.0.1:8232 --metrics-url http://127.0.0.1:9999/metrics \
+  --service zakurad --log-file /var/log/zakura/zakura.log \
+  --stop-after-height "$SEED_READY_HEIGHT" \
+  --required-finalized-at-least "$SEED_CKPT" \
+  --meta "mode=seed-priming,network=${NETWORK},vct_fast_sync=false,p2p_stack=legacy" \
+  --out "$OUT_DIR/seed-priming" || PRIME_RC=$?
+systemctl stop zakurad
+cp /var/log/zakura/zakura.log "$OUT_DIR/seed-priming/zakura.log"
+[ "$PRIME_RC" -eq 0 ] || exit "$PRIME_RC"
+python3 - <<'ENABLE_NATIVE_SEED'
+from pathlib import Path
+p=Path('/root/fleet.toml')
+s=p.read_text()
+assert 'p2p_stack = "legacy"' in s
+p.write_text(s.replace('p2p_stack = "legacy"', 'p2p_stack = "dual"'))
+ENABLE_NATIVE_SEED
+python3 deploy/deployer/deploy.py deploy --config /root/fleet.toml
+note "Seed priming passed. Restarted the same seed binary with the isolated native endpoint enabled."
+
+PAIR_RC=0
+python3 -u /root/pr-node-paired-smoke.py \
+  --state "$PAIRED_STATE_CACHE_DIR" --duration-minutes "$DURATION_MINUTES" || PAIR_RC=$?
 MONITOR_RC=0
 python3 /root/pr-node-monitor.py \
-  --duration-minutes "${DURATION_MINUTES}" \
+  --duration-minutes 0.2 \
   --interval 30 \
   --rpc-url http://127.0.0.1:8232 \
   --metrics-url http://127.0.0.1:9999/metrics \
   --service zakurad \
   --log-file /var/log/zakura/zakura.log \
   --notes "$NOTES" \
-  --meta "mode=${MODE},network=${NETWORK},sha=${SHA}" \
+  --meta "mode=${MODE},network=${NETWORK},sha=${SHA},downloader_sha=${SHA}" \
   "${MONITOR_CROSSING_ARGS[@]}" \
   --out "$OUT_DIR" || MONITOR_RC=$?
+
+cp -a /var/log/zakura/seed-traces "$OUT_DIR/seed-traces" 2>/dev/null || true
+python3 - <<'PAIR_SUMMARY'
+import json
+from pathlib import Path
+root=Path('/root/out')
+pair=json.loads((root/'paired/summary.json').read_text())
+summary=json.loads((root/'summary.json').read_text())
+summary['paired_smoke']=pair
+if not pair['pass']:
+    summary['verdict']='failed'
+(root/'summary.json').write_text(json.dumps(summary,indent=2)+'\n')
+with (root/'summary.md').open('a') as f:
+    f.write('\n## Native compatibility smoke\n\n')
+    f.write('Two full nodes on one disposable host. Both nodes run PR 966. The seed follows public mainnet over legacy P2P and serves the native-only downloader over loopback QUIC.\n\n')
+    f.write('Result: '+('PASS' if pair['pass'] else 'FAIL')+'\n\n')
+    f.write('Diagnostic outcome: '+pair.get('outcome', 'incomplete')+'\n\n')
+    for phase in pair.get('phases', []):
+        f.write(f"- {phase['phase']}: height {phase['start_height'] if 'start_height' in phase else pair['start_height']} to {phase['height']}, {phase['native_bodies']} native bodies, matching block hash {phase['block_hash']}\n")
+    if pair.get('error'): f.write(pair['error']+'\n')
+PAIR_SUMMARY
+if [ "$PAIR_RC" -ne 0 ]; then MONITOR_RC=$PAIR_RC; fi
 
 tail -n 2000 /var/log/zakura/zakura.log > "$OUT_DIR/zakura-tail.log" 2>/dev/null || true
 zstd -T0 -q -f /var/log/zakura/zakura.log -o "$OUT_DIR/zakura-full.log.zst" 2>/dev/null || true

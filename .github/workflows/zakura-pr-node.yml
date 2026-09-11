@@ -28,12 +28,12 @@ jobs:
           owner=os.environ['OWNER_RUN']
           nodes=[d for d in json.load(open('/tmp/droplets.json')) if d['name'].startswith('zakura-pr-adam-header-serving-') and d['name'].endswith('-'+owner)]
           volumes=[v for v in json.load(open('/tmp/volumes.json')) if v['name']=='zakura-pr-vol-'+owner or v['name'].startswith('zakura-pr-vol-'+owner+'-')]
-          assert len(nodes)<=1
+          assert len(nodes)==1 and nodes[0]["id"]==599761764
           print(json.dumps({'owner_run':owner,'nodes':[{'id':d['id'],'name':d['name'],'volume_ids':d.get('volume_ids',[])} for d in nodes],'volumes':[{'id':v['id'],'name':v['name']} for v in volumes]}))
           if nodes:
               Path('/tmp/owned-ip').write_text(next(n['ip_address'] for n in nodes[0]['networks']['v4'] if n['type']=='public'))
           CHECK
           if [ -f /tmp/owned-ip ]; then
             IP=$(cat /tmp/owned-ip)
-            ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -i /tmp/do_ssh "root@$IP" python3 - < .github/workflows/scripts/header-serving-inspect.py
+            ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -i /tmp/do_ssh "root@$IP" python3 - < .github/workflows/scripts/header-serving-fixture-recovery.py
           fi

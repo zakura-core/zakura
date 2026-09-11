@@ -43,7 +43,6 @@ RESOLUTION_KEYS = {
     "meta_url",
     "meta_sha256",
 }
-SPENTNESS_SCHEMA = 2
 
 
 class BundleImportError(RuntimeError):
@@ -320,7 +319,7 @@ def import_bundle(
         if hashlib.sha256(meta_bytes).hexdigest() != resolution["meta_sha256"]:
             raise BundleImportError("bundle metadata differs from resolution digest")
         meta = json.loads(meta_bytes)
-        if meta.get("schema_version") == SPENTNESS_SCHEMA:
+        if meta.get("schema_version") == spentness_release.BUNDLE_SCHEMA:
             try:
                 spentness = spentness_release.prepare_import(repo_root, bundle, meta)
             except (ValueError, OSError) as error:

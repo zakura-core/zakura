@@ -48,8 +48,7 @@ SPENTNESS_FILE_LIMITS = {
     spentness_release.COMMITMENT: 16 * 1024,
     spentness_release.VERIFICATION: 32 * 1024,
 }
-SUPPORTED_SCHEMAS = (1, 2)
-SPENTNESS_SCHEMA = 2
+SUPPORTED_SCHEMAS = (1, spentness_release.BUNDLE_SCHEMA)
 LATEST_REQUIRED_KEYS = {
     "schema_version",
     "network",
@@ -322,7 +321,7 @@ def _resolve_from_meta(
 
     files = _object(meta["files"], "meta.files")
     required_limits = dict(FILE_LIMITS)
-    if schema == SPENTNESS_SCHEMA:
+    if schema == spentness_release.BUNDLE_SCHEMA:
         required_limits.update(SPENTNESS_FILE_LIMITS)
     _check_keys(files, set(required_limits), set(), "meta.files")
     validated: dict[str, dict[str, Any]] = {}
@@ -350,7 +349,7 @@ def _resolve_from_meta(
             if hashlib.sha256(data).hexdigest() != entry["sha256"]:
                 raise BundleError(f"{name} digest does not match the bundle meta")
             (staging / name).write_bytes(data)
-        if schema == SPENTNESS_SCHEMA:
+        if schema == spentness_release.BUNDLE_SCHEMA:
             try:
                 spentness_release.validate_bundle(staging, meta)
             except (ValueError, OSError) as error:

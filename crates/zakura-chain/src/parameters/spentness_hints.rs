@@ -27,6 +27,16 @@ pub const FORMAT_VERSION: u16 = 1;
 mod commitments;
 pub use commitments::MAINNET_COMMITMENTS;
 
+/// Release-reviewed commitments for `network`, oldest first.
+///
+/// Only Mainnet has reviewed artifacts. Other networks always build ordinary state.
+pub fn release_commitments(network: &super::Network) -> &'static [Commitment] {
+    match network {
+        super::Network::Mainnet => MAINNET_COMMITMENTS,
+        super::Network::Testnet(_) => &[],
+    }
+}
+
 /// Release-reviewed identity. Artifact bytes remain outside the executable.
 ///
 /// A caller must resolve this descriptor against its release authority before use.
@@ -138,6 +148,16 @@ impl Commitment {
         }
         Ok(())
     }
+
+    /// Hex-encoded artifact digest, for logs and operator messages.
+    pub fn digest_hex(&self) -> String {
+        hex::encode(self.sha256)
+    }
+
+    /// Content-addressed cache file name: `<sha256>.bin`.
+    pub fn file_name(&self) -> String {
+        format!("{}.bin", self.digest_hex())
+    }
 }
 
 /// Structurally valid owned bytes. This type deliberately exposes no membership bits.
@@ -167,14 +187,7 @@ impl ParsedArtifact {
         if source.read(&mut [0; 1])? != 0 {
             return Err(Error::Format("trailing bytes"));
         }
-        let used_bits = output_count % BITS_PER_BYTE;
-        if used_bits != 0 && bytes[len - 1] >> used_bits != 0 {
-            return Err(Error::Format("nonzero padding bits"));
-        }
-        // The ordinary writer never inserts the genesis coinbase output.
-        if output_count != 0 && bytes[HEADER_LEN] & 1 != 0 {
-            return Err(Error::Format("genesis output must be absent"));
-        }
+        check_membership_bits(&bytes[HEADER_LEN..], output_count)?;
         let commitment = Commitment {
             chain_identity: parsed_header.chain_identity,
             terminal_height: parsed_header.terminal_height,
@@ -200,6 +213,19 @@ impl ParsedArtifact {
         }
         Ok(VerifiedArtifact(self))
     }
+}
+
+/// Reject set padding bits and a retained genesis output.
+fn check_membership_bits(bits: &[u8], output_count: u64) -> Result<(), Error> {
+    let used_bits = output_count % BITS_PER_BYTE;
+    if used_bits != 0 && bits.last().is_some_and(|last| last >> used_bits != 0) {
+        return Err(Error::Format("nonzero padding bits"));
+    }
+    // The ordinary writer never inserts the genesis coinbase output.
+    if bits.first().is_some_and(|first| first & 1 != 0) {
+        return Err(Error::Format("genesis output must be absent"));
+    }
+    Ok(())
 }
 
 /// Authenticated owned bytes. No later reads of a mutable source file occur.
@@ -358,7 +384,16 @@ mod tests {
         for end in 0..bytes.len() {
             assert!(ParsedArtifact::read(&bytes[..end]).is_err());
         }
-        for index in [0, 8, 10, 42, 46, 78, 86] {
+        // Flip one bit in every header field and in the first membership byte.
+        for index in [
+            0,
+            VERSION_OFFSET,
+            CHAIN_IDENTITY_OFFSET,
+            TERMINAL_HEIGHT_OFFSET,
+            TERMINAL_BLOCK_HASH_OFFSET,
+            OUTPUT_COUNT_OFFSET,
+            HEADER_LEN,
+        ] {
             let mut changed = bytes.clone();
             changed[index] ^= 1;
             assert!(VerifiedArtifact::read(changed.as_slice(), &pin).is_err());

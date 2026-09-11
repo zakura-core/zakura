@@ -49,6 +49,20 @@ export ZAKURA_SPENTNESS_BIN="$SPENTNESS_BIN"
 DATA_DIR=${RELEASE_STATE_DATA_DIR:-"${STATE_DIR%/}-release-state"}
 BUNDLE_SCHEMA=2
 LEGACY_BUNDLE_SCHEMA=1
+# The exporter derives both sidecar names from the artifact name.
+SPENTNESS_ARTIFACT=mainnet-spentness-hints.bin
+SPENTNESS_COMMITMENT=mainnet-spentness-hints.commitment.json
+SPENTNESS_VERIFICATION=mainnet-spentness-hints.verification.json
+# Bundle data files in upload order. meta.json is uploaded after all of them.
+BUNDLE_FILES=(
+    main-checkpoints.txt
+    mainnet-frontier.bin
+    mainnet-treestate-subtrees.bin
+    mainnet-frontier-grid.bin
+    "$SPENTNESS_ARTIFACT"
+    "$SPENTNESS_COMMITMENT"
+    "$SPENTNESS_VERIFICATION"
+)
 SPENTNESS_TIMEOUT=${RELEASE_STATE_SPENTNESS_TIMEOUT:-48h}
 : "${RELEASE_STATE_ORACLE_SOURCE:?set RELEASE_STATE_ORACLE_SOURCE to an independently synchronized archive cache}"
 : "${RELEASE_STATE_ORACLE_ID:?identify the independently synchronized source and its validation software}"
@@ -169,7 +183,7 @@ fi
     --mainnet-frontier-output "$STAGE/mainnet-frontier.bin" \
     --mainnet-subtree-output "$STAGE/mainnet-treestate-subtrees.bin" \
     --mainnet-frontier-grid-output "$STAGE/mainnet-frontier-grid.bin" \
-    --mainnet-spentness-output "$STAGE/mainnet-spentness-hints.bin" \
+    --mainnet-spentness-output "$STAGE/$SPENTNESS_ARTIFACT" \
     --spentness-replay-cache "$DATA_DIR/spentness-primary" \
     ${GRID_ARGS[@]+"${GRID_ARGS[@]}"} \
     > "$STAGE/main-checkpoints.txt"
@@ -185,10 +199,10 @@ timeout "$SPENTNESS_TIMEOUT" "$SPENTNESS_BIN" replay --source "$RELEASE_STATE_OR
 timeout "$SPENTNESS_TIMEOUT" "$SPENTNESS_BIN" generate --state "$DATA_DIR/spentness-independent" \
     --height "$HEIGHT" --block-hash "$BLOCK_HASH" \
     --output "$STAGE/independent-spentness.bin" --commitment "$STAGE/independent-commitment.json"
-cmp "$STAGE/mainnet-spentness-hints.bin" "$STAGE/independent-spentness.bin"
+cmp "$STAGE/$SPENTNESS_ARTIFACT" "$STAGE/independent-spentness.bin"
 timeout "$SPENTNESS_TIMEOUT" "$SPENTNESS_BIN" verify --state "$DATA_DIR/spentness-independent" \
-    --artifact "$STAGE/mainnet-spentness-hints.bin" \
-    --commitment "$STAGE/mainnet-spentness-hints.commitment.json"
+    --artifact "$STAGE/$SPENTNESS_ARTIFACT" \
+    --commitment "$STAGE/$SPENTNESS_COMMITMENT"
 
 # Never move the pointer backwards: an export from stale state would regress
 # latest.json, and retention could then purge the very bundle it points at.
@@ -201,20 +215,13 @@ HEIGHT="$HEIGHT" BLOCK_HASH="$BLOCK_HASH" GENERATED_AT="$GENERATED_AT" \
     BUNDLE_SCHEMA="$BUNDLE_SCHEMA" \
     RELEASE_STATE_GENERATOR_REVISION="$RELEASE_STATE_GENERATOR_REVISION" \
     RELEASE_STATE_ORACLE_ID="$RELEASE_STATE_ORACLE_ID" \
-    python3 - "$STAGE" <<'PY'
+    SPENTNESS_ARTIFACT="$SPENTNESS_ARTIFACT" SPENTNESS_VERIFICATION="$SPENTNESS_VERIFICATION" \
+    python3 - "$STAGE" "${BUNDLE_FILES[@]}" <<'PY'
 import hashlib, json, os, sys
 
-stage = sys.argv[1]
+stage, *bundle_files = sys.argv[1:]
 files = {}
-for name in (
-    "main-checkpoints.txt",
-    "mainnet-frontier.bin",
-    "mainnet-treestate-subtrees.bin",
-    "mainnet-frontier-grid.bin",
-    "mainnet-spentness-hints.bin",
-    "mainnet-spentness-hints.commitment.json",
-    "mainnet-spentness-hints.verification.json",
-):
+for name in bundle_files:
     data = open(os.path.join(stage, name), "rb").read()
     files[name] = {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
 
@@ -227,10 +234,10 @@ meta = {
     "files": files,
     "generator": {"name": "zakura-checkpoints", "mode": "offline"},
     "spentness": {
-        "verification": json.load(open(os.path.join(stage, "mainnet-spentness-hints.verification.json"))),
+        "verification": json.load(open(os.path.join(stage, os.environ["SPENTNESS_VERIFICATION"]))),
         "generator_revision": os.environ["RELEASE_STATE_GENERATOR_REVISION"],
         "independent_source": os.environ["RELEASE_STATE_ORACLE_ID"],
-        "reproduced_sha256": files["mainnet-spentness-hints.bin"]["sha256"],
+        "reproduced_sha256": files[os.environ["SPENTNESS_ARTIFACT"]]["sha256"],
     },
 }
 with open(os.path.join(stage, "meta.json"), "w", encoding="utf-8") as out:
@@ -263,13 +270,9 @@ PY
 else
     # Data files first, meta.json last, so a partially uploaded bundle is
     # never resolvable through a pointer.
-    rclone copyto "$STAGE/main-checkpoints.txt" "$BUNDLE_REMOTE/main-checkpoints.txt"
-    rclone copyto "$STAGE/mainnet-frontier.bin" "$BUNDLE_REMOTE/mainnet-frontier.bin"
-    rclone copyto "$STAGE/mainnet-treestate-subtrees.bin" "$BUNDLE_REMOTE/mainnet-treestate-subtrees.bin"
-    rclone copyto "$STAGE/mainnet-frontier-grid.bin" "$BUNDLE_REMOTE/mainnet-frontier-grid.bin"
-    rclone copyto "$STAGE/mainnet-spentness-hints.bin" "$BUNDLE_REMOTE/mainnet-spentness-hints.bin"
-    rclone copyto "$STAGE/mainnet-spentness-hints.commitment.json" "$BUNDLE_REMOTE/mainnet-spentness-hints.commitment.json"
-    rclone copyto "$STAGE/mainnet-spentness-hints.verification.json" "$BUNDLE_REMOTE/mainnet-spentness-hints.verification.json"
+    for name in "${BUNDLE_FILES[@]}"; do
+        rclone copyto "$STAGE/$name" "$BUNDLE_REMOTE/$name"
+    done
     rclone copyto "$STAGE/meta.json" "$BUNDLE_REMOTE/meta.json"
     echo "published bundle v$BUNDLE_SCHEMA/$HEIGHT ($BLOCK_HASH)" >&2
 fi

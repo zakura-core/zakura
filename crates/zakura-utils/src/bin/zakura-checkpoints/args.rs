@@ -369,6 +369,16 @@ impl Args {
     }
 
     /// The artifact output flags and their paths, in the order errors report them.
+    /// The spentness artifact and its JSON sidecars, when spentness export is enabled.
+    pub fn spentness_outputs(&self) -> Option<SpentnessOutputs> {
+        let artifact = self.mainnet_spentness_output.clone()?;
+        Some(SpentnessOutputs {
+            commitment: artifact.with_extension("commitment.json"),
+            verification: artifact.with_extension("verification.json"),
+            artifact,
+        })
+    }
+
     fn artifact_outputs(&self) -> [(&'static str, &Option<PathBuf>); 3] {
         [
             ("--mainnet-frontier-output", &self.mainnet_frontier_output),
@@ -387,20 +397,13 @@ impl Args {
     /// bundle expects two.
     fn reject_aliased_artifact_outputs(&self) -> Result<(), String> {
         let mut resolved: Vec<(&'static str, PathBuf)> = Vec::new();
-        let sidecar_commitment = self
-            .mainnet_spentness_output
-            .as_ref()
-            .map(|path| path.with_extension("commitment.json"));
-        let sidecar_verification = self
-            .mainnet_spentness_output
-            .as_ref()
-            .map(|path| path.with_extension("verification.json"));
-        for (flag, path) in self.artifact_outputs().into_iter().chain([
-            ("--mainnet-spentness-output", &self.mainnet_spentness_output),
-            ("spentness commitment sidecar", &sidecar_commitment),
-            ("spentness verification sidecar", &sidecar_verification),
-        ]) {
-            let Some(path) = path else { continue };
+        let spentness = self.spentness_outputs();
+        let outputs = self
+            .artifact_outputs()
+            .into_iter()
+            .filter_map(|(flag, path)| Some((flag, path.as_deref()?)))
+            .chain(spentness.iter().flat_map(SpentnessOutputs::labeled));
+        for (flag, path) in outputs {
             let destination = resolved_output_destination(path)?;
             if let Some((earlier, _)) = resolved
                 .iter()
@@ -412,6 +415,28 @@ impl Args {
         }
 
         Ok(())
+    }
+}
+
+/// Files written by a coupled spentness export.
+///
+/// The sidecar names derive from the artifact path, so the release publisher finds them.
+pub struct SpentnessOutputs {
+    /// The membership artifact.
+    pub artifact: PathBuf,
+    /// The commitment descriptor for review.
+    pub commitment: PathBuf,
+    /// The independent verification report.
+    pub verification: PathBuf,
+}
+
+impl SpentnessOutputs {
+    fn labeled(&self) -> [(&'static str, &Path); 3] {
+        [
+            ("--mainnet-spentness-output", &self.artifact),
+            ("spentness commitment sidecar", &self.commitment),
+            ("spentness verification sidecar", &self.verification),
+        ]
     }
 }
 

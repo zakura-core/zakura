@@ -17,7 +17,10 @@ COMPILED = MANIFEST.with_name("commitments.rs")
 MAX_BYTES = 512 * 1024 * 1024
 HEADER = struct.Struct("<8sH32sI32sQ")
 FORMAT_VERSION = 1
+# Release manifest and verification report schema.
 SCHEMA_VERSION = 1
+# The first release-state bundle schema that carries spentness files.
+BUNDLE_SCHEMA = 2
 HASH_BYTES = 32
 READ_CHUNK_BYTES = 1024 * 1024
 BITS_PER_BYTE = 8

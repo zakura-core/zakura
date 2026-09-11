@@ -473,7 +473,11 @@ impl StartCmd {
 
         // Temporary, explicitly armed diagnostic. The task does not poll state until the file exists.
         if let Some(probe_file) = std::env::var_os("ZAKURA_HANDOFF_PROBE_FILE") {
-            let probe_state = state.clone();
+            let probe_state: tower::util::BoxCloneService<
+                zakura_state::Request,
+                zakura_state::Response,
+                zakura_state::BoxError,
+            > = tower::util::BoxCloneService::new(state.clone());
             tokio::spawn(async move {
                 let probe_path = std::path::PathBuf::from(probe_file);
                 for _ in 0..1800 {

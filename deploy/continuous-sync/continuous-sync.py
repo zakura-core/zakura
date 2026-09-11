@@ -675,6 +675,14 @@ def clear_archived_traces(run_dir: Path) -> None:
     if traces.is_symlink():
         raise ControllerError(f"refusing to remove symlinked traces: {traces}")
     if traces.exists():
+        # Make the archive record durable before deleting its local payload.
+        with (run_dir / "run.json").open("rb") as metadata:
+            os.fsync(metadata.fileno())
+        directory_fd = os.open(run_dir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
         shutil.rmtree(traces)
 
 

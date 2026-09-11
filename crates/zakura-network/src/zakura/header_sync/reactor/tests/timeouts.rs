@@ -1350,6 +1350,85 @@ fn initial_vct_wire_assignment_arms_the_request_deadline() {
     assert!(deadline >= before + fixture.reactor.startup.request_timeout);
 }
 
+#[tokio::test(start_paused = true)]
+async fn header_serving_reproduction_busy_supplier_retries_without_new_tip_or_session() {
+    let mut fixture = ReadyVctRepairFixture::new();
+    let (peers, _outbounds) = fixture.connect(&[0x71], 7);
+    let peer = &peers[0];
+    fixture.schedule();
+    fixture.advertise(&peers, 7);
+    let first = fixture
+        .reactor
+        .peer_work_queue
+        .active(peer)
+        .expect("the sole supplier receives the repair request")
+        .clone();
+
+    fixture.reactor.handle_headers_outcome(
+        peer.clone(),
+        first.owner.session_id(),
+        first.owner.header_authority(),
+        HeadersOutcome {
+            request_id: first.request_id.get(),
+            target_tip_hash: fixture.target.hash,
+            outcome: HeadersOutcomeCode::Busy,
+        },
+    );
+    assert!(fixture.reactor.peer_work_queue.active(peer).is_none());
+
+    for _ in 0..300 {
+        time::advance(std::time::Duration::from_secs(1)).await;
+        fixture.reactor.refresh_statuses();
+        if let Some(retry) = fixture.reactor.peer_work_queue.active(peer) {
+            assert_eq!(retry.owner.session_id(), first.owner.session_id());
+            assert_ne!(retry.request_id, first.request_id);
+            assert!(matches!(
+                retry.purpose,
+                HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
+            ));
+            return;
+        }
+    }
+
+    panic!(
+        "no repair retry after 300 seconds with the same connected supplier: {:?}",
+        fixture.reactor.vct_repair.current()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn busy_vct_supplier_rotates_without_delaying_another_supplier() {
+    let mut fixture = ReadyVctRepairFixture::new();
+    let (peers, _outbounds) = fixture.connect(&[1, 2], 7);
+    fixture.schedule();
+    fixture.advertise(&peers, 7);
+    let first = fixture
+        .reactor
+        .peer_work_queue
+        .active(&peers[0])
+        .expect("the first supplier owns the request")
+        .clone();
+    fixture.reactor.handle_headers_outcome(
+        peers[0].clone(),
+        first.owner.session_id(),
+        first.owner.header_authority(),
+        HeadersOutcome {
+            request_id: first.request_id.get(),
+            target_tip_hash: fixture.target.hash,
+            outcome: HeadersOutcomeCode::Busy,
+        },
+    );
+    assert!(fixture.reactor.peer_work_queue.active(&peers[0]).is_none());
+    assert!(fixture.reactor.peer_work_queue.active(&peers[1]).is_some());
+    assert!(fixture
+        .reactor
+        .vct_repair
+        .current()
+        .unwrap()
+        .tried_sources
+        .is_empty());
+}
+
 #[test]
 fn local_capacity_backoff_starts_the_generation_stall_clock() {
     let mut fixture = ReadyVctRepairFixture::new();

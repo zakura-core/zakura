@@ -1,9 +1,9 @@
 use super::{config::*, events::*, peer_registry::SessionAdmission, wire::*, *};
 use crate::zakura::{
-    handle_pipe_exit, spawn_supervised_pipe, FramedRecv, FramedSend, OrderedSendError,
-    OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPolicy, Peer, PeerStreamSession,
-    Service, ServicePeerSnapshot, SinkReject, Stream, StreamMode, ZakuraBlockSyncCandidateState,
-    ZakuraConnId, ZakuraPeerId, FRAME_HEADER_BYTES,
+    handle_pipe_exit, spawn_supervised_pipe, FramedRecv, FramedSend, OrderedSendError, Peer,
+    PeerStreamSession, Service, ServicePeerSnapshot, SessionDemand, SessionOpening, SessionPolicy,
+    SinkReject, Stream, StreamMode, ZakuraBlockSyncCandidateState, ZakuraConnId, ZakuraPeerId,
+    FRAME_HEADER_BYTES,
 };
 use std::{
     sync::atomic::{AtomicU64, Ordering},
@@ -26,7 +26,7 @@ const BLOCK_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
     version: ZAKURA_BLOCK_SYNC_STREAM_VERSION,
     frame_cap: MAX_BS_FRAME_BYTES,
     capability: ZAKURA_CAP_BLOCK_SYNC,
-    mode: StreamMode::Ordered,
+    mode: StreamMode::Persistent,
 }];
 
 /// Service-declared streams for native block sync.
@@ -451,28 +451,28 @@ impl Service for BlockSyncService {
         block_sync_streams()
     }
 
-    fn ordered_stream_policy(&self, _kind: u16) -> OrderedStreamPolicy {
-        OrderedStreamPolicy {
-            opening: OrderedStreamOpening::EitherSide,
+    fn session_policy(&self) -> SessionPolicy {
+        SessionPolicy {
+            opening: SessionOpening::EitherSide,
             reopen: true,
         }
     }
 
-    fn ordered_session_demand(
+    fn session_demand(
         &self,
         conn_id: ZakuraConnId,
         peer: &ZakuraPeerId,
         _negotiated: u64,
         direction: ServicePeerDirection,
-    ) -> OrderedSessionDemand {
+    ) -> SessionDemand {
         if let Some(deadline) = self.peer_park_deadline(peer) {
-            return OrderedSessionDemand::RetryAt(deadline);
+            return SessionDemand::RetryAt(deadline);
         }
 
         let mut peer_snapshot = self.inner.peer_snapshot.clone();
         peer_snapshot.borrow_and_update();
         if !self.peer_slots_free(direction) {
-            return OrderedSessionDemand::WaitForChange(Box::pin(async move {
+            return SessionDemand::WaitForChange(Box::pin(async move {
                 if peer_snapshot.changed().await.is_err() {
                     std::future::pending::<()>().await;
                 }
@@ -495,7 +495,7 @@ impl Service for BlockSyncService {
                 .is_empty()
             {
                 let mut service_demand = self.service_demand.clone();
-                return OrderedSessionDemand::WaitForChange(Box::pin(async move {
+                return SessionDemand::WaitForChange(Box::pin(async move {
                     if let Some(demand) = service_demand.as_mut() {
                         tokio::select! {
                             changed = candidates.changed() => {
@@ -516,7 +516,7 @@ impl Service for BlockSyncService {
             }
         }
 
-        OrderedSessionDemand::OpenNow
+        SessionDemand::OpenNow
     }
 
     fn wants_peer(
@@ -711,7 +711,11 @@ impl Service for BlockSyncService {
                             run_cancel,
                             wiring.trace,
                         );
-                        routine.run().await
+                        tokio::select! {
+                            biased;
+                            () = connection_cancel_token.cancelled() => Ok(()),
+                            result = routine.run() => result,
+                        }
                     }
                     None => drain_inbound(recv, run_cancel).await,
                 };
@@ -760,8 +764,8 @@ impl Service for BlockSyncService {
             return false;
         };
         matches!(
-            self.ordered_session_demand(conn_id, peer, ZAKURA_CAP_BLOCK_SYNC, direction),
-            OrderedSessionDemand::OpenNow
+            self.session_demand(conn_id, peer, ZAKURA_CAP_BLOCK_SYNC, direction),
+            SessionDemand::OpenNow
         )
     }
 

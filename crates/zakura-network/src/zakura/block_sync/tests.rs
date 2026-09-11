@@ -32,8 +32,8 @@ use crate::zakura::{
     framed_channel,
     testkit::{await_until, TraceCapture, TraceValue},
     trace::BlockBodySource,
-    FramedRecv, FramedSend, OrderedSessionDemand, Peer, Service, ServicePeerSnapshot,
-    ServiceRegistry, StreamMode, ZakuraBlockSyncCandidateState,
+    FramedRecv, FramedSend, Peer, Service, ServicePeerSnapshot, ServiceRegistry, SessionDemand,
+    StreamMode, ZakuraBlockSyncCandidateState,
 };
 use zakura_chain::{
     fmt::HexDebug,
@@ -6232,7 +6232,7 @@ fn block_sync_stream_declares_kind_capability_version_and_frame_cap() {
     assert_eq!(stream.kind, ZAKURA_STREAM_BLOCK_SYNC);
     assert_eq!(stream.version, ZAKURA_BLOCK_SYNC_STREAM_VERSION);
     assert_eq!(stream.capability, ZAKURA_CAP_BLOCK_SYNC);
-    assert_eq!(stream.mode, StreamMode::Ordered);
+    assert_eq!(stream.mode, StreamMode::Persistent);
     assert_eq!(stream.frame_cap, MAX_BS_FRAME_BYTES);
 }
 
@@ -6255,14 +6255,14 @@ async fn service_registry_routes_block_sync_by_exact_capability_and_version() {
         .is_none());
     assert_eq!(
         registry
-            .ordered_streams_for_negotiated(ZAKURA_CAP_BLOCK_SYNC)
+            .persistent_streams_for_negotiated(ZAKURA_CAP_BLOCK_SYNC)
             .iter()
             .map(|stream| stream.kind)
             .collect::<Vec<_>>(),
         vec![ZAKURA_STREAM_BLOCK_SYNC]
     );
-    assert!(registry.ordered_streams_for_negotiated(0).is_empty());
-    assert!(registry.wants_ordered_stream(
+    assert!(registry.persistent_streams_for_negotiated(0).is_empty());
+    assert!(registry.wants_session(
         ZAKURA_STREAM_BLOCK_SYNC,
         ZAKURA_CAP_BLOCK_SYNC,
         &peer,
@@ -6534,6 +6534,78 @@ async fn add_peer_decode_failure_reports_malformed_and_cancels_connection() {
     tokio::time::timeout(Duration::from_secs(1), connection_cancel.cancelled())
         .await
         .expect("malformed frame cancels the connection");
+}
+
+#[tokio::test]
+async fn add_peer_connection_shutdown_cancels_pending_block_validation() {
+    use crate::zakura::transport::{OrderedStreamFailure, OrderedStreamFailureCause};
+
+    let config = ZakuraBlockSyncConfig::default();
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, _actions, _reactor_task) = spawn_block_sync_reactor(startup);
+    let input = &handle.routine_wiring.as_ref().unwrap().sequencer_input;
+    let held_capacity: Vec<_> = (0..input.max_capacity())
+        .map(|_| input.clone().try_reserve_owned().unwrap())
+        .collect();
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (inbound_tx, inbound_rx) = framed_channel(4);
+    let (outbound_tx, _outbound_rx) = framed_channel(4);
+    let cause = OrderedStreamFailureCause::default();
+    let streams = HashMap::from([(
+        ZAKURA_STREAM_BLOCK_SYNC,
+        (inbound_rx.with_failure_cause(cause.clone()), outbound_tx),
+    )]);
+    let connection_cancel = CancellationToken::new();
+    let remote = Peer::new(
+        peer(3),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC,
+        streams,
+        connection_cancel.clone(),
+    );
+    let session_cancel = remote.service_cancel_token();
+    inbound_tx
+        .send(Frame {
+            message_type: u16::from(MSG_BS_BLOCK),
+            flags: 0,
+            payload: vec![MSG_BS_BLOCK],
+        })
+        .await
+        .unwrap();
+    service.add_peer(remote);
+    cause.record(OrderedStreamFailure::RemoteClose);
+    session_cancel.cancel();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while inbound_tx.capacity() != inbound_tx.max_capacity() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the failed session takes its pending frame for validation");
+    assert_eq!(service.peer_count(), 1, "validation still owns the session");
+    assert!(!connection_cancel.is_cancelled());
+
+    connection_cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while service.peer_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("connection shutdown releases the session without decode capacity");
+    assert_eq!(input.capacity(), 0);
+    drop(held_capacity);
 }
 
 #[tokio::test]
@@ -15311,24 +15383,24 @@ async fn parked_connection_cleanup_allows_a_fresh_connection_after_cooldown() {
     handle.park_session_for_test(&peer, old_conn_id, Duration::ZERO);
 
     assert!(matches!(
-        service.ordered_session_demand(
+        service.session_demand(
             old_conn_id,
             &peer,
             ZAKURA_CAP_BLOCK_SYNC,
             ServicePeerDirection::Outbound,
         ),
-        OrderedSessionDemand::WaitForChange(_),
+        SessionDemand::WaitForChange(_),
     ));
 
     service.remove_peer(&peer, old_conn_id);
     assert!(matches!(
-        service.ordered_session_demand(
+        service.session_demand(
             new_conn_id,
             &peer,
             ZAKURA_CAP_BLOCK_SYNC,
             ServicePeerDirection::Outbound,
         ),
-        OrderedSessionDemand::OpenNow
+        SessionDemand::OpenNow
     ));
     reactor_task.abort();
 }
@@ -15353,13 +15425,13 @@ async fn same_connection_block_sync_session_waits_at_tip_then_reopens_for_new_wo
     let conn_id = 17;
     handle.park_session_for_test(&peer, conn_id, Duration::ZERO);
 
-    let demand = service.ordered_session_demand(
+    let demand = service.session_demand(
         conn_id,
         &peer,
         ZAKURA_CAP_BLOCK_SYNC,
         ServicePeerDirection::Outbound,
     );
-    let OrderedSessionDemand::WaitForChange(changed) = demand else {
+    let SessionDemand::WaitForChange(changed) = demand else {
         panic!("a locally parked session must stay absent while block sync is at tip");
     };
 
@@ -15375,13 +15447,13 @@ async fn same_connection_block_sync_session_waits_at_tip_then_reopens_for_new_wo
         .expect("new block work wakes the parked session demand");
 
     assert!(matches!(
-        service.ordered_session_demand(
+        service.session_demand(
             conn_id,
             &peer,
             ZAKURA_CAP_BLOCK_SYNC,
             ServicePeerDirection::Outbound,
         ),
-        OrderedSessionDemand::OpenNow,
+        SessionDemand::OpenNow,
     ));
     reactor_task.abort();
 }
@@ -15420,7 +15492,7 @@ async fn serving_only_coordinator_demand_keeps_block_session_available_during_fa
     let conn_id = 18;
     handle.park_session_for_test(&peer, conn_id, Duration::ZERO);
 
-    let OrderedSessionDemand::WaitForChange(changed) = service.ordered_session_demand(
+    let SessionDemand::WaitForChange(changed) = service.session_demand(
         conn_id,
         &peer,
         ZAKURA_CAP_BLOCK_SYNC,
@@ -15440,13 +15512,13 @@ async fn serving_only_coordinator_demand_keeps_block_session_available_during_fa
         .await
         .expect("fallback service demand wakes the parked ordered session");
     assert!(matches!(
-        service.ordered_session_demand(
+        service.session_demand(
             conn_id,
             &peer,
             ZAKURA_CAP_BLOCK_SYNC,
             ServicePeerDirection::Outbound,
         ),
-        OrderedSessionDemand::OpenNow,
+        SessionDemand::OpenNow,
     ));
     reactor_task.abort();
 }

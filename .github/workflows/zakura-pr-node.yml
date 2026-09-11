@@ -1,4 +1,4 @@
-name: Header serving reproduction inspection
+name: Header serving continuation capture
 on:
   workflow_dispatch:
 permissions:
@@ -6,7 +6,7 @@ permissions:
 jobs:
   inspect:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     strategy:
       fail-fast: false
       matrix:
@@ -39,4 +39,4 @@ jobs:
           print(next(n['ip_address'] for n in d['networks']['v4'] if n['type']=='public'))
           PY
           )
-          ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -i /tmp/do_ssh "root@$IP" python3 - < .github/workflows/scripts/header-serving-inspect.py
+          ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -i /tmp/do_ssh "root@$IP" python3 - < .github/workflows/scripts/header-serving-continuation.py

@@ -48,9 +48,10 @@ there stops before the pruned gap.
 Incoming status changes allow one extra range update per rate-limit window.
 Further range changes are coalesced and applied when the window expires, even
 if no new message arrives. Status replies remain rate limited.
-Each peer tracks the last status queued on its ordered stream. Ordinary range
-growth uses the configured refresh interval. Contractions have a separate window
-of at most one second, so pruning does not wait behind a tip-growth advertisement.
+Each peer tracks the last status queued on its ordered stream. Changes that raise
+the lower bound or reduce the upper bound use a separate window of at most one
+second, including when pruning and tip growth happen together. All other changes
+use the configured refresh interval, so pruning does not wait behind tip-only growth.
 Further changes coalesce into the latest range. Full queues back off for at most
 100 ms without consuming a range-change allowance. One deadline calculation schedules
 range changes, queue retries, and incomplete status exchanges.

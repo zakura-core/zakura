@@ -1132,7 +1132,7 @@ fn prepare_prune_batch_deletes_history_and_keeps_consensus_state() {
             .is_some(),
         "genesis transaction retained"
     );
-    for height in 4..=TEST_BLOCKS {
+    for height in std::iter::once(0).chain(4..=TEST_BLOCKS) {
         let block = state
             .db
             .block(Height(height).into())

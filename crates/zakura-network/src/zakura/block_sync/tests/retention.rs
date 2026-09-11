@@ -138,6 +138,47 @@ async fn retention_initial_status_preserves_archive_and_pruned_ranges() {
 }
 
 #[tokio::test]
+async fn retention_retries_initial_status_after_connecting_with_a_full_queue() {
+    let harness = RetentionHarness::with_refresh_interval(2, Duration::from_secs(30));
+    let (_inbound, receiver) = framed_channel(16);
+    let (sender, mut outbound) = framed_channel(1);
+    let filler = status();
+    sender
+        .try_send(
+            BlockSyncMessage::Status(filler)
+                .encode_frame()
+                .expect("filler status encodes"),
+        )
+        .expect("the outbound queue fills before connecting");
+    let mut peers = harness.handle.subscribe_peer_snapshot();
+    harness.service.add_peer(Peer::new_with_direction(
+        peer(0xed),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC,
+        ServicePeerDirection::Outbound,
+        HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (receiver, sender))]),
+        CancellationToken::new(),
+    ));
+    time::timeout(Duration::from_secs(5), async {
+        while peers.borrow_and_update().outbound_peers == 0 {
+            peers.changed().await.expect("reactor stays alive");
+        }
+    })
+    .await
+    .expect("the reactor attempts its initial status while the queue is full");
+
+    assert_eq!(wait_for_outbound_status(&mut outbound).await, filler);
+    let advertised = time::timeout(
+        Duration::from_millis(500),
+        wait_for_outbound_status(&mut outbound),
+    )
+    .await
+    .expect("the initial status retries promptly without a peer status or tip change");
+    assert_eq!(advertised.servable_low, block::Height(2));
+    assert_eq!(advertised.servable_high, block::Height(3));
+}
+
+#[tokio::test]
 async fn retention_rejects_pruned_reads_and_still_serves_retained_blocks() {
     let blocks = mainnet_blocks_1_to_3();
     let mut harness = RetentionHarness::new(2);

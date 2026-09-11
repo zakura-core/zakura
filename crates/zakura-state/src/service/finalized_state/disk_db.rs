@@ -1402,7 +1402,8 @@ impl DiskDb {
     // Write methods
     // Low-level write methods are located in the WriteDisk trait
 
-    /// Writes `batch` to the database.
+    /// Writes `batch` to the database and publishes its retained-body floor.
+    /// Body pruning must use this path so the floor is visible before callers publish a new tip.
     pub(crate) fn write(&self, batch: DiskWriteBatch) -> Result<(), rocksdb::Error> {
         self.db.write(batch.batch)?;
         // Header/full-state callers publish their new tip after this returns.
@@ -1422,7 +1423,8 @@ impl DiskDb {
 
     fn publish_retained_block_height(&self) {
         // Read under the publication lock so concurrent writers cannot publish
-        // an older observation after a newer one.
+        // an older observation after a newer one. Offline pruning can also lower
+        // a stale marker when older bodies still exist.
         self.retained_block_height.send_if_modified(|current| {
             let retained = self.lowest_retained_height().unwrap_or(Height::MIN);
             if *current == retained {

@@ -122,6 +122,35 @@ impl Fixture {
         }
     }
 
+    /// Model two connections using the same node-owned queue and generation source.
+    fn share_work_from(&mut self, other: &Self) {
+        self.routine.work = other.routine.work.clone();
+        self.routine.registry = other.routine.registry.clone();
+        self.routine.generation = self
+            .routine
+            .registry
+            .admit_session(
+                &self.routine.peer,
+                crate::zakura::ServicePeerDirection::Outbound,
+                &self.routine.config,
+                self.routine.conn_id,
+                Instant::now(),
+            )
+            .generation();
+        let status = BlockSyncStatus {
+            servable_low: self.routine.servable_low,
+            servable_high: self.routine.servable_high,
+            max_blocks_per_response: self.routine.max_blocks_per_response,
+            max_response_bytes: self.routine.max_response_bytes,
+            max_inflight_requests: self.routine.window.max_inflight_requests,
+            ..self.routine.config.initial_status()
+        };
+        self.routine
+            .registry
+            .upsert_status(&self.routine.peer, self.routine.generation, status);
+        assert_ne!(self.routine.generation, other.routine.generation);
+    }
+
     async fn publish(&mut self) {
         self.routine.try_fill().await;
         assert_eq!(
@@ -489,7 +518,12 @@ async fn r11_connection_drop_releases_only_unreceived_work() {
     let budget = f.routine.budget.clone();
     let registry = f.routine.registry.clone();
     let peer = f.routine.peer.clone();
+    let session = f.routine.session.clone();
     drop(f);
+    assert!(
+        session.connection_is_closed_for_test(),
+        "unfinished authorization ends only with the connection"
+    );
     assert_eq!(budget.reserved(), 0);
     assert!(!work.pending_contains(block::Height(100)));
     assert!(work.pending_contains(block::Height(101)));
@@ -556,7 +590,7 @@ async fn r09_reassigned_work_still_consumes_the_original_peers_response() {
     a.routine
         .expire_due_timeouts(deadline + Duration::from_millis(1));
     let mut b = Fixture::for_peer(100, 3, 2);
-    b.routine.work = a.routine.work.clone();
+    b.share_work_from(&a);
     b.publish().await;
     b.body(0).await;
     a.deliver(BlockSyncMessage::Block(a.blocks[0].clone()))
@@ -909,4 +943,113 @@ async fn r05_duplicate_body_remains_invalid_after_local_finality_advances() {
         "R05 consumed part below local floor",
     )
     .await;
+}
+
+#[tokio::test]
+async fn r09_former_owner_body_uses_the_replacement_work_owner() {
+    let mut a = Fixture::for_peer(100, 3, 1);
+    a.publish().await;
+    let old_owner = a.routine.window.outstanding[0].request.owner;
+    a.routine
+        .expire_due_timeouts(a.routine.window.outstanding[0].deadline);
+    let mut b = Fixture::for_peer(100, 3, 2);
+    b.share_work_from(&a);
+    b.publish().await;
+    let current_owner = b.routine.window.outstanding[0].request.owner;
+    assert_ne!(old_owner, current_owner);
+    a.deliver(BlockSyncMessage::Block(a.blocks[0].clone()))
+        .await
+        .unwrap();
+    let received = a
+        .bodies
+        .try_recv()
+        .expect("authorized useful late body reaches handling");
+    assert_eq!(received.owner, current_owner);
+    a.assert_live(1, "original connection consumes its own wire part");
+    a.assert_no_peer_fault();
+}
+
+#[tokio::test]
+async fn r11_queued_only_drop_skips_the_write_and_keeps_the_connection() {
+    let mut f = Fixture::new(100, 3);
+    f.routine.try_fill().await;
+    let queued = f.outbound.recv().await.unwrap();
+    let session = f.routine.session.clone();
+    drop(f);
+    assert!(!session.connection_is_closed_for_test());
+    queued
+        .write_with(|_| async {
+            panic!("a skipped request must not reach the wire");
+            #[allow(unreachable_code)]
+            Ok::<_, ()>(())
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn r11_withheld_ending_closes_locally_on_first_and_repeated_stall() {
+    for allow_park in [true, false] {
+        let mut f = Fixture::new(100, 3);
+        f.routine.allow_no_progress_park = allow_park;
+        f.publish().await;
+        for index in 0..3 {
+            f.body(index).await;
+        }
+        let deadline = f.routine.window.block_liveness_deadline.unwrap();
+        let result = f.routine.check_block_liveness(deadline);
+        assert!(matches!(result, Err(SinkReject::Connection(_))));
+        f.assert_live(3, "liveness is not terminal consumption");
+        f.assert_no_peer_fault();
+        let session = f.routine.session.clone();
+        drop(f);
+        assert!(session.connection_is_closed_for_test());
+    }
+}
+
+#[tokio::test]
+async fn status_availability_changes_preserve_existing_response_credit() {
+    let mut f = Fixture::new(100, 3);
+    f.publish().await;
+    f.body(0).await;
+    f.deliver(BlockSyncMessage::Status(BlockSyncStatus {
+        servable_low: block::Height(101),
+        servable_high: block::Height(200),
+        max_blocks_per_response: 128,
+        max_inflight_requests: 8,
+        ..f.routine.config.initial_status()
+    }))
+    .await
+    .unwrap();
+    assert!(!f.routine.session.connection_is_closed_for_test());
+    f.assert_live(1, "servable changes do not revoke prior hashes");
+    f.body(1).await;
+    f.deliver(f.done(2)).await.unwrap();
+}
+
+#[tokio::test]
+async fn status_numeric_changes_require_local_reconnect_without_a_peer_fault() {
+    for (blocks, inflight, bytes) in [
+        (127, 8, 33_554_432),
+        (128, 7, 33_554_432),
+        (128, 9, 33_554_432),
+        (128, 8, 33_554_431),
+    ] {
+        let mut f = Fixture::new(100, 3);
+        f.publish().await;
+        f.body(0).await;
+        f.deliver(BlockSyncMessage::Status(BlockSyncStatus {
+            servable_low: block::Height(100),
+            servable_high: block::Height(200),
+            max_blocks_per_response: blocks,
+            max_inflight_requests: inflight,
+            max_response_bytes: bytes,
+            ..f.routine.config.initial_status()
+        }))
+        .await
+        .unwrap();
+        assert!(f.routine.session.connection_is_closed_for_test());
+        f.assert_no_peer_fault();
+        f.assert_live(1, "numeric changes do not fabricate an ending");
+    }
 }

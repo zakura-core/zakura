@@ -1049,6 +1049,7 @@ impl HeaderSyncReactor {
                 VctRepairRetry::supplier(source, HeaderRequestTerminal::Disconnected),
             );
         }
+        self.prune_vct_supplier_history();
         self.publish_peer_state();
         self.emit_peer_lifecycle(
             hs_trace::HEADER_PEER_DISCONNECTED,
@@ -3221,12 +3222,18 @@ impl HeaderSyncReactor {
         }
     }
 
-    fn try_assign_vct_repair(&mut self) {
-        let now = Instant::now();
+    fn prune_vct_supplier_history(&mut self) {
         let connected_sources: HashSet<_> =
             self.peer_state.keys().map(source_id_from_peer).collect();
         if let Some(task) = self.vct_repair.current_mut() {
             task.retain_connected_sources(&connected_sources);
+        }
+    }
+
+    fn try_assign_vct_repair(&mut self) {
+        let now = Instant::now();
+        self.prune_vct_supplier_history();
+        if let Some(task) = self.vct_repair.current_mut() {
             task.resume_retry(now);
         }
         let Some(task) = self.vct_repair.ready().cloned() else {

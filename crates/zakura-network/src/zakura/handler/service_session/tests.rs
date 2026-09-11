@@ -255,7 +255,7 @@ impl Fixture {
             )
             .with_endpoint(endpoint)
         };
-        let server_opens = i_open_collision_winner(&server.node_id(), &client.node_id());
+        let server_opens = i_open_collision_winner(&server.id(), &client.id());
         let server_handler = handler(
             server_tx,
             server_sibling_tx,
@@ -509,11 +509,12 @@ impl ProtocolHandler for RawConnection {
 async fn raw_connection() -> Result<(Router, Endpoint, Connection, Connection), BoxError> {
     let local = ZakuraLocalLimits::from_config(&Config::default());
     let transport = || {
-        let mut transport = local.transport_config();
-        transport.stream_receive_window(64_000u32.into());
-        transport.receive_window(128_000u32.into());
-        transport.send_window(64_000);
-        transport
+        local
+            .transport_config_builder()
+            .stream_receive_window(64_000u32.into())
+            .receive_window(128_000u32.into())
+            .send_window(64_000)
+            .build()
     };
     let server = LocalEndpointFactory::with_transport_config(transport())
         .endpoint(93201)
@@ -649,18 +650,19 @@ impl RawFixture {
         let shutdown = handler.shutdown.clone();
         let mut limits = local.clamp(&local.initial_limits());
         limits.prelude_timeout = setup_timeout;
-        let peer_id = ZakuraPeerId::new(client.node_id().as_bytes().to_vec())?;
+        let peer_id = ZakuraPeerId::new(client.id().as_bytes().to_vec())?;
         let transcript_hash = native_connection_transcript_hash(
             ServicePeerDirection::Inbound,
-            &router.endpoint().node_id(),
-            &client.node_id(),
+            &router.endpoint().id(),
+            &client.id(),
         );
+        let remote_ip = confirmed_remote_ip(&remote);
         let serving = AbortOnDropHandle::new(tokio::spawn(async move {
             handler
                 .register_and_serve(
                     remote,
                     peer_id,
-                    None,
+                    remote_ip,
                     ConnectionServeContext {
                         limits,
                         accepted_capabilities: DATA.capability | SIBLING.capability,
@@ -981,7 +983,7 @@ fn raw_worker_context(client: &Endpoint, slots: Arc<Semaphore>) -> StreamWorkerC
     let (freshness_tx, _freshness_rx) = watch::channel(Instant::now());
     StreamWorkerContext {
         conn: ZakuraConnTrace::without_peer(1),
-        peer_id: ZakuraPeerId::new(client.node_id().as_bytes().to_vec()).unwrap(),
+        peer_id: ZakuraPeerId::new(client.id().as_bytes().to_vec()).unwrap(),
         stream_id: 1,
         _permit: slots.try_acquire_owned().unwrap(),
         limits: local.clamp(&local.initial_limits()),
@@ -1184,7 +1186,7 @@ async fn incomplete_pairs_expire_and_mismatched_roles_release_stream_permits(
     );
     let mut limits = local.clamp(&local.initial_limits());
     limits.prelude_timeout = Duration::from_millis(100);
-    let peer = ZakuraPeerId::new(client.node_id().as_bytes().to_vec())?;
+    let peer = ZakuraPeerId::new(client.id().as_bytes().to_vec())?;
     let (freshness, _freshness_rx) = watch::channel(Instant::now());
     let cancel = CancellationToken::new();
     let mut pending = PendingSessions::default();

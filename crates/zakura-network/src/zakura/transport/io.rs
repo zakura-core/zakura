@@ -607,7 +607,7 @@ mod tests {
     async fn quic_backpressure_holds_producer_and_preserves_another_stream() {
         use crate::zakura::testkit::LocalEndpointFactory;
         use iroh::{
-            endpoint::{Connection, TransportConfig, VarInt},
+            endpoint::{Connection, QuicTransportConfig, VarInt},
             protocol::{AcceptError, ProtocolHandler, Router},
         };
         use std::time::Duration;
@@ -624,12 +624,12 @@ mod tests {
         const ALPN: &[u8] = b"/zakura/test/producer-backpressure";
         // Scale down the windows so a single bounded frame reaches flow control.
         let transport_config = || {
-            let mut config = TransportConfig::default();
-            config
+            QuicTransportConfig::builder()
+                .max_remote_nat_traversal_addresses(0)
                 .stream_receive_window(VarInt::from_u32(16 * 1024))
                 .receive_window(VarInt::from_u32(128 * 1024))
-                .send_window(128 * 1024);
-            config
+                .send_window(128 * 1024)
+                .build()
         };
         let server = LocalEndpointFactory::with_transport_config(transport_config())
             .endpoint(92_001)

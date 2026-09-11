@@ -21,7 +21,7 @@ impl ZakuraProtocolHandler {
 
 pub(in crate::zakura::handler) async fn connect_and_serve(
     client: &Endpoint,
-    address: NodeAddr,
+    address: EndpointAddr,
     handler: ZakuraProtocolHandler,
     limits: ZakuraLocalLimits,
     alpn: &[u8],
@@ -33,8 +33,8 @@ pub(in crate::zakura::handler) async fn connect_and_serve(
     ),
     BoxError,
 > {
-    let remote_id = address.node_id;
-    let local_id = client.node_id();
+    let remote_id = address.id;
+    let local_id = client.id();
     let connection = timeout(deadline, client.connect(address, alpn)).await??;
     let local_peer = ZakuraPeerId::new(local_id.as_bytes().to_vec())?;
     let remote_peer = ZakuraPeerId::new(remote_id.as_bytes().to_vec())?;
@@ -51,13 +51,14 @@ pub(in crate::zakura::handler) async fn connect_and_serve(
         ),
     )
     .await??;
+    let remote_ip = confirmed_remote_ip(&connection);
     let serving_connection = connection.clone();
     let transport = AbortOnDropHandle::new(tokio::spawn(async move {
         handler
             .register_and_serve(
                 serving_connection,
                 remote_peer,
-                None,
+                remote_ip,
                 ConnectionServeContext {
                     limits: limits.clamp(&negotiated.limits),
                     accepted_capabilities: negotiated.accepted_capabilities,

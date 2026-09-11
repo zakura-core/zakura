@@ -1404,6 +1404,11 @@ impl FinalizedState {
             .is_some_and(|v| v.accepts_exact_roots_at(height))
     }
 
+    /// Whether the saved frontiers can still be advanced when VCT metadata is unavailable.
+    pub(crate) fn vct_can_recompute_trees(&self) -> bool {
+        !self.vct.is_below_last_checkpoint()
+    }
+
     /// Clears any cached successor prevalidation.
     ///
     /// The finalized write loop calls this when it discards checkpoint queue state, so a

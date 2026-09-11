@@ -455,3 +455,57 @@ For a fresh Ubuntu x86_64 host:
   restarts.
 - Secrets are read from host env files or GitHub secrets and are never written to
   repository-managed templates.
+
+## Trace archives
+
+New controller deployments enable `policy.archive_traces`. Install the AWS CLI
+on each sync host. Set these values in `/etc/zakura-traces.env` (mode 0600):
+
+```sh
+ZAKURA_TRACE_SPACE=YOUR_SPACE
+ZAKURA_TRACE_ENDPOINT=https://YOUR_REGION.digitaloceanspaces.com
+AWS_DEFAULT_REGION=YOUR_REGION
+AWS_ACCESS_KEY_ID=YOUR_SPACES_KEY
+AWS_SECRET_ACCESS_KEY=YOUR_SPACES_SECRET
+```
+
+Apply `spaces-lifecycle.json` to a dedicated trace Space before enabling the
+controller. The following command replaces the Space's lifecycle configuration.
+For a shared Space, merge the supplied rule with its existing rules first.
+
+```sh
+aws --endpoint-url https://YOUR_REGION.digitaloceanspaces.com s3api put-bucket-lifecycle-configuration --bucket YOUR_SPACE --lifecycle-configuration file://deploy/continuous-sync/spaces-lifecycle.json
+```
+
+The controller verifies seven-day expiration before uploading. It streams gzip
+compressed tar archives into `sync-traces/<hostname>/<run-id>.tar.gz` after the
+node stops. Upload failures halt the next run and preserve local traces.
+Daily reports and failure alerts include private download links valid for
+seven days from upload. A delayed report does not renew the links. Existing stopped runs are archived before retention can remove them.
+The lifecycle rule also removes abandoned multipart uploads after one day.
+
+See [Spaces lifecycle rules](https://docs.digitalocean.com/products/spaces/how-to/configure-lifecycle-rules/)
+and [private download links](https://docs.digitalocean.com/products/spaces/how-to/set-file-permissions/).
+
+The controller deletes each local `traces` directory after persisting the archive
+URL in `run.json`. It syncs the metadata file and directory before deletion.
+It keeps run metadata and logs under the existing retention
+policy. Cleanup also removes trace payloads from previously archived runs,
+including the protected latest failed run. A failed upload preserves the traces.
+Cleanup retries after a controller restart if deletion did not finish.
+
+Controller deployment does not update the daily report sender. After deploying
+controllers, update the sender's formatter from the same checkout:
+
+```sh
+python3 deploy/continuous-sync/deploy.py deploy-summary
+python3 deploy/continuous-sync/deploy.py summary-status
+```
+
+This update preserves existing delivery cursors. For a new sender, follow the
+[initialization procedure](#daily-summary) before enabling its timer.
+Configure the AWS CLI, credentials, and lifecycle rule on every sync host before
+controller deployment. Preflight checks archive access and expiration before
+starting a sync. The next daily report includes a download link for each
+unreported completion that has an archive URL. Runs completed before archival
+was enabled have no download link.

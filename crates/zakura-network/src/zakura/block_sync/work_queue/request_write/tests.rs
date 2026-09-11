@@ -162,6 +162,60 @@ impl Fixture {
     }
 }
 
+#[test]
+fn batched_ownership_filter_follows_publication_receipt_and_replacement() {
+    let mut f = Fixture::new();
+    let claim = f.take(1);
+    let owner = claim.owner();
+    let candidates = |owner| {
+        vec![
+            (block::Height(1), (owner, 11)),
+            (block::Height(2), (owner, 22)),
+            (block::Height(3), (owner, 33)),
+        ]
+    };
+    let work = f.work.clone();
+    let retained = |mut entries: Vec<(_, (BodyWorkOwner, u8))>| {
+        work.retain_owned(&mut entries, |(owner, _)| *owner);
+        entries
+    };
+
+    assert!(retained(candidates(owner)).is_empty(), "unpublished work");
+    assert!(claim.publish(|| {}));
+    assert_eq!(
+        retained(candidates(owner)),
+        vec![
+            (block::Height(1), (owner, 11)),
+            (block::Height(2), (owner, 22)),
+        ],
+    );
+
+    f.budget.release(
+        f.work
+            .release_active_reserved_height_for_owner(owner, block::Height(1))
+            .unwrap(),
+    );
+    assert_eq!(
+        retained(candidates(owner)),
+        vec![(block::Height(1), (owner, 11))],
+        "receipt retains its owner while the unsent height returns to pending",
+    );
+
+    f.reset();
+    f.refill();
+    assert!(retained(candidates(owner)).is_empty(), "reset work");
+    let replacement = f.take(2);
+    assert!(retained(candidates(replacement.owner())).is_empty());
+    assert!(replacement.publish(|| {}));
+    let mut mixed = candidates(owner);
+    mixed.insert(0, (block::Height(2), (replacement.owner(), 22)));
+    assert_eq!(
+        retained(mixed),
+        vec![(block::Height(2), (replacement.owner(), 22))],
+        "a later stale entry for the same height must not hide its current owner",
+    );
+}
+
 fn publish(claim: &Arc<RequestWrite>, sender: &FramedSend) {
     let slot = sender.try_reserve_guarded().unwrap();
     assert!(claim.publish(|| {

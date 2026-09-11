@@ -244,7 +244,7 @@ fn f04_discriminator_mismatch_is_rejected_before_block_decode_allocation() {
 
 proptest! {
     #[test]
-    fn f02_generated_terminal_fields(tag in prop_oneof![Just(4u8), Just(5u8)], height in any::<u32>(), count in any::<u32>()) {
+    fn f02_generated_terminal_fields(tag in prop_oneof![Just(4u8), Just(5u8)], height in any::<u32>(), count in prop_oneof![1u32..=MAX_BS_BLOCKS_PER_REQUEST, any::<u32>()]) {
         check_terminal(tag, height, count);
     }
 

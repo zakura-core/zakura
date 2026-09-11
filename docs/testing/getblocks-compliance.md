@@ -2,7 +2,7 @@
 
 These tests execute the requirements identified in the #896 coverage audit of
 [#747's regulation specification][spec] and [GetBlocks testing plan][plan]. They
-run against the #942–#945 implementation. Failures identify differences from the
+run against #971, the compliance branch above #945. Failures identify differences from the
 intended requirements. They do not silently redefine the specification to match
 the implementation.
 
@@ -14,6 +14,20 @@ misbehavior without rejection both fail this test.
 The current negotiated layout is data stream 6 version 3 and request stream 7
 version 1. Tests retain this accepted stack decision rather than restoring #747's
 older layout text.
+
+## Compliance branch results
+
+On 2026-09-11, the same 91-test profile ran locally over compliance implementation
+`8fc34706a` in [#971](https://github.com/zakura-core/zakura/pull/971), using Rust
+1.97.0, 64 generated cases, seed 896, and four load rounds. It reported **52 passed
+and 39 failed**. The early Block cap, header flags, terminal height boundaries,
+and discriminator-before-allocation witnesses now pass. Every remaining failure
+was also present in the initial run below.
+
+The terminal-field generator mixes valid counts with arbitrary counts so that
+invalid heights are exercised independently of count rejection. The tests still
+require the full specification. Authorization, nested allocation, response-byte,
+terminal-consumption, and connection-headroom work remain open.
 
 ## Initial results
 

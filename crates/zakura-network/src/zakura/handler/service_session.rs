@@ -328,6 +328,7 @@ impl ZakuraProtocolHandler {
             inbound_frame_cap: prelude.max_frame_bytes,
             message_payload_limits: self.registry.message_payload_limits(stream),
             message_types: self.registry.message_types(stream),
+            allowed_frame_flags: self.registry.allowed_frame_flags(stream),
             queue_depths: self.registry.stream_queue_depths(stream),
             write_policy: self.registry.stream_write_policy(stream),
             session_resources: None,

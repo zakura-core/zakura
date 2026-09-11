@@ -305,6 +305,10 @@ impl Service for DiscoveryService {
         discovery_streams()
     }
 
+    fn allowed_frame_flags(&self, _stream: Stream) -> u16 {
+        0
+    }
+
     fn session_policy(&self) -> SessionPolicy {
         SessionPolicy {
             opening: SessionOpening::InitiatorOnly,

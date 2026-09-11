@@ -1595,9 +1595,15 @@ impl PeerRoutine {
                 return Ok(());
             }
         }
-        let request_id = self
-            .next_request_id
-            .ok_or_else(|| SinkReject::local_connection("body work identities exhausted"))?;
+        let Some(request_id) = self.next_request_id else {
+            let released = self
+                .work
+                .release_reserved_heights_for_owner(original_owner, [height]);
+            self.budget.release(released);
+            return Err(SinkReject::local_connection(
+                "body work identities exhausted",
+            ));
+        };
         self.next_request_id = request_id.get().checked_add(1).and_then(NonZeroU64::new);
         let Some((owner, released)) =
             self.work

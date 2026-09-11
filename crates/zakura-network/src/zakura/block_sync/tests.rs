@@ -15330,3 +15330,30 @@ async fn serving_only_coordinator_demand_keeps_block_session_available_during_fa
     ));
     reactor_task.abort();
 }
+
+#[test]
+fn authorized_late_body_claims_current_pending_work_once() {
+    let height = block::Height(100);
+    let hash = block::Hash([7; 32]);
+    let work = WorkQueue::new(block::Height(99));
+    let scope = test_work_scope();
+    work.extend(scope, [(height, hash, BlockSizeEstimate::Confirmed(1000))]);
+    let request_id = std::num::NonZeroU64::new(9).unwrap();
+    assert!(work
+        .claim_authorized_body(height, block::Hash([8; 32]), 7, request_id)
+        .is_none());
+    assert!(work.pending_contains(height));
+    assert_eq!(work.hash_for_height(height), Some(hash));
+    assert_eq!(work.owner_for_height(height), None);
+    let (owner, released) = work
+        .claim_authorized_body(height, hash, 7, request_id)
+        .unwrap();
+    assert_eq!(owner, scope.bind(7, request_id));
+    assert_eq!(released, 0);
+    assert!(!work.pending_contains(height));
+    assert_eq!(work.owner_for_height(height), Some(owner));
+    assert!(work
+        .claim_authorized_body(height, hash, 8, request_id)
+        .is_none());
+    assert_eq!(work.owner_for_height(height), Some(owner));
+}

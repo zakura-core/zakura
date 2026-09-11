@@ -475,14 +475,11 @@ impl WorkQueue {
     ) -> Option<(zakura_header_chain::BodyWorkOwner, u64)> {
         let (owner, released, claim) = {
             let mut inner = self.lock();
-            let (owner, released) = if let Some(item) = inner.pending.get(&height) {
+            let (owner, released) = if let Some(mut item) = inner.pending.remove(&height) {
                 if item.hash != hash {
+                    inner.pending.insert(height, item);
                     return None;
                 }
-                let mut item = inner
-                    .pending
-                    .remove(&height)
-                    .expect("the pending item was checked under this lock");
                 let owner = item.scope.bind(session_id, request_id);
                 item.owner = Some(owner);
                 item.provisional = false;

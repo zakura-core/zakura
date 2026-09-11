@@ -8083,13 +8083,14 @@ mod tests {
             )
             .spawn();
         // A small sender buffer makes write completion reflect receiver credit.
-        let mut client_transport = local.transport_config();
-        client_transport.send_window(64 * 1024);
+        let client_transport = local
+            .transport_config_builder()
+            .send_window(64 * 1024)
+            .build();
         let client = LocalEndpointFactory::with_transport_config(client_transport)
             .endpoint(53)
             .await?;
-        let address = router.endpoint().node_addr().initialized().await;
-        client.add_node_addr(address.clone())?;
+        let address = router.endpoint().addr();
         let connection = timeout(Duration::from_secs(10), client.connect(address, ALPN)).await??;
         let (mut sender, mut receiver) = connection.open_bi().await?;
         let frame = Frame {
@@ -8251,9 +8252,10 @@ mod tests {
         const ALPN: &[u8] = b"/zakura/testkit/stream-cancel/0";
 
         let _guard = zakura_test::init();
-        let mut server_transport =
-            ZakuraLocalLimits::from_config(&Config::default()).transport_config();
-        server_transport.send_window(64 * 1024);
+        let server_transport = ZakuraLocalLimits::from_config(&Config::default())
+            .transport_config_builder()
+            .send_window(64 * 1024)
+            .build();
         let server = LocalEndpointFactory::with_transport_config(server_transport)
             .endpoint(50)
             .await?;
@@ -8877,8 +8879,7 @@ mod tests {
             )
             .spawn();
         let client = LocalEndpointFactory::new().endpoint(80).await?;
-        let server_addr = router.endpoint().node_addr().initialized().await;
-        client.add_node_addr(server_addr.clone())?;
+        let server_addr = router.endpoint().addr();
 
         // Only send headers and keep the send sides open. The reader must reject
         // before waiting for a payload that the peer has not supplied.

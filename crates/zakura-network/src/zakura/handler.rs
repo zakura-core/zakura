@@ -281,6 +281,13 @@ pub struct ZakuraConfig {
     /// out and keeps the experimental native P2P_V2_ALPN surface off all
     /// non-loopback interfaces.
     pub listen_addr: Option<SocketAddr>,
+    /// Enable QUIC NAT traversal with native peers. Disabled by default.
+    ///
+    /// Allows candidate interface-address exchange and peer-directed UDP probes
+    /// using Iroh's bounded defaults. Applies to all native peers, including
+    /// untrusted peers; this does not enable relays, external address lookup,
+    /// automatic router port mapping, or restrict connections to paired devices.
+    pub nat_traversal: bool,
     /// Total concurrent Zakura connections, inbound plus outbound.
     pub max_connections: usize,
     /// Maximum established Zakura connections admitted from one source IP.
@@ -330,6 +337,7 @@ impl Default for ZakuraConfig {
                 .map(ToString::to_string)
                 .collect(),
             listen_addr: Some(DEFAULT_ZAKURA_LISTEN_ADDR),
+            nat_traversal: false,
             max_connections: DEFAULT_ZAKURA_MAX_CONNECTIONS,
             max_connections_per_ip: DEFAULT_ZAKURA_MAX_CONNS_PER_IP,
             max_pending_handshakes: DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES,
@@ -388,6 +396,8 @@ fn bootstrap_peers_to_strings(peers: &[&str]) -> Vec<String> {
 /// Hard local ceilings enforced by the Zakura endpoint and handler.
 #[derive(Clone, Debug)]
 pub struct ZakuraLocalLimits {
+    /// Whether native QUIC connections may negotiate NAT traversal.
+    pub nat_traversal: bool,
     /// Total concurrent Zakura connection cap.
     pub max_connections: usize,
     /// Concurrent control handshakes cap.
@@ -419,6 +429,7 @@ impl ZakuraLocalLimits {
     pub fn from_config(config: &Config) -> Self {
         let handshake = ZakuraHandshakeConfig::for_network(&config.network);
         Self {
+            nat_traversal: config.zakura.nat_traversal,
             max_connections: config.zakura.max_connections.max(1),
             max_pending_handshakes: config.zakura.max_pending_handshakes.max(1),
             quic_idle_timeout: DEFAULT_ZAKURA_QUIC_IDLE_TIMEOUT,
@@ -482,8 +493,11 @@ impl ZakuraLocalLimits {
     }
 
     fn transport_config_builder(&self) -> iroh::endpoint::QuicTransportConfigBuilder {
-        QuicTransportConfig::builder()
-            .max_remote_nat_traversal_addresses(0)
+        let mut builder = QuicTransportConfig::builder();
+        if !self.nat_traversal {
+            builder = builder.max_remote_nat_traversal_addresses(0);
+        }
+        builder
             .max_concurrent_bidi_streams(VarInt::from_u32(u32::from(self.max_open_streams)))
             .max_concurrent_uni_streams(VarInt::from_u32(0))
             .stream_receive_window(VarInt::from_u32(DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW))
@@ -9926,11 +9940,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_transport_disables_nat_traversal() -> Result<(), BoxError> {
+    async fn production_transport_nat_traversal_is_opt_in() -> Result<(), BoxError> {
         let _guard = zakura_test::init();
         tokio::time::timeout(Duration::from_secs(20), async {
-            let limits = ZakuraLocalLimits::from_config(&Config::default());
-            for production_is_server in [true, false] {
+            for (nat_traversal, production_is_server) in
+                [(false, true), (false, false), (true, true), (true, false)]
+            {
+                let config: Config = toml::from_str(&format!(
+                    "network = 'Mainnet'\n[zakura]\nnat_traversal = {nat_traversal}"
+                ))?;
+                let limits = ZakuraLocalLimits::from_config(&config);
                 let production =
                     LocalEndpointFactory::with_transport_config(limits.transport_config())
                         .endpoint(886)
@@ -9973,12 +9992,26 @@ mod tests {
                 );
                 served?;
                 received?;
-                for connection in [&accepted, &connected] {
-                    let stats = connection.stats();
-                    assert_eq!(stats.frame_tx.add_address, 0);
-                    assert_eq!(stats.frame_rx.add_address, 0);
-                    assert_eq!(stats.frame_tx.reach_out, 0);
-                    assert_eq!(stats.frame_rx.reach_out, 0);
+                if nat_traversal {
+                    // Candidate advertisement is asynchronous and need not be symmetric
+                    // when a direct path already exists. Receiving a frame proves negotiation.
+                    loop {
+                        if [&accepted, &connected]
+                            .iter()
+                            .any(|connection| connection.stats().frame_rx.add_address > 0)
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                } else {
+                    for connection in [&accepted, &connected] {
+                        let stats = connection.stats();
+                        assert_eq!(stats.frame_tx.add_address, 0);
+                        assert_eq!(stats.frame_rx.add_address, 0);
+                        assert_eq!(stats.frame_tx.reach_out, 0);
+                        assert_eq!(stats.frame_rx.reach_out, 0);
+                    }
                 }
                 accepted.close(0u32.into(), b"done");
                 client.close().await;

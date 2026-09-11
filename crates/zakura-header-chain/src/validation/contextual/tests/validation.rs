@@ -119,7 +119,9 @@ fn difficulty_windows_upgrades_testnet_minimum_and_partitions_match() {
                 continue;
             }
             let spacing = NetworkUpgrade::target_spacing_for_height(&network, height);
-            let context_len = usize::try_from(height.0.min(28))
+            let span = u32::try_from(POW_ADJUSTMENT_BLOCK_SPAN)
+                .expect("the difficulty adjustment span fits in u32");
+            let context_len = usize::try_from(height.0.min(span))
                 .expect("bounded test context length fits in usize");
             let context = context(&network, candidate_time, spacing, context_len);
             validate_with_expected_target(&network, height, candidate_time, &context)
@@ -131,7 +133,7 @@ fn difficulty_windows_upgrades_testnet_minimum_and_partitions_match() {
     let activation_height = block::Height(299_188);
     let spacing = NetworkUpgrade::target_spacing_for_height(&testnet, activation_height);
     let previous_time = candidate_time - spacing * 6;
-    let mut exact_gap = context(&testnet, candidate_time, spacing, 28);
+    let mut exact_gap = context(&testnet, candidate_time, spacing, POW_ADJUSTMENT_BLOCK_SPAN);
     exact_gap[0].1 = previous_time;
     let previous_height = (activation_height - 1).expect("height is positive");
     let exact_gap_target = AdjustedDifficulty::new_from_header_time(
@@ -148,7 +150,7 @@ fn difficulty_windows_upgrades_testnet_minimum_and_partitions_match() {
     );
 
     let minimum_time = candidate_time + Duration::seconds(1);
-    let minimum_context = context(&testnet, minimum_time, spacing, 28)
+    let minimum_context = context(&testnet, minimum_time, spacing, POW_ADJUSTMENT_BLOCK_SPAN)
         .into_iter()
         .enumerate()
         .map(|(index, (difficulty, time))| {
@@ -275,7 +277,13 @@ fn median_and_production_max_time_boundaries_are_exact() {
     ] {
         let context = vec![
             (network.target_difficulty_limit().to_compact(), base);
-            usize::try_from(height.0.min(28)).expect("bounded height fits in usize")
+            usize::try_from(
+                height.0.min(
+                    u32::try_from(POW_ADJUSTMENT_BLOCK_SPAN)
+                        .expect("the difficulty adjustment span fits in u32"),
+                )
+            )
+            .expect("bounded height fits in usize")
         ];
         assert!(matches!(
             validate_with_expected_target(&network, height, base, &context),

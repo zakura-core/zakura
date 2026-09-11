@@ -1,6 +1,6 @@
 [package]
 name = "zakura-header-chain"
-version = "2.1.0"
+version = "2.1.1"
 authors.workspace = true
 description = "Fork-aware header-chain domain types and transition engine for Zakura"
 license.workspace = true
@@ -12,6 +12,12 @@ edition.workspace = true
 rust-version.workspace = true
 
 [features]
+
+# Experimental candidate NU7 consensus rules, dormant until NU7 activates.
+nu7-experimental = [
+    "zakura-chain/nu7-experimental",
+]
+
 fuzz-impl = []
 test-support = []
 
@@ -20,7 +26,7 @@ chrono = { workspace = true }
 rayon = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
-zakura-chain = { path = "../zakura-chain", version = "7.0.0" }
+zakura-chain = { path = "../zakura-chain", version = "7.0.1" }
 
 [dev-dependencies]
 criterion = { workspace = true }

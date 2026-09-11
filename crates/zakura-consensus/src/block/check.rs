@@ -14,9 +14,10 @@ use zakura_chain::{
             founders_reward, founders_reward_address, funding_stream_values, FundingStreamReceiver,
             ParameterSubsidy, SubsidyError,
         },
-        Network, NetworkUpgrade,
+        Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET, ORCHARD_BLOCK_ACTION_LIMIT,
+        SAPLING_BLOCK_IO_LIMIT, SPROUT_BLOCK_JOINSPLIT_LIMIT,
     },
-    transaction::{self, Transaction},
+    transaction::{self, ShieldedActionCounts, Transaction},
     transparent::{Address, Output},
     work::{difficulty::ExpandedDifficulty, equihash},
 };
@@ -402,6 +403,83 @@ pub fn time_is_valid_at(
     hash: &Hash,
 ) -> Result<(), zakura_chain::block::BlockTimeError> {
     zakura_header_chain::validate_future_time(header, now, *height, *hash)
+}
+
+/// Returns `Ok(())` if the ZIP 218 per-block shielded limits hold for the sum of
+/// `transactions` on `network` at `height`.
+///
+/// The block verifier passes every transaction in the block. The transaction
+/// verifier passes a single transaction, because a transaction whose own counts
+/// exceed a per-block limit can never be mined, so the mempool rejects it on
+/// submission.
+///
+/// The limits apply only once ZIP 218 is compiled in and NU7 is active, so this
+/// is a no-op in a default build and on any network without an NU7 activation
+/// height.
+///
+/// # Consensus
+///
+/// > For each block at height `height` where `IsNU7Activated(height)`, the
+/// > following limits MUST be satisfied:
+/// >
+/// > - The total number of Orchard actions across all transactions in the block
+/// >   MUST NOT exceed `OrchardBlockActionLimit`.
+/// > - The total number of Sapling inputs and outputs across all transactions in
+/// >   the block MUST NOT exceed `SaplingBlockIOLimit`.
+/// > - The total number of Sprout JoinSplits across all transactions in the
+/// >   block MUST NOT exceed `SproutBlockJoinSplitLimit`.
+/// > - The total shielded cost across all pools MUST NOT exceed
+/// >   `GlobalShieldedBudget`, where that cost is
+/// >   `Σ orchard_actions + Σ (sapling_spends + sapling_outputs) + 2 * Σ joinsplits`.
+///
+/// <https://zips.z.cash/zip-0218#shielded-pool-action-limits>
+pub fn shielded_action_limits_are_valid<'a>(
+    transactions: impl IntoIterator<Item = &'a Arc<Transaction>>,
+    height: Height,
+    network: &Network,
+) -> Result<(), TransactionError> {
+    if !NetworkUpgrade::is_zip218_active(network, height) {
+        return Ok(());
+    }
+
+    let totals = transactions
+        .into_iter()
+        .map(|tx| tx.shielded_action_counts())
+        .fold(
+            ShieldedActionCounts::default(),
+            ShieldedActionCounts::saturating_add,
+        );
+
+    if totals.orchard_actions > ORCHARD_BLOCK_ACTION_LIMIT {
+        return Err(TransactionError::OrchardActionsExceedBlockLimit {
+            actions: totals.orchard_actions,
+            limit: ORCHARD_BLOCK_ACTION_LIMIT,
+        });
+    }
+
+    if totals.sapling_ios > SAPLING_BLOCK_IO_LIMIT {
+        return Err(TransactionError::SaplingIOsExceedBlockLimit {
+            ios: totals.sapling_ios,
+            limit: SAPLING_BLOCK_IO_LIMIT,
+        });
+    }
+
+    if totals.sprout_joinsplits > SPROUT_BLOCK_JOINSPLIT_LIMIT {
+        return Err(TransactionError::SproutJoinSplitsExceedBlockLimit {
+            joinsplits: totals.sprout_joinsplits,
+            limit: SPROUT_BLOCK_JOINSPLIT_LIMIT,
+        });
+    }
+
+    let cost = totals.cost();
+    if cost > GLOBAL_SHIELDED_BUDGET {
+        return Err(TransactionError::ShieldedCostExceedsBlockBudget {
+            cost,
+            limit: GLOBAL_SHIELDED_BUDGET,
+        });
+    }
+
+    Ok(())
 }
 
 /// Check Merkle root validity.

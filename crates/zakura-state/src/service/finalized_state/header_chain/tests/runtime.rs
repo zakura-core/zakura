@@ -9,9 +9,15 @@ fn atomic_finality_context_can_use_a_newly_staged_anchor_path() {
         .initialize(metadata, anchor.clone())
         .expect("the empty schema initializes");
 
+    // Stage one node past the retained predecessor span, so the context cap
+    // binds whatever difficulty averaging window this build uses.
+    let predecessor_span = zakura_header_chain::POW_PREDECESSOR_CONTEXT_SPAN;
+    let staged_len =
+        u32::try_from(predecessor_span + 1).expect("the retained predecessor span fits in u32");
+
     let mut nodes = Vec::new();
     let mut parent = anchor;
-    for height in 1..=28 {
+    for height in 1..=staged_len {
         let mut header = *parent.header;
         header.previous_block_hash = parent.hash;
         header.time += chrono::Duration::seconds(1);
@@ -40,14 +46,14 @@ fn atomic_finality_context_can_use_a_newly_staged_anchor_path() {
     let staged: HashMap<_, _> = nodes.iter().map(|node| (node.hash, node)).collect();
     let contexts = authenticated_context_headers(&store, parent.hash, Some(&staged))
         .expect("the atomic batch can authenticate context from its staged node overlay");
-    assert_eq!(contexts.len(), 27);
+    assert_eq!(contexts.len(), predecessor_span);
     assert_eq!(
         contexts.first().map(|context| context.height),
         Some(block::Height(1))
     );
     assert_eq!(
         contexts.last().map(|context| context.height),
-        Some(block::Height(27))
+        Some(block::Height(staged_len - 1))
     );
     assert_eq!(
         parent.header.previous_block_hash,

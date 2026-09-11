@@ -32,6 +32,9 @@ use crate::{
     Config,
 };
 
+#[cfg(feature = "nu7-experimental")]
+use crate::service::finalized_state::HEADER_VALIDATION_CONTEXT;
+
 fn engine_config(network: Network, genesis: &Arc<block::Block>) -> EngineConfig {
     let frontier = Frontier::new(Height(0), genesis.hash());
     EngineConfig::new(
@@ -204,6 +207,102 @@ fn predecessor_overlay_is_atomically_replaced_from_finalized_state() {
             .len(),
         2
     );
+}
+
+#[test]
+#[cfg(feature = "nu7-experimental")]
+fn zip218_build_backfills_an_existing_validation_context_before_startup() {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let genesis = mainnet_block(0);
+    let state = state_with_genesis_config(&network, genesis.clone(), Config::ephemeral());
+    let predecessor_span = zakura_header_chain::POW_PREDECESSOR_CONTEXT_SPAN;
+    let chain_tip = u32::try_from(predecessor_span + 1)
+        .expect("the validation context span fits in a block height");
+
+    let header_cf = state
+        .db
+        .cf_handle("block_header_by_height")
+        .expect("the full-state header column exists");
+    let hash_cf = state
+        .db
+        .cf_handle("hash_by_height")
+        .expect("the full-state hash column exists");
+    let height_cf = state
+        .db
+        .cf_handle("height_by_hash")
+        .expect("the full-state reverse hash column exists");
+    let mut headers = vec![genesis.header.clone()];
+    let mut full_state = DiskWriteBatch::new();
+    for height in 1..=chain_tip {
+        let previous = headers
+            .last()
+            .expect("the synthetic chain starts at genesis");
+        let mut header = **previous;
+        header.previous_block_hash = previous.hash();
+        header.time += chrono::Duration::seconds(1);
+        header.nonce.0[0] =
+            u8::try_from(height).expect("the synthetic chain is shorter than 256 blocks");
+        let header = Arc::new(header);
+        let hash = header.hash();
+        let height = Height(height);
+        full_state.zs_insert(&header_cf, height, &header);
+        full_state.zs_insert(&hash_cf, height, hash);
+        full_state.zs_insert(&height_cf, hash, height);
+        headers.push(header);
+    }
+    state
+        .db
+        .write(full_state)
+        .expect("the synthetic finalized header chain writes");
+
+    let config = engine_config(network, &genesis);
+    let (runtime, report) = initialize_header_chain_reconciled(&state, &config, Vec::new())
+        .expect("the complete validation context initializes");
+    assert_eq!(report.validation_context_rows, predecessor_span);
+    drop(runtime);
+
+    let store = HeaderChainStore::new(state.header_chain_disk_db());
+    let mut contexts = Vec::new();
+    store
+        .audit_snapshot()
+        .expect("the initialized store has an audit snapshot")
+        .visit_validation_context_records(RowLimit::new(predecessor_span), &mut |record| {
+            contexts.push(record);
+            Ok(())
+        })
+        .expect("the validation context rows decode");
+    contexts.sort_unstable_by_key(|record| record.height);
+
+    // A build without ZIP 218 retained 17 averaging-window headers plus 10
+    // additional median-time headers below the finalized anchor.
+    let old_predecessor_span = 27;
+    let mut downgrade = DiskWriteBatch::new();
+    let context_cf = state
+        .db
+        .cf_handle(HEADER_VALIDATION_CONTEXT)
+        .expect("the validation context column exists");
+    for context in contexts
+        .iter()
+        .take(predecessor_span - old_predecessor_span)
+    {
+        downgrade.zs_delete(&context_cf, context.header.hash());
+    }
+    state
+        .db
+        .write(downgrade)
+        .expect("the pre-ZIP 218 context fixture writes");
+
+    assert_eq!(
+        store
+            .backfill_validation_context(&state)
+            .expect("authenticated full state backfills the wider context"),
+        predecessor_span - old_predecessor_span,
+    );
+    let (_, startup) = store
+        .startup(&config)
+        .expect("startup accepts the backfilled validation context");
+    assert!(startup.publication_allowed);
 }
 
 #[test]

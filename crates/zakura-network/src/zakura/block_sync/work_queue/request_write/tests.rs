@@ -15,11 +15,55 @@ impl RequestWriteStatus {
 thread_local! {
     static BEFORE_RESET_HEIGHT_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+    static BEFORE_DROP_CLEANUP: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
 }
 
 pub(super) fn before_reset_height_check() {
     if let Some(hook) = BEFORE_RESET_HEIGHT_CHECK.with_borrow_mut(Option::take) {
         hook();
+    }
+}
+
+pub(super) fn before_drop_cleanup() {
+    if let Some(hook) = BEFORE_DROP_CLEANUP.with_borrow_mut(Option::take) {
+        hook();
+    }
+}
+
+#[test]
+fn settlement_observes_write_status_while_last_owner_is_dropping() {
+    for started in [false, true] {
+        let mut f = Fixture::new();
+        let claim = f.take(1);
+        assert!(claim.publish(|| {}));
+        if started {
+            assert!(claim.try_start());
+        }
+        let weak = Arc::downgrade(&claim);
+        let owner = claim.owner();
+        let work = f.work.clone();
+        let mut budget = f.budget.clone();
+        // Arbitrate expiry after the last strong reference is gone, before Drop
+        // acquires the work lock to return the request's remaining heights.
+        BEFORE_DROP_CLEANUP.with_borrow_mut(|hook| {
+            *hook = Some(Box::new(move || {
+                assert!(weak.upgrade().is_none());
+                let outcome = work.release_reserved_and_return_items_detailed_for_owner(
+                    owner,
+                    [block::Height(1)],
+                );
+                assert_eq!(outcome.request_was_unwritten, !started);
+                assert_eq!(outcome.returned_count, 1);
+                assert_eq!(outcome.released_bytes, 100);
+                budget.release(outcome.released_bytes);
+            }));
+        });
+        drop(claim);
+        assert_eq!(f.budget.reserved(), 0);
+        assert_eq!(f.work.reserved_bytes(), 0);
+        assert_eq!(f.work.pending_len(), 2);
+        assert!(f.work.lock().request_writes.is_empty());
     }
 }
 

@@ -117,6 +117,9 @@ If a request expires before its write starts, it MUST be skipped and its work
 and reservation returned without a timeout penalty, retry avoidance, or an
 unanswered-probe charge. Requests whose writes have started remain accountable
 for timeouts even if the write has not finished.
+This applies to both routine expiry and the central floor watchdog. The watchdog
+MUST decide avoidance from the write disposition captured during settlement,
+atomically against writer startup.
 
 For example, suppose B takes four seconds to send each 2 MiB block. If A queues
 block 101 behind block 100, block 101 needs eight seconds of transfer allowance,

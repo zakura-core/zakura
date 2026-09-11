@@ -19,6 +19,9 @@ for name in ["/root/out/notes.md","/root/out/seed-priming/summary.json","/root/o
             print(name,json.dumps(summary))
         else:
             print(name,p.read_text()[-12000:])
+p=Path('/var/log/zakura/zakura.log')
+if p.exists():
+    print('seed_log_tail',subprocess.check_output(['tail','-n','60',str(p)],text=True)[-15000:])
 for port in [8232,18232]:
     try:
         req=urllib.request.Request(f"http://127.0.0.1:{port}",data=json.dumps({"jsonrpc":"2.0","id":"inspect","method":"getblockcount","params":[]}).encode(),headers={"Content-Type":"application/json"})

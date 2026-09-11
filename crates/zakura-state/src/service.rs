@@ -2007,16 +2007,15 @@ impl Service<Request> for StateService {
                 let read_service = self.read_service.clone();
 
                 async move {
-                    if sent_hash_response.is_some() {
-                        return Ok(Response::KnownBlock(sent_hash_response));
-                    };
-
+                    // The sent cache retains committed blocks until finalization.
+                    // Prefer committed state so retries can observe a completed write.
                     let response = read::non_finalized_state_contains_block_hash(
                         &read_service.latest_non_finalized_state(),
                         hash,
                     )
                     // TODO: Move this to a blocking task, perhaps by moving some of this logic to the ReadStateService.
-                    .or_else(|| read::finalized_state_contains_block_hash(&read_service.db, hash));
+                    .or_else(|| read::finalized_state_contains_block_hash(&read_service.db, hash))
+                    .or(sent_hash_response);
 
                     timer.finish_desc("Request::KnownBlock");
 
@@ -2089,6 +2088,7 @@ impl Service<Request> for StateService {
             | Request::BlockLocator
             | Request::Transaction(_)
             | Request::UnspentBestChainUtxo(_)
+            | Request::CheckBestTipMissingInputs { .. }
             | Request::Block(_)
             | Request::AnyChainBlock(_)
             | Request::BlockHeader(_)
@@ -2874,6 +2874,32 @@ impl Service<ReadRequest> for ReadStateService {
             ReadRequest::SpendingTransactionId(spend) => Ok(ReadResponse::TransactionId(
                 read::spending_transaction_hash(state.latest_best_chain(), &state.db, spend),
             )),
+
+            ReadRequest::CheckBestTipMissingInputs { parent, outpoints } => {
+                let finalized_height = state.db.finalized_tip_height();
+                let non_finalized = state.latest_non_finalized_state();
+                let Some((parent_height, parent_hash)) = read::best_tip(&non_finalized, &state.db)
+                else {
+                    return Ok(ReadResponse::BestTipMissingInput(None));
+                };
+                if parent_hash != parent
+                    || finalized_height.is_some_and(|height| {
+                        height > parent_height
+                            || read::hash_by_height(non_finalized.best_chain(), &state.db, height)
+                                != Some(state.db.finalized_tip_hash())
+                    })
+                {
+                    return Ok(ReadResponse::BestTipMissingInput(None));
+                }
+                let missing = outpoints.iter().copied().find(|outpoint| {
+                    read::unspent_utxo(non_finalized.best_chain(), &state.db, *outpoint).is_none()
+                });
+                // Finalization can remove an output spent after this snapshot's tip.
+                // An unchanged finalized height keeps the database aligned with the snapshot.
+                let missing =
+                    missing.filter(|_| state.db.finalized_tip_height() == finalized_height);
+                Ok(ReadResponse::BestTipMissingInput(missing))
+            }
 
             ReadRequest::UnspentBestChainUtxo(outpoint) => Ok(ReadResponse::UnspentBestChainUtxo(
                 read::unspent_utxo(state.latest_best_chain(), &state.db, outpoint),

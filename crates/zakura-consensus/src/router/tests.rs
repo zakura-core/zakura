@@ -483,3 +483,79 @@ async fn verify_fail_add_block_checkpoint() -> Result<(), Report> {
 
     Ok(())
 }
+
+/// A forged lookahead height cannot route a block into a finished checkpoint verifier.
+#[tokio::test]
+async fn forged_lookahead_height_is_rejected_before_checkpoint_routing() {
+    use tower::service_fn;
+    use zakura_chain::transparent;
+
+    let _init_guard = zakura_test::init();
+    for rewrite_expiry in [false, true] {
+        let mut block: Block = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        let hash = block.hash();
+        let checkpoint_height = Height(1_687_105);
+        let checkpoint_hash = block::Hash([0xCA; 32]);
+        let coinbase_hash = block.transactions[0].hash();
+        let coinbase = Arc::make_mut(&mut block.transactions[0]);
+        match &mut coinbase.inputs_mut()[0] {
+            transparent::Input::Coinbase { height, .. } => *height = checkpoint_height,
+            _ => panic!("the first transaction is coinbase"),
+        }
+        assert_eq!(block.hash(), hash);
+        assert_eq!(block.transactions[0].hash(), coinbase_hash);
+        if rewrite_expiry {
+            *Arc::make_mut(&mut block.transactions[0]).expiry_height_mut() = checkpoint_height;
+            assert_ne!(block.transactions[0].hash(), coinbase_hash);
+            assert_eq!(block.hash(), hash);
+        }
+        assert_ne!(block.header.previous_block_hash, checkpoint_hash);
+
+        let state = service_fn(|_| -> std::future::Ready<Result<zs::Response, BoxError>> {
+            panic!("the router must reject the forged height before state queries")
+        });
+        let transaction = service_fn(
+            |_| -> std::future::Ready<Result<transaction::Response, BoxError>> {
+                panic!("the router must reject the forged height before transaction verification")
+            },
+        );
+        let genesis: Block = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        let checkpoint = CheckpointVerifier::from_list(
+            [
+                (Height(0), genesis.hash()),
+                (checkpoint_height, checkpoint_hash),
+            ],
+            &Network::Mainnet,
+            Some((checkpoint_height, checkpoint_hash)),
+            state,
+        )
+        .unwrap();
+        let router = BlockVerifierRouter {
+            checkpoint,
+            max_checkpoint_height: checkpoint_height,
+            block: SemanticBlockVerifier::new(&Network::Mainnet, state, transaction),
+        };
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            router.oneshot(Request::Commit(Arc::new(block))),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(
+            !matches!(
+                &error,
+                RouterError::Checkpoint { source } if matches!(**source, VerifyCheckpointError::Finished)
+            ),
+            "{error:?}"
+        );
+        assert!(
+            error.misbehavior_score() > 0,
+            "the forged body must penalize its supplier: {error:?}"
+        );
+    }
+}

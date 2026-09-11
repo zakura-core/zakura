@@ -23,6 +23,14 @@ for port in [8232,18232]:
             emit('height',port=port,response=json.load(response))
     except Exception as e:
         emit('rpc_unavailable',port=port,error=str(e))
+for port in [9999,19999]:
+    try:
+        with urllib.request.urlopen(f'http://127.0.0.1:{port}/metrics',timeout=3) as response:
+            metrics=response.read().decode()
+        names=['state_vct_fast_block_count','sync_block_body_received','sync_block_request_sent','sync_zakura_legacy_fallback_engaged']
+        emit('metrics',port=port,values=[line for line in metrics.splitlines() if any(line.startswith(name) for name in names)])
+    except Exception:
+        pass
 for name in ['/root/out/notes.md','/root/out/seed-priming/summary.json','/root/out/paired/summary.json','/root/out/paired/events.jsonl']:
     p=Path(name)
     if p.exists():
@@ -33,6 +41,7 @@ for name in ['/var/log/zakura/seed-traces/header_sync.jsonl','/root/out/paired/t
         continue
     refusals=[]
     requests=[]
+    responses=[]
     snapshots=[]
     repairs=[]
     for line in p.open(errors='replace'):
@@ -40,9 +49,10 @@ for name in ['/var/log/zakura/seed-traces/header_sync.jsonl','/root/out/paired/t
         except ValueError: continue
         if row.get('outcome')=='busy': refusals.append(row)
         if row.get('event')=='header_request_sent': requests.append(row)
+        if row.get('event')=='header_response_received': responses.append(row)
         if row.get('event')=='header_snapshot_observed': snapshots.append(row)
         if row.get('event')=='header_vct_repair_state': repairs.append(row)
-    emit('header_trace',path=name,busy_count=len(refusals),last_busy=refusals[-8:],request_count=len(requests),last_requests=requests[-8:],last_snapshots=snapshots[-4:],last_repairs=repairs[-4:])
+    emit('header_trace',path=name,busy_count=len(refusals),last_busy=refusals[-8:],request_count=len(requests),last_requests=requests[-8:],response_count=len(responses),last_responses=responses[-8:],last_snapshots=snapshots[-4:],last_repairs=repairs[-4:])
 p=Path('/var/log/zakura/zakura.log')
 if p.exists():
     reasons=[]

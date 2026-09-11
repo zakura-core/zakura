@@ -1479,12 +1479,14 @@ where
 
             let admission_start = std::time::Instant::now();
             let mut early_result = None;
+            let mut state_admitted = false;
             let verification_result = tokio::select! {
                 biased;
 
                 admitted = admission.wait() => {
                     metrics::histogram!("mining.state_admission.duration_seconds")
                         .record(admission_start.elapsed().as_secs_f64());
+                    state_admitted = admitted;
                     if admitted
                         && admission.optimistic_relay_authorized()
                         && optimistic_block_inventory
@@ -1530,7 +1532,7 @@ where
                         height,
                         early_advertised,
                     }
-                } else {
+                } else if state_admitted {
                     if early_advertised {
                         metrics::counter!("mining.optimistic_inventory.post_commit_failures")
                             .increment(1);
@@ -1545,6 +1547,11 @@ where
                         height,
                         early_advertised,
                     }
+                } else {
+                    // State never admitted this block, so the gossip task has nothing to act on.
+                    // Sending an event here would let every rejected RPC submission, including
+                    // a resubmitted known block, restart the gossip task's committed-tip delay.
+                    return;
                 };
                 if mined_block_sender.send(event).is_err() {
                     metrics::counter!("mining.optimistic_inventory.final_send_failures")

@@ -3654,6 +3654,7 @@ async fn rpc_submitblock_errors() {
 
     // Init RPC
     let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (mined_tx, mut mined_rx) = tokio::sync::mpsc::unbounded_channel();
     let (rpc, _) = RpcImpl::new(
         Mainnet,
         Default::default(),
@@ -3668,7 +3669,7 @@ async fn rpc_submitblock_errors() {
         tip.clone(),
         MockAddressBookPeers::default(),
         rx,
-        None,
+        Some(mined_tx),
     );
 
     // Try to submit pre-populated blocks and assert that it responds with duplicate.
@@ -3691,6 +3692,14 @@ async fn rpc_submitblock_errors() {
     assert_eq!(
         submit_block_response,
         Ok(SubmitBlockErrorResponse::Rejected.into())
+    );
+
+    // State never admitted these blocks. Their rejections must not wake the gossip task, because
+    // each mined-block event restarts its committed-tip delay.
+    let event = tokio::time::timeout(std::time::Duration::from_millis(500), mined_rx.recv()).await;
+    assert!(
+        event.is_err(),
+        "rejected submissions must not send mined-block events: {event:?}"
     );
 
     mempool.expect_no_requests().await;

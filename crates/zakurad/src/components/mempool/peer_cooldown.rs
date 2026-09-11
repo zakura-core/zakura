@@ -18,7 +18,7 @@
 //! requested. Repeated failures double the cooldown.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     net::IpAddr,
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
@@ -48,7 +48,13 @@ pub const MAX_COOLDOWN_PEERS: usize = 20_000;
 /// the same state.
 #[derive(Clone, Debug, Default)]
 pub struct PeerCooldowns {
-    peers: Arc<Mutex<HashMap<IpAddr, Cooldown>>>,
+    peers: Arc<Mutex<CooldownState>>,
+}
+
+#[derive(Debug, Default)]
+struct CooldownState {
+    peers: HashMap<IpAddr, Cooldown>,
+    expirations: BTreeSet<(Instant, IpAddr)>,
 }
 
 /// One IP address's cooldown history.
@@ -71,25 +77,44 @@ impl Cooldown {
 impl PeerCooldowns {
     /// Returns true if transactions from `ip` should be ignored at `now`.
     pub fn is_cooling_down(&self, ip: IpAddr, now: Instant) -> bool {
-        self.peers()
-            .get(&ip.to_canonical())
-            .is_some_and(|cooldown| now < cooldown.until)
+        let state = self.peers();
+        match state.peers.get(&ip.to_canonical()) {
+            Some(cooldown) => now < cooldown.until,
+            // Preserve active entries at capacity. Pause untracked peers until
+            // an expired entry can make room for their cooldown history.
+            None => {
+                state.peers.len() == MAX_COOLDOWN_PEERS
+                    && state
+                        .expirations
+                        .first()
+                        .is_some_and(|(until, _)| now < *until)
+            }
+        }
     }
 
     /// Records an invalid transaction from `ip` at `now`.
     ///
     /// Returns the length of the cooldown this failure started, or `None` if
-    /// `ip` was already cooling down. Failures during a cooldown come from
+    /// `ip` was already cooling down or all history slots hold active cooldowns.
+    /// Failures during a cooldown come from
     /// transactions queued before it started, so they do not add strikes.
     pub fn record_invalid_transaction(&self, ip: IpAddr, now: Instant) -> Option<Duration> {
         let ip = ip.to_canonical();
-        let mut peers = self.peers();
+        let mut state = self.peers();
 
-        if !peers.contains_key(&ip) && peers.len() >= MAX_COOLDOWN_PEERS {
-            evict(&mut peers, now);
+        if !state.peers.contains_key(&ip) && state.peers.len() >= MAX_COOLDOWN_PEERS {
+            let &(until, oldest) = state
+                .expirations
+                .first()
+                .expect("each cooldown has one expiration");
+            if now < until {
+                return None;
+            }
+            state.expirations.remove(&(until, oldest));
+            state.peers.remove(&oldest);
         }
 
-        let cooldown = peers.entry(ip).or_insert(Cooldown {
+        let mut cooldown = state.peers.get(&ip).copied().unwrap_or(Cooldown {
             until: now,
             strikes: 0,
         });
@@ -102,9 +127,12 @@ impl PeerCooldowns {
             cooldown.strikes = 0;
         }
 
+        state.expirations.remove(&(cooldown.until, ip));
         cooldown.strikes = cooldown.strikes.saturating_add(1);
         let length = cooldown_length(cooldown.strikes);
         cooldown.until = now + length;
+        state.expirations.insert((cooldown.until, ip));
+        state.peers.insert(ip, cooldown);
 
         Some(length)
     }
@@ -112,34 +140,14 @@ impl PeerCooldowns {
     /// Returns the number of IP addresses with a cooldown history.
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.peers().len()
+        self.peers().peers.len()
     }
 
     /// Locks the cooldowns.
-    fn peers(&self) -> MutexGuard<'_, HashMap<IpAddr, Cooldown>> {
+    fn peers(&self) -> MutexGuard<'_, CooldownState> {
         self.peers
             .lock()
             .expect("no code panics while holding the peer cooldowns lock")
-    }
-}
-
-/// Makes room in `peers` for one new IP address.
-///
-/// Drops forgotten histories first. If the map is still full, drops the
-/// history whose cooldown ended earliest.
-fn evict(peers: &mut HashMap<IpAddr, Cooldown>, now: Instant) {
-    peers.retain(|_ip, cooldown| !cooldown.is_forgotten(now));
-
-    if peers.len() < MAX_COOLDOWN_PEERS {
-        return;
-    }
-
-    if let Some(earliest) = peers
-        .iter()
-        .min_by_key(|(_ip, cooldown)| cooldown.until)
-        .map(|(ip, _cooldown)| *ip)
-    {
-        peers.remove(&earliest);
     }
 }
 

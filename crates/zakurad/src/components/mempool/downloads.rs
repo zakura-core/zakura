@@ -711,10 +711,10 @@ where
     }
 
     /// Get a list of the currently pending transaction requests.
-    pub fn transaction_requests(&self) -> impl Iterator<Item = &Gossip> {
+    pub fn transaction_requests(&self) -> impl Iterator<Item = (&Gossip, &Option<QueueSource>)> {
         self.cancel_handles
             .iter()
-            .map(|(_tx_id, (_handle, tx, _source))| tx)
+            .map(|(_tx_id, (_handle, tx, source))| (tx, source))
     }
 
     /// Reject transactions that exceed the configured serialized size limit.
@@ -837,6 +837,35 @@ mod tests {
             u64::MAX,
             PeerCooldowns::default(),
         )
+    }
+
+    #[tokio::test]
+    async fn retry_requests_preserve_pushed_transaction_sources() {
+        let mut downloads = pending_downloads();
+        let transaction = empty_v5_transaction(1);
+        let source = QueueSource::LegacySocket("203.0.113.7:8233".parse().unwrap());
+        downloads
+            .download_if_needed_and_verify(
+                Gossip::Tx(transaction.clone()),
+                Some(source.clone()),
+                None,
+            )
+            .unwrap();
+        let retries: Vec<_> = downloads
+            .transaction_requests()
+            .map(|(tx, source)| (tx.clone(), source.clone()))
+            .collect();
+        downloads.cancel_all();
+        for (tx, source) in retries {
+            downloads
+                .download_if_needed_and_verify(tx, source, None)
+                .unwrap();
+        }
+        assert_eq!(downloads.pending_per_peer.get(&source), Some(&1));
+        assert!(downloads
+            .transaction_requests()
+            .any(|(tx, retry_source)| tx.id() == transaction.id()
+                && retry_source.as_ref() == Some(&source)));
     }
 
     #[tokio::test]

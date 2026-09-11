@@ -122,11 +122,11 @@ fn a_full_history_drops_forgotten_peers_first() {
     }
     assert_eq!(cooldowns.len(), MAX_COOLDOWN_PEERS);
 
-    // Every history is forgotten by now, so the new peer replaces all of them.
+    // Evict one forgotten history without scanning or clearing the map.
     let forgotten = start + BASE_COOLDOWN + MAX_COOLDOWN;
     cooldowns.record_invalid_transaction(PEER, forgotten);
 
-    assert_eq!(cooldowns.len(), 1);
+    assert_eq!(cooldowns.len(), MAX_COOLDOWN_PEERS);
     assert!(cooldowns.is_cooling_down(PEER, forgotten));
 }
 
@@ -159,6 +159,31 @@ fn history_stays_bounded() {
     let last = IpAddr::V4(Ipv4Addr::from(
         0x0a00_0000 + u32::try_from(MAX_COOLDOWN_PEERS).expect("the peer bound fits in u32"),
     ));
-    assert!(!cooldowns.is_cooling_down(first, start));
+    assert!(cooldowns.is_cooling_down(first, start));
     assert!(cooldowns.is_cooling_down(last, start + Duration::from_secs(1)));
+    assert!(!cooldowns.peers().peers.contains_key(&last));
+
+    // The untracked peer can acquire a slot once the earliest cooldown ends.
+    assert!(!cooldowns.is_cooling_down(last, start + BASE_COOLDOWN));
+    assert_eq!(
+        cooldowns.record_invalid_transaction(last, start + BASE_COOLDOWN),
+        Some(BASE_COOLDOWN)
+    );
+    assert!(!cooldowns.peers().peers.contains_key(&first));
+    assert!(cooldowns.peers().peers.contains_key(&last));
+    assert_eq!(cooldowns.peers().expirations.len(), MAX_COOLDOWN_PEERS);
+}
+
+#[test]
+fn extending_a_cooldown_replaces_its_expiration() {
+    let start = Instant::now();
+    let cooldowns = PeerCooldowns::default();
+    cooldowns.record_invalid_transaction(PEER, start);
+    cooldowns.record_invalid_transaction(PEER, start + BASE_COOLDOWN);
+    let state = cooldowns.peers();
+    assert_eq!(state.expirations.len(), 1);
+    assert_eq!(
+        state.expirations.first(),
+        Some(&(start + BASE_COOLDOWN * 3, PEER))
+    );
 }

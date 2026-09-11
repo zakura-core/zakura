@@ -248,7 +248,7 @@ async fn invalid_peer_transaction_starts_a_cooldown_instead_of_a_ban() -> Result
     assert!(!mempool
         .tx_downloads()
         .transaction_requests()
-        .any(|request| request.id() == later_transaction.id()));
+        .any(|(request, _)| request.id() == later_transaction.id()));
     peer_set.expect_no_requests().await;
 
     Ok(())
@@ -319,7 +319,7 @@ async fn crawled_transaction_from_cooling_down_peer_is_not_verified() -> Result<
             while mempool
                 .tx_downloads()
                 .transaction_requests()
-                .any(|request| request.id() == transaction_id)
+                .any(|(request, _)| request.id() == transaction_id)
             {
                 mempool.dummy_call().await;
                 time::sleep(Duration::from_millis(10)).await;
@@ -1197,19 +1197,22 @@ async fn mempool_reset_keeps_active_state_when_legacy_sync_falls_behind() -> Res
     assert!(mempool.is_enabled());
 
     // Queue the uncommitted transaction for download.
+    let source = QueueSource::LegacySocket("203.0.113.7:8233".parse().unwrap());
     let response = mempool
         .ready()
         .await
         .unwrap()
-        .call(Request::Queue(vec![uncommitted_tx_id.into()]))
+        .call(Request::QueueFromPeer {
+            transactions: vec![uncommitted_tx_id.into()],
+            source: source.clone(),
+        })
         .await
         .unwrap();
     let queued_responses = match response {
         Response::Queued(queue_responses) => queue_responses,
         _ => unreachable!("will never happen in this test"),
     };
-    assert_eq!(queued_responses.len(), 1);
-    assert!(queued_responses[0].is_ok());
+    assert!(queued_responses.is_empty());
     assert_eq!(mempool.tx_downloads().in_flight(), 1);
 
     // Query the mempool to make it poll chain_tip_change.
@@ -1249,6 +1252,12 @@ async fn mempool_reset_keeps_active_state_when_legacy_sync_falls_behind() -> Res
         &zakura_network::Request::TransactionsById(iter::once(uncommitted_tx_id).collect()),
     );
     assert_eq!(mempool.tx_downloads().in_flight(), 1);
+
+    assert!(mempool
+        .tx_downloads()
+        .transaction_requests()
+        .any(|(tx, retry_source)| tx.id() == uncommitted_tx_id
+            && retry_source.as_ref() == Some(&source)));
 
     Ok(())
 }

@@ -56,8 +56,10 @@ for name in ['/var/log/zakura/seed-traces/header_sync.jsonl','/root/out/paired/t
 p=Path('/var/log/zakura/zakura.log')
 if p.exists():
     reasons=[]
+    connection_failures=[]
     tail=deque(maxlen=6)
     for line in p.open(errors='replace'):
         tail.append(line)
         if 'header serving reproduction:' in line: reasons.append(line)
-    emit('storage_refusals',count=len(reasons),last=reasons[-10:],log_tail=list(tail))
+        if 'failed to make outbound connection' in line or 'handshake' in line.lower(): connection_failures.append(line)
+    emit('storage_refusals',count=len(reasons),last=reasons[-10:],connection_failures=connection_failures[-12:],log_tail=list(tail))

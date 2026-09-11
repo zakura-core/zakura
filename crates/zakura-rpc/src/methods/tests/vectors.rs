@@ -3787,14 +3787,10 @@ fn rpc_submitblock_cancellation_retains_queued_pow_capacity() {
             }
         });
         let hash = Mainnet.genesis_hash();
+        // Probe without reserving: a probe reservation could make the submission's own
+        // reservation fail as a duplicate, and the submission would then never hold capacity.
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                if matches!(
-                    rpc.gbt.mined_pow_checks.reserve(hash),
-                    Err(SubmitBlockErrorResponse::DuplicateInconclusive)
-                ) {
-                    break;
-                }
+            while !rpc.gbt.mined_pow_checks.contains(&hash) {
                 tokio::task::yield_now().await;
             }
         })
@@ -3809,15 +3805,13 @@ fn rpc_submitblock_cancellation_retains_queued_pow_capacity() {
         release.send(()).expect("the blocker is waiting");
         blocker.await.expect("the blocker exits");
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                if rpc.gbt.mined_pow_checks.reserve(hash).is_ok() {
-                    break;
-                }
+            while rpc.gbt.mined_pow_checks.contains(&hash) {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .expect("finishing the proof check releases capacity");
+        assert!(rpc.gbt.mined_pow_checks.reserve(hash).is_ok());
         verifier.expect_no_requests().await;
         queue_task.abort();
     });

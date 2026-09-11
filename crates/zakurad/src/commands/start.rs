@@ -472,7 +472,7 @@ impl StartCmd {
             .service(state_service);
 
         // Temporary, explicitly armed diagnostic. The task does not poll state until the file exists.
-        if let Some(probe_file) = std::env::var_os("ZAKURA_HANDOFF_PROBE_FILE") {
+        if let Some(probe_file) = std::env::var_os("CODEX_HANDOFF_PROBE_FILE") {
             let probe_state: tower::util::BoxCloneService<
                 zakura_state::Request,
                 zakura_state::Response,

@@ -963,7 +963,13 @@ impl StateService {
     /// handoff has happened, `block_write_sender.finalized` is `None`, so the cheap first check
     /// short-circuits and the database is not read again.
     fn try_handoff_to_non_finalized_write(&mut self) -> bool {
-        if self.block_write_sender.finalized.is_some() {
+        if self.block_write_sender.finalized.is_some()
+            && self
+                .read_service
+                .db
+                .finalized_tip_height()
+                .is_some_and(|height| height.0 >= self.max_checkpoint_height.0.saturating_sub(1))
+        {
             tracing::info!(target: "handoff_diagnostic", stage = "handoff_check",
                 durable_tip = ?self.read_service.db.finalized_tip_height(),
                 durable_hash = ?self.read_service.db.finalized_tip_hash(),

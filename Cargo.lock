@@ -7436,7 +7436,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "7.0.0"
+version = "7.0.1"
 dependencies = [
  "bech32",
  "bitflags",
@@ -7505,7 +7505,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-consensus"
-version = "8.0.1"
+version = "9.0.0"
 dependencies = [
  "blake2b_simd",
  "chrono",
@@ -7605,7 +7605,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-header-chain"
-version = "2.1.0"
+version = "2.1.1"
 dependencies = [
  "chrono",
  "criterion",
@@ -8147,7 +8147,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "8.0.0"
+version = "8.0.1"
 dependencies = [
  "bincode",
  "chrono",

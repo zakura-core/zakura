@@ -94,10 +94,15 @@ The workers and application senders retain the shared resource owner until they
 finish or drop it. Every member also consumes a transport stream slot.
 
 Every persistent member shares a local session identity, cancellation token, and
-message-rate budget. Closing any member retires the session. Cancellation resets
-unfinished writes before a replacement can send frames. A write deadline retires
-the session without closing unrelated services on the connection. Protocol
-violations can still close the connection.
+message-rate budget. A remote close on any member retires the session.
+Cancellation resets unfinished writes before a replacement can send frames.
+A write deadline retires the session without closing unrelated services on the
+connection. Protocol violations can still close the connection.
+
+Dropping an application receiver stops delivery to that receiver. The transport
+keeps reading within its frame and message-rate limits and discards those frames.
+Retained application handles keep the session alive. Normal retirement waits for
+every application handle to close and every member's queued writes to finish.
 
 The transport records the first remote close or write timeout before cancelling
 its session. Block sync settles that failure against unanswered download work,

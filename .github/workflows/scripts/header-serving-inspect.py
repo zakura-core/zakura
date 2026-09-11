@@ -34,7 +34,7 @@ for port in [9999,19999]:
         emit('metrics',port=port,values=[line for line in metrics.splitlines() if any(line.startswith(name) for name in names)])
     except Exception:
         pass
-for name in ['/root/out/notes.md','/root/out/seed-priming/summary.json','/root/out/paired/summary.json','/root/out/paired/events.jsonl']:
+for name in ['/root/out/notes.md','/root/out/seed-priming/summary.json','/root/out/paired/summary.json','/root/out/paired/events.jsonl','/root/out/paired-continuation/events.jsonl','/root/out/paired-continuation/summary.json']:
     p=Path(name)
     if p.exists():
         emit('progress',path=name,tail=''.join(deque(p.open(errors='replace'),maxlen=12)))

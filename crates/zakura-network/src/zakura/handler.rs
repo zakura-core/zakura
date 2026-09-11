@@ -4454,6 +4454,13 @@ async fn request_stream_worker(
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE));
             return;
         }
+        Err(SinkReject::Connection(error)) => {
+            debug!(?error, "Zakura request requires local connection closure");
+            let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE));
+            context.close_cause.record("request_local_connection_close");
+            context.connection_token.cancel();
+            return;
+        }
     };
 
     for frame in response_frames {

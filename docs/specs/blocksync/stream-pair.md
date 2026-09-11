@@ -96,6 +96,12 @@ applies the existing no-progress cooldown and repeated-stall disconnect before
 readmission. A timeout with no download obligation does not penalize the peer.
 A graceful end with a truncated frame payload remains invalid.
 
+A repeated no-progress disconnect is a local liveness decision. It uses the
+shared `SinkReject::Connection` outcome and a local connection-close cause,
+without recording protocol misconduct. `SinkReject::Local` still leaves the
+connection open for ordinary delivery failures. `SinkReject::Protocol` closes
+the connection for invalid peer data.
+
 ## Flow control
 
 Keep the existing 16 MiB receive window per stream, 32 MiB shared connection

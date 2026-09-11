@@ -17,25 +17,32 @@ older layout text.
 
 ## Compliance branch results
 
-On 2026-09-11, the same 91-test profile ran locally over compliance implementation
-`8fc34706a` in [#971](https://github.com/zakura-core/zakura/pull/971), using Rust
-1.97.0, 64 generated cases, seed 896, and four load rounds. It reported **52 passed
-and 39 failed**. The early Block cap, header flags, terminal height boundaries,
-and discriminator-before-allocation witnesses now pass. Every remaining failure
-was also present in the initial run below.
+On 2026-09-11, the expanded 95-test profile ran locally over compliance
+implementation `78a9f19a0` in [#971](https://github.com/zakura-core/zakura/pull/971),
+using Rust 1.97.0, 64 generated cases, seed 896, and four load rounds. It reported
+**57 passed and 38 failed**. Framing fixes resolved four original witnesses.
+Bounded nested decoding now also resolves the missing-transaction allocation
+witness. All four newly added generated tests pass, with no new failure relative
+to the earlier 39-failure baseline.
 
-The generated property profile reports 26 passed and three failed across 29
-tests. After the regression selection update in `69a6ca1b4`, all 152 fixed-profile
-tests ran, with 145 passed and seven failed. Those failures are the five known
-terminal-consumption regressions plus the T01 and T02 transport compliance
-witnesses also selected by this profile. Network/test all-target Clippy passes
-with warnings denied. These runs disable retries and fail-fast. The long
-transport qualification and 64-round load gates have not been rerun.
+The shared slice decoder carries actual input bounds through transactions,
+scripts, proof byte strings, and external-count arrays. The added properties
+measure allocations before incomplete collection rejection, exercise capacity
+growth edges, and compare complete generated transactions against streaming
+results. The allocation minima are encoded independently in the tests.
 
-The terminal-field generator mixes valid counts with arbitrary counts so that
-invalid heights are exercised independently of count rejection. The tests still
-require the full specification. Authorization, nested allocation, response-byte,
-terminal-consumption, and connection-headroom work remain open.
+The generated profile reports 30 passed and three failed across 33 tests. The
+fixed profile reports 145 passed and seven failed across 152 tests, unchanged
+from the framing baseline. Those failures are the five known ending-consumption
+regressions plus the T01 and T02 transport witnesses. Network/test all-target
+Clippy with warnings denied passes. The production branch also passes 159
+selected chain regressions and six serialization doc tests.
+
+No retries or expected-failure markers are used. Nextest flagged one passing
+replay control as leaky in the generated run. That control passed without the
+flag in an isolated diagnostic run. The original observation remains in the log. The long transport
+qualification and 64-round load gates have not been rerun. Authorization,
+response-byte, terminal-consumption, and connection-headroom work remain open.
 
 ## Initial results
 
@@ -78,7 +85,7 @@ The shared #896 admission and writer models remain in place.
 | --- | --- | --- |
 | F01 | Production message caps, tighter negotiated cap, nonzero flags rejected before absent payload waits | `handler::tests::compliance_frames` |
 | F02 | Terminals in both directions, legal/invalid heights and counts, truncations, tags, canonical consumption, exact 2 MB Block and excess | `block_sync::wire::compliance` |
-| F03 | Actual requested allocations, empty remaining transaction bytes, decoded retained bytes distinct from wire bytes | `block_sync::wire::compliance` |
+| F03 | Actual allocations, missing outer/nested collection bytes, independent element minima, capacity growth edges, complete transaction compatibility, retained bytes distinct from wire bytes | `block_sync::wire::compliance` |
 | F04 | Wrong discriminator before Block allocation, absent authorization before decode, invalid identity before handler capacity | Wire and receiver `compliance` modules |
 | R01 | Exact hash authorization before first write, immediate response, generated legal prefixes | `block_sync::peer_routine::compliance`, existing request-write regressions |
 | R02 | No overlapping retry on the same connection, buffered overlap shapes admitted only after the old terminal write | Receiver and serving `compliance` modules |

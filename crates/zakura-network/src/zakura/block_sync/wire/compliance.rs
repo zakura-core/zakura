@@ -2,7 +2,31 @@
 
 use super::*;
 use proptest::prelude::*;
+use zakura_chain::{
+    primitives::{Groth16Proof, Halo2Proof},
+    serialization::{CompactSizeMessage, TrustedPreallocate, ZcashReader},
+    transaction::Transaction,
+    transparent::{Input, Output, Script},
+};
 use zakura_test::allocations::measure;
+
+fn assert_unfunded_collection<T: ZcashDeserialize + TrustedPreallocate>(
+    count: usize,
+    minimum_wire_bytes: usize,
+    missing: usize,
+) {
+    let data = vec![0; count * minimum_wire_bytes - missing.min(minimum_wire_bytes)];
+    let (result, allocations) =
+        measure(|| ZcashReader::from_slice(&mut data.as_slice()).read_external_count::<T>(count));
+    assert!(result.is_err());
+    assert_eq!(
+        allocations.requested_bytes,
+        0,
+        "F03: {} cannot reserve {count} elements from {} bytes: {allocations:?}",
+        std::any::type_name::<T>(),
+        data.len(),
+    );
+}
 
 fn terminal(tag: u8, height: u32, count: u32) -> Vec<u8> {
     let mut bytes = vec![tag];
@@ -243,6 +267,70 @@ fn f04_discriminator_mismatch_is_rejected_before_block_decode_allocation() {
 }
 
 proptest! {
+    #[test]
+    fn f03_generated_complete_transactions_preserve_decoder_results(tx in any::<Transaction>()) {
+        let encoded = tx.zcash_serialize_to_vec().unwrap();
+        let mut streamed_bytes = encoded.as_slice();
+        let mut bounded_bytes = encoded.as_slice();
+        let streamed = Transaction::zcash_deserialize(&mut streamed_bytes);
+        let bounded = Transaction::zcash_deserialize_from_slice(&mut bounded_bytes);
+        prop_assert_eq!(bounded.is_ok(), streamed.is_ok());
+        if let Ok(expected) = streamed {
+            prop_assert_eq!(bounded.unwrap(), expected);
+            prop_assert_eq!(bounded_bytes, streamed_bytes);
+        }
+    }
+
+    #[test]
+    fn f03_generated_collections_reject_missing_input_before_allocation(
+        count in 1usize..=64,
+        missing in 1usize..=400,
+    ) {
+        // Codec minima from the wire layout, independent of production's
+        // TrustedPreallocate declarations. V5 split arrays use their own sizes.
+        assert_unfunded_collection::<Transaction>(count, 10, missing);
+        assert_unfunded_collection::<Input>(count, 41, missing);
+        assert_unfunded_collection::<Output>(count, 9, missing);
+        assert_unfunded_collection::<Groth16Proof>(count, 192, missing);
+        assert_unfunded_collection::<zakura_chain::sapling::Spend<zakura_chain::sapling::PerSpendAnchor>>(count, 384, missing);
+        assert_unfunded_collection::<zakura_chain::sapling::SpendPrefixInTransactionV5>(count, 96, missing);
+        assert_unfunded_collection::<zakura_chain::sapling::OutputInTransactionV4>(count, 948, missing);
+        assert_unfunded_collection::<zakura_chain::sapling::OutputPrefixInTransactionV5>(count, 756, missing);
+        assert_unfunded_collection::<zakura_chain::orchard::Action>(count, 820, missing);
+    }
+
+    #[test]
+    fn f03_generated_nested_byte_strings_reject_before_allocation(
+        declared in 1usize..=8_193,
+        supplied_fraction in 0usize..=99,
+    ) {
+        let supplied = declared * supplied_fraction / 100;
+        let mut bytes = Vec::new();
+        CompactSizeMessage::try_from(declared).unwrap().zcash_serialize(&mut bytes).unwrap();
+        bytes.resize(bytes.len() + supplied, 0);
+        let (script, script_alloc) = measure(|| Script::zcash_deserialize_from_slice(&mut bytes.as_slice()));
+        let (proof, proof_alloc) = measure(|| Halo2Proof::zcash_deserialize_from_slice(&mut bytes.as_slice()));
+        let (string, string_alloc) = measure(|| String::zcash_deserialize_from_slice(&mut bytes.as_slice()));
+        prop_assert!(script.is_err() && proof.is_err() && string.is_err());
+        for observed in [script_alloc, proof_alloc, string_alloc] {
+            prop_assert_eq!(observed.requested_bytes, 0, "F03 nested byte string: {:?}", observed);
+        }
+    }
+
+    #[test]
+    fn f03_generated_complete_proof_arrays_bound_allocation_at_growth_edges(
+        count in prop_oneof![0usize..=2_049, proptest::sample::select(vec![0usize, 1, 1_023, 1_024, 1_025, 2_047, 2_048, 2_049])],
+    ) {
+        let bytes = vec![0; count * 192];
+        let (proofs, observed) = measure(|| {
+            ZcashReader::from_slice(&mut bytes.as_slice()).read_external_count::<Groth16Proof>(count)
+        });
+        let proofs = proofs.unwrap();
+        prop_assert_eq!(proofs.len(), count);
+        prop_assert!(observed.largest_request <= count * std::mem::size_of::<Groth16Proof>());
+        prop_assert!(observed.peak_live_bytes <= count * std::mem::size_of::<Groth16Proof>());
+    }
+
     #[test]
     fn f02_generated_terminal_fields(tag in prop_oneof![Just(4u8), Just(5u8)], height in any::<u32>(), count in prop_oneof![1u32..=MAX_BS_BLOCKS_PER_REQUEST, any::<u32>()]) {
         check_terminal(tag, height, count);

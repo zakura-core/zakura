@@ -1,35 +1,49 @@
-name: PR smoke diagnostics
+name: PR smoke checks
 on:
   workflow_dispatch:
     inputs:
       target:
         type: choice
-        options: [pr945, pr944-main]
+        options: [pr945, pr944-main, pr945-primed, pr944-main-primed]
         default: pr945
+      followthrough:
+        type: boolean
+        default: false
 permissions:
   contents: read
 jobs:
   inspect:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: ./.github/actions/do-cli
         with:
           token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
           ssh_private_key: ${{ secrets.DO_SSH_PRIVATE_KEY }}
-      - name: Read only the task-owned test node
+      - name: Inspect or continue the task-owned test node
         env:
           TARGET: ${{ inputs.target }}
+          FOLLOWTHROUGH: ${{ inputs.followthrough }}
         run: |
           set -euo pipefail
           case "$TARGET" in
             pr945) ID=599550693; IP=157.230.182.55; NAME=zakura-pr-343dec5790b9318528bed191-34566433184 ;;
             pr944-main) ID=599552320; IP=68.183.97.2; NAME=zakura-pr-pr944-34567198563 ;;
+            pr945-primed) ID=599554996; IP=198.199.79.136; NAME=zakura-pr-pr945-34568164048 ;;
+            pr944-main-primed) ID=599554960; IP=134.209.216.84; NAME=zakura-pr-432f8ce4608822cc3cb7e826-34568166338 ;;
             *) exit 1 ;;
           esac
           doctl compute droplet get "$ID" -o json | jq -e --arg name "$NAME" --arg ip "$IP" '.[0] | .name == $name and any(.networks.v4[]; .ip_address == $ip)' > /dev/null
           mkdir -p /tmp/inspect
+          if [ "$FOLLOWTHROUGH" = true ]; then
+            case "$TARGET" in pr945-primed|pr944-main-primed) ;; *) exit 1 ;; esac
+            scp -i /tmp/do_ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new .github/workflows/scripts/pr-node-followthrough.py "root@$IP:/root/pr-node-followthrough.py"
+            TASK_RC=0
+            ssh -i /tmp/do_ssh -o BatchMode=yes "root@$IP" python3 -u /root/pr-node-followthrough.py || TASK_RC=$?
+            scp -r -i /tmp/do_ssh -o BatchMode=yes "root@$IP:/root/out/native-followthrough" /tmp/inspect/ || true
+            exit "$TASK_RC"
+          fi
           ssh -i /tmp/do_ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "root@$IP" 'python3 -' > /tmp/inspect/live.txt <<'PY'
           from pathlib import Path
           import json,subprocess,urllib.request

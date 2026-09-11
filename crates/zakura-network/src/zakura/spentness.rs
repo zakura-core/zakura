@@ -3,6 +3,7 @@
 use std::{
     collections::BTreeMap,
     fs::File,
+    mem::size_of,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
     time::Duration,
@@ -35,30 +36,190 @@ pub const RANGE_BYTES: u32 = 256 * 1024;
 pub const GET_RANGE: u16 = 1;
 /// Response message type. Status 0 is unavailable; status 1 includes a range.
 pub const RANGE: u16 = 2;
-const RESPONSE_HEADER: usize = 45;
+const DIGEST_LEN: usize = 32;
+const REQUEST_LEN: usize = DIGEST_LEN + size_of::<u64>() + size_of::<u32>();
+const RESPONSE_HEADER_LEN: usize = size_of::<u8>() + REQUEST_LEN;
+const SERVICE_ID: &str = "zakura.spentness.v1";
+const PROTOCOL_VERSION: u16 = 1;
+const FRAME_HEADROOM: u32 = 64;
+const TRANSPORT_FRAME_OVERHEAD: u32 = 8;
+const MAX_CONCURRENT_SERVES: usize = 4;
+const MAX_ACQUISITION_PEERS: usize = 3;
 const STREAMS: &[Stream] = &[Stream {
     kind: STREAM_KIND,
-    version: 1,
-    frame_cap: RANGE_BYTES + 64,
+    version: PROTOCOL_VERSION,
+    frame_cap: RANGE_BYTES + FRAME_HEADROOM,
     capability: CAPABILITY,
     mode: StreamMode::RequestResponse,
 }];
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const PEER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
+const SERVE_DELAY: Duration = Duration::from_millis(250);
+const UNAVAILABLE: u8 = 0;
+const AVAILABLE: u8 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RangeRequest {
+    digest: [u8; DIGEST_LEN],
+    offset: u64,
+    length: u32,
+}
+
+impl RangeRequest {
+    fn parse(frame: &Frame) -> Result<Self, BoxError> {
+        if frame.message_type != GET_RANGE || frame.flags != 0 {
+            return Err("invalid spentness range request".into());
+        }
+        let request = Self::parse_payload(&frame.payload)?;
+        request.end()?;
+        Ok(request)
+    }
+
+    fn parse_payload(payload: &[u8]) -> Result<Self, BoxError> {
+        let digest: [u8; DIGEST_LEN] = payload
+            .get(..DIGEST_LEN)
+            .ok_or("truncated spentness range digest")?
+            .try_into()?;
+        let remaining = payload
+            .get(DIGEST_LEN..)
+            .ok_or("truncated spentness range request")?;
+        let (offset, length) = remaining
+            .split_at_checked(size_of::<u64>())
+            .ok_or("truncated spentness range offset")?;
+        if length.len() != size_of::<u32>() {
+            return Err("invalid spentness range request length".into());
+        }
+
+        Ok(Self {
+            digest,
+            offset: u64::from_le_bytes(offset.try_into()?),
+            length: u32::from_le_bytes(length.try_into()?),
+        })
+    }
+
+    fn payload(self) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(REQUEST_LEN);
+        payload.extend_from_slice(&self.digest);
+        payload.extend_from_slice(&self.offset.to_le_bytes());
+        payload.extend_from_slice(&self.length.to_le_bytes());
+        payload
+    }
+
+    fn end(self) -> Result<u64, BoxError> {
+        if self.length == 0 || self.length > RANGE_BYTES {
+            return Err("spentness range exceeds limits".into());
+        }
+        self.offset
+            .checked_add(u64::from(self.length))
+            .ok_or_else(|| "spentness range exceeds limits".into())
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum RangeResponse<'a> {
+    Unavailable(RangeRequest),
+    Available {
+        request: RangeRequest,
+        bytes: &'a [u8],
+    },
+}
+
+impl<'a> RangeResponse<'a> {
+    fn parse(frame: &'a Frame) -> Result<Self, BoxError> {
+        if frame.message_type != RANGE || frame.flags != 0 {
+            return Err("invalid spentness response".into());
+        }
+        let (status, payload) = frame
+            .payload
+            .split_first()
+            .ok_or("truncated spentness response")?;
+        let (request, bytes) = payload
+            .split_at_checked(REQUEST_LEN)
+            .ok_or("truncated spentness response header")?;
+        let request = RangeRequest::parse_payload(request)?;
+
+        if *status == UNAVAILABLE && request.length == 0 && bytes.is_empty() {
+            return Ok(Self::Unavailable(request));
+        }
+        if *status != AVAILABLE || bytes.len() != usize::try_from(request.length)? {
+            return Err("invalid spentness response status or length".into());
+        }
+        request.end()?;
+        Ok(Self::Available { request, bytes })
+    }
+
+    fn unavailable(request: RangeRequest) -> Vec<u8> {
+        let mut unavailable = request;
+        unavailable.length = 0;
+        Self::payload(UNAVAILABLE, unavailable, &[])
+    }
+
+    fn available(request: RangeRequest, bytes: &[u8]) -> Vec<u8> {
+        debug_assert_eq!(u32::try_from(bytes.len()).ok(), Some(request.length));
+        Self::payload(AVAILABLE, request, bytes)
+    }
+
+    fn payload(status: u8, request: RangeRequest, bytes: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(RESPONSE_HEADER_LEN + bytes.len());
+        payload.push(status);
+        payload.extend_from_slice(&request.payload());
+        payload.extend_from_slice(bytes);
+        payload
+    }
+}
+
+fn response_frame(payload: Vec<u8>) -> Vec<Frame> {
+    vec![Frame {
+        message_type: RANGE,
+        flags: 0,
+        payload,
+    }]
+}
+
+fn load_supported(cache: &Path, pins: &[Commitment]) -> Vec<Arc<VerifiedArtifact>> {
+    pins.iter()
+        .filter_map(|pin| match load(cache, pin) {
+            Ok(artifact) => Some(Arc::new(artifact)),
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    digest = %hex::encode(pin.sha256),
+                    "spentness cache entry unavailable"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
+async fn wait_for_capable_peers(supervisor: &ZakuraSupervisorHandle) -> Vec<ZakuraPeerHandle> {
+    let mut changes = supervisor.subscribe();
+    timeout(PEER_DISCOVERY_TIMEOUT, async {
+        loop {
+            let peers = supervisor
+                .outbound_peer_handles_for_capability(CAPABILITY)
+                .await;
+            if !peers.is_empty() {
+                return peers;
+            }
+            if changes.changed().await.is_err() {
+                return Vec::new();
+            }
+        }
+    })
+    .await
+    .unwrap_or_default()
+}
 
 /// Load supported cache entries and prepare protocol negotiation and discovery.
 pub async fn prepare(
     cache: PathBuf,
     pins: &'static [Commitment],
 ) -> Result<(Arc<ArtifactService>, CustomService), BoxError> {
-    let artifacts = tokio::task::spawn_blocking(move || {
-        pins.iter().filter_map(|pin| match load(&cache, pin) {
-            Ok(artifact) => Some(Arc::new(artifact)),
-            Err(error) => { tracing::debug!(%error, digest = %hex::encode(pin.sha256), "spentness cache entry unavailable"); None }
-        }).collect::<Vec<_>>()
-    }).await?;
+    let artifacts = tokio::task::spawn_blocking(move || load_supported(&cache, pins)).await?;
     let service = Arc::new(ArtifactService::new(artifacts));
-    let id = ZakuraServiceId::new("zakura.spentness.v1")?;
-    let provides = if service.available().is_empty() {
+    let id = ZakuraServiceId::new(SERVICE_ID)?;
+    let provides = if service.is_empty() {
         Vec::new()
     } else {
         vec![id.clone()]
@@ -83,25 +244,10 @@ pub async fn download_missing(
     supervisor: ZakuraSupervisorHandle,
 ) {
     for pin in pins.iter().rev() {
-        if service.available().contains(&pin.sha256) {
+        if service.contains(&pin.sha256) {
             continue;
         }
-        let mut changes = supervisor.subscribe();
-        let peers = timeout(Duration::from_secs(60), async {
-            loop {
-                let peers = supervisor
-                    .outbound_peer_handles_for_capability(CAPABILITY)
-                    .await;
-                if !peers.is_empty() {
-                    return peers;
-                }
-                if changes.changed().await.is_err() {
-                    return Vec::new();
-                }
-            }
-        })
-        .await
-        .unwrap_or_default();
+        let peers = wait_for_capable_peers(&supervisor).await;
         match acquire(&cache, pin, &peers).await {
             Ok(artifact) => {
                 tracing::info!(digest = %hex::encode(pin.sha256), bytes = pin.byte_len, "verified spentness artifact from peers");
@@ -131,7 +277,7 @@ impl ArtifactService {
                     .map(|artifact| (artifact.commitment().sha256, artifact))
                     .collect(),
             ),
-            serving: Semaphore::new(4),
+            serving: Semaphore::new(MAX_CONCURRENT_SERVES),
         }
     }
 
@@ -143,6 +289,20 @@ impl ArtifactService {
             .keys()
             .copied()
             .collect()
+    }
+
+    fn contains(&self, digest: &[u8; DIGEST_LEN]) -> bool {
+        self.artifacts
+            .read()
+            .expect("artifact map lock is not poisoned")
+            .contains_key(digest)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.artifacts
+            .read()
+            .expect("artifact map lock is not poisoned")
+            .is_empty()
     }
 
     /// Make newly verified owned bytes available for onward serving.
@@ -168,19 +328,6 @@ impl Service for ArtifactService {
     }
 }
 
-fn request_fields(frame: &Frame) -> Result<([u8; 32], u64, u32), BoxError> {
-    if frame.message_type != GET_RANGE || frame.flags != 0 || frame.payload.len() != 44 {
-        return Err("invalid spentness range request".into());
-    }
-    let digest = frame.payload[..32].try_into()?;
-    let offset = u64::from_le_bytes(frame.payload[32..40].try_into()?);
-    let length = u32::from_le_bytes(frame.payload[40..44].try_into()?);
-    if length == 0 || length > RANGE_BYTES || offset.checked_add(u64::from(length)).is_none() {
-        return Err("spentness range exceeds limits".into());
-    }
-    Ok((digest, offset, length))
-}
-
 impl RequestResponseService for ArtifactService {
     fn request_frame<'a>(
         &'a self,
@@ -192,67 +339,56 @@ impl RequestResponseService for ArtifactService {
         frame: Frame,
     ) -> BoxRunFuture<'a, Result<Vec<Frame>, SinkReject>> {
         Box::pin(async move {
-            let (digest, offset, length) = request_fields(&frame).map_err(SinkReject::protocol)?;
-            let permit = self.serving.try_acquire().ok();
-            let artifact = permit.as_ref().and_then(|_| {
-                self.artifacts
-                    .read()
-                    .expect("artifact map lock is not poisoned")
-                    .get(&digest)
-                    .cloned()
-            });
-            let cap = max_frame.saturating_sub(8).min(max_message);
-            if cap < u32::try_from(RESPONSE_HEADER).expect("response header fits u32") {
+            let request = RangeRequest::parse(&frame).map_err(SinkReject::protocol)?;
+            let response_cap = max_frame
+                .saturating_sub(TRANSPORT_FRAME_OVERHEAD)
+                .min(max_message);
+            if response_cap
+                < u32::try_from(RESPONSE_HEADER_LEN).expect("response header fits in u32")
+            {
                 return Err(SinkReject::local(
                     "negotiated frame cap cannot carry a spentness response",
                 ));
             }
-            let mut payload = vec![0];
-            payload.extend_from_slice(&digest);
-            payload.extend_from_slice(&offset.to_le_bytes());
-            payload.extend_from_slice(&0u32.to_le_bytes());
-            if let Some(artifact) = artifact {
-                let end = offset + u64::from(length);
-                if end > artifact.commitment().byte_len {
-                    return Err(SinkReject::protocol(
-                        "spentness range exceeds artifact length",
-                    ));
-                }
-                if u64::from(length) + u64::try_from(RESPONSE_HEADER).expect("header fits u64")
-                    <= u64::from(cap)
-                {
-                    payload[0] = 1;
-                    payload[41..45].copy_from_slice(&length.to_le_bytes());
-                    payload.extend_from_slice(
-                        &artifact.bytes()[usize::try_from(offset).map_err(SinkReject::protocol)?
-                            ..usize::try_from(end).map_err(SinkReject::protocol)?],
-                    );
-                    // Four slots, each at most 256 KiB per 250 ms: aggregate <= 4 MiB/s.
-                    sleep(Duration::from_millis(250)).await;
-                }
+
+            let Ok(_permit) = self.serving.try_acquire() else {
+                return Ok(response_frame(RangeResponse::unavailable(request)));
+            };
+            let artifact = self
+                .artifacts
+                .read()
+                .expect("artifact map lock is not poisoned")
+                .get(&request.digest)
+                .cloned();
+            let Some(artifact) = artifact else {
+                return Ok(response_frame(RangeResponse::unavailable(request)));
+            };
+
+            let end = request.end().map_err(SinkReject::protocol)?;
+            if end > artifact.commitment().byte_len {
+                return Err(SinkReject::protocol(
+                    "spentness range exceeds artifact length",
+                ));
             }
-            Ok(vec![Frame {
-                message_type: RANGE,
-                flags: 0,
-                payload,
-            }])
+            let response_len = u64::from(request.length)
+                + u64::try_from(RESPONSE_HEADER_LEN).expect("response header fits in u64");
+            if response_len > u64::from(response_cap) {
+                return Ok(response_frame(RangeResponse::unavailable(request)));
+            }
+
+            let start = usize::try_from(request.offset).map_err(SinkReject::protocol)?;
+            let end = usize::try_from(end).map_err(SinkReject::protocol)?;
+            let payload = RangeResponse::available(request, &artifact.bytes()[start..end]);
+            // Four slots, each at most 256 KiB per 250 ms: aggregate <= 4 MiB/s.
+            sleep(SERVE_DELAY).await;
+            Ok(response_frame(payload))
         })
     }
 }
 
 /// Validate the single bounded response before the transport stores it.
 pub(crate) fn validate_response(frame: &Frame) -> Result<(), BoxError> {
-    if frame.message_type != RANGE || frame.flags != 0 || frame.payload.len() < RESPONSE_HEADER {
-        return Err("invalid spentness response".into());
-    }
-    let length = u32::from_le_bytes(frame.payload[41..45].try_into()?);
-    if length > RANGE_BYTES
-        || frame.payload.len() != RESPONSE_HEADER + usize::try_from(length)?
-        || !matches!((frame.payload[0], length), (0, 0) | (1, 1..))
-    {
-        return Err("invalid spentness response status or length".into());
-    }
-    Ok(())
+    RangeResponse::parse(frame).map(|_| ())
 }
 
 /// Load and reverify an exact content-addressed cache entry.
@@ -287,7 +423,7 @@ pub async fn acquire(
         return Ok(Arc::new(artifact));
     }
     tokio::fs::create_dir_all(cache).await?;
-    for peer in peers.iter().take(3) {
+    for peer in peers.iter().take(MAX_ACQUISITION_PEERS) {
         if let Ok(artifact) = acquire_from_peer(cache, pin, peer).await {
             return Ok(Arc::new(artifact));
         }
@@ -317,31 +453,32 @@ async fn acquire_from_peer(
     }
     while offset < pin.byte_len {
         let length = u32::try_from((pin.byte_len - offset).min(u64::from(RANGE_BYTES)))?;
-        let mut request = pin.sha256.to_vec();
-        request.extend_from_slice(&offset.to_le_bytes());
-        request.extend_from_slice(&length.to_le_bytes());
+        let request = RangeRequest {
+            digest: pin.sha256,
+            offset,
+            length,
+        };
         let frames = timeout(
             REQUEST_TIMEOUT,
-            peer.request(STREAM_KIND, offset, GET_RANGE, 0, request),
+            peer.request(STREAM_KIND, offset, GET_RANGE, 0, request.payload()),
         )
         .await??;
-        if frames.len() != 1 {
+        let [frame] = frames.as_slice() else {
             return Err("spentness peer returned an invalid response count".into());
-        }
-        let frame = &frames[0];
-        validate_response(frame)?;
-        if frame.payload[0] == 0 {
+        };
+        let RangeResponse::Available {
+            request: response_request,
+            bytes,
+        } = RangeResponse::parse(frame)?
+        else {
             return Err("spentness artifact is unavailable at this peer".into());
-        }
-        if frame.payload[1..33] != pin.sha256
-            || frame.payload[33..41] != offset.to_le_bytes()
-            || frame.payload[41..45] != length.to_le_bytes()
-        {
+        };
+        if response_request != request {
             return Err("spentness peer returned a different range".into());
         }
-        file.write_all(&frame.payload[RESPONSE_HEADER..]).await?;
+        file.write_all(bytes).await?;
         file.sync_data().await?;
-        offset += u64::from(length);
+        offset = request.end()?;
     }
     drop(file);
     let source = path.clone();
@@ -370,7 +507,7 @@ async fn acquire_from_peer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zakura_chain::parameters::spentness_hints::{encode, ParsedArtifact};
+    use zakura_chain::parameters::spentness_hints::{encode, ParsedArtifact, HEADER_LEN};
 
     #[derive(Debug)]
     struct Noop;
@@ -401,7 +538,7 @@ mod tests {
         let server_identity = tempfile::tempdir()?;
         let client_identity = tempfile::tempdir()?;
         let cache = tempfile::tempdir()?;
-        let service_id = ZakuraServiceId::new("zakura.spentness.v1")?;
+        let service_id = ZakuraServiceId::new(SERVICE_ID)?;
         let mut server_config = crate::Config::for_test(crate::P2pStack::Dual);
         server_config.identity_dir = server_identity.path().to_owned();
         server_config.zakura.listen_addr = Some("127.0.0.1:0".parse()?);
@@ -466,12 +603,19 @@ mod tests {
             assert_eq!(load(cache.path(), &pin)?.bytes(), bytes);
             client_service.insert(artifact);
             assert_eq!(client_service.available(), vec![pin.sha256]);
-            let mut request = [3; 32].to_vec();
-            request.extend_from_slice(&0u64.to_le_bytes());
-            request.extend_from_slice(&1u32.to_le_bytes());
-            let response = peer.request(STREAM_KIND, 0, GET_RANGE, 0, request).await?;
-            assert_eq!(
-                response[0].payload[0], 0,
+            let request = RangeRequest {
+                digest: [3; DIGEST_LEN],
+                offset: 0,
+                length: 1,
+            };
+            let response = peer
+                .request(STREAM_KIND, 0, GET_RANGE, 0, request.payload())
+                .await?;
+            assert!(
+                matches!(
+                    RangeResponse::parse(&response[0])?,
+                    RangeResponse::Unavailable(_)
+                ),
                 "missing artifacts are availability failures"
             );
             Ok::<_, BoxError>(())
@@ -490,47 +634,72 @@ mod tests {
         let pin = parsed.commitment().clone();
         let service = ArtifactService::new([Arc::new(parsed.verify(&pin)?)]);
         let peer = ZakuraPeerId::new(vec![1; 32])?;
-        let mut request = pin.sha256.to_vec();
-        request.extend_from_slice(&0u64.to_le_bytes());
-        request.extend_from_slice(&1u32.to_le_bytes());
+        let request = RangeRequest {
+            digest: pin.sha256,
+            offset: 0,
+            length: 1,
+        };
         let frame = Frame {
             message_type: GET_RANGE,
             flags: 0,
-            payload: request,
+            payload: request.payload(),
         };
-        let permit = service.serving.acquire_many(4).await?;
+        let permit = service
+            .serving
+            .acquire_many(u32::try_from(MAX_CONCURRENT_SERVES)?)
+            .await?;
         let response = service
             .request_frame(
                 peer.clone(),
                 STREAM_KIND,
                 0,
-                RANGE_BYTES + 64,
-                RANGE_BYTES + 64,
+                RANGE_BYTES + FRAME_HEADROOM,
+                RANGE_BYTES + FRAME_HEADROOM,
                 frame.clone(),
             )
             .await?;
-        assert_eq!(response[0].payload[0], 0);
+        assert!(matches!(
+            RangeResponse::parse(&response[0])?,
+            RangeResponse::Unavailable(_)
+        ));
         drop(permit);
-        let mut bad_range = frame.clone();
-        bad_range.payload[32..40].copy_from_slice(&pin.byte_len.to_le_bytes());
+        let bad_range = Frame {
+            payload: RangeRequest {
+                offset: pin.byte_len,
+                ..request
+            }
+            .payload(),
+            ..frame.clone()
+        };
         assert!(matches!(
             service
                 .request_frame(
                     peer.clone(),
                     STREAM_KIND,
                     0,
-                    RANGE_BYTES + 64,
-                    RANGE_BYTES + 64,
+                    RANGE_BYTES + FRAME_HEADROOM,
+                    RANGE_BYTES + FRAME_HEADROOM,
                     bad_range
                 )
                 .await,
             Err(SinkReject::Protocol(_))
         ));
+        let response_header = u32::try_from(RESPONSE_HEADER_LEN)?;
         let response = service
-            .request_frame(peer, STREAM_KIND, 0, 53, 45, frame)
+            .request_frame(
+                peer,
+                STREAM_KIND,
+                0,
+                response_header + TRANSPORT_FRAME_OVERHEAD,
+                response_header,
+                frame,
+            )
             .await?;
-        assert_eq!(response[0].payload.len(), RESPONSE_HEADER);
-        assert_eq!(response[0].payload[0], 0);
+        assert_eq!(response[0].payload.len(), RESPONSE_HEADER_LEN);
+        assert!(matches!(
+            RangeResponse::parse(&response[0])?,
+            RangeResponse::Unavailable(_)
+        ));
         Ok(())
     }
 
@@ -549,18 +718,26 @@ mod tests {
 
     #[test]
     fn range_bounds() {
-        let mut payload = vec![0; 40];
-        payload.extend_from_slice(&RANGE_BYTES.to_le_bytes());
         let mut frame = Frame {
             message_type: GET_RANGE,
             flags: 0,
-            payload,
+            payload: RangeRequest {
+                digest: [0; DIGEST_LEN],
+                offset: 0,
+                length: RANGE_BYTES,
+            }
+            .payload(),
         };
-        assert!(request_fields(&frame).is_ok());
-        frame.payload[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
-        assert!(request_fields(&frame).is_err());
-        frame.payload.truncate(43);
-        assert!(request_fields(&frame).is_err());
+        assert!(RangeRequest::parse(&frame).is_ok());
+        frame.payload = RangeRequest {
+            digest: [0; DIGEST_LEN],
+            offset: u64::MAX,
+            length: RANGE_BYTES,
+        }
+        .payload();
+        assert!(RangeRequest::parse(&frame).is_err());
+        frame.payload.truncate(REQUEST_LEN - 1);
+        assert!(RangeRequest::parse(&frame).is_err());
     }
 
     fn scripted_peer(
@@ -577,12 +754,10 @@ mod tests {
                 ..
             }) = receiver.recv().await
             {
-                let offset = u64::from_le_bytes(payload[32..40].try_into().unwrap());
-                let length = u32::from_le_bytes(payload[40..44].try_into().unwrap());
-                let mut response = vec![1];
-                response.extend_from_slice(&payload);
-                let start = usize::try_from(offset).unwrap();
-                response.extend_from_slice(&bytes[start..start + usize::try_from(length).unwrap()]);
+                let request = RangeRequest::parse_payload(&payload).unwrap();
+                let start = usize::try_from(request.offset).unwrap();
+                let end = start + usize::try_from(request.length).unwrap();
+                let response = RangeResponse::available(request, &bytes[start..end]);
                 let _ = completion.send(Ok(vec![Frame {
                     message_type: RANGE,
                     flags: 0,
@@ -598,7 +773,7 @@ mod tests {
         let bytes = encode([1; 32], 1, [2; 32], [false, true, false])?;
         let pin = ParsedArtifact::read(bytes.as_slice())?.commitment().clone();
         let mut corrupt = bytes.clone();
-        corrupt[86] ^= 4;
+        corrupt[HEADER_LEN] ^= 4;
         let (bad, bad_task) = scripted_peer(1, corrupt);
         let (good, good_task) = scripted_peer(2, bytes.clone());
         let cache = tempfile::tempdir()?;

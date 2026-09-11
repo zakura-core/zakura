@@ -16,7 +16,15 @@ MANIFEST = Path(
 COMPILED = MANIFEST.with_name("commitments.rs")
 MAX_BYTES = 512 * 1024 * 1024
 HEADER = struct.Struct("<8sH32sI32sQ")
-FIELDS = {
+FORMAT_VERSION = 1
+SCHEMA_VERSION = 1
+HASH_BYTES = 32
+READ_CHUNK_BYTES = 1024 * 1024
+BITS_PER_BYTE = 8
+MAGIC = b"ZKSHINT\0"
+ORACLE = "transparent-replay-v1"
+BYTE_FIELDS = ("chain_identity", "terminal_block_hash", "sha256")
+COMMITMENT_FIELDS = (
     "chain_identity",
     "terminal_height",
     "terminal_block_hash",
@@ -24,39 +32,38 @@ FIELDS = {
     "output_count",
     "byte_len",
     "sha256",
-}
+)
+FIELDS = set(COMMITMENT_FIELDS)
 
 
 def validate_commitment(pin: dict) -> None:
     if not isinstance(pin, dict) or set(pin) != FIELDS:
         raise ValueError("spentness commitment has unexpected fields")
-    for field in ("chain_identity", "terminal_block_hash", "sha256"):
+    for field in BYTE_FIELDS:
         value = pin[field]
         if (
             not isinstance(value, list)
-            or len(value) != 32
+            or len(value) != HASH_BYTES
             or any(type(n) is not int or not 0 <= n <= 255 for n in value)
         ):
-            raise ValueError(f"spentness {field} must contain 32 bytes")
+            raise ValueError(f"spentness {field} must contain {HASH_BYTES} bytes")
     for field, maximum in (
         ("terminal_height", 2**32 - 1),
         ("output_count", 2**64 - 1),
         ("byte_len", MAX_BYTES),
-        ("format_version", 1),
+        ("format_version", FORMAT_VERSION),
     ):
         if type(pin[field]) is not int or not 0 <= pin[field] <= maximum:
             raise ValueError(f"invalid spentness {field}")
     if (
-        pin["format_version"] != 1
-        or pin["byte_len"] != HEADER.size + (pin["output_count"] + 7) // 8
+        pin["format_version"] != FORMAT_VERSION
+        or pin["byte_len"]
+        != HEADER.size + (pin["output_count"] + BITS_PER_BYTE - 1) // BITS_PER_BYTE
     ):
         raise ValueError("spentness version, count, and length disagree")
 
 
-def validate_bundle(bundle: Path, meta: dict) -> dict:
-    """Verify all hint fields before a bundle can select a compiled descriptor."""
-    pin = json.loads((bundle / COMMITMENT).read_text())
-    validate_commitment(pin)
+def _validate_boundary(bundle: Path, pin: dict, meta: dict) -> None:
     if (
         pin["terminal_height"] != meta["height"]
         or bytes(pin["terminal_block_hash"])[::-1].hex() != meta["block_hash"]
@@ -72,17 +79,26 @@ def validate_bundle(bundle: Path, meta: dict) -> dict:
         raise ValueError("spentness chain identity differs from genesis checkpoint")
     if checkpoints[-1] != f"{meta['height']} {meta['block_hash']}":
         raise ValueError("spentness boundary differs from terminal checkpoint")
+
+
+def _validate_report(bundle: Path, pin: dict) -> dict:
     report = json.loads((bundle / VERIFICATION).read_text())
     if (
         not isinstance(report, dict)
         or type(report.get("schema_version")) is not int
-        or report.get("schema_version") != 1
+        or report.get("schema_version") != SCHEMA_VERSION
         or report.get("commitment") != pin
-        or report.get("oracle") != "transparent-replay-v1"
+        or report.get("oracle") != ORACLE
         or report.get("complete_entries") is not True
         or report.get("salted_multiset") is not True
+        or type(report.get("survivor_count")) is not int
+        or report["survivor_count"] < 0
     ):
         raise ValueError("spentness verification evidence is missing or mismatched")
+    return report
+
+
+def _validate_artifact(bundle: Path, pin: dict) -> int:
     digest = hashlib.sha256()
     survivors = 0
     size = 0
@@ -92,8 +108,8 @@ def validate_bundle(bundle: Path, meta: dict) -> dict:
             raise ValueError("truncated spentness header")
         magic, version, identity, height, block_hash, count = HEADER.unpack(header)
         if (magic, version, identity, height, block_hash, count) != (
-            b"ZKSHINT\0",
-            1,
+            MAGIC,
+            FORMAT_VERSION,
             bytes(pin["chain_identity"]),
             pin["terminal_height"],
             bytes(pin["terminal_block_hash"]),
@@ -104,7 +120,7 @@ def validate_bundle(bundle: Path, meta: dict) -> dict:
         size += len(header)
         last = 0
         first = True
-        while chunk := source.read(1024 * 1024):
+        while chunk := source.read(READ_CHUNK_BYTES):
             size += len(chunk)
             if size > pin["byte_len"]:
                 raise ValueError("spentness artifact exceeds committed length")
@@ -116,13 +132,12 @@ def validate_bundle(bundle: Path, meta: dict) -> dict:
             survivors += sum(byte.bit_count() for byte in chunk)
     if size != pin["byte_len"] or list(digest.digest()) != pin["sha256"]:
         raise ValueError("spentness artifact digest or length mismatch")
-    if count % 8 and last >> (count % 8):
+    if count % BITS_PER_BYTE and last >> (count % BITS_PER_BYTE):
         raise ValueError("spentness padding must be zero")
-    if (
-        type(report.get("survivor_count")) is not int
-        or report["survivor_count"] != survivors
-    ):
-        raise ValueError("spentness survivor count differs from verification evidence")
+    return survivors
+
+
+def _validate_provenance(meta: dict, pin: dict, report: dict) -> dict:
     evidence = meta.get("spentness")
     if not isinstance(evidence, dict) or evidence.get("verification") != report:
         raise ValueError("bundle lacks spentness verification provenance")
@@ -142,13 +157,26 @@ def validate_bundle(bundle: Path, meta: dict) -> dict:
         )
     if evidence.get("reproduced_sha256") != bytes(pin["sha256"]).hex():
         raise ValueError("independent source did not reproduce the spentness artifact")
+    return evidence
+
+
+def validate_bundle(bundle: Path, meta: dict) -> dict:
+    """Verify all hint fields before a bundle can select a compiled descriptor."""
+    pin = json.loads((bundle / COMMITMENT).read_text())
+    validate_commitment(pin)
+    _validate_boundary(bundle, pin, meta)
+    report = _validate_report(bundle, pin)
+    survivors = _validate_artifact(bundle, pin)
+    if report["survivor_count"] != survivors:
+        raise ValueError("spentness survivor count differs from verification evidence")
+    evidence = _validate_provenance(meta, pin, report)
     return {"commitment": pin, "provenance": evidence}
 
 
 def render_commitments(manifest: dict) -> str:
     if (
         not isinstance(manifest, dict)
-        or manifest.get("schema_version") != 1
+        or manifest.get("schema_version") != SCHEMA_VERSION
         or not isinstance(manifest.get("artifacts"), list)
     ):
         raise ValueError("unsupported spentness release manifest")
@@ -165,15 +193,7 @@ def render_commitments(manifest: dict) -> str:
         pin = entry["commitment"]
         validate_commitment(pin)
         rows.append("    Commitment {")
-        for name in (
-            "chain_identity",
-            "terminal_height",
-            "terminal_block_hash",
-            "format_version",
-            "output_count",
-            "byte_len",
-            "sha256",
-        ):
+        for name in COMMITMENT_FIELDS:
             value = pin[name]
             # Keep the generated byte order visible in review.
             if isinstance(value, list):
@@ -193,9 +213,9 @@ def prepare_import(repo: Path, bundle: Path, meta: dict) -> tuple[dict, str]:
     manifest = (
         json.loads(path.read_text())
         if path.exists()
-        else {"schema_version": 1, "artifacts": []}
+        else {"schema_version": SCHEMA_VERSION, "artifacts": []}
     )
-    if manifest.get("schema_version") != 1 or not isinstance(
+    if manifest.get("schema_version") != SCHEMA_VERSION or not isinstance(
         manifest.get("artifacts"), list
     ):
         raise ValueError("unsupported spentness release manifest")

@@ -43,6 +43,7 @@ RESOLUTION_KEYS = {
     "meta_url",
     "meta_sha256",
 }
+SPENTNESS_SCHEMA = 2
 
 
 class BundleImportError(RuntimeError):
@@ -319,7 +320,7 @@ def import_bundle(
         if hashlib.sha256(meta_bytes).hexdigest() != resolution["meta_sha256"]:
             raise BundleImportError("bundle metadata differs from resolution digest")
         meta = json.loads(meta_bytes)
-        if meta.get("schema_version") == 2:
+        if meta.get("schema_version") == SPENTNESS_SCHEMA:
             try:
                 spentness = spentness_release.prepare_import(repo_root, bundle, meta)
             except (ValueError, OSError) as error:
@@ -338,27 +339,28 @@ def import_bundle(
         _write_json(repo_root / spentness_release.MANIFEST, manifest)
         (repo_root / spentness_release.COMPILED).write_text(compiled)
 
-    _write_json(
-        provenance_path,
-        {
-            "schema_version": 1,
-            "network": "Mainnet",
-            "source": "release-state-bundle",
-            "generated_at": resolution["generated_at"],
-            "finalized_height": bundle_height,
-            "finalized_hash": resolution["block_hash"],
-            "checkpoints_sha256": hashlib.sha256(bundle_checkpoints).hexdigest(),
-            "frontier_sha256": hashlib.sha256(bundle_frontier).hexdigest(),
-            "frontier_size": len(bundle_frontier),
-            "subtrees_sha256": hashlib.sha256(subtree_bytes).hexdigest(),
-            "subtrees_size": len(subtree_bytes),
-            "frontier_grid_sha256": hashlib.sha256(grid_bytes).hexdigest(),
-            "frontier_grid_size": len(grid_bytes),
-            "frontier_grid_entries": FRONTIER_GRID_HEADER_PREFIX.unpack_from(grid_bytes)[5],
-            "meta_sha256": resolution["meta_sha256"],
-            **({"spentness_sha256": bytes(spentness[0]["artifacts"][-1]["commitment"]["sha256"]).hex()} if spentness else {}),
-        },
-    )
+    provenance = {
+        "schema_version": 1,
+        "network": "Mainnet",
+        "source": "release-state-bundle",
+        "generated_at": resolution["generated_at"],
+        "finalized_height": bundle_height,
+        "finalized_hash": resolution["block_hash"],
+        "checkpoints_sha256": hashlib.sha256(bundle_checkpoints).hexdigest(),
+        "frontier_sha256": hashlib.sha256(bundle_frontier).hexdigest(),
+        "frontier_size": len(bundle_frontier),
+        "subtrees_sha256": hashlib.sha256(subtree_bytes).hexdigest(),
+        "subtrees_size": len(subtree_bytes),
+        "frontier_grid_sha256": hashlib.sha256(grid_bytes).hexdigest(),
+        "frontier_grid_size": len(grid_bytes),
+        "frontier_grid_entries": FRONTIER_GRID_HEADER_PREFIX.unpack_from(grid_bytes)[5],
+        "meta_sha256": resolution["meta_sha256"],
+    }
+    if spentness is not None:
+        manifest, _compiled = spentness
+        latest_commitment = manifest["artifacts"][-1]["commitment"]
+        provenance["spentness_sha256"] = bytes(latest_commitment["sha256"]).hex()
+    _write_json(provenance_path, provenance)
 
     # The publish step names a crate version from this, and the PR body quotes it, so the
     # identity of the grid that was validated has to leave this function.

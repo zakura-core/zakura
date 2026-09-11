@@ -3,6 +3,7 @@
 
 use std::{
     fs::{self, File},
+    mem::size_of,
     path::{Path, PathBuf},
 };
 
@@ -21,6 +22,14 @@ use zakura_chain::{
     transparent::{OrderedUtxo, OutPoint, MIN_TRANSPARENT_COINBASE_MATURITY},
 };
 use zakura_state::{Config, FinalizedState, OutputLocation, ZakuraDb};
+
+const PROGRESS_INTERVAL: u32 = 10_000;
+const REPLAY_ENTRY_HEIGHT_LEN: usize = size_of::<u32>();
+const AUDIT_WRITE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+const AUDIT_WRITE_BUFFER_COUNT: i32 = 2;
+const AUDIT_HASH_DOMAIN: &[u8] = b"Zakura spentness audit v1\0";
+const VERIFICATION_SCHEMA_VERSION: u8 = 1;
+const VERIFICATION_ORACLE: &str = "transparent-replay-v1";
 
 #[derive(Parser)]
 struct Args {
@@ -145,7 +154,7 @@ fn replay(source: &Path, destination: &Path, height: u32, hash: block::Hash) -> 
         let (_, next_trees) =
             state.commit_finalized_direct(block.into(), trees, None, "spentness archive replay")?;
         trees = Some(next_trees);
-        if h % 10_000 == 0 {
+        if h.is_multiple_of(PROGRESS_INTERVAL) {
             eprintln!("replayed {h}/{height}");
         }
     }
@@ -210,7 +219,7 @@ fn add(sum: &mut [u8; 32], value: [u8; 32]) {
 
 fn outpoint_hash(salt: &[u8; 32], outpoint: OutPoint) -> Result<[u8; 32]> {
     let mut hash = Sha256::new();
-    hash.update(b"Zakura spentness audit v1\0");
+    hash.update(AUDIT_HASH_DOMAIN);
     hash.update(salt);
     hash.update(outpoint.zcash_serialize_to_vec()?);
     Ok(hash.finalize().into())
@@ -221,6 +230,20 @@ fn entry_bytes(entry: &OrderedUtxo) -> Result<Vec<u8>> {
     bytes.push(u8::from(entry.utxo.from_coinbase));
     bytes.extend_from_slice(&entry.utxo.output.zcash_serialize_to_vec()?);
     Ok(bytes)
+}
+
+fn entry_metadata(bytes: &[u8]) -> Result<(u32, bool)> {
+    let (height, rest) = bytes
+        .split_at_checked(REPLAY_ENTRY_HEIGHT_LEN)
+        .ok_or_else(|| eyre!("oracle UTXO entry has a truncated height"))?;
+    let (&coinbase, _) = rest
+        .split_first()
+        .ok_or_else(|| eyre!("oracle UTXO entry has no coinbase flag"))?;
+    ensure!(
+        coinbase <= 1,
+        "oracle UTXO entry has an invalid coinbase flag"
+    );
+    Ok((u32::from_le_bytes(height.try_into()?), coinbase == 1))
 }
 
 fn replay_transaction(
@@ -235,9 +258,9 @@ fn replay_transaction(
             let entry = replay.get(&key)?.ok_or_else(|| {
                 eyre!("oracle found a missing, future, or duplicate spend: {outpoint:?}")
             })?;
-            let creation_height = u32::from_le_bytes(entry[..4].try_into()?);
+            let (creation_height, from_coinbase) = entry_metadata(&entry)?;
             ensure!(
-                entry[4] == 0
+                !from_coinbase
                     || creation_height
                         .checked_add(MIN_TRANSPARENT_COINBASE_MATURITY)
                         .is_some_and(|mature| height.0 >= mature),
@@ -297,6 +320,88 @@ fn replay_transparent(db: &ZakuraDb, height: u32, replay: &rocksdb::DB) -> Resul
     Ok(())
 }
 
+struct ArtifactAudit {
+    absent: [u8; 32],
+    inputs: [u8; 32],
+    ordinal: u64,
+    survivors: u64,
+}
+
+impl ArtifactAudit {
+    fn new() -> Self {
+        Self {
+            absent: [0; 32],
+            inputs: [0; 32],
+            ordinal: 0,
+            survivors: 0,
+        }
+    }
+
+    fn check_transaction(
+        &mut self,
+        db: &ZakuraDb,
+        artifact: &VerifiedArtifact,
+        salt: &[u8; 32],
+        height: Height,
+        tx_index: usize,
+        tx: &zakura_chain::transaction::Transaction,
+    ) -> Result<()> {
+        for input in tx.inputs() {
+            if let Some(outpoint) = input.outpoint() {
+                add(&mut self.inputs, outpoint_hash(salt, outpoint)?);
+            }
+        }
+
+        let tx_hash = tx.hash();
+        for (index, output) in tx.outputs().iter().enumerate() {
+            let outpoint = OutPoint {
+                hash: tx_hash,
+                index: u32::try_from(index)?,
+            };
+            let entry = db.utxo(&outpoint);
+            let retained = artifact.retains(self.ordinal)?;
+            ensure!(
+                retained == entry.is_some(),
+                "wrong survivor bit at ordinal {}",
+                self.ordinal
+            );
+            if let Some(entry) = entry {
+                ensure!(
+                    height.0 != 0 && entry == OrderedUtxo::new(output.clone(), height, tx_index),
+                    "oracle UTXO entry differs at {outpoint:?}"
+                );
+                self.survivors = self
+                    .survivors
+                    .checked_add(1)
+                    .ok_or_else(|| eyre!("survivor count overflow"))?;
+            } else if height.0 != 0 {
+                add(&mut self.absent, outpoint_hash(salt, outpoint)?);
+            }
+            self.ordinal = self
+                .ordinal
+                .checked_add(1)
+                .ok_or_else(|| eyre!("ordinal overflow"))?;
+        }
+        Ok(())
+    }
+}
+
+fn open_audit_replay() -> Result<(tempfile::TempDir, rocksdb::DB)> {
+    let scratch_root = std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Config::default().cache_dir.join("spentness-audit"));
+    fs::create_dir_all(&scratch_root)?;
+    let scratch = tempfile::Builder::new()
+        .prefix("spentness-audit-")
+        .tempdir_in(scratch_root)?;
+    let mut options = rocksdb::Options::default();
+    options.create_if_missing(true);
+    options.set_write_buffer_size(AUDIT_WRITE_BUFFER_BYTES);
+    options.set_max_write_buffer_number(AUDIT_WRITE_BUFFER_COUNT);
+    let replay = rocksdb::DB::open(&options, scratch.path())?;
+    Ok((scratch, replay))
+}
+
 fn verify(db: &ZakuraDb, artifact: &VerifiedArtifact) -> Result<u64> {
     let pin = artifact.commitment();
     ensure!(
@@ -307,25 +412,11 @@ fn verify(db: &ZakuraDb, artifact: &VerifiedArtifact) -> Result<u64> {
         )? == pin.chain_identity,
         "chain identity mismatch"
     );
-    let scratch_root = std::env::var_os("TMPDIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Config::default().cache_dir.join("spentness-audit"));
-    fs::create_dir_all(&scratch_root)?;
-    let scratch = tempfile::Builder::new()
-        .prefix("spentness-audit-")
-        .tempdir_in(scratch_root)?;
-    let mut options = rocksdb::Options::default();
-    options.create_if_missing(true);
-    options.set_write_buffer_size(16 * 1024 * 1024);
-    options.set_max_write_buffer_number(2);
-    let replay = rocksdb::DB::open(&options, scratch.path())?;
+    let (_scratch, replay) = open_audit_replay()?;
     replay_transparent(db, pin.terminal_height, &replay)?;
     let mut salt = [0; 32];
     rand::rngs::OsRng.fill_bytes(&mut salt);
-    let mut absent = [0; 32];
-    let mut inputs = [0; 32];
-    let mut ordinal = 0u64;
-    let mut survivors = 0u64;
+    let mut audit = ArtifactAudit::new();
     for h in 0..=pin.terminal_height {
         let block = db
             .block(Height(h).into())
@@ -335,69 +426,90 @@ fn verify(db: &ZakuraDb, artifact: &VerifiedArtifact) -> Result<u64> {
             "oracle canonical hash mismatch at {h}"
         );
         for (tx_index, tx) in block.transactions.iter().enumerate() {
-            let tx_hash = tx.hash();
-            for input in tx.inputs() {
-                if let Some(outpoint) = input.outpoint() {
-                    add(&mut inputs, outpoint_hash(&salt, outpoint)?);
-                }
-            }
-            for (index, output) in tx.outputs().iter().enumerate() {
-                let outpoint = OutPoint {
-                    hash: tx_hash,
-                    index: u32::try_from(index)?,
-                };
-                // This oracle uses outpoint lookups, independently of the generator's merge.
-                let entry = db.utxo(&outpoint);
-                let retained = artifact.retains(ordinal)?;
-                ensure!(
-                    retained == entry.is_some(),
-                    "wrong survivor bit at ordinal {ordinal}"
-                );
-                if let Some(entry) = entry {
-                    ensure!(
-                        h != 0 && entry == OrderedUtxo::new(output.clone(), Height(h), tx_index),
-                        "oracle UTXO entry differs at {outpoint:?}"
-                    );
-                    survivors += 1;
-                } else if h != 0 {
-                    add(&mut absent, outpoint_hash(&salt, outpoint)?);
-                }
-                ordinal = ordinal
-                    .checked_add(1)
-                    .ok_or_else(|| eyre!("ordinal overflow"))?;
-            }
+            audit.check_transaction(db, artifact, &salt, Height(h), tx_index, tx)?;
         }
     }
     ensure!(
-        ordinal == pin.output_count,
+        audit.ordinal == pin.output_count,
         "output count differs from artifact"
     );
     ensure!(
-        u64::try_from(db.utxos_by_location().count())? == survivors,
+        u64::try_from(db.utxos_by_location().count())? == audit.survivors,
         "oracle contains unmatched UTXOs"
     );
     ensure!(
-        absent == inputs,
+        audit.absent == audit.inputs,
         "salted spent-output/input multiset mismatch"
     );
-    Ok(survivors)
+    Ok(audit.survivors)
 }
 
-fn main() -> Result<()> {
-    color_eyre::install()?;
-    zakura_utils::init_tracing();
-    match Args::parse().command {
-        Command::Install { artifact, cache } => {
-            let parsed = ParsedArtifact::read(File::open(artifact)?)?;
-            let pin = zakura_chain::parameters::spentness_hints::MAINNET_COMMITMENTS.iter()
-                .find(|pin| *pin == parsed.commitment()).ok_or_else(|| eyre!("this binary does not recognize the artifact; install a release with its reviewed commitment"))?;
-            let verified = parsed.verify(pin)?;
-            write(
-                cache.join(format!("{}.bin", hex::encode(pin.sha256))),
-                verified.bytes(),
-            )?;
-            Ok(())
-        }
+fn install(artifact_path: &Path, cache: &Path) -> Result<()> {
+    let parsed = ParsedArtifact::read(File::open(artifact_path)?)?;
+    let pin = zakura_chain::parameters::spentness_hints::MAINNET_COMMITMENTS
+        .iter()
+        .find(|pin| *pin == parsed.commitment())
+        .ok_or_else(|| {
+            eyre!(
+                "this binary does not recognize the artifact; install a release with its reviewed commitment"
+            )
+        })?;
+    let verified = parsed.verify(pin)?;
+    let cache_path = cache.join(format!("{}.bin", hex::encode(pin.sha256)));
+    write(cache_path, verified.bytes())
+}
+
+fn generate_command(
+    state: &Path,
+    height: u32,
+    block_hash: block::Hash,
+    output: PathBuf,
+    commitment: PathBuf,
+) -> Result<()> {
+    let (bytes, pin, survivors) = generate(&open(state)?, height, block_hash)?;
+    write(output, &bytes)?;
+    write(commitment, &serde_json::to_vec_pretty(&pin)?)?;
+    println!(
+        "outputs={} survivors={survivors} bytes={} sha256={}",
+        pin.output_count,
+        pin.byte_len,
+        hex::encode(pin.sha256)
+    );
+    Ok(())
+}
+
+fn verify_command(
+    state: &Path,
+    artifact_path: &Path,
+    commitment_path: &Path,
+    report: Option<PathBuf>,
+) -> Result<()> {
+    let pin: Commitment = serde_json::from_reader(File::open(commitment_path)?)?;
+    let artifact = VerifiedArtifact::read(File::open(artifact_path)?, &pin)
+        .wrap_err("authenticating artifact")?;
+    let survivors = verify(&open(state)?, &artifact)?;
+    if let Some(report) = report {
+        let report_value = serde_json::json!({
+            "schema_version": VERIFICATION_SCHEMA_VERSION,
+            "commitment": pin,
+            "survivor_count": survivors,
+            "oracle": VERIFICATION_ORACLE,
+            "complete_entries": true,
+            "salted_multiset": true,
+        });
+        write(report, &serde_json::to_vec_pretty(&report_value)?)?;
+    }
+    println!(
+        "verified outputs={} survivors={survivors} sha256={}",
+        pin.output_count,
+        hex::encode(pin.sha256)
+    );
+    Ok(())
+}
+
+fn run(command: Command) -> Result<()> {
+    match command {
+        Command::Install { artifact, cache } => install(&artifact, &cache),
         Command::Replay {
             source,
             destination,
@@ -410,54 +522,26 @@ fn main() -> Result<()> {
             block_hash,
             output,
             commitment,
-        } => {
-            let (bytes, pin, survivors) = generate(&open(&state)?, height, block_hash)?;
-            write(output, &bytes)?;
-            write(commitment, &serde_json::to_vec_pretty(&pin)?)?;
-            println!(
-                "outputs={} survivors={survivors} bytes={} sha256={}",
-                pin.output_count,
-                pin.byte_len,
-                hex::encode(pin.sha256)
-            );
-            Ok(())
-        }
+        } => generate_command(&state, height, block_hash, output, commitment),
         Command::Verify {
             state,
             artifact,
             commitment,
             report,
-        } => {
-            let pin: Commitment = serde_json::from_reader(File::open(commitment)?)?;
-            let artifact = VerifiedArtifact::read(File::open(artifact)?, &pin)
-                .wrap_err("authenticating artifact")?;
-            let survivors = verify(&open(&state)?, &artifact)?;
-            if let Some(report) = report {
-                write(
-                    report,
-                    &serde_json::to_vec_pretty(&serde_json::json!({
-                        "schema_version": 1,
-                        "commitment": pin,
-                        "survivor_count": survivors,
-                        "oracle": "transparent-replay-v1",
-                        "complete_entries": true,
-                        "salted_multiset": true,
-                    }))?,
-                )?;
-            }
-            println!(
-                "verified outputs={} survivors={survivors} sha256={}",
-                pin.output_count,
-                hex::encode(pin.sha256)
-            );
-            Ok(())
-        }
+        } => verify_command(&state, &artifact, &commitment, report),
     }
+}
+
+fn main() -> Result<()> {
+    color_eyre::install()?;
+    zakura_utils::init_tracing();
+    run(Args::parse().command)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zakura_chain::parameters::spentness_hints::HEADER_LEN;
     use zakura_chain::serialization::ZcashDeserializeInto;
 
     #[test]
@@ -593,7 +677,7 @@ mod tests {
         verify(&oracle, &verified)?;
         // Re-pin a false assertion: file authentication alone must not satisfy the oracle.
         let mut wrong = bytes;
-        wrong[86] ^= 2;
+        wrong[HEADER_LEN] ^= 2;
         let parsed = ParsedArtifact::read(wrong.as_slice())?;
         let false_pin = parsed.commitment().clone();
         ensure!(

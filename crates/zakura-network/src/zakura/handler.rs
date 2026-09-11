@@ -4549,6 +4549,57 @@ async fn write_outbound_request_frame(
     .map_err(|_| OutboundRequestError::Local("Zakura outbound request/response timed out".into()))?
 }
 
+enum OutboundResponseReadState {
+    Legacy(LegacyResponseReadState),
+    Spentness { frames: usize },
+}
+
+impl OutboundResponseReadState {
+    fn for_request(
+        stream: Stream,
+        message_type: u16,
+        payload: &[u8],
+        limits: ZakuraConnectionLimits,
+    ) -> Result<Self, OutboundRequestError> {
+        if stream.kind == super::spentness::STREAM_KIND {
+            return Ok(Self::Spentness { frames: 0 });
+        }
+        Ok(Self::Legacy(LegacyResponseReadState::new(
+            LegacyResponseBudget::from_request(message_type, payload, limits)?,
+        )))
+    }
+
+    fn validate_frame(
+        &mut self,
+        request_id: u64,
+        frame: &Frame,
+    ) -> Result<(), OutboundRequestError> {
+        match self {
+            Self::Legacy(state) => state.validate_frame(request_id, frame),
+            Self::Spentness { frames } => {
+                if *frames != 0 {
+                    return Err(OutboundRequestError::Fatal(
+                        "multiple spentness response frames".into(),
+                    ));
+                }
+                super::spentness::validate_response(frame).map_err(OutboundRequestError::Fatal)?;
+                *frames += 1;
+                Ok(())
+            }
+        }
+    }
+
+    fn finish(self) -> Result<(), OutboundRequestError> {
+        match self {
+            Self::Legacy(state) => state.finish(),
+            Self::Spentness { frames: 1 } => Ok(()),
+            Self::Spentness { .. } => Err(OutboundRequestError::Fatal(
+                "missing spentness response frame".into(),
+            )),
+        }
+    }
+}
+
 async fn write_outbound_request_frame_inner(
     connection: &Connection,
     limits: ZakuraConnectionLimits,
@@ -4558,14 +4609,8 @@ async fn write_outbound_request_frame_inner(
     flags: u16,
     payload: Vec<u8>,
 ) -> Result<Vec<Frame>, OutboundRequestError> {
-    // The legacy request stream validates responses with a legacy-message-specific budget.
-    let mut legacy_state = if stream.kind == super::spentness::STREAM_KIND {
-        None
-    } else {
-        Some(LegacyResponseReadState::new(
-            LegacyResponseBudget::from_request(message_type, &payload, limits)?,
-        ))
-    };
+    let mut response_state =
+        OutboundResponseReadState::for_request(stream, message_type, &payload, limits)?;
     let (mut send, mut recv) = timeout(OUTBOUND_STREAM_WRITE_TIMEOUT, connection.open_bi())
         .await
         .map_err(|_| -> BoxError { "Zakura outbound request stream open timed out".into() })
@@ -4617,27 +4662,11 @@ async fn write_outbound_request_frame_inner(
         .await
         {
             Ok(frame) => {
-                if let Some(state) = &mut legacy_state {
-                    state.validate_frame(request_id, &frame)?;
-                } else {
-                    if !frames.is_empty() {
-                        return Err(OutboundRequestError::Fatal(
-                            "multiple spentness response frames".into(),
-                        ));
-                    }
-                    super::spentness::validate_response(&frame)
-                        .map_err(OutboundRequestError::Fatal)?;
-                }
+                response_state.validate_frame(request_id, &frame)?;
                 frames.push(frame);
             }
             Err(ZakuraHandlerError::Closed) => {
-                if let Some(state) = legacy_state {
-                    state.finish()?;
-                } else if frames.len() != 1 {
-                    return Err(OutboundRequestError::Fatal(
-                        "missing spentness response frame".into(),
-                    ));
-                }
+                response_state.finish()?;
                 return Ok(frames);
             }
             Err(ZakuraHandlerError::Timeout(_)) => {

@@ -34,12 +34,19 @@ class SpentnessReleaseTests(unittest.TestCase):
             "chain_identity": [1] * 32,
             "terminal_height": 10,
             "terminal_block_hash": [2] * 32,
-            "format_version": 1,
+            "format_version": hints.FORMAT_VERSION,
             "output_count": 9,
-            "byte_len": 88,
+            "byte_len": hints.HEADER.size + 2,
         }
         data = (
-            hints.HEADER.pack(b"ZKSHINT\0", 1, bytes([1] * 32), 10, bytes([2] * 32), 9)
+            hints.HEADER.pack(
+                hints.MAGIC,
+                hints.FORMAT_VERSION,
+                bytes([1] * 32),
+                10,
+                bytes([2] * 32),
+                9,
+            )
             + b"\x06\x01"
         )
         self.pin["sha256"] = list(hashlib.sha256(data).digest())
@@ -49,10 +56,10 @@ class SpentnessReleaseTests(unittest.TestCase):
             "0 " + "01" * 32 + "\n10 " + "02" * 32 + "\n"
         )
         self.report = {
-            "schema_version": 1,
+            "schema_version": hints.SCHEMA_VERSION,
             "commitment": self.pin,
             "survivor_count": 3,
-            "oracle": "transparent-replay-v1",
+            "oracle": hints.ORACLE,
             "complete_entries": True,
             "salted_multiset": True,
         }
@@ -97,8 +104,8 @@ class SpentnessReleaseTests(unittest.TestCase):
         for data in (
             original[:-1],
             original + b"\0",
-            original[:86] + b"\x07\x01",
-            original[:86] + b"\x06\x81",
+            original[: hints.HEADER.size] + b"\x07\x01",
+            original[: hints.HEADER.size] + b"\x06\x81",
         ):
             with self.subTest(data=data):
                 path.write_bytes(data)

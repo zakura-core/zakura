@@ -33,6 +33,8 @@
 #                             construction instead of relying on a fresh genesis
 #                             walk reproducing it byte for byte.
 #   RELEASE_STATE_KEEP        legacy v1 bundles to retain (default 4)
+#   RELEASE_STATE_SPENTNESS_TIMEOUT
+#                             deadline for each spentness replay step (default 48h)
 #   RELEASE_STATE_LOCK_FILE   host-local publisher lock
 #                             (default: /tmp/zakura-release-state-publish.lock)
 
@@ -45,6 +47,9 @@ BIN=${ZAKURA_CHECKPOINTS_BIN:-zakura-checkpoints}
 SPENTNESS_BIN=${ZAKURA_SPENTNESS_BIN:-zakura-spentness}
 export ZAKURA_SPENTNESS_BIN="$SPENTNESS_BIN"
 DATA_DIR=${RELEASE_STATE_DATA_DIR:-"${STATE_DIR%/}-release-state"}
+BUNDLE_SCHEMA=2
+LEGACY_BUNDLE_SCHEMA=1
+SPENTNESS_TIMEOUT=${RELEASE_STATE_SPENTNESS_TIMEOUT:-48h}
 : "${RELEASE_STATE_ORACLE_SOURCE:?set RELEASE_STATE_ORACLE_SOURCE to an independently synchronized archive cache}"
 : "${RELEASE_STATE_ORACLE_ID:?identify the independently synchronized source and its validation software}"
 : "${RELEASE_STATE_GENERATOR_REVISION:?set RELEASE_STATE_GENERATOR_REVISION to the generator git revision}"
@@ -140,7 +145,7 @@ if [ -n "$POINTER_LISTING" ]; then
     # resume from. That is not an error: the run falls back to a full walk, which
     # is what the first grid-bearing export has to do anyway.
     POINTER_SCHEMA=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["schema_version"])' "$STAGE/existing-latest.json")
-    if [[ "$POINTER_SCHEMA" != 1 && "$POINTER_SCHEMA" != 2 ]]; then
+    if [[ "$POINTER_SCHEMA" != "$LEGACY_BUNDLE_SCHEMA" && "$POINTER_SCHEMA" != "$BUNDLE_SCHEMA" ]]; then
         echo "unsupported existing release-state schema" >&2
         exit 1
     fi
@@ -175,13 +180,13 @@ GENERATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 # Reproduce from a separate validated source, then check complete entries with the
 # tooling-only transparent replay oracle and fresh salted multiset accumulator.
-timeout 48h "$SPENTNESS_BIN" replay --source "$RELEASE_STATE_ORACLE_SOURCE" \
+timeout "$SPENTNESS_TIMEOUT" "$SPENTNESS_BIN" replay --source "$RELEASE_STATE_ORACLE_SOURCE" \
     --destination "$DATA_DIR/spentness-independent" --height "$HEIGHT" --block-hash "$BLOCK_HASH"
-timeout 48h "$SPENTNESS_BIN" generate --state "$DATA_DIR/spentness-independent" \
+timeout "$SPENTNESS_TIMEOUT" "$SPENTNESS_BIN" generate --state "$DATA_DIR/spentness-independent" \
     --height "$HEIGHT" --block-hash "$BLOCK_HASH" \
     --output "$STAGE/independent-spentness.bin" --commitment "$STAGE/independent-commitment.json"
 cmp "$STAGE/mainnet-spentness-hints.bin" "$STAGE/independent-spentness.bin"
-timeout 48h "$SPENTNESS_BIN" verify --state "$DATA_DIR/spentness-independent" \
+timeout "$SPENTNESS_TIMEOUT" "$SPENTNESS_BIN" verify --state "$DATA_DIR/spentness-independent" \
     --artifact "$STAGE/mainnet-spentness-hints.bin" \
     --commitment "$STAGE/mainnet-spentness-hints.commitment.json"
 
@@ -193,6 +198,7 @@ if [ -n "$POINTER_HEIGHT" ] && [ "$POINTER_HEIGHT" -gt "$HEIGHT" ]; then
 fi
 
 HEIGHT="$HEIGHT" BLOCK_HASH="$BLOCK_HASH" GENERATED_AT="$GENERATED_AT" \
+    BUNDLE_SCHEMA="$BUNDLE_SCHEMA" \
     RELEASE_STATE_GENERATOR_REVISION="$RELEASE_STATE_GENERATOR_REVISION" \
     RELEASE_STATE_ORACLE_ID="$RELEASE_STATE_ORACLE_ID" \
     python3 - "$STAGE" <<'PY'
@@ -213,7 +219,7 @@ for name in (
     files[name] = {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
 
 meta = {
-    "schema_version": 2,
+    "schema_version": int(os.environ["BUNDLE_SCHEMA"]),
     "network": "Mainnet",
     "height": int(os.environ["HEIGHT"]),
     "block_hash": os.environ["BLOCK_HASH"],
@@ -237,7 +243,7 @@ PY
 # the meta timestamp differs), so an existing bundle whose file digests match
 # is reused as-is and only the pointer is refreshed; different contents at the
 # same height mean timestamp-free determinism broke and a human should look.
-BUNDLE_REMOTE="$REMOTE_PREFIX/v2/$HEIGHT"
+BUNDLE_REMOTE="$REMOTE_PREFIX/v$BUNDLE_SCHEMA/$HEIGHT"
 BUNDLE_LISTING=$(list_remote_object "$BUNDLE_REMOTE/meta.json")
 if [ -n "$BUNDLE_LISTING" ]; then
     rclone copyto "$BUNDLE_REMOTE/meta.json" "$STAGE/existing-meta.json"
@@ -253,7 +259,7 @@ if existing.get("files") != staged["files"] or existing.get("block_hash") != sta
 PY
     cp "$STAGE/existing-meta.json" "$STAGE/meta.json"
     GENERATED_AT=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["generated_at"])' "$STAGE/meta.json")
-    echo "bundle v2/$HEIGHT already published; refreshing the pointer" >&2
+    echo "bundle v$BUNDLE_SCHEMA/$HEIGHT already published; refreshing the pointer" >&2
 else
     # Data files first, meta.json last, so a partially uploaded bundle is
     # never resolvable through a pointer.
@@ -265,31 +271,31 @@ else
     rclone copyto "$STAGE/mainnet-spentness-hints.commitment.json" "$BUNDLE_REMOTE/mainnet-spentness-hints.commitment.json"
     rclone copyto "$STAGE/mainnet-spentness-hints.verification.json" "$BUNDLE_REMOTE/mainnet-spentness-hints.verification.json"
     rclone copyto "$STAGE/meta.json" "$BUNDLE_REMOTE/meta.json"
-    echo "published bundle v2/$HEIGHT ($BLOCK_HASH)" >&2
+    echo "published bundle v$BUNDLE_SCHEMA/$HEIGHT ($BLOCK_HASH)" >&2
 fi
 META_SHA256=$(sha256_of "$STAGE/meta.json")
 
 cat > "$STAGE/latest.json" <<EOF
 {
-  "schema_version": 2,
+  "schema_version": $BUNDLE_SCHEMA,
   "network": "Mainnet",
   "height": $HEIGHT,
   "block_hash": "$BLOCK_HASH",
   "generated_at": "$GENERATED_AT",
-  "meta_url": "${RELEASE_STATE_PUBLIC_BASE%/}/v2/$HEIGHT/meta.json",
+  "meta_url": "${RELEASE_STATE_PUBLIC_BASE%/}/v$BUNDLE_SCHEMA/$HEIGHT/meta.json",
   "meta_sha256": "$META_SHA256"
 }
 EOF
 rclone copyto "$STAGE/latest.json" "$REMOTE_PREFIX/latest.json"
 echo "pointer now at height $HEIGHT" >&2
 
-# Version 2 bundles remain available for supported incomplete hinted runs.
+# Current-schema bundles remain available for supported incomplete hinted runs.
 # Only legacy bundles without spentness artifacts use the newest-N policy.
-LEGACY_LISTING=$(list_remote_object "$REMOTE_PREFIX/v1/")
+LEGACY_LISTING=$(list_remote_object "$REMOTE_PREFIX/v$LEGACY_BUNDLE_SCHEMA/")
 printf '%s\n' "$LEGACY_LISTING" \
     | tr -d '/' | awk '/^[0-9]+$/' | sort -n | head -n -"$KEEP" \
     | while read -r old_height; do
         [ -n "$old_height" ] || continue
-        echo "pruning bundle v1/$old_height" >&2
-        rclone purge "$REMOTE_PREFIX/v1/$old_height"
+        echo "pruning bundle v$LEGACY_BUNDLE_SCHEMA/$old_height" >&2
+        rclone purge "$REMOTE_PREFIX/v$LEGACY_BUNDLE_SCHEMA/$old_height"
     done

@@ -18,7 +18,15 @@
 // and argument invariants established by `Args::validate_mode` use `expect`.
 #![allow(clippy::print_stdout, clippy::print_stderr, clippy::unwrap_in_result)]
 
-use std::{fs, io::Write, path::Path, time::Instant};
+use std::{
+    ffi::OsStr,
+    fs,
+    io::Write,
+    path::Path,
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
 
 use color_eyre::eyre::{ensure, eyre, Context, Result};
 
@@ -39,6 +47,10 @@ const DEFAULT_FRONTIER_GRID_TARGET_COST_MS: u64 = 2_000;
 
 /// How often a long grid run reports progress, in entries.
 const FRONTIER_GRID_PROGRESS_INTERVAL: u64 = 100;
+const SPENTNESS_GENERATION_DEADLINE: Duration = Duration::from_secs(48 * 60 * 60);
+const CHILD_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const SPENTNESS_BINARY_ENV: &str = "ZAKURA_SPENTNESS_BIN";
+const DEFAULT_SPENTNESS_BINARY: &str = "zakura-spentness";
 
 /// One candidate block row read from the finalized state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -256,61 +268,11 @@ pub fn run_offline(args: &Args) -> Result<()> {
         )?;
     }
 
-    // Lock stdout once: the full list is ~14k lines and per-line locking is slow.
-    if let (Some(output), Some(replay)) =
-        (&args.mainnet_spentness_output, &args.spentness_replay_cache)
-    {
-        let executable =
-            std::env::var_os("ZAKURA_SPENTNESS_BIN").unwrap_or_else(|| "zakura-spentness".into());
-        let height = last_height.0.to_string();
-        let hash = last_hash.to_string();
-        let commitment = output.with_extension("commitment.json");
-        let report = output.with_extension("verification.json");
-        let source = args
-            .state_cache_dir
-            .as_ref()
-            .expect("offline mode requires a state cache");
-        for arguments in [
-            vec![
-                "replay".as_ref(),
-                "--source".as_ref(),
-                source.as_os_str(),
-                "--destination".as_ref(),
-                replay.as_os_str(),
-                "--height".as_ref(),
-                height.as_ref(),
-                "--block-hash".as_ref(),
-                hash.as_ref(),
-            ],
-            vec![
-                "generate".as_ref(),
-                "--state".as_ref(),
-                replay.as_os_str(),
-                "--height".as_ref(),
-                height.as_ref(),
-                "--block-hash".as_ref(),
-                hash.as_ref(),
-                "--output".as_ref(),
-                output.as_os_str(),
-                "--commitment".as_ref(),
-                commitment.as_os_str(),
-            ],
-            vec![
-                "verify".as_ref(),
-                "--state".as_ref(),
-                replay.as_os_str(),
-                "--artifact".as_ref(),
-                output.as_os_str(),
-                "--commitment".as_ref(),
-                commitment.as_os_str(),
-                "--report".as_ref(),
-                report.as_os_str(),
-            ],
-        ] {
-            run_spentness(&executable, &arguments)?;
-        }
+    if args.mainnet_spentness_output.is_some() {
+        write_spentness_artifacts(args, last_height, last_hash)?;
     }
 
+    // Lock stdout once: the full list is ~14k lines and per-line locking is slow.
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
     if args.full_list {
@@ -332,12 +294,77 @@ pub fn run_offline(args: &Args) -> Result<()> {
     Ok(())
 }
 
-fn run_spentness(executable: &std::ffi::OsStr, arguments: &[&std::ffi::OsStr]) -> Result<()> {
-    use std::{
-        process::{Command, Stdio},
-        thread,
-        time::Duration,
-    };
+fn write_spentness_artifacts(
+    args: &Args,
+    terminal_height: Height,
+    terminal_hash: block::Hash,
+) -> Result<()> {
+    let output = args
+        .mainnet_spentness_output
+        .as_ref()
+        .expect("spentness export requires an output path");
+    let replay = args
+        .spentness_replay_cache
+        .as_ref()
+        .expect("spentness export requires a replay cache");
+    let source = args
+        .state_cache_dir
+        .as_ref()
+        .expect("offline mode requires a state cache");
+    let executable =
+        std::env::var_os(SPENTNESS_BINARY_ENV).unwrap_or_else(|| DEFAULT_SPENTNESS_BINARY.into());
+    let height = terminal_height.0.to_string();
+    let hash = terminal_hash.to_string();
+    let commitment = output.with_extension("commitment.json");
+    let report = output.with_extension("verification.json");
+
+    run_spentness(
+        &executable,
+        &[
+            OsStr::new("replay"),
+            OsStr::new("--source"),
+            source.as_os_str(),
+            OsStr::new("--destination"),
+            replay.as_os_str(),
+            OsStr::new("--height"),
+            height.as_ref(),
+            OsStr::new("--block-hash"),
+            hash.as_ref(),
+        ],
+    )?;
+    run_spentness(
+        &executable,
+        &[
+            OsStr::new("generate"),
+            OsStr::new("--state"),
+            replay.as_os_str(),
+            OsStr::new("--height"),
+            height.as_ref(),
+            OsStr::new("--block-hash"),
+            hash.as_ref(),
+            OsStr::new("--output"),
+            output.as_os_str(),
+            OsStr::new("--commitment"),
+            commitment.as_os_str(),
+        ],
+    )?;
+    run_spentness(
+        &executable,
+        &[
+            OsStr::new("verify"),
+            OsStr::new("--state"),
+            replay.as_os_str(),
+            OsStr::new("--artifact"),
+            output.as_os_str(),
+            OsStr::new("--commitment"),
+            commitment.as_os_str(),
+            OsStr::new("--report"),
+            report.as_os_str(),
+        ],
+    )
+}
+
+fn run_spentness(executable: &OsStr, arguments: &[&OsStr]) -> Result<()> {
     let mut child = Command::new(executable)
         .args(arguments)
         .stdout(Stdio::null())
@@ -351,14 +378,14 @@ fn run_spentness(executable: &std::ffi::OsStr, arguments: &[&std::ffi::OsStr]) -
             ensure!(status.success(), "zakura-spentness failed with {status}");
             return Ok(());
         }
-        if started.elapsed() > Duration::from_secs(48 * 60 * 60) {
+        if started.elapsed() > SPENTNESS_GENERATION_DEADLINE {
             child.kill()?;
             child.wait()?;
             return Err(eyre!(
                 "zakura-spentness exceeded its 48-hour generation deadline"
             ));
         }
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(CHILD_STATUS_POLL_INTERVAL);
     }
 }
 

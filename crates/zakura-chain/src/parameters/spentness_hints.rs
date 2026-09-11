@@ -1,18 +1,28 @@
 //! External terminal-UTXO membership artifacts authenticated by release commitments.
 
-use std::io::{self, Read};
+use std::{
+    io::{self, Read},
+    mem::size_of,
+};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+const HASH_LEN: usize = 32;
+const BITS_PER_BYTE: u64 = 8;
+const MAGIC: &[u8; 8] = b"ZKSHINT\0";
+const VERSION_OFFSET: usize = MAGIC.len();
+const CHAIN_IDENTITY_OFFSET: usize = VERSION_OFFSET + size_of::<u16>();
+const TERMINAL_HEIGHT_OFFSET: usize = CHAIN_IDENTITY_OFFSET + HASH_LEN;
+const TERMINAL_BLOCK_HASH_OFFSET: usize = TERMINAL_HEIGHT_OFFSET + size_of::<u32>();
+const OUTPUT_COUNT_OFFSET: usize = TERMINAL_BLOCK_HASH_OFFSET + HASH_LEN;
 /// Fixed header length, excluding membership bits.
-pub const HEADER_LEN: usize = 86;
+pub const HEADER_LEN: usize = OUTPUT_COUNT_OFFSET + size_of::<u64>();
 /// Maximum artifact length accepted before allocation (512 MiB).
 pub const MAX_ARTIFACT_LEN: u64 = 512 * 1024 * 1024;
 /// Current Zakura artifact version.
 pub const FORMAT_VERSION: u16 = 1;
-const MAGIC: &[u8; 8] = b"ZKSHINT\0";
 
 mod commitments;
 pub use commitments::MAINNET_COMMITMENTS;
@@ -59,13 +69,63 @@ pub enum Error {
 
 /// Calculate the exact file size without overflowing or allocating.
 pub fn artifact_len(output_count: u64) -> Result<u64, Error> {
+    let header_len =
+        u64::try_from(HEADER_LEN).map_err(|_| Error::Format("artifact header is too large"))?;
     let len = output_count
-        .checked_add(7)
-        .and_then(|count| count.checked_div(8))
-        .and_then(|bytes| bytes.checked_add(86))
+        .div_ceil(BITS_PER_BYTE)
+        .checked_add(header_len)
         .filter(|len| *len <= MAX_ARTIFACT_LEN)
         .ok_or(Error::Format("output count exceeds artifact limit"))?;
     Ok(len)
+}
+
+fn header_field<const N: usize>(bytes: &[u8; HEADER_LEN], offset: usize) -> Result<[u8; N], Error> {
+    bytes
+        .get(offset..offset + N)
+        .ok_or(Error::Format("truncated artifact header"))?
+        .try_into()
+        .map_err(|_| Error::Format("invalid artifact header field"))
+}
+
+#[derive(Debug)]
+struct Header {
+    chain_identity: [u8; HASH_LEN],
+    terminal_height: u32,
+    terminal_block_hash: [u8; HASH_LEN],
+    output_count: u64,
+}
+
+impl Header {
+    fn parse(bytes: &[u8; HEADER_LEN]) -> Result<Self, Error> {
+        if &bytes[..MAGIC.len()] != MAGIC
+            || u16::from_le_bytes(header_field(bytes, VERSION_OFFSET)?) != FORMAT_VERSION
+        {
+            return Err(Error::Format("unknown magic or version"));
+        }
+
+        Ok(Self {
+            chain_identity: header_field(bytes, CHAIN_IDENTITY_OFFSET)?,
+            terminal_height: u32::from_le_bytes(header_field(bytes, TERMINAL_HEIGHT_OFFSET)?),
+            terminal_block_hash: header_field(bytes, TERMINAL_BLOCK_HASH_OFFSET)?,
+            output_count: u64::from_le_bytes(header_field(bytes, OUTPUT_COUNT_OFFSET)?),
+        })
+    }
+
+    fn encode(
+        chain_identity: [u8; HASH_LEN],
+        terminal_height: u32,
+        terminal_block_hash: [u8; HASH_LEN],
+    ) -> [u8; HEADER_LEN] {
+        let mut bytes = [0; HEADER_LEN];
+        bytes[..MAGIC.len()].copy_from_slice(MAGIC);
+        bytes[VERSION_OFFSET..CHAIN_IDENTITY_OFFSET].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+        bytes[CHAIN_IDENTITY_OFFSET..TERMINAL_HEIGHT_OFFSET].copy_from_slice(&chain_identity);
+        bytes[TERMINAL_HEIGHT_OFFSET..TERMINAL_BLOCK_HASH_OFFSET]
+            .copy_from_slice(&terminal_height.to_le_bytes());
+        bytes[TERMINAL_BLOCK_HASH_OFFSET..OUTPUT_COUNT_OFFSET]
+            .copy_from_slice(&terminal_block_hash);
+        bytes
+    }
 }
 
 impl Commitment {
@@ -92,18 +152,8 @@ impl ParsedArtifact {
     pub fn read(mut source: impl Read) -> Result<Self, Error> {
         let mut header = [0; HEADER_LEN];
         source.read_exact(&mut header)?;
-        if &header[..8] != MAGIC || u16::from_le_bytes([header[8], header[9]]) != FORMAT_VERSION {
-            return Err(Error::Format("unknown magic or version"));
-        }
-        let mut identity = [0; 32];
-        identity.copy_from_slice(&header[10..42]);
-        let mut height = [0; 4];
-        height.copy_from_slice(&header[42..46]);
-        let mut hash = [0; 32];
-        hash.copy_from_slice(&header[46..78]);
-        let mut count = [0; 8];
-        count.copy_from_slice(&header[78..86]);
-        let output_count = u64::from_le_bytes(count);
+        let parsed_header = Header::parse(&header)?;
+        let output_count = parsed_header.output_count;
         let byte_len = artifact_len(output_count)?;
         let len = usize::try_from(byte_len)
             .map_err(|_| Error::Format("artifact cannot fit in memory"))?;
@@ -117,7 +167,7 @@ impl ParsedArtifact {
         if source.read(&mut [0; 1])? != 0 {
             return Err(Error::Format("trailing bytes"));
         }
-        let used_bits = output_count % 8;
+        let used_bits = output_count % BITS_PER_BYTE;
         if used_bits != 0 && bytes[len - 1] >> used_bits != 0 {
             return Err(Error::Format("nonzero padding bits"));
         }
@@ -126,9 +176,9 @@ impl ParsedArtifact {
             return Err(Error::Format("genesis output must be absent"));
         }
         let commitment = Commitment {
-            chain_identity: identity,
-            terminal_height: u32::from_le_bytes(height),
-            terminal_block_hash: hash,
+            chain_identity: parsed_header.chain_identity,
+            terminal_height: parsed_header.terminal_height,
+            terminal_block_hash: parsed_header.terminal_block_hash,
             format_version: FORMAT_VERSION,
             output_count,
             byte_len,
@@ -184,8 +234,8 @@ impl VerifiedArtifact {
         if ordinal >= self.0.commitment.output_count {
             return Err(Error::Ordinal);
         }
-        let byte = usize::try_from(ordinal / 8).map_err(|_| Error::Ordinal)?;
-        Ok(self.0.bytes[HEADER_LEN + byte] & (1 << (ordinal % 8)) != 0)
+        let byte = usize::try_from(ordinal / BITS_PER_BYTE).map_err(|_| Error::Ordinal)?;
+        Ok(self.0.bytes[HEADER_LEN + byte] & (1 << (ordinal % BITS_PER_BYTE)) != 0)
     }
 }
 
@@ -217,12 +267,11 @@ impl Encoder {
         terminal_height: u32,
         terminal_block_hash: [u8; 32],
     ) -> Self {
-        let mut bytes = Vec::from(MAGIC.as_slice());
-        bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-        bytes.extend_from_slice(&chain_identity);
-        bytes.extend_from_slice(&terminal_height.to_le_bytes());
-        bytes.extend_from_slice(&terminal_block_hash);
-        bytes.extend_from_slice(&0u64.to_le_bytes());
+        let bytes = Vec::from(Header::encode(
+            chain_identity,
+            terminal_height,
+            terminal_block_hash,
+        ));
         Self { bytes, count: 0 }
     }
 
@@ -234,12 +283,12 @@ impl Encoder {
         }
         let next = count.checked_add(1).ok_or(Error::Ordinal)?;
         artifact_len(next)?;
-        if *count % 8 == 0 {
+        if count.is_multiple_of(BITS_PER_BYTE) {
             bytes.push(0);
         }
         if retained {
             let last = bytes.len() - 1;
-            bytes[last] |= 1 << (*count % 8);
+            bytes[last] |= 1 << (*count % BITS_PER_BYTE);
         }
         *count = next;
         Ok(())
@@ -247,7 +296,7 @@ impl Encoder {
 
     /// Finish the untrusted generated artifact.
     pub fn finish(mut self) -> Vec<u8> {
-        self.bytes[78..86].copy_from_slice(&self.count.to_le_bytes());
+        self.bytes[OUTPUT_COUNT_OFFSET..HEADER_LEN].copy_from_slice(&self.count.to_le_bytes());
         self.bytes
     }
 }

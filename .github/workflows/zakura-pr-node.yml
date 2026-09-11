@@ -1,15 +1,12 @@
-name: PR 966 native sync followthrough
+name: PR 966 sync diagnostics
 on:
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
-  verify:
+  inspect:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    env:
-      IP: "147.182.182.56"
-      EXPECTED_NAME: "zakura-pr-e3328340aa040971681ed222-34572860726"
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -18,24 +15,57 @@ jobs:
         with:
           token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
           ssh_private_key: ${{ secrets.DO_SSH_PRIVATE_KEY }}
-      - name: Finish sync on the exact task-owned node
+      - name: Read the exact task-owned node
+        env:
+          EXPECTED_NAME: "zakura-pr-e3328340aa040971681ed222-34572860726"
+          IP: "147.182.182.56"
         run: |
           set -euo pipefail
           doctl compute droplet list --tag-name zakura-pr-node -o json | jq -e --arg name "$EXPECTED_NAME" --arg ip "$IP" '[.[] | select(.name == $name and any(.networks.v4[]; .ip_address == $ip))] | length == 1' > /dev/null
-          mkdir -p /tmp/evidence
-          scp -i /tmp/do_ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new .github/workflows/scripts/pr966-sync-followthrough.py "root@$IP:/root/"
-          ssh -i /tmp/do_ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 -o StrictHostKeyChecking=accept-new "root@$IP" 'python3 -u /root/pr966-sync-followthrough.py' | tee /tmp/evidence/followthrough.log
-      - name: Collect bounded sync evidence
-        if: always()
-        run: |
-          mkdir -p /tmp/evidence
-          scp -r -i /tmp/do_ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "root@$IP:/root/out/native-followthrough" /tmp/evidence/ || true
-          scp -i /tmp/do_ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "root@$IP:/root/out/paired/summary.json" /tmp/evidence/initial-sync-restart.json || true
+          doctl compute droplet list -o json | jq -e '[.[] | select(.id == 599561515)] | length == 0' > /dev/null
+          doctl compute volume list -o json | jq -e '[.[] | select(.id == "9111088e-adab-11f1-8db9-6afac2c46685")] | length == 0' > /dev/null
+          echo "The previous test droplet and cloned volume are deleted."
+          mkdir -p /tmp/inspect
+          ssh -i /tmp/do_ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "root@$IP" 'python3 -' > /tmp/inspect/live.txt <<'PYREMOTE'
+          import json, subprocess, time, urllib.request
+          from pathlib import Path
+          sha = subprocess.check_output(['git', '-C', '/root/zakura', 'rev-parse', 'HEAD'], text=True).strip()
+          assert sha == 'e3328340aa040971681ed222a5bfc63fe43d8991', sha
+          print('TARGET_SHA', sha, flush=True)
+          processes=subprocess.check_output(['ps','-eo','pid,etime,pcpu,rss,comm'],text=True)
+          print('\n'.join(line for line in processes.splitlines() if 'zakurad' in line or 'rustc' in line),flush=True)
+          print(subprocess.run(['ps','-C','rustc','-o','pid,etime,%cpu,rss,comm'],text=True,capture_output=True).stdout,flush=True)
+          def rpc(url, method, params=None):
+              request=urllib.request.Request(url,data=json.dumps({'jsonrpc':'2.0','id':'pr966-readonly-evidence','method':method,'params':params or []}).encode(),headers={'Content-Type':'application/json'})
+              with urllib.request.urlopen(request,timeout=10) as response:data=json.load(response)
+              if data.get('error'):raise RuntimeError(str(data['error']))
+              return data['result']
+          seed='http://127.0.0.1:8232'
+          client='http://127.0.0.1:18232'
+          reference='http://159.65.183.89:8232'
+          for role,url in [('seed',seed),('client',client)]:
+              try:
+                  print(role, 'getblockchaininfo', json.dumps(rpc(url,'getblockchaininfo')))
+                  print(role, 'getpeerinfo', json.dumps(rpc(url,'getpeerinfo')))
+              except Exception as exc: print(role,str(exc))
+          print(subprocess.check_output(['systemctl','show','zakurad','--property=ActiveState,NRestarts,MainPID'],text=True))
+          for name in ['/var/log/zakura/zakura.log','/root/out/paired/downloader.log']:
+              path=Path(name)
+              if path.exists():
+                  lines=path.read_text(errors='replace').splitlines()
+                  print('LOG',name)
+                  print('\n'.join(line for line in lines[-350:] if 'ZakuradConfig' not in line))
+          for port in [9999,19999]:
+              with urllib.request.urlopen(f'http://127.0.0.1:{port}/metrics',timeout=5) as response:data=response.read().decode()
+              print('METRICS',port)
+              print('\n'.join(line for line in data.splitlines() if not line.startswith('#') and any(key in line for key in ['sync_','peer_','state_','header_','zakura_'])))
+          PYREMOTE
+          cat /tmp/inspect/live.txt
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: pr966-native-followthrough-${{ github.run_id }}
-          path: /tmp/evidence/
+          name: pr966-sync-diagnostics-${{ github.run_id }}
+          path: /tmp/inspect/
       - name: Remove temporary runner key
         if: always()
         run: rm -f /tmp/do_ssh

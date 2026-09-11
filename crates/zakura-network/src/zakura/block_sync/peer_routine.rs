@@ -21,7 +21,6 @@
 
 use std::{collections::BTreeMap, num::NonZeroU64, ops::Range};
 
-use futures::FutureExt;
 use tokio::sync::{futures::Notified, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -270,8 +269,6 @@ pub(super) struct PeerRoutine {
     /// This peer's ordered stream-6 frame reader. Decoded in the routine's own
     /// task; inbound never flows through the reactor (per-peer routines inverted data flow).
     recv: FramedRecv,
-    /// A received frame may be waiting for local body capacity when cancelled.
-    inbound_frame_pending: bool,
 
     // ---- per-peer download state (moved out of `PeerBlockState`) ----
     window: DownloadWindow,
@@ -383,7 +380,6 @@ impl PeerRoutine {
             config,
             allow_no_progress_park,
             recv,
-            inbound_frame_pending: false,
             window,
             received_status: false,
             servable_low: block::Height::MIN,
@@ -416,24 +412,16 @@ impl PeerRoutine {
     /// reject. A reject returns `Err(SinkReject::protocol(..))` so the supervised
     /// pipe tears the whole connection down.
     pub(super) async fn run(mut self) -> Result<(), SinkReject> {
-        let cancel = self.cancel.clone();
         let mut guard = block_sync_guard();
-        let result = tokio::select! {
-            biased;
-            () = cancel.cancelled() => Ok(()),
-            result = self.run_inner(&mut guard) => result,
-        };
+        let result = self.run_inner(&mut guard).await;
         // A transport failure can cancel the session before its queued responses
-        // reach us. Process ready frames before scoring unanswered work. A frame
-        // blocked on local capacity cannot establish a peer stall.
-        if result.is_ok() && !self.inbound_frame_pending {
+        // reach us. Validate them under the existing decode-capacity bound before
+        // scoring unanswered work. Connection shutdown can still stop this drain.
+        if result.is_ok() {
             if let Some(failure) = self.recv.failure() {
                 self.recv.close();
                 while let Ok(frame) = self.recv.try_recv() {
-                    match self.handle_frame(&mut guard, frame).now_or_never() {
-                        Some(result) => result?,
-                        None => return Ok(()),
-                    }
+                    self.handle_frame(&mut guard, frame).await?;
                 }
                 return self.handle_stream_failure(Instant::now(), failure);
             }
@@ -457,6 +445,9 @@ impl PeerRoutine {
         let mut bbr_trace_ticks = time::interval(BBR_TRACE_INTERVAL);
         bbr_trace_ticks.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         loop {
+            if self.cancel.is_cancelled() {
+                return Ok(());
+            }
             // missed-wake safety: register both `Notify`s via
             // `Notified::enable()` BEFORE the fill attempt. The budget/work
             // `Notify`s use `notify_waiters` (no stored permit), so a
@@ -501,12 +492,7 @@ impl PeerRoutine {
                         // in this same task. A protocol reject propagates out so
                         // the supervised pipe cancels the connection; the `Drop`
                         // guard returns unreceived work on the way out.
-                        Some(frame) => {
-                            self.inbound_frame_pending = true;
-                            let result = self.handle_frame(guard, frame).await;
-                            self.inbound_frame_pending = false;
-                            result?;
-                        }
+                        Some(frame) => self.handle_frame(guard, frame).await?,
                         // Stream closed by the peer. With no outstanding work this
                         // is a clean exit; with unanswered requests it is a
                         // no-progress stall (park or disconnect). `Drop` returns
@@ -565,7 +551,20 @@ impl PeerRoutine {
 
         let frame_payload_bytes = frame.payload.len();
         let body_permit = if is_block_frame(&frame) {
-            Some(self.reserve_body_decode_permit().await?)
+            let permit = self.reserve_body_decode_permit();
+            tokio::pin!(permit);
+            Some(tokio::select! {
+                biased;
+                () = self.cancel.cancelled() => {
+                    if self.recv.failure().is_none() {
+                        return Ok(());
+                    }
+                    // A remote close cannot excuse an unvalidated body. Keep
+                    // this bounded raw frame until its decode slot is available.
+                    permit.await?
+                }
+                permit = &mut permit => permit?,
+            })
         } else {
             None
         };
@@ -1423,6 +1422,9 @@ impl PeerRoutine {
         now: Instant,
         failure: OrderedStreamFailure,
     ) -> Result<(), SinkReject> {
+        // Local reset may have withdrawn the requests while decoding waited
+        // for capacity. It must remain neutral when the failed stream retires.
+        self.on_view_changed();
         self.gc_skipped_outstanding();
         if self.window.outstanding.is_empty() && self.window.block_liveness_deadline.is_none() {
             return Ok(());
@@ -3248,6 +3250,13 @@ mod tests {
     #[tokio::test]
     async fn local_cancel_and_idle_write_timeout_do_not_park_peers() {
         check_cancelled_session_policy(None, true, false, false).await;
+        for buffered in [
+            BufferedResponse::Backpressured,
+            BufferedResponse::AlreadyProcessing,
+        ] {
+            check_cancelled_session_with_buffered_response(None, true, false, false, buffered)
+                .await;
+        }
         check_cancelled_session_policy(
             Some(super::OrderedStreamFailure::WriteTimeout),
             false,
@@ -3280,8 +3289,37 @@ mod tests {
         CompleteWhileOutboundFull,
         StatusOnly,
         Malformed,
+        MalformedBlock,
+        MalformedBlockBackpressured,
+        MalformedBlockAlreadyProcessing,
         Backpressured,
         AlreadyProcessing,
+        ResetDuringBackpressure,
+    }
+
+    #[tokio::test]
+    async fn malformed_blocks_are_validated_before_stream_failure_settlement() {
+        for failure in [
+            super::OrderedStreamFailure::RemoteClose,
+            super::OrderedStreamFailure::WriteTimeout,
+        ] {
+            for readmitted in [false, true] {
+                for buffered in [
+                    BufferedResponse::MalformedBlock,
+                    BufferedResponse::MalformedBlockBackpressured,
+                    BufferedResponse::MalformedBlockAlreadyProcessing,
+                ] {
+                    check_cancelled_session_with_buffered_response(
+                        Some(failure),
+                        true,
+                        readmitted,
+                        false,
+                        buffered,
+                    )
+                    .await;
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -3297,6 +3335,7 @@ mod tests {
                     BufferedResponse::StatusOnly,
                     BufferedResponse::Malformed,
                     BufferedResponse::Backpressured,
+                    BufferedResponse::ResetDuringBackpressure,
                 ] {
                     check_cancelled_session_with_buffered_response(
                         Some(failure),
@@ -3381,14 +3420,18 @@ mod tests {
         let mut held_capacity = Vec::new();
         if matches!(
             buffered,
-            BufferedResponse::Backpressured | BufferedResponse::AlreadyProcessing
+            BufferedResponse::Backpressured
+                | BufferedResponse::AlreadyProcessing
+                | BufferedResponse::ResetDuringBackpressure
+                | BufferedResponse::MalformedBlockBackpressured
+                | BufferedResponse::MalformedBlockAlreadyProcessing
         ) {
             for _ in 0..4 {
                 held_capacity.push(sequencer_input.clone().try_reserve_owned().unwrap());
             }
         }
         let (reactor_input, _reactor_recv) = mpsc::channel(4);
-        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
+        let (view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(0),
             verified_block_hash: block::Hash([0; 32]),
@@ -3442,7 +3485,8 @@ mod tests {
             BufferedResponse::Complete
             | BufferedResponse::CompleteWhileOutboundFull
             | BufferedResponse::Backpressured
-            | BufferedResponse::AlreadyProcessing => {
+            | BufferedResponse::AlreadyProcessing
+            | BufferedResponse::ResetDuringBackpressure => {
                 in_send
                     .send(
                         super::BlockSyncMessage::Block(body.clone())
@@ -3483,6 +3527,17 @@ mod tests {
                     .await
                     .unwrap();
             }
+            BufferedResponse::MalformedBlock
+            | BufferedResponse::MalformedBlockBackpressured
+            | BufferedResponse::MalformedBlockAlreadyProcessing => {
+                let frame = crate::zakura::Frame {
+                    message_type: u16::from(super::MSG_BS_BLOCK),
+                    flags: 0,
+                    payload: vec![super::MSG_BS_BLOCK],
+                };
+                assert!(super::BlockSyncMessage::decode_frame(frame.clone()).is_err());
+                in_send.send(frame).await.unwrap();
+            }
             BufferedResponse::None => {}
         }
         if buffered == BufferedResponse::CompleteWhileOutboundFull {
@@ -3498,18 +3553,49 @@ mod tests {
             assert_eq!(routine.session.outbound_capacity(), 0);
         }
         let mut running = Box::pin(routine.run());
-        if buffered == BufferedResponse::AlreadyProcessing {
+        if matches!(
+            buffered,
+            BufferedResponse::AlreadyProcessing | BufferedResponse::MalformedBlockAlreadyProcessing
+        ) {
             // Poll until the body leaves the frame queue and waits for local
             // capacity. Cancellation must not turn that wait into a peer fault.
             assert!(futures::poll!(running.as_mut()).is_pending());
-            assert_eq!(in_send.capacity(), 3);
+            assert_eq!(
+                in_send.capacity(),
+                if buffered == BufferedResponse::MalformedBlockAlreadyProcessing {
+                    4
+                } else {
+                    3
+                }
+            );
         }
         if let Some(failure) = failure {
             cause.record(failure);
         }
         cancel.cancel();
+        if failure.is_some() && !held_capacity.is_empty() {
+            assert!(
+                futures::poll!(running.as_mut()).is_pending(),
+                "a failed stream must retain its unvalidated response until decode capacity returns"
+            );
+            assert!(work.in_flight_contains(block::Height(1)));
+            assert!(budget.reserved() > 0);
+            assert!(sequencer_recv.try_recv().is_err());
+            assert!(!registry.is_peer_parked(&peer, Instant::now()));
+            if buffered == BufferedResponse::ResetDuringBackpressure {
+                budget.clone().release(work.reset_above(block::Height(0)));
+                view_tx.send_modify(|view| view.reset_epoch += 1);
+            }
+            drop(held_capacity);
+        }
         let result = timeout(Duration::from_secs(1), running).await.unwrap();
-        if buffered == BufferedResponse::Malformed {
+        if matches!(
+            buffered,
+            BufferedResponse::Malformed
+                | BufferedResponse::MalformedBlock
+                | BufferedResponse::MalformedBlockBackpressured
+                | BufferedResponse::MalformedBlockAlreadyProcessing
+        ) {
             assert!(matches!(result, Err(SinkReject::Protocol(_))), "{result:?}");
             assert!(!registry.is_peer_parked(&peer, Instant::now()));
         } else if failure.is_some()
@@ -3549,13 +3635,17 @@ mod tests {
             assert!(!registry.is_peer_parked(&peer, Instant::now()));
         }
         assert_eq!(budget.reserved(), 0);
-        let received = matches!(
-            buffered,
-            BufferedResponse::Complete | BufferedResponse::CompleteWhileOutboundFull
-        );
+        let received = failure.is_some()
+            && matches!(
+                buffered,
+                BufferedResponse::Complete
+                    | BufferedResponse::CompleteWhileOutboundFull
+                    | BufferedResponse::Backpressured
+                    | BufferedResponse::AlreadyProcessing
+            );
         assert_eq!(
             work.pending_contains(block::Height(1)),
-            unanswered && !received
+            unanswered && !received && buffered != BufferedResponse::ResetDuringBackpressure
         );
         assert_eq!(work.in_flight_contains(block::Height(1)), received);
         assert_eq!(sequencer_recv.try_recv().is_ok(), received);

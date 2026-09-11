@@ -715,7 +715,11 @@ impl Service for BlockSyncService {
                             run_cancel,
                             wiring.trace,
                         );
-                        routine.run().await
+                        tokio::select! {
+                            biased;
+                            () = connection_cancel_token.cancelled() => Ok(()),
+                            result = routine.run() => result,
+                        }
                     }
                     None => drain_inbound(recv, run_cancel).await,
                 };

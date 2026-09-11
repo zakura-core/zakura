@@ -986,6 +986,11 @@ impl HeaderSyncReactor {
                     VctRepairRetry::supplier(source, HeaderRequestTerminal::SessionReplaced),
                 );
             }
+            let source = source_id_from_peer(&peer);
+            if let Some(task) = self.vct_repair.current_mut() {
+                task.forget_source(source);
+            }
+            self.rotate_vct_supplier(source);
         } else {
             self.vct_supplier_order.push_back(peer.clone());
         }

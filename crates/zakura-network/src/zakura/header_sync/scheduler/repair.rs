@@ -257,11 +257,19 @@ impl RepairRequirement {
         Ok(())
     }
 
+    /// Forget one supplier's failure history when its session is replaced.
+    ///
+    /// Durable semantic exclusions remain in the repair context and committed state.
+    pub fn forget_source(&mut self, source: SourceId) {
+        self.tried_sources.remove(&source);
+        self.excluded_input_sources.remove(&source);
+        self.busy_sources.remove(&source);
+    }
+
     /// Forget supplier identities that no longer have a live session.
     ///
     /// Durable state retains rejected and disputed semantic input. The reactor only needs the
-    /// identity sets to prevent repeated requests to a supplier while that supplier stays
-    /// connected.
+    /// identity sets to prevent repeated requests within a supplier's current session.
     pub fn retain_connected_sources(&mut self, connected_sources: &HashSet<SourceId>) {
         self.tried_sources
             .retain(|source| connected_sources.contains(source));

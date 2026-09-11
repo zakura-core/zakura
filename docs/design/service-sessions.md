@@ -118,6 +118,12 @@ its session. Block sync settles that failure against unanswered download work,
 including when cancellation wins over receiving EOF. Local cancellation alone
 does not charge the peer for a stall.
 
+Buffered block responses retain their bounded raw frames until decode capacity
+is available, even after a remote session failure. Block sync validates those
+responses before settling unanswered work, so malformed payloads cannot bypass
+peer rejection during local backpressure. Connection shutdown still cancels the
+pending validation and releases the session.
+
 The transport reports session exit after every worker and reader finishes.
 Reopening follows the service's policy and demand. Ephemeral request completion
 does not cancel the persistent session.

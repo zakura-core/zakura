@@ -125,6 +125,7 @@ impl Fixture {
     /// Model two connections using the same node-owned queue and generation source.
     fn share_work_from(&mut self, other: &Self) {
         self.routine.work = other.routine.work.clone();
+        self.routine.budget = other.routine.budget.clone();
         self.routine.registry = other.routine.registry.clone();
         self.routine.generation = self
             .routine

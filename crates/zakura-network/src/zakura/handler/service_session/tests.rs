@@ -967,6 +967,73 @@ async fn expired_pair_cannot_reclaim_capacity_before_an_outgoing_session() -> Re
 }
 
 #[tokio::test]
+async fn duplicate_pair_offers_leave_capacity_for_other_peers() -> Result<(), BoxError> {
+    let mut fixture = RawFixture::start(2, TEST_TIMEOUT).await?;
+    let (mut sibling_send, _sibling_recv) = fixture.offer(SIBLING, None).await?;
+    let mut sibling = timeout(TEST_TIMEOUT, fixture.siblings.recv())
+        .await?
+        .ok_or("missing sibling")?;
+    let (mut sibling_recv, _sibling_send) = sibling.take_stream(SIBLING.kind).unwrap();
+    let (_data_send, mut data_recv) = fixture.offer(DATA, Some(1)).await?;
+    let (mut request_send, _request_recv) = fixture.offer(REQUESTS, Some(1)).await?;
+    let mut active = Session::receive(&mut fixture.sessions).await?;
+    assert_eq!(fixture.capacity().available_permits(), 1);
+
+    // Either role can arrive first, but neither may reserve a second session.
+    for stream in [DATA, REQUESTS] {
+        let (_duplicate_send, mut duplicate_recv) = fixture.offer(stream, Some(2)).await?;
+        assert!(timeout(
+            Duration::from_secs(2),
+            duplicate_recv.read_exact(&mut [0; 1])
+        )
+        .await
+        .expect("duplicate offers must be rejected before the setup deadline")
+        .is_err());
+        assert_eq!(fixture.capacity().available_permits(), 1);
+        let other_peer = fixture
+            .service
+            .reserve_session(ServicePeerDirection::Inbound)?;
+        assert_eq!(fixture.capacity().available_permits(), 0);
+        drop(other_peer);
+
+        let request = frame(1, 7, 8);
+        request_send
+            .write_all(&request.encode(REQUESTS.frame_cap)?)
+            .await?;
+        assert_eq!(
+            timeout(TEST_TIMEOUT, active.request_recv.recv()).await?,
+            Some(request)
+        );
+        let response = frame(2, 8, 64);
+        timeout(TEST_TIMEOUT, active.data_send.send(response.clone())).await??;
+        assert_eq!(
+            read_frame(
+                &mut data_recv,
+                DATA.frame_cap,
+                &[],
+                None,
+                TEST_TIMEOUT,
+                Some(TEST_TIMEOUT),
+            )
+            .await?,
+            response
+        );
+        let ping = frame(3, 9, 8);
+        sibling_send
+            .write_all(&ping.encode(SIBLING.frame_cap)?)
+            .await?;
+        assert_eq!(
+            timeout(TEST_TIMEOUT, sibling_recv.recv()).await?,
+            Some(ping)
+        );
+        assert!(!active.cancel.is_cancelled());
+        assert!(!sibling.cancel_token().is_cancelled());
+        assert!(fixture.sessions.try_recv().is_err());
+    }
+    fixture.close().await
+}
+
+#[tokio::test]
 async fn paired_replacement_during_cleanup_preserves_the_connection() -> Result<(), BoxError> {
     let mut fixture = RawFixture::start(2, Duration::from_secs(3)).await?;
     let (mut sibling_send, _sibling_recv) = fixture.offer(SIBLING, None).await?;
@@ -979,39 +1046,28 @@ async fn paired_replacement_during_cleanup_preserves_the_connection() -> Result<
     let old = Session::receive(&mut fixture.sessions).await?;
 
     let (mut _new_data_send, mut new_data_recv) = fixture.offer(DATA, Some(2)).await?;
-    fixture.wait_for_slots(0, TEST_TIMEOUT).await?;
-    let (mut new_requests_send, mut _new_requests_recv) = fixture.offer(REQUESTS, None).await?;
+    assert!(timeout(
+        Duration::from_secs(1),
+        new_data_recv.read_exact(&mut [0; 1])
+    )
+    .await?
+    .is_err());
+    assert_eq!(fixture.capacity().available_permits(), 1);
+    let (mut new_requests_send, _new_requests_recv) = fixture.offer(REQUESTS, None).await?;
     // Keep the new setup read pending while the old pair's workers exit.
     tokio::time::sleep(Duration::from_millis(200)).await;
     old_data.0.reset(0u32.into())?;
     old_data.1.stop(0u32.into())?;
     old_requests.0.reset(0u32.into())?;
     old_requests.1.stop(0u32.into())?;
-    new_requests_send.write_all(&2u64.to_le_bytes()).await?;
     timeout(TEST_TIMEOUT, old.cancel.cancelled()).await?;
     let old_id = old.id;
     drop(old);
-    let mut byte = [0; 1];
-    let first_offer = tokio::select! {
-        session = Session::receive(&mut fixture.sessions) => Some(session?),
-        closed = new_data_recv.read_exact(&mut byte) => {
-            assert!(closed.is_err());
-            None
-        }
-    };
-    let mut replacement = match first_offer {
-        Some(session) => session,
-        None => {
-            assert!(
-                !sibling.cancel_token().is_cancelled(),
-                "a raced offer must not close the connection"
-            );
-            fixture.wait_for_slots(2, TEST_TIMEOUT).await?;
-            (_new_data_send, new_data_recv) = fixture.offer(DATA, Some(3)).await?;
-            (new_requests_send, _new_requests_recv) = fixture.offer(REQUESTS, Some(3)).await?;
-            Session::receive(&mut fixture.sessions).await?
-        }
-    };
+    fixture.wait_for_slots(2, TEST_TIMEOUT).await?;
+    new_requests_send.write_all(&2u64.to_le_bytes()).await?;
+    fixture.wait_for_slots(1, TEST_TIMEOUT).await?;
+    (_new_data_send, new_data_recv) = fixture.offer(DATA, Some(2)).await?;
+    let mut replacement = Session::receive(&mut fixture.sessions).await?;
     assert_ne!(replacement.id, old_id);
 
     let request = frame(1, 7, 8);

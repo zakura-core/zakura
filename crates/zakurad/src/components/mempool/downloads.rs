@@ -167,6 +167,7 @@ pub enum TransactionDownloadVerifyError {
     Invalid {
         error: zakura_consensus::error::TransactionError,
         advertiser_addr: Option<PeerSocketAddr>,
+        tip_height: Option<Height>,
     },
 
     #[error("transaction was served by a peer in a transaction cooldown")]
@@ -565,7 +566,7 @@ where
             // Hide the transaction data to avoid filling the logs
             trace!(?txid, result = ?result.as_ref().map(|_tx| ()), "verified transaction for the mempool");
 
-            result.map_err(|e| TransactionDownloadVerifyError::Invalid { error: e.into(), advertiser_addr } )
+            result.map_err(|e| TransactionDownloadVerifyError::Invalid { error: e.into(), advertiser_addr, tip_height } )
         }
         .map_ok(|(tx, spent_mempool_outpoints, tip_height)| {
             metrics::counter!(

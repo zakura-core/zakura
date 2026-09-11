@@ -2,7 +2,7 @@
 
 use std::sync::{
     atomic::{AtomicU8, Ordering},
-    Arc,
+    Arc, Weak,
 };
 
 use tokio_util::sync::CancellationToken;
@@ -37,6 +37,13 @@ impl RequestWriteStatus {
             .compare_exchange(QUEUED, EXPIRED, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
+}
+
+/// Keep the write disposition readable while the last owner is being dropped.
+#[derive(Debug)]
+pub(super) struct RequestWriteRegistration {
+    pub(super) claim: Weak<RequestWrite>,
+    pub(super) status: RequestWriteStatus,
 }
 
 /// One exact attempt owns its provisional budget until publication. Afterwards
@@ -105,12 +112,13 @@ impl RequestWrite {
             item.provisional = false;
         }
         inner.reserved_bytes = inner.reserved_bytes.saturating_add(self.estimated_bytes);
-        inner
-            .request_writes
-            .retain(|_, claim| claim.strong_count() > 0);
-        inner
-            .request_writes
-            .insert(self.owner, Arc::downgrade(self));
+        inner.request_writes.insert(
+            self.owner,
+            RequestWriteRegistration {
+                claim: Arc::downgrade(self),
+                status: self.status(),
+            },
+        );
         self.state.store(QUEUED, Ordering::Release);
         publish();
         true
@@ -196,6 +204,8 @@ impl Drop for RequestWrite {
             }
             WRITTEN => {}
             state => {
+                #[cfg(test)]
+                tests::before_drop_cleanup();
                 self.expire_unwritten();
                 if state == STARTED {
                     self.cancel.cancel();
@@ -207,6 +217,7 @@ impl Drop for RequestWrite {
                         self.items.iter().map(|(height, _)| *height),
                     );
                 self.budget.release(released.released_bytes);
+                self.work.lock().request_writes.remove(&self.owner);
             }
         }
     }

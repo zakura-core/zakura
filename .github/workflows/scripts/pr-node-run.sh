@@ -56,8 +56,8 @@ else
   df -h /mnt/snapshots
 fi
 
-# This branch is a disposable harness. The binaries still come from the exact PR head.
-[ "$SHA" = "e3328340aa040971681ed222a5bfc63fe43d8991" ] || { echo "wrong PR head" >&2; exit 1; }
+# Each diagnostic source is resolved to an exact commit by the workflow.
+[[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "expected full diagnostic SHA" >&2; exit 1; }
 [ "$MODE" = "tip" ] && [ "$NETWORK" = "mainnet" ] && [ "$P2P_STACK" = "dual" ] || {
   echo "paired smoke requires tip/mainnet/dual for the seed" >&2; exit 1;
 }
@@ -83,6 +83,7 @@ GIT_AUTH=$(printf 'x-access-token:%s' "${GH_CLONE_TOKEN}" | base64 -w0)
 git -c http.extraheader="AUTHORIZATION: basic ${GIT_AUTH}" \
   fetch --no-tags origin "${REFSPEC}"
 git checkout --detach "${SHA}"
+[ "$(git rev-parse HEAD)" = "$SHA" ] || exit 1
 rm -f /root/run.env
 unset GH_CLONE_TOKEN GIT_AUTH
 

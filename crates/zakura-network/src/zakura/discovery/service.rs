@@ -17,16 +17,16 @@ use std::{
     time::Duration,
 };
 
-use iroh::NodeId;
+use iroh::EndpointId;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::zakura::{
     handle_pipe_exit, spawn_supervised_peer_task, spawn_supervised_pipe, BlockSyncHandle,
     CloseCause, Event, Flow, Frame, FramedRecv, FramedSend, HeaderSyncHandle, OrderedSendError,
-    OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPolicy, Peer, PeerStreamSession, Pipe,
-    Service, ServiceAdmissionDecision, ServicePeerDirection, SinkReject, Stream, StreamMode,
-    ZakuraConnId, ZakuraPeerId, LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_DISCOVERY,
+    Peer, PeerStreamSession, Pipe, Service, ServiceAdmissionDecision, ServicePeerDirection,
+    SessionDemand, SessionOpening, SessionPolicy, SinkReject, Stream, StreamMode, ZakuraConnId,
+    ZakuraPeerId, LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_DISCOVERY,
 };
 
 #[cfg(test)]
@@ -47,7 +47,7 @@ const DISCOVERY_SERVICE_STREAMS: [Stream; 1] = [Stream {
     version: ZAKURA_DISCOVERY_STREAM_VERSION,
     frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
     capability: ZAKURA_CAP_DISCOVERY,
-    mode: StreamMode::Ordered,
+    mode: StreamMode::Persistent,
 }];
 
 /// Service-declared streams for native discovery.
@@ -99,7 +99,7 @@ impl DiscoveryPeerSession {
         &self,
         limit: u16,
         wanted_services: Vec<ZakuraServiceId>,
-        exclude_node_ids: Vec<NodeId>,
+        exclude_node_ids: Vec<EndpointId>,
     ) -> Result<(), OrderedSendError> {
         self.try_send_message(DiscoveryMessage::GetPeers {
             limit,
@@ -305,20 +305,20 @@ impl Service for DiscoveryService {
         discovery_streams()
     }
 
-    fn ordered_stream_policy(&self, _kind: u16) -> OrderedStreamPolicy {
-        OrderedStreamPolicy {
-            opening: OrderedStreamOpening::InitiatorOnly,
+    fn session_policy(&self) -> SessionPolicy {
+        SessionPolicy {
+            opening: SessionOpening::InitiatorOnly,
             reopen: true,
         }
     }
 
-    fn ordered_session_demand(
+    fn session_demand(
         &self,
         conn_id: ZakuraConnId,
         peer: &ZakuraPeerId,
         _negotiated: u64,
         direction: ServicePeerDirection,
-    ) -> OrderedSessionDemand {
+    ) -> SessionDemand {
         if self
             .session_states
             .lock()
@@ -326,7 +326,7 @@ impl Service for DiscoveryService {
             .get(&(peer.clone(), conn_id))
             .is_some_and(|record| record.state == DiscoverySessionState::Retired)
         {
-            return OrderedSessionDemand::Retire;
+            return SessionDemand::Retire;
         }
 
         let mut peers = self.handle.subscribe_peer_snapshot();
@@ -336,14 +336,14 @@ impl Service for DiscoveryService {
             ServicePeerDirection::Outbound => snapshot.outbound_slots_free,
         };
         if slots_free == 0 {
-            return OrderedSessionDemand::WaitForChange(Box::pin(async move {
+            return SessionDemand::WaitForChange(Box::pin(async move {
                 if peers.changed().await.is_err() {
                     std::future::pending::<()>().await;
                 }
             }));
         }
 
-        OrderedSessionDemand::OpenNow
+        SessionDemand::OpenNow
     }
 
     fn wants_peer(
@@ -504,7 +504,7 @@ struct DiscoveryExchangeStart {
     header_sync: Option<HeaderSyncHandle>,
     block_sync: Option<BlockSyncHandle>,
     connection_owners: Vec<Arc<dyn Service>>,
-    peer_node_id: NodeId,
+    peer_node_id: EndpointId,
     discovery_session: DiscoveryPeerSession,
     conn_id: ZakuraConnId,
     session_id: u64,
@@ -635,7 +635,7 @@ struct DiscoverySink {
     handle: ZakuraDiscoveryHandle,
     header_sync: Option<HeaderSyncHandle>,
     block_sync: Option<BlockSyncHandle>,
-    peer_node_id: NodeId,
+    peer_node_id: EndpointId,
     session: DiscoveryPeerSession,
     conn_id: ZakuraConnId,
     session_id: u64,
@@ -1000,9 +1000,9 @@ fn discovery_exchange_interval(record_refresh_interval: Duration) -> Duration {
 
 /// Returns the iroh node id encoded by a discovery peer id, if it is a 32-byte
 /// node id.
-fn node_id_from_peer_id(peer_id: &ZakuraPeerId) -> Option<NodeId> {
+fn node_id_from_peer_id(peer_id: &ZakuraPeerId) -> Option<EndpointId> {
     let bytes: [u8; 32] = peer_id.as_bytes().try_into().ok()?;
-    NodeId::from_bytes(&bytes).ok()
+    EndpointId::from_bytes(&bytes).ok()
 }
 
 /// A peer-hello import error that should be logged and ignored rather than
@@ -1633,7 +1633,7 @@ mod tests {
     fn discovery_sink_for_session(
         handle: &ZakuraDiscoveryHandle,
         peer_id: &ZakuraPeerId,
-        peer_node_id: NodeId,
+        peer_node_id: EndpointId,
         conn_id: ZakuraConnId,
         session_id: u64,
     ) -> (DiscoverySink, FramedRecv) {
@@ -1970,13 +1970,13 @@ mod tests {
         );
         assert_eq!(record.state, DiscoverySessionState::Retired);
         assert!(matches!(
-            service.ordered_session_demand(
+            service.session_demand(
                 0,
                 &peer_id,
                 ZAKURA_CAP_DISCOVERY,
                 ServicePeerDirection::Inbound,
             ),
-            OrderedSessionDemand::Retire,
+            SessionDemand::Retire,
         ));
         Ok(())
     }
@@ -2313,13 +2313,13 @@ mod tests {
         // A finished discovery-only exchange retires the session so the handler
         // cannot reopen the stream while the connection tears down.
         assert!(matches!(
-            service.ordered_session_demand(
+            service.session_demand(
                 0,
                 &peer_id,
                 ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_BLOCK_SYNC,
                 ServicePeerDirection::Inbound,
             ),
-            OrderedSessionDemand::Retire,
+            SessionDemand::Retire,
         ));
         wait_for_discovery_inbound_peers(&handle, 0).await;
 
@@ -2557,13 +2557,13 @@ mod tests {
         // The refresh loop still owns this session.
         // The handler must keep the stream eligible.
         assert!(!matches!(
-            service.ordered_session_demand(
+            service.session_demand(
                 0,
                 &peer_id,
                 ZAKURA_CAP_DISCOVERY | ZAKURA_CAP_HEADER_SYNC,
                 ServicePeerDirection::Inbound,
             ),
-            OrderedSessionDemand::Retire,
+            SessionDemand::Retire,
         ));
 
         connection_cancel.cancel();

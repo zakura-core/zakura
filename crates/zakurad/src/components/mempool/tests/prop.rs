@@ -4,10 +4,11 @@
 
 use std::{env, fmt, sync::Arc};
 
+use proptest::strategy::ValueTree;
 use proptest::{collection::vec, prelude::*};
 use proptest_derive::Arbitrary;
 
-use chrono::Duration;
+use chrono::{Duration, Utc};
 use tokio::time;
 use tower::{
     buffer::Buffer,
@@ -29,7 +30,7 @@ use zs::CheckpointVerifiedBlock;
 
 use crate::components::{
     mempool::tests::standard_verified_unmined_tx_strategy,
-    mempool::{config::Config, Mempool},
+    mempool::{config::Config, Mempool, MAX_ESTIMATED_DISTANCE_TO_ENABLE},
     sync::{RecentSyncLengths, SyncStatus},
 };
 
@@ -256,12 +257,196 @@ proptest! {
     }
 }
 
+#[tokio::test]
+async fn mempool_waits_for_estimated_tip_distance_when_sync_lengths_are_small() {
+    let network = Network::Mainnet;
+    let (
+        mut mempool,
+        _peer_set,
+        _state_service,
+        _state_guard,
+        _tx_verifier,
+        mut recent_syncs,
+        mut chain_tip_sender,
+    ) = setup(&network);
+
+    chain_tip_sender.set_finalized_tip(Some(chain_tip_with_estimated_distance(
+        &network,
+        MAX_ESTIMATED_DISTANCE_TO_ENABLE + 1,
+        1,
+    )));
+
+    SyncStatus::sync_close_to_tip(&mut recent_syncs);
+    mempool.dummy_call().await;
+
+    assert!(
+        !mempool.is_enabled(),
+        "mempool must stay disabled when the syncer looks caught up but the tip estimate is far"
+    );
+}
+
+#[tokio::test]
+async fn mempool_enables_and_disables_using_estimated_tip_distance_hysteresis() {
+    let network = Network::Mainnet;
+    let (
+        mut mempool,
+        _peer_set,
+        _state_service,
+        _state_guard,
+        _tx_verifier,
+        mut recent_syncs,
+        mut chain_tip_sender,
+    ) = setup(&network);
+    let between_thresholds = MAX_ESTIMATED_DISTANCE_TO_ENABLE + 1;
+    let beyond_disable_threshold = i64::from(zs::MAX_BLOCK_REORG_HEIGHT) + 1;
+
+    chain_tip_sender.set_finalized_tip(Some(chain_tip_with_estimated_distance(&network, 0, 1)));
+
+    SyncStatus::sync_close_to_tip(&mut recent_syncs);
+    mempool.dummy_call().await;
+    assert!(mempool.is_enabled());
+
+    chain_tip_sender.set_finalized_tip(Some(chain_tip_with_estimated_distance(
+        &network,
+        between_thresholds,
+        2,
+    )));
+
+    mempool.dummy_call().await;
+    assert!(
+        mempool.is_enabled(),
+        "an active mempool must stay enabled until the estimate exceeds the reorg window"
+    );
+
+    chain_tip_sender.set_finalized_tip(Some(chain_tip_with_estimated_distance(
+        &network,
+        beyond_disable_threshold,
+        3,
+    )));
+
+    mempool.dummy_call().await;
+    assert!(
+        !mempool.is_enabled(),
+        "mempool must disable after the estimated tip distance exceeds the reorg window"
+    );
+
+    chain_tip_sender.set_finalized_tip(Some(chain_tip_with_estimated_distance(
+        &network,
+        between_thresholds,
+        4,
+    )));
+
+    mempool.dummy_call().await;
+    assert!(
+        !mempool.is_enabled(),
+        "a disabled mempool must stay disabled until the estimate is within the enable threshold"
+    );
+}
+
 fn genesis_chain_tip() -> Option<ChainTipBlock> {
     zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
         .zcash_deserialize_into::<Arc<Block>>()
         .map(CheckpointVerifiedBlock::from)
         .map(ChainTipBlock::from)
         .ok()
+}
+
+#[tokio::test]
+async fn sparse_testnet_mempool_stays_enabled() {
+    for network in [
+        Network::new_default_testnet(),
+        Network::new_regtest(Default::default()),
+    ] {
+        let (mut mempool, _peers, _state, _guard, _verifier, mut syncs, _tip_sender) =
+            setup(&network);
+        SyncStatus::sync_close_to_tip(&mut syncs);
+        mempool.dummy_call().await;
+        assert!(
+            mempool.is_enabled(),
+            "an old testnet tip must allow activation"
+        );
+        SyncStatus::sync_far_from_tip(&mut syncs);
+        mempool.dummy_call().await;
+        assert!(
+            mempool.is_enabled(),
+            "an old testnet tip must not disable the mempool"
+        );
+    }
+}
+
+#[tokio::test]
+async fn activation_uses_the_decision_that_consumed_the_tip() {
+    let network = Network::Mainnet;
+    let (mut mempool, _peers, _state, _guard, _verifier, mut syncs, mut tip_sender) =
+        setup(&network);
+    tip_sender.set_finalized_tip(Some(chain_tip_with_estimated_distance(&network, 0, 1)));
+    SyncStatus::sync_close_to_tip(&mut syncs);
+    let should_start = mempool.is_caught_up_to_start();
+    assert!(should_start);
+    let action = mempool.chain_tip_change.last_tip_change();
+    SyncStatus::sync_far_from_tip(&mut syncs);
+    assert!(mempool.update_state(action.as_ref(), should_start));
+    assert!(mempool.is_enabled());
+    SyncStatus::sync_close_to_tip(&mut syncs);
+    mempool.dummy_call().await;
+    assert!(mempool.is_enabled());
+}
+
+#[tokio::test]
+async fn disabling_mempool_notifies_subscribers() {
+    let network = Network::Mainnet;
+    let (mut mempool, _peers, _state, _guard, _verifier, mut syncs, mut tip_sender) =
+        setup(&network);
+    tip_sender.set_finalized_tip(Some(chain_tip_with_estimated_distance(&network, 0, 1)));
+    SyncStatus::sync_close_to_tip(&mut syncs);
+    mempool.dummy_call().await;
+
+    let mut runner = proptest::test_runner::TestRunner::deterministic();
+    let transaction = standard_verified_unmined_tx_strategy()
+        .new_tree(&mut runner)
+        .expect("test transaction can be generated")
+        .current();
+    let tx_id = transaction.transaction.id();
+    mempool
+        .storage()
+        .insert(transaction, Vec::new(), None)
+        .expect("test transaction is accepted");
+    let mut subscriber = mempool.transaction_sender.subscribe();
+    tip_sender.set_finalized_tip(Some(chain_tip_with_estimated_distance(
+        &network,
+        i64::from(zs::MAX_BLOCK_REORG_HEIGHT) + 1,
+        2,
+    )));
+    mempool.dummy_call().await;
+    assert!(!mempool.is_enabled());
+    assert_eq!(
+        subscriber
+            .try_recv()
+            .expect("disable emits an invalidation"),
+        zakura_node_services::mempool::MempoolChange::invalidated([tx_id].into())
+    );
+    mempool.dummy_call().await;
+    assert!(
+        subscriber.try_recv().is_err(),
+        "disable emits only one invalidation"
+    );
+}
+
+fn chain_tip_with_estimated_distance(
+    network: &Network,
+    distance: block::HeightDiff,
+    hash_byte: u8,
+) -> ChainTipBlock {
+    let mut tip = genesis_chain_tip().expect("genesis chain tip should deserialize");
+    tip.height = block::Height(3_000_000 + u32::from(hash_byte));
+    tip.hash = block::Hash([hash_byte; 32]);
+    tip.previous_block_hash = block::Hash([hash_byte.saturating_sub(1); 32]);
+
+    let target_spacing = NetworkUpgrade::target_spacing_for_height(network, tip.height);
+    let distance_i32 = i32::try_from(distance).expect("test distance fits in i32");
+    tip.time = Utc::now() - target_spacing * distance_i32;
+
+    tip
 }
 
 /// Create a new [`Mempool`] instance using mocked services.

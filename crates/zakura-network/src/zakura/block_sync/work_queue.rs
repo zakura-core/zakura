@@ -101,6 +101,17 @@ impl WorkQueueInner {
     fn estimate_bytes(&self, estimate: BlockSizeEstimate) -> u64 {
         estimate_bytes_with(estimate, self.floor_estimate_bytes)
     }
+
+    fn owner_for_height(
+        &self,
+        height: block::Height,
+    ) -> Option<zakura_header_chain::BodyWorkOwner> {
+        self.pending
+            .get(&height)
+            .or_else(|| self.in_flight.get(&height))
+            .filter(|item| !item.provisional)
+            .and_then(|item| item.owner)
+    }
 }
 
 /// Compute a clamped body-size estimate from a [`BlockSizeEstimate`] hint.
@@ -1005,13 +1016,18 @@ impl WorkQueue {
         &self,
         height: block::Height,
     ) -> Option<zakura_header_chain::BodyWorkOwner> {
+        self.lock().owner_for_height(height)
+    }
+
+    /// Filter height metadata against current owners under one queue lock.
+    /// `Copy` prevents removed values from dropping request resources under the lock.
+    pub(super) fn retain_owned<T: Copy>(
+        &self,
+        entries: &mut Vec<(block::Height, T)>,
+        owner_of: impl Fn(&T) -> zakura_header_chain::BodyWorkOwner,
+    ) {
         let inner = self.lock();
-        inner
-            .pending
-            .get(&height)
-            .or_else(|| inner.in_flight.get(&height))
-            .filter(|item| !item.provisional)
-            .and_then(|item| item.owner)
+        entries.retain(|(height, entry)| inner.owner_for_height(*height) == Some(owner_of(entry)));
     }
 
     pub(super) fn pending_contains(&self, height: block::Height) -> bool {

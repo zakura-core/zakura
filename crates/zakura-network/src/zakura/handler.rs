@@ -4198,7 +4198,10 @@ async fn persistent_stream_worker_with_policy(
                                 result = inbound_tx.send(frame) => result,
                             };
                             if forwarded.is_err() {
-                                break;
+                                // Local receiver closure leaves retained senders and
+                                // queued writes alive. Keep bounded ingress checks and
+                                // real peer-close detection until the writers retire.
+                                continue;
                             }
                             // Queue depth is capped by the negotiated u16 limit, so
                             // this integer is exactly representable as f64.

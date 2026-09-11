@@ -8,6 +8,8 @@
 //! A persistent service session closes after every application stream handle is
 //! dropped and each member's queued writes finish. A retained receiver or sender
 //! clone keeps the session alive. Transport failures still cancel all members.
+//! After an application receiver closes, incoming frames still pass transport
+//! checks and are discarded until the session retires.
 
 use tokio::sync::mpsc;
 

@@ -23,6 +23,12 @@ for name in ["/root/out/notes.md","/root/out/seed-priming/summary.json","/root/o
 p=Path('/var/log/zakura/zakura.log')
 if p.exists():
     print('seed_log_tail',subprocess.check_output(['tail','-n','60',str(p)],text=True)[-15000:])
+config=Path('/etc/zakura/zakura.toml')
+if config.exists():
+    import tomllib
+    conf=tomllib.loads(config.read_text())
+    net=conf.get('network',{})
+    print('public_network_config',json.dumps({k:net.get(k) for k in ['p2p_stack','initial_mainnet_peers','peerset_initial_target_size','cache_dir','zakura']}))
 for port in [8232,18232]:
     try:
         req=urllib.request.Request(f"http://127.0.0.1:{port}",data=json.dumps({"jsonrpc":"2.0","id":"inspect","method":"getblockcount","params":[]}).encode(),headers={"Content-Type":"application/json"})

@@ -66,6 +66,78 @@ APPLY_CLASS_FULL = "full"
 LEGACY_ROUND_FINISH = "round_finish"
 LEGACY_CHECKPOINT_HANDOFF = "checkpoint_handoff"
 
+CSV_ENVELOPE_COLUMNS = ("ts", "wall_ts", "node", "process_trace_id")
+COMMIT_STATE_COLUMNS = (
+    "event",
+    "source",
+    "action",
+    "peer",
+    "reason",
+    "range_start",
+    "range_count",
+    "height",
+    "hash",
+    "apply_token",
+    "best_header_tip",
+    "elapsed_ms",
+    "result",
+    "requested_count",
+    "apply_class",
+    "local_frontier",
+    "queue_len",
+    "in_flight_count",
+)
+CSV_SCHEMAS = {
+    "commit_state": CSV_ENVELOPE_COLUMNS + COMMIT_STATE_COLUMNS + ("extra",),
+}
+NUMERIC_FIELDS = {
+    "apply_token",
+    "applying",
+    "assigned_len",
+    "best_header_tip",
+    "budget_reserved",
+    "checkpoint_height",
+    "elapsed_ms",
+    "height",
+    "in_flight_count",
+    "needed_count",
+    "new_best_header_height",
+    "new_finalized_height",
+    "new_verified_body_height",
+    "old_best_header_height",
+    "old_finalized_height",
+    "old_verified_body_height",
+    "outstanding",
+    "queue_len",
+    "range_count",
+    "range_start",
+    "reorder",
+    "request_id",
+    "requested_count",
+    "session_id",
+    "state_tip",
+    "stream_version",
+    "ts",
+    "verified_block_tip",
+}
+BOOLEAN_FIELDS = {
+    "local_frontier",
+}
+TEXT_FIELDS = {
+    "action",
+    "anchor_hash",
+    "apply_class",
+    "cause",
+    "error_kind",
+    "event",
+    "hash",
+    "process_trace_id",
+    "reason",
+    "result",
+    "source",
+    "validation_stage",
+}
+
 
 @dataclass(frozen=True)
 class TraceRow:
@@ -183,6 +255,7 @@ class OracleOptions:
     commit_trend_factor: float = COMMIT_TREND_FACTOR
     optional_lag_nodes: tuple[str, ...] = ()
     require_v7_request_ids: bool = False
+    required_commit_nodes: tuple[str, ...] = ()
 
 
 class NodeTrace:
@@ -232,13 +305,13 @@ def row_key(row: TraceRow) -> tuple[str, Any] | None:
 
     height = int_field(row.row, "height")
     block_hash = row.row.get("hash")
-    if height is not None and block_hash is not None:
+    if height is not None and isinstance(block_hash, str):
         return ("height_hash", (height, block_hash))
 
     action = row.row.get("action")
     range_start = int_field(row.row, "range_start")
     range_count = int_field(row.row, "range_count")
-    if action is not None and range_start is not None and range_count is not None:
+    if isinstance(action, str) and range_start is not None and range_count is not None:
         return ("action_range", (action, range_start, range_count))
 
     return None
@@ -257,32 +330,88 @@ def compact_row(row: TraceRow | None) -> dict[str, Any] | None:
     }
 
 
+def json_object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key: {key}")
+        value[key] = item
+    return value
+
+
+def load_json(value: str) -> Any:
+    return json.loads(value, object_pairs_hook=json_object_without_duplicates)
+
+
+def validate_trace_row(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("trace row must contain a JSON object")
+
+    event = value.get("event")
+    if not isinstance(event, str) or not event:
+        raise ValueError("trace row event must be a non-empty string")
+
+    for field in TEXT_FIELDS:
+        if field in value and value[field] is not None and not isinstance(value[field], str):
+            raise ValueError(f"trace row {field} must be a string")
+    for field in NUMERIC_FIELDS:
+        if field in value and value[field] is not None and int_field(value, field) is None:
+            raise ValueError(f"trace row {field} must be an integer")
+    for field in BOOLEAN_FIELDS:
+        if field in value and value[field] is not None and not isinstance(value[field], bool):
+            raise ValueError(f"trace row {field} must be a boolean")
+
+    return value
+
+
+def validate_csv_header(table: str, fieldnames: list[str] | None) -> tuple[str, ...]:
+    if not fieldnames:
+        raise ValueError("CSV header is missing")
+    if len(fieldnames) != len(set(fieldnames)):
+        raise ValueError("CSV header contains duplicate columns")
+
+    header = tuple(fieldnames)
+    expected = CSV_SCHEMAS.get(table)
+    if expected is not None and header != expected:
+        raise ValueError(f"CSV header does not match the {table} schema")
+    return header
+
+
 def read_jsonl(path: Path, node: str, table: str) -> list[TraceRow]:
     csv_path = path.with_suffix(".csv")
     if csv_path.exists():
         rows = []
-        numeric = {"ts", "range_start", "range_count", "height", "apply_token",
-                   "best_header_tip", "elapsed_ms", "requested_count", "local_frontier",
-                   "queue_len", "in_flight_count"}
         index = 0
         try:
             with csv_path.open(newline="", encoding="utf-8") as handle:
-                for index, record in enumerate(csv.DictReader(handle, strict=True), start=1):
+                reader = csv.DictReader(handle, strict=True)
+                header = validate_csv_header(table, reader.fieldnames)
+                for index, record in enumerate(reader, start=1):
                     if None in record or None in record.values():
                         raise ValueError("CSV row has a different field count from its header")
                     value = {}
+                    extra: dict[str, Any] = {}
                     for key, field in record.items():
                         if not field:
                             continue
                         if key == "extra":
-                            extra = json.loads(field)
+                            extra = load_json(field)
                             if not isinstance(extra, dict):
                                 raise ValueError("CSV extra field must contain a JSON object")
-                            value.update(extra)
                         else:
-                            value[key] = json.loads(field) if key in numeric else field
-                    rows.append(TraceRow(node, table, index, value))
-        except (csv.Error, ValueError) as error:
+                            value[key] = (
+                                load_json(field)
+                                if key in NUMERIC_FIELDS or key in BOOLEAN_FIELDS
+                                else field
+                            )
+                    collisions = sorted(set(header).intersection(extra))
+                    if collisions:
+                        raise ValueError(
+                            f"CSV extra field collides with columns: {', '.join(collisions)}"
+                        )
+                    value.update(extra)
+                    rows.append(TraceRow(node, table, index, validate_trace_row(value)))
+        except (csv.Error, RecursionError, ValueError) as error:
             rows.append(TraceRow(node, table, index + 1, {
                 "event": "csv_decode_error", "path": str(csv_path), "error": str(error),
             }))
@@ -297,8 +426,8 @@ def read_jsonl(path: Path, node: str, table: str) -> list[TraceRow]:
             if not line:
                 continue
             try:
-                value = json.loads(line)
-            except json.JSONDecodeError as error:
+                value = validate_trace_row(load_json(line))
+            except (RecursionError, ValueError) as error:
                 rows.append(
                     TraceRow(
                         node,
@@ -313,8 +442,7 @@ def read_jsonl(path: Path, node: str, table: str) -> list[TraceRow]:
                     )
                 )
                 continue
-            if isinstance(value, dict):
-                rows.append(TraceRow(node, table, index, value))
+            rows.append(TraceRow(node, table, index, value))
     return rows
 
 
@@ -341,7 +469,9 @@ def load_traces(root: Path) -> list[NodeTrace]:
                 "header_sync": read_jsonl(trace_dir / "header_sync.jsonl", node, "header_sync"),
                 "legacy_sync": read_jsonl(trace_dir / "legacy_sync.jsonl", node, "legacy_sync"),
             }
-            if any(tables.values()):
+            if any(tables.values()) or any(
+                trace_dir.joinpath(name).exists() for name in trace_files()
+            ):
                 nodes.append(NodeTrace(node, tables))
 
     return nodes
@@ -422,6 +552,21 @@ def check_commit_pairs(node: NodeTrace, options: OracleOptions) -> list[Failure]
             failures.append(failure(node, "commit_stalled_not_terminal", stalled, {"key": key}))
 
     failures.extend(check_commit_latency_trend(node, options))
+    return failures
+
+
+def check_required_commit_evidence(node: NodeTrace) -> list[Failure]:
+    rows = node.table("commit_state")
+    if not rows:
+        return [failure(node, "commit_state_has_events", None, {})]
+
+    failures: list[Failure] = []
+    for event, invariant in (
+        (COMMIT_START, "commit_state_has_commit_start"),
+        (COMMIT_FINISH, "commit_state_has_commit_finish"),
+    ):
+        if not node.events("commit_state", event):
+            failures.append(failure(node, invariant, rows[0], {}))
     return failures
 
 
@@ -899,11 +1044,20 @@ def run_oracle(root: Path, options: OracleOptions = OracleOptions()) -> list[Fai
                 failures.append(failure(node, "trace_jsonl_is_valid", row, {}))
             elif row.event == "csv_decode_error":
                 failures.append(failure(node, "trace_csv_is_valid", row, {}))
+        if node.node in options.required_commit_nodes:
+            failures.extend(check_required_commit_evidence(node))
         failures.extend(check_commit_pairs(node, options))
         failures.extend(check_frontiers(node))
         failures.extend(check_block_sync_activity(node, options))
         if node.node not in options.optional_lag_nodes:
             failures.extend(check_header_recovery(node, options))
+
+    loaded_nodes = {node.node for node in nodes}
+    for required_node in options.required_commit_nodes:
+        if required_node not in loaded_nodes:
+            failures.append(
+                Failure(required_node, "commit_state_has_events", None, {"root": str(root)})
+            )
 
     if options.require_handoff_boundary:
         failures.extend(check_checkpoint_to_full_handoff(nodes, options))
@@ -1074,7 +1228,14 @@ def run_self_test() -> None:
         write_jsonl(
             good / "commit_state.jsonl",
             [
-                {"ts": 1, "event": COMMIT_START, "apply_token": 1, "height": 1, "hash": "aa"},
+                {
+                    "ts": 1,
+                    "event": COMMIT_START,
+                    "apply_token": 1,
+                    "height": 1,
+                    "hash": "aa",
+                    "local_frontier": True,
+                },
                 {"ts": 2, "event": COMMIT_FINISH, "apply_token": 1, "height": 1, "hash": "aa"},
                 {
                     "ts": 3,
@@ -1743,11 +1904,20 @@ def run_self_test() -> None:
         jsonl_path = good / "commit_state.jsonl"
         original = read_jsonl(jsonl_path, "node1", "commit_state")
         with jsonl_path.with_suffix(".csv").open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=["ts", "event", "height", "hash", "extra"])
+            writer = csv.DictWriter(handle, fieldnames=CSV_SCHEMAS["commit_state"])
             writer.writeheader()
             for row in original:
                 values = dict(row.row)
-                record = {key: values.pop(key) for key in writer.fieldnames[:-1] if key in values}
+                record = {}
+                for key in writer.fieldnames[:-1]:
+                    if key not in values:
+                        continue
+                    field = values.pop(key)
+                    record[key] = (
+                        json.dumps(field)
+                        if key in NUMERIC_FIELDS or key in BOOLEAN_FIELDS
+                        else field
+                    )
                 record["extra"] = json.dumps(values)
                 writer.writerow(record)
         csv_rows = read_jsonl(jsonl_path, "node1", "commit_state")
@@ -1761,6 +1931,71 @@ def run_self_test() -> None:
                 "ts,event,height,extra\n" + record + "\n", encoding="utf-8",
             )
             assert any(f.invariant == "trace_csv_is_valid" for f in run_oracle(root / "malformed_csv"))
+
+        duplicate_json = root / "duplicate_json" / "node1"
+        duplicate_json.mkdir(parents=True)
+        (duplicate_json / "commit_state.jsonl").write_text(
+            '{"ts":1,"event":"commit_start","event":"commit_finish"}\n',
+            encoding="utf-8",
+        )
+        assert any(
+            f.invariant == "trace_jsonl_is_valid"
+            for f in run_oracle(root / "duplicate_json")
+        )
+
+        invalid_key = root / "invalid_key" / "node1"
+        write_jsonl(
+            invalid_key / "commit_state.jsonl",
+            [{"ts": 1, "event": COMMIT_START, "height": 1, "hash": ["aa"]}],
+        )
+        assert any(
+            f.invariant == "trace_jsonl_is_valid"
+            for f in run_oracle(root / "invalid_key")
+        )
+
+        nested_json = root / "nested_json" / "node1"
+        nested_json.mkdir(parents=True)
+        (nested_json / "commit_state.jsonl").write_text(
+            "[" * 20_000 + "]" * 20_000 + "\n",
+            encoding="utf-8",
+        )
+        assert any(
+            f.invariant == "trace_jsonl_is_valid"
+            for f in run_oracle(root / "nested_json")
+        )
+
+        extra_collision = root / "extra_collision" / "node1"
+        extra_collision.mkdir(parents=True)
+        with (extra_collision / "commit_state.csv").open(
+            "w", newline="", encoding="utf-8"
+        ) as handle:
+            writer = csv.DictWriter(handle, fieldnames=CSV_SCHEMAS["commit_state"])
+            writer.writeheader()
+            writer.writerow(
+                {
+                    "ts": 1,
+                    "event": COMMIT_START,
+                    "extra": json.dumps({"event": COMMIT_FINISH}),
+                }
+            )
+        assert any(
+            f.invariant == "trace_csv_is_valid"
+            for f in run_oracle(root / "extra_collision")
+        )
+
+        missing_evidence = root / "missing_evidence" / "node1"
+        missing_evidence.mkdir(parents=True)
+        with (missing_evidence / "commit_state.csv").open(
+            "w", newline="", encoding="utf-8"
+        ) as handle:
+            csv.writer(handle).writerow(CSV_SCHEMAS["commit_state"])
+        assert any(
+            f.invariant == "commit_state_has_events"
+            for f in run_oracle(
+                root / "missing_evidence",
+                OracleOptions(required_commit_nodes=("node1",)),
+            )
+        )
 
     print("trace_oracle self-test: PASS")
 
@@ -1810,6 +2045,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="require header-sync v7 GetHeaders trace rows to carry nonzero request IDs",
     )
     parser.add_argument(
+        "--require-commit-node",
+        action="append",
+        default=[],
+        help="node name required to contain commit_start and commit_finish rows",
+    )
+    parser.add_argument(
         "--optional-lag-node",
         action="append",
         default=[],
@@ -1835,6 +2076,7 @@ def main(argv: list[str]) -> int:
             persistent_lag_micros=args.persistent_lag_seconds * 1_000_000,
             require_handoff_boundary=args.require_handoff_boundary,
             require_v7_request_ids=args.require_v7_request_ids,
+            required_commit_nodes=tuple(args.require_commit_node),
             handoff_stall_micros=args.handoff_stall_seconds * 1_000_000,
             commit_trend_min_ms=args.commit_trend_min_ms,
             commit_trend_factor=args.commit_trend_factor,

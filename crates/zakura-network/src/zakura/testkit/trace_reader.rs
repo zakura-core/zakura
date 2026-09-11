@@ -1,12 +1,14 @@
 //! Post-flush JSONL and CSV trace reader for Zakura tests.
 
 use std::{
+    collections::HashSet,
     fs,
     io::{self, BufRead},
     path::{Path, PathBuf},
 };
 
 use serde_json::Value;
+use zakura_jsonl_trace::{ENVELOPE_COLUMNS, EXTRA_COLUMN};
 
 /// Loaded Zakura trace tables.
 #[derive(Clone, Debug, Default)]
@@ -118,17 +120,21 @@ impl TraceReader {
         if path.extension().and_then(|ext| ext.to_str()) == Some("csv") {
             let mut reader = csv::Reader::from_path(path)?;
             let headers = reader.headers()?.clone();
+            let header_columns = validate_csv_headers(&headers)?;
             for record in reader.records() {
                 let record = record?;
                 let mut row = serde_json::Map::new();
+                let mut extra = None;
                 for (column, value) in headers.iter().zip(record.iter()) {
                     if value.is_empty() {
                         continue;
                     }
-                    if column == "extra" {
-                        let extra: serde_json::Map<String, Value> = serde_json::from_str(value)
-                            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                        row.extend(extra);
+                    if column == EXTRA_COLUMN {
+                        extra = Some(
+                            serde_json::from_str::<serde_json::Map<String, Value>>(value).map_err(
+                                |error| io::Error::new(io::ErrorKind::InvalidData, error),
+                            )?,
+                        );
                     } else {
                         // CSV carries no type metadata. Keep identity and label columns textual.
                         let value = if matches!(
@@ -161,6 +167,18 @@ impl TraceReader {
                         row.insert(column.to_owned(), value);
                     }
                 }
+                if let Some(extra) = extra {
+                    if let Some(column) = extra
+                        .keys()
+                        .find(|column| header_columns.contains(column.as_str()))
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("CSV extra field collides with column {column:?}"),
+                        ));
+                    }
+                    row.extend(extra);
+                }
                 self.rows.push(TraceRow {
                     table: table.clone(),
                     source_node: source_node.clone(),
@@ -187,6 +205,28 @@ impl TraceReader {
 
         Ok(())
     }
+}
+
+fn validate_csv_headers(headers: &csv::StringRecord) -> io::Result<HashSet<String>> {
+    let columns: HashSet<_> = headers.iter().map(ToOwned::to_owned).collect();
+    if columns.len() != headers.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "CSV header contains duplicate columns",
+        ));
+    }
+    if !headers
+        .iter()
+        .take(ENVELOPE_COLUMNS.len())
+        .eq(ENVELOPE_COLUMNS.iter().copied())
+        || headers.iter().next_back() != Some(EXTRA_COLUMN)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "CSV header is missing the trace envelope or trailing extra column",
+        ));
+    }
+    Ok(columns)
 }
 
 impl<'a> TraceQuery<'a> {
@@ -320,11 +360,24 @@ mod tests {
         let mut writer =
             csv::Writer::from_path(dir.path().join("commit_state.csv")).expect("CSV file");
         writer
-            .write_record(["node", "event", "height", "hash", "reason", "extra"])
+            .write_record([
+                "ts",
+                "wall_ts",
+                "node",
+                "process_trace_id",
+                "event",
+                "height",
+                "hash",
+                "reason",
+                "extra",
+            ])
             .expect("header");
         writer
             .write_record([
+                "1",
+                "2026-09-11T00:00:00Z",
                 "01",
+                "process-1",
                 "commit_finish",
                 "42",
                 "1234",
@@ -344,6 +397,50 @@ mod tests {
                 ("new_count", TraceValue::U64(7)),
             ],
         );
+    }
+
+    #[test]
+    fn reader_rejects_duplicate_csv_columns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("commit_state.csv"),
+            "ts,wall_ts,node,process_trace_id,event,event,extra\n",
+        )
+        .expect("trace file");
+
+        let error = TraceReader::load(dir.path()).expect_err("duplicate header must fail");
+        assert!(error.to_string().contains("duplicate columns"));
+    }
+
+    #[test]
+    fn reader_rejects_csv_extra_collisions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut writer =
+            csv::Writer::from_path(dir.path().join("commit_state.csv")).expect("CSV file");
+        writer
+            .write_record([
+                "ts",
+                "wall_ts",
+                "node",
+                "process_trace_id",
+                "event",
+                "extra",
+            ])
+            .expect("header");
+        writer
+            .write_record([
+                "1",
+                "2026-09-11T00:00:00Z",
+                "01",
+                "process-1",
+                "commit_start",
+                r#"{"event":"commit_finish"}"#,
+            ])
+            .expect("row");
+        writer.flush().expect("flush");
+
+        let error = TraceReader::load(dir.path()).expect_err("extra collision must fail");
+        assert!(error.to_string().contains("collides with column"));
     }
 
     #[test]

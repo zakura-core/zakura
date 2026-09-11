@@ -369,6 +369,8 @@ run_trace_oracle() {
     "--commit-elapsed-ms" "${ZAKURA_E2E_ORACLE_COMMIT_ELAPSED_MS:-1800000}"
     "--persistent-lag-seconds" "${ZAKURA_E2E_ORACLE_PERSISTENT_LAG_SECONDS:-180}"
     "--handoff-stall-seconds" "${ZAKURA_E2E_ORACLE_HANDOFF_STALL_SECONDS:-180}"
+    "--require-commit-node" "node2"
+    "--require-commit-node" "node4"
   )
   if [[ "${ZAKURA_E2E_REQUIRE_HANDOFF}" == "1" ]]; then
     oracle_args+=("--require-handoff-boundary")

@@ -1,5 +1,6 @@
-use std::pin::Pin;
+use std::{pin::Pin, sync::Arc};
 
+use chrono::Utc;
 use proptest::prelude::*;
 use tower::ServiceExt;
 
@@ -14,11 +15,13 @@ use crate::{
 };
 use zakura_chain::{
     amount::{Amount, NonNegative},
-    parameters::NetworkKind,
+    block::{self, Height},
+    parameters::{Network, NetworkKind},
     transaction::{Transaction, UnminedTx, VerifiedUnminedTx},
     transparent::{self, Address},
 };
 use zakura_node_services::mempool::QueueSource;
+use zakura_state::{ChainTipBlock, ChainTipSender};
 
 mod prop;
 mod vector;
@@ -43,6 +46,7 @@ fn transaction_error_peer_log_labels_require_explicit_opt_in() {
     let error = TransactionDownloadVerifyError::Invalid {
         error: zakura_consensus::error::TransactionError::WrongVersion,
         advertiser_addr: Some("192.0.2.1:8233".parse().expect("valid test socket")),
+        tip_height: None,
     };
 
     assert_eq!(
@@ -76,10 +80,40 @@ impl Mempool {
     ///
     /// Requires a chain tip action to enable the mempool before the future resolves.
     pub async fn enable(&mut self, recent_syncs: &mut RecentSyncLengths) {
+        // Most mempool tests use old fixed chain vectors and only need an
+        // active mempool. Keep those tests independent from wall-clock tip
+        // estimates; dedicated tests cover the non-debug activation gate.
+        self.debug_enable_at_height = Some(Height(0));
         // Pretend we're close to tip
         SyncStatus::sync_close_to_tip(recent_syncs);
         // Make a dummy request to poll the mempool and make it enable itself
         self.dummy_call().await;
+    }
+
+    /// Replace the mempool's chain tip with a tip whose block time is now.
+    ///
+    /// The mempool only scores peer misbehavior while the estimated distance to
+    /// the network tip is small, and the old fixed chain vectors are always far
+    /// behind. Keep the returned sender alive for as long as the mempool runs.
+    pub fn use_current_chain_tip(&mut self, network: &Network) -> ChainTipSender {
+        let (mut chain_tip_sender, latest_chain_tip, chain_tip_change) =
+            ChainTipSender::new(None, network);
+        chain_tip_sender.set_finalized_tip(Some(ChainTipBlock {
+            hash: block::Hash([1; 32]),
+            height: self
+                .chain_tip_change
+                .best_tip_height()
+                .expect("test state has a tip"),
+            time: Utc::now(),
+            transactions: Vec::new(),
+            transaction_hashes: Arc::new([]),
+            previous_block_hash: block::Hash([0; 32]),
+        }));
+
+        self.latest_chain_tip = latest_chain_tip;
+        self.chain_tip_change = chain_tip_change;
+
+        chain_tip_sender
     }
 
     /// Pretend the synchronization is far from the tip and poll the mempool.

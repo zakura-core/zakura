@@ -802,7 +802,7 @@ async fn paired_roles_reject_wrong_messages_before_reading_payloads() -> Result<
         let (_, mut recv) = timeout(DEADLINE, streams.recv()).await?.unwrap();
         assert!(matches!(timeout(Duration::from_secs(1), read_frame(
             &mut recv, role.frame_cap, service.message_payload_limits(role), service.message_types(role),
-            Duration::from_secs(5), None,
+            service.allowed_frame_flags(role), Duration::from_secs(5), None,
         )).await?, Err(ZakuraHandlerError::InvalidMessageType(kind)) if kind == message));
         connection.close(0u32.into(), b"checked");
     }

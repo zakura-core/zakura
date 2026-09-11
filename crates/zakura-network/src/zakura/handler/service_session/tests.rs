@@ -1012,6 +1012,7 @@ async fn duplicate_pair_offers_leave_capacity_for_other_peers() -> Result<(), Bo
                 DATA.frame_cap,
                 &[],
                 None,
+                u16::MAX,
                 TEST_TIMEOUT,
                 Some(TEST_TIMEOUT),
             )
@@ -1086,6 +1087,7 @@ async fn paired_replacement_during_cleanup_preserves_the_connection() -> Result<
             DATA.frame_cap,
             &[],
             None,
+            u16::MAX,
             TEST_TIMEOUT,
             Some(TEST_TIMEOUT)
         )
@@ -1118,6 +1120,7 @@ fn raw_worker_context(client: &Endpoint, slots: Arc<Semaphore>) -> StreamWorkerC
         inbound_frame_cap: DATA.frame_cap,
         message_payload_limits: &[],
         message_types: None,
+        allowed_frame_flags: u16::MAX,
         queue_depths: None,
         write_policy: StreamWritePolicy::UntilCancelled,
         session_resources: None,
@@ -1256,6 +1259,7 @@ async fn request_response_allowlists_reject_headers_before_payloads() -> Result<
         stream,
         &[],
         types,
+        u16::MAX,
         42,
         LEGACY_REQUEST_PING,
         0,
@@ -1269,6 +1273,7 @@ async fn request_response_allowlists_reject_headers_before_payloads() -> Result<
             stream.frame_cap,
             &[],
             types,
+            u16::MAX,
             TEST_TIMEOUT,
             Some(TEST_TIMEOUT),
         )
@@ -1736,6 +1741,7 @@ async fn application_receive_half_or_sender_clone_keeps_session_alive() -> Resul
                         DATA.frame_cap,
                         &[],
                         None,
+                        u16::MAX,
                         TEST_TIMEOUT,
                         Some(TEST_TIMEOUT)
                     )
@@ -1802,6 +1808,7 @@ async fn abandoned_application_drains_queued_writes_before_retirement() -> Resul
                     DATA.frame_cap,
                     &[],
                     None,
+                    u16::MAX,
                     TEST_TIMEOUT,
                     Some(TEST_TIMEOUT)
                 )

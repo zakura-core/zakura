@@ -9029,21 +9029,22 @@ mod tests {
             )
             .spawn();
         let client = LocalEndpointFactory::new().endpoint(89_611).await?;
-        let connection = timeout(
-            Duration::from_secs(5),
-            client.connect(
-                LocalEndpointFactory::node_addr(router.endpoint()).await,
-                ALPN,
-            ),
-        )
-        .await??;
 
         for (flags, payload_len, allowed_flags) in [
             (0u16, 2_000_002u32, registry.allowed_frame_flags(stream)),
             (1, 1, registry.allowed_frame_flags(stream)),
             // A custom mask accepts bits independently and rejects unlisted bits.
             (4, 1, 3),
+            (3, 1, 3),
         ] {
+            let connection = timeout(
+                Duration::from_secs(5),
+                client.connect(
+                    LocalEndpointFactory::node_addr(router.endpoint()).await,
+                    ALPN,
+                ),
+            )
+            .await??;
             let (mut send, _) = timeout(Duration::from_secs(2), connection.open_bi()).await??;
             let header = [
                 3u16.to_le_bytes().as_slice(),
@@ -9052,6 +9053,9 @@ mod tests {
             ]
             .concat();
             timeout(Duration::from_secs(2), send.write_all(&header)).await??;
+            if flags == 3 {
+                timeout(Duration::from_secs(2), send.write_all(&[7])).await??;
+            }
             let (_, mut recv) = timeout(Duration::from_secs(2), stream_rx.recv())
                 .await?
                 .ok_or("capture handler closed")?;
@@ -9078,14 +9082,15 @@ mod tests {
                         ..
                     })
                 ));
-            } else {
+            } else if flags & !allowed_flags != 0 {
                 assert!(
                     matches!(result, Err(ZakuraHandlerError::UnsupportedFrameFlags(value)) if value == flags)
                 );
+            } else {
+                assert_eq!(result?.flags, flags);
             }
+            connection.close(0u32.into(), b"test complete");
         }
-
-        connection.close(0u32.into(), b"test complete");
         client.close().await;
         router.shutdown().await?;
         Ok(())

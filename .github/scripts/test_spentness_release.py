@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import subprocess
+import struct
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -31,9 +32,9 @@ class SpentnessReleaseTests(unittest.TestCase):
         self.bundle = self.root / "bundle"
         self.bundle.mkdir()
         self.pin = {
-            "chain_identity": [1] * 32,
+            "chain_identity": list(range(32)),
             "terminal_height": 10,
-            "terminal_block_hash": [2] * 32,
+            "terminal_block_hash": list(range(32, 64)),
             "format_version": hints.FORMAT_VERSION,
             "output_count": 9,
             "byte_len": hints.HEADER.size + 2,
@@ -42,9 +43,9 @@ class SpentnessReleaseTests(unittest.TestCase):
             hints.HEADER.pack(
                 hints.MAGIC,
                 hints.FORMAT_VERSION,
-                bytes([1] * 32),
+                bytes(self.pin["chain_identity"]),
                 10,
-                bytes([2] * 32),
+                bytes(self.pin["terminal_block_hash"]),
                 9,
             )
             + b"\x06\x01"
@@ -53,7 +54,8 @@ class SpentnessReleaseTests(unittest.TestCase):
         (self.bundle / hints.ARTIFACT).write_bytes(data)
         (self.bundle / hints.COMMITMENT).write_text(json.dumps(self.pin))
         (self.bundle / "main-checkpoints.txt").write_text(
-            "0 " + "01" * 32 + "\n10 " + "02" * 32 + "\n"
+            "0 " + bytes(self.pin["chain_identity"])[::-1].hex()
+            + "\n10 " + bytes(self.pin["terminal_block_hash"])[::-1].hex() + "\n"
         )
         self.report = {
             "schema_version": hints.SCHEMA_VERSION,
@@ -67,7 +69,7 @@ class SpentnessReleaseTests(unittest.TestCase):
         self.meta = {
             "schema_version": 2,
             "height": 10,
-            "block_hash": "02" * 32,
+            "block_hash": bytes(self.pin["terminal_block_hash"])[::-1].hex(),
             "network": "Mainnet",
             "generated_at": "2026-09-10T00:00:00Z",
             "spentness": {
@@ -97,6 +99,81 @@ class SpentnessReleaseTests(unittest.TestCase):
         self.assertIn("terminal_height: 5", compiled)
         self.assertIn("terminal_height: 10", compiled)
         self.assertNotIn("include_bytes", compiled)
+
+    def test_resealed_genesis_and_padding_fail_the_named_checks(self):
+        path = self.bundle / hints.ARTIFACT
+        header = path.read_bytes()[:hints.HEADER.size]
+        for bitmap, message in (
+            (b"\x07\x01", "retains genesis"),
+            (b"\x06\x81", "padding must be zero"),
+        ):
+            data = header + bitmap
+            pin = {**self.pin, "sha256": list(hashlib.sha256(data).digest())}
+            report = {**self.report, "commitment": pin,
+                      "survivor_count": sum(byte.bit_count() for byte in bitmap)}
+            meta = copy.deepcopy(self.meta)
+            meta["spentness"]["verification"] = report
+            meta["spentness"]["reproduced_sha256"] = bytes(pin["sha256"]).hex()
+            path.write_bytes(data)
+            (self.bundle / hints.COMMITMENT).write_text(json.dumps(pin))
+            (self.bundle / hints.VERIFICATION).write_text(json.dumps(report))
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                hints.validate_bundle(self.bundle, meta)
+
+    def importer_fixture(self):
+        importer = load_script("import-release-state")
+        repo = self.root / "repo"
+        for relative in (importer.CHECKPOINTS, importer.FRONTIER, importer.SUBTREES,
+                         importer.PROVENANCE, importer.EOS_FILE):
+            (repo / relative).parent.mkdir(parents=True, exist_ok=True)
+        genesis = (self.bundle / "main-checkpoints.txt").read_text().splitlines()[0]
+        (repo / importer.CHECKPOINTS).write_text(genesis + "\n")
+        (repo / importer.FRONTIER).write_bytes(b"old frontier")
+        (repo / importer.EOS_FILE).write_text("const ESTIMATED_RELEASE_HEIGHT: u32 = 1;\n")
+        for height, path in (
+            (0, repo / importer.SUBTREES),
+            (10, self.bundle / importer.SUBTREE_BUNDLE_NAME),
+        ):
+            prefix = importer.SUBTREE_HEADER_PREFIX.pack(b"ZKVCTST1", 1, 1, height, 0, 0, 0)
+            path.write_bytes(prefix + hashlib.sha256(prefix).digest())
+        (self.bundle / importer.FRONTIER.name).write_bytes(b"new frontier")
+        prefix = importer.FRONTIER_GRID_HEADER_PREFIX.pack(b"ZKVCTFR1", 1, 1, 1, 10, 1)
+        payload = struct.pack("<IIII", 0, 0, 0, 0)
+        (self.bundle / importer.FRONTIER_GRID_BUNDLE_NAME).write_bytes(
+            prefix + hashlib.sha256(prefix + payload).digest() + payload
+        )
+        meta_bytes = json.dumps(self.meta).encode()
+        (self.bundle / "meta.json").write_bytes(meta_bytes)
+        resolution = {
+            key: self.meta[key] for key in ("height", "block_hash", "generated_at")
+        }
+        resolution.update(meta_url="https://example.test/v2/10/meta.json",
+                          meta_sha256=hashlib.sha256(meta_bytes).hexdigest())
+        path = self.root / "resolution.json"
+        path.write_text(json.dumps(resolution))
+        return importer, repo, path
+
+    def test_schema_two_import_writes_manifest_compiled_pin_and_provenance(self):
+        importer, repo, resolution = self.importer_fixture()
+        result = importer.import_bundle(repo, self.bundle, resolution)
+        self.assertTrue(result["has_changes"])
+        manifest = json.loads((repo / hints.MANIFEST).read_text())
+        self.assertEqual(manifest["artifacts"][0]["commitment"], self.pin)
+        self.assertEqual((repo / hints.COMPILED).read_text(), hints.render_commitments(manifest))
+        provenance = json.loads((repo / importer.PROVENANCE).read_text())
+        self.assertEqual(provenance["spentness_sha256"], bytes(self.pin["sha256"]).hex())
+        self.assertFalse(importer.import_bundle(repo, self.bundle, resolution)["has_changes"])
+        with self.assertRaisesRegex(ValueError, "advance in height"):
+            hints.prepare_import(repo, self.bundle, self.meta)
+
+    def test_schema_two_import_requires_metadata(self):
+        importer, repo, resolution = self.importer_fixture()
+        before = (repo / importer.CHECKPOINTS).read_bytes()
+        (self.bundle / "meta.json").unlink()
+        with self.assertRaisesRegex(importer.BundleImportError, "metadata is required"):
+            importer.import_bundle(repo, self.bundle, resolution)
+        self.assertEqual((repo / importer.CHECKPOINTS).read_bytes(), before)
+        self.assertFalse((repo / hints.MANIFEST).exists())
 
     def test_artifact_mutation_truncation_and_trailing_bytes(self):
         path = self.bundle / hints.ARTIFACT

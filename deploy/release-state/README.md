@@ -148,6 +148,7 @@ deploying the same day over leaving it red for a week.
   (or the bucket was tampered with) — investigate before deleting anything.
 - `another release-state publisher is already running`: wait for the active
   timer or manual publication to finish before retrying.
+
 ## Spentness artifacts
 
 The publisher now writes schema 2 bundles with external spentness artifacts.

@@ -849,6 +849,8 @@ mod tests {
         frontier_grid_entries: Option<u32>,
         #[serde(default)]
         meta_sha256: Option<String>,
+        #[serde(default)]
+        spentness_sha256: Option<String>,
     }
 
     #[test]
@@ -998,6 +1000,19 @@ mod tests {
     }
 
     #[test]
+    fn mainnet_manifest_accepts_spentness_provenance() {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(MAINNET_VCT_MANIFEST).expect("embedded manifest is JSON");
+        let digest = hex::encode([0x5a; 32]);
+        value["spentness_sha256"] = digest.clone().into();
+        let manifest: MainnetVctManifest =
+            serde_json::from_value(value.clone()).expect("schema-2 import provenance must parse");
+        assert_eq!(manifest.spentness_sha256.as_deref(), Some(digest.as_str()));
+        value["unexpected_field"] = true.into();
+        assert!(serde_json::from_value::<MainnetVctManifest>(value).is_err());
+    }
+
+    #[test]
     fn embedded_mainnet_final_frontiers_parse() {
         let frontiers = embedded_final_frontiers(&Network::Mainnet)
             .expect("mainnet has embedded final frontiers");
@@ -1015,6 +1030,15 @@ mod tests {
         );
         assert_eq!(provenance.schema_version, 1);
         assert_eq!(provenance.network, "Mainnet");
+        if let Some(digest) = &provenance.spentness_sha256 {
+            let commitment =
+                zakura_chain::parameters::spentness_hints::release_commitments(&Network::Mainnet)
+                    .last()
+                    .expect("spentness provenance must have a compiled commitment");
+            assert_eq!(digest, &hex::encode(commitment.sha256));
+            assert_eq!(commitment.terminal_height, provenance.finalized_height);
+            assert_eq!(block::Hash(commitment.terminal_block_hash), finalized_hash);
+        }
         // All three grid fields or none: a half-written record would let the file and the
         // manifest disagree about which artifact is committed.
         let grid_fields = [

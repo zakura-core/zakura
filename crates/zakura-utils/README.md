@@ -243,6 +243,7 @@ You can override the binaries the script calls using these environmental variabl
 - `$ZCASH_CLI`
 - `$DIFF`
 - `$JQ`
+
 # Spentness maintenance
 
 Build `zakura-spentness` with `--features zakura-spentness`. Its `replay`,

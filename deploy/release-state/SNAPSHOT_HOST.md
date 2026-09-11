@@ -236,6 +236,7 @@ incident. Keep bootstrap and current R2 objects intact, so GitHub safely takes t
 when no newer bundle is available. A publisher run mutates nothing on the host beyond its own
 lock file and a temporary staging directory, so an interrupted run needs no container recovery.
 Preserve the service journal.
+
 # Spentness generation
 
 The schema 2 publisher requires a second independently synchronized archive source.

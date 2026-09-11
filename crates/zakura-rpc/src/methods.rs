@@ -225,6 +225,7 @@ pub(crate) const RPC_METHOD_ACCESS: &[(&str, RpcAccess)] = &[
     ("getblockhash", RpcAccess::Unauthenticated),
     ("getblocktemplate", RpcAccess::Unauthenticated),
     ("submitblock", RpcAccess::Unauthenticated),
+    ("submitsolution", RpcAccess::Unauthenticated),
     ("getmininginfo", RpcAccess::Unauthenticated),
     ("getnetworksolps", RpcAccess::Unauthenticated),
     ("getnetworkhashps", RpcAccess::Unauthenticated),

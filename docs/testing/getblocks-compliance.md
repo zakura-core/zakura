@@ -17,39 +17,55 @@ older layout text.
 
 ## Compliance branch results
 
-On 2026-09-11, the expanded 95-test profile ran locally over compliance
-implementation `8abca3e9c` in [#971](https://github.com/zakura-core/zakura/pull/971),
-using Rust 1.97.0, 64 generated cases, seed 896, and four load rounds. It reported
-**57 passed and 38 failed**. Framing fixes resolved four original witnesses.
-Bounded nested decoding now also resolves the missing-transaction allocation
-witness. All four newly added generated tests pass, with no new failure relative
-to the earlier 39-failure baseline. The subsequent local connection-close change
-retains the same 38-failure set.
+On 2026-09-11, property revision `6b4d4d949` includes compliance implementation
+`9d5161004` from [#971](https://github.com/zakura-core/zakura/pull/971).
+Local Rust 1.97.0 runs use 64 generated cases, seed 896, and four load rounds.
 
-Repeated no-progress stalls now use a shared local connection-close outcome
-without a protocol-fault cause. Ordinary local delivery failures keep the
-connection open. Twenty focused transport and buffered-response regressions pass.
-This change does not yet preserve all outstanding response authorizations.
+| Profile | Result |
+| --- | --- |
+| Compliance | 99 passed, 1 failed across 100 tests |
+| Generated properties | 33 passed across 33 tests |
+| Fixed regressions | 432 passed, 1 failed across 433 tests |
 
-The shared slice decoder carries actual input bounds through transactions,
-scripts, proof byte strings, and external-count arrays. The added properties
-measure allocations before incomplete collection rejection, exercise capacity
-growth edges, and compare complete generated transactions against streaming
-results. The allocation minima are encoded independently in the tests.
+The only failing witness in both profiles is T02 with two paused sibling
+streams. Their occupied receive windows still prevent the independent service
+frame from arriving before resumption. T01 now completes both directions and
+consumes all endings after worker and output pressure. Real checkpoint-verifier,
+storage ownership, allocation, and current bounded-load controls pass.
 
-The generated profile last reported 30 passed and three failed across 33 tests
-after the bounded-decoder change. It was not rerun for the local-close change.
-The fixed profile now includes the local-close classification regressions and
-reports 152 passed and seven failed across 159 tests. Those failures are the five known ending-consumption
-regressions plus the T01 and T02 transport witnesses. Network/test all-target
-Clippy with warnings denied passes. The production branch also passes 159
-selected chain regressions and six serialization doc tests.
+The receiver now retains original response credit through local expiry, finality,
+reset, and reassignment. It checks the next authorized header before handler
+capacity or full Block decoding, consumes actual object and byte counts, and
+keeps protocol slots until a valid ending. Locally undrainable authorization
+requires connection closure without a peer fault. Numeric Status ceilings remain
+fixed within the connection. Availability updates preserve existing credit.
 
-No retries or expected-failure markers are used. Nextest flagged one passing
-replay control as leaky in the generated run. That control passed without the
-flag in an isolated diagnostic run. The original observation remains in the log. The long transport
-qualification and 64-round load gates have not been rerun. Authorization,
-response-byte, terminal-consumption, and connection-headroom work remain open.
+Five additional receiver tests cover current ownership after reassignment,
+queued-only cancellation, first and repeated withheld-ending stalls, availability
+changes, and both directions of all three numeric ceiling changes. Fixtures share
+node work and byte budgets with distinct session generations. T01 keeps the same
+numeric limits that its connection initially advertised.
+
+The fixed regression migration preserves its test functions and original work
+invariants with legal exchanges. Reordering uses separate requests, retries finish
+their old exchange or use another connection, and rejected duplicates must leave
+accepted work intact. Two bounded fork/reset replays also found and now guard
+scheduling errors: preferring a server for the wrong height, or preferring a
+server whose retained authorization forbids requesting that height again.
+
+Network/test all-target Clippy with warnings denied passes. Formatting, Markdown
+lint, whitespace, and changelog checks pass. The final runs had no retry, ignored
+failure, or leak classification. Earlier runs did flag passing replay and service
+capacity tests as leaky, and one intermediate fork fixture was slow. Those
+observations remain in the execution logs. The known macOS linker unwind-size
+warning also remains.
+
+This is not full compliance or activation qualification. Shared authorization
+metadata bounds, same-connection session replacement races, real discovery and
+future subscription response adapters, and funded transport headroom remain
+open. The 2,048-case, 64-round load, and long transport gates have not been rerun.
+The earlier decoder stage separately passed 159 chain regressions and six
+serialization doc tests.
 
 ## Initial results
 

@@ -172,6 +172,11 @@ def main():
     deadline = time.monotonic() + args.duration_minutes * 60
     stderr = (OUT / "downloader-console.log").open("a")
     try:
+        preparation = json.loads((OUT.parent / "seed-priming/summary.json").read_text())
+        if preparation["verdict"] != "ok":
+            raise RuntimeError("seed priming did not pass")
+        result.update(seed_preparation=preparation, seed_vct_fast_sync=False,
+                      downloader_vct_fast_sync=True)
         actual = subprocess.check_output(["git", "-C", "/root/zakura", "rev-parse", "HEAD"], text=True).strip()
         if actual != EXPECTED_SHA:
             raise RuntimeError(f"unexpected tested source revision: {actual}")

@@ -139,7 +139,10 @@ mod common;
 use std::{
     cmp::Ordering,
     collections::HashSet,
-    env, fs, panic,
+    env, fs,
+    net::SocketAddr,
+    panic,
+    path::Path,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -168,7 +171,7 @@ use zakura_chain::{
 use zakura_node_services::rpc_client::RpcRequestClient;
 use zakura_rpc::{
     client::{
-        BlockTemplateResponse, DefaultRoots, GetBlockTemplateParameters,
+        BlockTemplateResponse, DefaultRoots, GetBlockHashResponse, GetBlockTemplateParameters,
         GetBlockTemplateRequestMode, GetBlockTemplateResponse, SubmitBlockErrorResponse,
         SubmitBlockResponse, TransactionTemplate,
     },
@@ -4439,6 +4442,41 @@ async fn wake_debug_mempool(rpc_client: &RpcRequestClient) -> Result<()> {
     Ok(())
 }
 
+/// Generates blocks through a cookie-authenticated test RPC listener.
+async fn generate_with_cookie(
+    rpc_address: SocketAddr,
+    cookie_path: &Path,
+    num_blocks: u32,
+) -> Result<Vec<GetBlockHashResponse>> {
+    let cookie = fs::read_to_string(cookie_path)
+        .wrap_err_with(|| format!("failed to read RPC cookie at {}", cookie_path.display()))?;
+    let (username, password) = cookie
+        .trim()
+        .split_once(':')
+        .ok_or_else(|| eyre!("RPC cookie does not contain basic-auth credentials"))?;
+    let response = reqwest::Client::builder()
+        .timeout(EXTENDED_LAUNCH_DELAY)
+        .build()?
+        .post(format!("http://{rpc_address}"))
+        .basic_auth(username, Some(password))
+        .header("Content-Type", "application/json")
+        .body(format!(
+            r#"{{"jsonrpc":"2.0","method":"generate","params":[{num_blocks}],"id":123}}"#
+        ))
+        .send()
+        .await?
+        .text()
+        .await?;
+
+    let mut response: serde_json::Map<String, Value> = serde_json::from_str(&response)?;
+    if let Some(error) = response.remove("error").filter(|error| !error.is_null()) {
+        return Err(eyre!("generate RPC failed: {error}"));
+    }
+
+    serde_json::from_value(response.remove("result").unwrap_or(Value::Null))
+        .wrap_err("generate RPC response did not contain block hashes")
+}
+
 /// Check that Zebra will disconnect from misbehaving peers.
 ///
 /// In order to simulate a misbehaviour peer we start two zakurad instances:
@@ -4500,6 +4538,17 @@ async fn disconnects_from_misbehaving_peers() -> Result<()> {
     let rpc_listen_addr = config.rpc.listen_addr.unwrap();
     let rpc_client_1 = RpcRequestClient::new_with_timeout(rpc_listen_addr, EXTENDED_LAUNCH_DELAY);
     let node_1_listen_addr = config.network.listen_addr;
+    let admin_rpc_listen_addr = loop {
+        let address = format!("127.0.0.1:{}", random_known_port()).parse()?;
+        if address != rpc_listen_addr && address != node_1_listen_addr {
+            break address;
+        }
+    };
+    let rpc_cookie_dir = tempfile::tempdir()?;
+    config.rpc.admin_listen_addr = Some(admin_rpc_listen_addr);
+    config.rpc.cookie_dir = rpc_cookie_dir.path().to_path_buf();
+    config.rpc.cookie_file_name = "admin.cookie".to_string();
+    let rpc_cookie_path = config.rpc.cookie_dir.join(&config.rpc.cookie_file_name);
 
     tracing::info!(
         ?rpc_listen_addr,
@@ -4546,6 +4595,7 @@ async fn disconnects_from_misbehaving_peers() -> Result<()> {
     config.network.initial_testnet_peers = [node_1_listen_addr.to_string()].into();
     config.network.listen_addr = "127.0.0.1:0".parse()?;
     config.rpc.listen_addr = Some(format!("127.0.0.1:{}", random_known_port()).parse()?);
+    config.rpc.admin_listen_addr = None;
     config.network.crawl_new_peer_interval = Duration::from_secs(5);
     config.network.cache_dir = false.into();
     config.state.ephemeral = true;
@@ -4600,7 +4650,7 @@ async fn disconnects_from_misbehaving_peers() -> Result<()> {
         // two remaining hashes to select a prospective tip.
         tracing::info!("committed genesis block, mining blocks with invalid PoW");
         tokio::time::sleep(Duration::from_secs(2)).await;
-        rpc_client_1.generate(3).await?;
+        generate_with_cookie(admin_rpc_listen_addr, &rpc_cookie_path, 3).await?;
 
         tokio::time::timeout(test_type.zakurad_timeout(), async {
             loop {

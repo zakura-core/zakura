@@ -120,6 +120,10 @@ for timeouts even if the write has not finished.
 This applies to both routine expiry and the central floor watchdog. The watchdog
 MUST decide avoidance from the write disposition captured during settlement,
 atomically against writer startup.
+If a competing body makes a queued request unwritable, receipt MUST retire that
+request immediately, return its remaining unsent work, and remove its peer
+obligation without waiting for the writer. The received body keeps its owner
+until the sequencer consumes it.
 
 For example, suppose B takes four seconds to send each 2 MiB block. If A queues
 block 101 behind block 100, block 101 needs eight seconds of transfer allowance,

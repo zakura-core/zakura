@@ -57,7 +57,7 @@ else
 fi
 
 # This branch is a disposable harness. The binaries still come from the exact PR head.
-[ "$SHA" = "71e93477b2e9cd240c5181e5bf3ef281227967c4" ] || { echo "wrong PR head" >&2; exit 1; }
+[ "$SHA" = "ab4a68521f1a3161537c1f3003c1bc2cce1f05ef" ] || { echo "wrong PR head" >&2; exit 1; }
 [ "$MODE" = "tip" ] && [ "$NETWORK" = "mainnet" ] && [ "$P2P_STACK" = "dual" ] || {
   echo "paired smoke requires tip/mainnet/dual for the seed" >&2; exit 1;
 }
@@ -151,7 +151,7 @@ metrics_endpoint = "127.0.0.1:9999"
 [nodes.zakura]
 listen_addr = "127.0.0.1:8234"
 bootstrap_peers = []
-dev_network = "header-serving-retry-20260911"
+dev_network = "header-serving-stability-20260911"
 trace_dir = "/var/log/zakura/seed-traces"
 TOML
 
@@ -287,7 +287,7 @@ if not pair['pass']:
 (root/'summary.json').write_text(json.dumps(summary,indent=2)+'\n')
 with (root/'summary.md').open('a') as f:
     f.write('\n## Paired mainnet smoke\n\n')
-    f.write('Two full nodes on one disposable host. The seed follows public mainnet over legacy P2P. The downloader uses only the PR 945 native protocol over QUIC.\n\n')
+    f.write('Two full nodes on one disposable host. The seed follows public mainnet over legacy P2P. The downloader uses only native QUIC.\n\n')
     f.write('Result: '+('PASS' if pair['pass'] else 'FAIL')+'\n\n')
     for phase in pair['phases']:
         f.write(f"- {phase['phase']}: height {phase['start_height'] if 'start_height' in phase else pair['start_height']} to {phase['height']}, {phase['native_bodies']} native bodies, matching block hash {phase['block_hash']}\n")

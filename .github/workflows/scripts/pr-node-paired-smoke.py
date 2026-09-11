@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run an isolated PR 945 downloader against the disposable mainnet seed."""
+"""Exercise stable header serving with two full nodes and live mainnet data."""
 
 import argparse
 import json
@@ -10,8 +10,8 @@ import time
 import urllib.request
 from pathlib import Path
 
-EXPECTED_SHA = "71e93477b2e9cd240c5181e5bf3ef281227967c4"
-COHORT = "header-serving-retry-20260911"
+EXPECTED_SHA = "ab4a68521f1a3161537c1f3003c1bc2cce1f05ef"
+COHORT = "header-serving-stability-20260911"
 OUT = Path("/root/out/paired")
 SEED_RPC = "http://127.0.0.1:8232"
 CLIENT_RPC = "http://127.0.0.1:18232"
@@ -138,6 +138,7 @@ def run_phase(proc, name, start, needed, deadline):
             text = metrics(19999)
             sample["native_bodies"] = metric(text, "sync_block_body_received")
             sample["native_requests"] = metric(text, "sync_block_request_sent")
+            sample["vct_fast_blocks"] = metric(text, "state_vct_fast_block_count")
             sample["legacy_fallbacks"] = metric(text, "sync_zakura_legacy_fallback_engaged")
             if sample["legacy_fallbacks"]:
                 raise AssertionError("native-only downloader used a legacy fallback")
@@ -198,10 +199,11 @@ def main():
             return subprocess.Popen([BINARY, "-c", str(config), "start"], stdout=stderr, stderr=stderr)
 
         proc = launch()
-        first = run_phase(proc, "initial-sync", start, 32, min(deadline - 300, time.monotonic() + 900))
+        first = run_phase(proc, "sync-while-serving", start, 512, min(deadline - 120, time.monotonic() + 600))
+        if first["vct_fast_blocks"] < 64:
+            raise RuntimeError("the downloader did not exercise VCT fast verification")
         result["phases"].append(first)
         stop(proc)
-        # Read persisted height after shutdown so startup work cannot fake restart progress.
         stopped_tip = subprocess.check_output(
             [BINARY, "-c", str(config), "tip-height", "--cache-dir", str(args.state),
              "--network", "Mainnet"], text=True, stderr=subprocess.STDOUT, timeout=120,
@@ -209,31 +211,34 @@ def main():
         restart_start = int(re.findall(r"^([0-9]+)$", stopped_tip, re.MULTILINE)[-1])
         emit("restarting", persisted_height=restart_start)
         proc = launch()
-        second = run_phase(proc, "restart-sync", restart_start, 1, deadline)
+        second = run_phase(proc, "restart-sync", restart_start, 64, deadline)
         result["phases"].append(second)
-        stop(proc)
-        proc = None
-        # Reconnect while the seed is advancing, as in the observed failure.
-        seed_before = rpc(SEED_RPC, "getblockcount")
-        seed_deadline = min(deadline - 320, time.monotonic() + 300)
-        observed_advance = False
-        while time.monotonic() < seed_deadline:
-            height = rpc(SEED_RPC, "getblockcount")
-            if height >= seed_before + 250:
-                observed_advance = True
-                emit("seed_advanced_before_reconnect", start=seed_before, height=height)
-                break
-            time.sleep(2)
-        result["advancing_seed_observed"] = observed_advance
-        emit("continuation_start", seed_advanced=observed_advance)
-        proc = launch()
-        third = run_phase(proc, "continued-sync", second["height"], 32,
-                          min(deadline, time.monotonic() + 300))
-        result["phases"].append(third)
-        checkpoint = int(Path("/root/zakura/crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt").read_text().splitlines()[-1].split()[0])
-        crossed = run_phase(proc, "checkpoint-crossing", checkpoint, 1,
-                            min(deadline, time.monotonic() + 300))
-        result["phases"].append(crossed)
+        trace = []
+        for line in Path("/var/log/zakura/seed-traces/header_sync.jsonl").open():
+            try: trace.append(json.loads(line))
+            except ValueError: pass
+        latest_process = trace[-1]["process_trace_id"]
+        trace = [r for r in trace if r.get("process_trace_id") == latest_process]
+        connected = next(r["ts"] for r in trace if r["event"] == "header_peer_connected")
+        snapshots = [r for r in trace if r["event"] == "header_snapshot_observed" and r["ts"] >= connected]
+        latest = None
+        across_updates = []
+        successes_during_updates = 0
+        for row in trace:
+            if row["event"] == "header_snapshot_observed": latest = row
+            if row["event"] != "header_response_served" or latest is None: continue
+            if snapshots and row["ts"] < snapshots[-1]["ts"]:
+                successes_during_updates += 1
+                if row["header_generation"] < latest["header_generation"]:
+                    across_updates.append({"request_id": row["request_id"], "target_hash": row["target_hash"],
+                        "request_generation": row["header_generation"], "current_generation": latest["header_generation"],
+                        "header_count": row["header_count"], "ts": row["ts"]})
+        result["serving_evidence"] = {"snapshot_updates": len(snapshots),
+            "successful_responses_while_advancing": successes_during_updates,
+            "successful_responses_across_generation_changes": across_updates,
+            "busy_replies": sum(r["event"] == "header_outcome" and r.get("outcome") == "busy" for r in trace)}
+        if len(snapshots) < 100 or not across_updates:
+            raise RuntimeError("the capture did not prove serving across ongoing head updates")
         stop(proc)
         proc = None
         stderr.flush()

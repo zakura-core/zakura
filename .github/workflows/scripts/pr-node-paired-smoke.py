@@ -101,6 +101,7 @@ vct_fast_sync = true
 [tracing]
 log_file = "/root/out/paired/downloader.log"
 use_color = false
+filter = "info,zakura_consensus::block=trace,zakura_consensus::transaction=trace,zakura_state::service=debug"
 '''
 
 
@@ -169,7 +170,7 @@ def run_phase(proc, name, start, needed, deadline, *, minimum_height=0, minimum_
             emit("sample", **sample)
             last_print = now
         time.sleep(10)
-    raise RuntimeError(f"{name} did not verify {needed} new native blocks before its deadline")
+    raise RuntimeError(f"{name} did not meet its progress, handoff and VCT gates before its deadline: {sample}")
 
 
 def main():

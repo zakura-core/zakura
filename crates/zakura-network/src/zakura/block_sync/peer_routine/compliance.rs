@@ -35,6 +35,15 @@ impl Fixture {
     }
 
     fn for_peer(start: u32, count: u32, peer_byte: u8) -> Self {
+        Self::with_initial_status(start, count, peer_byte, None)
+    }
+
+    fn with_initial_status(
+        start: u32,
+        count: u32,
+        peer_byte: u8,
+        initial_status: Option<BlockSyncStatus>,
+    ) -> Self {
         let blocks = fake_blocks_in_range(start, start + count - 1);
         let config = ZakuraBlockSyncConfig {
             max_blocks_per_response: 128,
@@ -103,13 +112,13 @@ impl Fixture {
             cancel,
             ZakuraTrace::noop(),
         );
-        routine.handle_status(BlockSyncStatus {
+        routine.handle_status(initial_status.unwrap_or(BlockSyncStatus {
             servable_low: block::Height(start),
             servable_high: block::Height(start + count - 1),
             max_blocks_per_response: 128,
             max_inflight_requests: 8,
             ..config.initial_status()
-        });
+        }));
         Self {
             routine,
             outbound,
@@ -1031,12 +1040,26 @@ async fn status_availability_changes_preserve_existing_response_credit() {
 #[tokio::test]
 async fn status_numeric_changes_require_local_reconnect_without_a_peer_fault() {
     for (blocks, inflight, bytes) in [
-        (127, 8, 33_554_432),
-        (128, 7, 33_554_432),
-        (128, 9, 33_554_432),
-        (128, 8, 33_554_431),
+        (3, 8, 1_048_576),
+        (5, 8, 1_048_576),
+        (4, 7, 1_048_576),
+        (4, 9, 1_048_576),
+        (4, 8, 1_048_575),
+        (4, 8, 1_048_577),
     ] {
-        let mut f = Fixture::new(100, 3);
+        let mut f = Fixture::with_initial_status(
+            100,
+            3,
+            0x47,
+            Some(BlockSyncStatus {
+                servable_low: block::Height(100),
+                servable_high: block::Height(102),
+                max_blocks_per_response: 4,
+                max_inflight_requests: 8,
+                max_response_bytes: 1_048_576,
+                ..BlockSyncStatus::default()
+            }),
+        );
         f.publish().await;
         f.body(0).await;
         f.deliver(BlockSyncMessage::Status(BlockSyncStatus {

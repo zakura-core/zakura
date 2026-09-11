@@ -1004,7 +1004,7 @@ fn raw_worker_context(client: &Endpoint, slots: Arc<Semaphore>) -> StreamWorkerC
 async fn paired_request_reader_close_interrupts_a_blocked_write() -> Result<(), BoxError> {
     let _guard = zakura_test::init();
     let (router, client, connection, remote) = raw_connection().await?;
-    for reset in [false, true] {
+    for (reset, drop_receiver) in [(false, false), (true, false), (false, true), (true, true)] {
         let (mut peer_send, mut peer_recv) = connection.open_bi().await?;
         peer_send
             .write_all(&frame(1, 0, 0).encode(DATA.frame_cap)?)
@@ -1049,6 +1049,15 @@ async fn paired_request_reader_close_interrupts_a_blocked_write() -> Result<(), 
         // the smaller QUIC windows, independently of scheduling or elapsed time.
         timeout(TEST_TIMEOUT, peer_recv.read_exact(&mut [0; 1])).await??;
         assert_eq!(resources.available_permits(), 0);
+        if drop_receiver {
+            drop(inbound_rx);
+            peer_send
+                .write_all(&frame(1, 19, 8).encode(DATA.frame_cap)?)
+                .await?;
+            assert!(timeout(Duration::from_millis(100), pair_cancel.cancelled())
+                .await
+                .is_err());
+        }
         if reset {
             peer_send.reset(0u32.into())?;
         } else {
@@ -1578,6 +1587,11 @@ async fn application_receive_half_or_sender_clone_keeps_session_alive() -> Resul
                 assert!(timeout(Duration::from_millis(100), cancel.cancelled())
                     .await
                     .is_err());
+                // Incoming traffic cannot retire a session with a retained sender.
+                peer_send.write_all(&ping.encode(DATA.frame_cap)?).await?;
+                assert!(timeout(Duration::from_millis(100), cancel.cancelled())
+                    .await
+                    .is_err());
                 timeout(TEST_TIMEOUT, clone.send(ping.clone())).await??;
                 assert_eq!(
                     read_frame(
@@ -1607,10 +1621,10 @@ async fn abandoned_application_drains_queued_writes_before_retirement() -> Resul
     for streams in [&[DATA][..], &[DATA, REQUESTS][..]] {
         let mut fixture =
             RawFixture::start_with_streams(1, Duration::from_secs(3), streams).await?;
-        let (_peer_send, mut peer_recv) = fixture
+        let (mut peer_send, mut peer_recv) = fixture
             .offer(DATA, (streams.len() > 1).then_some(72))
             .await?;
-        let _requests = if streams.len() > 1 {
+        let mut requests = if streams.len() > 1 {
             Some(fixture.offer(REQUESTS, Some(72)).await?)
         } else {
             None
@@ -1630,6 +1644,16 @@ async fn abandoned_application_drains_queued_writes_before_retirement() -> Resul
         // The empty request stream must let the data stream drain before the
         // whole session retires, even though all application handles are gone.
         drop(peer);
+        assert!(timeout(Duration::from_millis(100), cancel.cancelled())
+            .await
+            .is_err());
+        // The 64 KB QUIC window keeps data writes blocked while this frame reaches
+        // the dropped receiver, including on the otherwise idle request member.
+        let incoming = frame(1, 23, 8).encode(DATA.frame_cap)?;
+        match requests.as_mut() {
+            Some((request_send, _)) => request_send.write_all(&incoming).await?,
+            None => peer_send.write_all(&incoming).await?,
+        }
         assert!(timeout(Duration::from_millis(100), cancel.cancelled())
             .await
             .is_err());

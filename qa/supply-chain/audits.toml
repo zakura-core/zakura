@@ -172,6 +172,12 @@ criteria = "safe-to-deploy"
 version = "0.5.1"
 notes = "Reviewed all packaged source, manifest, and tests. This dependency-free no_std library performs bounded table-based Base32 encoding and decoding with no unsafe code, build script, runtime I/O, or ambient capabilities. All 19 unit tests, including QuickCheck round trips, and 1 doctest passed."
 
+[[audits.base64]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.22.1 -> 0.23.1"
+notes = "Reviewed the new SIMD implementation, feature/constructor guards, scalar encode/decode integration, padding/alphabet changes and manifest. All new unsafe is confined to SIMD: loads/stores have checked vector-width bounds, unaligned tails use unaligned writes, and CPU support is checked or required by an unsafe constructor/target cfg. Decode keeps the terminal quad in the scalar validator and falls back there on invalid vector bytes. No build script or new ambient capability; stream adapters only use caller-provided readers/writers. Ran 3,356,628 SIMD/scalar comparisons on AArch64 covering both alphabets, padding policies, vector boundaries, offsets, short outputs, malformed bytes and output canaries. AVX2 was source-reviewed, not executed."
+
 [[audits.base64ct]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -351,6 +357,12 @@ criteria = "safe-to-deploy"
 version = "1.2.66"
 notes = "Reviewed all packaged source, manifest, and tests. This crate exists to invoke a C compiler during someone else's build, so the capability is inherent; what is reviewable is whether it does anything beyond that, and it does not. It reads the documented CC, CFLAGS, AR, and target environment variables, spawns the compiler and archiver, and writes only into OUT_DIR. Compiler and flag selection comes from the target triple and the caller's configuration rather than from probing the filesystem for arbitrary binaries, and the parallel-build path coordinates through the jobserver rather than spawning without bound. All 43 tests passed with all features."
 
+[[audits.cesu8]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.1.0"
+notes = "Reviewed all source, manifest and both unchecked UTF-8 conversions. Decoder continuation/range checks restrict surrogate pairs to U+10000..U+10FFFF; the encoder slices only complete scalar boundaries from an existing str. No build script, dependencies or ambient operations. Two unit tests and five doctests pass. An additional probe round-trips all 1,112,064 Unicode scalars in both variants and checks valid UTF-8 output for all 65,536 two-byte inputs. The UTF-8 fast path is permissive, including ordinary NUL in Java mode; callers must not treat this API as a canonical-encoding validator."
+
 [[audits.cfg_aliases]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -434,6 +446,12 @@ who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
 version = "0.1.58"
 notes = "Reviewed all packaged source, manifest, and tests. Like cc, this is a build-time helper whose purpose is to run an external tool: it invokes cmake to configure and build a project the caller points it at, writing into OUT_DIR and reading the documented CMAKE, target, and profile environment variables. It has one unsafe expression, fetches nothing, and does not search the filesystem beyond the paths it is given. All 5 tests passed with all features."
+
+[[audits.cmov]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.5.4"
+notes = "Reviewed all production source, architecture backends and manifest. Inline assembly operates only on declared registers, with flags clobbered and no memory/stack access. AArch64 conditions and u16 equality mask unspecified upper bits. Casts preserve integer/NonZero/Ordering layouts and select only valid source values; slice chunk lengths are rounded down before unchecked splits and mutable halves do not overlap. Ran upstream core_impls (105 tests) and regression (4 tests), optimized, on AArch64 and separately the portable backend; all passed. Other architecture assembly was source-reviewed only. Portable timing remains best-effort as documented; no universal side-channel guarantee is asserted."
 
 [[audits.color-backtrace]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -647,6 +665,18 @@ criteria = "safe-to-deploy"
 version = "0.1.1"
 notes = "Reviewed all packaged source, manifest, and tests. XSalsa20 and XChaCha20 secret-box operations authenticate ciphertext before decryption, use typed key, nonce, and tag lengths, and delegate primitives and secret clearing to separately policy-checked dependencies. No unsafe code, build script, I/O, or ambient authority. All 6 integration tests and 3 doctests passed with all features."
 
+[[audits.ctr]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.9.2"
+notes = "Reviewed all production source, manifest, six endian/counter variants, backend dispatch and nonce ownership. No unsafe, build script or ambient operations. Counter arithmetic is deliberately wrapping; StreamCipherCore reports remaining blocks to the checked wrapper, while direct low-level block APIs require caller-controlled usage. This is unauthenticated encryption as documented. The separate cipher 0.4.4 partial-core exhaustion check has a modulo-versus-division defect and is not certified by this record; consumers of that helper need their own bound review."
+
+[[audits.ctutils]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.4.2"
+notes = "Reviewed all production implementations and manifest. No unsafe, build script or ambient operations. Choice constructors preserve 0/1; selection/equality delegate to cmov and slices visit all elements for equal public lengths. CtOption always owns an initialized value even when absent, and conversion to ordinary Option is explicitly variable-time. Caller constraints: custom traits/closures must meet timing contracts; lookup index types must represent the traversal count; signed negation excludes MIN with overflow checks. Source review only; no independent all-platform timing assessment."
+
 [[audits.curve25519-dalek]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
@@ -694,6 +724,24 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.23.0"
 notes = "Full packaged-source review: source is identical to 0.20.11 aside from package metadata; no unsafe code, build script, I/O, or ambient capabilities; derive entry points delegate generation to separately policy-checked darling_core."
+
+[[audits.data-encoding]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "2.11.0 -> 2.11.1"
+notes = "Reviewed the complete packaged delta. Only package version and author metadata change; encoding/decoding source, tests and dependencies are identical."
+
+[[audits.data-encoding-macro]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.21"
+notes = "Reviewed all packaged source and manifest. Declarative wrappers expand to byte-array constants or validated Encoding tables through data-encoding-macro-internal. No unsafe or ambient operations. All 16 unit tests and 6 doctests pass with all features."
+
+[[audits.data-encoding-macro-internal]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.19"
+notes = "Reviewed all packaged source and manifest. Parses developer-supplied literal maps, validates specifications via data-encoding, and emits numeric arrays/tables. No unsafe, build script, filesystem, network or process operations. The array declaration name is developer-supplied syntax, not runtime peer input. Verified through the public wrapper crate: 16 unit tests and 6 doctests pass."
 
 [[audits.der_derive]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -838,6 +886,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.6.1"
 notes = "Reviewed all packaged source and manifest. The procedural derive accepts only enums and generates type-checked matches that return booleans, references, mutable references, or owned fields without unsafe code. It has no build script, runtime I/O, or ambient capability, and the library target passed."
+
+[[audits.enum-assoc]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.4.1"
+notes = "Reviewed the complete production macro implementation and manifest. It parses developer-authored enum attributes/signatures/expressions and emits match arms with caller-supplied bodies/defaults. No hidden unsafe, build script, filesystem, process or network operations. Invalid developer input is a compilation error; this record does not certify arbitrary expressions supplied by a consumer."
 
 [[audits.enumflags2]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -1093,6 +1147,12 @@ criteria = "safe-to-deploy"
 version = "0.1.7"
 notes = "Reviewed all packaged source and manifest. The procedural derives parse visibility and prefix options and generate direct type-checked field borrows, clones, copies, and assignments; unsupported inputs become compile errors. There is no unsafe code, build script, runtime I/O, or ambient capability, and the all-feature library target passed."
 
+[[audits.ghash]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.5.0 -> 0.5.1"
+notes = "Reviewed the complete delta and GHASH wrapper source. The new initializer delegates a caller-supplied 128-bit starting value to Polyval; KeyInit still uses zero, preserving the existing transformation, block byte reversal, and zeroization behavior. No unsafe or ambient capabilities are added. The packaged known-answer vector passes with all features. Polyval implementation coverage remains a separate requirement."
+
 [[audits.git2]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
@@ -1181,11 +1241,29 @@ criteria = "safe-to-deploy"
 version = "0.4.1"
 notes = "Reviewed all packaged source, manifest, and tests. The zero-dependency no_std macro performs bounded const-time hex decoding; malformed literals fail during constant evaluation and no runtime capability is introduced. No unsafe code, build script, allocation, I/O, or ambient capabilities. All 8 integration tests and 4 doctests passed."
 
+[[audits.hickory-net]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.26.2"
+notes = "Reviewed both manifests, README, all 39 source files including feature-gated and test modules, and the predecessor resolver transport modules; the crate has no build script. There is no explicit unsafe, FFI or extern declaration, inline assembly, raw syscall, dynamic loading, process launch, filesystem access, or environment access, and the Android JNI manifest dependency has no source call site. Ambient capabilities are outbound and listening TCP/UDP/QUIC sockets, optional multicast membership, task and timer use, operating-system randomness, and optional platform or WebPKI trust-root access through dependencies. UDP resolver requests use per-attempt random local ports and require canonical source IP, source port, ID, and exact question-set matches; TCP and DoQ frame through 16-bit lengths, HTTP bodies stop above 65,535 bytes, multiplexed requests default to 32, and retries and timeouts bound ordinary work. TLS, QUIC, HTTP/2 and HTTP/3 delegate cryptography and certificate verification to rustls, ring and quinn, while optional DNSSEC bounds NSEC3 iterations and signature or key fanout. With Zakura's relays and external discovery disabled, the reachable Hickory network path is ordinary hostname resolution over UDP with TCP fallback; encrypted DNS, mDNS, DNSSEC, zone-transfer, dynamic-update, and server-listener APIs require other features or explicit use and are not Iroh's native peer QUIC transport. Low-level callers must keep encoded TCP writes within 65,535 bytes, send question-bearing requests, avoid sending after shutdown or polling completed futures again, and provide conforming async buffer and read contracts. Resolver consumers needing source and question validation must use UdpClientStream rather than the lower-level reusable UdpStream, which accepts datagrams from any source and exposes them for caller-side correlation. cargo +1.98.0 check --all-features --offline passed, but default and all-feature unit-test builds ran zero tests because the crates.io package omits the test_support development dependency; zero doc tests were present, and 11,808 malformed or byte-mutated DNS messages parsed without panic in the focused probe."
+
+[[audits.hickory-proto]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.25.2 -> 0.26.2"
+notes = "Reviewed the complete 0.25.2-to-0.26.2 tree diff, both manifests, README, and all 92 packaged Rust files (87 under src); the package declares build = false and contains no build script. Most of the large delta is deletion of transport, runtime, TLS, HTTP, QUIC, TCP, UDP, multicast, and DNSSEC-validation modules or relocation of substantially unchanged SerialMessage, record, TSIG, and text RDATA logic; substantive additions are access-control data structures, SMIMEA/SVCB handling, flattened errors, iterative name decoding, and bounded name encoding. RUSTSEC-2026-0119 is fixed because the encoder stores at most 64 compression candidates and tries compression for at most 120 names, bounding the former quadratic candidate search. For hickory-proto 0.26.2, RUSTSEC-2026-0118 is fixed by removal because the entire closest-encloser NSEC3 validation module and its cross-zone nonterminating loop are absent; validation now belongs outside hickory-proto and this record does not audit that downstream implementation. There are no unsafe blocks, extern/FFI declarations, raw syscalls, inline assembly, dynamic loading, sockets, subprocesses, or environment access; Android JNI and wasm bindings only convert error values, while cryptography uses dependency APIs and OS randomness supplies IDs and case randomization. Runtime filesystem capability is limited to caller-directed TrustAnchors::from_file and zone-parser $INCLUDE reads, whose nesting is capped at 256 but whose absolute and traversal paths are not sandboxed, so Zakura must keep those paths and any path-bearing zone text operator-controlled; no-std-rand users must supply a secure seed before query construction. Wire lengths, record counts, RDATA slices, labels, names, and pointer motion are checked against u16 and message bounds, and the new iterative pointer chase requires every pointer to move backward and rejects overlap; direct users of the safe but unchecked BinDecoder::clone(index) must only pass an in-buffer index. After initial offline cache misses for cc 1.2.60 and js-sys 0.3.95, cargo +1.98.0 test and cargo +1.98.0 test --all-features fetched only from crates.io and passed respectively 219 unit, 0 integration, and 46 doc tests and 304 unit, 2 integration, and 48 doc tests, all with zero failures; no-default and no-std-rand checks also passed. A release probe completed 100,000 deterministic malformed or random messages (24,711 parsed, reencoded, and reparsed), all 16,384 compression-pointer targets (1 accepted and 16,383 rejected), one 8,000-link pointer chain, and one 5,000-query encoding attempt with zero panics and a bounded oversize error; Android-specific code and non-macOS targets were not executed."
+
 [[audits.hickory-resolver]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
 version = "0.25.2"
 notes = "Reviewed all packaged source and manifest. The resolver drives hickory-proto and adds caching, connection pooling, and the system-configuration reader; it contains no unsafe code of its own and no build script. The parts that bound untrusted behaviour are present: the cache is capped with a configurable size and honours a maximum TTL, queries are bounded by attempts and timeout, and the CNAME chain is limited so a malicious server cannot drive an unbounded chase. Note that the advisories recorded against hickory-proto reach this crate through that dependency; they are held there. Its test target cannot be built from the published package because it imports test_support, a dev-dependency that does not resolve standalone; the library itself builds."
+
+[[audits.hickory-resolver]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.25.2 -> 0.26.2"
+notes = "Reviewed the complete 0.25.2-to-0.26.2 packaged-tree diff, including all 254 hunks across 38 differing paths, both manifests, README, examples, tests, all 24 new source files, and the absence of a build script. The delta adds four unsafe operations: Android wraps the JavaVM and application context pointers supplied by ndk-context, and macOS casts the documented ServerAddresses and SearchDomains System Configuration values to CFArray<CFString>; their pointer validity and element-type preconditions are supplied by the initialized platform runtime and OS, and no peer bytes reach them. There are no extern declarations, inline assembly, raw syscalls, dynamic loading, or process launches; ambient operations are host resolver and hosts-file reads, optional root-hint and trust-anchor reads, outbound DNS sockets, optional TLS/HTTPS/QUIC, and optional TOML state reads plus create/truncate/sync/rename writes. The ordinary resolver uses the network layer's source, port, ID and question checks, rejects foreign classes, bounds CNAME depth and cache TTLs, and enforces a pool deadline; the optional recursor additionally applies bailiwick and address filters plus recursion, glueless-follow, cache, and 200-query bounds. For Zakura's described configuration, system configuration and hosts lookup plus UDP with TCP fallback remain reachable for hostname resolution, while recursor, DNSSEC, mDNS, encrypted-DNS and opportunistic state-persistence paths require separate features or configuration and relay/external-discovery call sites are disabled. Callers must supply coherent TTL ranges, valid initialized Android context handles, OS-typed Apple DNS values, and a persistence path in a trusted directory because the predictable .tmp file is opened with truncation before rename; a configured stub-resolver trust_anchor path only enables validation and does not load that file, so custom anchors must be supplied with with_trust_anchor. cargo +1.98.0 check --all-features --offline passed and four all-feature doc tests passed, while default and all-feature unit-test builds ran zero tests because the crates.io package omits the test_support development dependency. A macOS system-configuration probe completed once with two name servers and one search domain and 4,097 malformed hosts inputs completed without panic; Windows, Android, and Linux target builds were not executed because Rust 1.98.0 lacked their target standard libraries on this host."
 
 [[audits.hmac]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -1345,6 +1423,12 @@ criteria = "safe-to-deploy"
 version = "2.2.0"
 notes = "Reviewed all packaged source, manifest, and tests. This is the data-loading abstraction the other ICU crates sit on; its unsafe is the yoke-backed cart handling that lets borrowed data outlive the buffer it came from, which is sound only because the cart is kept alive alongside it, and that pairing is what the Yokeable machinery enforces. Buffer providers validate the payload before it is exposed. There is no build script; the only ambient capability is whatever the caller's provider does. All 20 tests passed. Its documentation tests cannot run from the published package because they import the icu meta-crate, which is a dev-dependency that does not resolve standalone. "
 
+[[audits.identity-hash]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.1.0"
+notes = "Reviewed all packaged Rust source and manifest. No unsafe, build script, dependencies or ambient operations. Integer writes store the integer directly; the documented single-write contract is checked in debug builds. This is not a cryptographic or collision-resistant hash. The noq-proto consumer uses u32 path identifiers and its custom Hash implementation writes once. Source review only; no new execution was needed."
+
 [[audits.idna_adapter]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -1469,17 +1553,62 @@ criteria = "safe-to-deploy"
 version = "0.92.0"
 notes = "Reviewed the manifest, the module-level documentation, and the endpoint and connection paths. The crate contains no unsafe code and its build script only emits target cfgs. It layers node discovery, relay fallback, and hole punching over QUIC, and it delegates all packet parsing to iroh-quinn-proto rather than doing its own; peer identity is a public key verified through the QUIC handshake, so a relayed path cannot impersonate a node. The library builds; its test target needs iroh-relay's server feature, which the standalone resolution does not enable, and the suite is network-dependent."
 
+[[audits.iroh]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "1.1.0 -> 1.1.0@git:9e6cbf251d2edd6304c2d9799fc29bf39788d305"
+importable = false
+notes = "Compared all 72 packaged Rust files with the registry release; they are byte-identical. The only package delta is the ed25519-dalek requirement from 3.x to published 2.2. Reviewed raw-public-key certificate identity matching, TLS 1.3 signature delegation, and the retained Dalek strict verification path. It rejects small-order keys and R points and noncanonical scalar encodings; legacy_compatibility is absent from the resolved features. RFC8032 known-answer and mutated-message, wrong-key, signature-mutation, weak-key and scalar rejection tests pass. This delta does not attest the unaudited upstream 1.1.0 baseline or its dependencies."
+
 [[audits.iroh-base]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.92.0"
 notes = "Reviewed all packaged source, manifest, and tests. Public keys are validated through ed25519-dalek before construction, signature verification is strict, key generation requires a CryptoRngCore, secret Debug output is redacted, and ticket decoding checks kind, base32 length, postcard structure, and public-key validity. There is no unsafe code, build script, or ambient capability. All 10 unit tests passed with all features."
 
+[[audits.iroh-base]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.1.0"
+notes = "Reviewed all production Rust source and package manifest: key/signature conversion and strict signature verification, owned endpoint/address collections, bounded custom-address decoding and relay URL parsing. Public keys are validated through Dalek constructors; secret debug output is redacted and key generation delegates to the random source. No unsafe, build script, or ambient I/O in this package. Callers must bound externally supplied address collections and URL lengths and must not treat parsing as authorization. This registry-baseline record is separate from the recorded stable-Dalek fork delta. Source review; no new runtime tests in this pass."
+
+[[audits.iroh-base]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "1.1.0 -> 1.1.0@git:9e6cbf251d2edd6304c2d9799fc29bf39788d305"
+importable = false
+notes = "Compared all four packaged Rust files with the registry release; they are byte-identical. Only the ed25519-dalek and curve25519-dalek manifest requirements differ, retaining published 2.2.0 and 4.1.3. Reviewed parsing, signing and verify_strict use; the strict verification checks remain enabled. Fifteen existing key, serialization and endpoint-address tests, one doctest and two added authentication regression tests pass. This delta does not attest the unaudited upstream 1.1.0 baseline or its dependencies."
+
+[[audits.iroh-dns]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.1.0"
+notes = "Reviewed production Rust source, manifest and build script, including signed-packet bounds/signature-before-DNS parsing, endpoint metadata, resolver configuration/reset, retries and Android initialization. DNS/network operations and system resolver configuration access are explicit; build script only declares cfg names. Android unsafe initialization forwards the documented process-lifetime VM/context precondition to ndk_context. Audit discretion: caller-supplied retry delays of 1 or 2 ms panic in jitter calculation; use zero or at least 3 ms and bound retry counts. Iroh uses 200-3000 ms. Resolver resets can extend a request deadline, so callers needing an overall deadline must enforce it. No Android or live DNS tests in this pass; separate parser/resolver dependency audits remain required."
+
+[[audits.iroh-dns]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "1.1.0 -> 1.1.0@git:9e6cbf251d2edd6304c2d9799fc29bf39788d305"
+importable = false
+notes = "The packaged source, original manifest and build inputs are unchanged from registry 1.1.0. Compared all seven packaged Rust files byte for byte. Only the root workspace resolves the compatibility versions of sibling packages. This zero-source delta does not attest the unaudited upstream baseline or dependency graph."
+
+[[audits.iroh-metrics]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.0.1"
+notes = "Reviewed production ownership/serialization, registry and family locking, metric primitives, label encoding, and all optional service I/O boundaries, plus manifest. No unsafe or build script. Telemetry labels, registry schemas and export configuration are trusted caller inputs; callers must bound cardinality. Opt-in service binds the specified unauthenticated metrics listener, truncates the specified dump file, and sends metrics to the configured exporter with platform TLS verification. Use a protected monitoring interface and trusted exporter: these helpers do not provide hostile-client connection/resource limits or exporter deadlines, and configuration Debug can disclose the configured password. Counter wrapping and non-atomic histogram snapshots are telemetry semantics, not security accounting. Source review only; no service runtime tests in this pass."
+
 [[audits.iroh-metrics-derive]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.2.0"
 notes = "Full packaged-source review: no unsafe code, build script, I/O, or ambient capabilities; generated code is limited to metric trait implementations, static metadata, field references, and Arc clones."
+
+[[audits.iroh-metrics-derive]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.2.0 -> 1.0.1"
+notes = "Reviewed the complete packaged delta and generated code. Adds scalar/family field partitioning, label encoding and default initialization from developer-supplied syntax. Generated code borrows fields and uses bounded field/variant lists, safe matches and ordinary trait calls. No unsafe, filesystem, network or process operations were added. Runtime metric implementation remains a separate audit requirement."
 
 [[audits.iroh-quinn]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
@@ -1504,6 +1633,13 @@ who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
 version = "0.92.0"
 notes = "Reviewed all packaged source, manifest, build script, and tests. The crate contains no unsafe code and its build script only emits target cfgs. The relay forwards opaque frames between nodes that authenticate with their own keys, so it cannot read the traffic it carries; frame decoding checks the declared length against the configured maximum before allocating, and per-client send queues are bounded so a slow reader is dropped rather than allowed to grow the server's memory. All 7 tests passed."
+
+[[audits.iroh-relay]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "1.1.0 -> 1.1.0@git:9e6cbf251d2edd6304c2d9799fc29bf39788d305"
+importable = false
+notes = "The packaged source, original manifest and build inputs are unchanged from registry 1.1.0. Compared all 32 packaged Rust files byte for byte. Only the root workspace resolves the compatibility versions of sibling packages. This zero-source delta does not attest the unaudited upstream baseline or dependency graph."
 
 [[audits.is-terminal]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -1546,6 +1682,12 @@ who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
 version = "0.22.4"
 notes = "Reviewed all packaged source, manifest, and tests. The crate is a proc macro that generates JNI method signatures and native-method registration; it runs at compile time, has no I/O, and its unsafe expressions are in the code it emits rather than in its own execution. Malformed attributes produce a compile error through the token stream. All 70 tests passed with all features."
+
+[[audits.jni-sys]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.3.1"
+notes = "Reviewed both manifests, the lockfile, build.rs, the README and changelog, and every line of the sole Rust source file. The library is declaration-only apart from five safe Clone implementations: it defines C-layout scalar and raw-pointer types, the jvalue union, 230 unsafe native-interface function pointers, five unsafe VM-invocation function pointers, and three raw extern-system JVM entry points, while re-exporting selected ABI types from jni-sys 0.4. There are no unsafe blocks, pointer dereferences, inline assembly, raw syscalls, filesystem, network, process, or dynamic-loading operations in the library, and peer bytes cannot reach a capability without a caller choosing an unsafe JNI call. The build script normally emits only Cargo cfg and rerun metadata; its private _JNI_SYS_TEST path trusts JAVA_HOME and PATH to add libjvm search and link directives plus test-process environment, so production builders must not enable that knob from an untrusted build environment. Callers must supply a live thread-correct JVM environment, valid JNI references and IDs, correctly sized and live buffers and strings, matched acquire/release operations, and read only the initialized jvalue union member. cargo +1.98.0 test --all-features first failed offline because proc-macro2 1.0.105 was not cached, then passed after crates.io download with 0 unit tests and 0 doc tests; the opt-in libjvm path also passed offline with 0 unit tests and 0 doc tests. On aarch64 macOS, all 24 Rust/C ABI size, alignment, and representative-offset comparisons matched OpenJDK 26 jni.h, and a separate order check matched all 230 crate native-table entries to the first 230 header entries; the two newer header tail entries are unavailable through this crate but do not alter its prefix layout. No actual JNI function call or peer-input path was executed, non-macOS runtime ABIs were not exercised, and the separately packaged jni-sys 0.4 dependency was not audited by this record."
 
 [[audits.jni-sys]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
@@ -1711,6 +1853,12 @@ criteria = "safe-to-deploy"
 version = "0.7.2"
 notes = "Reviewed all packaged source, manifest, and tests. Loom is a test-only concurrency model checker: it replaces atomics, cells, and threads with instrumented versions and explores interleavings, so it is never linked into a production build. Its unsafe is the instrumented UnsafeCell and the thread-state bookkeeping, both of which exist only under the model checker's own scheduler. There is no build script and no ambient capability beyond the LOOM_ environment variables it documents. All 143 tests passed with all features."
 
+[[audits.lru]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.13.0 -> 0.18.3"
+notes = "Reviewed the complete production delta and surrounding list/map ownership: clone preserves the hasher and handles unbounded capacity, borrowed insertion ties returned mutable references to self, IterMut no longer creates an exclusive key reference, and pop detaches before a key destructor can panic. New constructors and key-aware insertion closures preserve ownership; find_and_promote only relinks a live node. No build script or ambient I/O. Focused probes with hashbrown 0.17.1 passed for panicking key destruction/recovery, bounded immutable-key caching, unbounded clone and double-ended mutable iteration. Not Miri or sanitizer execution. This record excludes 0.18.4 and its newly introduced retain method."
+
 [[audits.lru-slab]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -1722,6 +1870,12 @@ who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
 version = "1.11.1+lz4-1.10.0"
 notes = "The build script is the whole capability here: it compiles C sources shipped inside the package with cc and links the result, so building this crate runs a C toolchain over vendored third-party code. It fetches nothing and reads nothing outside the package and the environment variables it documents. The vendored tree declares LZ4 version 1.10.0, matching the version metadata in the crate version. The Rust side is extern declarations plus a thin frame-API wrapper with nine unsafe expressions. Auditing the bundled C beyond confirming its provenance is out of scope for this review and is noted here so the record is not read as covering it. All 2 tests passed."
+
+[[audits.mac-addr]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.3.0"
+notes = "Reviewed all packaged Rust source and manifest. The two unsafe byte-array views have matching size/alignment for repr(C) six- and eight-u8 structs and borrow from self. Parsing validates component counts before indexed writes; serde checks exact lengths. The legacy from_hex_format helper is permissive and must not be used as a strict input validator. No build script or ambient operations. Source review only."
 
 [[audits.matchit]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -1841,11 +1995,29 @@ criteria = "safe-to-deploy"
 version = "0.10.1"
 notes = "Reviewed all packaged source, manifest, and tests. The crate wraps HashMap values in nonempty vectors maintained by safe insert, entry, remove, retain, iterator, and optional Serde operations; lookups return None rather than indexing absent values. Unsafe code is forbidden and there is no build script, runtime I/O, or ambient capability. All 58 unit tests passed with all features."
 
+[[audits.n0-error]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.0.1"
+notes = "Reviewed production error ownership, source chaining, formatting, extension/construction macros and metadata, plus manifest. Errors remain owned boxes or borrowed references; no unsafe or build script. The only ambient reads are RUST_BACKTRACE and RUST_ERROR_LOCATION, cached once to control display of static caller locations. No network/process/file operations or secret reads. Caller-defined error sources and formatting retain their usual responsibility for termination and safe display. Source review only."
+
+[[audits.n0-error-macros]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.0.1"
+notes = "Reviewed the production attribute/derive implementation, generated implementations and manifest. Developer input is parsed with syn; generated code constructs errors, forwards sources, formats fields and captures static caller metadata. No unsafe or ambient operations are introduced. Defaults and formatting expressions are supplied by the developer; invalid attributes become compilation errors. Source review only."
+
 [[audits.n0-future]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.1.3"
 notes = "Reviewed all packaged source, manifest, and build script. Native targets re-export separately audited futures and Tokio primitives; the browser shim keeps task state in checked SendWrapper-wrapped Rc/RefCell values and implements cancellation and timers through wasm-bindgen without unsafe code. The build script only defines a target cfg alias. The all-features native library target passed; the package contains no native unit tests."
+
+[[audits.n0-future]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.1.3 -> 0.3.2"
+notes = "Reviewed the production delta, manifest and cfg-only build script. New optional futures use pin-project replacement; native spawning/cancellation delegates to Tokio. Browser task state/results remain in Rc/RefCell behind checked SendWrapper guards, with owned completion and cancellation handles. No new unsafe or filesystem/network/process access. Discretion: browser AbortHandle::is_finished uses cancelled && completed and can report an inaccurate status; it does not govern task/result destruction, and this record does not certify API parity or liveness for applications relying on that status. Browser runtime tests were not run."
 
 [[audits.n0-snafu]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -1858,6 +2030,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.3.0"
 notes = "Reviewed all packaged source, manifest, and tests. Watchable state is protected by RwLock, pending wakers are registered under a Mutex and drained after value changes or sender drops, and weak ownership cleanly reports disconnection without retaining producers. There is no unsafe code, build script, or ambient capability. All 11 unit tests passed with all features."
+
+[[audits.n0-watcher]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.3.0 -> 1.0.0"
+notes = "Reviewed production changes, manifests and surrounding synchronization. Cached values remain owned clones; peek borrows the watcher rather than unlocked shared storage. Registration rechecks the epoch after adding a waker, duplicate task wakers are suppressed, and Shared destruction wakes disconnected observers. Tuple/join storage is sized from caller-owned watcher lists. No unsafe, build script or ambient I/O. Source review only; exhaustive concurrency/liveness verification was not performed."
 
 [[audits.nested_enum_utils]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -1877,11 +2055,29 @@ criteria = "safe-to-deploy"
 version = "0.37.3"
 notes = "Reviewed all packaged source, manifest, and tests. The structure is unchanged from 0.36: platform interface enumeration whose unsafe is the getifaddrs, routing-socket, and IP Helper calls plus the linked-list walk, with each address copied out before the list is freed and nothing exposed but read-only metadata. All 7 tests passed with all features."
 
+[[audits.netdev]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.45.1 -> 0.46.2"
+notes = "Reviewed the complete 0.45.1-to-0.46.2 tree diff, both manifests, Cargo.lock, the unchanged build script, README, and every changed source hunk across Apple, BSD, Linux/Android, Windows, interface, and statistics code. The Windows change replaces the short-buffer-unsafe union view with null-, family-, and length-checked unaligned copies, bounds the six-byte physical-address copy, and resolves GetIpNetEntry2 only from the already loaded fixed iphlpapi.dll module with the matching system ABI. The new Linux/Android netlink reader is safe Rust and bounds datagrams and offsets, accepts only kernel port zero and the expected sequence, rejects truncation, short sends, interrupted or failed dumps and overruns, and stops after a two-second timeout. New Darwin/BSD neighbor handling proves record lengths before family-specific reads, parses BSD link addresses from checked byte slices, and keeps the existing kernel-owned routing-buffer lifetime and alignment assumptions; Apple statistics initializes its output only after a successful full-size sysctl write. Ambient behavior remains limited to OS interface and routing APIs and fixed system files, sockets, and frameworks; CoreWLAN IPC became opt-in, and the build script only reads the Cargo target OS and links SystemConfiguration. cargo +1.98.0 test --all-features --offline passed 28 unit tests with 0 failures and 0 doc tests, and one all-feature live macOS enumeration completed with 26 interfaces. Linux, Android, Windows, iOS, and BSD target-gated code was source-reviewed but not built or executed because only aarch64-apple-darwin is installed; consumers must provide only OS-owned buffers and preserve platform API lifetimes, and this delta record still depends on a safe accepted base rather than curing the separate 0.45.1 hold above."
+
 [[audits.netlink-packet-core]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.7.0"
 notes = "Reviewed all packaged source, manifest, packet framing, parsing, serialization, and tests. The safe parser validates the minimum header, advertised packet length, and backing slice before payload access; unchecked constructors document that malformed buffers may panic but contain no unsafe code. Runtime behavior is limited to caller-provided byte slices, with no build script or ambient I/O. All 10 library tests passed after omitting the Linux-only netlink-packet-route example dependency on macOS."
+
+[[audits.netlink-packet-core]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.7.0 -> 0.8.2"
+notes = "Reviewed production changes, added parsing/attribute/buffer macros and manifest. No new unsafe, build script or ambient operations. Integer/address parsers check widths before copying; checked message/NLA constructors validate headers and declared lengths. Attribute iteration either advances by a positive aligned length or terminates with an error. Zero-length DONE messages produce an initialized zero code. Low-level unchecked constructors and emitters retain documented caller buffer/size requirements. Source review only."
+
+[[audits.netlink-packet-core]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.8.2 -> 0.9.0"
+notes = "Reviewed the production delta and manifest. Removes paste and buffer-generation macros; explicit parser/emitter names preserve byte order and length checks. Lazy error context calls its closure only for Err. Other source changes disable little-endian fixtures on big-endian targets. No unsafe or ambient operations introduced; source review only."
 
 [[audits.netlink-packet-route]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
@@ -1895,11 +2091,29 @@ criteria = "safe-to-deploy"
 version = "0.24.0"
 notes = "Reviewed all packaged source and manifest. The crate contains no unsafe code and no build script; it encodes and decodes rtnetlink messages, and the decoding path is the one that reads kernel-supplied bytes. That path is written defensively: every attribute is parsed through a length-checked buffer wrapper that returns a DecodeError on truncation rather than indexing past the end, and unknown attribute types are preserved as raw bytes instead of being rejected or misinterpreted. The crate is Linux-only and cannot be built on the host used for this review, so it was reviewed by reading rather than by execution."
 
+[[audits.netlink-proto]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.11.5 -> 0.12.2"
+notes = "Reviewed the production delta, manifest, batch request tracking, concrete NetlinkFramed sink and codec. Batches are caller-provided messages for one destination; start_send appends initialized encoded bytes and poll_ready flushes before the next batch. Each request retains its own sequence ID and shared response sender. No unsafe code or new ambient capability is introduced; kernel socket operations remain delegated to netlink-sys. Source review only."
+
+[[audits.netlink-sys]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.8.8 -> 0.9.0"
+notes = "Reviewed the complete delta. IntoRawFd transfers the owned descriptor and suppresses Drop, preserving single close ownership. Existing netlink boolean getsockopt values now accept any nonzero result. Remaining changes affect docs, endian test gating and dev dependencies; syscall buffer sizing is unchanged."
+
 [[audits.netwatch]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
 version = "0.9.0"
 notes = "Reviewed all packaged source, manifest, build script, and tests. The crate watches for network interface and route changes and wraps UDP sockets for QUIC; its ten unsafe expressions are the platform socket options and the route-monitor callbacks. Change notifications are delivered through a watch channel with the latest state rather than an unbounded queue, and the monitor is torn down on drop. The build script only emits target cfgs. All 10 tests passed with all features."
+
+[[audits.netwatch]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.9.0 -> 0.19.3"
+notes = "Reviewed the complete 0.9.0-to-0.19.3 tree diff, both manifests, Cargo.lock, README, build.rs, every changed source and test hunk, and all newly added packaged files. The build script only reads Cargo target configuration through cfg_aliases and emits cfg aliases; it performs no file, network, subprocess, or dynamic-loading action. Production unsafe is limited to two BSD sysctl calls using live stack MIB and length pointers plus a fully initialized Vec sized by the first query, and Windows IpHelper callback registration, cancellation, and two null-checked context dereferences; Arc allocations stay at stable addresses, successful cancellation waits out callbacks before map removal, and the private handles round-trip losslessly through isize. Ambient capabilities comprise read-only access to the fixed /proc/net/route path, kernel netlink and BSD routing sockets, constant WMI queries, browser globals and event listeners, and caller-directed UDP sockets; Android also executes fixed ip arguments at two absolute paths and then by PATH lookup, so consumers on Android must supply a trusted PATH. Peer datagrams reach only caller-provided buffers and noq-udp metadata, transient receive errors are consumed without allocation or socket replacement, rebind is serialized by the write lock, and changed route parsing bounds-checks lengths before slicing, so the delta does not let peer bytes control FFI pointers, filesystem paths, commands, or allocation sizes in this crate. These changes do not invalidate the base audit's safety assumptions. cargo +1.98.0 test passed 17 tests (16 unit and one integration), and cargo +1.98.0 test --all-features --offline passed the same 17 again, for 34 passing executions and zero failures; the initial offline run executed no tests because noq-udp was not cached, while patchbay and doctests each executed zero tests in both completed runs. Only aarch64-apple-darwin was installed, so Windows, Linux, Android, iOS, FreeBSD, OpenBSD, NetBSD, esp-idf, and wasm code was not built or executed, and no separate malformed-input probe was added."
 
 [[audits.nix]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -1917,6 +2131,24 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.6.0"
 notes = "Reviewed all packaged source, manifest, and tests. The crate defines and parses IP and socket address values but performs no network I/O; its four unchecked UTF-8 conversions cover initialized prefixes of fixed buffers written only by ASCII address formatters. The default implementation passed 45 unit tests and 71 doctests, and the std facade used by Zakura plus the standalone unstable_ip path compiled. The unused optional serde feature has four stale Rust 2018 module imports and does not compile; this packaging defect does not affect Zakura's std-only deployment path."
+
+[[audits.noq]]
+who = "Claude Fable 5.1 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "1.2.0"
+notes = "Reviewed the manifest (whose unreachable optional pins such as gcc, aws-lc-sys and sharded-slab are enabled by no feature), the cfg_aliases-only build script unchanged from iroh-quinn 0.14.0, every production source file, and the full diff against iroh-quinn 0.14.0 (about 2400 net new lines: multipath Path/OpenPath handles, path-event and NAT-traversal broadcasts, on_closed, atomic handle refcounts, WakeGuard locking, owned Stopped futures, a smol runtime, and removal of async-std and UdpSender::try_send). The only production unsafe is new in this delta, a verbatim copy of std's Waker::noop in endpoint.rs respond() whose null data pointer no vtable function touches, and the only other unsafe is a cfg(test) Arc-backed counting waker with balanced from_raw and forget calls; there is no FFI, inline assembly, filesystem, environment or process access in the library, and its ambient capabilities are socket2 UDP socket creation and binding in Endpoint::client/server plus task spawning through the Runtime trait, with raw syscalls and packet parsing delegated to noq-udp and noq-proto, which are audited separately. Peer-driven work is bounded before it reaches noq-proto by the 50 microsecond receive work limiter and IO_LOOP_BOUND of 160 events per endpoint poll, a receive buffer sized once from EndpointConfig, at most 20 datagrams and 10 GSO segments per connection poll, and 32-slot lagging broadcast channels, while the inherited unbounded endpoint-to-connection mpsc queues remain the one place peer packets can accumulate if a connection task falls behind, unchanged from the base. Connection, Path, stream and Stopped handles hold counted references whose last drop implicitly closes the connection, the Relaxed refcounts only gate work done under the connection or endpoint mutex, State::drop notifies the endpoint and pending on_closed futures, and weak handles never keep a connection alive. Ran cargo +1.98.0 test offline with default features (32 passed, 3 ignored, 1 doctest passed), the 3 ignored stress tests plus the ignored many_connections test (4 passed), the __all_without_fips plus futures-io feature set (32 passed, aws-lc-rs built locally) and the post_quantum test (2 passed); a scratch probe then sent 45000 malformed datagrams (random bytes, unknown-version long headers, garbage v1 Initials, random short headers) at idle, live and closed endpoints with 0 send errors while 1 MiB and 256 KiB echoes completed with 0 lost packets, and exercised Retry, weak and strong handle and path-stat retention, on_closed, churn of 100 dropped Connecting and 100 dropped Connection handles returning both endpoints to 0 open connections, and Endpoint::close with accept yielding None and wait_idle completing. Consumers must treat read_to_end's size_limit as exact only for in-order data because out-of-order delivery can grow the assembled buffer up to the stream receive window (inherited from upstream quinn), must not call Path::stats on a Path obtained from OpenPath or WeakPathHandle::upgrade whose status() already reports it closed because the stats expect can panic if the path was discarded before the handle existed, must not trust Incoming metadata since well-formed garbage Initials surface before any decryption, and should expect a closed and drained endpoint to stop its driver and go silent rather than refuse new attempts. Not covered: wasm targets, the smol runtime beyond compilation, and the noq-proto and noq-udp internals this crate delegates to."
+
+[[audits.noq-proto]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.2.0"
+notes = "Reviewed both packaged manifests, all 59 Rust source files and tests, and the complete 0.13.0 predecessor tree diff, including packet, frame and transport parameter decoding, rustls/ring integration, Retry authentication, stream and endpoint bounds, congestion and pacing, multipath, and NAT traversal; the package declares no build script. The unsafe surface is limited to unchecked VarInt construction for internally QUIC-bounded stream and buffer offsets plus TransmitBuf's BufMut implementation, whose uninitialized-capacity advance delegates to Vec under BufMut's caller contract, so none lets peer bytes drive memory-unsafe access. Peer-controlled lengths are checked before reads and splits, stream and connection flow control bound buffering, CID and path queues are capped or sparse, anti-amplification gates unvalidated paths, and pacing uses checked or saturating arithmetic with bounded burst calculations. Rustls/ring protect handshake and packet data, while aes-gcm 0.10.3, and therefore polyval 0.6.2, are used only for RFC Retry integrity tags and remain separate audit holds not certified here. There is no FFI, assembly, raw syscall, dynamic loading, process execution, or socket I/O; the optional qlog factory reads QLOGDIR and creates or truncates caller-named files, and opt-in NAT traversal returns bounded UDP probes to authenticated peer-supplied addresses, so callers must keep qlog directory and prefix inputs trusted and leave NAT traversal disabled when that network capability is unacceptable. The rustls-ring deployment build passed 414 unit tests and 3 doctests, the all-features macOS build passed 421 unit tests and 3 doctests, and 394,758 malformed packet-header cases plus one maximum-delay Instant boundary case completed without panic. Callers must preserve the documented VarInt, StreamId, CID-length-at-most-20, monotonic-time, custom crypto and congestion-controller contracts and choose sane stream and path limits; non-macOS targets and the held cryptographic dependencies were reviewed as source or interfaces but were not executed."
+
+[[audits.noq-udp]]
+who = "Claude Fable 5.1 <noreply@anthropic.com>"
+criteria = "safe-to-deploy"
+version = "1.2.0"
+notes = "Reviewed the manifest and Cargo.toml.orig, the cfg_aliases-only build script, all nine source files, tests and bench of noq-udp 1.2.0, and every hunk of the 2,912-line diff against iroh-quinn-udp 0.5.7, which replaces link-time extern declarations of Apple's private sendmsg_x/recvmsg_x with dlsym(RTLD_DEFAULT) lookups behind the off-by-default fast-apple-datapath feature and a new unsafe opt-in switch, moves the Linux GSO/GRO probes from throwaway sockets onto the caller's socket (UDP_SEGMENT set then cleared, UDP_GRO left on) behind a uname() kernel-version gate, adds Windows SIO_UDP_CONNRESET/NETRESET ioctls and GetProcAddress-based Wine detection, grows the unix control buffer from 88 to 96 bytes, returns an error instead of unreachable!() on unknown address families, adds interface_index/timestamp to RecvMeta while keeping SO_TIMESTAMPNS disabled, and gives wasi/espidf a posix_minimal backend, none of which invalidates the base's assumptions. The 84 unsafe occurrences (27 unix.rs, 23 windows.rs, 13 apple_fast.rs, 15 cmsg, 3 linux.rs, 3 posix_minimal.rs) are zeroed FFI structs, msghdr/cmsg construction, sendmsg/recvmsg/recvmmsg/setsockopt/uname/WSASendMsg/WSARecvMsg/WSAIoctl calls, IoSliceMut-as-iovec/WSABUF and MaybeUninitSlice casts covered by std and socket2 layout guarantees, sockaddr_storage reinterpretation only after the family check, and the msghdr_x layout plus fn-pointer transmutes that match XNU's socket_private.h and are null-checked with fallback to the plain path; control buffers are repr(align(8)) with runtime asserts on cmsghdr alignment and capacity, the encoder panics rather than overflows, and the worst-case control data for the options the crate itself enables is 88 of 96 bytes on Linux (PKTINFO plus TOS/TCLASS plus UDP_GRO), 64 on macOS and FreeBSD and 88 of the 128 asserted on Windows, so the kernel never truncates, iteration relies on kernel-updated lengths plus libc CMSG_NXTHDR bounds, and the new apple_fast zero-length guard covers the macOS-before-14 recvmsg_x quirk. Two discretionary points: cmsg::decode (cmsg/mod.rs:81-85) checks the payload length only with a debug_assert and MSG_CTRUNC is never inspected, so a consumer that enables further cmsg-producing options (SO_TIMESTAMP or SO_TIMESTAMPNS, the IP_RECVERR queue, IP_RECVTTL and the like) on the socket could make release builds read a truncated cmsg past its data; and recv_single (unix.rs:557-574, inherited from the base) retries after MSG_TRUNC with the msghdr the kernel already shrank, which on non-Linux hosts could garble the ECN/dst_ip metadata (never the payload, and reads stay inside the 96-byte stack buffer) of the one datagram following an oversized one. Peer-controlled input reaches only kernel-mediated fields (byte counts, source address, ECN bits masked to two bits, GRO stride) and no peer-derived value indexes memory; the only ambient capabilities are options and syscalls on the caller's socket, a momentary throwaway socket on Windows for the WSARecvMsg pointer and GSO probe (inherited), the uname() call and the dlsym/GetProcAddress lookups, with no filesystem, environment, process or library loading. Ran the crate's suite with cargo 1.98.0 on macOS 26 (Darwin 25.5) offline in four configurations, all green: all-features debug 1 unit plus 9 integration tests (gso ignored as Linux/Windows-only), default 1 plus 8, no-default-features 1 plus 8, all-features release 1 plus 9, with apple_fast_datapath passing, meaning the private symbols resolved and batched sendmsg_x/recvmsg_x round-tripped on this host. A scratch probe crate ran 13 probes in the apple_slow build and 14 in the apple_fast build, all passing: exhaustive 256-value EcnCodepoint::from_bits, 2,824 malformed kernel-version strings without panic, encoder capacity boundary (six 16-byte cmsgs fill 96 bytes, the seventh push panics) and a three-cmsg mixed round trip, iteration over all 97 msg_controllen values never yielding a partial header while the unguarded iterator spun on zeroed tails for 37 values and the crate's guard for none, loopback sends keeping ECN and dst_ip intact on the datagram after an oversized one on v4 and dual-stack sockets in both orders, empty datagrams reporting len 0 and stride 0, a 32-datagram recvmsg_x batch all carrying ECN CE, a 4,000-byte datagram silently truncated to 1,500 on the fast path, and the debug_assert firing for 40 segments. Consumers must honor max_gso_segments() (with the value 1 a smaller segment_size is ignored and 300 bytes went out as one datagram), keep segment_size nonzero and below 65,536 and contents non-empty on the fast path, pass non-empty bufs with meta.len() at least min(bufs.len(), 32), never divide by a possibly zero stride, treat recv errors such as Windows WSAEMSGSIZE for oversized datagrams as non-fatal, and call the unsafe set_apple_fast_path only after confirming the OS supports the private API, on which release builds silently drop segments beyond 32. Linux recvmmsg/GSO/GRO/uname, Android, Windows, BSD, illumos and wasi code paths were source-reviewed only, nothing ran under Miri or sanitizers, the base's partially initialised sockaddr_storage assume_init pattern is unchanged, and the dependencies (libc, socket2, windows-sys, cfg_aliases, tracing, log) are outside this record."
 
 [[audits.num-bigint]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
@@ -1995,6 +2227,24 @@ who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
 version = "0.3.2"
 notes = "The crate is mechanically generated from Apple's framework headers: every method is a msg_send shim, which is why the unsafe count is enormous and why there is no hand-written logic to audit. It declares no ambient capability of its own beyond what the framework method being called does, and correctness is a claim about matching those headers rather than something reproducible from the package. It is reached through the same os_info dependency chain as the other framework crates and builds cleanly on default features. Its test target needs sibling objc2 dev-dependencies that do not resolve standalone. It defines no runnable tests."
+
+[[audits.objc2-core-wlan]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.3.2"
+notes = "Reviewed all 11 Rust source files (3,336 lines), both manifests, translation configuration and README; the normalized manifest disables build scripts and none is packaged. The crate is generated CoreWLAN class, protocol, constant and C-function declarations with no initialization, parsing, filesystem, process, environment, explicit dynamic loading, syscall or assembly logic; framework linkage and caller-invoked Wi-Fi and keychain operations are its only ambient capabilities. The two unsafe blocks are the CWMergeNetworks framework call and retain_autoreleased conversion, whose nonnull result is checked, while the 60 unsafe impls are header-derived Objective-C conformances and integer encodings with matching NSInteger or NSUInteger representation. Its 30 foreign blocks and 127 unsafe function declarations or wrappers expose the native ABI, raw-pointer parameters occur only behind an unsafe call boundary, and no safe function body takes a raw pointer. Callers must uphold pointer validity, framework availability, Objective-C method contracts and returned-object ownership, and peer bytes are not parsed or dereferenced by this crate. Default-feature and no-default-feature cargo +1.98.0 tests each passed 0 unit tests and 0 doctests, and the crate's representative call in a four-call compile-fail probe was rejected as unsafe. The all-features command did not execute tests because stable Rust rejects the nightly-only darwin_objc feature, and non-macOS targets were source-reviewed rather than compiled or executed."
+
+[[audits.objc2-security]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.3.2"
+notes = "Reviewed all 86 Rust source files (58,484 lines), comprising 82 generated modules and four glue or manual target-fix files, plus both manifests, translation configuration and README; build scripts are disabled and absent. The 607 unsafe blocks consist of 446 direct Security-framework calls, 124 owned Create/Copy-style CFRetained::from_raw conversions, 17 retains of borrowed Get results and 20 unchecked CStr literals; all 20 literals were statically checked and had exactly one trailing NUL with no interior NUL. The 569 unsafe impls are repr(C) struct or union encodings, pointer RefEncode implementations, Core Foundation type identities, and Send/Sync only for the immutable SecCertificate, with layouts and primitive encodings matching their declarations. No safe function body accepts a raw pointer or callback: raw-pointer, CSSM, certificate and key parsing, and deprecated AuthorizationExecuteWithPrivileges entries are unsafe foreign items or unsafe wrappers, while the only safe wrappers are five argument-free TypeID getters. Retained returns follow Apple Create/Copy ownership, borrowed Get results are explicitly retained, nullable returns remain Option, and declared nonnull returns are checked before construction. The crate performs no work at initialization, but callers invoking it deliberately gain Security-framework capabilities including keychain, trust, cryptography, legacy SecureTransport or CSSM and privileged process execution, and must uphold all pointer, buffer-length, callback-lifetime, typed-container and framework-availability contracts. Default-feature and no-default-feature cargo +1.98.0 tests each passed 0 unit tests and 0 doctests, the crate's representative call in a four-call compile-fail probe was rejected as unsafe, and the 20-literal static check passed. The all-features command stopped before tests because stable Rust rejects darwin_objc; the non-macOS CSSM evidence field and target-dependent SSLCipherSuite-width branches were reviewed in source but could not be compiled or run on the sole installed aarch64 macOS target."
+
+[[audits.objc2-security-foundation]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.3.2"
+notes = "Reviewed all four Rust source files (275 lines), both manifests, translation configuration and README; all framework declarations are generated, build scripts are disabled and none is packaged. The crate links SecurityFoundation but has no runtime logic or ambient operations on load, no unsafe blocks, and only the SFAuthorization class, its Objective-C methods and constants. Its three unsafe impls assert the header-declared NSCoding, NSObjectProtocol and NSSecureCoding conformances, and all 11 method declarations are unsafe, including every raw-pointer form. No safe function body takes a raw pointer; callers must uphold pointer validity, authorization-object lifetime, method availability and the linked framework ABI when deliberately invoking the authorization capability. Default-feature and no-default-feature cargo +1.98.0 tests each passed 0 unit tests and 0 doctests, and the crate's representative call in a four-call compile-fail probe was rejected as unsafe. The all-features command did not execute tests because stable Rust rejects the nightly-only darwin_objc feature, and non-macOS targets were not available for execution."
 
 [[audits.objc2-ui-kit]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
@@ -2444,6 +2694,12 @@ who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
 version = "0.41.0"
 notes = "Reviewed the manifest, the module-level documentation, and the unsafe surface, which is ten expressions of unchecked UTF-8 over spans the reader has already validated. XML is untrusted input and the reader is built for it: it is pull-based so nesting depth is the caller's loop rather than the stack, entity expansion is not performed for external or recursive entities, and the configuration exposes explicit limits for attribute and namespace handling. There is no build script. All 240 library tests passed."
+
+[[audits.quick-xml]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.41.0 -> 0.42.0"
+notes = "Reviewed manifest and capability boundaries, including the UTF-8 event/reader conversion, checked byte-to-string conversion, scalar parsing state, escaping and entity normalization. The crate forbids unsafe code and has no build script. File access only opens a caller-supplied path; other I/O uses supplied streams. Entity expansion calls a supplied resolver and does not fetch external resources; callers must bound input/depth and resolver expansion size. Changed string slices follow ASCII delimiters after UTF-8 validation. Combined parser probes exercised 71,936 malformed XML cases plus multilingual XML, invalid UTF-8 and unknown entities without panic. Optional encoding/serde/async paths were not runtime-tested; this is not a full XML conformance or resource-exhaustion audit."
 
 [[audits.quinn]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
@@ -3042,6 +3298,12 @@ criteria = "safe-to-deploy"
 version = "0.9.3"
 notes = "Reviewed all packaged source, manifest, DNS packet and zone parsers, writers, and tests. The safe parser checks every wire slice, caps labels and names, bounds record counts to header u16 values, and requires compression pointers to move strictly backward, preventing pointer cycles. Runtime operations are limited to caller-provided bytes and I/O; filesystem reads occur only in tests. All 117 unit tests and 6 doctests passed with all features."
 
+[[audits.simple-dns]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.9.3 -> 0.12.0"
+notes = "Reviewed manifest, unsafe/ambient surface (none), buffer/cursor primitives, compressed-name progress and length checks, packet sections, resource-data sub-buffer bounds, and caller-provided output adapters. Packet parsers use checked slices; record counts are u16 but preallocate before decoding, so callers must bound concurrent parsing. Pointer-only name chains move backward and chains with labels hit the name-length bound. No build script or hidden network/file/process I/O. Probes exercised 51,200 malformed DNS inputs with small section counts plus maximal-count short packets and compression-pointer boundaries without panic. This is not exhaustive record-type conformance coverage. Caller-built messages must fit wire-size limits; the custom Write helper can panic on a zero-progress writer, so use adequately sized output or a growable buffer."
+
 [[audits.sinsemilla]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
@@ -3101,6 +3363,12 @@ criteria = "safe-to-deploy"
 version = "0.8.1"
 notes = "Reviewed all packaged source, manifest, and tests. The WebSocket implementation holds a single unsafe expression. Framing is where untrusted bytes land and it is handled correctly: the payload length is checked against a configurable maximum before any buffer is reserved, reserved bits and unexpected opcodes are rejected, a server rejects an unmasked client frame, and text frames are validated as UTF-8 before being surfaced. There is no build script. All 14 tests passed with all features."
 
+[[audits.sorted-index-buffer]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.2.1"
+notes = "Reviewed all production source and manifest, including resizing, insertion, removal and range iteration. No unsafe, dependencies, build script or ambient operations. Documented usage requires dense indices: allocation scales with key span, not entry count. Callers must bound that span and keep indices below u64::MAX to avoid allocation failure or exclusive-upper-bound arithmetic overflow. The noq-proto consumer uses locally generated packet numbers below 2^62. This does not certify transport-wide resource limits."
+
 [[audits.spandoc]]
 who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
@@ -3143,6 +3411,18 @@ criteria = "safe-to-deploy"
 version = "0.1.0"
 notes = "Reviewed all packaged source, manifest, and tests. Unsafe string slicing uses monotonic offsets captured from String lengths after valid UTF-8 appends, and Writer records its final boundary on drop; an interrupted caller-supplied Read can leave an ungrouped valid prefix but cannot invalidate the slicing boundaries. There are no dependencies, build script, or independently acquired ambient capabilities. All 4 unit tests and 3 doctests passed."
 
+[[audits.strum]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.27.2 -> 0.28.0"
+notes = "Reviewed the complete delta. ParseError Display is available in no_std through core::fmt; its match arms are unchanged. Remaining changes update MSRV, docs and optional macro/hash-map dependencies, which require their own audit coverage. No new unsafe or ambient operations."
+
+[[audits.strum_macros]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.27.2 -> 0.28.0"
+notes = "Reviewed the complete delta. Generated enum parsing uses From for infallible default variants and TryFrom otherwise, preserving safe matching and delegated error functions. Discriminant attributes are parsed as syn Meta, with explicit Default propagation. No new unsafe or ambient operations. Two unit tests and 19 doctests pass after adding the missing strum 0.28 dev dependency in a disposable test copy; the unmodified archive had nine doctest failures from that missing dependency."
+
 [[audits.stun-rs]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
@@ -3178,6 +3458,12 @@ who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
 version = "0.6.1"
 notes = "Reviewed all packaged source, manifest, and tests. The crate reads macOS network configuration through the SystemConfiguration framework; its unsafe is the framework calls plus the CoreFoundation reference-count handling, which follows the Create versus Get rule. Everything it exposes is read-only: dynamic-store queries, network reachability, and preference lookups, with no setter that mutates system configuration. All 10 tests passed with all features."
+
+[[audits.system-configuration]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.6.1 -> 0.7.0"
+notes = "Reviewed the complete delta, including CoreFoundation ownership at changed FFI calls. Constructors now check null before wrapping create-rule pointers and return Option; successful ownership is unchanged. Other changes add error formatting and update examples. No new ambient capability."
 
 [[audits.system-configuration-sys]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -3347,6 +3633,12 @@ who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
 version = "0.12.3"
 notes = "Reviewed all packaged source, manifest, and tests. Frame decoding checks the payload length against the configured limit before reserving, and text payloads are validated through simdutf8 with a streaming validator that carries a partial code point across fragments rather than accepting a split sequence. The unsafe is concentrated in the masking routines, which use align_to_mut and run the scalar fallback over the unaligned prefix and suffix, so the vector path only ever sees correctly aligned data, and the SIMD variants are behind target-feature gates. There is no build script. All 9 tests passed with the client, server, rand, fastrand, and sha1_smol features."
+
+[[audits.tokio-websockets]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.12.3 -> 0.13.3"
+notes = "Reviewed production delta, manifest and surrounding SIMD dispatch/masking. Newly enabled AVX512 and new LSX paths are runtime feature gated and use aligned slice partitions; NEON key load now explicitly handles unaligned input. New response headers use validated HeaderName/HeaderValue and reserve required upgrade headers. TLS continues certificate verification through rustls/platform roots; missing provider can now panic as documented. The new nightly RNG delegates to the platform source. No new file/process capability. Source review only; no execution on LSX/AVX512 targets."
 
 [[audits.toml]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -3771,6 +4063,12 @@ criteria = "safe-to-deploy"
 version = "0.4.2"
 notes = "Reviewed all packaged source, JavaScript bindings, manifest, examples, and tests. The safe wrappers preserve stream-reader and writer lock lifetimes, release locks on drop, copy BYOB reads through separate JavaScript buffers to avoid transferring or invalidating WebAssembly memory, and map rejected promises into errors. There is no build script or hidden ambient capability. The all-feature library target compiled with its locked wasm-bindgen dependencies."
 
+[[audits.wasm-streams]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.4.2 -> 0.5.0"
+notes = "Reviewed the complete production delta, manifest and surrounding byte-source ownership/cancellation. User streams/readers/sinks are taken from their Option before awaited operations, so caught panics cannot reuse partially updated state. Buffers are initialized Rust storage copied to JS-owned arrays; abort handles stop pending pulls. Sink errors are retained and propagated instead of silently accepting writes. No new unsafe or ambient capability. Browser runtime and panic-unwind tests were not run; source review only."
+
 [[audits.web-sys]]
 who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
@@ -3928,6 +4226,12 @@ version = "0.61.2"
 notes = "The crate is mechanically generated from the Windows metadata: the enormous unsafe count is one extern declaration or call wrapper per API, not hand-written logic, and there is no runtime behaviour of its own to audit. It declares no ambient capability beyond what the Windows API being called does, and correctness is a claim about matching that metadata rather than something reproducible from the package. It compiles to nothing on the non-Windows targets this workspace ships and defines no runnable tests here. This is the raw extern-only variant; a second major version is in the graph alongside 0.52."
 
 [[audits.windows-sys]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.52.0 -> 0.45.0"
+notes = "Reviewed the normalized and original manifests, package metadata, README, all 272 Rust source files in 0.45.0, all 235 base source files, and the complete diff -ruN delta of 548,257 lines across 295 changed or version-only files and 10,740 hunks. Both package metadata records identify crates/libs/sys in the windows-rs project, and the uniform module contents are generated Windows declarations, constants, type aliases, layouts and Copy/Clone implementations rather than handwritten API wrappers. The backward delta removes WDK and newer Win32 modules, adds older Win32 modules, and replaces 19,844 windows-targets link invocations with 16,654 local link invocations plus three reviewed link macro definitions without introducing runtime wrapper logic or invalidating the base audit assumptions. The 0.45.0 manifest has no build script or build dependencies and only a target-conditional windows-targets 0.42.1 dependency. Whole-tree scans found 11,644 structs or unions all marked repr(C), repr(C, packed), or repr(transparent), 2,387 unsafe keywords all confined to unsafe extern callback typedefs, and zero unsafe blocks, unsafe function bodies, Rust enums, Drop implementations, mutable statics, raw-pointer dereferences or arithmetic, inline assembly, or raw syscalls. The only nondeclaration function bodies are 11,496 identical Clone implementations returning *self and three safe core helpers unchanged from the base; the crate makes no internal filesystem, network, process, environment, dynamic-loading, or other Windows API calls, so peer bytes cannot exercise an ambient capability within it. The fixed-name link macros only emit extern declarations, and calls remain unsafe, so consumers must uphold each Windows ABI contract for pointer validity, alignment, lengths, initialization, handles, callbacks and lifetimes and must not treat untrusted peer data as satisfying those preconditions. cargo +1.98.0 test --offline passed with 0 unit tests and 0 doc tests, cargo +1.98.0 check --all-features --offline passed, and cargo +1.98.0 test --all-features --offline compiled the library but failed before running tests because the macOS linker could not find -lwindows. No Windows target or runtime test and no per-API semantic comparison against Windows headers ran on this aarch64 macOS host, and no separate probes ran."
+
+[[audits.windows-sys]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.52.0 -> 0.59.0"
@@ -3937,6 +4241,12 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 version = "0.52.5"
 notes = "Reviewed all packaged source and manifest content. This no_std facade contains only cfg-selected link macro definitions for Windows raw-dylib or separately policy-checked target import-library packages; it has no build script, executable logic, I/O, or ambient authority of its own. Library and documentation targets compiled; the package defines no tests."
+
+[[audits.windows-targets]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.52.5 -> 0.42.2"
+notes = "Reviewed the complete packaged reverse delta and target manifest. Version 0.42.2 contains only an empty no_std library and selects the appropriate platform import-library dependency. The newer link macros are absent. No runtime code or build script; each binary import-library package remains a separate audit requirement."
 
 [[audits.windows-targets]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -3950,14 +4260,32 @@ version = "0.2.1"
 notes = "Reviewed all packaged source and manifest. Submitted closures are boxed once and reclaimed by the one-shot Windows thread-pool callback; public unscoped submission requires 'static, while Scope uses invariant lifetimes and an unwind-safe drop guard that waits for all submitted callbacks before borrowed data can expire. Pool drop waits before closing the cleanup group and pool. The Windows library target cross-compiled for x86_64-pc-windows-msvc."
 
 [[audits.windows_aarch64_gnullvm]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.42.2"
+notes = "Reviewed all Rust source and manifest; build script only selects the packaged lib directory for fixed Windows target triples. Verified source and binary archive bytes against microsoft/windows-rs commit 00fe13a47c3cdce3287069be671aaa3c273f1e0a under crates/targets/aarch64_gnullvm. LLVM inspection found only import descriptors, import data and optional debug sections; GNU executable sections contain only indirect import jumps plus padding, with no startup code. No Windows execution or full Windows API ABI verification was performed."
+
+[[audits.windows_aarch64_gnullvm]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.52.5 -> 0.52.6"
 
 [[audits.windows_aarch64_msvc]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.42.2"
+notes = "Reviewed all Rust source and manifest; build script only selects the packaged lib directory for fixed Windows target triples. Verified source and binary archive bytes against microsoft/windows-rs commit 00fe13a47c3cdce3287069be671aaa3c273f1e0a under crates/targets/aarch64_msvc. LLVM inspection found only import descriptors, import data and optional debug sections; GNU executable sections contain only indirect import jumps plus padding, with no startup code. No Windows execution or full Windows API ABI verification was performed."
+
+[[audits.windows_aarch64_msvc]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.52.5 -> 0.52.6"
+
+[[audits.windows_i686_gnu]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.42.2"
+notes = "Reviewed all Rust source and manifest; build script only selects the packaged lib directory for fixed Windows target triples. Verified source and binary archive bytes against microsoft/windows-rs commit 00fe13a47c3cdce3287069be671aaa3c273f1e0a under crates/targets/i686_gnu. LLVM inspection found only import descriptors, import data and optional debug sections; GNU executable sections contain only indirect import jumps plus padding, with no startup code. No Windows execution or full Windows API ABI verification was performed."
 
 [[audits.windows_i686_gnu]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -3970,9 +4298,21 @@ criteria = "safe-to-deploy"
 delta = "0.52.5 -> 0.52.6"
 
 [[audits.windows_i686_msvc]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.42.2"
+notes = "Reviewed all Rust source and manifest; build script only selects the packaged lib directory for fixed Windows target triples. Verified source and binary archive bytes against microsoft/windows-rs commit 00fe13a47c3cdce3287069be671aaa3c273f1e0a under crates/targets/i686_msvc. LLVM inspection found only import descriptors, import data and optional debug sections; GNU executable sections contain only indirect import jumps plus padding, with no startup code. No Windows execution or full Windows API ABI verification was performed."
+
+[[audits.windows_i686_msvc]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.52.5 -> 0.52.6"
+
+[[audits.windows_x86_64_gnu]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.42.2"
+notes = "Reviewed all Rust source and manifest; build script only selects the packaged lib directory for fixed Windows target triples. Verified source and binary archive bytes against microsoft/windows-rs commit 00fe13a47c3cdce3287069be671aaa3c273f1e0a under crates/targets/x86_64_gnu. LLVM inspection found only import descriptors, import data and optional debug sections; GNU executable sections contain only indirect import jumps plus padding, with no startup code. No Windows execution or full Windows API ABI verification was performed."
 
 [[audits.windows_x86_64_gnu]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -3980,9 +4320,21 @@ criteria = "safe-to-deploy"
 delta = "0.52.5 -> 0.52.6"
 
 [[audits.windows_x86_64_gnullvm]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.42.2"
+notes = "Reviewed all Rust source and manifest; build script only selects the packaged lib directory for fixed Windows target triples. Verified source and binary archive bytes against microsoft/windows-rs commit 00fe13a47c3cdce3287069be671aaa3c273f1e0a under crates/targets/x86_64_gnullvm. LLVM inspection found only import descriptors, import data and optional debug sections; GNU executable sections contain only indirect import jumps plus padding, with no startup code. No Windows execution or full Windows API ABI verification was performed."
+
+[[audits.windows_x86_64_gnullvm]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
 criteria = "safe-to-deploy"
 delta = "0.52.5 -> 0.52.6"
+
+[[audits.windows_x86_64_msvc]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "0.42.2"
+notes = "Reviewed all Rust source and manifest; build script only selects the packaged lib directory for fixed Windows target triples. Verified source and binary archive bytes against microsoft/windows-rs commit 00fe13a47c3cdce3287069be671aaa3c273f1e0a under crates/targets/x86_64_msvc. LLVM inspection found only import descriptors, import data and optional debug sections; GNU executable sections contain only indirect import jumps plus padding, with no startup code. No Windows execution or full Windows API ABI verification was performed."
 
 [[audits.windows_x86_64_msvc]]
 who = "Alfredo Garcia <oxarbitrage@gmail.com>"
@@ -4005,6 +4357,12 @@ who = "Claude Opus 5 <noreply@anthropic.com>"
 criteria = "safe-to-deploy"
 version = "0.17.3"
 notes = "Reviewed all packaged source and manifest. The crate queries Windows Management Instrumentation through COM; its unsafe is the COM vtable calls plus the VARIANT conversions, each checking the HRESULT before reading the returned value and freeing the variant afterwards. COM is initialized and uninitialized in matching pairs tied to a guard type. It is Windows-only and cannot be built or tested on the host used for this review, so it was reviewed by reading rather than by execution."
+
+[[audits.wmi]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "0.17.3 -> 0.18.4"
+notes = "Reviewed the complete packaged delta and the netwatch consumer. Changes retain local Call and remote PktPrivacy authentication defaults, preserve !Send connection ownership, initialize COM with CoIncrementMTAUsage when needed, and add explicitly invoked WMI instance writes/deletes. COM references and BSTR arguments remain alive across synchronous calls. The documented process-lifetime MTA retention is accepted; no shutdown-time initialization is introduced by netwatch. All 24 packaged Rust files match upstream commit 90dad22895ce91691470d15952f40cef87b4d856 after CRLF normalization. No obfuscation or hidden execution was found in this delta. Windows runtime tests were not run; this is a source delta audit, not a dismissal of Socket detector evidence that was unavailable behind sign-in."
 
 [[audits.writeable]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -4111,6 +4469,18 @@ who = "OpenAI Codex <noreply@openai.com>"
 criteria = "safe-to-deploy"
 delta = "1.0.0-rc.2 -> 1.0.0-rc.3"
 notes = "Reviewed the complete packaged delta. The two-lane batch inversion matches Montgomery inversion, skips zeros, handles odd tails, and has direct equality tests against ff::BatchInvert. Its prover inputs are challenge-blinded, and the dependency's inversion is already variable-time. Moving public inverse-FFT normalization to the affine inputs preserves the linear transform. The evaluator reuses cache slots only when the prior slot's last load precedes the new store, and the lower cache threshold changes only the plan workspace. All 76 executable all-feature tests pass. The no-default library target compiles; the no-default integration command fails because its existing plonk_api test imports the default-only BatchVerifier."
+
+[[audits.zakura-iroh-base]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.1.0-rc.0"
+notes = "Registry packaging review for source revision 80e2ec271469f478d2d46388254be71341b50015: compared all 4 upstream 1.1.0 Rust files with the prepared archive; all are byte-identical. Checked normalized manifests, library names and exact sibling package aliases. The prior audits.iroh-base/iroh-dns 1.1.0 source review and recorded compatibility delta apply to these unchanged files. The only added Rust file contains the two Dalek authentication regressions; both pass, along with 15 unit tests and one doctest, using the published Dalek 2.2 and Curve25519-Dalek 4.1.3 dependencies. Prior source-review scope and limitations: Reviewed all production Rust source and package manifest: key/signature conversion and strict signature verification, owned endpoint/address collections, bounded custom-address decoding and relay URL parsing. Public keys are validated through Dalek constructors; secret debug output is redacted and key generation delegates to the random source. No unsafe, build script, or ambient I/O in this package. Callers must bound externally supplied address collections and URL lengths and must not treat parsing as authorization. This registry-baseline record is separate from the recorded stable-Dalek fork delta. Source review; no new runtime tests in this pass."
+
+[[audits.zakura-iroh-dns]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+version = "1.1.0-rc.0"
+notes = "Registry packaging review for source revision 80e2ec271469f478d2d46388254be71341b50015: compared all 7 upstream 1.1.0 Rust files with the prepared archive; all are byte-identical. Checked normalized manifests, library names and exact sibling package aliases. The prior audits.iroh-base/iroh-dns 1.1.0 source review and recorded compatibility delta apply to these unchanged files. The archive rebuilt successfully. No new Android or live DNS execution was performed. Prior source-review scope and limitations: Reviewed production Rust source, manifest and build script, including signed-packet bounds/signature-before-DNS parsing, endpoint metadata, resolver configuration/reset, retries and Android initialization. DNS/network operations and system resolver configuration access are explicit; build script only declares cfg names. Android unsafe initialization forwards the documented process-lifetime VM/context precondition to ndk_context. Audit discretion: caller-supplied retry delays of 1 or 2 ms panic in jitter calculation; use zero or at least 3 ms and bound retry counts. Iroh uses 200-3000 ms. Resolver resets can extend a request deadline, so callers needing an overall deadline must enforce it. No Android or live DNS tests in this pass; separate parser/resolver dependency audits remain required."
 
 [[audits.zakura-jubjub]]
 who = "OpenAI Codex <noreply@openai.com>"
@@ -4410,7 +4780,7 @@ end = "2025-07-09"
 criteria = "safe-to-deploy"
 user-id = 3618 # David Tolnay (dtolnay)
 start = "2019-03-01"
-end = "2025-07-09"
+end = "2027-09-09"
 
 [[trusted.tokio]]
 criteria = "safe-to-deploy"
@@ -4420,7 +4790,7 @@ end = "2025-07-29"
 
 [[trusted.zakura-assets]]
 criteria = "safe-to-deploy"
-user-id = 1244 # Sean Bowe (ebfull)
+user-id = 1244
 start = "2026-08-11"
 end = "2027-08-24"
 
@@ -4471,3 +4841,15 @@ criteria = "safe-to-deploy"
 user-id = 169181 # Kris Nuttycombe (nuttycom)
 start = "2024-12-17"
 end = "2027-07-10"
+
+[[audits.zakura-iroh-base]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "1.1.0-rc.0 -> 1.1.0-rc.1"
+notes = "Compared every Rust file in the rc0 registry package with rc1 staged from fork revision 6562f6f3be8a9c9591fc89911cf8217196b824ec; all are byte-identical. Only release metadata changes. The archive rebuilt successfully. Prior audit scope and limitations remain."
+
+[[audits.zakura-iroh-dns]]
+who = "OpenAI Codex <noreply@openai.com>"
+criteria = "safe-to-deploy"
+delta = "1.1.0-rc.0 -> 1.1.0-rc.1"
+notes = "Compared every Rust file in the rc0 registry package with rc1 staged from fork revision 6562f6f3be8a9c9591fc89911cf8217196b824ec; all are byte-identical. Release metadata and exact sibling package versions change. The archive rebuilt successfully. Prior audit scope and limitations remain."

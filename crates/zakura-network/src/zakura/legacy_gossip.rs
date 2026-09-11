@@ -3641,7 +3641,7 @@ mod tests {
 
     async fn node_peer_id(node: &ZakuraTestNode) -> Result<ZakuraPeerId, BoxError> {
         Ok(ZakuraPeerId::new(
-            node.node_addr().await.node_id.as_bytes().to_vec(),
+            node.node_addr().await.id.as_bytes().to_vec(),
         )?)
     }
 
@@ -4071,6 +4071,8 @@ mod tests {
         wait_registered_count(&node_c, 2).await?;
 
         let a_peer_id = node_peer_id(&node_a).await?;
+        let b_peer_id = node_peer_id(&node_b).await?;
+        let c_peer_id = node_peer_id(&node_c).await?;
         let mut gossip = LegacyGossipAdapter::new(node_a.supervisor());
         gossip
             .ready()
@@ -4081,13 +4083,15 @@ mod tests {
         match recv_request(&mut rx_b).await? {
             Request::AdvertiseBlock(hash, Some(PeerSource::Zakura(peer_id))) => {
                 assert_eq!(hash, block.hash());
-                assert_eq!(peer_id, a_peer_id);
+                // C may forward the announcement before the direct A-to-B stream arrives.
+                assert!(peer_id == a_peer_id || peer_id == c_peer_id);
             }
             request => panic!("unexpected B request: {request:?}"),
         }
         match recv_request(&mut rx_c).await? {
-            Request::AdvertiseBlock(hash, Some(PeerSource::Zakura(_))) => {
+            Request::AdvertiseBlock(hash, Some(PeerSource::Zakura(peer_id))) => {
                 assert_eq!(hash, block.hash());
+                assert!(peer_id == a_peer_id || peer_id == b_peer_id);
             }
             request => panic!("unexpected C request: {request:?}"),
         }

@@ -98,7 +98,7 @@ impl Drop for ConnectedPeer {
 
 async fn connect_download_peer(
     client: &Endpoint,
-    address: NodeAddr,
+    address: EndpointAddr,
     handler: ZakuraProtocolHandler,
     limits: ZakuraLocalLimits,
 ) -> Result<ConnectedPeer, BoxError> {
@@ -350,16 +350,15 @@ async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
     let mut address = LocalEndpointFactory::node_addr(router.endpoint()).await;
     let link = if impaired {
         let server_address = *address
-            .direct_addresses()
+            .ip_addrs()
             .find(|address| address.is_ipv4())
             .unwrap();
         let link = link::ImpairedLink::new(server_address).await?;
-        address = NodeAddr::new(address.node_id).with_direct_addresses([link.address]);
+        address = EndpointAddr::new(address.id).with_addrs([iroh::TransportAddr::Ip(link.address)]);
         Some(link)
     } else {
         None
     };
-    let remote_id = address.node_id;
     let transport =
         connect_download_peer(&client, address, client_handler.clone(), limits.clone()).await?;
     let mut connection = transport.connection.clone();
@@ -602,7 +601,7 @@ async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
                 .iter()
                 .map(|block| u64::try_from(block.zcash_serialized_size()).unwrap())
                 .sum();
-            link.verify_path(&client, remote_id, useful);
+            link.verify_path(&connection, useful);
         }
         if round + 1 < rounds {
             let previous_client = client_session.0;
@@ -849,7 +848,7 @@ async fn remote_pair_reset_with_unanswered_work_preserves_no_progress_policy(
     let client = LocalEndpointFactory::with_transport_config(limits.transport_config())
         .endpoint(94302)
         .await?;
-    let remote_peer = ZakuraPeerId::new(server.node_id().as_bytes().to_vec())?;
+    let remote_peer = ZakuraPeerId::new(server.id().as_bytes().to_vec())?;
     let handler = |service: Arc<BlockSyncService>, endpoint| {
         ZakuraProtocolHandler::new_with_registry(
             ZakuraSupervisorHandle::new(16),

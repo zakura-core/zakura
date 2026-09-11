@@ -83,10 +83,15 @@ impl ImpairedLink {
         })
     }
 
-    pub(super) fn verify_path(&self, client: &Endpoint, server: NodeId, useful_bytes: u64) {
+    pub(super) fn verify_path(&self, connection: &Connection, useful_bytes: u64) {
+        let paths = connection.paths();
+        let selected = paths
+            .iter()
+            .find(|path| path.is_selected())
+            .expect("the active download connection has a selected path");
         assert_eq!(
-            client.remote_info(server).unwrap().conn_type,
-            ConnectionType::Direct(self.address),
+            selected.remote_addr(),
+            &iroh::TransportAddr::Ip(self.address),
             "iroh must not migrate around the impaired link"
         );
         assert!(

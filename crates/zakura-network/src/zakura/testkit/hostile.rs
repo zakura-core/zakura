@@ -57,12 +57,11 @@ impl HostilePeer {
             .endpoint(seed)
             .await?;
         let victim_addr = victim.node_addr().await;
-        let opens_block_pair = endpoint.node_id() < victim_addr.node_id;
-        endpoint.add_node_addr(victim_addr.clone())?;
+        let opens_block_pair = endpoint.id() < victim_addr.id;
         let connection = endpoint.connect(victim_addr, P2P_V2_ALPN).await?;
         let mut config = ZakuraHandshakeConfig::for_network(&Config::default().network);
         config.supported_capabilities = capabilities;
-        let local_peer_id = ZakuraPeerId::new(endpoint.node_id().as_bytes().to_vec())?;
+        let local_peer_id = ZakuraPeerId::new(endpoint.id().as_bytes().to_vec())?;
         run_native_initiator_handshake(&connection, &limits, &config, &local_peer_id).await?;
 
         Ok(Self {
@@ -78,9 +77,7 @@ impl HostilePeer {
 
     /// Return this peer's authenticated Iroh id as Zakura sees it.
     pub fn id(&self) -> Result<ZakuraPeerId, BoxError> {
-        Ok(ZakuraPeerId::new(
-            self.endpoint.node_id().as_bytes().to_vec(),
-        )?)
+        Ok(ZakuraPeerId::new(self.endpoint.id().as_bytes().to_vec())?)
     }
 
     /// Encode and send one canonical protocol-v8 header-sync message.
@@ -682,7 +679,7 @@ mod tests {
         let server_addr = LocalEndpointFactory::node_addr(router.endpoint()).await;
 
         let client = LocalEndpointFactory::new().endpoint(4041).await?;
-        client.add_node_addr(server_addr.clone())?;
+
         let connection = client.connect(server_addr, TEST_ALPN).await?;
 
         let (_send, mut recv) = connection.accept_bi().await?;

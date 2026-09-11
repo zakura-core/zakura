@@ -717,7 +717,7 @@ async fn connect_leecher_to_seeds(
             .await?;
     }
 
-    let leecher_id = leecher.node_addr().await.node_id.as_bytes().to_vec();
+    let leecher_id = leecher.node_addr().await.id.as_bytes().to_vec();
     let seed_ids = seed_peer_ids(cluster, seed_count).await;
     let leecher_peers = leecher.supervisor().subscribe();
     await_until(
@@ -756,7 +756,7 @@ async fn seed_peer_ids(cluster: &ZakuraTestCluster, seed_count: usize) -> Vec<Ve
                 .node(seed_index)
                 .node_addr()
                 .await
-                .node_id
+                .id
                 .as_bytes()
                 .to_vec(),
         );

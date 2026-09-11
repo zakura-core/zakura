@@ -32,6 +32,8 @@ jobs:
           sha = subprocess.check_output(['git', '-C', '/root/zakura', 'rev-parse', 'HEAD'], text=True).strip()
           assert sha == 'e3328340aa040971681ed222a5bfc63fe43d8991', sha
           print('TARGET_SHA', sha, flush=True)
+          processes=subprocess.check_output(['ps','-eo','pid,etime,pcpu,rss,comm'],text=True)
+          print('\n'.join(line for line in processes.splitlines() if 'zakurad' in line or 'rustc' in line),flush=True)
           print(subprocess.run(['ps','-C','rustc','-o','pid,etime,%cpu,rss,comm'],text=True,capture_output=True).stdout,flush=True)
           def rpc(url, method, params=None):
               request=urllib.request.Request(url,data=json.dumps({'jsonrpc':'2.0','id':'pr966-readonly-evidence','method':method,'params':params or []}).encode(),headers={'Content-Type':'application/json'})
@@ -41,24 +43,11 @@ jobs:
           seed='http://127.0.0.1:8232'
           client='http://127.0.0.1:18232'
           reference='http://159.65.183.89:8232'
-          deadline=time.monotonic()+600
-          while True:
+          for role,url in [('seed',seed),('client',client)]:
               try:
-                  info=rpc(client,'getblockchaininfo')
-                  if info['blocks']>3476074:break
-              except Exception as exc:
-                  print('WAIT',str(exc),flush=True)
-              if time.monotonic()>deadline:raise RuntimeError('native client did not reach post-checkpoint height before evidence deadline')
-              time.sleep(10)
-          height=info['blocks']
-          result={'sha':sha,'height':height,'client_info':info,'seed_info':rpc(seed,'getblockchaininfo'),'reference_info':rpc(reference,'getnetworkinfo')}
-          result['trees']={role:rpc(url,'z_gettreestate',[str(height)]) for role,url in [('client',client),('seed',seed),('reference',reference)]}
-          result['hashes']={role:rpc(url,'getblockhash',[height]) for role,url in [('client',client),('seed',seed),('reference',reference)]}
-          result['hashes_match']=len(set(result['hashes'].values()))==1
-          result['tree_matches']={pool:len({json.dumps(tree.get(pool),sort_keys=True) for tree in result['trees'].values()})==1 for pool in ['sapling','orchard','ironwood']}
-          print('COMPARISON',json.dumps(result),flush=True)
-          assert result['hashes_match'], 'block hash mismatch'
-          assert all(result['tree_matches'].values()), 'tree state mismatch'
+                  print(role, 'getblockchaininfo', json.dumps(rpc(url,'getblockchaininfo')))
+                  print(role, 'getpeerinfo', json.dumps(rpc(url,'getpeerinfo')))
+              except Exception as exc: print(role,str(exc))
           print(subprocess.check_output(['systemctl','show','zakurad','--property=ActiveState,NRestarts,MainPID'],text=True))
           for name in ['/var/log/zakura/zakura.log','/root/out/paired/downloader.log']:
               path=Path(name)

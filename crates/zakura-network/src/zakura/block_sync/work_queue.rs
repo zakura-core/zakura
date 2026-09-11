@@ -21,10 +21,7 @@
 //! reservation); it exists only to carry the `SizeMismatch` tolerance check
 //! through to the reactor's receive path and request budget.
 
-use std::{
-    num::NonZeroU64,
-    sync::{Mutex as StdMutex, Weak},
-};
+use std::{num::NonZeroU64, sync::Mutex as StdMutex};
 
 use tokio::sync::Notify;
 use zakura_chain::block;
@@ -32,6 +29,7 @@ use zakura_chain::block;
 use super::{request::BlockSizeEstimate, state::BlockBudgetLedger};
 
 mod request_write;
+use request_write::RequestWriteRegistration;
 pub(super) use request_write::{RequestWrite, RequestWriteStatus};
 
 /// Lower clamp on a body-size estimate.
@@ -58,6 +56,8 @@ pub(super) struct WorkItem {
 /// Diagnostics for an attempted `in_flight -> pending` retry transition.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct WorkReturnOutcome {
+    /// This owner's frame was skipped before writing, atomically with settlement.
+    pub(super) request_was_unwritten: bool,
     /// Reserved bytes released while returning or discarding items.
     pub(super) released_bytes: u64,
     /// Reserved items successfully moved back to `pending`.
@@ -88,10 +88,10 @@ struct WorkQueueInner {
     /// item, maintained incrementally at each ledger transition so
     /// [`WorkQueue::reserved_bytes`]
     reserved_bytes: u64,
-    /// Only queued or writing requests need reset notification. Weak entries
-    /// cannot retain expired requests or their session resources.
+    /// Weak owners allow reset notification without retaining session resources.
+    /// Their status survives until writing or terminal cleanup finishes.
     request_writes:
-        std::collections::HashMap<zakura_header_chain::BodyWorkOwner, Weak<RequestWrite>>,
+        std::collections::HashMap<zakura_header_chain::BodyWorkOwner, RequestWriteRegistration>,
 }
 
 impl WorkQueueInner {
@@ -631,16 +631,20 @@ impl WorkQueue {
         let claim;
         {
             let mut inner = self.lock();
-            claim =
-                owner.and_then(|owner| inner.request_writes.get(&owner).and_then(Weak::upgrade));
-            if let Some(claim) = &claim {
+            let registration = owner.and_then(|owner| inner.request_writes.get(&owner));
+            claim = registration.and_then(|registration| registration.claim.upgrade());
+            if let Some(registration) = registration {
                 // The writer claims under this same lock. Expiry skips an
-                // unwritten frame; an already-started frame must finish.
-                claim.expire_unwritten();
-                if claim.status().was_skipped() {
-                    // Skipping an unsent frame retires its whole request. Return
-                    // every remaining reservation without waiting for queue drain.
-                    heights.extend(claim.heights());
+                // unwritten frame even while its last owner is being dropped.
+                if registration.status.expire_unwritten() {
+                    self.available.notify_waiters();
+                }
+                outcome.request_was_unwritten = registration.status.was_skipped();
+                if outcome.request_was_unwritten {
+                    if let Some(claim) = &claim {
+                        // Skipping an unsent frame retires its whole request.
+                        heights.extend(claim.heights());
+                    }
                 }
             }
             for height in heights {
@@ -758,7 +762,7 @@ impl WorkQueue {
         let claims: Vec<_> = inner
             .request_writes
             .values()
-            .filter_map(Weak::upgrade)
+            .filter_map(|registration| registration.claim.upgrade())
             .collect();
         for claim in claims.iter().filter(|claim| claim.has_height_above(floor)) {
             claim.reset();

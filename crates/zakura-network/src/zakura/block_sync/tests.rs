@@ -3095,6 +3095,134 @@ fn floor_watchdog_skips_received_heights() {
     assert_eq!(queue.advance_floor(block::Height(1)), 0);
 }
 
+#[tokio::test]
+async fn floor_watchdog_only_avoids_requests_that_started_writing() {
+    use super::work_queue::RequestWrite;
+    use crate::zakura::transport::FrameWriteClaim;
+
+    #[derive(Clone, Copy, Debug)]
+    enum WriteState {
+        Queued,
+        Started,
+        Written,
+        Dropped,
+    }
+
+    for write_state in [
+        WriteState::Queued,
+        WriteState::Started,
+        WriteState::Written,
+        WriteState::Dropped,
+    ] {
+        let config = immediate_body_download_config();
+        let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+        let startup = BlockSyncStartup::new(
+            BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(0),
+                verified_block_hash: block::Hash([0; 32]),
+            },
+            (block::Height(0), block::Hash([0; 32])),
+            tip_rx,
+            config.clone(),
+        );
+        let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
+        let wiring = handle.routine_wiring.as_ref().unwrap();
+        let now = Instant::now();
+        let mut generation = 0;
+        // Register three servable peers without routines, so only the running
+        // reactor can expire the claim and apply floor avoidance.
+        for id in 1..=3 {
+            let current = wiring
+                .registry
+                .admit_session(&peer(id), ServicePeerDirection::Outbound, &config, 0, now)
+                .generation();
+            wiring.registry.upsert_status(&peer(id), current, status());
+            if id == 1 {
+                generation = current;
+            }
+        }
+        assert_eq!(wiring.registry.floor_gap_servable(block::Height(1)).0, 3);
+        wiring.work.set_estimate_floor_for_tests(1);
+        wiring.work.extend(
+            test_work_scope(),
+            [(
+                block::Height(1),
+                block::Hash([1; 32]),
+                BlockSizeEstimate::Confirmed(100),
+            )],
+        );
+        let items = wiring.work.take_for_request(
+            block::Height(1),
+            block::Height(1),
+            1,
+            100,
+            generation,
+            std::num::NonZeroU64::new(1).unwrap(),
+        );
+        assert_eq!(items.len(), 1);
+        let owner = items[0].1.owner.unwrap();
+        assert!(wiring.budget.clone().try_reserve(100));
+        let write = RequestWrite::new(
+            owner,
+            items,
+            wiring.work.clone(),
+            wiring.budget.clone(),
+            CancellationToken::new(),
+        );
+        assert!(write.publish(|| {
+            wiring.registry.set_outstanding(
+                &peer(1),
+                generation,
+                BTreeMap::from([(
+                    block::Height(1),
+                    OutstandingMeta {
+                        owner,
+                        hash: block::Hash([1; 32]),
+                        estimated_bytes: 100,
+                        queued_at: now,
+                        deadline: now,
+                    },
+                )]),
+            );
+        }));
+        let started = matches!(write_state, WriteState::Started | WriteState::Written);
+        if started {
+            assert!(write.try_start());
+        }
+        if matches!(write_state, WriteState::Written) {
+            write.written();
+        }
+        let write_status = write.status();
+        let write = if matches!(write_state, WriteState::Dropped) {
+            drop(write);
+            None
+        } else {
+            Some(write)
+        };
+
+        await_until(
+            "watchdog settles the expired floor claim",
+            Duration::from_secs(2),
+            || wiring.registry.total_unreceived() == 0 && wiring.budget.reserved() == 0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(write_status.was_skipped(), !started, "{write_state:?}");
+        assert_eq!(wiring.work.reserved_bytes(), 0);
+        assert!(wiring.work.pending_contains(block::Height(1)));
+        assert_eq!(
+            wiring
+                .registry
+                .is_floor_height_avoided(&peer(1), block::Height(1), Instant::now()),
+            started,
+            "floor avoidance must reflect the settled write: {write_state:?}",
+        );
+        reactor_task.abort();
+        drop(write);
+    }
+}
+
 #[test]
 fn late_body_does_not_resurrect_charge() {
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);

@@ -558,16 +558,33 @@ impl PeerRoutine {
         };
         let body_permit = if frame_type == MSG_BS_BLOCK {
             if self.window.outstanding.is_empty() {
+                self.report_misbehavior(BlockSyncMisbehavior::UnsolicitedBlock)
+                    .await;
                 return Err(SinkReject::protocol("Block has no response authorization"));
             }
-            let header = block::Header::zcash_deserialize_from_slice(&mut &frame.payload[1..])
-                .map_err(SinkReject::protocol)?;
-            let index = self.response_index(header.hash())?;
+            let header = match block::Header::zcash_deserialize_from_slice(&mut &frame.payload[1..])
+            {
+                Ok(header) => header,
+                Err(error) => {
+                    self.report_misbehavior(BlockSyncMisbehavior::MalformedMessage)
+                        .await;
+                    return Err(SinkReject::protocol(error));
+                }
+            };
+            let index = match self.response_index(header.hash()) {
+                Ok(index) => index,
+                Err(error) => {
+                    self.report_misbehavior(BlockSyncMisbehavior::UnsolicitedBlock)
+                        .await;
+                    return Err(error);
+                }
+            };
             let bytes = u64::try_from(frame.payload.len() - 1).expect("frame length fits u64");
-            self.window.outstanding[index]
-                .response
-                .check(1, bytes)
-                .map_err(SinkReject::protocol)?;
+            if let Err(error) = self.window.outstanding[index].response.check(1, bytes) {
+                self.report_misbehavior(BlockSyncMisbehavior::MalformedMessage)
+                    .await;
+                return Err(SinkReject::protocol(error));
+            }
             let permit = self.reserve_body_decode_permit();
             tokio::pin!(permit);
             Some(tokio::select! {
@@ -917,21 +934,20 @@ impl PeerRoutine {
             // (geometry included — an exempt grant is clamped at the window top, so
             // no above-window height can ride an exempt request past the gate).
             let snapshot = self.admission_snapshot(&view);
-            // This asks the shared peer registry:
-            // "Is there another pper that should take the floor instead of this peer?"
-            // This is helpful for rescuing the floor with a peer who has better latency score and
-            // is not saturated.
-            let floor_arm_allowed = !self.registry.floor_has_preferred_unsaturated_server(
-                view.download_floor,
-                &self.peer,
-                self.window.bbr_rtprop_ms(now),
-                in_bypass,
-            );
             let mut items = Vec::new();
-            if floor_arm_allowed && servable_low <= floor_high {
+            if servable_low <= floor_high {
                 if let Some(floor_start) = self
                     .work
                     .first_pending_in_range(servable_low, servable_high.min(floor_high))
+                    .filter(|height| {
+                        // Prefer only a peer that can serve the actual missing height.
+                        !self.registry.floor_has_preferred_unsaturated_server(
+                            *height,
+                            &self.peer,
+                            self.window.bbr_rtprop_ms(now),
+                            in_bypass,
+                        )
+                    })
                 {
                     // Prioritize the lowest missing block so commit can keep moving, even if
                     // that means freeing look-ahead budget. `admit` is the single authority
@@ -1685,15 +1701,18 @@ impl PeerRoutine {
         start_height: block::Height,
         returned: u32,
     ) -> Result<(), SinkReject> {
-        let index = self
-            .window
-            .outstanding_index_for_start(start_height)
-            .ok_or_else(|| SinkReject::protocol("BlocksDone has no live range"))?;
+        let Some(index) = self.window.outstanding_index_for_start(start_height) else {
+            self.report_misbehavior(BlockSyncMisbehavior::UnsolicitedDone)
+                .await;
+            return Err(SinkReject::protocol("BlocksDone has no live range"));
+        };
         let range = &self.window.outstanding[index];
         if returned == 0
             || returned > range.request.count
             || u64::from(returned) != range.response.consumed_objects()
         {
+            self.report_misbehavior(BlockSyncMisbehavior::MalformedMessage)
+                .await;
             return Err(SinkReject::protocol(
                 "BlocksDone count differs from consumed prefix",
             ));
@@ -1716,12 +1735,15 @@ impl PeerRoutine {
         start_height: block::Height,
         count: u32,
     ) -> Result<(), SinkReject> {
-        let index = self
-            .window
-            .outstanding_index_for_start(start_height)
-            .ok_or_else(|| SinkReject::protocol("RangeUnavailable has no live range"))?;
+        let Some(index) = self.window.outstanding_index_for_start(start_height) else {
+            self.report_misbehavior(BlockSyncMisbehavior::UnsolicitedDone)
+                .await;
+            return Err(SinkReject::protocol("RangeUnavailable has no live range"));
+        };
         let range = &self.window.outstanding[index];
         if count != range.request.count || range.response.consumed_objects() != 0 {
+            self.report_misbehavior(BlockSyncMisbehavior::MalformedMessage)
+                .await;
             return Err(SinkReject::protocol(
                 "RangeUnavailable does not match an unconsumed original range",
             ));
@@ -1873,6 +1895,10 @@ impl PeerRoutine {
                 // floor-preference comparison.
                 bbr_rtprop_ms: self.window.bbr_rtprop_ms(Instant::now()),
             },
+            self.window
+                .outstanding
+                .iter()
+                .map(|range| (range.request.start_height, range.request.end_height())),
         );
     }
 

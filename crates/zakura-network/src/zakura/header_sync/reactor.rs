@@ -3343,7 +3343,7 @@ impl HeaderSyncReactor {
             );
             return;
         }
-        candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.4));
+        // Keep the rotating order even when a later supplier offers a larger batch.
         let mut local_capacity_unavailable = false;
         let mut local_send_failure = false;
         for (peer, source, session, mut status, request_count) in candidates {

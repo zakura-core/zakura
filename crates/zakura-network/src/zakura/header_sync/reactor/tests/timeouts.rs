@@ -443,6 +443,15 @@ impl ReadyVctRepairFixture {
         Self::with_trace(None)
     }
 
+    fn with_two_header_range() -> Self {
+        let mut fixture = Self::new();
+        fixture.context = fixture
+            .context
+            .extend_empty_selected_range(&[fixture.snapshot.frontiers.header_best], None)
+            .expect("the fixture has two contiguous selected headers");
+        fixture
+    }
+
     fn with_trace(trace: Option<crate::zakura::ZakuraTrace>) -> Self {
         let mut startup = startup(CancellationToken::new());
         if let Some(trace) = trace {
@@ -493,7 +502,8 @@ impl ReadyVctRepairFixture {
             selected_tip_hash: self.snapshot.frontiers.header_best.hash,
             suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
             oldest_retained_height: self.anchor.height,
-            max_headers_per_response: 1,
+            max_headers_per_response: u32::try_from(self.context.selected_header_count())
+                .expect("the fixture repair range fits u32"),
             max_inflight_requests: 1,
             max_message_bytes: 2_000_000,
             tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
@@ -540,6 +550,29 @@ impl ReadyVctRepairFixture {
                 HeaderSyncMessage::Status(status.clone()),
             );
         }
+    }
+
+    fn reply_busy(&mut self, peer: &ZakuraPeerId) {
+        let active = self
+            .reactor
+            .peer_work_queue
+            .active(peer)
+            .expect("the supplier owns an active repair")
+            .clone();
+        assert!(matches!(
+            active.purpose,
+            HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
+        ));
+        self.reactor.handle_wire_response(
+            peer.clone(),
+            active.owner.session_id(),
+            active.owner.header_authority(),
+            HeaderSyncMessage::HeadersOutcome(HeadersOutcome {
+                request_id: active.request_id.get(),
+                target_tip_hash: active.target.status.selected_tip_hash,
+                outcome: HeadersOutcomeCode::Busy,
+            }),
+        );
     }
 }
 
@@ -1546,6 +1579,111 @@ async fn busy_vct_supplier_rotates_without_delaying_another_supplier() {
         .unwrap()
         .tried_sources
         .is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn busy_suppliers_give_a_smaller_repair_supplier_its_turn() {
+    let mut fixture = ReadyVctRepairFixture::with_two_header_range();
+    let (peers, _outbounds) = fixture.connect(&[1, 2, 3, 4], 7);
+    fixture.schedule();
+    fixture.advertise(&peers[..3], 7);
+    let mut status = fixture.status();
+    status.selected_tip_height = fixture.target.height;
+    status.selected_tip_hash = fixture.target.hash;
+    fixture
+        .reactor
+        .handle_wire_message(peers[3].clone(), 10, HeaderSyncMessage::Status(status));
+
+    for peer in &peers[..3] {
+        let active = fixture
+            .reactor
+            .peer_work_queue
+            .active(peer)
+            .expect("each larger supplier gets one turn")
+            .clone();
+        assert_eq!(active.max_header_count, 2);
+        // Two intervening refusals outlast even the capped 30-second Busy delay.
+        time::advance(std::time::Duration::from_secs(16)).await;
+        fixture.reactor.refresh_statuses();
+        assert_eq!(
+            fixture.reactor.peer_work_queue.active(peer).unwrap().owner,
+            active.owner,
+            "the refusal arrives before the request timeout"
+        );
+        fixture.reply_busy(peer);
+    }
+
+    let active = fixture
+        .reactor
+        .peer_work_queue
+        .active(&peers[3])
+        .expect("the smaller supplier gets a turn before any Busy supplier repeats");
+    assert!(matches!(
+        active.purpose,
+        HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
+    ));
+    assert_eq!(active.max_header_count, 1);
+    assert_eq!(active.target.status.selected_tip_hash, fixture.target.hash);
+    assert_eq!(fixture.reactor.vct_repair.current().unwrap().attempts, 3);
+    assert!(fixture
+        .reactor
+        .peer_state
+        .values()
+        .all(|peer| peer.unproductive_requests == 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn reconnecting_suppliers_give_a_waiting_repair_supplier_its_turn() {
+    for fresh_identity in [false, true] {
+        let mut fixture = ReadyVctRepairFixture::with_two_header_range();
+        let (peers, mut outbounds) = fixture.connect(&[1, 2, 3, 4], 7);
+        fixture.schedule();
+        fixture.advertise(&peers[..3], 7);
+        let mut status = fixture.status();
+        status.selected_tip_height = fixture.target.height;
+        status.selected_tip_hash = fixture.target.hash;
+        fixture.reactor.handle_wire_message(
+            peers[3].clone(),
+            10,
+            HeaderSyncMessage::Status(status),
+        );
+
+        for (index, peer) in peers[..3].iter().enumerate() {
+            let session_id = 7 + u64::try_from(index).unwrap();
+            assert_eq!(
+                fixture
+                    .reactor
+                    .peer_work_queue
+                    .active(peer)
+                    .unwrap()
+                    .owner
+                    .session_id(),
+                session_id
+            );
+            fixture.reply_busy(peer);
+            fixture
+                .reactor
+                .handle_peer_disconnected(peer, session_id, "test reconnect");
+            let marker = u8::try_from(index).unwrap() + if fresh_identity { 11 } else { 1 };
+            let (returning, new_outbounds) = fixture.connect(&[marker], session_id + 100);
+            outbounds.extend(new_outbounds);
+            fixture.advertise(&returning, session_id + 100);
+            time::advance(std::time::Duration::from_millis(1)).await;
+        }
+
+        let active = fixture
+            .reactor
+            .peer_work_queue
+            .active(&peers[3])
+            .expect("returning suppliers cannot jump ahead of a waiting supplier");
+        assert!(matches!(
+            active.purpose,
+            HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
+        ));
+        assert_eq!(active.max_header_count, 1);
+        assert_eq!(fixture.reactor.vct_repair.current().unwrap().attempts, 3);
+        assert_eq!(fixture.reactor.peer_state.len(), 4);
+    }
 }
 
 #[test]

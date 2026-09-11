@@ -57,7 +57,7 @@ else
 fi
 
 # This branch is a disposable harness. The binaries still come from the exact PR head.
-[ "$SHA" = "343dec5790b9318528bed191243ed91af75cbf7d" ] || { echo "wrong PR head" >&2; exit 1; }
+[ "$SHA" = "a30202f2f1c47e08e9c2f8510392353c37d24dfd" ] || { echo "wrong PR head" >&2; exit 1; }
 [ "$MODE" = "tip" ] && [ "$NETWORK" = "mainnet" ] && [ "$P2P_STACK" = "dual" ] || {
   echo "paired smoke requires tip/mainnet/dual for the seed" >&2; exit 1;
 }
@@ -150,7 +150,7 @@ metrics_endpoint = "127.0.0.1:9999"
 [nodes.zakura]
 listen_addr = "127.0.0.1:8234"
 bootstrap_peers = []
-dev_network = "pr945-mainnet-smoke-20260911"
+dev_network = "header-serving-repro-20260911"
 trace_dir = "/var/log/zakura/seed-traces"
 TOML
 

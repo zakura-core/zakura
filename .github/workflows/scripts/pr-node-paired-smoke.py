@@ -10,8 +10,8 @@ import time
 import urllib.request
 from pathlib import Path
 
-EXPECTED_SHA = "343dec5790b9318528bed191243ed91af75cbf7d"
-COHORT = "pr945-mainnet-smoke-20260911"
+EXPECTED_SHA = "a30202f2f1c47e08e9c2f8510392353c37d24dfd"
+COHORT = "header-serving-repro-20260911"
 OUT = Path("/root/out/paired")
 SEED_RPC = "http://127.0.0.1:8232"
 CLIENT_RPC = "http://127.0.0.1:18232"
@@ -211,6 +211,29 @@ def main():
         proc = launch()
         second = run_phase(proc, "restart-sync", restart_start, 1, deadline)
         result["phases"].append(second)
+        stop(proc)
+        proc = None
+        # Reconnect while the seed is advancing, as in the observed failure.
+        seed_before = rpc(SEED_RPC, "getblockcount")
+        seed_deadline = min(deadline - 320, time.monotonic() + 300)
+        observed_advance = False
+        while time.monotonic() < seed_deadline:
+            height = rpc(SEED_RPC, "getblockcount")
+            if height >= seed_before + 250:
+                observed_advance = True
+                emit("seed_advanced_before_reconnect", start=seed_before, height=height)
+                break
+            time.sleep(2)
+        result["advancing_seed_observed"] = observed_advance
+        emit("continuation_start", seed_advanced=observed_advance)
+        proc = launch()
+        third = run_phase(proc, "continued-sync", second["height"], 32,
+                          min(deadline, time.monotonic() + 300))
+        result["phases"].append(third)
+        checkpoint = int(Path("/root/zakura/crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt").read_text().splitlines()[-1].split()[0])
+        crossed = run_phase(proc, "checkpoint-crossing", checkpoint, 1,
+                            min(deadline, time.monotonic() + 300))
+        result["phases"].append(crossed)
         stop(proc)
         proc = None
         stderr.flush()

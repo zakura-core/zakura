@@ -1,6 +1,7 @@
 import json
 import subprocess
 import urllib.request
+import tomllib
 from collections import deque
 from pathlib import Path
 
@@ -16,6 +17,8 @@ for line in subprocess.check_output(['ps','-eo','pid,comm,pcpu,rss,etime'],text=
         pid=line.split()[0]
         io=Path('/proc')/pid/'io'
         if io.exists(): emit('process_io',pid=pid,values=io.read_text())
+cfg=tomllib.loads(Path('/etc/zakura/zakura.toml').read_text())
+emit('seed_network_config', fields={k:cfg['network'].get(k) for k in ['initial_mainnet_peers','peerset_initial_target_size','p2p_stack','cache_dir']})
 for port in [8232,18232]:
     try:
         req=urllib.request.Request(f'http://127.0.0.1:{port}',data=json.dumps({'jsonrpc':'2.0','id':'inspect','method':'getblockcount','params':[]}).encode(),headers={'Content-Type':'application/json'})
@@ -27,7 +30,7 @@ for port in [9999,19999]:
     try:
         with urllib.request.urlopen(f'http://127.0.0.1:{port}/metrics',timeout=3) as response:
             metrics=response.read().decode()
-        names=['state_vct_fast_block_count','sync_block_body_received','sync_block_request_sent','sync_zakura_legacy_fallback_engaged']
+        names=['state_vct_fast_block_count','sync_block_body_received','sync_block_request_sent','sync_zakura_legacy_fallback_engaged','pool_num_peers','peer_set','peer_connected','sync_zakura_watchdog']
         emit('metrics',port=port,values=[line for line in metrics.splitlines() if any(line.startswith(name) for name in names)])
     except Exception:
         pass
@@ -61,5 +64,5 @@ if p.exists():
     for line in p.open(errors='replace'):
         tail.append(line)
         if 'header serving reproduction:' in line: reasons.append(line)
-        if 'failed to make outbound connection' in line or 'handshake' in line.lower(): connection_failures.append(line)
+        if 'ZakuradConfig' not in line and ('failed to make outbound connection' in line or 'handshake' in line.lower()): connection_failures.append(line)
     emit('storage_refusals',count=len(reasons),last=reasons[-10:],connection_failures=connection_failures[-12:],log_tail=list(tail))

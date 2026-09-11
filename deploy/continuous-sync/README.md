@@ -480,9 +480,25 @@ aws --endpoint-url https://YOUR_REGION.digitaloceanspaces.com s3api put-bucket-l
 The controller verifies seven-day expiration before uploading. It streams gzip
 compressed tar archives into `sync-traces/<hostname>/<run-id>.tar.gz` after the
 node stops. Upload failures halt the next run and preserve local traces.
-Completion digests and failure alerts include private download links valid for
-seven days. Existing stopped runs are archived before retention can remove them.
+Daily reports and failure alerts include private download links valid for
+seven days from upload. A delayed report does not renew the links. Existing stopped runs are archived before retention can remove them.
 The lifecycle rule also removes abandoned multipart uploads after one day.
 
 See [Spaces lifecycle rules](https://docs.digitalocean.com/products/spaces/how-to/configure-lifecycle-rules/)
 and [private download links](https://docs.digitalocean.com/products/spaces/how-to/set-file-permissions/).
+
+Controller deployment does not update the daily report sender. After deploying
+controllers, update the sender's formatter from the same checkout:
+
+```sh
+python3 deploy/continuous-sync/deploy.py deploy-summary
+python3 deploy/continuous-sync/deploy.py summary-status
+```
+
+This update preserves existing delivery cursors. For a new sender, follow the
+[initialization procedure](#daily-summary) before enabling its timer.
+Configure the AWS CLI, credentials, and lifecycle rule on every sync host before
+controller deployment. Preflight checks archive access and expiration before
+starting a sync. The next daily report includes a download link for each
+unreported completion that has an archive URL. Runs completed before archival
+was enabled have no download link.

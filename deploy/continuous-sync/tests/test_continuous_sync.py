@@ -58,6 +58,21 @@ class ContinuousSyncTests(unittest.TestCase):
                 self.assertIn("upload failed", sync.load_state(state_path)["failure"])
                 post.assert_called_once()
 
+    def test_archive_preflight_rejects_missing_configuration_and_expiration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(Path(tmp), policy=sync.Policy(archive_traces=True))
+            config.paths.repo_dir.mkdir()
+            config.paths.config_template.write_text("")
+            config.paths.wipe_sentinel.write_text("")
+            with patch.object(sync.shutil, "which", return_value="/usr/bin/tool"), patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(sync.ControllerError, "ZAKURA_TRACE_SPACE"):
+                    sync.preflight(config)
+                with patch.dict(os.environ, {"ZAKURA_TRACE_SPACE": "test",
+                                            "ZAKURA_TRACE_ENDPOINT": "https://nyc3.digitaloceanspaces.com"}), patch.object(
+                        sync, "run", return_value=subprocess.CompletedProcess([], 0, '{"Rules":[]}')):
+                    with self.assertRaisesRegex(sync.ControllerError, "seven-day"):
+                        sync.preflight(config)
+
     def test_archive_rejects_symlink_before_upload(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

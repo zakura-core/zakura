@@ -357,6 +357,8 @@ def preflight(config: Config) -> None:
         if not path.exists():
             raise ControllerError(f"{description} is missing: {path}")
     check_free_space(config)
+    if config.policy.archive_traces:
+        trace_archive_destination()
 
 
 def safe_wipe_state(config: Config) -> None:
@@ -611,15 +613,8 @@ def wait_for_completion(
             time.sleep(config.policy.poll_interval_seconds)
 
 
-def archive_traces(config: Config, run_dir: Path, run_state: dict[str, Any]) -> None:
-    """Upload stopped-node traces before the controller can start another run."""
-    if not config.policy.archive_traces or run_state.get("trace_archive_url"):
-        return
-    traces = run_dir / "traces"
-    if traces.is_symlink():
-        raise ControllerError(f"refusing to archive symlinked traces: {traces}")
-    if not traces.exists():
-        return
+def trace_archive_destination() -> tuple[list[str], str]:
+    """Validate archive access and expiration before starting a sync or upload."""
     bucket = os.environ.get("ZAKURA_TRACE_SPACE", "")
     endpoint = os.environ.get("ZAKURA_TRACE_ENDPOINT", "")
     if not bucket or not re.fullmatch(r"https://[a-z0-9-]+\.digitaloceanspaces\.com", endpoint):
@@ -634,6 +629,19 @@ def archive_traces(config: Config, run_dir: Path, run_state: dict[str, Any]) -> 
                     or rule.get("Filter") == {"Prefix": "sync-traces/"})
                for rule in lifecycle.get("Rules", [])):
         raise ControllerError("Space requires a seven-day sync-traces/ expiration rule")
+    return aws, bucket
+
+
+def archive_traces(config: Config, run_dir: Path, run_state: dict[str, Any]) -> None:
+    """Upload stopped-node traces before the controller can start another run."""
+    if not config.policy.archive_traces or run_state.get("trace_archive_url"):
+        return
+    traces = run_dir / "traces"
+    if traces.is_symlink():
+        raise ControllerError(f"refusing to archive symlinked traces: {traces}")
+    if not traces.exists():
+        return
+    aws, bucket = trace_archive_destination()
     host = re.sub(r"[^A-Za-z0-9_.-]", "_", config.policy.hostname)
     key = f"sync-traces/{host}/{run_dir.name}.tar.gz"
     uri = f"s3://{bucket}/{key}"

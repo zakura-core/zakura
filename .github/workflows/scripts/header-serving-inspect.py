@@ -50,3 +50,14 @@ if p.exists():
             if row["event"]=="header_response_served" and latest and row["header_generation"]<latest["header_generation"]:
                 spanning.append({"request":row["request_id"],"request_generation":row["header_generation"],"current_generation":latest["header_generation"],"headers":row["header_count"]})
         print("spanning_responses",len(spanning),spanning[:5])
+for filename in ["events.jsonl", "traces/block_sync.jsonl", "traces/commit_state.jsonl", "traces/header_sync.jsonl"]:
+    path=Path('/root/out/paired')/filename
+    if path.exists():
+        print('client_trace_tail',filename,subprocess.check_output(['tail','-n','12',str(path)],text=True))
+try:
+    with urllib.request.urlopen('http://127.0.0.1:19999/metrics',timeout=5) as r:
+        for line in r.read().decode().splitlines():
+            if not line.startswith('#') and any(s in line for s in ['state_vct','sync_block','sync_zakura','checkpoint_']):
+                print('client_metric',line)
+except Exception as e:
+    print('client_metrics_unavailable',str(e))

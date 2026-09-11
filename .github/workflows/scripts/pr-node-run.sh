@@ -213,6 +213,14 @@ fi
 
 # Both isolated nodes run the exact PR binary.
 install -m 755 "/root/zakura/deploy/deployer/.build-cache/zakurad-${SHA}" /usr/local/bin/zakurad-downloader
+cat > /root/diagnostic-preflight.toml <<'TOML'
+[state]
+storage_mode = "pruned"
+TOML
+CODEX_HANDOFF_PROBE_FILE=/root/out/paired/trigger-state-tip-probe \
+  /usr/local/bin/zakurad-downloader -c /root/diagnostic-preflight.toml tip-height \
+    --cache-dir "$PAIRED_STATE_CACHE_DIR" --network "$NET_TOML" \
+    > "$OUT_DIR/diagnostic-start-height.txt"
 python3 deploy/deployer/deploy.py deploy --config /root/fleet.toml
 python3 deploy/deployer/deploy.py status --config /root/fleet.toml || true
 cmp /usr/local/bin/zakurad /usr/local/bin/zakurad-downloader

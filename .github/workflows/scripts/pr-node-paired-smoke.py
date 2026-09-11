@@ -188,17 +188,17 @@ def main():
         seed_id = seed_identity(min(deadline, time.monotonic() + 360))
         config = OUT / "downloader.toml"
         config.write_text(child_config(args.state, seed_id))
+        env = os.environ.copy()
+        env["CODEX_HANDOFF_PROBE_FILE"] = str(probe_file)
         initial = subprocess.check_output(
             [BINARY, "-c", str(config), "tip-height", "--cache-dir", str(args.state),
-             "--network", "Mainnet"], text=True, stderr=subprocess.STDOUT, timeout=180)
+             "--network", "Mainnet"], text=True, stderr=subprocess.STDOUT, timeout=180, env=env)
         start = int(re.findall(r"^([0-9]+)$", initial, re.MULTILINE)[-1])
         checkpoint = int(Path('/root/zakura/crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt').read_text().splitlines()[-1].split()[0])
         if start >= checkpoint:
             raise RuntimeError("fixture must start below checkpoint")
         result.update(start_height=start, checkpoint=checkpoint, seed_id=seed_id)
         emit("starting", **result)
-        env = os.environ.copy()
-        env["ZAKURA_HANDOFF_PROBE_FILE"] = str(probe_file)
         proc = subprocess.Popen([BINARY, "-c", str(config), "start"], env=env,
                                 stdout=console, stderr=console)
         while time.monotonic() < deadline:

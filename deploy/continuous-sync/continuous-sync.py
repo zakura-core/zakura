@@ -634,7 +634,10 @@ def trace_archive_destination() -> tuple[list[str], str]:
 
 def archive_traces(config: Config, run_dir: Path, run_state: dict[str, Any]) -> None:
     """Upload stopped-node traces before the controller can start another run."""
-    if not config.policy.archive_traces or run_state.get("trace_archive_url"):
+    if not config.policy.archive_traces:
+        return
+    if run_state.get("trace_archive_url"):
+        clear_archived_traces(run_dir)
         return
     traces = run_dir / "traces"
     if traces.is_symlink():
@@ -671,6 +674,24 @@ def archive_traces(config: Config, run_dir: Path, run_state: dict[str, Any]) -> 
     archived_state = dict(run_state, trace_archive_url=url, trace_archive_key=key)
     write_run_json(run_dir, archived_state)
     run_state.update(archived_state)
+    clear_archived_traces(run_dir)
+
+
+def clear_archived_traces(run_dir: Path) -> None:
+    """Remove trace payloads after their archive metadata reaches disk."""
+    traces = run_dir / "traces"
+    if traces.is_symlink():
+        raise ControllerError(f"refusing to remove symlinked traces: {traces}")
+    if traces.exists():
+        # Make the archive record durable before deleting its local payload.
+        with (run_dir / "run.json").open("rb") as metadata:
+            os.fsync(metadata.fileno())
+        directory_fd = os.open(run_dir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        shutil.rmtree(traces)
 
 
 def trace_download_text(run_state: dict[str, Any]) -> str:

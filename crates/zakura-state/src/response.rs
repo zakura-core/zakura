@@ -661,7 +661,7 @@ pub struct GetBlockTemplateChainInfo {
     pub min_time: DateTime32,
 
     /// The maximum time the miner can use in this block.
-    /// Depends on the `tip_hash`, and the local clock on testnet.
+    /// Depends on the `tip_hash` and the local clock.
     pub max_time: DateTime32,
 }
 

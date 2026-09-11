@@ -57,7 +57,7 @@ else
 fi
 
 # This branch is a disposable harness. The binaries still come from the exact PR head.
-[ "$SHA" = "343dec5790b9318528bed191243ed91af75cbf7d" ] || { echo "wrong PR head" >&2; exit 1; }
+[ "$SHA" = "432f8ce4608822cc3cb7e8267d9b84ab99b8af69" ] || { echo "wrong PR head" >&2; exit 1; }
 [ "$MODE" = "tip" ] && [ "$NETWORK" = "mainnet" ] && [ "$P2P_STACK" = "dual" ] || {
   echo "paired smoke requires tip/mainnet/dual for the seed" >&2; exit 1;
 }
@@ -150,7 +150,7 @@ metrics_endpoint = "127.0.0.1:9999"
 [nodes.zakura]
 listen_addr = "127.0.0.1:8234"
 bootstrap_peers = []
-dev_network = "pr945-mainnet-smoke-20260911"
+dev_network = "pr944-main-interop-smoke-20260911"
 trace_dir = "/var/log/zakura/seed-traces"
 TOML
 
@@ -210,8 +210,21 @@ TOML
   note "pre-checkpoint: verified database height ${VERIFIED_START_HEIGHT} is $((MAX_CKPT - VERIFIED_START_HEIGHT)) blocks below max checkpoint ${MAX_CKPT}."
 fi
 
+# Keep the exact PR binary for the downloader, then build/deploy current main as seed.
+install -m 755 "/root/zakura/deploy/deployer/.build-cache/zakurad-${SHA}" /usr/local/bin/zakurad-downloader
+python3 - <<'SEED_CONFIG'
+from pathlib import Path
+p=Path('/root/fleet.toml')
+s=p.read_text()
+assert 'commit = "432f8ce4608822cc3cb7e8267d9b84ab99b8af69"' in s
+p.write_text(s.replace('commit = "432f8ce4608822cc3cb7e8267d9b84ab99b8af69"', 'commit = "95b56c5fd3364c46a3c02c71c1b7dfe21c4c486a"'))
+SEED_CONFIG
+note "Interoperability test: current-main seed 95b56c5fd3364c46a3c02c71c1b7dfe21c4c486a, PR 944 native downloader ${SHA}."
 python3 deploy/deployer/deploy.py deploy --config /root/fleet.toml
 python3 deploy/deployer/deploy.py status --config /root/fleet.toml || true
+cmp /usr/local/bin/zakurad /root/zakura/deploy/deployer/.build-cache/zakurad-95b56c5fd3364c46a3c02c71c1b7dfe21c4c486a
+cmp /usr/local/bin/zakurad-downloader "/root/zakura/deploy/deployer/.build-cache/zakurad-${SHA}"
+sha256sum /usr/local/bin/zakurad /usr/local/bin/zakurad-downloader > "$OUT_DIR/binary-sha256.txt"
 
 # ---------------------------------------------------------------------------- #
 # Monitor for the requested duration, then package outputs
@@ -230,7 +243,7 @@ python3 /root/pr-node-monitor.py \
   --service zakurad \
   --log-file /var/log/zakura/zakura.log \
   --notes "$NOTES" \
-  --meta "mode=${MODE},network=${NETWORK},sha=${SHA}" \
+  --meta "mode=${MODE},network=${NETWORK},sha=95b56c5fd3364c46a3c02c71c1b7dfe21c4c486a,downloader_sha=${SHA}" \
   "${MONITOR_CROSSING_ARGS[@]}" \
   --out "$OUT_DIR" || MONITOR_RC=$?
 
@@ -247,8 +260,8 @@ if not pair['pass']:
     summary['verdict']='failed'
 (root/'summary.json').write_text(json.dumps(summary,indent=2)+'\n')
 with (root/'summary.md').open('a') as f:
-    f.write('\n## Paired mainnet smoke\n\n')
-    f.write('Two full nodes on one disposable host. The seed follows public mainnet over legacy P2P. The downloader uses only the PR 945 native protocol over QUIC.\n\n')
+    f.write('\n## Native compatibility smoke\n\n')
+    f.write('Two full nodes on one disposable host. The seed runs current main and follows public mainnet over legacy P2P. The PR 944 downloader uses only native QUIC.\n\n')
     f.write('Result: '+('PASS' if pair['pass'] else 'FAIL')+'\n\n')
     for phase in pair['phases']:
         f.write(f"- {phase['phase']}: height {phase['start_height'] if 'start_height' in phase else pair['start_height']} to {phase['height']}, {phase['native_bodies']} native bodies, matching block hash {phase['block_hash']}\n")

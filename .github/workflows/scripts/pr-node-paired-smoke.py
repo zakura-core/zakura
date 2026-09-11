@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run an isolated PR 945 downloader against the disposable mainnet seed."""
+"""Run an isolated PR 944 downloader against the disposable mainnet seed."""
 
 import argparse
 import json
@@ -10,12 +10,13 @@ import time
 import urllib.request
 from pathlib import Path
 
-EXPECTED_SHA = "343dec5790b9318528bed191243ed91af75cbf7d"
-COHORT = "pr945-mainnet-smoke-20260911"
+EXPECTED_SHA = "432f8ce4608822cc3cb7e8267d9b84ab99b8af69"
+COHORT = "pr944-main-interop-smoke-20260911"
 OUT = Path("/root/out/paired")
 SEED_RPC = "http://127.0.0.1:8232"
 CLIENT_RPC = "http://127.0.0.1:18232"
-BINARY = "/usr/local/bin/zakurad"
+BINARY = "/usr/local/bin/zakurad-downloader"
+SEED_SHA = "95b56c5fd3364c46a3c02c71c1b7dfe21c4c486a"
 
 
 def rpc(url, method, params=None):
@@ -165,7 +166,7 @@ def main():
     parser.add_argument("--duration-minutes", required=True, type=float)
     args = parser.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
-    result = {"sha": EXPECTED_SHA, "network": "mainnet", "cohort": COHORT,
+    result = {"sha": EXPECTED_SHA, "seed_sha": SEED_SHA, "network": "mainnet", "cohort": COHORT,
               "topology": "two full nodes on one disposable host, native QUIC over loopback",
               "seed_upstream": "public legacy peers", "phases": [], "pass": False}
     proc = None

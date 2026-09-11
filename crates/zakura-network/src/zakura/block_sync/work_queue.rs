@@ -21,7 +21,10 @@
 //! reservation); it exists only to carry the `SizeMismatch` tolerance check
 //! through to the reactor's receive path and request budget.
 
-use std::{num::NonZeroU64, sync::Mutex as StdMutex};
+use std::{
+    num::NonZeroU64,
+    sync::{Arc, Mutex as StdMutex},
+};
 
 use tokio::sync::Notify;
 use zakura_chain::block;
@@ -454,6 +457,8 @@ impl WorkQueue {
         self.release_active_reserved_height_matching(None, height)
     }
 
+    /// End the receipt reservation and retire any queued request it invalidates.
+    /// Returns all released bytes, including the request's other unsent heights.
     pub(super) fn release_active_reserved_height_for_owner(
         &self,
         owner: zakura_header_chain::BodyWorkOwner,
@@ -467,18 +472,23 @@ impl WorkQueue {
         owner: Option<zakura_header_chain::BodyWorkOwner>,
         height: block::Height,
     ) -> Option<u64> {
-        let mut inner = self.lock();
-        let released = {
-            let item = inner.in_flight.get_mut(&height)?;
-            if owner.is_some_and(|owner| item.owner != Some(owner)) {
-                return None;
-            }
-            if !item.budget.is_reserved() {
-                return None;
-            }
-            item.budget.release_reserved()
+        let (released, claim) = {
+            let mut inner = self.lock();
+            let (released, owner) = {
+                let item = inner.in_flight.get_mut(&height)?;
+                if owner.is_some_and(|owner| item.owner != Some(owner)) {
+                    return None;
+                }
+                if !item.budget.is_reserved() {
+                    return None;
+                }
+                (item.budget.release_reserved(), item.owner)
+            };
+            inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
+            let (outcome, claim) = self.return_items_locked(&mut inner, owner, []);
+            (released.saturating_add(outcome.released_bytes), claim)
         };
-        inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
+        drop(claim);
         Some(released)
     }
 
@@ -488,6 +498,8 @@ impl WorkQueue {
         self.claim_received_matching(None, height)
     }
 
+    /// Claim a received height and return its reservation plus any unsent bytes
+    /// released by retiring the queued request.
     pub(super) fn claim_received_for_owner(
         &self,
         owner: zakura_header_chain::BodyWorkOwner,
@@ -501,26 +513,31 @@ impl WorkQueue {
         owner: Option<zakura_header_chain::BodyWorkOwner>,
         height: block::Height,
     ) -> u64 {
-        let mut inner = self.lock();
-        if let Some(item) = inner.in_flight.get_mut(&height) {
-            if owner.is_some_and(|owner| item.owner != Some(owner)) {
+        let (released, claim) = {
+            let mut inner = self.lock();
+            let (released, owner) = if let Some(item) = inner.in_flight.get_mut(&height) {
+                if owner.is_some_and(|owner| item.owner != Some(owner)) {
+                    return 0;
+                }
+                (item.budget.release_reserved(), item.owner)
+            } else if let Some(mut item) = inner.pending.remove(&height) {
+                if owner.is_some_and(|owner| item.owner != Some(owner)) {
+                    inner.pending.insert(height, item);
+                    return 0;
+                }
+                let released = item.budget.release_reserved();
+                let owner = item.owner;
+                inner.in_flight.insert(height, item);
+                (released, owner)
+            } else {
                 return 0;
-            }
-            let released = item.budget.release_reserved();
+            };
             inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
-            return released;
-        }
-        if let Some(mut item) = inner.pending.remove(&height) {
-            if owner.is_some_and(|owner| item.owner != Some(owner)) {
-                inner.pending.insert(height, item);
-                return 0;
-            }
-            let released = item.budget.release_reserved();
-            inner.in_flight.insert(height, item);
-            inner.reserved_bytes = inner.reserved_bytes.saturating_sub(released);
-            return released;
-        }
-        0
+            let (outcome, claim) = self.return_items_locked(&mut inner, owner, []);
+            (released.saturating_add(outcome.released_bytes), claim)
+        };
+        drop(claim);
+        released
     }
 
     /// Release active request reservations, leaving received heights in place.
@@ -625,89 +642,97 @@ impl WorkQueue {
         owner: Option<zakura_header_chain::BodyWorkOwner>,
         heights: impl IntoIterator<Item = block::Height>,
     ) -> WorkReturnOutcome {
-        let mut moved = false;
+        let (outcome, claim) = {
+            let mut inner = self.lock();
+            self.return_items_locked(&mut inner, owner, heights)
+        };
+        drop(claim);
+        outcome
+    }
+
+    /// Settle requested heights and any queued request they retire. The caller
+    /// must retain the returned claim until after releasing the queue lock.
+    fn return_items_locked(
+        &self,
+        inner: &mut WorkQueueInner,
+        owner: Option<zakura_header_chain::BodyWorkOwner>,
+        heights: impl IntoIterator<Item = block::Height>,
+    ) -> (WorkReturnOutcome, Option<Arc<RequestWrite>>) {
         let mut outcome = WorkReturnOutcome::default();
         let mut heights: std::collections::BTreeSet<_> = heights.into_iter().collect();
-        let claim;
-        {
-            let mut inner = self.lock();
-            let registration = owner.and_then(|owner| inner.request_writes.get(&owner));
-            claim = registration.and_then(|registration| registration.claim.upgrade());
-            if let Some(registration) = registration {
-                // The writer claims under this same lock. Expiry skips an
-                // unwritten frame even while its last owner is being dropped.
-                if registration.status.expire_unwritten() {
-                    self.available.notify_waiters();
-                }
-                outcome.request_was_unwritten = registration.status.was_skipped();
-                if outcome.request_was_unwritten {
-                    if let Some(claim) = &claim {
-                        // Skipping an unsent frame retires its whole request.
-                        heights.extend(claim.heights());
-                    }
+        let registration = owner.and_then(|owner| inner.request_writes.get(&owner));
+        let claim = registration.and_then(|registration| registration.claim.upgrade());
+        if let Some(registration) = registration {
+            // The writer claims under this same lock. Expiry skips an
+            // unwritten frame even while its last owner is being dropped.
+            if registration.status.expire_unwritten() {
+                self.available.notify_waiters();
+            }
+            outcome.request_was_unwritten = registration.status.was_skipped();
+            if outcome.request_was_unwritten {
+                if let Some(claim) = &claim {
+                    // Skipping an unsent frame retires its whole request.
+                    heights.extend(claim.heights());
                 }
             }
-            for height in heights {
-                outcome.min_height = Some(
-                    outcome
-                        .min_height
-                        .map_or(height, |current| current.min(height)),
-                );
-                outcome.max_height = Some(
-                    outcome
-                        .max_height
-                        .map_or(height, |current| current.max(height)),
-                );
-                let Some(item) = inner.in_flight.get(&height) else {
-                    if inner.pending.contains_key(&height) {
-                        outcome.already_pending_count =
-                            outcome.already_pending_count.saturating_add(1);
-                    } else {
-                        outcome.missing_count = outcome.missing_count.saturating_add(1);
-                    }
-                    continue;
-                };
-                if owner.is_some_and(|owner| item.owner != Some(owner)) {
+        }
+        for height in heights {
+            outcome.min_height = Some(
+                outcome
+                    .min_height
+                    .map_or(height, |current| current.min(height)),
+            );
+            outcome.max_height = Some(
+                outcome
+                    .max_height
+                    .map_or(height, |current| current.max(height)),
+            );
+            let Some(item) = inner.in_flight.get(&height) else {
+                if inner.pending.contains_key(&height) {
+                    outcome.already_pending_count = outcome.already_pending_count.saturating_add(1);
+                } else {
                     outcome.missing_count = outcome.missing_count.saturating_add(1);
-                    continue;
                 }
-                if height <= inner.floor {
-                    let mut item = inner
-                        .in_flight
-                        .remove(&height)
-                        .expect("owned item exists because it was just checked");
-                    outcome.released_bytes = outcome
-                        .released_bytes
-                        .saturating_add(item.budget.release_reserved());
-                    outcome.committed_count = outcome.committed_count.saturating_add(1);
-                    continue;
-                }
-                match item.budget {
-                    BlockBudgetLedger::Released => {
-                        outcome.released_count = outcome.released_count.saturating_add(1);
-                        continue;
-                    }
-                    BlockBudgetLedger::Reserved(_) => {}
-                }
+                continue;
+            };
+            if owner.is_some_and(|owner| item.owner != Some(owner)) {
+                outcome.missing_count = outcome.missing_count.saturating_add(1);
+                continue;
+            }
+            if height <= inner.floor {
                 let mut item = inner
                     .in_flight
                     .remove(&height)
-                    .expect("reserved item exists because it was just checked");
+                    .expect("owned item exists because it was just checked");
                 outcome.released_bytes = outcome
                     .released_bytes
                     .saturating_add(item.budget.release_reserved());
-                item.owner = None;
-                outcome.returned_count = outcome.returned_count.saturating_add(1);
-                inner.pending.insert(height, item);
-                moved = true;
+                outcome.committed_count = outcome.committed_count.saturating_add(1);
+                continue;
             }
-            inner.reserved_bytes = inner.reserved_bytes.saturating_sub(outcome.released_bytes);
+            match item.budget {
+                BlockBudgetLedger::Released => {
+                    outcome.released_count = outcome.released_count.saturating_add(1);
+                    continue;
+                }
+                BlockBudgetLedger::Reserved(_) => {}
+            }
+            let mut item = inner
+                .in_flight
+                .remove(&height)
+                .expect("reserved item exists because it was just checked");
+            outcome.released_bytes = outcome
+                .released_bytes
+                .saturating_add(item.budget.release_reserved());
+            item.owner = None;
+            outcome.returned_count = outcome.returned_count.saturating_add(1);
+            inner.pending.insert(height, item);
         }
-        drop(claim);
-        if moved {
+        inner.reserved_bytes = inner.reserved_bytes.saturating_sub(outcome.released_bytes);
+        if outcome.returned_count > 0 {
             self.available.notify_waiters();
         }
-        outcome
+        (outcome, claim)
     }
 
     /// Garbage-collect committed heights: raise the floor to `max(self.floor,

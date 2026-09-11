@@ -2867,7 +2867,8 @@ mod tests {
     }
 
     #[derive(Clone, Copy)]
-    enum FirstToRetire {
+    enum ReceiptCleanup {
+        BeforeWriter,
         Writer,
         CommittedGc,
         ObsoleteGc,
@@ -2876,9 +2877,9 @@ mod tests {
     #[tokio::test]
     async fn skipped_write_retires_only_its_own_peer_obligation() {
         for order in [
-            FirstToRetire::Writer,
-            FirstToRetire::CommittedGc,
-            FirstToRetire::ObsoleteGc,
+            ReceiptCleanup::Writer,
+            ReceiptCleanup::CommittedGc,
+            ReceiptCleanup::ObsoleteGc,
         ] {
             for (other_request, progress_before_other) in
                 [(false, false), (true, false), (true, true)]
@@ -2888,12 +2889,22 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn competing_receipt_retires_unwritable_request_before_writer_reaches_it() {
+        check_skipped_write_obligation(ReceiptCleanup::BeforeWriter, false, false).await;
+    }
+
     async fn check_skipped_write_obligation(
-        order: FirstToRetire,
+        order: ReceiptCleanup,
         other_request: bool,
         progress_before_other: bool,
     ) {
         let config = ZakuraBlockSyncConfig {
+            request_timeout: if matches!(order, ReceiptCleanup::BeforeWriter) {
+                Duration::from_secs(1)
+            } else {
+                ZakuraBlockSyncConfig::default().request_timeout
+            },
             initial_block_probe_requests: if other_request { 2 } else { 1 },
             ..ZakuraBlockSyncConfig::default()
         };
@@ -2907,7 +2918,13 @@ mod tests {
                 [(
                     block::Height(u32::from(height)),
                     block::Hash([height; 32]),
-                    BlockSizeEstimate::Confirmed(1_000),
+                    BlockSizeEstimate::Confirmed(
+                        if matches!(order, ReceiptCleanup::BeforeWriter) {
+                            1_000_000
+                        } else {
+                            1_000
+                        },
+                    ),
                 )],
             );
         };
@@ -2979,23 +2996,40 @@ mod tests {
             routine.try_fill().await;
             assert_eq!(routine.window.outstanding.len(), 2);
         }
+        let skipped = work.subscribe_available().notified();
+        tokio::pin!(skipped);
+        skipped.as_mut().enable();
         // Another peer wins height 2 before this writer starts. Its body retains
         // this exact owner until the sequencer consumes it.
         budget.release(
             work.release_active_reserved_height_for_owner(owner, block::Height(2))
                 .unwrap(),
         );
-        let skipped = work.subscribe_available().notified();
-        tokio::pin!(skipped);
-        skipped.as_mut().enable();
         match order {
-            FirstToRetire::Writer => {}
-            FirstToRetire::CommittedGc => {
+            ReceiptCleanup::BeforeWriter => {
+                let liveness_deadline = routine.window.block_liveness_deadline.unwrap();
+                assert!(
+                    liveness_deadline < deadline,
+                    "transfer allowance outlasts liveness"
+                );
+                assert_eq!(work.owner_for_height(block::Height(2)), Some(owner));
+                assert_eq!(budget.reserved(), 0);
+                routine.gc_obsolete_outstanding();
+                let result = routine.handle_deadlines(liveness_deadline).await;
+                assert!(
+                    result.is_ok(),
+                    "a request made unwritable by receipt must not park its peer: {result:?}"
+                );
+                assert!(routine.window.outstanding.is_empty());
+                return;
+            }
+            ReceiptCleanup::Writer => {}
+            ReceiptCleanup::CommittedGc => {
                 budget.release(work.advance_floor(block::Height(2)));
                 view_tx.send_modify(|view| view.download_floor = block::Height(2));
                 routine.gc_committed_outstanding();
             }
-            FirstToRetire::ObsoleteGc => {
+            ReceiptCleanup::ObsoleteGc => {
                 budget.release(work.advance_floor(block::Height(2)));
                 routine.gc_obsolete_outstanding();
             }
@@ -3008,10 +3042,10 @@ mod tests {
             })
             .await
             .unwrap();
-        if matches!(order, FirstToRetire::Writer) {
+        if matches!(order, ReceiptCleanup::Writer) {
             timeout(Duration::from_secs(1), skipped)
                 .await
-                .expect("skipping a settled request must wake its routine");
+                .expect("receipt retirement must wake its routine");
         }
         if other_request {
             out_recv
@@ -3029,7 +3063,7 @@ mod tests {
         assert!(!registry.peer_has_outstanding_height(&peer, block::Height(2)));
         assert_eq!(
             work.owner_for_height(block::Height(2)),
-            matches!(order, FirstToRetire::Writer).then_some(owner),
+            matches!(order, ReceiptCleanup::Writer).then_some(owner),
         );
         assert!(!work.pending_contains(block::Height(2)));
         assert!(routine.retry_avoid.is_empty());

@@ -1541,13 +1541,10 @@ async fn rpc_getblock_preserves_historical_tree_error() {
         .respond(ReadResponse::TransactionIdsForBlock(Some(Arc::from(
             tx_hashes.into_boxed_slice(),
         ))));
-    read_state
+    let orchard_response = read_state
         .expect_request(ReadRequest::OrchardTree(hash.into()))
-        .await
-        .respond_error(Box::new(zakura_state::HistoricalTreeUnavailable {
-            hash_or_height: hash.into(),
-            last_checkpoint,
-        }));
+        .await;
+    // Receive concurrent requests before returning the error, which can cancel them.
     read_state
         .expect_request(ReadRequest::BlockInfo(
             block.header.previous_block_hash.into(),
@@ -1558,6 +1555,11 @@ async fn rpc_getblock_preserves_historical_tree_error() {
         .expect_request(ReadRequest::BlockInfo(hash.into()))
         .await
         .respond(ReadResponse::BlockInfo(None));
+
+    orchard_response.respond_error(Box::new(zakura_state::HistoricalTreeUnavailable {
+        hash_or_height: hash.into(),
+        last_checkpoint,
+    }));
 
     let error = block_future
         .await

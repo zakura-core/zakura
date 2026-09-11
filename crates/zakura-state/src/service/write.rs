@@ -2229,13 +2229,18 @@ impl WriteBlockWorkerTask {
             // invalid.
             let requires_exact_vct_roots = header_chain.is_some()
                 && finalized_state.vct_requires_exact_roots(ordered_block.0.height);
-            let vct_auxiliary_window = if requires_exact_vct_roots {
+            let mut vct_auxiliary_window = if requires_exact_vct_roots {
                 match header_chain
                     .as_ref()
                     .expect("exact VCT roots are required only with an attached header chain")
                     .vct_auxiliary_window(ordered_block.0.height, ordered_block.0.hash)
                 {
                     Ok(VctAuxiliaryWindowRead::Ready(auxiliary_window)) => Some(*auxiliary_window),
+                    Ok(VctAuxiliaryWindowRead::Missing { .. })
+                        if finalized_state.vct_can_recompute_trees() =>
+                    {
+                        None
+                    }
                     Ok(VctAuxiliaryWindowRead::Missing { height }) => {
                         let wait = vct_write_retry_manager.on_retryable_error(
                             height,
@@ -2283,11 +2288,10 @@ impl WriteBlockWorkerTask {
                             .delivery_roots(ordered_block.0.height, ordered_block.0.hash)
                             .is_some()
                     });
-            let next_block_took_vct_path = requires_exact_vct_roots && has_exact_vct_roots;
             let needs_vct_successor = finalized_state
                 .vct_fast_needs_successor(ordered_block.0.height, has_exact_vct_roots);
 
-            if requires_exact_vct_roots && !has_exact_vct_roots {
+            if vct_auxiliary_window.is_some() && !has_exact_vct_roots {
                 tracing::error!(
                     height = ?ordered_block.0.height,
                     hash = ?ordered_block.0.hash,
@@ -2310,28 +2314,39 @@ impl WriteBlockWorkerTask {
                     .and_then(|auxiliary_window| auxiliary_window.successor.as_ref())
                     .is_none()
             {
-                let auxiliary_window = vct_auxiliary_window
-                    .as_ref()
-                    .expect("exact VCT roots require an auxiliary window");
-                let (height, retry_cause) = missing_vct_successor_retry(
-                    auxiliary_window.successor_height,
-                    ordered_block.0.height,
-                );
-                let wait =
-                    vct_write_retry_manager.on_retryable_error(height, retry_cause, ordered_block);
-                if let Some(exit) = wait_for_vct_retry(
-                    wait,
-                    non_finalized_block_write_receiver,
-                    header_chain.as_ref(),
-                    &mut deferred_non_finalized_messages,
-                    &deadline_runtime,
-                    &mut vct_write_retry_manager,
-                    &mut checkpoint_resource_stall_recovery,
-                ) {
-                    return exit;
+                // Before the first fast commit, ordinary verification can advance the
+                // saved trees without native metadata. Frozen trees must still wait.
+                if finalized_state.vct_can_recompute_trees() {
+                    vct_auxiliary_window = None;
+                } else {
+                    let auxiliary_window = vct_auxiliary_window
+                        .as_ref()
+                        .expect("exact VCT roots require an auxiliary window");
+                    let (height, retry_cause) = missing_vct_successor_retry(
+                        auxiliary_window.successor_height,
+                        ordered_block.0.height,
+                    );
+                    let wait = vct_write_retry_manager.on_retryable_error(
+                        height,
+                        retry_cause,
+                        ordered_block,
+                    );
+                    if let Some(exit) = wait_for_vct_retry(
+                        wait,
+                        non_finalized_block_write_receiver,
+                        header_chain.as_ref(),
+                        &mut deferred_non_finalized_messages,
+                        &deadline_runtime,
+                        &mut vct_write_retry_manager,
+                        &mut checkpoint_resource_stall_recovery,
+                    ) {
+                        return exit;
+                    }
+                    continue;
                 }
-                continue;
             }
+
+            let next_block_took_vct_path = vct_auxiliary_window.is_some();
 
             // The successor header authenticates the current block's supplied roots.
             // Header-sync stores its ZIP-244 auth-data root alongside the contextually

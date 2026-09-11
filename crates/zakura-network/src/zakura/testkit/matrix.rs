@@ -12,7 +12,7 @@ pub enum ProfileId {
     ZakuraDisabled,
     /// Released Zakura v1.
     ZakuraV1,
-    /// Synthetic v2 profile that still offers v1.
+    /// Iroh 1.x cohort, which requires protocol v2.
     ZakuraV2,
     /// Plain Zebra peer.
     PlainZebra,
@@ -23,7 +23,7 @@ impl ProfileId {
         match self {
             Self::ZakuraDisabled => PeerProfile::ZakuraDisabled,
             Self::ZakuraV1 => PeerProfile::zakura_v1(),
-            Self::ZakuraV2 => PeerProfile::zakura_v2_offering_v1(),
+            Self::ZakuraV2 => PeerProfile::zakura_v2(),
             Self::PlainZebra => PeerProfile::PlainZebra,
         }
     }
@@ -131,7 +131,7 @@ const DEFAULT_EXPECTATIONS: &[MatrixExpectation] = &[
     MatrixExpectation {
         local: ProfileId::ZakuraV1,
         remote: ProfileId::ZakuraV2,
-        expected: ExpectedOutcome::Upgrade(1),
+        expected: ExpectedOutcome::NeutralReject(ZakuraRejectReason::IncompatibleZakuraProtocol),
     },
     MatrixExpectation {
         local: ProfileId::ZakuraV2,
@@ -146,7 +146,7 @@ const DEFAULT_EXPECTATIONS: &[MatrixExpectation] = &[
     MatrixExpectation {
         local: ProfileId::ZakuraV2,
         remote: ProfileId::ZakuraV1,
-        expected: ExpectedOutcome::Upgrade(1),
+        expected: ExpectedOutcome::NeutralReject(ZakuraRejectReason::IncompatibleZakuraProtocol),
     },
     MatrixExpectation {
         local: ProfileId::ZakuraV2,
@@ -202,7 +202,7 @@ mod tests {
                         cell.local, cell.remote,
                     );
                     assert!(
-                        alpn == P2P_V2_ALPN || alpn == b"p2p-v2/2",
+                        alpn == P2P_V2_ALPN || alpn == b"p2p-v2/1",
                         "unexpected ALPN for {} -> {}: {:?}",
                         cell.local,
                         cell.remote,

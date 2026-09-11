@@ -141,9 +141,15 @@ impl BlockSyncMessage {
                 let block_start = usize::try_from(reader.position())
                     .map_err(|_| BlockSyncWireError::NumericOverflow("block payload offset"))?;
                 validate_encoded_block_len(bytes.len().saturating_sub(block_start))?;
-                let block = Arc::new(block::Block::zcash_deserialize(&mut reader)?);
-                let block_end = usize::try_from(reader.position())
-                    .map_err(|_| BlockSyncWireError::NumericOverflow("block payload end"))?;
+                let mut block_bytes = &bytes[block_start..];
+                let block = Arc::new(block::Block::zcash_deserialize_from_slice(
+                    &mut block_bytes,
+                )?);
+                let block_end = bytes.len() - block_bytes.len();
+                reader.set_position(
+                    u64::try_from(block_end)
+                        .map_err(|_| BlockSyncWireError::NumericOverflow("block payload end"))?,
+                );
                 validate_encoded_block_len(block_end.saturating_sub(block_start))?;
                 Self::Block(block)
             }

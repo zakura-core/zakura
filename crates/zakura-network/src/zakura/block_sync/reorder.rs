@@ -353,8 +353,10 @@ impl BufferedBlockBody {
 }
 
 fn decode_raw_frame_payload(payload: &Arc<[u8]>) -> Arc<block::Block> {
-    let mut reader = Cursor::new(&payload[BLOCK_SYNC_MESSAGE_TYPE_BYTES..]);
-    Arc::new(block::Block::zcash_deserialize(&mut reader).expect(
-        "raw block bytes deserialize because the peer routine decoded them before buffering",
-    ))
+    let mut reader = &payload[BLOCK_SYNC_MESSAGE_TYPE_BYTES..];
+    Arc::new(
+        block::Block::zcash_deserialize_from_slice(&mut reader).expect(
+            "raw block bytes deserialize because the peer routine decoded them before buffering",
+        ),
+    )
 }

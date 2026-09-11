@@ -1,5 +1,7 @@
 //! Groth16 proofs for Zebra.
 
+use crate::serialization::ZcashReader;
+use std::io::Read as _;
 use std::{fmt, io};
 
 use serde::{Deserialize, Serialize};
@@ -57,7 +59,9 @@ impl ZcashSerialize for Groth16Proof {
 }
 
 impl ZcashDeserialize for Groth16Proof {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         let mut bytes = [0; 192];
         reader.read_exact(&mut bytes[..])?;
         Ok(Self(bytes))

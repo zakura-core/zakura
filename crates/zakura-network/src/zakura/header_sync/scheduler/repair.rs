@@ -13,7 +13,7 @@ use zakura_header_chain::{BodyWorkOwner, EngineSnapshot, SourceId, VctRepairCont
 /// A temporary refusal delays only the supplier that returned it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct BusySupplierBackoff {
-    retry_at: Instant,
+    retry_at: Option<Instant>,
     delay: Duration,
 }
 
@@ -220,7 +220,7 @@ impl RepairRequirement {
         self.busy_sources.insert(
             source,
             BusySupplierBackoff {
-                retry_at: now + delay,
+                retry_at: Some(now + delay),
                 delay,
             },
         );
@@ -235,7 +235,8 @@ impl RepairRequirement {
     pub fn supplier_is_backing_off(&self, source: SourceId, now: Instant) -> bool {
         self.busy_sources
             .get(&source)
-            .is_some_and(|backoff| backoff.retry_at > now)
+            .and_then(|backoff| backoff.retry_at)
+            .is_some_and(|retry_at| retry_at > now)
     }
 
     /// Rotate away from a supplier that returned semantic input excluded by durable state.
@@ -311,6 +312,11 @@ impl RepairRequirement {
 
     /// Resume a deferred context or local retry once its backoff has elapsed.
     pub fn resume_retry(&mut self, now: Instant) {
+        for backoff in self.busy_sources.values_mut() {
+            if backoff.retry_at.is_some_and(|retry_at| retry_at <= now) {
+                backoff.retry_at = None;
+            }
+        }
         match &self.state {
             RepairPolicyState::QueryingContext { deadline, retry_at } if *deadline <= now => {
                 self.state = RepairPolicyState::ContextBackoff {
@@ -335,14 +341,11 @@ impl RepairRequirement {
             RepairPolicyState::QueryingContext { deadline, .. } => Some(deadline),
             RepairPolicyState::ContextBackoff { retry_at }
             | RepairPolicyState::LocalBackoff { retry_at, .. } => Some(retry_at),
-            RepairPolicyState::Ready { .. } => {
-                let now = Instant::now();
-                self.busy_sources
-                    .values()
-                    .map(|backoff| backoff.retry_at)
-                    .filter(|retry_at| *retry_at > now)
-                    .min()
-            }
+            RepairPolicyState::Ready { .. } => self
+                .busy_sources
+                .values()
+                .filter_map(|backoff| backoff.retry_at)
+                .min(),
             _ => None,
         }
     }
@@ -557,6 +560,8 @@ mod tests {
             assert!(task.supplier_is_backing_off(source, Instant::now()));
             tokio::time::advance(Duration::from_millis(1)).await;
             assert!(!task.supplier_is_backing_off(source, Instant::now()));
+            assert_eq!(task.next_deadline(), Some(Instant::now()));
+            task.resume_retry(Instant::now());
             assert_eq!(task.next_deadline(), None);
             assert!(!task.tried_sources.contains(&source));
             assert!(task.tried_sources.contains(&excluded));

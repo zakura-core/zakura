@@ -57,7 +57,7 @@ else
 fi
 
 # This branch is a disposable harness. The binaries still come from the exact PR head.
-[ "$SHA" = "ab4a68521f1a3161537c1f3003c1bc2cce1f05ef" ] || { echo "wrong PR head" >&2; exit 1; }
+[ "$SHA" = "0e6398c22f0705b9ccf7a071a5229e743dd1572b" ] || { echo "wrong PR head" >&2; exit 1; }
 [ "$MODE" = "tip" ] && [ "$NETWORK" = "mainnet" ] && [ "$P2P_STACK" = "dual" ] || {
   echo "paired smoke requires tip/mainnet/dual for the seed" >&2; exit 1;
 }

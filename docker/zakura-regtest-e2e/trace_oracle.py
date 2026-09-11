@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Zakura regtest trace oracle.
 
-The oracle reads the per-node JSONL trace layout produced by the Docker e2e:
+The oracle reads the per-node CSV trace layout produced by the Docker e2e:
 
-    node*/commit_state.jsonl
-    node*/block_sync.jsonl
-    node*/header_sync.jsonl
-    node*/legacy_sync.jsonl
+    node*/commit_state.csv
+    node*/block_sync.csv
+    node*/header_sync.csv
+    node*/legacy_sync.csv
 
 It checks high-signal sync invariants and prints compact diagnostics for the
 first offending row in each node. It intentionally depends only on Python's
@@ -66,63 +66,17 @@ APPLY_CLASS_FULL = "full"
 LEGACY_ROUND_FINISH = "round_finish"
 LEGACY_CHECKPOINT_HANDOFF = "checkpoint_handoff"
 
-CSV_ENVELOPE_COLUMNS = ("ts", "wall_ts", "node", "process_trace_id")
-COMMIT_STATE_COLUMNS = (
-    "event",
-    "source",
-    "action",
-    "peer",
-    "reason",
-    "range_start",
-    "range_count",
-    "height",
-    "hash",
-    "apply_token",
-    "best_header_tip",
-    "elapsed_ms",
-    "result",
-    "requested_count",
-    "apply_class",
-    "local_frontier",
-    "queue_len",
-    "in_flight_count",
+TRACE_SCHEMA = json.loads(
+    (Path(__file__).resolve().parents[2] / "crates/zakura-jsonl-trace/schema.json").read_text()
 )
+CSV_ENVELOPE_COLUMNS = tuple(TRACE_SCHEMA["envelope"])
 CSV_SCHEMAS = {
-    "commit_state": CSV_ENVELOPE_COLUMNS + COMMIT_STATE_COLUMNS + ("extra",),
+    table: CSV_ENVELOPE_COLUMNS + tuple(columns) + ("extra",)
+    for table, columns in TRACE_SCHEMA["tables"].items()
 }
-NUMERIC_FIELDS = {
-    "apply_token",
-    "applying",
-    "assigned_len",
-    "best_header_tip",
-    "budget_reserved",
-    "checkpoint_height",
-    "elapsed_ms",
-    "height",
-    "in_flight_count",
-    "needed_count",
-    "new_best_header_height",
-    "new_finalized_height",
-    "new_verified_body_height",
-    "old_best_header_height",
-    "old_finalized_height",
-    "old_verified_body_height",
-    "outstanding",
-    "queue_len",
-    "range_count",
-    "range_start",
-    "reorder",
-    "request_id",
-    "requested_count",
-    "session_id",
-    "state_tip",
-    "stream_version",
-    "ts",
-    "verified_block_tip",
-}
-BOOLEAN_FIELDS = {
-    "local_frontier",
-}
+NUMERIC_FIELDS = set(TRACE_SCHEMA["integer_fields"])
+BOOLEAN_FIELDS = set(TRACE_SCHEMA["boolean_fields"])
+JSON_FIELDS = set(TRACE_SCHEMA["json_fields"])
 TEXT_FIELDS = {
     "action",
     "anchor_hash",
@@ -377,8 +331,8 @@ def validate_csv_header(table: str, fieldnames: list[str] | None) -> tuple[str, 
     return header
 
 
-def read_jsonl(path: Path, node: str, table: str) -> list[TraceRow]:
-    csv_path = path.with_suffix(".csv")
+def read_csv_segment(path: Path, node: str, table: str) -> list[TraceRow]:
+    csv_path = path
     if csv_path.exists():
         rows = []
         index = 0
@@ -401,7 +355,7 @@ def read_jsonl(path: Path, node: str, table: str) -> list[TraceRow]:
                         else:
                             value[key] = (
                                 load_json(field)
-                                if key in NUMERIC_FIELDS or key in BOOLEAN_FIELDS
+                                if key in NUMERIC_FIELDS or key in BOOLEAN_FIELDS or key in JSON_FIELDS
                                 else field
                             )
                     collisions = sorted(set(header).intersection(extra))
@@ -416,73 +370,60 @@ def read_jsonl(path: Path, node: str, table: str) -> list[TraceRow]:
                 "event": "csv_decode_error", "path": str(csv_path), "error": str(error),
             }))
         return rows
-    if not path.exists():
-        return []
+    return []
 
+
+def csv_segments(path: Path) -> list[Path]:
+    segments = [item for item in path.parent.glob(path.name + ".*")
+                if item.name.removeprefix(path.name + ".").isdigit()]
+    segments.sort(key=lambda item: int(item.suffix[1:]), reverse=True)
+    if path.is_file():
+        segments.append(path)
+    return segments
+
+
+def read_csv(path: Path, node: str, table: str) -> list[TraceRow]:
     rows: list[TraceRow] = []
-    with path.open("r", encoding="utf-8") as handle:
-        for index, line in enumerate(handle, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                value = validate_trace_row(load_json(line))
-            except (RecursionError, ValueError) as error:
-                rows.append(
-                    TraceRow(
-                        node,
-                        table,
-                        index,
-                        {
-                            "event": "json_decode_error",
-                            "path": str(path),
-                            "line": line[:400],
-                            "error": str(error),
-                        },
-                    )
-                )
-                continue
-            rows.append(TraceRow(node, table, index, value))
+    for segment in csv_segments(path):
+        for row in read_csv_segment(segment, node, table):
+            rows.append(TraceRow(node, table, len(rows) + 1, row.row))
     return rows
+
+
+def has_traces(path: Path) -> bool:
+    return any(csv_segments(path / name) for name in trace_files())
 
 
 def load_traces(root: Path) -> list[NodeTrace]:
     nodes: list[NodeTrace] = []
     node_dirs = sorted(path for path in root.iterdir() if path.is_dir() and path.name.startswith("node"))
-    if not node_dirs and any(root.joinpath(name).exists() for name in trace_files()):
+    if not node_dirs and has_traces(root):
         node_dirs = [root]
 
     for node_dir in node_dirs:
         candidates = [node_dir]
-        if not any(node_dir.joinpath(name).exists() for name in trace_files()):
+        if not has_traces(node_dir):
             candidates = [
                 child
                 for child in sorted(path for path in node_dir.iterdir() if path.is_dir())
-                if any(child.joinpath(name).exists() for name in trace_files())
+                if has_traces(child)
             ]
 
         for trace_dir in candidates:
             node = node_dir.name if trace_dir == node_dir else f"{node_dir.name}/{trace_dir.name}"
             tables = {
-                "commit_state": read_jsonl(trace_dir / "commit_state.jsonl", node, "commit_state"),
-                "block_sync": read_jsonl(trace_dir / "block_sync.jsonl", node, "block_sync"),
-                "header_sync": read_jsonl(trace_dir / "header_sync.jsonl", node, "header_sync"),
-                "legacy_sync": read_jsonl(trace_dir / "legacy_sync.jsonl", node, "legacy_sync"),
+                table: read_csv(trace_dir / f"{table}.csv", node, table)
+                for table in CSV_SCHEMAS
             }
-            if any(tables.values()) or any(
-                trace_dir.joinpath(name).exists() for name in trace_files()
-            ):
+            if any(tables.values()) or has_traces(trace_dir):
                 nodes.append(NodeTrace(node, tables))
 
     return nodes
 
 
 def trace_files() -> Iterable[str]:
-    yield "commit_state.csv"
-    yield "commit_state.jsonl"
-    yield "block_sync.jsonl"
-    yield "header_sync.jsonl"
-    yield "legacy_sync.jsonl"
+    for table in CSV_SCHEMAS:
+        yield f"{table}.csv"
 
 
 def check_commit_pairs(node: NodeTrace, options: OracleOptions) -> list[Failure]:
@@ -1041,7 +982,7 @@ def run_oracle(root: Path, options: OracleOptions = OracleOptions()) -> list[Fai
     for node in nodes:
         for row in node.rows:
             if row.event == "json_decode_error":
-                failures.append(failure(node, "trace_jsonl_is_valid", row, {}))
+                failures.append(failure(node, "trace_csv_is_valid", row, {}))
             elif row.event == "csv_decode_error":
                 failures.append(failure(node, "trace_csv_is_valid", row, {}))
         if node.node in options.required_commit_nodes:
@@ -1183,15 +1124,51 @@ def print_failures(failures: list[Failure]) -> None:
         print(json.dumps(payload, indent=2, sort_keys=True), file=sys.stderr)
 
 
-def write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
+def write_csv(path: Path, rows: Iterable[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
+    header = CSV_SCHEMAS[path.stem]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=header)
+        writer.writeheader()
         for row in rows:
-            handle.write(json.dumps(row, sort_keys=True))
-            handle.write("\n")
+            record = {
+                key: value if isinstance(value, str) else json.dumps(value)
+                for key, value in row.items() if key in header and value is not None
+            }
+            record["extra"] = json.dumps({key: value for key, value in row.items() if key not in header})
+            writer.writerow(record)
 
 
 def run_self_test() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        node = root / "node1"
+        for table, columns in TRACE_SCHEMA["tables"].items():
+            row: dict[str, Any] = {"event": "schema_probe", "node": "0001", "ts": 1}
+            for column in columns:
+                if column in NUMERIC_FIELDS:
+                    row[column] = 42
+                elif column in BOOLEAN_FIELDS:
+                    row[column] = False
+                elif column in JSON_FIELDS:
+                    row[column] = [{"nested": "quoted,\nvalue"}] if column == "tasks" else 1
+                elif column != "event":
+                    row[column] = "000123"
+            row["unknown_field"] = {"preserved": True}
+            write_csv(node / f"{table}.csv", [row])
+            assert read_csv(node / f"{table}.csv", "node1", table)[0].row == row, table
+        loaded = load_traces(root)
+        assert len(loaded) == 1 and len(loaded[0].tables) == 12
+        for suffix, event in ((".2", "old"), (".1", "middle"), ("", "new")):
+            path = node / "block_sync.csv"
+            write_csv(path, [{"event": event, "reason": "comma,\nand newline"}])
+            if suffix:
+                path.rename(node / f"block_sync.csv{suffix}")
+        (node / "block_sync.csv.lock").write_text("not a trace")
+        assert [row.event for row in read_csv(node / "block_sync.csv", "node1", "block_sync")] == [
+            "old", "middle", "new"
+        ]
+
     state = TraceRow("node1", "block_sync", 50, {"ts": 100})
     activity = TraceActivityIndex.build(
         TraceRow("node1", "block_sync", index, {"ts": ts})
@@ -1225,8 +1202,8 @@ def run_self_test() -> None:
         root = Path(tmp)
 
         good = root / "good" / "node1"
-        write_jsonl(
-            good / "commit_state.jsonl",
+        write_csv(
+            good / "commit_state.csv",
             [
                 {
                     "ts": 1,
@@ -1250,8 +1227,8 @@ def run_self_test() -> None:
                 },
             ],
         )
-        write_jsonl(
-            good / "block_sync.jsonl",
+        write_csv(
+            good / "block_sync.csv",
             [
                 {
                     "ts": 4,
@@ -1268,8 +1245,8 @@ def run_self_test() -> None:
         assert not run_oracle(root / "good"), "good trace should pass"
 
         v7_ids = root / "v7_ids" / "node2"
-        write_jsonl(
-            v7_ids / "header_sync.jsonl",
+        write_csv(
+            v7_ids / "header_sync.csv",
             [
                 {
                     "ts": 1,
@@ -1315,7 +1292,7 @@ def run_self_test() -> None:
                 "request_id": 1,
                 **mutations,
             }
-            write_jsonl(directory / "header_sync.jsonl", [row])
+            write_csv(directory / "header_sync.csv", [row])
             assert any(
                 failure.invariant == expected
                 for failure in check_v7_request_ids(load_traces(root / name))
@@ -1329,8 +1306,8 @@ def run_self_test() -> None:
             "session_id": 11,
             "request_id": 1,
         }
-        write_jsonl(
-            duplicate_ids / "header_sync.jsonl",
+        write_csv(
+            duplicate_ids / "header_sync.csv",
             [{"ts": 1, **duplicate}, {"ts": 2, **duplicate}],
         )
         assert any(
@@ -1339,8 +1316,8 @@ def run_self_test() -> None:
         )
 
         cross_process_ids = root / "v7_cross_process_ids" / "node2"
-        write_jsonl(
-            cross_process_ids / "header_sync.jsonl",
+        write_csv(
+            cross_process_ids / "header_sync.csv",
             [
                 {"ts": 1, **duplicate},
                 {"ts": 1, **duplicate, "process_trace_id": "restarted-process"},
@@ -1351,8 +1328,8 @@ def run_self_test() -> None:
         ), "request IDs may restart in a distinct traced process"
 
         handoff = root / "handoff" / "node2"
-        write_jsonl(
-            handoff / "legacy_sync.jsonl",
+        write_csv(
+            handoff / "legacy_sync.csv",
             [
                 {
                     "ts": 2,
@@ -1364,8 +1341,8 @@ def run_self_test() -> None:
                 }
             ],
         )
-        write_jsonl(
-            handoff / "commit_state.jsonl",
+        write_csv(
+            handoff / "commit_state.csv",
             [
                 {
                     "ts": 3,
@@ -1394,8 +1371,8 @@ def run_self_test() -> None:
         ), "checkpoint-to-full handoff trace should pass"
 
         no_handoff = root / "no_handoff" / "node2"
-        write_jsonl(
-            no_handoff / "commit_state.jsonl",
+        write_csv(
+            no_handoff / "commit_state.csv",
             [
                 {
                     "ts": 1,
@@ -1415,8 +1392,8 @@ def run_self_test() -> None:
         )
 
         no_later_full = root / "no_later_full" / "node2"
-        write_jsonl(
-            no_later_full / "legacy_sync.jsonl",
+        write_csv(
+            no_later_full / "legacy_sync.csv",
             [
                 {
                     "ts": 2,
@@ -1436,8 +1413,8 @@ def run_self_test() -> None:
         )
 
         cross_process = root / "cross_process" / "node2"
-        write_jsonl(
-            cross_process / "legacy_sync.jsonl",
+        write_csv(
+            cross_process / "legacy_sync.csv",
             [
                 {
                     "ts": 1,
@@ -1449,8 +1426,8 @@ def run_self_test() -> None:
                 }
             ],
         )
-        write_jsonl(
-            cross_process / "commit_state.jsonl",
+        write_csv(
+            cross_process / "commit_state.csv",
             [
                 {
                     "ts": 2,
@@ -1472,8 +1449,8 @@ def run_self_test() -> None:
         )
 
         slow_handoff = root / "slow_handoff" / "node2"
-        write_jsonl(
-            slow_handoff / "legacy_sync.jsonl",
+        write_csv(
+            slow_handoff / "legacy_sync.csv",
             [
                 {
                     "ts": 1,
@@ -1485,8 +1462,8 @@ def run_self_test() -> None:
                 }
             ],
         )
-        write_jsonl(
-            slow_handoff / "commit_state.jsonl",
+        write_csv(
+            slow_handoff / "commit_state.csv",
             [
                 {
                     "ts": 10_000_000,
@@ -1509,15 +1486,15 @@ def run_self_test() -> None:
         )
 
         bad_commit = root / "bad_commit" / "node1"
-        write_jsonl(
-            bad_commit / "commit_state.jsonl",
+        write_csv(
+            bad_commit / "commit_state.csv",
             [{"ts": 1, "event": COMMIT_START, "apply_token": 9, "height": 9, "hash": "bb"}],
         )
         assert any(f.invariant == "commit_start_has_finish" for f in run_oracle(root / "bad_commit"))
 
         terminal_stalled = root / "terminal_stalled" / "node1"
-        write_jsonl(
-            terminal_stalled / "commit_state.jsonl",
+        write_csv(
+            terminal_stalled / "commit_state.csv",
             [
                 {
                     "ts": 1,
@@ -1531,8 +1508,8 @@ def run_self_test() -> None:
         assert any(f.invariant == "commit_stalled_not_terminal" for f in run_oracle(root / "terminal_stalled"))
 
         bad_frontier = root / "bad_frontier" / "node1"
-        write_jsonl(
-            bad_frontier / "commit_state.jsonl",
+        write_csv(
+            bad_frontier / "commit_state.csv",
             [
                 {
                     "ts": 1,
@@ -1550,8 +1527,8 @@ def run_self_test() -> None:
         assert any(f.invariant == "verified_body_height_monotonic_except_reset" for f in failures)
 
         valid_reset = root / "valid_reset" / "node1"
-        write_jsonl(
-            valid_reset / "commit_state.jsonl",
+        write_csv(
+            valid_reset / "commit_state.csv",
             [
                 {
                     "ts": 1,
@@ -1567,8 +1544,8 @@ def run_self_test() -> None:
         assert not run_oracle(root / "valid_reset"), "valid reorg/reset should pass"
 
         persistent_lag = root / "persistent_lag" / "node1"
-        write_jsonl(
-            persistent_lag / "block_sync.jsonl",
+        write_csv(
+            persistent_lag / "block_sync.csv",
             [
                 {
                     "ts": 1,
@@ -1594,8 +1571,8 @@ def run_self_test() -> None:
         )
 
         query_spin = root / "query_spin" / "node1"
-        write_jsonl(
-            query_spin / "commit_state.jsonl",
+        write_csv(
+            query_spin / "commit_state.csv",
             [
                 {"ts": 1_000_000, "event": "state_read_start", "action": QUERY_NEEDED_BLOCKS},
                 {
@@ -1613,8 +1590,8 @@ def run_self_test() -> None:
                 },
             ],
         )
-        write_jsonl(
-            query_spin / "block_sync.jsonl",
+        write_csv(
+            query_spin / "block_sync.csv",
             [
                 {
                     "ts": 5_000_000,
@@ -1637,8 +1614,8 @@ def run_self_test() -> None:
         )
 
         self_healed_wedge = root / "self_healed_wedge" / "node1"
-        write_jsonl(
-            self_healed_wedge / "block_sync.jsonl",
+        write_csv(
+            self_healed_wedge / "block_sync.csv",
             [
                 {
                     "ts": 1,
@@ -1691,8 +1668,8 @@ def run_self_test() -> None:
         )
 
         lag_with_progress = root / "lag_with_progress" / "node1"
-        write_jsonl(
-            lag_with_progress / "block_sync.jsonl",
+        write_csv(
+            lag_with_progress / "block_sync.csv",
             [
                 {"ts": 10, "event": BLOCK_GET_BLOCKS_SENT, "range_start": 2, "range_count": 4},
                 {
@@ -1730,8 +1707,8 @@ def run_self_test() -> None:
         assert not run_oracle(root / "lag_with_progress", OracleOptions(persistent_lag_micros=1_000_000))
 
         queued_lag = root / "queued_lag" / "node1"
-        write_jsonl(
-            queued_lag / "block_sync.jsonl",
+        write_csv(
+            queued_lag / "block_sync.csv",
             [
                 {"ts": 9_500_000, "event": BLOCK_GET_BLOCKS_SENT, "range_start": 11, "range_count": 1},
                 {
@@ -1755,8 +1732,8 @@ def run_self_test() -> None:
         )
 
         latency_trend = root / "latency_trend" / "node1"
-        write_jsonl(
-            latency_trend / "commit_state.jsonl",
+        write_csv(
+            latency_trend / "commit_state.csv",
             [
                 {
                     "ts": 1,
@@ -1796,8 +1773,8 @@ def run_self_test() -> None:
         )
 
         stranded_anchor = root / "stranded_anchor" / "node1"
-        write_jsonl(
-            stranded_anchor / "header_sync.jsonl",
+        write_csv(
+            stranded_anchor / "header_sync.csv",
             [
                 {
                     "ts": 1,
@@ -1817,8 +1794,8 @@ def run_self_test() -> None:
         )
 
         recovered_anchor = root / "recovered_anchor" / "node1"
-        write_jsonl(
-            recovered_anchor / "header_sync.jsonl",
+        write_csv(
+            recovered_anchor / "header_sync.csv",
             [
                 {
                     "ts": 1,
@@ -1835,8 +1812,8 @@ def run_self_test() -> None:
         assert not run_oracle(root / "recovered_anchor", OracleOptions(persistent_lag_micros=1_000_000))
 
         bad_leak = root / "bad_leak" / "node1"
-        write_jsonl(
-            bad_leak / "block_sync.jsonl",
+        write_csv(
+            bad_leak / "block_sync.csv",
             [
                 {
                     "ts": 1,
@@ -1853,8 +1830,8 @@ def run_self_test() -> None:
         assert any(f.invariant == "final_block_sync_state_has_no_leaks" for f in run_oracle(root / "bad_leak"))
 
         optional_lag = root / "optional_lag" / "node4"
-        write_jsonl(
-            optional_lag / "block_sync.jsonl",
+        write_csv(
+            optional_lag / "block_sync.csv",
             [
                 {
                     "ts": 1,
@@ -1878,8 +1855,8 @@ def run_self_test() -> None:
         assert not run_oracle(root / "optional_lag", OracleOptions(optional_lag_nodes=("node4",)))
 
         optional_lag_leak = root / "optional_lag_leak" / "node4"
-        write_jsonl(
-            optional_lag_leak / "block_sync.jsonl",
+        write_csv(
+            optional_lag_leak / "block_sync.csv",
             [
                 {
                     "ts": 1,
@@ -1901,9 +1878,9 @@ def run_self_test() -> None:
         )
 
         # The same commit fixture must produce the same oracle result in CSV.
-        jsonl_path = good / "commit_state.jsonl"
-        original = read_jsonl(jsonl_path, "node1", "commit_state")
-        with jsonl_path.with_suffix(".csv").open("w", newline="", encoding="utf-8") as handle:
+        csv_path = good / "commit_state.csv"
+        original = read_csv(csv_path, "node1", "commit_state")
+        with csv_path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=CSV_SCHEMAS["commit_state"])
             writer.writeheader()
             for row in original:
@@ -1920,7 +1897,7 @@ def run_self_test() -> None:
                     )
                 record["extra"] = json.dumps(values)
                 writer.writerow(record)
-        csv_rows = read_jsonl(jsonl_path, "node1", "commit_state")
+        csv_rows = read_csv(csv_path, "node1", "commit_state")
         assert [row.row for row in csv_rows] == [row.row for row in original]
         assert not run_oracle(root / "good")
 
@@ -1934,33 +1911,33 @@ def run_self_test() -> None:
 
         duplicate_json = root / "duplicate_json" / "node1"
         duplicate_json.mkdir(parents=True)
-        (duplicate_json / "commit_state.jsonl").write_text(
+        (duplicate_json / "commit_state.csv").write_text(
             '{"ts":1,"event":"commit_start","event":"commit_finish"}\n',
             encoding="utf-8",
         )
         assert any(
-            f.invariant == "trace_jsonl_is_valid"
+            f.invariant == "trace_csv_is_valid"
             for f in run_oracle(root / "duplicate_json")
         )
 
         invalid_key = root / "invalid_key" / "node1"
-        write_jsonl(
-            invalid_key / "commit_state.jsonl",
-            [{"ts": 1, "event": COMMIT_START, "height": 1, "hash": ["aa"]}],
+        write_csv(
+            invalid_key / "commit_state.csv",
+            [{"ts": 1, "event": COMMIT_START, "height": ["invalid"], "hash": "aa"}],
         )
         assert any(
-            f.invariant == "trace_jsonl_is_valid"
+            f.invariant == "trace_csv_is_valid"
             for f in run_oracle(root / "invalid_key")
         )
 
         nested_json = root / "nested_json" / "node1"
         nested_json.mkdir(parents=True)
-        (nested_json / "commit_state.jsonl").write_text(
+        (nested_json / "commit_state.csv").write_text(
             "[" * 20_000 + "]" * 20_000 + "\n",
             encoding="utf-8",
         )
         assert any(
-            f.invariant == "trace_jsonl_is_valid"
+            f.invariant == "trace_csv_is_valid"
             for f in run_oracle(root / "nested_json")
         )
 
@@ -2056,6 +2033,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=[],
         help="node name whose body/header lag progress checks are informational only",
     )
+    parser.add_argument("--dump-csv", type=Path, help="decode a CSV table and retained segments to JSON for shell assertions")
+    parser.add_argument("--after", type=int, default=0, help="skip this many decoded rows with --dump-csv")
     return parser.parse_args(argv)
 
 
@@ -2063,6 +2042,16 @@ def main(argv: list[str]) -> int:
     args = parse_args(argv)
     if args.self_test:
         run_self_test()
+        return 0
+
+    if args.dump_csv is not None:
+        table = args.dump_csv.name.split(".csv", 1)[0]
+        rows = read_csv(args.dump_csv, args.dump_csv.parent.name, table)
+        if any(row.event == "csv_decode_error" for row in rows):
+            print("trace_oracle.py: malformed CSV input", file=sys.stderr)
+            return 1
+        for row in rows[args.after:]:
+            print(json.dumps(row.row, separators=(",", ":")))
         return 0
 
     if args.trace_dir is None:

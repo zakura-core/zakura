@@ -32,12 +32,12 @@ Each leg appends its result, CPU digest, absolute CPU counters, and block-latenc
 | `latency.md` / `.json` | per-block commit latency (p50/p90/p99/max, slowest heights, stalls) + per-stage pipeline timings |
 | `metrics-start.prom` / `metrics-final.prom` | live-head measurement boundary snapshots; stage timings use their delta |
 | `samples.csv` / `samples.jsonl` | height-over-time samples; historical runs also include the recorded metrics series |
-| `zakura-traces.tar.zst` | raw Zakura JSONL traces when the selected stack emits them (`commit_state.jsonl`, `block_sync.jsonl`, ...) |
+| `zakura-traces.tar.zst` | raw Zakura CSV traces when the selected stack emits them (`commit_state.csv`, `block_sync.csv`, ...) |
 | `meta.json`, `verdict.json` | machine-readable leg result + bottleneck verdict |
 
 Interpretation notes:
 
-- Per-block latency comes from the `commit_state.jsonl` trace (`commit_start` → `commit_finish` around the verifier commit). In `checkpoint` mode a block's latency includes waiting for its checkpoint range to fill, so high p99 there is batching, not slow verification; `semantic` mode is true per-block verify+commit latency.
+- Per-block latency comes from the `commit_state.csv` trace (`commit_start` → `commit_finish` around the verifier commit). In `checkpoint` mode a block's latency includes waiting for its checkpoint range to fill, so high p99 there is batching, not slow verification; `semantic` mode is true per-block verify+commit latency.
 - Stage timings use cumulative Prometheus histograms for historical sync and start/end deltas for live head. The exporter's rolling-window quantiles are deliberately omitted.
 - Production-default live-head runs use JSON-RPC for health samples, omit the metrics recorder, and scrape Prometheus only at the measurement boundaries, so exporter rendering does not distort the CPU profile. The experimental Zakura stack still uses its metrics-only header frontier.
 - Historical profiling starts after the first committed block and defaults to 300 seconds. Live-head profiling starts only after the head gate and defaults to 60 minutes. Sampling uses hardware `cycles` when available, else `cpu-clock`, at 49 Hz with DWARF unwinding.

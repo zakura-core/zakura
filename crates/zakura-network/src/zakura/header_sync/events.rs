@@ -51,7 +51,7 @@ pub struct HeaderSyncStartup {
     pub request_timeout: Duration,
     /// Status refresh interval.
     pub status_refresh_interval: Duration,
-    /// Optional JSONL trace emitter.
+    /// Optional CSV trace emitter.
     pub trace: ZakuraTrace,
     /// Shared shutdown signal.
     pub shutdown: CancellationToken,

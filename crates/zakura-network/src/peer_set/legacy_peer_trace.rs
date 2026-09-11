@@ -314,6 +314,19 @@ mod tests {
 
     const MAX_RECEIVED_BLOCK_HASHES: usize = 50_000;
 
+    #[test]
+    fn csv_header_matches_shared_schema() {
+        let schema: serde_json::Value =
+            serde_json::from_str(zakura_jsonl_trace::SCHEMA_JSON).expect("shared trace schema");
+        let columns: Vec<_> = schema["tables"][TABLE.table()]
+            .as_array()
+            .expect("legacy peer table")
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        assert_eq!(TABLE.header(), columns);
+    }
+
     fn hash(byte: u8) -> block::Hash {
         block::Hash([byte; 32])
     }

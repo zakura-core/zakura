@@ -65,7 +65,7 @@ const OUTBOUND_FULL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const BBR_TRACE_INTERVAL: Duration = Duration::from_secs(10);
 /// Minimum interval between repeated fill-stop trace rows for the same peer and reason.
 ///
-/// The counter remains exact. The JSONL trace samples steady-state refusal details.
+/// The counter remains exact. The CSV trace samples steady-state refusal details.
 /// Without this bound, idle peers can emit a row on every wake and consume hundreds
 /// of megabytes per minute during initial sync.
 const FILL_STOP_TRACE_INTERVAL: Duration = Duration::from_secs(10);

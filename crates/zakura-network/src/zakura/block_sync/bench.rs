@@ -115,7 +115,7 @@ pub struct BenchCommitter {
     finalized_height: block::Height,
     owner: zakura_header_chain::BodyWorkOwner,
     source: zakura_header_chain::SourceId,
-    // The JSONL trace writer guard (when `trace_dir` was supplied). Flushed via
+    // The CSV trace writer guard (when `trace_dir` was supplied). Flushed via
     // [`BenchCommitter::flush_trace`] so the trace tables are complete for review.
     trace_guard: Option<JsonlTraceGuard>,
     // Keeps the sequencer task alive for the lifetime of the committer.
@@ -129,7 +129,7 @@ pub struct BenchCommitter {
 /// caps total in-flight body bytes (reorder + applying), which backpressures the feed
 /// so the `applying` buffer can't grow unbounded — keep it finite for large windows.
 ///
-/// When `trace_dir` is `Some`, the sequencer's structured Zakura JSONL trace tables
+/// When `trace_dir` is `Some`, the sequencer's structured Zakura CSV trace tables
 /// (the `BLOCK_SYNC_STATE` body lifecycle, etc.) are written there — the same tables
 /// `perf-run-mainnet` produces via `[network.zakura] trace_dir`. The writer is flushed
 /// by [`BenchCommitter::flush_trace`]. `None` runs with a no-op tracer (zero overhead).
@@ -164,7 +164,7 @@ pub fn spawn_bench_sequencer(
     let source = zakura_header_chain::SourceId::from_digest([0xb2; 32]);
     let limit = submit_in_flight_limit.max(1);
 
-    // Real JSONL trace (same path as production) when a directory is supplied; the
+    // Real CSV trace (same path as production) when a directory is supplied; the
     // guard is handed to the committer so the bench can flush+drain it at the end.
     let (trace, trace_guard) = match trace_dir {
         Some(dir) => {
@@ -320,7 +320,7 @@ impl BenchCommitter {
         });
     }
 
-    /// Emit one `block_sync_state` snapshot row into `block_sync.jsonl`, mirroring the
+    /// Emit one `block_sync_state` snapshot row into `block_sync.csv`, mirroring the
     /// periodic row the full block-sync reactor writes in production (the row the
     /// zakura-trace-plots skill reads: `verified_block_tip`, `applying`, `reorder`,
     /// `submitted_applies`, and the in-flight byte counters). Cheap and non-blocking;
@@ -361,7 +361,7 @@ impl BenchCommitter {
         });
     }
 
-    /// Flush and drain the JSONL trace writer (if tracing was enabled), so the trace
+    /// Flush and drain the CSV trace writer (if tracing was enabled), so the trace
     /// tables on disk are complete before the bench process exits. A no-op when no
     /// `trace_dir` was supplied. Call after the drive loop finishes.
     pub async fn flush_trace(&mut self) {

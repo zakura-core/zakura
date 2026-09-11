@@ -1,6 +1,6 @@
 [package]
 name = "zakura-jsonl-trace"
-version = "1.2.0"
+version = "2.0.0"
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -9,7 +9,7 @@ keywords.workspace = true
 categories = ["development-tools::debugging"]
 edition.workspace = true
 rust-version.workspace = true
-description = "Shared non-blocking JSONL tracing support for the Zakura node. Internal crate, published to support cargo install zakura"
+description = "Shared non-blocking CSV tracing support for the Zakura node. Internal crate, published to support cargo install zakura"
 
 [dependencies]
 chrono = { workspace = true, features = ["clock", "std"] }

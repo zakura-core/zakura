@@ -344,7 +344,7 @@ pub struct Config {
     /// Literal addresses supplied in the node configuration can appear in startup logs and
     /// `seed` labels regardless of this setting.
     /// If `trace_dir` is configured in `[network.zakura]`, legacy sync diagnostics can write
-    /// unredacted addresses to `legacy_sync.jsonl`.
+    /// unredacted addresses to `legacy_sync.csv`.
     ///
     /// # Security
     ///

@@ -1,8 +1,10 @@
-//! Shared non-blocking JSONL tracing support for Zebra components.
+//! Shared non-blocking CSV tracing support for Zebra components.
 
 use std::{
     collections::{HashMap, HashSet},
     fmt,
+    fs::{self, File, OpenOptions},
+    io::{self, BufRead, BufReader, Write},
     path::PathBuf,
     sync::OnceLock,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -11,7 +13,6 @@ use std::{
 use serde::Serialize;
 use serde_json::{Map, Value};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
     runtime::Handle,
     sync::mpsc::{self, error::TryRecvError, error::TrySendError},
     task::JoinHandle,
@@ -38,18 +39,27 @@ pub const DEFAULT_BUFFER_FLUSH_BYTES: usize = 256 * 1024;
 /// `commit_finish` rows at the end of a sync, which never reach
 /// [`DEFAULT_BUFFER_FLUSH_BYTES`] — are durable within ~1s of being emitted. A
 /// long interval here is the root cause of the e2e trace-oracle "flush race":
-/// the oracle reads the JSONL only a few seconds after the final commits, so a
+/// the oracle reads the CSV only a few seconds after the final commits, so a
 /// 17s flush window left those rows unwritten and the oracle saw a `commit_start`
 /// with no matching `commit_finish` even though the node had committed (the live
 /// metrics show `applying = 0`). Tracing is opt-in (a `trace_dir` must be set),
 /// so the extra fsync cadence is negligible against the debuggability win.
 pub const DEFAULT_FILE_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Env var used to label every JSONL trace record with a stable node identifier.
+/// Default maximum size of a current CSV segment.
+pub const DEFAULT_CSV_ROTATION_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Default number of retained CSV segments older than the current segment.
+pub const DEFAULT_CSV_ROTATION_SEGMENTS: usize = 2;
+
+/// Env var used to label every CSV trace record with a stable node identifier.
 pub const NODE_ID_ENV: &str = "ZEBRA_NODE_ID";
 
 /// Envelope columns written for every trace row, in output order.
 pub const ENVELOPE_COLUMNS: &[&str] = &["ts", "wall_ts", "node", "process_trace_id"];
+
+/// Column names and value types for the node's structured CSV traces.
+pub const SCHEMA_JSON: &str = include_str!("../schema.json");
 
 /// Trailing CSV column carrying any fields missing from a table's declared header.
 ///
@@ -61,18 +71,7 @@ pub const EXTRA_COLUMN: &str = "extra";
 /// The on-disk encoding of a trace table.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum TraceFormat {
-    /// One JSON object per line.
-    ///
-    /// Self-describing and tolerant of sparse rows, at the cost of repeating
-    /// every key name on every row.
-    Jsonl,
-    /// RFC 4180 CSV with a fixed header written once, when the file is created.
-    ///
-    /// Worth roughly a third of the uncompressed bytes on dense tables whose
-    /// rows populate most columns. Sparse tables with many optional fields pad
-    /// every row with empty columns instead, and should stay [`Jsonl`].
-    ///
-    /// [`Jsonl`]: TraceFormat::Jsonl
+    /// RFC 4180 CSV with a fixed header in every segment.
     Csv,
 }
 
@@ -86,16 +85,6 @@ pub struct JsonlTraceTable {
 }
 
 impl JsonlTraceTable {
-    /// Create a JSONL trace table definition.
-    pub const fn new(table: &'static str, file_name: &'static str) -> Self {
-        Self {
-            table,
-            file_name,
-            format: TraceFormat::Jsonl,
-            header: &[],
-        }
-    }
-
     /// Create a CSV trace table definition.
     ///
     /// `header` lists this table's own columns; the [`ENVELOPE_COLUMNS`] are
@@ -137,7 +126,7 @@ impl JsonlTraceTable {
     }
 }
 
-/// A serializable typed JSONL trace event.
+/// A serializable typed CSV trace event.
 pub trait JsonlTraceEvent: Serialize {
     /// The table that receives this event.
     const TABLE: JsonlTraceTable;
@@ -288,7 +277,6 @@ where
     T: Serialize,
 {
     match format {
-        TraceFormat::Jsonl => serde_json::to_vec(row).ok(),
         TraceFormat::Csv => match serde_json::to_value(row).ok()? {
             Value::Object(row) => Some(render_csv_row(header, row)),
             _ => None,
@@ -306,7 +294,7 @@ macro_rules! impl_jsonl_trace_event {
     };
 }
 
-/// A typed, non-blocking JSONL event emitter.
+/// A typed, non-blocking CSV event emitter.
 #[derive(Clone, Debug)]
 pub struct JsonlEventEmitter {
     tracer: JsonlTracer,
@@ -329,7 +317,7 @@ impl JsonlEventEmitter {
         }
     }
 
-    /// Return the underlying JSONL tracer.
+    /// Return the underlying CSV tracer.
     pub fn tracer(&self) -> &JsonlTracer {
         &self.tracer
     }
@@ -395,7 +383,6 @@ impl JsonlEventEmitter {
         build(&mut row);
 
         let line = match table.format() {
-            TraceFormat::Jsonl => serde_json::to_vec(&Value::Object(row)).ok(),
             TraceFormat::Csv => Some(render_csv_row(table.header(), row)),
         };
 
@@ -468,7 +455,7 @@ fn elapsed_micros(elapsed: Duration) -> u64 {
     saturating_micros(elapsed)
 }
 
-/// Returns the process-wide node identifier used to tag JSONL trace records.
+/// Returns the process-wide node identifier used to tag CSV trace records.
 ///
 /// Resolution order: `ZEBRA_NODE_ID`, `HOSTNAME`, `/etc/hostname`, then
 /// `"unknown"`. The value is resolved once on first call and cached for the
@@ -489,7 +476,7 @@ pub fn node_id() -> &'static str {
         .as_str()
 }
 
-/// Returns an opaque identifier shared by every JSONL emitter in this process.
+/// Returns an opaque identifier shared by every CSV emitter in this process.
 ///
 /// The identifier disambiguates appended trace rows across process restarts.
 /// Emitter-local monotonic timestamps restart from zero after each restart.
@@ -523,7 +510,7 @@ pub struct JsonlWriteEvent {
     pub line: Vec<u8>,
 }
 
-/// Settings for the background JSONL writer.
+/// Settings for the background CSV writer.
 #[derive(Clone, Debug)]
 pub struct JsonlTraceConfig {
     /// Bounded queue capacity.
@@ -536,6 +523,10 @@ pub struct JsonlTraceConfig {
     pub buffer_flush_bytes: usize,
     /// Maximum time between forced file flushes and syncs.
     pub file_flush_interval: Duration,
+    /// Target size for the current CSV segment. A single row may exceed it.
+    pub csv_rotation_bytes: u64,
+    /// Number of older CSV segments to retain.
+    pub csv_rotation_segments: usize,
 }
 
 impl Default for JsonlTraceConfig {
@@ -546,7 +537,24 @@ impl Default for JsonlTraceConfig {
             batch_linger: DEFAULT_BATCH_LINGER,
             buffer_flush_bytes: DEFAULT_BUFFER_FLUSH_BYTES,
             file_flush_interval: DEFAULT_FILE_FLUSH_INTERVAL,
+            csv_rotation_bytes: DEFAULT_CSV_ROTATION_BYTES,
+            csv_rotation_segments: DEFAULT_CSV_ROTATION_SEGMENTS,
         }
+    }
+}
+
+impl JsonlTraceConfig {
+    /// Return defaults with the controller-provided CSV limit, when valid.
+    pub fn from_environment() -> Self {
+        let mut config = Self::default();
+        if let Ok(value) = std::env::var("ZAKURA_TRACE_FILE_BYTES") {
+            if let Ok(bytes) = value.parse::<u64>() {
+                if bytes > 0 {
+                    config.csv_rotation_bytes = bytes;
+                }
+            }
+        }
+        config
     }
 }
 
@@ -555,7 +563,7 @@ struct TraceRuntime {
     tx: mpsc::Sender<JsonlWriteEvent>,
 }
 
-/// A non-blocking handle for emitting JSONL trace records.
+/// A non-blocking handle for emitting CSV trace records.
 #[derive(Clone)]
 pub struct JsonlTracer {
     inner: TraceState,
@@ -567,7 +575,7 @@ enum TraceState {
     Enabled(TraceRuntime),
 }
 
-/// A spawned JSONL writer plus its tracer.
+/// A spawned CSV writer plus its tracer.
 ///
 /// Dropping this guard leaves the writer's normal channel-close shutdown
 /// behavior in place. Calling [`JsonlTraceGuard::shutdown`] explicitly asks the
@@ -579,7 +587,7 @@ pub struct JsonlTraceGuard {
     writer: Option<JoinHandle<()>>,
 }
 
-/// Reserve errors for the bounded JSONL trace queue.
+/// Reserve errors for the bounded CSV trace queue.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum JsonlTraceReserveError {
     /// Tracing is disabled.
@@ -590,7 +598,7 @@ pub enum JsonlTraceReserveError {
     Closed,
 }
 
-/// Send errors for the bounded JSONL trace queue.
+/// Send errors for the bounded CSV trace queue.
 #[derive(Debug)]
 pub enum JsonlTraceSendError {
     /// Tracing is disabled.
@@ -634,7 +642,7 @@ impl JsonlTracer {
     /// If there is no current Tokio runtime, tracing is disabled and a no-op
     /// tracer is returned.
     pub fn spawn(trace_dir: PathBuf) -> Self {
-        Self::spawn_with_config(trace_dir, JsonlTraceConfig::default())
+        Self::spawn_with_config(trace_dir, JsonlTraceConfig::from_environment())
     }
 
     /// Spawn a background writer using `config` on the current Tokio runtime.
@@ -651,7 +659,7 @@ impl JsonlTracer {
     /// If there is no current Tokio runtime, tracing is disabled and the guard
     /// contains a no-op tracer.
     pub fn spawn_guard(trace_dir: PathBuf) -> JsonlTraceGuard {
-        Self::spawn_guard_with_config(trace_dir, JsonlTraceConfig::default())
+        Self::spawn_guard_with_config(trace_dir, JsonlTraceConfig::from_environment())
     }
 
     /// Spawn a guarded background writer using `config` on the current Tokio
@@ -666,7 +674,7 @@ impl JsonlTracer {
         let Ok(handle) = Handle::try_current() else {
             tracing::warn!(
                 ?trace_dir,
-                "JSONL tracing requested without an active Tokio runtime, disabling tracing"
+                "CSV tracing requested without an active Tokio runtime, disabling tracing"
             );
             return JsonlTraceGuard::disabled();
         };
@@ -675,7 +683,7 @@ impl JsonlTracer {
         let writer = TraceWriter::new(trace_dir.clone(), config);
         let shutdown = CancellationToken::new();
         let writer = handle.spawn(run_trace_writer(rx, writer, shutdown.clone()));
-        tracing::info!(?trace_dir, "JSONL tracing enabled");
+        tracing::info!(?trace_dir, "CSV tracing enabled");
 
         JsonlTraceGuard {
             tracer: Self::new(tx),
@@ -774,36 +782,152 @@ impl std::fmt::Debug for JsonlTracer {
     }
 }
 
+#[derive(Clone)]
 struct TableWriter {
-    file: tokio::fs::File,
-    encode_buf: Vec<u8>,
+    trace_dir: PathBuf,
+    file_name: &'static str,
+    format: TraceFormat,
+    header: &'static [&'static str],
+    config: JsonlTraceConfig,
 }
 
 impl TableWriter {
-    fn new(file: tokio::fs::File, buffer_flush_bytes: usize) -> Self {
+    fn new(
+        trace_dir: PathBuf,
+        file_name: &'static str,
+        format: TraceFormat,
+        header: &'static [&'static str],
+        config: JsonlTraceConfig,
+    ) -> Self {
         Self {
-            file,
-            encode_buf: Vec::with_capacity(buffer_flush_bytes),
+            trace_dir,
+            file_name,
+            format,
+            header,
+            config,
         }
     }
 
-    fn append_line(&mut self, line: &[u8]) {
-        self.encode_buf.extend_from_slice(line);
-        self.encode_buf.push(b'\n');
-    }
+    fn append_lines(&self, lines: &[Vec<u8>], sync_file: bool) -> io::Result<()> {
+        fs::create_dir_all(&self.trace_dir)?;
+        let _lock = TableLock::acquire(&self.trace_dir.join(format!("{}.lock", self.file_name)))?;
+        let path = self.trace_dir.join(self.file_name);
 
-    async fn flush_buffer(&mut self, sync_file: bool) -> std::io::Result<()> {
-        if !self.encode_buf.is_empty() {
-            self.file.write_all(&self.encode_buf).await?;
-            self.encode_buf.clear();
-            self.file.flush().await?;
+        if self.format == TraceFormat::Csv {
+            self.validate_csv_segments()?;
         }
 
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut length = file.metadata()?.len();
+        let header = render_csv_header(self.header);
+        let header_length = u64::try_from(header.len() + 1).unwrap_or(u64::MAX);
+
+        if self.format == TraceFormat::Csv && length == 0 {
+            file.write_all(&header)?;
+            file.write_all(b"\n")?;
+            length = header_length;
+        }
+
+        for line in lines {
+            let line_length = u64::try_from(line.len() + 1).unwrap_or(u64::MAX);
+            if self.format == TraceFormat::Csv
+                && self.config.csv_rotation_segments > 0
+                && length > header_length
+                && length.saturating_add(line_length) > self.config.csv_rotation_bytes
+            {
+                file.sync_data()?;
+                drop(file);
+                self.rotate_csv_segments()?;
+                file = OpenOptions::new().create(true).append(true).open(&path)?;
+                file.write_all(&header)?;
+                file.write_all(b"\n")?;
+                length = header_length;
+            }
+
+            file.write_all(line)?;
+            file.write_all(b"\n")?;
+            length = length.saturating_add(line_length);
+        }
+
+        file.flush()?;
         if sync_file {
-            self.file.sync_data().await?;
+            file.sync_data()?;
+        }
+        Ok(())
+    }
+
+    fn validate_csv_segments(&self) -> io::Result<()> {
+        let expected = render_csv_header(self.header);
+        let current = self.trace_dir.join(self.file_name);
+        let mut paths = vec![current];
+        for index in 1..=self.config.csv_rotation_segments {
+            paths.push(self.trace_dir.join(format!("{}.{}", self.file_name, index)));
         }
 
+        for path in paths {
+            if !path.exists() || path.metadata()?.len() == 0 {
+                continue;
+            }
+            let file = File::open(&path)?;
+            let mut reader = BufReader::new(file);
+            let mut header = Vec::new();
+            let read = reader.read_until(b'\n', &mut header)?;
+            if read == 0 || header.strip_suffix(b"\n") != Some(expected.as_slice()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("CSV header mismatch in {}", path.display()),
+                ));
+            }
+        }
         Ok(())
+    }
+
+    fn rotate_csv_segments(&self) -> io::Result<()> {
+        if self.config.csv_rotation_segments == 0 {
+            return Ok(());
+        }
+
+        let current = self.trace_dir.join(self.file_name);
+        let oldest = self.trace_dir.join(format!(
+            "{}.{}",
+            self.file_name, self.config.csv_rotation_segments
+        ));
+        if oldest.exists() {
+            fs::remove_file(oldest)?;
+        }
+        for index in (1..self.config.csv_rotation_segments).rev() {
+            let source = self.trace_dir.join(format!("{}.{}", self.file_name, index));
+            let destination = self
+                .trace_dir
+                .join(format!("{}.{}", self.file_name, index + 1));
+            if source.exists() {
+                fs::rename(source, destination)?;
+            }
+        }
+        if current.exists() {
+            fs::rename(
+                current,
+                self.trace_dir.join(format!("{}.1", self.file_name)),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+struct TableLock {
+    _file: File,
+}
+
+impl TableLock {
+    fn acquire(path: &std::path::Path) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        file.lock()?;
+        Ok(Self { _file: file })
     }
 }
 
@@ -812,7 +936,6 @@ struct TraceWriter {
     config: JsonlTraceConfig,
     tables: HashMap<&'static str, TableWriter>,
     disabled_tables: HashSet<&'static str>,
-    trace_dir_created: bool,
     last_file_flush: Instant,
 }
 
@@ -823,7 +946,6 @@ impl TraceWriter {
             config,
             tables: HashMap::new(),
             disabled_tables: HashSet::new(),
-            trace_dir_created: false,
             last_file_flush: Instant::now(),
         }
     }
@@ -833,40 +955,47 @@ impl TraceWriter {
     }
 
     async fn write_batch(&mut self, batch: Vec<JsonlWriteEvent>, force_flush: bool) {
+        let sync_file =
+            force_flush || self.last_file_flush.elapsed() >= self.config.file_flush_interval;
+        let mut grouped: HashMap<&'static str, Vec<Vec<u8>>> = HashMap::new();
         for event in batch {
             if self.disabled_tables.contains(event.table) {
                 continue;
             }
 
-            let append_result = match self
-                .table_writer_mut(event.table, event.file_name, event.format, event.header)
-                .await
-            {
-                Some(table_writer) => {
-                    table_writer.append_line(&event.line);
-                    Ok(())
-                }
-                None => Err(()),
-            };
+            if !self.tables.contains_key(event.table) {
+                self.tables.insert(
+                    event.table,
+                    TableWriter::new(
+                        self.trace_dir.clone(),
+                        event.file_name,
+                        event.format,
+                        event.header,
+                        self.config.clone(),
+                    ),
+                );
+            }
+            grouped.entry(event.table).or_default().push(event.line);
+        }
 
-            if append_result.is_err() {
-                self.disable_table(event.table);
+        if sync_file {
+            for &table in self.tables.keys() {
+                grouped.entry(table).or_default();
             }
         }
 
-        let flush_file =
-            force_flush || self.last_file_flush.elapsed() >= self.config.file_flush_interval;
         let mut failed_tables = Vec::new();
-
-        for (&table_name, table_writer) in &mut self.tables {
-            let should_flush_buffer =
-                table_writer.encode_buf.len() >= self.config.buffer_flush_bytes;
-
-            if !should_flush_buffer && !flush_file && !force_flush {
+        for (table_name, lines) in grouped {
+            let Some(table_writer) = self.tables.get(&table_name).cloned() else {
                 continue;
-            }
-
-            if let Err(error) = table_writer.flush_buffer(flush_file || force_flush).await {
+            };
+            let result =
+                tokio::task::spawn_blocking(move || table_writer.append_lines(&lines, sync_file))
+                    .await;
+            if let Err(error) = result
+                .map_err(|error| io::Error::other(error.to_string()))
+                .and_then(|result| result)
+            {
                 tracing::warn!(
                     ?error,
                     table = table_name,
@@ -877,7 +1006,7 @@ impl TraceWriter {
             }
         }
 
-        if flush_file || force_flush {
+        if sync_file {
             self.last_file_flush = Instant::now();
         }
 
@@ -893,93 +1022,6 @@ impl TraceWriter {
     fn disable_table(&mut self, table: &'static str) {
         self.tables.remove(table);
         self.disabled_tables.insert(table);
-    }
-
-    async fn table_writer_mut(
-        &mut self,
-        table: &'static str,
-        file_name: &'static str,
-        format: TraceFormat,
-        header: &'static [&'static str],
-    ) -> Option<&mut TableWriter> {
-        if self.disabled_tables.contains(table) {
-            return None;
-        }
-
-        if !self.tables.contains_key(table) {
-            if !self.trace_dir_created {
-                if let Err(error) = tokio::fs::create_dir_all(&self.trace_dir).await {
-                    tracing::warn!(
-                        ?error,
-                        trace_dir = ?self.trace_dir,
-                        "failed to create trace directory, disabling trace table"
-                    );
-                    self.disabled_tables.insert(table);
-                    return None;
-                }
-                self.trace_dir_created = true;
-            }
-
-            let mut file = match tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .read(format == TraceFormat::Csv)
-                .open(self.trace_dir.join(file_name))
-                .await
-            {
-                Ok(file) => file,
-                Err(error) => {
-                    tracing::warn!(
-                        ?error,
-                        table,
-                        trace_dir = ?self.trace_dir,
-                        "failed to open trace table, disabling trace table"
-                    );
-                    self.disabled_tables.insert(table);
-                    return None;
-                }
-            };
-
-            let mut csv_header = render_csv_header(header);
-            csv_header.push(b'\n');
-            let write_header = if format == TraceFormat::Csv {
-                let validation = async {
-                    if file.metadata().await?.len() == 0 {
-                        return Ok(true);
-                    }
-                    // Bound the read to the expected header, even for a malformed file.
-                    let mut existing = vec![0; csv_header.len()];
-                    file.read_exact(&mut existing).await?;
-                    if existing != csv_header {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "CSV trace header differs from the current schema",
-                        ));
-                    }
-                    Ok(false)
-                }
-                .await;
-                match validation {
-                    Ok(write_header) => write_header,
-                    Err(error) => {
-                        tracing::warn!(?error, table, "invalid CSV header, disabling trace table");
-                        self.disabled_tables.insert(table);
-                        return None;
-                    }
-                }
-            } else {
-                false
-            };
-
-            let mut table_writer = TableWriter::new(file, self.config.buffer_flush_bytes);
-            if write_header {
-                table_writer.append_line(&csv_header[..csv_header.len() - 1]);
-            }
-
-            self.tables.insert(table, table_writer);
-        }
-
-        self.tables.get_mut(table)
     }
 }
 
@@ -1098,7 +1140,8 @@ mod tests {
 
     use super::*;
 
-    const TEST_TABLE: JsonlTraceTable = JsonlTraceTable::new("typed", "typed.jsonl");
+    const TEST_TABLE: JsonlTraceTable =
+        JsonlTraceTable::csv("typed", "typed.csv", &["event", "value", "optional"]);
 
     #[derive(Serialize)]
     struct TestEvent {
@@ -1145,6 +1188,26 @@ mod tests {
         fields
     }
 
+    fn decoded_test_row(event: &JsonlWriteEvent) -> Value {
+        let fields = csv_fields(std::str::from_utf8(&event.line).expect("CSV UTF-8"));
+        Value::Object(
+            csv_columns(event.header)
+                .zip(fields)
+                .filter_map(|(key, field)| {
+                    if field.is_empty() || key == EXTRA_COLUMN {
+                        return None;
+                    }
+                    let value = if matches!(key, "ts" | "value" | "optional") {
+                        serde_json::from_str(&field).expect("numeric field")
+                    } else {
+                        Value::String(field)
+                    };
+                    Some((key.to_owned(), value))
+                })
+                .collect(),
+        )
+    }
+
     #[test]
     fn common_adapters_use_display_and_saturating_numeric_forms() {
         assert_eq!(
@@ -1169,9 +1232,9 @@ mod tests {
 
         let written = rx.try_recv().expect("typed event uses the reserved slot");
         assert_eq!(written.table, "typed");
-        assert_eq!(written.file_name, "typed.jsonl");
+        assert_eq!(written.file_name, "typed.csv");
 
-        let row: Value = serde_json::from_slice(&written.line).expect("valid typed event JSON");
+        let row: Value = decoded_test_row(&written);
         assert_eq!(row["node"], "node-typed");
         assert_eq!(row["process_trace_id"], process_trace_id());
         assert_eq!(row["event"], "typed_event");
@@ -1190,7 +1253,7 @@ mod tests {
         });
 
         let written = rx.try_recv().expect("raw event uses the reserved slot");
-        let row: Value = serde_json::from_slice(&written.line).expect("valid raw event JSON");
+        let row: Value = decoded_test_row(&written);
         assert_eq!(row["node"], "node-raw");
         assert_eq!(row["process_trace_id"], process_trace_id());
         assert_eq!(row["event"], "raw_event");
@@ -1209,7 +1272,7 @@ mod tests {
         });
 
         let written = rx.try_recv().expect("typed event uses the reserved slot");
-        let row: Value = serde_json::from_slice(&written.line).expect("valid typed event JSON");
+        let row: Value = decoded_test_row(&written);
 
         let wall_ts = row["wall_ts"].as_str().expect("wall_ts is a string");
         let parsed = chrono::DateTime::parse_from_rfc3339(wall_ts).expect("wall_ts is RFC 3339");
@@ -1380,7 +1443,7 @@ mod tests {
                 file_name: "csv.csv",
                 format: TraceFormat::Csv,
                 header: &["event"],
-                line: format!("1,t,n,run{generation},").into_bytes(),
+                line: format!("1,t,n,process,run{generation},").into_bytes(),
             })
             .await
             .expect("send should succeed");
@@ -1394,11 +1457,142 @@ mod tests {
 
         assert_eq!(lines.len(), 3, "one header plus two rows: {written}");
         assert_eq!(lines[0], "ts,wall_ts,node,process_trace_id,event,extra");
-        assert_eq!(lines[1], "1,t,n,run0,");
+        assert_eq!(lines[1], "1,t,n,process,run0,");
         assert_eq!(
-            lines[2], "1,t,n,run1,",
+            lines[2], "1,t,n,process,run1,",
             "a restart appends rows without repeating the header"
         );
+    }
+
+    #[tokio::test]
+    async fn writer_rotates_csv_segments_with_one_header_per_segment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let trace_dir = dir.path().join("traces");
+        let config = JsonlTraceConfig {
+            csv_rotation_bytes: 56,
+            csv_rotation_segments: 3,
+            ..JsonlTraceConfig::default()
+        };
+        let writer = TableWriter::new(
+            trace_dir.clone(),
+            "csv.csv",
+            TraceFormat::Csv,
+            &["event"],
+            config,
+        );
+        let lines = (0..4)
+            .map(|index| format!("1,t,n,process,run{index},").into_bytes())
+            .collect::<Vec<_>>();
+
+        writer
+            .append_lines(&lines, true)
+            .expect("CSV write and rotation should succeed");
+
+        let expected_header = "ts,wall_ts,node,process_trace_id,event,extra";
+        for suffix in ["", ".1", ".2", ".3"] {
+            let path = trace_dir.join(format!("csv.csv{suffix}"));
+            let content = std::fs::read_to_string(path).expect("retained CSV segment");
+            assert_eq!(content.lines().next(), Some(expected_header));
+            assert_eq!(
+                content
+                    .lines()
+                    .filter(|line| *line == expected_header)
+                    .count(),
+                1
+            );
+        }
+        let rows = ["run0", "run1", "run2", "run3"];
+        let all_segments = ["", ".1", ".2", ".3"]
+            .into_iter()
+            .map(|suffix| {
+                std::fs::read_to_string(trace_dir.join(format!("csv.csv{suffix}")))
+                    .expect("segment")
+            })
+            .collect::<Vec<_>>();
+        for row in rows {
+            assert_eq!(
+                all_segments
+                    .iter()
+                    .filter(|segment| segment.contains(row))
+                    .count(),
+                1,
+                "each row must occur in one retained segment"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_csv_writers_share_the_lock_and_header() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let trace_dir = dir.path().join("traces");
+        let config = JsonlTraceConfig::default();
+        let first = TableWriter::new(
+            trace_dir.clone(),
+            "csv.csv",
+            TraceFormat::Csv,
+            &["event"],
+            config.clone(),
+        );
+        let second = first.clone();
+        let first_task = tokio::task::spawn_blocking(move || {
+            first.append_lines(&[b"1,t,n,process,first,".to_vec()], true)
+        });
+        let second_task = tokio::task::spawn_blocking(move || {
+            second.append_lines(&[b"1,t,n,process,second,".to_vec()], true)
+        });
+        first_task
+            .await
+            .expect("first writer task")
+            .expect("first write");
+        second_task
+            .await
+            .expect("second writer task")
+            .expect("second write");
+
+        let content = std::fs::read_to_string(trace_dir.join("csv.csv")).expect("CSV");
+        assert_eq!(
+            content
+                .matches("ts,wall_ts,node,process_trace_id,event,extra\n")
+                .count(),
+            1
+        );
+        assert!(content.contains("first"));
+        assert!(content.contains("second"));
+    }
+
+    #[tokio::test]
+    async fn zero_csv_rotation_segments_do_not_repeat_headers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let trace_dir = dir.path().join("traces");
+        let config = JsonlTraceConfig {
+            csv_rotation_bytes: 1,
+            csv_rotation_segments: 0,
+            ..JsonlTraceConfig::default()
+        };
+        let writer = TableWriter::new(
+            trace_dir.clone(),
+            "csv.csv",
+            TraceFormat::Csv,
+            &["event"],
+            config,
+        );
+        writer
+            .append_lines(
+                &[
+                    b"1,t,n,process,one,".to_vec(),
+                    b"1,t,n,process,two,".to_vec(),
+                ],
+                true,
+            )
+            .expect("CSV write without rotation should succeed");
+        let content = std::fs::read_to_string(trace_dir.join("csv.csv")).expect("CSV");
+        assert_eq!(
+            content
+                .matches("ts,wall_ts,node,process_trace_id,event,extra\n")
+                .count(),
+            1
+        );
+        assert_eq!(content.lines().count(), 3);
     }
 
     #[test]
@@ -1437,7 +1631,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writer_task_produces_per_table_jsonl() {
+    async fn writer_task_produces_per_table_csv() {
         let dir = tempfile::tempdir().expect("tempdir");
         let trace_dir = dir.path().join("traces");
 
@@ -1447,20 +1641,20 @@ mod tests {
 
         tx.send(JsonlWriteEvent {
             table: "alpha",
-            file_name: "alpha.jsonl",
-            format: TraceFormat::Jsonl,
-            header: &[],
-            line: br#"{"value":1}"#.to_vec(),
+            file_name: "alpha.csv",
+            format: TraceFormat::Csv,
+            header: &["value"],
+            line: b",,,,1,".to_vec(),
         })
         .await
         .expect("send should succeed");
 
         tx.send(JsonlWriteEvent {
             table: "beta",
-            file_name: "beta.jsonl",
-            format: TraceFormat::Jsonl,
-            header: &[],
-            line: br#"{"value":2}"#.to_vec(),
+            file_name: "beta.csv",
+            format: TraceFormat::Csv,
+            header: &["value"],
+            line: b",,,,2,".to_vec(),
         })
         .await
         .expect("send should succeed");
@@ -1468,15 +1662,21 @@ mod tests {
         drop(tx);
         handle.await.expect("writer task should complete");
 
-        let alpha = tokio::fs::read_to_string(trace_dir.join("alpha.jsonl"))
+        let alpha = tokio::fs::read_to_string(trace_dir.join("alpha.csv"))
             .await
             .expect("alpha file");
-        let beta = tokio::fs::read_to_string(trace_dir.join("beta.jsonl"))
+        let beta = tokio::fs::read_to_string(trace_dir.join("beta.csv"))
             .await
             .expect("beta file");
 
-        assert_eq!(alpha.trim(), "{\"value\":1}");
-        assert_eq!(beta.trim(), "{\"value\":2}");
+        assert_eq!(
+            alpha,
+            "ts,wall_ts,node,process_trace_id,value,extra\n,,,,1,\n"
+        );
+        assert_eq!(
+            beta,
+            "ts,wall_ts,node,process_trace_id,value,extra\n,,,,2,\n"
+        );
     }
 
     #[tokio::test]
@@ -1497,21 +1697,24 @@ mod tests {
 
         tx.send(JsonlWriteEvent {
             table: "alpha",
-            file_name: "alpha.jsonl",
-            format: TraceFormat::Jsonl,
-            header: &[],
-            line: br#"{"value":1}"#.to_vec(),
+            file_name: "alpha.csv",
+            format: TraceFormat::Csv,
+            header: &["value"],
+            line: b",,,,1,".to_vec(),
         })
         .await
         .expect("send should succeed");
 
         time::sleep(Duration::from_millis(80)).await;
 
-        let alpha = tokio::fs::read_to_string(trace_dir.join("alpha.jsonl"))
+        let alpha = tokio::fs::read_to_string(trace_dir.join("alpha.csv"))
             .await
             .expect("alpha file should be flushed while the writer is idle");
 
-        assert_eq!(alpha.trim(), "{\"value\":1}");
+        assert_eq!(
+            alpha,
+            "ts,wall_ts,node,process_trace_id,value,extra\n,,,,1,\n"
+        );
 
         drop(tx);
         handle.await.expect("writer task should complete");
@@ -1528,10 +1731,10 @@ mod tests {
 
         let send_result = tracer.try_send(JsonlWriteEvent {
             table: "alpha",
-            file_name: "alpha.jsonl",
-            format: TraceFormat::Jsonl,
-            header: &[],
-            line: br#"{"value":1}"#.to_vec(),
+            file_name: "alpha.csv",
+            format: TraceFormat::Csv,
+            header: &["value"],
+            line: b",,,,1,".to_vec(),
         });
 
         assert!(matches!(send_result, Err(JsonlTraceSendError::Disabled(_))));
@@ -1553,19 +1756,22 @@ mod tests {
         tracer
             .try_send(JsonlWriteEvent {
                 table: "alpha",
-                file_name: "alpha.jsonl",
-                format: TraceFormat::Jsonl,
-                header: &[],
-                line: br#"{"value":1}"#.to_vec(),
+                file_name: "alpha.csv",
+                format: TraceFormat::Csv,
+                header: &["value"],
+                line: b",,,,1,".to_vec(),
             })
             .expect("queued row");
 
         guard.shutdown().await;
 
-        let alpha = tokio::fs::read_to_string(trace_dir.join("alpha.jsonl"))
+        let alpha = tokio::fs::read_to_string(trace_dir.join("alpha.csv"))
             .await
             .expect("alpha file");
-        assert_eq!(alpha.trim(), "{\"value\":1}");
+        assert_eq!(
+            alpha,
+            "ts,wall_ts,node,process_trace_id,value,extra\n,,,,1,\n"
+        );
     }
 
     #[test]
@@ -1597,18 +1803,18 @@ mod tests {
         tracer
             .try_send(JsonlWriteEvent {
                 table: "alpha",
-                file_name: "alpha.jsonl",
-                format: TraceFormat::Jsonl,
-                header: &[],
-                line: br#"{"value":1}"#.to_vec(),
+                file_name: "alpha.csv",
+                format: TraceFormat::Csv,
+                header: &["value"],
+                line: b",,,,1,".to_vec(),
             })
             .expect("first row fits");
         let full = tracer.try_send(JsonlWriteEvent {
             table: "alpha",
-            file_name: "alpha.jsonl",
-            format: TraceFormat::Jsonl,
-            header: &[],
-            line: br#"{"value":2}"#.to_vec(),
+            file_name: "alpha.csv",
+            format: TraceFormat::Csv,
+            header: &["value"],
+            line: b",,,,2,".to_vec(),
         });
 
         assert!(matches!(full, Err(JsonlTraceSendError::Full(_))));
@@ -1622,10 +1828,10 @@ mod tests {
         tracer
             .try_send(JsonlWriteEvent {
                 table: "alpha",
-                file_name: "alpha.jsonl",
-                format: TraceFormat::Jsonl,
-                header: &[],
-                line: br#"{"value":0}"#.to_vec(),
+                file_name: "alpha.csv",
+                format: TraceFormat::Csv,
+                header: &["value"],
+                line: b",,,,0,".to_vec(),
             })
             .expect("first row fits");
 
@@ -1634,10 +1840,10 @@ mod tests {
         for value in 0..10_000 {
             let result = tracer.try_send(JsonlWriteEvent {
                 table: "alpha",
-                file_name: "alpha.jsonl",
-                format: TraceFormat::Jsonl,
-                header: &[],
-                line: format!(r#"{{"value":{value}}}"#).into_bytes(),
+                file_name: "alpha.csv",
+                format: TraceFormat::Csv,
+                header: &["value"],
+                line: format!(",,,,{value},").into_bytes(),
             });
             if matches!(result, Err(JsonlTraceSendError::Full(_))) {
                 full += 1;

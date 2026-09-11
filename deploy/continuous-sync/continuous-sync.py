@@ -538,9 +538,6 @@ def rotate_run_logs(config: Config, run_dir: Path) -> None:
     """Keep trace and node-log rotations inside the run that produced them."""
     rotation_config = run_dir / ".trace-logrotate.conf"
     rotation_config.write_text(
-        f'{json.dumps(str(run_dir / "traces" / "*.jsonl"))} {{\n'
-        f"    size {config.policy.trace_file_bytes}\n"
-        "    rotate 2\n    missingok\n    notifempty\n    copytruncate\n    nocompress\n}\n"
         f'{json.dumps(str(run_dir / "zebrad.log"))} {{\n'
         "    size 64M\n    rotate 1\n    missingok\n    notifempty\n    copytruncate\n    nocompress\n}\n",
         encoding="utf-8",

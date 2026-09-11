@@ -52,7 +52,7 @@ pub struct BlockSyncStartup {
     pub shutdown: CancellationToken,
     /// Enables query actions for state-backed metadata.
     pub state_queries_enabled: bool,
-    /// JSONL trace emitter for block-sync scheduling, download, and commit rows.
+    /// CSV trace emitter for block-sync scheduling, download, and commit rows.
     pub trace: ZakuraTrace,
 }
 

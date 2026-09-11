@@ -162,6 +162,7 @@ def subst_for(node: Node) -> dict[str, str]:
         "SERVICE_NAME": str(raw["service_name"]),
         "CONTROLLER_SERVICE_NAME": str(raw["controller_service_name"]),
         "CONTROLLER_CONFIG_PATH": str(raw["controller_config_path"]),
+        "TRACE_WRITER_ENV_PATH": str(Path(raw["controller_config_path"]).with_name("trace-writer.env")),
         "MODE_LABEL": str(raw["mode_label"]),
         "P2P_STACK": str(raw["p2p_stack"]),
         "PUBLIC_IP": str(raw.get("public_ip", "")),
@@ -180,6 +181,7 @@ def subst_for(node: Node) -> dict[str, str]:
         "HEALTH_MIN_CONNECTED_PEERS": str(raw["health_min_connected_peers"]),
         "MIN_FREE_BYTES": str(raw["min_free_bytes"]),
         "RETENTION_RUNS": str(raw["retention_runs"]),
+        "TRACE_FILE_BYTES": str(raw.get("trace_file_bytes", 128 * 1024**2)),
         "COOLDOWN_SECONDS": str(raw["cooldown_seconds"]),
         "WIPE_ENTRIES": toml_string_list(raw["wipe_entries"]),
         "PRESERVE_ENTRIES": toml_string_list(raw["preserve_entries"]),
@@ -227,6 +229,7 @@ def render_files(node: Node) -> dict[str, str]:
         "zakura-monitor.service": render_template("zakura-monitor.service", subst),
         "zakura-monitor.timer": render_template("zakura-monitor.timer", subst),
         "logrotate": render_template("logrotate", subst),
+        "trace-writer.env": render_template("trace-writer.env", subst),
         "tmpfiles.conf": render_template("tmpfiles.conf", subst),
     }
 
@@ -269,6 +272,7 @@ install -m 755 /tmp/zakura-monitor-status.sh /usr/local/sbin/zakura-monitor-stat
 install -m 644 /tmp/zakura-continuous-controller.toml "$controller_config"
 install -m 644 /tmp/zakura-alert-monitor.toml "$alert_config"
 install -m 644 /tmp/zakura-continuous-zakurad.toml.template "$config_template"
+install -m 644 /tmp/zakura-trace-writer.env "$(dirname "$controller_config")/trace-writer.env"
 install -m 644 /tmp/zakura.service "/etc/systemd/system/${{node_service}}"
 install -m 644 /tmp/zakura-continuous-controller.service "/etc/systemd/system/${{controller_service}}"
 install -m 644 /tmp/zakura-monitor.service /etc/systemd/system/zakura-monitor.service
@@ -287,6 +291,7 @@ rm -f /tmp/zakura-continuous-sync.py \
   /tmp/zakura-continuous-controller.toml \
   /tmp/zakura-alert-monitor.toml \
   /tmp/zakura-continuous-zakurad.toml.template \
+  /tmp/zakura-trace-writer.env \
   /tmp/zakura.service \
   /tmp/zakura-continuous-controller.service \
   /tmp/zakura-monitor.service \
@@ -324,6 +329,7 @@ def deploy_node(node: Node, args: argparse.Namespace) -> tuple[str, bool, str]:
         "controller.toml": tmp_dir / "controller.toml",
         "alert-monitor.toml": tmp_dir / "alert-monitor.toml",
         "zakurad.toml.template": tmp_dir / "zakurad.toml.template",
+        "trace-writer.env": tmp_dir / "trace-writer.env",
         "zakura.service": tmp_dir / "zakura.service",
         "zakura-continuous-sync.service": tmp_dir / "zakura-continuous-sync.service",
         "zakura-monitor.service": tmp_dir / "zakura-monitor.service",
@@ -342,6 +348,7 @@ def deploy_node(node: Node, args: argparse.Namespace) -> tuple[str, bool, str]:
         (staged["controller.toml"], "/tmp/zakura-continuous-controller.toml"),
         (staged["alert-monitor.toml"], "/tmp/zakura-alert-monitor.toml"),
         (staged["zakurad.toml.template"], "/tmp/zakura-continuous-zakurad.toml.template"),
+        (staged["trace-writer.env"], "/tmp/zakura-trace-writer.env"),
         (staged["zakura.service"], "/tmp/zakura.service"),
         (staged["zakura-continuous-sync.service"], "/tmp/zakura-continuous-controller.service"),
         (staged["zakura-monitor.service"], "/tmp/zakura-monitor.service"),

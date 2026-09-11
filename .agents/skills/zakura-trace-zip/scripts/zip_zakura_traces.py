@@ -5,21 +5,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import time
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
 
-TRACE_FILE_NAMES = {
-    "block_sync.jsonl",
-    "commit_state.jsonl",
-    "header_sync.jsonl",
-    "stream.jsonl",
-    "conn.jsonl",
-    "handshake.jsonl",
-    "discovery.jsonl",
-    "legacy_request.jsonl",
-}
+TRACE_FILE_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+\.csv(?:\.\d+)?$")
+
+
+def is_trace_file(path: Path) -> bool:
+    """Return whether a path is a trace payload rather than a coordination file."""
+    return bool(TRACE_FILE_PATTERN.fullmatch(path.name)) and not path.name.endswith(".lock")
 
 
 def infer_label(trace_dir: Path) -> str:
@@ -59,11 +56,11 @@ def validate_trace_dir(trace_dir: Path) -> None:
     if not trace_dir.is_dir():
         raise SystemExit(f"trace directory does not exist: {trace_dir}")
 
-    present = {path.name for path in trace_dir.iterdir() if path.is_file()}
-    if not (present & TRACE_FILE_NAMES):
+    present = {path for path in trace_dir.rglob("*") if path.is_file() and is_trace_file(path)}
+    if not present:
         raise SystemExit(
             f"{trace_dir} does not look like a Zakura trace directory "
-            f"(expected one of: {', '.join(sorted(TRACE_FILE_NAMES))})"
+            f"(expected CSV trace files)"
         )
 
 
@@ -87,7 +84,7 @@ def add_manifest(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("trace_dir", help="Directory containing Zakura JSONL trace files")
+    parser.add_argument("trace_dir", help="Directory containing Zakura CSV trace files")
     parser.add_argument("--out-dir", default="perf-artifacts", help="Directory for the zip archive")
     parser.add_argument("--output", help="Exact zip path. Overrides --out-dir.")
     parser.add_argument("--force", action="store_true", help="Overwrite an existing archive")
@@ -111,7 +108,7 @@ def main() -> None:
     if output_path.exists() and not args.force:
         raise SystemExit(f"archive already exists, use --force to overwrite: {output_path}")
 
-    trace_files = sorted(path for path in trace_dir.rglob("*") if path.is_file())
+    trace_files = sorted(path for path in trace_dir.rglob("*") if path.is_file() and is_trace_file(path))
     label = infer_label(trace_dir)
     included_related = related_files(trace_dir, label) if args.include_related else []
 

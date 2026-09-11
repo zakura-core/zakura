@@ -29,7 +29,7 @@ v2 stack.
    `/var/lib/zakura/state` and `/var/lib/zakura/non_finalized_state`.
 7. Preserve `/var/lib/zakura/network` and controller state.
 8. Render `/etc/zakura/zebrad.toml` with the node's assigned `p2p_stack`.
-   Detailed JSONL traces are enabled for every sync.
+   Detailed CSV traces are enabled for every sync.
 9. Start `zakura.service` with `Restart=no`.
 10. Poll metrics and `/ready` until the node is stably near tip.
 11. Stop the node, record the completion for the daily audit digest, and start
@@ -90,7 +90,7 @@ Host files:
 - run artifacts: `/var/log/zakura/runs/<timestamp>-<sha>/`
 - node log: `/var/log/zakura/zebrad.log`
 - trace symlink: `/var/log/zakura/traces`
-- legacy sync trace: `/var/log/zakura/traces/legacy_sync.jsonl`
+- legacy sync trace: `/var/log/zakura/traces/legacy_sync.csv`
 - monitor log: `/var/log/zakura/monitor.log`
 
 ## Deployment
@@ -373,17 +373,15 @@ successful runs first, oldest first. The current run and the most recent failed
 run are protected, including their traces, metadata, samples, and log tail.
 Protected runs may exceed the target; cleanup never discards them to meet it.
 
-During sync, the controller checks trace files with logrotate every polling
-interval (normally 30 seconds). Each stream rotates at 128 MiB and keeps two older
-segments beside the current file. Files can exceed that size between checks.
-This preserves recent detailed history, not necessarily the entire sync.
-`copytruncate` keeps the existing append-only writer working without a restart;
-a small number of records can be lost at the copy/truncate boundary. Only the
-controller rotates traces, so retention cannot race a separate trace cleaner.
+The trace writer rotates each CSV table at 128 MiB and keeps two older segments.
+The deployment sets the limit through `ZAKURA_TRACE_FILE_BYTES`.
+The writer keeps each row intact, so one large row can exceed the limit.
+Each segment contains its own header. The writer locks append and rotation
+together. The controller uses logrotate only for the node log.
 
-For example, read `block_sync.jsonl.2`, then `.1`, then `block_sync.jsonl` for
-chronological history. To use tools that expect one file, concatenate those
-segments into a separate analysis directory. The stopped failure's files remain
+Read `block_sync.csv.2`, then `.1`, then `block_sync.csv` for chronological
+history. The readers skip each segment's header. Do not concatenate CSV files
+without removing subsequent headers. The stopped failure's files remain
 unchanged until a newer failure replaces its protected status.
 
 The controller also retains two cached binaries and removes interrupted

@@ -542,7 +542,7 @@ impl StartCmd {
         let advertised_services = Self::advertised_services(&config);
 
         let (peer_set, address_book, misbehavior_sender, zakura_endpoint) =
-            zakura_network::init_with_zakura(
+            zakura_network::init_with_zakura_and_retention(
                 config.network.clone(),
                 inbound,
                 latest_chain_tip.clone(),
@@ -551,6 +551,7 @@ impl StartCmd {
                 zcashd_compat_block_gossip_peer_ips,
                 zakura_header_sync_driver_startup,
                 custom_services,
+                Some(read_only_state_service.subscribe_retained_block_height()),
             )
             .await
             .map_err(|error| eyre!(error))?;

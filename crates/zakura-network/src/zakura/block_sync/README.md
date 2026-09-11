@@ -35,6 +35,21 @@ The distinction matters: anything anchored to the download floor is self-propell
 (downloading moves the floor, which permits more downloading),
 while anything anchored to the verified tip is pinned until real progress commits.
 
+## Retained serving range
+
+Native block-sync status advertises the range of retained, verified block bodies.
+The node initializes its lower bound from the persisted pruning marker and refreshes
+it after pruning commits, even when the verified tip stays unchanged. Archive nodes
+advertise from height zero. Requests for pruned heights return `RangeUnavailable`
+without querying storage. Genesis remains servable separately, and a request starting
+there stops before the pruned gap.
+
+Checkpoint retention can put the lower bound above the verified tip. Until retained
+bodies reach that height, the node advertises only genesis, which is always retained.
+This storage boundary does not advance the node's download floor or discard blocks
+it still needs from other peers. Embedders using pruned state should pass its retained
+height watch to `init_with_zakura_and_retention`.
+
 ## The two lanes: Floor vs AboveFloor
 
 `RequestPriority` classifies a request by its start height

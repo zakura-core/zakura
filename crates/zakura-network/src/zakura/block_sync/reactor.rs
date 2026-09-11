@@ -113,7 +113,58 @@ fn block_sync_frontiers(snapshot: &zakura_header_chain::EngineSnapshot) -> Block
 
 /// Spawn a block-sync reactor and return its handle plus action stream.
 pub fn spawn_block_sync_reactor(
+    startup: BlockSyncStartup,
+) -> (
+    BlockSyncHandle,
+    mpsc::Receiver<BlockSyncAction>,
+    JoinHandle<()>,
+) {
+    spawn_block_sync_reactor_inner(startup, None)
+}
+
+/// Attach the storage-owned retained-body floor before advertising any status.
+pub(crate) fn spawn_block_sync_reactor_with_retention(
+    startup: BlockSyncStartup,
+    retained_height: watch::Receiver<block::Height>,
+    genesis_hash: block::Hash,
+) -> (
+    BlockSyncHandle,
+    mpsc::Receiver<BlockSyncAction>,
+    JoinHandle<()>,
+) {
+    spawn_block_sync_reactor_inner(
+        startup,
+        Some(BodyRetention {
+            retained_height,
+            genesis_hash,
+        }),
+    )
+}
+
+#[derive(Debug)]
+struct BodyRetention {
+    retained_height: watch::Receiver<block::Height>,
+    genesis_hash: block::Hash,
+}
+
+impl BodyRetention {
+    fn apply(&self, mut status: BlockSyncStatus) -> BlockSyncStatus {
+        let retained_height = *self.retained_height.borrow();
+        if retained_height > status.servable_high {
+            // Checkpoint sync can skip all non-genesis bodies below its retention start.
+            status.servable_low = block::Height::MIN;
+            status.servable_high = block::Height::MIN;
+            status.tip_hash = self.genesis_hash;
+        } else {
+            status.servable_low = retained_height;
+        }
+        status
+    }
+}
+
+fn spawn_block_sync_reactor_inner(
     mut startup: BlockSyncStartup,
+    body_retention: Option<BodyRetention>,
 ) -> (
     BlockSyncHandle,
     mpsc::Receiver<BlockSyncAction>,
@@ -138,7 +189,10 @@ pub fn spawn_block_sync_reactor(
         );
     }
 
-    let state = BlockSyncState::new(&startup);
+    let mut state = BlockSyncState::new(&startup);
+    if let Some(retention) = &body_retention {
+        state.last_advertised_status = retention.apply(state.last_advertised_status);
+    }
     let (events_tx, events_rx) =
         mpsc::channel(startup.config.peer_limits.inbound_queue_depth.max(1));
     let events_keepalive = events_tx.clone();
@@ -257,6 +311,7 @@ pub fn spawn_block_sync_reactor(
         routine_wiring: Some(routine_wiring),
     };
     let reactor = BlockSyncReactor {
+        body_retention,
         verified_block_tip: startup.frontiers.verified_block_tip,
         request_floor: startup.frontiers.verified_block_tip,
         pending_needed_query: None,
@@ -302,6 +357,7 @@ pub fn spawn_block_sync_reactor(
 
 #[derive(Debug)]
 pub(super) struct BlockSyncReactor {
+    body_retention: Option<BodyRetention>,
     startup: BlockSyncStartup,
     state: BlockSyncState,
     /// Latest atomic header-engine view used to stamp body-work ownership.
@@ -399,6 +455,11 @@ impl BlockSyncReactor {
         let mut header_tip = self.startup.header_tip.clone();
         let mut header_tip_open = header_tip.is_some();
         let mut committed_views = self.startup.committed_views.clone();
+        let mut retained_height = self
+            .body_retention
+            .as_ref()
+            .map(|retention| retention.retained_height.clone());
+        let mut retention_open = retained_height.is_some();
         set_block_reactor_active_connection_gauge(self.state.peers.len());
         // Per-peer request timeouts are owned by the routines. This local tick
         // also retries the level-triggered needed-body query, so a lost routine
@@ -474,6 +535,20 @@ impl BlockSyncReactor {
                             self.publish_metrics();
                         }
                         Err(_) => header_tip_open = false,
+                    }
+                }
+                changed = async {
+                    match retained_height.as_mut() {
+                        Some(retained_height) => retained_height.changed().await,
+                        None => std::future::pending().await,
+                    }
+                }, if retention_open => {
+                    if changed.is_ok() {
+                        self.state.pending_status_refresh = true;
+                        self.flush_status_refresh().await;
+                    } else {
+                        // Preserve the final floor if the state writer shuts down.
+                        retention_open = false;
                     }
                 }
                 changed = self.sequencer_view.changed() => {
@@ -2324,12 +2399,16 @@ impl BlockSyncReactor {
     }
 
     fn clamp_served_block_count(&self, start_height: block::Height, count: u32) -> u32 {
-        if start_height > self.state.servable_high {
+        let status = self.local_status();
+        if start_height == block::Height::MIN && status.servable_low > block::Height::MIN {
+            // Genesis is retained separately. Do not cross the pruned gap after it.
+            return count.min(1);
+        }
+        if start_height < status.servable_low || start_height > status.servable_high {
             return 0;
         }
 
-        let available = self
-            .state
+        let available = status
             .servable_high
             .0
             .checked_sub(start_height.0)
@@ -2342,14 +2421,17 @@ impl BlockSyncReactor {
     }
 
     fn local_status(&self) -> BlockSyncStatus {
-        BlockSyncStatus {
+        let status = BlockSyncStatus {
             servable_low: block::Height::MIN,
             servable_high: self.state.servable_high,
             tip_hash: self.state.servable_hash,
             max_blocks_per_response: self.startup.config.advertised_max_blocks_per_response(),
             max_inflight_requests: self.startup.config.advertised_max_inflight_requests(),
             max_response_bytes: self.startup.config.advertised_max_response_bytes(),
-        }
+        };
+        self.body_retention
+            .as_ref()
+            .map_or(status, |retention| retention.apply(status))
     }
 
     /// Hand a data-plane action to the action driver without letting a slow or

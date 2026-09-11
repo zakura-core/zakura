@@ -3481,6 +3481,7 @@ pub async fn spawn_zakura_endpoint_with_services(
         header_sync_driver_startup,
         custom_services,
         None,
+        None,
     )
     .await
 }
@@ -3491,6 +3492,7 @@ pub(crate) async fn spawn_zakura_endpoint_with_peer_registry(
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
     custom_services: Vec<CustomService>,
     peer_registry: PeerRegistry,
+    retained_block_height: Option<watch::Receiver<block::Height>>,
 ) -> Result<Option<ZakuraEndpoint>, BoxError> {
     spawn_zakura_endpoint_inner(
         config,
@@ -3498,6 +3500,7 @@ pub(crate) async fn spawn_zakura_endpoint_with_peer_registry(
         header_sync_driver_startup,
         custom_services,
         Some(peer_registry),
+        retained_block_height,
     )
     .await
 }
@@ -3508,6 +3511,7 @@ async fn spawn_zakura_endpoint_inner(
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
     custom_services: Vec<CustomService>,
     peer_registry: Option<PeerRegistry>,
+    retained_block_height: Option<watch::Receiver<block::Height>>,
 ) -> Result<Option<ZakuraEndpoint>, BoxError> {
     if !config.v2_p2p() {
         return Ok(None);
@@ -3589,26 +3593,34 @@ async fn spawn_zakura_endpoint_inner(
     startup.shutdown = header_sync_shutdown.clone();
     let (header_sync, header_sync_actions, header_sync_task) = spawn_header_sync_reactor(startup)?;
     let block_sync_driver_enabled = header_sync_driver_startup.is_some();
-    let (block_sync, block_sync_actions, block_sync_task) =
-        if let Some(driver_startup) = header_sync_driver_startup.as_ref() {
-            let best_header_tip = driver_startup.best_header_tip.unwrap_or(anchor);
-            let mut startup = BlockSyncStartup::new_with_committed_views(
-                BlockSyncFrontiers {
-                    finalized_height: driver_startup.frontiers.finalized_height,
-                    verified_block_tip: driver_startup.frontiers.verified_block_tip,
-                    verified_block_hash: driver_startup.verified_block_tip_hash,
-                },
-                best_header_tip,
-                driver_startup.committed_views.clone(),
-                config.zakura.block_sync.clone(),
-            );
-            startup.shutdown = header_sync_shutdown.clone();
-            startup.trace = trace.clone();
-            let (handle, actions, task) = spawn_block_sync_reactor(startup);
-            (Some(handle), Some(actions), Some(task))
-        } else {
-            (None, None, None)
+    let (block_sync, block_sync_actions, block_sync_task) = if let Some(driver_startup) =
+        header_sync_driver_startup.as_ref()
+    {
+        let best_header_tip = driver_startup.best_header_tip.unwrap_or(anchor);
+        let mut startup = BlockSyncStartup::new_with_committed_views(
+            BlockSyncFrontiers {
+                finalized_height: driver_startup.frontiers.finalized_height,
+                verified_block_tip: driver_startup.frontiers.verified_block_tip,
+                verified_block_hash: driver_startup.verified_block_tip_hash,
+            },
+            best_header_tip,
+            driver_startup.committed_views.clone(),
+            config.zakura.block_sync.clone(),
+        );
+        startup.shutdown = header_sync_shutdown.clone();
+        startup.trace = trace.clone();
+        let (handle, actions, task) = match retained_block_height {
+            Some(retained_height) => super::block_sync::spawn_block_sync_reactor_with_retention(
+                startup,
+                retained_height,
+                config.network.genesis_hash(),
+            ),
+            None => spawn_block_sync_reactor(startup),
         };
+        (Some(handle), Some(actions), Some(task))
+    } else {
+        (None, None, None)
+    };
     let discovery_service = Arc::new(super::DiscoveryService::with_sync_services(
         discovery.clone(),
         header_sync.clone(),

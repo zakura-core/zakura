@@ -71,6 +71,7 @@ pub use events::{
     BlockSyncEvent, BlockSyncMisbehavior,
 };
 pub use reactor::spawn_block_sync_reactor;
+pub(crate) use reactor::spawn_block_sync_reactor_with_retention;
 pub use request::BlockSizeEstimate;
 #[cfg(test)]
 pub(crate) use service::block_sync_streams;

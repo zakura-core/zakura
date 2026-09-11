@@ -212,6 +212,9 @@ where
 }
 
 /// Initialize a peer set with optional Zakura runtime components.
+///
+/// Pruned nodes should use [`init_with_zakura_and_retention`] to advertise only
+/// retained block bodies. This initializer keeps archive serving behavior.
 #[allow(clippy::too_many_arguments)]
 pub async fn init_with_zakura<S, C>(
     config: Config,
@@ -222,6 +225,49 @@ pub async fn init_with_zakura<S, C>(
     block_gossip_peer_ips: Vec<IpAddr>,
     header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
     custom_services: Vec<CustomService>,
+) -> Result<
+    (
+        Buffer<BoxService<Request, Response, BoxError>, Request>,
+        Arc<std::sync::Mutex<AddressBook>>,
+        mpsc::Sender<(PeerSocketAddr, u32)>,
+        Option<ZakuraEndpoint>,
+    ),
+    BoxError,
+>
+where
+    S: Service<Request, Response = Response, Error = BoxError> + Clone + Send + Sync + 'static,
+    S::Future: Send + 'static,
+    C: ChainTip + Clone + Send + Sync + 'static,
+{
+    init_with_zakura_and_retention(
+        config,
+        inbound_service,
+        latest_chain_tip,
+        user_agent,
+        advertised_services,
+        block_gossip_peer_ips,
+        header_sync_driver_startup,
+        custom_services,
+        None,
+    )
+    .await
+}
+
+/// Initialize a peer set with a storage-owned retained block-body floor.
+///
+/// Supply a watch initialized from persisted pruning and updated after each prune
+/// to advertise only retained native block ranges. `None` keeps archive behavior.
+#[allow(clippy::too_many_arguments)]
+pub async fn init_with_zakura_and_retention<S, C>(
+    config: Config,
+    inbound_service: S,
+    latest_chain_tip: C,
+    user_agent: String,
+    advertised_services: PeerServices,
+    block_gossip_peer_ips: Vec<IpAddr>,
+    header_sync_driver_startup: Option<ZakuraHeaderSyncDriverStartup>,
+    custom_services: Vec<CustomService>,
+    retained_block_height: Option<tokio::sync::watch::Receiver<zakura_chain::block::Height>>,
 ) -> Result<
     (
         Buffer<BoxService<Request, Response, BoxError>, Request>,
@@ -260,6 +306,7 @@ where
         header_sync_driver_startup,
         custom_services,
         peer_registry.clone(),
+        retained_block_height,
     )
     .await?;
     let zakura_startup_shutdown = zakura_endpoint

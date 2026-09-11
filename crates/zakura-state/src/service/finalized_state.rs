@@ -320,6 +320,9 @@ pub struct FinalizedState {
     /// The last instance that is dropped will close the underlying database.
     pub db: ZakuraDb,
 
+    /// Retained body floor, published after successful finalized commits.
+    pub(super) retained_block_height: tokio::sync::watch::Sender<block::Height>,
+
     /// Commit-time verified-commitment-trees state.
     vct: VctCommitState,
 }
@@ -423,11 +426,14 @@ impl FinalizedState {
             .zip(db.finalized_tip_height())
             .is_some_and(|(last_checkpoint_height, tip)| tip < last_checkpoint_height);
 
+        let (retained_block_height, _) =
+            tokio::sync::watch::channel(db.lowest_retained_height().unwrap_or(block::Height::MIN));
         let new_state = Self {
             debug_stop_at_height: config.debug_stop_at_height.map(block::Height),
             checkpoint_raw_tx_retention_start: None,
             checkpoint_raw_tx_archive_backlog: Arc::new(AtomicBool::new(false)),
             db,
+            retained_block_height,
             vct: VctCommitState::new(vct, is_vct_sync_below_last_checkpoint),
         };
 
@@ -1365,6 +1371,27 @@ impl FinalizedState {
         );
 
         if result.is_ok() {
+            if matches!(
+                retention,
+                RetentionPlan::Prune { .. }
+                    | RetentionPlan::DrainBacklog { .. }
+                    | RetentionPlan::Skip {
+                        write_marker: true,
+                        ..
+                    }
+            ) {
+                let retained_height = self
+                    .db
+                    .lowest_retained_height()
+                    .unwrap_or(block::Height::MIN);
+                self.retained_block_height.send_if_modified(|current| {
+                    if *current == retained_height {
+                        return false;
+                    }
+                    *current = retained_height;
+                    true
+                });
+            }
             if retention.clears_archive_backlog() {
                 self.checkpoint_raw_tx_archive_backlog
                     .store(false, Ordering::Relaxed);

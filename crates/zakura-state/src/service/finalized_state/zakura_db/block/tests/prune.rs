@@ -336,6 +336,8 @@ fn checkpoint_retention_hands_off_to_online_pruning_at_start() {
     let max_checkpoint_height = Height(tx_retention + checkpoint_lowest_retained.0 - 1);
     let mut state =
         new_unvalidated_state_with_checkpoint_retention(&config, &network, max_checkpoint_height);
+    let mut retained_height = state.retained_block_height.subscribe();
+    assert_eq!(*retained_height.borrow_and_update(), Height::MIN);
     let blocks = network.blockchain_map();
 
     for height in 0..=max_checkpoint_height.0 {
@@ -354,6 +356,14 @@ fn checkpoint_retention_hands_off_to_online_pruning_at_start() {
         state.db.lowest_retained_height(),
         Some(checkpoint_lowest_retained),
         "checkpoint skipping advances the marker to the retention start"
+    );
+
+    assert!(retained_height
+        .has_changed()
+        .expect("state owns the publisher"));
+    assert_eq!(
+        *retained_height.borrow_and_update(),
+        checkpoint_lowest_retained
     );
 
     for height in 1..checkpoint_lowest_retained.0 {
@@ -391,6 +401,10 @@ fn checkpoint_retention_hands_off_to_online_pruning_at_start() {
         Some(online_prune_until),
         "online pruning resumes exactly at the checkpoint retention start"
     );
+    assert!(retained_height
+        .has_changed()
+        .expect("state owns the publisher"));
+    assert_eq!(*retained_height.borrow_and_update(), online_prune_until);
     assert!(
         state
             .db
@@ -701,6 +715,8 @@ fn archive_to_pruned_checkpoint_sync_drains_archive_raw_transactions_before_skip
         &network,
         max_checkpoint_height,
     );
+    let mut retained_height = pruned_state.retained_block_height.subscribe();
+    assert_eq!(*retained_height.borrow_and_update(), Height::MIN);
 
     let block: Arc<Block> = blocks
         .get(&TEST_BLOCKS)
@@ -716,6 +732,13 @@ fn archive_to_pruned_checkpoint_sync_drains_archive_raw_transactions_before_skip
         pruned_state.db.lowest_retained_height(),
         Some(checkpoint_lowest_retained),
         "archive backlog is pruned up to the checkpoint retention start"
+    );
+    assert!(retained_height
+        .has_changed()
+        .expect("state owns the publisher"));
+    assert_eq!(
+        *retained_height.borrow_and_update(),
+        checkpoint_lowest_retained
     );
 
     for height in 1..checkpoint_lowest_retained.0 {
@@ -853,6 +876,10 @@ fn archive_mode_keeps_checkpoint_raw_transactions_before_checkpoint_retention_st
         state.db.lowest_retained_height(),
         None,
         "archive mode does not write a pruning marker"
+    );
+    assert_eq!(
+        *state.retained_block_height.subscribe().borrow(),
+        Height::MIN
     );
 }
 
@@ -1202,6 +1229,10 @@ fn reopened_pruned_database_reports_pruned_before_committing_a_block() {
     // without waiting for a block commit to prune anything.
     let reopened = FinalizedState::new(&config, &network).expect("reopening the database succeeds");
 
+    assert_eq!(
+        *reopened.retained_block_height.subscribe().borrow(),
+        Height(4)
+    );
     assert!(reopened.db.is_pruned());
     assert!(reopened.db.prunes_historical_data());
     assert_eq!(

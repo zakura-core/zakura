@@ -309,6 +309,9 @@ pub struct ReadStateService {
     /// keeps reporting the absent band rather than serving unchecked data.
     historical_subtrees: Option<Arc<finalized_state::SubtreeArtifact>>,
 
+    /// Lowest height whose block bodies are retained, updated after finalized commits.
+    retained_block_height: tokio::sync::watch::Receiver<block::Height>,
+
     /// Watch channel publishing the next VCT supplied-root repair needed by the finalized writer.
     vct_root_repair_receiver: tokio::sync::watch::Receiver<VctRootRepairStatus>,
 
@@ -1547,6 +1550,7 @@ impl ReadStateService {
             historical_trees,
             historical_subtrees,
             vct_root_repair_receiver,
+            retained_block_height: finalized_state.retained_block_height.subscribe(),
             header_chain_snapshot_receiver: header_chain.snapshots,
             header_chain_view_receiver: header_chain.views,
             header_runtime_status_receiver: header_chain.runtime_status,
@@ -1617,6 +1621,16 @@ impl ReadStateService {
         }
 
         artifact_checkpoint.is_some()
+    }
+
+    /// Subscribe to the lowest height at and above which block bodies are retained.
+    ///
+    /// The initial value reflects persisted pruning. Later values follow successful
+    /// finalized commits, including checkpoint retention and online pruning. Archive
+    /// state publishes zero. Genesis is always retained separately, and checkpoint
+    /// retention can put this floor above the current verified tip.
+    pub fn subscribe_retained_block_height(&self) -> tokio::sync::watch::Receiver<block::Height> {
+        self.retained_block_height.clone()
     }
 
     /// Subscribe to VCT supplied-root repair needs discovered by the finalized writer.

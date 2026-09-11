@@ -27,9 +27,9 @@ jobs:
           from pathlib import Path
           owner=os.environ['OWNER_RUN']
           nodes=[d for d in json.load(open('/tmp/droplets.json')) if d['name'].startswith('zakura-pr-adam-header-serving-') and d['name'].endswith('-'+owner)]
-          volumes=[v for v in json.load(open('/tmp/volumes.json')) if v['name']=='zakura-pr-vol-'+owner]
+          volumes=[v for v in json.load(open('/tmp/volumes.json')) if v['name']=='zakura-pr-vol-'+owner or v['name'].startswith('zakura-pr-vol-'+owner+'-')]
           assert len(nodes)<=1
-          print(json.dumps({'owner_run':owner,'nodes':[{'id':d['id'],'name':d['name']} for d in nodes],'volumes':[{'id':v['id'],'name':v['name']} for v in volumes]}))
+          print(json.dumps({'owner_run':owner,'nodes':[{'id':d['id'],'name':d['name'],'volume_ids':d.get('volume_ids',[])} for d in nodes],'volumes':[{'id':v['id'],'name':v['name']} for v in volumes]}))
           if nodes:
               Path('/tmp/owned-ip').write_text(next(n['ip_address'] for n in nodes[0]['networks']['v4'] if n['type']=='public'))
           CHECK

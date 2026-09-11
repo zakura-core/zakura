@@ -1326,6 +1326,83 @@ async fn poll_ready_hands_off_at_max_checkpoint_height() -> Result<()> {
     Ok(())
 }
 
+/// Diagnostic: the production Tower buffer does not poll state merely because a checkpoint commits.
+#[tokio::test(flavor = "multi_thread")]
+async fn diagnostic_buffered_checkpoint_needs_an_extra_request() -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
+    use tower::{Service, ServiceExt};
+
+    struct ObservedState {
+        inner: StateService,
+        checkpoint_open: Arc<AtomicBool>,
+    }
+
+    impl Service<Request> for ObservedState {
+        type Response = Response;
+        type Error = BoxError;
+        type Future = <StateService as Service<Request>>::Future;
+
+        fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), BoxError>> {
+            let result = self.inner.poll_ready(cx);
+            self.checkpoint_open.store(
+                self.inner.block_write_sender.finalized.is_some(),
+                Ordering::SeqCst,
+            );
+            result
+        }
+
+        fn call(&mut self, request: Request) -> Self::Future {
+            let future = self.inner.call(request);
+            self.checkpoint_open.store(
+                self.inner.block_write_sender.finalized.is_some(),
+                Ordering::SeqCst,
+            );
+            future
+        }
+    }
+
+    let _guard = zakura_test::init();
+    let blocks: Vec<Arc<Block>> = zakura_test::vectors::MAINNET_BLOCKS
+        .range(0..=1)
+        .map(|(_, bytes)| bytes.zcash_deserialize_into::<Arc<Block>>().unwrap())
+        .collect();
+    let (state, read, _tip, _change) =
+        StateService::new(Config::ephemeral(), &Network::Mainnet, Height(1), 0).await?;
+    let checkpoint_open = Arc::new(AtomicBool::new(true));
+    let buffered = Buffer::new(
+        BoxService::new(ObservedState {
+            inner: state,
+            checkpoint_open: checkpoint_open.clone(),
+        }),
+        1,
+    );
+    for block in blocks {
+        timeout(
+            Duration::from_secs(10),
+            buffered
+                .clone()
+                .oneshot(Request::CommitCheckpointVerifiedBlock(block.into())),
+        )
+        .await?
+        .expect("diagnostic state request succeeds");
+    }
+    assert_eq!(read.db.finalized_tip_height(), Some(Height(1)));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(checkpoint_open.load(Ordering::SeqCst),
+        "diagnostic reproduction: durable checkpoint leaves its write channel open while the buffer is idle");
+    eprintln!("DIAGNOSTIC: durable checkpoint still has an open checkpoint writer after 200ms without new requests");
+    timeout(Duration::from_secs(5), buffered.oneshot(Request::Tip))
+        .await?
+        .expect("diagnostic state request succeeds");
+    assert!(
+        !checkpoint_open.load(Ordering::SeqCst),
+        "one Tip query triggers the missed handoff"
+    );
+    eprintln!("DIAGNOSTIC: one read-only Tip request closes the checkpoint writer channel");
+    Ok(())
+}
+
 /// Legacy-only nodes must preserve the ordinary state handoff without creating or
 /// reconstructing the native header runtime.
 #[tokio::test(flavor = "multi_thread")]

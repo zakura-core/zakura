@@ -55,6 +55,19 @@ for name in ['/var/log/zakura/seed-traces/header_sync.jsonl','/root/out/paired/t
         if row.get('event')=='header_response_received': responses.append(row)
         if row.get('event')=='header_snapshot_observed': snapshots.append(row)
         if row.get('event')=='header_vct_repair_state': repairs.append(row)
+    current_process=requests[-1].get('process_trace_id') if requests else None
+    correlated=[]
+    for busy in refusals:
+        if busy.get('process_trace_id') != current_process or busy.get('event') != 'header_request_terminal': continue
+        original=next((r for r in requests if r.get('process_trace_id')==current_process and r.get('session_id')==busy.get('session_id') and r.get('request_id')==busy.get('request_id')),None)
+        if not original or original.get('header_count')!=1: continue
+        def matches(r):
+            return r.get('process_trace_id')==current_process and r.get('session_id')==busy.get('session_id') and r.get('peer')==busy.get('peer') and r.get('target_hash')==busy.get('target_hash') and r['ts']>busy['ts']
+        retry=next((r for r in requests if matches(r)),None)
+        success=next((r for r in responses if matches(r)),None)
+        correlated.append({'original':original,'busy':busy,'retry':retry,'success':success})
+    emit('correlated_repair_refusals',path=name,count=len(correlated),first=correlated[:5])
+    emit('first_busy',path=name,rows=refusals[:6])
     emit('header_trace',path=name,busy_count=len(refusals),last_busy=refusals[-8:],request_count=len(requests),last_requests=requests[-8:],response_count=len(responses),last_responses=responses[-8:],last_snapshots=snapshots[-4:],last_repairs=repairs[-4:])
 p=Path('/var/log/zakura/zakura.log')
 if p.exists():

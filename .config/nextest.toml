@@ -41,7 +41,7 @@ default-filter = "not test(check_no_git_dependencies) and not test(=fully_synced
 
 # Controlled regulation tests must fail on their first divergent execution.
 [[profile.all-tests.overrides]]
-filter = 'test(~message_payload_limits_) or test(~inbound_frame_cap_rejects_) or test(~paused_ordered_reads_) or test(~stream_cancel_closes_ordered_worker_) or test(~block_sync::service::tests::) or test(~transport::io::) or test(~reconciliation_rejects_stale_admissions_) or test(~regulation::request::) or test(~serving_regulation::) or test(~block_sync::serving::) or test(~work_queue::request_write::tests::) or test(~handler::service_session::tests::) or test(~service::block_range::tests::) or (test(~handler::tests::paired_block_sync::) and not test(~handler::tests::paired_block_sync::gate::))'
+filter = 'test(~native_block_cap_) or test(~terminal_codecs_) or test(~frame_tag_mismatch_) or test(~message_payload_limits_) or test(~inbound_frame_cap_rejects_) or test(~paused_ordered_reads_) or test(~stream_cancel_closes_ordered_worker_) or test(~block_sync::service::tests::) or test(~transport::io::) or test(~reconciliation_rejects_stale_admissions_) or test(~regulation::request::) or test(~serving_regulation::) or test(~block_sync::serving::) or test(~work_queue::request_write::tests::) or test(~handler::service_session::tests::) or test(~service::block_range::tests::) or (test(~handler::tests::paired_block_sync::) and not test(~handler::tests::paired_block_sync::gate::))'
 retries = 0
 slow-timeout = { period = "60s", terminate-after = 1 }
 
@@ -74,7 +74,7 @@ default-filter = "not test(check_no_git_dependencies) and not test(=fully_synced
 
 # Controlled regulation tests must fail on their first divergent execution.
 [[profile.full-tests.overrides]]
-filter = 'test(~message_payload_limits_) or test(~inbound_frame_cap_rejects_) or test(~paused_ordered_reads_) or test(~stream_cancel_closes_ordered_worker_) or test(~block_sync::service::tests::) or test(~transport::io::) or test(~reconciliation_rejects_stale_admissions_) or test(~regulation::request::) or test(~serving_regulation::) or test(~block_sync::serving::) or test(~work_queue::request_write::tests::) or test(~handler::service_session::tests::) or test(~service::block_range::tests::) or (test(~handler::tests::paired_block_sync::) and not test(~handler::tests::paired_block_sync::gate::))'
+filter = 'test(~native_block_cap_) or test(~terminal_codecs_) or test(~frame_tag_mismatch_) or test(~message_payload_limits_) or test(~inbound_frame_cap_rejects_) or test(~paused_ordered_reads_) or test(~stream_cancel_closes_ordered_worker_) or test(~block_sync::service::tests::) or test(~transport::io::) or test(~reconciliation_rejects_stale_admissions_) or test(~regulation::request::) or test(~serving_regulation::) or test(~block_sync::serving::) or test(~work_queue::request_write::tests::) or test(~handler::service_session::tests::) or test(~service::block_range::tests::) or (test(~handler::tests::paired_block_sync::) and not test(~handler::tests::paired_block_sync::gate::))'
 retries = 0
 slow-timeout = { period = "60s", terminate-after = 1 }
 
@@ -248,7 +248,8 @@ default-filter = 'package(zakura) and test(~zcashd_compat)'
 
 # Also selected by ordinary unit-test profiles; isolate the fixed regression checks.
 [profile.blocksync-regression]
-default-filter = 'test(~message_payload_limits_) or test(~inbound_frame_cap_rejects_) or test(~paused_ordered_reads_) or test(~stream_cancel_closes_ordered_worker_) or test(~block_sync::service::tests::) or test(~transport::io::) or test(~reconciliation_rejects_stale_admissions_) or test(~regulation::request::) or test(~serving_regulation::) or test(~block_sync::serving::) or test(~work_queue::request_write::tests::) or test(~handler::service_session::tests::) or test(~service::block_range::tests::) or (test(~handler::tests::paired_block_sync::) and not test(~handler::tests::paired_block_sync::gate::))'
+fail-fast = false
+default-filter = 'test(~native_block_cap_) or test(~terminal_codecs_) or test(~frame_tag_mismatch_) or test(~message_payload_limits_) or test(~inbound_frame_cap_rejects_) or test(~paused_ordered_reads_) or test(~stream_cancel_closes_ordered_worker_) or test(~block_sync::service::tests::) or test(~transport::io::) or test(~reconciliation_rejects_stale_admissions_) or test(~regulation::request::) or test(~serving_regulation::) or test(~block_sync::serving::) or test(~work_queue::request_write::tests::) or test(~handler::service_session::tests::) or test(~service::block_range::tests::) or (test(~handler::tests::paired_block_sync::) and not test(~handler::tests::paired_block_sync::gate::))'
 retries = 0
 slow-timeout = { period = "60s", terminate-after = 1 }
 

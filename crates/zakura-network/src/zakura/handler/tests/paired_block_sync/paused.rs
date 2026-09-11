@@ -41,6 +41,16 @@ impl Service for PausedService {
         Some((1, 1))
     }
 
+    fn stream_write_policy(&self, _: Stream) -> StreamWritePolicy {
+        // Two paused streams must retain connection credit past block sync's
+        // 32-second deadline. A sibling timeout would release it prematurely.
+        StreamWritePolicy::Timeout(if self.streams.len() == 2 {
+            LOSS_DEADLINE
+        } else {
+            Duration::from_secs(10)
+        })
+    }
+
     fn add_peer(&self, mut peer: Peer) {
         let cancel = peer.service_cancel_token();
         for stream in &self.streams {
@@ -71,6 +81,13 @@ pub(super) struct PausedSession {
 }
 
 impl PausedSession {
+    pub(super) fn assert_active(&self) {
+        assert!(
+            !self.cancel.is_cancelled(),
+            "the paused sibling must retain its receive window"
+        );
+    }
+
     pub(super) async fn receive(receiver: &mut mpsc::Receiver<Self>) -> Result<Self, BoxError> {
         let session = timeout(DEADLINE, receiver.recv())
             .await?

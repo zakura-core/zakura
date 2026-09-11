@@ -479,7 +479,12 @@ async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
             await_until(
                 "an existing write or block-progress deadline retires the saturated pair",
                 Duration::from_secs(42),
-                || client_session.1.cancel_token().is_cancelled(),
+                || {
+                    for sibling in paused_senders.iter().chain(&paused_receivers) {
+                        sibling.assert_active();
+                    }
+                    client_session.1.cancel_token().is_cancelled()
+                },
             )
             .await?;
             assert_eq!(*downloader.received.borrow(), 0);
@@ -596,6 +601,9 @@ async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
             server_session.0
         );
         assert!(connection.close_reason().is_none());
+        for sibling in paused_senders.iter().chain(&paused_receivers) {
+            sibling.assert_active();
+        }
         if let Some(link) = &link {
             let useful = blocks
                 .iter()

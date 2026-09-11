@@ -842,8 +842,8 @@ application RTT estimate, or an inferred bandwidth-delay product.
 
 This baseline restriction does not preclude a future negotiated telemetry
 extension. A candidate `BlockPart` envelope could carry a connection-local
-sequence, a monotonic transport-submission timestamp, and bounded queue
-residence. These fields would change at each hop outside the part commitment.
+sequence and a monotonic transport-submission timestamp. These fields would
+change at each hop outside the part commitment.
 Their units, precision, reset/wrap behavior, authentication, and byte limits
 remain profile choices. They are not wire fields in this draft.
 

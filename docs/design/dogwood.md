@@ -267,8 +267,8 @@ can confuse peer performance with upstream part availability.
 We should test ordinary-delivery feedback as a way to reduce challenge traffic.
 A candidate negotiated extension attaches a connection-local sequence and a
 monotonic send timestamp to each `BlockPart`. The sender records the timestamp
-when it submits the part to the transport. Optional queue residence records
-the interval from verified availability to submission. The sender regenerates
+when it submits the part to the transport. The receiver records local receipt
+time. The sender regenerates
 these fields at each hop outside the immutable part commitment.
 
 Subtracting a remote timestamp from local arrival time does not give one-way
@@ -308,6 +308,14 @@ that sender timestamps are worth their wire cost. The subsequent real TCP
 experiment also found no consistent benefit from sender spans. Keep sender
 timestamps out of the baseline wire profile. Receiver-local delivery feedback
 still needs joint tests with the full subscription controller.
+
+The [submission-timestamp and nonce-echo experiment](dogwood-experiments.md#submission-timestamps-nonce-echoes-and-shared-credit)
+adds separate proposer routes and shared connection credit over real TCP.
+It improves one upstream-delay case but shows no consistent advantage during
+capacity drops. Echo calibration rejects a large future timestamp shift while
+accepting an 8 ms shift. Deliberately delayed echoes also inflate the learned
+credit. Treat remote timing as optional telemetry. Require actual delivery for
+credit increases and retain hard limits independently of clock calibration.
 
 ### Baseline challenge controller
 

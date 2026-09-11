@@ -12,6 +12,141 @@ The local worktree is `zakura.dogwood-experiments`, alongside the docs worktree.
 Its `docs/experiments/dogwood` directory retains the September 5 experiments
 and adds the scripts and result directories named below.
 
+## Submission timestamps, nonce echoes, and shared credit
+
+`tcp_timing_credit.py` tests sender submission timestamps with nonce-echo
+calibration over four real TCP connections. It runs in a disposable network
+namespace with a shared 100 Mbps loopback queue. The two matrices configure
+5 ms or 25 ms delay, producing minimum echo RTTs near 10 ms or 50 ms.
+Supplier application pacing offers 80/40/20/10 Mbps. Each run releases 160
+synthetic bodies at 32 ms intervals, with four required 64 KiB parts and five
+available parts. This offers 65.536 Mbps of body data before redundancy.
+
+Two alternating proposer scopes maintain separate standing part masks and
+receiver-measured route histories. The supplier delays upstream availability
+by 2 ms for its nearby proposer and 35 ms for the other proposer. These are
+synthetic entry-point delays, not geographic network measurements. Every
+300 ms, the receiver can change future masks using delivery rate and local
+per-proposer arrival history. Existing bodies retain their assignments.
+Occasional extra part subscriptions probe idle suppliers. Both proposers share
+each connection's payload credit, calibration state, and delivery-rate estimate.
+
+The receiver sends an unpredictable 64-bit nonce every 100 ms. The supplier
+echoes the nonce with its submission timestamp on the same TCP connection as
+parts. The receiver measures RTT on its own monotonic clock. For local challenge
+send `t0`, local echo receipt `t1`, and remote echo submission `s`, an honest
+clock offset lies in `[s-t1, s-t0]`. Calibration intersects recent intervals
+with a 200 ppm drift allowance. It expires after one second without an echo.
+This interval depends on honest timestamps; a consistent forged offset can
+remain indistinguishable from an ordinary clock offset.
+
+The experiment compares three policies:
+
+- **Receiver RTT:** local nonce RTT and receiver-only delivery-rate samples.
+- **Unchecked timestamps:** the same RTT measurement, sender/receiver rate
+  spans, and a submission-to-receipt delay estimate using the offset midpoint.
+- **Echo-checked timestamps:** sender/receiver spans with timestamp validation
+  against the offset interval and monotonicity. Delay uses the conservative
+  offset bound. Invalid telemetry falls back to receiver-only rate sampling;
+  it does not invalidate a delivered part.
+
+Every sample needs at least four parts. Bytes divided by the larger of sender
+and receiver spans bounds the sample by observed receiver delivery. A recent
+maximum supplies the rate estimate. A fixed future timestamp offset cancels
+in sender-span differences. Compression of sender spacing cannot push this
+sample above the receiver rate, although compressed receiver arrivals remain
+a source of estimation error when sender timing is dishonest.
+
+The candidate targets twice the estimated bandwidth-delay product. It limits
+credit to 128 KiB–2 MiB per peer and starts at 256 KiB. It raises the limit by
+at most 64 KiB per update, only after delivering at least half the current
+credit while demand reached 75% of that credit. Rising local RTT or estimated
+transit delay lowers the target. Payload arrival replenishes spent credit
+immediately; the receiver does not revoke outstanding grants when lowering
+the limit. These rules form an experimental controller, not BBR conformance.
+
+The attack matrix changes peer zero's part timestamps by 8 or 100 ms, compresses
+timestamp spacing, or forges both echo and part timestamps. A separate pair
+compares an honest 10 Mbps supplier with the same supplier delaying each echo
+by 80 ms. Honest scenarios include upstream stalls and an 80-to-5 Mbps upload
+drop from two to four seconds. The controller cannot use configured rates or
+the scenario label. Each run reports all released bodies, completion within
+800 ms and 1,200 ms, peak credit, route changes, and timestamp rejection counts.
+
+The final archive contains 81 low-RTT runs, 63 longer-RTT runs, and nine actual
+network-drop runs. The network-drop case changes the shared qdisc from 100 to
+50 Mbps at two seconds and restores 100 Mbps at four seconds. This differs
+from the supplier-pacing drop, which occurs before submission. Each table cell
+below gives **completion within 800 ms / completion within 1,200 ms**, out of
+480 released bodies across three repetitions.
+
+| Configured queue delay | Scenario | Receiver RTT | Unchecked timestamps | Echo-checked timestamps |
+| --- | --- | --- | --- | --- |
+| 5 ms | Baseline | 480 / 480 | 480 / 480 | 480 / 480 |
+| 5 ms | Upstream gap | 480 / 480 | 480 / 480 | 480 / 480 |
+| 5 ms | Supplier pacing drop | 383 / 413 | 397 / 416 | 386 / 416 |
+| 25 ms | Baseline | 480 / 480 | 476 / 480 | 480 / 480 |
+| 25 ms | Upstream gap | 453 / 468 | 463 / 473 | 478 / 480 |
+| 25 ms | Supplier pacing drop | 319 / 371 | 306 / 349 | 309 / 345 |
+| 25 ms | Actual network drop | 297 / 359 | 271 / 335 | 276 / 345 |
+
+Sender timing helps the longer-RTT upstream-gap case in these repetitions.
+It does not consistently improve delivery when capacity drops. The 50 Mbps
+network-drop interval cannot sustain the 65.536 Mbps body load even without
+redundancy. All policies lose timely completions. In the longer-RTT baseline,
+mean run p95 is 292.4 ms with receiver-only sampling and 339.1 ms with checked
+timestamps. The three repetitions and observed variation do not establish a
+general performance advantage for either estimator.
+
+The low-RTT runs mostly hold credit at its 128 KiB minimum after startup. The
+longer-RTT baseline exercises growth: peak peer-zero authorization reaches
+896 KiB under receiver-only and checked timestamp policies. During the actual
+network drop, the first checked run reduces peer-zero's configured credit from
+about 808 KiB before the drop to 158 KiB during it, then grows again after
+capacity returns. Local echo RTT and delivered load contribute to that response;
+the experiment does not attribute it solely to sender timestamps.
+
+Echo calibration rejects impossible claims but accepts some forged timing.
+The following counts cover peer-zero part timestamps under the checked policy:
+
+| Remote timestamp behavior | Rejected / received, 5 ms queue delay | Rejected / received, 25 ms queue delay |
+| --- | --- | --- |
+| Part stamp 8 ms ahead | 0 / 1,007 | 0 / 1,749 |
+| Part stamp 100 ms ahead | 1,009 / 1,009 | 1,740 / 1,759 |
+| Echo stamp 50 ms ahead; part stamp 58 ms ahead | 0 / 996 | Not run |
+| Compressed timestamp spacing | 0 / 1,003 | Not run |
+
+The 8 ms shift fits the timing uncertainty. Some longer-RTT deliveries also
+leave room for a 100 ms claim. A consistent forged echo offset can move the
+calibration interval. The receiver still accepts valid payloads when it rejects
+timing metadata. No other supplier's timestamps fail validation in these runs.
+
+Delayed echoes expose a separate weakness in application RTT. At 25 ms queue
+delay, adding 80 ms of echo processing delay raises the slow supplier's minimum
+RTT from about 50 to 130 ms. Its peak authorized credit rises from 256 to
+320 KiB under all three policies. Under checked timestamps, mean configured
+credit rises from about 142 to 311 KiB over the recorded control updates.
+The nonce proves that the reply follows the challenge; it does not prove
+prompt processing or physical propagation delay. Calibration therefore cannot
+guarantee that an attacker receives no excess credit.
+
+All 153 runs finish without harness errors or uncredited payloads. No peer
+exceeds the 2 MiB authorization cap or the 256-part supplier queue cap. The
+local suite passes 91 tests, including nonce replay rejection, asymmetric-delay
+offset bounds, receiver-bounded rate samples, forged offset acceptance, and
+credit growth limits. Raw results, source snapshots, hashes, image IDs, and
+commands remain in `2026-09-11-timing-credit-final`,
+`2026-09-11-timing-credit-long-rtt`, and `2026-09-11-timing-credit-network-drop`.
+`summarize_timing_credit.py` validates accounting and produces comparison tables.
+
+These runs use synthetic payload hashes, not Dogwood proofs or coding work.
+They do not implement the specification's immutable grant protocol, preserve
+failure coverage during route changes, or bound all pending assignments by the
+payload credit limit. The report records pending assignment bytes separately.
+The results support further testing of submission timing for upstream-limited
+delivery. They do not justify treating echo calibration as timestamp
+authentication or selecting this controller for production.
+
 ## Feedback-driven standing routes
 
 `feedback_routes.py` changes standing mask subscriptions between concurrent

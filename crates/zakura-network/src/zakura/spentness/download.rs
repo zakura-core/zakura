@@ -179,7 +179,9 @@ pub async fn acquire_before_state(
             let peers = cursor.next(wait_for_capable_peers(&supervisor).await);
             match acquire(cache, commitment, &peers).await {
                 Ok(artifact) => return Ok(artifact),
-                Err(error) => tracing::warn!(%error, "pre-state spentness acquisition failed; retrying after delay"),
+                Err(error) => {
+                    tracing::warn!(%error, "pre-state spentness acquisition failed; retrying after delay")
+                }
             }
             sleep(RETRY_DELAY).await;
         }

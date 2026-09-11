@@ -2145,6 +2145,7 @@ impl HeaderSyncReactor {
                     && source_id_from_peer(peer) == source
             })
             .map(|(peer, _)| peer.clone());
+        let retry_session_is_current = peer.is_some();
         if let Some(peer) = peer {
             self.request_deadlines.remove(&peer);
         }
@@ -2174,6 +2175,13 @@ impl HeaderSyncReactor {
                         .is_ok(),
                 });
         if retry_scheduled {
+            if !retry_session_is_current {
+                // Retained local work can finish after its supplier reconnects.
+                // Its failure history belongs to the departed session.
+                if let Some(task) = self.vct_repair.get_mut(owner) {
+                    task.forget_source(source);
+                }
+            }
             if matches!(
                 retry.attribution,
                 VctRepairRetryAttribution::Supplier | VctRepairRetryAttribution::ExcludedInput

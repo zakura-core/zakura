@@ -1557,6 +1557,76 @@ async fn stale_disconnect_preserves_reconnected_supplier_backoff() {
     );
 }
 
+#[test]
+fn retained_old_session_repair_failure_keeps_the_new_session_eligible() {
+    for phase in [HeaderTargetPhase::Preparing, HeaderTargetPhase::Applying] {
+        for disconnect_first in [false, true] {
+            let mut fixture = ReadyVctRepairFixture::new();
+            let (peers, _old_outbounds) = fixture.connect(&[0x71], 7);
+            let peer = &peers[0];
+            fixture.schedule();
+            fixture.advertise(&peers, 7);
+            let old = fixture
+                .reactor
+                .peer_work_queue
+                .active(peer)
+                .unwrap()
+                .clone();
+            fixture
+                .reactor
+                .peer_work_queue
+                .active_mut(peer)
+                .unwrap()
+                .phase = phase;
+
+            if disconnect_first {
+                fixture
+                    .reactor
+                    .handle_peer_disconnected(peer, 7, "test disconnect");
+            }
+            let (reconnected, _new_outbounds) = fixture.connect(&[0x71], 8);
+            fixture.advertise(&reconnected, 8);
+            assert_eq!(
+                fixture.reactor.peer_work_queue.active(peer).unwrap().owner,
+                old.owner
+            );
+
+            let error = invalid_header_failure(old.source, old.owner);
+            match phase {
+                HeaderTargetPhase::Preparing => fixture.reactor.handle_header_target_prepared(
+                    peer.clone(),
+                    old.source,
+                    old.owner,
+                    HeaderTargetPreparationResult::Failed(error),
+                ),
+                HeaderTargetPhase::Applying => {
+                    fixture.reactor.handle_header_target_admission_ready(
+                        peer.clone(),
+                        old.source,
+                        old.owner,
+                        HeaderTargetAdmissionResult::Failed(error),
+                    )
+                }
+                _ => unreachable!("the fixture only retains local repair phases"),
+            }
+
+            let retry = fixture
+                .reactor
+                .peer_work_queue
+                .active(peer)
+                .expect("a late failure from the old session does not exclude its replacement");
+            assert_eq!(retry.owner.session_id(), 8);
+            assert!(!fixture
+                .reactor
+                .vct_repair
+                .current()
+                .unwrap()
+                .tried_sources
+                .contains(&old.source));
+        }
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn busy_vct_supplier_rotates_without_delaying_another_supplier() {
     let mut fixture = ReadyVctRepairFixture::new();

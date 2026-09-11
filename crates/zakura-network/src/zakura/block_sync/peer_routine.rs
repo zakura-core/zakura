@@ -663,20 +663,12 @@ impl PeerRoutine {
         outstanding.local_work_active = false;
         outstanding.write_status.expire_unwritten();
         let outstanding = &self.window.outstanding[index];
-        let floor = self.download_floor();
-        let unreceived: Vec<_> = unreceived_heights(outstanding).collect();
-        let released = self.work.release_reserved_heights_for_owner(
-            outstanding.request.owner,
-            unreceived.iter().copied().filter(|h| *h <= floor),
+        let (unreceived, outcome) = return_range_work(
+            &self.work,
+            &mut self.budget,
+            outstanding,
+            self.sequencer_view.borrow().download_floor,
         );
-        let outcome = self
-            .work
-            .release_reserved_and_return_items_detailed_for_owner(
-                outstanding.request.owner,
-                unreceived.iter().copied().filter(|h| *h > floor),
-            );
-        self.budget
-            .release(released.saturating_add(outcome.released_bytes));
         self.trace_work_returned(reason, outstanding, unreceived.len(), outcome);
         if outstanding.write_status.was_skipped() {
             self.window.retire_locally(index);
@@ -1789,14 +1781,12 @@ impl PeerRoutine {
             // be re-fetched, so both retry dispositions return only the still-reserved
             // unreceived heights to `pending`. `return_items` is idempotent.
             Disposition::RetryOriginal | Disposition::RetryMissing => {
-                let unreceived: Vec<_> = unreceived_heights(&outstanding).collect();
-                let outcome = self
-                    .work
-                    .release_reserved_and_return_items_detailed_for_owner(
-                        outstanding.request.owner,
-                        unreceived.iter().copied(),
-                    );
-                self.budget.release(outcome.released_bytes);
+                let (unreceived, outcome) = return_range_work(
+                    &self.work,
+                    &mut self.budget,
+                    &outstanding,
+                    self.sequencer_view.borrow().download_floor,
+                );
                 self.trace_work_returned(
                     disposition.trace_label(),
                     &outstanding,
@@ -1914,6 +1904,28 @@ impl PeerRoutine {
 
 fn elapsed_ms_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Return only still-needed unreceived work. Finality releases estimates, never wire credit.
+fn return_range_work(
+    work: &WorkQueue,
+    budget: &mut super::state::ByteBudget,
+    outstanding: &OutstandingBlockRange,
+    floor: block::Height,
+) -> (Vec<block::Height>, WorkReturnOutcome) {
+    let released = work.release_reserved_heights_for_owner(
+        outstanding.request.owner,
+        unreceived_heights(outstanding).filter(|height| *height <= floor),
+    );
+    let needed: Vec<_> = unreceived_heights(outstanding)
+        .filter(|height| *height > floor)
+        .collect();
+    let outcome = work.release_reserved_and_return_items_detailed_for_owner(
+        outstanding.request.owner,
+        needed.iter().copied(),
+    );
+    budget.release(released.saturating_add(outcome.released_bytes));
+    (needed, outcome)
 }
 
 /// The still-unreceived heights of an outstanding request (the ones that return
@@ -3045,6 +3057,7 @@ mod tests {
         let (in_send, in_recv) = framed_channel(4);
         let cause = OrderedStreamFailureCause::default();
         let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
+        let session_observer = session.clone();
         let (sequencer_input, mut sequencer_recv) = mpsc::channel(4);
         let mut held_capacity = Vec::new();
         if matches!(
@@ -3224,6 +3237,12 @@ mod tests {
             drop(held_capacity);
         }
         let result = timeout(Duration::from_secs(1), running).await.unwrap();
+        assert_eq!(
+            session_observer.connection_is_closed_for_test(),
+            result
+                .as_ref()
+                .is_err_and(|error| error.closes_connection())
+        );
         if matches!(
             buffered,
             BufferedResponse::Malformed

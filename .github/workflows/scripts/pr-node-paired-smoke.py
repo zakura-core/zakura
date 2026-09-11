@@ -5,13 +5,13 @@ import argparse
 import json
 import re
 import signal
+import struct
 import subprocess
 import time
 import urllib.request
 from pathlib import Path
 
 EXPECTED_SHA = "ab4a68521f1a3161537c1f3003c1bc2cce1f05ef"
-COHORT = "header-serving-stability-20260911"
 OUT = Path("/root/out/paired")
 SEED_RPC = "http://127.0.0.1:8232"
 CLIENT_RPC = "http://127.0.0.1:18232"
@@ -80,7 +80,7 @@ cache_dir = "/root/paired-client-network-cache"
 [network.zakura]
 listen_addr = "127.0.0.1:18234"
 bootstrap_peers = ["{seed_id}@127.0.0.1:8234"]
-dev_network = "{COHORT}"
+max_connections = 1
 trace_dir = "/root/out/paired/traces"
 
 [state]
@@ -116,6 +116,17 @@ def stop(proc):
         raise RuntimeError("downloader did not stop within 90 seconds")
     if proc.returncode not in (0, -signal.SIGINT):
         raise RuntimeError(f"downloader shutdown returned {proc.returncode}")
+
+
+def running_height(proc, deadline):
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"downloader exited during startup: {proc.returncode}")
+        try:
+            return rpc(CLIENT_RPC, "getblockcount")
+        except (OSError, ValueError, RuntimeError):
+            time.sleep(1)
+    raise RuntimeError("downloader RPC did not become ready")
 
 
 def check_hash(height):
@@ -166,9 +177,9 @@ def main():
     parser.add_argument("--duration-minutes", required=True, type=float)
     args = parser.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
-    result = {"sha": EXPECTED_SHA, "network": "mainnet", "cohort": COHORT,
+    result = {"sha": EXPECTED_SHA, "network": "mainnet", "cohort": None,
               "topology": "two full nodes on one disposable host, native QUIC over loopback",
-              "seed_upstream": "public legacy peers", "phases": [], "pass": False}
+              "seed_upstream": "public mainnet peers, dual transport", "phases": [], "pass": False}
     proc = None
     deadline = time.monotonic() + args.duration_minutes * 60
     stderr = (OUT / "downloader-console.log").open("a")
@@ -182,6 +193,13 @@ def main():
         if actual != EXPECTED_SHA:
             raise RuntimeError(f"unexpected tested source revision: {actual}")
         seed_id = seed_identity(min(deadline, time.monotonic() + 360))
+        first_seed = rpc(SEED_RPC, "getblockcount")
+        emit("waiting_for_seed_progress", height=first_seed)
+        while rpc(SEED_RPC, "getblockcount") < first_seed + 100:
+            if time.monotonic() >= deadline - 180:
+                raise RuntimeError("seed did not advance 100 blocks before the paired test")
+            time.sleep(2)
+        emit("seed_advancing", height=rpc(SEED_RPC, "getblockcount"))
         config = OUT / "downloader.toml"
         config.write_text(child_config(args.state, seed_id))
         initial = subprocess.check_output(
@@ -198,19 +216,22 @@ def main():
         def launch():
             return subprocess.Popen([BINARY, "-c", str(config), "start"], stdout=stderr, stderr=stderr)
 
+        handoff_bytes = Path("/root/zakura/crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin").read_bytes()
+        handoff = struct.unpack("<I", handoff_bytes[:4])[0]
+        required_fast = min(64, max(0, handoff - start))
+        if required_fast == 0:
+            raise RuntimeError("this fresh fixture must start below the embedded VCT handoff")
+        result.update(vct_handoff=handoff, required_vct_fast_blocks=required_fast)
         proc = launch()
+        start = running_height(proc, deadline - 120)
         first = run_phase(proc, "sync-while-serving", start, 512, min(deadline - 120, time.monotonic() + 600))
-        if first["vct_fast_blocks"] < 64:
-            raise RuntimeError("the downloader did not exercise VCT fast verification")
+        if first["vct_fast_blocks"] < required_fast:
+            raise RuntimeError("the downloader did not verify the available VCT fast range")
         result["phases"].append(first)
         stop(proc)
-        stopped_tip = subprocess.check_output(
-            [BINARY, "-c", str(config), "tip-height", "--cache-dir", str(args.state),
-             "--network", "Mainnet"], text=True, stderr=subprocess.STDOUT, timeout=120,
-        )
-        restart_start = int(re.findall(r"^([0-9]+)$", stopped_tip, re.MULTILINE)[-1])
-        emit("restarting", persisted_height=restart_start)
         proc = launch()
+        restart_start = running_height(proc, deadline)
+        emit("restarting", restored_running_height=restart_start)
         second = run_phase(proc, "restart-sync", restart_start, 64, deadline)
         result["phases"].append(second)
         trace = []
@@ -233,11 +254,19 @@ def main():
                     across_updates.append({"request_id": row["request_id"], "target_hash": row["target_hash"],
                         "request_generation": row["header_generation"], "current_generation": latest["header_generation"],
                         "header_count": row["header_count"], "ts": row["ts"]})
-        result["serving_evidence"] = {"snapshot_updates": len(snapshots),
+        client_trace = [json.loads(line) for line in (OUT / "traces/header_sync.jsonl").read_text().splitlines()]
+        client_peers = {row["peer"] for row in client_trace if row["event"] == "header_peer_connected"}
+        if len(client_peers) != 1:
+            raise RuntimeError("downloader did not remain connected to its single seed")
+        received = {(row["request_id"], row["target_hash"]) for row in client_trace if row["event"] == "header_response_received"}
+        delivered_across_updates = [row for row in across_updates if (row["request_id"], row["target_hash"]) in received]
+        result["serving_evidence"] = {"client_peer_count": len(client_peers),
+            "spanning_responses_received_by_client": len(delivered_across_updates),
+            "snapshot_updates": len(snapshots),
             "successful_responses_while_advancing": successes_during_updates,
             "successful_responses_across_generation_changes": across_updates,
             "busy_replies": sum(r["event"] == "header_outcome" and r.get("outcome") == "busy" for r in trace)}
-        if len(snapshots) < 100 or not across_updates:
+        if len(snapshots) < 100 or not delivered_across_updates:
             raise RuntimeError("the capture did not prove serving across ongoing head updates")
         stop(proc)
         proc = None

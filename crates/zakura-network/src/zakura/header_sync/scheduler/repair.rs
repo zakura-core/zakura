@@ -1,11 +1,21 @@
 //! Generation- and branch-owned auxiliary VCT repair work.
 
-use std::collections::HashSet;
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 use thiserror::Error;
 use tokio::time::Instant;
 use zakura_chain::block;
 use zakura_header_chain::{BodyWorkOwner, EngineSnapshot, SourceId, VctRepairContext};
+
+/// A temporary refusal delays only the supplier that returned it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BusySupplierBackoff {
+    retry_at: Instant,
+    delay: Duration,
+}
 
 /// Structurally complete state of one auxiliary repair task.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -84,6 +94,8 @@ pub(in crate::zakura::header_sync) struct RepairRequirement {
     pub tried_sources: HashSet<SourceId>,
     /// Connected suppliers that returned input excluded by this durable episode.
     pub excluded_input_sources: HashSet<SourceId>,
+    /// Temporary refusals, bounded by live peer admission limits.
+    busy_sources: HashMap<SourceId, BusySupplierBackoff>,
 }
 
 impl RepairRequirement {
@@ -97,6 +109,7 @@ impl RepairRequirement {
             attempts: 0,
             tried_sources: HashSet::new(),
             excluded_input_sources: HashSet::new(),
+            busy_sources: HashMap::new(),
         }
     }
 
@@ -183,9 +196,46 @@ impl RepairRequirement {
             _ => return Err(RepairPolicyError::IllegalState),
         };
         self.attempts = self.attempts.saturating_add(1);
+        self.busy_sources.remove(&source);
         self.tried_sources.insert(source);
         self.state = RepairPolicyState::Ready { context };
         Ok(())
+    }
+
+    /// Retry a busy supplier after exponential backoff, without blocking other suppliers.
+    pub fn retry_after_busy(
+        &mut self,
+        source: SourceId,
+        now: Instant,
+    ) -> Result<(), RepairPolicyError> {
+        let RepairPolicyState::Assigned { context } = &self.state else {
+            return Err(RepairPolicyError::IllegalState);
+        };
+        let delay = self
+            .busy_sources
+            .get(&source)
+            .map_or(Duration::from_secs(1), |backoff| {
+                backoff.delay.saturating_mul(2).min(Duration::from_secs(30))
+            });
+        self.busy_sources.insert(
+            source,
+            BusySupplierBackoff {
+                retry_at: now + delay,
+                delay,
+            },
+        );
+        self.attempts = self.attempts.saturating_add(1);
+        self.state = RepairPolicyState::Ready {
+            context: context.clone(),
+        };
+        Ok(())
+    }
+
+    /// Whether this supplier's temporary refusal still prevents another request.
+    pub fn supplier_is_backing_off(&self, source: SourceId, now: Instant) -> bool {
+        self.busy_sources
+            .get(&source)
+            .is_some_and(|backoff| backoff.retry_at > now)
     }
 
     /// Rotate away from a supplier that returned semantic input excluded by durable state.
@@ -201,6 +251,7 @@ impl RepairRequirement {
             return Err(RepairPolicyError::IllegalState);
         }
         self.attempts = self.attempts.saturating_add(1);
+        self.busy_sources.remove(&source);
         self.tried_sources.insert(source);
         Ok(())
     }
@@ -215,6 +266,8 @@ impl RepairRequirement {
             .retain(|source| connected_sources.contains(source));
         self.excluded_input_sources
             .retain(|source| connected_sources.contains(source));
+        self.busy_sources
+            .retain(|source, _| connected_sources.contains(source));
     }
 
     /// Back off ready or assigned repair work after a local failure.
@@ -282,6 +335,14 @@ impl RepairRequirement {
             RepairPolicyState::QueryingContext { deadline, .. } => Some(deadline),
             RepairPolicyState::ContextBackoff { retry_at }
             | RepairPolicyState::LocalBackoff { retry_at, .. } => Some(retry_at),
+            RepairPolicyState::Ready { .. } => {
+                let now = Instant::now();
+                self.busy_sources
+                    .values()
+                    .map(|backoff| backoff.retry_at)
+                    .filter(|retry_at| *retry_at > now)
+                    .min()
+            }
             _ => None,
         }
     }
@@ -468,6 +529,42 @@ mod tests {
         let completed = task.clone();
         assert_eq!(task.retry(source), Err(RepairPolicyError::IllegalState));
         assert_eq!(task, completed, "completed work cannot transition again");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn busy_backoff_is_bounded_and_preserves_semantic_exclusions() {
+        let mut task = task(&snapshot());
+        let source = SourceId::from_digest([8; 32]);
+        let excluded = SourceId::from_digest([9; 32]);
+        let context = context();
+        mark_context_requested(&mut task);
+        task.resolve(context.clone())
+            .expect("the selected context resolves");
+        task.assign(task.owner, context.clone())
+            .expect("the excluded supplier is assigned");
+        task.exclude_input(excluded)
+            .expect("semantic input is excluded");
+
+        for seconds in [1, 2, 4, 8, 16, 30, 30] {
+            task.assign(task.owner, context.clone())
+                .expect("the busy supplier is assigned");
+            task.retry_after_busy(source, Instant::now())
+                .expect("Busy schedules a retry");
+            let delay = Duration::from_secs(seconds);
+            assert_eq!(task.next_deadline(), Some(Instant::now() + delay));
+            assert!(task.supplier_is_backing_off(source, Instant::now()));
+            tokio::time::advance(delay - Duration::from_millis(1)).await;
+            assert!(task.supplier_is_backing_off(source, Instant::now()));
+            tokio::time::advance(Duration::from_millis(1)).await;
+            assert!(!task.supplier_is_backing_off(source, Instant::now()));
+            assert_eq!(task.next_deadline(), None);
+            assert!(!task.tried_sources.contains(&source));
+            assert!(task.tried_sources.contains(&excluded));
+            assert!(task.excluded_input_sources.contains(&excluded));
+        }
+        task.retain_connected_sources(&[excluded].into_iter().collect());
+        assert!(task.busy_sources.is_empty());
+        assert!(task.excluded_input_sources.contains(&excluded));
     }
 
     #[test]

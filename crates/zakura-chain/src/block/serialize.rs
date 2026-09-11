@@ -1,5 +1,6 @@
 //! Serialization and deserialization for Zcash blocks.
 
+use crate::serialization::ZcashReader;
 use std::{borrow::Borrow, io};
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -9,8 +10,7 @@ use hex::{FromHex, FromHexError};
 use crate::{
     block::{header::ZCASH_BLOCK_VERSION, merkle, Block, CountedHeader, Hash, Header},
     serialization::{
-        CompactSizeMessage, ReadZcashExt, SerializationError, ZcashDeserialize,
-        ZcashDeserializeInto, ZcashSerialize,
+        CompactSizeMessage, ReadZcashExt, SerializationError, ZcashDeserialize, ZcashSerialize,
     },
     work::{difficulty::CompactDifficulty, equihash},
 };
@@ -84,13 +84,15 @@ impl ZcashSerialize for Header {
 }
 
 impl ZcashDeserialize for Header {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         let version = reader.read_u32::<LittleEndian>()?;
         validate_header_version(version).map_err(SerializationError::Parse)?;
 
         Ok(Header {
             version,
-            previous_block_hash: Hash::zcash_deserialize(&mut reader)?,
+            previous_block_hash: reader.read_value::<Hash>()?,
             merkle_root: merkle::Root(reader.read_32_bytes()?),
             commitment_bytes: reader.read_32_bytes()?.into(),
             // This can't panic, because all u32 values are valid `Utc.timestamp`s
@@ -102,7 +104,7 @@ impl ZcashDeserialize for Header {
                 ))?,
             difficulty_threshold: CompactDifficulty(reader.read_u32::<LittleEndian>()?),
             nonce: reader.read_32_bytes()?.into(),
-            solution: equihash::Solution::zcash_deserialize(reader)?,
+            solution: reader.read_value::<equihash::Solution>()?,
         })
     }
 }
@@ -122,14 +124,16 @@ impl ZcashSerialize for CountedHeader {
 }
 
 impl ZcashDeserialize for CountedHeader {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         let header = CountedHeader {
-            header: (&mut reader).zcash_deserialize_into()?,
+            header: reader.read_value()?,
         };
 
         // We ignore the number of transactions in a header-only message,
         // it should always be zero.
-        let _transaction_count: CompactSizeMessage = (&mut reader).zcash_deserialize_into()?;
+        let _transaction_count: CompactSizeMessage = reader.read_value()?;
 
         Ok(header)
     }
@@ -147,7 +151,9 @@ impl ZcashSerialize for Block {
 }
 
 impl ZcashDeserialize for Block {
-    fn zcash_deserialize<R: io::Read>(reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         // # Consensus
         //
         // > The size of a block MUST be less than or equal to 2000000 bytes.
@@ -155,10 +161,10 @@ impl ZcashDeserialize for Block {
         // https://zips.z.cash/protocol/protocol.pdf#blockheader
         //
         // If the limit is reached, we'll get an UnexpectedEof error
-        let limited_reader = &mut reader.take(MAX_BLOCK_BYTES);
+        let limited_reader = &mut reader.with_limit(MAX_BLOCK_BYTES);
         Ok(Block {
-            header: limited_reader.zcash_deserialize_into()?,
-            transactions: limited_reader.zcash_deserialize_into()?,
+            header: limited_reader.read_value()?,
+            transactions: limited_reader.read_value()?,
         })
     }
 }

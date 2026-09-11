@@ -1,5 +1,6 @@
 //! Sprout message authentication codes.
 
+use crate::serialization::ZcashReader;
 use std::io::{self, Read};
 
 use crate::{
@@ -47,7 +48,9 @@ impl From<&Mac> for [u8; 32] {
 }
 
 impl ZcashDeserialize for Mac {
-    fn zcash_deserialize<R: Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         let bytes = reader.read_32_bytes()?;
 
         Ok(Self(bytes.into()))

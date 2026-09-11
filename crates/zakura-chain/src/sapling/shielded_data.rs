@@ -422,6 +422,10 @@ where
 }
 
 impl TrustedPreallocate for Groth16Proof {
+    fn min_serialized_size() -> u64 {
+        192
+    }
+
     fn max_allocation() -> u64 {
         // Each V5 transaction proof array entry must have a corresponding
         // spend or output prefix. We use the larger limit, so we don't reject

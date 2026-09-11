@@ -343,7 +343,10 @@ def check_free_space(config: Config, *, recovery: bool = False) -> None:
 
 
 def preflight(config: Config) -> None:
-    for command in ("cargo", "git", "systemctl", "logrotate"):
+    commands = ("cargo", "git", "systemctl", "logrotate")
+    if config.policy.archive_traces:
+        commands += ("aws", "tar", "gzip")
+    for command in commands:
         if shutil.which(command) is None:
             raise ControllerError(f"required command is unavailable: {command}")
     for path, description in (
@@ -613,6 +616,8 @@ def archive_traces(config: Config, run_dir: Path, run_state: dict[str, Any]) -> 
     if not config.policy.archive_traces or run_state.get("trace_archive_url"):
         return
     traces = run_dir / "traces"
+    if traces.is_symlink():
+        raise ControllerError(f"refusing to archive symlinked traces: {traces}")
     if not traces.exists():
         return
     bucket = os.environ.get("ZAKURA_TRACE_SPACE", "")
@@ -655,8 +660,9 @@ def archive_traces(config: Config, run_dir: Path, run_state: dict[str, Any]) -> 
               capture=True, timeout=180).stdout.strip()
     if not url.startswith("https://"):
         raise ControllerError("Space returned an invalid download URL")
-    run_state.update(trace_archive_url=url, trace_archive_key=key)
-    write_run_json(run_dir, run_state)
+    archived_state = dict(run_state, trace_archive_url=url, trace_archive_key=key)
+    write_run_json(run_dir, archived_state)
+    run_state.update(archived_state)
 
 
 def trace_download_text(run_state: dict[str, Any]) -> str:
@@ -936,7 +942,11 @@ def run_loop(config: Config, config_path: Path) -> int:
                 return 2
             stop_service(config)
             safe_wipe_state(config)
-            cleanup_retention(config, recovery=True)
+            try:
+                cleanup_retention(config, recovery=True)
+            except Exception as error:
+                halt(config, state_path, state, {}, f"retention recovery failed: {error}")
+                return 1
             try:
                 check_free_space(config, recovery=True)
             except DiskPressure:
@@ -965,7 +975,11 @@ def run_loop(config: Config, config_path: Path) -> int:
             stop_service(config)
             run_dir = config.paths.runs_dir / str(current_run) if current_run else None
             if isinstance(error, DiskPressure):
-                cleanup_retention(config, active_run=run_dir, recovery=True)
+                try:
+                    cleanup_retention(config, active_run=run_dir, recovery=True)
+                except Exception as recovery_error:
+                    reason += f"; retention recovery failed: {recovery_error}"
+                    error = recovery_error
             halt(config, state_path, state, run_state or state, reason)
             if not isinstance(error, DiskPressure):
                 return 1

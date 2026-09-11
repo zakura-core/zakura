@@ -39,6 +39,35 @@ alert_status = load_module("continuous_sync_alert_status", ALERT_STATUS_PATH)
 
 
 class ContinuousSyncTests(unittest.TestCase):
+    def test_retention_archive_failure_reports_halt_during_disk_recovery(self):
+        for restarting in (False, True):
+            with self.subTest(restarting=restarting), tempfile.TemporaryDirectory() as tmp:
+                config = make_config(Path(tmp), policy=sync.Policy(archive_traces=True))
+                state_path = config.paths.state_dir / "state.json"
+                if restarting:
+                    sync.save_state(state_path, {"failed": True, "failure": "DiskPressure: low"})
+                with (
+                    patch.object(sync, "one_cycle", side_effect=sync.DiskPressure("low")),
+                    patch.object(sync, "stop_service"),
+                    patch.object(sync, "safe_wipe_state"),
+                    patch.object(sync, "cleanup_retention", side_effect=sync.ControllerError("upload failed")),
+                    patch.object(sync, "post_slack", return_value=False) as post,
+                ):
+                    self.assertEqual(sync.run_loop(config, Path("unused")), 1)
+                self.assertTrue(sync.load_state(state_path)["failed"])
+                self.assertIn("upload failed", sync.load_state(state_path)["failure"])
+                post.assert_called_once()
+
+    def test_archive_rejects_symlink_before_upload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "run"
+            run_dir.mkdir()
+            (run_dir / "traces").symlink_to(root / "missing")
+            config = make_config(root, policy=sync.Policy(archive_traces=True))
+            with self.assertRaisesRegex(sync.ControllerError, "symlink"):
+                sync.archive_traces(config, run_dir, {})
+
     def test_archive_requires_expiration_and_preserves_traces(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = make_config(Path(tmp), policy=sync.Policy(archive_traces=True))

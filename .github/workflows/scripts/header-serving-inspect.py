@@ -1,5 +1,5 @@
 """Read progress and traces only on the exact disposable serving test host."""
-import json,subprocess,urllib.request
+import json,re,subprocess,urllib.request
 from pathlib import Path
 from collections import Counter
 processes=subprocess.check_output(["ps","-eo","pid,comm,etime,pcpu,rss"],text=True)
@@ -61,3 +61,15 @@ try:
                 print('client_metric',line)
 except Exception as e:
     print('client_metrics_unavailable',str(e))
+path=Path('/root/out/paired/downloader.log')
+if path.exists():
+    stages=Counter()
+    first_block=[]
+    for line in path.open():
+        for stage in ['performing block checks','built async tx checks','passed quick checks','got state UTXOs','awaiting async checks','finished async checks','got tx verify result','queueing block for contextual verification']:
+            if stage in line:
+                height=re.search(r'height=Some\(Height\((\d+)\)\)',line)
+                stages[(height.group(1) if height else '?',stage)]+=1
+                if height and height.group(1)=='3476011':first_block.append(line.strip()[:1600])
+    print('client_verifier_stages',json.dumps([{'height':h,'stage':s,'count':n} for (h,s),n in stages.items()]))
+    print('client_first_full_block_progress',json.dumps(first_block[-35:]))

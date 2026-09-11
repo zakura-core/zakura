@@ -10,9 +10,8 @@ pub(super) fn cache_status() -> BlockSyncStatus {
         servable_low: block::Height(1),
         servable_high: block::Height(COUNT),
         tip_hash: block::Hash([0; 32]),
-        max_blocks_per_response: 128,
-        max_inflight_requests: 32,
-        max_response_bytes: 32 * 1024 * 1024,
+        // Match connect-time numeric ceilings. Only cache availability differs.
+        ..ZakuraBlockSyncConfig::default().initial_status()
     }
 }
 

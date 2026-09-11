@@ -137,7 +137,7 @@ def check_hash(height):
     return client_hash
 
 
-def run_phase(proc, name, start, needed, deadline):
+def run_phase(proc, name, start, needed, deadline, *, minimum_height=0, minimum_vct=0):
     last_print = 0
     while time.monotonic() < deadline:
         if proc.poll() is not None:
@@ -153,8 +153,9 @@ def run_phase(proc, name, start, needed, deadline):
             sample["legacy_fallbacks"] = metric(text, "sync_zakura_legacy_fallback_engaged")
             if sample["legacy_fallbacks"]:
                 raise AssertionError("native-only downloader used a legacy fallback")
-            if (sample["height"] >= start + needed and sample["native_bodies"] >= needed
-                    and sample["native_requests"] > 0):
+            if (sample["height"] >= max(start + needed, minimum_height)
+                    and sample["native_bodies"] >= needed and sample["native_requests"] > 0
+                    and sample["vct_fast_blocks"] >= minimum_vct):
                 sample["block_hash"] = check_hash(sample["height"])
                 (OUT / f"{name}-metrics.txt").write_text(text)
                 emit("phase_pass", **sample)
@@ -217,9 +218,9 @@ def main():
         start = running_height(proc, deadline - 120)
         result.update(start_height=start)
         emit("running", start_height=start)
-        first = run_phase(proc, "sync-while-serving", start, 512, min(deadline - 120, time.monotonic() + 600))
-        if first["vct_fast_blocks"] < 1:
-            raise RuntimeError("the downloader did not exercise VCT fast verification")
+        first = run_phase(proc, "sync-while-serving", start, 512,
+                          min(deadline - 120, time.monotonic() + 600),
+                          minimum_height=handoff + 64, minimum_vct=1)
         result["phases"].append(first)
         stop(proc)
         proc = launch()

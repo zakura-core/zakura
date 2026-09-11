@@ -10,8 +10,8 @@ import time
 import urllib.request
 from pathlib import Path
 
-EXPECTED_SHA = "a30202f2f1c47e08e9c2f8510392353c37d24dfd"
-COHORT = "header-serving-repro-20260911"
+EXPECTED_SHA = "71e93477b2e9cd240c5181e5bf3ef281227967c4"
+COHORT = "header-serving-retry-20260911"
 OUT = Path("/root/out/paired")
 SEED_RPC = "http://127.0.0.1:8232"
 CLIENT_RPC = "http://127.0.0.1:18232"

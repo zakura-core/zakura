@@ -149,6 +149,11 @@ impl BlockSyncPeerSession {
         self.cancel_token.cancel();
     }
 
+    #[cfg(test)]
+    pub(super) fn connection_is_closed_for_test(&self) -> bool {
+        self.connection_cancel.is_cancelled()
+    }
+
     /// Wait until the reactor has installed or rejected this exact session.
     pub(super) async fn wait_until_reactor_ready(&self) {
         self.reactor_ready.notified().await;

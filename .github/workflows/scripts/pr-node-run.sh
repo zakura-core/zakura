@@ -155,13 +155,13 @@ dev_network = "header-serving-stability-20260911"
 trace_dir = "/var/log/zakura/seed-traces"
 TOML
 
-# Keep the fixture supplied by the archive node instead of random cached peers.
+# Bootstrap from public mainnet peers. B still connects only to the isolated seed.
 python3 - <<'PIN_ARCHIVE_PEER'
 from pathlib import Path
 p = Path('deploy/deployer/templates/zakura.toml')
 s = p.read_text()
 assert s.count('[network]') == 1
-s = s.replace('[network]', '[network]\ninitial_mainnet_peers = ["104.131.174.28:8233"]\npeerset_initial_target_size = 1')
+s = s.replace('[network]', '[network]\ninitial_mainnet_peers = ["138.197.11.145:8233", "209.38.85.70:8233", "159.65.183.89:8233", "104.131.184.123:8233", "dnsseed.z.cash:8233", "dnsseed.str4d.xyz:8233"]\npeerset_initial_target_size = 25')
 p.write_text(s)
 PIN_ARCHIVE_PEER
 

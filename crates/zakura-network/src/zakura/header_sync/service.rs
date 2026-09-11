@@ -725,7 +725,7 @@ impl Service for HeaderSyncService {
         let Ok(bytes) = <[u8; 32]>::try_from(peer.as_bytes()) else {
             return false;
         };
-        let Ok(node_id) = iroh::NodeId::from_bytes(&bytes) else {
+        let Ok(node_id) = iroh::EndpointId::from_bytes(&bytes) else {
             return false;
         };
         self.header_sync
@@ -882,7 +882,7 @@ impl Sink for HeaderSyncPassthroughSink {
 }
 
 /// Return the iroh node identity for a valid header-sync peer ID.
-fn header_peer_node_id(peer: &ZakuraPeerId) -> Option<iroh::NodeId> {
+fn header_peer_node_id(peer: &ZakuraPeerId) -> Option<iroh::EndpointId> {
     let bytes = <[u8; 32]>::try_from(peer.as_bytes()).ok()?;
-    iroh::NodeId::from_bytes(&bytes).ok()
+    iroh::EndpointId::from_bytes(&bytes).ok()
 }

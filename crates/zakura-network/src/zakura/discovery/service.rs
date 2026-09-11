@@ -17,7 +17,7 @@ use std::{
     time::Duration,
 };
 
-use iroh::NodeId;
+use iroh::EndpointId;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -100,7 +100,7 @@ impl DiscoveryPeerSession {
         &self,
         limit: u16,
         wanted_services: Vec<ZakuraServiceId>,
-        exclude_node_ids: Vec<NodeId>,
+        exclude_node_ids: Vec<EndpointId>,
     ) -> Result<(), OrderedSendError> {
         self.try_send_message(DiscoveryMessage::GetPeers {
             limit,
@@ -505,7 +505,7 @@ struct DiscoveryExchangeStart {
     header_sync: Option<HeaderSyncHandle>,
     block_sync: Option<BlockSyncHandle>,
     connection_owners: Vec<Arc<dyn Service>>,
-    peer_node_id: NodeId,
+    peer_node_id: EndpointId,
     discovery_session: DiscoveryPeerSession,
     conn_id: ZakuraConnId,
     session_id: u64,
@@ -636,7 +636,7 @@ struct DiscoverySink {
     handle: ZakuraDiscoveryHandle,
     header_sync: Option<HeaderSyncHandle>,
     block_sync: Option<BlockSyncHandle>,
-    peer_node_id: NodeId,
+    peer_node_id: EndpointId,
     session: DiscoveryPeerSession,
     conn_id: ZakuraConnId,
     session_id: u64,
@@ -1001,9 +1001,9 @@ fn discovery_exchange_interval(record_refresh_interval: Duration) -> Duration {
 
 /// Returns the iroh node id encoded by a discovery peer id, if it is a 32-byte
 /// node id.
-fn node_id_from_peer_id(peer_id: &ZakuraPeerId) -> Option<NodeId> {
+fn node_id_from_peer_id(peer_id: &ZakuraPeerId) -> Option<EndpointId> {
     let bytes: [u8; 32] = peer_id.as_bytes().try_into().ok()?;
-    NodeId::from_bytes(&bytes).ok()
+    EndpointId::from_bytes(&bytes).ok()
 }
 
 /// A peer-hello import error that should be logged and ignored rather than
@@ -1634,7 +1634,7 @@ mod tests {
     fn discovery_sink_for_session(
         handle: &ZakuraDiscoveryHandle,
         peer_id: &ZakuraPeerId,
-        peer_node_id: NodeId,
+        peer_node_id: EndpointId,
         conn_id: ZakuraConnId,
         session_id: u64,
     ) -> (DiscoverySink, FramedRecv) {

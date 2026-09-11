@@ -1404,6 +1404,11 @@ impl FinalizedState {
             .is_some_and(|v| v.accepts_exact_roots_at(height))
     }
 
+    /// Whether the saved frontiers can still be advanced when VCT metadata is unavailable.
+    pub(crate) fn vct_can_recompute_trees(&self) -> bool {
+        !self.vct.is_below_last_checkpoint()
+    }
+
     /// Clears any cached successor prevalidation.
     ///
     /// The finalized write loop calls this when it discards checkpoint queue state, so a
@@ -1464,9 +1469,8 @@ impl FinalizedState {
     /// The committer therefore cannot recompute the root locally.
     /// Local recomputation could fold an incorrect root into the history MMR.
     /// The committer leaves the database untouched.
-    /// Header sync does not request individual roots.
-    /// A later delivery of the same header range can fill the missing root.
-    /// Another fanout peer's in-flight response can provide that delivery.
+    /// Header sync requests a bounded selected range that starts at the missing height.
+    /// A later delivery can fill the missing root.
     /// Otherwise, the commit remains parked and the section 8 stall metrics and logs report it.
     /// An incorrect root therefore never corrupts state, at the cost
     /// of stalling the sync at this height.

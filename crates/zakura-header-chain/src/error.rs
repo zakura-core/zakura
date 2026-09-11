@@ -125,6 +125,8 @@ pub struct HeaderChainError {
 }
 
 impl HeaderChainError {
+    const AUXILIARY_CAPACITY_SUBJECT: &'static str = "header_auxiliary_capacity";
+
     /// Construct a category-preserving error with explicit attribution.
     pub fn new(
         category: ErrorCategory,
@@ -237,6 +239,21 @@ impl HeaderChainError {
             Attribution::None,
             source,
         )
+    }
+
+    /// Construct an auxiliary-capacity refusal that requires authoritative state progress.
+    pub fn auxiliary_capacity(source: Option<BoxError>) -> Self {
+        Self::local_resource(
+            ErrorSubject::Local(Self::AUXILIARY_CAPACITY_SUBJECT),
+            source,
+        )
+    }
+
+    /// Return whether state refused this operation because auxiliary capacity was unavailable.
+    pub fn is_auxiliary_capacity_refusal(&self) -> bool {
+        self.category == ErrorCategory::LocalResourceOrStorage
+            && self.subject == ErrorSubject::Local(Self::AUXILIARY_CAPACITY_SUBJECT)
+            && self.attribution == Attribution::None
     }
 
     /// Return true only for categories that automatically justify header-peer scoring.

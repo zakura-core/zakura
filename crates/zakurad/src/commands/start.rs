@@ -86,7 +86,7 @@ use color_eyre::eyre::{eyre, Report};
 use futures::FutureExt;
 use tokio::{
     pin, select,
-    sync::{oneshot, watch},
+    sync::{mpsc, oneshot, watch},
     task::{AbortHandle, JoinHandle},
 };
 use tokio_util::sync::CancellationToken;
@@ -117,6 +117,34 @@ use crate::{
     config::ZakuradConfig,
     prelude::*,
 };
+
+struct BlockSyncDriverExitGuard {
+    fatal_events: mpsc::UnboundedSender<()>,
+    shutdown: CancellationToken,
+}
+
+impl Drop for BlockSyncDriverExitGuard {
+    fn drop(&mut self) {
+        if !self.shutdown.is_cancelled() {
+            let _ = self.fatal_events.send(());
+        }
+    }
+}
+
+fn supervise_block_sync_driver(
+    driver: impl std::future::Future<Output = ()>,
+    fatal_events: mpsc::UnboundedSender<()>,
+    shutdown: CancellationToken,
+) -> impl std::future::Future<Output = ()> {
+    let exit_guard = BlockSyncDriverExitGuard {
+        fatal_events,
+        shutdown,
+    };
+    async move {
+        let _exit_guard = exit_guard;
+        driver.await;
+    }
+}
 
 #[cfg(feature = "internal-miner")]
 use crate::components;
@@ -304,6 +332,7 @@ impl StartCmd {
         &self,
         config: Arc<ZakuradConfig>,
         custom_services: Vec<zakura_network::zakura::CustomService>,
+        ready: Option<tokio::sync::oneshot::Sender<crate::node::NodeServices>>,
         shutdown: CancellationToken,
         shutdown_cleanup_required: CancellationToken,
     ) -> Result<(), Report> {
@@ -341,6 +370,7 @@ impl StartCmd {
 
         Self::validate_consensus_config(&config)?;
         Self::validate_debug_blocksync_throughput_config(&config)?;
+        config.rpc.validate().map_err(|error| eyre!(error))?;
 
         if config.zcashd_compat.enabled {
             zcashd_compat::run_preflight(&config, self.unsafe_low_specs)?;
@@ -495,16 +525,18 @@ impl StartCmd {
             .then(|| config.state.pruning_config())
             .flatten()
             .map(|pruning| pruning.tx_retention);
+        let pending_blocks = zakura_rpc::PendingBlockRegistry::default();
         let inbound = ServiceBuilder::new()
             .load_shed()
             .buffer(inbound::downloads::MAX_INBOUND_CONCURRENCY)
             .timeout(MAX_INBOUND_RESPONSE_TIME)
-            .service(Inbound::new(
+            .service(Inbound::new_with_pending_blocks(
                 config.sync.full_verify_concurrency_limit,
                 config.network.expose_peer_addresses,
                 zcashd_compat_pruning_retention,
                 zcashd_compat_block_gossip_peer_ips.clone(),
                 setup_rx,
+                pending_blocks.clone(),
             ));
 
         let advertised_services = Self::advertised_services(&config);
@@ -527,6 +559,7 @@ impl StartCmd {
             Some(endpoint) => endpoint.take_header_sync_fatal_events().await,
             None => None,
         };
+        let mut block_sync_fatal_events = None;
 
         // Not added to node_tasks, because it must outlive start() being dropped to shutdown the
         // endpoint
@@ -564,25 +597,32 @@ impl StartCmd {
                     endpoint.block_sync(),
                     endpoint.take_block_sync_actions().await,
                 ) {
+                    let (block_sync_fatal_tx, block_sync_fatal_rx) = mpsc::unbounded_channel();
+                    block_sync_fatal_events = Some(block_sync_fatal_rx);
+                    let block_driver_shutdown = shutdown.clone();
                     let block_driver_task = tokio::spawn(
-                        drive_block_sync_actions(
-                            block_actions,
-                            endpoint.supervisor(),
-                            Some(endpoint.clone()),
-                            block_sync.clone(),
-                            latest_chain_tip.clone(),
-                            read_only_state_service.clone(),
-                            Some(tower::util::BoxCloneService::new(state.clone())),
-                            Some(header_chain_body_evidence.clone()),
-                            block_verifier_router.clone(),
-                            max_checkpoint_height,
-                            config.sync.checkpoint_verify_concurrency_limit,
-                            config.sync.full_verify_concurrency_limit,
-                            config.sync.zakura_block_apply_concurrency_limit,
-                            trace.clone(),
-                            blocksync_throughput_probe.clone(),
-                            zakura_block_sync_handoff.clone(),
-                            shutdown.clone().cancelled_owned(),
+                        supervise_block_sync_driver(
+                            drive_block_sync_actions(
+                                block_actions,
+                                endpoint.supervisor(),
+                                Some(endpoint.clone()),
+                                block_sync.clone(),
+                                latest_chain_tip.clone(),
+                                read_only_state_service.clone(),
+                                Some(tower::util::BoxCloneService::new(state.clone())),
+                                Some(header_chain_body_evidence.clone()),
+                                block_verifier_router.clone(),
+                                max_checkpoint_height,
+                                config.sync.checkpoint_verify_concurrency_limit,
+                                config.sync.full_verify_concurrency_limit,
+                                config.sync.zakura_block_apply_concurrency_limit,
+                                trace.clone(),
+                                blocksync_throughput_probe.clone(),
+                                zakura_block_sync_handoff.clone(),
+                                shutdown.clone().cancelled_owned(),
+                            ),
+                            block_sync_fatal_tx,
+                            block_driver_shutdown,
                         )
                         .in_current_span(),
                     );
@@ -645,7 +685,7 @@ impl StartCmd {
         let submit_block_channel = SubmitBlockChannel::new();
 
         // Launch RPC server
-        let (rpc_impl, mut rpc_tx_queue_handle) = RpcImpl::new(
+        let (rpc_impl, mut rpc_tx_queue_handle) = RpcImpl::new_with_pending_blocks(
             config.network.network.clone(),
             config.mining.clone(),
             config.rpc.debug_force_finished_sync,
@@ -660,11 +700,20 @@ impl StartCmd {
             address_book.clone(),
             LAST_WARN_ERROR_LOG_SENDER.subscribe(),
             Some(submit_block_channel.sender()),
+            pending_blocks,
         );
         node_tasks.track(&rpc_tx_queue_handle);
         let rpc_impl = rpc_impl.with_end_of_support_height(
             sync::end_of_support::end_of_support_height(&config.network.network),
         );
+
+        let node_services = ready.as_ref().map(|_| crate::node::NodeServices {
+            read_state: read_only_state_service.clone(),
+            latest_chain_tip: latest_chain_tip.clone(),
+            chain_tip_change: chain_tip_change.clone(),
+            sync_status: sync_status.clone(),
+            mempool: mempool.clone(),
+        });
 
         let rpc_task_handle = if config.rpc.listen_addr.is_some() {
             RpcServer::start(rpc_impl.clone(), config.rpc.clone())
@@ -674,6 +723,15 @@ impl StartCmd {
             tokio::spawn(std::future::pending().in_current_span())
         };
         node_tasks.track(&rpc_task_handle);
+
+        let admin_rpc_task_handle = if config.rpc.admin_listen_addr.is_some() {
+            RpcServer::start_admin(rpc_impl.clone(), config.rpc.clone())
+                .await
+                .expect("admin server should start")
+        } else {
+            tokio::spawn(std::future::pending().in_current_span())
+        };
+        node_tasks.track(&admin_rpc_task_handle);
 
         let zcashd_compat_shutdown_timeout =
             Self::zcashd_compat_supervisor_shutdown_timeout(&config);
@@ -903,10 +961,15 @@ impl StartCmd {
         // await cleanup. Do not add a yield between the spawn and this marker.
         shutdown_cleanup_required.cancel();
 
+        if let Some((ready, services)) = ready.zip(node_services) {
+            let _ = ready.send(services);
+        }
+
         // TODO: put tasks into an ongoing FuturesUnordered and a startup FuturesUnordered?
 
         // ongoing tasks
         pin!(rpc_task_handle);
+        pin!(admin_rpc_task_handle);
         pin!(indexer_rpc_task_handle);
         pin!(syncer_task_handle);
         pin!(block_gossip_task_handle);
@@ -954,10 +1017,31 @@ impl StartCmd {
                     }
                 },
 
+                block_sync_fatal_event = async {
+                    match block_sync_fatal_events.as_mut() {
+                        Some(events) => events.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => match block_sync_fatal_event {
+                    Some(()) => Self::handle_block_sync_driver_exit(&shutdown),
+                    None => {
+                        block_sync_fatal_events = None;
+                        exit_when_task_finishes = false;
+                        Ok(())
+                    }
+                },
+
                 rpc_join_result = &mut rpc_task_handle => {
                     let rpc_server_result = rpc_join_result
                         .expect("unexpected panic in the rpc task");
                     info!(?rpc_server_result, "rpc task exited");
+                    Ok(())
+                }
+
+                admin_rpc_join_result = &mut admin_rpc_task_handle => {
+                    let admin_rpc_server_result = admin_rpc_join_result
+                        .expect("unexpected panic in the admin rpc task");
+                    info!(?admin_rpc_server_result, "admin rpc task exited");
                     Ok(())
                 }
 
@@ -1073,6 +1157,7 @@ impl StartCmd {
 
         // ongoing tasks
         rpc_task_handle.abort();
+        admin_rpc_task_handle.abort();
         rpc_tx_queue_handle.abort();
         health_task_handle.abort();
         syncer_task_handle.abort();
@@ -1168,6 +1253,13 @@ impl StartCmd {
         Err(eyre!(event))
     }
 
+    fn handle_block_sync_driver_exit(shutdown: &CancellationToken) -> Result<(), Report> {
+        shutdown.cancel();
+        Err(eyre!(
+            "critical Zakura block-sync driver exited unexpectedly"
+        ))
+    }
+
     /// Returns the bound for the state service buffer,
     /// based on the configurations of the services that use the state concurrently.
     fn state_buffer_bound(config: &ZakuradConfig) -> usize {
@@ -1204,6 +1296,7 @@ impl Runnable for StartCmd {
                 self.start(
                     APPLICATION.config(),
                     Vec::new(),
+                    None,
                     shutdown,
                     shutdown_cleanup_required,
                 )
@@ -1274,6 +1367,7 @@ impl config::Override<ZakuradConfig> for StartCmd {
             .map_err(|err| std::io::Error::other(err.to_string()))?;
         Self::validate_debug_blocksync_throughput_config(&config)
             .map_err(|err| std::io::Error::other(err.to_string()))?;
+        config.rpc.validate().map_err(std::io::Error::other)?;
 
         Ok(config)
     }
@@ -1286,7 +1380,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use zakura_chain::block;
 
-    use super::StartCmd;
+    use super::{supervise_block_sync_driver, StartCmd};
     use crate::components::zcashd_compat;
     use crate::config::ZakuradConfig;
     use zakura_network::types::PeerServices;
@@ -1647,6 +1741,73 @@ mod tests {
 
         assert!(shutdown.is_cancelled(), "the node starts normal shutdown");
         assert!(error.to_string().contains("VCT local apply operation"));
+    }
+
+    #[tokio::test]
+    async fn block_sync_driver_exit_returns_an_error_and_starts_shutdown() {
+        let shutdown = CancellationToken::new();
+        let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        supervise_block_sync_driver(async {}, fatal_tx, shutdown.clone()).await;
+        fatal_rx
+            .recv()
+            .await
+            .expect("an unexpected driver exit must notify the node root");
+
+        let error = StartCmd::handle_block_sync_driver_exit(&shutdown)
+            .expect_err("a critical block-sync driver exit must stop the node");
+
+        assert!(shutdown.is_cancelled(), "the node starts normal shutdown");
+        assert!(error.to_string().contains("block-sync driver exited"));
+    }
+
+    #[tokio::test]
+    async fn block_sync_driver_panic_notifies_the_node_root() {
+        let shutdown = CancellationToken::new();
+        let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel();
+        let driver = tokio::spawn(supervise_block_sync_driver(
+            async { panic!("simulated block-sync driver panic") },
+            fatal_tx,
+            shutdown,
+        ));
+
+        fatal_rx
+            .recv()
+            .await
+            .expect("a driver panic must notify the node root");
+        let error = driver
+            .await
+            .expect_err("the simulated driver panic propagates");
+        assert!(error.is_panic(), "the driver task reports a panic");
+    }
+
+    #[tokio::test]
+    async fn unpolled_block_sync_driver_cancellation_notifies_the_node_root() {
+        let shutdown = CancellationToken::new();
+        let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel();
+        let driver = supervise_block_sync_driver(std::future::pending(), fatal_tx, shutdown);
+
+        drop(driver);
+
+        fatal_rx
+            .recv()
+            .await
+            .expect("canceling an unpolled driver must notify the node root");
+    }
+
+    #[tokio::test]
+    async fn requested_shutdown_suppresses_block_sync_driver_fatal_event() {
+        let shutdown = CancellationToken::new();
+        let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel();
+        shutdown.cancel();
+
+        supervise_block_sync_driver(async {}, fatal_tx, shutdown).await;
+
+        assert_eq!(
+            fatal_rx.recv().await,
+            None,
+            "requested shutdown closes the channel without a fatal event",
+        );
     }
 }
 
@@ -3387,6 +3548,130 @@ mod zakura_header_sync_driver_tests {
         let _ = shutdown_tx.send(());
         driver.await.expect("driver task exits cleanly");
         reactor_task.abort();
+    }
+
+    #[tokio::test]
+    async fn block_sync_driver_reports_failed_needed_query_for_retry() {
+        let (action_tx, action_rx) = mpsc::channel(8);
+        let (tip_tx, tip_rx) = watch::channel((block::Height(2), block::Hash([2; 32])));
+        drop(tip_tx);
+        let startup = block_sync_startup_with_snapshot(
+            BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(0),
+                verified_block_hash: block::Hash([0; 32]),
+            },
+            (block::Height(2), block::Hash([2; 32])),
+            tip_rx,
+            zakura_network::zakura::ZakuraBlockSyncConfig::default(),
+        );
+        let (block_sync, mut reactor_actions, reactor_task) =
+            zakura_network::zakura::spawn_block_sync_reactor(startup);
+        let first_query = tokio::time::timeout(Duration::from_secs(1), reactor_actions.recv())
+            .await
+            .expect("startup needed-body query arrives")
+            .expect("reactor action channel stays open");
+        let (first_query_id, first_scope) = match &first_query {
+            BlockSyncAction::QueryNeededBlocks {
+                query_id, scope, ..
+            } => (*query_id, *scope),
+            action => panic!("expected startup needed-body query, got {action:?}"),
+        };
+        let read_state = service_fn(|request: zakura_state::ReadRequest| async move {
+            match request {
+                zakura_state::ReadRequest::MissingBlockBodyMetadata { .. } => {
+                    Err::<zakura_state::ReadResponse, zakura_state::BoxError>(
+                        std::io::Error::other("simulated needed-body query failure").into(),
+                    )
+                }
+                request => panic!("unexpected read request: {request:?}"),
+            }
+        });
+        let (verifier, _commit_rx) = commit_channel_verifier();
+        let (driver, shutdown_tx) = DriverParams::default().spawn(
+            action_rx,
+            block_sync,
+            zakura_chain::chain_tip::NoChainTip,
+            read_state,
+            verifier,
+        );
+
+        action_tx
+            .send(first_query)
+            .await
+            .expect("driver action channel stays open");
+
+        let retry = tokio::time::timeout(Duration::from_secs(1), reactor_actions.recv())
+            .await
+            .expect("failed needed-body query retries")
+            .expect("reactor action channel stays open");
+        assert!(matches!(
+            retry,
+            BlockSyncAction::QueryNeededBlocks {
+                query_id,
+                scope,
+                ..
+            } if query_id != first_query_id && scope == first_scope
+        ));
+
+        let _ = shutdown_tx.send(());
+        driver.await.expect("driver task exits cleanly");
+        reactor_task.abort();
+    }
+
+    #[tokio::test]
+    async fn block_sync_driver_stops_when_needed_query_failure_receiver_closes() {
+        let (action_tx, action_rx) = mpsc::channel(1);
+        let (tip_tx, tip_rx) = watch::channel((block::Height(2), block::Hash([2; 32])));
+        drop(tip_tx);
+        let startup = block_sync_startup_with_snapshot(
+            BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(0),
+                verified_block_hash: block::Hash([0; 32]),
+            },
+            (block::Height(2), block::Hash([2; 32])),
+            tip_rx,
+            zakura_network::zakura::ZakuraBlockSyncConfig::default(),
+        );
+        let (block_sync, mut reactor_actions, reactor_task) =
+            zakura_network::zakura::spawn_block_sync_reactor(startup);
+        let first_query = tokio::time::timeout(Duration::from_secs(1), reactor_actions.recv())
+            .await
+            .expect("startup needed-body query arrives")
+            .expect("reactor action channel stays open");
+        reactor_task.abort();
+        reactor_task
+            .await
+            .expect_err("the test aborts the block-sync reactor");
+
+        let read_state = service_fn(|request: zakura_state::ReadRequest| async move {
+            match request {
+                zakura_state::ReadRequest::MissingBlockBodyMetadata { .. } => {
+                    Err::<zakura_state::ReadResponse, zakura_state::BoxError>(
+                        std::io::Error::other("simulated needed-body query failure").into(),
+                    )
+                }
+                request => panic!("unexpected read request: {request:?}"),
+            }
+        });
+        let (verifier, _commit_rx) = commit_channel_verifier();
+        let (driver, _shutdown_tx) = DriverParams::default().spawn(
+            action_rx,
+            block_sync,
+            zakura_chain::chain_tip::NoChainTip,
+            read_state,
+            verifier,
+        );
+        action_tx
+            .send(first_query)
+            .await
+            .expect("driver action channel stays open");
+
+        tokio::time::timeout(Duration::from_secs(1), driver)
+            .await
+            .expect("closed completion receiver stops the driver")
+            .expect("driver task exits without panicking");
     }
 
     #[tokio::test]

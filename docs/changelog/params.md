@@ -32,6 +32,7 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| VCT busy-supplier retry backoff | `crates/zakura-network/src/zakura/header_sync/scheduler/repair.rs` | no retry in the same episode → 1 s, doubling to 30 s | [#970](https://github.com/zakura-core/zakura/pull/970) | Recover from temporary refusal without requiring chain progress, while bounding repeated requests to each supplier. |
 | `BlockSyncService::stream_write_policy` (data) | `crates/zakura-network/src/zakura/block_sync/service.rs` | `10 s` → `32 s` | [#945](https://github.com/zakura-core/zakura/pull/945) | Allow healthy block-data writes to wait for shared connection credit on lossy links with a paused service. |
 | `DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW` | `crates/zakura-network/src/zakura/handler.rs` | `32 MiB` → `16 MiB` | [#943](https://github.com/zakura-core/zakura/pull/943) | Leave connection receive credit for another service while one stream's application reads are paused. |
 | `get_blocks_regulation.*` defaults | `crates/zakura-network/src/zakura/block_sync/config.rs` | new → one response per authenticated identity; `64` per node | [#892](https://github.com/zakura-core/zakura/pull/892) | Hold capacity through storage jobs, results, and application writes, including across reconnects. |

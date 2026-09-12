@@ -84,6 +84,7 @@ where
         self.0.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn elts_count(&self) -> T {
         self.0.iter().map(|r| r.end - r.start).sum()
     }

@@ -28,7 +28,9 @@
         "src/connection/streams/recv.rs",
         "src/connection/streams/send.rs",
         "src/connection/streams/state.rs",
-        "src/tests/mod.rs"
+        "src/range_set/array_range_set.rs",
+        "src/tests/mod.rs",
+        "src/tests/multipath.rs"
       ],
       "added_files": []
     },

@@ -493,9 +493,9 @@ impl QuicTransportConfigBuilder {
     /// Setting this to any nonzero value will enable the Multipath Extension for QUIC,
     /// <https://datatracker.ietf.org/doc/draft-ietf-quic-multipath/>.
     ///
-    /// The value provided specifies the number maximum number of paths this endpoint may open
-    /// concurrently when multipath is negotiated. For any path to be opened, the remote must
-    /// enable multipath as well.
+    /// The value bounds retained path state and unused path authorization together.
+    /// Closing paths remain charged until their protocol state is discarded after draining.
+    /// For any path to be opened, the remote must enable multipath as well.
     ///
     /// Note: this method will ignore values less than the recommended 13 and will log a warning.
     pub fn max_concurrent_multipath_paths(mut self, max_concurrent: u32) -> Self {

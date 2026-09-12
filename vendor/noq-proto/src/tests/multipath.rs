@@ -1592,6 +1592,107 @@ fn new_identifiers_after_abandon_does_not_panic() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn retiring_paths_keep_capacity_until_protocol_state_is_discarded() -> TestResult {
+    for closing_side in [Client, Server] {
+        retiring_path_capacity(closing_side, false)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn retiring_paths_respect_a_reduced_capacity_after_cleanup() -> TestResult {
+    for closing_side in [Client, Server] {
+        retiring_path_capacity(closing_side, true)?;
+    }
+    Ok(())
+}
+
+fn retiring_path_capacity(closing_side: crate::Side, shrink: bool) -> TestResult {
+    let _guard = subscribe();
+    let mut config = TransportConfig::default();
+    config.max_concurrent_multipath_paths(MAX_PATHS);
+    let mut pair = ConnPair::builder()
+        .with_transport_cfg(config)
+        .with_latency(Duration::ZERO)
+        .connect();
+    let network_path = FourTuple::from_remote(pair.routes.public_server_addr());
+    let path1 = pair.open_path(Client, network_path, PathStatus::Available)?;
+    let path2 = pair.open_path(Client, network_path, PathStatus::Available)?;
+    pair.drive();
+    for side in [Client, Server] {
+        assert_eq!(pair.paths(side).len(), 3);
+        if shrink {
+            pair.set_max_concurrent_paths(side, 1)?;
+        }
+    }
+
+    pair.close_path(closing_side, path1, 0u8.into())?;
+    pair.close_path(closing_side, path2, 0u8.into())?;
+    // Deliver close messages and their replies without advancing the drain timer.
+    for _ in 0..8 {
+        pair.drive_client();
+        pair.drive_server();
+    }
+    for side in [Client, Server] {
+        assert_eq!(pair.stats(side).frame_rx.path_abandon, 2);
+        assert_eq!(pair.paths(side).len(), 3, "old path state remains retained");
+        // Reapplying the configuration must not bypass retained-state accounting.
+        pair.set_max_concurrent_paths(side, if shrink { 1 } else { MAX_PATHS })?;
+        assert_eq!(
+            pair.stats(side).frame_tx.max_path_id,
+            0,
+            "replacement credit must wait for cleanup"
+        );
+    }
+    assert_matches!(
+        pair.open_path(Client, network_path, PathStatus::Available),
+        Err(crate::PathError::MaxPathIdReached)
+    );
+    transfer_while_paths_are_retained(&mut pair, b"during cleanup")?;
+    for side in [Client, Server] {
+        assert_eq!(pair.paths(side).len(), 3);
+    }
+
+    pair.drive();
+    for side in [Client, Server] {
+        assert_eq!(pair.paths(side), vec![PathId::ZERO]);
+        assert!(!pair.is_closed(side));
+    }
+    if shrink {
+        assert_matches!(
+            pair.open_path(Client, network_path, PathStatus::Available),
+            Err(crate::PathError::MaxPathIdReached)
+        );
+        for side in [Client, Server] {
+            pair.set_max_concurrent_paths(side, 2)?;
+        }
+        pair.drive();
+    }
+    let replacement = pair.open_path(Client, network_path, PathStatus::Available)?;
+    assert_eq!(replacement, PathId::from(3u8));
+    pair.drive();
+
+    transfer_while_paths_are_retained(&mut pair, b"after cleanup")?;
+    Ok(())
+}
+
+fn transfer_while_paths_are_retained(pair: &mut ConnPair, message: &[u8]) -> TestResult {
+    let stream = pair.streams(Client).open(Dir::Uni).unwrap();
+    pair.send_stream(Client, stream).write(message)?;
+    pair.send_stream(Client, stream).finish()?;
+    for _ in 0..8 {
+        pair.drive_client();
+        pair.drive_server();
+    }
+    let mut recv = pair.recv_stream(Server, stream);
+    let mut chunks = recv.read(true)?;
+    assert_eq!(chunks.next(usize::MAX)?.unwrap().bytes, message);
+    assert!(chunks.next(usize::MAX)?.is_none());
+    let _ = chunks.finalize();
+    Ok(())
+}
+
 /// Ported from picoquic `multipath_test_ab1`. Abandon + reopen cycle, 3 rounds.
 #[test]
 fn abandon_cycle() -> TestResult {

@@ -262,7 +262,7 @@ pub struct Connection {
 
     //
     // Multipath
-    /// Maximum number of concurrent paths
+    /// Maximum number of paths with retained state or unused authorization
     ///
     /// Initially set from the [`TransportConfig::max_concurrent_multipath_paths`]. Even
     /// when multipath is disabled this will be set to 1, it is not used in that case
@@ -301,6 +301,8 @@ pub struct Connection {
     /// [`Connection::local_cid_state`] since some of this has to be kept around for some
     /// time after a path is abandoned.
     abandoned_paths: AbandonedPaths,
+    /// Paths whose protocol state has been discarded and whose capacity can be reused.
+    discarded_path_count: u64,
 
     /// State for n0's (<https://n0.computer>) nat traversal protocol.
     n0_nat_traversal: n0_nat_traversal::State,
@@ -431,6 +433,7 @@ impl Connection {
             remote_max_path_id: PathId::ZERO,
             max_path_id_with_cids: PathId::ZERO,
             abandoned_paths: Default::default(),
+            discarded_path_count: 0,
 
             n0_nat_traversal: Default::default(),
             qlog,
@@ -2838,10 +2841,11 @@ impl Connection {
         self.streams.queue_max_stream_id(pending);
     }
 
-    /// Modify the number of open paths allowed when multipath is enabled
+    /// Modify the number of retained or authorized paths allowed when multipath is enabled
     ///
     /// When reducing the number of concurrent paths this will only affect delaying sending
-    /// new MAX_PATH_ID frames until fewer than this number of paths are possible.  To
+    /// new MAX_PATH_ID frames until fewer than this number of paths are possible. Closing
+    /// paths retain their capacity until their protocol state is discarded. To
     /// actively reduce paths they must be closed using [`Connection::close_path`], which
     /// can also be used to close not-yet-opened paths.
     ///
@@ -2856,18 +2860,23 @@ impl Connection {
             return Err(MultipathNotNegotiated { _private: () });
         }
         self.max_concurrent_paths = count;
-
-        let in_use_count = self
-            .local_max_path_id
-            .next()
-            .saturating_sub(self.abandoned_paths.len())
-            .as_u32();
-        let extra_needed = count.get().saturating_sub(in_use_count);
-        let new_max_path_id = self.local_max_path_id.saturating_add(extra_needed);
-
-        self.set_max_path_id(now, new_max_path_id);
+        self.issue_available_path_ids(now);
 
         Ok(())
+    }
+
+    /// Refresh path authorization while counting all retained protocol state.
+    fn issue_available_path_ids(&mut self, now: Instant) {
+        // Every u32 path ID, including zero, contributes one authorized slot.
+        let authorized = u64::from(self.local_max_path_id.as_u32()) + 1;
+        let retained_or_available = authorized
+            .checked_sub(self.discarded_path_count)
+            .expect("discarded paths were previously authorized");
+        let extra =
+            u64::from(self.max_concurrent_paths.get()).saturating_sub(retained_or_available);
+        let extra =
+            u32::try_from(extra).expect("additional paths cannot exceed the configured u32 count");
+        self.set_max_path_id(now, self.local_max_path_id.saturating_add(extra));
     }
 
     /// If needed, issues a new MAX_PATH_ID frame and new CIDs for any newly allowed paths
@@ -3449,6 +3458,8 @@ impl Connection {
         self.partial_stats += path_stats;
         self.paths.remove(&path_id);
         self.spaces[SpaceId::Data].number_spaces.remove(&path_id);
+        self.discarded_path_count += 1; // Each unique u32 path ID is discarded at most once.
+        self.issue_available_path_ids(now);
 
         self.events.push_back(
             PathEvent::Discarded {
@@ -5379,8 +5390,6 @@ impl Connection {
                             now + 3 * pto,
                             self.qlog.with_time(now),
                         );
-
-                        self.set_max_path_id(now, self.local_max_path_id.saturating_add(1u8));
                     }
                 }
                 Frame::PathStatusAvailable(info) => {
@@ -6709,6 +6718,10 @@ impl Connection {
             // multipath is enabled, register the local and remote maximums
             self.local_max_path_id = local_max_path_id;
             self.remote_max_path_id = remote_max_path_id;
+            self.max_concurrent_paths = self
+                .config
+                .max_concurrent_multipath_paths
+                .expect("multipath was negotiated from the configured path count");
             let initial_max_path_id = local_max_path_id.min(remote_max_path_id);
             debug!(%initial_max_path_id, "multipath negotiated");
             multipath_enabled = true;
@@ -7235,7 +7248,7 @@ struct AbandonedPaths(ArrayRangeSet<ABANDONED_PATH_INLINE_RANGES, u32>);
 const ABANDONED_PATH_INLINE_RANGES: usize = 16;
 
 impl AbandonedPaths {
-    /// The number of abandoned paths.
+    #[cfg(test)]
     fn len(&self) -> u32 {
         self.0.elts_count()
     }

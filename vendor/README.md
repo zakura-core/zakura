@@ -44,6 +44,13 @@ as well as occupied records, so a record count alone is insufficient. Exhausting
 this local limit terminates the connection before inserting another record and
 discards any unfinished transmit batch. Native defaults do not yet enable it.
 
+The multipath limit includes closing paths and unused path IDs already granted
+to the peer. Replacement IDs are issued only after old protocol state is
+discarded. Reducing the configured count delays replacement grants until the
+retained state fits the new limit. This preserves the drain interval required
+for reordered packets while bounding overlapping path state. It applies to the
+native endpoint's existing multipath configuration.
+
 This is work in progress. The node memory envelope, metadata and buffer allocation
 allowances, production window policy and final qualification remain incomplete.
 The patch is not evidence of production compliance.

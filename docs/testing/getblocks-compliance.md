@@ -17,6 +17,54 @@ older layout text.
 
 ## Compliance branch results
 
+The September 12 transport changes enable 16 remote and 17 local bidirectional
+streams, 256 KiB receive credit per stream and 9.5 MiB per connection. Finite
+fragment, packet-history and send-range limits are enabled. Received fragments
+and compacted runs own independent backing allocations. The shared policy
+applies to every native message.
+
+At combined property revision `d594451d2`, including compliance `13bd5044f`,
+local Rust 1.97.0 checks report:
+
+| Profile | Result |
+| --- | --- |
+| Compliance, 64 cases and four load rounds | 104 passed |
+| Fixed regressions, same bounded settings | 473 passed |
+| Properties, 2,048 cases and seed 896 | 49 assertions passed, two output-handle closure flags |
+| Transport dependency, 2,048 cases and seed 896 | 447 passed |
+
+Both T02 witnesses pass. The ordinary native regression fills 32 sibling stream
+windows with acknowledged unread bytes, transfers 19 MiB through the remaining
+stream, and drains the original streams without reconnecting. No retries or
+timeout-policy changes were used. Nextest classified
+`cancelled_burst_recovers_after_all_owners_finish` and
+`get_blocks_admission_waiters_match_shared_model` as leaky despite passing
+assertions. Their output-handle closure cause remains unresolved. These flags
+are not heap-allocation measurements.
+
+These results do not establish a node-wide transport memory bound. Endpoint
+identity mappings currently survive connection and actor cleanup, and idle remote
+actors retain separate state. The [capacity model][capacity] records those
+lifetimes, pending control and packet metadata, receive batching, and the
+allocation evidence needed before assigning a node-wide byte budget. Optimized
+five-sample throughput comparisons, complete node memory qualification, 64-round
+load and remaining subscription publisher contracts are still outstanding.
+
+The earlier regression run at `df4053278` passed 469 tests and failed four.
+Those fixtures assumed the former 16 MiB stream window, queued a complete
+32,000-request burst before starting independent work, or required a default
+connection stall that the new policy prevents. The updated pressure fixture
+continues offering the same bounded burst while the independent download runs.
+It waits for the burst to finish queuing or for stable queue backpressure before
+starting the download, then aborts and joins any pending producer after completion.
+The recovery fixture explicitly uses the former 16/32 MiB credit configuration
+and retains its no-body-before-resumption assertion. Production T02 and full
+occupancy use the enabled native settings.
+
+[capacity]: ../design/native-transport-capacity.md
+
+### Earlier September 11 baseline
+
 On 2026-09-11, property code revision `6f1ba00ad` includes compliance
 implementation `af5fa24a2` from [#971](https://github.com/zakura-core/zakura/pull/971).
 Local Rust 1.97.0 runs use seed 896. Compliance and fixed regressions use 64
@@ -39,8 +87,8 @@ selection passes, including 2,048 cases for the generated allocation check.
 Clippy passes with warnings denied. The full profile results above precede that
 test-helper move.
 
-The failing witness in compliance and fixed regressions is T02 with two paused sibling
-streams. Their occupied receive windows still prevent the independent service
+At that earlier revision, the failing witness in compliance and fixed regressions
+was T02 with two paused sibling streams. Their occupied receive windows prevented the independent service
 frame from arriving before resumption. T01 now completes both directions and
 consumes all endings after worker and output pressure. Real checkpoint-verifier,
 storage ownership, allocation, and current bounded-load controls pass.

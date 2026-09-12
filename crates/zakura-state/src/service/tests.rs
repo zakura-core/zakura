@@ -1326,6 +1326,64 @@ async fn poll_ready_hands_off_at_max_checkpoint_height() -> Result<()> {
     Ok(())
 }
 
+/// Tip reconciliation must release children queued before the final checkpoint became durable.
+#[tokio::test(flavor = "multi_thread")]
+async fn checkpoint_tip_handoff_drains_waiting_children() -> Result<()> {
+    use color_eyre::eyre::eyre;
+    use tower::Service;
+
+    let _init_guard = zakura_test::init();
+    let blocks: Vec<Arc<Block>> = zakura_test::vectors::MAINNET_BLOCKS
+        .range(0..=2)
+        .map(|(_, bytes)| bytes.zcash_deserialize_into::<Arc<Block>>().unwrap())
+        .collect();
+    let (mut state, _read, _tip, _tip_change) =
+        StateService::new(Config::ephemeral(), &Network::Mainnet, Height(1), 0)
+            .await
+            .expect("ephemeral state opens");
+    state
+        .queue_and_commit_to_finalized_state(blocks[0].clone().into())
+        .await??;
+    state
+        .call(Request::Tip)
+        .await
+        .map_err(|error| eyre!(error))?;
+    assert!(
+        state.block_write_sender.finalized.is_some(),
+        "an intermediate checkpoint cannot hand off"
+    );
+
+    // Exercise the internal writer queue with the small historical vectors. Production consensus
+    // submits semantic blocks after Canopy; this test only checks their release to the writer.
+    let _child = state.queue_and_commit_to_non_finalized_state(blocks[2].clone().prepare(), None);
+    state
+        .queue_and_commit_to_finalized_state(blocks[1].clone().into())
+        .await??;
+    assert!(state
+        .non_finalized_state_queued_blocks
+        .has_queued_children(blocks[1].hash()));
+    assert!(state.block_write_sender.finalized.is_some());
+
+    // Deliberately call without poll_ready: the Tip request itself owns this guarantee.
+    state
+        .call(Request::Tip)
+        .await
+        .map_err(|error| eyre!(error))?;
+    assert!(state.block_write_sender.finalized.is_none());
+    assert!(!state
+        .non_finalized_state_queued_blocks
+        .has_queued_children(blocks[1].hash()));
+    state
+        .call(Request::Tip)
+        .await
+        .map_err(|error| eyre!(error))?;
+    assert!(
+        state.block_write_sender.finalized.is_none(),
+        "reconciliation is idempotent"
+    );
+    Ok(())
+}
+
 /// Legacy-only nodes must preserve the ordinary state handoff without creating or
 /// reconstructing the native header runtime.
 #[tokio::test(flavor = "multi_thread")]

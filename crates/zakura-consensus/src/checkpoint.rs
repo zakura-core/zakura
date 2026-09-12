@@ -1261,6 +1261,12 @@ where
         // we don't reject the entire checkpoint.
         // Instead, we reset the verifier to the successfully committed state tip.
         let state_service = self.state_service.clone();
+        // Notify at checkpoint boundaries, including the mandatory checkpoint when optional
+        // checkpoint sync is disabled. State owns the configured handoff height.
+        let handoff_state = self
+            .checkpoint_list
+            .contains(req_block.block.height)
+            .then(|| self.state_service.clone());
         let recovery_state = self.state_service.clone();
         let reset_sender = self.reset_sender.clone();
         let network = self.network.clone();
@@ -1298,6 +1304,26 @@ where
                 {
                     zs::Response::Committed(committed_hash) => {
                         assert_eq!(committed_hash, hash, "state must commit correct hash");
+                        if let Some(state) = handoff_state {
+                            // Retain the notification even if its response times out. A delayed
+                            // buffer worker must still reconcile the already-durable checkpoint.
+                            let reconcile_tip = tokio::spawn(async move {
+                                let response = state
+                                    .oneshot(zs::Request::Tip)
+                                    .await
+                                    .map_err(VerifyCheckpointError::Tip)?;
+                                assert!(
+                                    matches!(response, zs::Response::Tip(_)),
+                                    "state must respond with the reconciled tip"
+                                );
+                                metrics::counter!("checkpoint.state_tip_reconciled").increment(1);
+                                Ok::<(), VerifyCheckpointError>(())
+                            });
+                            tokio::time::timeout(std::time::Duration::from_secs(30), reconcile_tip)
+                                .await
+                                .map_err(|error| VerifyCheckpointError::Tip(error.into()))?
+                                .expect("retained state tip task must preserve state invariants")?;
+                        }
                         Ok(hash)
                     }
                     _ => unreachable!("wrong response for CommitCheckpointVerifiedBlock"),

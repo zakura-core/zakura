@@ -1,5 +1,15 @@
 use super::*;
 
+impl ResponseScope {
+    pub(crate) fn new(connection_cancel: CancellationToken, cause: CloseCause) -> Self {
+        Self::with_memory(
+            connection_cancel,
+            cause,
+            crate::zakura::regulation::ResponseMemory::default().connection(),
+        )
+    }
+}
+
 impl ResponseAuthorization {
     /// Counter/window fixtures do not publish writes. Writer tests use a real scope.
     pub(crate) fn for_test() -> Self {
@@ -20,7 +30,10 @@ fn retirement_fences_prepared_and_queued_writes_without_closing() {
             assert!(permission.publish(|| {}));
         }
         assert!(scope.retire());
-        assert!(scope.authorize().is_none());
+        assert_eq!(
+            scope.authorize().unwrap_err(),
+            ResponseAdmissionError::Retired
+        );
         assert!(!permission.publish(|| panic!("a retired receiver cannot publish")));
         assert!(!permission.try_start(|| panic!("a retired receiver cannot start")));
         drop(authorization);
@@ -137,6 +150,9 @@ fn publication_is_complete_before_retirement_returns() {
     release_tx.send(()).unwrap();
     publisher.join().unwrap();
     let scope = retirement.join().unwrap();
-    assert!(scope.authorize().is_none());
+    assert_eq!(
+        scope.authorize().unwrap_err(),
+        ResponseAdmissionError::Retired
+    );
     assert!(!authorization.write_permission().try_start(|| true));
 }

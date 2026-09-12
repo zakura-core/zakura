@@ -6907,6 +6907,7 @@ async fn assert_pending_block_validation_cancellation(exit: PendingValidationExi
         streams,
         connection_cancel.clone(),
         CloseCause::new(),
+        crate::zakura::regulation::ResponseMemory::default().connection(),
     );
     if matches!(exit, PendingValidationExit::StartupFailure) {
         inbound_tx

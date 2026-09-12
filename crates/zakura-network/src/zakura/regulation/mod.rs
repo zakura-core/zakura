@@ -20,7 +20,12 @@ mod response;
 pub(crate) use response::ResponseCredit;
 
 mod response_scope;
-pub(crate) use response_scope::{ResponseAuthorization, ResponseScope, ResponseWritePermission};
+pub(crate) use response_scope::{
+    ResponseAdmissionError, ResponseAuthorization, ResponseScope, ResponseWritePermission,
+};
+
+mod response_memory;
+pub(crate) use response_memory::{ConnectionResponseMemory, ResponseMemory};
 
 #[cfg(test)]
 mod tests;

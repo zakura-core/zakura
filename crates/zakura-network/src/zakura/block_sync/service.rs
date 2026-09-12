@@ -12,7 +12,9 @@ use std::{
 use tokio::sync::Notify;
 
 mod sessions;
-use crate::zakura::regulation::{ResponseAuthorization, ResponseScope};
+use crate::zakura::regulation::{
+    ConnectionResponseMemory, ResponseAdmissionError, ResponseAuthorization, ResponseScope,
+};
 pub(super) use sessions::CurrentSessions;
 use sessions::SessionCapacity;
 
@@ -75,6 +77,7 @@ impl BlockSyncPeerSession {
         requests: FramedSend,
         connection_cancel: CancellationToken,
         close_cause: crate::zakura::CloseCause,
+        response_memory: ConnectionResponseMemory,
     ) -> Self {
         Self {
             peer_id: session.peer_id().clone(),
@@ -84,7 +87,11 @@ impl BlockSyncPeerSession {
             requests,
             remote_status: watch::channel(false).0,
             cancel_token: session.cancel_token(),
-            response_scope: ResponseScope::new(connection_cancel.clone(), close_cause.clone()),
+            response_scope: ResponseScope::with_memory(
+                connection_cancel.clone(),
+                close_cause.clone(),
+                response_memory,
+            ),
             connection_cancel,
             close_cause,
             reactor_ready: Arc::new(Notify::new()),
@@ -155,8 +162,14 @@ impl BlockSyncPeerSession {
         self.cancel_token.cancel();
     }
 
-    pub(super) fn authorize_response(&self) -> Option<ResponseAuthorization> {
+    pub(super) fn authorize_response(
+        &self,
+    ) -> Result<ResponseAuthorization, ResponseAdmissionError> {
         self.response_scope.authorize()
+    }
+
+    pub(super) fn response_memory(&self) -> ConnectionResponseMemory {
+        self.response_scope.memory()
     }
 
     #[cfg(test)]
@@ -732,6 +745,7 @@ impl Service for BlockSyncService {
                 request_sender,
                 connection_cancel_token.clone(),
                 close_cause.clone(),
+                peer.response_memory(),
             );
             let old_record = active_peers.insert(
                 peer_id.clone(),

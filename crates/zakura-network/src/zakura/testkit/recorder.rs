@@ -223,6 +223,7 @@ mod tests {
             HashMap::from([(crate::zakura::ZAKURA_STREAM_GOSSIP, stream)]),
             cancel_token,
             crate::zakura::CloseCause::new(),
+            crate::zakura::regulation::ResponseMemory::default().connection(),
         );
         (peer, peer_send)
     }

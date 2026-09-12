@@ -104,6 +104,19 @@ fn check_request_metadata(count: usize) -> Result<(), proptest::test_runner::Tes
     prop_assert_eq!(memory.reserved_for_test(), funded);
     prop_assert!(!status.was_skipped());
     drop(status);
-    prop_assert_eq!(memory.reserved_for_test(), 0);
+    prop_assert_eq!(
+        memory.reserved_for_test(),
+        ResponseMemory::setup_bytes_for_test() + ResponseScope::setup_bytes_for_test()
+    );
+    drop(scope);
+    prop_assert_eq!(
+        memory.reserved_for_test(),
+        ResponseMemory::setup_bytes_for_test()
+    );
+    drop(memory);
+    prop_assert_eq!(
+        node.reserved_for_test(),
+        ResponseMemory::node_setup_bytes_for_test()
+    );
     Ok(())
 }

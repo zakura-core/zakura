@@ -10,11 +10,12 @@
 //! # Thread counts
 //!
 //! Rayon's global pool and the Tokio runtime are both process-global, so a thread-count
-//! sweep needs one process per point. Both are read from the environment rather than
-//! baked into the case table:
+//! sweep needs one process per point. The Rayon pool, Tokio worker pool, and Tokio blocking
+//! pool read their sizes from the environment rather than the case table:
 //!
 //! ```sh
-//! ZAKURA_BENCH_RAYON_THREADS=1 cargo bench -p zakura-consensus --bench worst_case_tx_verification
+//! ZAKURA_BENCH_RAYON_THREADS=1 ZAKURA_BENCH_TOKIO_BLOCKING_THREADS=1 \
+//!     cargo bench -p zakura-consensus --bench worst_case_tx_verification
 //! ```
 //!
 //! This matters here specifically: all Zakura proof verification runs on the global rayon
@@ -86,6 +87,8 @@ const DEFAULT_BENCH_THREADS: usize = 4;
 
 const RAYON_THREADS_VAR: &str = "ZAKURA_BENCH_RAYON_THREADS";
 const TOKIO_THREADS_VAR: &str = "ZAKURA_BENCH_TOKIO_THREADS";
+const TOKIO_BLOCKING_THREADS_VAR: &str = "ZAKURA_BENCH_TOKIO_BLOCKING_THREADS";
+const WARM_CACHES_VAR: &str = "ZAKURA_BENCH_WARM_CACHES";
 
 const BENCHMARK_CASES: &[BenchmarkCase] = &[
     BenchmarkCase {
@@ -242,6 +245,7 @@ impl Service<zs::Request> for BenchmarkState {
 
 fn worst_case_tx_verification(c: &mut Criterion) {
     init_rayon(rayon_threads());
+    let warm_caches = std::env::var_os(WARM_CACHES_VAR).is_some();
 
     let (candidates, load_stats) = load_mainnet_candidates();
     println!(
@@ -258,6 +262,7 @@ fn worst_case_tx_verification(c: &mut Criterion) {
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(tokio_worker_threads())
+        .max_blocking_threads(tokio_blocking_threads())
         .enable_all()
         .build()
         .expect("tokio runtime should build for the benchmark");
@@ -277,20 +282,27 @@ fn worst_case_tx_verification(c: &mut Criterion) {
 
         let mut sample_seconds = Vec::new();
 
+        let benchmark_group = if warm_caches {
+            "tx_verifier_repeated_workload_warm_caches"
+        } else {
+            "tx_verifier_repeated_workload"
+        };
+
         c.bench_with_input(
-            BenchmarkId::new("tx_verifier_repeated_workload", case.name),
+            BenchmarkId::new(benchmark_group, case.name),
             &workload.requests,
             |b, requests| {
                 b.iter_custom(|iterations| {
                     let start = Instant::now();
 
                     for _ in 0..iterations {
-                        // Every iteration replays the same workload, and every shielded bundle
-                        // verified once is remembered process-wide. Without this the first
-                        // iteration measures verification and the rest measure cache hits — the
-                        // opposite of the worst case these numbers size the block limits
-                        // against, which is a block of transactions the node has never seen.
-                        clear_shielded_verification_caches();
+                        // The default mode clears process-wide verification caches because the
+                        // worst case is a block of transactions the node has never seen. The
+                        // opt-in warm mode measures the production block path after the mempool
+                        // has verified each shielded bundle.
+                        if !warm_caches {
+                            clear_shielded_verification_caches();
+                        }
 
                         let verified = runtime.block_on(async {
                             let verifier =
@@ -329,6 +341,11 @@ fn rayon_threads() -> usize {
 /// from it, so a sweep should usually move both together.
 fn tokio_worker_threads() -> usize {
     env_threads(TOKIO_THREADS_VAR)
+}
+
+/// Tokio blocking-pool limit. Transaction parser construction runs on this pool.
+fn tokio_blocking_threads() -> usize {
+    env_threads(TOKIO_BLOCKING_THREADS_VAR)
 }
 
 /// Reads a thread count from the environment, falling back to [`DEFAULT_BENCH_THREADS`].
@@ -733,7 +750,7 @@ fn print_workload_metadata(case: &BenchmarkCase, workload: &Workload) {
     let stats = &workload.stats;
 
     println!(
-        "worst_case_tx_verification: case={} mode=tx verifier repeated workload target_block_bytes={} actual_block_bytes={} actual_tx_bytes={} block_fill_percent={:.2} block_bytes_remaining={} actual_shielded_pool_actions={} actual_global_shielded_budget={} unique_txs={} repeated_txs={} rayon_threads={} tokio_worker_threads={} transparent_prevouts_allowed={}",
+        "worst_case_tx_verification: case={} mode=tx verifier repeated workload target_block_bytes={} actual_block_bytes={} actual_tx_bytes={} block_fill_percent={:.2} block_bytes_remaining={} actual_shielded_pool_actions={} actual_global_shielded_budget={} unique_txs={} repeated_txs={} rayon_threads={} tokio_worker_threads={} tokio_blocking_threads={} transparent_prevouts_allowed={}",
         case.name,
         max_block_bytes(),
         stats.modeled_block_bytes,
@@ -746,6 +763,7 @@ fn print_workload_metadata(case: &BenchmarkCase, workload: &Workload) {
         stats.repeated_transactions,
         rayon_threads(),
         tokio_worker_threads(),
+        tokio_blocking_threads(),
         ALLOW_TRANSPARENT_PREVOUTS_WITHOUT_UTXOS,
     );
     println!(

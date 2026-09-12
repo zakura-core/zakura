@@ -3,6 +3,8 @@
 
 use super::*;
 
+mod transport_windows;
+
 // The initial download precedes twenty session replacements.
 const REOPEN_DOWNLOAD_ROUNDS: u32 = 21;
 

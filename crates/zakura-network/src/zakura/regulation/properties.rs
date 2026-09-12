@@ -3,6 +3,8 @@
 use super::*;
 use proptest::prelude::*;
 
+mod response_lifecycle;
+
 proptest! {
     #[test]
     fn slot_histories_bound_owned_work(

@@ -129,7 +129,7 @@ pub use service::read::{
 };
 pub use service::{
     finalized_state::{DiskWriteBatch, FallibleDiskValue, FromDisk, IntoDisk, WriteDisk, ZakuraDb},
-    ReadStateService, VctRootRepairState, VctRootRepairStatus,
+    OwnedBlockRange, ReadStateService, VctRootRepairState, VctRootRepairStatus,
 };
 
 // Allow use in external tests

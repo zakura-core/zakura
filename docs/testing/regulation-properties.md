@@ -41,6 +41,18 @@ The fixed service regressions separately exercise the real GetBlocks request que
 including a write paused after its first claim and replacement on a new connection.
 Discovery response and future subscription adapters remain to be added.
 
+Requester metadata histories share the production node pool across four connection
+contexts. An independent model sums live allocation owners after every reserve,
+release, and context clone. Fixed tests measure the actual authorization allocation,
+check admission before allocation, and retain writer handles after owner Drop.
+Production transport tests cover service fanout and session replacement. Receiver
+tests hold the pool full for a simulated minute, then release another connection's
+owner and require progress without a peer fault. The current production charge
+covers the authorization's shared allocation, including inline phase storage.
+The first-use allocation witness remains red on macOS because scope and
+cancellation locks allocate additional storage. Expected hashes, request-write
+allocations, and retained container capacity also need funding.
+
 ## GetBlocks coverage
 
 | Boundary | Generated checks | Production path |

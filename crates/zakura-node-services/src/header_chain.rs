@@ -91,7 +91,7 @@ pub struct RetainedHeaderPath {
     pub common_ancestor: Frontier,
     /// Exact retained target.
     pub target: Frontier,
-    /// Exact generation and branch fixed at acquisition.
+    /// Original request scope, retained for correlation across local head updates.
     pub scope: HeaderWorkAuthority,
 }
 
@@ -195,7 +195,7 @@ pub struct RetainedHeaderPathPage {
     pub common_ancestor: Frontier,
     /// Exact retained target.
     pub target: Frontier,
-    /// Exact generation and branch fixed at acquisition.
+    /// Original request scope, retained for correlation across local head updates.
     pub scope: HeaderWorkAuthority,
     /// Canonical headers in parent-first order.
     pub headers: Vec<Arc<block::Header>>,

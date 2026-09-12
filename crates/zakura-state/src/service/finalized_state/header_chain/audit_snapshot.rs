@@ -1,8 +1,8 @@
-//! Coherent, bounded RocksDB views used by startup recovery audits.
+//! Coherent, bounded RocksDB views used by audits and header serving.
 
 use super::*;
 
-/// One RocksDB snapshot retained for a complete header-chain startup audit.
+/// One RocksDB snapshot retained for a bounded read or a header-chain startup audit.
 pub struct HeaderChainAuditSnapshot<'a> {
     store: &'a HeaderChainStore,
     snapshot: rocksdb::SnapshotWithThreadMode<'a, rocksdb::DB>,
@@ -22,6 +22,117 @@ impl HeaderChainAuditSnapshot<'_> {
                 V::decode(&value).map_err(|_| StoreError::Incoherent("invalid durable value"))
             })
             .transpose()
+    }
+
+    pub(super) fn get_legacy<C, K, V>(
+        &self,
+        cf: &C,
+        key: &K,
+    ) -> Result<Option<V>, HeaderChainStoreError>
+    where
+        C: rocksdb::AsColumnFamilyRef,
+        K: IntoDisk,
+        V: FromDisk,
+    {
+        self.snapshot
+            .get_cf(cf, key.as_bytes())
+            .map(|value| value.map(V::from_bytes))
+            .map_err(|_| StoreError::Unavailable("header path snapshot read failed").into())
+    }
+
+    pub(super) fn retained_path_node(
+        &self,
+        hash: block::Hash,
+    ) -> Result<Option<HeaderNodeDisk>, HeaderChainStoreError> {
+        let Some(node) = self.get_value::<HeaderNodeDisk>(HEADER_NODE_BY_HASH, hash.0)? else {
+            return Ok(None);
+        };
+        if node.hash != hash
+            || node.header.hash() != hash
+            || node.header.previous_block_hash != node.parent_hash
+        {
+            return Err(HeaderChainStoreError::Incoherent(
+                "retained path node key and header fields disagree",
+            ));
+        }
+        Ok(Some(node))
+    }
+
+    pub(super) fn finalized_frontier(
+        &self,
+        hash: block::Hash,
+    ) -> Result<Option<Frontier>, HeaderChainStoreError> {
+        let height_by_hash = self.store.cf("height_by_hash")?;
+        let height: Option<block::Height> = self.get_legacy(&height_by_hash, &hash)?;
+        let Some(height) = height else {
+            return Ok(None);
+        };
+        let hash_by_height = self.store.cf("hash_by_height")?;
+        let canonical_hash: Option<block::Hash> = self.get_legacy(&hash_by_height, &height)?;
+        if canonical_hash != Some(hash) {
+            return Err(StoreError::Incoherent("finalized height/hash indexes disagree").into());
+        }
+        Ok(Some(Frontier::new(height, hash)))
+    }
+
+    pub(super) fn finalized_header(
+        &self,
+        frontier: Frontier,
+    ) -> Result<Arc<block::Header>, HeaderChainStoreError> {
+        let block_header_by_height = self.store.cf("block_header_by_height")?;
+        let header: Option<Arc<block::Header>> =
+            self.get_legacy(&block_header_by_height, &frontier.height)?;
+        let header = header.ok_or(StoreError::Incoherent(
+            "finalized header path has a missing header",
+        ))?;
+        if header.hash() != frontier.hash {
+            return Err(StoreError::Incoherent(
+                "finalized header disagrees with its canonical hash index",
+            )
+            .into());
+        }
+        Ok(header)
+    }
+
+    pub(super) fn finalized_hash(
+        &self,
+        height: block::Height,
+    ) -> Result<Option<block::Hash>, HeaderChainStoreError> {
+        let family = self.store.cf("hash_by_height")?;
+        self.get_legacy(&family, &height)
+    }
+
+    pub(super) fn untrusted_aux_deliveries(
+        &self,
+        hash: block::Hash,
+    ) -> Result<Vec<UntrustedAuxDeliveryRow>, HeaderChainStoreError> {
+        let family = self.store.cf(HEADER_AUX_DELIVERY)?;
+        let mut rows = Vec::new();
+        for row in self.snapshot.iterator_cf(
+            &family,
+            rocksdb::IteratorMode::From(&hash.0, rocksdb::Direction::Forward),
+        ) {
+            let (key, value) = row.map_err(|_| {
+                StoreError::Unavailable("header path auxiliary snapshot read failed")
+            })?;
+            if !key.starts_with(&hash.0) {
+                break;
+            }
+            if key.len() != 64
+                || rows.len() == zakura_header_chain::MAX_AUX_DELIVERIES_PER_HEADER_V1
+            {
+                return Err(StoreError::Incoherent("invalid auxiliary snapshot index").into());
+            }
+            let row = decode_untrusted_aux_delivery(&value)
+                .map_err(|_| StoreError::Incoherent("invalid auxiliary snapshot value"))?;
+            if row.delivery().header_hash != hash
+                || key[32..] != row.delivery().delivery_id.digest()
+            {
+                return Err(StoreError::Incoherent("auxiliary key/value mismatch").into());
+            }
+            rows.push(row);
+        }
+        Ok(rows)
     }
 
     fn visit_raw(

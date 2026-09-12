@@ -155,7 +155,7 @@ owner = "zakura_header_chain::HeaderSyncWorkOwner"
 tests = [
     "IN-05::response_completion_requires_the_reserved_branch_scope",
     "IN-05::stale_locator_completion_cannot_rebase_onto_a_new_generation",
-    "IN-05::generation_change_retires_served_path_before_late_page_completion",
+    "PW-03::serving_finishes_through_repeated_head_and_finality_updates",
     "IN-05::completed_target_is_scoped_to_exact_generation_and_branch",
     "IN-05::generation_or_anchor_change_retires_retry_work_before_reuse",
     "IN-06::generation_change_retires_every_repair_state",
@@ -654,7 +654,7 @@ id = "LC-WORK-01"
 name = "Generation-scoped forward work"
 status = "implemented"
 owner = "zakura_header_chain::HeaderWorkAuthority + zakura_header_chain::BodyWorkAuthority"
-tests = ["AUD-08::completed_target_is_scoped_to_exact_generation_and_branch", "IN-05::generation_or_anchor_change_retires_retry_work_before_reuse", "IN-05::generation_change_retires_unstarted_targets_before_new_scheduling", "AUD-06::committed_snapshot_retires_in_flight_state_results", "AUD-09::generation_change_retires_every_repair_state", "IN-05::generation_change_retires_served_path_before_late_page_completion", "IN-05::work_queue_refreshes_queued_authority_and_preserves_registered_requests", "IN-05::reactor_reset_mid_download_drops_stale_anchors_and_releases_budget", "IN-05::committed_reanchor_releases_stale_submitted_bodies", "IN-05::stale_retry_completion_releases_only_exact_infrastructure", "IN-05::compatible_body_completion_rebases_to_current_authority"]
+tests = ["AUD-08::completed_target_is_scoped_to_exact_generation_and_branch", "IN-05::generation_or_anchor_change_retires_retry_work_before_reuse", "IN-05::generation_change_retires_unstarted_targets_before_new_scheduling", "AUD-06::committed_snapshot_retires_in_flight_state_results", "AUD-09::generation_change_retires_every_repair_state", "PW-03::serving_finishes_through_repeated_head_and_finality_updates", "IN-05::work_queue_refreshes_queued_authority_and_preserves_registered_requests", "IN-05::reactor_reset_mid_download_drops_stale_anchors_and_releases_budget", "IN-05::committed_reanchor_releases_stale_submitted_bodies", "IN-05::stale_retry_completion_releases_only_exact_infrastructure", "IN-05::compatible_body_completion_rebases_to_current_authority"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -742,7 +742,7 @@ id = "LC-AUX-07"
 name = "Authoritative repair progress"
 status = "implemented"
 owner = "zakura_state::service::finalized_state::HeaderChainRuntime"
-tests = ["IN-06::repair_context_reconstructs_rejected_input_after_engine_hydration", "IN-06::repair_range_prefixes_bind_selection_boundaries_and_state_version", "IN-06::selected_body_window_reads_four_thousand_hashes_in_one_coherent_range", "IN-06::selected_auxiliary_range_rejects_atomically_and_then_admits_every_root", "IN-06::selected_range_repair_rejects_atomically_then_commits_every_delivery", "IN-06::vct_repair_selects_the_peer_with_the_largest_supported_prefix", "IN-06::retained_path_serves_a_bounded_finalized_range_below_the_header_frontier", "IN-06::mixed_pages_load_tree_aux_for_the_finalized_prefix", "IN-06::header_insertion_wakes_a_vct_park_but_a_repeat_insertion_does_not", "IN-06::supplier_failures_rotate_to_an_untried_fourth_supplier_without_repeating", "IN-06::local_send_failures_back_off_without_consuming_a_supplier", "IN-06::a_failed_repair_send_still_tries_the_remaining_candidates", "IN-06::alternating_missing_heights_cannot_postpone_the_stall_report", "IN-06::retained_rooted_supplier_is_skipped_for_an_untried_supplier", "IN-06::supplier_history_releases_disconnected_sources_without_clearing_the_episode", "IN-06::disconnected_supplier_history_cannot_block_a_new_supplier", "IN-06::context_without_admission_capacity_waits_without_a_wire_attempt", "IN-06::vct_auxiliary_capacity_refusal_waits_without_timed_replay", "IN-06::vct_resource_refusal_waits_for_a_newer_committed_state"]
+tests = ["IN-06::repair_context_reconstructs_rejected_input_after_engine_hydration", "IN-06::repair_range_prefixes_bind_selection_boundaries_and_state_version", "IN-06::selected_body_window_reads_four_thousand_hashes_in_one_coherent_range", "IN-06::selected_auxiliary_range_rejects_atomically_and_then_admits_every_root", "IN-06::selected_range_repair_rejects_atomically_then_commits_every_delivery", "IN-06::vct_repair_bounds_the_selected_supplier_prefix_by_local_capacity", "IN-06::busy_suppliers_give_a_smaller_repair_supplier_its_turn", "IN-06::successful_supplier_gives_the_next_repair_to_a_waiting_supplier", "IN-06::reconnecting_suppliers_give_a_waiting_repair_supplier_its_turn", "IN-06::replacement_session_retries_the_interrupted_repair", "IN-06::replacement_session_clears_busy_history_before_the_old_disconnect", "IN-06::retained_old_session_repair_failure_keeps_the_new_session_eligible", "IN-06::replacement_session_joins_behind_a_waiting_supplier", "IN-06::retained_path_serves_a_bounded_finalized_range_below_the_header_frontier", "IN-06::mixed_pages_load_tree_aux_for_the_finalized_prefix", "IN-06::header_insertion_wakes_a_vct_park_but_a_repeat_insertion_does_not", "IN-06::supplier_failures_rotate_to_an_untried_fourth_supplier_without_repeating", "IN-06::local_send_failures_back_off_without_consuming_a_supplier", "IN-06::a_failed_repair_send_still_tries_the_remaining_candidates", "IN-06::alternating_missing_heights_cannot_postpone_the_stall_report", "IN-06::retained_rooted_supplier_is_skipped_for_an_untried_supplier", "IN-06::supplier_history_releases_disconnected_sources_without_clearing_the_episode", "IN-06::disconnected_supplier_history_cannot_block_a_new_supplier", "IN-06::context_without_admission_capacity_waits_without_a_wire_attempt", "IN-06::vct_auxiliary_capacity_refusal_waits_without_timed_replay", "IN-06::vct_resource_refusal_waits_for_a_newer_committed_state"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -822,7 +822,7 @@ id = "LC-WIRE-05"
 name = "Snapshot-bound path serving"
 status = "implemented"
 owner = "zakura_state::RetainedPathLease"
-tests = ["PW-03::retained_path_leases_are_exact_bounded_session_scoped_and_expiring", "PW-03::retained_path_pages_keep_one_target_and_release_after_completion"]
+tests = ["PW-03::retained_path_leases_are_exact_bounded_session_scoped_and_expiring", "PW-03::retained_path_pages_keep_one_target_and_release_after_completion", "PW-03::serving_finishes_through_repeated_head_and_finality_updates", "PW-03::retained_path_survives_finalization_during_and_between_page_reads", "PW-03::retained_path_rejects_a_target_pruned_before_lease_commit_or_page_capture", "PW-03::finalized_metadata_is_not_attached_to_a_losing_path"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -830,7 +830,7 @@ id = "LC-WIRE-06"
 name = "No target substitution"
 status = "implemented"
 owner = "zakura_network::HeaderPathLease"
-tests = ["PW-03::retained_path_leases_are_exact_bounded_session_scoped_and_expiring", "PW-03::retained_path_pages_keep_one_target_and_release_after_completion"]
+tests = ["PW-03::retained_path_leases_are_exact_bounded_session_scoped_and_expiring", "PW-03::retained_path_pages_keep_one_target_and_release_after_completion", "PW-03::serving_finishes_through_repeated_head_and_finality_updates", "PW-03::retained_path_survives_finalization_during_and_between_page_reads", "PW-03::retained_path_rejects_a_target_pruned_before_lease_commit_or_page_capture", "PW-03::finalized_metadata_is_not_attached_to_a_losing_path"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -854,7 +854,7 @@ id = "LC-WIRE-09"
 name = "Continuation target integrity"
 status = "implemented"
 owner = "zakura_network::zakura::header_sync::ActiveHeaderRequest::continuation_locator"
-tests = ["PW-03::requester_stages_all_pages_before_one_exact_admission", "PW-03::complete_target_is_independent_of_page_partition", "PW-03::retained_path_pages_keep_one_target_and_release_after_completion"]
+tests = ["PW-03::requester_stages_all_pages_before_one_exact_admission", "PW-03::complete_target_is_independent_of_page_partition", "PW-03::retained_path_pages_keep_one_target_and_release_after_completion", "PW-03::serving_finishes_through_repeated_head_and_finality_updates", "PW-03::retained_path_survives_finalization_during_and_between_page_reads", "PW-03::retained_path_rejects_a_target_pruned_before_lease_commit_or_page_capture", "PW-03::finalized_metadata_is_not_attached_to_a_losing_path"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]

@@ -443,7 +443,26 @@ impl ReadyVctRepairFixture {
         Self::with_trace(None)
     }
 
+    fn with_two_header_range() -> Self {
+        let mut fixture = Self::new();
+        fixture.context = fixture
+            .context
+            .extend_empty_selected_range(&[fixture.snapshot.frontiers.header_best], None)
+            .expect("the fixture has two contiguous selected headers");
+        fixture
+    }
+
     fn with_trace(trace: Option<crate::zakura::ZakuraTrace>) -> Self {
+        Self::with_selected_tip(
+            trace,
+            zakura_header_chain::Frontier::new(block::Height(2), block::Hash([0x42; 32])),
+        )
+    }
+
+    fn with_selected_tip(
+        trace: Option<crate::zakura::ZakuraTrace>,
+        selected_tip: zakura_header_chain::Frontier,
+    ) -> Self {
         let mut startup = startup(CancellationToken::new());
         if let Some(trace) = trace {
             startup.trace = trace;
@@ -451,8 +470,7 @@ impl ReadyVctRepairFixture {
         let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
         let mut snapshot = committed_snapshot(anchor);
         let target = zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0x41; 32]));
-        snapshot.frontiers.header_best =
-            zakura_header_chain::Frontier::new(block::Height(2), block::Hash([0x42; 32]));
+        snapshot.frontiers.header_best = selected_tip;
         let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
         startup.committed_snapshots = Some(snapshots_rx);
         let (handle, _actions, reactor) =
@@ -493,7 +511,8 @@ impl ReadyVctRepairFixture {
             selected_tip_hash: self.snapshot.frontiers.header_best.hash,
             suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
             oldest_retained_height: self.anchor.height,
-            max_headers_per_response: 1,
+            max_headers_per_response: u32::try_from(self.context.selected_header_count())
+                .expect("the fixture repair range fits u32"),
             max_inflight_requests: 1,
             max_message_bytes: 2_000_000,
             tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
@@ -540,6 +559,29 @@ impl ReadyVctRepairFixture {
                 HeaderSyncMessage::Status(status.clone()),
             );
         }
+    }
+
+    fn reply_busy(&mut self, peer: &ZakuraPeerId) {
+        let active = self
+            .reactor
+            .peer_work_queue
+            .active(peer)
+            .expect("the supplier owns an active repair")
+            .clone();
+        assert!(matches!(
+            active.purpose,
+            HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
+        ));
+        self.reactor.handle_wire_response(
+            peer.clone(),
+            active.owner.session_id(),
+            active.owner.header_authority(),
+            HeaderSyncMessage::HeadersOutcome(HeadersOutcome {
+                request_id: active.request_id.get(),
+                target_tip_hash: active.target.status.selected_tip_hash,
+                outcome: HeadersOutcomeCode::Busy,
+            }),
+        );
     }
 }
 
@@ -1350,6 +1392,447 @@ fn initial_vct_wire_assignment_arms_the_request_deadline() {
     assert!(deadline >= before + fixture.reactor.startup.request_timeout);
 }
 
+#[tokio::test(start_paused = true)]
+async fn header_serving_reproduction_busy_supplier_retries_without_new_tip_or_session() {
+    let mut fixture = ReadyVctRepairFixture::new();
+    let (peers, _outbounds) = fixture.connect(&[0x71], 7);
+    let peer = &peers[0];
+    fixture.schedule();
+    fixture.advertise(&peers, 7);
+    let first = fixture
+        .reactor
+        .peer_work_queue
+        .active(peer)
+        .expect("the sole supplier receives the repair request")
+        .clone();
+
+    fixture.reactor.handle_headers_outcome(
+        peer.clone(),
+        first.owner.session_id(),
+        first.owner.header_authority(),
+        HeadersOutcome {
+            request_id: first.request_id.get(),
+            target_tip_hash: fixture.target.hash,
+            outcome: HeadersOutcomeCode::Busy,
+        },
+    );
+    assert!(fixture.reactor.peer_work_queue.active(peer).is_none());
+
+    for _ in 0..300 {
+        time::advance(std::time::Duration::from_secs(1)).await;
+        fixture.reactor.refresh_statuses();
+        if let Some(retry) = fixture.reactor.peer_work_queue.active(peer) {
+            assert_eq!(retry.owner.session_id(), first.owner.session_id());
+            assert_ne!(retry.request_id, first.request_id);
+            assert!(matches!(
+                retry.purpose,
+                HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
+            ));
+            return;
+        }
+    }
+
+    panic!(
+        "no repair retry after 300 seconds with the same connected supplier: {:?}",
+        fixture.reactor.vct_repair.current()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn vct_supplier_disconnect_clears_failure_history_before_reconnect() {
+    for outcome in [
+        HeadersOutcomeCode::Busy,
+        HeadersOutcomeCode::TargetNotRetained,
+    ] {
+        let mut fixture = ReadyVctRepairFixture::new();
+        let (peers, _old_outbounds) = fixture.connect(&[0x71], 7);
+        let peer = &peers[0];
+        fixture.schedule();
+        fixture.advertise(&peers, 7);
+        let first = fixture
+            .reactor
+            .peer_work_queue
+            .active(peer)
+            .unwrap()
+            .clone();
+        fixture.reactor.handle_headers_outcome(
+            peer.clone(),
+            7,
+            first.owner.header_authority(),
+            HeadersOutcome {
+                request_id: first.request_id.get(),
+                target_tip_hash: fixture.target.hash,
+                outcome,
+            },
+        );
+
+        time::advance(std::time::Duration::from_millis(1)).await;
+        fixture
+            .reactor
+            .handle_peer_disconnected(peer, 7, "test disconnect");
+        let (reconnected, _new_outbounds) = fixture.connect(&[0x71], 8);
+        assert_eq!(reconnected, peers);
+        fixture.advertise(&reconnected, 8);
+
+        let retry = fixture
+            .reactor
+            .peer_work_queue
+            .active(peer)
+            .expect("the reconnected supplier is eligible before the old deadline")
+            .clone();
+        assert_eq!(retry.owner.session_id(), 8);
+        assert!(matches!(
+            retry.purpose,
+            HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
+        ));
+
+        fixture.reactor.handle_headers_outcome(
+            peer.clone(),
+            8,
+            retry.owner.header_authority(),
+            HeadersOutcome {
+                request_id: retry.request_id.get(),
+                target_tip_hash: fixture.target.hash,
+                outcome: HeadersOutcomeCode::Busy,
+            },
+        );
+        let task = fixture.reactor.vct_repair.current().unwrap();
+        assert!(task.tried_sources.is_empty());
+        assert_eq!(
+            task.next_deadline(),
+            Some(Instant::now() + std::time::Duration::from_secs(1)),
+            "the new session starts with the initial Busy delay"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn stale_disconnect_preserves_reconnected_supplier_backoff() {
+    let mut fixture = ReadyVctRepairFixture::new();
+    let (peers, _old_outbounds) = fixture.connect(&[0x71], 7);
+    let peer = &peers[0];
+    fixture
+        .reactor
+        .handle_peer_disconnected(peer, 7, "test disconnect");
+    let (reconnected, _new_outbounds) = fixture.connect(&[0x71], 8);
+    fixture.schedule();
+    fixture.advertise(&reconnected, 8);
+    let active = fixture
+        .reactor
+        .peer_work_queue
+        .active(peer)
+        .unwrap()
+        .clone();
+    fixture.reactor.handle_headers_outcome(
+        peer.clone(),
+        8,
+        active.owner.header_authority(),
+        HeadersOutcome {
+            request_id: active.request_id.get(),
+            target_tip_hash: fixture.target.hash,
+            outcome: HeadersOutcomeCode::Busy,
+        },
+    );
+    let before = fixture.reactor.vct_repair.current().unwrap().clone();
+
+    fixture
+        .reactor
+        .handle_peer_disconnected(peer, 7, "late old session disconnect");
+    assert_eq!(fixture.reactor.peer_state[peer].session.session_id(), 8);
+    assert_eq!(fixture.reactor.vct_repair.current(), Some(&before));
+    fixture.advertise(&reconnected, 8);
+    assert!(fixture.reactor.peer_work_queue.active(peer).is_none());
+
+    time::advance(std::time::Duration::from_secs(1)).await;
+    fixture.reactor.refresh_statuses();
+    assert_eq!(
+        fixture
+            .reactor
+            .peer_work_queue
+            .active(peer)
+            .expect("the new session remains eligible when its own backoff expires")
+            .owner
+            .session_id(),
+        8
+    );
+}
+
+#[test]
+fn retained_old_session_repair_failure_keeps_the_new_session_eligible() {
+    for phase in [HeaderTargetPhase::Preparing, HeaderTargetPhase::Applying] {
+        for disconnect_first in [false, true] {
+            let mut fixture = ReadyVctRepairFixture::new();
+            let (peers, _old_outbounds) = fixture.connect(&[0x71], 7);
+            let peer = &peers[0];
+            fixture.schedule();
+            fixture.advertise(&peers, 7);
+            let old = fixture
+                .reactor
+                .peer_work_queue
+                .active(peer)
+                .unwrap()
+                .clone();
+            fixture
+                .reactor
+                .peer_work_queue
+                .active_mut(peer)
+                .unwrap()
+                .phase = phase;
+
+            if disconnect_first {
+                fixture
+                    .reactor
+                    .handle_peer_disconnected(peer, 7, "test disconnect");
+            }
+            let (reconnected, _new_outbounds) = fixture.connect(&[0x71], 8);
+            fixture.advertise(&reconnected, 8);
+            assert_eq!(
+                fixture.reactor.peer_work_queue.active(peer).unwrap().owner,
+                old.owner
+            );
+
+            let error = invalid_header_failure(old.source, old.owner);
+            match phase {
+                HeaderTargetPhase::Preparing => fixture.reactor.handle_header_target_prepared(
+                    peer.clone(),
+                    old.source,
+                    old.owner,
+                    HeaderTargetPreparationResult::Failed(error),
+                ),
+                HeaderTargetPhase::Applying => {
+                    fixture.reactor.handle_header_target_admission_ready(
+                        peer.clone(),
+                        old.source,
+                        old.owner,
+                        HeaderTargetAdmissionResult::Failed(error),
+                    )
+                }
+                _ => unreachable!("the fixture only retains local repair phases"),
+            }
+
+            let retry = fixture
+                .reactor
+                .peer_work_queue
+                .active(peer)
+                .expect("a late failure from the old session does not exclude its replacement");
+            assert_eq!(retry.owner.session_id(), 8);
+            assert!(!fixture
+                .reactor
+                .vct_repair
+                .current()
+                .unwrap()
+                .tried_sources
+                .contains(&old.source));
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn busy_vct_supplier_rotates_without_delaying_another_supplier() {
+    let mut fixture = ReadyVctRepairFixture::new();
+    let (peers, _outbounds) = fixture.connect(&[1, 2], 7);
+    fixture.schedule();
+    fixture.advertise(&peers, 7);
+    let first = fixture
+        .reactor
+        .peer_work_queue
+        .active(&peers[0])
+        .expect("the first supplier owns the request")
+        .clone();
+    fixture.reactor.handle_headers_outcome(
+        peers[0].clone(),
+        first.owner.session_id(),
+        first.owner.header_authority(),
+        HeadersOutcome {
+            request_id: first.request_id.get(),
+            target_tip_hash: fixture.target.hash,
+            outcome: HeadersOutcomeCode::Busy,
+        },
+    );
+    assert!(fixture.reactor.peer_work_queue.active(&peers[0]).is_none());
+    assert!(fixture.reactor.peer_work_queue.active(&peers[1]).is_some());
+    assert!(fixture
+        .reactor
+        .vct_repair
+        .current()
+        .unwrap()
+        .tried_sources
+        .is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn busy_suppliers_give_a_smaller_repair_supplier_its_turn() {
+    let mut fixture = ReadyVctRepairFixture::with_two_header_range();
+    let (peers, _outbounds) = fixture.connect(&[1, 2, 3, 4], 7);
+    fixture.schedule();
+    fixture.advertise(&peers[..3], 7);
+    let mut status = fixture.status();
+    status.selected_tip_height = fixture.target.height;
+    status.selected_tip_hash = fixture.target.hash;
+    fixture
+        .reactor
+        .handle_wire_message(peers[3].clone(), 10, HeaderSyncMessage::Status(status));
+
+    for peer in &peers[..3] {
+        let active = fixture
+            .reactor
+            .peer_work_queue
+            .active(peer)
+            .expect("each larger supplier gets one turn")
+            .clone();
+        assert_eq!(active.max_header_count, 2);
+        // Two intervening refusals outlast even the capped 30-second Busy delay.
+        time::advance(std::time::Duration::from_secs(16)).await;
+        fixture.reactor.refresh_statuses();
+        assert_eq!(
+            fixture.reactor.peer_work_queue.active(peer).unwrap().owner,
+            active.owner,
+            "the refusal arrives before the request timeout"
+        );
+        fixture.reply_busy(peer);
+    }
+
+    let active = fixture
+        .reactor
+        .peer_work_queue
+        .active(&peers[3])
+        .expect("the smaller supplier gets a turn before any Busy supplier repeats");
+    assert!(matches!(
+        active.purpose,
+        HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
+    ));
+    assert_eq!(active.max_header_count, 1);
+    assert_eq!(active.target.status.selected_tip_hash, fixture.target.hash);
+    assert_eq!(fixture.reactor.vct_repair.current().unwrap().attempts, 3);
+    assert!(fixture
+        .reactor
+        .peer_state
+        .values()
+        .all(|peer| peer.unproductive_requests == 0));
+}
+
+#[test]
+fn successful_supplier_gives_the_next_repair_to_a_waiting_supplier() {
+    let selected = [
+        zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0x41; 32])),
+        zakura_header_chain::Frontier::new(block::Height(2), block::Hash([0x42; 32])),
+        zakura_header_chain::Frontier::new(block::Height(3), block::Hash([0x43; 32])),
+    ];
+    let mut fixture = ReadyVctRepairFixture::with_selected_tip(None, selected[2]);
+    fixture.context = fixture
+        .context
+        .extend_empty_selected_range(&selected[1..], None)
+        .expect("the first repair covers all three headers");
+    let (peers, _outbounds) = fixture.connect(&[0x71, 0x72], 7);
+    fixture.schedule();
+    let mut small_status = fixture.status();
+    small_status.max_headers_per_response = 1;
+    fixture.reactor.handle_wire_message(
+        peers[0].clone(),
+        7,
+        HeaderSyncMessage::Status(small_status),
+    );
+    fixture.advertise(&peers[1..], 8);
+
+    let first = fixture
+        .reactor
+        .peer_work_queue
+        .active(&peers[0])
+        .expect("the first supplier receives its one-header request")
+        .clone();
+    assert_eq!(first.max_header_count, 1);
+    fixture
+        .reactor
+        .peer_work_queue
+        .active_mut(&peers[0])
+        .unwrap()
+        .phase = HeaderTargetPhase::Applying;
+    fixture.reactor.handle_header_target_admission_ready(
+        peers[0].clone(),
+        first.source,
+        first.owner,
+        HeaderTargetAdmissionResult::Applied,
+    );
+    assert!(matches!(
+        fixture.reactor.vct_repair.current().unwrap().state,
+        RepairPolicyState::Completed
+    ));
+
+    fixture.target = selected[1];
+    fixture.context = zakura_header_chain::VctRepairContext::unconstrained(
+        fixture.target,
+        zakura_header_chain::HeaderLocator::for_continuation(selected[0]),
+        Some(selected[2].hash),
+    )
+    .extend_empty_selected_range(&selected[2..], None)
+    .expect("the next repair covers the remaining two headers");
+    fixture.schedule();
+    fixture.reactor.try_assign_vct_repair();
+
+    let next = fixture
+        .reactor
+        .peer_work_queue
+        .active(&peers[1])
+        .expect("the waiting supplier gets the next repair after the first succeeds");
+    assert_eq!(next.max_header_count, 2);
+    assert_eq!(next.target.status.selected_tip_hash, selected[2].hash);
+    assert!(fixture.reactor.peer_work_queue.active(&peers[0]).is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn reconnecting_suppliers_give_a_waiting_repair_supplier_its_turn() {
+    for fresh_identity in [false, true] {
+        let mut fixture = ReadyVctRepairFixture::with_two_header_range();
+        let (peers, mut outbounds) = fixture.connect(&[1, 2, 3, 4], 7);
+        fixture.schedule();
+        fixture.advertise(&peers[..3], 7);
+        let mut status = fixture.status();
+        status.selected_tip_height = fixture.target.height;
+        status.selected_tip_hash = fixture.target.hash;
+        fixture.reactor.handle_wire_message(
+            peers[3].clone(),
+            10,
+            HeaderSyncMessage::Status(status),
+        );
+
+        for (index, peer) in peers[..3].iter().enumerate() {
+            let session_id = 7 + u64::try_from(index).unwrap();
+            assert_eq!(
+                fixture
+                    .reactor
+                    .peer_work_queue
+                    .active(peer)
+                    .unwrap()
+                    .owner
+                    .session_id(),
+                session_id
+            );
+            fixture.reply_busy(peer);
+            fixture
+                .reactor
+                .handle_peer_disconnected(peer, session_id, "test reconnect");
+            let marker = u8::try_from(index).unwrap() + if fresh_identity { 11 } else { 1 };
+            let (returning, new_outbounds) = fixture.connect(&[marker], session_id + 100);
+            outbounds.extend(new_outbounds);
+            fixture.advertise(&returning, session_id + 100);
+            time::advance(std::time::Duration::from_millis(1)).await;
+        }
+
+        let active = fixture
+            .reactor
+            .peer_work_queue
+            .active(&peers[3])
+            .expect("returning suppliers cannot jump ahead of a waiting supplier");
+        assert!(matches!(
+            active.purpose,
+            HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
+        ));
+        assert_eq!(active.max_header_count, 1);
+        assert_eq!(fixture.reactor.vct_repair.current().unwrap().attempts, 3);
+        assert_eq!(fixture.reactor.peer_state.len(), 4);
+    }
+}
+
 #[test]
 fn local_capacity_backoff_starts_the_generation_stall_clock() {
     let mut fixture = ReadyVctRepairFixture::new();
@@ -1609,11 +2092,10 @@ fn disconnected_supplier_history_cannot_block_a_new_supplier() {
 }
 
 #[test]
-fn replacement_session_keeps_the_authenticated_supplier_identity() {
+fn replacement_session_retries_the_interrupted_repair() {
     let mut fixture = ReadyVctRepairFixture::new();
     let (peers, _first_outbound) = fixture.connect(&[0x71], 7);
     let peer = &peers[0];
-    let source = source_id_from_peer(peer);
     fixture.schedule();
     fixture.advertise(&peers, 7);
     assert!(fixture.reactor.peer_work_queue.active(peer).is_some());
@@ -1635,7 +2117,7 @@ fn replacement_session_keeps_the_authenticated_supplier_identity() {
         .vct_repair
         .current()
         .expect("the replacement keeps the repair scheduled");
-    assert_eq!(task.tried_sources, [source].into_iter().collect());
+    assert!(task.tried_sources.is_empty());
     assert_eq!(
         fixture.reactor.vct_supplier_order,
         [peer.clone()].into_iter().collect::<VecDeque<_>>()
@@ -1645,7 +2127,71 @@ fn replacement_session_keeps_the_authenticated_supplier_identity() {
     fixture
         .reactor
         .handle_wire_message(peer.clone(), 8, HeaderSyncMessage::Status(status));
-    assert!(fixture.reactor.peer_work_queue.active(peer).is_none());
+    assert_eq!(
+        fixture
+            .reactor
+            .peer_work_queue
+            .active(peer)
+            .unwrap()
+            .owner
+            .session_id(),
+        8
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn replacement_session_clears_busy_history_before_the_old_disconnect() {
+    let mut fixture = ReadyVctRepairFixture::new();
+    let (peers, _old_outbounds) = fixture.connect(&[0x71], 7);
+    let peer = &peers[0];
+    fixture.schedule();
+    fixture.advertise(&peers, 7);
+    fixture.reply_busy(peer);
+    let (replacement, _new_outbounds) = fixture.connect(&[0x71], 8);
+    fixture.advertise(&replacement, 8);
+
+    assert_eq!(
+        fixture
+            .reactor
+            .peer_work_queue
+            .active(peer)
+            .expect("the replacement can retry before the old Busy delay expires")
+            .owner
+            .session_id(),
+        8
+    );
+    fixture.reply_busy(peer);
+    let before = fixture.reactor.vct_repair.current().unwrap().clone();
+    assert_eq!(
+        before.next_deadline(),
+        Some(Instant::now() + std::time::Duration::from_secs(1))
+    );
+    fixture
+        .reactor
+        .handle_peer_disconnected(peer, 7, "late replaced session");
+    assert_eq!(fixture.reactor.vct_repair.current(), Some(&before));
+    assert_eq!(fixture.reactor.peer_state[peer].session.session_id(), 8);
+}
+
+#[test]
+fn replacement_session_joins_behind_a_waiting_supplier() {
+    let mut fixture = ReadyVctRepairFixture::new();
+    let (peers, _old_outbounds) = fixture.connect(&[0x71, 0x72], 7);
+    fixture.advertise(&peers, 7);
+    let (replacement, _new_outbounds) = fixture.connect(&[0x71], 9);
+    fixture.schedule();
+    fixture.advertise(&replacement, 9);
+    assert!(fixture.reactor.peer_work_queue.active(&peers[0]).is_none());
+    assert_eq!(
+        fixture
+            .reactor
+            .peer_work_queue
+            .active(&peers[1])
+            .expect("the waiting supplier precedes a replacement connection")
+            .owner
+            .session_id(),
+        8
+    );
 }
 
 #[test]

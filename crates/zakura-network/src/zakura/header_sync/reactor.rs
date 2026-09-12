@@ -513,6 +513,8 @@ struct VctSupplierRejections {
     already_serving: u64,
     /// Peers already tried in the current durable episode.
     already_tried: u64,
+    /// Peers waiting for a retry after a temporary Busy response.
+    supplier_backoff: u64,
     /// Peers that already supplied a retained rooted payload for this target.
     retained_source: u64,
     /// Peers that already returned semantic input excluded by this episode.
@@ -984,6 +986,11 @@ impl HeaderSyncReactor {
                     VctRepairRetry::supplier(source, HeaderRequestTerminal::SessionReplaced),
                 );
             }
+            let source = source_id_from_peer(&peer);
+            if let Some(task) = self.vct_repair.current_mut() {
+                task.forget_source(source);
+            }
+            self.rotate_vct_supplier(source);
         } else {
             self.vct_supplier_order.push_back(peer.clone());
         }
@@ -1047,6 +1054,7 @@ impl HeaderSyncReactor {
                 VctRepairRetry::supplier(source, HeaderRequestTerminal::Disconnected),
             );
         }
+        self.prune_vct_supplier_history();
         self.publish_peer_state();
         self.emit_peer_lifecycle(
             hs_trace::HEADER_PEER_DISCONNECTED,
@@ -1866,6 +1874,7 @@ impl HeaderSyncReactor {
                         .get_mut(repair_owner)
                         .expect("the admitted repair remains owned by its active request")
                         .complete();
+                    self.rotate_vct_supplier(source);
                     if let Some(task) = self.vct_repair.get(repair_owner) {
                         self.emit_vct_repair_state(task, "admission", Some("applied"));
                     }
@@ -2136,6 +2145,7 @@ impl HeaderSyncReactor {
                     && source_id_from_peer(peer) == source
             })
             .map(|(peer, _)| peer.clone());
+        let retry_session_is_current = peer.is_some();
         if let Some(peer) = peer {
             self.request_deadlines.remove(&peer);
         }
@@ -2151,7 +2161,13 @@ impl HeaderSyncReactor {
             self.vct_repair
                 .get_mut(owner)
                 .is_some_and(|task| match retry.attribution {
-                    VctRepairRetryAttribution::Supplier => task.retry(source).is_ok(),
+                    VctRepairRetryAttribution::Supplier => {
+                        if retry.terminal == HeaderRequestTerminal::Busy {
+                            task.retry_after_busy(source, now).is_ok()
+                        } else {
+                            task.retry(source).is_ok()
+                        }
+                    }
                     VctRepairRetryAttribution::ExcludedInput => task.exclude_input(source).is_ok(),
                     VctRepairRetryAttribution::Stale => false,
                     VctRepairRetryAttribution::Local => task
@@ -2159,6 +2175,13 @@ impl HeaderSyncReactor {
                         .is_ok(),
                 });
         if retry_scheduled {
+            if !retry_session_is_current {
+                // Retained local work can finish after its supplier reconnects.
+                // Its failure history belongs to the departed session.
+                if let Some(task) = self.vct_repair.get_mut(owner) {
+                    task.forget_source(source);
+                }
+            }
             if matches!(
                 retry.attribution,
                 VctRepairRetryAttribution::Supplier | VctRepairRetryAttribution::ExcludedInput
@@ -2320,6 +2343,7 @@ impl HeaderSyncReactor {
                 rejected_schema = record.rejections.unsupported_schema,
                 rejected_busy = record.rejections.already_serving,
                 rejected_tried = record.rejections.already_tried,
+                supplier_backoff = record.rejections.supplier_backoff,
                 retained_source = record.rejections.retained_source,
                 excluded_input = record.rejections.excluded_input,
                 send_failed = record.rejections.send_failed,
@@ -2384,6 +2408,10 @@ impl HeaderSyncReactor {
             row.insert(
                 hs_trace::REJECTED_TRIED.into(),
                 record.rejections.already_tried.into(),
+            );
+            row.insert(
+                "supplier_backoff".into(),
+                record.rejections.supplier_backoff.into(),
             );
             row.insert(
                 hs_trace::BEST_PEER_HEIGHT.into(),
@@ -3208,12 +3236,18 @@ impl HeaderSyncReactor {
         }
     }
 
-    fn try_assign_vct_repair(&mut self) {
-        let now = Instant::now();
+    fn prune_vct_supplier_history(&mut self) {
         let connected_sources: HashSet<_> =
             self.peer_state.keys().map(source_id_from_peer).collect();
         if let Some(task) = self.vct_repair.current_mut() {
             task.retain_connected_sources(&connected_sources);
+        }
+    }
+
+    fn try_assign_vct_repair(&mut self) {
+        let now = Instant::now();
+        self.prune_vct_supplier_history();
+        if let Some(task) = self.vct_repair.current_mut() {
             task.resume_retry(now);
         }
         let Some(task) = self.vct_repair.ready().cloned() else {
@@ -3301,6 +3335,10 @@ impl HeaderSyncReactor {
                 rejections.already_tried += 1;
                 continue;
             }
+            if task.supplier_is_backing_off(source, now) {
+                rejections.supplier_backoff += 1;
+                continue;
+            }
             candidates.push((
                 peer.clone(),
                 source,
@@ -3319,7 +3357,7 @@ impl HeaderSyncReactor {
             );
             return;
         }
-        candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.4));
+        // Keep the rotating order even when a later supplier offers a larger batch.
         let mut local_capacity_unavailable = false;
         let mut local_send_failure = false;
         for (peer, source, session, mut status, request_count) in candidates {
@@ -3498,60 +3536,8 @@ impl HeaderSyncReactor {
 
     fn retire_obsolete_work(&mut self, snapshot: &zakura_header_chain::EngineSnapshot) {
         self.peer_work_queue.retire_obsolete_unstarted(snapshot);
-        let obsolete_served_paths: Vec<_> = self
-            .served_paths
-            .iter()
-            .filter_map(|(peer, state)| {
-                let (target_tip_hash, scope) = match state {
-                    ServedPathState::Acquiring {
-                        target_tip_hash,
-                        scope,
-                        ..
-                    } => (*target_tip_hash, *scope),
-                    ServedPathState::Active { target, scope, .. } => (target.hash, *scope),
-                };
-                (scope
-                    != zakura_header_chain::HeaderWorkAuthority::for_target(
-                        snapshot,
-                        target_tip_hash,
-                    ))
-                .then(|| peer.clone())
-            })
-            .collect();
-        for peer in obsolete_served_paths {
-            self.served_path_deadlines.remove(&peer);
-            match self.served_paths.remove(&peer) {
-                Some(ServedPathState::Active {
-                    session_id,
-                    lease_id,
-                    target,
-                    scope,
-                    pending_request,
-                    ..
-                }) => {
-                    if let Some(pending) = pending_request {
-                        self.send_headers_outcome(
-                            &peer,
-                            pending.request_id.get(),
-                            target.hash,
-                            HeadersOutcomeCode::Busy,
-                        );
-                    }
-                    self.release_lease(peer, session_id, lease_id, scope);
-                }
-                Some(ServedPathState::Acquiring {
-                    request_id,
-                    target_tip_hash,
-                    ..
-                }) => self.send_headers_outcome(
-                    &peer,
-                    request_id.get(),
-                    target_tip_hash,
-                    HeadersOutcomeCode::Busy,
-                ),
-                None => {}
-            }
-        }
+        // Serving owns an exact retained path. A new local tip does not change the
+        // requested hashes or retire its session, lease, or pending response.
         if let Some(task) = self.vct_repair.retain_current(snapshot) {
             if let Some(peer) = self
                 .peer_work_queue

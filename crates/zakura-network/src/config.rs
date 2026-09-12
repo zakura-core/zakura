@@ -13,7 +13,7 @@ use std::{
 
 use indexmap::IndexSet;
 use iroh::SecretKey;
-use rand::rngs::OsRng;
+use rand::{rngs::OsRng, RngCore};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use tokio::fs;
 
@@ -723,7 +723,7 @@ impl Config {
 
     /// Resolves the Zakura native iroh [`SecretKey`] for this node, persisting a
     /// freshly generated key on first use so the node keeps a stable
-    /// [`NodeId`](iroh::NodeId) across restarts.
+    /// [`EndpointId`](iroh::EndpointId) across restarts.
     ///
     /// Resolution order:
     /// 1. If [`zakura_node_secret_key`](Self::zakura_node_secret_key) is configured,
@@ -785,6 +785,10 @@ impl Config {
 
         Config {
             p2p_stack,
+            zakura: ZakuraConfig {
+                listen_addr: Some("127.0.0.1:0".parse().expect("valid test bind address")),
+                ..ZakuraConfig::default()
+            },
             ..Config::default()
         }
     }
@@ -812,7 +816,9 @@ fn load_or_generate_zakura_secret_key(key_file: &Path) -> SecretKey {
         ),
     }
 
-    let secret_key = SecretKey::generate(OsRng);
+    let mut key_bytes = [0; 32];
+    OsRng.fill_bytes(&mut key_bytes);
+    let secret_key = SecretKey::from_bytes(&key_bytes);
     persist_zakura_secret_key(key_file, &secret_key);
     secret_key
 }

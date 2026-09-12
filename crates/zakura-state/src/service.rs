@@ -72,6 +72,7 @@ use crate::{
 };
 
 pub mod block_iter;
+mod block_range;
 pub mod chain_tip;
 pub mod watch_receiver;
 
@@ -91,6 +92,7 @@ pub mod arbitrary;
 #[cfg(test)]
 mod tests;
 
+pub use block_range::OwnedBlockRange;
 pub use finalized_state::{OutputLocation, TransactionIndex, TransactionLocation};
 use write::NonFinalizedWriteMessage;
 pub use write::{VctRootRepairState, VctRootRepairStatus};
@@ -1662,9 +1664,10 @@ impl ReadStateService {
             .borrow_mapped(|non_finalized_state| non_finalized_state.best_chain().cloned())
     }
 
-    /// Test-only access to the inner database.
+    /// Returns the shared database handle.
+    ///
     /// Can be used to modify the database without doing any consensus checks.
-    #[cfg(any(test, feature = "proptest-impl"))]
+    #[cfg(any(test, feature = "indexer", feature = "proptest-impl"))]
     pub fn db(&self) -> &ZakuraDb {
         &self.db
     }

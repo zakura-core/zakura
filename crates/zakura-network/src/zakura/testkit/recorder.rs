@@ -141,7 +141,7 @@ impl Service for InboundRecorder {
         for stream in self
             .streams()
             .iter()
-            .filter(|stream| matches!(stream.mode, crate::zakura::StreamMode::Ordered))
+            .filter(|stream| matches!(stream.mode, crate::zakura::StreamMode::Persistent))
         {
             let Some((session_id, mut recv, _send)) = peer.take_stream_with_session_id(stream.kind)
             else {

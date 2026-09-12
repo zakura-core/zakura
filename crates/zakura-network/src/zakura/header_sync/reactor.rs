@@ -8,7 +8,7 @@ use std::{
 };
 
 use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
-use iroh::NodeId;
+use iroh::EndpointId;
 use tokio::{
     sync::{mpsc, watch},
     task::JoinHandle,
@@ -1507,6 +1507,10 @@ impl HeaderSyncReactor {
             self.report_misbehavior(peer, HeaderSyncMisbehavior::MalformedMessage);
             return;
         };
+        let checkpoint_prefix_ready = self
+            .committed_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| Self::should_prepare_checkpoint_prefix(snapshot, active));
         let _ = active;
         debug_assert_eq!(
             self.peer_work_queue.owned_header_count(&peer),
@@ -1516,7 +1520,8 @@ impl HeaderSyncReactor {
         // A peer can advertise an arbitrarily distant target.
         // The reactor bounds response staging by admitting a validated prefix at capacity.
         // The reactor limits continuations to remaining capacity.
-        // This limit prevents a peer from forcing small prefix commits with short pages.
+        // A local checkpoint-sized minimum also allows a selected extension to unblock
+        // body validation without letting short peer pages force tiny prefix commits.
         let durable_prefix_full = self.committed_snapshot.as_ref().is_some_and(|snapshot| {
             Self::request_header_prefix_remaining(
                 snapshot,
@@ -1524,8 +1529,13 @@ impl HeaderSyncReactor {
                 target_tip_height,
             ) == 0
         });
-        let bounded_prefix =
-            !complete && (self.peer_work_queue.budget_is_full() || durable_prefix_full);
+        let bounded_prefix = !complete
+            && (self.peer_work_queue.budget_is_full()
+                || durable_prefix_full
+                || checkpoint_prefix_ready);
+        if !complete && checkpoint_prefix_ready {
+            metrics::counter!("sync.header.checkpoint_prefix.prepared.total").increment(1);
+        }
         let active = self
             .peer_work_queue
             .active_mut(&peer)
@@ -2915,6 +2925,28 @@ impl HeaderSyncReactor {
             .saturating_sub(selected_non_finalized)
             .saturating_sub(claimed);
         u32::try_from(remaining).unwrap_or(u32::MAX)
+    }
+
+    /// Prepare enough selected-chain headers for a checkpoint and its VCT successor
+    /// when the admitted body pipeline has less than that much work remaining.
+    fn should_prepare_checkpoint_prefix(
+        snapshot: &zakura_header_chain::EngineSnapshot,
+        active: &ActiveHeaderRequest,
+    ) -> bool {
+        let checkpoint_gap =
+            zakura_chain::parameters::checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP;
+        let body_lag = snapshot
+            .frontiers
+            .header_best
+            .height
+            .0
+            .saturating_sub(snapshot.frontiers.verified_best.height.0);
+        snapshot.mode == zakura_header_chain::EngineMode::Integrated
+            && matches!(active.purpose, HeaderTargetPurpose::Normal)
+            && active.common_ancestor == Some(snapshot.frontiers.header_best)
+            && active.entries.len() > checkpoint_gap
+            && usize::try_from(body_lag).expect("u32 body lag fits usize on supported targets")
+                <= checkpoint_gap
     }
 
     /// Return requester headroom after both the durable DAG limit and the integrated body window.
@@ -5362,9 +5394,9 @@ fn next_height(height: block::Height) -> block::Height {
     block::Height(height.0.saturating_add(1).min(block::Height::MAX.0))
 }
 
-fn node_id_from_peer(peer: &ZakuraPeerId) -> Option<NodeId> {
+fn node_id_from_peer(peer: &ZakuraPeerId) -> Option<EndpointId> {
     let bytes: [u8; 32] = peer.as_bytes().try_into().ok()?;
-    NodeId::from_bytes(&bytes).ok()
+    EndpointId::from_bytes(&bytes).ok()
 }
 
 fn header_direction_label(direction: ServicePeerDirection) -> &'static str {

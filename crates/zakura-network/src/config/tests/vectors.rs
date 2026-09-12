@@ -509,6 +509,7 @@ fn p2p_v2_old_config_without_zakura_fields_uses_safe_defaults() {
         config.zakura.bootstrap_peers,
         default_testnet_zakura_bootstrap_peers()
     );
+    assert!(!config.zakura.nat_traversal);
     assert!(config.zakura.max_connections > 0);
     assert_eq!(
         config.zakura.max_connections_per_ip,
@@ -585,6 +586,7 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
 
         [zakura]
         bootstrap_peers = ["ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6@127.0.0.1:8233"]
+        nat_traversal = true
         max_connections = 7
         max_connections_per_ip = 5
         max_pending_handshakes = 3
@@ -608,6 +610,8 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
     assert!(serialized.contains("p2p_stack = \"dual\""));
     assert!(serialized.contains("[zakura]"));
     assert!(serialized.contains("bootstrap_peers"));
+    assert!(config.zakura.nat_traversal);
+    assert!(serialized.contains("nat_traversal = true"));
     assert!(serialized.contains("max_connections = 7"));
     assert!(serialized.contains("max_connections_per_ip = 5"));
     assert!(serialized.contains("trace_dir = \"target/zakura-test-traces\""));
@@ -809,12 +813,12 @@ fn max_block_time_start_height_serialization_roundtrip() {
 
 /// With no `zakura_node_secret_key` and a writable identity directory, the
 /// generated Zakura iroh identity must be persisted on first use and reused on
-/// every later startup, so the node's `NodeId` is stable across restarts.
+/// every later startup, so the node's `EndpointId` is stable across restarts.
 ///
 /// This is the regression test for `claude-ephemeral-node-secret-on-restart`:
 /// before the fix, `Config::zakura_secret_key` generated a fresh ephemeral key on
 /// every call and never wrote the reserved identity key file, so two startups
-/// produced different `NodeId`s and no key file existed.
+/// produced different `EndpointId`s and no key file existed.
 #[test]
 fn zakura_secret_key_is_persisted_and_stable_across_restarts() {
     let _init_guard = zakura_test::init();
@@ -850,7 +854,7 @@ fn zakura_secret_key_is_persisted_and_stable_across_restarts() {
     }
 
     // Second startup reading the same key file (simulating a process restart)
-    // must reuse the persisted key, yielding the same `NodeId`.
+    // must reuse the persisted key, yielding the same `EndpointId`.
     let after_restart = load_or_generate_zakura_secret_key(&key_file);
 
     assert_eq!(

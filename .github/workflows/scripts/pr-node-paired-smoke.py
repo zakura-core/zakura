@@ -11,7 +11,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-EXPECTED_SHA = "3e9b4f6d617f91b05e5050f7ac9b6e4c768821b7"
+EXPECTED_SHA = "bd2bed5f7248975626fc82bcb78dfa3981e588d8"
 OUT = Path("/root/out/paired")
 SEED_RPC = "http://127.0.0.1:8232"
 CLIENT_RPC = "http://127.0.0.1:18232"

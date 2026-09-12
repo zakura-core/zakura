@@ -3512,8 +3512,6 @@ checksum = "549e471b99ccaf2f89101bec68f4d244457d5a95a9c3d0672e9564124397741d"
 [[package]]
 name = "noq"
 version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1e6c57353d26be91a242f0ec96073066c4481a03f6be874daafb18902394515"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -3534,8 +3532,6 @@ dependencies = [
 [[package]]
 name = "noq-proto"
 version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a46813e306c29c4f86357b6ffa39a8e1c97bb274b9a296a19a56d62e4111225"
 dependencies = [
  "aes-gcm",
  "bytes",
@@ -7621,8 +7617,6 @@ dependencies = [
 [[package]]
 name = "zakura-iroh"
 version = "1.1.0-rc.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c32bb2578da5ea98b56bd19870b43947b7b39ba52bd7a22fce1d8cb58a225165"
 dependencies = [
  "backon",
  "blake3",

@@ -247,6 +247,11 @@ jobs:
         env:
           FULL_COVERAGE: ${{ github.event_name != 'pull_request' }}
 
+      - name: Run vendored QUIC protocol regressions
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: cargo nextest run --manifest-path vendor/Cargo.toml --locked -p noq-proto --lib --retries 0 --no-fail-fast
+
       - name: Upload nextest archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
         with:

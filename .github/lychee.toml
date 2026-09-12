@@ -54,6 +54,10 @@ exclude_path = [
     "target",
     ".git",
     "qa/supply-chain",
+    # Preserve third-party package documentation with its original links.
+    "vendor/noq",
+    "vendor/noq-proto",
+    "vendor/zakura-iroh",
     # Contains intentionally unresolved ADR filename placeholders.
     "docs/decisions/template.md",
     # CHANGELOG contains historical references to deprecated URLs

@@ -133,6 +133,9 @@ jobs:
             --ignore node_modules \
             --ignore target \
             --ignore .git \
+            --ignore vendor/noq \
+            --ignore vendor/noq-proto \
+            --ignore vendor/zakura-iroh \
             --config .github/.markdownlint.yaml
 
   docs-check-success:

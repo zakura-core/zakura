@@ -844,6 +844,7 @@ impl ZakuraEndpoint {
     /// immediately bounce off the admission cap.
     pub(crate) fn has_native_admission_capacity(&self) -> bool {
         self.handler.admission.available_permits() > 0
+            && self.handler.transport_admission.available_permits() > 0
     }
 
     /// Shut down the Router's ordered accept/handler lifecycle.
@@ -1983,6 +1984,8 @@ pub struct ZakuraProtocolHandler {
     next_conn_id: Arc<AtomicU64>,
     next_stream_id: Arc<AtomicU64>,
     admission: Arc<Semaphore>,
+    // Includes handshakes and closing transport state, beyond handler lifetime.
+    transport_admission: Arc<Semaphore>,
     pending_handshakes: Arc<Semaphore>,
     shutdown: CancellationToken,
     // Bound endpoint supplies the local identity for connection collision handling.
@@ -2098,6 +2101,7 @@ impl ZakuraProtocolHandler {
             // and late completions from colliding after a node restart.
             next_stream_id: Arc::new(AtomicU64::new(random_stream_session_seed())),
             admission: Arc::new(Semaphore::new(limits.max_connections)),
+            transport_admission: Arc::new(Semaphore::new(limits.max_connections)),
             pending_handshakes: Arc::new(Semaphore::new(limits.max_pending_handshakes)),
             shutdown: CancellationToken::new(),
             limits,
@@ -2140,6 +2144,34 @@ impl ZakuraProtocolHandler {
     pub fn with_endpoint(mut self, endpoint: Endpoint) -> Self {
         self.endpoint = Some(endpoint);
         self
+    }
+
+    fn reserve_transport(
+        &self,
+    ) -> Result<Box<dyn std::any::Any + Send + Sync>, ZakuraHandlerError> {
+        self.transport_admission
+            .clone()
+            .try_acquire_owned()
+            .map(|permit| Box::new(permit) as Box<dyn std::any::Any + Send + Sync>)
+            .map_err(|_| ZakuraHandlerError::ResourceLimit("transport admission"))
+    }
+
+    fn incoming_transport_admission(&self) -> iroh::protocol::IncomingAdmission {
+        let handler = self.clone();
+        Arc::new(move |_| match handler.reserve_transport() {
+            Ok(owner) => Some(owner),
+            Err(_) => {
+                metrics::counter!("zakura.p2p.conn.rejected.transport_admission").increment(1);
+                None
+            }
+        })
+    }
+
+    fn spawn_router(&self, endpoint: Endpoint) -> Router {
+        Router::builder(endpoint)
+            .incoming_admission(self.incoming_transport_admission())
+            .accept(P2P_V2_ALPN, self.clone())
+            .spawn()
     }
 
     async fn accept_connection(&self, connection: Connection) -> Result<(), AcceptError> {
@@ -3654,7 +3686,9 @@ async fn spawn_zakura_endpoint_inner(
     let secret_key = zakura_secret_key(config)?;
     let local_node_id = secret_key.public();
     let discovery_secret_key = secret_key.clone();
-    let builder = direct_endpoint_builder(secret_key).transport_config(limits.transport_config());
+    let builder = direct_endpoint_builder(secret_key)
+        .transport_config(limits.transport_config())
+        .incoming_queue_limits(limits.max_pending_handshakes, 64 * 1024, 2 * 1024 * 1024);
     // Bind a fixed address when configured so this node has a stable, advertisable
     // Zakura endpoint; otherwise bind loopback-only so the unset (dial-out-only)
     // case does not expose the native P2P_V2_ALPN surface on all interfaces.
@@ -3813,9 +3847,7 @@ async fn spawn_zakura_endpoint_inner(
     // peer's source IP and enforce the per-IP connection cap.
     .with_endpoint(endpoint.clone());
     handler.set_header_sync_enabled(header_sync_ready);
-    let router = Router::builder(endpoint)
-        .accept(P2P_V2_ALPN, handler.clone())
-        .spawn();
+    let router = handler.spawn_router(endpoint);
     let endpoint = ZakuraEndpoint {
         router,
         supervisor,
@@ -3931,10 +3963,20 @@ pub(crate) async fn serve_native_dial_connection(
         .clone()
         .try_acquire_owned()
         .map_err(|_| ZakuraHandlerError::ResourceLimit("admission"))?;
-    let connection = timeout(
-        limits.control_timeout,
-        endpoint.router.endpoint().connect(node_addr, P2P_V2_ALPN),
-    )
+    let transport_owner = endpoint.handler.reserve_transport()?;
+    let connection = timeout(limits.control_timeout, async {
+        let connecting = endpoint
+            .router
+            .endpoint()
+            .connect_with_owner(
+                node_addr,
+                P2P_V2_ALPN,
+                iroh::endpoint::ConnectOptions::new(),
+                transport_owner,
+            )
+            .await?;
+        Ok::<_, iroh::endpoint::ConnectError>(connecting.await?)
+    })
     .await
     .map_err(|_| ZakuraHandlerError::Timeout("native dial"))??;
     let remote_node_id = connection.remote_id();
@@ -5720,6 +5762,7 @@ mod tests {
     mod paired_block_sync;
     mod quic_progress;
     mod serving_progress;
+    mod transport_ownership;
 
     use super::*;
     use crate::{

@@ -14067,9 +14067,8 @@ async fn reactor_refill_window_advances_past_claimed_heights() {
         }
     ));
 
-    // Populate the work queue with heights 1..=3 (max_claimed = 3), then nudge the
-    // producer. `NeededBlocks` and `HeaderTipChanged` share one FIFO event channel,
-    // so the queue is populated before the re-query runs (no watch race).
+    // Populate heights 1..=3, then nudge the producer without changing the tip.
+    // A periodic refill can run between the two events, so both use the same tip.
     let metas: Vec<_> = (1..=3)
         .map(|height| BlockSyncBlockMeta {
             height: block::Height(height),
@@ -14083,8 +14082,8 @@ async fn reactor_refill_window_advances_past_claimed_heights() {
         .expect("needed-blocks event queues");
     handle
         .send(BlockSyncEvent::HeaderTipChanged {
-            height: block::Height(50_001),
-            hash: block::Hash([51; 32]),
+            height: best_header_tip,
+            hash: block::Hash([50; 32]),
         })
         .await
         .expect("header-tip event queues");
@@ -14103,7 +14102,7 @@ async fn reactor_refill_window_advances_past_claimed_heights() {
                 "refill must advance past the claimed heights, not rescan from the floor",
             );
             assert_eq!(limit, 8);
-            assert_eq!(best_header_tip, block::Height(50_001));
+            assert_eq!(best_header_tip, block::Height(50_000));
         }
         action => panic!("expected the advanced refill query, got {action:?}"),
     }

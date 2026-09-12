@@ -1,5 +1,6 @@
 //! Tracks transaction locations by their inputs and revealed nullifiers.
 
+#[cfg(feature = "indexer")]
 use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, TryRecvError};
@@ -7,12 +8,116 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use zakura_chain::block::Height;
 
+use crate::service::finalized_state::ZakuraDb;
+
+#[cfg(feature = "indexer")]
 use crate::{
-    service::{finalized_state::ZakuraDb, non_finalized_state::Chain, read},
+    service::{non_finalized_state::Chain, read},
     Spend,
 };
 
+#[cfg(all(test, not(feature = "indexer")))]
+use crate::service::finalized_state::WriteDisk;
+
 use super::{super::super::DiskWriteBatch, CancelFormatChange};
+
+#[cfg(feature = "indexer")]
+fn first_spend_is_indexed(
+    transaction: &zakura_chain::transaction::Transaction,
+    zakura_db: &ZakuraDb,
+) -> Option<bool> {
+    transaction
+        .inputs()
+        .iter()
+        .filter_map(|input| Some(input.outpoint()?.into()))
+        .chain(transaction.sprout_nullifiers().cloned().map(Spend::from))
+        .chain(transaction.sapling_nullifiers().cloned().map(Spend::from))
+        .chain(
+            transaction
+                .orchard_nullifiers()
+                .cloned()
+                .map(Spend::Orchard),
+        )
+        .chain(
+            transaction
+                .ironwood_nullifiers()
+                .cloned()
+                .map(Spend::Ironwood),
+        )
+        .next()
+        .map(|spend| {
+            read::spending_transaction_hash::<Arc<Chain>>(None, zakura_db, spend).is_some()
+        })
+}
+
+#[cfg(all(test, not(feature = "indexer")))]
+fn first_spend_is_indexed(
+    transaction: &zakura_chain::transaction::Transaction,
+    zakura_db: &ZakuraDb,
+) -> Option<bool> {
+    let has_transaction_hash = |location: Option<crate::TransactionLocation>| {
+        location
+            .and_then(|location| zakura_db.transaction_hash(location))
+            .is_some()
+    };
+
+    if let Some(outpoint) = transaction
+        .inputs()
+        .iter()
+        .find_map(|input| input.outpoint())
+    {
+        return Some(has_transaction_hash(zakura_db.spending_tx_loc(&outpoint)));
+    }
+    if let Some(nullifier) = transaction.sprout_nullifiers().next() {
+        return Some(has_transaction_hash(
+            zakura_db.sprout_revealing_tx_loc(nullifier),
+        ));
+    }
+    if let Some(nullifier) = transaction.sapling_nullifiers().next() {
+        return Some(has_transaction_hash(
+            zakura_db.sapling_revealing_tx_loc(nullifier),
+        ));
+    }
+    if let Some(nullifier) = transaction.orchard_nullifiers().next() {
+        return Some(has_transaction_hash(
+            zakura_db.orchard_revealing_tx_loc(nullifier),
+        ));
+    }
+    if let Some(nullifier) = transaction.ironwood_nullifiers().next() {
+        return Some(has_transaction_hash(
+            zakura_db.ironwood_revealing_tx_loc(nullifier),
+        ));
+    }
+
+    None
+}
+
+#[cfg(all(test, not(feature = "indexer")))]
+fn prepare_nullifier_index_batch(
+    batch: &mut DiskWriteBatch,
+    zakura_db: &ZakuraDb,
+    transaction: &zakura_chain::transaction::Transaction,
+    transaction_location: crate::TransactionLocation,
+) {
+    let db = zakura_db.db();
+    let sprout_nullifiers = db.cf_handle("sprout_nullifiers").unwrap();
+    let sapling_nullifiers = db.cf_handle("sapling_nullifiers").unwrap();
+    let orchard_nullifiers = db.cf_handle("orchard_nullifiers").unwrap();
+    let ironwood_nullifiers = db.cf_handle("ironwood_nullifiers").unwrap();
+
+    for nullifier in transaction.sprout_nullifiers() {
+        batch.zs_insert(&sprout_nullifiers, nullifier, transaction_location);
+    }
+    for nullifier in transaction.sapling_nullifiers() {
+        batch.zs_insert(&sapling_nullifiers, nullifier, transaction_location);
+    }
+    for nullifier in transaction.orchard_nullifiers() {
+        batch.zs_insert(&orchard_nullifiers, nullifier, transaction_location);
+    }
+    for nullifier in transaction.ironwood_nullifiers() {
+        batch.zs_insert(&ironwood_nullifiers, nullifier, transaction_location);
+    }
+}
 
 /// Runs disk format upgrade for tracking transaction locations by their inputs and revealed nullifiers.
 ///
@@ -46,19 +151,8 @@ pub fn run(
                 }
 
                 if !should_index_at_height {
-                    if let Some(spend) = tx
-                        .inputs()
-                        .iter()
-                        .filter_map(|input| Some(input.outpoint()?.into()))
-                        .chain(tx.sprout_nullifiers().cloned().map(Spend::from))
-                        .chain(tx.sapling_nullifiers().cloned().map(Spend::from))
-                        .chain(tx.orchard_nullifiers().cloned().map(Spend::Orchard))
-                        .chain(tx.ironwood_nullifiers().cloned().map(Spend::Ironwood))
-                        .next()
-                    {
-                        if read::spending_transaction_hash::<Arc<Chain>>(None, zakura_db, spend)
-                            .is_some()
-                        {
+                    if let Some(is_indexed) = first_spend_is_indexed(&tx, zakura_db) {
+                        if is_indexed {
                             // Skip transactions in blocks with existing indexes
                             return Ok(());
                         } else {
@@ -88,7 +182,11 @@ pub fn run(
                         .zs_insert(&spent_output_location, &tx_loc);
                 }
 
+                #[cfg(feature = "indexer")]
                 batch.prepare_nullifier_batch(zakura_db, &tx, tx_loc);
+
+                #[cfg(all(test, not(feature = "indexer")))]
+                prepare_nullifier_index_batch(&mut batch, zakura_db, &tx, tx_loc);
             }
 
             if !matches!(cancel_receiver.try_recv(), Err(TryRecvError::Empty)) {

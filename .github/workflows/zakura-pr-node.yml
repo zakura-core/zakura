@@ -17,7 +17,7 @@ jobs:
           ssh_private_key: ${{ secrets.DO_SSH_PRIVATE_KEY }}
       - name: Inspect only this test's disposable resources
         env:
-          OWNER_RUN: '34658397744'
+          OWNER_RUN: '34668817244'
         run: |
           set -euo pipefail
           doctl compute droplet list --tag-name zakura-pr-node -o json > /tmp/droplets.json
@@ -26,7 +26,7 @@ jobs:
           import json,os
           from pathlib import Path
           owner=os.environ['OWNER_RUN']
-          nodes=[d for d in json.load(open('/tmp/droplets.json')) if d['name'].startswith('zakura-pr-adam-header-serving-') and d['name'].endswith('-'+owner)]
+          nodes=[d for d in json.load(open('/tmp/droplets.json')) if d['name'].startswith('zakura-pr-adam-checkpoint-handoff-') and d['name'].endswith('-'+owner)]
           volumes=[v for v in json.load(open('/tmp/volumes.json')) if v['name']=='zakura-pr-vol-'+owner or v['name'].startswith('zakura-pr-vol-'+owner+'-')]
           assert len(nodes)<=1
           print(json.dumps({'owner_run':owner,'nodes':[{'id':d['id'],'name':d['name'],'volume_ids':d.get('volume_ids',[])} for d in nodes],'volumes':[{'id':v['id'],'name':v['name']} for v in volumes]}))

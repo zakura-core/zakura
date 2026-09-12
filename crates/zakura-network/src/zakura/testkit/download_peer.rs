@@ -86,7 +86,9 @@ impl DownloadOnlyPeer {
             ]),
             cancel,
             CloseCause::new(),
-            crate::zakura::regulation::ResponseMemory::default().connection(),
+            crate::zakura::regulation::ResponseMemory::default()
+                .try_connection()
+                .expect("default response budget funds a connection"),
         )
     }
 }

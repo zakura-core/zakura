@@ -1,6 +1,19 @@
 use super::*;
 
 impl ResponseScope {
+    pub(crate) fn setup_bytes_for_test() -> u64 {
+        SCOPE_SETUP_BYTES
+    }
+
+    pub(crate) fn with_memory(
+        connection_cancel: CancellationToken,
+        cause: CloseCause,
+        memory: ConnectionResponseMemory,
+    ) -> Self {
+        Self::try_with_memory(&connection_cancel, &cause, memory)
+            .expect("the fixture funds scope setup")
+    }
+
     pub(crate) fn authorize(&self) -> Result<ResponseAuthorization, ResponseAdmissionError> {
         self.authorize_with_metadata(0)
     }

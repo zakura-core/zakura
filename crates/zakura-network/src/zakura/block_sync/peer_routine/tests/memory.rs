@@ -3,7 +3,7 @@ use crate::zakura::block_sync::sequencer_task::{SequencedBody, SequencerView};
 use crate::zakura::BlockSyncMessage;
 use crate::zakura::{
     block_sync::{events::RoutineToReactor, MSG_BS_GET_BLOCKS},
-    regulation::{ConnectionResponseMemory, ResponseMemory},
+    regulation::{ConnectionResponseMemory, ResponseMemory, ResponseScope},
     FramedRecv, FramedSend, SinkReject,
 };
 
@@ -86,7 +86,10 @@ impl Fixture {
 
 #[tokio::test(start_paused = true)]
 async fn metadata_capacity_reduces_the_batch_before_taking_work() {
-    let node = ResponseMemory::new(1024, 1024);
+    let setup = ResponseMemory::node_setup_bytes_for_test()
+        + ResponseMemory::setup_bytes_for_test()
+        + ResponseScope::setup_bytes_for_test();
+    let node = ResponseMemory::new(setup + 1024, setup + 1024);
     let mut f = Fixture::new(node.connection(), true);
     f.routine.max_blocks_per_response = 128;
     f.routine.config.max_blocks_per_response = 128;
@@ -105,9 +108,9 @@ async fn metadata_capacity_reduces_the_batch_before_taking_work() {
     assert_eq!(preferred, 128);
     let (funded_count, reservation) = f.routine.authorize_request_metadata().unwrap();
     assert!(funded_count > 0 && funded_count < preferred);
-    assert!(node.reserved_for_test() <= 1024);
+    assert!(node.reserved_for_test() <= setup + 1024);
     drop(reservation);
-    assert_eq!(node.reserved_for_test(), 0);
+    assert_eq!(node.reserved_for_test(), setup);
     f.routine.try_fill().await;
     let frame = f.output.try_recv().unwrap();
     let BlockSyncMessage::GetBlocks { count, .. } = BlockSyncMessage::decode_frame(frame).unwrap()
@@ -115,8 +118,8 @@ async fn metadata_capacity_reduces_the_batch_before_taking_work() {
         panic!("the funded request must be GetBlocks");
     };
     assert!(usize::try_from(count).unwrap() <= funded_count);
-    assert!(node.reserved_for_test() > 0);
-    assert!(node.reserved_for_test() <= 1024);
+    assert!(node.reserved_for_test() > setup);
+    assert!(node.reserved_for_test() <= setup + 1024);
     assert_eq!(f.work.pending_len() + f.work.in_flight_len(), 128);
     assert!(!f.session.connection_is_closed_for_test());
     assert!(!f.session.cancel_token().is_cancelled());
@@ -124,10 +127,13 @@ async fn metadata_capacity_reduces_the_batch_before_taking_work() {
 
 #[tokio::test(start_paused = true)]
 async fn metadata_exhaustion_preserves_work_and_wakes_on_another_connection_release() {
-    let node = ResponseMemory::new(4096, 4096);
+    let setup = ResponseMemory::node_setup_bytes_for_test()
+        + 2 * ResponseMemory::setup_bytes_for_test()
+        + ResponseScope::setup_bytes_for_test();
+    let node = ResponseMemory::new(setup + 4096, setup + 4096);
     let other_connection = node.connection();
-    let held = other_connection.try_reserve(4096).unwrap();
     let mut f = Fixture::new(node.connection(), true);
+    let held = other_connection.try_reserve(4096).unwrap();
     f.routine.try_fill().await;
     assert!(f.routine.response_memory_waiting);
     assert_eq!(f.work.pending_len(), 1);
@@ -161,8 +167,12 @@ async fn metadata_exhaustion_preserves_work_and_wakes_on_another_connection_rele
 
 #[tokio::test(start_paused = true)]
 async fn idle_receiver_does_not_spin_on_its_own_provisional_memory_release() {
-    let node = ResponseMemory::new(4096, 4096);
-    let f = Fixture::new(node.connection(), false);
+    let setup = ResponseMemory::node_setup_bytes_for_test()
+        + ResponseMemory::setup_bytes_for_test()
+        + ResponseScope::setup_bytes_for_test();
+    let node = ResponseMemory::new(setup + 4096, setup + 4096);
+    let memory = node.connection();
+    let f = Fixture::new(memory.clone(), false);
     let running = tokio::spawn(f.routine.run());
     // An idle fill may prepare and return a record. Its release must not cause
     // another immediate fill forever, preventing this timer from advancing.
@@ -175,5 +185,5 @@ async fn idle_receiver_does_not_spin_on_its_own_provisional_memory_release() {
         .unwrap()
         .unwrap()
         .is_ok());
-    assert!(node.connection().try_reserve(4096).is_some());
+    assert!(memory.try_reserve(4096).is_some());
 }

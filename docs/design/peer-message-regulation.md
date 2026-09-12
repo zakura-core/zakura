@@ -66,10 +66,21 @@ order.
 
 The endpoint creates one response metadata pool with a 128 MiB node limit and a
 16 MiB limit per connection. All service sessions on that connection receive the
-same context, including later escalation and replacement. Authorization records
-reserve their allocation before creation and retain the charge through the last
-writer handle, even after an ending or connection close. Exhaustion pauses new
-requests locally, and a release wakes affected waiters.
+same context, including later escalation and replacement. The limits include
+512 bytes for pool accounting, 4 KiB per connection context, and 512 bytes per
+receiver scope. These fixed allowances cover the shared allocations and first-use
+locks. Cold allocation probes check their sizes. Pool and scope setup initialize
+their platform locks while funded. Pool funding survives the endpoint handle if
+connections still use it. Connection and scope funding survives through their
+last owner.
+
+Connection setup is reserved before registration can replace another connection.
+Receiver setup is reserved before retiring the prior receiver or publishing its
+registry admission. A failure declines that admission locally and leaves the
+existing receiver intact. Authorization records reserve their allocation before
+creation and retain the charge through the last writer handle, even after an
+ending or connection close. Exhaustion pauses new requests locally, and a release
+wakes affected waiters.
 
 An adapter can include its allocation plan in that reservation. Every planned
 allocation must remain owned by the authorization or one of its writer handles.
@@ -79,10 +90,10 @@ readers retain the authorization's memory charge after the writer and response
 owner exit. If the preferred batch cannot fit, the requester tries progressively
 smaller batches before waiting for capacity.
 
-First-use scope and cancellation locks can allocate on some platforms and still
-need funding. Retained window and registry capacities also need charges before
-these limits bound all protocol metadata. These allowances are separate from
-body storage, decoding, and execution budgets.
+Retained window and registry capacities still need charges before these limits
+bound all protocol metadata. Transport setup, stream buffers and cancellation
+children also need their own aggregate accounting. These allowances are separate
+from body storage, decoding, and execution budgets.
 
 ## Capacity admission and QUIC backpressure
 

@@ -1033,7 +1033,13 @@ mod tests {
 
     #[test]
     fn response_memory_survives_service_fanout_and_escalation() {
-        let node = crate::zakura::regulation::ResponseMemory::new(100, 80);
+        let setup = crate::zakura::regulation::ResponseMemory::setup_bytes_for_test();
+        let node = crate::zakura::regulation::ResponseMemory::new(
+            crate::zakura::regulation::ResponseMemory::node_setup_bytes_for_test()
+                + 2 * setup
+                + 100,
+            setup + 80,
+        );
         let memory = node.connection();
         let first = TestService::new("first", vec![stream(5, 1)]);
         let second = TestService::new("second", vec![stream(6, 2)]);

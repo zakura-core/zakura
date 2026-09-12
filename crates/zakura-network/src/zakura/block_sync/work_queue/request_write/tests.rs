@@ -196,7 +196,10 @@ fn status_retains_metadata_after_request_and_response_owners_exit() {
     assert_eq!(f.metadata.reserved_for_test(), funded);
     assert!(!status.was_skipped());
     drop(status);
-    assert_eq!(f.metadata.reserved_for_test(), 0);
+    assert_eq!(
+        f.metadata.reserved_for_test(),
+        crate::zakura::regulation::ResponseMemory::setup_bytes_for_test()
+    );
 }
 
 #[test]

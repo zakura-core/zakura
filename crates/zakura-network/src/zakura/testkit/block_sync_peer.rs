@@ -129,6 +129,7 @@ impl SyntheticBlockSyncPeers {
             streams,
             cancel.clone(),
             CloseCause::new(),
+            crate::zakura::regulation::ResponseMemory::default().connection(),
         ));
 
         let peer = SyntheticBlockSyncPeer {

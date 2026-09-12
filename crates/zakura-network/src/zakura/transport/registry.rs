@@ -484,6 +484,7 @@ impl ServiceRegistry {
             mut streams,
             cancel_token,
             close_cause,
+            response_memory,
         ) = peer.into_parts();
 
         for service in self.services_for_negotiated(negotiated) {
@@ -512,6 +513,7 @@ impl ServiceRegistry {
                 cancel_token.clone(),
                 service_cancel_token,
                 close_cause.clone(),
+                response_memory.clone(),
             ));
         }
     }
@@ -530,6 +532,7 @@ impl ServiceRegistry {
             mut streams,
             cancel_token,
             close_cause,
+            response_memory,
         ) = peer.into_parts();
         let mut admitted_capabilities = 0;
 
@@ -565,6 +568,7 @@ impl ServiceRegistry {
                 cancel_token.clone(),
                 service_cancel_token,
                 close_cause.clone(),
+                response_memory.clone(),
             ));
         }
 
@@ -622,6 +626,7 @@ mod tests {
         wants: Mutex<bool>,
         added: Mutex<Vec<ZakuraPeerId>>,
         added_streams: Mutex<Vec<Vec<u16>>>,
+        response_memory: Mutex<Vec<crate::zakura::regulation::ConnectionResponseMemory>>,
         removed: Mutex<Vec<ZakuraPeerId>>,
     }
 
@@ -633,6 +638,7 @@ mod tests {
                 wants: Mutex::new(true),
                 added: Mutex::new(Vec::new()),
                 added_streams: Mutex::new(Vec::new()),
+                response_memory: Mutex::new(Vec::new()),
                 removed: Mutex::new(Vec::new()),
             })
         }
@@ -676,7 +682,9 @@ mod tests {
                 streams,
                 _cancel_token,
                 _cause,
+                response_memory,
             ) = peer.into_parts();
+            self.response_memory.lock().unwrap().push(response_memory);
             self.added
                 .lock()
                 .expect("test service added list should not be poisoned")
@@ -1021,6 +1029,55 @@ mod tests {
             .lock()
             .expect("test mutex should not be poisoned")
             .is_empty());
+    }
+
+    #[test]
+    fn response_memory_survives_service_fanout_and_escalation() {
+        let node = crate::zakura::regulation::ResponseMemory::new(100, 80);
+        let memory = node.connection();
+        let first = TestService::new("first", vec![stream(5, 1)]);
+        let second = TestService::new("second", vec![stream(6, 2)]);
+        let registry = ServiceRegistry::new(vec![first.clone(), second.clone()]).unwrap();
+        let id = ZakuraPeerId::new(vec![61; 32]).unwrap();
+        registry.add_peer(
+            Peer::new(
+                id.clone(),
+                None,
+                3,
+                HashMap::new(),
+                CancellationToken::new(),
+            )
+            .with_response_memory(memory.clone()),
+        );
+        let first_memory = first.response_memory.lock().unwrap()[0].clone();
+        let second_memory = second.response_memory.lock().unwrap()[0].clone();
+        let first_owner = first_memory.try_reserve(40).unwrap();
+        let second_owner = second_memory.try_reserve(40).unwrap();
+        assert!(memory.try_reserve(1).is_none());
+        let (send, recv) = framed_channel(1);
+        assert_eq!(
+            registry.add_escalated_peer(
+                Peer::new(
+                    id,
+                    None,
+                    3,
+                    HashMap::from([(6, (recv, send))]),
+                    CancellationToken::new()
+                )
+                .with_response_memory(memory.clone())
+            ),
+            2
+        );
+        let replacement = second.response_memory.lock().unwrap()[1].clone();
+        assert!(replacement.try_reserve(1).is_none());
+        let other_connection = node.connection();
+        let other_owner = other_connection.try_reserve(20).unwrap();
+        assert!(other_connection.try_reserve(1).is_none());
+        drop(first_owner);
+        let replacement_owner = replacement.try_reserve(40).unwrap();
+        assert!(other_connection.try_reserve(1).is_none());
+        drop((second_owner, other_owner, replacement_owner));
+        assert!(other_connection.try_reserve(80).is_some());
     }
 
     #[test]

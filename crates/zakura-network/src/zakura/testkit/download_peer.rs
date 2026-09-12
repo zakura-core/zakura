@@ -86,6 +86,7 @@ impl DownloadOnlyPeer {
             ]),
             cancel,
             CloseCause::new(),
+            crate::zakura::regulation::ResponseMemory::default().connection(),
         )
     }
 }

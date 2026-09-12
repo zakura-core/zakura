@@ -62,8 +62,19 @@ For GetBlocks, the work lock is acquired before the response scope lock. Termina
 handling releases the scope lock before returning local work. Session admission
 holds its session-table lock while retiring the old scope, without taking the
 work lock. This preserves request publication atomicity without an inverse lock
-order. The scope does not yet account for retained metadata. Per-connection and
-node metadata limits remain required before qualification.
+order.
+
+The endpoint creates one response metadata pool with a 128 MiB node limit and a
+16 MiB limit per connection. All service sessions on that connection receive the
+same context, including later escalation and replacement. Authorization records
+reserve their allocation before creation and retain the charge through the last
+writer handle, even after an ending or connection close. Exhaustion pauses new
+requests locally, and a release wakes affected waiters.
+
+This accounting currently covers authorization records. Expected hashes,
+request-write copies, and retained window and registry capacities still need
+charges before these limits bound all protocol metadata. These allowances are
+separate from body storage, decoding, and execution budgets.
 
 ## Capacity admission and QUIC backpressure
 

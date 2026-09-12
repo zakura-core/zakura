@@ -1,5 +1,20 @@
 use super::*;
 
+impl BlockSyncPeerSession {
+    /// Set the pool before a routine publishes its first request.
+    pub(in crate::zakura::block_sync) fn with_response_memory_for_test(
+        mut self,
+        memory: ConnectionResponseMemory,
+    ) -> Self {
+        self.response_scope = ResponseScope::with_memory(
+            self.connection_cancel.clone(),
+            self.close_cause.clone(),
+            memory,
+        );
+        self
+    }
+}
+
 use super::super::work_queue::{RequestWrite, WorkQueue};
 use crate::zakura::transport::{
     worker_framed_channel, ByteBudget, FrameWriteClaim, FramedWorkerRecv,
@@ -104,7 +119,7 @@ async fn replacement_fences_old_publication_and_queued_first_write() {
         let (_new_input, mut new_output) = add_fence_peer(&service, &peer, 1, connection.clone());
         let new = service.current_sessions_for_test().snapshot()[&peer].clone();
         assert_ne!(old.session_id(), new.session_id());
-        assert!(old.authorize_response().is_none());
+        assert!(old.authorize_response().is_err());
         if queued {
             let mut wrote = false;
             old_output
@@ -242,7 +257,7 @@ async fn finished_exchange_and_new_connection_allow_replacement() {
         assert_ne!(old.session_id(), new.session_id());
         assert_eq!(old_connection.is_cancelled(), !finished);
         assert!(!next_connection.is_cancelled());
-        assert!(new.authorize_response().is_some());
+        assert!(new.authorize_response().is_ok());
         service.remove_peer(&peer, next_id);
     }
 }
@@ -268,7 +283,7 @@ async fn removing_a_session_fences_writers_before_erasing_its_record() {
             }
             assert!(service.current_sessions_for_test().snapshot().is_empty());
             assert!(!request.write.try_start());
-            assert!(session.authorize_response().is_none());
+            assert!(session.authorize_response().is_err());
             assert_eq!(connection.is_cancelled(), started);
         }
     }

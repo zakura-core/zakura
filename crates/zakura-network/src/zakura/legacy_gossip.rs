@@ -3721,6 +3721,7 @@ mod tests {
             HashMap::from([(ZAKURA_STREAM_GOSSIP, stream)]),
             cancel_token,
             CloseCause::new(),
+            crate::zakura::regulation::ResponseMemory::default().connection(),
         );
         (peer, peer_send)
     }

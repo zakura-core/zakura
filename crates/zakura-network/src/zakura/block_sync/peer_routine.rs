@@ -44,7 +44,7 @@ use super::{
     BlockSyncMessage, BlockSyncMisbehavior, BlockSyncPeerSession, BlockSyncStatus,
     ZakuraBlockSyncConfig, ZakuraPeerId, ZakuraTrace, MSG_BS_BLOCK,
 };
-use crate::zakura::regulation::ResponseCredit;
+use crate::zakura::regulation::{ResponseAdmissionError, ResponseCredit};
 use crate::zakura::transport::OrderedStreamFailure;
 use crate::zakura::{trace::BlockBodySource, Admit, FramedRecv, SinkReject, ZakuraConnId};
 use std::{sync::Arc, time::Duration, time::Instant};
@@ -114,6 +114,7 @@ enum FillStop {
     InflightBudget,
     RetryAvoid,
     Budget,
+    ResponseMemory,
     Internal,
     OutboundFull,
     SendError,
@@ -136,6 +137,7 @@ impl FillStop {
             FillStop::InflightBudget => "inflight_budget",
             FillStop::RetryAvoid => "retry_avoid",
             FillStop::Budget => "budget",
+            FillStop::ResponseMemory => "response_metadata",
             FillStop::Internal => "internal",
             FillStop::OutboundFull => "outbound_full",
             FillStop::SendError => "send_error",
@@ -248,6 +250,7 @@ pub(super) struct PeerRoutine {
     /// Authoritative for the routine's own want-work decision (mirrored into the
     /// registry for the reactor's serving-side reads).
     max_blocks_per_response: u32,
+    response_memory_waiting: bool,
     max_response_bytes: u32,
     /// Rate meter for sending our `Status` reply to this peer's inbound `Status`.
     /// The reply decision is routine-local; the actual send stays reactor-side via
@@ -350,6 +353,7 @@ impl PeerRoutine {
             servable_low: block::Height::MIN,
             servable_high: block::Height::MIN,
             max_blocks_per_response,
+            response_memory_waiting: false,
             max_response_bytes,
             status_reply_meter,
             inbound_status_meter,
@@ -431,6 +435,7 @@ impl PeerRoutine {
         // `self.work`.
         let budget = self.budget.clone();
         let work = self.work.clone();
+        let response_memory = self.session.response_memory();
         // Per-peer BBR heartbeat cadence. `Skip` so a routine busy past a tick emits one
         // fresh sample rather than a catch-up burst. Observability only.
         let mut bbr_trace_ticks = time::interval(BBR_TRACE_INTERVAL);
@@ -446,10 +451,13 @@ impl PeerRoutine {
             // would be lost if we registered after — the routine would stall.
             let capacity = budget.subscribe_capacity().notified();
             let available = work.subscribe_available().notified();
+            let response_capacity = response_memory.subscribe_capacity().notified();
             tokio::pin!(capacity);
             tokio::pin!(available);
+            tokio::pin!(response_capacity);
             Notified::enable(capacity.as_mut());
             Notified::enable(available.as_mut());
+            Notified::enable(response_capacity.as_mut());
 
             let retry_filter_deadline = if self.session.outbound_capacity() > 0 {
                 self.try_fill().await
@@ -507,6 +515,9 @@ impl PeerRoutine {
                 }
                 _ = &mut available => {
                     self.trace_wake("work_added");
+                }
+                _ = &mut response_capacity, if self.response_memory_waiting => {
+                    self.trace_wake("response_metadata_capacity");
                 }
                 _ = bbr_trace_ticks.tick() => self.trace_bbr_sample(),
                 _ = &mut outbound_queue_poll, if !outbound_queue_has_capacity => {}
@@ -834,6 +845,7 @@ impl PeerRoutine {
     /// There is no floor gate: downloads are governed by the byte budget and
     /// per-peer slots, never floor-distance / near-tip lag.
     async fn try_fill(&mut self) -> Option<Instant> {
+        self.response_memory_waiting = false;
         self.gc_skipped_outstanding();
         // The BBR cwnd is clamped to the peer's advertised hard cap inside
         // `available_slots`, so there is no separate window to reconcile on a
@@ -895,9 +907,16 @@ impl PeerRoutine {
                     break FillStop::SendError;
                 }
             };
-            let Some(authorization) = self.session.authorize_response() else {
-                self.session.cancel_token().cancel();
-                break FillStop::SendError;
+            let authorization = match self.session.authorize_response() {
+                Ok(authorization) => authorization,
+                Err(ResponseAdmissionError::MemoryFull) => {
+                    self.response_memory_waiting = true;
+                    break FillStop::ResponseMemory;
+                }
+                Err(ResponseAdmissionError::Retired) => {
+                    self.session.cancel_token().cancel();
+                    break FillStop::SendError;
+                }
             };
             let Some(request_id) = self.next_request_id else {
                 break FillStop::Internal;
@@ -1968,6 +1987,7 @@ impl Drop for PeerRoutine {
 
 #[cfg(test)]
 mod tests {
+    mod memory;
     use std::sync::atomic::AtomicU64;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};

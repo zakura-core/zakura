@@ -1,10 +1,17 @@
 //! Fence requester publication and first writes before replacing a receiver.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio_util::sync::CancellationToken;
 
+use super::response_memory::{ConnectionResponseMemory, ResponseMemoryPermit};
 use crate::zakura::CloseCause;
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ResponseAdmissionError {
+    Retired,
+    MemoryFull,
+}
 
 /// One receiver incarnation. Retiring it prevents further publication or starts.
 /// Started exchanges still require their message-specific ending or connection close.
@@ -16,12 +23,21 @@ struct Scope {
     state: Mutex<ScopeState>,
     connection_cancel: CancellationToken,
     close_cause: CloseCause,
+    memory: ConnectionResponseMemory,
 }
 
 #[derive(Debug, Default)]
 struct ScopeState {
     retired: bool,
     started: usize,
+}
+
+impl Scope {
+    fn lock(&self) -> MutexGuard<'_, ScopeState> {
+        self.state
+            .lock()
+            .expect("response scope mutex is never poisoned")
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -38,6 +54,16 @@ struct Authorization {
     scope: ResponseScope,
     // Always lock the scope before this phase, including terminal and Drop paths.
     phase: Mutex<Phase>,
+    _memory: ResponseMemoryPermit,
+}
+
+fn authorization_allocation_bytes() -> u64 {
+    // The Arc allocation includes its counters and alignment padding.
+    let (layout, _) = std::alloc::Layout::new::<[usize; 2]>()
+        .extend(std::alloc::Layout::new::<Authorization>())
+        .expect("the fixed authorization fields fit an allocation");
+    u64::try_from(layout.pad_to_align().size())
+        .expect("authorization allocation size fits the byte counter")
 }
 
 /// Unique owner of an exchange through its validated ending. Dropping a started
@@ -50,28 +76,39 @@ pub(crate) struct ResponseAuthorization(Arc<Authorization>);
 pub(crate) struct ResponseWritePermission(Arc<Authorization>);
 
 impl ResponseScope {
-    pub(crate) fn new(connection_cancel: CancellationToken, close_cause: CloseCause) -> Self {
+    pub(crate) fn with_memory(
+        connection_cancel: CancellationToken,
+        close_cause: CloseCause,
+        memory: ConnectionResponseMemory,
+    ) -> Self {
         Self(Arc::new(Scope {
             state: Mutex::new(ScopeState::default()),
             connection_cancel,
             close_cause,
+            memory,
         }))
     }
 
     /// Prepare before taking local work or allocating message-specific expectations.
-    pub(crate) fn authorize(&self) -> Option<ResponseAuthorization> {
-        let state = self
-            .0
-            .state
-            .lock()
-            .expect("response scope mutex is never poisoned");
+    pub(crate) fn authorize(&self) -> Result<ResponseAuthorization, ResponseAdmissionError> {
+        let state = self.0.lock();
         if state.retired || self.0.connection_cancel.is_cancelled() {
-            return None;
+            return Err(ResponseAdmissionError::Retired);
         }
-        Some(ResponseAuthorization(Arc::new(Authorization {
+        let memory = self
+            .0
+            .memory
+            .try_reserve(authorization_allocation_bytes())
+            .ok_or(ResponseAdmissionError::MemoryFull)?;
+        Ok(ResponseAuthorization(Arc::new(Authorization {
             scope: self.clone(),
             phase: Mutex::new(Phase::Prepared),
+            _memory: memory,
         })))
+    }
+
+    pub(crate) fn memory(&self) -> ConnectionResponseMemory {
+        self.0.memory.clone()
     }
 
     /// Fence old publishers and writers before removing or replacing their session.

@@ -8,6 +8,44 @@ use crate::zakura::{
 };
 use zakura_test::allocations::measure;
 
+#[tokio::test]
+async fn r02_window_capacity_is_funded_before_work_and_after_the_ending() {
+    for count in [1, 2, 3, 4, 7, 8, 127, 128] {
+        let mut fixture = Fixture::new(100, count);
+        let memory = fixture.routine.session.response_memory();
+        let baseline = memory.reserved_for_test();
+        let (prepared, allocations) =
+            measure(|| fixture.routine.authorize_request_metadata().unwrap());
+        let window_bytes = u64::try_from(
+            fixture.routine.window.outstanding.capacity()
+                * std::mem::size_of::<super::super::super::state::OutstandingBlockRange>(),
+        )
+        .unwrap();
+        assert!(window_bytes > 0);
+        assert!(
+            u64::try_from(allocations.peak_live_bytes).unwrap()
+                <= memory.reserved_for_test() - baseline
+        );
+        assert_eq!(fixture.routine.work.in_flight_len(), 0);
+        drop(prepared);
+        assert_eq!(memory.reserved_for_test(), baseline + window_bytes);
+
+        fixture.publish().await;
+        for index in 0..usize::try_from(count).unwrap() {
+            fixture.body(index).await;
+        }
+        fixture.deliver(fixture.done(count)).await.unwrap();
+        assert!(fixture.routine.window.outstanding.is_empty());
+        assert_eq!(memory.reserved_for_test(), baseline + window_bytes);
+        fixture.assert_no_peer_fault();
+        drop(fixture);
+        assert_eq!(
+            memory.reserved_for_test(),
+            ResponseMemory::setup_bytes_for_test()
+        );
+    }
+}
+
 proptest! {
     #[test]
     fn r02_generated_request_metadata_plan_funds_retained_allocations(count in 1usize..=128) {

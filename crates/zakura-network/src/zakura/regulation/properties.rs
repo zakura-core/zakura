@@ -5,6 +5,7 @@ use proptest::prelude::*;
 
 mod response_lifecycle;
 mod response_memory;
+mod response_vec;
 
 proptest! {
     #[test]

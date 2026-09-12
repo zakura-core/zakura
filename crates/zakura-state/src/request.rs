@@ -1557,6 +1557,29 @@ pub enum Request {
 }
 
 impl Request {
+    pub(crate) fn available_during_spentness(&self) -> bool {
+        matches!(
+            self,
+            Self::CommitCheckpointVerifiedBlock(_)
+                | Self::ApplyHeaderChainInsert { .. }
+                | Self::RecordHeaderChainBodyUnavailable { .. }
+                | Self::RecordHeaderChainBodyInvalid { .. }
+                | Self::RestartHeaderChainBodyAvailability { .. }
+                | Self::RetryHeaderChainBodyAvailability { .. }
+                | Self::Depth(_)
+                | Self::Tip
+                | Self::BlockLocator
+                | Self::Transaction(_)
+                | Self::Block(_)
+                | Self::AnyChainBlock(_)
+                | Self::BlockHeader(_)
+                | Self::FindBlockHashes { .. }
+                | Self::FindBlockHeaders { .. }
+                | Self::BestChainBlockHash(_)
+                | Self::KnownBlock(_)
+        )
+    }
+
     /// Returns a [`&'static str`](str) name of the variant representing this value.
     pub fn variant_name(&self) -> &'static str {
         match self {
@@ -2115,6 +2138,53 @@ pub enum ReadRequest {
 }
 
 impl ReadRequest {
+    pub(crate) fn available_during_spentness(&self) -> bool {
+        #[cfg(feature = "indexer")]
+        if matches!(self, Self::RawBlocksByHeightRange { .. }) {
+            return true;
+        }
+        matches!(
+            self,
+            Self::UsageInfo
+                | Self::PruningInfo
+                | Self::Tip
+                | Self::FinalizedTip
+                | Self::Depth(_)
+                | Self::Block(_)
+                | Self::AnyChainBlock(_)
+                | Self::BlockAndSize(_)
+                | Self::BlockHeader(_)
+                | Self::Transaction(_)
+                | Self::AnyChainTransaction(_)
+                | Self::TransactionIdsForBlock(_)
+                | Self::AnyChainTransactionIdsForBlock(_)
+                | Self::BlockLocator
+                | Self::FindBlockHashes { .. }
+                | Self::FindBlockHeaders { .. }
+                | Self::HeaderChainSnapshot
+                | Self::HeaderLocator
+                | Self::HeaderValidationLease { .. }
+                | Self::VctRepairContext { .. }
+                | Self::AcquireRetainedHeaderPath { .. }
+                | Self::ReadRetainedHeaderPath { .. }
+                | Self::ReleaseRetainedHeaderPath { .. }
+                | Self::BlockRoots { .. }
+                | Self::BestHeaderTip
+                | Self::MissingBlockBodyMetadata { .. }
+                | Self::BlocksByHeightRange { .. }
+                | Self::SaplingTree(_)
+                | Self::OrchardTree(_)
+                | Self::IronwoodTree(_)
+                | Self::SaplingSubtrees { .. }
+                | Self::OrchardSubtrees { .. }
+                | Self::IronwoodSubtrees { .. }
+                | Self::BestChainBlockHash(_)
+                | Self::TipBlockSize
+                | Self::ChainTips
+                | Self::NonFinalizedBlocksListener { .. }
+        )
+    }
+
     /// Returns a [`&'static str`](str) name of the variant representing this value.
     pub fn variant_name(&self) -> &'static str {
         match self {

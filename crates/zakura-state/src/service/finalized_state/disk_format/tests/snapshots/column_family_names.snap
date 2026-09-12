@@ -38,6 +38,7 @@ expression: cf_names
   "sapling_note_commitment_subtree",
   "sapling_note_commitment_tree",
   "sapling_nullifiers",
+  "spentness_metadata",
   "sprout_anchors",
   "sprout_note_commitment_tree",
   "sprout_nullifiers",

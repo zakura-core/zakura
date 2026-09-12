@@ -44,6 +44,14 @@ use crate::components::{
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
+/// Wait until the state writer can take a checkpoint body at `height`.
+async fn wait_for_spentness_height(
+    status: &mut watch::Receiver<zs::SpentnessStatus>,
+    height: Height,
+) -> Result<(), zs::SpentnessError> {
+    zs::wait_for_spentness(status, |status| status.admits_checkpoint_body(height)).await
+}
+
 /// A multiplier used to calculate the extra number of blocks we allow in the
 /// verifier, state, and block commit pipelines, on top of the lookahead limit.
 ///
@@ -330,6 +338,9 @@ where
 
     /// Structured diagnostics for legacy block downloads and verification.
     trace: LegacySyncTrace,
+
+    /// Pause verification before its timeout while local construction blocks this height.
+    spentness_status: Option<watch::Receiver<zs::SpentnessStatus>>,
 }
 
 fn take_task_state(
@@ -443,7 +454,15 @@ where
             cancel_handles: HashMap::new(),
             task_states: Arc::new(Mutex::new(HashMap::new())),
             trace,
+            spentness_status: None,
         }
+    }
+
+    pub(super) fn set_spentness_status(
+        self: Pin<&mut Self>,
+        status: watch::Receiver<zs::SpentnessStatus>,
+    ) {
+        *self.project().spentness_status = Some(status);
     }
 
     fn transition_task(
@@ -558,6 +577,7 @@ where
         let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
 
         let mut verifier = self.verifier.clone();
+        let spentness_status = self.spentness_status.clone();
         let latest_chain_tip = self.latest_chain_tip.clone();
 
         let lookahead_limit = self.lookahead_limit;
@@ -800,6 +820,18 @@ where
                     Err(BlockDownloadVerifyError::BehindTipHeightLimit { height: block_height, hash })?;
                 }
 
+                if let Some(mut status) = spentness_status {
+                    tokio::select! {
+                        biased;
+                        _ = &mut cancel_rx => {
+                            return Err(BlockDownloadVerifyError::CancelledAwaitingVerifierReadiness { height: block_height, hash });
+                        }
+                        result = wait_for_spentness_height(&mut status, block_height) => {
+                            result.map_err(|error| BlockDownloadVerifyError::VerifierServiceError { error: error.into() })?;
+                        }
+                    }
+                }
+
                 // Wait for the verifier service to be ready.
                 let readiness = verifier.ready();
                 // Prefer the cancel handle if both are ready.
@@ -943,5 +975,33 @@ where
     #[allow(dead_code)]
     pub fn is_empty(&mut self) -> bool {
         self.pending.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod spentness_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn spentness_wait_precedes_verifier_deadlines() {
+        let (sender, mut status) = watch::channel(zs::SpentnessStatus::Applying {
+            terminal_height: Height(10),
+        });
+        wait_for_spentness_height(&mut status, Height(10))
+            .await
+            .unwrap();
+        let mut later = status.clone();
+        let task =
+            tokio::spawn(async move { wait_for_spentness_height(&mut later, Height(11)).await });
+        tokio::task::yield_now().await;
+        sender.send_replace(zs::SpentnessStatus::Rebuilding);
+        tokio::time::advance(std::time::Duration::from_secs(3600)).await;
+        assert!(!task.is_finished());
+        sender.send_replace(zs::SpentnessStatus::Usable);
+        task.await.unwrap().unwrap();
+        sender.send_replace(zs::SpentnessStatus::Failed);
+        assert!(wait_for_spentness_height(&mut status, Height(11))
+            .await
+            .is_err());
     }
 }

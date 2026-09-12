@@ -144,7 +144,11 @@ fn format_upgrades(
         )),
         Box::new(drop_header_root_auth_frontier::Upgrade),
         Box::new(unauthenticated_commitment_roots::Upgrade),
-    ] as [Box<dyn DiskFormatUpgrade>; 10])
+        Box::new(no_migration::NoMigration::new(
+            "guard incomplete spentness construction from older binaries",
+            Version::new(29, 0, 0),
+        )),
+    ] as [Box<dyn DiskFormatUpgrade>; 11])
         .into_iter()
         .filter(move |upgrade| upgrade.version() > min_version())
 }
@@ -549,6 +553,12 @@ impl DbFormatChange {
                     "checking database format produced by new blocks in this instance is valid"
                 );
             }
+        }
+
+        // Construction deliberately leaves indexes and historical transparent accounting partial.
+        // Its ordered rebuild validates those rows before it publishes completion.
+        if db.spentness_incomplete() {
+            return Ok(());
         }
 
         #[cfg(feature = "indexer")]
@@ -1109,13 +1119,16 @@ fn vct_format_changes_include_root_auth_metadata_updates() {
 
     let upgrades: Vec<_> = format_upgrades(Some(Version::new(27, 3, 0))).collect();
 
-    assert_eq!(upgrades.len(), 6);
+    assert_eq!(upgrades.len(), 7);
     assert_eq!(upgrades[0].version(), Version::new(28, 0, 0));
     assert_eq!(upgrades[1].version(), Version::new(28, 0, 1));
     assert_eq!(upgrades[2].version(), Version::new(28, 0, 2));
     assert_eq!(upgrades[3].version(), Version::new(28, 1, 3));
     assert_eq!(upgrades[4].version(), Version::new(28, 1, 4));
     assert_eq!(upgrades[5].version(), Version::new(28, 1, 5));
+    assert_eq!(upgrades[6].version(), Version::new(29, 0, 0));
+    assert!(upgrades[6].is_reusable_major_upgrade());
+    assert!(!upgrades[6].needs_migration());
     assert!(
         !upgrades[3].needs_migration(),
         "the header-chain column families are created on open without rebasing authenticated roots"

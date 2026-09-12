@@ -38,6 +38,11 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Diagnose an incomplete state's cursor by re-enumerating retained bodies.
+    AuditProgress {
+        #[arg(long)]
+        state: PathBuf,
+    },
     /// Provision a local artifact only when this binary recognizes its release commitment.
     Install {
         #[arg(long)]
@@ -132,6 +137,19 @@ fn write(path: PathBuf, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Print the cursor audit, and fail when retained bodies disagree with the cursor.
+///
+/// The audit never changes the database.
+fn audit_progress(state: &Path) -> Result<()> {
+    let audit = zakura_state::audit_spentness_progress(&state_config(state), &NETWORK)?;
+    println!("{}", serde_json::to_string_pretty(&audit)?);
+    ensure!(
+        audit.cursor_matches,
+        "retained bodies differ from the construction cursor; audit made no changes"
+    );
+    Ok(())
+}
+
 fn install(artifact_path: &Path, cache: &Path) -> Result<()> {
     let parsed = ParsedArtifact::read(File::open(artifact_path)?)?;
     let commitment = release_commitments(&NETWORK)
@@ -149,6 +167,7 @@ fn install(artifact_path: &Path, cache: &Path) -> Result<()> {
 
 fn run(command: Command) -> Result<()> {
     match command {
+        Command::AuditProgress { state } => audit_progress(&state),
         Command::Install { artifact, cache } => install(&artifact, &cache),
         Command::Replay {
             source,

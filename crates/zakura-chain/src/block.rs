@@ -315,6 +315,17 @@ impl Block {
         })
     }
 
+    /// Return exact shielded and deferred changes while transparent indexes are under construction.
+    pub fn shielded_chain_value_pool_change(
+        &self,
+        deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
+    ) -> Result<ValueBalance<NegativeAllowed>, ValueBalanceError> {
+        self.chain_value_pool_change_from_utxos(
+            deferred_pool_balance_change,
+            Transaction::shielded_value_balance,
+        )
+    }
+
     fn chain_value_pool_change_from_utxos<F>(
         &self,
         deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,

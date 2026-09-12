@@ -358,6 +358,7 @@ pub(crate) struct BlockWriteTaskFailure {
 #[derive(Debug)]
 pub(crate) enum BlockWriteTaskExit {
     Completed,
+    SpentnessFailed(BlockWriteTaskFailure),
     HeaderChainAttachmentFailed(HeaderChainAttachmentError),
     HeaderChainRuntimeFailed(BlockWriteTaskFailure),
 }
@@ -389,7 +390,9 @@ impl BlockWriteTaskExit {
         match self {
             Self::Completed => None,
             Self::HeaderChainAttachmentFailed(error) => Some(error.into()),
-            Self::HeaderChainRuntimeFailed(error) => Some(error.clone()),
+            Self::HeaderChainRuntimeFailed(error) | Self::SpentnessFailed(error) => {
+                Some(error.clone())
+            }
         }
     }
 }
@@ -1896,6 +1899,26 @@ fn recover_resource_stall<M: HeaderChainMaintenance>(
     Ok(())
 }
 
+/// Serve at most one pending header-chain control message, deferring any other message.
+///
+/// Returns `false` when the non-finalized write channel is closed.
+fn serve_header_control_message(
+    receiver: &mut UnboundedReceiver<NonFinalizedWriteMessage>,
+    header_chain: Option<&HeaderChainWriter>,
+    deferred: &mut VecDeque<NonFinalizedWriteMessage>,
+) -> bool {
+    match receiver.try_recv() {
+        Ok(message) => {
+            if let Err(message) = handle_header_chain_control_message(header_chain, message) {
+                deferred.push_back(message);
+            }
+            true
+        }
+        Err(TryRecvError::Empty) => true,
+        Err(TryRecvError::Disconnected) => false,
+    }
+}
+
 /// Apply one header-chain control message.
 ///
 /// `Ok(true)` reports a durable commit. A refused, stale, resource-stalled, or no-change
@@ -2115,6 +2138,7 @@ impl WriteBlockWorkerTask {
         } = &mut self;
 
         let mut prev_finalized_note_commitment_trees: Option<NoteCommitmentTrees> = None;
+        let mut spentness_cache = super::finalized_state::SpentnessReplayCache::default();
         let mut deferred_non_finalized_messages = VecDeque::new();
         let deadline_runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
@@ -2142,16 +2166,37 @@ impl WriteBlockWorkerTask {
         // Write all the finalized blocks sent by the state,
         // until the state closes the finalized block channel's sender.
         loop {
-            match non_finalized_block_write_receiver.try_recv() {
-                Ok(msg) => {
-                    if let Err(msg) =
-                        handle_header_chain_control_message(header_chain.as_ref(), msg)
-                    {
-                        deferred_non_finalized_messages.push_back(msg);
+            // The writer notices a closed channel where it next waits for work.
+            serve_header_control_message(
+                non_finalized_block_write_receiver,
+                header_chain.as_ref(),
+                &mut deferred_non_finalized_messages,
+            );
+
+            // The rebuild holds the tip at H, but header control messages keep flowing.
+            if finalized_state.db.spentness_rebuilding() {
+                let mut yield_control = || {
+                    let open = serve_header_control_message(
+                        non_finalized_block_write_receiver,
+                        header_chain.as_ref(),
+                        &mut deferred_non_finalized_messages,
+                    );
+                    if open {
+                        Ok(())
+                    } else {
+                        Err(crate::SpentnessError::WriterStopped)
                     }
+                };
+                if let Err(error) =
+                    finalized_state.rebuild_spentness_step(&mut spentness_cache, &mut yield_control)
+                {
+                    finalized_state.db.fail_spentness();
+                    return BlockWriteTaskExit::SpentnessFailed(BlockWriteTaskFailure::runtime(
+                        "spentness rebuild stopped the writer",
+                        error,
+                    ));
                 }
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => {}
+                continue;
             }
 
             let ordered_block = match vct_write_retry_manager.take_retryable_block() {
@@ -2408,6 +2453,15 @@ impl WriteBlockWorkerTask {
                     chain_tip_sender.set_finalized_tip(tip_block);
                 }
                 Err((ordered_block, error)) => {
+                    if error.spentness_failure().is_some() {
+                        finalized_state.db.fail_spentness();
+                        return BlockWriteTaskExit::SpentnessFailed(
+                            BlockWriteTaskFailure::runtime(
+                                "spentness commit stopped the writer",
+                                error,
+                            ),
+                        );
+                    }
                     let mut attributed_failure_repair = None;
                     if let (Some(auxiliary_window), Some(failure)) = (
                         vct_auxiliary_window_for_outcome.as_ref(),

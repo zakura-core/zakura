@@ -418,6 +418,8 @@ impl StartCmd {
         // together under `[consensus]`.
         state_config.checkpoint_sync = config.consensus.checkpoint_sync;
         state_config.vct_fast_sync = config.consensus.vct_fast_sync_enabled();
+        let spentness_config =
+            spentness::prepare_construction(&config, &state_config, shutdown.clone()).await?;
 
         let (
             mut state_service,
@@ -427,6 +429,7 @@ impl StartCmd {
             header_chain_body_evidence,
         ) = zakura_state::init_with_header_chain_body_evidence(
             state_config,
+            spentness_config,
             &config.network.network,
             max_checkpoint_height,
             config.sync.checkpoint_verify_concurrency_limit
@@ -584,6 +587,11 @@ impl StartCmd {
 
         // Start health server if configured (after sync_status is available)
 
+        // Verifiers and the syncer wait on construction progress only when hints are enabled.
+        let spentness_status = (config.spentness.mode
+            != zakura_chain::parameters::spentness_hints::Mode::Off)
+            .then(|| read_only_state_service.spentness_status_receiver());
+
         info!("initializing verifiers");
         let (tx_verifier_setup_tx, tx_verifier_setup_rx) = oneshot::channel();
         let (block_verifier_router, tx_verifier, consensus_task_handles, max_checkpoint_height) =
@@ -592,6 +600,7 @@ impl StartCmd {
                 &config.network.network,
                 state.clone(),
                 read_only_state_service.clone(),
+                spentness_status.clone(),
                 tx_verifier_setup_rx,
             )
             .await;
@@ -648,6 +657,9 @@ impl StartCmd {
             latest_chain_tip.clone(),
             misbehavior_sender.clone(),
         );
+        if let Some(status) = spentness_status {
+            syncer.set_spentness_status(status);
+        }
 
         info!("initializing mempool");
         let (mempool, mempool_transaction_subscriber) = Mempool::new(
@@ -2034,6 +2046,7 @@ mod zakura_header_sync_driver_tests {
             let (mut state_service, read_state, latest_tip, tip_change, header_chain_authority) =
                 zakura_state::init_with_header_chain_body_evidence(
                     state_config.clone(),
+                    zakura_state::SpentnessConfig::default(),
                     &network,
                     block::Height(0),
                     2,
@@ -2126,6 +2139,7 @@ mod zakura_header_sync_driver_tests {
             let (mut state_service, read_state, latest_tip, tip_change, header_chain_authority) =
                 zakura_state::init_with_header_chain_body_evidence(
                     state_config,
+                    zakura_state::SpentnessConfig::default(),
                     &network,
                     block::Height(0),
                     2,

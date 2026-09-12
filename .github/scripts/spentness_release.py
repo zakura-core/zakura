@@ -14,6 +14,10 @@ MANIFEST = Path(
     "crates/zakura-chain/src/parameters/spentness_hints/mainnet-manifest.json"
 )
 COMPILED = MANIFEST.with_name("commitments.rs")
+FRONTIER_REGISTRY = Path(
+    "crates/zakura-state/src/service/finalized_state/vct/spentness_frontiers.rs"
+)
+FRONTIER_DIRECTORY = FRONTIER_REGISTRY.parent / "spentness-frontiers"
 MAX_BYTES = 512 * 1024 * 1024
 HEADER = struct.Struct("<8sH32sI32sQ")
 FORMAT_VERSION = 1
@@ -228,5 +232,39 @@ def prepare_import(repo: Path, bundle: Path, meta: dict) -> tuple[dict, str]:
             >= entry["commitment"]["terminal_height"]
         ):
             raise ValueError("spentness release descriptors must advance in height")
+        verify_retained_frontier(repo, old)
+    entry["frontier_sha256"] = hashlib.sha256(
+        (bundle / "mainnet-frontier.bin").read_bytes()
+    ).hexdigest()
     manifest["artifacts"].append(entry)
     return manifest, render_commitments(manifest)
+
+
+def frontier_path(entry: dict) -> Path:
+    validate_commitment(entry["commitment"])
+    return FRONTIER_DIRECTORY / (bytes(entry["commitment"]["sha256"]).hex() + ".bin")
+
+
+def verify_retained_frontier(repo: Path, entry: dict) -> None:
+    if hashlib.sha256(
+        (repo / frontier_path(entry)).read_bytes()
+    ).hexdigest() != entry.get("frontier_sha256"):
+        raise ValueError(
+            "retained spentness handoff frontier differs from its manifest"
+        )
+
+
+def render_frontiers(manifest: dict) -> str:
+    rows = [
+        "//! Reviewed historical handoff frontiers retained for supported spentness runs.",
+        "",
+        "/// Each entry binds the complete spentness commitment digest to its VCT handoff bytes.",
+        "#[rustfmt::skip]",
+        "pub(super) const FRONTIERS: &[([u8; 32], &[u8])] = &[",
+    ]
+    for entry in manifest["artifacts"]:
+        digest = entry["commitment"]["sha256"]
+        path = frontier_path(entry).relative_to(FRONTIER_REGISTRY.parent)
+        rows.append(f'    ({digest}, include_bytes!("{path}")),')
+    rows.append("];")
+    return "\n".join(rows) + "\n"

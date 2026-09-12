@@ -17,13 +17,18 @@ use tokio::{
 };
 use zakura_chain::parameters::spentness_hints::{Commitment, VerifiedArtifact};
 
+use tokio_util::sync::CancellationToken;
+
 use super::{
     cache::{load, partial_path, publish},
     wire::{RangeRequest, RangeResponse, GET_RANGE, RANGE_BYTES},
-    ArtifactService, CAPABILITY, STREAM_KIND,
+    ArtifactService, CAPABILITY, SERVICE_ID, STREAM_KIND,
 };
 use crate::{
-    zakura::{Frame, ZakuraPeerHandle, ZakuraPeerId, ZakuraSupervisorHandle},
+    zakura::{
+        spawn_zakura_endpoint_with_services, CustomService, Frame, Peer, Service, Stream,
+        ZakuraConnId, ZakuraPeerHandle, ZakuraPeerId, ZakuraServiceId, ZakuraSupervisorHandle,
+    },
     BoxError,
 };
 
@@ -37,6 +42,10 @@ const SOURCE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long to wait for the first peer that negotiated the capability.
 const PEER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long the temporary pre-state endpoint may take to shut down.
+const BOOTSTRAP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound startup retries so Auto mode can fall back to ordinary sync.
+const BOOTSTRAP_ACQUISITION_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 /// Continue after the last source, so unavailable peers cannot pin the first cohort.
 #[derive(Clone, Default)]
@@ -123,6 +132,69 @@ pub async fn download_missing(
         _ = acquisition => {},
         _ = shutdown.cancelled() => {},
     }
+}
+
+/// The temporary pre-state endpoint runs no node services; it only seeks artifacts.
+#[derive(Debug)]
+struct NoNodeServices;
+
+impl Service for NoNodeServices {
+    fn name(&self) -> &'static str {
+        "spentness-bootstrap"
+    }
+    fn streams(&self) -> &[Stream] {
+        &[]
+    }
+    fn add_peer(&self, _peer: Peer) {}
+    fn remove_peer(&self, _peer: &ZakuraPeerId, _conn: ZakuraConnId) {}
+}
+
+/// Acquire a release-selected artifact over a temporary endpoint before writable state opens.
+///
+/// The endpoint shuts down before this returns, so the node can start its normal endpoint.
+pub async fn acquire_before_state(
+    config: &crate::Config,
+    cache: &Path,
+    commitment: &Commitment,
+    shutdown: CancellationToken,
+) -> Result<Arc<VerifiedArtifact>, BoxError> {
+    commitment.validate()?;
+    let endpoint = spawn_zakura_endpoint_with_services(
+        config,
+        |_, _| Arc::new(NoNodeServices),
+        None,
+        vec![CustomService {
+            service: Arc::new(ArtifactService::new([])),
+            provides: Vec::new(),
+            seeks: vec![ZakuraServiceId::new(SERVICE_ID)?],
+        }],
+    )
+    .await?
+    .ok_or("peer spentness acquisition requires the Zakura transport or a local artifact file")?;
+
+    let supervisor = endpoint.supervisor();
+    let acquisition = async {
+        let mut cursor = SourceCursor::default();
+        loop {
+            let peers = cursor.next(wait_for_capable_peers(&supervisor).await);
+            match acquire(cache, commitment, &peers).await {
+                Ok(artifact) => return Ok(artifact),
+                Err(error) => {
+                    tracing::warn!(%error, "pre-state spentness acquisition failed; retrying after delay")
+                }
+            }
+            sleep(RETRY_DELAY).await;
+        }
+    };
+    let result = tokio::select! {
+        result = timeout(BOOTSTRAP_ACQUISITION_TIMEOUT, acquisition) =>
+            result.unwrap_or_else(|_| Err("spentness startup acquisition exceeded its one-hour deadline".into())),
+        _ = shutdown.cancelled() => Err("spentness acquisition cancelled during shutdown".into()),
+    };
+    timeout(BOOTSTRAP_SHUTDOWN_TIMEOUT, endpoint.shutdown())
+        .await
+        .map_err(|_| "spentness bootstrap shutdown timed out")?;
+    result
 }
 
 /// Return a cached artifact, or acquire it from at most three single sources.

@@ -7505,7 +7505,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-consensus"
-version = "8.0.1"
+version = "9.0.0"
 dependencies = [
  "blake2b_simd",
  "chrono",
@@ -8147,7 +8147,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "8.0.0"
+version = "9.0.0"
 dependencies = [
  "bincode",
  "chrono",
@@ -8258,7 +8258,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-utils"
-version = "2.2.4"
+version = "2.2.5"
 dependencies = [
  "clap",
  "color-eyre",

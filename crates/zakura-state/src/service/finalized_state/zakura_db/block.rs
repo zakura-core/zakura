@@ -972,6 +972,14 @@ impl ZakuraDb {
     where
         C: FnOnce(&mut Self, DiskWriteBatch) -> Result<(), CommitCheckpointVerifiedError>,
     {
+        if self.spentness_incomplete() {
+            return self.write_spentness_block(
+                finalized,
+                prev_note_commitment_trees,
+                vct_data,
+                commit,
+            );
+        }
         let tx_hash_indexes: HashMap<transaction::Hash, usize> = finalized
             .transaction_hashes
             .iter()

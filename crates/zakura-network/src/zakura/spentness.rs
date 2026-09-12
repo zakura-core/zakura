@@ -21,7 +21,7 @@ mod server;
 mod wire;
 
 pub use cache::{artifact_path, load, publish};
-pub use download::{acquire, download_missing};
+pub use download::{acquire, acquire_before_state, download_missing};
 pub use server::ArtifactService;
 pub use wire::{GET_RANGE, RANGE, RANGE_BYTES};
 
@@ -198,8 +198,23 @@ mod tests {
         })
         .await;
         client.shutdown().await;
+
+        // A cold node acquires through the temporary pre-state endpoint.
+        let cold_cache = tempfile::tempdir()?;
+        let cold_start = timeout(
+            Duration::from_secs(20),
+            acquire_before_state(
+                &client_config,
+                cold_cache.path(),
+                &commitment,
+                tokio_util::sync::CancellationToken::new(),
+            ),
+        )
+        .await;
         server.shutdown().await;
         result??;
+        assert_eq!(cold_start??.bytes(), bytes);
+        assert_eq!(load(cold_cache.path(), &commitment)?.bytes(), bytes);
         Ok(())
     }
 }

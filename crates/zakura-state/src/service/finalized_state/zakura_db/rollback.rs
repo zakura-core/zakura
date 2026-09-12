@@ -117,6 +117,23 @@ pub enum RollbackFinalizedStateError {
     #[error("state database is empty")]
     EmptyState,
 
+    /// The state database could not be opened, for example during incomplete spentness construction.
+    #[error("cannot open the state database for rollback: {0}")]
+    Open(#[source] Box<crate::StateInitError>),
+
+    /// The spentness progress record could not be read.
+    #[error(transparent)]
+    Spentness(#[from] crate::SpentnessError),
+
+    /// Rollback cannot cross a completed spentness handoff or a stricter VCT boundary.
+    #[error("target height {target:?} is below the rollback floor {floor:?}")]
+    BelowRollbackFloor {
+        /// Requested rollback height.
+        target: block::Height,
+        /// Lowest height this database can roll back to.
+        floor: block::Height,
+    },
+
     /// The requested target height is above the finalized tip.
     #[error("target height {target:?} is above finalized tip {tip:?}")]
     TargetAboveTip {
@@ -263,7 +280,7 @@ pub fn preview_rollback_finalized_state(
 ) -> Result<RollbackFinalizedStateSummary, RollbackFinalizedStateError> {
     check_format_version(&config, network)?;
 
-    let db = open_rollback_db(&config, network, true);
+    let db = open_rollback_db(&config, network, true)?;
     let bounds = validate_rollback(&db, &options)?;
 
     // A dry run only reports the plan, so it deliberately skips the genesis-to-target treestate
@@ -283,7 +300,7 @@ pub fn rollback_finalized_state(
 ) -> Result<RollbackFinalizedStateSummary, RollbackFinalizedStateError> {
     check_format_version(&config, network)?;
 
-    let db = open_rollback_db(&config, network, false);
+    let db = open_rollback_db(&config, network, false)?;
     let prepared = prepare_rollback(&db, network, &options)?;
 
     let backup = if options.keep_rolled_back_blocks {
@@ -338,7 +355,11 @@ fn check_format_version(
     }
 }
 
-fn open_rollback_db(config: &Config, network: &Network, read_only: bool) -> ZakuraDb {
+fn open_rollback_db(
+    config: &Config,
+    network: &Network,
+    read_only: bool,
+) -> Result<ZakuraDb, RollbackFinalizedStateError> {
     ZakuraDb::new(
         config,
         STATE_DATABASE_KIND,
@@ -353,7 +374,30 @@ fn open_rollback_db(config: &Config, network: &Network, read_only: bool) -> Zaku
             .iter()
             .map(ToString::to_string),
         read_only,
-    ).expect("opening the finalized state database failed; the configured cache directory must contain a readable Zakura database")
+    )
+    .map_err(|error| RollbackFinalizedStateError::Open(Box::new(error)))
+}
+
+/// Reject rollback below a completed spentness handoff, or below a stricter VCT boundary.
+///
+/// Opening the database already rejects incomplete construction.
+fn check_spentness_rollback_floor(
+    db: &ZakuraDb,
+    target: block::Height,
+) -> Result<(), RollbackFinalizedStateError> {
+    let Some(super::spentness::Progress::Complete { rollback_floor, .. }) =
+        db.spentness_progress()?
+    else {
+        return Ok(());
+    };
+    let floor = block::Height(rollback_floor);
+    let floor = db
+        .vct_synced_below()
+        .map_or(floor, |vct_floor| vct_floor.max(floor));
+    if target < floor {
+        return Err(RollbackFinalizedStateError::BelowRollbackFloor { target, floor });
+    }
+    Ok(())
 }
 
 /// The validated bounds of a rollback: where the finalized tip is now, and where it will end up.
@@ -394,6 +438,7 @@ fn validate_rollback(
     db: &ZakuraDb,
     options: &RollbackFinalizedStateOptions,
 ) -> Result<RollbackBounds, RollbackFinalizedStateError> {
+    check_spentness_rollback_floor(db, options.target_height)?;
     let old_tip = db.tip().ok_or(RollbackFinalizedStateError::EmptyState)?;
     let (old_tip_height, _) = old_tip;
 

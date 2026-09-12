@@ -1,6 +1,6 @@
 [package]
 name = "zakura-state"
-version = "8.0.0"
+version = "9.0.0"
 authors.workspace = true
 description = "State contextual verification and storage code for the Zakura node. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -61,6 +61,7 @@ rocksdb = { workspace = true, features = ["lz4"] }
 semver = { workspace = true }
 crossbeam-channel = { workspace = true }
 serde = { workspace = true, features = ["serde_derive"] }
+serde_json = { workspace = true }
 serde-big-array = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
@@ -97,7 +98,6 @@ toml = { workspace = true }
 
 hex = { workspace = true, features = ["serde"] }
 insta = { workspace = true, features = ["ron", "redactions"] }
-serde_json = { workspace = true }
 
 proptest = { workspace = true }
 proptest-derive = { workspace = true }

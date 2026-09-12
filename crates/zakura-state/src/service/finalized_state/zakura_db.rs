@@ -60,6 +60,7 @@ pub(crate) const PARALLEL_BLOCK_READ_THRESHOLD: usize = 16;
 pub mod prune;
 pub mod rollback;
 pub mod shielded;
+pub(crate) mod spentness;
 pub mod transparent;
 
 #[cfg(any(test, feature = "proptest-impl"))]
@@ -103,6 +104,9 @@ pub struct ZakuraDb {
     // TODO: move the generic upgrade code and fields to DiskDb
     format_change_handle: Option<DbFormatChangeThreadHandle>,
 
+    /// Shared construction gate and immutable artifact for the ordered writer.
+    spentness: spentness::Runtime,
+
     /// The inner low-level database wrapper for the RocksDB database.
     db: DiskDb,
 }
@@ -132,6 +136,29 @@ impl ZakuraDb {
         debug_skip_format_upgrades: bool,
         column_families_in_code: impl IntoIterator<Item = String>,
         read_only: bool,
+    ) -> Result<ZakuraDb, StateInitError> {
+        Self::new_with_spentness(
+            config,
+            db_kind,
+            format_version_in_code,
+            network,
+            debug_skip_format_upgrades,
+            column_families_in_code,
+            read_only,
+            spentness::SpentnessSetup::ordinary(network),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::unwrap_in_result)]
+    pub(crate) fn new_with_spentness(
+        config: &Config,
+        db_kind: impl AsRef<str>,
+        format_version_in_code: &Version,
+        network: &Network,
+        debug_skip_format_upgrades: bool,
+        column_families_in_code: impl IntoIterator<Item = String>,
+        read_only: bool,
+        spentness: spentness::SpentnessSetup,
     ) -> Result<ZakuraDb, StateInitError> {
         // A read-only secondary follows another process's primary database and must never delete
         // it, whereas an ephemeral database deletes its files on drop, so the two modes are
@@ -210,8 +237,11 @@ impl ZakuraDb {
 
         let mut db = ZakuraDb {
             config: Arc::new(config.clone()),
-            debug_skip_format_upgrades,
+            // Skip shutdown format checks until startup finishes, so a database that
+            // spentness initialization rejects below drops without checking partial indexes.
+            debug_skip_format_upgrades: true,
             format_change_handle: None,
+            spentness: spentness::Runtime::new(spentness),
             db: disk_db,
         };
 
@@ -223,6 +253,8 @@ impl ZakuraDb {
             return Err(StateInitError::VctSproutHistoryUnrepairable);
         }
 
+        db.initialize_spentness(read_only)?;
+        db.debug_skip_format_upgrades = debug_skip_format_upgrades;
         db.run_startup_format_change(format_change)?;
 
         Ok(db)

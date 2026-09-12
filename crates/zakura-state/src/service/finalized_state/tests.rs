@@ -14,6 +14,7 @@ use crate::{arbitrary::Prepare, service::check, SemanticallyVerifiedBlock};
 
 mod prop;
 mod rollback;
+mod spentness;
 mod transparent;
 mod vectors;
 

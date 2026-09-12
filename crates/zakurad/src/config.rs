@@ -7,6 +7,7 @@
 use std::{collections::HashMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
+use zakura_chain::parameters::spentness_hints::Mode;
 use zakura_rpc::config::mining::{default_miner_address, MinerAddressType};
 
 use crate::components::With;
@@ -23,6 +24,28 @@ const DENY_CONFIG_KEY_SUFFIX_LIST: [&str; 5] = [
     // Only raw private keys; paths like *_private_key_path are not affected.
     "private_key",
 ];
+
+/// Local spentness construction and distribution settings.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SpentnessConfig {
+    /// Select whether the node may use a release-pinned artifact.
+    pub mode: Mode,
+    /// Load the artifact from this path instead of peers.
+    ///
+    /// The file supplies bytes only. It cannot authorize an unrecognized digest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_file: Option<PathBuf>,
+    /// Download artifacts to and serve artifacts from this directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_dir: Option<PathBuf>,
+}
+
+impl SpentnessConfig {
+    fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
 
 /// Returns true if a leaf key name should be considered sensitive and blocked
 /// from environment variable overrides.
@@ -56,6 +79,10 @@ pub struct ZakuradConfig {
     //
     // These configs use full paths to avoid a rustdoc link bug (#7048).
     pub consensus: zakura_consensus::config::Config,
+
+    /// Local spentness construction and peer distribution.
+    #[serde(skip_serializing_if = "SpentnessConfig::is_default")]
+    pub spentness: SpentnessConfig,
 
     /// Metrics configuration
     pub metrics: crate::components::metrics::Config,

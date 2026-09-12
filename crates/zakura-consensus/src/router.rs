@@ -394,6 +394,7 @@ async fn init_with_transaction_state<S, TransactionState, Mempool>(
     network: &Network,
     mut state_service: S,
     transaction_state: TransactionState,
+    spentness_status: Option<tokio::sync::watch::Receiver<zs::SpentnessStatus>>,
     mempool: oneshot::Receiver<Mempool>,
 ) -> (
     Buffer<BoxService<Request, block::Hash, RouterError>, Request>,
@@ -524,7 +525,8 @@ where
         "initializing block verifier router"
     );
 
-    let block = SemanticBlockVerifier::new(network, state_service.clone(), transaction.clone());
+    let block = SemanticBlockVerifier::new(network, state_service.clone(), transaction.clone())
+        .with_spentness_status(spentness_status);
     let checkpoint = CheckpointVerifier::from_checkpoint_list(list, network, tip, state_service);
     let router = BlockVerifierRouter {
         checkpoint,
@@ -568,15 +570,27 @@ where
     Mempool::Future: Send + 'static,
 {
     let transaction_state = state_service.clone();
-    init_with_transaction_state(config, network, state_service, transaction_state, mempool).await
+    init_with_transaction_state(
+        config,
+        network,
+        state_service,
+        transaction_state,
+        None,
+        mempool,
+    )
+    .await
 }
 
 /// Initializes verification and routes transaction read-only queries through `read_state_service`.
+///
+/// When `spentness_status` is present, semantic verification waits until spentness
+/// construction makes monetary state usable.
 pub async fn init_with_read_state<S, R, Mempool>(
     config: Config,
     network: &Network,
     state_service: S,
     read_state_service: R,
+    spentness_status: Option<tokio::sync::watch::Receiver<zs::SpentnessStatus>>,
     mempool: oneshot::Receiver<Mempool>,
 ) -> (
     Buffer<BoxService<Request, block::Hash, RouterError>, Request>,
@@ -602,7 +616,15 @@ where
     Mempool::Future: Send + 'static,
 {
     let transaction_state = TransactionStateRouter::new(state_service.clone(), read_state_service);
-    init_with_transaction_state(config, network, state_service, transaction_state, mempool).await
+    init_with_transaction_state(
+        config,
+        network,
+        state_service,
+        transaction_state,
+        spentness_status,
+        mempool,
+    )
+    .await
 }
 
 /// Parses the checkpoint list for `network` and `config`.

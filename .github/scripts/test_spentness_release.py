@@ -9,6 +9,7 @@ import subprocess
 import struct
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -52,6 +53,7 @@ class SpentnessReleaseTests(unittest.TestCase):
         )
         self.pin["sha256"] = list(hashlib.sha256(data).digest())
         (self.bundle / hints.ARTIFACT).write_bytes(data)
+        (self.bundle / "mainnet-frontier.bin").write_bytes(b"current frontier")
         (self.bundle / hints.COMMITMENT).write_text(json.dumps(self.pin))
         (self.bundle / "main-checkpoints.txt").write_text(
             "0 " + bytes(self.pin["chain_identity"])[::-1].hex()
@@ -88,8 +90,16 @@ class SpentnessReleaseTests(unittest.TestCase):
         manifest_path.parent.mkdir(parents=True)
         old = copy.deepcopy(self.pin)
         old["terminal_height"] = 5
+        old["sha256"][0] ^= 1
+        old_entry = {
+            "commitment": old,
+            "frontier_sha256": hashlib.sha256(b"old frontier").hexdigest(),
+        }
+        retained = self.root / hints.frontier_path(old_entry)
+        retained.parent.mkdir(parents=True)
+        retained.write_bytes(b"old frontier")
         manifest_path.write_text(
-            json.dumps({"schema_version": 1, "artifacts": [{"commitment": old}]})
+            json.dumps({"schema_version": 1, "artifacts": [old_entry]})
         )
         manifest, compiled = hints.prepare_import(self.root, self.bundle, self.meta)
         self.assertEqual(
@@ -99,6 +109,16 @@ class SpentnessReleaseTests(unittest.TestCase):
         self.assertIn("terminal_height: 5", compiled)
         self.assertIn("terminal_height: 10", compiled)
         self.assertNotIn("include_bytes", compiled)
+        self.assertEqual(retained.read_bytes(), b"old frontier")
+        registry = hints.render_frontiers(manifest)
+        self.assertEqual(registry.count("include_bytes!"), 2)
+        self.assertEqual(
+            manifest["artifacts"][-1]["frontier_sha256"],
+            hashlib.sha256(b"current frontier").hexdigest(),
+        )
+        retained.write_bytes(b"corrupt frontier")
+        with self.assertRaisesRegex(ValueError, "retained spentness handoff"):
+            hints.prepare_import(self.root, self.bundle, self.meta)
 
     def test_resealed_genesis_and_padding_fail_the_named_checks(self):
         path = self.bundle / hints.ARTIFACT
@@ -160,11 +180,41 @@ class SpentnessReleaseTests(unittest.TestCase):
         manifest = json.loads((repo / hints.MANIFEST).read_text())
         self.assertEqual(manifest["artifacts"][0]["commitment"], self.pin)
         self.assertEqual((repo / hints.COMPILED).read_text(), hints.render_commitments(manifest))
+        self.assertEqual((repo / hints.FRONTIER_REGISTRY).read_text(), hints.render_frontiers(manifest))
+        self.assertEqual((repo / hints.frontier_path(manifest["artifacts"][0])).read_bytes(), b"new frontier")
         provenance = json.loads((repo / importer.PROVENANCE).read_text())
         self.assertEqual(provenance["spentness_sha256"], bytes(self.pin["sha256"]).hex())
         self.assertFalse(importer.import_bundle(repo, self.bundle, resolution)["has_changes"])
         with self.assertRaisesRegex(ValueError, "advance in height"):
             hints.prepare_import(repo, self.bundle, self.meta)
+
+    def test_schema_two_failure_restores_retained_frontiers_and_registry(self):
+        importer, repo, resolution = self.importer_fixture()
+        paths = (importer.CHECKPOINTS, importer.FRONTIER, importer.SUBTREES,
+                 importer.PROVENANCE, importer.EOS_FILE, hints.MANIFEST, hints.COMPILED,
+                 hints.FRONTIER_REGISTRY, hints.frontier_path({"commitment": self.pin}))
+
+        def snapshot():
+            return {path: (repo / path).read_bytes() if (repo / path).exists() else None
+                    for path in paths}
+
+        before = snapshot()
+        replace = os.replace
+        for failure_index in range(1, len(paths) + 1):
+            calls = 0
+
+            def fail_once(source, target):
+                nonlocal calls
+                calls += 1
+                if calls == failure_index:
+                    raise OSError("injected schema-2 install failure")
+                return replace(source, target)
+
+            with self.subTest(failure_index=failure_index), patch.object(os, "replace", side_effect=fail_once):
+                with self.assertRaisesRegex(OSError, "injected schema-2"):
+                    importer.import_bundle(repo, self.bundle, resolution)
+            self.assertEqual(snapshot(), before)
+            self.assertFalse(list(repo.glob(".release-state-import-*")))
 
     def test_schema_two_import_requires_metadata(self):
         importer, repo, resolution = self.importer_fixture()

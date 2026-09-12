@@ -251,6 +251,10 @@ Build `zakura-spentness` with `--features zakura-spentness`. Its `replay`,
 membership artifacts. `install` provisions an artifact only when the binary
 contains its reviewed commitment. It does not enable hinted sync.
 
+`audit-progress --state <cache-dir>` diagnoses an incomplete construction cursor.
+It re-enumerates retained transactions and checks their header Merkle roots.
+It prints the recorded and enumerated counts without modifying state.
+
 The coupled checkpoint exporter accepts `--mainnet-spentness-output` and
 `--spentness-replay-cache`. It writes the artifact and commitment/verification
 sidecars before emitting the checkpoint list.

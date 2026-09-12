@@ -1478,6 +1478,7 @@ fn vct_frozen_frontier_survives_reopen() -> Result<()> {
                 false,
                 true,
                 false,
+                super::super::SpentnessSetup::ordinary(&network),
             ).expect("opening the finalized state should succeed");
             prop_assert_eq!(reopened.vct_fast_synced_below(), Some(Height(handoff_height)), "the marker is still durable after reopen");
 
@@ -3147,7 +3148,7 @@ fn vct_untrusted_fixture_drives_byte_identical_state() -> Result<()> {
 ///
 /// The config gate, the artifact load, and the typed-error fallback all live in the handler, so
 /// testing only the helpers would leave the seam that actually serves `z_gettreestate` unproven.
-fn read_service_over(finalized_state: &FinalizedState) -> crate::ReadStateService {
+pub(super) fn read_service_over(finalized_state: &FinalizedState) -> crate::ReadStateService {
     use zakura_node_services::sync_lifecycle::{
         HeaderRuntimeDetachedReason, HeaderRuntimeStatus, LifecycleEpoch,
     };

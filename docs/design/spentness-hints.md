@@ -1,13 +1,12 @@
-# Spentness artifact tooling and peer distribution
+# Spentness hints
 
-This implementation supplies the first stage of spentness hints. It generates,
-audits, distributes, and caches terminal UTXO membership. It does not change
-checkpoint commits or enable hinted state construction.
+Zakura can use reviewed terminal UTXO membership to omit spent outputs during
+checkpoint construction. The ordered writer then rebuilds derived indexes at H
+before ordinary commits resume. The default remains off. The compiled public
+commitment list remains empty until maintainers review an artifact.
 
-The ordered writer, construction gates, blocking index rebuild at H, recovery
-markers, and differential sync benchmarks form the next stage. Activation stays
-off until those parts work together. A faster initial pass alone does not establish
-an end-to-end sync improvement.
+Matched sync benchmarks and public-network rollout remain separate work.
+A faster initial pass alone does not establish an end-to-end sync improvement.
 
 ## Artifact and trust
 
@@ -28,7 +27,7 @@ the compiled release list. A descriptor supplied by a peer cannot authorize a hi
 
 The compiled list starts empty because no public artifact has been reviewed.
 The release importer adds descriptors and provenance. It keeps older descriptors
-for future incomplete-run recovery. The bitmap never enters source data or the
+and their matching VCT handoff frontiers for incomplete-run recovery. The bitmap never enters source data or the
 executable. Checkpoint hashes alone do not authenticate terminal UTXO membership;
 maintainers must review the generation evidence before accepting a descriptor.
 
@@ -104,14 +103,16 @@ mismatch to an individual chunk or disconnect the peer.
 Enable artifact distribution explicitly:
 
 ```toml
-[network.zakura]
-spentness_cache_dir = "/data/zakura/spentness"
+[spentness]
+cache_dir = "/data/zakura/spentness"
 ```
 
-The startup task waits up to 60 seconds for a capable peer, then makes bounded
+The distribution task waits up to 60 seconds for a capable peer, then makes bounded
 acquisition attempts. It retries missing artifacts after a 60-second pause until
 acquisition succeeds or the endpoint shuts down. Each source has a ten-minute
-deadline. An unavailable artifact does not block ordinary sync.
+deadline. An unavailable artifact does not block ordinary sync when hinted
+construction is disabled. Pre-state acquisition rotates peer cohorts for up to
+one hour. Auto mode then falls back to ordinary sync; Require mode reports failure.
 Supported historical cache entries also remain available for serving.
 
 For offline or seed provisioning, use a binary that contains the reviewed pin:
@@ -125,6 +126,92 @@ cache bytes. Seed operators retain supported artifacts and load them before
 rolling out a release that selects their commitments. Nodes fetch artifacts from
 peers; the HTTPS bundle publisher serves release automation, not node acquisition.
 
+## Construction and recovery
+
+For a release with a reviewed commitment, select an explicit construction policy:
+
+```toml
+[spentness]
+mode = "require" # "off" (default), "auto", or "require"
+# artifact_file = "/data/hints.bin"
+```
+
+Construction requires checkpoint sync and VCT fast sync. `auto` can use ordinary
+sync if the empty database cannot start with compatible hints. `require` reports
+the failure. Neither policy starts hints midway through an ordinary database.
+An explicit file supplies bytes only; it cannot authorize an unrecognized digest.
+
+Before opening writable state, the node verifies a local artifact or starts a
+temporary peer endpoint to acquire the selected artifact. The node shuts down
+that endpoint before starting its normal endpoint. It uses the configured serving
+cache, or `<state.cache_dir>/spentness`, and keeps a durable recovery copy in the
+state cache. Nodes never download bitmap bytes from HTTP.
+
+The writer persists one versioned record with each atomic block batch:
+
+```text
+Applying { commitment, height, block_hash, next_ordinal, survivor_value }
+  -> Rebuilding { commitment, indexed_height, replay_accounting, survivor_value }
+  -> Complete { commitment, rollback_floor }
+```
+
+Applying consumes every output bit, including genesis and non-address scripts.
+It inserts terminal survivors without resolving or deleting spent input UTXOs.
+It retains raw transactions and defers address indexes. It preserves shielded
+and deferred accounting. The transparent balance at this stage describes the
+survivors created so far, so construction gates block monetary consumers.
+
+At H, the writer checks the exact hash, output count, and VCT handoff frontiers.
+It then holds the consensus tip at H while it replays retained transactions.
+The replay uses transaction-location indexes and caches at most 64 creating
+transactions. It restores address balances, received totals, first-receive
+locations, address UTXOs, transaction indexes, and historical value pools.
+Each replay block commits its index updates and cursor in one batch.
+
+The final audit compares complete survivor entries with retained-body replay.
+It also checks address ownership, address balances, output count, and terminal
+pool values. The replay and audit never change live consensus UTXOs. A mismatch
+stops the writer without attributing the failure to a peer.
+
+State access gates block pending-UTXO responses, monetary RPCs, mempool checks,
+mining checks, and ordinary semantic admission during construction. Header
+control messages continue during replay and the final audit. The legacy syncer
+waits before starting verifier deadlines. The native stall watchdog pauses
+during rebuilding. Completion lifts the gates and releases retained history
+to the existing pruning backlog.
+
+Startup resumes Applying with its original recognized commitment, even when a
+new release selects a later commitment. If the artifact is missing, restore
+identical bytes in the reported cache path or set `spentness.artifact_file`.
+Rebuilding needs retained bodies but no bitmap. Startup finishes that replay
+before exposing state. Completed databases need no bitmap for later operation.
+Unknown or revoked commitments stop startup with a compatibility error.
+
+Database format 29 gives this construction a separate major-version directory.
+The existing upgrade mechanism reuses ordinary format-28 data. Older binaries
+do not open format-29 data as ordinary state. Incomplete runs also require the
+same database format and indexer feature when they resume.
+
+Read-only opens, exports, offline pruning, and offline rollback reject incomplete
+state. After completion, rollback cannot cross H or a stricter VCT boundary.
+To diagnose a cursor without opening monetary state, stop the node and run:
+
+```sh
+zakura-spentness audit-progress --state /data/zakura
+```
+
+The audit re-enumerates retained transactions and verifies their header Merkle
+roots. It prints recorded and enumerated output counts. A mismatch returns an
+error without changing the record.
+
+`state.spentness.construction_height` and `state.spentness.rebuilt_height` report
+the two passes. `SpentnessStatus` and `state.spentness.usable` report consumer
+availability. The writer suppresses provisional value-pool metrics until completion. The
+`state.spentness.utxo.*` counters describe initial-pass reads, inserts, deletes,
+and omissions. Initial-pass reads and deletes remain zero. The preparation,
+commit, and rebuild-audit histograms separate those costs. Benchmark the entire
+path through the first ordinary commit above H before claiming a speedup.
+
 ## Release-state schema 2
 
 `zakura-checkpoints --mainnet-spentness-output` couples generation to its selected
@@ -136,9 +223,11 @@ after generation and verification succeed. Each helper has a 48-hour deadline.
 Schema 2 requires the hint, commitment, verification report, and frontier grid.
 The publisher uploads data before metadata and moves `latest.json` last.
 The importer checks the descriptor, format, digest, counts, genesis, shared H/hash,
-and provenance before generating Rust commitments. It never imports bitmap bytes.
+and provenance before generating Rust commitments. It retains each matching VCT
+frontier under the artifact digest and verifies retained frontier hashes on later
+imports. It never imports bitmap bytes.
 Version 2 bundles have no automatic newest-N deletion policy. Retention must cover
-all supported incomplete hinted runs when the state writer is introduced.
+all supported incomplete hinted runs.
 
 Deploy the fetcher/importer before enabling the version 2 publisher. Configure
 `RELEASE_STATE_ORACLE_SOURCE`, `RELEASE_STATE_ORACLE_ID`, and

@@ -259,15 +259,6 @@ jobs:
         with:
           ip: ${{ steps.droplet.outputs.ip }}
 
-      - name: Fetch the exact previously built candidate
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh run download 34653015599 -R zakura-core/zakura \
-            -n zakura-pr-node-34653015599 --dir /tmp/serving-prebuilt
-          test -f /tmp/serving-prebuilt/tested-binary/zakurad.zst
-          test -f /tmp/serving-prebuilt/tested-binary/metadata.json
-
       - name: Build, deploy, and monitor the node
         env:
           IP: ${{ steps.droplet.outputs.ip }}
@@ -299,8 +290,6 @@ jobs:
           } > /tmp/run.env
           scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
             /tmp/run.env \
-            /tmp/serving-prebuilt/tested-binary/zakurad.zst \
-            /tmp/serving-prebuilt/tested-binary/metadata.json \
             .github/workflows/scripts/pr-node-run.sh \
             .github/workflows/scripts/pr-node-monitor.py \
             .github/workflows/scripts/pr-node-paired-smoke.py \

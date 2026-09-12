@@ -11,7 +11,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-EXPECTED_SHA = "0e6398c22f0705b9ccf7a071a5229e743dd1572b"
+EXPECTED_SHA = "3e9b4f6d617f91b05e5050f7ac9b6e4c768821b7"
 OUT = Path("/root/out/paired")
 SEED_RPC = "http://127.0.0.1:8232"
 CLIENT_RPC = "http://127.0.0.1:18232"
@@ -101,7 +101,7 @@ vct_fast_sync = true
 [tracing]
 log_file = "/root/out/paired/downloader.log"
 use_color = false
-filter = "info,zakura_consensus::block=trace,zakura_consensus::transaction=trace,zakura_state::service=debug"
+filter = "info"
 '''
 
 
@@ -151,6 +151,7 @@ def run_phase(proc, name, start, needed, deadline, *, minimum_height=0, minimum_
             sample["native_bodies"] = metric(text, "sync_block_body_received")
             sample["native_requests"] = metric(text, "sync_block_request_sent")
             sample["vct_fast_blocks"] = metric(text, "state_vct_fast_block_count")
+            sample["checkpoint_handoff_checks"] = metric(text, "checkpoint_state_tip_reconciled")
             sample["legacy_fallbacks"] = metric(text, "sync_zakura_legacy_fallback_engaged")
             if sample["legacy_fallbacks"]:
                 raise AssertionError("native-only downloader used a legacy fallback")
@@ -221,13 +222,14 @@ def main():
         emit("running", start_height=start)
         first = run_phase(proc, "sync-while-serving", start, 512,
                           min(deadline - 120, time.monotonic() + 600),
-                          minimum_height=handoff + 64, minimum_vct=1)
+                          minimum_height=handoff + 256, minimum_vct=1)
         result["phases"].append(first)
         stop(proc)
         proc = launch()
         restart_start = running_height(proc, deadline)
         emit("restarting", restored_running_height=restart_start)
-        second = run_phase(proc, "restart-sync", restart_start, 64, deadline)
+        second = run_phase(proc, "restart-sync", restart_start, 128, deadline,
+                           minimum_height=first["height"] + 128)
         result["phases"].append(second)
         trace = []
         for line in Path("/var/log/zakura/seed-traces/header_sync.jsonl").open():
@@ -266,7 +268,8 @@ def main():
         stop(proc)
         proc = None
         stderr.flush()
-        if "panicked at" in (OUT / "downloader-console.log").read_text(errors="replace"):
+        if any(re.search(r"panicked|invalid detailed check", path.read_text(errors="replace"), re.IGNORECASE)
+               for path in [OUT / "downloader-console.log", OUT / "downloader.log"]):
             raise RuntimeError("downloader panic found in the console log")
         result["pass"] = True
     except Exception as exc:

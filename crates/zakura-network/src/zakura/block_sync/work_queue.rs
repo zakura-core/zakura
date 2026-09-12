@@ -325,7 +325,10 @@ impl WorkQueue {
             return Vec::new();
         }
         let mut inner = self.lock();
-        let mut taken: Vec<(block::Height, WorkItem)> = Vec::new();
+        // The requester funds max_count elements before taking work. Avoid
+        // geometric growth beyond that allocation plan, including tiny takes.
+        let mut taken: Vec<(block::Height, WorkItem)> =
+            Vec::with_capacity(max_count.min(inner.pending.len()));
         let mut estimated_bytes = 0u64;
         let mut next_expected: Option<block::Height> = None;
         let mut scope = None;

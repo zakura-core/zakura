@@ -25,7 +25,9 @@ pub(crate) use response_scope::{
 };
 
 mod response_memory;
-pub(crate) use response_memory::{ConnectionResponseMemory, ResponseMemory};
+pub(crate) use response_memory::{
+    collection_allocation_bytes, shared_allocation_bytes, ConnectionResponseMemory, ResponseMemory,
+};
 
 #[cfg(test)]
 mod tests;

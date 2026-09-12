@@ -44,7 +44,9 @@ use super::{
     BlockSyncMessage, BlockSyncMisbehavior, BlockSyncPeerSession, BlockSyncStatus,
     ZakuraBlockSyncConfig, ZakuraPeerId, ZakuraTrace, MSG_BS_BLOCK,
 };
-use crate::zakura::regulation::{ResponseAdmissionError, ResponseCredit};
+use crate::zakura::regulation::{
+    collection_allocation_bytes, ResponseAdmissionError, ResponseAuthorization, ResponseCredit,
+};
 use crate::zakura::transport::OrderedStreamFailure;
 use crate::zakura::{trace::BlockBodySource, Admit, FramedRecv, SinkReject, ZakuraConnId};
 use std::{sync::Arc, time::Duration, time::Instant};
@@ -856,6 +858,26 @@ impl PeerRoutine {
 
     // ===================== want-work fill loop (ports `fill_peer`) ===========
 
+    /// Reserve the whole request allocation plan atomically. A smaller request
+    /// can make progress when the pool cannot fund the preferred batch size.
+    fn authorize_request_metadata(
+        &self,
+    ) -> Result<(usize, ResponseAuthorization), ResponseAdmissionError> {
+        let mut count = self.request_count_cap();
+        loop {
+            let bytes = RequestWrite::metadata_bytes(count)
+                .and_then(|bytes| {
+                    bytes.checked_add(collection_allocation_bytes::<ExpectedBlock>(count)?)
+                })
+                .ok_or(ResponseAdmissionError::MemoryFull)?;
+            match self.session.authorize_response_with_metadata(bytes) {
+                Ok(authorization) => return Ok((count, authorization)),
+                Err(ResponseAdmissionError::MemoryFull) if count > 1 => count = count.div_ceil(2),
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// Fill this peer's available slots in a single pass, letting the byte budget
     /// (re-checked each iteration via `try_reserve`) be the congestion window. The
     /// per-peer state is routine-local / in the registry.
@@ -925,8 +947,8 @@ impl PeerRoutine {
                     break FillStop::SendError;
                 }
             };
-            let authorization = match self.session.authorize_response() {
-                Ok(authorization) => authorization,
+            let (max_count, authorization) = match self.authorize_request_metadata() {
+                Ok(prepared) => prepared,
                 Err(ResponseAdmissionError::MemoryFull) => {
                     self.response_memory_waiting = true;
                     break FillStop::ResponseMemory;
@@ -946,7 +968,6 @@ impl PeerRoutine {
             // Compute this chunk's count and byte ceiling before taking any work.
             // The count cap is the peer/request cap; the byte cap is enforced by
             // the budgeted work-queue take and then by the reservation below.
-            let max_count = self.request_count_cap();
             let response_byte_cap = u64::from(self.max_response_bytes.max(1));
 
             let view = *self.sequencer_view.borrow();
@@ -1098,13 +1119,13 @@ impl PeerRoutine {
                 let keep_len = keep.len();
                 let mut returned_avoided = false;
                 if keep.start > 0 {
-                    let avoided: Vec<_> = items.drain(..keep.start).collect();
-                    self.work.return_unpublished(&avoided);
+                    self.work.return_unpublished(&items[..keep.start]);
+                    items.drain(..keep.start);
                     returned_avoided = true;
                 }
                 if keep_len < items.len() {
-                    let avoided = items.split_off(keep_len);
-                    self.work.return_unpublished(&avoided);
+                    self.work.return_unpublished(&items[keep_len..]);
+                    items.truncate(keep_len);
                     returned_avoided = true;
                 }
                 if returned_avoided {
@@ -1147,9 +1168,17 @@ impl PeerRoutine {
                 break FillStop::Budget;
             }
             let owner = scope.bind(self.generation, request_id);
+            let expected_blocks = items
+                .iter()
+                .map(|(height, item)| ExpectedBlock {
+                    height: *height,
+                    hash: item.hash,
+                    estimated_bytes: item.estimated_bytes,
+                })
+                .collect();
             let claim = RequestWrite::new(
                 owner,
-                items.clone(),
+                items,
                 self.work.clone(),
                 self.budget.clone(),
                 self.session.cancel_token(),
@@ -1168,14 +1197,7 @@ impl PeerRoutine {
                 // on a send failure below); equals the sum of the per-height
                 // `expected_blocks` estimates.
                 estimated_bytes: reserved_bytes,
-                expected_blocks: items
-                    .iter()
-                    .map(|(height, item)| ExpectedBlock {
-                        height: *height,
-                        hash: item.hash,
-                        estimated_bytes: item.estimated_bytes,
-                    })
-                    .collect(),
+                expected_blocks,
             };
 
             let queued_at = Instant::now();

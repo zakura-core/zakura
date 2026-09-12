@@ -2,6 +2,20 @@
 
 use crate::zakura::transport::ByteBudget;
 
+/// Requested heap size of an Arc, including its reference counts and padding.
+pub(crate) fn shared_allocation_bytes<T>() -> u64 {
+    let (layout, _) = std::alloc::Layout::new::<[usize; 2]>()
+        .extend(std::alloc::Layout::new::<T>())
+        .expect("fixed shared metadata fits an allocation");
+    u64::try_from(layout.pad_to_align().size())
+        .expect("shared allocation size fits the byte counter")
+}
+
+/// Bound a collection allocation before constructing its elements.
+pub(crate) fn collection_allocation_bytes<T>(count: usize) -> Option<u64> {
+    u64::try_from(std::alloc::Layout::array::<T>(count).ok()?.size()).ok()
+}
+
 /// Retained response metadata is separate from body, decoder, and worker budgets.
 const NODE_RESPONSE_METADATA_BYTES: u64 = 128 * 1024 * 1024;
 const CONNECTION_RESPONSE_METADATA_BYTES: u64 = 16 * 1024 * 1024;

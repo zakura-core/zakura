@@ -7,7 +7,9 @@ use std::sync::{
 
 use tokio_util::sync::CancellationToken;
 
-use super::response_memory::{ConnectionResponseMemory, ResponseMemoryPermit};
+use super::response_memory::{
+    shared_allocation_bytes, ConnectionResponseMemory, ResponseMemoryPermit,
+};
 use crate::zakura::CloseCause;
 
 #[derive(Debug, Eq, PartialEq)]
@@ -58,15 +60,6 @@ struct Authorization {
     _memory: ResponseMemoryPermit,
 }
 
-fn authorization_allocation_bytes() -> u64 {
-    // The Arc allocation includes its counters and alignment padding.
-    let (layout, _) = std::alloc::Layout::new::<[usize; 2]>()
-        .extend(std::alloc::Layout::new::<Authorization>())
-        .expect("the fixed authorization fields fit an allocation");
-    u64::try_from(layout.pad_to_align().size())
-        .expect("authorization allocation size fits the byte counter")
-}
-
 /// Unique owner of an exchange through its validated ending. Dropping a started
 /// exchange closes its connection locally because the response cannot be drained.
 #[derive(Debug)]
@@ -90,16 +83,23 @@ impl ResponseScope {
         }))
     }
 
-    /// Prepare before taking local work or allocating message-specific expectations.
-    pub(crate) fn authorize(&self) -> Result<ResponseAuthorization, ResponseAdmissionError> {
+    /// Reserve the adapter's allocation plan before taking work. Every planned
+    /// allocation must remain owned by this authorization or a writer permission.
+    pub(crate) fn authorize_with_metadata(
+        &self,
+        metadata_bytes: u64,
+    ) -> Result<ResponseAuthorization, ResponseAdmissionError> {
         let state = self.0.lock();
         if state.retired || self.0.connection_cancel.is_cancelled() {
             return Err(ResponseAdmissionError::Retired);
         }
+        let bytes = shared_allocation_bytes::<Authorization>()
+            .checked_add(metadata_bytes)
+            .ok_or(ResponseAdmissionError::MemoryFull)?;
         let memory = self
             .0
             .memory
-            .try_reserve(authorization_allocation_bytes())
+            .try_reserve(bytes)
             .ok_or(ResponseAdmissionError::MemoryFull)?;
         Ok(ResponseAuthorization(Arc::new(Authorization {
             scope: self.clone(),

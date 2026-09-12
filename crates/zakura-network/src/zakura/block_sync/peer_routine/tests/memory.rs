@@ -1,5 +1,6 @@
 use super::*;
 use crate::zakura::block_sync::sequencer_task::{SequencedBody, SequencerView};
+use crate::zakura::BlockSyncMessage;
 use crate::zakura::{
     block_sync::{events::RoutineToReactor, MSG_BS_GET_BLOCKS},
     regulation::{ConnectionResponseMemory, ResponseMemory},
@@ -81,6 +82,44 @@ impl Fixture {
             budget,
         }
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn metadata_capacity_reduces_the_batch_before_taking_work() {
+    let node = ResponseMemory::new(1024, 1024);
+    let mut f = Fixture::new(node.connection(), true);
+    f.routine.max_blocks_per_response = 128;
+    f.routine.config.max_blocks_per_response = 128;
+    f.routine.servable_high = block::Height(128);
+    f.work.extend(
+        crate::zakura::block_sync::test_work_scope(),
+        (2u8..=128).map(|height| {
+            (
+                block::Height(u32::from(height)),
+                block::Hash([height; 32]),
+                BlockSizeEstimate::Confirmed(1_000),
+            )
+        }),
+    );
+    let preferred = f.routine.request_count_cap();
+    assert_eq!(preferred, 128);
+    let (funded_count, reservation) = f.routine.authorize_request_metadata().unwrap();
+    assert!(funded_count > 0 && funded_count < preferred);
+    assert!(node.reserved_for_test() <= 1024);
+    drop(reservation);
+    assert_eq!(node.reserved_for_test(), 0);
+    f.routine.try_fill().await;
+    let frame = f.output.try_recv().unwrap();
+    let BlockSyncMessage::GetBlocks { count, .. } = BlockSyncMessage::decode_frame(frame).unwrap()
+    else {
+        panic!("the funded request must be GetBlocks");
+    };
+    assert!(usize::try_from(count).unwrap() <= funded_count);
+    assert!(node.reserved_for_test() > 0);
+    assert!(node.reserved_for_test() <= 1024);
+    assert_eq!(f.work.pending_len() + f.work.in_flight_len(), 128);
+    assert!(!f.session.connection_is_closed_for_test());
+    assert!(!f.session.cancel_token().is_cancelled());
 }
 
 #[tokio::test(start_paused = true)]

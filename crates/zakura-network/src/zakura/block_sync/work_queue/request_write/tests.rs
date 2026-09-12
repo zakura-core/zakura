@@ -8,7 +8,11 @@ use std::{num::NonZeroU64, time::Duration};
 
 impl RequestWriteStatus {
     pub(in crate::zakura::block_sync) fn written_for_tests() -> Self {
-        Self(Arc::new(AtomicU8::new(WRITTEN)))
+        Self {
+            state: Arc::new(AtomicU8::new(WRITTEN)),
+            _response_write: crate::zakura::regulation::ResponseAuthorization::for_test()
+                .write_permission(),
+        }
     }
 }
 
@@ -96,6 +100,7 @@ struct Fixture {
     budget: ByteBudget,
     cancel: CancellationToken,
     authorizations: Vec<crate::zakura::regulation::ResponseAuthorization>,
+    metadata: crate::zakura::regulation::ConnectionResponseMemory,
 }
 
 impl Fixture {
@@ -105,6 +110,7 @@ impl Fixture {
             budget: ByteBudget::new(1000),
             cancel: CancellationToken::new(),
             authorizations: Vec::new(),
+            metadata: crate::zakura::regulation::ResponseMemory::default().connection(),
         };
         fixture.work.set_estimate_floor_for_tests(1);
         fixture.refill();
@@ -130,6 +136,13 @@ impl Fixture {
     }
 
     fn take(&mut self, id: u64) -> Arc<RequestWrite> {
+        let authorization = crate::zakura::regulation::ResponseScope::with_memory(
+            CancellationToken::new(),
+            crate::zakura::CloseCause::new(),
+            self.metadata.clone(),
+        )
+        .authorize_with_metadata(RequestWrite::metadata_bytes(2).unwrap())
+        .unwrap();
         let items = self.work.take_for_request(
             block::Height(1),
             block::Height(2),
@@ -140,12 +153,6 @@ impl Fixture {
         );
         assert_eq!(items.len(), 2);
         assert!(self.budget.try_reserve(200));
-        let authorization = crate::zakura::regulation::ResponseScope::new(
-            CancellationToken::new(),
-            crate::zakura::CloseCause::new(),
-        )
-        .authorize()
-        .unwrap();
         let permission = authorization.write_permission();
         self.authorizations.push(authorization);
         RequestWrite::new(
@@ -171,6 +178,25 @@ impl Fixture {
     fn reset(&mut self) {
         self.budget.release(self.work.reset_above(block::Height(0)));
     }
+}
+
+#[test]
+fn status_retains_metadata_after_request_and_response_owners_exit() {
+    let mut f = Fixture::new();
+    let write = f.take(1);
+    let status = write.status();
+    let funded = f.metadata.reserved_for_test();
+    assert!(funded > RequestWrite::metadata_bytes(2).unwrap());
+    assert!(write.publish(|| {}));
+    assert!(write.try_start());
+    write.written();
+    f.authorizations[0].finish();
+    drop(write);
+    f.authorizations.clear();
+    assert_eq!(f.metadata.reserved_for_test(), funded);
+    assert!(!status.was_skipped());
+    drop(status);
+    assert_eq!(f.metadata.reserved_for_test(), 0);
 }
 
 #[test]

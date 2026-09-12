@@ -162,10 +162,11 @@ impl BlockSyncPeerSession {
         self.cancel_token.cancel();
     }
 
-    pub(super) fn authorize_response(
+    pub(super) fn authorize_response_with_metadata(
         &self,
+        metadata_bytes: u64,
     ) -> Result<ResponseAuthorization, ResponseAdmissionError> {
-        self.response_scope.authorize()
+        self.response_scope.authorize_with_metadata(metadata_bytes)
     }
 
     pub(super) fn response_memory(&self) -> ConnectionResponseMemory {

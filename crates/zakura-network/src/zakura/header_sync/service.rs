@@ -18,8 +18,8 @@ use super::{events::*, pipe::run_peer, wire::*, FRAME_HEADER_BYTES};
 use crate::zakura::ZakuraSupervisorHandle;
 use crate::zakura::{
     handle_pipe_exit, spawn_supervised_pipe, BoxRunFuture, CloseCause, Frame, FramedRecv,
-    FramedSend, OrderedSendError, OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPolicy,
-    Peer, PeerStreamSession, Service, ServicePeerDirection, Sink, SinkReject, Stream, StreamMode,
+    FramedSend, OrderedSendError, Peer, PeerStreamSession, Service, ServicePeerDirection,
+    SessionDemand, SessionOpening, SessionPolicy, Sink, SinkReject, Stream, StreamMode,
     ZakuraConnId, ZakuraPeerId, ZAKURA_CAP_HEADER_SYNC,
 };
 
@@ -34,9 +34,8 @@ const HEADER_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
     kind: ZAKURA_STREAM_HEADER_SYNC,
     version: ZAKURA_HEADER_SYNC_STREAM_VERSION,
     frame_cap: HEADER_SYNC_FRAME_CAP,
-    message_payload_caps: &[],
     capability: ZAKURA_CAP_HEADER_SYNC,
-    mode: StreamMode::Ordered,
+    mode: StreamMode::Persistent,
 }];
 
 /// The sole stream declaration for native header sync.
@@ -58,9 +57,8 @@ mod stream_tests {
                 kind: ZAKURA_STREAM_HEADER_SYNC,
                 version: 8,
                 frame_cap: HEADER_SYNC_FRAME_CAP,
-                message_payload_caps: &[],
                 capability: 1 << 5,
-                mode: StreamMode::Ordered,
+                mode: StreamMode::Persistent,
             }
         );
     }
@@ -484,12 +482,12 @@ impl HeaderSyncService {
         self
     }
 
-    fn coordinator_demand(&self) -> Option<OrderedSessionDemand> {
+    fn coordinator_demand(&self) -> Option<SessionDemand> {
         let mut service_demand = self.service_demand.clone()?;
         if service_demand.borrow().header.is_enabled() {
             return None;
         }
-        Some(OrderedSessionDemand::WaitForChange(Box::pin(async move {
+        Some(SessionDemand::WaitForChange(Box::pin(async move {
             loop {
                 if service_demand.changed().await.is_err() {
                     std::future::pending::<()>().await;
@@ -511,20 +509,20 @@ impl Service for HeaderSyncService {
         header_sync_streams()
     }
 
-    fn ordered_stream_policy(&self, _kind: u16) -> OrderedStreamPolicy {
-        OrderedStreamPolicy {
-            opening: OrderedStreamOpening::InitiatorOnly,
+    fn session_policy(&self) -> SessionPolicy {
+        SessionPolicy {
+            opening: SessionOpening::InitiatorOnly,
             reopen: true,
         }
     }
 
-    fn ordered_session_demand(
+    fn session_demand(
         &self,
         _conn_id: ZakuraConnId,
         peer: &ZakuraPeerId,
         _negotiated: u64,
         direction: ServicePeerDirection,
-    ) -> OrderedSessionDemand {
+    ) -> SessionDemand {
         if let Some(demand) = self.coordinator_demand() {
             return demand;
         }
@@ -535,7 +533,7 @@ impl Service for HeaderSyncService {
             ServicePeerDirection::Outbound => snapshot.outbound_slots_free,
         };
         if slots_free == 0 {
-            return OrderedSessionDemand::WaitForChange(Box::pin(async move {
+            return SessionDemand::WaitForChange(Box::pin(async move {
                 if peers.changed().await.is_err() {
                     std::future::pending::<()>().await;
                 }
@@ -543,7 +541,7 @@ impl Service for HeaderSyncService {
         }
 
         let Some(node_id) = header_peer_node_id(peer) else {
-            return OrderedSessionDemand::Retire;
+            return SessionDemand::Retire;
         };
         if self
             .header_sync
@@ -553,12 +551,12 @@ impl Service for HeaderSyncService {
         {
             // The reactor publishes the backed-off set without per-node deadlines.
             // The service re-offers each target after one conservative backoff window.
-            return OrderedSessionDemand::RetryAt(
+            return SessionDemand::RetryAt(
                 std::time::Instant::now() + HEADER_SYNC_ADVISORY_BACKOFF,
             );
         }
 
-        OrderedSessionDemand::OpenNow
+        SessionDemand::OpenNow
     }
 
     fn wants_peer(
@@ -804,19 +802,19 @@ impl Service for HeaderSyncPassthroughService {
         header_sync_streams()
     }
 
-    fn ordered_stream_policy(&self, kind: u16) -> OrderedStreamPolicy {
-        self.inner.ordered_stream_policy(kind)
+    fn session_policy(&self) -> SessionPolicy {
+        self.inner.session_policy()
     }
 
-    fn ordered_session_demand(
+    fn session_demand(
         &self,
         conn_id: ZakuraConnId,
         peer: &ZakuraPeerId,
         negotiated: u64,
         direction: ServicePeerDirection,
-    ) -> OrderedSessionDemand {
+    ) -> SessionDemand {
         self.inner
-            .ordered_session_demand(conn_id, peer, negotiated, direction)
+            .session_demand(conn_id, peer, negotiated, direction)
     }
 
     fn wants_peer(

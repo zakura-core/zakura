@@ -494,9 +494,8 @@ mod tests {
         kind: CUSTOM_FRAME_CAP_STREAM_KIND,
         version: 1,
         frame_cap: CUSTOM_FRAME_CAP_BYTES,
-        message_payload_caps: &[],
         capability: CUSTOM_FRAME_CAP_CAPABILITY,
-        mode: StreamMode::Ordered,
+        mode: StreamMode::Persistent,
     }];
 
     #[derive(Debug, Default)]

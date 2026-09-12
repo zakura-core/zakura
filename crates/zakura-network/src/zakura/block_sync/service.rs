@@ -2,10 +2,10 @@ use super::{
     config::*, declaration::GET_BLOCKS, events::*, peer_registry::SessionAdmission, wire::*, *,
 };
 use crate::zakura::{
-    handle_pipe_exit, spawn_supervised_pipe, FramedRecv, FramedSend, MessagePayloadCap,
-    OrderedSendError, OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPolicy, Peer,
-    PeerStreamSession, Service, ServicePeerSnapshot, SinkReject, Stream, StreamMode,
-    ZakuraBlockSyncCandidateState, ZakuraConnId, ZakuraPeerId, FRAME_HEADER_BYTES,
+    handle_pipe_exit, spawn_supervised_pipe, FramedRecv, FramedSend, OrderedSendError, Peer,
+    PeerStreamSession, Service, ServicePeerSnapshot, SessionDemand, SessionOpening, SessionPolicy,
+    SinkReject, Stream, StreamMode, ZakuraBlockSyncCandidateState, ZakuraConnId, ZakuraPeerId,
+    FRAME_HEADER_BYTES,
 };
 use std::{
     sync::atomic::{AtomicU64, Ordering},
@@ -23,24 +23,34 @@ pub const MAX_BS_FRAME_BYTES: u32 = {
     (MAX_BS_MESSAGE_BYTES + FRAME_HEADER_BYTES) as u32
 };
 
-const BLOCK_SYNC_MESSAGE_PAYLOAD_CAPS: [MessagePayloadCap; 1] = [MessagePayloadCap {
-    // A one-byte message type always fits in the frame's u16 field.
-    message_type: MSG_BS_GET_BLOCKS as u16,
-    max_payload_bytes: GET_BLOCKS.payload_cap,
-}];
-
 const BLOCK_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
     kind: ZAKURA_STREAM_BLOCK_SYNC,
     version: ZAKURA_BLOCK_SYNC_STREAM_VERSION,
     frame_cap: MAX_BS_FRAME_BYTES,
-    message_payload_caps: &BLOCK_SYNC_MESSAGE_PAYLOAD_CAPS,
     capability: ZAKURA_CAP_BLOCK_SYNC,
-    mode: StreamMode::Ordered,
+    mode: StreamMode::Persistent,
 }];
 
 /// Service-declared streams for native block sync.
 pub(crate) fn block_sync_streams() -> &'static [Stream] {
     &BLOCK_SYNC_SERVICE_STREAMS
+}
+
+/// Payload limits that block sync declares for its stream, checked from the frame header.
+const BLOCK_SYNC_MESSAGE_PAYLOAD_LIMITS: [(u16, usize); 1] = [(
+    // A one-byte message type always fits in the frame's u16 field.
+    MSG_BS_GET_BLOCKS as u16,
+    // A u32 payload cap always fits usize on supported targets.
+    GET_BLOCKS.payload_cap as usize,
+)];
+
+/// Return the payload limits for one block-sync stream.
+pub(super) fn block_sync_message_payload_limits(stream: Stream) -> &'static [(u16, usize)] {
+    if block_sync_streams().contains(&stream) {
+        &BLOCK_SYNC_MESSAGE_PAYLOAD_LIMITS
+    } else {
+        &[]
+    }
 }
 
 /// Cloneable typed stream-6 sender.
@@ -92,6 +102,10 @@ impl BlockSyncPeerSession {
     /// Peer disconnect/local shutdown cancellation token.
     pub fn cancel_token(&self) -> CancellationToken {
         self.cancel_token.clone()
+    }
+
+    pub(super) fn request_sender(&self) -> FramedSend {
+        self.send.clone()
     }
 
     /// Current free slots in this peer's bounded outbound stream queue.
@@ -460,28 +474,32 @@ impl Service for BlockSyncService {
         block_sync_streams()
     }
 
-    fn ordered_stream_policy(&self, _kind: u16) -> OrderedStreamPolicy {
-        OrderedStreamPolicy {
-            opening: OrderedStreamOpening::EitherSide,
+    fn message_payload_limits(&self, stream: Stream) -> &'static [(u16, usize)] {
+        block_sync_message_payload_limits(stream)
+    }
+
+    fn session_policy(&self) -> SessionPolicy {
+        SessionPolicy {
+            opening: SessionOpening::EitherSide,
             reopen: true,
         }
     }
 
-    fn ordered_session_demand(
+    fn session_demand(
         &self,
         conn_id: ZakuraConnId,
         peer: &ZakuraPeerId,
         _negotiated: u64,
         direction: ServicePeerDirection,
-    ) -> OrderedSessionDemand {
+    ) -> SessionDemand {
         if let Some(deadline) = self.peer_park_deadline(peer) {
-            return OrderedSessionDemand::RetryAt(deadline);
+            return SessionDemand::RetryAt(deadline);
         }
 
         let mut peer_snapshot = self.inner.peer_snapshot.clone();
         peer_snapshot.borrow_and_update();
         if !self.peer_slots_free(direction) {
-            return OrderedSessionDemand::WaitForChange(Box::pin(async move {
+            return SessionDemand::WaitForChange(Box::pin(async move {
                 if peer_snapshot.changed().await.is_err() {
                     std::future::pending::<()>().await;
                 }
@@ -504,7 +522,7 @@ impl Service for BlockSyncService {
                 .is_empty()
             {
                 let mut service_demand = self.service_demand.clone();
-                return OrderedSessionDemand::WaitForChange(Box::pin(async move {
+                return SessionDemand::WaitForChange(Box::pin(async move {
                     if let Some(demand) = service_demand.as_mut() {
                         tokio::select! {
                             changed = candidates.changed() => {
@@ -525,7 +543,7 @@ impl Service for BlockSyncService {
             }
         }
 
-        OrderedSessionDemand::OpenNow
+        SessionDemand::OpenNow
     }
 
     fn wants_peer(
@@ -720,7 +738,11 @@ impl Service for BlockSyncService {
                             run_cancel,
                             wiring.trace,
                         );
-                        routine.run().await
+                        tokio::select! {
+                            biased;
+                            () = connection_cancel_token.cancelled() => Ok(()),
+                            result = routine.run() => result,
+                        }
                     }
                     None => drain_inbound(recv, run_cancel).await,
                 };
@@ -769,8 +791,8 @@ impl Service for BlockSyncService {
             return false;
         };
         matches!(
-            self.ordered_session_demand(conn_id, peer, ZAKURA_CAP_BLOCK_SYNC, direction),
-            OrderedSessionDemand::OpenNow
+            self.session_demand(conn_id, peer, ZAKURA_CAP_BLOCK_SYNC, direction),
+            SessionDemand::OpenNow
         )
     }
 

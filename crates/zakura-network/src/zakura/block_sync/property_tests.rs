@@ -4,10 +4,13 @@ use proptest::{prelude::*, test_runner::TestCaseResult};
 use zakura_chain::block;
 
 use super::{
-    config::MAX_BS_RESPONSE_BYTES, declaration::GET_BLOCKS, service::block_sync_streams, wire::*,
+    config::MAX_BS_RESPONSE_BYTES,
+    declaration::GET_BLOCKS,
+    service::{block_sync_message_payload_limits, block_sync_streams},
+    wire::*,
     BlockSyncWireError,
 };
-use crate::zakura::{message_payload_cap, Frame, FRAME_HEADER_BYTES};
+use crate::zakura::{Frame, Stream, FRAME_HEADER_BYTES};
 
 trait MessagePropertySpec {
     type Value: Clone + Debug + Eq;
@@ -329,18 +332,22 @@ fn get_blocks_deterministic_coverage_is_closed() {
 #[test]
 fn get_blocks_declaration_drives_the_preallocation_cap() {
     let stream = block_sync_streams()[0];
-    let stream_payload_cap = stream
-        .frame_cap
-        .checked_sub(u32::try_from(FRAME_HEADER_BYTES).expect("the frame header size fits u32"))
+    let stream_payload_cap = usize::try_from(stream.frame_cap)
+        .expect("u32 frame caps fit usize on supported targets")
+        .checked_sub(FRAME_HEADER_BYTES)
         .expect("the block-sync frame cap includes its header");
+    let get_blocks_cap =
+        usize::try_from(GET_BLOCKS.payload_cap).expect("u32 payload caps fit usize");
 
     assert_eq!(
-        message_payload_cap(
-            stream_payload_cap,
-            u16::from(MSG_BS_GET_BLOCKS),
-            stream.message_payload_caps,
-        ),
-        GET_BLOCKS.payload_cap,
+        block_sync_message_payload_limits(stream),
+        &[(u16::from(MSG_BS_GET_BLOCKS), get_blocks_cap)],
     );
+    assert!(get_blocks_cap < stream_payload_cap);
+    assert!(block_sync_message_payload_limits(Stream {
+        version: stream.version + 1,
+        ..stream
+    })
+    .is_empty());
     assert_eq!(GET_BLOCKS.allocation_cap, 0);
 }

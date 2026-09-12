@@ -4,6 +4,7 @@ use super::*;
 use proptest::prelude::*;
 
 mod response_lifecycle;
+mod response_memory;
 
 proptest! {
     #[test]

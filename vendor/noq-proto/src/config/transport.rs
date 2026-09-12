@@ -37,6 +37,7 @@ pub struct TransportConfig {
     pub(crate) receive_fragment_limit: Option<NonZeroUsize>,
     pub(crate) receive_window: VarInt,
     pub(crate) send_window: u64,
+    pub(crate) bounded_send_buffers: bool,
     pub(crate) packet_history_limit: Option<NonZeroUsize>,
     pub(crate) send_fairness: bool,
 
@@ -174,12 +175,24 @@ impl TransportConfig {
     /// Acknowledged bytes behind a missing prefix still consume this window until
     /// the buffer releases them. Reset releases the abandoned payload immediately.
     ///
-    /// Provides an upper bound on memory when communicating with peers that issue large amounts of
-    /// flow control credit. Endpoints that wish to handle large numbers of connections robustly
-    /// should take care to set this low enough to guarantee memory exhaustion does not occur if
-    /// every connection uses the entire window.
+    /// This limits payload independently of flow control credit granted by the peer. It does not
+    /// bound backing allocations retained by zero-copy writes. Use `bounded_send_buffers` to
+    /// bound those allocations, with separate allowances for metadata and allocator overhead.
     pub fn send_window(&mut self, value: u64) -> &mut Self {
         self.send_window = value;
+        self
+    }
+
+    /// Copy outgoing stream data into independently owned blocks of at most 64 KiB.
+    ///
+    /// This prevents small slices from retaining large source allocations. Requested payload
+    /// storage is bounded by retained bytes plus two blocks per buffered stream, accounting for
+    /// a partially acknowledged front and spare tail capacity. Metadata and allocator overhead
+    /// need separate allowances. Fully acknowledged or reset buffers release all payload storage.
+    ///
+    /// Disabled by default to preserve zero-copy writes from `Bytes`.
+    pub fn bounded_send_buffers(&mut self, value: bool) -> &mut Self {
+        self.bounded_send_buffers = value;
         self
     }
 
@@ -605,6 +618,7 @@ impl Default for TransportConfig {
             receive_fragment_limit: None,
             receive_window: VarInt::MAX,
             send_window: (8 * STREAM_RWND).into(),
+            bounded_send_buffers: false,
             send_fairness: true,
             packet_history_limit: None,
 
@@ -661,6 +675,7 @@ impl fmt::Debug for TransportConfig {
             receive_fragment_limit,
             receive_window,
             send_window,
+            bounded_send_buffers,
             packet_history_limit,
             send_fairness,
             packet_threshold,
@@ -708,6 +723,7 @@ impl fmt::Debug for TransportConfig {
             .field("receive_fragment_limit", receive_fragment_limit)
             .field("receive_window", receive_window)
             .field("send_window", send_window)
+            .field("bounded_send_buffers", bounded_send_buffers)
             .field("packet_history_limit", packet_history_limit)
             .field("send_fairness", send_fairness)
             .field("packet_threshold", packet_threshold)

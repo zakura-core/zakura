@@ -38,6 +38,14 @@ missing prefix. Reset releases abandoned send storage before refunding its space
 and preserves the final offset required by RESET_STREAM. Rejected early data
 returns both local stream slots and retained send capacity.
 
+Native connections enable bounded send buffers. Slice and Bytes writes copy into
+independently owned blocks of at most 64 KiB. Partial acknowledgments cannot keep
+an arbitrarily large source allocation alive. The requested payload storage is
+at most retained bytes plus two blocks per buffered stream, allowing for a
+partially acknowledged front block and spare tail capacity. Idle and reset
+buffers release their payload storage. Metadata and allocator overhead still
+need separate funding. Dependency consumers retain zero-copy writes by default.
+
 An optional packet-history limit bounds the packet-number span of sent and lost
 records in each path and encryption space. The indexed buffers allocate for gaps
 as well as occupied records, so a record count alone is insufficient. Exhausting

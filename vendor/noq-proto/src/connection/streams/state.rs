@@ -129,6 +129,7 @@ pub struct StreamsState {
     ///
     /// Note this may be less than `retained_send_bytes` if the user has set a new value.
     pub(super) send_window: u64,
+    pub(super) bounded_send_buffers: bool,
     /// Configured upper bound for how much unacked data the peer can send us per stream
     pub(super) stream_receive_window: u64,
     receive_fragment_limit: usize,
@@ -183,6 +184,7 @@ impl StreamsState {
             data_recvd: 0,
             retained_send_bytes: 0,
             send_window,
+            bounded_send_buffers: false,
             stream_receive_window: stream_receive_window.into(),
             receive_fragment_limit: usize::MAX,
             initial_max_stream_data_uni: 0u32.into(),
@@ -203,6 +205,11 @@ impl StreamsState {
 
     pub(crate) fn with_local_stream_limits(mut self, bidi: VarInt, uni: VarInt) -> Self {
         self.max_concurrent_local_count = [bidi.into(), uni.into()];
+        self
+    }
+
+    pub(crate) fn with_bounded_send_buffers(mut self, enabled: bool) -> Self {
+        self.bounded_send_buffers = enabled;
         self
     }
 
@@ -399,7 +406,7 @@ impl StreamsState {
         let Some(stream) = self
             .send
             .get_mut(&id)
-            .map(get_or_insert_send(max_send_data))
+            .map(get_or_insert_send(max_send_data, self.bounded_send_buffers))
         else {
             return;
         };
@@ -730,7 +737,7 @@ impl StreamsState {
         if let Some(ss) = self
             .send
             .get_mut(&id)
-            .map(get_or_insert_send(max_send_data))
+            .map(get_or_insert_send(max_send_data, self.bounded_send_buffers))
         {
             if ss.increase_max_data(offset) {
                 if write_limit > 0 {
@@ -988,8 +995,9 @@ impl StreamsState {
 #[inline]
 pub(super) fn get_or_insert_send(
     max_data: VarInt,
+    bounded_send_buffers: bool,
 ) -> impl Fn(&mut Option<Box<Send>>) -> &mut Box<Send> {
-    move |opt| opt.get_or_insert_with(|| Send::new(max_data))
+    move |opt| opt.get_or_insert_with(|| Send::new(max_data, bounded_send_buffers))
 }
 
 #[inline]

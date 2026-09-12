@@ -489,6 +489,7 @@ impl ZakuraLocalLimits {
             .stream_receive_window(VarInt::from_u32(DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW))
             .receive_window(VarInt::from_u32(DEFAULT_ZAKURA_RECEIVE_WINDOW))
             .send_window(DEFAULT_ZAKURA_SEND_WINDOW)
+            .bounded_send_buffers(true)
             .max_idle_timeout(Some(
                 self.quic_idle_timeout
                     .try_into()

@@ -413,6 +413,50 @@ fn export_keying_material() {
 }
 
 #[test]
+fn bounded_send_buffers_apply_to_both_sides_of_local_and_remote_streams() {
+    let _guard = subscribe();
+    for bounded in [false, true] {
+        for opener in [Client, Server] {
+            let mut transport = TransportConfig::default();
+            transport.bounded_send_buffers(bounded);
+            let mut pair = ConnPair::builder().with_transport_cfg(transport).connect();
+            let stream = pair.streams(opener).open(Dir::Bi).unwrap();
+            let expected: Vec<_> = (0..2 * 64 * 1024 + 17)
+                .map(|index| u8::try_from(index % 251).unwrap())
+                .collect();
+            for sender in [opener, !opener] {
+                let mut source = vec![42; 512 * 1024];
+                source[4096..4096 + expected.len()].copy_from_slice(&expected);
+                let owner: Arc<[u8]> = source.into();
+                let weak = Arc::downgrade(&owner);
+                let mut chunks = [Bytes::from_owner(owner).slice(4096..4096 + expected.len())];
+                assert_eq!(
+                    pair.send_stream(sender, stream)
+                        .write_chunks(&mut chunks.as_mut_slice())
+                        .unwrap(),
+                    expected.len()
+                );
+                assert_eq!(weak.upgrade().is_none(), bounded);
+                pair.send_stream(sender, stream).finish().unwrap();
+                pair.drive();
+                if sender == opener {
+                    assert_eq!(pair.streams(!opener).accept(Dir::Bi), Some(stream));
+                }
+                let mut recv = pair.recv_stream(!sender, stream);
+                let mut received = recv.read(true).unwrap();
+                let mut actual = Vec::new();
+                while let Some(chunk) = received.next(usize::MAX).unwrap() {
+                    actual.extend_from_slice(&chunk.bytes);
+                }
+                let _ = received.finalize();
+                assert_eq!(actual, expected);
+                assert!(weak.upgrade().is_none());
+            }
+        }
+    }
+}
+
+#[test]
 fn packet_history_limit_stops_before_an_unfunded_packet_is_built() {
     packet_history_exhaustion(true);
 }

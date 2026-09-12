@@ -69,8 +69,8 @@ The endpoint creates one response metadata pool with a 128 MiB node limit and a
 same context, including later escalation and replacement. The limits include
 512 bytes for pool accounting, 4 KiB per connection context, and 512 bytes per
 receiver scope. These fixed allowances cover the shared allocations and first-use
-locks. Cold allocation probes check their sizes. Pool and scope setup initialize
-their platform locks while funded. Pool funding survives the endpoint handle if
+locks. Cold allocation probes check their sizes. Accounting and scope locks are initialized
+while setup funding is held. Pool funding survives the endpoint handle if
 connections still use it. Connection and scope funding survives through their
 last owner.
 
@@ -90,7 +90,16 @@ readers retain the authorization's memory charge after the writer and response
 owner exit. If the preferred batch cannot fit, the requester tries progressively
 smaller batches before waiting for capacity.
 
-Retained window and registry capacities still need charges before these limits
+Container growth is admitted together with the request, then receives a separate
+memory permit. The shared ResponseVec keeps that permit with its backing capacity.
+Growth funds the old and new allocations simultaneously, moves the entries, and
+releases the old permit only after the old allocation is freed. GetBlocks uses it
+for its download window. Finishing the last request leaves an empty window whose
+retained capacity is still charged. Exact growth and smaller request batches are
+tried when geometric growth cannot fit, so a buffer cannot consume the memory
+needed to create the request that would use it.
+
+Registry snapshots and range capacity still need charges before these limits
 bound all protocol metadata. Transport setup, stream buffers and cancellation
 children also need their own aggregate accounting. These allowances are separate
 from body storage, decoding, and execution budgets.

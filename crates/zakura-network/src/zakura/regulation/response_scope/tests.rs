@@ -1,6 +1,16 @@
 use super::*;
 
 impl ResponseScope {
+    /// Reserve the adapter's allocation plan before taking work. Every planned
+    /// allocation must remain owned by this authorization or a writer permission.
+    pub(crate) fn authorize_with_metadata(
+        &self,
+        metadata_bytes: u64,
+    ) -> Result<ResponseAuthorization, ResponseAdmissionError> {
+        self.authorize_with_retained_memory(metadata_bytes, 0)
+            .map(|(authorization, _)| authorization)
+    }
+
     pub(crate) fn setup_bytes_for_test() -> u64 {
         SCOPE_SETUP_BYTES
     }

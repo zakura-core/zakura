@@ -109,6 +109,43 @@ fn failed_scope_setup_preserves_the_existing_receiver() {
 }
 
 #[test]
+fn jointly_admitted_storage_outlives_the_exchange_and_scope() {
+    let node = ResponseMemory::default();
+    let connection = node.connection();
+    let baseline = node.reserved_for_test();
+    let scope = ResponseScope::with_memory(CancellationToken::new(), CloseCause::new(), connection);
+    let (mut authorization, retained) = scope.authorize_with_retained_memory(128, 256).unwrap();
+    let writer = authorization.write_permission();
+    assert!(writer.publish(|| {}));
+    assert!(writer.try_start(|| true));
+    authorization.finish();
+    drop((authorization, writer, scope));
+    assert_eq!(node.reserved_for_test(), baseline + 256);
+    drop(retained);
+    assert_eq!(node.reserved_for_test(), NODE_SETUP_BYTES);
+}
+
+#[test]
+fn retained_growth_and_request_admission_are_atomic() {
+    let setup = CONNECTION_SETUP_BYTES + ResponseScope::setup_bytes_for_test();
+    let node = pool(setup + 4096, setup + 4096);
+    let connection = node.connection();
+    let scope = ResponseScope::with_memory(CancellationToken::new(), CloseCause::new(), connection);
+    let before = node.reserved_for_test();
+    assert!(matches!(
+        scope.authorize_with_retained_memory(1, 4096),
+        Err(ResponseAdmissionError::MemoryFull)
+    ));
+    assert!(matches!(
+        scope.authorize_with_retained_memory(1, u64::MAX),
+        Err(ResponseAdmissionError::MemoryFull)
+    ));
+    assert_eq!(node.reserved_for_test(), before);
+    assert!(scope.authorize_with_retained_memory(1, 2048).is_ok());
+    assert_eq!(node.reserved_for_test(), before);
+}
+
+#[test]
 fn allocation_plans_are_admitted_as_one_reservation() {
     let setup = CONNECTION_SETUP_BYTES + ResponseScope::setup_bytes_for_test();
     let limit = setup + 4096;

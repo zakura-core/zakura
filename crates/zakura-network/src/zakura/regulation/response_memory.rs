@@ -101,6 +101,7 @@ impl ResponseMemory {
         let setup = ConnectionSetup { pool: self.clone() };
         let mut connection = ByteBudget::new(self.connection_limit);
         assert!(connection.try_reserve(CONNECTION_SETUP_BYTES));
+        connection.subscribe_capacity().notify_waiters();
         Some(ConnectionResponseMemory(Arc::new(ConnectionMemory {
             pool: self.clone(),
             connection,
@@ -135,6 +136,27 @@ impl ConnectionResponseMemory {
     /// Releases in either domain release node bytes and wake all affected sessions.
     pub(crate) fn subscribe_capacity(&self) -> &tokio::sync::Notify {
         self.0.pool.node.subscribe_capacity()
+    }
+}
+
+impl ResponseMemoryPermit {
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Transfer part of one admission to storage with a different lifetime.
+    pub(crate) fn split_off(&mut self, bytes: u64) -> Option<Self> {
+        if bytes == 0 {
+            return None;
+        }
+        self.bytes = self
+            .bytes
+            .checked_sub(bytes)
+            .expect("split memory is part of the original reservation");
+        Some(Self {
+            memory: self.memory.clone(),
+            bytes,
+        })
     }
 }
 

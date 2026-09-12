@@ -12,5 +12,22 @@ pub(crate) use request::{
 mod slots;
 pub(crate) use slots::{SlotBudget, SlotPermit};
 
+mod response;
+pub(crate) use response::ResponseCredit;
+
+mod response_scope;
+pub(crate) use response_scope::{
+    ResponseAdmissionError, ResponseAuthorization, ResponseScope, ResponseWritePermission,
+};
+
+mod response_memory;
+pub(crate) use response_memory::{
+    collection_allocation_bytes, shared_allocation_bytes, ConnectionResponseMemory, ResponseMemory,
+    ResponseMemoryPermit,
+};
+
+mod response_vec;
+pub(crate) use response_vec::ResponseVec;
+
 #[cfg(test)]
 mod tests;

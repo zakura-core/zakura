@@ -441,13 +441,10 @@ pub(crate) fn spawn_supervised_peer_task(
 /// Map a finished pipe run to its connection-teardown effect — the single place
 /// the "is this exit fatal to the whole connection?" decision lives.
 ///
-/// A protocol reject is fatal: it cancels the shared `connection_cancel` token so
-/// the whole connection tears down. A local reject (e.g. a closed service queue)
-/// tears down only this stream — the per-service token is already cancelled by
-/// the [`PipeTeardown`] — so it is logged and the connection is left for other
-/// services. `Ok` is a normal/parked exit and does nothing here. Panic-path
-/// connection teardown is separate (`on_panic`), because a panic never returns a
-/// `Result` to inspect.
+/// Protocol rejects and unrecoverable local state close the connection with
+/// distinct causes. An ordinary local delivery failure leaves other services
+/// running. The per-service token is cancelled by [`PipeTeardown`]. `Ok` has no
+/// connection effect. Panic teardown is separate because it returns no result.
 pub(crate) fn handle_pipe_exit(
     service: &'static str,
     connection_cancel: &CancellationToken,
@@ -467,6 +464,11 @@ pub(crate) fn handle_pipe_exit(
         }
         Err(SinkReject::Local(error)) => {
             tracing::debug!(?error, service, "Zakura stream stopped on local error");
+        }
+        Err(SinkReject::Connection(error)) => {
+            tracing::debug!(?error, service, "Zakura connection stopped on local error");
+            close_cause.record("service_local_connection_close");
+            connection_cancel.cancel();
         }
     }
 }
@@ -600,6 +602,38 @@ mod tests {
 
         assert!(cancel.is_cancelled());
         assert_eq!(cause.get_or("fallback"), "service_protocol_reject");
+    }
+
+    #[test]
+    fn local_connection_exit_closes_without_a_protocol_cause() {
+        let cancel = CancellationToken::new();
+        let cause = CloseCause::new();
+
+        handle_pipe_exit(
+            "test",
+            &cancel,
+            &cause,
+            Err(SinkReject::local_connection("response drain unavailable")),
+        );
+
+        assert!(cancel.is_cancelled());
+        assert_eq!(cause.get_or("fallback"), "service_local_connection_close");
+    }
+
+    #[test]
+    fn local_delivery_exit_preserves_connection_and_close_cause() {
+        let cancel = CancellationToken::new();
+        let cause = CloseCause::new();
+
+        handle_pipe_exit(
+            "test",
+            &cancel,
+            &cause,
+            Err(SinkReject::local("handler unavailable")),
+        );
+
+        assert!(!cancel.is_cancelled());
+        assert_eq!(cause.get_or("still_open"), "still_open");
     }
 
     #[tokio::test]

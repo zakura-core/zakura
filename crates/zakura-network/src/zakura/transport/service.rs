@@ -164,6 +164,7 @@ pub struct Peer {
     cancel_token: CancellationToken,
     service_cancel_token: CancellationToken,
     close_cause: CloseCause,
+    response_memory: crate::zakura::regulation::ConnectionResponseMemory,
 }
 
 impl Peer {
@@ -225,6 +226,9 @@ impl Peer {
             streams,
             cancel_token,
             CloseCause::new(),
+            crate::zakura::regulation::ResponseMemory::default()
+                .try_connection()
+                .expect("default response budget funds a connection"),
         )
     }
 
@@ -238,6 +242,7 @@ impl Peer {
         streams: HashMap<u16, (FramedRecv, FramedSend)>,
         cancel_token: CancellationToken,
         close_cause: CloseCause,
+        response_memory: crate::zakura::regulation::ConnectionResponseMemory,
     ) -> Self {
         let streams = streams
             .into_iter()
@@ -257,6 +262,7 @@ impl Peer {
             streams,
             cancel_token,
             close_cause,
+            response_memory,
         )
     }
 
@@ -270,6 +276,7 @@ impl Peer {
         streams: HashMap<u16, ServiceStream>,
         cancel_token: CancellationToken,
         close_cause: CloseCause,
+        response_memory: crate::zakura::regulation::ConnectionResponseMemory,
     ) -> Self {
         let service_cancel_token = streams
             .values()
@@ -286,6 +293,7 @@ impl Peer {
             cancel_token,
             service_cancel_token,
             close_cause,
+            response_memory,
         )
     }
 
@@ -300,6 +308,7 @@ impl Peer {
         cancel_token: CancellationToken,
         service_cancel_token: CancellationToken,
         close_cause: CloseCause,
+        response_memory: crate::zakura::regulation::ConnectionResponseMemory,
     ) -> Self {
         Self {
             id,
@@ -311,6 +320,7 @@ impl Peer {
             cancel_token,
             service_cancel_token,
             close_cause,
+            response_memory,
         }
     }
 
@@ -362,6 +372,10 @@ impl Peer {
         self.close_cause.clone()
     }
 
+    pub(crate) fn response_memory(&self) -> crate::zakura::regulation::ConnectionResponseMemory {
+        self.response_memory.clone()
+    }
+
     /// Split this peer into fields so the registry can fan streams out by owner.
     pub(crate) fn into_parts(
         self,
@@ -374,6 +388,7 @@ impl Peer {
         HashMap<u16, ServiceStream>,
         CancellationToken,
         CloseCause,
+        crate::zakura::regulation::ConnectionResponseMemory,
     ) {
         (
             self.id,
@@ -384,6 +399,7 @@ impl Peer {
             self.streams,
             self.cancel_token,
             self.close_cause,
+            self.response_memory,
         )
     }
 }
@@ -418,6 +434,13 @@ pub trait Service: fmt::Debug + Send + Sync + 'static {
     /// unlisted type from its header, before allocating or reading its payload.
     fn message_types(&self, _stream: Stream) -> Option<&'static [u16]> {
         None
+    }
+
+    /// Flag bits accepted by this stream's codec. The reader rejects other bits
+    /// before allocating or reading the payload. Native services return zero.
+    /// Custom services retain unrestricted flags unless they declare a mask.
+    fn allowed_frame_flags(&self, _stream: Stream) -> u16 {
+        u16::MAX
     }
 
     /// Optional per-stream inbound and outbound application queue limits.
@@ -586,6 +609,10 @@ pub enum SinkReject {
     /// Local sink state prevented delivery; the peer is not at fault.
     #[error("inbound sink could not accept frame locally: {0}")]
     Local(#[source] BoxError),
+
+    /// Local state cannot safely continue on this connection. No peer fault is implied.
+    #[error("inbound sink requires connection closure locally: {0}")]
+    Connection(#[source] BoxError),
 }
 
 impl SinkReject {
@@ -598,20 +625,45 @@ impl SinkReject {
     pub fn local(error: impl Into<BoxError>) -> Self {
         Self::Local(error.into())
     }
+
+    /// Close the connection because local protocol state cannot be retained or drained.
+    pub fn local_connection(error: impl Into<BoxError>) -> Self {
+        Self::Connection(error.into())
+    }
+
+    /// Whether continuing other streams on this connection would be unsafe.
+    pub fn closes_connection(&self) -> bool {
+        matches!(self, Self::Protocol(_) | Self::Connection(_))
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    impl super::Peer {
+        /// The endpoint supplies one context for the whole connection before fanout.
+        pub(crate) fn with_response_memory(
+            mut self,
+            memory: crate::zakura::regulation::ConnectionResponseMemory,
+        ) -> Self {
+            self.response_memory = memory;
+            self
+        }
+    }
     use super::*;
 
     #[test]
     fn sink_reject_constructors_preserve_protocol_and_local_contract() {
         let protocol = SinkReject::protocol("bad frame");
         let local = SinkReject::local("closed queue");
+        let connection = SinkReject::local_connection("response state unavailable");
 
         assert!(matches!(protocol, SinkReject::Protocol(_)));
         assert!(matches!(local, SinkReject::Local(_)));
         assert!(protocol.to_string().contains("protocol-invalid"));
         assert!(local.to_string().contains("locally"));
+        assert!(matches!(connection, SinkReject::Connection(_)));
+        assert!(protocol.closes_connection());
+        assert!(!local.closes_connection());
+        assert!(connection.closes_connection());
     }
 }

@@ -41,6 +41,82 @@ Ordinary local failures release resources whose work has ended and return affect
 scheduler. They do not count as peer violations. Universal panic recovery belongs to separate
 runtime work. Bounded decoder tests still check that untrusted payloads cannot cause a panic.
 
+## Response lifetime and session replacement
+
+The shared requester primitives separate response credit from session lifetime.
+An explicit credit grant can add object and byte allowances within the message's
+outstanding-credit limits. It preserves cumulative consumption and rejects an
+overflowing or excessive grant without changing either counter. The message
+adapter must record each grant before publishing it, validate its identity and
+sequence, and prohibit grants after closure. Existing finite GetBlocks requests
+receive their credit once. Renewal supports the future subscription contract.
+`ResponseCredit` counts consumed objects and actual bytes. `ResponseScope` fences
+publication and first writes for one receiver incarnation. Each exchange has one
+`ResponseAuthorization` owner, retained until its validated ending. The writer
+holds a separate permission and cannot complete the response by finishing a write.
+Identity, ordering, legal endings, and useful local work remain message policy.
+
+Session admission retires the predecessor scope before publishing a replacement.
+Retirement waits for a publication already in progress and prevents further
+publications or first writes. A queued request that never started can be skipped.
+If any exchange started and still lacks its ending, retirement closes its
+connection locally before admitting another receiver on that connection.
+Dropping that exchange's owner has the same close behavior. This is not a peer
+protocol fault. A different connection can proceed independently.
+
+For GetBlocks, the work lock is acquired before the response scope lock. Terminal
+handling releases the scope lock before returning local work. Session admission
+holds its session-table lock while retiring the old scope, without taking the
+work lock. This preserves request publication atomicity without an inverse lock
+order.
+
+The endpoint creates one response metadata pool with a 128 MiB node limit and a
+16 MiB limit per connection. All service sessions on that connection receive the
+same context, including later escalation and replacement. The limits include
+512 bytes for pool accounting, 4 KiB per connection context, and 512 bytes per
+receiver scope. These fixed allowances cover the shared allocations and first-use
+locks. Cold allocation probes check their sizes. Accounting and scope locks are initialized
+while setup funding is held. Pool funding survives the endpoint handle if
+connections still use it. Connection and scope funding survives through their
+last owner.
+
+Connection setup is reserved before registration can replace another connection.
+Receiver setup is reserved before retiring the prior receiver or publishing its
+registry admission. A failure declines that admission locally and leaves the
+existing receiver intact. Authorization records reserve their allocation before
+creation and retain the charge through the last writer handle, even after an
+ending or connection close. Exhaustion pauses new requests locally, and a release
+wakes affected waiters.
+
+An adapter can include its allocation plan in that reservation. Every planned
+allocation must remain owned by the authorization or one of its writer handles.
+GetBlocks includes expected hashes, the taken-work vector, and writer and status
+allocations. The work vector is moved into the writer without cloning it. Status
+readers retain the authorization's memory charge after the writer and response
+owner exit. If the preferred batch cannot fit, the requester tries progressively
+smaller batches before waiting for capacity.
+
+Container growth is admitted together with the request, then receives a separate
+memory permit. The shared ResponseVec keeps that permit with its backing capacity.
+Growth funds the old and new allocations simultaneously, moves the entries, and
+releases the old permit only after the old allocation is freed. GetBlocks uses it
+for its download window, sorted registry height index, response ranges, and scratch
+snapshot. Finishing the last request leaves empty buffers whose retained capacity
+is still charged. Exact growth and smaller request batches are
+tried when geometric growth cannot fit, so a buffer cannot consume the memory
+needed to create the request that would use it.
+
+Both snapshot copies are prepared before taking work. Publication filters current
+owners under the work queue lock, releases that lock, sorts in place, then swaps
+the scratch and published buffers under the registry lock. It requires no new
+allocation. Registry admission fences old generations and frees their published
+buffers. An old routine retains its own scratch funding until it exits.
+
+The remaining metadata collections, transport setup, stream buffers and cancellation
+children still need aggregate accounting before these limits bound all protocol
+metadata. These allowances are separate from body storage, decoding, and execution
+budgets.
+
 ## Capacity admission and QUIC backpressure
 
 The receiver starts response work only when worker capacity and bounded output capacity are
@@ -54,6 +130,13 @@ Stopping application reads must stop draining the QUIC receive buffer. Once the 
 existing stream credit, it cannot send more data on that stream. Already authorized bytes still
 count toward the resource bound. Account for both stream and connection credit.
 See [QUIC flow control](https://www.rfc-editor.org/rfc/rfc9000.html#section-4.1).
+
+The current implementation uses published transport packages. It bounds application work and
+requester metadata, but does not yet fund transport state through handshakes and final cleanup.
+Transport send capacity must eventually count retained payload, including acknowledged tails
+behind a missing prefix. Stream and fragment limits must cover locally opened and retiring state.
+The dependency changes needed for these bounds are reviewed separately. Their blocked witnesses
+and re-enable conditions are recorded in the [transport capacity plan](native-transport-capacity.md).
 
 Pausing request intake must not trap responses or control messages needed to finish active work.
 A mixed ordered stream can create that dependency even when every queue is bounded. The concrete

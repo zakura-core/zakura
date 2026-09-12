@@ -387,6 +387,10 @@ impl<'a> From<&'a Block> for Hash {
 pub const MAX_BLOCK_LOCATOR_LENGTH: u64 = 101;
 
 impl TrustedPreallocate for Hash {
+    fn min_serialized_size() -> u64 {
+        32
+    }
+
     fn max_allocation() -> u64 {
         MAX_BLOCK_LOCATOR_LENGTH
     }

@@ -216,7 +216,7 @@ impl PeerRoutine {
     /// peer is idle, so the controller's balance is observable between deliveries — e.g.
     /// a cwnd that keeps ramping up only to be pulled back by the reliability discount
     /// instead of settling near `r = 1.0`.
-    pub(super) fn trace_bbr_sample(&self) {
+    pub(super) fn trace_bbr_sample(&mut self) {
         self.emit(bs_trace::BLOCK_PEER_BBR, |row| {
             row.peer = Some(trace_peer(&self.peer));
             row.peer_outstanding = Some(saturating_usize(self.window.outstanding.len()));

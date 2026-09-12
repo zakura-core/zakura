@@ -9,6 +9,9 @@ use tokio_util::sync::CancellationToken;
 use zakura_header_chain::BodyWorkOwner;
 
 use super::{block, BlockBudgetLedger, WorkItem, WorkQueue};
+use crate::zakura::regulation::{
+    collection_allocation_bytes, shared_allocation_bytes, ResponseWritePermission,
+};
 use crate::zakura::transport::{ByteBudget, FrameWriteClaim};
 
 const UNPUBLISHED: u8 = 0;
@@ -20,20 +23,24 @@ const EXPIRED: u8 = 4;
 #[cfg(test)]
 mod tests;
 
-/// Observes whether transport skipped an attempt without retaining its work or
-/// byte reservation. The routine can keep this after the writer drops its claim.
+/// Observes whether transport skipped an attempt without retaining local work or
+/// body bytes. Metadata funding remains live with this status after the writer exits.
 #[derive(Clone, Debug)]
-pub(in crate::zakura::block_sync) struct RequestWriteStatus(Arc<AtomicU8>);
+pub(in crate::zakura::block_sync) struct RequestWriteStatus {
+    state: Arc<AtomicU8>,
+    // Status readers can outlive both the writer and the response owner.
+    _response_write: ResponseWritePermission,
+}
 
 impl RequestWriteStatus {
     pub(in crate::zakura::block_sync) fn was_skipped(&self) -> bool {
-        self.0.load(Ordering::Acquire) == EXPIRED
+        self.state.load(Ordering::Acquire) == EXPIRED
     }
 
     /// Retire a queued attempt atomically against writer startup. Returns true
     /// only for the transition; a started frame remains the transport's owner.
     pub(in crate::zakura::block_sync) fn expire_unwritten(&self) -> bool {
-        self.0
+        self.state
             .compare_exchange(QUEUED, EXPIRED, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
@@ -57,15 +64,23 @@ pub(crate) struct RequestWrite {
     budget: ByteBudget,
     cancel: CancellationToken,
     state: Arc<AtomicU8>,
+    response_write: ResponseWritePermission,
 }
 
 impl RequestWrite {
+    pub(in crate::zakura::block_sync) fn metadata_bytes(max_count: usize) -> Option<u64> {
+        collection_allocation_bytes::<(block::Height, WorkItem)>(max_count)?
+            .checked_add(shared_allocation_bytes::<Self>())?
+            .checked_add(shared_allocation_bytes::<AtomicU8>())
+    }
+
     pub(in crate::zakura::block_sync) fn new(
         owner: BodyWorkOwner,
         items: Vec<(block::Height, WorkItem)>,
         work: Arc<WorkQueue>,
         budget: ByteBudget,
         cancel: CancellationToken,
+        response_write: ResponseWritePermission,
     ) -> Arc<Self> {
         let estimated_bytes = items.iter().map(|(_, item)| item.estimated_bytes).sum();
         Arc::new(Self {
@@ -76,11 +91,15 @@ impl RequestWrite {
             budget,
             cancel,
             state: Arc::new(AtomicU8::new(UNPUBLISHED)),
+            response_write,
         })
     }
 
     pub(in crate::zakura::block_sync) fn status(&self) -> RequestWriteStatus {
-        RequestWriteStatus(self.state.clone())
+        RequestWriteStatus {
+            state: self.state.clone(),
+            _response_write: self.response_write.clone(),
+        }
     }
 
     /// Record outstanding state and enqueue into already-reserved capacity under
@@ -103,25 +122,26 @@ impl RequestWrite {
             UNPUBLISHED,
             "a request is published once"
         );
-        for (height, _) in &self.items {
-            let item = inner
-                .in_flight
-                .get_mut(height)
-                .expect("every provisional item was checked under this lock");
-            item.budget = BlockBudgetLedger::reserved(item.estimated_bytes);
-            item.provisional = false;
-        }
-        inner.reserved_bytes = inner.reserved_bytes.saturating_add(self.estimated_bytes);
-        inner.request_writes.insert(
-            self.owner,
-            RequestWriteRegistration {
-                claim: Arc::downgrade(self),
-                status: self.status(),
-            },
-        );
-        self.state.store(QUEUED, Ordering::Release);
-        publish();
-        true
+        self.response_write.publish(|| {
+            for (height, _) in &self.items {
+                let item = inner
+                    .in_flight
+                    .get_mut(height)
+                    .expect("every provisional item was checked under this lock");
+                item.budget = BlockBudgetLedger::reserved(item.estimated_bytes);
+                item.provisional = false;
+            }
+            inner.reserved_bytes = inner.reserved_bytes.saturating_add(self.estimated_bytes);
+            inner.request_writes.insert(
+                self.owner,
+                RequestWriteRegistration {
+                    claim: Arc::downgrade(self),
+                    status: self.status(),
+                },
+            );
+            self.state.store(QUEUED, Ordering::Release);
+            publish();
+        })
     }
 
     pub(super) fn owner(&self) -> BodyWorkOwner {
@@ -184,9 +204,15 @@ impl FrameWriteClaim for RequestWrite {
             self.expire_unwritten();
             return false;
         }
-        self.state
-            .compare_exchange(QUEUED, STARTED, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+        let started = self.response_write.try_start(|| {
+            self.state
+                .compare_exchange(QUEUED, STARTED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        });
+        if !started {
+            self.expire_unwritten();
+        }
+        started
     }
 
     fn written(&self) {

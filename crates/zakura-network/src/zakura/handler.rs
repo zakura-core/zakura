@@ -150,11 +150,12 @@ pub const ZAKURA_DUPLICATE_EVICT_MIN_AGE: Duration = Duration::from_secs(300);
 /// resolution (milliseconds) so a genuine race keeps the transcript-tiebreak
 /// winner instead of flapping.
 pub const ZAKURA_SAME_IP_DUPLICATE_EVICT_MIN_AGE: Duration = Duration::from_secs(5);
-/// A paused stream may consume at most half the connection receive window,
-/// leaving credit for another service stream.
-pub const DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW: u32 = 16 * 1024 * 1024;
-/// QUIC connection receive window used by Zakura endpoints.
-pub const DEFAULT_ZAKURA_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;
+/// Maximum retained remotely initiated bidirectional transport streams.
+pub const DEFAULT_ZAKURA_REMOTE_BIDI_STREAMS: u32 = 16;
+/// Receive credit available to one stream, including before application admission.
+pub const DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW: u32 = 256 * 1024;
+/// Covers 32 paused siblings and progress through batched connection credit updates.
+pub const DEFAULT_ZAKURA_RECEIVE_WINDOW: u32 = 38 * DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW;
 /// QUIC send window used by Zakura endpoints.
 pub const DEFAULT_ZAKURA_SEND_WINDOW: u64 = 32 * 1024 * 1024;
 /// Initial backoff before re-dialing a configured Zakura bootstrap peer.
@@ -484,7 +485,9 @@ impl ZakuraLocalLimits {
     fn transport_config_builder(&self) -> iroh::endpoint::QuicTransportConfigBuilder {
         QuicTransportConfig::builder()
             .max_remote_nat_traversal_addresses(0)
-            .max_concurrent_bidi_streams(VarInt::from_u32(u32::from(self.max_open_streams)))
+            .max_concurrent_bidi_streams(VarInt::from_u32(
+                u32::from(self.max_open_streams).min(DEFAULT_ZAKURA_REMOTE_BIDI_STREAMS),
+            ))
             .max_concurrent_uni_streams(VarInt::from_u32(0))
             .stream_receive_window(VarInt::from_u32(DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW))
             .receive_window(VarInt::from_u32(DEFAULT_ZAKURA_RECEIVE_WINDOW))
@@ -1584,6 +1587,7 @@ struct RegisteredConnectionServeContext {
     conn_id: ZakuraConnId,
     connection_token: CancellationToken,
     close_cause: CloseCause,
+    response_memory: crate::zakura::regulation::ConnectionResponseMemory,
     accepted_capabilities: u64,
     /// Whether this side dialed the connection. The dialer (initiator) opens
     /// ordinary ordered streams. The node-id winner opens block sync (the sole
@@ -1603,6 +1607,7 @@ struct StreamWorkerContext {
     inbound_frame_cap: u32,
     message_payload_limits: &'static [(u16, usize)],
     message_types: Option<&'static [u16]>,
+    allowed_frame_flags: u16,
     queue_depths: Option<(usize, usize)>,
     write_policy: StreamWritePolicy,
     session_resources: Option<Arc<dyn crate::zakura::SessionResources>>,
@@ -1976,6 +1981,7 @@ pub struct ZakuraProtocolHandler {
     supported_capabilities: Arc<AtomicU64>,
     limits: ZakuraLocalLimits,
     registry: Arc<ServiceRegistry>,
+    response_memory: crate::zakura::regulation::ResponseMemory,
     trace: ZakuraTrace,
     next_conn_id: Arc<AtomicU64>,
     next_stream_id: Arc<AtomicU64>,
@@ -2089,6 +2095,7 @@ impl ZakuraProtocolHandler {
             registry,
             trace,
             next_conn_id: Arc::new(AtomicU64::new(1)),
+            response_memory: crate::zakura::regulation::ResponseMemory::default(),
             // Stream session IDs are local correlation generations, not wire
             // sequence numbers. A random process seed prevents preserved traces
             // and late completions from colliding after a node restart.
@@ -2324,6 +2331,7 @@ impl ZakuraProtocolHandler {
         let conn_id = context.conn_id;
         let connection_token = context.connection_token;
         let close_cause = context.close_cause;
+        let response_memory = context.response_memory;
         let accepted_capabilities = context.accepted_capabilities;
         let stream_sem = Arc::new(Semaphore::new(usize::from(limits.max_open_streams)));
         let mut workers = JoinSet::new();
@@ -2436,6 +2444,7 @@ impl ZakuraProtocolHandler {
                     HashMap::new(),
                     connection_token.clone(),
                     close_cause.clone(),
+                    response_memory.clone(),
                 ));
             cleanup_guard.add_admitted_capabilities(accepted_capabilities);
         } else if !connection_token.is_cancelled() {
@@ -2507,6 +2516,7 @@ impl ZakuraProtocolHandler {
                             std::mem::take(&mut service_streams),
                             connection_token.clone(),
                             close_cause.clone(),
+                            response_memory.clone(),
                         ));
                 cleanup_guard.add_admitted_capabilities(admitted_capabilities);
             }
@@ -2645,6 +2655,7 @@ impl ZakuraProtocolHandler {
                                     service_streams,
                                     connection_token.clone(),
                                     close_cause.clone(),
+                                    response_memory.clone(),
                                 ),
                             );
                             cleanup_guard.add_admitted_capabilities(admitted_capabilities);
@@ -2807,6 +2818,7 @@ impl ZakuraProtocolHandler {
                                 service_streams,
                                 connection_token.clone(),
                                 close_cause.clone(),
+                                response_memory.clone(),
                             ),
                         );
                         cleanup_guard.add_admitted_capabilities(admitted_capabilities);
@@ -2873,6 +2885,7 @@ impl ZakuraProtocolHandler {
                                     stream,
                                     self.registry.message_payload_limits(stream),
                                     self.registry.message_types(stream),
+                                    self.registry.allowed_frame_flags(stream),
                                     request_id,
                                     message_type,
                                     flags,
@@ -3223,6 +3236,7 @@ impl ZakuraProtocolHandler {
             inbound_frame_cap: inbound_frame_cap_for_stream(&admission.limits, stream),
             message_payload_limits: self.registry.message_payload_limits(stream),
             message_types: self.registry.message_types(stream),
+            allowed_frame_flags: self.registry.allowed_frame_flags(stream),
             queue_depths: self.registry.stream_queue_depths(stream),
             write_policy: self.registry.stream_write_policy(stream),
             session_resources: resources,
@@ -3315,6 +3329,18 @@ impl ZakuraProtocolHandler {
             return Ok(());
         }
 
+        // Reserve before registration can replace an existing connection.
+        let Some(response_memory) = self.response_memory.try_connection() else {
+            debug!(
+                ?peer_id,
+                "declining connection at local response metadata capacity"
+            );
+            connection.close(
+                VarInt::from_u32(ZAKURA_CLOSE_RESOURCE),
+                b"response metadata",
+            );
+            return Ok(());
+        };
         let (outbound_tx, outbound_rx) =
             mpsc::channel(usize::from(context.limits.max_inbound_queue_depth));
         let close_cause = CloseCause::new();
@@ -3368,6 +3394,7 @@ impl ZakuraProtocolHandler {
                         conn_id,
                         connection_token: disconnect_token,
                         close_cause,
+                        response_memory,
                         accepted_capabilities: context.accepted_capabilities,
                         is_initiator: context.role == "initiator",
                         i_open_collision_winner: context.i_open_collision_winner,
@@ -4149,6 +4176,7 @@ async fn persistent_stream_worker_with_policy(
                     reader_context.inbound_frame_cap,
                     reader_context.message_payload_limits,
                     reader_context.message_types,
+                    reader_context.allowed_frame_flags,
                     reader_context.limits.idle_timeout,
                     // A persistent ordered stream is legitimately quiet between
                     // frames; do not let an inter-frame gap time out and cancel
@@ -4379,6 +4407,7 @@ async fn request_stream_worker(
             context.inbound_frame_cap,
             context.message_payload_limits,
             context.message_types,
+            context.allowed_frame_flags,
             context.limits.idle_timeout,
             // A request stream carries its request frame immediately after the
             // prelude, so a peer that opens one and then goes silent is treated
@@ -4447,6 +4476,13 @@ async fn request_stream_worker(
                 "Zakura inbound sink could not answer request locally"
             );
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE));
+            return;
+        }
+        Err(SinkReject::Connection(error)) => {
+            debug!(?error, "Zakura request requires local connection closure");
+            let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_RESOURCE));
+            context.close_cause.record("request_local_connection_close");
+            context.connection_token.cancel();
             return;
         }
     };
@@ -4552,6 +4588,7 @@ async fn read_frame(
     max_frame_bytes: u32,
     message_payload_limits: &[(u16, usize)],
     message_types: Option<&[u16]>,
+    allowed_frame_flags: u16,
     read_timeout: Duration,
     first_byte_timeout: Option<Duration>,
 ) -> Result<Frame, ZakuraHandlerError> {
@@ -4585,6 +4622,9 @@ async fn read_frame(
         return Err(ZakuraHandlerError::InvalidMessageType(message_type));
     }
     let flags = reader.read_u16::<LittleEndian>()?;
+    if flags & !allowed_frame_flags != 0 {
+        return Err(ZakuraHandlerError::UnsupportedFrameFlags(flags));
+    }
     let payload_len = usize::try_from(reader.read_u32::<LittleEndian>()?)
         .expect("u32 payload lengths fit usize on supported targets");
     let max_frame_bytes =
@@ -4737,6 +4777,7 @@ async fn write_outbound_request_frame(
     stream: Stream,
     message_payload_limits: &'static [(u16, usize)],
     message_types: Option<&'static [u16]>,
+    allowed_frame_flags: u16,
     request_id: u64,
     message_type: u16,
     flags: u16,
@@ -4750,6 +4791,7 @@ async fn write_outbound_request_frame(
             stream,
             message_payload_limits,
             message_types,
+            allowed_frame_flags,
             request_id,
             message_type,
             flags,
@@ -4767,6 +4809,7 @@ async fn write_outbound_request_frame_inner(
     stream: Stream,
     message_payload_limits: &'static [(u16, usize)],
     message_types: Option<&'static [u16]>,
+    allowed_frame_flags: u16,
     request_id: u64,
     message_type: u16,
     flags: u16,
@@ -4822,6 +4865,7 @@ async fn write_outbound_request_frame_inner(
             inbound_frame_cap,
             message_payload_limits,
             message_types,
+            allowed_frame_flags,
             limits.idle_timeout,
             // This is the requester side of a one-shot legacy request/response:
             // the responder streams its frames promptly, so a silent gap before
@@ -5582,6 +5626,9 @@ pub enum ZakuraHandlerError {
     /// The frame header names a message that is invalid on this stream role.
     #[error("invalid message type {0} for this stream role")]
     InvalidMessageType(u16),
+    /// The frame uses flags outside the service codec's declared mask.
+    #[error("unsupported frame flags {0:#06x}")]
+    UnsupportedFrameFlags(u16),
     /// Two ordered stream roles failed to name one complete session.
     #[error("invalid Zakura service session")]
     InvalidServiceSession,
@@ -5676,6 +5723,12 @@ mod tests {
     mod paired_block_sync;
     mod quic_progress;
     mod serving_progress;
+
+    // These witnesses require unpublished transport APIs and their native
+    // integration. `ignore` alone still type-checks unavailable constructors.
+    // Restore both before enabling this module. See native-transport-capacity.md.
+    #[cfg(any())]
+    mod transport_ownership;
 
     use super::*;
     use crate::{
@@ -7327,6 +7380,7 @@ mod tests {
             streams,
             connection_cancel.clone(),
             CloseCause::new(),
+            crate::zakura::regulation::ResponseMemory::default().connection(),
         ));
 
         let frame = tokio::time::timeout(Duration::from_secs(1), outbound_rx.recv())
@@ -8114,6 +8168,8 @@ mod tests {
             mode: StreamMode::Persistent,
         };
         let encoded = frame.encode(stream.frame_cap)?;
+        let buffered_frames =
+            2 + usize::try_from(DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW).unwrap() / encoded.len();
         // Opening a QUIC stream becomes visible to the receiver after the first bytes.
         sender.write_all(&encoded[..1]).await?;
         let (send, recv) = timeout(Duration::from_secs(5), stream_rx.recv())
@@ -8131,6 +8187,7 @@ mod tests {
             inbound_frame_cap: stream.frame_cap,
             message_payload_limits: &[],
             message_types: None,
+            allowed_frame_flags: u16::MAX,
             queue_depths: None,
             write_policy: StreamWritePolicy::Timeout(OUTBOUND_STREAM_WRITE_TIMEOUT),
             session_resources: None,
@@ -8164,7 +8221,7 @@ mod tests {
             sender
         }));
         timeout(Duration::from_secs(10), async {
-            while *progress_rx.borrow_and_update() < 16 {
+            while *progress_rx.borrow_and_update() < buffered_frames {
                 progress_rx.changed().await.unwrap();
             }
         })
@@ -8196,6 +8253,7 @@ mod tests {
                 stream.frame_cap,
                 &[],
                 None,
+                u16::MAX,
                 Duration::from_secs(2),
                 None,
             ),
@@ -8337,6 +8395,7 @@ mod tests {
             inbound_frame_cap: inbound_frame_cap_for_stream(&limits, stream),
             message_payload_limits: &[],
             message_types: None,
+            allowed_frame_flags: u16::MAX,
             queue_depths: None,
             write_policy: StreamWritePolicy::Timeout(OUTBOUND_STREAM_WRITE_TIMEOUT),
             session_resources: None,
@@ -8543,6 +8602,7 @@ mod tests {
                 inbound_frame_cap: inbound_frame_cap_for_stream(&limits, stream),
                 message_payload_limits: &[],
                 message_types: None,
+                allowed_frame_flags: u16::MAX,
                 queue_depths: None,
                 write_policy: StreamWritePolicy::Timeout(OUTBOUND_STREAM_WRITE_TIMEOUT),
                 session_resources: None,
@@ -8920,6 +8980,7 @@ mod tests {
                     frame_cap,
                     payload_limits,
                     None,
+                    u16::MAX,
                     Duration::from_secs(5),
                     Some(Duration::from_secs(5)),
                 ),
@@ -8971,12 +9032,104 @@ mod tests {
                     stream.frame_cap,
                     payload_limits,
                     None,
+                    u16::MAX,
                     Duration::from_secs(2),
                     Some(Duration::from_secs(2)),
                 ),
             )
             .await??;
             assert_eq!(BlockSyncMessage::decode_frame(frame)?, message);
+        }
+        client.close().await;
+        router.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_block_cap_and_declared_flags_reject_headers_before_payload_reads(
+    ) -> Result<(), BoxError> {
+        const ALPN: &[u8] = b"/zakura/testkit/frame-header-policy/1";
+        let _guard = zakura_test::init();
+        let service = Arc::new(BlockSyncService::new(ZakuraBlockSyncConfig::default()));
+        let stream = service.streams()[0];
+        let registry = ServiceRegistry::new(vec![service])?;
+        assert_eq!(registry.allowed_frame_flags(stream), 0);
+        assert_eq!(NoopService.allowed_frame_flags(stream), u16::MAX);
+
+        let server = LocalEndpointFactory::new().endpoint(89_610).await?;
+        let (connection_tx, _connection_rx) = mpsc::channel(8);
+        let (stream_tx, mut stream_rx) = mpsc::channel(8);
+        let router = Router::builder(server)
+            .accept(
+                ALPN,
+                CaptureConnection {
+                    connection_tx,
+                    stream_tx,
+                },
+            )
+            .spawn();
+        let client = LocalEndpointFactory::new().endpoint(89_611).await?;
+
+        for (flags, payload_len, allowed_flags) in [
+            (0u16, 2_000_002u32, registry.allowed_frame_flags(stream)),
+            (1, 1, registry.allowed_frame_flags(stream)),
+            // A custom mask accepts bits independently and rejects unlisted bits.
+            (4, 1, 3),
+            (3, 1, 3),
+        ] {
+            let connection = timeout(
+                Duration::from_secs(5),
+                client.connect(
+                    LocalEndpointFactory::node_addr(router.endpoint()).await,
+                    ALPN,
+                ),
+            )
+            .await??;
+            let (mut send, _) = timeout(Duration::from_secs(2), connection.open_bi()).await??;
+            let header = [
+                3u16.to_le_bytes().as_slice(),
+                flags.to_le_bytes().as_slice(),
+                payload_len.to_le_bytes().as_slice(),
+            ]
+            .concat();
+            timeout(Duration::from_secs(2), send.write_all(&header)).await??;
+            if flags == 3 {
+                timeout(Duration::from_secs(2), send.write_all(&[7])).await??;
+            }
+            let (_, mut recv) = timeout(Duration::from_secs(2), stream_rx.recv())
+                .await?
+                .ok_or("capture handler closed")?;
+            let result = timeout(
+                Duration::from_millis(100),
+                read_frame(
+                    &mut recv,
+                    stream.frame_cap,
+                    registry.message_payload_limits(stream),
+                    registry.message_types(stream),
+                    allowed_flags,
+                    Duration::from_secs(5),
+                    None,
+                ),
+            )
+            .await
+            .expect("invalid headers reject while the sender withholds the payload");
+            if flags == 0 {
+                assert!(matches!(
+                    result,
+                    Err(ZakuraHandlerError::OversizeFrame {
+                        payload_len: 2_000_002,
+                        max_frame_bytes: 2_000_009,
+                        ..
+                    })
+                ));
+            } else if flags & !allowed_flags != 0 {
+                assert!(
+                    matches!(result, Err(ZakuraHandlerError::UnsupportedFrameFlags(value)) if value == flags)
+                );
+            } else {
+                assert_eq!(result?.flags, flags);
+            }
+            connection.close(0u32.into(), b"test complete");
         }
         client.close().await;
         router.shutdown().await?;
@@ -9083,6 +9236,7 @@ mod tests {
             inbound_cap,
             &[],
             None,
+            u16::MAX,
             Duration::from_secs(2),
             Some(Duration::from_secs(2)),
         )
@@ -9118,6 +9272,7 @@ mod tests {
             raw_cap,
             &[],
             None,
+            u16::MAX,
             Duration::from_secs(2),
             Some(Duration::from_secs(2)),
         )
@@ -9158,6 +9313,7 @@ mod tests {
             inbound_cap,
             &[],
             None,
+            u16::MAX,
             Duration::from_secs(2),
             Some(Duration::from_secs(2)),
         )

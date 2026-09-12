@@ -158,6 +158,12 @@ pub struct CountedHeader {
 pub const ZCASH_BLOCK_VERSION: u32 = 4;
 
 impl TrustedPreallocate for CountedHeader {
+    fn min_serialized_size() -> u64 {
+        // Fixed header fields, the shortest supported (Regtest) solution,
+        // and the trailing transaction count.
+        4 + 3 * 32 + 4 + 4 + 32 + 1 + 36 + 1
+    }
+
     /// Cap `CountedHeader` preallocation at the existing protocol-level
     /// constant `MAX_HEADERS_PER_MESSAGE = 160`. The previous return value was
     /// derived from `MAX_PROTOCOL_MESSAGE_LEN`, allowing peer-controlled

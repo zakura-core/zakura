@@ -26,7 +26,13 @@ mod gate;
 mod link;
 mod paused;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_policy_keeps_progress_with_all_sibling_streams_unread() -> Result<(), BoxError> {
+    gate::transport_windows::check_native_policy_headroom().await
+}
+
 struct Workload {
+    transport: Option<QuicTransportConfig>,
     peer_limit: Option<usize>,
     pressure: bool,
     impaired: bool,
@@ -39,6 +45,7 @@ struct Workload {
 impl Default for Workload {
     fn default() -> Self {
         Self {
+            transport: None,
             peer_limit: None,
             pressure: false,
             impaired: false,
@@ -301,8 +308,55 @@ async fn download_rounds(
     .await
 }
 
+async fn start_request_pressure(
+    send: FramedSend,
+) -> Result<AbortOnDropHandle<Result<(), BoxError>>, BoxError> {
+    const REQUESTS: usize = 32_000;
+    let (progress, mut observed) = watch::channel(0);
+    let writer = send.clone();
+    let task = AbortOnDropHandle::new(tokio::spawn(async move {
+        for queued in 1..=REQUESTS {
+            writer
+                .send(
+                    crate::zakura::block_sync::BlockSyncMessage::GetBlocks {
+                        start_height: block::Height(1),
+                        count: 1,
+                    }
+                    .encode_frame()?,
+                )
+                .await?;
+            progress.send_replace(queued);
+        }
+        Ok(())
+    }));
+    timeout(DEADLINE, async {
+        loop {
+            let queued = *observed.borrow_and_update();
+            if queued == REQUESTS {
+                break;
+            }
+            match timeout(Duration::from_millis(100), observed.changed()).await {
+                Ok(result) => result?,
+                Err(_) if queued > 0 && send.capacity() == 0 => break,
+                Err(_) => continue,
+            }
+        }
+        Ok::<_, BoxError>(())
+    })
+    .await
+    .map_err(|_| std::io::Error::other("request pressure setup timed out"))??;
+    // Keep offering the same bounded burst during the independent download.
+    // A full transport window must not prevent the download from starting.
+    eprintln!(
+        "pressure burst: {} of {REQUESTS} requests queued",
+        *observed.borrow()
+    );
+    Ok(task)
+}
+
 async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
     let Workload {
+        transport,
         peer_limit,
         pressure,
         impaired,
@@ -321,10 +375,26 @@ async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
     let mut limits = ZakuraLocalLimits::from_config(&Config::default());
     // Let the declared request burst test serving pressure, not rate rejection.
     limits.message_rate_per_second = 40_000;
-    let server = LocalEndpointFactory::with_transport_config(limits.transport_config())
+    const SATURATED_STREAM_WINDOW: u32 = 16 * 1024 * 1024;
+    let constrained_credit = resume_after.is_some() || recover_on_fresh_peer;
+    assert!(!constrained_credit || transport.is_none());
+    let transport_config = transport.unwrap_or_else(|| {
+        if constrained_credit {
+            // Recovery tests deliberately exhaust connection credit. The native
+            // policy instead reserves enough credit for independent progress.
+            limits
+                .transport_config_builder()
+                .stream_receive_window(SATURATED_STREAM_WINDOW.into())
+                .receive_window((2 * SATURATED_STREAM_WINDOW).into())
+                .build()
+        } else {
+            limits.transport_config()
+        }
+    });
+    let server = LocalEndpointFactory::with_transport_config(transport_config.clone())
         .endpoint(94101)
         .await?;
-    let client = LocalEndpointFactory::with_transport_config(limits.transport_config())
+    let client = LocalEndpointFactory::with_transport_config(transport_config.clone())
         .endpoint(94102)
         .await?;
     let handler =
@@ -369,11 +439,20 @@ async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
     .await?;
     let mut paused_receivers = Vec::new();
     let mut paused_senders = Vec::new();
+    let sibling_window = if constrained_credit {
+        SATURATED_STREAM_WINDOW
+    } else {
+        DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW
+    };
     let before_siblings = connection.stats().udp_rx.bytes;
     for _ in 0..paused_siblings {
         let sender = paused::PausedSession::receive(&mut server_siblings).await?;
         let receiver = paused::PausedSession::receive(&mut client_siblings).await?;
-        sender.fill_window().await?;
+        if constrained_credit {
+            sender.fill_window_bytes(SATURATED_STREAM_WINDOW).await?;
+        } else {
+            sender.fill_window().await?;
+        }
         paused_senders.push(sender);
         paused_receivers.push(receiver);
     }
@@ -387,7 +466,7 @@ async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
                     .udp_rx
                     .bytes
                     .saturating_sub(before_siblings)
-                    >= u64::from(paused_siblings) * u64::from(DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW)
+                    >= u64::from(paused_siblings) * u64::from(sibling_window)
             },
         )
         .await?;
@@ -406,27 +485,11 @@ async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
             .sessions_for_transport_test()
             .pop()
             .unwrap();
-        if pressure {
-            // All requests precede the download. Their receiver waits for capacity;
-            // only A's download below must complete.
-            timeout(DEADLINE, async {
-                for _ in 0..32_000 {
-                    server_session
-                        .2
-                        .send(
-                            crate::zakura::block_sync::BlockSyncMessage::GetBlocks {
-                                start_height: block::Height(1),
-                                count: 1,
-                            }
-                            .encode_frame()?,
-                        )
-                        .await?;
-                }
-                Ok::<_, BoxError>(())
-            })
-            .await
-            .map_err(|_| std::io::Error::other("request pressure setup timed out"))??;
-        }
+        let request_pressure = if pressure {
+            Some(start_request_pressure(server_session.2.clone()).await?)
+        } else {
+            None
+        };
         let mut start = Instant::now();
         downloader
             ._tip
@@ -514,7 +577,7 @@ async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
 
             let fresh_node = Node::new(blocks.clone(), true);
             let fresh_endpoint =
-                LocalEndpointFactory::with_transport_config(limits.transport_config())
+                LocalEndpointFactory::with_transport_config(transport_config.clone())
                     .endpoint(94103)
                     .await?;
             let (fresh_sibling, fresh_siblings) = paused::PausedService::new(paused_siblings);
@@ -587,6 +650,14 @@ async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
         .await?;
         let elapsed = start.elapsed();
         total += elapsed;
+        if let Some(task) = request_pressure {
+            task.abort();
+            match task.await {
+                Ok(result) => result?,
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         if rounds > 1 {
             eprintln!("matched round {}/{}: {:?}", round + 1, rounds, elapsed);
         }
@@ -684,7 +755,7 @@ async fn paired_download_matches_every_block_and_ending() -> Result<(), BoxError
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn paired_download_completes_while_serving_capacity_is_full() -> Result<(), BoxError> {
     eprintln!(
-        "paired matched download under 32000-request pressure: {:?}",
+        "paired matched download with an offered 32000-request burst: {:?}",
         download(true).await?
     );
     Ok(())
@@ -802,7 +873,7 @@ async fn paired_roles_reject_wrong_messages_before_reading_payloads() -> Result<
         let (_, mut recv) = timeout(DEADLINE, streams.recv()).await?.unwrap();
         assert!(matches!(timeout(Duration::from_secs(1), read_frame(
             &mut recv, role.frame_cap, service.message_payload_limits(role), service.message_types(role),
-            Duration::from_secs(5), None,
+            service.allowed_frame_flags(role), Duration::from_secs(5), None,
         )).await?, Err(ZakuraHandlerError::InvalidMessageType(kind)) if kind == message));
         connection.close(0u32.into(), b"checked");
     }
@@ -831,8 +902,15 @@ impl BlockRangeSource for StalledSource {
 }
 
 #[tokio::test]
-async fn remote_pair_reset_with_unanswered_work_preserves_no_progress_policy(
-) -> Result<(), BoxError> {
+async fn unfinished_pair_retirement_closes_connection_without_readmission() -> Result<(), BoxError>
+{
+    for remote_reset in [false, true] {
+        check_unfinished_pair_retirement(remote_reset).await?;
+    }
+    Ok(())
+}
+
+async fn check_unfinished_pair_retirement(remote_reset: bool) -> Result<(), BoxError> {
     let blocks = blocks();
     let downloader = Node::with_range_source(
         blocks.clone(),
@@ -903,55 +981,37 @@ async fn remote_pair_reset_with_unanswered_work_preserves_no_progress_policy(
         .await
         .expect("server sees initial request");
     assert!(downloader.handle.outstanding_requests_for_test() > 0);
-    // Local retirement returns work without charging the remote peer a stall.
-    downloader
+    let download_session = downloader
         .service
         .sessions_for_transport_test()
         .pop()
         .unwrap()
-        .1
-        .cancel_token()
-        .cancel();
-    timeout(DEADLINE, seen.notified())
-        .await
-        .expect("local cancellation permits another request");
-    assert!(!downloader.service.is_peer_parked_for_test(&remote_peer));
-    assert!(downloader.handle.outstanding_requests_for_test() > 0);
-    server_node
-        .service
-        .sessions_for_transport_test()
-        .pop()
-        .unwrap()
-        .1
-        .cancel_token()
-        .cancel();
-    await_until("remote reset parks unanswered download", DEADLINE, || {
-        downloader.service.is_peer_parked_for_test(&remote_peer)
-    })
-    .await?;
-    assert!(transport.connection.close_reason().is_none());
-    assert!(
-        timeout(Duration::from_secs(1), seen.notified())
-            .await
-            .is_err(),
-        "cooldown must prevent new requests"
-    );
-    timeout(DEADLINE, seen.notified())
-        .await
-        .expect("cooldown permits one readmission");
-    server_node
-        .service
-        .sessions_for_transport_test()
-        .pop()
-        .unwrap()
-        .1
-        .cancel_token()
-        .cancel();
-    // This fixture keeps a QUIC clone after register_and_serve returns. The
-    // production caller closes it when the cancelled connection handler exits.
+        .1;
+    if remote_reset {
+        server_node
+            .service
+            .sessions_for_transport_test()
+            .pop()
+            .unwrap()
+            .1
+            .cancel_token()
+            .cancel();
+    } else {
+        download_session.cancel_token().cancel();
+    }
+    // Keeping a QUIC clone in this fixture prevents automatic socket close, so
+    // observe the production connection token and handler exit directly.
     timeout(DEADLINE, &mut transport._task)
         .await
-        .expect("repeated remote reset ends the connection handler")??;
+        .expect("unfinished authorization requires connection closure")??;
+    assert!(download_session.connection_is_closed_for_test());
+    assert!(!downloader.service.is_peer_parked_for_test(&remote_peer));
+    assert!(
+        timeout(Duration::from_millis(100), seen.notified())
+            .await
+            .is_err(),
+        "retirement must not readmit unanswered work on the old connection"
+    );
     assert_eq!(downloader.service.peer_count(), 0);
     assert_eq!(*downloader.received.borrow(), 0);
     drop(transport);

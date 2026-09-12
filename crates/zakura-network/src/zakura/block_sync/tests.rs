@@ -1044,13 +1044,6 @@ async fn drain_parent_first_actions(
                 }
                 *verified_tip = height;
             }
-            BlockSyncAction::Misbehavior {
-                reason:
-                    BlockSyncMisbehavior::BodyPayloadMismatch(_)
-                    | BlockSyncMisbehavior::InvalidBlock
-                    | BlockSyncMisbehavior::UnsolicitedBlock,
-                ..
-            } => {}
             BlockSyncAction::QueryNeededBlocks { .. } => {}
             action => panic!("unexpected action while draining body responses: {action:?}"),
         }
@@ -1075,6 +1068,9 @@ fn window_request(height: u32) -> OutstandingBlockRange {
     let byte = u8::try_from(height).expect("test heights fit in u8");
     let now = Instant::now();
     OutstandingBlockRange {
+        authorization: crate::zakura::regulation::ResponseAuthorization::for_test(),
+        response: crate::zakura::regulation::ResponseCredit::new(1, u64::MAX),
+        local_work_active: true,
         write_status: work_queue::RequestWriteStatus::written_for_tests(),
         charged_for_liveness: true,
         request: BlockRangeRequest {
@@ -1101,6 +1097,9 @@ fn window_request_range(start: u32, count: u32) -> OutstandingBlockRange {
     let byte = u8::try_from(start).expect("test heights fit in u8");
     let now = Instant::now();
     OutstandingBlockRange {
+        authorization: crate::zakura::regulation::ResponseAuthorization::for_test(),
+        response: crate::zakura::regulation::ResponseCredit::new(u64::from(count), u64::MAX),
+        local_work_active: true,
         write_status: work_queue::RequestWriteStatus::written_for_tests(),
         charged_for_liveness: true,
         request: BlockRangeRequest {
@@ -1133,7 +1132,7 @@ fn block_liveness_disconnects_silent_active_peer_after_default_timeout() {
 
     let now = Instant::now();
     let mut window = download_window();
-    window.outstanding.push(window_request(1));
+    window.outstanding.push_for_test(window_request(1));
     window.arm_liveness(now, timeout);
 
     assert_eq!(
@@ -1198,7 +1197,7 @@ fn block_liveness_progress_before_deadline_keeps_peer_alive() {
     let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
     let mut now = Instant::now();
     let mut window = download_window();
-    window.outstanding.push(window_request(1));
+    window.outstanding.push_for_test(window_request(1));
     window.arm_liveness(now, timeout);
 
     for _ in 0..4 {
@@ -1214,7 +1213,7 @@ fn block_liveness_disconnects_silent_peer_after_outstanding_drains() {
     let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
     let now = Instant::now();
     let mut window = download_window();
-    window.outstanding.push(window_request(1));
+    window.outstanding.push_for_test(window_request(1));
     window.arm_liveness(now, timeout);
 
     window.outstanding.clear();
@@ -1229,7 +1228,7 @@ fn block_liveness_disarms_when_satisfied_request_drains() {
     let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
     let now = Instant::now();
     let mut window = download_window();
-    window.outstanding.push(window_request(1));
+    window.outstanding.push_for_test(window_request(1));
     window.arm_liveness(now, timeout);
     window.note_block_progress(now + Duration::from_millis(1), timeout);
     window.outstanding.clear();
@@ -1253,7 +1252,7 @@ fn block_liveness_uses_probe_cap_until_first_accepted_body() {
     assert!(!window.has_block_progress());
     assert_eq!(window.no_progress_request_cap(), 1);
 
-    window.outstanding.push(window_request(1));
+    window.outstanding.push_for_test(window_request(1));
     window.arm_liveness(now, timeout);
 
     assert_eq!(window.requests_without_block_progress, 1);
@@ -1271,14 +1270,14 @@ fn block_liveness_resuming_after_idle_gets_fresh_deadline() {
     let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
     let now = Instant::now();
     let mut window = download_window();
-    window.outstanding.push(window_request(1));
+    window.outstanding.push_for_test(window_request(1));
     window.arm_liveness(now, timeout);
     window.note_block_progress(now + Duration::from_millis(1), timeout);
     window.outstanding.clear();
     window.disarm_liveness_after_progress_if_idle();
 
     let resumed = now + Duration::from_secs(60);
-    window.outstanding.push(window_request(2));
+    window.outstanding.push_for_test(window_request(2));
     window.arm_liveness(resumed, timeout);
 
     assert_eq!(window.block_liveness_deadline, Some(resumed + timeout));
@@ -1289,7 +1288,7 @@ fn block_liveness_multi_block_range_progress_resets_each_body() {
     let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
     let start = Instant::now();
     let mut window = download_window();
-    window.outstanding.push(window_request_range(1, 3));
+    window.outstanding.push_for_test(window_request_range(1, 3));
     window.arm_liveness(start, timeout);
 
     let first = start + Duration::from_secs(4);
@@ -1324,7 +1323,7 @@ fn view_reset_reclears_probe_streak_so_unproven_peer_can_reprobe() {
     let now = Instant::now();
     let mut window = DownloadWindow::new(&config);
 
-    window.outstanding.push(window_request(1));
+    window.outstanding.push_for_test(window_request(1));
     window.arm_liveness(now, timeout);
     assert_eq!(window.requests_without_block_progress, 1);
     assert_eq!(window.no_progress_request_cap(), 1);
@@ -1360,11 +1359,11 @@ fn view_reset_preserves_proof_but_reclears_streak() {
     let now = Instant::now();
     let mut window = DownloadWindow::new(&config);
 
-    window.outstanding.push(window_request(1));
+    window.outstanding.push_for_test(window_request(1));
     window.arm_liveness(now, timeout);
     window.note_block_progress(now + Duration::from_millis(1), timeout);
     // Prove, then issue further requests that go unanswered before the reset.
-    window.outstanding.push(window_request(2));
+    window.outstanding.push_for_test(window_request(2));
     window.arm_liveness(now + Duration::from_millis(2), timeout);
     assert!(window.has_block_progress());
     assert_eq!(window.no_progress_request_cap(), 8);
@@ -1393,7 +1392,7 @@ fn backpressure_extends_liveness_instead_of_disconnecting() {
     let now = Instant::now();
     let mut window = download_window();
 
-    window.outstanding.push(window_request(1));
+    window.outstanding.push_for_test(window_request(1));
     window.arm_liveness(now, timeout);
     assert_eq!(
         window.check_liveness(now + timeout),
@@ -1903,6 +1902,51 @@ fn frame_decode_rejects_mismatched_unknown_flags_and_trailing_payload() {
         BlockSyncMessage::decode_frame(frame),
         Err(BlockSyncWireError::MismatchedFrameMessageType { .. })
     ));
+}
+
+#[test]
+fn frame_tag_mismatch_precedes_block_deserialization() {
+    let frame = Frame {
+        message_type: u16::from(MSG_BS_BLOCKS_DONE),
+        flags: 0,
+        // There are no body bytes. Attempting Block decoding would return EOF.
+        payload: vec![MSG_BS_BLOCK],
+    };
+    assert!(matches!(
+        BlockSyncMessage::decode_frame(frame),
+        Err(BlockSyncWireError::MismatchedFrameMessageType {
+            frame: 4,
+            payload: 3,
+        })
+    ));
+}
+
+#[test]
+fn terminal_codecs_agree_on_height_boundaries() {
+    for height in [block::Height::MAX.0, block::Height::MAX.0 + 1, u32::MAX] {
+        for message in [
+            BlockSyncMessage::BlocksDone {
+                start_height: block::Height(height),
+                returned: 1,
+            },
+            BlockSyncMessage::RangeUnavailable {
+                start_height: block::Height(height),
+                count: 1,
+            },
+        ] {
+            if height > block::Height::MAX.0 {
+                assert!(matches!(
+                    message.encode(),
+                    Err(BlockSyncWireError::HeightOutOfRange(value)) if value == height
+                ));
+            } else {
+                assert_eq!(
+                    BlockSyncMessage::decode(&message.encode().unwrap()).unwrap(),
+                    message
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -3144,12 +3188,19 @@ async fn floor_watchdog_only_avoids_requests_that_started_writing() {
         assert_eq!(items.len(), 1);
         let owner = items[0].1.owner.unwrap();
         assert!(wiring.budget.clone().try_reserve(100));
+        let authorization = crate::zakura::regulation::ResponseScope::new(
+            CancellationToken::new(),
+            crate::zakura::CloseCause::new(),
+        )
+        .authorize()
+        .unwrap();
         let write = RequestWrite::new(
             owner,
             items,
             wiring.work.clone(),
             wiring.budget.clone(),
             CancellationToken::new(),
+            authorization.write_permission(),
         );
         assert!(write.publish(|| {
             wiring.registry.set_outstanding(
@@ -4028,6 +4079,16 @@ async fn reactor_timeout_recovery_is_local_and_healthy_peer_keeps_filling() {
     let healthy = peer_b.clone();
     let healthy_in = inbounds.remove(&healthy).expect("healthy peer inbound");
 
+    // Finish the already observed first request before awaiting its successor.
+    send_inbound(
+        &healthy_in,
+        BlockSyncMessage::RangeUnavailable {
+            start_height: offered[&healthy],
+            count: 1,
+        },
+    )
+    .await;
+
     let healthy_offers = tokio::time::timeout(Duration::from_secs(3), async {
         let mut count = 0usize;
         loop {
@@ -4069,11 +4130,11 @@ async fn reactor_timeout_recovery_is_local_and_healthy_peer_keeps_filling() {
 }
 
 #[tokio::test]
-async fn block_liveness_parks_silent_peer_and_traces_reason() {
-    // The first no-progress deadline must retire only the block-sync session.
-    // Preserve the shared connection and make the peer ineligible during its cooldown.
-    let mut capture = TraceCapture::for_test("block_liveness_parks_silent_peer_and_traces_reason")
-        .expect("trace capture initializes");
+async fn block_liveness_closes_silent_connection_without_peer_fault() {
+    // The first no-progress deadline closes a connection with unfinished authorization.
+    let mut capture =
+        TraceCapture::for_test("block_liveness_closes_silent_connection_without_peer_fault")
+            .expect("trace capture initializes");
     let mut config = immediate_body_download_config();
     config.request_timeout = Duration::from_millis(400);
     config.max_inflight_block_bytes = BS_PER_BLOCK_WORST_CASE_BYTES * 64;
@@ -4142,20 +4203,20 @@ async fn block_liveness_parks_silent_peer_and_traces_reason() {
     assert_eq!(start_height, block::Height(1));
     assert_eq!(count, 1);
 
-    await_until(
-        "silent block-sync session is locally parked",
-        Duration::from_secs(3),
-        || {
-            handle.peer_snapshot().outbound_peers == 0
-                && !service.wants_peer(&peer, ZAKURA_CAP_BLOCK_SYNC, ServicePeerDirection::Outbound)
-        },
-    )
+    tokio::time::timeout(Duration::from_secs(3), connection_cancel.cancelled())
+        .await
+        .expect("undrainable authorization closes the whole connection");
+    await_until("the receiver retires", Duration::from_secs(1), || {
+        service.peer_count() == 0
+    })
     .await
-    .expect("silent active peer is parked by block-progress liveness");
-    assert!(
-        !connection_cancel.is_cancelled(),
-        "a first no-progress stall preserves the shared connection",
-    );
+    .unwrap();
+    while let Ok(action) = actions.try_recv() {
+        assert!(
+            !matches!(action, BlockSyncAction::Misbehavior { .. }),
+            "a local liveness deadline is not a protocol offense"
+        );
+    }
 
     capture.flush().await;
     let reader = capture.reader().expect("trace rows load");
@@ -4167,19 +4228,12 @@ async fn block_liveness_parks_silent_peer_and_traces_reason() {
             ("block_progress_proven", TraceValue::U64(0)),
         ],
     );
-    reader.table("block_sync").assert_row(
-        bs_trace::BLOCK_PEER_PARKED,
-        &[(
-            bs_trace::REASON,
-            TraceValue::Str("block_sync_no_block_progress"),
-        )],
-    );
 
     reactor_task.abort();
 }
 
 #[tokio::test]
-async fn late_unowned_body_is_rejected_and_the_session_is_parked() {
+async fn late_authorized_body_can_reclaim_needed_work_after_expiry() {
     check_cold_probe_deadline(true).await;
 }
 
@@ -4282,32 +4336,17 @@ async fn check_cold_probe_deadline(expired: bool) {
         }
     })
     .await;
-    if !expired {
-        submitted.expect("the still-owned cold probe must reach the verifier");
-        assert_eq!(handle.peer_snapshot().outbound_peers, 1);
-        assert!(!connection_cancel.is_cancelled());
-        reactor_task.abort();
-        return;
-    }
-    assert!(
-        submitted.is_err(),
-        "a retired owner cannot reach the verifier"
-    );
-    await_until(
-        "late unowned body does not prevent the session park",
-        Duration::from_millis(1500),
-        || {
-            handle.peer_snapshot().outbound_peers == 0
-                && !service.wants_peer(&peer, ZAKURA_CAP_BLOCK_SYNC, ServicePeerDirection::Outbound)
+    submitted.expect("an authorized late probe must reach the current work owner");
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(1),
+            returned: 1,
         },
     )
-    .await
-    .expect("an unproven peer is still parked at its liveness deadline");
-    assert!(
-        !connection_cancel.is_cancelled(),
-        "a first no-progress stall preserves the shared connection",
-    );
-
+    .await;
+    assert_eq!(handle.peer_snapshot().outbound_peers, 1);
+    assert!(!connection_cancel.is_cancelled());
     reactor_task.abort();
 }
 
@@ -5913,6 +5952,9 @@ fn outstanding_three_block_range(budget: &mut ByteBudget) -> OutstandingBlockRan
     assert!(budget.try_reserve(request.estimated_bytes));
     let now = Instant::now();
     OutstandingBlockRange {
+        authorization: crate::zakura::regulation::ResponseAuthorization::for_test(),
+        response: crate::zakura::regulation::ResponseCredit::new(3, u64::MAX),
+        local_work_active: true,
         write_status: work_queue::RequestWriteStatus::written_for_tests(),
         charged_for_liveness: true,
         request,
@@ -6316,6 +6358,9 @@ fn underestimated_body_is_buffered_and_releases_only_its_estimate() {
     assert!(budget.try_reserve(request.estimated_bytes));
     let now = Instant::now();
     let mut outstanding = OutstandingBlockRange {
+        authorization: crate::zakura::regulation::ResponseAuthorization::for_test(),
+        response: crate::zakura::regulation::ResponseCredit::new(1, u64::MAX),
+        local_work_active: true,
         write_status: work_queue::RequestWriteStatus::written_for_tests(),
         charged_for_liveness: true,
         request,
@@ -6794,7 +6839,7 @@ async fn add_peer_request_protocol_reject_cancels_pending_block_validation() {
 }
 
 #[tokio::test]
-async fn add_peer_startup_failure_preserves_pending_block_validation() {
+async fn add_peer_startup_failure_rejects_unauthorized_body_before_capacity() {
     assert_pending_block_validation_cancellation(PendingValidationExit::StartupFailure).await;
 }
 
@@ -6810,7 +6855,8 @@ async fn assert_pending_block_validation_cancellation(exit: PendingValidationExi
         CloseCause, ZAKURA_BLOCK_SYNC_STREAM_VERSION, ZAKURA_STREAM_BLOCK_REQUESTS,
     };
 
-    let config = ZakuraBlockSyncConfig::default();
+    let config = immediate_body_download_config();
+    let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
     let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let startup = BlockSyncStartup::new(
         BlockSyncFrontiers {
@@ -6827,12 +6873,12 @@ async fn assert_pending_block_validation_cancellation(exit: PendingValidationExi
     let held_capacity: Vec<_> = (0..input.max_capacity())
         .map(|_| input.clone().try_reserve_owned().unwrap())
         .collect();
-    let mut held_capacity = Some(held_capacity);
+    let _held_capacity = held_capacity;
     let service = BlockSyncService::new_with_handle(config, handle.clone());
     let (inbound_tx, inbound_rx) = framed_channel(4);
     let (outbound_tx, _outbound_rx) = framed_channel(4);
     let (request_tx, request_rx) = framed_channel(1);
-    let (request_send, _requests) = framed_channel(1);
+    let (request_send, mut requests) = framed_channel(1);
     let cause = OrderedStreamFailureCause::default();
     let connection_cancel = CancellationToken::new();
     let session_cancel = connection_cancel.child_token();
@@ -6861,20 +6907,70 @@ async fn assert_pending_block_validation_cancellation(exit: PendingValidationExi
         streams,
         connection_cancel.clone(),
         CloseCause::new(),
+        crate::zakura::regulation::ResponseMemory::default().connection(),
     );
+    if matches!(exit, PendingValidationExit::StartupFailure) {
+        inbound_tx
+            .send(Frame {
+                message_type: u16::from(MSG_BS_BLOCK),
+                flags: 0,
+                payload: vec![MSG_BS_BLOCK],
+            })
+            .await
+            .unwrap();
+        cause.record(OrderedStreamFailure::RemoteClose);
+        session_cancel.cancel();
+        service.add_peer(remote);
+        tokio::time::timeout(Duration::from_secs(1), connection_cancel.cancelled())
+            .await
+            .expect("startup failure does not excuse a queued unauthorized frame");
+        assert_eq!(
+            input.capacity(),
+            0,
+            "authorization is checked before decode capacity"
+        );
+        return;
+    }
+    service.add_peer(remote);
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::Status(BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(1),
+            tip_hash: block.hash(),
+            max_blocks_per_response: 1,
+            max_inflight_requests: 1,
+            max_response_bytes: MAX_BS_RESPONSE_BYTES,
+        }),
+    )
+    .await;
+    handle
+        .send(BlockSyncEvent::HeaderTipChanged {
+            height: block::Height(1),
+            hash: block.hash(),
+        })
+        .await
+        .unwrap();
+    handle
+        .send(BlockSyncEvent::NeededBlocks(vec![block_meta(&block)]))
+        .await
+        .unwrap();
+    assert_eq!(
+        wait_for_outbound_getblocks(&mut requests).await,
+        (block::Height(1), 1)
+    );
+    // The authorized header passes the cheap precheck. Its missing transaction
+    // bytes can only be rejected after full body decode obtains capacity.
+    let mut payload = vec![MSG_BS_BLOCK];
+    payload.extend(block.header.zcash_serialize_to_vec().unwrap());
     inbound_tx
         .send(Frame {
             message_type: u16::from(MSG_BS_BLOCK),
             flags: 0,
-            payload: vec![MSG_BS_BLOCK],
+            payload,
         })
         .await
         .unwrap();
-    if matches!(exit, PendingValidationExit::StartupFailure) {
-        cause.record(OrderedStreamFailure::RemoteClose);
-        session_cancel.cancel();
-    }
-    service.add_peer(remote);
     tokio::time::timeout(Duration::from_secs(1), async {
         while inbound_tx.capacity() != inbound_tx.max_capacity() {
             tokio::task::yield_now().await;
@@ -6898,11 +6994,6 @@ async fn assert_pending_block_validation_cancellation(exit: PendingValidationExi
         tokio::time::timeout(Duration::from_secs(1), connection_cancel.cancelled())
             .await
             .expect("a request protocol reject interrupts pending block validation");
-    } else if matches!(exit, PendingValidationExit::StartupFailure) {
-        drop(held_capacity.take());
-        tokio::time::timeout(Duration::from_secs(1), connection_cancel.cancelled())
-            .await
-            .expect("a frame queued before startup is validated after stream failure");
     } else {
         session_cancel.cancel();
         tokio::task::yield_now().await;
@@ -6920,9 +7011,7 @@ async fn assert_pending_block_validation_cancellation(exit: PendingValidationExi
     })
     .await
     .expect("connection shutdown releases the session without decode capacity");
-    if held_capacity.is_some() {
-        assert_eq!(input.capacity(), 0);
-    }
+    assert_eq!(input.capacity(), 0);
 }
 
 #[tokio::test]
@@ -7194,7 +7283,7 @@ async fn reactor_releases_request_budget_at_receipt_not_apply() {
                 servable_high: block::Height(2),
                 tip_hash: blocks[1].hash(),
                 max_blocks_per_response: 4,
-                max_inflight_requests: 1,
+                max_inflight_requests: 2,
                 max_response_bytes: MAX_BS_RESPONSE_BYTES,
             })
             .encode_frame()
@@ -7257,11 +7346,9 @@ async fn reactor_releases_request_budget_at_receipt_not_apply() {
     };
     assert_eq!(handle.local_status().servable_high, block::Height(0));
 
-    // Receipt — not apply-finish — released the request reservation, so with the
-    // one-block-hint budget and the one-slot window both freed by the delivery,
-    // the height-2 GetBlocks must go out while height 1 is still
-    // submitted-but-unapplied (retention is bounded by the resident gate, not
-    // the request budget).
+    // Receipt releases the estimated work bytes before application. The first
+    // protocol slot remains occupied until its ending, so the second slot is
+    // what permits this independent request while height 1 is unapplied.
     let (start_height, count) = wait_for_outbound_getblocks(&mut outbound_rx).await;
     assert_eq!(start_height, block::Height(2));
     assert_eq!(count, 1);
@@ -7962,7 +8049,7 @@ async fn reactor_keeps_active_response_when_needed_snapshot_omits_inflight_heigh
 }
 
 #[tokio::test]
-async fn reactor_ignores_unmatched_body_for_currently_needed_height() {
+async fn reactor_rejects_unmatched_body_even_when_locally_needed() {
     let blocks = mainnet_blocks_1_to_3();
     let config = immediate_body_download_config();
     let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
@@ -8051,19 +8138,24 @@ async fn reactor_ignores_unmatched_body_for_currently_needed_height() {
         .await
         .expect("unmatched needed block queues");
 
-    let quiet = tokio::time::timeout(Duration::from_millis(200), async {
-        loop {
-            if let BlockSyncAction::Misbehavior { reason, .. } = next_action(&mut actions).await {
-                return reason;
+    loop {
+        match next_action(&mut actions).await {
+            BlockSyncAction::Misbehavior { peer, reason } => {
+                assert_eq!(peer, peer_id);
+                assert_eq!(reason, BlockSyncMisbehavior::UnsolicitedBlock);
+                break;
             }
+            BlockSyncAction::QueryNeededBlocks { .. } => {}
+            action => panic!("unauthorized body must not submit: {action:?}"),
         }
-    })
-    .await;
-    assert!(
-        quiet.is_err(),
-        "unmatched body for a currently needed height should not be hard misbehavior",
-    );
-
+    }
+    await_until(
+        "unauthorized response retires its connection",
+        Duration::from_secs(1),
+        || service.peer_count() == 0,
+    )
+    .await
+    .unwrap();
     reactor_task.abort();
 }
 
@@ -8137,46 +8229,28 @@ async fn reactor_rejects_unmatched_body_for_ownerless_queued_height() {
         .await
         .expect("unmatched queued block queues");
 
-    // Deliver height 1 through its live request.
-    // Only that owned body may enter verification.
-    inbound_tx
-        .send(
-            BlockSyncMessage::Block(blocks[0].clone())
-                .encode_frame()
-                .expect("block encodes"),
-        )
-        .await
-        .expect("matched block queues");
-
-    let submitted = loop {
-        if let BlockSyncAction::SubmitBlock { block, .. } = next_action(&mut actions).await {
-            break block.hash();
-        }
-    };
-    assert_eq!(submitted, blocks[0].hash());
-    assert!(
-        tokio::time::timeout(Duration::from_millis(200), async {
-            loop {
-                if matches!(
-                    next_action(&mut actions).await,
-                    BlockSyncAction::SubmitBlock { .. }
-                ) {
-                    break;
-                }
+    loop {
+        match next_action(&mut actions).await {
+            BlockSyncAction::Misbehavior { reason, .. } => {
+                assert_eq!(reason, BlockSyncMisbehavior::UnsolicitedBlock);
+                break;
             }
-        })
-        .await
-        .is_err(),
-        "the ownerless height-2 body must not be submitted",
-    );
-
+            BlockSyncAction::QueryNeededBlocks { .. } => {}
+            action => panic!("an unauthorized body must not reach verification: {action:?}"),
+        }
+    }
+    await_until(
+        "unauthorized body closes its receiver",
+        Duration::from_secs(1),
+        || service.peer_count() == 0,
+    )
+    .await
+    .unwrap();
+    while let Ok(action) = actions.try_recv() {
+        assert!(!matches!(action, BlockSyncAction::SubmitBlock { .. }));
+    }
     reactor_task.abort();
 }
-
-// The per-peer routine design removes the reactor's late-body path.
-// Each routine decodes frames from its peer's stream.
-// Disconnect closes that stream and exits the routine.
-// The live-peer test above verifies rejection of an ownerless body before commit.
 
 #[tokio::test]
 async fn reactor_queries_needed_blocks_above_submitted_floor() {
@@ -8458,6 +8532,15 @@ async fn reactor_retries_unavailable_body_without_scoring_its_supplier() {
             action => panic!("unexpected action before submit: {action:?}"),
         }
     };
+
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(1),
+            returned: 1,
+        },
+    )
+    .await;
 
     handle
         .send(BlockSyncEvent::BlockApplyFinished {
@@ -9211,18 +9294,6 @@ async fn reactor_keeps_block_sync_peer_after_catch_up_and_reuses_later() {
         assert_eq!(service.peer_count(), 1);
     }
 
-    inbound_tx
-        .send(
-            BlockSyncMessage::BlocksDone {
-                start_height: block::Height(1),
-                returned: 3,
-            }
-            .encode_frame()
-            .expect("BlocksDone encodes"),
-        )
-        .await
-        .expect("BlocksDone queues");
-
     handle
         .send(BlockSyncEvent::StateFrontiersChanged(BlockSyncFrontiers {
             finalized_height: block::Height(0),
@@ -9238,6 +9309,16 @@ async fn reactor_keeps_block_sync_peer_after_catch_up_and_reuses_later() {
         "caught-up nodes must keep block-sync peers so they can serve fresh nodes",
     );
     assert_eq!(service.peer_count(), 1);
+
+    // State progress did not fabricate receipt of the three missing bodies.
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::RangeUnavailable {
+            start_height: block::Height(1),
+            count: 3,
+        },
+    )
+    .await;
 
     handle
         .send(BlockSyncEvent::HeaderTipChanged {
@@ -9359,7 +9440,7 @@ async fn reactor_accepts_multi_block_range_and_submits_parent_first() {
     assert_eq!(start_height, block::Height(1));
     assert_eq!(count, 3);
 
-    for index in [1usize, 2, 0] {
+    for index in [0usize, 1, 2] {
         inbound_tx
             .send(
                 BlockSyncMessage::Block(blocks[index].clone())
@@ -9843,12 +9924,13 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
     let metas: Vec<_> = blocks.iter().map(block_meta).collect();
     let prefix: std::collections::HashSet<_> =
         (FIRST_NEEDED..=PREFIX_END).map(block::Height).collect();
-    let sparse_above_hole: std::collections::HashSet<_> = [873, 888, 905, 920]
+    let sparse_above_hole: std::collections::HashSet<_> = [881, 897, 913, 929]
         .into_iter()
         .map(block::Height)
         .collect();
 
     let mut config = immediate_body_download_config();
+    config.max_blocks_per_response = 16;
     config.max_inflight_block_bytes = u64::MAX;
     config.request_timeout = Duration::from_secs(300);
     config.peer_limits.max_outbound_peers = 1;
@@ -9894,15 +9976,10 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
         .await
         .expect("checkpoint metadata queues after peer connection");
 
-    let (feed_tx, mut feed_rx) = mpsc::unbounded_channel::<u32>();
-    let blocks_for_feeder = blocks.clone();
+    let (feed_tx, mut feed_rx) = mpsc::unbounded_channel::<BlockSyncMessage>();
     let feeder = tokio::spawn(async move {
-        while let Some(height) = feed_rx.recv().await {
-            let index = usize::try_from(height - FIRST_NEEDED)
-                .expect("fed test height is inside block vector");
-            let frame = BlockSyncMessage::Block(blocks_for_feeder[index].clone())
-                .encode_frame()
-                .expect("block frame encodes");
+        while let Some(message) = feed_rx.recv().await {
+            let frame = message.encode_frame().expect("response frame encodes");
             if old_inbound.send(frame).await.is_err() {
                 break;
             }
@@ -9937,8 +10014,13 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
                         for height in start_height.0..end_height {
                             let height = block::Height(height);
                             if height.0 <= PREFIX_END || sparse_above_hole.contains(&height) {
-                                feed_tx.send(height.0).expect("feeder task stays open");
+                                feed_tx.send(BlockSyncMessage::Block(block_at(height.0))).expect("feeder task stays open");
                             }
+                        }
+                        if end_height <= PREFIX_END + 1 {
+                            feed_tx.send(BlockSyncMessage::BlocksDone {
+                                start_height, returned: count,
+                            }).expect("feeder task stays open");
                         }
                     }
                 }
@@ -10079,8 +10161,9 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
 #[tokio::test]
 async fn reactor_reset_mid_download_drops_stale_anchors_and_releases_budget() {
     let mut config = ZakuraBlockSyncConfig {
+        max_blocks_per_response: 1,
         max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
-        ..immediate_body_download_config()
+        ..fill_loop_mechanics_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
     let blocks = mainnet_blocks_1_to_3();
@@ -10103,7 +10186,7 @@ async fn reactor_reset_mid_download_drops_stale_anchors_and_releases_budget() {
         47,
         block::Height(3),
         blocks[2].hash(),
-        1,
+        2,
         u32::try_from(BS_PER_BLOCK_WORST_CASE_BYTES * 2).unwrap_or(u32::MAX),
     )
     .await;
@@ -10137,7 +10220,11 @@ async fn reactor_reset_mid_download_drops_stale_anchors_and_releases_budget() {
         .expect("old-fork needed metadata queues");
     assert_eq!(
         wait_for_outbound_getblocks(&mut outbound_rx).await,
-        (block::Height(2), 2)
+        (block::Height(2), 1)
+    );
+    assert_eq!(
+        wait_for_outbound_getblocks(&mut outbound_rx).await,
+        (block::Height(3), 1)
     );
 
     inbound_tx
@@ -10148,6 +10235,15 @@ async fn reactor_reset_mid_download_drops_stale_anchors_and_releases_budget() {
         )
         .await
         .expect("out-of-order old-fork block queues");
+
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(3),
+            returned: 1,
+        },
+    )
+    .await;
 
     handle
         .send(BlockSyncEvent::ChainTipReset(BlockSyncFrontiers {
@@ -10163,14 +10259,29 @@ async fn reactor_reset_mid_download_drops_stale_anchors_and_releases_budget() {
     // query (idempotent: it is filtered while the stale height is still in flight,
     // and re-extended once the Sequencer's `reset_above` clears it) and wait for
     // the height-2 request that proves stale bytes were released.
+    // The first connection still authorizes height 2. A second connection
+    // can take the replacement work without issuing an overlapping request.
+    let (_, _new_inbound, mut outbound_rx) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        48,
+        block::Height(3),
+        blocks[2].hash(),
+        2,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
     let new_fork_meta = vec![BlockSyncBlockMeta {
         height: block::Height(2),
         hash: block::Hash([92; 32]),
         size: BlockSizeEstimate::Advertised(20_000),
     }];
+    let replacement_deadline = tokio::time::sleep(Duration::from_secs(2));
+    tokio::pin!(replacement_deadline);
     loop {
         tokio::select! {
             biased;
+            _ = &mut replacement_deadline => panic!("a retained response must not postpone the fresh supplier"),
             frame = outbound_rx.recv() => {
                 let frame = frame.expect("outbound channel is live");
                 match BlockSyncMessage::decode_frame(frame).expect("outbound frame decodes") {
@@ -10196,11 +10307,6 @@ async fn reactor_reset_mid_download_drops_stale_anchors_and_releases_budget() {
                             .await
                             .expect("new-fork needed metadata queues");
                     }
-                    // The honest in-flight height-3 body (within the peer's advertised
-                    // servable range) that races the in-place reset must NOT be scored
-                    // `UnsolicitedBlock` — `ignore_servable_range_response` drops it
-                    // quietly so a reorg does not churn honest peers. Any misbehavior
-                    // here is a regression and falls through to the panic below.
                     action => panic!("unexpected action before new fork request: {action:?}"),
                 }
             }
@@ -10410,6 +10516,8 @@ async fn reactor_forward_reset_preserves_future_outstanding_body() {
         .await
         .expect("forward reset event queues");
 
+    // A local floor advance does not consume the first authorized wire part.
+    send_inbound(&inbound_tx, BlockSyncMessage::Block(blocks[1].clone())).await;
     inbound_tx
         .send(
             BlockSyncMessage::Block(blocks[2].clone())
@@ -10446,8 +10554,9 @@ async fn reactor_forward_reset_preserves_future_outstanding_body() {
 #[tokio::test]
 async fn reactor_forward_reset_preserves_buffered_successor_body() {
     let mut config = ZakuraBlockSyncConfig {
+        max_blocks_per_response: 1,
         max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
-        ..immediate_body_download_config()
+        ..fill_loop_mechanics_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
     let blocks = mainnet_blocks_1_to_3();
@@ -10470,7 +10579,7 @@ async fn reactor_forward_reset_preserves_buffered_successor_body() {
         73,
         block::Height(3),
         blocks[2].hash(),
-        1,
+        2,
         u32::try_from(BS_PER_BLOCK_WORST_CASE_BYTES * 2).unwrap_or(u32::MAX),
     )
     .await;
@@ -10496,7 +10605,11 @@ async fn reactor_forward_reset_preserves_buffered_successor_body() {
         .expect("initial needed metadata queues");
     assert_eq!(
         wait_for_outbound_getblocks(&mut outbound_rx).await,
-        (block::Height(2), 2)
+        (block::Height(2), 1)
+    );
+    assert_eq!(
+        wait_for_outbound_getblocks(&mut outbound_rx).await,
+        (block::Height(3), 1)
     );
 
     inbound_tx
@@ -10510,8 +10623,8 @@ async fn reactor_forward_reset_preserves_buffered_successor_body() {
     inbound_tx
         .send(
             BlockSyncMessage::BlocksDone {
-                start_height: block::Height(2),
-                returned: 2,
+                start_height: block::Height(3),
+                returned: 1,
             }
             .encode_frame()
             .expect("BlocksDone encodes"),
@@ -10611,6 +10724,15 @@ async fn reactor_destructive_forward_reset_does_not_rerequest_same_hash_in_fligh
             .expect("block queues");
     }
 
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(1),
+            returned: 2,
+        },
+    )
+    .await;
+
     let mut submitted = Vec::new();
     while submitted.len() < 2 {
         match next_action(&mut actions).await {
@@ -10683,6 +10805,15 @@ async fn reactor_destructive_forward_reset_does_not_rerequest_same_hash_in_fligh
             )
             .await
             .expect("same-hash body queues");
+        send_inbound(
+            &inbound_tx,
+            BlockSyncMessage::BlocksDone {
+                start_height: block::Height(2),
+                returned: 1,
+            },
+        )
+        .await;
+
         let no_resubmit = tokio::time::timeout(Duration::from_millis(200), async {
             loop {
                 match actions.recv().await {
@@ -10832,6 +10963,15 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
             action => panic!("unexpected action before first submit: {action:?}"),
         }
     };
+
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(1),
+            returned: 1,
+        },
+    )
+    .await;
 
     handle
         .send(BlockSyncEvent::ChainTipReset(BlockSyncFrontiers {
@@ -10984,8 +11124,9 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
 #[tokio::test]
 async fn reactor_fast_forward_reset_clears_buffered_bodies_and_releases_budget() {
     let mut config = ZakuraBlockSyncConfig {
+        max_blocks_per_response: 1,
         max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 2,
-        ..immediate_body_download_config()
+        ..fill_loop_mechanics_config()
     };
     config.peer_limits.outbound_queue_depth = 16;
     let blocks = mainnet_blocks_1_to_3();
@@ -11008,7 +11149,7 @@ async fn reactor_fast_forward_reset_clears_buffered_bodies_and_releases_budget()
         50,
         block::Height(4),
         block::Hash([4; 32]),
-        1,
+        2,
         u32::try_from(BS_PER_BLOCK_WORST_CASE_BYTES * 2).unwrap_or(u32::MAX),
     )
     .await;
@@ -11042,7 +11183,11 @@ async fn reactor_fast_forward_reset_clears_buffered_bodies_and_releases_budget()
         .expect("initial needed metadata queues");
     assert_eq!(
         wait_for_outbound_getblocks(&mut outbound_rx).await,
-        (block::Height(2), 2)
+        (block::Height(2), 1)
+    );
+    assert_eq!(
+        wait_for_outbound_getblocks(&mut outbound_rx).await,
+        (block::Height(3), 1)
     );
 
     inbound_tx
@@ -11053,6 +11198,15 @@ async fn reactor_fast_forward_reset_clears_buffered_bodies_and_releases_budget()
         )
         .await
         .expect("out-of-order body queues");
+
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(3),
+            returned: 1,
+        },
+    )
+    .await;
 
     handle
         .send(BlockSyncEvent::ChainTipReset(BlockSyncFrontiers {
@@ -11081,6 +11235,16 @@ async fn reactor_fast_forward_reset_clears_buffered_bodies_and_releases_budget()
         "caught-up reset keeps the previous block-sync peer available for serving",
     );
     assert_eq!(service.peer_count(), 1);
+
+    // The discarded height-2 work still owns a protocol slot until its ending.
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::RangeUnavailable {
+            start_height: block::Height(2),
+            count: 1,
+        },
+    )
+    .await;
 
     // the fast-forward commit + budget release run on the Sequencer task while
     // routines re-query, so re-supply the needed metadata on every query and wait
@@ -11157,7 +11321,7 @@ async fn reactor_fuzzes_arrival_order_across_fork_parent_first() {
             "stale-before-new-needed",
             vec![2],
             vec![3],
-            vec![ForkBody::New(2), ForkBody::Old(2), ForkBody::New(3)],
+            vec![ForkBody::New(2), ForkBody::New(3)],
         ),
         (
             "new-out-of-order-with-stale-tail",
@@ -11169,6 +11333,7 @@ async fn reactor_fuzzes_arrival_order_across_fork_parent_first() {
 
     for (case, old_before_reset, old_before_new_needed, after_new_needed) in cases {
         let mut config = ZakuraBlockSyncConfig {
+            max_blocks_per_response: 1,
             max_inflight_block_bytes: BS_PER_BLOCK_WORST_CASE_BYTES * 3,
             ..fill_loop_mechanics_config()
         };
@@ -11192,13 +11357,13 @@ async fn reactor_fuzzes_arrival_order_across_fork_parent_first() {
         );
         let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
         let service = BlockSyncService::new_with_handle(config, handle.clone());
-        let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
+        let (old_peer, inbound_tx, mut outbound_rx) = connect_peer_with_status(
             &service,
             &mut actions,
             51,
             block::Height(4),
             old_blocks[2].hash(),
-            1,
+            3,
             u32::try_from(BS_PER_BLOCK_WORST_CASE_BYTES * 3).unwrap_or(u32::MAX),
         )
         .await;
@@ -11227,11 +11392,13 @@ async fn reactor_fuzzes_arrival_order_across_fork_parent_first() {
             ))
             .await
             .expect("old-fork needed metadata queues");
-        assert_eq!(
-            wait_for_outbound_getblocks(&mut outbound_rx).await,
-            (block::Height(1), 3),
-            "{case}: old fork request schedules"
-        );
+        for height in 1..=3 {
+            assert_eq!(
+                wait_for_outbound_getblocks(&mut outbound_rx).await,
+                (block::Height(height), 1),
+                "{case}: independent old fork request schedules"
+            );
+        }
 
         let mut submitted_tip = block::Height(0);
         for height in old_before_reset {
@@ -11243,6 +11410,14 @@ async fn reactor_fuzzes_arrival_order_across_fork_parent_first() {
                 )
                 .await
                 .expect("old-fork block queues");
+            send_inbound(
+                &inbound_tx,
+                BlockSyncMessage::BlocksDone {
+                    start_height: block::Height(u32::try_from(height).unwrap()),
+                    returned: 1,
+                },
+            )
+            .await;
             drain_parent_first_actions(&mut actions, &mut submitted_tip, None).await;
         }
 
@@ -11285,8 +11460,57 @@ async fn reactor_fuzzes_arrival_order_across_fork_parent_first() {
                 )
                 .await
                 .expect("stale old-fork block queues");
+            send_inbound(
+                &inbound_tx,
+                BlockSyncMessage::BlocksDone {
+                    start_height: block::Height(u32::try_from(height).unwrap()),
+                    returned: 1,
+                },
+            )
+            .await;
             drain_parent_first_actions(&mut actions, &mut submitted_tip, Some(&new_blocks)).await;
         }
+
+        // Old authorizations remain live, but only the fresh connection may
+        // claim replacement work after the fork changes.
+        send_inbound(
+            &inbound_tx,
+            BlockSyncMessage::Status(BlockSyncStatus {
+                servable_low: block::Height(0),
+                servable_high: block::Height(1),
+                tip_hash: old_blocks[0].hash(),
+                max_blocks_per_response: 16,
+                max_inflight_requests: 3,
+                max_response_bytes: u32::try_from(BS_PER_BLOCK_WORST_CASE_BYTES * 3).unwrap(),
+            }),
+        )
+        .await;
+        await_until(
+            "the old supplier stops advertising replacement heights",
+            Duration::from_secs(1),
+            || {
+                handle
+                    .routine_wiring
+                    .as_ref()
+                    .unwrap()
+                    .registry
+                    .candidate_snapshot()
+                    .iter()
+                    .any(|(peer, _, _, high)| peer == &old_peer && *high == block::Height(1))
+            },
+        )
+        .await
+        .unwrap();
+        let (_, new_inbound, mut outbound_rx) = connect_peer_with_status(
+            &service,
+            &mut actions,
+            52,
+            block::Height(4),
+            new_blocks[2].hash(),
+            3,
+            MAX_BS_RESPONSE_BYTES,
+        )
+        .await;
 
         // reset and the producer are decoupled across tasks, so re-supply the
         // new-fork metadata on every query until the height-2 re-fetch appears.
@@ -11306,9 +11530,20 @@ async fn reactor_fuzzes_arrival_order_across_fork_parent_first() {
             .send(BlockSyncEvent::NeededBlocks(new_fork_meta.clone()))
             .await
             .expect("new-fork needed metadata queues");
+        let replacement_deadline = tokio::time::sleep(Duration::from_secs(2));
+        tokio::pin!(replacement_deadline);
         loop {
             tokio::select! {
                 biased;
+                _ = &mut replacement_deadline => {
+                    let wiring = handle.routine_wiring.as_ref().unwrap();
+                    panic!("{case}: replacement request stalled: floor={:?}, hash2={:?}, pending2={}, inflight2={}, reserved={}, candidates={:?}",
+                        wiring.view.borrow().download_floor,
+                        wiring.work.hash_for_height(block::Height(2)),
+                        wiring.work.pending_contains(block::Height(2)),
+                        wiring.work.in_flight_contains(block::Height(2)),
+                        wiring.work.reserved_bytes(), wiring.registry.candidate_snapshot());
+                }
                 frame = outbound_rx.recv() => {
                     let frame = frame.expect("outbound channel is live");
                     match BlockSyncMessage::decode_frame(frame).expect("outbound frame decodes") {
@@ -11317,7 +11552,7 @@ async fn reactor_fuzzes_arrival_order_across_fork_parent_first() {
                             count,
                         } => {
                             assert_eq!(
-                                count, 2,
+                                count, 1,
                                 "{case}: new fork request schedules after reset"
                             );
                             break;
@@ -11334,19 +11569,22 @@ async fn reactor_fuzzes_arrival_order_across_fork_parent_first() {
                                 .await
                                 .expect("new-fork needed metadata queues");
                         }
-                        BlockSyncAction::Misbehavior { .. } => {}
                         action => panic!("{case}: unexpected action before new fork re-fetch: {action:?}"),
                     }
                 }
             }
         }
 
+        assert_eq!(
+            wait_for_outbound_getblocks(&mut outbound_rx).await,
+            (block::Height(3), 1)
+        );
         for body in after_new_needed {
-            let block = match body {
-                ForkBody::Old(height) => old_blocks[height - 1].clone(),
-                ForkBody::New(height) => new_blocks[height - 1].clone(),
+            let (block, inbound, height) = match body {
+                ForkBody::Old(height) => (old_blocks[height - 1].clone(), &inbound_tx, height),
+                ForkBody::New(height) => (new_blocks[height - 1].clone(), &new_inbound, height),
             };
-            inbound_tx
+            inbound
                 .send(
                     BlockSyncMessage::Block(block)
                         .encode_frame()
@@ -11354,6 +11592,14 @@ async fn reactor_fuzzes_arrival_order_across_fork_parent_first() {
                 )
                 .await
                 .expect("fork body queues");
+            send_inbound(
+                inbound,
+                BlockSyncMessage::BlocksDone {
+                    start_height: block::Height(u32::try_from(height).unwrap()),
+                    returned: 1,
+                },
+            )
+            .await;
             drain_parent_first_actions(&mut actions, &mut submitted_tip, Some(&new_blocks)).await;
         }
         assert_eq!(
@@ -11384,10 +11630,10 @@ async fn reactor_fuzzes_arrival_order_across_fork_parent_first() {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(
             handle.peer_snapshot().outbound_peers,
-            1,
+            2,
             "{case}: caught-up fork handling keeps the old block-sync peer available for serving",
         );
-        assert_eq!(service.peer_count(), 1);
+        assert_eq!(service.peer_count(), 2);
         handle
             .send(BlockSyncEvent::NeededBlocks(vec![BlockSyncBlockMeta {
                 height: block::Height(4),
@@ -11423,7 +11669,7 @@ async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
     let service =
         BlockSyncService::new_with_handle(immediate_body_download_config(), handle.clone());
-    let (peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
+    let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
         48,
@@ -11463,9 +11709,20 @@ async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
         .expect("reset event queues");
     // reset (`reset_above`) and the producer are decoupled, so re-supply the
     // new-fork metadata on every query until the height-2 re-fetch appears.
+    let replacement = forked_block(&blocks[1], 222);
+    let (_, replacement_inbound, mut outbound_rx) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        49,
+        block::Height(2),
+        replacement.hash(),
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
     let new_fork_meta = vec![BlockSyncBlockMeta {
         height: block::Height(2),
-        hash: block::Hash([222; 32]),
+        hash: replacement.hash(),
         size: BlockSizeEstimate::Advertised(block_size(&blocks[1])),
     }];
     loop {
@@ -11509,31 +11766,49 @@ async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
         .await
         .expect("old-fork body queues");
 
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(2),
+            returned: 1,
+        },
+    )
+    .await;
+    send_inbound(
+        &replacement_inbound,
+        BlockSyncMessage::Block(replacement.clone()),
+    )
+    .await;
+    send_inbound(
+        &replacement_inbound,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(2),
+            returned: 1,
+        },
+    )
+    .await;
     loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::Misbehavior { peer, reason } => {
-                assert_eq!(peer, peer_id);
-                assert!(matches!(
-                    reason,
-                    BlockSyncMisbehavior::BodyPayloadMismatch(
-                        zakura_header_chain::BodyPayloadMismatch {
-                            requested,
-                            delivered,
-                            kind: zakura_header_chain::BodyCommitmentKind::HeaderHash,
-                            source,
-                            ..
-                        }
-                    ) if requested == block::Hash([222; 32])
-                        && delivered == blocks[1].hash()
-                        && source == zakura_header_chain::SourceId::from_digest([48; 32])
-                ));
+            BlockSyncAction::SubmitBlock { block, .. } => {
+                assert_eq!(block.hash(), replacement.hash());
                 break;
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action before stale body rejection: {action:?}"),
+            action => panic!("authorized old data must not replace current fork work: {action:?}"),
         }
     }
-
+    while let Ok(Some(action)) =
+        tokio::time::timeout(Duration::from_millis(100), actions.recv()).await
+    {
+        assert!(
+            !matches!(
+                action,
+                BlockSyncAction::SubmitBlock { .. } | BlockSyncAction::Misbehavior { .. }
+            ),
+            "old authorization remains legal after the fork changes: {action:?}"
+        );
+    }
+    assert_eq!(service.peer_count(), 2);
     reactor_task.abort();
 }
 
@@ -11564,7 +11839,7 @@ async fn reactor_legacy_commit_dedups_inflight_request_and_reuses_budget() {
         49,
         block::Height(2),
         blocks[1].hash(),
-        1,
+        2,
         u32::try_from(BS_PER_BLOCK_WORST_CASE_BYTES).unwrap_or(u32::MAX),
     )
     .await;
@@ -11621,15 +11896,18 @@ async fn reactor_legacy_commit_dedups_inflight_request_and_reuses_budget() {
     assert_eq!(
         wait_for_outbound_getblocks(&mut outbound_rx).await,
         (block::Height(2), 1),
-        "legacy commit must release the duplicate in-flight reservation"
+        "legacy commit releases estimated bytes while the old protocol slot remains held"
     );
 
     reactor_task.abort();
 }
 
 #[tokio::test]
-async fn reactor_treats_duplicate_buffered_blocks_as_benign() {
-    let config = immediate_body_download_config();
+async fn reactor_rejects_duplicate_buffered_body_and_keeps_first_receipt() {
+    let config = ZakuraBlockSyncConfig {
+        max_blocks_per_response: 1,
+        ..fill_loop_mechanics_config()
+    };
     let blocks = [
         mainnet_block(&BLOCK_MAINNET_1_BYTES),
         mainnet_block(&BLOCK_MAINNET_2_BYTES),
@@ -11667,7 +11945,7 @@ async fn reactor_treats_duplicate_buffered_blocks_as_benign() {
                 servable_high: block::Height(2),
                 tip_hash: blocks[1].hash(),
                 max_blocks_per_response: 4,
-                max_inflight_requests: 1,
+                max_inflight_requests: 2,
                 max_response_bytes: MAX_BS_RESPONSE_BYTES,
             })
             .encode_frame()
@@ -11699,46 +11977,76 @@ async fn reactor_treats_duplicate_buffered_blocks_as_benign() {
 
     let (start_height, count) = wait_for_outbound_getblocks(&mut outbound_rx).await;
     assert_eq!(start_height, block::Height(1));
-    assert_eq!(count, 2);
+    assert_eq!(count, 1);
+    assert_eq!(
+        wait_for_outbound_getblocks(&mut outbound_rx).await,
+        (block::Height(2), 1)
+    );
 
-    for block in [&blocks[1], &blocks[1], &blocks[0]] {
-        inbound_tx
-            .send(
-                BlockSyncMessage::Block(block.clone())
-                    .encode_frame()
-                    .expect("block encodes"),
-            )
-            .await
-            .expect("block queues");
+    send_inbound(&inbound_tx, BlockSyncMessage::Block(blocks[1].clone())).await;
+    send_inbound(&inbound_tx, BlockSyncMessage::Block(blocks[1].clone())).await;
+    loop {
+        match next_action(&mut actions).await {
+            BlockSyncAction::Misbehavior { reason, .. } => {
+                assert_eq!(reason, BlockSyncMisbehavior::UnsolicitedBlock);
+                break;
+            }
+            BlockSyncAction::QueryNeededBlocks { .. } => {}
+            action => panic!("the buffered successor must wait for its parent: {action:?}"),
+        }
     }
-
+    await_until(
+        "duplicate body closes its connection",
+        Duration::from_secs(1),
+        || service.peer_count() == 0,
+    )
+    .await
+    .unwrap();
+    let (_, fresh_inbound, mut fresh_outbound) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        45,
+        block::Height(2),
+        blocks[1].hash(),
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+    assert_eq!(
+        wait_for_outbound_getblocks(&mut fresh_outbound).await,
+        (block::Height(1), 1)
+    );
+    send_inbound(&fresh_inbound, BlockSyncMessage::Block(blocks[0].clone())).await;
+    send_inbound(
+        &fresh_inbound,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(1),
+            returned: 1,
+        },
+    )
+    .await;
     let mut submitted = Vec::new();
     while submitted.len() < 2 {
         match next_action(&mut actions).await {
-            BlockSyncAction::SubmitBlock { block, .. } => submitted.push(
-                block
-                    .coinbase_height()
-                    .expect("submitted test block has height"),
-            ),
-            BlockSyncAction::Misbehavior { reason, .. } => {
-                panic!("duplicate buffered body was misclassified: {reason:?}")
+            BlockSyncAction::SubmitBlock { block, .. } => {
+                submitted.push(block.coinbase_height().unwrap())
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action before submit: {action:?}"),
+            action => panic!("accepted bodies must survive the rejected duplicate: {action:?}"),
         }
     }
     assert_eq!(submitted, vec![block::Height(1), block::Height(2)]);
-
-    let quiet = tokio::time::timeout(Duration::from_millis(100), async {
-        while let Some(action) = actions.recv().await {
-            if let BlockSyncAction::Misbehavior { reason, .. } = action {
-                panic!("duplicate buffered body was misclassified after submit: {reason:?}");
-            }
-        }
-    })
-    .await;
-    assert!(quiet.is_err());
-
+    while let Ok(Some(action)) =
+        tokio::time::timeout(Duration::from_millis(100), actions.recv()).await
+    {
+        assert!(
+            !matches!(
+                action,
+                BlockSyncAction::SubmitBlock { .. } | BlockSyncAction::Misbehavior { .. }
+            ),
+            "the accepted successor must be submitted only once: {action:?}"
+        );
+    }
     reactor_task.abort();
 }
 
@@ -11867,7 +12175,7 @@ async fn reactor_ignores_redundant_status_burst_without_spam_score() {
 }
 
 #[tokio::test]
-async fn reactor_rejects_block_hash_mismatch_without_hard_drop_for_size_mismatch() {
+async fn reactor_rejects_block_with_no_expected_header_hash() {
     let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let startup = BlockSyncStartup::new(
         BlockSyncFrontiers {
@@ -11949,20 +12257,7 @@ async fn reactor_rejects_block_hash_mismatch_without_hard_drop_for_size_mismatch
     loop {
         match next_action(&mut actions).await {
             BlockSyncAction::Misbehavior { reason, .. } => {
-                assert!(matches!(
-                    reason,
-                    BlockSyncMisbehavior::BodyPayloadMismatch(
-                        zakura_header_chain::BodyPayloadMismatch {
-                            requested,
-                            delivered,
-                            kind: zakura_header_chain::BodyCommitmentKind::HeaderHash,
-                            source,
-                            ..
-                        }
-                    ) if requested == block::Hash([9; 32])
-                        && delivered == mainnet_block(&BLOCK_MAINNET_1_BYTES).hash()
-                        && source == zakura_header_chain::SourceId::from_digest([41; 32])
-                ));
+                assert_eq!(reason, BlockSyncMisbehavior::UnsolicitedBlock);
                 break;
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
@@ -12258,6 +12553,15 @@ async fn reactor_schedules_gap_below_buffered_reorder_run() {
         )
         .await
         .expect("block frame queues");
+
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(3),
+            returned: 1,
+        },
+    )
+    .await;
 
     // Height 3 is now buffered in the reorder buffer and marked covered. Drain
     // to quiescence: this both lets the reactor finish processing the body and
@@ -13283,6 +13587,15 @@ async fn committed_reanchor_releases_stale_submitted_bodies() {
         vec![block::Height(1), block::Height(2), block::Height(3)]
     );
 
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(1),
+            returned: 3,
+        },
+    )
+    .await;
+
     snapshots
         .send(Some(committed_view(
             test_committed_snapshot(
@@ -13754,9 +14067,8 @@ async fn reactor_refill_window_advances_past_claimed_heights() {
         }
     ));
 
-    // Populate the work queue with heights 1..=3 (max_claimed = 3), then nudge the
-    // producer. `NeededBlocks` and `HeaderTipChanged` share one FIFO event channel,
-    // so the queue is populated before the re-query runs (no watch race).
+    // Populate heights 1..=3, then nudge the producer without changing the tip.
+    // A periodic refill can run between the two events, so both use the same tip.
     let metas: Vec<_> = (1..=3)
         .map(|height| BlockSyncBlockMeta {
             height: block::Height(height),
@@ -13770,8 +14082,8 @@ async fn reactor_refill_window_advances_past_claimed_heights() {
         .expect("needed-blocks event queues");
     handle
         .send(BlockSyncEvent::HeaderTipChanged {
-            height: block::Height(50_001),
-            hash: block::Hash([51; 32]),
+            height: best_header_tip,
+            hash: block::Hash([50; 32]),
         })
         .await
         .expect("header-tip event queues");
@@ -13790,7 +14102,7 @@ async fn reactor_refill_window_advances_past_claimed_heights() {
                 "refill must advance past the claimed heights, not rescan from the floor",
             );
             assert_eq!(limit, 8);
-            assert_eq!(best_header_tip, block::Height(50_001));
+            assert_eq!(best_header_tip, block::Height(50_000));
         }
         action => panic!("expected the advanced refill query, got {action:?}"),
     }
@@ -13914,52 +14226,26 @@ async fn reactor_retries_matched_range_unavailable_without_scoring_peer() {
         .await
         .expect("unmatched RangeUnavailable frame queues");
 
-    // routines re-query on a low-water ping, so a benign `QueryNeededBlocks`
-    // may appear; the unmatched RangeUnavailable must NOT score the peer or trigger
-    // a fresh GetBlocks for the already-in-flight range. A fresh request would land
-    // on this peer's own outbound, so watch the real wire while draining advisory
-    // queries / misbehavior off the action channel.
     loop {
-        tokio::select! {
-            biased;
-            frame = outbound_rx.recv() => {
-                let frame = frame.expect("outbound channel is live");
-                match BlockSyncMessage::decode_frame(frame).expect("outbound frame decodes") {
-                    BlockSyncMessage::GetBlocks { .. } => {
-                        panic!("unmatched RangeUnavailable must not trigger a fresh request")
-                    }
-                    BlockSyncMessage::Status(_) => {}
-                    msg => panic!("unexpected outbound message after unmatched RangeUnavailable: {msg:?}"),
-                }
+        match next_action(&mut actions).await {
+            BlockSyncAction::Misbehavior { reason, .. } => {
+                assert_eq!(reason, BlockSyncMisbehavior::UnsolicitedDone);
+                break;
             }
-            action = tokio::time::timeout(Duration::from_millis(50), actions.recv()) => {
-                match action {
-                    Ok(Some(BlockSyncAction::Misbehavior { .. })) => {
-                        panic!("unmatched RangeUnavailable must not score the serving peer")
-                    }
-                    Ok(Some(_)) => {}
-                    Ok(None) | Err(_) => break,
-                }
-            }
+            BlockSyncAction::QueryNeededBlocks { .. } => {}
+            action => panic!("unexpected action after unmatched ending: {action:?}"),
         }
     }
-    assert_eq!(handle.peer_snapshot().outbound_peers, 1);
-
+    await_until(
+        "unmatched ending closes its connection",
+        Duration::from_secs(1),
+        || service.peer_count() == 0,
+    )
+    .await
+    .unwrap();
     reactor_task.abort();
 }
 
-/// Regression guard for F-88604: two misbehaving peers that sort ahead of an honest
-/// peer and spam `RangeUnavailable` for a contested range do **not** wedge body sync
-/// — the honest peer is still offered the range and makes progress.
-///
-/// The audit flagged the unpenalized retry path as a possible wedge (two peers
-/// re-occupying the whole fanout). Verified here that it is not: `handle_range_unavailable`
-/// reschedules immediately after each response, and with one in-flight request per
-/// peer the other misbehaving peer is still busy holding its stale request when the
-/// first frees its slot, so the honest peer claims the freed companion slot. The
-/// behavior is bounded churn, not a liveness wedge, so no peer-scoring guard is added.
-/// This test fails if a future change ever lets the fanout peers lock the honest peer
-/// out.
 #[tokio::test]
 async fn reactor_does_not_wedge_honest_peer_under_range_unavailable_spam() {
     let blocks = mainnet_blocks_1_to_3();
@@ -14192,31 +14478,13 @@ async fn misbehavior_flood_cannot_consume_needed_query_capacity() {
     }
 
     send_inbound(&inbound_tx, BlockSyncMessage::Block(blocks[1].clone())).await;
-    send_inbound(
-        &inbound_tx,
-        BlockSyncMessage::Status(BlockSyncStatus {
-            servable_low: block::Height(1),
-            servable_high: block::Height(2),
-            tip_hash: blocks[1].hash(),
-            max_blocks_per_response: 16,
-            max_inflight_requests: 1,
-            max_response_bytes: MAX_BS_RESPONSE_BYTES,
-        }),
-    )
-    .await;
     await_until(
-        "the download routine handles the unsolicited body before its status barrier",
+        "the unsolicited body retires its connection",
         Duration::from_secs(1),
-        || {
-            wiring.registry.candidate_snapshot().iter().any(
-                |(peer, received_status, _, servable_high)| {
-                    peer == &peer_id && *received_status && *servable_high == block::Height(2)
-                },
-            )
-        },
+        || service.peer_count() == 0,
     )
     .await
-    .expect("the download routine reports the attacker-controlled body");
+    .unwrap();
     assert_eq!(
         wiring.actions.capacity(),
         BS_ACTION_CONTROL_RESERVE,
@@ -14382,7 +14650,7 @@ async fn reactor_publishes_block_sync_candidate_gap() {
 }
 
 #[tokio::test]
-async fn oversize_body_policy_reports_size_mismatch_and_retries_without_buffering() {
+async fn reactor_accepts_authorized_body_above_its_local_size_estimate() {
     let mut config = ZakuraBlockSyncConfig {
         size_deviation_tolerance: 100,
         ..immediate_body_download_config()
@@ -14468,50 +14736,36 @@ async fn oversize_body_policy_reports_size_mismatch_and_retries_without_bufferin
 
     loop {
         match next_action(&mut actions).await {
-            BlockSyncAction::Misbehavior { reason, .. } => {
-                assert_eq!(reason, BlockSyncMisbehavior::SizeMismatch);
+            BlockSyncAction::SubmitBlock {
+                block: submitted, ..
+            } => {
+                assert_eq!(submitted.hash(), block.hash());
                 break;
             }
             BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action during size mismatch test: {action:?}"),
+            action => panic!("a legal body above its estimate must still submit: {action:?}"),
         }
     }
-
-    let no_submit = tokio::time::timeout(Duration::from_millis(200), async {
-        while let Some(action) = actions.recv().await {
-            if matches!(action, BlockSyncAction::SubmitBlock { .. }) {
-                return false;
-            }
-        }
-        true
-    })
-    .await
-    .unwrap_or(true);
-    assert!(
-        no_submit,
-        "oversize body is not submitted after SizeMismatch"
-    );
-
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(1),
+            returned: 1,
+        },
+    )
+    .await;
+    while let Ok(Some(action)) =
+        tokio::time::timeout(Duration::from_millis(100), actions.recv()).await
+    {
+        assert!(
+            !matches!(action, BlockSyncAction::Misbehavior { .. }),
+            "local size estimates do not create a peer obligation: {action:?}"
+        );
+    }
+    assert_eq!(service.peer_count(), 1);
     reactor_task.abort();
 }
 
-// SECURITY AUDIT (candidate claude-block-sync-unsolicited-blocksdone-not-rejected /
-// codex-blocksync-unsolicited-blocksdone-not-rejected): SR-6/SR-7 response
-// correlation + fail-closed.
-//
-// `handle_blocks_done` reports `UnsolicitedDone` only when the peer is *unknown*.
-// For a known, active peer that sends a valid `BlocksDone` with no matching
-// outstanding request, the `if let Some(index)` body is skipped and the reactor
-// falls through to `schedule()` with no `else` reporting `UnsolicitedDone`.
-// `UnsolicitedDone` is a *hard* block-sync misbehavior (`block_sync_misbehavior_is_hard`
-// in zakurad start.rs), so the production driver `drive_block_sync_actions`
-// disconnects on the first offense -- but this branch never emits it, so an
-// admitted peer can stream uncorrelated response terminators forever and stay
-// connected.
-//
-// This test asserts the SAFE behavior (the reactor must report `UnsolicitedDone`).
-// It currently FAILS, which is the reproduction. Do not weaken it to pass; the
-// fix is to add the missing `else` branch in `handle_blocks_done`.
 #[tokio::test]
 async fn reactor_known_peer_unsolicited_blocks_done_is_reported_as_misbehavior() {
     let config = ZakuraBlockSyncConfig::default();
@@ -14583,7 +14837,7 @@ async fn reactor_known_peer_unsolicited_blocks_done_is_reported_as_misbehavior()
 }
 
 #[tokio::test]
-async fn reactor_accepts_unmatched_body_for_height_active_on_another_request() {
+async fn reactor_rejects_body_authorized_only_on_another_connection() {
     let config = immediate_body_download_config();
     let blocks = mainnet_blocks_1_to_3();
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
@@ -14647,66 +14901,55 @@ async fn reactor_accepts_unmatched_body_for_height_active_on_another_request() {
         .await
         .expect("empty needed metadata queues");
 
-    // The peer that did NOT get the request sends the body+terminator as real
-    // inbound frames. First valid completion wins: the body is accepted even
-    // though another peer currently owns the request slot, and the later
-    // duplicate from the original owner will be dropped by the sequencer.
-    let (late_peer, late_inbound) = if requested_peer == peer1 {
-        (peer2, inbound2)
+    // Authorization belongs to the requested connection, even when another
+    // peer sends a useful body for exactly the same current work.
+    let (late_peer, late_inbound, requested_inbound) = if requested_peer == peer1 {
+        (peer2, inbound2, inbound1)
     } else {
-        (peer1, inbound1)
+        (peer1, inbound1, inbound2)
     };
     send_inbound(&late_inbound, BlockSyncMessage::Block(blocks[1].clone())).await;
-    let submitted = tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            match next_action(&mut actions).await {
-                BlockSyncAction::SubmitBlock { block, .. } => return block.hash(),
-                BlockSyncAction::QueryNeededBlocks { .. } => {}
-                BlockSyncAction::Misbehavior { peer, reason } => {
-                    assert_ne!(
-                        peer, late_peer,
-                        "late active body was reported as {reason:?}"
-                    );
-                }
-                action => {
-                    panic!("unexpected action while waiting for late body submit: {action:?}")
-                }
+    loop {
+        match next_action(&mut actions).await {
+            BlockSyncAction::Misbehavior { peer, reason } => {
+                assert_eq!(peer, late_peer);
+                assert_eq!(reason, BlockSyncMisbehavior::UnsolicitedBlock);
+                break;
             }
+            BlockSyncAction::QueryNeededBlocks { .. } => {}
+            action => panic!("unauthorized cross-peer body was accepted: {action:?}"),
         }
-    })
-    .await
-    .expect("late active body is accepted and submitted");
+    }
+    send_inbound(
+        &requested_inbound,
+        BlockSyncMessage::Block(blocks[1].clone()),
+    )
+    .await;
+    let submitted = loop {
+        match next_action(&mut actions).await {
+            BlockSyncAction::SubmitBlock { block, .. } => break block.hash(),
+            BlockSyncAction::QueryNeededBlocks { .. } => {}
+            action => panic!("the authorized owner must still complete: {action:?}"),
+        }
+    };
     assert_eq!(submitted, blocks[1].hash());
     assert_eq!(
         trace.first_block_body_source(submitted),
         Some(BlockBodySource::Zakura)
     );
-
     send_inbound(
-        &late_inbound,
+        &requested_inbound,
         BlockSyncMessage::BlocksDone {
             start_height: block::Height(2),
             returned: 1,
         },
     )
     .await;
-
-    while let Ok(Some(action)) =
-        tokio::time::timeout(Duration::from_millis(200), actions.recv()).await
-    {
-        if let BlockSyncAction::Misbehavior { peer, reason } = action {
-            assert_ne!(
-                peer, late_peer,
-                "late response for an active request was reported as {reason:?}"
-            );
-        }
-    }
-
     reactor_task.abort();
 }
 
 #[tokio::test]
-async fn reactor_ignores_duplicate_response_at_body_download_floor() {
+async fn reactor_rejects_duplicate_response_at_body_download_floor() {
     let config = immediate_body_download_config();
     let blocks = mainnet_blocks_1_to_3();
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
@@ -14786,37 +15029,30 @@ async fn reactor_ignores_duplicate_response_at_body_download_floor() {
         )
         .await
         .expect("duplicate block frame queues");
-    inbound_tx
-        .send(
-            BlockSyncMessage::BlocksDone {
-                start_height: block::Height(2),
-                returned: 1,
+    loop {
+        match next_action(&mut actions).await {
+            BlockSyncAction::Misbehavior { peer, reason } => {
+                assert_eq!(peer, peer_id);
+                assert_eq!(reason, BlockSyncMisbehavior::UnsolicitedBlock);
+                break;
             }
-            .encode_frame()
-            .expect("duplicate terminator frame encodes"),
-        )
-        .await
-        .expect("duplicate terminator frame queues");
-
-    while let Ok(Some(action)) =
-        tokio::time::timeout(Duration::from_millis(200), actions.recv()).await
-    {
-        if let BlockSyncAction::Misbehavior { peer, reason } = action {
-            assert_ne!(
-                peer, peer_id,
-                "duplicate response at body_download_floor was reported as {reason:?}"
-            );
+            BlockSyncAction::QueryNeededBlocks { .. } => {}
+            action => panic!("unauthorized body must not submit: {action:?}"),
         }
     }
-
+    await_until(
+        "unauthorized response retires its connection",
+        Duration::from_secs(1),
+        || service.peer_count() == 0,
+    )
+    .await
+    .unwrap();
     reactor_task.abort();
 }
 
 #[tokio::test]
-async fn reactor_ignores_matched_duplicate_response_at_body_download_floor() {
-    // fanout = 1: a height is requested from exactly one peer. The duplicate body
-    // that must be ignored at the floor instead arrives unsolicited from the
-    // *other* connected peer after the height has committed.
+async fn reactor_rejected_duplicate_preserves_honest_connection_budget() {
+    // A rejected duplicate must leave the honest connection and body budget usable.
     let blocks = mainnet_blocks_1_to_3();
     let block2_size = block_size(&blocks[1]);
     let mut config = immediate_body_download_config();
@@ -14869,7 +15105,8 @@ async fn reactor_ignores_matched_duplicate_response_at_body_download_floor() {
     ];
     let first_request = wait_for_getblocks_across(&mut outbound_by_peer).await;
     assert_eq!((first_request.1, first_request.2), (block::Height(2), 1));
-    // The other peer is the one that will deliver the ignored duplicate.
+    drop(outbound_by_peer);
+    // The other connection has no authorization for this body.
     let (other_peer, requested_inbound, other_inbound) = if first_request.0 == peer_a {
         (peer_b.clone(), &inbound_a, &inbound_b)
     } else {
@@ -14879,6 +15116,15 @@ async fn reactor_ignores_matched_duplicate_response_at_body_download_floor() {
     send_inbound(
         requested_inbound,
         BlockSyncMessage::Block(blocks[1].clone()),
+    )
+    .await;
+
+    send_inbound(
+        requested_inbound,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(2),
+            returned: 1,
+        },
     )
     .await;
 
@@ -14906,11 +15152,30 @@ async fn reactor_ignores_matched_duplicate_response_at_body_download_floor() {
         .await
         .expect("apply result queues");
 
-    // A late duplicate body for the now-committed height arrives from the other
-    // peer as a real inbound frame; it sits at/below the body-download floor and
-    // must be ignored without permanently consuming reorder budget.
-    let _ = &other_peer;
     send_inbound(other_inbound, BlockSyncMessage::Block(blocks[1].clone())).await;
+    loop {
+        match next_action(&mut actions).await {
+            BlockSyncAction::Misbehavior { peer, reason } => {
+                assert_eq!(peer, other_peer);
+                assert_eq!(reason, BlockSyncMisbehavior::UnsolicitedBlock);
+                break;
+            }
+            BlockSyncAction::QueryNeededBlocks { .. } => {}
+            action => panic!("duplicate body must not submit: {action:?}"),
+        }
+    }
+    await_until(
+        "only the unauthorized connection retires",
+        Duration::from_secs(1),
+        || service.peer_count() == 1,
+    )
+    .await
+    .unwrap();
+    let mut outbound_by_peer = if first_request.0 == peer_a {
+        vec![(peer_a.clone(), &mut outbound_a)]
+    } else {
+        vec![(peer_b.clone(), &mut outbound_b)]
+    };
 
     handle
         .send(BlockSyncEvent::NeededBlocks(vec![
@@ -14924,13 +15189,7 @@ async fn reactor_ignores_matched_duplicate_response_at_body_download_floor() {
         .await
         .expect("next needed metadata queues");
 
-    // The commit pipeline now runs on its own task and reports the committed
-    // floor back asynchronously, so the late duplicate can momentarily reach the
-    // unmatched-queued path and transiently reserve before the Sequencer reports
-    // it `Redundant` and releases. The invariant that still must hold is that the
-    // duplicate consumes no budget *permanently*: both remaining heights (3 and 4)
-    // must still get requested, each exactly once, within the two-block budget.
-    // Collect GetBlocks until 3 and 4 are both covered and assert no double-fetch.
+    // Both remaining heights must fit the same budget on the honest connection.
     let mut requested: Vec<block::Height> = Vec::new();
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -14956,12 +15215,11 @@ async fn reactor_ignores_matched_duplicate_response_at_body_download_floor() {
     deduped.dedup();
     assert_eq!(
         requested, deduped,
-        "a matched duplicate response at the body floor must not consume reorder budget \
-         (no height should be fetched twice)"
+        "a rejected duplicate must not consume the honest connection budget"
     );
     assert!(
         requested.contains(&block::Height(3)) && requested.contains(&block::Height(4)),
-        "both needed heights must be fetched once the duplicate releases its transient reservation"
+        "both needed heights must be fetched after the duplicate is rejected"
     );
 
     reactor_task.abort();
@@ -15276,4 +15534,31 @@ async fn serving_only_coordinator_demand_keeps_block_session_available_during_fa
         SessionDemand::OpenNow,
     ));
     reactor_task.abort();
+}
+
+#[test]
+fn authorized_late_body_claims_current_pending_work_once() {
+    let height = block::Height(100);
+    let hash = block::Hash([7; 32]);
+    let work = WorkQueue::new(block::Height(99));
+    let scope = test_work_scope();
+    work.extend(scope, [(height, hash, BlockSizeEstimate::Confirmed(1000))]);
+    let request_id = std::num::NonZeroU64::new(9).unwrap();
+    assert!(work
+        .claim_authorized_body(height, block::Hash([8; 32]), 7, request_id)
+        .is_none());
+    assert!(work.pending_contains(height));
+    assert_eq!(work.hash_for_height(height), Some(hash));
+    assert_eq!(work.owner_for_height(height), None);
+    let (owner, released) = work
+        .claim_authorized_body(height, hash, 7, request_id)
+        .unwrap();
+    assert_eq!(owner, scope.bind(7, request_id));
+    assert_eq!(released, 0);
+    assert!(!work.pending_contains(height));
+    assert_eq!(work.owner_for_height(height), Some(owner));
+    assert!(work
+        .claim_authorized_body(height, hash, 8, request_id)
+        .is_none());
+    assert_eq!(work.owner_for_height(height), Some(owner));
 }

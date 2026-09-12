@@ -23,7 +23,7 @@ pub enum BlockSizeEstimate {
 /// A contiguous block-range request issued to one peer and tracked in its
 /// `outstanding` set. Built by the reactor's per-peer issuance path from a chunk
 /// taken out of the [`WorkQueue`](super::work_queue::WorkQueue).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(super) struct BlockRangeRequest {
     /// Exact session/request and durable coordinates that own this range.
     pub(super) owner: zakura_header_chain::BodyWorkOwner,
@@ -60,17 +60,5 @@ impl BlockRangeRequest {
         self.contains(height)
             .then(|| height.0.checked_sub(self.start_height.0))
             .flatten()
-    }
-
-    pub(super) fn expected_hash(&self, height: block::Height) -> Option<block::Hash> {
-        self.expected_blocks
-            .iter()
-            .find_map(|expected| (expected.height == height).then_some(expected.hash))
-    }
-
-    pub(super) fn estimated_bytes_for_height(&self, height: block::Height) -> Option<u64> {
-        self.expected_blocks
-            .iter()
-            .find_map(|expected| (expected.height == height).then_some(expected.estimated_bytes))
     }
 }

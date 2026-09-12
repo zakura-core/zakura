@@ -1,5 +1,6 @@
 //! Sprout funds transfers using [`JoinSplit`]s.
 
+use crate::serialization::ZcashReader;
 use std::{fmt, io};
 
 use serde::{Deserialize, Serialize};
@@ -11,7 +12,7 @@ use crate::{
     primitives::{x25519, Bctv14Proof, Groth16Proof, ZkSnarkProof},
     serialization::{
         ReadZcashExt, SerializationError, TrustedPreallocate, WriteZcashExt, ZcashDeserialize,
-        ZcashDeserializeInto, ZcashSerialize,
+        ZcashSerialize,
     },
 };
 
@@ -190,7 +191,9 @@ impl<P: ZkSnarkProof> JoinSplit<P> {
 }
 
 impl<P: ZkSnarkProof> ZcashDeserialize for JoinSplit<P> {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         // # Consensus
         //
         // > Elements of a JoinSplit description MUST have the types given above
@@ -200,8 +203,8 @@ impl<P: ZkSnarkProof> ZcashDeserialize for JoinSplit<P> {
         // See comments below for each specific type.
         Ok(JoinSplit::<P> {
             // Type is `{0 .. MAX_MONEY}`; see [`NonNegative::valid_range()`].
-            vpub_old: (&mut reader).zcash_deserialize_into()?,
-            vpub_new: (&mut reader).zcash_deserialize_into()?,
+            vpub_old: reader.read_value()?,
+            vpub_new: reader.read_value()?,
             // Type is `B^{ℓ^{Sprout}_{Merkle}}` i.e. 32 bytes.
             anchor: tree::Root::from(reader.read_32_bytes()?),
             // Types are `B^{ℓ^{Sprout}_{PRF}}` i.e. 32 bytes.
@@ -223,21 +226,21 @@ impl<P: ZkSnarkProof> ZcashDeserialize for JoinSplit<P> {
             // Types are `B^{ℓ^{Sprout}_{PRF}}` i.e. 32 bytes.
             // See [`note::Mac::zcash_deserialize`].
             vmacs: [
-                note::Mac::zcash_deserialize(&mut reader)?,
-                note::Mac::zcash_deserialize(&mut reader)?,
+                reader.read_value::<note::Mac>()?,
+                reader.read_value::<note::Mac>()?,
             ],
             // Type is described in https://zips.z.cash/protocol/protocol.pdf#grothencoding.
             // It is not enforced here; this just reads 192 bytes.
             // The type is validated when validating the proof, see
             // [`groth16::Item::try_from`]. In #3179 we plan to validate here instead.
-            zkproof: P::zcash_deserialize(&mut reader)?,
+            zkproof: reader.read_value::<P>()?,
             // Types are `Sym.C`, i.e. `B^Y^{\[N\]}`, i.e. arbitrary-sized byte arrays
             // https://zips.z.cash/protocol/protocol.pdf#concretesym but fixed to
             // 601 bytes in https://zips.z.cash/protocol/protocol.pdf#joinsplitencodingandconsensus
             // See [`note::EncryptedNote::zcash_deserialize`].
             enc_ciphertexts: [
-                note::EncryptedNote::zcash_deserialize(&mut reader)?,
-                note::EncryptedNote::zcash_deserialize(&mut reader)?,
+                reader.read_value::<note::EncryptedNote>()?,
+                reader.read_value::<note::EncryptedNote>()?,
             ],
         })
     }
@@ -264,6 +267,10 @@ pub(crate) const BCTV14_JOINSPLIT_SIZE: u64 = JOINSPLIT_SIZE_WITHOUT_ZKPROOF + 2
 pub(crate) const GROTH16_JOINSPLIT_SIZE: u64 = JOINSPLIT_SIZE_WITHOUT_ZKPROOF + 192;
 
 impl TrustedPreallocate for JoinSplit<Bctv14Proof> {
+    fn min_serialized_size() -> u64 {
+        BCTV14_JOINSPLIT_SIZE
+    }
+
     fn max_allocation() -> u64 {
         // The longest Vec<JoinSplit> we receive from an honest peer must fit inside a valid block.
         // Since encoding the length of the vec takes at least one byte
@@ -273,6 +280,10 @@ impl TrustedPreallocate for JoinSplit<Bctv14Proof> {
 }
 
 impl TrustedPreallocate for JoinSplit<Groth16Proof> {
+    fn min_serialized_size() -> u64 {
+        GROTH16_JOINSPLIT_SIZE
+    }
+
     // The longest Vec<JoinSplit> we receive from an honest peer must fit inside a valid block.
     // Since encoding the length of the vec takes at least one byte
     // (MAX_BLOCK_BYTES - 1) / GROTH16_JOINSPLIT_SIZE is a loose upper bound on the max allocation

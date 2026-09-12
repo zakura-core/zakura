@@ -8,7 +8,11 @@ use std::{num::NonZeroU64, time::Duration};
 
 impl RequestWriteStatus {
     pub(in crate::zakura::block_sync) fn written_for_tests() -> Self {
-        Self(Arc::new(AtomicU8::new(WRITTEN)))
+        Self {
+            state: Arc::new(AtomicU8::new(WRITTEN)),
+            _response_write: crate::zakura::regulation::ResponseAuthorization::for_test()
+                .write_permission(),
+        }
     }
 }
 
@@ -95,6 +99,8 @@ struct Fixture {
     work: Arc<WorkQueue>,
     budget: ByteBudget,
     cancel: CancellationToken,
+    authorizations: Vec<crate::zakura::regulation::ResponseAuthorization>,
+    metadata: crate::zakura::regulation::ConnectionResponseMemory,
 }
 
 impl Fixture {
@@ -103,6 +109,8 @@ impl Fixture {
             work: Arc::new(WorkQueue::new(block::Height(0))),
             budget: ByteBudget::new(1000),
             cancel: CancellationToken::new(),
+            authorizations: Vec::new(),
+            metadata: crate::zakura::regulation::ResponseMemory::default().connection(),
         };
         fixture.work.set_estimate_floor_for_tests(1);
         fixture.refill();
@@ -128,6 +136,13 @@ impl Fixture {
     }
 
     fn take(&mut self, id: u64) -> Arc<RequestWrite> {
+        let authorization = crate::zakura::regulation::ResponseScope::with_memory(
+            CancellationToken::new(),
+            crate::zakura::CloseCause::new(),
+            self.metadata.clone(),
+        )
+        .authorize_with_metadata(RequestWrite::metadata_bytes(2).unwrap())
+        .unwrap();
         let items = self.work.take_for_request(
             block::Height(1),
             block::Height(2),
@@ -138,12 +153,15 @@ impl Fixture {
         );
         assert_eq!(items.len(), 2);
         assert!(self.budget.try_reserve(200));
+        let permission = authorization.write_permission();
+        self.authorizations.push(authorization);
         RequestWrite::new(
             items[0].1.owner.unwrap(),
             items,
             self.work.clone(),
             self.budget.clone(),
             self.cancel.clone(),
+            permission,
         )
     }
 
@@ -163,6 +181,28 @@ impl Fixture {
 }
 
 #[test]
+fn status_retains_metadata_after_request_and_response_owners_exit() {
+    let mut f = Fixture::new();
+    let write = f.take(1);
+    let status = write.status();
+    let funded = f.metadata.reserved_for_test();
+    assert!(funded > RequestWrite::metadata_bytes(2).unwrap());
+    assert!(write.publish(|| {}));
+    assert!(write.try_start());
+    write.written();
+    f.authorizations[0].finish();
+    drop(write);
+    f.authorizations.clear();
+    assert_eq!(f.metadata.reserved_for_test(), funded);
+    assert!(!status.was_skipped());
+    drop(status);
+    assert_eq!(
+        f.metadata.reserved_for_test(),
+        crate::zakura::regulation::ResponseMemory::setup_bytes_for_test()
+    );
+}
+
+#[test]
 fn batched_ownership_filter_follows_publication_receipt_and_replacement() {
     let mut f = Fixture::new();
     let claim = f.take(1);
@@ -176,7 +216,8 @@ fn batched_ownership_filter_follows_publication_receipt_and_replacement() {
     };
     let work = f.work.clone();
     let retained = |mut entries: Vec<(_, (BodyWorkOwner, u8))>| {
-        work.retain_owned(&mut entries, |(owner, _)| *owner);
+        let retained = work.retain_owned(&mut entries, |(owner, _)| *owner);
+        entries.truncate(retained);
         entries
     };
 

@@ -87,12 +87,19 @@ of a partial write resets both streams before another frame can be sent.
 Received blocks and replacement requests keep their exact ownership during
 cleanup; an obsolete request cannot return their reservations.
 
+Session replacement also fences the old receiver's publication and first-write
+claims before admitting the new receiver. An unfinished started request closes
+its connection locally. Completing the request write does not finish response
+authorization. Only a validated ending permits reuse of that connection, unless
+the request was proven never started. Replacement on a new connection can proceed
+while the old connection closes.
+
 Full buffers alone do not cause a disconnect. Existing request expiry,
 block-progress liveness, and bounded data writes handle sustained stalls.
 Cancellation returns unreceived work for retry and keeps running jobs charged.
-Pair reopening uses the existing cooldown and backoff. Other services remain
-usable unless a connection-wide failure or repeated-stall policy closes the
-connection.
+Pair reopening uses the existing cooldown and backoff after exchanges finish or
+unwritten requests are skipped. Undrainable started responses close the connection
+under local liveness policy, including its other services.
 
 Active responses, admission waiters, and the oldest response age are reported
 under `sync.block.serving.*`. Observations follow the last database/result/frame

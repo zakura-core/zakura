@@ -5,6 +5,7 @@ use super::{
     work_queue::{RequestWriteStatus, WorkQueue},
     *,
 };
+use crate::zakura::regulation::ResponseVec;
 use crate::zakura::{ServicePeerDirection, ServicePeerSnapshot, ZakuraBlockSyncCandidateState};
 use std::num::NonZeroU64;
 
@@ -358,10 +359,10 @@ impl BlockSyncState {
 /// Carved out of `PeerBlockState` so the window math stays unit-testable
 /// while the per-peer download state moves into the spawned
 /// [`PeerRoutine`](super::peer_routine) (per-peer routines). The routine embeds one of these.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(super) struct DownloadWindow {
     pub(super) max_inflight_requests: u32,
-    pub(super) outstanding: Vec<OutstandingBlockRange>,
+    pub(super) outstanding: ResponseVec<OutstandingBlockRange>,
     /// Per-peer BBR-lite estimators + cwnd — the sole congestion controller. Under
     /// [`CwndUnit::Bytes`] the cwnd is itself a byte budget sourced from header size
     /// hints (no fixed per-request byte weight), so there is no `nominal_request_bytes`.
@@ -395,7 +396,7 @@ impl DownloadWindow {
     pub(super) fn new(config: &ZakuraBlockSyncConfig) -> Self {
         Self {
             max_inflight_requests: config.advertised_max_inflight_requests(),
-            outstanding: Vec::new(),
+            outstanding: ResponseVec::new(),
             bbr: BbrState::new(config),
             cwnd_unit: config.bbr_cwnd_unit,
             startup_request_cap: usize::try_from(config.initial_inflight_requests)
@@ -470,7 +471,13 @@ impl DownloadWindow {
     /// per-block worst case when nothing is outstanding. Used only for diagnostics and
     /// the floor-bypass byte bonus, never for admission.
     fn representative_body_bytes(&self) -> u64 {
-        let outstanding = self.outstanding.len() as u64;
+        let outstanding = u64::try_from(
+            self.outstanding
+                .iter()
+                .filter(|range| range.local_work_active)
+                .count(),
+        )
+        .expect("bounded request count fits u64");
         if outstanding == 0 {
             return block::MAX_BLOCK_BYTES;
         }
@@ -820,12 +827,6 @@ impl DownloadWindow {
             .min(EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER)
     }
 
-    pub(super) fn outstanding_index_for_height(&self, height: block::Height) -> Option<usize> {
-        self.outstanding
-            .iter()
-            .position(|outstanding| outstanding.request.contains(height))
-    }
-
     pub(super) fn outstanding_index_for_start(&self, start_height: block::Height) -> Option<usize> {
         self.outstanding
             .iter()
@@ -861,9 +862,13 @@ impl PeerBlockState {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(super) struct OutstandingBlockRange {
     pub(super) request: BlockRangeRequest,
+    pub(super) response: crate::zakura::regulation::ResponseCredit,
+    pub(super) authorization: crate::zakura::regulation::ResponseAuthorization,
+    /// Local work may end while the peer still owns response credit.
+    pub(super) local_work_active: bool,
     pub(super) write_status: RequestWriteStatus,
     /// Whether this attempt still contributes to the no-progress probe streak.
     pub(super) charged_for_liveness: bool,
@@ -883,6 +888,9 @@ pub(super) struct DeliverySnapshot {
 impl OutstandingBlockRange {
     /// Size estimates still reserved for unreceived heights.
     pub(super) fn reserved_bytes(&self) -> u64 {
+        if !self.local_work_active {
+            return 0;
+        }
         self.request
             .expected_blocks
             .iter()
@@ -890,10 +898,6 @@ impl OutstandingBlockRange {
             .fold(0u64, |acc, expected| {
                 acc.saturating_add(expected.estimated_bytes)
             })
-    }
-
-    pub(super) fn estimated_bytes_for_height(&self, height: block::Height) -> Option<u64> {
-        self.request.estimated_bytes_for_height(height)
     }
 
     pub(super) fn has_received(&self, height: block::Height) -> bool {
@@ -910,25 +914,6 @@ impl OutstandingBlockRange {
 
     pub(super) fn record_body_bytes(&mut self, bytes: u64) {
         self.delivered_bytes = self.delivered_bytes.saturating_add(bytes);
-    }
-
-    /// Mark every requested height at or below `tip` as received and return the
-    /// sum of the per-height size estimates those newly-received heights still
-    /// held, so the caller releases exactly the reservation those heights held.
-    pub(super) fn mark_received_through(&mut self, tip: block::Height) -> u64 {
-        self.request
-            .expected_blocks
-            .iter()
-            .filter(|expected| {
-                expected.height <= tip
-                    && self
-                        .request
-                        .offset_for_height(expected.height)
-                        .is_some_and(|offset| self.received.insert_offset(offset))
-            })
-            .fold(0u64, |acc, expected| {
-                acc.saturating_add(expected.estimated_bytes)
-            })
     }
 
     pub(super) fn is_complete(&self) -> bool {

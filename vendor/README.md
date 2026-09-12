@@ -38,6 +38,12 @@ missing prefix. Reset releases abandoned send storage before refunding its space
 and preserves the final offset required by RESET_STREAM. Rejected early data
 returns both local stream slots and retained send capacity.
 
+An optional packet-history limit bounds the packet-number span of sent and lost
+records in each path and encryption space. The indexed buffers allocate for gaps
+as well as occupied records, so a record count alone is insufficient. Exhausting
+this local limit terminates the connection before inserting another record and
+discards any unfinished transmit batch. Native defaults do not yet enable it.
+
 This is work in progress. The node memory envelope, metadata and buffer allocation
 allowances, production window policy and final qualification remain incomplete.
 The patch is not evidence of production compliance.

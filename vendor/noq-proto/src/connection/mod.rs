@@ -1089,6 +1089,10 @@ impl Connection {
                 return Some(transmit);
             }
 
+            if self.state.is_drained() {
+                return None;
+            }
+
             let info = self.scheduling_info(path_id);
             if let Some(transmit) = self.poll_transmit_on_path(
                 now,
@@ -1103,6 +1107,10 @@ impl Connection {
                     self.partial_stats.transmits_tx += 1;
                 }
                 return Some(transmit);
+            }
+
+            if self.state.is_drained() {
+                return None;
             }
 
             // Continue checking other paths, tail-loss probes may need to be sent
@@ -1374,6 +1382,12 @@ impl Connection {
                 connection_close_pending,
                 pad_datagram,
             ) {
+                PollPathSpaceStatus::Drained => {
+                    // A terminal limit can be reached after earlier packets in this batch.
+                    // Discard the whole batch, which may end with an unpadded datagram.
+                    buf.clear();
+                    return None;
+                }
                 PollPathSpaceStatus::NothingToSend { path_blocked } => {
                     // Continue checking other spaces, tail-loss probes may need to be sent
                     // in all spaces.
@@ -1625,15 +1639,7 @@ impl Connection {
             let Some(mut builder) =
                 PacketBuilder::new(now, space_id, path_id, remote_cid, transmit, self)
             else {
-                // Confidentiality limit is exceeded and the connection has been killed. We
-                // should not send any other packets. This works in a roundabout way: We
-                // have started a datagram but not written anything into it. So even if we
-                // get called again for another space we will see an already started
-                // datagram and try and start another packet here. Then be stopped by the
-                // same confidentiality limit.
-                return PollPathSpaceStatus::NothingToSend {
-                    path_blocked: PathBlocked::No,
-                };
+                return PollPathSpaceStatus::Drained;
             };
             last_packet_number = Some(builder.packet_number);
 
@@ -7266,6 +7272,8 @@ pub trait NetworkChangeHint: fmt::Debug + 'static {
 /// Return value for [`Connection::poll_transmit_path_space`].
 #[derive(Debug)]
 enum PollPathSpaceStatus {
+    /// The connection terminated during packet construction. Discard the entire batch.
+    Drained,
     /// Nothing was written into the [`TransmitBuf`].
     NothingToSend {
         /// [`PathBlocked`] helps differentiate whether the path had something but was blocked by

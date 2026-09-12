@@ -248,6 +248,13 @@ impl QuicTransportConfigBuilder {
         self
     }
 
+    /// Bound retained packet-number spans, including gaps and loss history.
+    /// Exceeding the limit terminates the connection as a local resource failure.
+    pub fn packet_history_limit(mut self, value: Option<std::num::NonZeroUsize>) -> Self {
+        self.0.packet_history_limit(value);
+        self
+    }
+
     /// Maximum number of bytes the peer may transmit across all streams of a connection before
     /// becoming blocked.
     ///

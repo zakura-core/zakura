@@ -37,6 +37,7 @@ pub struct TransportConfig {
     pub(crate) receive_fragment_limit: Option<NonZeroUsize>,
     pub(crate) receive_window: VarInt,
     pub(crate) send_window: u64,
+    pub(crate) packet_history_limit: Option<NonZeroUsize>,
     pub(crate) send_fairness: bool,
 
     pub(crate) packet_threshold: u32,
@@ -179,6 +180,17 @@ impl TransportConfig {
     /// every connection uses the entire window.
     pub fn send_window(&mut self, value: u64) -> &mut Self {
         self.send_window = value;
+        self
+    }
+
+    /// Maximum packet-number span retained in each path and encryption space.
+    ///
+    /// Packet history uses storage proportional to its index span, including
+    /// gaps. The connection terminates locally before allocating a history that
+    /// exceeds this bound. This also includes packets retained for loss recovery.
+    /// `None` preserves the behavior without this extra limit.
+    pub fn packet_history_limit(&mut self, value: Option<NonZeroUsize>) -> &mut Self {
+        self.packet_history_limit = value;
         self
     }
 
@@ -594,6 +606,7 @@ impl Default for TransportConfig {
             receive_window: VarInt::MAX,
             send_window: (8 * STREAM_RWND).into(),
             send_fairness: true,
+            packet_history_limit: None,
 
             packet_threshold: 3,
             time_threshold: 9.0 / 8.0,
@@ -648,6 +661,7 @@ impl fmt::Debug for TransportConfig {
             receive_fragment_limit,
             receive_window,
             send_window,
+            packet_history_limit,
             send_fairness,
             packet_threshold,
             time_threshold,
@@ -694,6 +708,7 @@ impl fmt::Debug for TransportConfig {
             .field("receive_fragment_limit", receive_fragment_limit)
             .field("receive_window", receive_window)
             .field("send_window", send_window)
+            .field("packet_history_limit", packet_history_limit)
             .field("send_fairness", send_fairness)
             .field("packet_threshold", packet_threshold)
             .field("time_threshold", time_threshold)

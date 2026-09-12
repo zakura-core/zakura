@@ -8225,6 +8225,8 @@ mod tests {
             mode: StreamMode::Persistent,
         };
         let encoded = frame.encode(stream.frame_cap)?;
+        let buffered_frames =
+            2 + usize::try_from(DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW).unwrap() / encoded.len();
         // Opening a QUIC stream becomes visible to the receiver after the first bytes.
         sender.write_all(&encoded[..1]).await?;
         let (send, recv) = timeout(Duration::from_secs(5), stream_rx.recv())
@@ -8276,7 +8278,7 @@ mod tests {
             sender
         }));
         timeout(Duration::from_secs(10), async {
-            while *progress_rx.borrow_and_update() < 16 {
+            while *progress_rx.borrow_and_update() < buffered_frames {
                 progress_rx.changed().await.unwrap();
             }
         })

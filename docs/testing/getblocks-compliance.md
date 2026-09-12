@@ -17,26 +17,27 @@ older layout text.
 
 ## Compliance branch results
 
-On 2026-09-11, property code revision `6701b0f30` includes compliance
-implementation `4418ff4f9` from [#971](https://github.com/zakura-core/zakura/pull/971).
+On 2026-09-11, property code revision `6f1ba00ad` includes compliance
+implementation `af5fa24a2` from [#971](https://github.com/zakura-core/zakura/pull/971).
 Local Rust 1.97.0 runs use seed 896. Compliance and fixed regressions use 64
 generated cases and four load rounds. The property profile uses 2,048 cases.
 
 | Profile | Result |
 | --- | --- |
-| Compliance | 102 passed, 1 failed across 103 tests |
+| Compliance | 103 passed, 1 failed across 104 tests |
 | Property profile, 2,048 cases | 40 passed across 40 tests |
-| Fixed regressions | 464 passed, 1 failed across 465 tests |
+| Fixed regressions | 466 passed, 1 failed across 467 tests |
 
-All 40 property tests pass in one run. The receiver-history property takes 79
+All 40 property tests pass in one run. The receiver-history property takes 78
 seconds with the five-minute outer limit added in `1ae81b3a6`. Its two-second
 per-event waits and input bounds are unchanged. The earlier 60-second timeout
 and process leak classifications remain recorded in the execution evidence.
 
-The Clippy follow-up `c2c292ab1`, imported by `ba088bc49`, makes the memory-transfer
-helper's invariant explicit. Its final 34-test ownership and allocation selection
-passes, including 2,048 cases for each generated test. The full profile results
-above precede that helper-only follow-up.
+A follow-up moves the registry fixture helpers into test sources in `da97e5e55`,
+imported by `936e9cb54`. Its final 73-test registry, receiver, and allocation
+selection passes, including 2,048 cases for the generated allocation check.
+Clippy passes with warnings denied. The full profile results above precede that
+test-helper move.
 
 The failing witness in compliance and fixed regressions is T02 with two paused sibling
 streams. Their occupied receive windows still prevent the independent service
@@ -95,9 +96,15 @@ with the request. Both buffers are charged during growth, and removing entries
 keeps backing capacity charged. The receiver witness verifies this before taking
 work and after consuming the ending. A shared collection property compares
 contents, capacity, allocation peaks, and counters with an independent model
-after each generated action. Registry snapshots and range capacity remain
-uncharged. Transport setup and cancellation children also require aggregate
-accounting, so this is not yet a complete protocol metadata bound.
+after each generated action. The registry now uses funded response ranges and a
+sorted height index. Admission prepares both the routine's scratch snapshot and
+the registry's published copy. Publication filters current owners, sorts in place,
+and swaps the buffers without allocating. Probes check this while the pool is full
+and after each body. Denied growth preserves the current snapshot and allocates
+nothing. Replacement releases the old published buffers and fences the old
+producer, while that producer's scratch storage keeps its funding until Drop.
+Other metadata collections, transport setup, and cancellation children still
+require aggregate accounting, so this is not yet a complete metadata bound.
 
 The fixed regression migration preserves its test functions and original work
 invariants with legal exchanges. Reordering uses separate requests, retries finish
@@ -109,7 +116,7 @@ server whose retained authorization forbids requesting that height again.
 Network/test all-target Clippy with warnings denied passes. Formatting, Markdown
 lint, whitespace, and changelog checks pass. No tests were retried or marked as
 expected failures. These three full profile runs have no leak classifications.
-The preceding 35-test allocation selection classified
+An earlier 35-test allocation selection classified
 `allocation_plans_are_admitted_as_one_reservation` and
 `retained_growth_and_request_admission_are_atomic` as leaky despite passing
 assertions. [Nextest reports this](https://www.nexte.st/docs/features/leaky-tests/)

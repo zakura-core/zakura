@@ -62,9 +62,12 @@ response owner. Retained window capacity is admitted with the request, then keep
 its own permit after the exchange ends. An independent collection model checks
 growth, removal, and clearing against the node budget. Allocation probes require
 both buffers to be funded during replacement and no allocation for denied growth
-or changes within existing capacity. The actual GetBlocks receiver keeps this
-capacity charged through body completion and the ending. Registry snapshots and
-range capacity still need funding.
+or changes within existing capacity. GetBlocks prepares its scratch snapshot,
+published height index, and response ranges in the same admission. Probes require
+publication to allocate nothing, including while the pool is full. The receiver
+keeps capacity charged through body completion and the ending, and a replaced
+generation cannot overwrite the new registry entry. Other metadata collections
+and transport accounting remain to be audited.
 
 ## GetBlocks coverage
 

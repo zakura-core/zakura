@@ -18,6 +18,38 @@ impl ConnectionResponseMemory {
 }
 
 #[test]
+fn allocation_plans_are_admitted_as_one_reservation() {
+    let node = ResponseMemory::new(4096, 4096);
+    let connection = node.connection();
+    let scope = ResponseScope::with_memory(
+        CancellationToken::new(),
+        CloseCause::new(),
+        connection.clone(),
+    );
+    let empty = scope.authorize().unwrap();
+    let fixed = node.reserved_for_test();
+    drop(empty);
+    assert_eq!(node.reserved_for_test(), 0);
+
+    assert_eq!(
+        scope.authorize_with_metadata(u64::MAX).unwrap_err(),
+        ResponseAdmissionError::MemoryFull,
+    );
+    assert_eq!(node.reserved_for_test(), 0);
+    let owner = scope.authorize_with_metadata(4096 - fixed).unwrap();
+    let writer = owner.write_permission();
+    assert_eq!(node.reserved_for_test(), 4096);
+    assert_eq!(
+        scope.authorize_with_metadata(1).unwrap_err(),
+        ResponseAdmissionError::MemoryFull,
+    );
+    drop(owner);
+    assert_eq!(node.reserved_for_test(), 4096);
+    drop(writer);
+    assert_eq!(node.reserved_for_test(), 0);
+}
+
+#[test]
 fn both_limits_apply_across_messages_connections_and_clones() {
     let node = ResponseMemory::new(100, 70);
     let first = node.connection();

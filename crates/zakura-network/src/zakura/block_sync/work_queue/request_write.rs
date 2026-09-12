@@ -9,7 +9,9 @@ use tokio_util::sync::CancellationToken;
 use zakura_header_chain::BodyWorkOwner;
 
 use super::{block, BlockBudgetLedger, WorkItem, WorkQueue};
-use crate::zakura::regulation::ResponseWritePermission;
+use crate::zakura::regulation::{
+    collection_allocation_bytes, shared_allocation_bytes, ResponseWritePermission,
+};
 use crate::zakura::transport::{ByteBudget, FrameWriteClaim};
 
 const UNPUBLISHED: u8 = 0;
@@ -21,20 +23,24 @@ const EXPIRED: u8 = 4;
 #[cfg(test)]
 mod tests;
 
-/// Observes whether transport skipped an attempt without retaining its work or
-/// byte reservation. The routine can keep this after the writer drops its claim.
+/// Observes whether transport skipped an attempt without retaining local work or
+/// body bytes. Metadata funding remains live with this status after the writer exits.
 #[derive(Clone, Debug)]
-pub(in crate::zakura::block_sync) struct RequestWriteStatus(Arc<AtomicU8>);
+pub(in crate::zakura::block_sync) struct RequestWriteStatus {
+    state: Arc<AtomicU8>,
+    // Status readers can outlive both the writer and the response owner.
+    _response_write: ResponseWritePermission,
+}
 
 impl RequestWriteStatus {
     pub(in crate::zakura::block_sync) fn was_skipped(&self) -> bool {
-        self.0.load(Ordering::Acquire) == EXPIRED
+        self.state.load(Ordering::Acquire) == EXPIRED
     }
 
     /// Retire a queued attempt atomically against writer startup. Returns true
     /// only for the transition; a started frame remains the transport's owner.
     pub(in crate::zakura::block_sync) fn expire_unwritten(&self) -> bool {
-        self.0
+        self.state
             .compare_exchange(QUEUED, EXPIRED, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
@@ -62,6 +68,12 @@ pub(crate) struct RequestWrite {
 }
 
 impl RequestWrite {
+    pub(in crate::zakura::block_sync) fn metadata_bytes(max_count: usize) -> Option<u64> {
+        collection_allocation_bytes::<(block::Height, WorkItem)>(max_count)?
+            .checked_add(shared_allocation_bytes::<Self>())?
+            .checked_add(shared_allocation_bytes::<AtomicU8>())
+    }
+
     pub(in crate::zakura::block_sync) fn new(
         owner: BodyWorkOwner,
         items: Vec<(block::Height, WorkItem)>,
@@ -84,7 +96,10 @@ impl RequestWrite {
     }
 
     pub(in crate::zakura::block_sync) fn status(&self) -> RequestWriteStatus {
-        RequestWriteStatus(self.state.clone())
+        RequestWriteStatus {
+            state: self.state.clone(),
+            _response_write: self.response_write.clone(),
+        }
     }
 
     /// Record outstanding state and enqueue into already-reserved capacity under

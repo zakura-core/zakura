@@ -71,12 +71,18 @@ reserve their allocation before creation and retain the charge through the last
 writer handle, even after an ending or connection close. Exhaustion pauses new
 requests locally, and a release wakes affected waiters.
 
-This accounting currently covers the authorization's shared allocation, including
-its inline phase state. First-use scope and cancellation locks can allocate on
-some platforms and still need funding. Expected hashes, request-write copies,
-and retained window and registry capacities also need
-charges before these limits bound all protocol metadata. These allowances are
-separate from body storage, decoding, and execution budgets.
+An adapter can include its allocation plan in that reservation. Every planned
+allocation must remain owned by the authorization or one of its writer handles.
+GetBlocks includes expected hashes, the taken-work vector, and writer and status
+allocations. The work vector is moved into the writer without cloning it. Status
+readers retain the authorization's memory charge after the writer and response
+owner exit. If the preferred batch cannot fit, the requester tries progressively
+smaller batches before waiting for capacity.
+
+First-use scope and cancellation locks can allocate on some platforms and still
+need funding. Retained window and registry capacities also need charges before
+these limits bound all protocol metadata. These allowances are separate from
+body storage, decoding, and execution budgets.
 
 ## Capacity admission and QUIC backpressure
 

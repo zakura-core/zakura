@@ -1,6 +1,10 @@
 use super::*;
 
 impl ResponseScope {
+    pub(crate) fn authorize(&self) -> Result<ResponseAuthorization, ResponseAdmissionError> {
+        self.authorize_with_metadata(0)
+    }
+
     pub(crate) fn new(connection_cancel: CancellationToken, cause: CloseCause) -> Self {
         Self::with_memory(
             connection_cancel,

@@ -49,8 +49,11 @@ Production transport tests cover service fanout and session replacement. Receive
 tests hold the pool full for a simulated minute, then release another connection's
 owner and require progress without a peer fault. The current production charge
 covers the authorization's shared allocation, including inline phase storage.
-The first-use allocation witness remains red on macOS because scope and
-cancellation locks allocate additional storage. GetBlocks also reserves an
+Cold allocation probes include pool creation, connection context and tokens,
+receiver setup, first-use locks, authorization, and unfinished cleanup. They check
+the fixed allowances separately and require zero allocations on denied admission.
+Setup charges survive through their last owners. Failed receiver setup must leave
+the current receiver usable. GetBlocks also reserves an
 allocation plan for expected hashes, taken work, and writer state before taking
 work. Generated measurements compare retained allocations with that plan for
 request sizes 1–128. Fixed examples cover capacity boundaries, a smaller batch
@@ -122,6 +125,10 @@ explorer. Share a checker when messages have the same contract. Keep protocol
 fields and expected response semantics in their own adapters.
 
 ## Running and replaying
+
+The receiver-history test has a five-minute outer limit in this profile because
+2,048 cases decode real block fixtures serially. Its per-event waits remain two
+seconds. This does not change response deadlines or the generated input bounds.
 
 Ordinary unit-test lanes run the properties once. Select the suite explicitly:
 

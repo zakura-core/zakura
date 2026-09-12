@@ -17,15 +17,24 @@ older layout text.
 
 ## Compliance branch results
 
-On 2026-09-11, property revision `b41698531` includes compliance implementation
-`401e9c54d` from [#971](https://github.com/zakura-core/zakura/pull/971).
-Local Rust 1.97.0 runs use 64 generated cases, seed 896, and four load rounds.
+On 2026-09-11, property code revision `cdd7265c1` includes compliance
+implementation `f2ff306f2` from [#971](https://github.com/zakura-core/zakura/pull/971).
+Local Rust 1.97.0 runs use seed 896. Compliance and fixed regressions use 64
+generated cases and four load rounds. The property profile uses 2,048 cases.
 
 | Profile | Result |
 | --- | --- |
 | Compliance | 101 passed, 1 failed across 102 tests |
-| Property profile | 37 passed, 1 failed across 38 tests |
-| Fixed regressions | 454 passed, 1 failed across 455 tests |
+| Property profile, 2,048 cases | 38 passed (2 leaky), 1 timed out across 39 tests |
+| Receiver-history continuation | 1 passed with the bounded timeout described below |
+| Fixed regressions | 458 passed, 1 failed across 459 tests |
+
+The receiver-history property reached the harness's 60-second limit. With a
+five-minute limit for that test alone, its 2,048 cases pass in 78 seconds at the
+same seed. `1ae81b3a6` adds that profile override. Its two-second per-event waits
+and input bounds are unchanged. All 39 property tests completed across these two
+runs. This is not a single clean qualification run because two tests had process
+leak classifications.
 
 The failing witness in compliance and fixed regressions is T02 with two paused sibling
 streams. Their occupied receive windows still prevent the independent service
@@ -68,11 +77,20 @@ temporary vectors. Status handles retain funding after the writer and response
 owner exit. Generated allocation measurements cover request sizes 1–128, with
 fixed examples at the capacity boundaries.
 
-The property profile still fails its first-use allocation witness. On this Mac,
-the authorization call retains 184 bytes but charges 56. Scope and cancellation
-locks account for the additional first-use storage. This witness is not warmed
-up or marked as an expected failure. Retained window and registry capacities
-remain uncharged, so the shared pool is not yet a complete metadata bound.
+The first-use allocation witness now passes. Production includes fixed charges
+for pool accounting (512 bytes), each connection context (4 KiB), and each receiver
+scope (512 bytes). The probe measures each cold constructor, including tokens and
+first-use locks, before measuring authorization. Denied connection, scope, and
+request admission must allocate nothing. A separate cold lifecycle probe includes
+unfinished cleanup. The node's notification storage remains funded with its pool,
+including after the endpoint handle exits.
+
+Connection funding precedes registration, and receiver funding precedes retiring
+the prior receiver or publishing registry admission. A fixed service test fills
+the pool, attempts replacement, and requires the previous receiver to remain
+usable. Retained window and registry capacities remain uncharged. Transport setup
+and cancellation children also require aggregate accounting, so this is not yet
+a complete protocol metadata bound.
 
 The fixed regression migration preserves its test functions and original work
 invariants with legal exchanges. Reordering uses separate requests, retries finish
@@ -82,12 +100,14 @@ scheduling errors: preferring a server for the wrong height, or preferring a
 server whose retained authorization forbids requesting that height again.
 
 Network/test all-target Clippy with warnings denied passes. Formatting, Markdown
-lint, whitespace, and changelog checks pass. The final runs had no retry, ignored
-failure, or leaky classification. An earlier fixed-regression run classified the
-passing service test `abandoned_application_drains_queued_writes_before_retirement`
-as leaky. An intermediate property run also classified a passing lifecycle history
-as leaky. These observations remain in the execution logs. The known macOS linker
-unwind-size warning also remains.
+lint, whitespace, and changelog checks pass. No tests were retried or marked as
+expected failures. The 2,048-case property run classified
+`missing_write_ownership_reduces_to_a_concrete_replay` and
+`f03_generated_complete_proof_arrays_bound_allocation_at_growth_edges` as leaky.
+Their assertions passed, but those process-lifecycle observations remain unresolved.
+The compliance, fixed-regression, and focused allocation runs had no such
+classification. Older leak observations remain in the execution logs. The known
+macOS linker unwind-size warning also remains.
 
 This is not full compliance or activation qualification. Complete authorization
 metadata bounds, real discovery and future subscription response adapters, and

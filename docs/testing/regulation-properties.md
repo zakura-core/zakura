@@ -58,7 +58,13 @@ allocation plan for expected hashes, taken work, and writer state before taking
 work. Generated measurements compare retained allocations with that plan for
 request sizes 1–128. Fixed examples cover capacity boundaries, a smaller batch
 under a constrained pool, and status handles that outlive their writer and
-response owner. Retained window and registry capacity still need funding.
+response owner. Retained window capacity is admitted with the request, then keeps
+its own permit after the exchange ends. An independent collection model checks
+growth, removal, and clearing against the node budget. Allocation probes require
+both buffers to be funded during replacement and no allocation for denied growth
+or changes within existing capacity. The actual GetBlocks receiver keeps this
+capacity charged through body completion and the ending. Registry snapshots and
+range capacity still need funding.
 
 ## GetBlocks coverage
 

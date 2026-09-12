@@ -17,24 +17,26 @@ older layout text.
 
 ## Compliance branch results
 
-On 2026-09-11, property code revision `cdd7265c1` includes compliance
-implementation `f2ff306f2` from [#971](https://github.com/zakura-core/zakura/pull/971).
+On 2026-09-11, property code revision `6701b0f30` includes compliance
+implementation `4418ff4f9` from [#971](https://github.com/zakura-core/zakura/pull/971).
 Local Rust 1.97.0 runs use seed 896. Compliance and fixed regressions use 64
 generated cases and four load rounds. The property profile uses 2,048 cases.
 
 | Profile | Result |
 | --- | --- |
-| Compliance | 101 passed, 1 failed across 102 tests |
-| Property profile, 2,048 cases | 38 passed (2 leaky), 1 timed out across 39 tests |
-| Receiver-history continuation | 1 passed with the bounded timeout described below |
-| Fixed regressions | 458 passed, 1 failed across 459 tests |
+| Compliance | 102 passed, 1 failed across 103 tests |
+| Property profile, 2,048 cases | 40 passed across 40 tests |
+| Fixed regressions | 464 passed, 1 failed across 465 tests |
 
-The receiver-history property reached the harness's 60-second limit. With a
-five-minute limit for that test alone, its 2,048 cases pass in 78 seconds at the
-same seed. `1ae81b3a6` adds that profile override. Its two-second per-event waits
-and input bounds are unchanged. All 39 property tests completed across these two
-runs. This is not a single clean qualification run because two tests had process
-leak classifications.
+All 40 property tests pass in one run. The receiver-history property takes 79
+seconds with the five-minute outer limit added in `1ae81b3a6`. Its two-second
+per-event waits and input bounds are unchanged. The earlier 60-second timeout
+and process leak classifications remain recorded in the execution evidence.
+
+The Clippy follow-up `c2c292ab1`, imported by `ba088bc49`, makes the memory-transfer
+helper's invariant explicit. Its final 34-test ownership and allocation selection
+passes, including 2,048 cases for each generated test. The full profile results
+above precede that helper-only follow-up.
 
 The failing witness in compliance and fixed regressions is T02 with two paused sibling
 streams. Their occupied receive windows still prevent the independent service
@@ -88,9 +90,14 @@ including after the endpoint handle exits.
 Connection funding precedes registration, and receiver funding precedes retiring
 the prior receiver or publishing registry admission. A fixed service test fills
 the pool, attempts replacement, and requires the previous receiver to remain
-usable. Retained window and registry capacities remain uncharged. Transport setup
-and cancellation children also require aggregate accounting, so this is not yet
-a complete protocol metadata bound.
+usable. Retained window capacity now has a separate permit admitted atomically
+with the request. Both buffers are charged during growth, and removing entries
+keeps backing capacity charged. The receiver witness verifies this before taking
+work and after consuming the ending. A shared collection property compares
+contents, capacity, allocation peaks, and counters with an independent model
+after each generated action. Registry snapshots and range capacity remain
+uncharged. Transport setup and cancellation children also require aggregate
+accounting, so this is not yet a complete protocol metadata bound.
 
 The fixed regression migration preserves its test functions and original work
 invariants with legal exchanges. Reordering uses separate requests, retries finish
@@ -101,18 +108,21 @@ server whose retained authorization forbids requesting that height again.
 
 Network/test all-target Clippy with warnings denied passes. Formatting, Markdown
 lint, whitespace, and changelog checks pass. No tests were retried or marked as
-expected failures. The 2,048-case property run classified
-`missing_write_ownership_reduces_to_a_concrete_replay` and
-`f03_generated_complete_proof_arrays_bound_allocation_at_growth_edges` as leaky.
-Their assertions passed, but those process-lifecycle observations remain unresolved.
-The compliance, fixed-regression, and focused allocation runs had no such
-classification. Older leak observations remain in the execution logs. The known
-macOS linker unwind-size warning also remains.
+expected failures. These three full profile runs have no leak classifications.
+The preceding 35-test allocation selection classified
+`allocation_plans_are_admitted_as_one_reservation` and
+`retained_growth_and_request_admission_are_atomic` as leaky despite passing
+assertions. [Nextest reports this](https://www.nexte.st/docs/features/leaky-tests/)
+when output handles remain open past its timeout,
+not from a heap measurement. Those observations and older classifications remain
+unresolved and recorded in the execution logs. No leak timeout or result policy
+was changed. The known macOS linker unwind-size warning also remains.
 
 This is not full compliance or activation qualification. Complete authorization
 metadata bounds, real discovery and future subscription response adapters, and
-funded transport headroom remain open. Full 2,048-case qualification, 64-round
-load, and long transport gates have not been rerun.
+funded transport headroom remain open. The current property profile has completed
+2,048 cases, but qualification also requires the missing adapters and bounds,
+64-round load, and long transport gates.
 The earlier decoder stage separately passed 159 chain regressions and six
 serialization doc tests.
 

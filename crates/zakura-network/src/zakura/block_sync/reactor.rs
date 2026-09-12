@@ -1926,19 +1926,17 @@ impl BlockSyncReactor {
         now: Instant,
         reason: &'static str,
     ) -> bool {
-        let Some(peer_state) = self.state.peers.get(peer) else {
+        let Some(peer_state) = self.state.peers.get_mut(peer) else {
             return false;
         };
         let msg = BlockSyncMessage::Status(status);
         let started = Instant::now();
         let session = peer_state.session.clone();
         let result = session.try_send_status(status);
-        if let Some(peer_state) = self.state.peers.get_mut(peer) {
-            match &result {
-                Ok(()) => peer_state.status_delivery.queued(status, now),
-                Err(OrderedSendError::Full) => peer_state.status_delivery.queue_full(now),
-                Err(_) => {}
-            }
+        match &result {
+            Ok(()) => peer_state.status_delivery.queued(status, now),
+            Err(OrderedSendError::Full) => peer_state.status_delivery.queue_full(now),
+            Err(_) => {}
         }
         match result {
             Ok(()) => {

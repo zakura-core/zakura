@@ -119,6 +119,7 @@ pub fn spawn_block_sync_reactor(
     mpsc::Receiver<BlockSyncAction>,
     JoinHandle<()>,
 ) {
+    let body_retention = startup.body_retention.clone();
     debug_assert!(
         !startup.state_queries_enabled
             || startup.committed_views.is_some()
@@ -139,6 +140,10 @@ pub fn spawn_block_sync_reactor(
     }
 
     let state = BlockSyncState::new(&startup);
+    let mut local_status = state.local_status(&startup.config);
+    if let Some(retention) = &body_retention {
+        local_status = retention.apply(local_status);
+    }
     let (events_tx, events_rx) =
         mpsc::channel(startup.config.peer_limits.inbound_queue_depth.max(1));
     let events_keepalive = events_tx.clone();
@@ -157,7 +162,7 @@ pub fn spawn_block_sync_reactor(
         .saturating_add(BS_ACTION_SPARE_POOL);
     let (actions_tx, actions_rx) = mpsc::channel(actions_capacity);
     let (peers_tx, peers_rx) = watch::channel(state.peer_snapshot(startup.config.peer_limits));
-    let (status_tx, status_rx) = watch::channel(state.last_advertised_status);
+    let (status_tx, status_rx) = watch::channel(local_status);
     let (candidates_tx, candidates_rx) = watch::channel(ZakuraBlockSyncCandidateState::default());
 
     // The Sequencer (commit pipeline) and the committed-throughput meter move out
@@ -257,6 +262,8 @@ pub fn spawn_block_sync_reactor(
         routine_wiring: Some(routine_wiring),
     };
     let reactor = BlockSyncReactor {
+        body_retention,
+        status_refresh_at: None,
         verified_block_tip: startup.frontiers.verified_block_tip,
         request_floor: startup.frontiers.verified_block_tip,
         pending_needed_query: None,
@@ -302,6 +309,9 @@ pub fn spawn_block_sync_reactor(
 
 #[derive(Debug)]
 pub(super) struct BlockSyncReactor {
+    body_retention: Option<BodyRetention>,
+    /// Earliest pending status delivery, rebuilt after delivery state changes.
+    status_refresh_at: Option<Instant>,
     startup: BlockSyncStartup,
     state: BlockSyncState,
     /// Latest atomic header-engine view used to stamp body-work ownership.
@@ -399,17 +409,16 @@ impl BlockSyncReactor {
         let mut header_tip = self.startup.header_tip.clone();
         let mut header_tip_open = header_tip.is_some();
         let mut committed_views = self.startup.committed_views.clone();
+        let mut retained_height = self
+            .body_retention
+            .as_ref()
+            .map(|retention| retention.retained_height.clone());
+        let mut retention_open = retained_height.is_some();
         set_block_reactor_active_connection_gauge(self.state.peers.len());
         // Per-peer request timeouts are owned by the routines. This local tick
         // also retries the level-triggered needed-body query, so a lost routine
         // notification or a full action queue cannot consume the refill need.
         let mut metrics_ticks = time::interval(self.startup.config.request_timeout);
-        let mut status_ticks = time::interval(
-            self.startup
-                .config
-                .status_refresh_interval
-                .max(Duration::from_millis(1)),
-        );
 
         self.query_needed_blocks().await;
         self.publish_metrics();
@@ -427,6 +436,14 @@ impl BlockSyncReactor {
             tokio::pin!(empty_state_header_quiet);
             let needed_query_retry = self.needed_query_retry_sleep();
             tokio::pin!(needed_query_retry);
+            let status_refresh_at = self.status_refresh_at;
+            let status_refresh = async move {
+                match status_refresh_at {
+                    Some(deadline) => time::sleep_until(deadline.into()).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::pin!(status_refresh);
             tokio::select! {
                 _ = self.startup.shutdown.cancelled() => break,
                 event = self.lifecycle.recv() => {
@@ -476,6 +493,18 @@ impl BlockSyncReactor {
                         Err(_) => header_tip_open = false,
                     }
                 }
+                changed = async {
+                    let Some(retained_height) = retained_height.as_mut() else {
+                        return std::future::pending().await;
+                    };
+                    retained_height.changed().await
+                }, if retention_open => {
+                    // Preserve the final floor if the state writer shuts down.
+                    retention_open = changed.is_ok();
+                    if retention_open {
+                        self.flush_status_refresh();
+                    }
+                }
                 changed = self.sequencer_view.changed() => {
                     match changed {
                         Ok(()) => {
@@ -511,7 +540,7 @@ impl BlockSyncReactor {
                     self.refresh_throughput();
                     self.trace_sync_state(true);
                 }
-                _ = status_ticks.tick() => self.flush_status_refresh().await,
+                _ = &mut status_refresh => self.flush_status_refresh(),
                 _ = &mut floor_watchdog => {
                     self.run_floor_watchdog(Instant::now());
                     self.publish_metrics();
@@ -794,7 +823,8 @@ impl BlockSyncReactor {
         self.trace_peer_connected(&peer, direction, self.state.peers.len());
         self.publish_peer_snapshot();
         self.publish_candidate_state();
-        self.send_status_and_mark_refresh(&peer, "peer_connected", Instant::now());
+        self.send_status(&peer, self.local_status(), Instant::now(), "peer_connected");
+        self.flush_status_refresh();
         // The routine fills its own slots; it begins want-work as soon as it has
         // a status and work.
     }
@@ -814,6 +844,7 @@ impl BlockSyncReactor {
         }
         self.registry.remove(&peer);
         self.state.parked_peers.remove(&peer);
+        self.flush_status_refresh();
         self.publish_peer_snapshot();
         self.publish_candidate_state();
     }
@@ -1056,7 +1087,6 @@ impl BlockSyncReactor {
         // read-only control inputs; updating them is cheap and idempotent.
         let reset_advanced = view.reset_epoch != self.last_reset_epoch;
         let reaction_advanced = view.reaction_epoch != self.last_reaction_epoch;
-        let old_serving_tip = (self.state.servable_high, self.state.servable_hash);
         let tip_advanced = view.verified_tip > self.verified_block_tip;
 
         if view.verified_tip > block::Height(0) {
@@ -1109,8 +1139,7 @@ impl BlockSyncReactor {
         }
         self.prune_needed_below_floor();
 
-        self.queue_status_refresh_if_changed(old_serving_tip);
-        self.flush_status_refresh().await;
+        self.flush_status_refresh();
         // After a destructive reset the WorkQueue is empty above the new floor, but
         // peer routines clear their registry outstanding asynchronously. A plain query can see the pre-reset outstanding amount, decide the
         // pipeline is "full", and skip the refill, leaving `pending` empty and
@@ -1315,8 +1344,9 @@ impl BlockSyncReactor {
         self.publish_candidate_state();
         self.restart_body_alarm_for_new_supplier();
         if send_reply {
-            self.send_status(&peer, "status_reply");
+            self.send_status(&peer, self.local_status(), Instant::now(), "status_reply");
         }
+        self.flush_status_refresh();
     }
 
     fn restart_body_alarm_for_new_supplier(&mut self) {
@@ -1889,15 +1919,26 @@ impl BlockSyncReactor {
             .max(max_blocks_per_response)
     }
 
-    fn send_status(&self, peer: &ZakuraPeerId, reason: &'static str) -> bool {
-        let Some(peer_state) = self.state.peers.get(peer) else {
+    fn send_status(
+        &mut self,
+        peer: &ZakuraPeerId,
+        status: BlockSyncStatus,
+        now: Instant,
+        reason: &'static str,
+    ) -> bool {
+        let Some(peer_state) = self.state.peers.get_mut(peer) else {
             return false;
         };
-        let status = self.local_status();
         let msg = BlockSyncMessage::Status(status);
         let started = Instant::now();
         let session = peer_state.session.clone();
-        match session.try_send_status(status) {
+        let result = session.try_send_status(status);
+        match &result {
+            Ok(()) => peer_state.status_delivery.queued(status, now),
+            Err(OrderedSendError::Full) => peer_state.status_delivery.queue_full(now),
+            Err(_) => {}
+        }
+        match result {
             Ok(()) => {
                 self.trace_message_sent(peer, &msg, "queued", started.elapsed());
                 self.trace_status_sent(peer, reason, status);
@@ -1932,25 +1973,6 @@ impl BlockSyncReactor {
                 false
             }
         }
-    }
-
-    fn send_status_and_mark_refresh(
-        &mut self,
-        peer: &ZakuraPeerId,
-        reason: &'static str,
-        now: Instant,
-    ) -> bool {
-        if !self.send_status(peer, reason) {
-            return false;
-        }
-
-        // Consume the status-advertisement refresh allowance only after the
-        // Status enters the peer's outbound queue.
-        if let Some(peer_state) = self.state.peers.get_mut(peer) {
-            peer_state.refresh_meter.mark_taken(now);
-        }
-
-        true
     }
 
     fn send_block(&self, peer: &ZakuraPeerId, block: Arc<block::Block>) -> bool {
@@ -2101,78 +2123,49 @@ impl BlockSyncReactor {
         }
     }
 
-    async fn flush_status_refresh(&mut self) {
-        // `received_status` is a registry fact now; snapshot which peers have not
-        // sent us their Status so the retry filter below can read it without
-        // re-locking per peer.
-        let unready: HashSet<ZakuraPeerId> = self
+    fn flush_status_refresh(&mut self) {
+        let status = self.local_status();
+        self.status.send_if_modified(|current| {
+            if *current == status {
+                return false;
+            }
+            *current = status;
+            true
+        });
+        let unready: HashSet<_> = self
             .registry
             .candidate_snapshot()
             .into_iter()
             .filter_map(|(peer, received_status, _, _)| (!received_status).then_some(peer))
             .collect();
-        let has_unready_peers = !unready.is_empty();
-        if !self.state.pending_status_refresh && !has_unready_peers {
-            return;
-        }
         let now = Instant::now();
-
-        // A genuine serving-range change is debounced by the global
-        // `status_refresh` meter so a burst of tip changes advertises once per
-        // window. Only consume that window when there is actually a change to
-        // advertise: a flush that exists only to retry a Status to a peer that
-        // has not acknowledged ours must not poison the change window, or the
-        // first real advertisement after connect is silently dropped (the
-        // connect-time retry would have already taken the window).
-        let status = self.local_status();
-        let status_needs_refresh =
-            self.state.pending_status_refresh && status != self.state.last_advertised_status;
-        let status_changed = status_needs_refresh && self.state.status_refresh.try_take(now);
-
-        // Keep a rate-limited change pending until the periodic tick advertises the
-        // latest status. Clearing the change here can lose a serving-tip advance
-        // when several commits occur during one refresh interval.
-        self.state.pending_status_refresh = status_needs_refresh && !status_changed;
-        if status_changed {
-            self.state.last_advertised_status = status;
-            let _ = self.status.send(status);
-        }
-
-        let peer_ids: Vec<_> = self
+        let due: Vec<_> = self
             .state
             .peers
             .iter()
-            .filter_map(|(peer_id, peer)| {
-                // On a real change, advertise to every peer immediately; the
-                // global meter above already debounced the change, so the
-                // per-peer `unsolicited` meter must not also suppress it. We
-                // still consume the per-peer allowance after the frame queues so
-                // a same-window retry to this peer stays spaced. Otherwise the
-                // only reason to send is a retry to a peer that has not
-                // acknowledged our Status, which stays gated solely by that
-                // peer's `unsolicited` meter.
-                let should_send_status = status_changed
-                    || (unready.contains(peer_id) && peer.refresh_meter.is_ready(now));
-
-                if should_send_status {
-                    Some(peer_id.clone())
-                } else {
-                    None
-                }
+            .filter(|(_, peer)| !peer.session.cancel_token().is_cancelled())
+            .filter_map(|(id, peer)| {
+                peer.status_delivery
+                    .next_deadline(status, !unready.contains(id))
+                    .filter(|deadline| *deadline <= now)
+                    .map(|_| id.clone())
             })
             .collect();
-
-        for peer in peer_ids {
-            self.send_status_and_mark_refresh(&peer, "refresh", now);
+        for peer in due {
+            self.send_status(&peer, status, now, "refresh");
         }
-    }
-
-    fn queue_status_refresh_if_changed(&mut self, old_serving_tip: (block::Height, block::Hash)) {
-        if old_serving_tip != (self.state.servable_high, self.state.servable_hash)
-            && self.local_status() != self.state.last_advertised_status
-        {
-            self.state.pending_status_refresh = true;
-        }
+        // The same delivery rules choose both sends and wakes. A full queue
+        // cannot lose its retry when another peer accepts the new range.
+        self.status_refresh_at = self
+            .state
+            .peers
+            .iter()
+            .filter(|(_, peer)| !peer.session.cancel_token().is_cancelled())
+            .filter_map(|(id, peer)| {
+                peer.status_delivery
+                    .next_deadline(status, !unready.contains(id))
+            })
+            .min();
     }
 
     fn floor_gap_diagnostics(&self, now: Instant) -> Option<FloorGapDiagnostics> {
@@ -2327,12 +2320,16 @@ impl BlockSyncReactor {
     }
 
     fn clamp_served_block_count(&self, start_height: block::Height, count: u32) -> u32 {
-        if start_height > self.state.servable_high {
+        let status = self.local_status();
+        if start_height == block::Height::MIN && status.servable_low > block::Height::MIN {
+            // Genesis is retained separately. Do not cross the pruned gap after it.
+            return count.min(1);
+        }
+        if start_height < status.servable_low || start_height > status.servable_high {
             return 0;
         }
 
-        let available = self
-            .state
+        let available = status
             .servable_high
             .0
             .checked_sub(start_height.0)
@@ -2345,14 +2342,10 @@ impl BlockSyncReactor {
     }
 
     fn local_status(&self) -> BlockSyncStatus {
-        BlockSyncStatus {
-            servable_low: block::Height::MIN,
-            servable_high: self.state.servable_high,
-            tip_hash: self.state.servable_hash,
-            max_blocks_per_response: self.startup.config.advertised_max_blocks_per_response(),
-            max_inflight_requests: self.startup.config.advertised_max_inflight_requests(),
-            max_response_bytes: self.startup.config.advertised_max_response_bytes(),
-        }
+        let status = self.state.local_status(&self.startup.config);
+        self.body_retention
+            .as_ref()
+            .map_or(status, |retention| retention.apply(status))
     }
 
     /// Hand a data-plane action to the action driver without letting a slow or

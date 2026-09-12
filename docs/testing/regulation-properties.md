@@ -114,9 +114,13 @@ concrete input from the old failing CI run remains a fixed regression.
 
 The [GetBlocks compliance suite](getblocks-compliance.md) now executes the missing
 requirements from #747, including rules the #942–#945 stack does not yet satisfy.
-A failing requirement is an ordinary failing test. It is not ignored, inverted,
-or retried until green. The implemented [serving design](../design/getblocks-regulation.md)
-remains distinct from the intended requirements being tested.
+Requirements supported by published packages remain ordinary failing tests when
+they find a counterexample. They are not inverted or retried until green. Five
+[dependency-blocked transport witnesses](../design/native-transport-capacity.md)
+retain their assertions but are excluded from compilation with explicit reasons
+and re-enable requirements. They do not count as passing coverage. The implemented
+[serving design](../design/getblocks-regulation.md) remains distinct from the
+intended requirements being tested.
 
 Receiver tests observe exact requested hashes, consumed parts, and terminal state.
 Generated local histories combine response prefixes with deadlines, finality,

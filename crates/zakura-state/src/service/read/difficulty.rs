@@ -45,9 +45,7 @@ fn finalized_state_query_interrupted_error() -> BoxError {
 
 /// Returns the [`GetBlockTemplateChainInfo`] for the current best chain.
 ///
-/// # Panics
-///
-/// - If we don't have enough blocks in the state.
+/// Returns an error if the state cannot supply the complete difficulty context.
 pub fn get_block_template_chain_info(
     non_finalized_state: &NonFinalizedState,
     db: &ZakuraDb,
@@ -71,13 +69,13 @@ pub fn get_block_template_chain_info(
     let (best_tip_height, best_tip_hash, best_relevant_chain, best_tip_history_tree) =
         best_relevant_chain_and_history_tree_result?;
 
-    Ok(difficulty_time_and_history_tree(
+    difficulty_time_and_history_tree(
         best_relevant_chain,
         best_tip_height,
         best_tip_hash,
         network,
         best_tip_history_tree,
-    ))
+    )
 }
 
 /// Accepts a `non_finalized_state`, [`ZakuraDb`], `num_blocks`, and a block hash to start at.
@@ -212,7 +210,10 @@ fn difficulty_time_and_history_tree(
     tip_hash: block::Hash,
     network: &Network,
     history_tree: Arc<HistoryTree>,
-) -> GetBlockTemplateChainInfo {
+) -> Result<GetBlockTemplateChainInfo, BoxError> {
+    if relevant_chain.is_empty() {
+        return Err("mining template difficulty context is empty".into());
+    }
     let relevant_data: Vec<(CompactDifficulty, DateTime<Utc>)> = relevant_chain
         .iter()
         .map(|block| (block.header.difficulty_threshold, block.header.time))
@@ -251,8 +252,7 @@ fn difficulty_time_and_history_tree(
         tip_height,
         network,
         relevant_data.iter().cloned(),
-    )
-    .expect("the mining template requires a complete committed difficulty context");
+    )?;
     let expected_difficulty = difficulty_adjustment.expected_difficulty_threshold();
 
     let mut result = GetBlockTemplateChainInfo {
@@ -265,9 +265,9 @@ fn difficulty_time_and_history_tree(
         max_time,
     };
 
-    adjust_difficulty_and_time_for_testnet(&mut result, network, tip_height, relevant_data);
+    adjust_difficulty_and_time_for_testnet(&mut result, network, tip_height, relevant_data)?;
 
-    result
+    Ok(result)
 }
 
 /// Adjust the difficulty and time for the testnet minimum difficulty rule.
@@ -278,9 +278,9 @@ fn adjust_difficulty_and_time_for_testnet(
     network: &Network,
     previous_block_height: Height,
     relevant_data: Vec<(CompactDifficulty, DateTime<Utc>)>,
-) {
+) -> Result<(), BoxError> {
     if network == &Network::Mainnet {
-        return;
+        return Ok(());
     }
 
     // On testnet, changing the block time can also change the difficulty,
@@ -306,20 +306,16 @@ fn adjust_difficulty_and_time_for_testnet(
 
     // The tip is the first relevant data block, because they are in reverse order.
     let previous_block_time = relevant_data.first().expect("has at least one block").1;
-    let previous_block_time: DateTime32 = previous_block_time
-        .try_into()
-        .expect("valid blocks have in-range times");
+    let previous_block_time: DateTime32 = previous_block_time.try_into()?;
 
     let Some(minimum_difficulty_spacing) =
         NetworkUpgrade::minimum_difficulty_spacing_for_height(network, previous_block_height)
     else {
         // Returns early if the testnet minimum difficulty consensus rule is not active
-        return;
+        return Ok(());
     };
 
-    let minimum_difficulty_spacing: Duration32 = minimum_difficulty_spacing
-        .try_into()
-        .expect("small positive values are in-range");
+    let minimum_difficulty_spacing: Duration32 = minimum_difficulty_spacing.try_into()?;
 
     // The first minimum difficulty time is strictly greater than the spacing.
     let std_difficulty_max_time = previous_block_time
@@ -369,8 +365,41 @@ fn adjust_difficulty_and_time_for_testnet(
             previous_block_height,
             network,
             relevant_data.iter().cloned(),
-        )
-        .expect("the testnet mining template retains the same complete difficulty context")
+        )?
         .expected_difficulty_threshold();
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zakura_chain::serialization::ZcashDeserializeInto;
+
+    #[test]
+    fn mining_template_rejects_incomplete_difficulty_context() {
+        let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into()
+            .expect("the genesis vector is valid");
+
+        for network in [Network::Mainnet, Network::new_default_testnet()] {
+            for tip in [0, 1, 26, 27, 28, 3_474_810] {
+                let required = usize::try_from((tip + 1).min(28)).unwrap();
+                for count in 0..=required {
+                    let result = difficulty_time_and_history_tree(
+                        vec![block.clone(); count],
+                        Height(tip),
+                        block.hash(),
+                        &network,
+                        Arc::new(HistoryTree::default()),
+                    );
+                    assert_eq!(
+                        result.is_ok(),
+                        count == required,
+                        "network={network:?}, tip={tip}, count={count}: {result:?}"
+                    );
+                }
+            }
+        }
     }
 }

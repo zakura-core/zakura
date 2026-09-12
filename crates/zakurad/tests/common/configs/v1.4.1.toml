@@ -107,6 +107,7 @@ max_connections = 256
 max_connections_per_ip = 16
 max_pending_handshakes = 32
 message_rate_per_second = 2048
+nat_traversal = false
 stream_open_rate_per_second = 32
 
 [rpc]

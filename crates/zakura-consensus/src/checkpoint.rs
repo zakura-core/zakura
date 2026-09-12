@@ -1305,20 +1305,24 @@ where
                     zs::Response::Committed(committed_hash) => {
                         assert_eq!(committed_hash, hash, "state must commit correct hash");
                         if let Some(state) = handoff_state {
-                            // This task survives a dropped caller. The checkpoint must be durable
-                            // before the writable state's Tip request reconciles queued children.
-                            let response = tokio::time::timeout(
-                                std::time::Duration::from_secs(30),
-                                state.oneshot(zs::Request::Tip),
-                            )
-                            .await
-                            .map_err(|error| VerifyCheckpointError::Tip(error.into()))?
-                            .map_err(VerifyCheckpointError::Tip)?;
-                            assert!(
-                                matches!(response, zs::Response::Tip(_)),
-                                "state must respond with the reconciled tip"
-                            );
-                            metrics::counter!("checkpoint.state_tip_reconciled").increment(1);
+                            // Retain the notification even if its response times out. A delayed
+                            // buffer worker must still reconcile the already-durable checkpoint.
+                            let reconcile_tip = tokio::spawn(async move {
+                                let response = state
+                                    .oneshot(zs::Request::Tip)
+                                    .await
+                                    .map_err(VerifyCheckpointError::Tip)?;
+                                assert!(
+                                    matches!(response, zs::Response::Tip(_)),
+                                    "state must respond with the reconciled tip"
+                                );
+                                metrics::counter!("checkpoint.state_tip_reconciled").increment(1);
+                                Ok::<(), VerifyCheckpointError>(())
+                            });
+                            tokio::time::timeout(std::time::Duration::from_secs(30), reconcile_tip)
+                                .await
+                                .map_err(|error| VerifyCheckpointError::Tip(error.into()))?
+                                .expect("retained state tip task must preserve state invariants")?;
                         }
                         Ok(hash)
                     }

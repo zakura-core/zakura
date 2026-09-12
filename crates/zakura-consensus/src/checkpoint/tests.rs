@@ -112,6 +112,72 @@ async fn checkpoint_completion_reconciles_tip_without_another_caller() -> Result
     Ok(())
 }
 
+/// A delayed worker must receive the handoff notification even after its response times out.
+#[tokio::test(start_paused = true)]
+async fn checkpoint_handoff_survives_a_delayed_buffer_worker() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+    let genesis =
+        Arc::<Block>::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])?;
+    let hash = genesis.hash();
+    let (release_commit, commit_gate) = tokio::sync::watch::channel(false);
+    let (started, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (reconciled, mut reconciled_rx) = tokio::sync::mpsc::unbounded_channel();
+    let inner = tower::service_fn(move |request| {
+        let mut gate = commit_gate.clone();
+        let started = started.clone();
+        let reconciled = reconciled.clone();
+        async move {
+            match request {
+                zs::Request::CommitCheckpointVerifiedBlock(_) => {
+                    started.send(()).expect("the test observes the commit");
+                    gate.wait_for(|released| *released)
+                        .await
+                        .expect("the test retains the commit gate");
+                    Ok::<_, BoxError>(zs::Response::Committed(hash))
+                }
+                zs::Request::Tip => {
+                    reconciled
+                        .send(())
+                        .expect("the test observes reconciliation");
+                    Ok(zs::Response::Tip(Some((block::Height(0), hash))))
+                }
+                _ => panic!("checkpoint completion only commits and reconciles the tip"),
+            }
+        }
+    });
+    let (state, worker) = tower::buffer::Buffer::pair(inner, 1);
+    tokio::pin!(worker);
+    let mut verifier = CheckpointVerifier::from_list(
+        BTreeMap::from([(block::Height(0), hash)]),
+        &Mainnet,
+        None,
+        state,
+    )
+    .map_err(|error| eyre!(error))?;
+    let response = verifier.call(genesis);
+    tokio::select! {
+        started = started_rx.recv() => started.expect("the checkpoint commit starts"),
+        _ = &mut worker => panic!("the verifier keeps the state buffer open"),
+        _ = tokio::time::sleep(Duration::from_secs(VERIFY_TIMEOUT_SECONDS)) => {
+            panic!("the checkpoint commit did not reach the worker");
+        }
+    }
+    // Let the write finish while the worker is unavailable until after the notification deadline.
+    release_commit.send_replace(true);
+    let result = timeout(Duration::from_secs(31), response).await?;
+    assert!(matches!(result, Err(VerifyCheckpointError::Tip(_))));
+    tokio::select! {
+        notification = reconciled_rx.recv() => {
+            notification.expect("the delayed worker must still receive the completion notification");
+        }
+        _ = &mut worker => panic!("the verifier keeps the state buffer open"),
+        _ = tokio::time::sleep(Duration::from_secs(1)) => {
+            panic!("the completion notification was canceled before the worker resumed");
+        }
+    }
+    Ok(())
+}
+
 /// A handoff notification failure must not roll back successfully committed verifier progress.
 #[tokio::test]
 async fn failed_handoff_check_preserves_committed_checkpoint_progress() -> Result<(), Report> {

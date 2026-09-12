@@ -119,7 +119,7 @@ impl ResponseScope {
             .memory
             .try_reserve(bytes)
             .ok_or(ResponseAdmissionError::MemoryFull)?;
-        let retained = memory.split_off(retained_bytes);
+        let retained = (retained_bytes > 0).then(|| memory.split_off(retained_bytes));
         Ok((
             ResponseAuthorization(Arc::new(Authorization {
                 scope: self.clone(),

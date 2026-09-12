@@ -145,18 +145,15 @@ impl ResponseMemoryPermit {
     }
 
     /// Transfer part of one admission to storage with a different lifetime.
-    pub(crate) fn split_off(&mut self, bytes: u64) -> Option<Self> {
-        if bytes == 0 {
-            return None;
-        }
+    pub(crate) fn split_off(&mut self, bytes: u64) -> Self {
         self.bytes = self
             .bytes
             .checked_sub(bytes)
             .expect("split memory is part of the original reservation");
-        Some(Self {
+        Self {
             memory: self.memory.clone(),
             bytes,
-        })
+        }
     }
 }
 

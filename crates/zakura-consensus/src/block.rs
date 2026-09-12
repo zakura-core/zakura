@@ -38,6 +38,7 @@ mod prepared;
 pub mod request;
 pub mod subsidy;
 
+pub use prepared::{PreparedCandidateResolver, ResolvePreparedCandidateError};
 pub use request::{PreparedCandidateSource, Request};
 
 #[cfg(test)]
@@ -267,14 +268,26 @@ where
     V: Service<tx::Request, Response = tx::Response, Error = BoxError> + Send + Clone + 'static,
     V::Future: Send + 'static,
 {
-    /// Creates a new SemanticBlockVerifier
+    /// Creates a semantic block verifier for tests.
+    #[cfg(test)]
     pub fn new(network: &Network, state_service: S, transaction_verifier: V) -> Self {
-        Self {
+        Self::new_with_prepared_candidates(network, state_service, transaction_verifier).0
+    }
+
+    pub(crate) fn new_with_prepared_candidates(
+        network: &Network,
+        state_service: S,
+        transaction_verifier: V,
+    ) -> (Self, PreparedCandidateResolver) {
+        let prepared_candidates = prepared::PreparedCandidateCache::default();
+        let resolver = prepared_candidates.resolver();
+        let verifier = Self {
             network: network.clone(),
             state_service,
             transaction_verifier,
-            prepared_candidates: Default::default(),
-        }
+            prepared_candidates,
+        };
+        (verifier, resolver)
     }
 }
 
@@ -416,6 +429,20 @@ where
                 }
                 metrics::histogram!("mining.solved_header_check.duration_seconds")
                     .record(solved_header_start.elapsed().as_secs_f64());
+            }
+
+            // Background template preparation repeats whenever a miner polls, and each poll
+            // carries a fresh random work ID. Reuse the candidate an earlier poll prepared
+            // when the template content is unchanged, so unchanged polling does not re-run
+            // script verification, signature batches and proposal validation for a block the
+            // node has already prepared. The new work ID becomes another alias for it.
+            //
+            // Skipping proposal validation here loses no verdict: the reused candidate already
+            // passed it, and a solved block is checked in full on the `CommitMined` path.
+            if request.prepared_candidate_source() == Some(PreparedCandidateSource::ServerTemplate)
+                && prepared_candidates.reuse_server_candidate(&block, request.work_id(), &network)
+            {
+                return Ok(hash);
             }
 
             // Next, check the Merkle root validity, to ensure that

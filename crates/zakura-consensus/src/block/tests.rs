@@ -318,6 +318,38 @@ async fn prepared_mined_commit_rechecks_equihash() {
 }
 
 #[tokio::test]
+async fn prepared_mined_commit_rechecks_difficulty() {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let candidate = Arc::new(
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+            .expect("the genesis block deserializes"),
+    );
+    let mut verifier = prepared_test_verifier(&network);
+    prepare_for_test(&mut verifier, candidate.clone()).await;
+
+    let mut solved = (*candidate).clone();
+    Arc::make_mut(&mut solved.header).difficulty_threshold = INVALID_COMPACT_DIFFICULTY;
+    let result = verifier
+        .ready()
+        .await
+        .expect("the verifier is ready")
+        .call(Request::CommitMined {
+            block: Arc::new(solved),
+            work_id: Some("work".to_owned()),
+            admission: zs::BlockAdmission::pending(),
+        })
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(VerifyBlockError::Block {
+            source: BlockError::InvalidDifficulty(_, _)
+        })
+    ));
+}
+
+#[tokio::test]
 async fn prepared_mined_commit_rechecks_header_time() {
     let _init_guard = zakura_test::init();
     let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
@@ -437,6 +469,231 @@ async fn failed_preparation_does_not_populate_the_cache() {
     assert_eq!(transaction_calls.load(Ordering::Relaxed), 2);
 }
 
+/// Counts the work each preparation request costs.
+///
+/// The transaction counter covers script verification and the signature and proof batches; the
+/// proposal counter covers contextual validation against a cloned non-finalized state.
+fn counting_prepared_test_verifier(
+    network: &Network,
+) -> (
+    impl Service<Request, Response = block::Hash, Error = VerifyBlockError>,
+    Arc<std::sync::atomic::AtomicUsize>,
+    Arc<std::sync::atomic::AtomicUsize>,
+    PreparedCandidateResolver,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let transaction_calls = Arc::new(AtomicUsize::new(0));
+    let proposal_calls = Arc::new(AtomicUsize::new(0));
+    let transaction = service_fn({
+        let transaction_calls = transaction_calls.clone();
+        move |request| {
+            transaction_calls.fetch_add(1, Ordering::Relaxed);
+            async move { Ok::<_, BoxError>(accept_block_transaction(request)) }
+        }
+    });
+    let state = service_fn({
+        let proposal_calls = proposal_calls.clone();
+        move |request: zs::Request| {
+            let proposal_calls = proposal_calls.clone();
+            async move {
+                let response = match request {
+                    zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+                    zs::Request::CheckBlockProposalValidity(_) => {
+                        proposal_calls.fetch_add(1, Ordering::Relaxed);
+                        zs::Response::ValidBlockProposal
+                    }
+                    _ => panic!("reuse test received an unexpected state request: {request:?}"),
+                };
+                Ok::<_, BoxError>(response)
+            }
+        }
+    });
+
+    let (verifier, resolver) =
+        SemanticBlockVerifier::new_with_prepared_candidates(network, state, transaction);
+    (verifier, transaction_calls, proposal_calls, resolver)
+}
+
+async fn prepare_with_work_id<V>(verifier: &mut V, block: Arc<Block>, work_id: &str)
+where
+    V: Service<Request, Response = block::Hash, Error = VerifyBlockError>,
+{
+    verifier
+        .ready()
+        .await
+        .expect("the verifier is ready")
+        .call(Request::Prepare {
+            block,
+            work_id: Some(work_id.to_owned()),
+            source: PreparedCandidateSource::ServerTemplate,
+        })
+        .await
+        .expect("the candidate prepares successfully");
+}
+
+/// A miner polling an unchanged tip and mempool must not make the node prepare the same
+/// candidate again.
+///
+/// Every template response carries a fresh random work ID, so without reuse each poll re-runs
+/// script verification, the signature batches and proposal validation for transactions the node
+/// has already prepared.
+#[tokio::test]
+async fn unchanged_server_template_polls_reuse_the_prepared_candidate() {
+    use std::sync::atomic::Ordering;
+
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let candidate = Arc::new(
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+            .expect("the genesis block deserializes"),
+    );
+    let (mut verifier, transaction_calls, proposal_calls, resolver) =
+        counting_prepared_test_verifier(&network);
+
+    prepare_with_work_id(&mut verifier, candidate.clone(), "work-1").await;
+    let transactions_after_first = transaction_calls.load(Ordering::Relaxed);
+    assert_eq!(transactions_after_first, candidate.transactions.len());
+    assert_eq!(proposal_calls.load(Ordering::Relaxed), 1);
+
+    // A later poll of the same template content, under a new work ID.
+    prepare_with_work_id(&mut verifier, candidate.clone(), "work-2").await;
+    assert_eq!(
+        transaction_calls.load(Ordering::Relaxed),
+        transactions_after_first,
+        "an unchanged template must not be verified again",
+    );
+    assert_eq!(
+        proposal_calls.load(Ordering::Relaxed),
+        1,
+        "an unchanged template must not be validated against the state again",
+    );
+
+    // Both work IDs name the same prepared candidate.
+    let first = resolver
+        .resolve("work-1", *candidate.header)
+        .expect("the original work ID resolves");
+    let second = resolver
+        .resolve("work-2", *candidate.header)
+        .expect("the reused work ID resolves");
+    assert_eq!(first.hash(), second.hash());
+
+    // A template whose content changed is prepared as usual.
+    let mut changed = (*candidate).clone();
+    Arc::make_mut(&mut changed.header).previous_block_hash = block::Hash([9; 32]);
+    prepare_with_work_id(&mut verifier, Arc::new(changed), "work-3").await;
+    assert!(
+        transaction_calls.load(Ordering::Relaxed) > transactions_after_first,
+        "a changed template is verified",
+    );
+    assert_eq!(proposal_calls.load(Ordering::Relaxed), 2);
+}
+
+/// A client proposal's response is a verdict the client acts on, so it is verified even when an
+/// equivalent server candidate is already prepared.
+#[tokio::test]
+async fn a_client_proposal_is_verified_even_when_a_server_candidate_matches() {
+    use std::sync::atomic::Ordering;
+
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let candidate = Arc::new(
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+            .expect("the genesis block deserializes"),
+    );
+    let (mut verifier, transaction_calls, proposal_calls, _resolver) =
+        counting_prepared_test_verifier(&network);
+
+    prepare_with_work_id(&mut verifier, candidate.clone(), "server").await;
+    let transactions_after_server = transaction_calls.load(Ordering::Relaxed);
+
+    verifier
+        .ready()
+        .await
+        .expect("the verifier is ready")
+        .call(Request::Prepare {
+            block: candidate,
+            work_id: Some("proposal".to_owned()),
+            source: PreparedCandidateSource::ClientProposal,
+        })
+        .await
+        .expect("the proposal is valid");
+
+    assert!(
+        transaction_calls.load(Ordering::Relaxed) > transactions_after_server,
+        "a client proposal is verified even when a server candidate matches",
+    );
+    assert_eq!(proposal_calls.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn cache_eviction_between_resolution_and_commit_uses_full_verification() {
+    const SERVER_CANDIDATE_LIMIT: u32 = 24;
+
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let candidate = Arc::new(
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+            .expect("the genesis block deserializes"),
+    );
+    let state = service_fn(|request: zs::Request| async move {
+        let response = match request {
+            zs::Request::KnownBlock(hash) => zs::Response::KnownBlock(
+                (hash == block::Hash([0; 32])).then_some(zs::KnownBlock::Finalized),
+            ),
+            zs::Request::CheckBlockProposalValidity(_) => zs::Response::ValidBlockProposal,
+            _ => panic!("cache-eviction test received an unexpected state request: {request:?}"),
+        };
+        Ok::<_, BoxError>(response)
+    });
+    let transaction =
+        service_fn(|request| async move { Ok::<_, BoxError>(accept_block_transaction(request)) });
+    let (mut verifier, resolver) =
+        SemanticBlockVerifier::new_with_prepared_candidates(&network, state, transaction);
+    prepare_for_test(&mut verifier, candidate.clone()).await;
+
+    let resolved = resolver
+        .resolve("work", *candidate.header)
+        .expect("the candidate resolves before eviction");
+    for index in 0..=SERVER_CANDIDATE_LIMIT {
+        let mut replacement = (*candidate).clone();
+        Arc::make_mut(&mut replacement.header).version = index.saturating_add(5);
+        resolver.insert_for_test(
+            Arc::new(replacement),
+            &format!("replacement-{index}"),
+            PreparedCandidateSource::ServerTemplate,
+            &network,
+        );
+    }
+    assert_eq!(
+        resolver.resolve("work", *candidate.header),
+        Err(ResolvePreparedCandidateError::StaleWork)
+    );
+
+    let mut tampered = (*resolved).clone();
+    let extra_transaction: Transaction = zakura_test::vectors::DUMMY_TX1
+        .zcash_deserialize_into()
+        .expect("the dummy transaction deserializes");
+    tampered.transactions.push(Arc::new(extra_transaction));
+    let result = verifier
+        .ready()
+        .await
+        .expect("the verifier is ready")
+        .call(Request::CommitMined {
+            block: Arc::new(tampered),
+            work_id: Some("work".to_owned()),
+            admission: zs::BlockAdmission::pending(),
+        })
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(VerifyBlockError::Block {
+            source: BlockError::BadMerkleRoot { .. }
+        })
+    ));
+}
+
 #[tokio::test]
 async fn proposal_validation_succeeds_when_cache_insertion_conflicts() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -496,7 +753,96 @@ async fn proposal_validation_succeeds_when_cache_insertion_conflicts() {
         })
         .await;
     assert!(commit_result.is_ok());
-    assert_eq!(transaction_calls.load(Ordering::Relaxed), 2);
+    // The conflicting work ID prevents cache insertion, so commit verifies once more.
+    assert_eq!(transaction_calls.load(Ordering::Relaxed), 3);
+}
+
+#[tokio::test]
+async fn prepared_and_full_commits_produce_the_same_state_input() {
+    use std::sync::Mutex;
+
+    let state_service = |committed: Arc<Mutex<Option<zs::SemanticallyVerifiedBlock>>>| {
+        service_fn(move |request: zs::Request| {
+            let committed = committed.clone();
+            async move {
+                let response = match request {
+                    zs::Request::KnownBlock(hash) => zs::Response::KnownBlock(
+                        (hash == block::Hash([0; 32])).then_some(zs::KnownBlock::Finalized),
+                    ),
+                    zs::Request::CheckBlockProposalValidity(_) => zs::Response::ValidBlockProposal,
+                    zs::Request::CheckPreparedMinedRelayEligibility(_) => {
+                        zs::Response::PreparedMinedRelayEligibility(
+                            zs::PreparedMinedRelayEligibility::CommitFirst,
+                        )
+                    }
+                    zs::Request::CommitSemanticallyVerifiedBlock(block)
+                    | zs::Request::CommitSemanticallyVerifiedBlockWithAdmission { block, .. } => {
+                        let hash = block.hash;
+                        *committed
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(block);
+                        zs::Response::Committed(hash)
+                    }
+                    _ => {
+                        panic!("equivalence test received an unexpected state request: {request:?}")
+                    }
+                };
+                Ok(response)
+            }
+        })
+    };
+
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let block = Arc::new(
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+            .expect("the genesis block deserializes"),
+    );
+    let full_commit = Arc::new(Mutex::new(None));
+    let prepared_commit = Arc::new(Mutex::new(None));
+    let transaction = || {
+        service_fn(|request| async move { Ok::<_, BoxError>(accept_block_transaction(request)) })
+    };
+
+    let mut full_verifier =
+        SemanticBlockVerifier::new(&network, state_service(full_commit.clone()), transaction());
+    let full_hash = full_verifier
+        .ready()
+        .await
+        .expect("the full verifier is ready")
+        .call(Request::Commit(block.clone()))
+        .await
+        .expect("full verification commits the block");
+
+    let mut prepared_verifier = SemanticBlockVerifier::new(
+        &network,
+        state_service(prepared_commit.clone()),
+        transaction(),
+    );
+    prepare_for_test(&mut prepared_verifier, block.clone()).await;
+    let prepared_hash = prepared_verifier
+        .ready()
+        .await
+        .expect("the prepared verifier is ready")
+        .call(Request::CommitMined {
+            block,
+            work_id: Some("work".to_owned()),
+            admission: zs::BlockAdmission::pending(),
+        })
+        .await
+        .expect("prepared verification commits the block");
+
+    assert_eq!(prepared_hash, full_hash);
+    assert_eq!(
+        prepared_commit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref(),
+        full_commit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref(),
+    );
 }
 
 // TODO: enable this test after implementing contextual verification

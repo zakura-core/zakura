@@ -34,6 +34,8 @@ pub(crate) struct RequestAdmission<P> {
     node: SlotBudget,
     peer_capacity: usize,
     peers: Arc<Mutex<HashMap<ZakuraPeerId, WeakSlotBudget>>>,
+    #[cfg(test)]
+    pub(crate) session_lock_probe: Arc<zakura_test::resources::LockProbe>,
 }
 
 impl<P: RequestPolicy + Clone> RequestAdmission<P> {
@@ -45,15 +47,21 @@ impl<P: RequestPolicy + Clone> RequestAdmission<P> {
             node,
             peer_capacity,
             peers: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            session_lock_probe: Arc::default(),
         }
     }
 
     /// Reconnects share the authenticated peer's capacity with its old work.
     pub(crate) fn session(&self, peer: &ZakuraPeerId) -> RequestSession<P> {
+        #[cfg(test)]
+        let lock_started = std::time::Instant::now();
         let mut peers = self
             .peers
             .lock()
             .expect("peer budget registry is not poisoned");
+        #[cfg(test)]
+        let _lock_observation = self.session_lock_probe.acquired_since(lock_started);
         // Permits keep their semaphore alive even after the old session closes.
         // Remove expired identities on each connection so churn cannot grow the map.
         peers.retain(|_, budget| budget.is_alive());
@@ -271,3 +279,6 @@ impl WorkLease {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) mod properties;

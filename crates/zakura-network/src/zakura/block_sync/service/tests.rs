@@ -639,6 +639,14 @@ impl BlockSyncService {
 }
 
 impl BlockSyncHandle {
+    pub(crate) fn exchange_counts_for_test(&self) -> (u64, u64) {
+        self.routine_wiring
+            .as_ref()
+            .unwrap()
+            .registry
+            .exchange_counts_for_test()
+    }
+
     pub(crate) fn active_serving_requests_for_test(&self) -> usize {
         self.routine_wiring
             .as_ref()
@@ -671,7 +679,27 @@ impl BlockSyncHandle {
     }
 }
 
+impl BlockSyncPeerSession {
+    pub(crate) fn hold_data_capacity_for_test(&self) -> Vec<Box<dyn Send + '_>> {
+        (0..self.send.max_capacity())
+            .map(|_| Box::new(self.send.try_reserve_guarded().unwrap()) as Box<dyn Send>)
+            .collect()
+    }
+    pub(crate) fn data_capacity_for_test(&self) -> usize {
+        self.send.capacity()
+    }
+}
+
 impl BlockSyncService {
+    pub(crate) fn with_serving_status_for_test(
+        &mut self,
+        status: BlockSyncStatus,
+    ) -> watch::Sender<BlockSyncStatus> {
+        let (sender, receiver) = watch::channel(status);
+        self.local_status = Some(receiver);
+        sender
+    }
+
     pub(crate) fn new_for_test(config: ZakuraBlockSyncConfig) -> Self {
         let sessions = CurrentSessions::new();
         let (_peer_snapshot_tx, peer_snapshot) =

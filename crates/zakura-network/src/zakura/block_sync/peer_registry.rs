@@ -44,6 +44,8 @@ mod test_helpers;
 /// Per-peer facts the reactor needs globally and the routine reads back.
 #[derive(Debug)]
 pub(super) struct Entry {
+    #[cfg(test)]
+    pub(super) exchange_counts: (u64, u64),
     pub(super) direction: ServicePeerDirection,
     pub(super) servable_low: block::Height,
     pub(super) servable_high: block::Height,
@@ -85,6 +87,8 @@ impl Entry {
         generation: u64,
     ) -> Self {
         Self {
+            #[cfg(test)]
+            exchange_counts: (0, 0),
             direction,
             servable_low: block::Height::MIN,
             servable_high: block::Height::MIN,
@@ -583,6 +587,10 @@ impl PeerRegistry {
         peers
             .entry(peer.clone())
             .and_modify(|entry| {
+                #[cfg(test)]
+                {
+                    entry.exchange_counts = (0, 0);
+                }
                 entry.direction = direction;
                 entry.outstanding = ResponseVec::new();
                 entry.response_ranges = ResponseVec::new();
@@ -1806,3 +1814,6 @@ mod floor_bias_tests {
         assert!(!reg.is_peer_parked(&peer, now));
     }
 }
+
+#[cfg(test)]
+mod compliance_observations;

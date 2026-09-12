@@ -1,5 +1,8 @@
 use super::{config::*, error::*, *};
 
+#[cfg(test)]
+mod compliance;
+
 /// Zakura stream kind reserved for native block sync.
 pub const ZAKURA_STREAM_BLOCK_SYNC: u16 = 6;
 /// Request-only stream paired with the block-sync data stream.

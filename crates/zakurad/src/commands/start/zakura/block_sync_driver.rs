@@ -1751,6 +1751,7 @@ pub(crate) fn block_sync_needed_blocks_from_state(
 
 #[cfg(test)]
 mod tests {
+    mod compliance;
     use super::super::SyncCoordinator;
     use super::*;
 

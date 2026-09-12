@@ -59,6 +59,9 @@ use zakura_chain::{
 
 mod trace;
 
+#[cfg(test)]
+mod compliance;
+
 /// How long a routine avoids a height after returning it because of a failure.
 /// The delay lets another routine take the height first on the single-threaded
 /// test runtime. The queue keeps the height pending for every other peer.
@@ -239,6 +242,8 @@ pub(super) struct PeerRoutine {
     /// This peer's ordered stream-6 frame reader. Decoded in the routine's own
     /// task; inbound never flows through the reactor (per-peer routines inverted data flow).
     recv: FramedRecv,
+    #[cfg(test)]
+    decode_probe: Option<Arc<zakura_test::execution::ExecutionProbe>>,
 
     // ---- per-peer download state (moved out of `PeerBlockState`) ----
     window: DownloadWindow,
@@ -353,6 +358,8 @@ impl PeerRoutine {
             config,
             allow_no_progress_park,
             recv,
+            #[cfg(test)]
+            decode_probe: None,
             window,
             outstanding_snapshot: ResponseVec::new(),
             received_status: false,
@@ -614,25 +621,36 @@ impl PeerRoutine {
         };
         // Measured here, on the per-peer task, so the body size never has to be
         // recomputed by re-serializing the block on another thread (A1).
-        let (msg, raw_block_payload) =
-            match BlockSyncMessage::decode_frame_with_raw_block_payload(frame) {
-                Ok(decoded) => decoded,
-                Err(error) => {
-                    // A malformed frame is `MalformedMessage` misbehavior AND a fatal
-                    // protocol reject for the whole connection. Report via the shared
-                    // channel, then reject; the report is best-effort and never blocks.
-                    let protocol_error =
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string());
-                    tracing::debug!(peer = ?self.peer, ?error, "malformed Zakura block-sync frame");
-                    let _ = self
-                        .routine_to_reactor
-                        .try_send(RoutineToReactor::Misbehavior {
-                            peer: self.peer.clone(),
-                            reason: BlockSyncMisbehavior::MalformedMessage,
-                        });
-                    return Err(SinkReject::protocol(protocol_error));
-                }
-            };
+        #[cfg(test)]
+        let decoded = if let Some(probe) = &self.decode_probe {
+            let (decoded, allocations) = zakura_test::allocations::measure(|| {
+                BlockSyncMessage::decode_frame_with_raw_block_payload(frame)
+            });
+            probe.allocations(allocations);
+            decoded
+        } else {
+            BlockSyncMessage::decode_frame_with_raw_block_payload(frame)
+        };
+        #[cfg(not(test))]
+        let decoded = BlockSyncMessage::decode_frame_with_raw_block_payload(frame);
+        let (msg, raw_block_payload) = match decoded {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                // A malformed frame is `MalformedMessage` misbehavior AND a fatal
+                // protocol reject for the whole connection. Report via the shared
+                // channel, then reject; the report is best-effort and never blocks.
+                let protocol_error =
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string());
+                tracing::debug!(peer = ?self.peer, ?error, "malformed Zakura block-sync frame");
+                let _ = self
+                    .routine_to_reactor
+                    .try_send(RoutineToReactor::Misbehavior {
+                        peer: self.peer.clone(),
+                        reason: BlockSyncMisbehavior::MalformedMessage,
+                    });
+                return Err(SinkReject::protocol(protocol_error));
+            }
+        };
         let body_wire_bytes = msg.block_body_wire_bytes(frame_payload_bytes);
         self.trace_message_received(&msg);
 
@@ -1319,6 +1337,9 @@ impl PeerRoutine {
                 break FillStop::SendError;
             }
             metrics::counter!("sync.block.request.sent").increment(1);
+            #[cfg(test)]
+            self.registry
+                .observe_exchange_for_test(&self.peer, self.generation, true);
             if in_bypass {
                 // A floor request borrowed a bypass slot while the cwnd was saturated.
                 metrics::counter!("sync.block.request.floor_bypass").increment(1);
@@ -1817,6 +1838,9 @@ impl PeerRoutine {
         };
         self.charge_short_response_reliability(index, disposition);
         self.finish_outstanding_at(index, disposition);
+        #[cfg(test)]
+        self.registry
+            .observe_exchange_for_test(&self.peer, self.generation, false);
         Ok(())
     }
 
@@ -1845,6 +1869,9 @@ impl PeerRoutine {
         );
         self.charge_short_response_reliability(index, Disposition::RetryOriginal);
         self.finish_outstanding_at(index, Disposition::RetryOriginal);
+        #[cfg(test)]
+        self.registry
+            .observe_exchange_for_test(&self.peer, self.generation, false);
         Ok(())
     }
 

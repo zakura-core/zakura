@@ -41,7 +41,7 @@ default-filter = "not test(check_no_git_dependencies) and not test(=fully_synced
 
 # Controlled regulation tests must fail on their first divergent execution.
 [[profile.all-tests.overrides]]
-filter = 'test(~native_block_cap_) or test(~terminal_codecs_) or test(~frame_tag_mismatch_) or test(~message_payload_limits_) or test(~inbound_frame_cap_rejects_) or test(~paused_ordered_reads_) or test(~stream_cancel_closes_ordered_worker_) or test(~block_sync::service::tests::) or test(~transport::io::) or test(~reconciliation_rejects_stale_admissions_) or test(~regulation::request::) or test(~serving_regulation::) or test(~block_sync::serving::) or test(~work_queue::request_write::tests::) or test(~handler::service_session::tests::) or test(~service::block_range::tests::) or (test(~handler::tests::paired_block_sync::) and not test(~handler::tests::paired_block_sync::gate::))'
+filter = 'test(~native_block_cap_) or test(~terminal_codecs_) or test(~frame_tag_mismatch_) or test(~message_payload_limits_) or test(~inbound_frame_cap_rejects_) or test(~paused_ordered_reads_) or test(~stream_cancel_closes_ordered_worker_) or test(~block_sync::service::tests::) or test(~transport::io::) or test(~reconciliation_rejects_stale_admissions_) or test(~regulation::request::) or test(~regulation::properties::) or test(~serving_regulation::) or test(~block_sync::serving::) or test(~work_queue::request_write::tests::) or test(~handler::service_session::tests::) or test(~service::block_range::tests::) or (test(~handler::tests::paired_block_sync::) and not test(~handler::tests::paired_block_sync::gate::))'
 retries = 0
 slow-timeout = { period = "60s", terminate-after = 1 }
 
@@ -74,7 +74,7 @@ default-filter = "not test(check_no_git_dependencies) and not test(=fully_synced
 
 # Controlled regulation tests must fail on their first divergent execution.
 [[profile.full-tests.overrides]]
-filter = 'test(~native_block_cap_) or test(~terminal_codecs_) or test(~frame_tag_mismatch_) or test(~message_payload_limits_) or test(~inbound_frame_cap_rejects_) or test(~paused_ordered_reads_) or test(~stream_cancel_closes_ordered_worker_) or test(~block_sync::service::tests::) or test(~transport::io::) or test(~reconciliation_rejects_stale_admissions_) or test(~regulation::request::) or test(~serving_regulation::) or test(~block_sync::serving::) or test(~work_queue::request_write::tests::) or test(~handler::service_session::tests::) or test(~service::block_range::tests::) or (test(~handler::tests::paired_block_sync::) and not test(~handler::tests::paired_block_sync::gate::))'
+filter = 'test(~native_block_cap_) or test(~terminal_codecs_) or test(~frame_tag_mismatch_) or test(~message_payload_limits_) or test(~inbound_frame_cap_rejects_) or test(~paused_ordered_reads_) or test(~stream_cancel_closes_ordered_worker_) or test(~block_sync::service::tests::) or test(~transport::io::) or test(~reconciliation_rejects_stale_admissions_) or test(~regulation::request::) or test(~regulation::properties::) or test(~serving_regulation::) or test(~block_sync::serving::) or test(~work_queue::request_write::tests::) or test(~handler::service_session::tests::) or test(~service::block_range::tests::) or (test(~handler::tests::paired_block_sync::) and not test(~handler::tests::paired_block_sync::gate::))'
 retries = 0
 slow-timeout = { period = "60s", terminate-after = 1 }
 
@@ -249,7 +249,7 @@ default-filter = 'package(zakura) and test(~zcashd_compat)'
 # Also selected by ordinary unit-test profiles; isolate the fixed regression checks.
 [profile.blocksync-regression]
 fail-fast = false
-default-filter = 'test(~peer_registry::) or test(~block_sync::tests::) or test(~block_sync::bbr::) or test(~regulation::response_memory::) or test(~regulation::response_scope::) or test(~regulation::response_vec::) or test(~transport::registry::tests::response_memory_) or test(~regulation::response::) or test(~authorized_late_body_claims_) or test(~peer_routine::tests::) or test(~transport::pipe::tests::local_) or test(~transport::pipe::tests::protocol_pipe_exit_) or test(~transport::service::tests::sink_reject_) or test(~peer_routine::tests::cancelled_session_settles_) or test(~peer_routine::tests::buffered_responses_are_) or test(~peer_routine::tests::malformed_blocks_are_) or test(~native_block_cap_) or test(~terminal_codecs_) or test(~frame_tag_mismatch_) or test(~message_payload_limits_) or test(~inbound_frame_cap_rejects_) or test(~paused_ordered_reads_) or test(~stream_cancel_closes_ordered_worker_) or test(~block_sync::service::tests::) or test(~transport::io::) or test(~reconciliation_rejects_stale_admissions_) or test(~regulation::request::) or test(~serving_regulation::) or test(~block_sync::serving::) or test(~work_queue::request_write::tests::) or test(~handler::service_session::tests::) or test(~service::block_range::tests::) or (test(~handler::tests::paired_block_sync::) and not test(~handler::tests::paired_block_sync::gate::))'
+default-filter = '(test(~peer_registry::) or test(~block_sync::tests::) or test(~block_sync::bbr::) or test(~regulation::response_memory::) or test(~regulation::response_scope::) or test(~regulation::response_vec::) or test(~transport::registry::tests::response_memory_) or test(~regulation::response::) or test(~authorized_late_body_claims_) or test(~peer_routine::tests::) or test(~transport::pipe::tests::local_) or test(~transport::pipe::tests::protocol_pipe_exit_) or test(~transport::service::tests::sink_reject_) or test(~peer_routine::tests::cancelled_session_settles_) or test(~peer_routine::tests::buffered_responses_are_) or test(~peer_routine::tests::malformed_blocks_are_) or test(~native_block_cap_) or test(~terminal_codecs_) or test(~frame_tag_mismatch_) or test(~message_payload_limits_) or test(~inbound_frame_cap_rejects_) or test(~paused_ordered_reads_) or test(~stream_cancel_closes_ordered_worker_) or test(~block_sync::service::tests::) or test(~transport::io::) or test(~reconciliation_rejects_stale_admissions_) or test(~regulation::request::) or test(~regulation::properties::) or test(~serving_regulation::) or test(~block_sync::serving::) or test(~work_queue::request_write::tests::) or test(~handler::service_session::tests::) or test(~service::block_range::tests::) or (test(~handler::tests::paired_block_sync::) and not test(~handler::tests::paired_block_sync::gate::))) and not (test(~regulation::properties::) or test(~regulation::request::properties::) or test(~serving_regulation::properties::) or test(~serving_regulation::policy::properties::) or test(~block_sync::serving::tests::properties::) or test(~service::block_range::tests::properties::))'
 retries = 0
 slow-timeout = { period = "60s", terminate-after = 1 }
 
@@ -259,4 +259,37 @@ default-filter = 'test(~handler::tests::paired_block_sync::gate::)'
 test-threads = 1
 retries = 0
 slow-timeout = { period = "90m", terminate-after = 1 }
+failure-output = "immediate"
+
+# Generated contracts and fixed model witnesses. Do not retry counterexamples.
+[profile.regulation-properties]
+fail-fast = false
+default-filter = 'test(~regulation::properties::) or test(~regulation::request::properties::) or test(~serving_regulation::properties::) or test(~serving_regulation::policy::properties::) or test(~block_sync::serving::tests::properties::) or test(~service::block_range::tests::properties::) or (test(~::compliance::) and (test(~_generated_) or test(~f02_bounded_response_payloads)))'
+retries = 0
+slow-timeout = { period = "60s", terminate-after = 1 }
+
+# Scheduled runs execute 2,048 receiver histories with real block decoding.
+# Per-event waits remain bounded inside the fixture.
+[[profile.regulation-properties.overrides]]
+filter = 'test(~r09_r10_generated_local_changes_preserve_live_authorization)'
+slow-timeout = { period = "5m", terminate-after = 1 }
+
+# Executable PR 747 requirements may be red while the implementation catches up.
+# Run every witness. Do not hide failures with retries or expected-failure markers.
+[profile.regulation-compliance]
+default-filter = 'test(~::compliance::) or test(~::compliance_frames::) or (package(zakura-test) and test(~allocations::tests::))'
+fail-fast = false
+retries = 0
+test-threads = 4
+slow-timeout = { period = "90s", terminate-after = 1 }
+failure-output = "immediate"
+
+# Same bounded tests with more rounds on scheduled/manual jobs.
+[profile.regulation-load]
+default-filter = 'test(~serving::tests::compliance::load::) or test(~handler::tests::paired_block_sync::compliance::) or test(~serving::tests::compliance::c05_)'
+fail-fast = false
+retries = 0
+test-threads = 1
+slow-timeout = { period = "10m", terminate-after = 1 }
+success-output = "immediate"
 failure-output = "immediate"

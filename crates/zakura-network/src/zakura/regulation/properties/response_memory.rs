@@ -31,6 +31,34 @@ fn response_authorization_funds_allocation_before_retaining_it() {
     assert_eq!(node.reserved_for_test(), 0);
 }
 
+#[test]
+fn response_authorization_transitions_do_not_allocate_unfunded_storage() {
+    use crate::zakura::CloseCause;
+    use tokio_util::sync::CancellationToken;
+    use zakura_test::allocations::measure;
+
+    let node = ResponseMemory::new(4096, 4096);
+    let scope = ResponseScope::with_memory(
+        CancellationToken::new(),
+        CloseCause::new(),
+        node.connection(),
+    );
+    let mut authorization = scope.authorize().unwrap();
+    let writer = authorization.write_permission();
+    let funded_before = node.reserved_for_test();
+    let (_, allocated) = measure(|| {
+        assert!(writer.publish(|| {}));
+        assert!(writer.try_start(|| true));
+        authorization.finish();
+    });
+    let additionally_funded = node.reserved_for_test() - funded_before;
+    assert!(
+        u64::try_from(allocated.peak_live_bytes).unwrap() <= additionally_funded,
+        "transitions retained {} extra bytes with {additionally_funded} extra bytes funded",
+        allocated.peak_live_bytes,
+    );
+}
+
 proptest! {
     #[test]
     fn response_metadata_histories_account_for_every_retained_owner(

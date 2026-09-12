@@ -29,6 +29,7 @@
         "src/connection/streams/send.rs",
         "src/connection/streams/state.rs",
         "src/range_set/array_range_set.rs",
+        "src/range_set/tests.rs",
         "src/tests/mod.rs",
         "src/tests/multipath.rs"
       ],

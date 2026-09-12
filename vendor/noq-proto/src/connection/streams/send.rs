@@ -2,7 +2,7 @@ use bytes::Bytes;
 use thiserror::Error;
 
 use crate::{
-    VarInt,
+    TransportError, VarInt,
     connection::{send_buffer::SendBuffer, streams::BytesOrSlice},
     frame,
 };
@@ -24,7 +24,11 @@ pub(super) struct Send {
 }
 
 impl Send {
-    pub(super) fn new(max_data: VarInt, bounded_send_buffers: bool) -> Box<Self> {
+    pub(super) fn new(
+        max_data: VarInt,
+        bounded_send_buffers: bool,
+        range_limit: Option<std::num::NonZeroUsize>,
+    ) -> Box<Self> {
         Box::new(Self {
             max_data: max_data.into(),
             state: SendState::Ready,
@@ -32,7 +36,8 @@ impl Send {
                 SendBuffer::new_bounded()
             } else {
                 SendBuffer::new()
-            },
+            }
+            .with_range_limit(range_limit),
             priority: 0,
             fin_pending: false,
             connection_blocked: false,
@@ -116,9 +121,9 @@ impl Send {
     }
 
     /// Returns whether the stream has been finished and all data has been acknowledged by the peer
-    pub(super) fn ack(&mut self, frame: frame::StreamMeta) -> bool {
-        self.pending.ack(frame.offsets);
-        match self.state {
+    pub(super) fn ack(&mut self, frame: frame::StreamMeta) -> Result<bool, TransportError> {
+        self.pending.ack(frame.offsets)?;
+        Ok(match self.state {
             SendState::DataSent {
                 ref mut finish_acked,
             } => {
@@ -126,7 +131,7 @@ impl Send {
                 *finish_acked && self.pending.is_fully_acked()
             }
             _ => false,
-        }
+        })
     }
 
     /// Handle increase to stream-level flow control limit

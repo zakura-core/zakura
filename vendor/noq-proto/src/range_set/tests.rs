@@ -5,6 +5,48 @@ use super::*;
 mod array_range_set {
     use super::*;
 
+    #[test_strategy::proptest]
+    fn bounded_insert_matches_independent_membership(
+        #[strategy(1usize..32)] limit: usize,
+        #[strategy(proptest::collection::vec((0usize..256, 0usize..16), 1..500))] inserts: Vec<(
+            usize,
+            usize,
+        )>,
+    ) {
+        let mut set: ArrayRangeSet = ArrayRangeSet::new();
+        let mut reference = vec![false; 256];
+        for (start, length) in inserts {
+            let end = (start + length).min(256);
+            let mut candidate = reference.clone();
+            candidate[start..end].fill(true);
+            let ranges = candidate
+                .iter()
+                .enumerate()
+                .filter(|(index, present)| **present && (*index == 0 || !candidate[*index - 1]))
+                .count();
+            let capacity = set.heap_capacity();
+            let result = set.try_insert(
+                u64::try_from(start).unwrap()..u64::try_from(end).unwrap(),
+                limit,
+            );
+            if ranges <= limit {
+                assert_eq!(result.unwrap(), reference != candidate);
+                reference = candidate;
+            } else {
+                assert!(result.is_err());
+                assert_eq!(
+                    set.heap_capacity(),
+                    capacity,
+                    "reject before growing storage"
+                );
+            }
+            assert!(set.heap_capacity() <= 2 * limit);
+            for (index, expected) in reference.iter().enumerate() {
+                assert_eq!(set.contains(u64::try_from(index).unwrap()), *expected);
+            }
+        }
+    }
+
     #[test]
     fn merge_and_split() {
         let mut set: ArrayRangeSet = ArrayRangeSet::new();

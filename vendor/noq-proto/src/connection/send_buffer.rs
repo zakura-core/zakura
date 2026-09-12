@@ -2,11 +2,12 @@ use std::{collections::VecDeque, ops::Range};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use crate::{VarInt, connection::streams::BytesOrSlice, range_set::ArrayRangeSet};
+use crate::{TransportError, VarInt, connection::streams::BytesOrSlice, range_set::ArrayRangeSet};
 
 /// Buffer of outgoing retransmittable stream data
 #[derive(Default, Debug)]
 pub(super) struct SendBuffer {
+    range_limit: Option<std::num::NonZeroUsize>,
     /// Data queued by the application that has to be retained for resends.
     ///
     /// Only data up to the highest contiguous acknowledged offset can be discarded.
@@ -241,6 +242,11 @@ impl SendBuffer {
         buffer
     }
 
+    pub(super) fn with_range_limit(mut self, limit: Option<std::num::NonZeroUsize>) -> Self {
+        self.range_limit = limit;
+        self
+    }
+
     /// Append application data to the end of the stream
     pub(super) fn write<'a>(&'a mut self, data: impl BytesOrSlice<'a>) {
         self.data.append(data);
@@ -250,25 +256,44 @@ impl SendBuffer {
     pub(super) fn discard(&mut self) {
         let offset = self.offset();
         let bounded = self.data.bounded;
+        let range_limit = self.range_limit;
         *self = Self::default();
+        self.range_limit = range_limit;
         self.data.bounded = bounded;
         self.data.offset = offset;
         self.unsent = offset;
     }
 
     /// Discard a range of acknowledged stream data
-    pub(super) fn ack(&mut self, mut range: Range<u64>) {
+    pub(super) fn ack(&mut self, mut range: Range<u64>) -> Result<(), TransportError> {
         // Clamp the range to data which is still tracked
         let base_offset = self.fully_acked_offset();
         range.start = base_offset.max(range.start);
         range.end = base_offset.max(range.end);
 
-        self.acks.insert(range);
+        if range.start == base_offset {
+            // A newly acknowledged prefix needs no range record, even at capacity.
+            self.data.pop_front((range.end - base_offset) as usize);
+        } else {
+            self.acks
+                .try_insert(
+                    range,
+                    self.range_limit.map_or(usize::MAX, |limit| limit.get()),
+                )
+                .map_err(|_| TransportError::INTERNAL_ERROR("send buffer range memory limit"))?;
+        }
 
-        while self.acks.min() == Some(self.fully_acked_offset()) {
+        while self
+            .acks
+            .min()
+            .is_some_and(|start| start <= self.fully_acked_offset())
+        {
             let prefix = self.acks.pop_min().unwrap();
-            let to_advance = (prefix.end - prefix.start) as usize;
+            let to_advance = prefix.end.saturating_sub(self.fully_acked_offset()) as usize;
             self.data.pop_front(to_advance);
+        }
+        if self.acks.is_empty() {
+            self.acks = ArrayRangeSet::new();
         }
 
         // Remove retransmit ranges which have been acknowledged
@@ -276,6 +301,10 @@ impl SendBuffer {
         // We have to do this since we have just dropped the data, and asking
         // for non-present data would be an error.
         self.retransmits.remove(0..self.fully_acked_offset());
+        if self.retransmits.is_empty() {
+            self.retransmits = ArrayRangeSet::new();
+        }
+        Ok(())
     }
 
     /// Compute the next range to transmit on this stream and update state to account for that
@@ -311,6 +340,9 @@ impl SendBuffer {
             let end = range.end.min((max_len as u64).saturating_add(range.start));
             if end != range.end {
                 self.retransmits.insert(end..range.end);
+            }
+            if self.retransmits.is_empty() {
+                self.retransmits = ArrayRangeSet::new();
             }
             return (range.start..end, encode_length);
         }
@@ -351,7 +383,7 @@ impl SendBuffer {
     }
 
     /// Queue a range of sent but unacknowledged data to be retransmitted
-    pub(super) fn retransmit(&mut self, mut range: Range<u64>) {
+    pub(super) fn retransmit(&mut self, mut range: Range<u64>) -> Result<(), TransportError> {
         debug_assert!(range.end <= self.unsent, "unsent data can't be lost");
         // don't allow retransmitting data that has already been fully acknowledged,
         // since we don't have it anymore.
@@ -360,7 +392,13 @@ impl SendBuffer {
         // for simplicity. Not doing so would require clipping the range against
         // all acknowledged ranges.
         range.start = range.start.max(self.fully_acked_offset());
-        self.retransmits.insert(range);
+        self.retransmits
+            .try_insert(
+                range,
+                self.range_limit.map_or(usize::MAX, |limit| limit.get()),
+            )
+            .map_err(|_| TransportError::INTERNAL_ERROR("send buffer range memory limit"))?;
+        Ok(())
     }
 
     pub(super) fn retransmit_all_for_0rtt(&mut self) {
@@ -405,6 +443,83 @@ mod tests {
         Arc,
         atomic::{AtomicBool, Ordering},
     };
+
+    #[test]
+    fn send_buffer_ack_ranges_respect_capacity() {
+        let mut buffer = SendBuffer::new_bounded().with_range_limit(std::num::NonZeroUsize::new(2));
+        buffer.write(&[42; 32][..]);
+        let _ = buffer.poll_transmit(64);
+        buffer.ack(1..2).unwrap();
+        buffer.ack(3..4).unwrap();
+        assert!(buffer.ack(5..6).is_err());
+        assert_eq!(buffer.acks.range_count(), 2);
+        assert_eq!(buffer.acks.heap_capacity(), 0);
+        buffer.ack(3..4).unwrap(); // duplicate at capacity
+        buffer.ack(0..1).unwrap(); // disjoint prefix needs no new record
+        assert_eq!(buffer.fully_acked_offset(), 2);
+        buffer.ack(5..6).unwrap();
+        buffer.ack(4..5).unwrap(); // merge at capacity
+        buffer.ack(2..4).unwrap(); // overlaps the oldest tracked range
+        assert_eq!(buffer.fully_acked_offset(), 6);
+        assert_eq!(buffer.acks.heap_capacity(), 0);
+        buffer.discard();
+        buffer.write(&[42; 32][..]);
+        let _ = buffer.poll_transmit(64);
+        buffer.ack(33..34).unwrap();
+        buffer.ack(35..36).unwrap();
+        assert!(buffer.ack(37..38).is_err(), "reset must preserve the limit");
+    }
+
+    #[test]
+    fn send_buffer_retransmit_ranges_respect_capacity() {
+        let mut buffer = SendBuffer::new_bounded().with_range_limit(std::num::NonZeroUsize::new(2));
+        buffer.write(&[42; 32][..]);
+        let _ = buffer.poll_transmit(64);
+        buffer.retransmit(1..2).unwrap();
+        buffer.retransmit(3..4).unwrap();
+        assert!(buffer.retransmit(5..6).is_err());
+        assert_eq!(buffer.retransmits.range_count(), 2);
+        assert_eq!(buffer.retransmits.heap_capacity(), 0);
+        buffer.retransmit(3..4).unwrap();
+        buffer.retransmit(2..3).unwrap();
+        assert_eq!(buffer.retransmits.range_count(), 1);
+        buffer.retransmit(5..6).unwrap();
+        assert!(buffer.retransmit(7..8).is_err());
+    }
+
+    #[test]
+    fn send_buffer_releases_idle_range_storage() {
+        let mut buffer = SendBuffer::new_bounded();
+        buffer.write(&[42; 1024][..]);
+        let _ = buffer.poll_transmit(2048);
+        for start in (1..1024).step_by(2) {
+            buffer.ack(start..start + 1).unwrap();
+            buffer.retransmit(start..start + 1).unwrap();
+        }
+        assert!(buffer.acks.heap_capacity() >= 512);
+        assert!(buffer.retransmits.heap_capacity() >= 512);
+        buffer.ack(0..1024).unwrap();
+        assert!(buffer.is_fully_acked());
+        assert_eq!(buffer.acks.heap_capacity(), 0);
+        assert_eq!(buffer.retransmits.heap_capacity(), 0);
+    }
+
+    #[test]
+    fn send_buffer_releases_consumed_retransmit_storage() {
+        let mut buffer = SendBuffer::new_bounded();
+        buffer.write(&[42; 1024][..]);
+        let _ = buffer.poll_transmit(2048);
+        for start in (1..1024).step_by(2) {
+            buffer.retransmit(start..start + 1).unwrap();
+        }
+        assert!(buffer.retransmits.heap_capacity() >= 512);
+        for start in (1..1024).step_by(2) {
+            assert_eq!(buffer.poll_transmit(32).0, start..start + 1);
+        }
+        assert!(!buffer.has_unsent_data());
+        assert_eq!(buffer.retained(), 1024);
+        assert_eq!(buffer.retransmits.heap_capacity(), 0);
+    }
 
     #[test]
     fn bounded_send_buffer_releases_source_aliases_including_after_reset() {
@@ -457,13 +572,13 @@ mod tests {
         assert!(buffer.data.last_segment.capacity() <= BOUNDED_SEND_CHUNK_BYTES);
         let end = u64::try_from(length).unwrap();
         let _ = buffer.poll_transmit(length + 16);
-        buffer.ack(0..end - 1);
+        buffer.ack(0..end - 1).unwrap();
         assert_eq!(buffer.data.to_vec(), vec![42]);
         assert!(buffer.data.segments.len() <= 1);
         buffer.write(b"next".as_slice());
         let _ = buffer.poll_transmit(64);
         assert_eq!(buffer.data.to_vec(), b"*next");
-        buffer.ack(end - 1..end + 4);
+        buffer.ack(end - 1..end + 4).unwrap();
         assert!(buffer.is_fully_acked());
         assert_eq!(buffer.data.segments.capacity(), 0);
         assert_eq!(buffer.data.last_segment.capacity(), 0);
@@ -477,7 +592,7 @@ mod tests {
         let _ = buffer.poll_transmit(length + 16);
         for offset in 0..1024 {
             let before = buffer.data.last_segment.as_ptr();
-            buffer.ack(offset..offset + 1);
+            buffer.ack(offset..offset + 1).unwrap();
             buffer.write(b"*".as_slice());
             let _ = buffer.poll_transmit(32);
             assert_eq!(buffer.data.last_segment.as_ptr(), before.wrapping_add(1));
@@ -544,7 +659,7 @@ mod tests {
 
         // Offset 0 requires no space
         assert_eq!(buf.poll_transmit(16), (0..16, false));
-        buf.retransmit(0..16);
+        buf.retransmit(0..16).unwrap();
         assert_eq!(buf.poll_transmit(16), (0..16, false));
         let mut transmitted = 16u64;
 
@@ -553,7 +668,7 @@ mod tests {
             buf.poll_transmit((SIZE1 - transmitted + 1) as usize),
             (transmitted..SIZE1, false)
         );
-        buf.retransmit(transmitted..SIZE1);
+        buf.retransmit(transmitted..SIZE1).unwrap();
         assert_eq!(
             buf.poll_transmit((SIZE1 - transmitted + 1) as usize),
             (transmitted..SIZE1, false)
@@ -565,7 +680,7 @@ mod tests {
             buf.poll_transmit((SIZE2 - transmitted + 2) as usize),
             (transmitted..SIZE2, false)
         );
-        buf.retransmit(transmitted..SIZE2);
+        buf.retransmit(transmitted..SIZE2).unwrap();
         assert_eq!(
             buf.poll_transmit((SIZE2 - transmitted + 2) as usize),
             (transmitted..SIZE2, false)
@@ -577,7 +692,7 @@ mod tests {
             buf.poll_transmit((SIZE3 - transmitted + 4) as usize),
             (transmitted..SIZE3, false)
         );
-        buf.retransmit(transmitted..SIZE3);
+        buf.retransmit(transmitted..SIZE3).unwrap();
         assert_eq!(
             buf.poll_transmit((SIZE3 - transmitted + 4) as usize),
             (transmitted..SIZE3, false)
@@ -589,7 +704,8 @@ mod tests {
             buf.poll_transmit(chunk.len() + 8),
             (transmitted..transmitted + chunk.len() as u64, false)
         );
-        buf.retransmit(transmitted..transmitted + chunk.len() as u64);
+        buf.retransmit(transmitted..transmitted + chunk.len() as u64)
+            .unwrap();
         assert_eq!(
             buf.poll_transmit(chunk.len() + 8),
             (transmitted..transmitted + chunk.len() as u64, false)
@@ -639,20 +755,20 @@ mod tests {
         assert!(same(buf.get(8 * 2000..msg_len), &seg4));
         assert!(same(buf.get(9 * 2000..msg_len), &seg5));
         // Now drain the segments
-        buf.ack(0..K);
+        buf.ack(0..K).unwrap();
         assert_eq!(aggregate_unacked(&buf), &msg[N..]);
-        buf.ack(0..3 * K);
+        buf.ack(0..3 * K).unwrap();
         assert_eq!(aggregate_unacked(&buf), &msg[3 * N..]);
-        buf.ack(3 * K..5 * K);
+        buf.ack(3 * K..5 * K).unwrap();
         assert_eq!(aggregate_unacked(&buf), &msg[5 * N..]);
         // ack with gap, doesn't free anything
-        buf.ack(7 * K..9 * K);
+        buf.ack(7 * K..9 * K).unwrap();
         assert_eq!(aggregate_unacked(&buf), &msg[5 * N..]);
         // fill the gap, free up to 9 K
-        buf.ack(4 * K..7 * K);
+        buf.ack(4 * K..7 * K).unwrap();
         assert_eq!(aggregate_unacked(&buf), &msg[9 * N..]);
         // ack all
-        buf.ack(0..msg_len);
+        buf.ack(0..msg_len).unwrap();
         assert_eq!(aggregate_unacked(&buf), &[] as &[u8]);
     }
 
@@ -665,12 +781,12 @@ mod tests {
         assert_eq!(buf.poll_transmit(16), (0..16, false));
         assert_eq!(buf.poll_transmit(16), (16..23, true));
         // Lose the first, but not the second
-        buf.retransmit(0..16);
+        buf.retransmit(0..16).unwrap();
         // Ensure we only retransmit the lost frame, then continue sending fresh data
         assert_eq!(buf.poll_transmit(16), (0..16, false));
         assert_eq!(buf.poll_transmit(16), (23..MSG.len() as u64, true));
         // Lose the second frame
-        buf.retransmit(16..23);
+        buf.retransmit(16..23).unwrap();
         assert_eq!(buf.poll_transmit(16), (16..23, true));
     }
 
@@ -680,7 +796,7 @@ mod tests {
         const MSG: &[u8] = b"Hello, world!";
         buf.write(MSG);
         assert_eq!(buf.poll_transmit(16), (0..8, true));
-        buf.ack(0..8);
+        buf.ack(0..8).unwrap();
         assert_eq!(aggregate_unacked(&buf), &MSG[8..]);
     }
 
@@ -691,9 +807,9 @@ mod tests {
         buf.write(MSG);
         assert_eq!(buf.poll_transmit(16), (0..16, false));
         assert_eq!(buf.poll_transmit(16), (16..23, true));
-        buf.ack(16..23);
+        buf.ack(16..23).unwrap();
         assert_eq!(aggregate_unacked(&buf), MSG);
-        buf.ack(0..16);
+        buf.ack(0..16).unwrap();
         assert_eq!(aggregate_unacked(&buf), &MSG[23..]);
         assert!(buf.acks.is_empty());
     }
@@ -788,13 +904,13 @@ mod proptests {
                         max_full_send_offset = range.end;
                     }
                     trace!("Op::Ack({:?})", range);
-                    sb.ack(range);
+                    sb.ack(range).unwrap();
                 }
                 Op::Retransmit(range) => {
                     // we can only get retransmits for data that has been sent
                     let range = map_range(range, 0..max_send_offset);
                     trace!("Op::Retransmit({:?})", range);
-                    sb.retransmit(range);
+                    sb.retransmit(range).unwrap();
                 }
                 Op::PollTransmit(max_len) => {
                     trace!("Op::PollTransmit({})", max_len);
@@ -827,7 +943,7 @@ mod proptests {
         }
         // Drain all remaining data
         trace!("Op::Retransmit({:?})", 0..max_send_offset);
-        sb.retransmit(0..max_send_offset);
+        sb.retransmit(0..max_send_offset).unwrap();
         loop {
             trace!("Op::PollTransmit({})", 1024);
             let (range, _partial) = sb.poll_transmit(1024);
@@ -835,7 +951,7 @@ mod proptests {
                 break;
             }
             trace!("Op::Ack({:?})", range);
-            sb.ack(range);
+            sb.ack(range).unwrap();
         }
         assert!(
             sb.is_fully_acked(),

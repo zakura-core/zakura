@@ -46,6 +46,18 @@ partially acknowledged front block and spare tail capacity. Idle and reset
 buffers release their payload storage. Metadata and allocator overhead still
 need separate funding. Dependency consumers retain zero-copy writes by default.
 
+Native connections also cap each send stream's acknowledgment and retransmission
+range sets at 4,096 records. Admission checks precede growth. Duplicates, merges
+and newly acknowledged prefixes remain possible at capacity. Exhaustion is a
+local connection failure, including during loss detection and path retirement.
+Empty range sets release their backing arrays. The arrays can reserve up to twice
+the record limit, which needs a separate metadata allowance.
+
+The native policy now enables 16 remote and 17 local bidirectional streams,
+256 KiB per stream and 9.5 MiB connection credit. It enables the receive-fragment
+and packet-history limits described above. The policy and outstanding allocation
+proof are recorded in ../docs/design/native-transport-capacity.md.
+
 An optional packet-history limit bounds the packet-number span of sent and lost
 records in each path and encryption space. The indexed buffers allocate for gaps
 as well as occupied records, so a record count alone is insufficient. Exhausting

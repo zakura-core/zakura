@@ -150,13 +150,22 @@ pub const ZAKURA_DUPLICATE_EVICT_MIN_AGE: Duration = Duration::from_secs(300);
 /// resolution (milliseconds) so a genuine race keeps the transcript-tiebreak
 /// winner instead of flapping.
 pub const ZAKURA_SAME_IP_DUPLICATE_EVICT_MIN_AGE: Duration = Duration::from_secs(5);
-/// A paused stream may consume at most half the connection receive window,
-/// leaving credit for another service stream.
-pub const DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW: u32 = 16 * 1024 * 1024;
-/// QUIC connection receive window used by Zakura endpoints.
-pub const DEFAULT_ZAKURA_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;
+/// Maximum retained remotely initiated bidirectional transport streams.
+pub const DEFAULT_ZAKURA_REMOTE_BIDI_STREAMS: u32 = 16;
+/// Includes local service, setup, compatibility and retiring bidirectional streams.
+pub const DEFAULT_ZAKURA_LOCAL_BIDI_STREAMS: u32 = 17;
+/// Receive credit available to one stream, including before application admission.
+pub const DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW: u32 = 256 * 1024;
+/// Covers 32 paused siblings and progress through batched connection credit updates.
+pub const DEFAULT_ZAKURA_RECEIVE_WINDOW: u32 = 38 * DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW;
+/// Maximum retained fragment records in a receive stream.
+pub const DEFAULT_ZAKURA_RECEIVE_FRAGMENT_LIMIT: usize = 1024;
+/// Maximum packet-number span retained in each path and encryption space.
+pub const DEFAULT_ZAKURA_PACKET_HISTORY_LIMIT: usize = 4096;
 /// QUIC send window used by Zakura endpoints.
 pub const DEFAULT_ZAKURA_SEND_WINDOW: u64 = 32 * 1024 * 1024;
+/// Maximum retained ranges in each send-stream acknowledgment or retransmission set.
+pub const DEFAULT_ZAKURA_SEND_BUFFER_RANGE_LIMIT: usize = 4096;
 /// Initial backoff before re-dialing a configured Zakura bootstrap peer.
 pub const DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 /// Maximum backoff between re-dials of a configured Zakura bootstrap peer.
@@ -484,12 +493,25 @@ impl ZakuraLocalLimits {
     fn transport_config_builder(&self) -> iroh::endpoint::QuicTransportConfigBuilder {
         QuicTransportConfig::builder()
             .max_remote_nat_traversal_addresses(0)
-            .max_concurrent_bidi_streams(VarInt::from_u32(u32::from(self.max_open_streams)))
+            .max_concurrent_bidi_streams(VarInt::from_u32(
+                u32::from(self.max_open_streams).min(DEFAULT_ZAKURA_REMOTE_BIDI_STREAMS),
+            ))
             .max_concurrent_uni_streams(VarInt::from_u32(0))
+            .max_concurrent_local_bidi_streams(VarInt::from_u32(DEFAULT_ZAKURA_LOCAL_BIDI_STREAMS))
+            .max_concurrent_local_uni_streams(VarInt::from_u32(0))
             .stream_receive_window(VarInt::from_u32(DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW))
             .receive_window(VarInt::from_u32(DEFAULT_ZAKURA_RECEIVE_WINDOW))
+            .receive_fragment_limit(std::num::NonZeroUsize::new(
+                DEFAULT_ZAKURA_RECEIVE_FRAGMENT_LIMIT,
+            ))
+            .packet_history_limit(std::num::NonZeroUsize::new(
+                DEFAULT_ZAKURA_PACKET_HISTORY_LIMIT,
+            ))
             .send_window(DEFAULT_ZAKURA_SEND_WINDOW)
             .bounded_send_buffers(true)
+            .send_buffer_range_limit(std::num::NonZeroUsize::new(
+                DEFAULT_ZAKURA_SEND_BUFFER_RANGE_LIMIT,
+            ))
             .max_idle_timeout(Some(
                 self.quic_idle_timeout
                     .try_into()

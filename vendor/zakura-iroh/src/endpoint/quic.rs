@@ -287,6 +287,16 @@ impl QuicTransportConfigBuilder {
         self
     }
 
+    /// Limit each send stream's retained acknowledgment and retransmission range sets.
+    ///
+    /// Exceeding the range count closes the connection as a local resource failure. Each set's
+    /// backing array can reserve up to twice the limit and releases storage when empty.
+    /// `None` preserves admission without this extra limit.
+    pub fn send_buffer_range_limit(mut self, value: Option<std::num::NonZeroUsize>) -> Self {
+        self.0.send_buffer_range_limit(value);
+        self
+    }
+
     /// Whether to implement fair queuing for send streams having the same priority.
     ///
     /// When enabled, connections schedule data from outgoing streams having the same priority in a

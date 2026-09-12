@@ -45,6 +45,9 @@ impl<const N: usize, T: fmt::Debug + Default> fmt::Debug for ArrayRangeSet<N, T>
 /// An inline capacity of 2 is chosen to keep `SentFrame` below 128 bytes.
 pub(crate) const ARRAY_RANGE_SET_INLINE_CAPACITY: usize = 2;
 
+#[derive(Debug)]
+pub(crate) struct RangeSetFull;
+
 impl<const N: usize> Clone for ArrayRangeSet<N> {
     fn clone(&self) -> Self {
         // tinyvec keeps the heap representation after clones.
@@ -85,6 +88,15 @@ where
     }
 
     #[cfg(test)]
+    pub(crate) fn heap_capacity(&self) -> usize {
+        if self.0.is_heap() {
+            self.0.capacity()
+        } else {
+            0
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn elts_count(&self) -> T {
         self.0.iter().map(|r| r.end - r.start).sum()
     }
@@ -119,11 +131,18 @@ where
     }
 
     pub(crate) fn insert(&mut self, x: Range<T>) -> bool {
+        self.try_insert(x, usize::MAX)
+            .expect("an unlimited range set can admit another range")
+    }
+
+    /// Reject a new disjoint range before allocation when the record limit is full.
+    /// Duplicates and merges remain allowed at capacity.
+    pub(crate) fn try_insert(&mut self, x: Range<T>, limit: usize) -> Result<bool, RangeSetFull> {
         let mut result = false;
 
         if x.is_empty() {
             // Don't try to deal with ranges where x.end <= x.start
-            return false;
+            return Ok(false);
         }
 
         // Find the first range that might interact with `x`.
@@ -132,8 +151,11 @@ where
         let idx = self.0.partition_point(|r| r.end < x.start);
 
         if idx == self.0.len() {
+            if self.0.len() >= limit {
+                return Err(RangeSetFull);
+            }
             self.0.push(x);
-            return true;
+            return Ok(true);
         }
 
         let range = &mut self.0[idx];
@@ -141,8 +163,11 @@ where
         if x.end < range.start {
             // The range is fully before this range and therefore not extensible.
             // Add a new range to the left
+            if self.0.len() >= limit {
+                return Err(RangeSetFull);
+            }
             self.0.insert(idx, x);
-            return true;
+            return Ok(true);
         } else if range.start > x.start {
             // The new range starts before this range but overlaps.
             // Extend the current range to the left
@@ -159,7 +184,7 @@ where
 
         if x.end <= range.end {
             // Fully contained
-            return result;
+            return Ok(result);
         }
 
         // Extend the current range to the end of the new range.
@@ -178,7 +203,7 @@ where
             }
         }
 
-        true
+        Ok(true)
     }
 
     pub(crate) fn remove(&mut self, x: Range<T>) -> bool {

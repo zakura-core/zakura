@@ -130,6 +130,7 @@ pub struct StreamsState {
     /// Note this may be less than `retained_send_bytes` if the user has set a new value.
     pub(super) send_window: u64,
     pub(super) bounded_send_buffers: bool,
+    pub(super) send_buffer_range_limit: Option<std::num::NonZeroUsize>,
     /// Configured upper bound for how much unacked data the peer can send us per stream
     pub(super) stream_receive_window: u64,
     receive_fragment_limit: usize,
@@ -185,6 +186,7 @@ impl StreamsState {
             retained_send_bytes: 0,
             send_window,
             bounded_send_buffers: false,
+            send_buffer_range_limit: None,
             stream_receive_window: stream_receive_window.into(),
             receive_fragment_limit: usize::MAX,
             initial_max_stream_data_uni: 0u32.into(),
@@ -210,6 +212,14 @@ impl StreamsState {
 
     pub(crate) fn with_bounded_send_buffers(mut self, enabled: bool) -> Self {
         self.bounded_send_buffers = enabled;
+        self
+    }
+
+    pub(crate) fn with_send_buffer_range_limit(
+        mut self,
+        limit: Option<std::num::NonZeroUsize>,
+    ) -> Self {
+        self.send_buffer_range_limit = limit;
         self
     }
 
@@ -403,11 +413,11 @@ impl StreamsState {
         self.ensure_remote(id);
 
         let max_send_data = self.max_send_data(id);
-        let Some(stream) = self
-            .send
-            .get_mut(&id)
-            .map(get_or_insert_send(max_send_data, self.bounded_send_buffers))
-        else {
+        let Some(stream) = self.send.get_mut(&id).map(get_or_insert_send(
+            max_send_data,
+            self.bounded_send_buffers,
+            self.send_buffer_range_limit,
+        )) else {
             return;
         };
 
@@ -627,9 +637,12 @@ impl StreamsState {
         builder.sent_frames().stream_frames.clone()
     }
 
-    pub(crate) fn received_ack_of(&mut self, frame: frame::StreamMeta) {
+    pub(crate) fn received_ack_of(
+        &mut self,
+        frame: frame::StreamMeta,
+    ) -> Result<(), TransportError> {
         let mut entry = match self.send.entry(frame.id) {
-            hash_map::Entry::Vacant(_) => return,
+            hash_map::Entry::Vacant(_) => return Ok(()),
             hash_map::Entry::Occupied(e) => e,
         };
 
@@ -638,37 +651,38 @@ impl StreamsState {
             // this closure should be unreachable. If we did somehow screw that up,
             // then we might hit an underflow below with unpredictable effects down
             // the line. Best to short-circuit.
-            return;
+            return Ok(());
         };
 
         if stream.is_reset() {
             // We account for outstanding data on reset streams at time of reset
-            return;
+            return Ok(());
         }
         let id = frame.id;
         let retained = stream.pending.retained();
-        let finished = stream.ack(frame);
+        let finished = stream.ack(frame)?;
         self.retained_send_bytes -= retained - stream.pending.retained();
         if !finished {
             // The stream is unfinished or may still need retransmits
-            return;
+            return Ok(());
         }
 
         entry.remove_entry();
         self.stream_freed(id, StreamHalf::Send);
         self.events.push_back(StreamEvent::Finished { id });
+        Ok(())
     }
 
-    pub(crate) fn retransmit(&mut self, frame: frame::StreamMeta) {
+    pub(crate) fn retransmit(&mut self, frame: frame::StreamMeta) -> Result<(), TransportError> {
         let Some(stream) = self.send.get_mut(&frame.id).and_then(|s| s.as_mut()) else {
             // Loss of data on a closed stream is a noop
-            return;
+            return Ok(());
         };
         if !stream.is_pending() {
             self.pending.push_pending(frame.id, stream.priority);
         }
         stream.fin_pending |= frame.fin;
-        stream.pending.retransmit(frame.offsets);
+        stream.pending.retransmit(frame.offsets)
     }
 
     pub(crate) fn retransmit_all_for_0rtt(&mut self) {
@@ -734,11 +748,11 @@ impl StreamsState {
 
         let write_limit = self.write_limit();
         let max_send_data = self.max_send_data(id);
-        if let Some(ss) = self
-            .send
-            .get_mut(&id)
-            .map(get_or_insert_send(max_send_data, self.bounded_send_buffers))
-        {
+        if let Some(ss) = self.send.get_mut(&id).map(get_or_insert_send(
+            max_send_data,
+            self.bounded_send_buffers,
+            self.send_buffer_range_limit,
+        )) {
             if ss.increase_max_data(offset) {
                 if write_limit > 0 {
                     self.events.push_back(StreamEvent::Writable { id });
@@ -996,8 +1010,9 @@ impl StreamsState {
 pub(super) fn get_or_insert_send(
     max_data: VarInt,
     bounded_send_buffers: bool,
+    range_limit: Option<std::num::NonZeroUsize>,
 ) -> impl Fn(&mut Option<Box<Send>>) -> &mut Box<Send> {
-    move |opt| opt.get_or_insert_with(|| Send::new(max_data, bounded_send_buffers))
+    move |opt| opt.get_or_insert_with(|| Send::new(max_data, bounded_send_buffers, range_limit))
 }
 
 #[inline]
@@ -2294,11 +2309,14 @@ mod tests {
         };
         assert_eq!(stream.write(b"abcdefgh"), Ok(8));
         assert_eq!(stream.write(b"more"), Err(WriteError::Blocked));
-        stream.state.received_ack_of(frame::StreamMeta {
-            id,
-            offsets: 1..8,
-            fin: false,
-        });
+        stream
+            .state
+            .received_ack_of(frame::StreamMeta {
+                id,
+                offsets: 1..8,
+                fin: false,
+            })
+            .unwrap();
         assert_eq!(
             stream.state.write_limit(),
             0,
@@ -2306,11 +2324,14 @@ mod tests {
         );
         assert_eq!(stream.state.poll(), None);
         assert_eq!(stream.write(b"more"), Err(WriteError::Blocked));
-        stream.state.received_ack_of(frame::StreamMeta {
-            id,
-            offsets: 0..1,
-            fin: false,
-        });
+        stream
+            .state
+            .received_ack_of(frame::StreamMeta {
+                id,
+                offsets: 0..1,
+                fin: false,
+            })
+            .unwrap();
         assert_eq!(stream.state.poll(), Some(StreamEvent::Writable { id }));
         assert_eq!(stream.state.write_limit(), 8);
         assert_eq!(stream.write(b"reclaimed"), Ok(8));
@@ -2341,11 +2362,14 @@ mod tests {
             conn_state: &conn_state,
         };
         assert_eq!(stream.write(b"abcdefgh"), Ok(8));
-        stream.state.received_ack_of(frame::StreamMeta {
-            id,
-            offsets: 1..8,
-            fin: false,
-        });
+        stream
+            .state
+            .received_ack_of(frame::StreamMeta {
+                id,
+                offsets: 1..8,
+                fin: false,
+            })
+            .unwrap();
         stream.reset(0u32.into()).unwrap();
         assert_eq!(stream.state.write_limit(), 8);
         let reset = stream.state.send[&id].as_ref().unwrap();
@@ -2362,11 +2386,14 @@ mod tests {
             stream.reset(0u32.into()),
             Err(crate::ClosedStream { _private: () })
         );
-        stream.state.received_ack_of(frame::StreamMeta {
-            id,
-            offsets: 0..1,
-            fin: false,
-        });
+        stream
+            .state
+            .received_ack_of(frame::StreamMeta {
+                id,
+                offsets: 0..1,
+                fin: false,
+            })
+            .unwrap();
         assert_eq!(
             stream.state.write_limit(),
             8,
@@ -2434,11 +2461,14 @@ mod tests {
         assert_eq!(stream.state.poll(), None);
 
         // Ack the data
-        stream.state.received_ack_of(frame::StreamMeta {
-            id: stream_id,
-            offsets: 0..larger_send_window,
-            fin: false,
-        });
+        stream
+            .state
+            .received_ack_of(frame::StreamMeta {
+                id: stream_id,
+                offsets: 0..larger_send_window,
+                fin: false,
+            })
+            .unwrap();
 
         assert_eq!(
             stream.state.poll(),
@@ -2506,20 +2536,26 @@ mod tests {
         assert_eq!(stream.write(&data), Err(WriteError::Blocked));
 
         // Ack some data, assert that writes are still not accepted due to outstanding sends
-        stream.state.received_ack_of(frame::StreamMeta {
-            id: stream_id,
-            offsets: 0..smaller_send_window,
-            fin: false,
-        });
+        stream
+            .state
+            .received_ack_of(frame::StreamMeta {
+                id: stream_id,
+                offsets: 0..smaller_send_window,
+                fin: false,
+            })
+            .unwrap();
 
         assert_eq!(stream.write(&data), Err(WriteError::Blocked));
 
         // Ack the rest of the data
-        stream.state.received_ack_of(frame::StreamMeta {
-            id: stream_id,
-            offsets: smaller_send_window..initial_send_window,
-            fin: false,
-        });
+        stream
+            .state
+            .received_ack_of(frame::StreamMeta {
+                id: stream_id,
+                offsets: smaller_send_window..initial_send_window,
+                fin: false,
+            })
+            .unwrap();
 
         // This should generate a `Writable` event
         assert_eq!(

@@ -38,6 +38,7 @@ pub struct TransportConfig {
     pub(crate) receive_window: VarInt,
     pub(crate) send_window: u64,
     pub(crate) bounded_send_buffers: bool,
+    pub(crate) send_buffer_range_limit: Option<NonZeroUsize>,
     pub(crate) packet_history_limit: Option<NonZeroUsize>,
     pub(crate) send_fairness: bool,
 
@@ -193,6 +194,17 @@ impl TransportConfig {
     /// Disabled by default to preserve zero-copy writes from `Bytes`.
     pub fn bounded_send_buffers(&mut self, value: bool) -> &mut Self {
         self.bounded_send_buffers = value;
+        self
+    }
+
+    /// Limit the acknowledgment and retransmission range sets retained by each send stream.
+    ///
+    /// Each set admits at most this many disjoint ranges. Duplicates, merges and acknowledged
+    /// prefixes remain allowed at capacity. Exceeding the limit closes the connection as a local
+    /// resource failure. Backing arrays can reserve up to twice this many records per set and
+    /// release their storage when empty. `None` preserves admission without this extra limit.
+    pub fn send_buffer_range_limit(&mut self, value: Option<NonZeroUsize>) -> &mut Self {
+        self.send_buffer_range_limit = value;
         self
     }
 
@@ -619,6 +631,7 @@ impl Default for TransportConfig {
             receive_window: VarInt::MAX,
             send_window: (8 * STREAM_RWND).into(),
             bounded_send_buffers: false,
+            send_buffer_range_limit: None,
             send_fairness: true,
             packet_history_limit: None,
 
@@ -676,6 +689,7 @@ impl fmt::Debug for TransportConfig {
             receive_window,
             send_window,
             bounded_send_buffers,
+            send_buffer_range_limit,
             packet_history_limit,
             send_fairness,
             packet_threshold,
@@ -724,6 +738,7 @@ impl fmt::Debug for TransportConfig {
             .field("receive_window", receive_window)
             .field("send_window", send_window)
             .field("bounded_send_buffers", bounded_send_buffers)
+            .field("send_buffer_range_limit", send_buffer_range_limit)
             .field("packet_history_limit", packet_history_limit)
             .field("send_fairness", send_fairness)
             .field("packet_threshold", packet_threshold)

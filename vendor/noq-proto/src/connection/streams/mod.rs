@@ -279,6 +279,7 @@ impl<'a> SendStream<'a> {
             .map(get_or_insert_send(
                 max_send_data,
                 self.state.bounded_send_buffers,
+                self.state.send_buffer_range_limit,
             ))
             .ok_or(WriteError::ClosedStream)?;
 
@@ -328,6 +329,7 @@ impl<'a> SendStream<'a> {
             .map(get_or_insert_send(
                 max_send_data,
                 self.state.bounded_send_buffers,
+                self.state.send_buffer_range_limit,
             ))
             .ok_or(FinishError::ClosedStream)?;
 
@@ -353,6 +355,7 @@ impl<'a> SendStream<'a> {
             .map(get_or_insert_send(
                 max_send_data,
                 self.state.bounded_send_buffers,
+                self.state.send_buffer_range_limit,
             ))
             .ok_or(ClosedStream { _private: () })?;
 
@@ -385,6 +388,7 @@ impl<'a> SendStream<'a> {
             .map(get_or_insert_send(
                 max_send_data,
                 self.state.bounded_send_buffers,
+                self.state.send_buffer_range_limit,
             ))
             .ok_or(ClosedStream { _private: () })?;
 

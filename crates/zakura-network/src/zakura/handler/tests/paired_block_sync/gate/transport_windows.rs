@@ -167,8 +167,22 @@ async fn headroom_covers_all_candidate_streams_and_one_extra_local_stream() -> R
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_policy_keeps_progress_with_all_sibling_streams_unread() -> Result<(), BoxError> {
+    let limits = ZakuraLocalLimits::from_config(&Config::default());
+    assert!(
+        unread_headroom_with_config(
+            32,
+            limits.transport_config(),
+            DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW,
+            DEFAULT_ZAKURA_RECEIVE_WINDOW,
+        )
+        .await?
+    );
+    Ok(())
+}
+
 async fn unread_headroom(paused: usize, connection_windows: u32) -> Result<bool, BoxError> {
-    const ALPN: &[u8] = b"/zakura/test/acknowledged-headroom/1";
     const WINDOW: u32 = 64 * 1024;
     let config = Windows {
         name: "acknowledged-headroom",
@@ -177,6 +191,16 @@ async fn unread_headroom(paused: usize, connection_windows: u32) -> Result<bool,
         remote_streams: u32::try_from(paused.div_ceil(2).max(1))?,
     }
     .config();
+    unread_headroom_with_config(paused, config, WINDOW, WINDOW * connection_windows).await
+}
+
+async fn unread_headroom_with_config(
+    paused: usize,
+    config: QuicTransportConfig,
+    window_bytes: u32,
+    connection_bytes: u32,
+) -> Result<bool, BoxError> {
+    const ALPN: &[u8] = b"/zakura/test/acknowledged-headroom/1";
     let server = LocalEndpointFactory::with_transport_config(config.clone())
         .endpoint(971_020)
         .await?;
@@ -196,7 +220,7 @@ async fn unread_headroom(paused: usize, connection_windows: u32) -> Result<bool,
     })
     .await??;
     let result = timeout(DEADLINE, async {
-        let payload = vec![42; usize::try_from(WINDOW)?];
+        let payload = vec![42; usize::try_from(window_bytes)?];
         let mut unread = Vec::new();
         let mut unused_halves = Vec::new();
         for index in 0..paused {
@@ -231,7 +255,7 @@ async fn unread_headroom(paused: usize, connection_windows: u32) -> Result<bool,
         let probe = async {
             // Exercise multiple connection-credit updates, not just one frame
             // that happens to fit in the initially available credit.
-            let probe_bytes = usize::try_from(WINDOW * connection_windows)? * 2;
+            let probe_bytes = usize::try_from(connection_bytes)? * 2;
             tokio::try_join!(
                 async {
                     send.write_all(&vec![43; probe_bytes]).await?;
@@ -253,8 +277,12 @@ async fn unread_headroom(paused: usize, connection_windows: u32) -> Result<bool,
         // Resumption must complete the exact original streams and the same
         // pending probe, even for the deliberately exhausted negative control.
         for recv in unread {
-            super::super::super::quic_progress::drain_stream(recv, usize::try_from(WINDOW)?, 42)
-                .await?;
+            super::super::super::quic_progress::drain_stream(
+                recv,
+                usize::try_from(window_bytes)?,
+                42,
+            )
+            .await?;
         }
         if !progressed {
             probe.await?;

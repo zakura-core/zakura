@@ -69,6 +69,31 @@ The maximum connection count remains a separate ceiling. Application objects,
 verification and state caches retain their own budgets outside this transport
 allowance.
 
+## Endpoint lifetime
+
+Connection reservations alone cannot fund the current endpoint implementation.
+`RemoteMap::start_remote_state_actor` creates an endpoint-ID mapping when a remote
+actor starts. `AddrMap::get` inserts both forward and reverse entries, and the map
+has no removal operation. `RemoteMap::remove_or_restart_actor` removes an idle
+actor's sender but leaves those mapping entries behind. Sequential connections
+with new identities can therefore grow endpoint storage after each connection's
+transport reservation is released. This is established by source inspection.
+
+Remote actors also retain their own state for up to 60 seconds after becoming
+idle. That state needs an endpoint allocation owner independent of a connection's
+owner. A complete node model needs bounded admission for remote actors and their
+mapping entries, funding retained capacity through cleanup and concurrent reuse.
+Closing a connection or expiring an actor must not leave unfunded map capacity.
+The same owner must cover incoming peers and outgoing resolution attempts.
+
+Before selecting a numeric connection charge, finish the pending-control and
+packet-metadata bounds, separate fixed endpoint/receive-batch storage, and bound
+these endpoint lifetimes. Then reserve from one configurable node pool before
+creating each owner. Verify sequential identity churn as well as simultaneous
+connection saturation. A count semaphore or an RSS sample alone cannot establish
+this bound. The proposed 4 GiB starting budget remains provisional until those
+charges establish how many connections it can actually fund.
+
 ## Qualification
 
 The milestone is complete only when the enabled policy passes T02 and the full

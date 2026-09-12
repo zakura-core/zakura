@@ -118,9 +118,14 @@ impl PausedSession {
     }
 
     pub(super) async fn fill_window(&self) -> Result<(), BoxError> {
+        self.fill_window_bytes(DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW)
+            .await
+    }
+
+    pub(super) async fn fill_window_bytes(&self, window_bytes: u32) -> Result<(), BoxError> {
         let payload = vec![42; usize::try_from(FRAME_BYTES)? - FRAME_HEADER_BYTES];
         timeout(DEADLINE, async {
-            for _ in 0..DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW / FRAME_BYTES {
+            for _ in 0..window_bytes / FRAME_BYTES {
                 self.send
                     .send(Frame {
                         message_type: 1,

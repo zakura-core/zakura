@@ -12,7 +12,7 @@ const REOPEN_DOWNLOAD_ROUNDS: u32 = 21;
 #[ignore = "standalone 240-second impaired-link activation gate"]
 async fn paired_download_completes_with_request_pressure_and_packet_loss() -> Result<(), BoxError> {
     eprintln!(
-        "paired matched download, 32000 requests, 50ms RTT, 1% loss: {:?}",
+        "paired matched download, offered 32000-request burst, 50ms RTT, 1% loss: {:?}",
         download_over_link(true, true).await?
     );
     Ok(())

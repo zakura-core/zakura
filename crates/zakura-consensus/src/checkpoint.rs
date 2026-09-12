@@ -1067,8 +1067,6 @@ pub enum VerifyCheckpointError {
     Dropped,
     #[error(transparent)]
     CommitCheckpointVerified(BoxError),
-    #[error("checkpoint committed but state handoff check failed: {0}")]
-    CheckpointHandoff(#[source] BoxError),
     #[error(transparent)]
     Tip(BoxError),
     #[error(transparent)]
@@ -1147,7 +1145,7 @@ impl VerifyCheckpointError {
             | Self::ShuttingDown => {
                 BodyVerificationClass::Retryable(TransientBodyFailureKind::Canceled)
             }
-            Self::Dropped | Self::Tip(_) | Self::CheckpointList(_) | Self::CheckpointHandoff(_) => {
+            Self::Dropped | Self::Tip(_) | Self::CheckpointList(_) => {
                 BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
             }
             Self::QueuedLimit => {
@@ -1308,20 +1306,19 @@ where
                         assert_eq!(committed_hash, hash, "state must commit correct hash");
                         if let Some(state) = handoff_state {
                             // This task survives a dropped caller. The checkpoint must be durable
-                            // before the state checks whether it can release queued children.
+                            // before the writable state's Tip request reconciles queued children.
                             let response = tokio::time::timeout(
                                 std::time::Duration::from_secs(30),
-                                state.oneshot(zs::Request::CheckCheckpointHandoff),
+                                state.oneshot(zs::Request::Tip),
                             )
                             .await
-                            .map_err(|error| {
-                                VerifyCheckpointError::CheckpointHandoff(error.into())
-                            })?
-                            .map_err(VerifyCheckpointError::CheckpointHandoff)?;
+                            .map_err(|error| VerifyCheckpointError::Tip(error.into()))?
+                            .map_err(VerifyCheckpointError::Tip)?;
                             assert!(
-                                matches!(response, zs::Response::CheckpointHandoffChecked),
-                                "state must respond to the checkpoint handoff check"
+                                matches!(response, zs::Response::Tip(_)),
+                                "state must respond with the reconciled tip"
                             );
+                            metrics::counter!("checkpoint.state_tip_reconciled").increment(1);
                         }
                         Ok(hash)
                     }

@@ -68,9 +68,6 @@ pub enum Response {
     /// indicating that a block was successfully committed to the state.
     Committed(block::Hash),
 
-    /// The handoff conditions were rechecked for [`Request::CheckCheckpointHandoff`].
-    CheckpointHandoffChecked,
-
     /// Response to [`Request::InvalidateBlock`] indicating that a block was found and
     /// invalidated in the state.
     Invalidated(block::Hash),

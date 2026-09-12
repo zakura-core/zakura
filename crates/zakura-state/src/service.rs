@@ -1725,10 +1725,6 @@ impl Service<Request> for StateService {
         let span = Span::current();
 
         match req {
-            Request::CheckCheckpointHandoff => {
-                self.try_handoff_to_non_finalized_write();
-                async { Ok(Response::CheckpointHandoffChecked) }.boxed()
-            }
             Request::ApplyHeaderChainInsert { prepared } => {
                 let rsp_rx = self.send_header_chain_insert(prepared);
                 async move {
@@ -2085,9 +2081,23 @@ impl Service<Request> for StateService {
                 .boxed()
             }
 
+            Request::Tip => {
+                // Checkpoint completion explicitly reconciles state even when no other request
+                // follows it. Keep this guarantee separate from incidental readiness polls.
+                self.try_handoff_to_non_finalized_write();
+                let read_state = self.read_service.clone();
+                async move {
+                    let response = read_state.oneshot(ReadRequest::Tip).await?;
+                    Ok(response
+                        .try_into()
+                        .expect("read tip has a writable state response"))
+                }
+                .instrument(span)
+                .boxed()
+            }
+
             // Runs concurrently using the ReadStateService
-            Request::Tip
-            | Request::Depth(_)
+            Request::Depth(_)
             | Request::BestChainNextMedianTimePast
             | Request::BestChainBlockHash(_)
             | Request::BlockLocator

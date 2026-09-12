@@ -40,10 +40,14 @@ pub(super) struct SendBuffer {
 /// Any segment larger than this will be stored as-is, possibly triggering a flush of the buffer.
 const MAX_COMBINE: usize = 1452;
 
+/// Payload allocation size when independent bounded storage is requested.
+pub(super) const BOUNDED_SEND_CHUNK_BYTES: usize = 64 * 1024;
+
 /// This is where the data of the send buffer lives. It supports appending at the end,
 /// removing from the front, and retrieving data by range.
 #[derive(Default, Debug)]
 struct SendBufferData {
+    bounded: bool,
     /// Start offset of the buffered data
     offset: u64,
     /// Total size of [`Self::segments`] and [`Self::last_segment`]
@@ -69,6 +73,10 @@ impl SendBufferData {
     /// Append data to the end of the buffer
     fn append<'a>(&'a mut self, data: impl BytesOrSlice<'a>) {
         self.len += data.len();
+        if self.bounded {
+            self.append_bounded(data.as_ref());
+            return;
+        }
         if data.len() > MAX_COMBINE {
             // use in place
             if !self.last_segment.is_empty() {
@@ -91,6 +99,25 @@ impl SendBufferData {
             };
             // copy the rest into the now empty last_segment
             self.last_segment.extend_from_slice(rest);
+        }
+    }
+
+    fn append_bounded(&mut self, mut data: &[u8]) {
+        while !data.is_empty() {
+            if self.last_segment.capacity() == 0 {
+                self.last_segment = BytesMut::with_capacity(BOUNDED_SEND_CHUNK_BYTES);
+            }
+            // Use only existing capacity, including after prefix acknowledgments.
+            // Compacting that prefix on every small write would repeatedly copy retained data.
+            let count = data
+                .len()
+                .min(self.last_segment.capacity() - self.last_segment.len());
+            self.last_segment.extend_from_slice(&data[..count]);
+            data = &data[count..];
+            if self.last_segment.len() == self.last_segment.capacity() {
+                self.segments
+                    .push_back(std::mem::take(&mut self.last_segment).freeze());
+            }
         }
     }
 
@@ -118,6 +145,9 @@ impl SendBufferData {
         }
         // the rest has to be in the last segment
         self.last_segment.advance(n);
+        if self.bounded && self.len == 0 {
+            self.last_segment = BytesMut::new();
+        }
         // shrink segments if we have a lot of unused capacity
         if self.segments.len() * 4 < self.segments.capacity() {
             self.segments.shrink_to_fit();
@@ -205,6 +235,12 @@ impl SendBuffer {
         Self::default()
     }
 
+    pub(super) fn new_bounded() -> Self {
+        let mut buffer = Self::new();
+        buffer.data.bounded = true;
+        buffer
+    }
+
     /// Append application data to the end of the stream
     pub(super) fn write<'a>(&'a mut self, data: impl BytesOrSlice<'a>) {
         self.data.append(data);
@@ -213,7 +249,9 @@ impl SendBuffer {
     /// Release send storage while preserving the final offset for RESET_STREAM.
     pub(super) fn discard(&mut self) {
         let offset = self.offset();
+        let bounded = self.data.bounded;
         *self = Self::default();
+        self.data.bounded = bounded;
         self.data.offset = offset;
         self.unsent = offset;
     }
@@ -363,6 +401,97 @@ impl SendBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    #[test]
+    fn bounded_send_buffer_releases_source_aliases_including_after_reset() {
+        struct Owner {
+            bytes: Vec<u8>,
+            dropped: Arc<AtomicBool>,
+        }
+        impl AsRef<[u8]> for Owner {
+            fn as_ref(&self) -> &[u8] {
+                &self.bytes
+            }
+        }
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let mut buffer = SendBuffer::new_bounded();
+        for _ in 0..2 {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let alias = Bytes::from_owner(Owner {
+                bytes: vec![42; 8 * BOUNDED_SEND_CHUNK_BYTES],
+                dropped: dropped.clone(),
+            })
+            .slice(4096..8192);
+            buffer.write(alias);
+            assert!(
+                dropped.load(Ordering::SeqCst),
+                "retaining 4 KiB must not retain the source's 512 KiB allocation"
+            );
+            assert_eq!(buffer.data.to_vec(), vec![42; 4096]);
+            buffer.discard();
+        }
+    }
+
+    #[test]
+    fn bounded_send_buffer_limits_partial_prefix_storage_and_releases_idle_blocks() {
+        let mut buffer = SendBuffer::new_bounded();
+        let length = 8 * BOUNDED_SEND_CHUNK_BYTES + 17;
+        buffer.write(vec![42; length].as_slice());
+        assert!(
+            buffer
+                .data
+                .segments
+                .iter()
+                .all(|segment| segment.len() <= BOUNDED_SEND_CHUNK_BYTES),
+            "one retained byte must not pin an oversized send segment"
+        );
+        assert!(buffer.data.last_segment.capacity() <= BOUNDED_SEND_CHUNK_BYTES);
+        let end = u64::try_from(length).unwrap();
+        let _ = buffer.poll_transmit(length + 16);
+        buffer.ack(0..end - 1);
+        assert_eq!(buffer.data.to_vec(), vec![42]);
+        assert!(buffer.data.segments.len() <= 1);
+        buffer.write(b"next".as_slice());
+        let _ = buffer.poll_transmit(64);
+        assert_eq!(buffer.data.to_vec(), b"*next");
+        buffer.ack(end - 1..end + 4);
+        assert!(buffer.is_fully_acked());
+        assert_eq!(buffer.data.segments.capacity(), 0);
+        assert_eq!(buffer.data.last_segment.capacity(), 0);
+    }
+
+    #[test]
+    fn bounded_send_buffer_coalesces_small_writes_without_recopying_retained_data() {
+        let mut buffer = SendBuffer::new_bounded();
+        let length = BOUNDED_SEND_CHUNK_BYTES / 2;
+        buffer.write(vec![42; length].as_slice());
+        let _ = buffer.poll_transmit(length + 16);
+        for offset in 0..1024 {
+            let before = buffer.data.last_segment.as_ptr();
+            buffer.ack(offset..offset + 1);
+            buffer.write(b"*".as_slice());
+            let _ = buffer.poll_transmit(32);
+            assert_eq!(buffer.data.last_segment.as_ptr(), before.wrapping_add(1));
+            assert!(buffer.data.segments.is_empty());
+        }
+        assert_eq!(buffer.data.to_vec(), vec![42; length]);
+        // Fill the remaining tail capacity and start another block. The advanced block
+        // must remain at the front, so discarded prefix storage cannot accumulate.
+        let added = length - 1024 + 1;
+        buffer.write(vec![42; added].as_slice());
+        assert_eq!(buffer.data.segments.len(), 1);
+        assert_eq!(buffer.data.last_segment.len(), 1);
+        assert_eq!(buffer.data.to_vec(), vec![42; length + added]);
+    }
 
     #[test]
     fn fragment_with_length() {
@@ -629,9 +758,14 @@ mod proptests {
     #[proptest]
     fn send_buffer_matches_reference(
         #[strategy(proptest::collection::vec(any::<Op>(), 1..100))] ops: Vec<Op>,
+        bounded: bool,
     ) {
         let _guard = subscribe();
-        let mut sb = SendBuffer::new();
+        let mut sb = if bounded {
+            SendBuffer::new_bounded()
+        } else {
+            SendBuffer::new()
+        };
         // all data written to the send buffer
         let mut buf = Vec::new();
         // max offset that has been returned by poll_transmit
@@ -681,6 +815,14 @@ mod proptests {
 
                     assert_eq!(t1, t2, "Data mismatch for range {:?}", range);
                 }
+            }
+            if bounded {
+                let blocks = sb.data.segments.len() + usize::from(!sb.data.last_segment.is_empty());
+                assert!(
+                    blocks * BOUNDED_SEND_CHUNK_BYTES
+                        <= sb.data.len() + 2 * BOUNDED_SEND_CHUNK_BYTES
+                );
+                assert!(sb.data.last_segment.capacity() <= BOUNDED_SEND_CHUNK_BYTES);
             }
         }
         // Drain all remaining data

@@ -266,14 +266,24 @@ impl QuicTransportConfigBuilder {
         self
     }
 
-    /// Maximum number of bytes to transmit to a peer without acknowledgment.
+    /// Maximum stream payload bytes retained for transmission.
     ///
-    /// Provides an upper bound on memory when communicating with peers that issue large amounts of
-    /// flow control credit. Endpoints that wish to handle large numbers of connections robustly
-    /// should take care to set this low enough to guarantee memory exhaustion does not occur if
-    /// every connection uses the entire window.
+    /// Acknowledged tails behind a missing prefix still consume this window until released.
+    /// This does not bound backing allocations retained by zero-copy writes. Use
+    /// `bounded_send_buffers` to bound those allocations, with separate allowances for metadata
+    /// and allocator overhead.
     pub fn send_window(mut self, value: u64) -> Self {
         self.0.send_window(value);
+        self
+    }
+
+    /// Copy outgoing stream data into independently owned blocks of at most 64 KiB.
+    ///
+    /// Requested payload storage is bounded by retained bytes plus two blocks per buffered
+    /// stream. Metadata and allocator overhead need separate allowances. Disabled by default
+    /// to preserve zero-copy `Bytes` writes.
+    pub fn bounded_send_buffers(mut self, value: bool) -> Self {
+        self.0.bounded_send_buffers(value);
         self
     }
 

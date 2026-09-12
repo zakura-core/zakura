@@ -276,7 +276,10 @@ impl<'a> SendStream<'a> {
             .state
             .send
             .get_mut(&self.id)
-            .map(get_or_insert_send(max_send_data))
+            .map(get_or_insert_send(
+                max_send_data,
+                self.state.bounded_send_buffers,
+            ))
             .ok_or(WriteError::ClosedStream)?;
 
         if limit == 0 {
@@ -322,7 +325,10 @@ impl<'a> SendStream<'a> {
             .state
             .send
             .get_mut(&self.id)
-            .map(get_or_insert_send(max_send_data))
+            .map(get_or_insert_send(
+                max_send_data,
+                self.state.bounded_send_buffers,
+            ))
             .ok_or(FinishError::ClosedStream)?;
 
         let was_pending = stream.is_pending();
@@ -344,7 +350,10 @@ impl<'a> SendStream<'a> {
             .state
             .send
             .get_mut(&self.id)
-            .map(get_or_insert_send(max_send_data))
+            .map(get_or_insert_send(
+                max_send_data,
+                self.state.bounded_send_buffers,
+            ))
             .ok_or(ClosedStream { _private: () })?;
 
         if matches!(stream.state, SendState::ResetSent) {
@@ -373,7 +382,10 @@ impl<'a> SendStream<'a> {
             .state
             .send
             .get_mut(&self.id)
-            .map(get_or_insert_send(max_send_data))
+            .map(get_or_insert_send(
+                max_send_data,
+                self.state.bounded_send_buffers,
+            ))
             .ok_or(ClosedStream { _private: () })?;
 
         stream.priority = priority;

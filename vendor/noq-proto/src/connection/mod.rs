@@ -414,6 +414,7 @@ impl Connection {
                 config.receive_window,
                 config.stream_receive_window,
             )
+            .with_bounded_send_buffers(config.bounded_send_buffers)
             .with_receive_fragment_limit(config.receive_fragment_limit)
             .with_local_stream_limits(
                 config.max_concurrent_local_bidi_streams,

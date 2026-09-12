@@ -24,11 +24,15 @@ pub(super) struct Send {
 }
 
 impl Send {
-    pub(super) fn new(max_data: VarInt) -> Box<Self> {
+    pub(super) fn new(max_data: VarInt, bounded_send_buffers: bool) -> Box<Self> {
         Box::new(Self {
             max_data: max_data.into(),
             state: SendState::Ready,
-            pending: SendBuffer::new(),
+            pending: if bounded_send_buffers {
+                SendBuffer::new_bounded()
+            } else {
+                SendBuffer::new()
+            },
             priority: 0,
             fin_pending: false,
             connection_blocked: false,

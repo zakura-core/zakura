@@ -29,7 +29,11 @@ struct Scope {
     connection_cancel: CancellationToken,
     close_cause: CloseCause,
     memory: ConnectionResponseMemory,
+    _setup: ResponseMemoryPermit,
 }
+
+// Includes the shared scope and platform mutex storage initialized before use.
+const SCOPE_SETUP_BYTES: u64 = 512;
 
 #[derive(Debug, Default)]
 struct ScopeState {
@@ -70,17 +74,29 @@ pub(crate) struct ResponseAuthorization(Arc<Authorization>);
 pub(crate) struct ResponseWritePermission(Arc<Authorization>);
 
 impl ResponseScope {
-    pub(crate) fn with_memory(
-        connection_cancel: CancellationToken,
-        close_cause: CloseCause,
+    pub(crate) fn try_with_memory(
+        connection_cancel: &CancellationToken,
+        close_cause: &CloseCause,
         memory: ConnectionResponseMemory,
-    ) -> Self {
-        Self(Arc::new(Scope {
-            state: Mutex::new(ScopeState::default()),
-            connection_cancel,
-            close_cause,
+    ) -> Result<Self, ResponseAdmissionError> {
+        let setup = memory
+            .try_reserve(SCOPE_SETUP_BYTES)
+            .ok_or(ResponseAdmissionError::MemoryFull)?;
+        let retired = connection_cancel.is_cancelled();
+        let scope = Scope {
+            state: Mutex::new(ScopeState {
+                retired,
+                started: 0,
+            }),
+            connection_cancel: connection_cancel.clone(),
+            close_cause: close_cause.clone(),
             memory,
-        }))
+            _setup: setup,
+        };
+        // Some targets allocate a mutex on its first lock. Initialize it while
+        // setup is funded, before another thread can race that initialization.
+        drop(scope.lock());
+        Ok(Self(Arc::new(scope)))
     }
 
     /// Reserve the adapter's allocation plan before taking work. Every planned

@@ -223,7 +223,9 @@ mod tests {
             HashMap::from([(crate::zakura::ZAKURA_STREAM_GOSSIP, stream)]),
             cancel_token,
             crate::zakura::CloseCause::new(),
-            crate::zakura::regulation::ResponseMemory::default().connection(),
+            crate::zakura::regulation::ResponseMemory::default()
+                .try_connection()
+                .expect("default response budget funds a connection"),
         );
         (peer, peer_send)
     }

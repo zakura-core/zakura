@@ -268,6 +268,12 @@ default-filter = 'test(~regulation::properties::) or test(~regulation::request::
 retries = 0
 slow-timeout = { period = "60s", terminate-after = 1 }
 
+# Scheduled runs execute 2,048 receiver histories with real block decoding.
+# Per-event waits remain bounded inside the fixture.
+[[profile.regulation-properties.overrides]]
+filter = 'test(~r09_r10_generated_local_changes_preserve_live_authorization)'
+slow-timeout = { period = "5m", terminate-after = 1 }
+
 # Executable PR 747 requirements may be red while the implementation catches up.
 # Run every witness. Do not hide failures with retries or expected-failure markers.
 [profile.regulation-compliance]

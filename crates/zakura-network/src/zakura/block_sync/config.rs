@@ -161,7 +161,8 @@ pub enum CwndUnit {
 /// Block-sync peer status advertisement.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct BlockSyncStatus {
-    /// Earliest block body this peer can serve.
+    /// Lower bound of the contiguous advertised body range.
+    /// Separately retained genesis may also be served below this bound.
     pub servable_low: block::Height,
     /// Highest contiguous verified block body this peer can serve.
     pub servable_high: block::Height,

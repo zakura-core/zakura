@@ -779,8 +779,12 @@ impl ZakuraDb {
     /// Returns `None` if the database has never pruned any data (it is
     /// effectively an archive database).
     pub fn lowest_retained_height(&self) -> Option<Height> {
-        let pruning_metadata = self.db.cf_handle(PRUNING_METADATA)?;
-        self.db.zs_get(&pruning_metadata, &())
+        self.db.lowest_retained_height()
+    }
+
+    /// Subscribe to the durable body floor before commit callers publish their new tip.
+    pub(crate) fn subscribe_retained_block_height(&self) -> tokio::sync::watch::Receiver<Height> {
+        self.db.subscribe_retained_block_height()
     }
 
     /// Returns `true` if the database has pruned historical data, and therefore

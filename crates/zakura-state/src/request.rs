@@ -1375,6 +1375,10 @@ pub enum Request {
 
     /// Returns [`Response::Tip(Option<(Height, block::Hash)>)`](Response::Tip)
     /// with the current best chain tip.
+    ///
+    /// The writable state service first reconciles durable checkpoint completion with queued
+    /// semantic writes. Checkpoint commit tasks use this request as a handoff barrier, including
+    /// when the buffer would otherwise stay idle. [`ReadRequest::Tip`] only reads the tip.
     Tip,
 
     /// Computes a block locator object based on the current best chain.

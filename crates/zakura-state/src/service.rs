@@ -945,9 +945,9 @@ impl StateService {
     ///
     /// The height condition is the one that matters in production: the checkpoint verifier only
     /// commits blocks up to `max_checkpoint_height`, so once the finalized tip reaches that height
-    /// the handoff happens immediately, **without** waiting for a semantically verified block to
-    /// arrive. The first semantically verified block then has a valid finalized parent the instant
-    /// it shows up, instead of the pipeline stalling at the checkpoint boundary.
+    /// the next check hands off without waiting for a semantically verified block to arrive.
+    /// Checkpoint completion explicitly requests this check because a buffered service is not
+    /// polled while its request queue is empty.
     ///
     /// The queued-child condition is a fallback for configurations with no finite checkpoint height
     /// (`max_checkpoint_height == Height::MAX`, e.g. full-verification test setups), where the
@@ -1621,6 +1621,17 @@ impl ReadStateService {
         artifact_checkpoint.is_some()
     }
 
+    /// Subscribe to the lowest height at and above which block bodies are retained.
+    ///
+    /// The initial value reflects persisted pruning. Later values follow successful
+    /// writes, before their callers publish the corresponding verified tip. Archive
+    /// state publishes zero. Genesis is always retained separately, and checkpoint
+    /// retention can put this floor above the current verified tip.
+    /// Read-only secondary databases refresh it when they catch up with the primary.
+    pub fn subscribe_retained_block_height(&self) -> tokio::sync::watch::Receiver<block::Height> {
+        self.db.subscribe_retained_block_height()
+    }
+
     /// Subscribe to VCT supplied-root repair needs discovered by the finalized writer.
     pub fn subscribe_vct_root_repairs(&self) -> tokio::sync::watch::Receiver<VctRootRepairStatus> {
         self.vct_root_repair_receiver.clone()
@@ -2081,9 +2092,23 @@ impl Service<Request> for StateService {
                 .boxed()
             }
 
+            Request::Tip => {
+                // Checkpoint completion explicitly reconciles state even when no other request
+                // follows it. Keep this guarantee separate from incidental readiness polls.
+                self.try_handoff_to_non_finalized_write();
+                let read_state = self.read_service.clone();
+                async move {
+                    let response = read_state.oneshot(ReadRequest::Tip).await?;
+                    Ok(response
+                        .try_into()
+                        .expect("read tip has a writable state response"))
+                }
+                .instrument(span)
+                .boxed()
+            }
+
             // Runs concurrently using the ReadStateService
-            Request::Tip
-            | Request::Depth(_)
+            Request::Depth(_)
             | Request::BestChainNextMedianTimePast
             | Request::BestChainBlockHash(_)
             | Request::BlockLocator

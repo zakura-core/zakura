@@ -27,6 +27,125 @@ use super::*;
 /// high system load.
 const VERIFY_TIMEOUT_SECONDS: u64 = 10;
 
+/// Checkpoint completion must reconcile state without another caller, even if its response is dropped.
+#[tokio::test]
+async fn checkpoint_completion_reconciles_tip_without_another_caller() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+    let blocks: Vec<Arc<Block>> = zakura_test::vectors::MAINNET_BLOCKS
+        .range(0..=2)
+        .map(|(_, bytes)| Arc::<Block>::zcash_deserialize(&bytes[..]).unwrap())
+        .collect();
+    let initial_tip = (block::Height(0), blocks[0].hash());
+    let committed_tip = (block::Height(1), blocks[1].hash());
+    for drop_response in [false, true] {
+        let (release_commit, commit_gate) = tokio::sync::watch::channel(false);
+        let (started, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (reconciled, mut reconciled_rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = tower::service_fn(move |request: zs::Request| {
+            let mut gate = commit_gate.clone();
+            let started = started.clone();
+            let reconciled = reconciled.clone();
+            async move {
+                match request {
+                    zs::Request::CommitCheckpointVerifiedBlock(block) => {
+                        started.send(()).expect("the test observes the commit");
+                        gate.wait_for(|released| *released)
+                            .await
+                            .expect("the test retains the commit gate");
+                        Ok::<_, BoxError>(zs::Response::Committed(block.hash))
+                    }
+                    zs::Request::Tip => {
+                        assert!(
+                            *gate.borrow(),
+                            "tip reconciliation must follow the durable commit"
+                        );
+                        reconciled
+                            .send(())
+                            .expect("the test observes reconciliation");
+                        Ok(zs::Response::Tip(Some(committed_tip)))
+                    }
+                    _ => panic!("checkpoint completion only commits and reconciles the tip"),
+                }
+            }
+        });
+        // The later list entry covers a mandatory checkpoint below the full list's maximum.
+        let checkpoints = BTreeMap::from([
+            initial_tip,
+            committed_tip,
+            (block::Height(2), blocks[2].hash()),
+        ]);
+        let mut verifier =
+            CheckpointVerifier::from_list(checkpoints, &Mainnet, Some(initial_tip), state)
+                .map_err(|error| eyre!(error))?;
+        let response = verifier.call(blocks[1].clone());
+        let response = if drop_response {
+            drop(response);
+            None
+        } else {
+            Some(response)
+        };
+        timeout(
+            Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
+            started_rx.recv(),
+        )
+        .await?
+        .expect("the checkpoint commit starts");
+        assert!(matches!(
+            reconciled_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        release_commit.send_replace(true);
+        timeout(
+            Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
+            reconciled_rx.recv(),
+        )
+        .await
+        .expect("completion must reconcile state without another caller")
+        .expect("the completion task must retain the reconciliation request");
+        if let Some(response) = response {
+            assert_eq!(
+                timeout(Duration::from_secs(VERIFY_TIMEOUT_SECONDS), response).await??,
+                committed_tip.1
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A handoff notification failure must not roll back successfully committed verifier progress.
+#[tokio::test]
+async fn failed_handoff_check_preserves_committed_checkpoint_progress() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+    let genesis =
+        Arc::<Block>::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])?;
+    let hash = genesis.hash();
+    let state = tower::service_fn(move |request| async move {
+        match request {
+            zs::Request::CommitCheckpointVerifiedBlock(_) => Ok(zs::Response::Committed(hash)),
+            zs::Request::Tip => {
+                Err::<_, BoxError>(std::io::Error::other("injected handoff failure").into())
+            }
+            _ => panic!("a committed checkpoint must not request state recovery"),
+        }
+    });
+    let mut verifier = CheckpointVerifier::from_list(
+        BTreeMap::from([(block::Height(0), hash)]),
+        &Mainnet,
+        None,
+        state,
+    )
+    .map_err(|error| eyre!(error))?;
+    let result = timeout(
+        Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
+        verifier.call(genesis),
+    )
+    .await?;
+    assert!(matches!(result, Err(VerifyCheckpointError::Tip(_))));
+    verifier.apply_pending_reset();
+    assert_eq!(verifier.previous_checkpoint_height(), FinalCheckpoint);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn single_item_checkpoint_list_test() -> Result<(), Report> {
     single_item_checkpoint_list().await
@@ -1323,7 +1442,9 @@ async fn dropped_response_must_preserve_failed_commit_reset() -> Result<(), Repo
                     )
                 }
                 zs::Request::Tip => Ok(zs::Response::Tip(Some(initial_tip))),
-                _ => unreachable!("the verifier only commits blocks and reads the tip"),
+                _ => unreachable!(
+                    "the verifier only commits blocks, checks handoff, and reads the tip"
+                ),
             }
         }
     });

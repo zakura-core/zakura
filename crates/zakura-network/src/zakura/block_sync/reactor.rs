@@ -494,16 +494,15 @@ impl BlockSyncReactor {
                     }
                 }
                 changed = async {
-                    match retained_height.as_mut() {
-                        Some(retained_height) => retained_height.changed().await,
-                        None => std::future::pending().await,
-                    }
+                    let Some(retained_height) = retained_height.as_mut() else {
+                        return std::future::pending().await;
+                    };
+                    retained_height.changed().await
                 }, if retention_open => {
-                    if changed.is_ok() {
+                    // Preserve the final floor if the state writer shuts down.
+                    retention_open = changed.is_ok();
+                    if retention_open {
                         self.flush_status_refresh();
-                    } else {
-                        // Preserve the final floor if the state writer shuts down.
-                        retention_open = false;
                     }
                 }
                 changed = self.sequencer_view.changed() => {

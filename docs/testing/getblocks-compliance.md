@@ -17,15 +17,15 @@ older layout text.
 
 ## Compliance branch results
 
-On 2026-09-11, property revision `5d607efd6` includes compliance implementation
-`efed51f1d` from [#971](https://github.com/zakura-core/zakura/pull/971).
+On 2026-09-11, property revision `b41698531` includes compliance implementation
+`401e9c54d` from [#971](https://github.com/zakura-core/zakura/pull/971).
 Local Rust 1.97.0 runs use 64 generated cases, seed 896, and four load rounds.
 
 | Profile | Result |
 | --- | --- |
-| Compliance | 99 passed, 1 failed across 100 tests |
-| Property profile | 36 passed, 1 failed across 37 tests |
-| Fixed regressions | 451 passed, 1 failed across 452 tests |
+| Compliance | 101 passed, 1 failed across 102 tests |
+| Property profile | 37 passed, 1 failed across 38 tests |
+| Fixed regressions | 454 passed, 1 failed across 455 tests |
 
 The failing witness in compliance and fixed regressions is T02 with two paused sibling
 streams. Their occupied receive windows still prevent the independent service
@@ -52,21 +52,27 @@ complete request writes with unfinished responses, validated completion, owner
 Drop, and replacement on a new connection. The real GetBlocks request queue is
 used for the service checks. A separate independent requester model passed 2,048
 generated histories with seed 896, retaining stale writer handles across receiver
-generations. That longer run covers the shared lifecycle and budget models only.
+generations. The longer runs cover the shared lifecycle and budget models and
+the request metadata allocation property, not the full qualification suite.
 
 The shared metadata pool now follows each connection through service fanout,
 escalation, and replacement. Fixed checks cover exhaustion and wakeup without a
 peer fault. Generated ownership histories compare live allocation owners with
 the node and connection counters. The allocation probe found that publication
 created another mutex allocation. Inline atomic phase storage now keeps those
-transitions inside the funded record and that witness passes.
+transitions inside the funded record and that witness passes. GetBlocks now adds
+expected hashes, the taken-work vector, and writer/state allocations to the plan
+before taking work. A constrained pool reduces the batch before waiting. The
+work vector is moved into the writer, and retry filtering does not allocate
+temporary vectors. Status handles retain funding after the writer and response
+owner exit. Generated allocation measurements cover request sizes 1–128, with
+fixed examples at the capacity boundaries.
 
 The property profile still fails its first-use allocation witness. On this Mac,
 the authorization call retains 184 bytes but charges 56. Scope and cancellation
 locks account for the additional first-use storage. This witness is not warmed
-up or marked as an expected failure. Variable storage and retained container
-capacity also remain uncharged, so the shared pool is not yet a complete metadata
-bound.
+up or marked as an expected failure. Retained window and registry capacities
+remain uncharged, so the shared pool is not yet a complete metadata bound.
 
 The fixed regression migration preserves its test functions and original work
 invariants with legal exchanges. Reordering uses separate requests, retries finish
@@ -76,12 +82,12 @@ scheduling errors: preferring a server for the wrong height, or preferring a
 server whose retained authorization forbids requesting that height again.
 
 Network/test all-target Clippy with warnings denied passes. Formatting, Markdown
-lint, whitespace, and changelog checks pass. The final runs had no retry or
-ignored failure. Fixed regressions classified the passing service test
-`abandoned_application_drains_queued_writes_before_retirement` as leaky. An
-intermediate property run also classified a passing lifecycle history as leaky.
-Earlier replay and service observations remain in the execution logs. The known
-macOS linker unwind-size warning also remains.
+lint, whitespace, and changelog checks pass. The final runs had no retry, ignored
+failure, or leaky classification. An earlier fixed-regression run classified the
+passing service test `abandoned_application_drains_queued_writes_before_retirement`
+as leaky. An intermediate property run also classified a passing lifecycle history
+as leaky. These observations remain in the execution logs. The known macOS linker
+unwind-size warning also remains.
 
 This is not full compliance or activation qualification. Complete authorization
 metadata bounds, real discovery and future subscription response adapters, and

@@ -50,8 +50,12 @@ tests hold the pool full for a simulated minute, then release another connection
 owner and require progress without a peer fault. The current production charge
 covers the authorization's shared allocation, including inline phase storage.
 The first-use allocation witness remains red on macOS because scope and
-cancellation locks allocate additional storage. Expected hashes, request-write
-allocations, and retained container capacity also need funding.
+cancellation locks allocate additional storage. GetBlocks also reserves an
+allocation plan for expected hashes, taken work, and writer state before taking
+work. Generated measurements compare retained allocations with that plan for
+request sizes 1–128. Fixed examples cover capacity boundaries, a smaller batch
+under a constrained pool, and status handles that outlive their writer and
+response owner. Retained window and registry capacity still need funding.
 
 ## GetBlocks coverage
 

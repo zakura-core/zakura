@@ -152,20 +152,12 @@ pub const ZAKURA_DUPLICATE_EVICT_MIN_AGE: Duration = Duration::from_secs(300);
 pub const ZAKURA_SAME_IP_DUPLICATE_EVICT_MIN_AGE: Duration = Duration::from_secs(5);
 /// Maximum retained remotely initiated bidirectional transport streams.
 pub const DEFAULT_ZAKURA_REMOTE_BIDI_STREAMS: u32 = 16;
-/// Includes local service, setup, compatibility and retiring bidirectional streams.
-pub const DEFAULT_ZAKURA_LOCAL_BIDI_STREAMS: u32 = 17;
 /// Receive credit available to one stream, including before application admission.
 pub const DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW: u32 = 256 * 1024;
 /// Covers 32 paused siblings and progress through batched connection credit updates.
 pub const DEFAULT_ZAKURA_RECEIVE_WINDOW: u32 = 38 * DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW;
-/// Maximum retained fragment records in a receive stream.
-pub const DEFAULT_ZAKURA_RECEIVE_FRAGMENT_LIMIT: usize = 1024;
-/// Maximum packet-number span retained in each path and encryption space.
-pub const DEFAULT_ZAKURA_PACKET_HISTORY_LIMIT: usize = 4096;
 /// QUIC send window used by Zakura endpoints.
 pub const DEFAULT_ZAKURA_SEND_WINDOW: u64 = 32 * 1024 * 1024;
-/// Maximum retained ranges in each send-stream acknowledgment or retransmission set.
-pub const DEFAULT_ZAKURA_SEND_BUFFER_RANGE_LIMIT: usize = 4096;
 /// Initial backoff before re-dialing a configured Zakura bootstrap peer.
 pub const DEFAULT_ZAKURA_REDIAL_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 /// Maximum backoff between re-dials of a configured Zakura bootstrap peer.
@@ -497,21 +489,9 @@ impl ZakuraLocalLimits {
                 u32::from(self.max_open_streams).min(DEFAULT_ZAKURA_REMOTE_BIDI_STREAMS),
             ))
             .max_concurrent_uni_streams(VarInt::from_u32(0))
-            .max_concurrent_local_bidi_streams(VarInt::from_u32(DEFAULT_ZAKURA_LOCAL_BIDI_STREAMS))
-            .max_concurrent_local_uni_streams(VarInt::from_u32(0))
             .stream_receive_window(VarInt::from_u32(DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW))
             .receive_window(VarInt::from_u32(DEFAULT_ZAKURA_RECEIVE_WINDOW))
-            .receive_fragment_limit(std::num::NonZeroUsize::new(
-                DEFAULT_ZAKURA_RECEIVE_FRAGMENT_LIMIT,
-            ))
-            .packet_history_limit(std::num::NonZeroUsize::new(
-                DEFAULT_ZAKURA_PACKET_HISTORY_LIMIT,
-            ))
             .send_window(DEFAULT_ZAKURA_SEND_WINDOW)
-            .bounded_send_buffers(true)
-            .send_buffer_range_limit(std::num::NonZeroUsize::new(
-                DEFAULT_ZAKURA_SEND_BUFFER_RANGE_LIMIT,
-            ))
             .max_idle_timeout(Some(
                 self.quic_idle_timeout
                     .try_into()
@@ -867,7 +847,6 @@ impl ZakuraEndpoint {
     /// immediately bounce off the admission cap.
     pub(crate) fn has_native_admission_capacity(&self) -> bool {
         self.handler.admission.available_permits() > 0
-            && self.handler.transport_admission.available_permits() > 0
     }
 
     /// Shut down the Router's ordered accept/handler lifecycle.
@@ -2007,8 +1986,6 @@ pub struct ZakuraProtocolHandler {
     next_conn_id: Arc<AtomicU64>,
     next_stream_id: Arc<AtomicU64>,
     admission: Arc<Semaphore>,
-    // Includes handshakes and closing transport state, beyond handler lifetime.
-    transport_admission: Arc<Semaphore>,
     pending_handshakes: Arc<Semaphore>,
     shutdown: CancellationToken,
     // Bound endpoint supplies the local identity for connection collision handling.
@@ -2124,7 +2101,6 @@ impl ZakuraProtocolHandler {
             // and late completions from colliding after a node restart.
             next_stream_id: Arc::new(AtomicU64::new(random_stream_session_seed())),
             admission: Arc::new(Semaphore::new(limits.max_connections)),
-            transport_admission: Arc::new(Semaphore::new(limits.max_connections)),
             pending_handshakes: Arc::new(Semaphore::new(limits.max_pending_handshakes)),
             shutdown: CancellationToken::new(),
             limits,
@@ -2167,34 +2143,6 @@ impl ZakuraProtocolHandler {
     pub fn with_endpoint(mut self, endpoint: Endpoint) -> Self {
         self.endpoint = Some(endpoint);
         self
-    }
-
-    fn reserve_transport(
-        &self,
-    ) -> Result<Box<dyn std::any::Any + Send + Sync>, ZakuraHandlerError> {
-        self.transport_admission
-            .clone()
-            .try_acquire_owned()
-            .map(|permit| Box::new(permit) as Box<dyn std::any::Any + Send + Sync>)
-            .map_err(|_| ZakuraHandlerError::ResourceLimit("transport admission"))
-    }
-
-    fn incoming_transport_admission(&self) -> iroh::protocol::IncomingAdmission {
-        let handler = self.clone();
-        Arc::new(move |_| match handler.reserve_transport() {
-            Ok(owner) => Some(owner),
-            Err(_) => {
-                metrics::counter!("zakura.p2p.conn.rejected.transport_admission").increment(1);
-                None
-            }
-        })
-    }
-
-    fn spawn_router(&self, endpoint: Endpoint) -> Router {
-        Router::builder(endpoint)
-            .incoming_admission(self.incoming_transport_admission())
-            .accept(P2P_V2_ALPN, self.clone())
-            .spawn()
     }
 
     async fn accept_connection(&self, connection: Connection) -> Result<(), AcceptError> {
@@ -3709,9 +3657,7 @@ async fn spawn_zakura_endpoint_inner(
     let secret_key = zakura_secret_key(config)?;
     let local_node_id = secret_key.public();
     let discovery_secret_key = secret_key.clone();
-    let builder = direct_endpoint_builder(secret_key)
-        .transport_config(limits.transport_config())
-        .incoming_queue_limits(limits.max_pending_handshakes, 64 * 1024, 2 * 1024 * 1024);
+    let builder = direct_endpoint_builder(secret_key).transport_config(limits.transport_config());
     // Bind a fixed address when configured so this node has a stable, advertisable
     // Zakura endpoint; otherwise bind loopback-only so the unset (dial-out-only)
     // case does not expose the native P2P_V2_ALPN surface on all interfaces.
@@ -3870,7 +3816,9 @@ async fn spawn_zakura_endpoint_inner(
     // peer's source IP and enforce the per-IP connection cap.
     .with_endpoint(endpoint.clone());
     handler.set_header_sync_enabled(header_sync_ready);
-    let router = handler.spawn_router(endpoint);
+    let router = Router::builder(endpoint)
+        .accept(P2P_V2_ALPN, handler.clone())
+        .spawn();
     let endpoint = ZakuraEndpoint {
         router,
         supervisor,
@@ -3986,20 +3934,10 @@ pub(crate) async fn serve_native_dial_connection(
         .clone()
         .try_acquire_owned()
         .map_err(|_| ZakuraHandlerError::ResourceLimit("admission"))?;
-    let transport_owner = endpoint.handler.reserve_transport()?;
-    let connection = timeout(limits.control_timeout, async {
-        let connecting = endpoint
-            .router
-            .endpoint()
-            .connect_with_owner(
-                node_addr,
-                P2P_V2_ALPN,
-                iroh::endpoint::ConnectOptions::new(),
-                transport_owner,
-            )
-            .await?;
-        Ok::<_, iroh::endpoint::ConnectError>(connecting.await?)
-    })
+    let connection = timeout(
+        limits.control_timeout,
+        endpoint.router.endpoint().connect(node_addr, P2P_V2_ALPN),
+    )
     .await
     .map_err(|_| ZakuraHandlerError::Timeout("native dial"))??;
     let remote_node_id = connection.remote_id();
@@ -5786,6 +5724,11 @@ mod tests {
     mod paired_block_sync;
     mod quic_progress;
     mod serving_progress;
+
+    // These witnesses require unpublished transport APIs and their native
+    // integration. `ignore` alone still type-checks unavailable constructors.
+    // Restore both before enabling this module. See native-transport-capacity.md.
+    #[cfg(any())]
     mod transport_ownership;
 
     use super::*;

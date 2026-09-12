@@ -1,115 +1,69 @@
 # Native transport capacity
 
-This document defines the transport milestone for message regulation. The policy
-is shared by all native messages. It includes streams before application admission
-and retains capacity while transport state is closing.
+## Current scope
 
-## Stream progress
+The compliance stack uses published `zakura-iroh` 1.1.0-rc.1 and `noq`/`noq-proto`
+1.2.0. Transport dependency modifications are being reviewed separately in the
+maintained transport forks. The node's application work and requester metadata
+budgets remain enabled. Complete transport memory and cleanup bounds are deferred.
 
-The native endpoint allows 16 remotely initiated and 17 locally initiated
-bidirectional streams. Unidirectional application streams are disabled. The local
-limit includes control setup, compatibility requests and retired streams whose
-receive final offset is still unknown. A stream returns its transport slot only
-when both halves are freed. The application handshake advertises 16 open streams.
+The published APIs support the enabled receive policy: at most 16 remotely
+initiated bidirectional streams, 256 KiB per stream and 9.5 MiB per connection.
+Unidirectional application streams are disabled. Locally initiated stream state
+does not yet have the proposed transport lifetime limit.
 
-Each receive stream has 256 KiB of credit. Connection credit is 9.5 MiB, or 38
-stream windows. Thirty-two paused siblings can retain 8 MiB, leaving 1.5 MiB for
-the remaining stream. The pinned transport batches MAX_DATA updates until one
-eighth of connection credit has been consumed. That threshold is 1.1875 MiB.
-The remaining stream therefore has enough credit to reach successive updates.
+For the fixed scenario with 32 paused sibling receive windows, 8 MiB remains
+unread and 1.5 MiB remains available for independent progress. This exceeds the
+transport's connection-credit update threshold of 9.5 MiB / 8. T02 and the
+32-sibling regression remain enabled because they use published APIs. Passing
+these scenarios does not establish a bound over arbitrary local stream churn.
 
-For a stream window W, a connection window C, and S paused streams, the required
-inequality is C - S*W > C/8. The policy uses S=32 and C=38*W, so the available
-6*W exceeds the update threshold of 4.75*W. Increasing a stream count or window
-requires recomputing this inequality before changing production defaults.
+## Dependency-blocked witnesses
 
-Verification must fill every paused stream with acknowledged, unread bytes,
-exercise both stream directions, deliver more than one connection window through
-the remaining stream, then drain every original stream without reconnecting.
-The original one- and two-sibling T02 witnesses must also pass.
+The full bodies of these five tests remain in
+`handler/tests/transport_ownership.rs`. Each has an explicit `ignore` reason.
+The module also uses `cfg(any())` because Rust type-checks ignored tests and the
+published packages lack the constructors and configuration methods they call.
+They are excluded from passing test totals and cannot run with `--ignored` alone.
 
-## Allocation inventory
+| Test | Required change before enabling |
+| --- | --- |
+| `closed_transport_keeps_its_owner_while_an_unread_receive_half_exists` | Publish owned incoming construction. The owner must release after retained connection and stream state is destroyed. |
+| `transport_owner_releases_on_preconstruction_error_and_cancelled_handshake` | Publish outgoing owner transfer that handles failed construction and cancelled handshakes. |
+| `native_router_reserves_transport_before_handshake` | Publish the Router admission hook and restore native admission before connection construction. |
+| `closing_inbound_transport_blocks_native_dial_until_last_handle_retires` | Restore one inbound/outbound transport pool whose reservations survive application closure and final transport cleanup. |
+| `stopped_local_stream_reopens_only_after_transport_final_offset` | Publish local stream limits that retain stopped receive records until FIN or RESET supplies their final offset. |
 
-Flow-control credit is not an allocation budget. These bounds are inputs to the
-node allowance and must be verified separately.
+The complete native integration is preserved in commit `26ad05407`. Once the
+dependency APIs are reviewed and published, restore the corresponding integration,
+remove the module exclusion and individual ignores, and run all five tests.
+Do not replace their ownership assertions with application-handler completion.
 
-| Resource | Policy | Lifetime |
-| --- | --- | --- |
-| Receive payload credit | 9.5 MiB per connection | Until consumed or discarded |
-| Receive fragment records | 1,024 per receive stream | Includes retained backing capacity |
-| Send payload | 32 MiB per connection | Includes acknowledged tails behind a missing prefix |
-| Send backing | Owned 64 KiB blocks | Payload plus at most two blocks per buffered stream |
-| Send range records | 4,096 per set, two sets per send stream | Reject before growth; release empty arrays |
-| Packet history | Span of 4,096 per path and encryption space | Includes sent and lost records and gaps |
-| Multipath | Existing eight-path limit | Includes closing paths and unused granted IDs |
-| Driver datagram queue | 256 packets per connection | Slot retained through protocol processing |
-| Raw incoming attempts | 32 attempts, 2 MiB additional packets | Before connection admission |
-| Connection admission | Shared inbound/outbound pool | Owner released after transport storage destruction |
+## Remaining transport bounds
 
-With finite fragment limits, received stream fragments own their allocation.
-Compaction removes duplicate bytes and copies each contiguous run into a separate
-allocation. For ordered native readers, the retained backing after an insert is
-at most 2.5*W + 32 KiB per stream, where W is its receive window. A subsequent
-insert adds at most one datagram before compaction. During compaction the old
-backing, a temporary buffer of at most W and new runs totaling at most W can
-coexist. A conservative peak allowance is therefore 4.5*W + 32 KiB + D, with D
-the maximum admitted datagram size. Fragment heap capacity and allocator overhead
-are separate. Application-owned copies after a read use the application budget.
+| Resource | Deferred work |
+| --- | --- |
+| Connection lifetime | Reserve before inbound/outbound construction and retain ownership through failed handshakes and final cleanup. |
+| Receive queues | Fund the raw incoming queue and bound datagrams waiting for a connection driver before protocol flow control runs. |
+| Send storage | Count retained bytes after partial acknowledgments and reset. Bound backing allocations held by small slices. |
+| Receive storage | Account for fragment records, backing allocations, compaction peaks and retained collection capacity. |
+| Transport metadata | Bound acknowledgment/retransmission ranges, packet history including sparse indices, and closing/unused multipath state. |
+| Local streams | Count locally opened and retiring streams until their protocol state is freed. |
+| Endpoint state | Bound identity mappings and idle actors across sequential new identities as well as simultaneous connections. |
+| Node total | Fund all live allocation owners from one node-wide transport budget, including pending control state, receive batching and allocator overhead. |
 
-The regression tests check release of a 1 MiB packet backing after admitting one
-byte, independent ownership of compacted runs, and actual backing capacity through
-generated insert, read, overlap and compaction histories. These checks establish
-stream backing ownership, not a process RSS ceiling or an unordered-history bound.
-
-The node-wide byte allowance is not established by this table. Receive batching,
-pending control retransmissions, packet-frame metadata, endpoint tables, and
-allocator overhead still require explicit bounds and allocation evidence. A
-connection charge must cover their sum before constructing transport state.
-The maximum connection count remains a separate ceiling. Application objects,
-verification and state caches retain their own budgets outside this transport
-allowance.
-
-## Endpoint lifetime
-
-Connection reservations alone cannot fund the current endpoint implementation.
-`Tasks::start_remote_state_actor` creates an endpoint-ID mapping when a remote
-actor starts. `AddrMap::get` inserts both forward and reverse entries, and the map
-has no removal operation. `RemoteMap::remove_or_restart_actor` removes an idle
-actor's sender but leaves those mapping entries behind. Sequential connections
-with new identities can therefore grow endpoint storage after each connection's
-transport reservation is released. This is established by source inspection.
-
-Remote actors also retain their own state through a 60-second idle timeout.
-That state needs an endpoint allocation owner independent of a connection's
-owner. A complete node model needs bounded admission for remote actors and their
-mapping entries, funding retained capacity through cleanup and concurrent reuse.
-Closing a connection or expiring an actor must not leave unfunded map capacity.
-The same owner must cover incoming peers and outgoing resolution attempts.
-
-Before selecting a numeric connection charge, finish the pending-control and
-packet-metadata bounds, separate fixed endpoint/receive-batch storage, and bound
-these endpoint lifetimes. Then reserve from one configurable node pool before
-creating each owner. Verify sequential identity churn as well as simultaneous
-connection saturation. A count semaphore or an RSS sample alone cannot establish
-this bound. The proposed 4 GiB starting budget remains provisional until those
-charges establish how many connections it can actually fund.
+The extracted patch addresses parts of this inventory. It does not complete the
+endpoint or node-wide bound. Its numeric limits and buffer-copying policy remain
+subject to review and performance qualification.
 
 ## Qualification
 
-On September 12, combined property revision `d594451d2`, including compliance
-`13bd5044f`, passes 104 compliance witnesses and 473 fixed regressions. All 49
-property assertions pass with 2,048 cases and seed 896, with two unresolved
-nextest output-handle closure flags. The full-occupancy witness is included in
-the ordinary regression selection. The transport dependency passes 447 protocol
-tests. These results precede optimized throughput and complete node allocation
-qualification.
+Record fresh results on the published-package stack. Earlier passing totals from
+the dependency-patched integration do not qualify this revision. Runtime skips
+must be reported separately from the five compile-excluded witnesses above.
 
-The milestone is complete only when the enabled policy passes T02 and the full
-occupancy witness, its allocation inventory has a funded node-wide bound, and
-tests cover denial, handshake failure, retirement and reuse at capacity. RSS
-measurements supplement allocation and ownership evidence. They do not replace
-the bounds. Optimized throughput must retain the existing 90 percent threshold
-against the baseline on both lossless and impaired links, with five samples each.
-
-The copied transport dependencies contain unpublished APIs. Publishing those
-changes and updating registry requirements remains a release prerequisite.
+Full transport qualification requires the completed allocation inventory, denial,
+handshake failure, retirement and reuse at capacity, plus sustained load and
+optimized throughput comparisons. The existing five-sample median threshold is
+90 percent of the baseline on both lossless and impaired links. These gates remain
+open while the dependency work is deferred.

@@ -1,8 +1,0 @@
-[workspace]
-resolver = "2"
-members = ["noq", "noq-proto", "zakura-iroh"]
-
-[patch.crates-io]
-noq = { path = "noq" }
-noq-proto = { path = "noq-proto" }
-zakura-iroh = { path = "zakura-iroh" }

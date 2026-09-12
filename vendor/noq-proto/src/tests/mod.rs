@@ -413,6 +413,95 @@ fn export_keying_material() {
 }
 
 #[test]
+fn packet_history_limit_stops_before_an_unfunded_packet_is_built() {
+    packet_history_exhaustion(true);
+}
+
+#[test]
+fn packet_history_limit_without_gso_stops_before_an_unfunded_packet_is_built() {
+    packet_history_exhaustion(false);
+}
+
+fn packet_history_exhaustion(gso: bool) {
+    let _guard = subscribe();
+    let mut congestion = crate::congestion::NewRenoConfig::default();
+    congestion.initial_window(512 * 1024);
+    let mut transport = TransportConfig::default();
+    transport
+        .packet_history_limit(NonZeroUsize::new(32))
+        .enable_segmentation_offload(gso)
+        .deterministic_packet_numbers(true)
+        .congestion_controller_factory(Arc::new(congestion));
+    let mut client = client_config();
+    client.transport_config(Arc::new(transport));
+    let mut pair = Pair::default();
+    let (client_ch, _) = pair.connect_with(client);
+    let stream = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    pair.client_send(client_ch, stream)
+        .write(&vec![42; 128 * 1024])
+        .unwrap();
+    pair.client_send(client_ch, stream).finish().unwrap();
+    // Hold back server processing so no acknowledgment can release packet history.
+    pair.drive_client();
+    assert_matches!(pair.client_conn_mut(client_ch).poll(), Some(Event::ConnectionLost {
+        reason: ConnectionError::TransportError(error),
+    }) if error.code == TransportErrorCode::INTERNAL_ERROR && error.reason == "packet history memory limit");
+    let before = pair.client_conn_mut(client_ch).stats().udp_tx.datagrams;
+    pair.drive_client();
+    assert_eq!(
+        pair.client_conn_mut(client_ch).stats().udp_tx.datagrams,
+        before
+    );
+}
+
+#[test]
+fn packet_history_limit_allows_repeated_acknowledged_transfers() {
+    packet_history_repeated_transfers(false);
+}
+
+#[test]
+fn packet_history_limit_allows_repeated_transfers_with_packet_loss() {
+    packet_history_repeated_transfers(true);
+}
+
+fn packet_history_repeated_transfers(drop_packets: bool) {
+    let _guard = subscribe();
+    let mut transport = TransportConfig::default();
+    transport.packet_history_limit(NonZeroUsize::new(32));
+    let mut client = client_config();
+    client.transport_config(Arc::new(transport));
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect_with(client);
+    let stream = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    let mut received = Vec::new();
+    for transfer in 0..128 {
+        pair.client_send(client_ch, stream)
+            .write(b"acknowledged")
+            .unwrap();
+        if drop_packets && transfer % 16 == 0 {
+            pair.drive_client();
+            assert!(pair.server.inbound.pop_last().is_some());
+        }
+        pair.drive();
+        let mut recv = pair.server_recv(server_ch, stream);
+        let mut chunks = recv.read(true).unwrap();
+        loop {
+            match chunks.next(usize::MAX) {
+                Ok(Some(chunk)) => received.extend_from_slice(&chunk.bytes),
+                Err(ReadError::Blocked) => break,
+                result => panic!("stream must stay open between transfers: {result:?}"),
+            }
+        }
+        let _ = chunks.finalize();
+        assert!(!pair.client_conn_mut(client_ch).is_closed());
+    }
+    pair.client_send(client_ch, stream).finish().unwrap();
+    pair.drive();
+    assert_eq!(received, b"acknowledged".repeat(128));
+    assert_eq!(pair.client_streams(client_ch).send_streams(), 0);
+}
+
+#[test]
 fn finish_stream_simple() {
     let _guard = subscribe();
     let mut pair = Pair::default();

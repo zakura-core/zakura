@@ -358,6 +358,23 @@ impl PacketNumberSpace {
         }
     }
 
+    /// Whether retaining this packet preserves the bound on indexed storage.
+    pub(super) fn can_track_packet(&self, number: u64, limit: usize) -> bool {
+        let oldest = self
+            .sent_packets
+            .keys()
+            .next()
+            .into_iter()
+            .chain(self.lost_packets.keys().next())
+            .min();
+        oldest.is_none_or(|oldest| {
+            number
+                .checked_sub(oldest)
+                .and_then(|span| usize::try_from(span).ok())
+                .is_some_and(|span| span < limit)
+        })
+    }
+
     /// Get the next outgoing packet number in this space
     ///
     /// In the Data space, the connection's [`PacketNumberFilter`] must be used rather than calling
@@ -1386,6 +1403,43 @@ mod test {
     use crate::{ConnectionIdGenerator, RandomConnectionIdGenerator};
 
     use super::*;
+
+    #[test]
+    fn packet_history_limit_counts_sparse_indices_and_lost_packets() {
+        let now = Instant::now();
+        let mut space = PacketNumberSpace::new_deterministic(now, SpaceId::Data);
+        let packet = || SentPacket {
+            path_generation: 0,
+            time_sent: now,
+            size: 1,
+            ack_eliciting: true,
+            largest_acked: FxHashMap::default(),
+            retransmits: ThinRetransmits::default(),
+            path_retransmits: PathRetransmits::default(),
+            stream_frames: frame::StreamMetaVec::default(),
+        };
+        assert!(space.can_track_packet(100, 8));
+        space.sent_packets.insert(100, packet());
+        space.sent_packets.insert(107, packet());
+        assert_eq!(space.sent_packets.values().count(), 2);
+        assert!(space.can_track_packet(107, 8));
+        assert!(!space.can_track_packet(108, 8));
+        space.lost_packets.insert(97, LostPacket { time_sent: now });
+        assert!(!space.can_track_packet(105, 8));
+        space.sent_packets.remove(100);
+        assert!(
+            !space.can_track_packet(108, 8),
+            "lost history still owns the earlier span"
+        );
+        space.lost_packets.remove(97);
+        assert!(space.can_track_packet(114, 8));
+        assert!(!space.can_track_packet(115, 8));
+        space.sent_packets.remove(107);
+        assert!(
+            space.can_track_packet(1_000_000, 8),
+            "empty history can start at a new index"
+        );
+    }
 
     #[test]
     fn sanity() {

@@ -41,8 +41,8 @@ pub(super) struct PacketBuilder<'a, 'b> {
 impl<'a, 'b> PacketBuilder<'a, 'b> {
     /// Write a new packet header to `buffer` and determine the packet's properties
     ///
-    /// Marks the connection drained and returns `None` if the confidentiality limit would be
-    /// violated.
+    /// Marks the connection drained and returns `None` if a confidentiality or
+    /// packet-history resource limit would be exceeded.
     pub(super) fn new(
         now: Instant,
         space_id: SpaceId,
@@ -54,6 +54,17 @@ impl<'a, 'b> PacketBuilder<'a, 'b> {
     where
         'b: 'a,
     {
+        if conn.state.is_drained() {
+            return None;
+        }
+        if let Some(limit) = conn.config.packet_history_limit {
+            let space = conn.spaces[space_id].for_path(path_id);
+            let number = space.peek_tx_number();
+            if !space.can_track_packet(number, limit.get()) {
+                conn.kill(TransportError::INTERNAL_ERROR("packet history memory limit").into());
+                return None;
+            }
+        }
         let mut qlog = QlogSentPacket::default();
 
         let version = conn.version;

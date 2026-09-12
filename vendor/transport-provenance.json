@@ -21,11 +21,14 @@
         "src/config/transport.rs",
         "src/connection/assembler.rs",
         "src/connection/mod.rs",
+        "src/connection/packet_builder.rs",
         "src/connection/send_buffer.rs",
+        "src/connection/spaces.rs",
         "src/connection/streams/mod.rs",
         "src/connection/streams/recv.rs",
         "src/connection/streams/send.rs",
-        "src/connection/streams/state.rs"
+        "src/connection/streams/state.rs",
+        "src/tests/mod.rs"
       ],
       "added_files": []
     },

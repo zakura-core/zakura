@@ -1484,6 +1484,75 @@ fn reopening_interrupted_fast_sync_with_vct_disabled_panics() {
 }
 
 #[test]
+#[should_panic(expected = "network.p2p_stack")]
+fn reopening_interrupted_fast_sync_on_legacy_stack_refuses_to_park() {
+    let _init_guard = zakura_test::init();
+    let dir = tempfile::tempdir().expect("temp dir is created");
+    let config = Config {
+        cache_dir: dir.path().to_path_buf(),
+        ephemeral: false,
+        checkpoint_sync: true,
+        vct_fast_sync: true,
+        enable_zakura_header_seed_from_committed_blocks: false,
+        ..Config::default()
+    };
+    {
+        let state = new_state_with_blocks(&config, &Mainnet);
+        let mut batch = DiskWriteBatch::new();
+        batch.update_vct_sync_marker(&state.db, Height(100));
+        state.db.write_batch(batch).expect("marker batch writes");
+    }
+    {
+        let v2_config = Config {
+            enable_zakura_header_seed_from_committed_blocks: true,
+            ..config.clone()
+        };
+        let state = FinalizedState::new(&v2_config, &Mainnet)
+            .expect("the v2 stack can resume the interrupted VCT sync");
+        assert_eq!(state.db.vct_synced_below(), Some(Height(100)));
+        let reader = FinalizedState::new_with_debug(&config, &Mainnet, true, true)
+            .expect("a read-only state does not resume VCT writes");
+        assert_eq!(reader.db.vct_synced_below(), Some(Height(100)));
+    }
+    let _state = FinalizedState::new(&config, &Mainnet);
+}
+
+#[test]
+fn read_only_interrupted_fast_sync_accepts_disabled_sync_settings() {
+    let _init_guard = zakura_test::init();
+    let dir = tempfile::tempdir().expect("temp dir is created");
+    let config = Config {
+        cache_dir: dir.path().to_path_buf(),
+        ephemeral: false,
+        checkpoint_sync: true,
+        vct_fast_sync: true,
+        enable_zakura_header_seed_from_committed_blocks: true,
+        ..Config::default()
+    };
+    {
+        let state = new_state_with_blocks(&config, &Mainnet);
+        let mut batch = DiskWriteBatch::new();
+        batch.update_vct_sync_marker(&state.db, Height(100));
+        state.db.write_batch(batch).expect("marker batch writes");
+    }
+    for checkpoint_sync in [false, true] {
+        for vct_fast_sync in [false, true] {
+            for enable_zakura_header_seed_from_committed_blocks in [false, true] {
+                let reader_config = Config {
+                    checkpoint_sync,
+                    vct_fast_sync,
+                    enable_zakura_header_seed_from_committed_blocks,
+                    ..config.clone()
+                };
+                let reader = FinalizedState::new_with_debug(&reader_config, &Mainnet, true, true)
+                    .expect("readers do not need a VCT repair source");
+                assert_eq!(reader.db.vct_synced_below(), Some(Height(100)));
+            }
+        }
+    }
+}
+
+#[test]
 fn validate_storage_mode_enforces_retention_floor() {
     let pruned = |tx_retention| Config {
         storage_mode: StorageMode::Pruned(PruningConfig { tx_retention }),

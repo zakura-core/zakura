@@ -71,7 +71,11 @@ async fn bidirectional_transfers_exceed_flow_control_windows() -> Result<(), Box
     Ok(())
 }
 
-async fn drain_stream(mut recv: RecvStream, expected: usize, byte: u8) -> Result<(), BoxError> {
+pub(super) async fn drain_stream(
+    mut recv: RecvStream,
+    expected: usize,
+    byte: u8,
+) -> Result<(), BoxError> {
     let mut buffer = vec![0; 64 * 1024];
     let mut received = 0;
     while let Some(count) = recv.read(&mut buffer).await? {

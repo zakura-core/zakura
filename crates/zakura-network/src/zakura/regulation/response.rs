@@ -6,7 +6,8 @@ use thiserror::Error;
 ///
 /// Consuming the last part does not consume an ending. The owner retains this
 /// value until its message-specific terminal or connection closure. There is no
-/// local-work expiry operation and spent credit cannot be restored.
+/// local-work expiry operation. Only an explicit new grant adds credit, and
+/// granting does not erase consumption from earlier responses.
 #[derive(Debug)]
 pub(crate) struct ResponseCredit {
     objects: u64,
@@ -21,12 +22,44 @@ pub(crate) struct ResponseCreditExceeded;
 
 impl ResponseCredit {
     pub(crate) fn new(objects: u64, bytes: u64) -> Self {
-        Self {
-            objects,
-            bytes,
+        let mut credit = Self {
+            objects: 0,
+            bytes: 0,
             consumed_objects: 0,
             consumed_bytes: 0,
+        };
+        credit
+            .grant(objects, bytes, objects, bytes)
+            .expect("the initial grant equals its limits and consumption is zero");
+        credit
+    }
+
+    /// Add a new grant before publishing it to the peer. The message owns grant
+    /// identity, publication ordering and closure. Limits bound outstanding
+    /// credit, while cumulative counters remain intact for response matching.
+    pub(crate) fn grant(
+        &mut self,
+        objects: u64,
+        bytes: u64,
+        object_limit: u64,
+        byte_limit: u64,
+    ) -> Result<(), ResponseCreditExceeded> {
+        let objects = self
+            .objects
+            .checked_add(objects)
+            .ok_or(ResponseCreditExceeded)?;
+        let bytes = self
+            .bytes
+            .checked_add(bytes)
+            .ok_or(ResponseCreditExceeded)?;
+        if objects - self.consumed_objects > object_limit
+            || bytes - self.consumed_bytes > byte_limit
+        {
+            return Err(ResponseCreditExceeded);
         }
+        self.objects = objects;
+        self.bytes = bytes;
+        Ok(())
     }
 
     /// Check before allocation or waiting for handler capacity. Consumption is separate.

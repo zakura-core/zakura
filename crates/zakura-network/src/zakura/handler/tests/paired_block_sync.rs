@@ -28,6 +28,7 @@ mod link;
 mod paused;
 
 struct Workload {
+    transport: Option<QuicTransportConfig>,
     peer_limit: Option<usize>,
     pressure: bool,
     impaired: bool,
@@ -40,6 +41,7 @@ struct Workload {
 impl Default for Workload {
     fn default() -> Self {
         Self {
+            transport: None,
             peer_limit: None,
             pressure: false,
             impaired: false,
@@ -327,6 +329,7 @@ async fn download_rounds(
 
 async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
     let Workload {
+        transport,
         peer_limit,
         pressure,
         impaired,
@@ -347,10 +350,11 @@ async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
     if pressure {
         limits.message_rate_per_second = 40_000;
     }
-    let server = LocalEndpointFactory::with_transport_config(limits.transport_config())
+    let transport_config = transport.unwrap_or_else(|| limits.transport_config());
+    let server = LocalEndpointFactory::with_transport_config(transport_config.clone())
         .endpoint(94101)
         .await?;
-    let client = LocalEndpointFactory::with_transport_config(limits.transport_config())
+    let client = LocalEndpointFactory::with_transport_config(transport_config.clone())
         .endpoint(94102)
         .await?;
     let handler =
@@ -540,7 +544,7 @@ async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
 
             let fresh_node = Node::new(blocks.clone(), true);
             let fresh_endpoint =
-                LocalEndpointFactory::with_transport_config(limits.transport_config())
+                LocalEndpointFactory::with_transport_config(transport_config.clone())
                     .endpoint(94103)
                     .await?;
             let (fresh_sibling, fresh_siblings) = paused::PausedService::new(paused_siblings);

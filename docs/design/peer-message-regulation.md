@@ -44,6 +44,12 @@ runtime work. Bounded decoder tests still check that untrusted payloads cannot c
 ## Response lifetime and session replacement
 
 The shared requester primitives separate response credit from session lifetime.
+An explicit credit grant can add object and byte allowances within the message's
+outstanding-credit limits. It preserves cumulative consumption and rejects an
+overflowing or excessive grant without changing either counter. The message
+adapter must record each grant before publishing it, validate its identity and
+sequence, and prohibit grants after closure. Existing finite GetBlocks requests
+receive their credit once. Renewal supports the future subscription contract.
 `ResponseCredit` counts consumed objects and actual bytes. `ResponseScope` fences
 publication and first writes for one receiver incarnation. Each exchange has one
 `ResponseAuthorization` owner, retained until its validated ending. The writer

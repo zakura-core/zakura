@@ -46,13 +46,8 @@ impl StatusDelivery {
     ) -> Option<Instant> {
         let deadline = match self.last_queued {
             None => self.handshake_at,
-            Some(previous) if previous != latest => {
-                if contracts(previous, latest) {
-                    self.contraction.next_allowed
-                } else {
-                    self.growth.next_allowed
-                }
-            }
+            Some(previous) if contracts(previous, latest) => self.contraction.next_allowed,
+            Some(previous) if previous != latest => self.growth.next_allowed,
             Some(_) if !received_status => self.handshake_at,
             Some(_) => return None,
         };

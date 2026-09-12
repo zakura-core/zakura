@@ -19,6 +19,9 @@ pub(crate) use slots::{SlotBudget, SlotPermit};
 mod response;
 pub(crate) use response::ResponseCredit;
 
+mod response_scope;
+pub(crate) use response_scope::{ResponseAuthorization, ResponseScope, ResponseWritePermission};
+
 #[cfg(test)]
 mod tests;
 

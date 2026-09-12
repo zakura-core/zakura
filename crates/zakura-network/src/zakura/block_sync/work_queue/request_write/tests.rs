@@ -95,6 +95,7 @@ struct Fixture {
     work: Arc<WorkQueue>,
     budget: ByteBudget,
     cancel: CancellationToken,
+    authorizations: Vec<crate::zakura::regulation::ResponseAuthorization>,
 }
 
 impl Fixture {
@@ -103,6 +104,7 @@ impl Fixture {
             work: Arc::new(WorkQueue::new(block::Height(0))),
             budget: ByteBudget::new(1000),
             cancel: CancellationToken::new(),
+            authorizations: Vec::new(),
         };
         fixture.work.set_estimate_floor_for_tests(1);
         fixture.refill();
@@ -138,12 +140,21 @@ impl Fixture {
         );
         assert_eq!(items.len(), 2);
         assert!(self.budget.try_reserve(200));
+        let authorization = crate::zakura::regulation::ResponseScope::new(
+            CancellationToken::new(),
+            crate::zakura::CloseCause::new(),
+        )
+        .authorize()
+        .unwrap();
+        let permission = authorization.write_permission();
+        self.authorizations.push(authorization);
         RequestWrite::new(
             items[0].1.owner.unwrap(),
             items,
             self.work.clone(),
             self.budget.clone(),
             self.cancel.clone(),
+            permission,
         )
     }
 

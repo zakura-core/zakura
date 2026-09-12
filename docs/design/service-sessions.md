@@ -105,8 +105,11 @@ finish or drop it. Every member also consumes a transport stream slot.
 Every persistent member shares a local session identity, cancellation token, and
 message-rate budget. A remote close on any member retires the session.
 Cancellation resets unfinished writes before a replacement can send frames.
-A write deadline retires the session without closing unrelated services on the
-connection. Protocol violations can still close the connection.
+A write deadline retires the session. Message authorization can require closing
+the connection as well. GetBlocks fences the old receiver before replacement
+and closes locally if any started exchange cannot be drained. A queued request
+proven never started or an exchange with a validated ending allows reuse.
+Protocol violations can still close the connection.
 
 Dropping an application receiver stops delivery to that receiver. The transport
 keeps reading within its frame and message-rate limits and discards those frames.

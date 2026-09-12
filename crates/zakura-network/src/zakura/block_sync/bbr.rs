@@ -1030,6 +1030,7 @@ mod bbr_tests {
         let now = Instant::now();
         for _ in 0..n {
             window.outstanding.push(OutstandingBlockRange {
+                authorization: crate::zakura::regulation::ResponseAuthorization::for_test(),
                 response: crate::zakura::regulation::ResponseCredit::new(1, u64::MAX),
                 local_work_active: true,
                 write_status: super::super::work_queue::RequestWriteStatus::written_for_tests(),
@@ -1139,6 +1140,7 @@ mod bbr_tests {
             // A `u32` index; the test count is tiny so the cast is safe.
             let height = block::Height(1 + i as u32);
             window.outstanding.push(OutstandingBlockRange {
+                authorization: crate::zakura::regulation::ResponseAuthorization::for_test(),
                 response: crate::zakura::regulation::ResponseCredit::new(1, u64::MAX),
                 local_work_active: true,
                 write_status: super::super::work_queue::RequestWriteStatus::written_for_tests(),

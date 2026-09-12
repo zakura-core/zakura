@@ -69,8 +69,8 @@ async fn compare_uniform_receive_windows() -> Result<(), BoxError> {
         )?;
     }
     for impaired in [false, true] {
-        let mut samples = [[Duration::ZERO; SAMPLES]; 4];
-        for sample in 0..SAMPLES {
+        let mut samples = [[Duration::ZERO; 4]; SAMPLES];
+        for (sample, durations) in samples.iter_mut().enumerate() {
             // Rotate order so one configuration is not always measured first.
             let policies = [BASELINE, CANDIDATES[0], CANDIDATES[1], CANDIDATES[2]];
             for offset in 0..policies.len() {
@@ -82,7 +82,7 @@ async fn compare_uniform_receive_windows() -> Result<(), BoxError> {
                     ..Workload::default()
                 })
                 .await?;
-                samples[index][sample] = elapsed;
+                durations[index] = elapsed;
                 eprintln!(
                     "window sample: impaired={impaired} policy={} sample={} elapsed_ns={}",
                     policy.name,
@@ -104,14 +104,16 @@ async fn compare_uniform_receive_windows() -> Result<(), BoxError> {
                 }
             }
         }
-        for durations in &mut samples {
+        let medians: [Duration; 4] = std::array::from_fn(|policy| {
+            let mut durations: [Duration; SAMPLES] =
+                std::array::from_fn(|sample| samples[sample][policy]);
             durations.sort_unstable();
-        }
+            durations[SAMPLES / 2]
+        });
         for (index, policy) in CANDIDATES.iter().enumerate() {
             // Each sample transfers the same useful bytes and consumes every
             // ending on its original connection, so this is a throughput ratio.
-            let ratio = samples[0][SAMPLES / 2].as_secs_f64()
-                / samples[index + 1][SAMPLES / 2].as_secs_f64();
+            let ratio = medians[0].as_secs_f64() / medians[index + 1].as_secs_f64();
             eprintln!(
                 "window median: impaired={impaired} policy={} throughput_ratio={ratio:.6} meets_90_percent={}",
                 policy.name,

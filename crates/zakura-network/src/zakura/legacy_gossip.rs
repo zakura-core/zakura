@@ -40,10 +40,10 @@ use crate::{
 
 use super::trace::BlockBodySource;
 use super::{
-    spawn_supervised_peer_task, BoxRunFuture, Frame, FramedSend, OrderedSendError,
-    OrderedSessionDemand, OrderedStreamOpening, OrderedStreamPolicy, Peer, RequestResponseService,
-    Service as ZakuraService, ServicePeerDirection, SinkReject, Stream, StreamMode, ZakuraConnId,
-    ZakuraPeerHandle, ZakuraPeerId, ZakuraSupervisorHandle, ZakuraTrace, FRAME_HEADER_BYTES,
+    spawn_supervised_peer_task, BoxRunFuture, Frame, FramedSend, OrderedSendError, Peer,
+    RequestResponseService, Service as ZakuraService, ServicePeerDirection, SessionDemand,
+    SessionOpening, SessionPolicy, SinkReject, Stream, StreamMode, ZakuraConnId, ZakuraPeerHandle,
+    ZakuraPeerId, ZakuraSupervisorHandle, ZakuraTrace, FRAME_HEADER_BYTES,
     LOCAL_MAX_CONTROL_FRAME_BYTES, ZAKURA_CAP_LEGACY_GOSSIP,
 };
 
@@ -145,7 +145,7 @@ const LEGACY_GOSSIP_SERVICE_STREAMS: [Stream; 2] = [
         version: LEGACY_GOSSIP_VERSION,
         frame_cap: LOCAL_MAX_CONTROL_FRAME_BYTES,
         capability: ZAKURA_CAP_LEGACY_GOSSIP,
-        mode: StreamMode::Ordered,
+        mode: StreamMode::Persistent,
     },
     Stream {
         kind: ZAKURA_STREAM_LEGACY_REQUESTS,
@@ -2544,9 +2544,9 @@ impl ZakuraService for LegacyGossipSink {
         legacy_gossip_streams()
     }
 
-    fn ordered_stream_policy(&self, _kind: u16) -> OrderedStreamPolicy {
-        OrderedStreamPolicy {
-            opening: OrderedStreamOpening::InitiatorOnly,
+    fn session_policy(&self) -> SessionPolicy {
+        SessionPolicy {
+            opening: SessionOpening::InitiatorOnly,
             reopen: true,
         }
     }
@@ -2560,17 +2560,17 @@ impl ZakuraService for LegacyGossipSink {
         self.outbound.owns_connection(peer, conn_id)
     }
 
-    fn ordered_session_demand(
+    fn session_demand(
         &self,
         conn_id: ZakuraConnId,
         peer: &ZakuraPeerId,
         _negotiated: u64,
         _direction: ServicePeerDirection,
-    ) -> OrderedSessionDemand {
+    ) -> SessionDemand {
         if self.outbound.is_retired(peer, conn_id) {
-            return OrderedSessionDemand::Retire;
+            return SessionDemand::Retire;
         }
-        OrderedSessionDemand::OpenNow
+        SessionDemand::OpenNow
     }
 
     fn add_peer(&self, mut peer: Peer) {
@@ -4704,8 +4704,8 @@ mod tests {
             "a retired gossip stream must not hold a reopen-gap claim"
         );
         assert!(matches!(
-            sink.ordered_session_demand(conn_id, &peer_id, 0, ServicePeerDirection::Outbound),
-            OrderedSessionDemand::Retire,
+            sink.session_demand(conn_id, &peer_id, 0, ServicePeerDirection::Outbound),
+            SessionDemand::Retire,
         ));
         let (send, _rx) = framed_channel(1);
         assert!(
@@ -4767,8 +4767,8 @@ mod tests {
             "a reset churn counter must keep the reopen-gap claim"
         );
         assert!(matches!(
-            sink.ordered_session_demand(conn_id, &peer_id, 0, ServicePeerDirection::Outbound),
-            OrderedSessionDemand::OpenNow,
+            sink.session_demand(conn_id, &peer_id, 0, ServicePeerDirection::Outbound),
+            SessionDemand::OpenNow,
         ));
     }
 

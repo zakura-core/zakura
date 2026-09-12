@@ -142,6 +142,7 @@ fn local_limits(max_frame_bytes: u32, control_timeout: Duration) -> ZakuraLocalL
     let defaults = Config::default();
     let handshake = ZakuraHandshakeConfig::for_network(&defaults.network);
     ZakuraLocalLimits {
+        nat_traversal: false,
         max_connections: DEFAULT_ZAKURA_MAX_CONNECTIONS,
         max_pending_handshakes: DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES,
         quic_idle_timeout: DEFAULT_ZAKURA_QUIC_IDLE_TIMEOUT,

@@ -133,7 +133,7 @@ fn classify(error: &ZakuraHandlerError) -> HandshakeOutcome {
         | ZakuraHandlerError::IrohWrite(_)
         | ZakuraHandlerError::IrohRead(_)
         | ZakuraHandlerError::IrohClosedStream(_) => HandshakeOutcome::LocalFault("transport"),
-        ZakuraHandlerError::ResourceLimit(_) => {
+        ZakuraHandlerError::ResourceLimit(_) | ZakuraHandlerError::SessionFull => {
             HandshakeOutcome::ResourceRejected("local-resource")
         }
         ZakuraHandlerError::Validation(error) => match error.failure_class() {
@@ -148,6 +148,8 @@ fn classify(error: &ZakuraHandlerError) -> HandshakeOutcome {
         },
         ZakuraHandlerError::Oversize
         | ZakuraHandlerError::OversizeFrame { .. }
+        | ZakuraHandlerError::InvalidMessageType(_)
+        | ZakuraHandlerError::InvalidServiceSession
         | ZakuraHandlerError::Protocol(_) => HandshakeOutcome::PeerViolation("invalid-control"),
         ZakuraHandlerError::InvalidBootstrapPeer
         | ZakuraHandlerError::InvalidSecretKey

@@ -71,8 +71,10 @@ reserve their allocation before creation and retain the charge through the last
 writer handle, even after an ending or connection close. Exhaustion pauses new
 requests locally, and a release wakes affected waiters.
 
-This accounting currently covers authorization records. Expected hashes,
-request-write copies, and retained window and registry capacities still need
+This accounting currently covers the authorization's shared allocation, including
+its inline phase state. First-use scope and cancellation locks can allocate on
+some platforms and still need funding. Expected hashes, request-write copies,
+and retained window and registry capacities also need
 charges before these limits bound all protocol metadata. These allowances are
 separate from body storage, decoding, and execution budgets.
 

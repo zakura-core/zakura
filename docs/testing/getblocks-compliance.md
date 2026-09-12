@@ -17,15 +17,15 @@ older layout text.
 
 ## Compliance branch results
 
-On 2026-09-11, property revision `6b4d4d949` includes compliance implementation
-`9d5161004` from [#971](https://github.com/zakura-core/zakura/pull/971).
+On 2026-09-11, property revision `27015b314` includes compliance implementation
+`e0d1b45c2` from [#971](https://github.com/zakura-core/zakura/pull/971).
 Local Rust 1.97.0 runs use 64 generated cases, seed 896, and four load rounds.
 
 | Profile | Result |
 | --- | --- |
 | Compliance | 99 passed, 1 failed across 100 tests |
-| Generated properties | 33 passed across 33 tests |
-| Fixed regressions | 432 passed, 1 failed across 433 tests |
+| Generated properties | 34 passed across 34 tests |
+| Fixed regressions | 442 passed, 1 failed across 443 tests |
 
 The only failing witness in both profiles is T02 with two paused sibling
 streams. Their occupied receive windows still prevent the independent service
@@ -46,6 +46,14 @@ changes, and both directions of all three numeric ceiling changes. Fixtures shar
 node work and byte budgets with distinct session generations. T01 keeps the same
 numeric limits that its connection initially advertised.
 
+The shared response scope now fences publication and first writes before session
+replacement or removal. Fixed tests cover prepared and queued writes, partial and
+complete request writes with unfinished responses, validated completion, owner
+Drop, and replacement on a new connection. The real GetBlocks request queue is
+used for the service checks. A separate independent requester model passed 2,048
+generated histories with seed 896, retaining stale writer handles across receiver
+generations. That longer run covers this new model only.
+
 The fixed regression migration preserves its test functions and original work
 invariants with legal exchanges. Reordering uses separate requests, retries finish
 their old exchange or use another connection, and rejected duplicates must leave
@@ -61,9 +69,9 @@ observations remain in the execution logs. The known macOS linker unwind-size
 warning also remains.
 
 This is not full compliance or activation qualification. Shared authorization
-metadata bounds, same-connection session replacement races, real discovery and
-future subscription response adapters, and funded transport headroom remain
-open. The 2,048-case, 64-round load, and long transport gates have not been rerun.
+metadata bounds, real discovery and future subscription response adapters, and
+funded transport headroom remain open. Full 2,048-case qualification, 64-round
+load, and long transport gates have not been rerun.
 The earlier decoder stage separately passed 159 chain regressions and six
 serialization doc tests.
 

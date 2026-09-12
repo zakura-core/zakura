@@ -32,6 +32,15 @@ encoder, bounded output queue, and `QueuedFrame::write_with` boundary. Its sessi
 model retains the original owner across reconnects. Observation handles are weak
 and do not keep work alive.
 
+Requester lifecycle histories use the production `ResponseScope` and
+`ResponseAuthorization` with an independent exchange model. They vary publication,
+first-write admission, valid endings, owner Drop, connection closure, and receiver
+replacement. Old writer permissions survive those events so a stale writer must
+remain fenced. These histories contain no GetBlocks range or scheduling fields.
+The fixed service regressions separately exercise the real GetBlocks request queue,
+including a write paused after its first claim and replacement on a new connection.
+Discovery response and future subscription adapters remain to be added.
+
 ## GetBlocks coverage
 
 | Boundary | Generated checks | Production path |

@@ -122,16 +122,56 @@ type TxVerifier = Buffer<
 >;
 type InboundTxDownloads = TxDownloads<Timeout<Outbound>, Timeout<TxVerifier>, ReadState>;
 
+/// The maximum estimated distance to the network tip, in blocks, at which the
+/// mempool and its crawler activate, and at which the mempool scores peer
+/// misbehavior.
+///
+/// This matches `getblocktemplate`'s `MAX_ESTIMATED_DISTANCE_TO_NETWORK_CHAIN_TIP`.
+/// An active mempool only disables beyond [`zs::MAX_BLOCK_REORG_HEIGHT`], so
+/// the gap between the two thresholds keeps the mempool from flapping.
+const MAX_ESTIMATED_DISTANCE_TO_ENABLE: block::HeightDiff = 100;
+
+/// Returns true when the local-clock estimate puts the best chain tip within
+/// [`MAX_ESTIMATED_DISTANCE_TO_ENABLE`] blocks of the network tip.
+/// Test networks bypass the estimate because mining can stop for long periods.
+pub(crate) fn is_estimated_close_to_network_tip(chain_tip_change: &ChainTipChange) -> bool {
+    if chain_tip_change.network().is_a_test_network() {
+        return chain_tip_change.best_tip_height().is_some();
+    }
+
+    chain_tip_change
+        .estimate_distance_to_network_chain_tip()
+        .is_some_and(|(distance, _height)| distance <= MAX_ESTIMATED_DISTANCE_TO_ENABLE)
+}
+
 fn transaction_misbehavior(
     error: &TransactionDownloadVerifyError,
+    best_tip_height: Option<block::Height>,
 ) -> Option<(PeerSocketAddr, u32)> {
     let TransactionDownloadVerifyError::Invalid {
         error,
         advertiser_addr: Some(advertiser_addr),
+        tip_height,
     } = error
     else {
         return None;
     };
+
+    if tip_height.is_none() || *tip_height != best_tip_height {
+        return None;
+    }
+
+    // Tip timestamps only estimate freshness. Honest peers can use a different
+    // branch or lock context even when this node passes the distance gate.
+    if matches!(
+        error,
+        TransactionError::WrongConsensusBranchId
+            | TransactionError::WrongConsensusBranchIdNu6_3GracePeriod
+            | TransactionError::LockedUntilAfterBlockHeight(_)
+            | TransactionError::LockedUntilAfterBlockTime(_)
+    ) {
+        return None;
+    }
 
     let score = error.mempool_misbehavior_score();
     (score != 0).then_some((*advertiser_addr, score))
@@ -378,7 +418,7 @@ impl Mempool {
 
         // Make sure `is_enabled` is accurate.
         // Otherwise, it is only updated in `poll_ready`, right before each service call.
-        service.update_state(None);
+        service.update_state(None, service.is_caught_up_to_start());
 
         (service, transaction_subscriber)
     }
@@ -413,24 +453,43 @@ impl Mempool {
 
     /// Returns `true` if Zakura is caught up enough to start the mempool.
     ///
-    /// During Zakura sync, [`SyncStatus`] is updated from state's effective
-    /// best-header frontier. That frontier uses the verified block tip when it
-    /// is ahead of the stored header tip, so a locally mined latest block does
-    /// not keep the mempool disabled just because peers have not advertised its
-    /// header yet.
+    /// Mempool activation needs both sync throughput to have slowed down and an
+    /// independent local-clock estimate that the state tip is close to the
+    /// network tip. The estimate prevents a peer-starved syncer from looking
+    /// caught up just because it is downloading zero blocks per round.
     fn is_caught_up_to_start(&self) -> bool {
-        self.sync_status.is_close_to_tip() || self.is_enabled_by_debug()
+        self.is_enabled_by_debug() || self.is_current_enough_for_mempool()
+    }
+
+    /// Returns true when sync throughput and the tip estimate permit mempool use.
+    fn is_current_enough_for_mempool(&self) -> bool {
+        self.sync_status.is_close_to_tip()
+            && is_estimated_close_to_network_tip(&self.chain_tip_change)
+    }
+
+    /// Returns the estimated distance to the network tip, if a state tip exists.
+    fn estimated_distance_to_network_tip(&self) -> Option<block::HeightDiff> {
+        self.chain_tip_change
+            .estimate_distance_to_network_chain_tip()
+            .map(|(distance, _height)| distance)
+    }
+
+    /// Returns true when the node has fallen far enough behind to disable an
+    /// already-active mempool.
+    fn is_far_enough_to_disable(&self) -> bool {
+        !self.is_enabled_by_debug()
+            && !self.chain_tip_change.network().is_a_test_network()
+            && self
+                .estimated_distance_to_network_tip()
+                .is_none_or(|distance| distance > i64::from(zs::MAX_BLOCK_REORG_HEIGHT))
     }
 
     /// Replaces the active state with a freshly-initialised [`ActiveState::Enabled`],
     /// using `tip_action`'s best tip hash as the `last_seen_tip_hash`.
-    fn enable_at_tip(&mut self, tip_action: &TipAction) {
+    fn enable_at_tip(&mut self, tip_action: &TipAction, reason: &'static str) {
         let (last_seen_tip_hash, tip_height) = tip_action.best_tip_hash_and_height();
 
-        info!(
-            ?tip_height,
-            "activating mempool: Zakura is close to the tip"
-        );
+        info!(?tip_height, reason, "activating mempool");
 
         let tx_downloads = Box::pin(TxDownloads::new(
             Timeout::new(self.outbound.clone(), TRANSACTION_DOWNLOAD_TIMEOUT),
@@ -452,32 +511,58 @@ impl Mempool {
     ///
     /// Accepts an optional [`TipAction`] for setting the `last_seen_tip_hash` field
     /// when enabling the mempool state, it will not enable the mempool if this is None.
+    /// Uses the activation decision sampled before consuming the tip action.
     ///
     /// Returns `true` if the state changed.
-    fn update_state(&mut self, tip_action: Option<&TipAction>) -> bool {
-        let is_caught_up_to_start = self.is_caught_up_to_start();
+    fn update_state(
+        &mut self,
+        tip_action: Option<&TipAction>,
+        is_caught_up_to_start: bool,
+    ) -> bool {
+        let is_far_enough_to_disable = self.is_far_enough_to_disable();
 
-        // TODO: revisit these state transitions after header sync can prove
-        // whether Zakura is behind the network tip.
-        match (is_caught_up_to_start, self.is_enabled(), tip_action) {
+        match (
+            is_caught_up_to_start,
+            is_far_enough_to_disable,
+            self.is_enabled(),
+            tip_action,
+        ) {
             // the active state is up to date, or there is no tip action to activate the mempool
-            (false, false, _) | (true, true, _) | (true, false, None) => return false,
+            (false, _, false, _) | (true, _, true, _) | (true, _, false, None) => return false,
 
             // Enable state - there should be a chain tip when Zakura is close
             // to the network tip.
-            (true, false, Some(tip_action)) => self.enable_at_tip(tip_action),
+            (true, _, false, Some(tip_action)) => self.enable_at_tip(
+                tip_action,
+                if self.is_enabled_by_debug() {
+                    "debug height reached"
+                } else {
+                    "estimated close to the network tip"
+                },
+            ),
 
-            // TODO: only disable an already-active mempool when a validated
-            // Zakura header/block-sync frontier proves Zakura is behind a
-            // higher-work chain that follows this node's consensus rules.
-            //
-            // The legacy sync status can be triggered by lower-work forks,
-            // stale peers, or peers on incompatible consensus rules, so
-            // it is strong enough to delay initial activation but not to shut
-            // down a working mempool.
-            (false, true, _) => {
-                return false;
+            // Disable once the same clock estimate used for activation falls
+            // outside the rollback window.
+            (_, true, true, _) => {
+                let estimated_distance_to_network_tip = self.estimated_distance_to_network_tip();
+                info!(
+                    ?estimated_distance_to_network_tip,
+                    disable_distance = zs::MAX_BLOCK_REORG_HEIGHT,
+                    "deactivating mempool: Zakura is far from the network tip"
+                );
+
+                if let ActiveState::Enabled { storage, .. } = &self.active_state {
+                    let invalidated_ids: HashSet<_> = storage.tx_ids().collect();
+                    if !invalidated_ids.is_empty() {
+                        let _ = self
+                            .transaction_sender
+                            .send(MempoolChange::invalidated(invalidated_ids));
+                    }
+                }
+                self.active_state = ActiveState::Disabled;
             }
+
+            (false, false, true, _) => return false,
         };
 
         true
@@ -608,13 +693,13 @@ impl Service<Request> for Mempool {
         Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send + 'static>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        let should_check_tip = self.is_enabled() || self.is_caught_up_to_start();
+        let is_caught_up_to_start = self.is_caught_up_to_start();
+        let should_check_tip = self.is_enabled() || is_caught_up_to_start;
         let tip_action = should_check_tip
             .then(|| self.chain_tip_change.last_tip_change())
             .flatten();
 
-        // TODO: Consider broadcasting a `MempoolChange` when the mempool is disabled.
-        let is_state_changed = self.update_state(tip_action.as_ref());
+        let is_state_changed = self.update_state(tip_action.as_ref(), is_caught_up_to_start);
 
         tracing::trace!(is_enabled = ?self.is_enabled(), ?is_state_changed, "started polling the mempool...");
 
@@ -647,17 +732,14 @@ impl Service<Request> for Mempool {
             // and dropping completed verification results.
             std::mem::drop(previous_state);
 
-            // Re-initialise an empty state.
-            //
-            // This deliberately bypasses the initial-activation gate in `update_state()`:
-            // the mempool was already active when the reset arrived, and the legacy
-            // far-from-tip sync status must not disable an already-active mempool
-            // (it can be triggered by lower-work forks, stale peers, or peers on
-            // incompatible consensus rules).
+            // Re-initialise an empty state. `update_state()` has already applied
+            // the distance-based disable gate, so an active mempool can safely
+            // reset at the current tip.
             self.enable_at_tip(
                 tip_action
                     .as_ref()
                     .expect("this branch only matches when tip_action is a Reset"),
+                "chain tip reset",
             );
 
             // Re-verify the transactions that were pending or valid at the previous tip.
@@ -679,6 +761,8 @@ impl Service<Request> for Mempool {
 
             return Poll::Ready(Ok(()));
         }
+
+        let is_current_enough_for_mempool = self.is_current_enough_for_mempool();
 
         if let ActiveState::Enabled {
             storage,
@@ -750,8 +834,12 @@ impl Service<Request> for Mempool {
                     }
                     Ok(Err(boxed_err)) => {
                         let (tx_id, error) = *boxed_err;
-                        if let Some((advertiser_addr, score)) = transaction_misbehavior(&error) {
-                            let _ = self.misbehavior_sender.try_send((advertiser_addr, score));
+                        if is_current_enough_for_mempool {
+                            if let Some((advertiser_addr, score)) =
+                                transaction_misbehavior(&error, best_tip_height)
+                            {
+                                let _ = self.misbehavior_sender.try_send((advertiser_addr, score));
+                            }
                         }
 
                         let peer_label =

@@ -131,6 +131,20 @@ existing stream credit, it cannot send more data on that stream. Already authori
 count toward the resource bound. Account for both stream and connection credit.
 See [QUIC flow control](https://www.rfc-editor.org/rfc/rfc9000.html#section-4.1).
 
+The native endpoint reserves a shared transport slot before constructing an inbound or outbound
+QUIC connection. The transport retains that owner through failed handshakes, application handler
+exit and closing state until its final driver and stream handles retire. This is separate from
+application connection admission. The raw incoming queue is also bounded before acceptance.
+The local dependency patch and its release constraint are described in
+[the transport patch](../../vendor/README.md). The slot count alone does not establish the
+required node memory envelope or stream progress bound.
+
+Send capacity counts retained payload, including acknowledged tails behind a missing prefix.
+Reset frees abandoned storage before returning capacity. Stream count and receive fragment
+limits must also cover locally opened and retiring streams. These transport bounds complement
+the application budgets below. Their native window policy and full allocation allowances still
+require qualification.
+
 Pausing request intake must not trap responses or control messages needed to finish active work.
 A mixed ordered stream can create that dependency even when every queue is bounded. The concrete
 stream layout must demonstrate simultaneous bidirectional serving and control progress before

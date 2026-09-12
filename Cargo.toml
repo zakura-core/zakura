@@ -21,10 +21,15 @@ members = [
 # The asset packaging crate publishes on the release-state cadence rather than with the
 # workspace, and its payload is generated rather than committed, so it is deliberately not a
 # member. Zakura consumes the published crate from crates.io like any other dependency.
-exclude = ["crates/zakura-assets"]
+exclude = ["crates/zakura-assets", "vendor/noq", "vendor/noq-proto", "vendor/zakura-iroh"]
 
 # Use the edition 2021 dependency resolver in the workspace, to match the crates
 resolver = "2"
+
+[patch.crates-io]
+noq = { path = "vendor/noq" }
+noq-proto = { path = "vendor/noq-proto" }
+zakura-iroh = { path = "vendor/zakura-iroh" }
 
 [workspace.package]
 authors = ["Zakura Contributors"]

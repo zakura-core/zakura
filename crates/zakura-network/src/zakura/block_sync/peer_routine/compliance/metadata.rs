@@ -23,13 +23,20 @@ fn r02_request_metadata_capacity_boundaries() {
 }
 
 fn check_request_metadata(count: usize) -> Result<(), proptest::test_runner::TestCaseError> {
+    let conversion_error = |error: std::num::TryFromIntError| {
+        proptest::test_runner::TestCaseError::fail(error.to_string())
+    };
+    let height_count = u32::try_from(count).map_err(conversion_error)?;
+    let body_count = u64::from(height_count);
     let node = ResponseMemory::default();
     let memory = node.connection();
     let scope =
         ResponseScope::with_memory(CancellationToken::new(), CloseCause::new(), memory.clone());
     let planned = RequestWrite::metadata_bytes(count).unwrap()
-        + u64::try_from(count * std::mem::size_of::<ExpectedBlock>()).unwrap();
-    let mut authorization = scope.authorize_with_metadata(planned).unwrap();
+        + u64::try_from(count * std::mem::size_of::<ExpectedBlock>()).map_err(conversion_error)?;
+    let mut authorization = scope.authorize_with_metadata(planned).map_err(|error| {
+        proptest::test_runner::TestCaseError::fail(format!("request plan admission: {error:?}"))
+    })?;
     let funded = memory.reserved_for_test();
     let work = Arc::new(WorkQueue::new(block::Height(0)));
     work.set_estimate_floor_for_tests(1);
@@ -45,7 +52,7 @@ fn check_request_metadata(count: usize) -> Result<(), proptest::test_runner::Tes
     );
     let items = work.take_for_request(
         block::Height(1),
-        block::Height(u32::try_from(count).unwrap()),
+        block::Height(height_count),
         count,
         u64::MAX,
         1,
@@ -54,9 +61,10 @@ fn check_request_metadata(count: usize) -> Result<(), proptest::test_runner::Tes
     prop_assert_eq!(items.len(), count);
     prop_assert!(items.capacity() <= count);
     let item_bytes =
-        u64::try_from(items.capacity() * std::mem::size_of::<(block::Height, WorkItem)>()).unwrap();
-    let mut bodies = ByteBudget::new(u64::try_from(count).unwrap());
-    prop_assert!(bodies.try_reserve(u64::try_from(count).unwrap()));
+        u64::try_from(items.capacity() * std::mem::size_of::<(block::Height, WorkItem)>())
+            .map_err(conversion_error)?;
+    let mut bodies = ByteBudget::new(body_count);
+    prop_assert!(bodies.try_reserve(body_count));
     let owner = items[0].1.owner.unwrap();
     let cancel = CancellationToken::new();
     let ((write, expected), allocations) = measure(|| {
@@ -79,8 +87,9 @@ fn check_request_metadata(count: usize) -> Result<(), proptest::test_runner::Tes
         (write, expected)
     });
     prop_assert!(allocations.retained_bytes > 0);
+    let peak_live_bytes = u64::try_from(allocations.peak_live_bytes).map_err(conversion_error)?;
     prop_assert!(
-        item_bytes + u64::try_from(allocations.peak_live_bytes).unwrap() <= planned,
+        item_bytes + peak_live_bytes <= planned,
         "{} item bytes + {} allocation bytes exceed plan {}",
         item_bytes,
         allocations.peak_live_bytes,

@@ -102,8 +102,11 @@ impl Fixture {
         fs::write(&path, bytes).unwrap();
         let frontiers =
             commitment_aux::produce_final_frontiers_bytes(&ordinary.db, terminal).unwrap();
+        // The fixture stops VCT sync below the Mainnet checkpoint handoff.
+        // A writable open resumes that sync only on a native P2P stack.
         let config = Config {
             cache_dir: directory.path().join("state"),
+            enable_zakura_header_seed_from_committed_blocks: true,
             ..Config::default()
         };
         let mut fixture = Self {

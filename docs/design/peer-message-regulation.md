@@ -94,15 +94,22 @@ Container growth is admitted together with the request, then receives a separate
 memory permit. The shared ResponseVec keeps that permit with its backing capacity.
 Growth funds the old and new allocations simultaneously, moves the entries, and
 releases the old permit only after the old allocation is freed. GetBlocks uses it
-for its download window. Finishing the last request leaves an empty window whose
-retained capacity is still charged. Exact growth and smaller request batches are
+for its download window, sorted registry height index, response ranges, and scratch
+snapshot. Finishing the last request leaves empty buffers whose retained capacity
+is still charged. Exact growth and smaller request batches are
 tried when geometric growth cannot fit, so a buffer cannot consume the memory
 needed to create the request that would use it.
 
-Registry snapshots and range capacity still need charges before these limits
-bound all protocol metadata. Transport setup, stream buffers and cancellation
-children also need their own aggregate accounting. These allowances are separate
-from body storage, decoding, and execution budgets.
+Both snapshot copies are prepared before taking work. Publication filters current
+owners under the work queue lock, releases that lock, sorts in place, then swaps
+the scratch and published buffers under the registry lock. It requires no new
+allocation. Registry admission fences old generations and frees their published
+buffers. An old routine retains its own scratch funding until it exits.
+
+The remaining metadata collections, transport setup, stream buffers and cancellation
+children still need aggregate accounting before these limits bound all protocol
+metadata. These allowances are separate from body storage, decoding, and execution
+budgets.
 
 ## Capacity admission and QUIC backpressure
 

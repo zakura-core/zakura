@@ -25,14 +25,6 @@ impl<T> ResponseVec<T> {
             .expect("the fixture funds collection growth");
         self.push(value);
     }
-
-    pub(crate) fn clear(&mut self) {
-        self.values.clear();
-    }
-
-    pub(crate) fn truncate(&mut self, len: usize) {
-        self.values.truncate(len);
-    }
 }
 
 #[test]

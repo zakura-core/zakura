@@ -1,5 +1,6 @@
 use super::*;
 use crate::zakura::block_sync::sequencer_task::{SequencedBody, SequencerView};
+use crate::zakura::block_sync::state::OutstandingBlockRange;
 use crate::zakura::BlockSyncMessage;
 use crate::zakura::{
     block_sync::{events::RoutineToReactor, MSG_BS_GET_BLOCKS},
@@ -109,8 +110,13 @@ async fn metadata_capacity_reduces_the_batch_before_taking_work() {
     let (funded_count, reservation) = f.routine.authorize_request_metadata().unwrap();
     assert!(funded_count > 0 && funded_count < preferred);
     assert!(node.reserved_for_test() <= setup + 1024);
+    let window_bytes = u64::try_from(
+        f.routine.window.outstanding.capacity() * std::mem::size_of::<OutstandingBlockRange>(),
+    )
+    .unwrap();
+    assert!(window_bytes > 0);
     drop(reservation);
-    assert_eq!(node.reserved_for_test(), setup);
+    assert_eq!(node.reserved_for_test(), setup + window_bytes);
     f.routine.try_fill().await;
     let frame = f.output.try_recv().unwrap();
     let BlockSyncMessage::GetBlocks { count, .. } = BlockSyncMessage::decode_frame(frame).unwrap()

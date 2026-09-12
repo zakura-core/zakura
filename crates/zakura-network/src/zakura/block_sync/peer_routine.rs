@@ -858,10 +858,10 @@ impl PeerRoutine {
 
     // ===================== want-work fill loop (ports `fill_peer`) ===========
 
-    /// Reserve the whole request allocation plan atomically. A smaller request
-    /// can make progress when the pool cannot fund the preferred batch size.
+    /// Admit the request and any retained window growth together. Trying exact
+    /// growth and smaller batches avoids stranding capacity in an unused buffer.
     fn authorize_request_metadata(
-        &self,
+        &mut self,
     ) -> Result<(usize, ResponseAuthorization), ResponseAdmissionError> {
         let mut count = self.request_count_cap();
         loop {
@@ -870,11 +870,29 @@ impl PeerRoutine {
                     bytes.checked_add(collection_allocation_bytes::<ExpectedBlock>(count)?)
                 })
                 .ok_or(ResponseAdmissionError::MemoryFull)?;
-            match self.session.authorize_response_with_metadata(bytes) {
-                Ok(authorization) => return Ok((count, authorization)),
-                Err(ResponseAdmissionError::MemoryFull) if count > 1 => count = count.div_ceil(2),
-                Err(error) => return Err(error),
+            for geometric in [true, false] {
+                let plan = match self.window.outstanding.plan_capacity(1, geometric) {
+                    Ok(plan) => plan,
+                    Err(_) if geometric => continue,
+                    Err(error) => return Err(error),
+                };
+                let retained_bytes = plan.as_ref().map_or(0, |plan| plan.bytes());
+                match self
+                    .session
+                    .authorize_response_with_retained_memory(bytes, retained_bytes)
+                {
+                    Ok((authorization, funding)) => {
+                        self.window.outstanding.apply_capacity(plan, funding)?;
+                        return Ok((count, authorization));
+                    }
+                    Err(ResponseAdmissionError::MemoryFull) => {}
+                    Err(error) => return Err(error),
+                }
             }
+            if count == 1 {
+                return Err(ResponseAdmissionError::MemoryFull);
+            }
+            count = count.div_ceil(2);
         }
     }
 

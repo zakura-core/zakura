@@ -99,29 +99,35 @@ impl ResponseScope {
         Ok(Self(Arc::new(scope)))
     }
 
-    /// Reserve the adapter's allocation plan before taking work. Every planned
-    /// allocation must remain owned by this authorization or a writer permission.
-    pub(crate) fn authorize_with_metadata(
+    /// Admit the exchange and retained container growth atomically. The caller
+    /// transfers the separate permit to that storage before publishing work.
+    pub(crate) fn authorize_with_retained_memory(
         &self,
         metadata_bytes: u64,
-    ) -> Result<ResponseAuthorization, ResponseAdmissionError> {
+        retained_bytes: u64,
+    ) -> Result<(ResponseAuthorization, Option<ResponseMemoryPermit>), ResponseAdmissionError> {
         let state = self.0.lock();
         if state.retired || self.0.connection_cancel.is_cancelled() {
             return Err(ResponseAdmissionError::Retired);
         }
         let bytes = shared_allocation_bytes::<Authorization>()
             .checked_add(metadata_bytes)
+            .and_then(|bytes| bytes.checked_add(retained_bytes))
             .ok_or(ResponseAdmissionError::MemoryFull)?;
-        let memory = self
+        let mut memory = self
             .0
             .memory
             .try_reserve(bytes)
             .ok_or(ResponseAdmissionError::MemoryFull)?;
-        Ok(ResponseAuthorization(Arc::new(Authorization {
-            scope: self.clone(),
-            phase: AtomicU8::new(PREPARED),
-            _memory: memory,
-        })))
+        let retained = memory.split_off(retained_bytes);
+        Ok((
+            ResponseAuthorization(Arc::new(Authorization {
+                scope: self.clone(),
+                phase: AtomicU8::new(PREPARED),
+                _memory: memory,
+            })),
+            retained,
+        ))
     }
 
     pub(crate) fn memory(&self) -> ConnectionResponseMemory {

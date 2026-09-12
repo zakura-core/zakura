@@ -1132,7 +1132,7 @@ fn block_liveness_disconnects_silent_active_peer_after_default_timeout() {
 
     let now = Instant::now();
     let mut window = download_window();
-    window.outstanding.push(window_request(1));
+    window.outstanding.push_for_test(window_request(1));
     window.arm_liveness(now, timeout);
 
     assert_eq!(
@@ -1197,7 +1197,7 @@ fn block_liveness_progress_before_deadline_keeps_peer_alive() {
     let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
     let mut now = Instant::now();
     let mut window = download_window();
-    window.outstanding.push(window_request(1));
+    window.outstanding.push_for_test(window_request(1));
     window.arm_liveness(now, timeout);
 
     for _ in 0..4 {
@@ -1213,7 +1213,7 @@ fn block_liveness_disconnects_silent_peer_after_outstanding_drains() {
     let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
     let now = Instant::now();
     let mut window = download_window();
-    window.outstanding.push(window_request(1));
+    window.outstanding.push_for_test(window_request(1));
     window.arm_liveness(now, timeout);
 
     window.outstanding.clear();
@@ -1228,7 +1228,7 @@ fn block_liveness_disarms_when_satisfied_request_drains() {
     let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
     let now = Instant::now();
     let mut window = download_window();
-    window.outstanding.push(window_request(1));
+    window.outstanding.push_for_test(window_request(1));
     window.arm_liveness(now, timeout);
     window.note_block_progress(now + Duration::from_millis(1), timeout);
     window.outstanding.clear();
@@ -1252,7 +1252,7 @@ fn block_liveness_uses_probe_cap_until_first_accepted_body() {
     assert!(!window.has_block_progress());
     assert_eq!(window.no_progress_request_cap(), 1);
 
-    window.outstanding.push(window_request(1));
+    window.outstanding.push_for_test(window_request(1));
     window.arm_liveness(now, timeout);
 
     assert_eq!(window.requests_without_block_progress, 1);
@@ -1270,14 +1270,14 @@ fn block_liveness_resuming_after_idle_gets_fresh_deadline() {
     let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
     let now = Instant::now();
     let mut window = download_window();
-    window.outstanding.push(window_request(1));
+    window.outstanding.push_for_test(window_request(1));
     window.arm_liveness(now, timeout);
     window.note_block_progress(now + Duration::from_millis(1), timeout);
     window.outstanding.clear();
     window.disarm_liveness_after_progress_if_idle();
 
     let resumed = now + Duration::from_secs(60);
-    window.outstanding.push(window_request(2));
+    window.outstanding.push_for_test(window_request(2));
     window.arm_liveness(resumed, timeout);
 
     assert_eq!(window.block_liveness_deadline, Some(resumed + timeout));
@@ -1288,7 +1288,7 @@ fn block_liveness_multi_block_range_progress_resets_each_body() {
     let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
     let start = Instant::now();
     let mut window = download_window();
-    window.outstanding.push(window_request_range(1, 3));
+    window.outstanding.push_for_test(window_request_range(1, 3));
     window.arm_liveness(start, timeout);
 
     let first = start + Duration::from_secs(4);
@@ -1323,7 +1323,7 @@ fn view_reset_reclears_probe_streak_so_unproven_peer_can_reprobe() {
     let now = Instant::now();
     let mut window = DownloadWindow::new(&config);
 
-    window.outstanding.push(window_request(1));
+    window.outstanding.push_for_test(window_request(1));
     window.arm_liveness(now, timeout);
     assert_eq!(window.requests_without_block_progress, 1);
     assert_eq!(window.no_progress_request_cap(), 1);
@@ -1359,11 +1359,11 @@ fn view_reset_preserves_proof_but_reclears_streak() {
     let now = Instant::now();
     let mut window = DownloadWindow::new(&config);
 
-    window.outstanding.push(window_request(1));
+    window.outstanding.push_for_test(window_request(1));
     window.arm_liveness(now, timeout);
     window.note_block_progress(now + Duration::from_millis(1), timeout);
     // Prove, then issue further requests that go unanswered before the reset.
-    window.outstanding.push(window_request(2));
+    window.outstanding.push_for_test(window_request(2));
     window.arm_liveness(now + Duration::from_millis(2), timeout);
     assert!(window.has_block_progress());
     assert_eq!(window.no_progress_request_cap(), 8);
@@ -1392,7 +1392,7 @@ fn backpressure_extends_liveness_instead_of_disconnecting() {
     let now = Instant::now();
     let mut window = download_window();
 
-    window.outstanding.push(window_request(1));
+    window.outstanding.push_for_test(window_request(1));
     window.arm_liveness(now, timeout);
     assert_eq!(
         window.check_liveness(now + timeout),
@@ -14067,9 +14067,8 @@ async fn reactor_refill_window_advances_past_claimed_heights() {
         }
     ));
 
-    // Populate the work queue with heights 1..=3 (max_claimed = 3), then nudge the
-    // producer. `NeededBlocks` and `HeaderTipChanged` share one FIFO event channel,
-    // so the queue is populated before the re-query runs (no watch race).
+    // Populate heights 1..=3, then nudge the producer without changing the tip.
+    // A periodic refill can run between the two events, so both use the same tip.
     let metas: Vec<_> = (1..=3)
         .map(|height| BlockSyncBlockMeta {
             height: block::Height(height),
@@ -14083,8 +14082,8 @@ async fn reactor_refill_window_advances_past_claimed_heights() {
         .expect("needed-blocks event queues");
     handle
         .send(BlockSyncEvent::HeaderTipChanged {
-            height: block::Height(50_001),
-            hash: block::Hash([51; 32]),
+            height: best_header_tip,
+            hash: block::Hash([50; 32]),
         })
         .await
         .expect("header-tip event queues");
@@ -14103,7 +14102,7 @@ async fn reactor_refill_window_advances_past_claimed_heights() {
                 "refill must advance past the claimed heights, not rescan from the floor",
             );
             assert_eq!(limit, 8);
-            assert_eq!(best_header_tip, block::Height(50_001));
+            assert_eq!(best_header_tip, block::Height(50_000));
         }
         action => panic!("expected the advanced refill query, got {action:?}"),
     }

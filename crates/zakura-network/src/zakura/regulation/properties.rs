@@ -3,9 +3,11 @@
 use super::*;
 use proptest::prelude::*;
 
+mod discovery_response;
 mod response_lifecycle;
 mod response_memory;
 mod response_vec;
+mod subscription_response;
 
 proptest! {
     #[test]

@@ -39,7 +39,27 @@ replacement. Old writer permissions survive those events so a stale writer must
 remain fenced. These histories contain no GetBlocks range or scheduling fields.
 The fixed service regressions separately exercise the real GetBlocks request queue,
 including a write paused after its first claim and replacement on a new connection.
-Discovery response and future subscription adapters remain to be added.
+The discovery response adapter uses the same authorization and credit primitives
+with the real GetPeers/Peers codec and signed node records. GetPeers has no wire
+request ID, so the adapter permits one outstanding query. A valid Peers message
+is its whole response, including an empty result. Generated histories cover
+count and actual byte bounds, excluded node identities, malformed responses,
+first writes, loss of local interest, receiver retirement, and connection closure.
+Fixed examples reject bad signatures and prove that failed handling does not
+restore authorization. Allocation probes require early authorization, envelope,
+count and byte rejection to allocate nothing. This is test-only reuse coverage.
+Production discovery migration remains separate.
+
+The future subscription contract adapter keeps authorization live across fresh
+object and byte grants. It exercises the production checked credit arithmetic,
+authorization lifecycle and slot budgets. A generated oracle tracks available
+credit separately from cumulative consumption. Fixed cases check that grants
+precede publication, idle authorization holds no execution slot, crossed pages
+remain authorized after Close, and terminal capacity is independent of exhausted
+data credit. It also covers retirement and atomic rejection of overflowing or
+excessive grants. This is not a header v8 subscription implementation. Publisher
+cursor validation and crossing Grant/Close tombstone scenarios still need their
+message-specific adapter coverage.
 
 Requester metadata histories share the production node pool across four connection
 contexts. An independent model sums live allocation owners after every reserve,

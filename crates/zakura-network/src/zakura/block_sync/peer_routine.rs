@@ -31,7 +31,7 @@ use super::{
         request_priority as classify_priority, AdmissionOutcome, AdmissionSnapshot,
         RequestPriority,
     },
-    peer_registry::{hard_outbound_capacity, PeerRegistry},
+    peer_registry::{hard_outbound_capacity, OutstandingMeta, PeerRegistry},
     pipe::block_sync_guard,
     reorder::BufferedBlockBody,
     request::{BlockRangeRequest, ExpectedBlock},
@@ -46,6 +46,7 @@ use super::{
 };
 use crate::zakura::regulation::{
     collection_allocation_bytes, ResponseAdmissionError, ResponseAuthorization, ResponseCredit,
+    ResponseVec,
 };
 use crate::zakura::transport::OrderedStreamFailure;
 use crate::zakura::{trace::BlockBodySource, Admit, FramedRecv, SinkReject, ZakuraConnId};
@@ -241,6 +242,8 @@ pub(super) struct PeerRoutine {
 
     // ---- per-peer download state (moved out of `PeerBlockState`) ----
     window: DownloadWindow,
+    /// Funded scratch storage swapped with the registry's published height index.
+    outstanding_snapshot: ResponseVec<(block::Height, OutstandingMeta)>,
     /// Whether this peer has sent a `Status` yet (gates want-work; mirrored into
     /// the registry for the reactor's serving/candidate reads).
     received_status: bool,
@@ -351,6 +354,7 @@ impl PeerRoutine {
             allow_no_progress_park,
             recv,
             window,
+            outstanding_snapshot: ResponseVec::new(),
             received_status: false,
             servable_low: block::Height::MIN,
             servable_high: block::Height::MIN,
@@ -852,21 +856,66 @@ impl PeerRoutine {
                     bytes.checked_add(collection_allocation_bytes::<ExpectedBlock>(count)?)
                 })
                 .ok_or(ResponseAdmissionError::MemoryFull)?;
+            let required_heights = self
+                .window
+                .outstanding
+                .iter()
+                .try_fold(count, |total, range| {
+                    total.checked_add(range.request.expected_blocks.len())
+                })
+                .ok_or(ResponseAdmissionError::MemoryFull)?;
+            let required_ranges = self
+                .window
+                .outstanding
+                .len()
+                .checked_add(1)
+                .ok_or(ResponseAdmissionError::MemoryFull)?;
             for geometric in [true, false] {
-                let plan = match self.window.outstanding.plan_capacity(1, geometric) {
-                    Ok(plan) => plan,
-                    Err(_) if geometric => continue,
-                    Err(error) => return Err(error),
-                };
-                let retained_bytes = plan.as_ref().map_or(0, |plan| plan.bytes());
-                match self
-                    .session
-                    .authorize_response_with_retained_memory(bytes, retained_bytes)
-                {
-                    Ok((authorization, funding)) => {
-                        self.window.outstanding.apply_capacity(plan, funding)?;
-                        return Ok((count, authorization));
-                    }
+                let prepared = self.registry.prepare_response_storage(
+                    &self.peer,
+                    self.generation,
+                    |published, ranges| {
+                        let window_plan = self.window.outstanding.plan_capacity(1, geometric)?;
+                        let scratch_plan = self.outstanding_snapshot.plan_capacity(
+                            required_heights.saturating_sub(self.outstanding_snapshot.len()),
+                            geometric,
+                        )?;
+                        let published_plan = published.plan_capacity(
+                            required_heights.saturating_sub(published.len()),
+                            geometric,
+                        )?;
+                        let ranges_plan = ranges.plan_capacity(
+                            required_ranges.saturating_sub(ranges.len()),
+                            geometric,
+                        )?;
+                        let retained_bytes = [
+                            window_plan.as_ref().map_or(0, |plan| plan.bytes()),
+                            scratch_plan.as_ref().map_or(0, |plan| plan.bytes()),
+                            published_plan.as_ref().map_or(0, |plan| plan.bytes()),
+                            ranges_plan.as_ref().map_or(0, |plan| plan.bytes()),
+                        ]
+                        .into_iter()
+                        .try_fold(0u64, u64::checked_add)
+                        .ok_or(ResponseAdmissionError::MemoryFull)?;
+                        let (authorization, mut funding) = self
+                            .session
+                            .authorize_response_with_retained_memory(bytes, retained_bytes)?;
+                        self.window
+                            .outstanding
+                            .apply_capacity_from(window_plan, &mut funding)?;
+                        self.outstanding_snapshot
+                            .apply_capacity_from(scratch_plan, &mut funding)?;
+                        published.apply_capacity_from(published_plan, &mut funding)?;
+                        ranges.apply_capacity_from(ranges_plan, &mut funding)?;
+                        assert!(
+                            funding.is_none_or(|funding| funding.bytes() == 0),
+                            "every admitted allocation is transferred to its retained buffer"
+                        );
+                        Ok(authorization)
+                    },
+                );
+                match prepared {
+                    Ok(authorization) => return Ok((count, authorization)),
                     Err(ResponseAdmissionError::MemoryFull) => {}
                     Err(error) => return Err(error),
                 }
@@ -1880,50 +1929,48 @@ impl PeerRoutine {
     /// Received-but-uncommitted heights are excluded here because they are held in
     /// `work.in_flight` instead — the producer's `!in_flight_contains` clause
     /// already keeps them out of `pending`.
-    fn publish_outstanding(&self) {
-        let mut unreceived = Vec::new();
+    fn publish_outstanding(&mut self) {
+        self.outstanding_snapshot.clear();
         for outstanding in &self.window.outstanding {
             if !outstanding.local_work_active {
                 continue;
             }
             for expected in &outstanding.request.expected_blocks {
                 if !outstanding.has_received(expected.height) {
-                    unreceived.push((expected.height, (outstanding, expected)));
+                    self.outstanding_snapshot.push((
+                        expected.height,
+                        OutstandingMeta {
+                            owner: outstanding.request.owner,
+                            hash: expected.hash,
+                            estimated_bytes: expected.estimated_bytes,
+                            queued_at: outstanding.queued_at,
+                            deadline: outstanding.deadline,
+                        },
+                    ));
                 }
             }
         }
         // Filter before combining overlapping heights so a stale request cannot
-        // hide the current owner's metadata.
-        self.work.retain_owned(&mut unreceived, |(outstanding, _)| {
-            outstanding.request.owner
-        });
-        let map = unreceived
-            .into_iter()
-            .map(|(height, (outstanding, expected))| {
-                (
-                    height,
-                    super::peer_registry::OutstandingMeta {
-                        owner: outstanding.request.owner,
-                        hash: expected.hash,
-                        estimated_bytes: expected.estimated_bytes,
-                        queued_at: outstanding.queued_at,
-                        deadline: outstanding.deadline,
-                    },
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        if map.is_empty() {
-            self.registry.clear_outstanding(&self.peer, self.generation);
-        } else {
-            self.registry
-                .set_outstanding(&self.peer, self.generation, map);
-        }
+        // hide the current owner's metadata. Release the queue lock before the registry lock.
+        let retained = self
+            .work
+            .retain_owned(&mut self.outstanding_snapshot, |meta| meta.owner);
+        self.outstanding_snapshot.truncate(retained);
+        self.outstanding_snapshot
+            .sort_unstable_by_key(|(height, _)| *height);
+        assert!(
+            self.outstanding_snapshot
+                .windows(2)
+                .all(|pair| pair[0].0 != pair[1].0),
+            "each height belongs to one current request owner"
+        );
         // Publish the window diagnostics for the reactor's periodic trace row and
         // for other routines' cross-peer floor-bias decisions.
         let hard_capacity = hard_outbound_capacity(self.window.max_inflight_requests);
-        self.registry.publish_slots(
+        self.registry.publish_response_snapshot(
             &self.peer,
             self.generation,
+            &mut self.outstanding_snapshot,
             super::peer_registry::SlotDiagnostics {
                 hard_capacity,
                 effective_window: self.window.bbr_effective_cwnd().min(hard_capacity),
@@ -2154,6 +2201,15 @@ mod tests {
             verified_block_tip: block::Height(0),
             verified_block_hash: block::Hash([0; 32]),
         }));
+        let generation = registry
+            .admit_session(
+                &peer,
+                crate::zakura::ServicePeerDirection::Outbound,
+                &config,
+                0,
+                Instant::now(),
+            )
+            .generation();
         let mut routine = PeerRoutine::new(
             peer,
             0,
@@ -2161,7 +2217,7 @@ mod tests {
             in_recv,
             config,
             true,
-            0,
+            generation,
             budget,
             Arc::clone(&work),
             registry,
@@ -2256,6 +2312,16 @@ mod tests {
             verified_block_hash: block::Hash([0; 32]),
         }));
 
+        let registry = Arc::new(PeerRegistry::new());
+        let generation = registry
+            .admit_session(
+                &peer,
+                crate::zakura::ServicePeerDirection::Outbound,
+                &config,
+                0,
+                Instant::now(),
+            )
+            .generation();
         let mut routine = PeerRoutine::new(
             peer,
             0,
@@ -2263,10 +2329,10 @@ mod tests {
             in_recv,
             config,
             true,
-            0,
+            generation,
             budget.clone(),
             work.clone(),
-            Arc::new(PeerRegistry::new()),
+            registry,
             Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
             sequencer_input_tx,
             Arc::new(AtomicU64::new(0)),
@@ -2835,6 +2901,16 @@ mod tests {
             verified_block_hash: block::Hash([0; 32]),
         }));
 
+        let registry = Arc::new(PeerRegistry::new());
+        let generation = registry
+            .admit_session(
+                &peer,
+                crate::zakura::ServicePeerDirection::Outbound,
+                &config,
+                0,
+                Instant::now(),
+            )
+            .generation();
         let mut routine = PeerRoutine::new(
             peer,
             0,
@@ -2842,10 +2918,10 @@ mod tests {
             in_recv,
             config,
             true,
-            0,
+            generation,
             budget,
             Arc::clone(&work),
-            Arc::new(PeerRegistry::new()),
+            registry,
             Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
             sequencer_input_tx,
             Arc::new(AtomicU64::new(0)),

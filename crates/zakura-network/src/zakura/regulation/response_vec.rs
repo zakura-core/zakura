@@ -124,6 +124,29 @@ impl<T> ResponseVec<T> {
     pub(crate) fn remove(&mut self, index: usize) -> T {
         self.values.remove(index)
     }
+
+    /// Split this buffer's share from an admitted group of allocation plans.
+    pub(crate) fn apply_capacity_from(
+        &mut self,
+        plan: Option<CapacityPlan<T>>,
+        funding: &mut Option<ResponseMemoryPermit>,
+    ) -> Result<(), ResponseAdmissionError> {
+        let part = plan.as_ref().map(|plan| {
+            funding
+                .as_mut()
+                .expect("buffer growth belongs to the admitted allocation group")
+                .split_off(plan.bytes())
+        });
+        self.apply_capacity(plan, part)
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.values.clear();
+    }
+
+    pub(crate) fn truncate(&mut self, len: usize) {
+        self.values.truncate(len);
+    }
 }
 
 impl<T> Deref for ResponseVec<T> {

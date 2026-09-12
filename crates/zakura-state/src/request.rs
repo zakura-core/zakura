@@ -1365,6 +1365,13 @@ pub enum Request {
     /// [0]: (crate::error::CommitCheckpointVerifiedError)
     CommitCheckpointVerifiedBlock(CheckpointVerifiedBlock),
 
+    /// Recheck whether durable checkpoint writes allow queued semantic writes to start.
+    ///
+    /// Checkpoint completion sends this request because a buffered state service is not polled
+    /// again until another request arrives. This does not force an early handoff, and repeated
+    /// checks are harmless. Returns [`Response::CheckpointHandoffChecked`].
+    CheckCheckpointHandoff,
+
     /// Computes the depth in the current best chain of the block identified by the given hash.
     ///
     /// Returns
@@ -1576,6 +1583,7 @@ impl Request {
                 "commit_semantically_verified_block_with_admission"
             }
             Request::CommitCheckpointVerifiedBlock(_) => "commit_checkpoint_verified_block",
+            Request::CheckCheckpointHandoff => "check_checkpoint_handoff",
             Request::AwaitUtxo(_) => "await_utxo",
             Request::Depth(_) => "depth",
             Request::Tip => "tip",
@@ -2237,6 +2245,7 @@ impl TryFrom<Request> for ReadRequest {
             | Request::CommitSemanticallyVerifiedBlock(_)
             | Request::CommitSemanticallyVerifiedBlockWithAdmission { .. }
             | Request::CommitCheckpointVerifiedBlock(_)
+            | Request::CheckCheckpointHandoff
             | Request::InvalidateBlock(_)
             | Request::ReconsiderBlock(_) => Err("ReadService does not write blocks"),
 

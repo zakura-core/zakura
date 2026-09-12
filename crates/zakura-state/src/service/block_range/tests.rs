@@ -313,7 +313,7 @@ async fn readiness_failure_releases_resources_without_dispatching_a_read() {
             .await
             .unwrap();
     let failure = BlockWriteTaskFailure::from(&HeaderChainAttachmentError::MissingGenesis);
-    read_state.block_write_failure.set(failure.clone()).unwrap();
+    read_state.block_write_failure.set(failure.clone());
     let error = timeout(
         DEADLINE,
         read_state.read_owned_block_range(block::Height(1), 1, 10, resources, |_| {

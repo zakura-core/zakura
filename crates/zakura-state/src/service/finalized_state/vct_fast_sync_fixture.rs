@@ -14,10 +14,7 @@
 
 #![allow(dead_code)]
 
-use std::{
-    collections::HashMap,
-    sync::{Arc, OnceLock},
-};
+use std::{collections::HashMap, sync::Arc};
 
 use proptest::{
     strategy::{Strategy, ValueTree},
@@ -462,7 +459,7 @@ fn read_service_over(state: &FinalizedState) -> ReadStateService {
     ReadStateService::new(
         state,
         None,
-        Arc::new(OnceLock::new()),
+        Arc::new(crate::service::write::BlockWriteFailure::default()),
         WatchReceiver::new(non_finalized_receiver),
         repair_receiver,
         HeaderChainSubscriptions {

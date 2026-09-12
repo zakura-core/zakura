@@ -734,7 +734,7 @@ id = "LC-AUX-06"
 name = "Semantic auxiliary capacity"
 status = "implemented"
 owner = "zakura_header_chain::HeaderChainEngine::plan_transition"
-tests = ["IN-06::auxiliary_admission_preserves_semantic_diversity_under_duplicate_delivery_pressure", "DG-06::projected_auxiliary_rows_cannot_duplicate_a_semantic_payload", "DG-06::projected_per_header_auxiliary_count_must_stay_within_the_plan_limit"]
+tests = ["IN-06::full_auxiliary_bucket_replaces_only_checked_negative_input", "IN-06::repair_context_reconstructs_rejected_input_after_engine_hydration", "IN-06::auxiliary_admission_preserves_semantic_diversity_under_duplicate_delivery_pressure", "DG-06::projected_auxiliary_rows_cannot_duplicate_a_semantic_payload", "DG-06::projected_per_header_auxiliary_count_must_stay_within_the_plan_limit"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]
@@ -742,7 +742,15 @@ id = "LC-AUX-07"
 name = "Authoritative repair progress"
 status = "implemented"
 owner = "zakura_state::service::finalized_state::HeaderChainRuntime"
-tests = ["IN-06::repair_context_reconstructs_rejected_input_after_engine_hydration", "IN-06::repair_range_prefixes_bind_selection_boundaries_and_state_version", "IN-06::selected_body_window_reads_four_thousand_hashes_in_one_coherent_range", "IN-06::selected_auxiliary_range_rejects_atomically_and_then_admits_every_root", "IN-06::selected_range_repair_rejects_atomically_then_commits_every_delivery", "IN-06::vct_repair_selects_the_peer_with_the_largest_supported_prefix", "IN-06::retained_path_serves_a_bounded_finalized_range_below_the_header_frontier", "IN-06::mixed_pages_load_tree_aux_for_the_finalized_prefix", "IN-06::header_insertion_wakes_a_vct_park_but_a_repeat_insertion_does_not", "IN-06::supplier_failures_rotate_to_an_untried_fourth_supplier_without_repeating", "IN-06::local_send_failures_back_off_without_consuming_a_supplier", "IN-06::a_failed_repair_send_still_tries_the_remaining_candidates", "IN-06::alternating_missing_heights_cannot_postpone_the_stall_report", "IN-06::retained_rooted_supplier_is_skipped_for_an_untried_supplier", "IN-06::supplier_history_releases_disconnected_sources_without_clearing_the_episode", "IN-06::disconnected_supplier_history_cannot_block_a_new_supplier", "IN-06::context_without_admission_capacity_waits_without_a_wire_attempt", "IN-06::vct_auxiliary_capacity_refusal_waits_without_timed_replay", "IN-06::vct_resource_refusal_waits_for_a_newer_committed_state"]
+tests = ["IN-06::repair_context_reconstructs_rejected_input_after_engine_hydration", "IN-06::repair_range_prefixes_bind_selection_boundaries_and_state_version", "IN-06::selected_body_window_reads_four_thousand_hashes_in_one_coherent_range", "IN-06::selected_auxiliary_range_rejects_atomically_and_then_admits_every_root", "IN-06::selected_range_repair_rejects_atomically_then_commits_every_delivery", "IN-06::vct_repair_selects_the_peer_with_the_largest_supported_prefix", "IN-06::retained_path_serves_a_bounded_finalized_range_below_the_header_frontier", "IN-06::mixed_pages_load_tree_aux_for_the_finalized_prefix", "IN-06::header_insertion_wakes_a_vct_park_but_a_repeat_insertion_does_not", "IN-06::supplier_failures_rotate_to_an_untried_fourth_supplier_without_repeating", "IN-06::local_send_failures_back_off_without_consuming_a_supplier", "IN-06::a_failed_repair_send_still_tries_the_remaining_candidates", "IN-06::alternating_missing_heights_cannot_postpone_the_stall_report", "IN-06::retained_rooted_supplier_is_skipped_for_an_untried_supplier", "IN-06::supplier_history_releases_disconnected_sources_without_clearing_the_episode", "IN-06::disconnected_supplier_history_cannot_block_a_new_supplier", "IN-06::context_without_admission_capacity_waits_without_a_wire_attempt", "IN-06::vct_auxiliary_capacity_refusal_resumes_only_after_state_changes", "IN-06::vct_resource_refusal_waits_for_a_newer_committed_state"]
+networks = ["mainnet", "testnet", "custom"]
+
+[[rule]]
+id = "LC-AUX-08"
+name = "Commit capacity reserve"
+status = "implemented"
+owner = "zakura_header_chain::HeaderChainEngine::plan_transition"
+tests = ["DG-06::projected_commit_reserve_includes_missing_successors", "IN-06::fork_selection_reclaims_displaced_auxiliary_rows_before_using_the_reserve", "IN-06::repair_context_does_not_grant_the_commit_reserve_to_a_speculative_target", "IN-06::reserve_pressure_withdraws_speculative_sweep_repairs", "IN-06::capacity_deadline_survives_continuous_peer_lifecycle_events", "IN-06::capacity_deadline_survives_failed_context_reads", "IN-06::recovered_capacity_starts_a_new_deadline_after_immediate_assignment", "IN-06::commit_window_repairs_resume_finality_at_auxiliary_saturation", "IN-06::repair_context_uses_one_prerequisite_when_only_reserved_capacity_remains", "IN-06::capacity_deadline_wakes_the_reactor_and_observes_a_simultaneous_state_change", "IN-06::saturated_vct_repair_reports_one_fatal_event_without_retrying", "IN-06::vct_auxiliary_capacity_refusal_resumes_only_after_state_changes"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]

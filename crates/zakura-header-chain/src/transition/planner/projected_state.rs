@@ -108,6 +108,52 @@ impl<'a> ProjectedTransitionState<'a> {
         self.aux_changes.push(AuxDelta::Put(Box::new(delivery)));
     }
 
+    /// Replace non-authoritative input when its retained header's bucket is full.
+    pub(super) fn make_aux_delivery_room(
+        &mut self,
+        engine: &HeaderChainEngine,
+        hash: block::Hash,
+        limits: EngineLimits,
+        selected_repair: bool,
+    ) -> Result<(), TransitionFailure> {
+        let node = self
+            .graph
+            .view_header_node(hash)
+            .ok_or(GraphError::UnknownHeaderNode(hash))?;
+        if node.aux_delivery_ids.len() < limits.max_aux_deliveries_per_header.get() {
+            return Ok(());
+        }
+        // Input retention grants no header or root authority. A selected repair may
+        // replace an unchecked candidate, including recovered rows whose outcome claims
+        // recovery discarded. Ordinary delivery cannot displace unchecked candidates.
+        let Some(replaceable) = engine
+            .aux_deliveries(hash)
+            .iter()
+            .filter(|delivery| {
+                delivery.is_rejected()
+                    || delivery.is_disputed()
+                    || (selected_repair && delivery.is_unauthenticated())
+            })
+            .filter(|delivery| node.aux_delivery_ids.contains(&delivery.delivery_id))
+            .min_by_key(|delivery| {
+                (
+                    delivery.is_unauthenticated(),
+                    !delivery.is_rejected(),
+                    delivery.delivery_id,
+                )
+            })
+        else {
+            return Err(TransitionFailure::AuxiliaryLimitExceeded);
+        };
+        self.graph
+            .remove_auxiliary_evidence_delivery(hash, replaceable.delivery_id)?;
+        self.aux_changes.push(AuxDelta::Delete {
+            header_hash: hash,
+            delivery_id: replaceable.delivery_id,
+        });
+        Ok(())
+    }
+
     /// Add an operator invalidation and dirty verified selection when it changes state.
     pub(super) fn add_operator_invalidation(
         &mut self,
@@ -172,21 +218,96 @@ impl<'a> ProjectedTransitionState<'a> {
     /// Enforce retention against the projected graph.
     pub(super) fn enforce_retention(
         &mut self,
+        engine: &HeaderChainEngine,
         header_best: Frontier,
         retention_references: impl IntoIterator<Item = zakura_chain::block::Hash>,
         limits: EngineLimits,
+        integrated: bool,
     ) -> Result<RetentionPlan, TransitionFailure> {
         let verified_best = self
             .verified
             .last()
             .copied()
             .unwrap_or_else(|| self.graph.view_finalized_frontier());
+        let auxiliary_budget = if integrated {
+            let delta = self.graph.delta();
+            let removed_with_headers = delta
+                .deleted_header_hashes()
+                .iter()
+                .map(|hash| engine.aux_deliveries(*hash).len())
+                .sum::<usize>();
+            let mut retained = engine
+                .aux_delivery_count()
+                .saturating_sub(removed_with_headers);
+            for change in &self.aux_changes {
+                match change {
+                    AuxDelta::Put(delivery)
+                        if engine.aux_delivery(delivery.delivery_id).is_none()
+                            && self.graph.view_header_node(delivery.header_hash).is_some() =>
+                    {
+                        retained = retained.saturating_add(1);
+                    }
+                    AuxDelta::Delete { header_hash, .. }
+                        if self.graph.view_header_node(*header_hash).is_some() =>
+                    {
+                        retained = retained.saturating_sub(1);
+                    }
+                    _ => {}
+                }
+            }
+            if retained
+                <= limits
+                    .max_aux_deliveries_total
+                    .get()
+                    .saturating_sub(limits.max_aux_deliveries_per_header.get().saturating_mul(3))
+            {
+                None
+            } else {
+                let mut occupied = 0usize;
+                let finalized = self.graph.view_finalized_frontier();
+                for offset in 0..3 {
+                    let Some(height) = finalized.height.0.checked_add(offset).map(block::Height)
+                    else {
+                        break;
+                    };
+                    if height > header_best.height {
+                        break;
+                    }
+                    let frontier = self
+                        .graph
+                        .view_header_ancestor(header_best.hash, height)?
+                        .ok_or(GraphError::UnknownHeaderNode(header_best.hash))?;
+                    occupied = occupied.saturating_add(
+                        self.graph
+                            .view_header_node(frontier.hash)
+                            .ok_or(GraphError::UnknownHeaderNode(frontier.hash))?
+                            .aux_delivery_ids
+                            .len(),
+                    );
+                }
+                let reserve = limits
+                    .max_aux_deliveries_per_header
+                    .get()
+                    .saturating_mul(3)
+                    .saturating_sub(occupied);
+                Some(super::retention::AuxiliaryRetentionBudget {
+                    retained,
+                    maximum: limits
+                        .max_aux_deliveries_total
+                        .get()
+                        .saturating_sub(reserve),
+                })
+            }
+        } else {
+            None
+        };
         Ok(super::retention::enforce_retention(
             &mut self.graph,
             header_best,
             verified_best,
             retention_references,
             limits,
+            auxiliary_budget,
         )?)
     }
 
@@ -204,7 +325,7 @@ impl<'a> ProjectedTransitionState<'a> {
             .collect();
         self.aux_changes.retain(|change| match change {
             AuxDelta::Put(delivery) => self.graph.view_header_node(delivery.header_hash).is_some(),
-            AuxDelta::Delete { .. } => true,
+            AuxDelta::Delete { header_hash, .. } => !evicted.contains(header_hash),
         });
         let mut aux_deletes: Vec<_> = evicted
             .iter()
@@ -251,6 +372,8 @@ impl<'a> SettledProjectedState<'a> {
         &self,
         engine: &HeaderChainEngine,
         limits: EngineLimits,
+        selected: &[Frontier],
+        integrated: bool,
     ) -> Result<(), TransitionFailure> {
         let deleted = self
             .aux_changes
@@ -272,6 +395,26 @@ impl<'a> SettledProjectedState<'a> {
             .saturating_add(inserted);
         if projected_total > limits.max_aux_deliveries_total.get() {
             return Err(TransitionFailure::AuxiliaryLimitExceeded);
+        }
+        // Keep the finalized root and the next commit's two-header authentication window
+        // within the hard limit even when speculative deliveries saturate the remaining store.
+        let commit_window = &selected[..selected.len().min(3)];
+        if integrated {
+            let occupied = commit_window.iter().try_fold(0usize, |count, frontier| {
+                let node = self
+                    .graph
+                    .view_header_node(frontier.hash)
+                    .ok_or(GraphError::UnknownHeaderNode(frontier.hash))?;
+                Ok::<_, GraphError>(count.saturating_add(node.aux_delivery_ids.len()))
+            })?;
+            let reserve = limits
+                .max_aux_deliveries_per_header
+                .get()
+                .saturating_mul(3)
+                .saturating_sub(occupied);
+            if projected_total.saturating_add(reserve) > limits.max_aux_deliveries_total.get() {
+                return Err(TransitionFailure::AuxiliaryLimitExceeded);
+            }
         }
         for delivery in self.aux_changes.iter().filter_map(|change| match change {
             AuxDelta::Put(delivery) => Some(delivery),

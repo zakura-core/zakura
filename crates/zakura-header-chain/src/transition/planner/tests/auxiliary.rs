@@ -151,7 +151,7 @@ fn auxiliary_limit_uses_the_post_retention_delivery_set() {
     config.limits.max_aux_deliveries_per_header =
         std::num::NonZeroUsize::new(1).expect("one is nonzero");
     config.limits.max_aux_deliveries_total =
-        std::num::NonZeroUsize::new(1).expect("one is nonzero");
+        std::num::NonZeroUsize::new(4).expect("four reserves three commit-window slots");
 
     let mut request = insertion(&store, 1, EvidenceId::from_digest([0xa3; 32]));
     let TransitionEvent::InsertHeaders(insert) = &mut request.event else {
@@ -1100,7 +1100,7 @@ fn auxiliary_resource_limits_reject_equal_plus_one_without_effects() {
     config.limits.max_aux_deliveries_per_header =
         std::num::NonZeroUsize::new(1).expect("one is nonzero");
     config.limits.max_aux_deliveries_total =
-        std::num::NonZeroUsize::new(2).expect("two is nonzero");
+        std::num::NonZeroUsize::new(3).expect("the three-header reserve fits");
 
     let mut exact = insertion(&store, 1, EvidenceId::from_digest([0xd1; 32]));
     let TransitionEvent::InsertHeaders(insert) = &mut exact.event else {
@@ -1141,4 +1141,426 @@ fn auxiliary_resource_limits_reject_equal_plus_one_without_effects() {
     assert_eq!(store.metadata.state_version, StateVersion::new(0));
     assert!(!store.metadata.alarms.resource_stalled);
     assert!(store.aux.is_empty());
+}
+
+#[test]
+fn commit_window_repairs_resume_finality_at_auxiliary_saturation() {
+    let (mut store, mut config) = TestStore::new(EngineMode::Integrated);
+    config.limits.max_aux_deliveries_per_header = std::num::NonZeroUsize::new(1).unwrap();
+    config.limits.max_aux_deliveries_total = std::num::NonZeroUsize::new(5).unwrap();
+    let clock = ManualClock(Utc::now());
+    let anchor = store.metadata.frontiers.finalized;
+    let anchor_lease = store.lease.clone();
+    let initial = insertion(&store, 5, EvidenceId::from_digest([0x71; 32]));
+    let TransitionEvent::InsertHeaders(mut insert) = initial.event else {
+        unreachable!("the fixture constructs a header insertion");
+    };
+    let headers = insert.batch.headers().to_vec();
+    let anchor_delivery = crate::AuxDelivery::new(
+        EvidenceId::from_digest([0x72; 32]),
+        anchor.hash,
+        insert.source,
+        insert.owner,
+        crate::BodySizeHint::Unknown,
+        None,
+    );
+    store
+        .graph
+        .record_auxiliary_evidence_delivery(anchor.hash, anchor_delivery.delivery_id)
+        .unwrap();
+    store.aux.push(anchor_delivery);
+    for (index, header) in headers.iter().enumerate().skip(2).take(2) {
+        insert.aux.push(crate::AuxDelivery::new(
+            EvidenceId::from_digest([u8::try_from(index).unwrap(); 32]),
+            header.hash,
+            insert.source,
+            insert.owner,
+            crate::BodySizeHint::Unknown,
+            None,
+        ));
+    }
+    let plan = apply_transition(
+        &store,
+        TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: TransitionEvent::InsertHeaders(insert.clone()),
+        },
+        &context(&config, &clock, None),
+    )
+    .expect("speculative deliveries fill their two slots");
+    store.commit(&plan);
+    assert_eq!(store.aux.len(), 3);
+
+    store.lease = anchor_lease.clone();
+    insert.owner = crate::HeaderWorkOwner {
+        authority: crate::HeaderWorkAuthority {
+            header_generation: store.metadata.header_generation,
+            branch: BranchId::new(anchor.hash, store.metadata.frontiers.header_best.hash),
+        },
+        session_id: 1,
+        request_id: NonZeroU64::new(2).unwrap(),
+    }
+    .into();
+    let speculative = crate::AuxDelivery::new(
+        EvidenceId::from_digest([0x73; 32]),
+        headers[4].hash,
+        insert.source,
+        insert.owner,
+        crate::BodySizeHint::Unknown,
+        None,
+    );
+    insert.aux = vec![speculative];
+    insert.batch = PreparedHeaderBatch::new(
+        headers.clone(),
+        anchor,
+        config.network().clone(),
+        config.trust_anchor_digest(),
+        EvidenceId::from_digest([0x79; 32]),
+    )
+    .unwrap();
+    let refused = apply_transition(
+        &store,
+        TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: TransitionEvent::InsertHeaders(insert),
+        },
+        &context(&config, &clock, None),
+    );
+    assert!(
+        matches!(refused, Err(TransitionFailure::AuxiliaryLimitExceeded)),
+        "{refused:?}"
+    );
+    assert_eq!(store.aux.len(), 3, "refusal preserves protected evidence");
+
+    let owner = body_owner(&store.snapshot(), 8, 9);
+    let source = SourceId::from_digest([0x74; 32]);
+    let deliveries: Vec<_> = headers[..2]
+        .iter()
+        .enumerate()
+        .map(|(index, header)| {
+            crate::AuxDelivery::new(
+                EvidenceId::from_digest([0x75 + u8::try_from(index).unwrap(); 32]),
+                header.hash,
+                source,
+                owner.into(),
+                crate::BodySizeHint::Unknown,
+                Some(crate::TreeAuxRecordV1 {
+                    height: header.height,
+                    sapling_root: Default::default(),
+                    orchard_root: Default::default(),
+                    ironwood_root: Default::default(),
+                    sapling_tx_count: 0,
+                    orchard_tx_count: 0,
+                    ironwood_tx_count: 0,
+                    auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([0; 32]),
+                }),
+            )
+        })
+        .collect();
+    let target = Frontier::new(headers[1].height, headers[1].hash);
+    let repair = TransitionRequest {
+        expected_version: store.metadata.state_version,
+        event: TransitionEvent::InsertHeaders(Box::new(crate::InsertHeaders {
+            owner: owner.into(),
+            source,
+            parent_hash: anchor.hash,
+            target_tip_hash: target.hash,
+            completion: TargetCompletion::SelectedAuxiliaryRepair {
+                common_ancestor: anchor,
+                selected_target: target,
+                episode: crate::VctRepairContext::unconstrained(
+                    target,
+                    crate::HeaderLocator::for_continuation(anchor),
+                    None,
+                )
+                .episode,
+            },
+            batch: PreparedHeaderBatch::new(
+                headers[..2].to_vec(),
+                anchor,
+                config.network().clone(),
+                config.trust_anchor_digest(),
+                EvidenceId::from_digest([0x77; 32]),
+            )
+            .unwrap(),
+            aux: deliveries.clone(),
+        })),
+    };
+    let plan = apply_transition(&store, repair, &context(&config, &clock, None))
+        .expect("the blocked commit and successor use the reserve");
+    assert!(plan.change_set.delete_nodes.is_empty());
+    store.commit(&plan);
+    assert_eq!(
+        store.aux.len(),
+        5,
+        "the repair respects the hard aggregate limit"
+    );
+    assert!(deliveries
+        .iter()
+        .all(|delivery| store.aux.contains(delivery)));
+    assert!(store.aux.contains(&anchor_delivery));
+
+    let checkpoint = store.selected[1];
+    let plan = apply_transition(
+        &store,
+        TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: TransitionEvent::VerifiedChainChanged(crate::VerifiedChainChanged {
+                full_state_transition_id: EvidenceId::from_digest([0x78; 32]),
+                old_tip: anchor,
+                new_path: vec![crate::VerifiedHeaderRef {
+                    height: checkpoint.height,
+                    hash: checkpoint.hash,
+                    header: store
+                        .graph
+                        .header_node(checkpoint.hash)
+                        .unwrap()
+                        .header
+                        .clone(),
+                }],
+                cause: crate::VerifiedChangeCause::CheckpointFinalizedGrow,
+            }),
+        },
+        &context(&config, &clock, Some(&Authority)),
+    )
+    .expect("checkpoint finality advances after its auxiliary prerequisites arrive");
+    store.commit(&plan);
+    assert_eq!(store.metadata.frontiers.finalized, checkpoint);
+    assert_eq!(
+        store.aux.len(),
+        4,
+        "finality releases the old frontier's capacity"
+    );
+    assert!(deliveries
+        .iter()
+        .all(|delivery| store.aux.contains(delivery)));
+    assert!(!store.aux.contains(&anchor_delivery));
+}
+
+#[test]
+fn fork_selection_reclaims_displaced_auxiliary_rows_before_using_the_reserve() {
+    let (mut store, mut config) = TestStore::new(EngineMode::Integrated);
+    let clock = ManualClock(Utc::now());
+    let anchor = store.graph.finalized_frontier();
+    let difficulty = store
+        .graph
+        .header_node(anchor.hash)
+        .unwrap()
+        .header
+        .difficulty_threshold;
+    let displaced = insert_verified_branch(&mut store.graph, anchor, 4, difficulty, 0x81);
+    synchronize_fixture(&mut store, anchor);
+    config.limits.max_aux_deliveries_per_header = std::num::NonZeroUsize::new(1).unwrap();
+    config.limits.max_aux_deliveries_total = std::num::NonZeroUsize::new(5).unwrap();
+    let mut request = insertion(&store, 5, EvidenceId::from_digest([0x82; 32]));
+    let TransitionEvent::InsertHeaders(insert) = &request.event else {
+        unreachable!()
+    };
+    let new_headers = insert.batch.headers().to_vec();
+    let new_tip = insert.target_tip_hash;
+    let old_path = store.selected.clone();
+    for (index, frontier) in old_path.iter().enumerate() {
+        let delivery = crate::AuxDelivery::new(
+            EvidenceId::from_digest([u8::try_from(index).unwrap(); 32]),
+            frontier.hash,
+            insert.source,
+            insert.owner,
+            crate::BodySizeHint::Unknown,
+            None,
+        );
+        store
+            .graph
+            .record_auxiliary_evidence_delivery(frontier.hash, delivery.delivery_id)
+            .unwrap();
+        store.aux.push(delivery);
+    }
+    assert_eq!(store.aux.len(), 5);
+    let mut protected_store = store.clone();
+    synchronize_fixture(&mut protected_store, displaced);
+    let protected_result = apply_transition(
+        &protected_store,
+        request.clone(),
+        &context(&config, &clock, None),
+    );
+    assert!(
+        matches!(
+            protected_result,
+            Err(TransitionFailure::AuxiliaryLimitExceeded)
+        ),
+        "verified evidence cannot be evicted for reserve space: {protected_result:?}"
+    );
+    let mut recovered = store.clone();
+    for header in &new_headers {
+        recovered
+            .graph
+            .insert(
+                header.header.clone(),
+                HeaderValidationState::Valid,
+                [],
+                BodyValidationState::Unknown,
+            )
+            .unwrap();
+    }
+    synchronize_fixture(&mut recovered, anchor);
+    let recovered_plan = apply_transition(
+        &recovered,
+        TransitionRequest {
+            expected_version: recovered.metadata.state_version,
+            event: TransitionEvent::ReevaluateDeferred,
+        },
+        &context(&config, &clock, None),
+    )
+    .expect("startup settlement reclaims an older saturated selection");
+    recovered.commit(&recovered_plan);
+    assert_eq!(recovered.aux.len(), 1);
+    let plan = apply_transition(&store, request.clone(), &context(&config, &clock, None))
+        .expect("a header-only fork change reclaims unprotected displaced rows");
+    assert_eq!(plan.change_set.metadata.frontiers.header_best.hash, new_tip);
+    assert!(old_path
+        .iter()
+        .skip(1)
+        .all(|frontier| plan.change_set.delete_nodes.contains(&frontier.hash)));
+    assert!(!plan.change_set.delete_nodes.contains(&anchor.hash));
+    store.commit(&plan);
+    assert_eq!(store.aux.len(), 1, "the finalized anchor remains retained");
+    request.expected_version = store.metadata.state_version;
+    let TransitionEvent::InsertHeaders(insert) = &mut request.event else {
+        unreachable!()
+    };
+    insert.owner = crate::HeaderWorkAuthority::for_target(&store.snapshot(), new_tip)
+        .bind(2, NonZeroU64::new(2).unwrap())
+        .into();
+    insert.batch = PreparedHeaderBatch::new(
+        new_headers.clone(),
+        anchor,
+        config.network().clone(),
+        config.trust_anchor_digest(),
+        EvidenceId::from_digest([0x83; 32]),
+    )
+    .unwrap();
+    for (index, header) in new_headers.iter().take(2).enumerate() {
+        insert.aux.push(crate::AuxDelivery::new(
+            EvidenceId::from_digest([0x90 + u8::try_from(index).unwrap(); 32]),
+            header.hash,
+            insert.source,
+            insert.owner,
+            crate::BodySizeHint::Unknown,
+            None,
+        ));
+    }
+    store.lease = ValidationLease::new(
+        anchor,
+        vec![HeaderContextFact {
+            frontier: anchor,
+            header: store.graph.header_node(anchor.hash).unwrap().header.clone(),
+        }],
+        config.network().clone(),
+        config.trust_anchor_digest(),
+    );
+    let plan = apply_transition(&store, request, &context(&config, &clock, None))
+        .expect("both new commit prerequisites fit after fork selection");
+    store.commit(&plan);
+    assert_eq!(store.aux.len(), 3);
+}
+
+#[test]
+fn full_auxiliary_bucket_replaces_only_checked_negative_input() {
+    for status in [0, 1, 2, 3] {
+        let (mut store, mut config) = TestStore::new(EngineMode::Integrated);
+        let clock = ManualClock(Utc::now());
+        config.limits.max_aux_deliveries_per_header = std::num::NonZeroUsize::new(2).unwrap();
+        config.limits.max_aux_deliveries_total = std::num::NonZeroUsize::new(6).unwrap();
+        let anchor_lease = store.lease.clone();
+        let mut request = insertion(&store, 2, EvidenceId::from_digest([0xa0; 32]));
+        let plan =
+            apply_transition(&store, request.clone(), &context(&config, &clock, None)).unwrap();
+        store.commit(&plan);
+        store.lease = anchor_lease;
+        let TransitionEvent::InsertHeaders(insert) = &mut request.event else {
+            unreachable!()
+        };
+        let header = insert.batch.headers()[0].clone();
+        let boundary = insert.batch.headers()[1].hash;
+        insert.batch = PreparedHeaderBatch::new(
+            insert.batch.headers().to_vec(),
+            store.lease.parent,
+            config.network().clone(),
+            config.trust_anchor_digest(),
+            EvidenceId::from_digest([0xa4; 32]),
+        )
+        .unwrap();
+        insert.owner =
+            crate::HeaderWorkAuthority::for_target(&store.snapshot(), insert.target_tip_hash)
+                .bind(2, NonZeroU64::new(2).unwrap())
+                .into();
+        let record = |marker| crate::TreeAuxRecordV1 {
+            height: header.height,
+            sapling_root: Default::default(),
+            orchard_root: Default::default(),
+            ironwood_root: Default::default(),
+            sapling_tx_count: marker,
+            orchard_tx_count: 0,
+            ironwood_tx_count: 0,
+            auth_data_root: [0; 32].into(),
+        };
+        let authenticated = crate::AuxDelivery::new(
+            EvidenceId::from_digest([0xa1; 32]),
+            header.hash,
+            SourceId::from_digest([0xa1; 32]),
+            insert.owner,
+            crate::BodySizeHint::Unknown,
+            Some(record(1)),
+        )
+        .promote_recovered_outcome(1, [Some([1; 32]), None], Some(boundary))
+        .unwrap();
+        let mut candidate = crate::AuxDelivery::new(
+            EvidenceId::from_digest([0xa2; 32]),
+            header.hash,
+            SourceId::from_digest([0xa2; 32]),
+            insert.owner,
+            crate::BodySizeHint::Unknown,
+            Some(record(2)),
+        );
+        if status != 0 {
+            candidate = candidate
+                .promote_recovered_outcome(status, [Some([2; 32]), None], Some(boundary))
+                .unwrap();
+        }
+        for delivery in [authenticated, candidate] {
+            store
+                .graph
+                .record_auxiliary_evidence_delivery(header.hash, delivery.delivery_id)
+                .unwrap();
+            store.aux.push(delivery);
+        }
+        let incoming = crate::AuxDelivery::new(
+            EvidenceId::from_digest([0xa3; 32]),
+            header.hash,
+            insert.source,
+            insert.owner,
+            crate::BodySizeHint::Unknown,
+            Some(record(3)),
+        );
+        insert.aux = vec![incoming];
+        request.expected_version = store.metadata.state_version;
+        let result = apply_transition(&store, request, &context(&config, &clock, None));
+        if status < 2 {
+            assert!(
+                matches!(result, Err(TransitionFailure::AuxiliaryLimitExceeded)),
+                "status {status}: {result:?}"
+            );
+            continue;
+        }
+        let plan = result.expect("checked negative input cannot permanently occupy the bucket");
+        assert!(plan.change_set.delete_nodes.is_empty());
+        assert!(plan.change_set.aux_changes.contains(&AuxDelta::Delete {
+            header_hash: header.hash,
+            delivery_id: candidate.delivery_id,
+        }));
+        store.commit(&plan);
+        assert_eq!(store.aux.len(), 2);
+        assert!(store.aux.contains(&authenticated));
+        assert!(store.aux.contains(&incoming));
+        assert!(!store.aux.contains(&candidate));
+    }
 }

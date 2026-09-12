@@ -991,6 +991,10 @@ impl StartCmd {
         let old_databases_task_handle_fused = (&mut old_databases_task_handle).fuse();
         pin!(old_databases_task_handle_fused);
 
+        let writer_health = read_only_state_service.clone();
+        let writer_failure = writer_health.wait_for_writer_failure();
+        tokio::pin!(writer_failure);
+
         // Wait for tasks to finish
         let mut zcashd_compat_task_finished = false;
         let exit_status = {
@@ -1002,6 +1006,12 @@ impl StartCmd {
 
                 let result = select! {
                 _ = shutdown.cancelled() => Ok(()),
+
+                failure = &mut writer_failure => {
+                    tracing::error!(%failure, "block writer failed; terminating the node");
+                    shutdown.cancel();
+                    Err(eyre!(failure))
+                },
 
                 header_sync_fatal_event = async {
                     match header_sync_fatal_events.as_mut() {

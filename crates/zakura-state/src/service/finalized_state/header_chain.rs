@@ -1716,6 +1716,15 @@ impl HeaderChainReader {
         .map_err(HeaderChainStoreError::Store)
     }
 
+    /// Return the current input capacity outside the selected commit reserve.
+    pub(crate) fn speculative_auxiliary_capacity(&self) -> Result<usize, HeaderChainStoreError> {
+        let engine = self
+            .transition_engine
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        Ok(engine.speculative_auxiliary_capacity(self.config.limits))
+    }
+
     /// Resolve an exact, still-current VCT repair owner to one selected header request.
     pub(crate) fn vct_repair_context(
         &self,
@@ -1788,16 +1797,14 @@ impl HeaderChainReader {
             } else {
                 None
             };
-        let deliveries = self.coherent_aux_deliveries(&target)?;
+        self.coherent_aux_deliveries(&target)?;
         let durable_rows = self.store.untrusted_aux_deliveries(target_hash)?;
         let engine = self
             .transition_engine
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-        let total_delivery_count = engine.aux_delivery_count();
-        let admission_capacity_available = deliveries.len()
-            < self.config.limits.max_aux_deliveries_per_header.get()
-            && total_delivery_count < self.config.limits.max_aux_deliveries_total.get()
+        let admission_capacity_available = engine
+            .auxiliary_admission_capacity(target_hash, self.config.limits)
             && !snapshot.alarms.resource_stalled;
         let mut context = zakura_header_chain::VctRepairContext::from_durable_rows(
             selected_target,
@@ -1811,14 +1818,16 @@ impl HeaderChainReader {
             return Ok(Some(context));
         }
 
-        let available_aggregate_capacity = self
-            .config
-            .limits
-            .max_aux_deliveries_total
-            .get()
-            .saturating_sub(total_delivery_count);
-        let range_limit =
-            available_aggregate_capacity.min(self.config.limits.max_headers_per_transition.get());
+        let available_aggregate_capacity =
+            engine.speculative_auxiliary_capacity(self.config.limits);
+        // Under capacity pressure, repair the prerequisite without a speculative suffix.
+        let range_limit = if available_aggregate_capacity
+            < self.config.limits.max_headers_per_transition.get()
+        {
+            1
+        } else {
+            available_aggregate_capacity.min(self.config.limits.max_headers_per_transition.get())
+        };
         if range_limit <= 1 {
             return Ok(Some(context));
         }
@@ -2558,6 +2567,13 @@ impl HeaderChainRuntime {
     /// Return the sole committed-snapshot publisher.
     pub fn publisher(&self) -> &Publisher {
         &self.publisher
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_auxiliary_limits_for_test(&mut self, per_header: usize, total: usize) {
+        self.config.limits.max_aux_deliveries_per_header =
+            std::num::NonZeroUsize::new(per_header).unwrap();
+        self.config.limits.max_aux_deliveries_total = std::num::NonZeroUsize::new(total).unwrap();
     }
 
     /// Return a read-only handle whose compound reads share the transition lock.

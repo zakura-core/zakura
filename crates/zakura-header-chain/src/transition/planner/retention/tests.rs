@@ -80,7 +80,7 @@ fn candidate_tip_eviction_is_lowest_work_then_smallest_raw_hash() {
             .0
     });
 
-    let plan = enforce_retention(&mut store, header_best, anchor, [], limits(10, 100))
+    let plan = enforce_retention(&mut store, header_best, anchor, [], limits(10, 100), None)
         .expect("retention succeeds");
     assert!(store.header_node(expected[0].hash).is_none());
     assert!(store.header_node(expected[1].hash).is_none());
@@ -144,7 +144,7 @@ fn eligible_tip_with_deferred_descendant_is_evicted_without_stalling() {
         .expect("the deferred child is retained")
         .is_eligible());
 
-    let plan = enforce_retention(&mut store, header_best, anchor, [], limits(10, 100))
+    let plan = enforce_retention(&mut store, header_best, anchor, [], limits(10, 100), None)
         .expect("retention evicts the ineligible descendant subtree");
 
     assert!(store.header_node(deferred.hash).is_none());
@@ -169,7 +169,7 @@ fn permanent_subtrees_are_evicted_first_only_under_pressure() {
     let selected = insert_header(&mut store, anchor.hash, 2, []);
     let spare = insert_header(&mut store, anchor.hash, 3, []);
 
-    enforce_retention(&mut store, selected, anchor, [], limits(10, 2))
+    enforce_retention(&mut store, selected, anchor, [], limits(10, 2), None)
         .expect("permanent subtree frees capacity");
     assert!(store.header_node(permanent.hash).is_none());
     assert!(store.header_node(selected.hash).is_some());
@@ -192,7 +192,7 @@ fn permanent_eviction_exposes_leaf_for_node_limit_eviction() {
     );
     let selected = insert_header(&mut store, anchor.hash, 3, []);
 
-    let plan = enforce_retention(&mut store, selected, anchor, [], limits(10, 1))
+    let plan = enforce_retention(&mut store, selected, anchor, [], limits(10, 1), None)
         .expect("permanent eviction exposes the parent as an eviction candidate");
 
     assert!(!plan.admission_refused);
@@ -223,7 +223,7 @@ fn retention_below_both_limits_has_no_graph_work_or_effects() {
     let before_permanent = store.header_node(permanent.hash).cloned();
     let before_selected = store.header_node(selected.hash).cloned();
 
-    let plan = enforce_retention(&mut store, selected, anchor, [], limits(10, 10))
+    let plan = enforce_retention(&mut store, selected, anchor, [], limits(10, 10), None)
         .expect("a graph below both limits needs no eviction planning");
 
     assert_eq!(plan, RetentionPlan::default());
@@ -250,8 +250,15 @@ fn protected_paths_and_context_references_fail_closed_under_node_pressure() {
         }],
     );
 
-    let plan = enforce_retention(&mut store, selected, anchor, [first.hash], limits(10, 1))
-        .expect("retention returns a typed refusal");
+    let plan = enforce_retention(
+        &mut store,
+        selected,
+        anchor,
+        [first.hash],
+        limits(10, 1),
+        None,
+    )
+    .expect("retention returns a typed refusal");
     assert!(plan.admission_refused);
     assert!(plan.resource_stalled);
     assert!(store.header_node(selected.hash).is_some());
@@ -275,7 +282,7 @@ fn verified_side_node_does_not_become_a_protection_root() {
     let selected = insert_header(&mut store, selected_parent.hash, 3, []);
     let _header_only = insert_header(&mut store, anchor.hash, 4, []);
 
-    let plan = enforce_retention(&mut store, selected, selected, [], limits(1, 100))
+    let plan = enforce_retention(&mut store, selected, selected, [], limits(1, 100), None)
         .expect("retention evicts both unprotected side branches");
 
     assert!(!plan.admission_refused);
@@ -300,7 +307,7 @@ fn unselected_verified_body_paths_do_not_fill_retention_capacity() {
         .expect("the full-state branch becomes verified");
     let selected = insert_header(&mut store, anchor.hash, 3, []);
 
-    let plan = enforce_retention(&mut store, selected, selected, [], limits(1, 1))
+    let plan = enforce_retention(&mut store, selected, selected, [], limits(1, 1), None)
         .expect("retention removes the unprotected verified side path");
 
     assert!(!plan.admission_refused);
@@ -351,6 +358,7 @@ fn authoritative_full_state_replacement_evicts_the_dropped_verified_branch() {
         replacement,
         staged_tips,
         limits(10, 100),
+        None,
     )
     .expect("the authoritative full-state fork set permits replacement");
 
@@ -401,6 +409,7 @@ fn reference_pruned_before_retention_is_no_longer_protectable() {
         anchor,
         [block::Hash([0x91; 32])],
         limits(10, 100),
+        None,
     )
     .expect("a reference already pruned by finality is ignored");
 
@@ -421,7 +430,7 @@ fn exact_v1_node_boundary_refuses_to_evict_the_selected_path() {
         crate::MAX_NON_FINALIZED_NODES_V1 + 1
     );
 
-    let plan = enforce_retention(&mut store, selected, anchor, [], EngineLimits::v1())
+    let plan = enforce_retention(&mut store, selected, anchor, [], EngineLimits::v1(), None)
         .expect("the exact boundary produces a typed refusal");
     assert!(plan.admission_refused);
     assert!(plan.resource_stalled);

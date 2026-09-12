@@ -1,6 +1,61 @@
 use super::*;
 
 #[test]
+fn missing_vct_delivery_recovers_but_incoherent_delivery_fails_closed() {
+    let _init_guard = zakura_test::init();
+    let network = Network::new_regtest(Default::default());
+    let state = FinalizedState::new(&Config::ephemeral(), &network).unwrap();
+    let genesis = regtest_genesis_block();
+    let height = genesis.coinbase_height().unwrap();
+    let writer = header_writer(&state, &network, height, &genesis);
+    let mut selected = writer
+        .runtime
+        .selected_auxiliary_window(height, genesis.hash())
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(HeaderChainWriter::prepare_vct_auxiliary_window(height, Some(selected.clone())),
+        Ok(VctAuxiliaryWindowRead::Missing { height: missing }) if missing == height)
+    );
+    let delivery = zakura_header_chain::AuxDelivery::new(
+        EvidenceId::from_digest([0xa1; 32]),
+        genesis.hash(),
+        SourceId::from_digest([0xa2; 32]),
+        zakura_header_chain::BodyWorkAuthority::for_snapshot(&selected.engine_snapshot)
+            .bind(1, std::num::NonZeroU64::new(1).unwrap())
+            .into(),
+        zakura_header_chain::BodySizeHint::Unknown,
+        Some(zakura_header_chain::TreeAuxRecordV1 {
+            height,
+            sapling_root: Default::default(),
+            orchard_root: Default::default(),
+            ironwood_root: Default::default(),
+            sapling_tx_count: 0,
+            orchard_tx_count: 0,
+            ironwood_tx_count: 0,
+            auth_data_root: genesis.auth_data_root(),
+        }),
+    );
+    selected.delivery_header.auxiliary_deliveries.push(delivery);
+    let VctAuxiliaryWindowRead::Ready(window) =
+        HeaderChainWriter::prepare_vct_auxiliary_window(height, Some(selected.clone())).unwrap()
+    else {
+        panic!("the coherent replacement makes the missing roots available");
+    };
+    assert!(window.delivery_roots(height, genesis.hash()).is_some());
+
+    selected.delivery_header.auxiliary_deliveries[0].header_hash = block::Hash([0xff; 32]);
+    assert!(matches!(
+        HeaderChainWriter::prepare_vct_auxiliary_window(height, Some(selected)),
+        Err(HeaderChainStoreError::Store(
+            zakura_header_chain::StoreError::Incoherent(
+                "selected VCT delivery disagrees with its retained header"
+            )
+        ))
+    ));
+}
+
+#[test]
 fn only_new_vct_failure_evidence_starts_a_repair_episode() {
     assert_eq!(
         vct_failure_repair_trigger(&ApplyResult::Committed),
@@ -18,8 +73,8 @@ fn only_new_vct_failure_evidence_starts_a_repair_episode() {
     );
 }
 
-#[test]
-fn attachment_failure_exits_with_a_typed_error_before_publication() {
+#[tokio::test]
+async fn attachment_failure_exits_with_a_typed_error_before_publication() {
     let _init_guard = zakura_test::init();
     let network = Network::new_regtest(Default::default());
     let finalized_state = FinalizedState::new(&Config::ephemeral(), &network)
@@ -62,8 +117,16 @@ fn attachment_failure_exits_with_a_typed_error_before_publication() {
     );
 
     drop(senders.finalized.take());
-    let task = Arc::into_inner(task.expect("the writer task was spawned"))
-        .expect("the fixture owns the only writer-task handle");
+    let task = task.expect("the writer task was spawned");
+    let held_handle = task.clone();
+    let observed = tokio::time::timeout(Duration::from_secs(5), task_failure.wait())
+        .await
+        .expect("writer failure reaches supervision while a clone holds its join handle");
+    assert!(observed
+        .to_string()
+        .contains("finalized state has no authenticated genesis"));
+    drop(held_handle);
+    let task = Arc::into_inner(task).expect("the fixture owns the only writer-task handle");
     let result = task.join().expect("attachment failure does not panic");
 
     assert!(matches!(
@@ -75,7 +138,7 @@ fn attachment_failure_exits_with_a_typed_error_before_publication() {
             .get()
             .expect("every service clone can observe the failure")
             .to_string(),
-        "header-chain attachment failed: finalized state has no authenticated genesis header at semantic handoff"
+        "block writer failed: finalized state has no authenticated genesis header at semantic handoff"
     );
     assert!(snapshot_receiver.borrow().is_none());
     assert!(view_receiver.borrow().is_none());

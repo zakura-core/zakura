@@ -158,6 +158,24 @@ Keep these three resource-limit outcomes separate:
 
 ## Recovery audit
 
+Every integrated transition reserves auxiliary capacity for the finalized header and its two
+selected successors. Retention reclaims unprotected branches when a fork change would consume
+the new window's reserve. The planner and independent verifier check the post-retention bound.
+The planner refuses admission when protected evidence prevents reserve recovery.
+Finality releases old deliveries through the existing retention rules.
+
+At a full per-header bucket, admission can replace rejected or disputed input. A selected repair
+can also replace unchecked input, including recovered rows whose outcome claims recovery
+has discarded. The row and header index change atomically. Authenticated input on a retained
+header cannot be deleted. Input replacement grants no header validity or root authority.
+
+Startup settlement applies the same retention policy to an older saturated database. It cannot
+reconstruct inconsistent authoritative data or discard protected paths. Header sync starts its
+absolute capacity deadline on blockage. Failed context reads preserve the deadline. A positive
+capacity result clears it before assignment. A new blockage starts a new deadline. Expiry reports
+one fatal event after thirty continuous minutes. The sweep withdraws speculative requests when
+only the commit reserve remains.
+
 Recovery reads a coherent durable snapshot and audits every authoritative row. It fails closed on contradictions in
 node identity, ancestry, work, validation, body authority, trust pins, eligibility roots, auxiliary provenance,
 finality, configuration, protected paths, or limits.

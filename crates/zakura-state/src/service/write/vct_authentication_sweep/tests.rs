@@ -939,6 +939,49 @@ fn a_fresh_manager_recreates_repair_from_a_durable_dispute() {
 }
 
 #[test]
+fn reserve_pressure_withdraws_speculative_sweep_repairs() {
+    let _init_guard = zakura_test::init();
+    let missing = Height(BODY_TIP + 3);
+    let mut fixture = Fixture::new();
+    fixture.insert_headers(Some(missing), None);
+    let mut sweeper = VctAuthenticationSweeper::default();
+    fixture.sweep(&mut sweeper);
+    assert_eq!(
+        fixture.repair_state(),
+        VctRootRepairState::Unavailable { height: missing }
+    );
+    // Eleven retained rows plus the missing finalized-anchor slot exhaust this budget.
+    fixture.writer.runtime.set_auxiliary_limits_for_test(1, 12);
+    fixture.writer.config.limits.max_aux_deliveries_per_header =
+        std::num::NonZeroUsize::new(1).unwrap();
+    fixture.writer.config.limits.max_aux_deliveries_total =
+        std::num::NonZeroUsize::new(12).unwrap();
+    assert_eq!(
+        fixture
+            .writer
+            .runtime
+            .reader()
+            .speculative_auxiliary_capacity()
+            .unwrap(),
+        0
+    );
+    fixture.sweep(&mut sweeper);
+    assert_eq!(fixture.repair_state(), VctRootRepairState::Idle);
+    assert_eq!(
+        fixture.authentication(Height(BODY_TIP + 1)),
+        Some(TestAuxStatus::Authenticated)
+    );
+    // A real committer repair still wins while speculative capacity is exhausted.
+    let required = Height(BODY_TIP + 2);
+    fixture.repair.request_committer_repair_for_test(required);
+    fixture.sweep(&mut sweeper);
+    assert_eq!(
+        fixture.repair_state(),
+        VctRootRepairState::Unavailable { height: required }
+    );
+}
+
+#[test]
 fn a_transient_anchor_gate_preserves_an_existing_repair() {
     let _init_guard = zakura_test::init();
     let repair_height = Height(BODY_TIP + 2);

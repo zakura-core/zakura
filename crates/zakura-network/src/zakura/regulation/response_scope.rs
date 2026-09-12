@@ -1,6 +1,9 @@
 //! Fence requester publication and first writes before replacing a receiver.
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{
+    atomic::{AtomicU8, Ordering},
+    Arc, Mutex, MutexGuard,
+};
 
 use tokio_util::sync::CancellationToken;
 
@@ -40,20 +43,18 @@ impl Scope {
     }
 }
 
-#[derive(Debug, PartialEq)]
-enum Phase {
-    Prepared,
-    Queued,
-    Started,
-    Finished,
-    Abandoned,
-}
+const PREPARED: u8 = 0;
+const QUEUED: u8 = 1;
+const STARTED: u8 = 2;
+const FINISHED: u8 = 3;
+const ABANDONED: u8 = 4;
 
 #[derive(Debug)]
 struct Authorization {
     scope: ResponseScope,
-    // Always lock the scope before this phase, including terminal and Drop paths.
-    phase: Mutex<Phase>,
+    // The scope lock serializes every access. Inline atomic storage avoids a
+    // second mutex that can allocate when first locked on some platforms.
+    phase: AtomicU8,
     _memory: ResponseMemoryPermit,
 }
 
@@ -102,7 +103,7 @@ impl ResponseScope {
             .ok_or(ResponseAdmissionError::MemoryFull)?;
         Ok(ResponseAuthorization(Arc::new(Authorization {
             scope: self.clone(),
-            phase: Mutex::new(Phase::Prepared),
+            phase: AtomicU8::new(PREPARED),
             _memory: memory,
         })))
     }
@@ -148,15 +149,10 @@ impl ResponseAuthorization {
             .state
             .lock()
             .expect("response scope mutex is never poisoned");
-        let mut phase = self
-            .0
-            .phase
-            .lock()
-            .expect("response phase mutex is never poisoned");
-        if *phase == Phase::Started {
+        if self.0.phase.load(Ordering::Relaxed) == STARTED {
             state.started -= 1;
         }
-        *phase = Phase::Finished;
+        self.0.phase.store(FINISHED, Ordering::Relaxed);
     }
 }
 
@@ -171,18 +167,13 @@ impl ResponseWritePermission {
             .state
             .lock()
             .expect("response scope mutex is never poisoned");
-        let mut phase = self
-            .0
-            .phase
-            .lock()
-            .expect("response phase mutex is never poisoned");
         if state.retired
             || self.0.scope.0.connection_cancel.is_cancelled()
-            || *phase != Phase::Prepared
+            || self.0.phase.load(Ordering::Relaxed) != PREPARED
         {
             return false;
         }
-        *phase = Phase::Queued;
+        self.0.phase.store(QUEUED, Ordering::Relaxed);
         publish();
         true
     }
@@ -197,14 +188,9 @@ impl ResponseWritePermission {
             .state
             .lock()
             .expect("response scope mutex is never poisoned");
-        let mut phase = self
-            .0
-            .phase
-            .lock()
-            .expect("response phase mutex is never poisoned");
         if state.retired
             || self.0.scope.0.connection_cancel.is_cancelled()
-            || *phase != Phase::Queued
+            || self.0.phase.load(Ordering::Relaxed) != QUEUED
             || !claim()
         {
             return false;
@@ -213,7 +199,7 @@ impl ResponseWritePermission {
             .started
             .checked_add(1)
             .expect("each started exchange owns a distinct allocation");
-        *phase = Phase::Started;
+        self.0.phase.store(STARTED, Ordering::Relaxed);
         true
     }
 }
@@ -227,17 +213,12 @@ impl Drop for ResponseAuthorization {
             .state
             .lock()
             .expect("response scope mutex is never poisoned");
-        let mut phase = self
-            .0
-            .phase
-            .lock()
-            .expect("response phase mutex is never poisoned");
-        if *phase == Phase::Started {
+        if self.0.phase.load(Ordering::Relaxed) == STARTED {
             // Close before releasing the last record of unfinished authorization.
             self.0.scope.close_unfinished();
             state.started -= 1;
         }
-        *phase = Phase::Abandoned;
+        self.0.phase.store(ABANDONED, Ordering::Relaxed);
     }
 }
 

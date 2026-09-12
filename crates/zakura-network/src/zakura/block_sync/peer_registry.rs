@@ -38,6 +38,9 @@ use crate::zakura::{
     ZakuraConnId,
 };
 
+#[cfg(test)]
+mod test_helpers;
+
 /// Per-peer facts the reactor needs globally and the routine reads back.
 #[derive(Debug)]
 pub(super) struct Entry {
@@ -712,58 +715,6 @@ impl PeerRegistry {
         {
             entry.outstanding.clear();
         }
-    }
-
-    /// Populate a query fixture without a running request producer.
-    #[cfg(test)]
-    pub(super) fn set_outstanding(
-        &self,
-        peer: &ZakuraPeerId,
-        generation: u64,
-        outstanding: BTreeMap<block::Height, OutstandingMeta>,
-    ) {
-        let mut peers = self.lock();
-        if let Some(entry) = peers
-            .get_mut(peer)
-            .filter(|entry| entry.generation == generation)
-        {
-            entry.outstanding.clear();
-            for item in outstanding {
-                entry.outstanding.push_for_test(item);
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn publish_slots(
-        &self,
-        peer: &ZakuraPeerId,
-        generation: u64,
-        slots: SlotDiagnostics,
-        response_ranges: impl IntoIterator<Item = (block::Height, block::Height)>,
-    ) {
-        let mut peers = self.lock();
-        if let Some(entry) = peers
-            .get_mut(peer)
-            .filter(|entry| entry.generation == generation)
-        {
-            entry.slots = slots;
-            entry.response_ranges.clear();
-            for range in response_ranges {
-                entry.response_ranges.push_for_test(range);
-            }
-            entry.response_ranges.sort_unstable();
-        }
-    }
-
-    #[cfg(test)]
-    pub(super) fn response_capacity_for_test(&self, peer: &ZakuraPeerId) -> (usize, usize) {
-        self.lock().get(peer).map_or((0, 0), |entry| {
-            (
-                entry.outstanding.capacity(),
-                entry.response_ranges.capacity(),
-            )
-        })
     }
 
     /// Aggregate the routines' slot diagnostics for the periodic trace row.

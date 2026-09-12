@@ -9,34 +9,38 @@ use crate::zakura::{
 use zakura_test::allocations::measure;
 
 #[tokio::test]
-async fn r02_window_capacity_is_funded_before_work_and_after_the_ending() {
+async fn r02_retained_metadata_capacity_is_funded_before_work_and_after_the_ending() {
     for count in [1, 2, 3, 4, 7, 8, 127, 128] {
         let mut fixture = Fixture::new(100, count);
+        fixture.routine.config.max_blocks_per_response = count;
         let memory = fixture.routine.session.response_memory();
         let baseline = memory.reserved_for_test();
         let (prepared, allocations) =
             measure(|| fixture.routine.authorize_request_metadata().unwrap());
-        let window_bytes = u64::try_from(
-            fixture.routine.window.outstanding.capacity()
-                * std::mem::size_of::<super::super::super::state::OutstandingBlockRange>(),
-        )
-        .unwrap();
-        assert!(window_bytes > 0);
+        let retained_bytes = fixture.routine.retained_metadata_bytes_for_test();
+        assert!(retained_bytes > 0);
         assert!(
             u64::try_from(allocations.peak_live_bytes).unwrap()
                 <= memory.reserved_for_test() - baseline
         );
         assert_eq!(fixture.routine.work.in_flight_len(), 0);
         drop(prepared);
-        assert_eq!(memory.reserved_for_test(), baseline + window_bytes);
+        assert_eq!(memory.reserved_for_test(), baseline + retained_bytes);
 
         fixture.publish().await;
+        // A fill attempt may prepare another request before learning there is no
+        // more work. Any retained capacity from that attempt stays charged too.
+        let retained_bytes = fixture.routine.retained_metadata_bytes_for_test();
+        let (_, allocation) = measure(|| fixture.routine.publish_outstanding());
+        assert_eq!(allocation.requested_bytes, 0);
         for index in 0..usize::try_from(count).unwrap() {
             fixture.body(index).await;
+            let (_, allocation) = measure(|| fixture.routine.publish_outstanding());
+            assert_eq!(allocation.requested_bytes, 0);
         }
         fixture.deliver(fixture.done(count)).await.unwrap();
         assert!(fixture.routine.window.outstanding.is_empty());
-        assert_eq!(memory.reserved_for_test(), baseline + window_bytes);
+        assert_eq!(memory.reserved_for_test(), baseline + retained_bytes);
         fixture.assert_no_peer_fault();
         drop(fixture);
         assert_eq!(
@@ -157,4 +161,59 @@ fn check_request_metadata(count: usize) -> Result<(), proptest::test_runner::Tes
         ResponseMemory::node_setup_bytes_for_test()
     );
     Ok(())
+}
+
+#[tokio::test]
+async fn r02_denied_snapshot_growth_allocates_nothing_and_preserves_published_work() {
+    let setup = ResponseMemory::node_setup_bytes_for_test()
+        + ResponseMemory::setup_bytes_for_test()
+        + ResponseScope::setup_bytes_for_test();
+    let limit = setup + 128 * 1024;
+    let node = ResponseMemory::new(limit, limit);
+    let memory = node.connection();
+    let mut fixture = Fixture::new(100, 1);
+    fixture.routine.session = fixture
+        .routine
+        .session
+        .clone()
+        .with_response_memory_for_test(memory.clone());
+    fixture.routine.config.max_blocks_per_response = 1;
+    fixture.publish().await;
+    fixture.routine.config.max_blocks_per_response = 128;
+    let capacity = fixture.routine.retained_metadata_bytes_for_test();
+    let held = memory
+        .try_reserve(limit - node.reserved_for_test())
+        .unwrap();
+    let (denied, allocation) = measure(|| fixture.routine.authorize_request_metadata());
+    assert!(matches!(denied, Err(ResponseAdmissionError::MemoryFull)));
+    assert_eq!(allocation.requested_bytes, 0);
+    assert_eq!(fixture.routine.retained_metadata_bytes_for_test(), capacity);
+    assert_eq!(node.reserved_for_test(), limit);
+    assert!(fixture
+        .routine
+        .registry
+        .peer_has_outstanding_height(&fixture.routine.peer, block::Height(100)));
+    let (_, allocation) = measure(|| fixture.routine.publish_outstanding());
+    assert_eq!(allocation.requested_bytes, 0);
+    assert_eq!(node.reserved_for_test(), limit);
+    drop(held);
+    let before = node.reserved_for_test();
+    let (prepared, allocation) = measure(|| fixture.routine.authorize_request_metadata().unwrap());
+    assert_eq!(prepared.0, 128);
+    assert!(allocation.requested_bytes > 0);
+    assert!(before + u64::try_from(allocation.peak_live_bytes).unwrap() <= limit);
+    drop(prepared);
+    fixture.body(0).await;
+    fixture.deliver(fixture.done(1)).await.unwrap();
+    fixture.assert_no_peer_fault();
+    drop(fixture);
+    assert_eq!(
+        node.reserved_for_test(),
+        ResponseMemory::node_setup_bytes_for_test() + ResponseMemory::setup_bytes_for_test()
+    );
+    drop(memory);
+    assert_eq!(
+        node.reserved_for_test(),
+        ResponseMemory::node_setup_bytes_for_test()
+    );
 }

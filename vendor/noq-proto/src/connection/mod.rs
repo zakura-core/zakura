@@ -415,6 +415,7 @@ impl Connection {
                 config.stream_receive_window,
             )
             .with_bounded_send_buffers(config.bounded_send_buffers)
+            .with_send_buffer_range_limit(config.send_buffer_range_limit)
             .with_receive_fragment_limit(config.receive_fragment_limit)
             .with_local_stream_limits(
                 config.max_concurrent_local_bidi_streams,
@@ -3043,7 +3044,7 @@ impl Connection {
                 // ACK_FREQUENCY frame
                 self.ack_frequency.on_acked(path, packet);
 
-                self.on_packet_acked(now, path, packet, info);
+                self.on_packet_acked(now, path, packet, info)?;
             }
         }
 
@@ -3081,7 +3082,7 @@ impl Connection {
         }
 
         // Must be called before crypto/pto_count are clobbered
-        self.detect_lost_packets(now, space, path, true);
+        self.detect_lost_packets(now, space, path, true)?;
 
         // If the peer did not complete the handshake address validation the ACK could be
         // spoofed, e.g. in the Initial space. Setting the pto_count back to 0 removes the
@@ -3203,7 +3204,13 @@ impl Connection {
 
     // Not timing-aware, so it's safe to call this for inferred acks, such as arise from
     // high-latency handshakes
-    fn on_packet_acked(&mut self, now: Instant, path_id: PathId, pn: u64, info: SentPacket) {
+    fn on_packet_acked(
+        &mut self,
+        now: Instant,
+        path_id: PathId,
+        pn: u64,
+        info: SentPacket,
+    ) -> Result<(), TransportError> {
         let path = self.path_data_mut(path_id);
         let app_limited = path.app_limited;
         path.remove_in_flight(&info);
@@ -3224,8 +3231,9 @@ impl Connection {
         }
 
         for frame in info.stream_frames {
-            self.streams.received_ack_of(frame);
+            self.streams.received_ack_of(frame)?;
         }
+        Ok(())
     }
 
     fn set_key_discard_timer(&mut self, now: Instant, space: SpaceKind) {
@@ -3265,7 +3273,10 @@ impl Connection {
     fn on_loss_detection_timeout(&mut self, now: Instant, path_id: PathId) {
         if let Some((_, pn_space)) = self.loss_time_and_space(path_id) {
             // Time threshold loss Detection
-            self.detect_lost_packets(now, pn_space, path_id, false);
+            if let Err(error) = self.detect_lost_packets(now, pn_space, path_id, false) {
+                self.kill(error.into());
+                return;
+            }
             self.set_loss_detection_timer(now, path_id);
             return;
         }
@@ -3321,7 +3332,7 @@ impl Connection {
         pn_space: SpaceId,
         path_id: PathId,
         due_to_ack: bool,
-    ) {
+    ) -> Result<(), TransportError> {
         let mut lost_packets = Vec::<u64>::new();
         let mut lost_mtu_probe = None;
         let mut in_persistent_congestion = false;
@@ -3413,7 +3424,7 @@ impl Connection {
             loss_delay,
             in_persistent_congestion,
             size_of_lost_packets,
-        );
+        )
     }
 
     /// Drops the path state, declaring any remaining in-flight packets as lost
@@ -3441,7 +3452,7 @@ impl Connection {
                 lost_bytes = size_of_lost_packets,
                 "packets lost on path abandon"
             );
-            self.handle_lost_packets(
+            if let Err(error) = self.handle_lost_packets(
                 SpaceId::Data,
                 path_id,
                 now,
@@ -3450,7 +3461,10 @@ impl Connection {
                 Duration::ZERO,
                 false,
                 size_of_lost_packets,
-            );
+            ) {
+                self.kill(error.into());
+                return;
+            }
         }
         // Before removing the path, we fetch the final path stats via `Self::path_stats`.
         // This ensures snapshot values (like rtt) are properly updated.
@@ -3481,7 +3495,7 @@ impl Connection {
         loss_delay: Duration,
         in_persistent_congestion: bool,
         size_of_lost_packets: u64,
-    ) {
+    ) -> Result<(), TransportError> {
         debug_assert!(lost_packets.is_sorted(), "lost_packets must be sorted");
 
         self.drain_lost_packets(now, pn_space, path_id);
@@ -3517,7 +3531,7 @@ impl Connection {
                     .remove_in_flight(&info);
 
                 for frame in info.stream_frames {
-                    self.streams.retransmit(frame);
+                    self.streams.retransmit(frame)?;
                 }
                 self.spaces[pn_space].pending |= info.retransmits;
                 let path = self.path_data_mut(path_id);
@@ -3577,6 +3591,7 @@ impl Connection {
             self.path_data_mut(path_id).mtud.on_probe_lost();
             self.path_stats.get_mut(path_id).lost_plpmtud_probes += 1;
         }
+        Ok(())
     }
 
     /// Returns the earliest time packets should be declared lost for all spaces on a path.
@@ -4631,7 +4646,7 @@ impl Connection {
 
                 let space = &mut self.spaces[SpaceId::Initial];
                 if let Some(info) = space.for_path(PathId::ZERO).take(0) {
-                    self.on_packet_acked(now, PathId::ZERO, 0, info);
+                    self.on_packet_acked(now, PathId::ZERO, 0, info)?;
                 };
 
                 self.discard_space(now, SpaceKind::Initial); // Make sure we clean up after

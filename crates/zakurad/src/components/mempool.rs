@@ -24,10 +24,11 @@ use std::{
     iter,
     pin::{pin, Pin},
     task::{Context, Poll},
+    time::Instant,
 };
 
 use futures::{future::FutureExt, stream::Stream};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, oneshot};
 use tower::{
     buffer::Buffer,
     timeout::Timeout,
@@ -57,6 +58,7 @@ mod crawler;
 pub mod downloads;
 mod error;
 pub mod gossip;
+mod peer_cooldown;
 mod pending_outputs;
 mod queue_checker;
 mod storage;
@@ -123,8 +125,8 @@ type TxVerifier = Buffer<
 type InboundTxDownloads = TxDownloads<Timeout<Outbound>, Timeout<TxVerifier>, ReadState>;
 
 /// The maximum estimated distance to the network tip, in blocks, at which the
-/// mempool and its crawler activate, and at which the mempool scores peer
-/// misbehavior.
+/// mempool and its crawler activate, and at which the mempool starts peer
+/// transaction cooldowns.
 ///
 /// This matches `getblocktemplate`'s `MAX_ESTIMATED_DISTANCE_TO_NETWORK_CHAIN_TIP`.
 /// An active mempool only disables beyond [`zs::MAX_BLOCK_REORG_HEIGHT`], so
@@ -144,10 +146,17 @@ pub(crate) fn is_estimated_close_to_network_tip(chain_tip_change: &ChainTipChang
         .is_some_and(|(distance, _height)| distance <= MAX_ESTIMATED_DISTANCE_TO_ENABLE)
 }
 
-fn transaction_misbehavior(
+/// Returns the peer to put in a transaction cooldown for `error`, if any.
+///
+/// Only consensus failures that would otherwise count as peer misbehavior
+/// start a cooldown. Policy rejections, duplicate spends, failures without a
+/// legacy advertiser address, and failures verified against a tip other than
+/// `best_tip_height` do not. Branch ID and lock time failures do not either,
+/// because they depend on this node's tip, which can lag the relaying peer's.
+fn transaction_cooldown_peer(
     error: &TransactionDownloadVerifyError,
     best_tip_height: Option<block::Height>,
-) -> Option<(PeerSocketAddr, u32)> {
+) -> Option<PeerSocketAddr> {
     let TransactionDownloadVerifyError::Invalid {
         error,
         advertiser_addr: Some(advertiser_addr),
@@ -162,7 +171,9 @@ fn transaction_misbehavior(
     }
 
     // Tip timestamps only estimate freshness. Honest peers can use a different
-    // branch or lock context even when this node passes the distance gate.
+    // branch or lock context even when this node passes the distance gate. The
+    // verifier checks lock times before any proof or script, so a peer that
+    // triggers them costs little.
     if matches!(
         error,
         TransactionError::WrongConsensusBranchId
@@ -173,8 +184,7 @@ fn transaction_misbehavior(
         return None;
     }
 
-    let score = error.mempool_misbehavior_score();
-    (score != 0).then_some((*advertiser_addr, score))
+    (error.mempool_misbehavior_score() != 0).then_some(*advertiser_addr)
 }
 
 /// The state of the mempool.
@@ -224,7 +234,7 @@ impl ActiveState {
     }
 
     /// Returns a list of requests that will retry every stored and pending transaction.
-    fn transaction_retry_requests(&self) -> Vec<Gossip> {
+    fn transaction_retry_requests(&self) -> Vec<(Gossip, Option<QueueSource>)> {
         match self {
             ActiveState::Disabled => Vec::new(),
             ActiveState::Enabled {
@@ -237,10 +247,12 @@ impl ActiveState {
                 let storage = storage
                     .transactions()
                     .values()
-                    .map(|tx| tx.transaction.clone().into());
+                    .map(|tx| (tx.transaction.clone().into(), None));
                 transactions.extend(storage);
 
-                let pending = tx_downloads.transaction_requests().cloned();
+                let pending = tx_downloads
+                    .transaction_requests()
+                    .map(|(tx, source)| (tx.clone(), source.clone()));
                 transactions.extend(pending);
 
                 transactions
@@ -348,8 +360,10 @@ pub struct Mempool {
     /// Used to broadcast transaction ids to peers.
     transaction_sender: broadcast::Sender<MempoolChange>,
 
-    /// Sender for reporting peer addresses that advertised unexpectedly invalid transactions.
-    misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
+    /// Peers whose transactions are ignored after they relayed invalid
+    /// transactions. Shared with the download tasks, and kept across mempool
+    /// resets and deactivations.
+    peer_cooldowns: peer_cooldown::PeerCooldowns,
 
     // Diagnostics
     //
@@ -386,7 +400,6 @@ impl Mempool {
         sync_status: SyncStatus,
         latest_chain_tip: zs::LatestChainTip,
         chain_tip_change: ChainTipChange,
-        misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
     ) -> (Self, MempoolTxSubscriber) {
         let (transaction_sender, _) =
             tokio::sync::broadcast::channel(gossip::MEMPOOL_CHANGE_CHANNEL_CAPACITY);
@@ -405,7 +418,7 @@ impl Mempool {
             _state_guard: state,
             tx_verifier,
             transaction_sender,
-            misbehavior_sender,
+            peer_cooldowns: peer_cooldown::PeerCooldowns::default(),
             #[cfg(feature = "progress-bar")]
             queued_count_bar: None,
             #[cfg(feature = "progress-bar")]
@@ -497,6 +510,7 @@ impl Mempool {
             self.read_state.clone(),
             self.expose_peer_addresses,
             self.config.max_transaction_bytes,
+            self.peer_cooldowns.clone(),
         ));
         self.active_state = ActiveState::Enabled {
             storage: storage::Storage::new(&self.config),
@@ -750,10 +764,10 @@ impl Service<Request> for Mempool {
                     "re-verifying mempool transactions after a chain fork"
                 );
 
-                for tx in tx_retries {
+                for (tx, source) in tx_retries {
                     // This is just an efficiency optimisation, so we don't care if queueing
                     // transaction requests fails.
-                    let _result = tx_downloads.download_if_needed_and_verify(tx, None, None);
+                    let _result = tx_downloads.download_if_needed_and_verify(tx, source, None);
                 }
             }
 
@@ -834,11 +848,27 @@ impl Service<Request> for Mempool {
                     }
                     Ok(Err(boxed_err)) => {
                         let (tx_id, error) = *boxed_err;
-                        if is_current_enough_for_mempool {
-                            if let Some((advertiser_addr, score)) =
-                                transaction_misbehavior(&error, best_tip_height)
+                        // Only start cooldowns while this node's validation context is
+                        // current. A stale node verifies transactions against old rules.
+                        let cooldown_peer = is_current_enough_for_mempool
+                            .then(|| transaction_cooldown_peer(&error, best_tip_height))
+                            .flatten();
+                        if let Some(advertiser_addr) = cooldown_peer {
+                            if let Some(cooldown) = self
+                                .peer_cooldowns
+                                .record_invalid_transaction(advertiser_addr.ip(), Instant::now())
                             {
-                                let _ = self.misbehavior_sender.try_send((advertiser_addr, score));
+                                tracing::debug!(
+                                    ?tx_id,
+                                    peer = %legacy_peer_log_label(
+                                        advertiser_addr,
+                                        self.expose_peer_addresses,
+                                    ),
+                                    ?cooldown,
+                                    "ignoring peer transaction advertisements after an invalid transaction"
+                                );
+                                metrics::counter!("mempool.peer_cooldown.started.total")
+                                    .increment(1);
                             }
                         }
 
@@ -860,6 +890,10 @@ impl Service<Request> for Mempool {
                             ) => metrics::counter!(
                                 "mempool.rejected.transactions.total",
                                 "reason" => "transaction_too_large"
+                            )
+                            .increment(1),
+                            TransactionDownloadVerifyError::PeerCoolingDown => metrics::counter!(
+                                "mempool.peer_cooldown.ignored.transactions.total"
                             )
                             .increment(1),
                             _ => metrics::counter!(
@@ -1166,15 +1200,31 @@ impl Service<Request> for Mempool {
                         "got mempool QueueFromPeer request"
                     );
 
-                    for gossiped_tx in transactions {
-                        if storage.should_download_or_verify(gossiped_tx.id()).is_err() {
-                            continue;
-                        }
-                        let _ = tx_downloads.download_if_needed_and_verify(
-                            gossiped_tx,
-                            Some(source.clone()),
-                            None,
+                    let is_cooling_down = match &source {
+                        QueueSource::LegacySocket(addr) => self
+                            .peer_cooldowns
+                            .is_cooling_down(addr.ip(), Instant::now()),
+                        QueueSource::Zakura(_) => false,
+                    };
+
+                    if is_cooling_down {
+                        trace!(
+                            req_count = ?transactions.len(),
+                            "ignored transactions from a peer in a transaction cooldown"
                         );
+                        metrics::counter!("mempool.peer_cooldown.ignored.transactions.total")
+                            .increment(u64::try_from(transactions.len()).unwrap_or(u64::MAX));
+                    } else {
+                        for gossiped_tx in transactions {
+                            if storage.should_download_or_verify(gossiped_tx.id()).is_err() {
+                                continue;
+                            }
+                            let _ = tx_downloads.download_if_needed_and_verify(
+                                gossiped_tx,
+                                Some(source.clone()),
+                                None,
+                            );
+                        }
                     }
 
                     self.update_metrics();

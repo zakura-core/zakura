@@ -38,32 +38,35 @@ type StateService = Buffer<BoxService<zs::Request, zs::Response, zs::BoxError>, 
 type MockTxVerifier = MockService<tx::Request, tx::Response, PanicAssertion, TransactionError>;
 
 #[test]
-fn policy_rejection_has_no_misbehavior_score() {
+fn policy_rejection_does_not_start_a_cooldown() {
     let policy_error = TransactionDownloadVerifyError::PolicyRejected(
         storage::NonStandardTransactionError::TransactionTooLarge {
             actual_bytes: 250_001,
             max_bytes: 250_000,
         },
     );
-    assert_eq!(transaction_misbehavior(&policy_error, None), None);
+    assert_eq!(transaction_cooldown_peer(&policy_error, None), None);
 
     let advertiser_addr = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
     let consensus_error = zakura_consensus::error::TransactionError::WrongVersion;
-    let expected_score = consensus_error.mempool_misbehavior_score();
-    assert_ne!(expected_score, 0, "control error must have a score");
+    assert_ne!(
+        consensus_error.mempool_misbehavior_score(),
+        0,
+        "control error must have a score"
+    );
     let invalid_error = TransactionDownloadVerifyError::Invalid {
         error: consensus_error,
         advertiser_addr: Some(advertiser_addr),
         tip_height: Some(block::Height(100)),
     };
     assert_eq!(
-        transaction_misbehavior(&invalid_error, Some(block::Height(100))),
-        Some((advertiser_addr, expected_score))
+        transaction_cooldown_peer(&invalid_error, Some(block::Height(100))),
+        Some(advertiser_addr)
     );
 }
 
 #[test]
-fn stale_verification_failures_do_not_score_peers() {
+fn stale_verification_failures_do_not_start_cooldowns() {
     let peer = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
     let error = TransactionDownloadVerifyError::Invalid {
         error: TransactionError::WrongVersion,
@@ -72,20 +75,21 @@ fn stale_verification_failures_do_not_score_peers() {
     };
 
     assert_eq!(
-        transaction_misbehavior(&error, Some(block::Height(101))),
+        transaction_cooldown_peer(&error, Some(block::Height(101))),
         None
     );
-    assert_eq!(transaction_misbehavior(&error, None), None);
+    assert_eq!(transaction_cooldown_peer(&error, None), None);
     assert_eq!(
-        transaction_misbehavior(&error, Some(block::Height(100))),
-        Some((peer, 100))
+        transaction_cooldown_peer(&error, Some(block::Height(100))),
+        Some(peer)
     );
 }
 
 #[test]
-fn context_dependent_failures_do_not_score_current_peers() {
+fn context_dependent_failures_do_not_start_cooldowns() {
     for error in [
         TransactionError::WrongConsensusBranchId,
+        TransactionError::WrongConsensusBranchIdNu6_3GracePeriod,
         TransactionError::LockedUntilAfterBlockHeight(block::Height(101)),
         TransactionError::LockedUntilAfterBlockTime(chrono::Utc::now()),
     ] {
@@ -95,14 +99,14 @@ fn context_dependent_failures_do_not_score_current_peers() {
             tip_height: Some(block::Height(100)),
         };
         assert_eq!(
-            transaction_misbehavior(&error, Some(block::Height(100))),
+            transaction_cooldown_peer(&error, Some(block::Height(100))),
             None
         );
     }
 }
 
 #[test]
-fn invalid_shielded_proof_sizes_ban_mempool_peers() {
+fn invalid_shielded_proof_sizes_start_a_cooldown() {
     let advertiser_addr = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
 
     for consensus_error in [
@@ -116,27 +120,26 @@ fn invalid_shielded_proof_sizes_ban_mempool_peers() {
         };
 
         assert_eq!(
-            transaction_misbehavior(&invalid_error, Some(block::Height(100))),
-            Some((advertiser_addr, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE)),
+            transaction_cooldown_peer(&invalid_error, Some(block::Height(100))),
+            Some(advertiser_addr),
         );
     }
 }
 
 /// Check that a mempool far behind the network tip rejects invalid peer
-/// transactions without scoring the peer.
+/// transactions without starting a peer cooldown.
 ///
 /// Regression test: a debug-enabled mempool on a node syncing from scratch
 /// verified current network transactions against stale consensus rules and
 /// banned every honest peer that relayed them.
 #[tokio::test(flavor = "multi_thread")]
-async fn stale_mempool_rejects_invalid_peer_transaction_without_misbehavior() -> Result<(), Report>
-{
-    assert_peer_error_is_not_scored(None, false, TransactionError::WrongVersion).await
+async fn stale_mempool_rejects_invalid_peer_transaction_without_cooldown() -> Result<(), Report> {
+    assert_peer_error_starts_no_cooldown(None, false, TransactionError::WrongVersion).await
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn future_dated_tip_does_not_score_branch_mismatch() -> Result<(), Report> {
-    assert_peer_error_is_not_scored(
+async fn future_dated_tip_does_not_cool_down_branch_mismatch() -> Result<(), Report> {
+    assert_peer_error_starts_no_cooldown(
         Some(chrono::Utc::now() + chrono::Duration::minutes(90)),
         false,
         TransactionError::WrongConsensusBranchId,
@@ -145,8 +148,8 @@ async fn future_dated_tip_does_not_score_branch_mismatch() -> Result<(), Report>
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn caught_up_mempool_does_not_score_stale_verification() -> Result<(), Report> {
-    assert_peer_error_is_not_scored(
+async fn caught_up_mempool_does_not_cool_down_stale_verification() -> Result<(), Report> {
+    assert_peer_error_starts_no_cooldown(
         Some(chrono::Utc::now() - chrono::Duration::minutes(300)),
         true,
         TransactionError::WrongVersion,
@@ -154,7 +157,7 @@ async fn caught_up_mempool_does_not_score_stale_verification() -> Result<(), Rep
     .await
 }
 
-async fn assert_peer_error_is_not_scored(
+async fn assert_peer_error_starts_no_cooldown(
     tip_time: Option<chrono::DateTime<chrono::Utc>>,
     catch_up: bool,
     error: TransactionError,
@@ -167,8 +170,6 @@ async fn assert_peer_error_is_not_scored(
         .transaction
         .clone();
     let peer_addr = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
-    let (misbehavior_tx, mut misbehavior_rx) = tokio::sync::mpsc::channel(1);
-
     let (
         mut mempool,
         mut peer_set,
@@ -177,13 +178,7 @@ async fn assert_peer_error_is_not_scored(
         mut tx_verifier,
         mut recent_syncs,
         _mempool_transaction_receiver,
-    ) = setup_with_mempool_config_and_misbehavior_sender(
-        &network,
-        mempool::Config::default(),
-        true,
-        misbehavior_tx,
-    )
-    .await;
+    ) = setup_with_mempool_config(&network, mempool::Config::default(), true).await;
     let mut tip_sender = tip_time.map(|time| {
         let mut sender = mempool.use_current_chain_tip(&network);
         sender.set_finalized_tip(Some(zs::ChainTipBlock {
@@ -256,16 +251,21 @@ async fn assert_peer_error_is_not_scored(
     .await
     .expect("invalid transaction verification should finish");
 
-    assert!(matches!(
-        misbehavior_rx.try_recv(),
-        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-    ));
+    assert!(
+        !mempool
+            .peer_cooldowns
+            .is_cooling_down(peer_addr.ip(), std::time::Instant::now()),
+        "a context-dependent or stale failure must not start a peer cooldown"
+    );
 
     Ok(())
 }
 
+/// Check that an oversized peer transaction does not start a peer cooldown, but
+/// an invalid one does, and that the mempool then ignores that peer's
+/// transaction advertisements instead of banning it.
 #[tokio::test(flavor = "multi_thread")]
-async fn oversized_peer_transaction_is_rejected_without_misbehavior() -> Result<(), Report> {
+async fn invalid_peer_transaction_starts_a_cooldown_instead_of_a_ban() -> Result<(), Report> {
     let network = Network::Mainnet;
     let mut transactions = network
         .unmined_transactions_in_blocks(2..)
@@ -294,7 +294,10 @@ async fn oversized_peer_transaction_is_rejected_without_misbehavior() -> Result<
     };
     let peer_addr = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
     let queue_source = QueueSource::LegacySocket(peer_addr.remove_socket_addr_privacy());
-    let (misbehavior_tx, mut misbehavior_rx) = tokio::sync::mpsc::channel(1);
+    let later_transaction = transactions
+        .get(1)
+        .expect("mainnet test vectors contain several unmined transactions")
+        .clone();
 
     let (
         mut mempool,
@@ -304,14 +307,8 @@ async fn oversized_peer_transaction_is_rejected_without_misbehavior() -> Result<
         mut tx_verifier,
         mut recent_syncs,
         _mempool_transaction_receiver,
-    ) = setup_with_mempool_config_and_misbehavior_sender(
-        &network,
-        mempool_config,
-        true,
-        misbehavior_tx,
-    )
-    .await;
-    // Peer misbehavior is only scored when the mempool's validation context is current.
+    ) = setup_with_mempool_config(&network, mempool_config, true).await;
+    // Cooldowns only start when the mempool's validation context is current.
     let _chain_tip_sender = mempool.use_current_chain_tip(&network);
     mempool.enable(&mut recent_syncs).await;
 
@@ -359,10 +356,12 @@ async fn oversized_peer_transaction_is_rejected_without_misbehavior() -> Result<
     ));
     assert_eq!(mempool.storage().transaction_count(), 0);
     tx_verifier.expect_no_requests().await;
-    assert!(matches!(
-        misbehavior_rx.try_recv(),
-        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-    ));
+    assert!(
+        !mempool
+            .peer_cooldowns
+            .is_cooling_down(peer_addr.ip(), std::time::Instant::now()),
+        "policy rejections must not start a peer cooldown"
+    );
 
     let at_limit_id = at_limit_transaction.id();
     let response = mempool
@@ -371,7 +370,7 @@ async fn oversized_peer_transaction_is_rejected_without_misbehavior() -> Result<
         .expect("mempool service becomes ready")
         .call(Request::QueueFromPeer {
             transactions: vec![at_limit_id.into()],
-            source: queue_source,
+            source: queue_source.clone(),
         })
         .await
         .expect("mempool service queues the peer transaction");
@@ -404,12 +403,119 @@ async fn oversized_peer_transaction_is_rejected_without_misbehavior() -> Result<
     .await
     .expect("invalid transaction should reach the rejection cache");
 
-    let expected_score = TransactionError::WrongVersion.mempool_misbehavior_score();
-    assert_eq!(misbehavior_rx.try_recv(), Ok((peer_addr, expected_score)));
-    assert!(matches!(
-        misbehavior_rx.try_recv(),
-        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-    ));
+    assert!(
+        mempool
+            .peer_cooldowns
+            .is_cooling_down(peer_addr.ip(), std::time::Instant::now()),
+        "an invalid transaction must start a peer cooldown"
+    );
+
+    // The mempool ignores the next advertisement from the same peer, even on
+    // a different port, and does not download it.
+    let other_port = PeerSocketAddr::from(([203, 0, 113, 7], 18233));
+    let response = mempool
+        .ready()
+        .await
+        .expect("mempool service becomes ready")
+        .call(Request::QueueFromPeer {
+            transactions: vec![later_transaction.id().into()],
+            source: QueueSource::LegacySocket(other_port.remove_socket_addr_privacy()),
+        })
+        .await
+        .expect("mempool service accepts the peer request");
+    assert!(matches!(response, Response::Queued(results) if results.is_empty()));
+    assert!(!mempool
+        .tx_downloads()
+        .transaction_requests()
+        .any(|(request, _)| request.id() == later_transaction.id()));
+    peer_set.expect_no_requests().await;
+
+    Ok(())
+}
+
+/// The crawler queues transactions without a peer source, and the peer set
+/// routes their downloads to the peer that listed them. The mempool must not
+/// verify a transaction that a cooling down peer serves, and must not reject
+/// it, so another peer can still relay it.
+#[tokio::test(flavor = "multi_thread")]
+async fn crawled_transaction_from_cooling_down_peer_is_not_verified() -> Result<(), Report> {
+    let network = Network::Mainnet;
+    let transaction = network
+        .unmined_transactions_in_blocks(1..=1)
+        .next()
+        .expect("mainnet test vectors contain an unmined transaction")
+        .transaction
+        .clone();
+    let transaction_id = transaction.id();
+    let cooling_down_peer = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
+    let other_peer = PeerSocketAddr::from(([198, 51, 100, 9], 8233));
+
+    let (
+        mut mempool,
+        mut peer_set,
+        _state_service,
+        _chain_tip_change,
+        mut tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup(&network, u64::MAX, true).await;
+    mempool.enable(&mut recent_syncs).await;
+    mempool
+        .peer_cooldowns
+        .record_invalid_transaction(cooling_down_peer.ip(), std::time::Instant::now());
+
+    for (serving_peer, is_verified) in [(cooling_down_peer, false), (other_peer, true)] {
+        mempool
+            .ready()
+            .await
+            .expect("mempool service becomes ready")
+            .call(Request::Queue(vec![transaction_id.into()]))
+            .await
+            .expect("mempool service queues the crawled transaction");
+
+        peer_set
+            .expect_request_that(|request| {
+                matches!(request, zn::Request::TransactionsById(ids) if ids.contains(&transaction_id))
+            })
+            .await
+            .respond(zn::Response::Transactions(vec![
+                zn::InventoryResponse::Available((transaction.clone(), Some(serving_peer))),
+            ]));
+
+        if is_verified {
+            tx_verifier
+                .expect_request_that(|request| {
+                    matches!(
+                        request,
+                        tx::Request::Mempool { transaction, .. } if transaction.id() == transaction_id
+                    )
+                })
+                .await
+                .respond(Err(TransactionError::WrongVersion));
+        }
+
+        timeout(Duration::from_secs(3), async {
+            while mempool
+                .tx_downloads()
+                .transaction_requests()
+                .any(|(request, _)| request.id() == transaction_id)
+            {
+                mempool.dummy_call().await;
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("crawled transaction download should finish");
+
+        if !is_verified {
+            tx_verifier.expect_no_requests().await;
+        }
+        assert_eq!(
+            mempool.storage().contains_rejected(&transaction_id),
+            is_verified,
+            "only a verified transaction reaches the rejection cache"
+        );
+    }
 
     Ok(())
 }
@@ -1270,19 +1376,22 @@ async fn mempool_reset_keeps_active_state_when_legacy_sync_falls_behind() -> Res
     assert!(mempool.is_enabled());
 
     // Queue the uncommitted transaction for download.
+    let source = QueueSource::LegacySocket("203.0.113.7:8233".parse().unwrap());
     let response = mempool
         .ready()
         .await
         .unwrap()
-        .call(Request::Queue(vec![uncommitted_tx_id.into()]))
+        .call(Request::QueueFromPeer {
+            transactions: vec![uncommitted_tx_id.into()],
+            source: source.clone(),
+        })
         .await
         .unwrap();
     let queued_responses = match response {
         Response::Queued(queue_responses) => queue_responses,
         _ => unreachable!("will never happen in this test"),
     };
-    assert_eq!(queued_responses.len(), 1);
-    assert!(queued_responses[0].is_ok());
+    assert!(queued_responses.is_empty());
     assert_eq!(mempool.tx_downloads().in_flight(), 1);
 
     // Query the mempool to make it poll chain_tip_change.
@@ -1322,6 +1431,12 @@ async fn mempool_reset_keeps_active_state_when_legacy_sync_falls_behind() -> Res
         &zakura_network::Request::TransactionsById(iter::once(uncommitted_tx_id).collect()),
     );
     assert_eq!(mempool.tx_downloads().in_flight(), 1);
+
+    assert!(mempool
+        .tx_downloads()
+        .transaction_requests()
+        .any(|(tx, retry_source)| tx.id() == uncommitted_tx_id
+            && retry_source.as_ref() == Some(&source)));
 
     Ok(())
 }
@@ -2861,30 +2976,6 @@ async fn setup_with_mempool_config(
     RecentSyncLengths,
     tokio::sync::broadcast::Receiver<MempoolChange>,
 ) {
-    let (misbehavior_tx, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
-    setup_with_mempool_config_and_misbehavior_sender(
-        network,
-        mempool_config,
-        should_commit_genesis_block,
-        misbehavior_tx,
-    )
-    .await
-}
-
-async fn setup_with_mempool_config_and_misbehavior_sender(
-    network: &Network,
-    mempool_config: mempool::Config,
-    should_commit_genesis_block: bool,
-    misbehavior_tx: tokio::sync::mpsc::Sender<(PeerSocketAddr, u32)>,
-) -> (
-    Mempool,
-    MockPeerSet,
-    StateService,
-    ChainTipChange,
-    MockTxVerifier,
-    RecentSyncLengths,
-    tokio::sync::broadcast::Receiver<MempoolChange>,
-) {
     let peer_set = MockService::build().for_unit_tests();
 
     // UTXO verification doesn't matter here.
@@ -2908,7 +2999,6 @@ async fn setup_with_mempool_config_and_misbehavior_sender(
         sync_status,
         latest_chain_tip,
         chain_tip_change.clone(),
-        misbehavior_tx,
     );
 
     let mut mempool_transaction_receiver = mempool_transaction_subscriber.subscribe();
@@ -2965,6 +3055,7 @@ async fn cancel_handles_drained_after_verification_timeout() {
     use crate::components::mempool::{
         crawler::RATE_LIMIT_DELAY,
         downloads::{Downloads, TRANSACTION_DOWNLOAD_TIMEOUT, TRANSACTION_VERIFY_TIMEOUT},
+        peer_cooldown::PeerCooldowns,
     };
 
     let _init_guard = zakura_test::init();
@@ -2980,6 +3071,7 @@ async fn cancel_handles_drained_after_verification_timeout() {
         state,
         false,
         u64::MAX,
+        PeerCooldowns::default(),
     ));
 
     let mut iter = Network::Mainnet.unmined_transactions_in_blocks(1..=10);

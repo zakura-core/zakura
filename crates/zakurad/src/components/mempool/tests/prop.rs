@@ -470,7 +470,6 @@ fn setup(
     let (mut chain_tip_sender, latest_chain_tip, chain_tip_change) =
         ChainTipSender::new(None, network);
 
-    let (misbehavior_tx, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
     let (mempool, mempool_transaction_subscriber) = Mempool::new(
         &Config {
             tx_cost_limit: 160_000_000,
@@ -484,7 +483,6 @@ fn setup(
         sync_status,
         latest_chain_tip,
         chain_tip_change,
-        misbehavior_tx,
     );
 
     let mut transaction_receiver = mempool_transaction_subscriber.subscribe();

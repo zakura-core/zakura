@@ -206,22 +206,31 @@ async fn response(
     cap: u32,
     count_cap: u32,
 ) -> usize {
-    let mut expected = Vec::new();
-    let mut bytes = 0usize;
-    for offset in 0..requested.min(count_cap) {
-        let Some(encoded) = source.encoded.get(&block::Height(start + offset)) else {
-            break;
-        };
-        if source.fail || bytes + encoded.len() > usize::try_from(cap).unwrap() {
-            break;
+    let encoded = source.encoded.clone();
+    let fail = source.fail;
+    // Decoding large expected responses must not block the task polling other
+    // peers' frame deadlines when these checkers run together with join_all.
+    let expected = tokio::task::spawn_blocking(move || {
+        let mut expected = Vec::new();
+        let mut bytes = 0usize;
+        for offset in 0..requested.min(count_cap) {
+            let Some(encoded) = encoded.get(&block::Height(start + offset)) else {
+                break;
+            };
+            if fail || bytes + encoded.len() > usize::try_from(cap).unwrap() {
+                break;
+            }
+            bytes += encoded.len();
+            expected.push(
+                block::Block::zcash_deserialize(encoded.as_slice())
+                    .unwrap()
+                    .hash(),
+            );
         }
-        bytes += encoded.len();
-        expected.push(
-            block::Block::zcash_deserialize(encoded.as_slice())
-                .unwrap()
-                .hash(),
-        );
-    }
+        expected
+    })
+    .await
+    .unwrap();
     for (offset, hash) in expected.iter().enumerate() {
         let BlockSyncMessage::Block(body) = f.next().await else {
             panic!("C07 missing expected prefix body");

@@ -23,7 +23,7 @@ pub enum BlockSizeEstimate {
 /// A contiguous block-range request issued to one peer and tracked in its
 /// `outstanding` set. Built by the reactor's per-peer issuance path from a chunk
 /// taken out of the [`WorkQueue`](super::work_queue::WorkQueue).
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub(super) struct BlockRangeRequest {
     /// Exact session/request and durable coordinates that own this range.
     pub(super) owner: zakura_header_chain::BodyWorkOwner,

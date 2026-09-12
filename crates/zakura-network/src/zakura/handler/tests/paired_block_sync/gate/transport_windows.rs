@@ -1,6 +1,7 @@
 //! Compare transport credit policies without changing production defaults.
 
 use super::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const MIB: u32 = 1024 * 1024;
 const SAMPLES: usize = 5;
@@ -218,6 +219,8 @@ async fn unread_headroom_with_config(
         )
     })
     .await??;
+    let probe_bytes = usize::try_from(connection_bytes)? * 2;
+    let probe_received = AtomicUsize::new(0);
     let result = timeout(DEADLINE, async {
         let payload = vec![42; usize::try_from(window_bytes)?];
         let mut unread = Vec::new();
@@ -254,24 +257,45 @@ async fn unread_headroom_with_config(
         let probe = async {
             // Exercise multiple connection-credit updates, not just one frame
             // that happens to fit in the initially available credit.
-            let probe_bytes = usize::try_from(connection_bytes)? * 2;
             tokio::try_join!(
                 async {
                     send.write_all(&vec![43; probe_bytes]).await?;
                     send.finish()?;
                     Ok::<_, BoxError>(())
                 },
-                super::super::super::quic_progress::drain_stream(response, probe_bytes, 43),
+                super::super::super::quic_progress::drain_stream_with_progress(
+                    response,
+                    probe_bytes,
+                    43,
+                    |received| probe_received.store(received, Ordering::Relaxed),
+                ),
             )?;
             Ok::<_, BoxError>(())
         };
         tokio::pin!(probe);
-        let progressed = match timeout(Duration::from_millis(500), &mut probe).await {
-            Ok(result) => {
-                result?;
-                true
+        let mut last_received = 0;
+        let completed_with_siblings_unread = loop {
+            // Slow transfers may continue while they consume useful bytes.
+            // A whole interval without progress detects exhausted credit. The
+            // outer deadline still bounds full completion and sibling cleanup.
+            match timeout(Duration::from_secs(3), &mut probe).await {
+                Ok(result) => {
+                    result?;
+                    break true;
+                }
+                Err(_) => {
+                    let received = probe_received.load(Ordering::Relaxed);
+                    if received == last_received {
+                        eprintln!(
+                            "headroom probe stalled: received={received}/{probe_bytes}; local={:?}; remote={:?}",
+                            connection.stats(),
+                            remote.stats(),
+                        );
+                        break false;
+                    }
+                    last_received = received;
+                }
             }
-            Err(_) => false,
         };
         // Resumption must complete the exact original streams and the same
         // pending probe, even for the deliberately exhausted negative control.
@@ -283,15 +307,24 @@ async fn unread_headroom_with_config(
             )
             .await?;
         }
-        if !progressed {
+        if !completed_with_siblings_unread {
             probe.await?;
         }
         assert!(connection.close_reason().is_none());
         assert!(remote.close_reason().is_none());
         drop(unused_halves);
-        Ok::<_, BoxError>(progressed)
+        Ok::<_, BoxError>(completed_with_siblings_unread)
     })
-    .await;
+    .await
+    .map_err(|error| -> BoxError {
+        format!(
+            "headroom check timed out: received={}/{probe_bytes}; local={:?}; remote={:?}: {error}",
+            probe_received.load(Ordering::Relaxed),
+            connection.stats(),
+            remote.stats(),
+        )
+        .into()
+    });
     connection.close(0u32.into(), b"headroom experiment finished");
     client.close().await;
     server.close().await;

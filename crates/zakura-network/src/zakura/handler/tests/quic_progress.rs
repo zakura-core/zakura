@@ -72,9 +72,19 @@ async fn bidirectional_transfers_exceed_flow_control_windows() -> Result<(), Box
 }
 
 pub(super) async fn drain_stream(
+    recv: RecvStream,
+    expected: usize,
+    byte: u8,
+) -> Result<(), BoxError> {
+    drain_stream_with_progress(recv, expected, byte, |_| {}).await
+}
+
+/// Reports cumulative validated bytes without treating a partial transfer as completion.
+pub(super) async fn drain_stream_with_progress(
     mut recv: RecvStream,
     expected: usize,
     byte: u8,
+    mut progress: impl FnMut(usize),
 ) -> Result<(), BoxError> {
     let mut buffer = vec![0; 64 * 1024];
     let mut received = 0;
@@ -82,6 +92,7 @@ pub(super) async fn drain_stream(
         assert!(buffer[..count].iter().all(|value| *value == byte));
         received += count;
         assert!(received <= expected);
+        progress(received);
     }
     assert_eq!(received, expected);
     Ok(())

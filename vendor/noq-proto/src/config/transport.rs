@@ -155,6 +155,8 @@ impl TransportConfig {
     /// Limit retained receive fragments per stream independently of payload
     /// credit. Excess fragmentation closes the connection as a local resource
     /// failure. `None` preserves the default behavior without this extra limit.
+    /// A finite limit also copies retained stream fragments into independent
+    /// allocations, including after compaction, so packet backing is released.
     pub fn receive_fragment_limit(&mut self, value: Option<NonZeroUsize>) -> &mut Self {
         self.receive_fragment_limit = value;
         self

@@ -31,7 +31,9 @@ A local stream retains its slot until both halves are freed, including stopped
 receive halves awaiting their final offset. Fragment compaction frees retained
 heap capacity on stop and pool reuse. The fragment limit does not bound unordered
 read history or the separate crypto stream. Native message readers use ordered
-reads. The new optional limits have not yet been selected for native defaults.
+reads. Finite fragment limits copy admitted fragments into independent allocations
+and repack each contiguous run separately during compaction. A small retained
+slice therefore cannot keep a large packet or another run's backing alive.
 
 The send window counts retained payload, including acknowledged tails behind a
 missing prefix. Reset releases abandoned send storage before refunding its space
@@ -62,7 +64,7 @@ An optional packet-history limit bounds the packet-number span of sent and lost
 records in each path and encryption space. The indexed buffers allocate for gaps
 as well as occupied records, so a record count alone is insufficient. Exhausting
 this local limit terminates the connection before inserting another record and
-discards any unfinished transmit batch. Native defaults do not yet enable it.
+discards any unfinished transmit batch. The native policy enables this limit.
 
 The multipath limit includes closing paths and unused path IDs already granted
 to the peer. Replacement IDs are issued only after old protocol state is
@@ -72,7 +74,7 @@ for reordered packets while bounding overlapping path state. It applies to the
 native endpoint's existing multipath configuration.
 
 This is work in progress. The node memory envelope, metadata and buffer allocation
-allowances, production window policy and final qualification remain incomplete.
+allowances and final qualification remain incomplete.
 The patch is not evidence of production compliance.
 Cargo patches are not inherited by downstream workspaces, so publishing packages
 that use these new APIs requires publishing the transport changes and updating

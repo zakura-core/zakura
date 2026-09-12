@@ -46,8 +46,23 @@ node allowance and must be verified separately.
 | Raw incoming attempts | 32 attempts, 2 MiB additional packets | Before connection admission |
 | Connection admission | Shared inbound/outbound pool | Owner released after transport storage destruction |
 
-The node-wide byte allowance is not established by this table. Receive backing
-after compaction, receive batching, packet-frame metadata, endpoint tables, and
+With finite fragment limits, received stream fragments own their allocation.
+Compaction removes duplicate bytes and copies each contiguous run into a separate
+allocation. For ordered native readers, the retained backing after an insert is
+at most 2.5*W + 32 KiB per stream, where W is its receive window. A subsequent
+insert adds at most one datagram before compaction. During compaction the old
+backing, a temporary buffer of at most W and new runs totaling at most W can
+coexist. A conservative peak allowance is therefore 4.5*W + 32 KiB + D, with D
+the maximum admitted datagram size. Fragment heap capacity and allocator overhead
+are separate. Application-owned copies after a read use the application budget.
+
+The regression tests check release of a 1 MiB packet backing after admitting one
+byte, independent ownership of compacted runs, and actual backing capacity through
+generated insert, read, overlap and compaction histories. These checks establish
+stream backing ownership, not a process RSS ceiling or an unordered-history bound.
+
+The node-wide byte allowance is not established by this table. Receive batching,
+pending control retransmissions, packet-frame metadata, endpoint tables, and
 allocator overhead still require explicit bounds and allocation evidence. A
 connection charge must cover their sum before constructing transport state.
 The maximum connection count remains a separate ceiling. Application objects,

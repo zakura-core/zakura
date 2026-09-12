@@ -26,6 +26,11 @@ mod gate;
 mod link;
 mod paused;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_policy_keeps_progress_with_all_sibling_streams_unread() -> Result<(), BoxError> {
+    gate::transport_windows::check_native_policy_headroom().await
+}
+
 struct Workload {
     transport: Option<QuicTransportConfig>,
     peer_limit: Option<usize>,

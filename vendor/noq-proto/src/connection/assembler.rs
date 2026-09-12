@@ -994,7 +994,7 @@ mod proptests {
                 }
                 prop_assert!(backing <= asm.allocated);
                 // The generated offsets stay in a 512-byte receive window.
-                prop_assert!(asm.allocated <= 5 * MAX_OFFSET as usize / 2 + 32768);
+                prop_assert!(asm.allocated <= 5 * usize::try_from(MAX_OFFSET).unwrap() / 2 + 32768);
                 asm.data = BinaryHeap::from(chunks);
             }
         }

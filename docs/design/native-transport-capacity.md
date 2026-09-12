@@ -72,15 +72,15 @@ allowance.
 ## Endpoint lifetime
 
 Connection reservations alone cannot fund the current endpoint implementation.
-`RemoteMap::start_remote_state_actor` creates an endpoint-ID mapping when a remote
+`Tasks::start_remote_state_actor` creates an endpoint-ID mapping when a remote
 actor starts. `AddrMap::get` inserts both forward and reverse entries, and the map
 has no removal operation. `RemoteMap::remove_or_restart_actor` removes an idle
 actor's sender but leaves those mapping entries behind. Sequential connections
 with new identities can therefore grow endpoint storage after each connection's
 transport reservation is released. This is established by source inspection.
 
-Remote actors also retain their own state for up to 60 seconds after becoming
-idle. That state needs an endpoint allocation owner independent of a connection's
+Remote actors also retain their own state through a 60-second idle timeout.
+That state needs an endpoint allocation owner independent of a connection's
 owner. A complete node model needs bounded admission for remote actors and their
 mapping entries, funding retained capacity through cleanup and concurrent reuse.
 Closing a connection or expiring an actor must not leave unfunded map capacity.
@@ -95,6 +95,14 @@ this bound. The proposed 4 GiB starting budget remains provisional until those
 charges establish how many connections it can actually fund.
 
 ## Qualification
+
+On September 12, combined property revision `d594451d2`, including compliance
+`13bd5044f`, passes 104 compliance witnesses and 473 fixed regressions. All 49
+property assertions pass with 2,048 cases and seed 896, with two unresolved
+nextest output-handle closure flags. The full-occupancy witness is included in
+the ordinary regression selection. The transport dependency passes 447 protocol
+tests. These results precede optimized throughput and complete node allocation
+qualification.
 
 The milestone is complete only when the enabled policy passes T02 and the full
 occupancy witness, its allocation inventory has a funded node-wide bound, and

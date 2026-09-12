@@ -243,6 +243,8 @@ impl QuicTransportConfigBuilder {
     /// Limit retained receive fragments per stream independently of payload
     /// credit. Excess fragmentation closes the connection as a local resource
     /// failure. `None` preserves the behavior without this extra limit.
+    /// A finite limit also gives retained stream fragments independent backing
+    /// allocations, including after compaction.
     pub fn receive_fragment_limit(mut self, value: Option<std::num::NonZeroUsize>) -> Self {
         self.0.receive_fragment_limit(value);
         self

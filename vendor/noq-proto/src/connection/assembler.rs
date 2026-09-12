@@ -17,6 +17,8 @@ pub(super) struct Assembler {
     buffered: usize,
     /// Estimated number of allocated bytes, will never be less than `buffered`.
     allocated: usize,
+    /// Finite fragment policies retain independently owned payload allocations.
+    bounded: bool,
     /// Number of bytes read by the application. When only ordered reads have been used, this is
     /// the length of the contiguous prefix of the stream which has been consumed by the
     /// application, aka the stream offset.
@@ -108,6 +110,11 @@ impl Assembler {
         let mut offset = self.bytes_read;
         for chunk in buffers.iter_mut().rev() {
             chunk.try_mark_defragment(offset);
+            if self.bounded {
+                // Repack trimmed allocations and merge adjacent fragments, even
+                // when their previous backing had good utilization.
+                chunk.defragmented = false;
+            }
             let size = chunk.bytes.len();
             offset = chunk.offset + size as u64;
             self.buffered += size;
@@ -129,16 +136,20 @@ impl Assembler {
             // Overlap is resolved by try_mark_defragment
             if chunk.offset != offset + (buffer.len() as u64) {
                 if !buffer.is_empty() {
-                    self.data
-                        .push(Buffer::new_defragmented(offset, buffer.split().freeze()));
+                    self.data.push(Buffer::new_defragmented(
+                        offset,
+                        take_compacted(&mut buffer, self.bounded),
+                    ));
                 }
                 offset = chunk.offset;
             }
             buffer.extend_from_slice(&chunk.bytes);
         }
         if !buffer.is_empty() {
-            self.data
-                .push(Buffer::new_defragmented(offset, buffer.split().freeze()));
+            self.data.push(Buffer::new_defragmented(
+                offset,
+                take_compacted(&mut buffer, self.bounded),
+            ));
         }
     }
 
@@ -162,6 +173,12 @@ impl Assembler {
             allocation_size,
             bytes.len()
         );
+        if fragment_limit != usize::MAX && !self.bounded {
+            self.bounded = true;
+            if !self.data.is_empty() {
+                self.defragment();
+            }
+        }
         self.end = self.end.max(offset + bytes.len() as u64);
         if bytes.is_empty() {
             return Ok(());
@@ -175,10 +192,11 @@ impl Assembler {
             for duplicate in recvd.iter_range(range.clone()) {
                 if duplicate.start > offset {
                     check_fragment_capacity(self.data.len(), fragment_limit)?;
-                    let buffer = Buffer::new(
+                    let buffer = Buffer::new_received(
                         offset,
                         bytes.split_to((duplicate.start - offset) as usize),
                         allocation_size,
+                        self.bounded,
                     );
                     self.buffered += buffer.bytes.len();
                     self.allocated += buffer.allocation_size;
@@ -203,7 +221,7 @@ impl Assembler {
             return Ok(());
         }
         check_fragment_capacity(self.data.len(), fragment_limit)?;
-        let buffer = Buffer::new(offset, bytes, allocation_size);
+        let buffer = Buffer::new_received(offset, bytes, allocation_size, self.bounded);
         self.buffered += buffer.bytes.len();
         self.allocated += buffer.allocation_size;
         self.data.push(buffer);
@@ -238,6 +256,17 @@ impl Assembler {
         self.state = State::default();
         self.buffered = 0;
         self.allocated = 0;
+    }
+}
+
+fn take_compacted(buffer: &mut BytesMut, bounded: bool) -> Bytes {
+    if bounded {
+        // Gapped runs must not keep each other's allocation alive after a read.
+        let bytes = Bytes::copy_from_slice(buffer);
+        buffer.clear();
+        bytes
+    } else {
+        buffer.split().freeze()
     }
 }
 
@@ -277,6 +306,15 @@ struct Buffer {
 }
 
 impl Buffer {
+    fn new_received(offset: u64, bytes: Bytes, allocation_size: usize, bounded: bool) -> Self {
+        if bounded {
+            let owned = Bytes::copy_from_slice(&bytes);
+            Self::new(offset, owned, bytes.len())
+        } else {
+            Self::new(offset, bytes, allocation_size)
+        }
+    }
+
     /// Constructs a new fragmented Buffer
     fn new(offset: u64, bytes: Bytes, allocation_size: usize) -> Self {
         Self {
@@ -368,6 +406,42 @@ pub(crate) struct IllegalOrderedRead;
 mod test {
     use super::*;
     use assert_matches::assert_matches;
+
+    #[test]
+    fn bounded_receive_releases_packet_backing_before_retaining_a_fragment() {
+        let backing: std::sync::Arc<[u8]> = vec![42; 1024 * 1024].into();
+        let weak = std::sync::Arc::downgrade(&backing);
+        let bytes = Bytes::from_owner(backing).slice(100..101);
+        let mut x = Assembler::new();
+        x.insert_with_limit(0, bytes, 1, 8).unwrap();
+        assert!(weak.upgrade().is_none(), "retained the packet allocation");
+        assert_eq!(x.allocated, 1);
+        assert_eq!(x.read(1, true).unwrap().bytes.as_ref(), &[42]);
+    }
+
+    #[test]
+    fn bounded_receive_compaction_owns_each_contiguous_run() {
+        let mut x = Assembler::new();
+        for (offset, bytes) in [(0, b"abc"), (3, b"def"), (9, b"jkl"), (12, b"mno")] {
+            let mut data = vec![0; 1024 * 1024];
+            data[..3].copy_from_slice(bytes);
+            x.insert_with_limit(offset, Bytes::from(data).slice(..3), 3, 8)
+                .unwrap();
+        }
+        x.defragment();
+        assert_eq!(x.data.len(), 2, "contiguous fragments must merge");
+        assert_eq!(x.allocated, 12);
+        for chunk in x.data.into_vec() {
+            let expected = if chunk.offset == 0 {
+                b"abcdef"
+            } else {
+                b"jklmno"
+            };
+            assert_eq!(chunk.bytes.as_ref(), expected);
+            let owned = chunk.bytes.try_into_mut().expect("independent allocation");
+            assert_eq!(owned.capacity(), chunk.allocation_size);
+        }
+    }
 
     #[test]
     fn sparse_fragment_limit_bounds_ordered_and_unordered_storage() {
@@ -834,6 +908,7 @@ mod proptests {
     #[proptest]
     fn assembler_matches_reference(
         #[strategy(proptest::collection::vec(any::<Op>(), 1..100))] ops: Vec<Op>,
+        bounded: bool,
     ) {
         let data = make_data();
         let mut asm = Assembler::new();
@@ -843,7 +918,11 @@ mod proptests {
             match op {
                 Op::Insert { offset, len } => {
                     let bytes = get_slice(&data, offset, len);
-                    asm.insert(offset, bytes, len);
+                    if bounded {
+                        asm.insert_with_limit(offset, bytes, len, 1024).unwrap();
+                    } else {
+                        asm.insert(offset, bytes, len);
+                    }
                     reference.insert(offset, len);
                 }
                 Op::Read { max_len } => {
@@ -902,6 +981,21 @@ mod proptests {
                         asm.defragment();
                     }
                 }
+            }
+            if bounded {
+                let mut chunks = mem::take(&mut asm.data).into_vec();
+                let mut backing = 0;
+                for chunk in &mut chunks {
+                    let bytes = mem::take(&mut chunk.bytes);
+                    let owned = bytes.try_into_mut().expect("no shared retained allocation");
+                    prop_assert!(owned.capacity() <= chunk.allocation_size);
+                    backing += owned.capacity();
+                    chunk.bytes = owned.freeze();
+                }
+                prop_assert!(backing <= asm.allocated);
+                // The generated offsets stay in a 512-byte receive window.
+                prop_assert!(asm.allocated <= 5 * MAX_OFFSET as usize / 2 + 32768);
+                asm.data = BinaryHeap::from(chunks);
             }
         }
 

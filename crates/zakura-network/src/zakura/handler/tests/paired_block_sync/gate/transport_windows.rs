@@ -167,8 +167,7 @@ async fn headroom_covers_all_candidate_streams_and_one_extra_local_stream() -> R
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn native_policy_keeps_progress_with_all_sibling_streams_unread() -> Result<(), BoxError> {
+pub(crate) async fn check_native_policy_headroom() -> Result<(), BoxError> {
     let limits = ZakuraLocalLimits::from_config(&Config::default());
     assert!(
         unread_headroom_with_config(

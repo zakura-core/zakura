@@ -7,6 +7,8 @@ mod clock;
 mod cluster;
 mod endpoint;
 mod gossip;
+#[cfg(test)]
+mod handshake;
 mod hostile;
 mod matrix;
 #[cfg(test)]

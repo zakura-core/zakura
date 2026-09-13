@@ -49,6 +49,7 @@ pub mod transaction;
 
 #[cfg(any(test, feature = "proptest-impl"))]
 pub use block::check::difficulty_is_valid;
+pub use block::check::proof_of_work_is_valid;
 #[cfg(any(test, feature = "proptest-impl"))]
 pub use checkpoint::CheckpointVerifier;
 

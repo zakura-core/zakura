@@ -75,6 +75,17 @@ impl MinedSubmissions {
             hash,
         })
     }
+
+    /// Returns true if a submission holds the entry for `hash`.
+    /// Unlike [`Self::reserve`], this probe never holds an entry, so it cannot make a
+    /// concurrent submission fail as a duplicate.
+    #[cfg(test)]
+    pub(crate) fn contains(&self, hash: &block::Hash) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(hash)
+    }
 }
 
 impl Drop for MinedSubmission {

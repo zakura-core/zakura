@@ -3630,6 +3630,278 @@ async fn rpc_submitblock_cancellation_keeps_verification_ownership() {
     queue_task.abort();
 }
 
+#[tokio::test]
+async fn rpc_submitblock_rejects_invalid_proof_of_work_without_a_submission_slot() {
+    let _init_guard = zakura_test::init();
+    check_invalid_pow_submissions(Mainnet, false).await;
+    let custom = Parameters::build()
+        .with_target_difficulty_limit(U256::MAX)
+        .expect("the target limit is valid")
+        .to_network()
+        .expect("the custom network parameters are valid");
+    check_invalid_pow_submissions(custom, true).await;
+}
+
+async fn check_invalid_pow_submissions(network: Network, invalid_equihash: bool) {
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut verifier: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (mined_tx, _mined_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (rpc, queue_task) = RpcImpl::new(
+        network.clone(),
+        Default::default(),
+        false,
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool, 1),
+        Buffer::new(state, 1),
+        Buffer::new(read_state, 1),
+        verifier.clone(),
+        MockSyncStatus::default(),
+        NoChainTip,
+        MockAddressBookPeers::default(),
+        rx,
+        Some(mined_tx),
+    );
+    let rpc = Arc::new(rpc);
+    let genesis: Block = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("genesis bytes deserialize");
+
+    // More distinct invalid blocks than the submission bound. The verifier never answers, so
+    // any slot these blocks held would stay held for the rest of the test.
+    let invalid_submissions: Vec<_> = (0..32u8)
+        .map(|nonce| {
+            let mut block = genesis.clone();
+            Arc::make_mut(&mut block.header).nonce = [nonce; 32].into();
+            if invalid_equihash {
+                Arc::make_mut(&mut block.header).difficulty_threshold =
+                    network.target_difficulty_limit().to_compact();
+                assert!(
+                    zakura_consensus::difficulty_is_valid(
+                        &block.header,
+                        &network,
+                        &block.coinbase_height().unwrap(),
+                        &block.hash()
+                    )
+                    .is_ok(),
+                    "the easy target isolates Equihash rejection"
+                );
+                assert!(matches!(
+                    zakura_consensus::proof_of_work_is_valid(
+                        &block.header,
+                        &network,
+                        &block.coinbase_height().unwrap(),
+                        &block.hash()
+                    ),
+                    Err(zakura_consensus::VerifyBlockError::Equihash { .. })
+                ));
+            }
+            let bytes = block.zcash_serialize_to_vec().expect("block serializes");
+            let rpc = rpc.clone();
+            tokio::spawn(async move { rpc.submit_block(HexData(bytes), None).await })
+        })
+        .collect();
+    let responses = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        futures::future::join_all(invalid_submissions),
+    )
+    .await
+    .expect("invalid blocks are rejected without waiting for the verifier");
+    for response in responses {
+        let response = response.unwrap().unwrap();
+        assert!(
+            response == SubmitBlockErrorResponse::Rejected.into()
+                || response == SubmitBlockErrorResponse::Inconclusive.into(),
+            "invalid blocks either fail PoW or exceed the bounded precheck capacity"
+        );
+    }
+    verifier.expect_no_requests().await;
+
+    // A solved block still reaches the verifier.
+    let solved = tokio::spawn({
+        let rpc = rpc.clone();
+        let bytes = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.to_vec();
+        async move { rpc.submit_block(HexData(bytes), None).await }
+    });
+    verifier
+        .expect_request_that(|request| {
+            matches!(request, zakura_consensus::Request::CommitMined { .. })
+        })
+        .await
+        .respond(Mainnet.genesis_hash());
+    assert_eq!(
+        solved.await.unwrap().unwrap(),
+        SubmitBlockResponse::Accepted
+    );
+    queue_task.abort();
+}
+
+#[test]
+fn rpc_submitblock_cancellation_retains_queued_pow_capacity() {
+    let _init_guard = zakura_test::init();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("the test runtime starts");
+    runtime.block_on(async {
+        let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+        let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+        let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+        let mut verifier: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        let (rpc, queue_task) = RpcImpl::new(
+            Mainnet,
+            Default::default(),
+            false,
+            "0.0.1",
+            "RPC test",
+            Buffer::new(mempool, 1),
+            Buffer::new(state, 1),
+            Buffer::new(read_state, 1),
+            verifier.clone(),
+            MockSyncStatus::default(),
+            NoChainTip,
+            MockAddressBookPeers::default(),
+            rx,
+            None,
+        );
+        let rpc = Arc::new(rpc);
+        let (release, gate) = std::sync::mpsc::channel();
+        let (started, running) = tokio::sync::oneshot::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            started.send(()).expect("the test waits for the blocker");
+            gate.recv().expect("the test releases the blocker");
+        });
+        running.await.expect("the blocker starts");
+        let submission = tokio::spawn({
+            let rpc = rpc.clone();
+            async move {
+                rpc.submit_block(
+                    HexData(zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.to_vec()),
+                    None,
+                )
+                .await
+            }
+        });
+        let hash = Mainnet.genesis_hash();
+        // Probe without reserving: a probe reservation could make the submission's own
+        // reservation fail as a duplicate, and the submission would then never hold capacity.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !rpc.gbt.mined_pow_checks.contains(&hash) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the RPC reserves capacity before queueing proof verification");
+        submission.abort();
+        assert!(submission.await.unwrap_err().is_cancelled());
+        assert!(matches!(
+            rpc.gbt.mined_pow_checks.reserve(hash),
+            Err(SubmitBlockErrorResponse::DuplicateInconclusive)
+        ));
+        release.send(()).expect("the blocker is waiting");
+        blocker.await.expect("the blocker exits");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while rpc.gbt.mined_pow_checks.contains(&hash) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("finishing the proof check releases capacity");
+        assert!(rpc.gbt.mined_pow_checks.reserve(hash).is_ok());
+        verifier.expect_no_requests().await;
+        queue_task.abort();
+    });
+}
+
+#[tokio::test]
+async fn rpc_submitblock_preserves_custom_network_pow_waivers() {
+    let _init_guard = zakura_test::init();
+    let custom = Parameters::build()
+        .with_network_name("PowDisabledCustom")
+        .expect("the custom network name is valid")
+        .with_disable_pow(true)
+        .to_network()
+        .expect("the custom network parameters are valid");
+    let mainnet_genesis: Block = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("genesis bytes deserialize");
+    for (network, mut block) in [
+        (
+            Network::new_regtest(Default::default()),
+            (*zakura_chain::block::genesis::regtest_genesis_block()).clone(),
+        ),
+        (custom, mainnet_genesis),
+    ] {
+        let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+        let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+        let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+        let mut verifier: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        let (mined_tx, _mined_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (rpc, queue_task) = RpcImpl::new(
+            network.clone(),
+            Default::default(),
+            false,
+            "0.0.1",
+            "RPC test",
+            Buffer::new(mempool, 1),
+            Buffer::new(state, 1),
+            Buffer::new(read_state, 1),
+            verifier.clone(),
+            MockSyncStatus::default(),
+            NoChainTip,
+            MockAddressBookPeers::default(),
+            rx,
+            Some(mined_tx),
+        );
+        Arc::make_mut(&mut block.header).nonce = [0; 32].into();
+        let height = block.coinbase_height().unwrap();
+        assert!(
+            zakura_consensus::difficulty_is_valid(&block.header, &network, &height, &block.hash())
+                .is_err(),
+            "the fixture must fail the unwaived proof-of-work check"
+        );
+
+        // A waiver still rejects a target above the network limit before the verifier.
+        let mut invalid_target = block.clone();
+        Arc::make_mut(&mut invalid_target.header).difficulty_threshold =
+            ExpandedDifficulty::from(U256::MAX).to_compact();
+        assert_eq!(
+            rpc.submit_block(
+                HexData(invalid_target.zcash_serialize_to_vec().unwrap()),
+                None
+            )
+            .await
+            .unwrap(),
+            SubmitBlockErrorResponse::Rejected.into()
+        );
+        verifier.expect_no_requests().await;
+
+        let hash = block.hash();
+        let submission = tokio::spawn(async move {
+            rpc.submit_block(HexData(block.zcash_serialize_to_vec().unwrap()), None)
+                .await
+        });
+        verifier
+            .expect_request_that(|request| {
+                matches!(request, zakura_consensus::Request::CommitMined { .. })
+            })
+            .await
+            .respond(hash);
+        assert_eq!(
+            submission.await.unwrap().unwrap(),
+            SubmitBlockResponse::Accepted
+        );
+        queue_task.abort();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_submitblock_errors() {
     let _init_guard = zakura_test::init();

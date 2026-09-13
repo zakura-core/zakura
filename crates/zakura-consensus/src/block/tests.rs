@@ -280,6 +280,46 @@ async fn mined_orphan_replays_skip_transaction_verification() {
 }
 
 #[tokio::test]
+async fn proposals_reject_cross_network_solution_shapes() {
+    let _init_guard = zakura_test::init();
+    let custom = Parameters::build()
+        .with_network_name("PowDisabledCustom")
+        .expect("the custom network name is valid")
+        .with_disable_pow(true)
+        .to_network()
+        .expect("the custom network parameters are valid");
+    for network in [
+        Network::Mainnet,
+        Network::new_default_testnet(),
+        Network::new_regtest(Default::default()),
+        custom,
+    ] {
+        let mut candidate =
+            Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+                .expect("the genesis block deserializes");
+        let wrong_network = if network.is_regtest() {
+            Network::Mainnet
+        } else {
+            Network::new_regtest(Default::default())
+        };
+        Arc::make_mut(&mut candidate.header).solution =
+            equihash::Solution::for_proposal_for_network(&wrong_network);
+        let result = prepared_test_verifier(&network)
+            .oneshot(Request::CheckProposal(Arc::new(candidate)))
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(VerifyBlockError::Equihash {
+                    source: equihash::Error::InvalidSolutionSize { .. }
+                })
+            ),
+            "proposal shape must match {network}: {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn prepared_mined_commit_rechecks_equihash() {
     let _init_guard = zakura_test::init();
     let network = Network::Mainnet;

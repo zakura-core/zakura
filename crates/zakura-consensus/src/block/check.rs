@@ -148,6 +148,25 @@ pub fn difficulty_is_valid(
     Ok(())
 }
 
+/// Checks a submitted block's difficulty and proof of work under the network policy.
+/// Custom networks that disable proof of work still require a valid difficulty threshold.
+pub fn proof_of_work_is_valid(
+    header: &Header,
+    network: &Network,
+    height: &Height,
+    hash: &Hash,
+) -> Result<(), super::VerifyBlockError> {
+    let policy = PowPolicy::for_network(network)?;
+    if policy.is_authenticated_custom_waiver() {
+        difficulty_threshold_is_valid(header, network, height, hash)?;
+        policy.validate_solution(header)?;
+    } else {
+        difficulty_is_valid(header, network, height, hash)?;
+        equihash_solution_is_valid(header, network)?;
+    }
+    Ok(())
+}
+
 /// Returns `Ok(())` if the `EquihashSolution` is valid for `header` on `network`
 pub fn equihash_solution_is_valid(
     header: &Header,
@@ -473,6 +492,27 @@ mod tests {
     };
 
     use super::UnmatchedCoinbaseOutputs;
+
+    #[test]
+    fn waived_pow_still_rejects_cross_network_solution_shape() {
+        use zakura_chain::{
+            block,
+            parameters::{testnet::RegtestParameters, Network},
+            work::equihash,
+        };
+        let network = Network::new_regtest(RegtestParameters::default());
+        let mut header = *block::genesis::regtest_genesis_block().header;
+        let height = block::Height(0);
+        let hash = header.hash();
+        assert!(super::proof_of_work_is_valid(&header, &network, &height, &hash).is_ok());
+        header.solution = equihash::Solution::for_proposal();
+        assert!(matches!(
+            super::proof_of_work_is_valid(&header, &network, &height, &hash),
+            Err(crate::block::VerifyBlockError::Equihash {
+                source: equihash::Error::InvalidSolutionSize { .. }
+            })
+        ));
+    }
 
     fn output(value: u64) -> Output {
         let value = Amount::<NonNegative>::try_from(value).expect("test value is a valid amount");

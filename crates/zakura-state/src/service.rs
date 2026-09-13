@@ -2254,7 +2254,9 @@ where
             .iter()
             .copied()
             .filter(|frontier| {
-                frontier.height >= start && frontier.height <= best_header_tip.height
+                frontier.height >= start
+                    && frontier.height.0 < start.0.saturating_add(count)
+                    && frontier.height <= best_header_tip.height
             })
             .map(|frontier| (frontier.height, frontier.hash))
             .collect(),
@@ -2264,14 +2266,13 @@ where
     // fork at the same height can never borrow another block's size.
     let advertised_sizes: HashMap<block::Height, NonZeroU32> = match header_chain {
         Some(reader) => {
-            let mut selected: Vec<(block::Height, block::Hash)> = selected_hashes
+            let window: Vec<(block::Height, block::Hash)> = selected_hashes
                 .iter()
                 .map(|(height, hash)| (*height, *hash))
                 .collect();
-            selected.sort_unstable_by_key(|(height, _)| *height);
-            let hashes: Vec<block::Hash> = selected.iter().map(|(_, hash)| *hash).collect();
+            let hashes: Vec<block::Hash> = window.iter().map(|(_, hash)| *hash).collect();
             let hints = reader.body_size_hints_by_hash(&hashes)?;
-            selected
+            window
                 .into_iter()
                 .zip(hints)
                 .filter_map(|((height, _), hint)| hint.map(|size| (height, size)))
@@ -3058,6 +3059,7 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             ReadRequest::BlockSizesByHash { hashes } => {
+                // The cap equals the largest header page (MAX_HS_RANGE in zakura-network), so a full page always fits.
                 let cap = usize::try_from(MAX_HEADER_SYNC_HEIGHT_RANGE)
                     .expect("u32 fits usize on supported targets");
                 if hashes.len() > cap {

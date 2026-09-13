@@ -5,6 +5,7 @@
 use std::{
     borrow::Cow,
     collections::{BTreeSet, HashMap, HashSet},
+    num::NonZeroU32,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -1582,6 +1583,24 @@ impl HeaderChainReader {
                 .min(selected_tip.height.0),
         );
         self.store.projection_range(HEADER_SELECTED, start, end)
+    }
+
+    /// Advisory body sizes for `hashes` from the retained auxiliary deliveries, parallel to
+    /// `hashes` (`None` when no non-rejected delivery knows the size). Reads the in-memory
+    /// engine only, so it is cheap for a whole needed-body window; see
+    /// [`AuxDelivery::advertised_body_size`] for the selection rule.
+    pub(crate) fn body_size_hints_by_hash(
+        &self,
+        hashes: &[block::Hash],
+    ) -> Result<Vec<Option<NonZeroU32>>, HeaderChainStoreError> {
+        let engine = self
+            .transition_engine
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+        Ok(hashes
+            .iter()
+            .map(|hash| AuxDelivery::advertised_body_size(engine.aux_deliveries(*hash)))
+            .collect())
     }
 
     pub(crate) fn selected_successor(

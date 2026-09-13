@@ -1594,3 +1594,89 @@ async fn retained_path_serves_a_bounded_finalized_range_below_the_header_frontie
         RetainedPathLeaseOutcome::TargetNotRetained
     ));
 }
+
+#[test]
+fn body_size_hints_by_hash_read_known_sizes_from_retained_deliveries() {
+    let (runtime, _db, _genesis, path) = reconciled_store_with_finalized_prefix(5);
+    let parent = Frontier::new(path[2].height, path[2].hash);
+    let target = Frontier::new(path[3].height, path[3].hash);
+    let successor = Frontier::new(path[4].height, path[4].hash);
+    let snapshot = runtime.publisher().snapshot();
+    let owner = zakura_header_chain::BodyWorkAuthority::for_snapshot(&snapshot)
+        .bind(27, NonZeroU64::new(28).expect("twenty-eight is nonzero"));
+    let range = runtime
+        .reader()
+        .vct_repair_context(owner, target.height)
+        .expect("the range repair context is coherent")
+        .expect("the selected empty range needs repair");
+    let prefix = range
+        .bounded_prefix(1)
+        .expect("the one-header range prefix exists");
+    let lease = runtime
+        .reader()
+        .validation_context(parent.hash)
+        .expect("the repair parent validation context is coherent")
+        .expect("the repair parent remains retained");
+    let rules =
+        HeaderRules::for_validation_lease(&lease).expect("the repair parent produces header rules");
+    let batch = zakura_header_chain::prepare_headers(
+        HeaderBatchInput::new(std::slice::from_ref(&path[3].header)),
+        parent,
+        &rules,
+        &SystemClock,
+    )
+    .expect("the selected prefix passes deterministic preparation");
+    let source = SourceId::from_digest([0xc1; 32]);
+    let known_size = std::num::NonZeroU32::new(123_456).expect("the fixture size is nonzero");
+    let request = TransitionRequest {
+        expected_version: StateVersion::default(),
+        event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+            owner: owner.into(),
+            source,
+            parent_hash: parent.hash,
+            target_tip_hash: target.hash,
+            completion: TargetCompletion::SelectedAuxiliaryRepair {
+                common_ancestor: parent,
+                selected_target: target,
+                episode: prefix.episode,
+            },
+            batch,
+            aux: vec![AuxDelivery::new(
+                EvidenceId::from_digest([0xc2; 32]),
+                target.hash,
+                source,
+                owner.into(),
+                zakura_header_chain::BodySizeHint::Known(known_size),
+                Some(zakura_header_chain::TreeAuxRecordV1 {
+                    height: target.height,
+                    sapling_root: Default::default(),
+                    orchard_root: Default::default(),
+                    ironwood_root: Default::default(),
+                    sapling_tx_count: 1,
+                    orchard_tx_count: 0,
+                    ironwood_tx_count: 0,
+                    auth_data_root: [0xc3; 32].into(),
+                }),
+            )],
+        })),
+    };
+    let context = TransitionContext {
+        config: &runtime.config,
+        clock: &SystemClock,
+        full_state_authority: None,
+        retention_references: &[],
+    };
+    assert!(matches!(
+        runtime
+            .apply(request, &context)
+            .expect("the one-header range prefix applies"),
+        ApplyResult::Committed
+    ));
+
+    let hints = runtime
+        .reader()
+        .body_size_hints_by_hash(&[parent.hash, target.hash, successor.hash])
+        .expect("the delivery hints read");
+
+    assert_eq!(hints, vec![None, Some(known_size), None]);
+}

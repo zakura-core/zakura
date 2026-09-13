@@ -1,3 +1,4 @@
+use super::super::tests::mainnet_decoder;
 use super::*;
 
 #[test]
@@ -184,7 +185,7 @@ async fn teardown_before_reconciliation_removes_registry_generations() {
     // Neither admission nor removal can be observed by the reactor in this test.
     reactor_task.abort();
     let registry = handle.routine_wiring.as_ref().unwrap().registry.clone();
-    let service = BlockSyncService::new_with_handle(config, handle);
+    let service = BlockSyncService::new_with_handle(config, handle, mainnet_decoder());
     let current = service.current_sessions_for_test();
     for close_connection in [true, false] {
         for identity in 32..64 {
@@ -219,7 +220,7 @@ async fn stale_teardown_cannot_remove_an_unobserved_replacement() {
         spawn_block_sync_reactor(BlockSyncStartup::inert(config.clone()));
     reactor_task.abort();
     let registry = handle.routine_wiring.as_ref().unwrap().registry.clone();
-    let service = BlockSyncService::new_with_handle(config, handle);
+    let service = BlockSyncService::new_with_handle(config, handle, mainnet_decoder());
     let peer = ZakuraPeerId::new(vec![91; 32]).unwrap();
     let (old, _old_input, _old_output) = admit_unobserved_peer(&service, peer.clone(), 1);
     let (new, _new_input, _new_output) = admit_unobserved_peer(&service, peer.clone(), 2);
@@ -331,6 +332,7 @@ impl BlockSyncService {
             watch::channel(ServicePeerSnapshot::new(0, 0, config.peer_limits));
         let (_candidates_tx, candidates) = watch::channel(ZakuraBlockSyncCandidateState::default());
         Self {
+            decoder: mainnet_decoder(),
             range_source: None,
             local_status: None,
             inner: Arc::new(BlockSyncServiceInner {

@@ -8,11 +8,10 @@ use thiserror::Error;
 use crate::{
     fmt::HexDebug,
     parameters::Network,
-    serialization::{TrustedPreallocate, MAX_HEADERS_PER_MESSAGE},
-    work::{
-        difficulty::CompactDifficulty,
-        equihash::{Solution, REGTEST_SOLUTION_SIZE},
+    serialization::{
+        CompactSize64, TrustedPreallocate, ZcashDecoder, ZcashSerialize, MAX_HEADERS_PER_MESSAGE,
     },
+    work::{difficulty::CompactDifficulty, equihash::Solution},
 };
 
 use super::{merkle, Commitment, CommitmentError, Hash, Height};
@@ -162,18 +161,26 @@ pub const ZCASH_BLOCK_VERSION: u32 = 4;
 
 impl TrustedPreallocate for CountedHeader {
     fn min_serialized_size() -> u64 {
+        Self::min_serialized_size_for(ZcashDecoder::any_network())
+    }
+
+    fn min_serialized_size_for(decoder: ZcashDecoder) -> u64 {
         // The Equihash input contains the version, hashes, timestamp, and difficulty.
         const HEADER_FIELDS_BEFORE_NONCE_BYTES: usize = Solution::INPUT_LENGTH;
         const NONCE_BYTES: usize = 32;
-        const REGTEST_SOLUTION_LENGTH_BYTES: usize = 1;
         const ZERO_TRANSACTION_COUNT_BYTES: usize = 1;
 
-        // Regtest has the shortest solution the decoder accepts. Its length
-        // prefix and the trailing zero transaction count each occupy one byte.
+        // Regtest's 36-byte solution needs a one-byte length prefix. Mainnet
+        // and Testnet require 1,344 solution bytes and a three-byte prefix.
+        // Use the configured network so Regtest does not loosen their bound.
+        let solution_bytes = decoder.minimum_equihash_solution_size();
+        let solution_length = CompactSize64::from(
+            u64::try_from(solution_bytes).expect("fixed Equihash solution sizes fit in u64"),
+        );
         let minimum_bytes = HEADER_FIELDS_BEFORE_NONCE_BYTES
             + NONCE_BYTES
-            + REGTEST_SOLUTION_LENGTH_BYTES
-            + REGTEST_SOLUTION_SIZE
+            + solution_length.zcash_serialized_size()
+            + solution_bytes
             + ZERO_TRANSACTION_COUNT_BYTES;
         u64::try_from(minimum_bytes).expect("the fixed counted header size fits in u64")
     }

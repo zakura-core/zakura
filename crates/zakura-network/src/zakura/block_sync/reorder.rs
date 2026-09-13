@@ -1,4 +1,8 @@
-use super::{state::*, wire::BLOCK_SYNC_MESSAGE_TYPE_BYTES, *};
+use super::{
+    state::*,
+    wire::{RawBlockPayload, BLOCK_SYNC_MESSAGE_TYPE_BYTES},
+    *,
+};
 
 #[derive(Clone, Debug)]
 pub(crate) struct ReorderBuffer {
@@ -228,14 +232,14 @@ struct BufferedBlock {
 
 #[derive(Clone, Debug)]
 pub(super) enum BufferedBlockBody {
-    RawFramePayload(Arc<[u8]>),
+    RawFramePayload(RawBlockPayload),
     Decoded {
         block: Arc<block::Block>,
         decoded_attributed_memory_size_bytes: u64,
     },
     DecodedWithRawFramePayload {
         block: Arc<block::Block>,
-        raw_frame_payload: Arc<[u8]>,
+        raw_frame_payload: RawBlockPayload,
         decoded_attributed_memory_size_bytes: u64,
     },
 }
@@ -244,7 +248,7 @@ impl BufferedBlockBody {
     #[cfg(any(test, feature = "internal-bench"))]
     pub(super) fn from_decoded_block(
         block: Arc<block::Block>,
-        raw_frame_payload: Option<Arc<[u8]>>,
+        raw_frame_payload: Option<RawBlockPayload>,
     ) -> Self {
         let decoded_attributed_memory_size_bytes = block.attributed_memory_size_bytes();
         Self::from_measured_decoded_block(
@@ -256,7 +260,7 @@ impl BufferedBlockBody {
 
     pub(super) fn from_measured_decoded_block(
         block: Arc<block::Block>,
-        raw_frame_payload: Option<Arc<[u8]>>,
+        raw_frame_payload: Option<RawBlockPayload>,
         decoded_attributed_memory_size_bytes: u64,
     ) -> Self {
         match raw_frame_payload {
@@ -325,7 +329,7 @@ impl BufferedBlockBody {
             BufferedBlockBody::Decoded { block, .. }
             | BufferedBlockBody::DecodedWithRawFramePayload { block, .. } => block.clone(),
             BufferedBlockBody::RawFramePayload(payload) => {
-                let block = decode_raw_frame_payload(payload);
+                let block = payload.decode_block();
                 let decoded_attributed_memory_size_bytes = block.attributed_memory_size_bytes();
                 let serialized_bytes = payload.len().saturating_sub(BLOCK_SYNC_MESSAGE_TYPE_BYTES);
                 // Metrics accepts f64 samples; these lossy conversions are observability-only.
@@ -350,13 +354,4 @@ impl BufferedBlockBody {
             }
         }
     }
-}
-
-fn decode_raw_frame_payload(payload: &Arc<[u8]>) -> Arc<block::Block> {
-    let mut reader = &payload[BLOCK_SYNC_MESSAGE_TYPE_BYTES..];
-    Arc::new(
-        block::Block::zcash_deserialize_from_slice(&mut reader).expect(
-            "raw block bytes deserialize because the peer routine decoded them before buffering",
-        ),
-    )
 }

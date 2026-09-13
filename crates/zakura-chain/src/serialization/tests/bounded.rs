@@ -4,18 +4,136 @@
 //! and buffer growth. Complete block fixtures must still decode to the same
 //! values as before, leaving any bytes after the block unread.
 
-use std::io::{self, Read};
+use std::{
+    io::{self, Read},
+    sync::Arc,
+};
 
 use crate::{
-    block::{Block, Hash},
+    block::{Block, CountedHeader, Hash},
+    parameters::Network,
     primitives::{Groth16Proof, Halo2Proof},
     serialization::{
         zcash_deserialize_bytes_external_count, CompactSizeMessage, SerializationError,
-        TrustedPreallocate, ZcashDeserialize, ZcashReader, ZcashSerialize,
+        TrustedPreallocate, ZcashDecoder, ZcashDeserialize, ZcashReader, ZcashSerialize,
     },
     transaction::Transaction,
     transparent::Script,
+    work::equihash::Solution,
 };
+
+fn block_for_network(network: &Network) -> Block {
+    let mut block =
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES[..]).unwrap();
+    Arc::make_mut(&mut block.header).solution = Solution::for_proposal_for_network(network);
+    block
+}
+
+#[test]
+fn header_minimum_matches_the_configured_network_encoding() {
+    for (network, expected_size) in [
+        (Network::Mainnet, 1_488),
+        (Network::new_default_testnet(), 1_488),
+        (Network::new_regtest(Default::default()), 178),
+    ] {
+        let decoder = ZcashDecoder::for_network(&network);
+        let header = CountedHeader {
+            header: block_for_network(&network).header,
+        };
+        let encoded = header.zcash_serialize_to_vec().unwrap();
+        assert_eq!(encoded.len(), expected_size);
+        assert_eq!(
+            CountedHeader::min_serialized_size_for(decoder),
+            u64::try_from(expected_size).unwrap()
+        );
+
+        // Arc and nested read limits must preserve the same collection bound.
+        let mut bytes = encoded.as_slice();
+        let mut reader = decoder.reader(&mut bytes);
+        let headers = reader
+            .with_limit(u64::MAX)
+            .read_external_count::<Arc<CountedHeader>>(1)
+            .unwrap();
+        assert_eq!(*headers[0], header);
+        assert_eq!(reader.remaining_bytes(), Some(0));
+
+        let mut bytes = &encoded[..encoded.len() - 1];
+        let mut reader = decoder.reader(&mut bytes);
+        assert!(matches!(
+            reader
+                .with_limit(u64::MAX)
+                .read_external_count::<Arc<CountedHeader>>(1),
+            Err(SerializationError::Parse("Vector exceeds available input"))
+        ));
+        assert_eq!(reader.remaining_bytes(), Some(encoded.len() - 1));
+    }
+}
+
+#[test]
+fn nested_block_decoding_rejects_the_other_networks_solution_shape() {
+    let networks = [
+        Network::Mainnet,
+        Network::new_default_testnet(),
+        Network::new_regtest(Default::default()),
+    ];
+    for encoded_network in &networks {
+        let block = block_for_network(encoded_network);
+        let encoded = block.zcash_serialize_to_vec().unwrap();
+        for configured_network in &networks {
+            let decoder = ZcashDecoder::for_network(configured_network);
+            let mut bytes = encoded.as_slice();
+            let result = decoder.decode::<Block>(&mut bytes);
+            if encoded_network.is_regtest() == configured_network.is_regtest() {
+                assert_eq!(result.unwrap(), block);
+                assert!(bytes.is_empty());
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(SerializationError::Parse(
+                        "incorrect equihash solution size"
+                    ))
+                ));
+            }
+        }
+        // Offline decoding still accepts either supported format.
+        assert_eq!(
+            Block::zcash_deserialize_from_slice(&mut encoded.as_slice()).unwrap(),
+            block
+        );
+    }
+}
+
+#[test]
+fn wrong_network_solution_is_rejected_before_reading_its_bytes() {
+    let regtest = Network::new_regtest(Default::default());
+    for network in [
+        Network::Mainnet,
+        Network::new_default_testnet(),
+        regtest.clone(),
+    ] {
+        let other_network = if network.is_regtest() {
+            &Network::Mainnet
+        } else {
+            &regtest
+        };
+        let solution = Solution::for_proposal_for_network(other_network);
+        let encoded = solution.zcash_serialize_to_vec().unwrap();
+        let mut bytes = encoded.as_slice();
+        let decoder = ZcashDecoder::for_network(&network);
+        let result = decoder
+            .reader(&mut bytes)
+            .with_limit(u64::MAX)
+            .read_value::<Solution>();
+        assert!(matches!(
+            result,
+            Err(SerializationError::Parse(
+                "incorrect equihash solution size"
+            ))
+        ));
+        let prefix_bytes = if other_network.is_regtest() { 1 } else { 3 };
+        assert_eq!(bytes, &encoded[prefix_bytes..]);
+    }
+}
 
 #[test]
 fn nested_limits_preserve_available_bytes_and_advance_the_parent() {

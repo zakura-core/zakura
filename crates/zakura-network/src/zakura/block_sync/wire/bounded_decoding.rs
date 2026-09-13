@@ -9,12 +9,83 @@
 use super::*;
 use proptest::prelude::*;
 use zakura_chain::{
+    parameters::Network,
     primitives::{Groth16Proof, Halo2Proof},
-    serialization::{CompactSizeMessage, TrustedPreallocate, ZcashReader},
+    serialization::{CompactSizeMessage, TrustedPreallocate, ZcashReader, MAX_HEADERS_PER_MESSAGE},
     transaction::Transaction,
     transparent::{Input, Output, Script},
+    work::equihash::Solution,
 };
 use zakura_test::allocations::measure;
+
+#[test]
+fn network_bound_blocks_keep_their_rules_for_buffered_replay() {
+    use super::super::reorder::BufferedBlockBody;
+
+    for network in [
+        Network::Mainnet,
+        Network::new_default_testnet(),
+        Network::new_regtest(Default::default()),
+    ] {
+        let decoder = ZcashDecoder::for_network(&network);
+        let mut block =
+            block::Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES[..])
+                .unwrap();
+        Arc::make_mut(&mut block.header).solution = Solution::for_proposal_for_network(&network);
+        let block = Arc::new(block);
+        let frame = BlockSyncMessage::Block(block.clone())
+            .encode_frame()
+            .unwrap();
+        let (message, payload) =
+            BlockSyncMessage::decode_frame_with_raw_block_payload(frame, decoder).unwrap();
+        assert_eq!(message, BlockSyncMessage::Block(block.clone()));
+        let mut buffered =
+            BufferedBlockBody::from_decoded_block(block.clone(), payload).retain_for_backlog();
+        assert_eq!(buffered.decoded_block(), block);
+        buffered.retain_for_backlog_in_place();
+        assert_eq!(buffered.decoded_block(), block);
+
+        let other_network = if network.is_regtest() {
+            Network::Mainnet
+        } else {
+            Network::new_regtest(Default::default())
+        };
+        let frame = BlockSyncMessage::Block(block).encode_frame().unwrap();
+        assert!(BlockSyncMessage::decode_frame_with_raw_block_payload(
+            frame,
+            ZcashDecoder::for_network(&other_network)
+        )
+        .is_err());
+    }
+}
+
+proptest! {
+    #[test]
+    fn f03_network_header_counts_reject_missing_bytes_without_allocating(
+        network_index in 0usize..3,
+        count in 1usize..=MAX_HEADERS_PER_MESSAGE,
+        missing in 1usize..=1_488,
+    ) {
+        let network = match network_index {
+            0 => Network::Mainnet,
+            1 => Network::new_default_testnet(),
+            _ => Network::new_regtest(Default::default()),
+        };
+        let decoder = ZcashDecoder::for_network(&network);
+        let block = block::Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES[..]).unwrap();
+        let mut header = *block.header;
+        header.solution = Solution::for_proposal_for_network(&network);
+        let encoded = block::CountedHeader { header: Arc::new(header) }.zcash_serialize_to_vec().unwrap();
+        let data = vec![0; count * encoded.len() - missing.min(encoded.len())];
+        let mut bytes = data.as_slice();
+        let (result, allocations) = measure(|| decoder.reader(&mut bytes)
+            .with_limit(u64::MAX)
+            .read_external_count::<Arc<block::CountedHeader>>(count));
+        prop_assert!(matches!(result, Err(SerializationError::Parse("Vector exceeds available input"))));
+        prop_assert_eq!(bytes.len(), data.len());
+        prop_assert_eq!(allocations.requested_bytes, 0);
+    }
+}
 
 fn assert_unfunded_collection<T: ZcashDeserialize + TrustedPreallocate>(
     count: usize,

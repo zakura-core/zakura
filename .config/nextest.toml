@@ -265,4 +265,4 @@ failure-output = "immediate"
 fail-fast = false
 retries = 0
 slow-timeout = { period = "90s", terminate-after = 1 }
-default-filter = '(package(zakura-chain) and (test(~serialization) or test(~preallocate) or test(~round_trip))) or test(~block_sync::wire::bounded_decoding::)'
+default-filter = '(package(zakura-chain) and (test(~serialization) or test(~preallocate) or test(~round_trip))) or test(~block_sync::wire::bounded_decoding::) or test(~protocol::external::codec::) or test(~block_sync::tests::network_bound_)'

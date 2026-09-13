@@ -1921,6 +1921,7 @@ pub(crate) struct NativeHandshakeNegotiated {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn service_registry(
+    decoder: zakura_chain::serialization::ZcashDecoder,
     _supervisor: &ZakuraSupervisorHandle,
     header_sync: Option<super::HeaderSyncHandle>,
     block_sync: Option<BlockSyncHandle>,
@@ -1942,13 +1943,16 @@ pub(crate) fn service_registry(
     };
     services.push(header_sync_service.clone());
     let block_sync = match block_sync {
-        Some(block_sync) => BlockSyncService::new_with_handle(block_sync_config, block_sync),
+        Some(block_sync) => {
+            BlockSyncService::new_with_handle(block_sync_config, block_sync, decoder)
+        }
         None => match header_sync.as_ref() {
             Some(header_sync) => BlockSyncService::new_with_header_tip(
                 block_sync_config,
                 header_sync.subscribe_tip(),
+                decoder,
             ),
-            None => BlockSyncService::new(block_sync_config),
+            None => BlockSyncService::new(block_sync_config, decoder),
         },
     };
     let block_sync = Arc::new(block_sync.with_service_demand(service_demand)) as Arc<dyn Service>;
@@ -3732,6 +3736,7 @@ async fn spawn_zakura_endpoint_inner(
         .as_ref()
         .map(|startup| startup.service_demand.clone());
     let registry = service_registry(
+        zakura_chain::serialization::ZcashDecoder::for_network(&config.network),
         &supervisor,
         Some(header_sync.clone()),
         block_sync.clone(),

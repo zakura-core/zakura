@@ -59,12 +59,21 @@ fn mainnet_blocks_1_to_3() -> Vec<Arc<block::Block>> {
     ]
 }
 
-fn raw_block_payload(block: &Arc<block::Block>) -> Arc<[u8]> {
+pub(super) fn mainnet_decoder() -> zakura_chain::serialization::ZcashDecoder {
+    zakura_chain::serialization::ZcashDecoder::for_network(
+        &zakura_chain::parameters::Network::Mainnet,
+    )
+}
+
+fn raw_block_payload(block: &Arc<block::Block>) -> super::wire::RawBlockPayload {
     let frame = BlockSyncMessage::Block(block.clone())
         .encode_frame()
         .expect("test block frame encodes");
 
-    Arc::from(frame.payload.into_boxed_slice())
+    BlockSyncMessage::decode_frame_with_raw_block_payload(frame, mainnet_decoder())
+        .unwrap()
+        .1
+        .unwrap()
 }
 
 fn forked_block(block: &Arc<block::Block>, nonce_tag: u8) -> Arc<block::Block> {
@@ -800,7 +809,7 @@ async fn newly_eligible_supplier_preserves_persistent_body_alarm_once() {
     startup.best_header_tip = (header.height, header.hash);
     startup.committed_views = Some(snapshot_rx);
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle);
+    let service = BlockSyncService::new_with_handle(config, handle, mainnet_decoder());
     let (_supplier, inbound, _outbound) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -3450,7 +3459,7 @@ async fn reactor_fill_loop_saturates_multiple_slots_in_one_pass() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
 
     // Peer serves heights 1..=4 and accepts four concurrent single-block requests.
     let (_peer_id, _inbound, mut outbound) = connect_peer_with_status_message(
@@ -3722,7 +3731,7 @@ async fn reactor_fill_loop_saturates_every_peer_window_not_just_one() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
 
     // Three peers, each willing to serve heights 1..=12 and accept four
     // concurrent single-block requests. The budget is ample, so the fill order
@@ -3845,7 +3854,7 @@ async fn reactor_budget_constrained_issuance_rotates_across_peers() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
 
     // Three peers, each able to serve height 1 with a single in-flight slot.
     // Distinct ascending id bytes give the old sorted order a fixed lowest peer
@@ -3957,7 +3966,7 @@ async fn reactor_timeout_recovery_is_local_and_healthy_peer_keeps_filling() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
 
     // Two peers, both able to serve heights 1..=2 with a single in-flight slot.
     // One will be left holding an unanswered request (the slow peer); the other
@@ -4091,7 +4100,7 @@ async fn block_liveness_parks_silent_peer_and_traces_reason() {
     );
     startup.trace = ZakuraTrace::new(capture.tracer(), "01");
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
 
     let peer = peer(0x51);
     let (inbound_tx, inbound_rx) = framed_channel(16);
@@ -4209,7 +4218,7 @@ async fn check_cold_probe_deadline(expired: bool) {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
 
     let peer = peer(0x53);
     let (inbound_tx, inbound_rx) = framed_channel(16);
@@ -4335,7 +4344,7 @@ async fn peer_emits_periodic_bbr_heartbeat_while_idle() {
     );
     startup.trace = ZakuraTrace::new(capture.tracer(), "01");
     let (_handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, _handle.clone());
+    let service = BlockSyncService::new_with_handle(config, _handle.clone(), mainnet_decoder());
 
     let peer = peer(0x5b);
     let (inbound_tx, inbound_rx) = framed_channel(16);
@@ -6372,7 +6381,10 @@ fn block_sync_stream_declares_kind_capability_version_and_frame_cap() {
 
 #[tokio::test]
 async fn service_registry_routes_block_sync_by_exact_capability_and_version() {
-    let service = Arc::new(BlockSyncService::new(ZakuraBlockSyncConfig::default()));
+    let service = Arc::new(BlockSyncService::new(
+        ZakuraBlockSyncConfig::default(),
+        mainnet_decoder(),
+    ));
     let registry =
         ServiceRegistry::new(vec![service]).expect("block-sync service declares unique kind");
     let peer = peer(1);
@@ -6417,7 +6429,7 @@ async fn service_registry_routes_block_sync_by_exact_capability_and_version() {
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn inert_reactor_parks_after_header_tip_watch_closes() {
-    let _service = BlockSyncService::new(ZakuraBlockSyncConfig::default());
+    let _service = BlockSyncService::new(ZakuraBlockSyncConfig::default(), mainnet_decoder());
 
     let elapsed = tokio::time::timeout(Duration::from_secs(1), future::pending::<()>()).await;
 
@@ -6565,7 +6577,7 @@ async fn session_publication_bypasses_full_bounded_event_queue() {
         // only checks the lifecycle-bypass plumbing.
         routine_wiring: None,
     };
-    let service = BlockSyncService::new_with_handle(config, handle);
+    let service = BlockSyncService::new_with_handle(config, handle, mainnet_decoder());
     let peer = peer(91);
     let (inbound_tx, inbound_rx) = framed_channel(4);
     let (outbound_tx, _outbound_rx) = framed_channel(4);
@@ -6653,7 +6665,8 @@ async fn reconciliation_rejects_stale_admissions_and_service_ignores_stale_disco
         older_cancel.clone(),
     );
 
-    let service = BlockSyncService::new_with_handle(config.clone(), handle.clone());
+    let service =
+        BlockSyncService::new_with_handle(config.clone(), handle.clone(), mainnet_decoder());
     handle.current_sessions.insert_fixture(1, older);
     tokio::time::timeout(Duration::from_secs(1), older_cancel.cancelled())
         .await
@@ -6720,12 +6733,47 @@ async fn reconciliation_rejects_stale_admissions_and_service_ignores_stale_disco
 
 #[tokio::test]
 async fn add_peer_decode_failure_reports_malformed_and_cancels_connection() {
-    // inverted inbound flow: the per-peer pipe-routine decodes inbound frames in its own
-    // task. A malformed frame is `MalformedMessage` misbehavior AND a fatal protocol
-    // reject for the whole connection (the routine returns `Err(SinkReject::protocol)`,
-    // which `handle_pipe_exit` turns into a connection cancel). With real reactor
-    // wiring the routine runs; we observe the `Misbehavior(MalformedMessage)` action
-    // and the connection-cancel.
+    assert_peer_decode_failure(
+        mainnet_decoder(),
+        Frame {
+            message_type: u16::from(MSG_BS_STATUS),
+            flags: 0,
+            payload: Vec::new(),
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn network_bound_peer_decode_rejects_the_other_networks_block() {
+    use zakura_chain::{
+        parameters::Network, serialization::ZcashDecoder, work::equihash::Solution,
+    };
+
+    for network in [
+        Network::Mainnet,
+        Network::new_default_testnet(),
+        Network::new_regtest(Default::default()),
+    ] {
+        let other_network = if network.is_regtest() {
+            Network::Mainnet
+        } else {
+            Network::new_regtest(Default::default())
+        };
+        let mut block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
+        Arc::make_mut(&mut Arc::make_mut(&mut block).header).solution =
+            Solution::for_proposal_for_network(&other_network);
+        let frame = BlockSyncMessage::Block(block).encode_frame().unwrap();
+        assert_peer_decode_failure(ZcashDecoder::for_network(&network), frame).await;
+    }
+}
+
+async fn assert_peer_decode_failure(
+    decoder: zakura_chain::serialization::ZcashDecoder,
+    frame: Frame,
+) {
+    // Drive the real service and per-peer reader. A decode error must report
+    // malformed-message misbehavior and close the connection.
     let config = ZakuraBlockSyncConfig::default();
     let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let startup = BlockSyncStartup::new(
@@ -6738,8 +6786,8 @@ async fn add_peer_decode_failure_reports_malformed_and_cancels_connection() {
         tip_rx,
         config.clone(),
     );
-    let (handle, mut actions, _reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), decoder);
 
     let peer = peer(3);
     let (inbound_tx, inbound_rx) = framed_channel(4);
@@ -6756,11 +6804,7 @@ async fn add_peer_decode_failure_reports_malformed_and_cancels_connection() {
     ));
 
     inbound_tx
-        .send(Frame {
-            message_type: u16::from(MSG_BS_STATUS),
-            flags: 0,
-            payload: Vec::new(),
-        })
+        .send(frame)
         .await
         .expect("malformed inbound frame queues");
 
@@ -6781,6 +6825,7 @@ async fn add_peer_decode_failure_reports_malformed_and_cancels_connection() {
     tokio::time::timeout(Duration::from_secs(1), connection_cancel.cancelled())
         .await
         .expect("malformed frame cancels the connection");
+    reactor_task.abort();
 }
 
 #[tokio::test]
@@ -6828,7 +6873,7 @@ async fn assert_pending_block_validation_cancellation(exit: PendingValidationExi
         .map(|_| input.clone().try_reserve_owned().unwrap())
         .collect();
     let mut held_capacity = Some(held_capacity);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let (inbound_tx, inbound_rx) = framed_channel(4);
     let (outbound_tx, _outbound_rx) = framed_channel(4);
     let (request_tx, request_rx) = framed_channel(1);
@@ -7035,7 +7080,7 @@ async fn reactor_drives_tip_to_getblocks_to_submit_over_framed_path() {
     let trace = ZakuraTrace::noop();
     startup.trace = trace.clone();
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let peer = peer(40);
     let (inbound_tx, inbound_rx) = framed_channel(8);
     let (outbound_tx, mut outbound_rx) = framed_channel(8);
@@ -7172,7 +7217,7 @@ async fn reactor_releases_request_budget_at_receipt_not_apply() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let peer_id = peer(41);
     let (inbound_tx, inbound_rx) = framed_channel(8);
     let (outbound_tx, mut outbound_rx) = framed_channel(8);
@@ -7315,7 +7360,7 @@ async fn reactor_does_not_requeue_held_height_reported_still_needed() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let peer_id = peer(73);
     let (inbound_tx, inbound_rx) = framed_channel(8);
     let (outbound_tx, mut outbound_rx) = framed_channel(8);
@@ -7478,7 +7523,7 @@ async fn reactor_buffers_body_larger_than_its_size_hint() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -7577,7 +7622,7 @@ async fn reactor_downloads_run_ahead_of_stalled_commit() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
 
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status_message(
         &service,
@@ -7736,7 +7781,7 @@ async fn reactor_keeps_applying_body_after_non_advancing_duplicate_result() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -7854,7 +7899,7 @@ async fn reactor_keeps_active_response_when_needed_snapshot_omits_inflight_heigh
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let peer_id = peer(42);
     let (inbound_tx, inbound_rx) = framed_channel(8);
     let (outbound_tx, mut outbound_rx) = framed_channel(8);
@@ -7977,7 +8022,7 @@ async fn reactor_ignores_unmatched_body_for_currently_needed_height() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let peer_id = peer(142);
     let (inbound_tx, inbound_rx) = framed_channel(8);
     let (outbound_tx, mut outbound_rx) = framed_channel(8);
@@ -8085,7 +8130,7 @@ async fn reactor_rejects_unmatched_body_for_ownerless_queued_height() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     // One request slot and a response byte cap of one block-1 hint, so the single
     // GetBlocks below covers only height 1 and height 2 stays queued without an
     // outstanding request — the gap the unmatched-queued acceptance path fills.
@@ -8198,7 +8243,7 @@ async fn reactor_queries_needed_blocks_above_submitted_floor() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let peer_id = peer(43);
     let (inbound_tx, inbound_rx) = framed_channel(8);
     let (outbound_tx, mut outbound_rx) = framed_channel(8);
@@ -8385,7 +8430,7 @@ async fn reactor_retries_unavailable_body_without_scoring_its_supplier() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let peer_id = peer(42);
     let (inbound_tx, inbound_rx) = framed_channel(8);
     let (outbound_tx, mut outbound_rx) = framed_channel(8);
@@ -8620,7 +8665,7 @@ async fn reactor_keeps_issuing_far_above_floor_with_no_near_tip_pause() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
 
     // Peer serves heights 1..=4 with four concurrent single-block slots.
     let (_peer_id, _inbound, mut outbound) = connect_peer_with_status_message(
@@ -8702,7 +8747,7 @@ async fn routine_refills_after_budget_release_no_missed_wake() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status_message(
         &service,
         &mut actions,
@@ -8815,7 +8860,7 @@ async fn routine_disconnect_returns_outstanding_and_releases_budget() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let (peer_a, _a_in, mut a_out) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -8916,7 +8961,7 @@ async fn reactor_reserves_size_hint_per_block_not_worst_case() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
 
     // One slot, a generous response-byte and per-request block count, so neither
     // the slot count, the peer's response-byte cap, nor the block-count cap is the
@@ -8982,7 +9027,7 @@ async fn reactor_packs_small_estimates_under_peer_response_byte_cap() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
 
     let one_worst_case_response =
         u32::try_from(BS_PER_BLOCK_WORST_CASE_BYTES).expect("worst-case block size fits u32");
@@ -9048,7 +9093,7 @@ async fn reactor_tiny_estimates_pack_into_one_worst_case_budget_block() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
 
     let (_peer_id, _inbound, mut outbound) = connect_peer_with_status_message(
         &service,
@@ -9148,7 +9193,7 @@ async fn reactor_keeps_block_sync_peer_after_catch_up_and_reuses_later() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -9303,7 +9348,7 @@ async fn reactor_accepts_multi_block_range_and_submits_parent_first() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let peer = peer(43);
     let (inbound_tx, inbound_rx) = framed_channel(8);
     let (outbound_tx, mut outbound_rx) = framed_channel(8);
@@ -9441,7 +9486,7 @@ async fn reactor_backpressures_inbound_body_flood_without_dropping_bodies() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let peer = peer(64);
     let (inbound_tx, inbound_rx) = framed_channel(8);
     let (outbound_tx, mut outbound_rx) = framed_channel(8);
@@ -9575,7 +9620,7 @@ async fn reactor_restarted_at_genesis_queries_and_schedules_without_tip_change()
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
 
     match next_action(&mut actions).await {
         BlockSyncAction::QueryNeededBlocks {
@@ -9650,7 +9695,7 @@ async fn reactor_accepts_blocks_done_after_completed_range() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let (peer, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -9744,7 +9789,7 @@ async fn reactor_retries_missing_heights_after_partial_blocks_done() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let (_peer, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -9870,7 +9915,7 @@ async fn checkpoint_hole_disconnect_retries_first_missing_height_with_fresh_peer
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
 
     let (old_peer, old_inbound, mut old_outbound) = connect_peer_with_status_message(
         &service,
@@ -10096,7 +10141,7 @@ async fn reactor_reset_mid_download_drops_stale_anchors_and_releases_budget() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -10230,7 +10275,7 @@ async fn reactor_forward_reset_preserves_submitted_successor_body() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -10365,7 +10410,7 @@ async fn reactor_forward_reset_preserves_future_outstanding_body() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let (peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -10463,7 +10508,7 @@ async fn reactor_forward_reset_preserves_buffered_successor_body() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let (peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -10576,7 +10621,7 @@ async fn reactor_destructive_forward_reset_does_not_rerequest_same_hash_in_fligh
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -10758,7 +10803,7 @@ async fn reactor_ignores_stale_apply_completion_after_resubmit() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let peer_id = peer(61);
     let (inbound_tx, inbound_rx) = framed_channel(16);
     let (outbound_tx, mut outbound_rx) = framed_channel(16);
@@ -11001,7 +11046,7 @@ async fn reactor_fast_forward_reset_clears_buffered_bodies_and_releases_budget()
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -11191,7 +11236,7 @@ async fn reactor_fuzzes_arrival_order_across_fork_parent_first() {
             config.clone(),
         );
         let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-        let service = BlockSyncService::new_with_handle(config, handle.clone());
+        let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
         let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
             &service,
             &mut actions,
@@ -11421,8 +11466,11 @@ async fn reactor_competing_fork_download_switches_to_current_header_hashes() {
         immediate_body_download_config(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service =
-        BlockSyncService::new_with_handle(immediate_body_download_config(), handle.clone());
+    let service = BlockSyncService::new_with_handle(
+        immediate_body_download_config(),
+        handle.clone(),
+        mainnet_decoder(),
+    );
     let (peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -11557,7 +11605,7 @@ async fn reactor_legacy_commit_dedups_inflight_request_and_reuses_budget() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let (_peer_id, _inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -11646,7 +11694,7 @@ async fn reactor_treats_duplicate_buffered_blocks_as_benign() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let peer_id = peer(44);
     let (inbound_tx, inbound_rx) = framed_channel(8);
     let (outbound_tx, mut outbound_rx) = framed_channel(8);
@@ -11758,7 +11806,7 @@ async fn reactor_accepts_rapid_status_growth_without_spam_score() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle);
+    let service = BlockSyncService::new_with_handle(config, handle, mainnet_decoder());
     let peer_id = peer(46);
     let (inbound_tx, inbound_rx) = framed_channel(8);
     let (outbound_tx, mut outbound_rx) = framed_channel(8);
@@ -11821,7 +11869,7 @@ async fn reactor_ignores_redundant_status_burst_without_spam_score() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle);
+    let service = BlockSyncService::new_with_handle(config, handle, mainnet_decoder());
     let peer_id = peer(47);
     let (inbound_tx, inbound_rx) = framed_channel(8);
     let (outbound_tx, mut outbound_rx) = framed_channel(8);
@@ -11880,8 +11928,11 @@ async fn reactor_rejects_block_hash_mismatch_without_hard_drop_for_size_mismatch
         immediate_body_download_config(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service =
-        BlockSyncService::new_with_handle(immediate_body_download_config(), handle.clone());
+    let service = BlockSyncService::new_with_handle(
+        immediate_body_download_config(),
+        handle.clone(),
+        mainnet_decoder(),
+    );
     let peer = peer(41);
     let (inbound_tx, inbound_rx) = framed_channel(8);
     let (outbound_tx, mut outbound_rx) = framed_channel(8);
@@ -11999,7 +12050,7 @@ async fn scheduled_get_blocks_is_sent_once_via_session() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
 
     // Admit a peer through the production `add_peer` path with an observable
     // outbound transport channel.
@@ -12101,7 +12152,7 @@ async fn reactor_scores_exact_supplier_for_commitment_matching_consensus_invalid
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let (bad_peer, bad_inbound, mut bad_outbound) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -12228,7 +12279,7 @@ async fn reactor_schedules_gap_below_buffered_reorder_run() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -12329,7 +12380,7 @@ async fn reactor_debounces_status_advertisements_on_serving_tip_change() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let (_peer_id, _inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -12423,7 +12474,7 @@ async fn reactor_retries_status_to_peer_without_status_when_local_status_unchang
         config.clone(),
     );
     let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle);
+    let service = BlockSyncService::new_with_handle(config, handle, mainnet_decoder());
     let peer = peer(63);
     let (_inbound_tx, inbound_rx) = framed_channel(8);
     let (outbound_tx, mut outbound_rx) = framed_channel(8);
@@ -12475,7 +12526,7 @@ async fn reactor_replies_to_first_status_when_connect_status_queue_was_full() {
         config.clone(),
     );
     let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let peer = peer(64);
     let (inbound_tx, inbound_rx) = framed_channel(8);
     let (outbound_tx, mut outbound_rx) = framed_channel(1);
@@ -12538,7 +12589,7 @@ async fn reactor_does_not_ping_pong_rapid_repeated_status() {
         config.clone(),
     );
     let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle);
+    let service = BlockSyncService::new_with_handle(config, handle, mainnet_decoder());
     let peer = peer(65);
     let (inbound_tx, inbound_rx) = framed_channel(8);
     let (outbound_tx, mut outbound_rx) = framed_channel(16);
@@ -12587,7 +12638,7 @@ async fn reactor_preserves_successor_work_across_stale_finalized_reset() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -12711,7 +12762,7 @@ async fn committed_reanchor_requeries_while_downloads_in_flight() {
     );
     let (snapshots, startup) = committed_block_sync_startup(initial, config.clone());
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let (_peer_id, _inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -12786,7 +12837,7 @@ async fn epoch_change_supersedes_stale_floor_query() {
     );
     let (snapshots, startup) = committed_block_sync_startup(initial, config.clone());
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
 
     let BlockSyncAction::QueryNeededBlocks {
         query_id,
@@ -12951,7 +13002,7 @@ async fn header_extension_preserves_checkpoint_pipeline() {
     );
     let (snapshots, startup) = committed_block_sync_startup(initial, config.clone());
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let BlockSyncAction::QueryNeededBlocks {
         query_id, scope, ..
     } = next_action(&mut actions).await
@@ -13130,7 +13181,7 @@ async fn committed_body_progress_preserves_same_target_native_response() {
     );
     let (snapshots, startup) = committed_block_sync_startup(initial, config.clone());
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -13232,7 +13283,7 @@ async fn committed_reanchor_releases_stale_submitted_bodies() {
     );
     let (snapshots, startup) = committed_block_sync_startup(initial, config.clone());
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -13349,7 +13400,7 @@ async fn reactor_clamps_tiny_submitted_apply_config_above_checkpoint_range() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
 
     wait_for_query_needed_blocks(&mut actions, block::Height(0), block::Height(4)).await;
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
@@ -13859,7 +13910,7 @@ async fn reactor_retries_matched_range_unavailable_without_scoring_peer() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -13979,7 +14030,7 @@ async fn reactor_does_not_wedge_honest_peer_under_range_unavailable_spam() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
 
     // Two misbehaving peers (ids 0x01, 0x02 sort first) and one honest peer (0x03).
     let (m1, m1_in, mut m1_out) = connect_peer_with_status(
@@ -14082,7 +14133,7 @@ async fn reactor_range_unavailable_retries_only_unverified_suffix() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let (_peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -14156,7 +14207,7 @@ async fn misbehavior_flood_cannot_consume_needed_query_capacity() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let (peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -14265,7 +14316,7 @@ async fn reactor_publishes_block_sync_candidate_gap() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let peer_id = peer(77);
     let (inbound_tx, inbound_rx) = framed_channel(8);
     let (outbound_tx, mut outbound_rx) = framed_channel(8);
@@ -14400,7 +14451,7 @@ async fn oversize_body_policy_reports_size_mismatch_and_retries_without_bufferin
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let peer = peer(42);
     let (inbound_tx, inbound_rx) = framed_channel(8);
     let (outbound_tx, mut outbound_rx) = framed_channel(8);
@@ -14528,7 +14579,7 @@ async fn reactor_known_peer_unsolicited_blocks_done_is_reported_as_misbehavior()
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
 
     // Connect a peer that advertises no downloadable work (servable_high == our
     // verified tip), so the reactor never schedules a GetBlocks and the peer has
@@ -14600,7 +14651,7 @@ async fn reactor_accepts_unmatched_body_for_height_active_on_another_request() {
     let trace = ZakuraTrace::noop();
     startup.trace = trace.clone();
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
 
     let (peer1, inbound1, mut outbound1) = connect_peer_with_status(
         &service,
@@ -14721,7 +14772,7 @@ async fn reactor_ignores_duplicate_response_at_body_download_floor() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let (peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -14834,7 +14885,7 @@ async fn reactor_ignores_matched_duplicate_response_at_body_download_floor() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let (peer_a, inbound_a, mut outbound_a) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -14990,7 +15041,8 @@ async fn reactor_scores_unsolicited_terminator_from_connected_peer() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config.clone(), handle.clone());
+    let service =
+        BlockSyncService::new_with_handle(config.clone(), handle.clone(), mainnet_decoder());
 
     let (peer_id, inbound_tx, _outbound_rx) = connect_peer_with_status(
         &service,
@@ -15048,7 +15100,7 @@ async fn repeated_misbehavior_is_recorded_without_disconnecting_the_peer() {
         config.clone(),
     );
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
 
     // Connect the probe peer with a real pipe-routine (per-peer routines) so its inbound frames
     // are decoded and dispatched.
@@ -15131,7 +15183,7 @@ async fn parked_connection_cleanup_allows_a_fresh_connection_after_cooldown() {
         config.clone(),
     );
     let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let peer = peer(93);
     let old_conn_id = 7;
     let new_conn_id = 8;
@@ -15175,7 +15227,7 @@ async fn same_connection_block_sync_session_waits_at_tip_then_reopens_for_new_wo
         config.clone(),
     );
     let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let peer = peer(9);
     let conn_id = 17;
     handle.park_session_for_test(&peer, conn_id, Duration::ZERO);
@@ -15241,7 +15293,7 @@ async fn serving_only_coordinator_demand_keeps_block_session_available_during_fa
         },
     };
     let (demand_tx, demand_rx) = watch::channel(applying);
-    let service = BlockSyncService::new_with_handle(config, handle.clone())
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder())
         .with_service_demand(Some(demand_rx));
     let peer = peer(10);
     let conn_id = 18;

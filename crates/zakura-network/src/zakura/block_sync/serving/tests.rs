@@ -361,7 +361,10 @@ async fn missing_status_expires_without_starting_storage() {
 #[tokio::test]
 async fn paired_version_is_selected_without_a_test_override() {
     use crate::zakura::Service;
-    let service = BlockSyncService::new(ZakuraBlockSyncConfig::default());
+    let service = BlockSyncService::new(
+        ZakuraBlockSyncConfig::default(),
+        super::super::tests::mainnet_decoder(),
+    );
     assert_eq!(service.streams().len(), 2);
     assert!(service.streams().iter().all(|stream| {
         stream.mode == crate::zakura::StreamMode::Persistent

@@ -142,6 +142,9 @@ pub(crate) async fn run_scenario(
         scenario.config.clone(),
         handle.clone(),
         scenario.transport_queue_depth.unwrap_or(1024),
+        zakura_chain::serialization::ZcashDecoder::for_network(
+            &zakura_chain::parameters::Network::Mainnet,
+        ),
     ));
     for spec in &scenario.peers {
         tasks.push(peer::spawn_peer_lifecycle(

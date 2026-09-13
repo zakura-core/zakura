@@ -1,23 +1,14 @@
-//! Per-peer pipe-routine for Zakura block sync.
+//! Receive and validate block responses from one connected peer.
 //!
-//! A per-peer routine inverts the inbound data flow. One task owns each connected
-//! peer's `FramedRecv`. The task decodes each stream-6 frame and runs the download
-//! logic directly. The reactor does not demultiplex inbound frames or create a
-//! per-peer `PeerInput` channel. The routine sends only shared concerns to the
-//! reactor through [`RoutineToReactor`]. These concerns include
-//! status advertisements, producer re-query pings, and
-//! misbehavior. The routine owns its `BlockSyncPeerSession`, outstanding requests,
-//! adaptive outbound window, timeout-recovery slots, servable caps, and fill loop.
+//! This task reads the peer's frames and matches each block or ending against
+//! its original written request. Local deadlines and chain changes can release
+//! download work while that response remains live. Only an ending or connection
+//! closure releases a started request's response permission.
 //!
-//! The per-peer task runs the throughput-critical matched-body
-//! `sequencer_input.send(..).await`. Sequencer backpressure therefore stalls only
-//! one routine. The download decision uses the byte budget and per-peer slots.
-//! `take_in_range(servable_low, servable_high, n)` uses `servable_high` as its
-//! upper bound.
-//!
-//! The routine or shared [`PeerRegistry`] owns all per-peer download state. The
-//! routine receives inbound traffic from its own `FramedRecv`. Its fill loop,
-//! matched-body path, and unmatched-body paths run in the same task.
+//! Useful blocks go to the sequencer. Waiting for sequencer capacity pauses this
+//! peer's reader. Shared decisions, such as status updates and peer faults, go to
+//! the reactor through [`RoutineToReactor`]. This task owns the request window,
+//! timeouts and refill loop, with shared peer state in [`PeerRegistry`].
 
 use std::{collections::BTreeMap, num::NonZeroU64, ops::Range};
 

@@ -59,7 +59,9 @@ policy; opening another pair requires a new reservation.
 Message encodings are unchanged. Every frame has the ordinary eight-byte header
 and a payload beginning with the block-sync discriminator. Reject a frame's
 message type for the wrong role before allocating its payload. Status is bounded
-to 53 payload bytes; GetBlocks and both ending messages to nine. Block decoding
+to 53 payload bytes; GetBlocks and both ending messages to nine. Block frames
+are capped at 2,000,001 payload bytes, including their discriminator. Reject
+nonzero flags from the frame header before reading any payload. Block decoding
 retains its existing maximum block-size check.
 
 Status travels on the data stream. A request can arrive first on the other

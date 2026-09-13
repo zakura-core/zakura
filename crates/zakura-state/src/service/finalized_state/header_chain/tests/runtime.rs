@@ -207,7 +207,19 @@ fn selected_body_window_reads_four_thousand_hashes_in_one_coherent_range() {
 /// finalized columns. Remaining headers sit in the retained graph above the finalized frontier.
 /// Returns the runtime, its open database, the genesis header, and the requested path.
 fn reconciled_store_with_finalized_prefix(
-    path_len: u8,
+    path_len: u32,
+) -> (
+    HeaderChainRuntime,
+    DiskDb,
+    VerifiedHeaderRef,
+    Vec<VerifiedHeaderRef>,
+) {
+    reconciled_store_with_finality(path_len, 3)
+}
+
+fn reconciled_store_with_finality(
+    path_len: u32,
+    finalized_count: usize,
 ) -> (
     HeaderChainRuntime,
     DiskDb,
@@ -233,7 +245,7 @@ fn reconciled_store_with_finalized_prefix(
         let mut header = *parent.header;
         header.previous_block_hash = parent.hash;
         header.time += chrono::Duration::seconds(1);
-        header.nonce.0[0] = marker;
+        header.nonce.0[..4].copy_from_slice(&marker.to_le_bytes());
         let header = Arc::new(header);
         let height = parent
             .height
@@ -259,7 +271,7 @@ fn reconciled_store_with_finalized_prefix(
         .cf_handle("block_header_by_height")
         .expect("the finalized header column exists");
     let mut batch = DiskWriteBatch::new();
-    for header in std::iter::once(&genesis).chain(path[..3].iter()) {
+    for header in std::iter::once(&genesis).chain(path[..finalized_count].iter()) {
         batch.zs_insert(&hash_by_height, header.height, header.hash);
         batch.zs_insert(&height_by_hash, header.hash, header.height);
         batch.zs_insert(
@@ -271,13 +283,16 @@ fn reconciled_store_with_finalized_prefix(
     db.write(batch)
         .expect("the canonical finalized header fixture commits");
 
-    let finalized = Frontier::new(path[2].height, path[2].hash);
+    let finalized = Frontier::new(
+        path[finalized_count - 1].height,
+        path[finalized_count - 1].hash,
+    );
     let (runtime, _) = store
         .startup_reconciled(
             &engine_config,
             finalized,
-            path[..3].to_vec(),
-            path[3..].to_vec(),
+            path[..finalized_count].to_vec(),
+            path[finalized_count..].to_vec(),
         )
         .expect("the finalized prefix and retained suffix reconcile");
     (runtime, db, genesis, path)
@@ -1310,7 +1325,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
                 child.hash,
             ),
         )
-        .expect("the first requester-order intersection is selected")
+        .expect("the nearest locator ancestor is selected")
     else {
         panic!("the target itself intersects the locator");
     };
@@ -1337,12 +1352,12 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
             target_intersection.lease_id,
             target_intersection.scope,
         )
-        .expect("the requester-order test lease releases"));
+        .expect("the target-intersection lease releases"));
 
     assert!(reader
         .release_retained_path(owner, 7, lease.lease_id, lease_scope)
         .expect("the exact owner can release its lease"));
-    for marker in 1..MAX_RETAINED_PATH_LEASES {
+    for marker in 1..=MAX_RETAINED_PATH_LEASES {
         let marker = u8::try_from(marker).expect("the lease cap fits in one byte");
         assert!(matches!(
             reader
@@ -1464,8 +1479,7 @@ async fn retained_path_serves_a_bounded_finalized_range_below_the_header_frontie
         &runtime.publisher().snapshot(),
         target.hash,
     );
-    // Long retained paths may occupy every general slot. The registry preserves one slot for the
-    // bounded finalized fallback that supplies a VCT repair range.
+    // Transfers occupy every ordinary slot. The reserve still admits a bounded repair.
     let retained_target = Frontier::new(path[3].height, path[3].hash);
     let retained_scope = zakura_header_chain::HeaderWorkAuthority::for_target(
         &runtime.publisher().snapshot(),
@@ -1516,7 +1530,7 @@ async fn retained_path_serves_a_bounded_finalized_range_below_the_header_frontie
         .release_retained_path(owner, 11, lease.lease_id, scope)
         .expect("the finalized target cursor releases"));
 
-    // The finalized fallback also serves a bounded range from an earlier canonical locator.
+    // The same acquisition serves a range from an earlier canonical locator.
     let long_path_owner = SourceId::from_digest([0x84; 32]);
     let RetainedPathLeaseOutcome::Acquired(long_path_lease) = reader
         .acquire_retained_path(long_path_owner, 11, target.hash, &[genesis.hash], scope)
@@ -1571,7 +1585,7 @@ async fn retained_path_serves_a_bounded_finalized_range_below_the_header_frontie
         .release_retained_path(nearest_owner, 11, nearest_lease.lease_id, scope)
         .expect("the nearest canonical locator cursor releases"));
 
-    // A locator at or above the target leaves no ancestor to continue from.
+    // A locator above the target cannot intersect its ancestry.
     let above_owner = SourceId::from_digest([0x82; 32]);
     assert!(matches!(
         reader
@@ -1593,4 +1607,428 @@ async fn retained_path_serves_a_bounded_finalized_range_below_the_header_frontie
             .expect("the unknown target lookup is coherent"),
         RetainedPathLeaseOutcome::TargetNotRetained
     ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn retained_path_requests_have_identical_rules_across_finality() {
+    for finalized_count in [1, 3, 5] {
+        let (runtime, _db, genesis, path) = reconciled_store_with_finality(5, finalized_count);
+        let reader = runtime.reader();
+        let owner = SourceId::from_digest([0xc1; 32]);
+        let target = Frontier::new(path[2].height, path[2].hash);
+        let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target.hash);
+        for page_count in [1, 4] {
+            let RetainedPathLeaseOutcome::Acquired(lease) = reader
+                .acquire_retained_path(
+                    owner,
+                    1,
+                    target.hash,
+                    &[
+                        genesis.hash,
+                        path[0].hash,
+                        path[4].hash,
+                        block::Hash([0xff; 32]),
+                    ],
+                    scope,
+                )
+                .expect("the target resolves on either side of finality")
+            else {
+                panic!("the same locator must acquire every target");
+            };
+            assert_eq!(lease.common_ancestor.hash, path[0].hash);
+            let mut after = lease.common_ancestor.hash;
+            let mut headers = Vec::new();
+            loop {
+                let RetainedPathReadOutcome::Page(page) = reader
+                    .read_retained_path(owner, 1, lease.lease_id, scope, after, page_count)
+                    .expect("the cursor reads a coherent page")
+                else {
+                    panic!("the path must remain available");
+                };
+                assert_eq!(page.target, target);
+                assert!(page.aux_deliveries.iter().all(Vec::is_empty));
+                after = page
+                    .headers
+                    .last()
+                    .expect("the path has two headers")
+                    .hash();
+                headers.extend(page.headers);
+                if page.complete {
+                    break;
+                }
+            }
+            assert_eq!(
+                headers,
+                vec![path[1].header.clone(), path[2].header.clone()]
+            );
+            assert!(reader
+                .release_retained_path(owner, 1, lease.lease_id, scope)
+                .unwrap());
+        }
+        let RetainedPathLeaseOutcome::Acquired(lease) = reader
+            .acquire_retained_path(owner, 1, target.hash, &[genesis.hash, target.hash], scope)
+            .unwrap()
+        else {
+            panic!("the target itself must intersect in every storage band");
+        };
+        assert_eq!(lease.common_ancestor, target);
+        let RetainedPathReadOutcome::Page(page) = reader
+            .read_retained_path(owner, 1, lease.lease_id, scope, target.hash, 1)
+            .unwrap()
+        else {
+            panic!("the empty path must be readable");
+        };
+        assert!(page.headers.is_empty());
+        assert!(page.complete);
+        assert!(reader
+            .release_retained_path(owner, 1, lease.lease_id, scope)
+            .unwrap());
+        assert_eq!(
+            reader
+                .acquire_retained_path(owner, 1, target.hash, &[path[4].hash], scope)
+                .unwrap(),
+            RetainedPathLeaseOutcome::NoLocatorIntersection
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn retained_path_reserves_bounded_repair_capacity_for_every_storage_band() {
+    let (runtime, _db, genesis, path) =
+        reconciled_store_with_finalized_prefix(crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE + 4);
+    let reader = runtime.reader();
+    let ordinary_target = path.last().unwrap();
+    let ordinary_scope =
+        HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), ordinary_target.hash);
+    let mut ordinary_leases = Vec::new();
+    for marker in 1..MAX_RETAINED_PATH_LEASES {
+        let RetainedPathLeaseOutcome::Acquired(lease) = reader
+            .acquire_retained_path(
+                SourceId::from_digest([u8::try_from(marker).unwrap(); 32]),
+                1,
+                ordinary_target.hash,
+                &[genesis.hash],
+                ordinary_scope,
+            )
+            .unwrap()
+        else {
+            panic!("ordinary transfers must fill the general slots");
+        };
+        ordinary_leases.push(lease);
+    }
+    let owner = SourceId::from_digest([0xc2; 32]);
+    assert_eq!(
+        reader
+            .acquire_retained_path(
+                owner,
+                1,
+                ordinary_target.hash,
+                &[genesis.hash],
+                ordinary_scope
+            )
+            .unwrap(),
+        RetainedPathLeaseOutcome::Busy
+    );
+
+    assert_eq!(
+        reader
+            .acquire_retained_path(
+                owner,
+                1,
+                ordinary_target.hash,
+                &[block::Hash([0xee; 32])],
+                ordinary_scope
+            )
+            .unwrap(),
+        RetainedPathLeaseOutcome::Busy,
+        "reserve traversal stops at the range limit before resolving a missing locator"
+    );
+
+    // Each two-header repair uses the reserve and stops at its admitted target.
+    for (target, ancestor) in [
+        (&path[1], &genesis),
+        (&path[2], &path[0]),
+        (&path[3], &path[1]),
+    ] {
+        let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target.hash);
+        let RetainedPathLeaseOutcome::Acquired(lease) = reader
+            .acquire_retained_path(owner, 1, target.hash, &[ancestor.hash], scope)
+            .unwrap()
+        else {
+            panic!("bounded repair must acquire the reserved slot");
+        };
+        let RetainedPathReadOutcome::Page(page) = reader
+            .read_retained_path(
+                owner,
+                1,
+                lease.lease_id,
+                scope,
+                ancestor.hash,
+                crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE,
+            )
+            .unwrap()
+        else {
+            panic!("bounded repair must read the reserved path");
+        };
+        assert_eq!(page.headers.len(), 2);
+        assert_eq!(page.headers.last().unwrap().hash(), target.hash);
+        assert!(page.complete);
+        assert_eq!(
+            reader
+                .acquire_retained_path(
+                    SourceId::from_digest([0xc3; 32]),
+                    1,
+                    target.hash,
+                    &[ancestor.hash],
+                    scope
+                )
+                .unwrap(),
+            RetainedPathLeaseOutcome::Busy
+        );
+        assert!(reader
+            .release_retained_path(owner, 1, lease.lease_id, scope)
+            .unwrap());
+    }
+
+    let target = &path[3];
+    let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target.hash);
+    let RetainedPathLeaseOutcome::Acquired(lease) = reader
+        .acquire_retained_path(owner, 1, target.hash, &[path[1].hash], scope)
+        .unwrap()
+    else {
+        panic!("the released reserve must be reusable");
+    };
+    let released = ordinary_leases.pop().unwrap();
+    assert!(reader
+        .release_retained_path(released.peer, 1, released.lease_id, ordinary_scope)
+        .unwrap());
+    let RetainedPathLeaseOutcome::Acquired(replacement) = reader
+        .acquire_retained_path(
+            released.peer,
+            2,
+            ordinary_target.hash,
+            &[genesis.hash],
+            ordinary_scope,
+        )
+        .unwrap()
+    else {
+        panic!("a reserve lease must not consume a released general slot");
+    };
+    ordinary_leases.push(replacement);
+    tokio::time::advance(Duration::from_secs(20)).await;
+    let ordinary = &ordinary_leases[0];
+    assert!(matches!(
+        reader
+            .read_retained_path(
+                ordinary.peer,
+                1,
+                ordinary.lease_id,
+                ordinary_scope,
+                genesis.hash,
+                1
+            )
+            .unwrap(),
+        RetainedPathReadOutcome::Page(_)
+    ));
+
+    assert!(matches!(
+        reader
+            .read_retained_path(owner, 1, lease.lease_id, scope, path[1].hash, 1)
+            .unwrap(),
+        RetainedPathReadOutcome::Page(_)
+    ));
+    let deadline = runtime.leases.lock().unwrap().by_peer[&owner].idle_deadline;
+    assert_eq!(
+        deadline, lease.idle_deadline,
+        "paging cannot extend a bounded lease's lifetime"
+    );
+    tokio::time::advance(Duration::from_secs(11)).await;
+    assert_eq!(
+        reader
+            .read_retained_path(owner, 1, lease.lease_id, scope, path[2].hash, 1)
+            .unwrap(),
+        RetainedPathReadOutcome::Unavailable
+    );
+    assert!(
+        matches!(
+            reader
+                .read_retained_path(
+                    ordinary.peer,
+                    1,
+                    ordinary.lease_id,
+                    ordinary_scope,
+                    path[0].hash,
+                    1
+                )
+                .unwrap(),
+            RetainedPathReadOutcome::Page(_)
+        ),
+        "ordinary transfers retain their renewable idle deadline"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn retained_path_long_transfers_use_ordinary_capacity_across_finality() {
+    let range = crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE;
+    let target_index = usize::try_from(range).unwrap();
+    for finalized_count in [1, target_index + 2] {
+        let (runtime, _db, genesis, path) =
+            reconciled_store_with_finality(range + 2, finalized_count);
+        let reader = runtime.reader();
+        let target = &path[target_index];
+        let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target.hash);
+        let owner = SourceId::from_digest([0xc4; 32]);
+        let RetainedPathLeaseOutcome::Acquired(lease) = reader
+            .acquire_retained_path(owner, 1, target.hash, &[genesis.hash], scope)
+            .unwrap()
+        else {
+            panic!("long paths must use ordinary capacity in either storage band");
+        };
+        let RetainedPathReadOutcome::Page(first) = reader
+            .read_retained_path(owner, 1, lease.lease_id, scope, genesis.hash, range)
+            .unwrap()
+        else {
+            panic!("the first protocol range must be readable");
+        };
+        assert_eq!(first.headers.len(), target_index);
+        assert!(!first.complete);
+        let RetainedPathReadOutcome::Page(last) = reader
+            .read_retained_path(
+                owner,
+                1,
+                lease.lease_id,
+                scope,
+                path[target_index - 1].hash,
+                range,
+            )
+            .unwrap()
+        else {
+            panic!("the final page must be readable");
+        };
+        assert_eq!(last.headers, vec![target.header.clone()]);
+        assert!(last.complete);
+        assert!(runtime.leases.lock().unwrap().by_peer[&owner]
+            .lifetime_deadline
+            .is_none());
+        for marker in 1..MAX_RETAINED_PATH_LEASES - 1 {
+            assert!(matches!(
+                reader
+                    .acquire_retained_path(
+                        SourceId::from_digest([u8::try_from(marker).unwrap(); 32]),
+                        1,
+                        target.hash,
+                        &[genesis.hash],
+                        scope
+                    )
+                    .unwrap(),
+                RetainedPathLeaseOutcome::Acquired(_)
+            ));
+        }
+        let repair_owner = SourceId::from_digest([0xc5; 32]);
+        assert_eq!(
+            reader
+                .acquire_retained_path(repair_owner, 1, target.hash, &[genesis.hash], scope)
+                .unwrap(),
+            RetainedPathLeaseOutcome::Busy
+        );
+        assert!(
+            matches!(
+                reader
+                    .acquire_retained_path(repair_owner, 1, target.hash, &[path[0].hash], scope)
+                    .unwrap(),
+                RetainedPathLeaseOutcome::Acquired(_)
+            ),
+            "a protocol-sized repair must still use the reserve in either storage band"
+        );
+    }
+}
+
+#[test]
+fn retained_path_reservations_keep_capacity_classes_separate() {
+    let mut registry = RetainedPathLeaseRegistry::default();
+    let now = Instant::now();
+    let peers: Vec<_> = (0..MAX_RETAINED_PATH_LEASES)
+        .map(|marker| SourceId::from_digest([u8::try_from(marker).unwrap(); 32]))
+        .collect();
+    let mut reservations = Vec::new();
+    for peer in &peers {
+        reservations.push(
+            registry
+                .reserve(*peer, now, RetainedPathCapacity::Bounded)
+                .unwrap(),
+        );
+    }
+    assert_eq!(
+        reservations.last().unwrap().1,
+        RetainedPathCapacity::Bounded
+    );
+    registry.release_reservation(peers[0], reservations[0].0);
+    assert_eq!(
+        registry
+            .reserve(peers[0], now, RetainedPathCapacity::General)
+            .unwrap()
+            .1,
+        RetainedPathCapacity::General
+    );
+    assert!(registry
+        .reserve(peers[0], now, RetainedPathCapacity::Bounded)
+        .is_none());
+    assert!(registry
+        .reserve(
+            SourceId::from_digest([0xff; 32]),
+            now,
+            RetainedPathCapacity::Bounded
+        )
+        .is_none());
+}
+
+#[test]
+fn retained_path_busy_admission_does_not_lock_the_engine() {
+    let (runtime, _db, genesis, path) = reconciled_store_with_finalized_prefix(4);
+    let reader = runtime.reader();
+    let target = path.last().unwrap();
+    let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target.hash);
+    let owner = SourceId::from_digest([0xc6; 32]);
+    assert!(matches!(
+        reader
+            .acquire_retained_path(owner, 1, target.hash, &[genesis.hash], scope)
+            .unwrap(),
+        RetainedPathLeaseOutcome::Acquired(_)
+    ));
+    let engine = reader.transition_engine.clone();
+    let _ = std::thread::spawn(move || {
+        let _guard = engine.lock().unwrap();
+        panic!("poison the engine to detect any access after failed admission");
+    })
+    .join();
+    assert_eq!(
+        reader
+            .acquire_retained_path(owner, 2, target.hash, &[genesis.hash], scope)
+            .unwrap(),
+        RetainedPathLeaseOutcome::Busy
+    );
+    for marker in 0..MAX_RETAINED_PATH_LEASES - 1 {
+        reader
+            .leases
+            .lock()
+            .unwrap()
+            .reserve(
+                SourceId::from_digest([u8::try_from(marker).unwrap(); 32]),
+                Instant::now(),
+                RetainedPathCapacity::Bounded,
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        reader
+            .acquire_retained_path(
+                SourceId::from_digest([0xff; 32]),
+                1,
+                target.hash,
+                &[genesis.hash],
+                scope
+            )
+            .unwrap(),
+        RetainedPathLeaseOutcome::Busy
+    );
 }

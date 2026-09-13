@@ -18,7 +18,15 @@
 // and argument invariants established by `Args::validate_mode` use `expect`.
 #![allow(clippy::print_stdout, clippy::print_stderr, clippy::unwrap_in_result)]
 
-use std::{fs, io::Write, path::Path, time::Instant};
+use std::{
+    ffi::{OsStr, OsString},
+    fs,
+    io::Write,
+    path::Path,
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
 
 use color_eyre::eyre::{ensure, eyre, Context, Result};
 
@@ -39,6 +47,14 @@ const DEFAULT_FRONTIER_GRID_TARGET_COST_MS: u64 = 2_000;
 
 /// How often a long grid run reports progress, in entries.
 const FRONTIER_GRID_PROGRESS_INTERVAL: u64 = 100;
+
+/// Deadline for each `zakura-spentness` step. Full-history replay can take a day.
+const SPENTNESS_GENERATION_DEADLINE: Duration = Duration::from_secs(48 * 60 * 60);
+/// How often to check whether a `zakura-spentness` step has exited.
+const CHILD_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Environment variable that selects the installed `zakura-spentness` helper.
+const SPENTNESS_BINARY_ENV: &str = "ZAKURA_SPENTNESS_BIN";
+const DEFAULT_SPENTNESS_BINARY: &str = "zakura-spentness";
 
 /// One candidate block row read from the finalized state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -256,6 +272,10 @@ pub fn run_offline(args: &Args) -> Result<()> {
         )?;
     }
 
+    if args.mainnet_spentness_output.is_some() {
+        write_spentness_artifacts(args, last_height, last_hash)?;
+    }
+
     // Lock stdout once: the full list is ~14k lines and per-line locking is slow.
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
@@ -276,6 +296,98 @@ pub fn run_offline(args: &Args) -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Replay, generate, and verify the spentness artifact at the selected terminal checkpoint.
+///
+/// Each step runs the separately built `zakura-spentness` helper with a deadline.
+fn write_spentness_artifacts(
+    args: &Args,
+    terminal_height: Height,
+    terminal_hash: block::Hash,
+) -> Result<()> {
+    let outputs = args
+        .spentness_outputs()
+        .expect("validate_mode requires a spentness output path");
+    let replay = args
+        .spentness_replay_cache
+        .as_deref()
+        .expect("validate_mode pairs the spentness output with a replay cache")
+        .as_os_str();
+    let source = args
+        .state_cache_dir
+        .as_deref()
+        .expect("offline mode requires a state cache")
+        .as_os_str();
+    let helper =
+        std::env::var_os(SPENTNESS_BINARY_ENV).unwrap_or_else(|| DEFAULT_SPENTNESS_BINARY.into());
+    let height = OsString::from(terminal_height.0.to_string());
+    let hash = OsString::from(terminal_hash.to_string());
+
+    run_spentness(
+        &helper,
+        "replay",
+        &[
+            ("--source", source),
+            ("--destination", replay),
+            ("--height", &height),
+            ("--block-hash", &hash),
+        ],
+    )?;
+    run_spentness(
+        &helper,
+        "generate",
+        &[
+            ("--state", replay),
+            ("--height", &height),
+            ("--block-hash", &hash),
+            ("--output", outputs.artifact.as_os_str()),
+            ("--commitment", outputs.commitment.as_os_str()),
+        ],
+    )?;
+    run_spentness(
+        &helper,
+        "verify",
+        &[
+            ("--state", replay),
+            ("--artifact", outputs.artifact.as_os_str()),
+            ("--commitment", outputs.commitment.as_os_str()),
+            ("--report", outputs.verification.as_os_str()),
+        ],
+    )
+}
+
+/// Run one `zakura-spentness` subcommand, killing it after the generation deadline.
+fn run_spentness(helper: &OsStr, subcommand: &str, flags: &[(&str, &OsStr)]) -> Result<()> {
+    let mut command = Command::new(helper);
+    // Preserve helper summaries without mixing them into checkpoint stdout.
+    command
+        .arg(subcommand)
+        .stdout(Stdio::from(std::io::stderr()));
+    for (flag, value) in flags {
+        command.arg(flag).arg(value);
+    }
+    let mut child = command.spawn().wrap_err(
+        "starting zakura-spentness; build and install it with --features zakura-spentness",
+    )?;
+
+    let started = Instant::now();
+    while started.elapsed() <= SPENTNESS_GENERATION_DEADLINE {
+        if let Some(status) = child.try_wait()? {
+            ensure!(
+                status.success(),
+                "zakura-spentness {subcommand} failed with {status}"
+            );
+            return Ok(());
+        }
+        thread::sleep(CHILD_STATUS_POLL_INTERVAL);
+    }
+    child.kill()?;
+    child.wait()?;
+    Err(eyre!(
+        "zakura-spentness {subcommand} exceeded its {}-hour deadline",
+        SPENTNESS_GENERATION_DEADLINE.as_secs() / 3600
+    ))
 }
 
 /// Generate only the frontier grid, for a checkpoint the binary already ships.

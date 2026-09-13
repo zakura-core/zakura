@@ -73,6 +73,7 @@
 //!
 //! Some of the diagnostic features are optional, and need to be enabled at compile-time.
 
+mod spentness;
 pub(crate) mod zakura;
 
 use std::{
@@ -331,7 +332,7 @@ impl StartCmd {
     pub(crate) async fn start(
         &self,
         config: Arc<ZakuradConfig>,
-        custom_services: Vec<zakura_network::zakura::CustomService>,
+        mut custom_services: Vec<zakura_network::zakura::CustomService>,
         ready: Option<tokio::sync::oneshot::Sender<crate::node::NodeServices>>,
         shutdown: CancellationToken,
         shutdown_cleanup_required: CancellationToken,
@@ -541,6 +542,9 @@ impl StartCmd {
 
         let advertised_services = Self::advertised_services(&config);
 
+        let spentness_distribution =
+            spentness::prepare_distribution(&config, &mut custom_services).await?;
+
         let (peer_set, address_book, misbehavior_sender, zakura_endpoint) =
             zakura_network::init_with_zakura(
                 config.network.clone(),
@@ -560,6 +564,9 @@ impl StartCmd {
             None => None,
         };
         let mut block_sync_fatal_events = None;
+        if let (Some(distribution), Some(endpoint)) = (spentness_distribution, &zakura_endpoint) {
+            node_tasks.track(&distribution.spawn_downloads(endpoint.supervisor()));
+        }
 
         // Not added to node_tasks, because it must outlive start() being dropped to shutdown the
         // endpoint

@@ -4,15 +4,21 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
+import os
 import re
+import shutil
 import struct
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from typing import Any
+
+import spentness_release
 
 CHECKPOINTS = Path("crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt")
 FRONTIER = Path("crates/zakura-state/src/service/finalized_state/vct/mainnet-frontier.bin")
@@ -78,6 +84,107 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
         encoding="utf-8",
     )
     temporary.replace(path)
+
+
+def _install_artifacts(repo_root: Path, artifacts: dict[Path, bytes]) -> None:
+    """Stage every artifact and restore the previous files if installation fails."""
+    staging = Path(tempfile.mkdtemp(prefix=".release-state-import-", dir=repo_root))
+    prepared: list[tuple[Path, Path, Path | None]] = []
+    installing = False
+    try:
+        for index, (relative, contents) in enumerate(artifacts.items()):
+            target = repo_root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            staged = staging / f"{index}.new"
+            backup = staging / f"{index}.old" if target.exists() else None
+            if backup is not None:
+                shutil.copy2(target, backup)
+                with backup.open("rb") as original:
+                    os.fsync(original.fileno())
+            with staged.open("wb") as output:
+                output.write(contents)
+                output.flush()
+                os.fsync(output.fileno())
+            staged.chmod(target.stat().st_mode & 0o777 if target.exists() else 0o644)
+            prepared.append((target, staged, backup))
+        # Persist newly created artifact directories before committing their files.
+        directories = {repo_root}
+        for target, _staged, _backup in prepared:
+            parent = target.parent
+            while parent != repo_root:
+                directories.add(parent)
+                parent = parent.parent
+        for directory in sorted(directories, key=lambda path: len(path.parts), reverse=True):
+            _sync_directory(directory)
+        journal = [
+            {"path": str(target.relative_to(repo_root)), "backup": backup.name if backup else None}
+            for target, _staged, backup in prepared
+        ]
+        with (staging / "journal.json").open("w") as output:
+            json.dump(journal, output)
+            output.flush()
+            os.fsync(output.fileno())
+        (staging / "ready").touch()
+        _sync_directory(staging)
+        _sync_directory(repo_root)
+        installing = True
+        for target, staged, _backup in prepared:
+            os.replace(staged, target)
+            _sync_directory(target.parent)
+        with (staging / "committed").open("wb") as output:
+            os.fsync(output.fileno())
+        _sync_directory(staging)
+    except BaseException:
+        if installing:
+            try:
+                _recover_import(repo_root, staging)
+            except OSError as error:
+                raise BundleImportError(
+                    f"import rollback failed; recover originals from {staging}: {error}"
+                ) from error
+        if staging.exists():
+            shutil.rmtree(staging)
+        raise
+    shutil.rmtree(staging)
+
+
+def _sync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _recover_import(repo_root: Path, staging: Path) -> None:
+    if staging.is_symlink() or not staging.is_dir():
+        raise BundleImportError(f"unexpected recovery path: {staging}")
+    for entry in staging.iterdir():
+        if (entry.is_symlink() or not entry.is_file()
+                or not re.fullmatch(r"(?:[0-9]+\.(?:new|old)|journal\.json|ready|committed|restore)", entry.name)):
+            raise BundleImportError(f"unexpected recovery file; preserve {staging}")
+    journal_path = staging / "journal.json"
+    if (staging / "ready").exists() and not (staging / "committed").exists():
+        allowed = {CHECKPOINTS, FRONTIER, SUBTREES, PROVENANCE, EOS_FILE,
+                   spentness_release.MANIFEST, spentness_release.COMPILED}
+        journal = json.loads(journal_path.read_text())
+        for index, entry in enumerate(journal):
+            if Path(entry["path"]) not in allowed or entry["backup"] not in (None, f"{index}.old"):
+                raise BundleImportError(f"invalid recovery journal in {staging}")
+        for entry in reversed(journal):
+            target = repo_root / entry["path"]
+            if entry["backup"] is None:
+                target.unlink(missing_ok=True)
+            else:
+                # Keep the backup so another interruption can repeat recovery.
+                restored = staging / "restore"
+                shutil.copy2(staging / entry["backup"], restored)
+                with restored.open("rb") as original:
+                    os.fsync(original.fileno())
+                os.replace(restored, target)
+            _sync_directory(target.parent)
+    shutil.rmtree(staging)
+    _sync_directory(repo_root)
 
 
 def _subtree_digest(prefix: bytes, payload: bytes) -> bytes:
@@ -272,13 +379,30 @@ def import_bundle(
     floor_eos: bool = True,
     previous_frontier_grid: Path | None = None,
 ) -> dict[str, Any]:
+    """Serialize imports and recover an interrupted installation before validation."""
+    descriptor = os.open(repo_root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        for staging in sorted(repo_root.glob(".release-state-import-*")):
+            _recover_import(repo_root, staging)
+        return _import_bundle(repo_root, bundle, resolution_path,
+                              floor_eos=floor_eos, previous_frontier_grid=previous_frontier_grid)
+    finally:
+        os.close(descriptor)
+
+
+def _import_bundle(
+    repo_root: Path,
+    bundle: Path,
+    resolution_path: Path,
+    *,
+    floor_eos: bool = True,
+    previous_frontier_grid: Path | None = None,
+) -> dict[str, Any]:
     """Import a newer bundle while requiring an append-only checkpoint history."""
 
     resolution = _load_resolution(resolution_path)
     checkpoint_path = repo_root / CHECKPOINTS
-    frontier_path = repo_root / FRONTIER
-    provenance_path = repo_root / PROVENANCE
-    subtree_path = repo_root / SUBTREES
 
     try:
         committed_checkpoints = checkpoint_path.read_bytes()
@@ -310,34 +434,60 @@ def import_bundle(
     subtree_bytes = _prepare_subtree_import(repo_root, bundle, bundle_height)
     grid_bytes = _prepare_frontier_grid_import(previous_frontier_grid, bundle, bundle_height)
 
-    checkpoint_path.write_bytes(bundle_checkpoints)
-    frontier_path.write_bytes(bundle_frontier)
-    subtree_path.parent.mkdir(parents=True, exist_ok=True)
-    subtree_path.write_bytes(subtree_bytes)
-    print("imported subtree-root artifact")
-    # The grid itself is published to crates.io by the workflow, not written into the tree.
-    print("imported frontier grid")
+    try:
+        meta_bytes = (bundle / "meta.json").read_bytes()
+        meta = json.loads(meta_bytes)
+    except (OSError, ValueError) as error:
+        raise BundleImportError(f"bundle metadata is required: {error}") from error
+    if hashlib.sha256(meta_bytes).hexdigest() != resolution["meta_sha256"]:
+        raise BundleImportError("bundle metadata differs from resolution digest")
+    if (
+        not isinstance(meta, dict)
+        or type(meta.get("schema_version")) is not int
+        or meta["schema_version"] not in (1, spentness_release.BUNDLE_SCHEMA)
+        or meta.get("network") != "Mainnet"
+        or any(meta.get(key) != resolution[key] for key in ("height", "block_hash", "generated_at"))
+    ):
+        raise BundleImportError("bundle metadata differs from the resolved Mainnet boundary")
+    spentness = None
+    if meta["schema_version"] == spentness_release.BUNDLE_SCHEMA:
+        try:
+            spentness = spentness_release.prepare_import(repo_root, bundle, meta)
+        except (ValueError, OSError) as error:
+            raise BundleImportError(f"cannot import spentness descriptor: {error}") from error
 
-    _write_json(
-        provenance_path,
-        {
-            "schema_version": 1,
-            "network": "Mainnet",
-            "source": "release-state-bundle",
-            "generated_at": resolution["generated_at"],
-            "finalized_height": bundle_height,
-            "finalized_hash": resolution["block_hash"],
-            "checkpoints_sha256": hashlib.sha256(bundle_checkpoints).hexdigest(),
-            "frontier_sha256": hashlib.sha256(bundle_frontier).hexdigest(),
-            "frontier_size": len(bundle_frontier),
-            "subtrees_sha256": hashlib.sha256(subtree_bytes).hexdigest(),
-            "subtrees_size": len(subtree_bytes),
-            "frontier_grid_sha256": hashlib.sha256(grid_bytes).hexdigest(),
-            "frontier_grid_size": len(grid_bytes),
-            "frontier_grid_entries": FRONTIER_GRID_HEADER_PREFIX.unpack_from(grid_bytes)[5],
-            "meta_sha256": resolution["meta_sha256"],
-        },
-    )
+    artifacts = {
+        CHECKPOINTS: bundle_checkpoints,
+        FRONTIER: bundle_frontier,
+        SUBTREES: subtree_bytes,
+    }
+    if spentness is not None:
+        manifest, compiled = spentness
+        artifacts[spentness_release.MANIFEST] = (json.dumps(manifest, indent=2) + "\n").encode()
+        artifacts[spentness_release.COMPILED] = compiled.encode()
+
+    provenance = {
+        "schema_version": 1,
+        "network": "Mainnet",
+        "source": "release-state-bundle",
+        "generated_at": resolution["generated_at"],
+        "finalized_height": bundle_height,
+        "finalized_hash": resolution["block_hash"],
+        "checkpoints_sha256": hashlib.sha256(bundle_checkpoints).hexdigest(),
+        "frontier_sha256": hashlib.sha256(bundle_frontier).hexdigest(),
+        "frontier_size": len(bundle_frontier),
+        "subtrees_sha256": hashlib.sha256(subtree_bytes).hexdigest(),
+        "subtrees_size": len(subtree_bytes),
+        "frontier_grid_sha256": hashlib.sha256(grid_bytes).hexdigest(),
+        "frontier_grid_size": len(grid_bytes),
+        "frontier_grid_entries": FRONTIER_GRID_HEADER_PREFIX.unpack_from(grid_bytes)[5],
+        "meta_sha256": resolution["meta_sha256"],
+    }
+    if spentness is not None:
+        manifest, _compiled = spentness
+        latest_commitment = manifest["artifacts"][-1]["commitment"]
+        provenance["spentness_sha256"] = bytes(latest_commitment["sha256"]).hex()
+    artifacts[PROVENANCE] = (json.dumps(provenance, indent=2) + "\n").encode()
 
     # The publish step names a crate version from this, and the PR body quotes it, so the
     # identity of the grid that was validated has to leave this function.
@@ -358,14 +508,13 @@ def import_bundle(
         eos_floor = bundle_height + 3456
         if current_eos < eos_floor:
             formatted = f"{eos_floor:_}"
-            eos_path.write_text(
-                EOS_PATTERN.sub(rf"\g<1>{formatted}", eos_text, count=1),
-                encoding="utf-8",
-            )
-            print(f"floored ESTIMATED_RELEASE_HEIGHT at {formatted}")
+            artifacts[EOS_FILE] = EOS_PATTERN.sub(rf"\g<1>{formatted}", eos_text, count=1).encode()
+            print(f"staged ESTIMATED_RELEASE_HEIGHT at {formatted}")
         else:
             print(f"ESTIMATED_RELEASE_HEIGHT {current_eos} already at or above the floor")
 
+    _install_artifacts(repo_root, artifacts)
+    print("imported release-state artifacts")
     return result
 
 
@@ -445,9 +594,94 @@ def _self_test() -> int:
                 ),
                 encoding="utf-8",
             )
+            resolution = json.loads(self.resolution.read_text())
+            meta = {
+                "schema_version": 1,
+                "network": "Mainnet",
+                **{key: resolution[key] for key in ("height", "block_hash", "generated_at")},
+            }
+            meta_bytes = json.dumps(meta).encode()
+            (self.bundle / "meta.json").write_bytes(meta_bytes)
+            resolution["meta_sha256"] = hashlib.sha256(meta_bytes).hexdigest()
+            self.resolution.write_text(json.dumps(resolution))
 
         def tearDown(self) -> None:
             self.scratch.cleanup()
+
+        def snapshot(self):
+            return {
+                relative: (self.root / relative).read_bytes()
+                if (self.root / relative).exists() else None
+                for relative in (CHECKPOINTS, FRONTIER, SUBTREES, PROVENANCE, EOS_FILE)
+            }
+
+        def test_missing_metadata_rejects_without_writing(self) -> None:
+            before = self.snapshot()
+            (self.bundle / "meta.json").unlink()
+            with self.assertRaisesRegex(BundleImportError, "metadata is required"):
+                import_bundle(self.root, self.bundle, self.resolution)
+            self.assertEqual(self.snapshot(), before)
+
+        def test_invalid_eos_rejects_before_installation(self) -> None:
+            (self.root / EOS_FILE).write_text("invalid source")
+            before = self.snapshot()
+            with self.assertRaisesRegex(BundleImportError, "cannot find ESTIMATED_RELEASE_HEIGHT"):
+                import_bundle(self.root, self.bundle, self.resolution)
+            self.assertEqual(self.snapshot(), before)
+
+        def test_failed_installation_restores_every_artifact(self) -> None:
+            before = self.snapshot()
+            replace = os.replace
+            for failure_index in range(1, 6):
+                calls = 0
+
+                def fail_once(source, target):
+                    nonlocal calls
+                    calls += 1
+                    if calls == failure_index:
+                        raise OSError("injected install failure")
+                    return replace(source, target)
+
+                with self.subTest(failure_index=failure_index):
+                    with patch.object(os, "replace", side_effect=fail_once):
+                        with self.assertRaisesRegex(OSError, "injected install failure"):
+                            import_bundle(self.root, self.bundle, self.resolution)
+                    self.assertEqual(self.snapshot(), before)
+                    self.assertFalse(list(self.root.glob(".release-state-import-*")))
+
+        def test_interrupted_installation_recovers_before_validation(self) -> None:
+            before = self.snapshot()
+            child = os.fork()
+            if child == 0:
+                replace = os.replace
+
+                def interrupt(source, target):
+                    replace(source, target)
+                    os._exit(23)
+
+                with patch.object(os, "replace", side_effect=interrupt):
+                    import_bundle(self.root, self.bundle, self.resolution)
+                os._exit(24)
+            _, status = os.waitpid(child, 0)
+            self.assertEqual(os.waitstatus_to_exitcode(status), 23)
+            self.assertNotEqual(self.snapshot(), before)
+            # Recovery must run even when the next bundle cannot pass validation.
+            (self.bundle / "meta.json").unlink()
+            with self.assertRaisesRegex(BundleImportError, "metadata is required"):
+                import_bundle(self.root, self.bundle, self.resolution)
+            self.assertEqual(self.snapshot(), before)
+            self.assertFalse(list(self.root.glob(".release-state-import-*")))
+
+        def test_interrupted_staging_does_not_require_a_complete_journal(self) -> None:
+            before = self.snapshot()
+            staging = self.root / ".release-state-import-incomplete"
+            staging.mkdir()
+            (staging / "journal.json").write_text("[{\"path\":")
+            (self.bundle / "meta.json").unlink()
+            with self.assertRaisesRegex(BundleImportError, "metadata is required"):
+                import_bundle(self.root, self.bundle, self.resolution)
+            self.assertEqual(self.snapshot(), before)
+            self.assertFalse(staging.exists())
 
         def test_import_and_no_op(self) -> None:
             result = import_bundle(self.root, self.bundle, self.resolution)

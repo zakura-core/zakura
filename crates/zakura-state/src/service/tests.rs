@@ -1326,9 +1326,9 @@ async fn poll_ready_hands_off_at_max_checkpoint_height() -> Result<()> {
     Ok(())
 }
 
-/// Tip reconciliation must release children queued before the final checkpoint became durable.
+/// The handoff request must release children queued before the final checkpoint became durable.
 #[tokio::test(flavor = "multi_thread")]
-async fn checkpoint_tip_handoff_drains_waiting_children() -> Result<()> {
+async fn checkpoint_handoff_request_drains_waiting_children() -> Result<()> {
     use color_eyre::eyre::eyre;
     use tower::Service;
 
@@ -1345,7 +1345,7 @@ async fn checkpoint_tip_handoff_drains_waiting_children() -> Result<()> {
         .queue_and_commit_to_finalized_state(blocks[0].clone().into())
         .await??;
     state
-        .call(Request::Tip)
+        .call(Request::CheckCheckpointHandoff)
         .await
         .map_err(|error| eyre!(error))?;
     assert!(
@@ -1364,17 +1364,25 @@ async fn checkpoint_tip_handoff_drains_waiting_children() -> Result<()> {
         .has_queued_children(blocks[1].hash()));
     assert!(state.block_write_sender.finalized.is_some());
 
-    // Deliberately call without poll_ready: the Tip request itself owns this guarantee.
+    // Deliberately call without poll_ready: Tip only reads, and the handoff request owns the check.
     state
         .call(Request::Tip)
         .await
         .map_err(|error| eyre!(error))?;
+    assert!(state.block_write_sender.finalized.is_some());
+    assert_eq!(
+        state
+            .call(Request::CheckCheckpointHandoff)
+            .await
+            .map_err(|error| eyre!(error))?,
+        Response::CheckpointHandoffChecked
+    );
     assert!(state.block_write_sender.finalized.is_none());
     assert!(!state
         .non_finalized_state_queued_blocks
         .has_queued_children(blocks[1].hash()));
     state
-        .call(Request::Tip)
+        .call(Request::CheckCheckpointHandoff)
         .await
         .map_err(|error| eyre!(error))?;
     assert!(

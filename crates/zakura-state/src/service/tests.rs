@@ -40,6 +40,51 @@ use crate::{
 
 const LAST_BLOCK_HEIGHT: u32 = 10;
 
+#[tokio::test]
+async fn await_utxo_does_not_return_outputs_rejected_after_poll_ready() {
+    use tower::{Service, ServiceExt};
+
+    let _init_guard = zakura_test::init();
+    let (mut state, _, _, _) =
+        StateService::new(Config::ephemeral(), &Network::Mainnet, Height::MAX, 0)
+            .await
+            .expect("the ephemeral state opens");
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_419200_BYTES
+        .zcash_deserialize_into()
+        .expect("the mainnet block vector decodes");
+    let block = block.prepare();
+    let outpoint = *block
+        .new_outputs
+        .keys()
+        .next()
+        .expect("the block vector contains transparent outputs");
+    state.non_finalized_block_write_sent_hashes.add(&block);
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    state.non_finalized_rejected_receiver = receiver;
+
+    timeout(Duration::from_secs(5), state.ready())
+        .await
+        .expect("state readiness completes within the test timeout")
+        .expect("the state writer is running");
+    // A write failure can arrive after readiness was checked but before the request is called.
+    sender
+        .send(super::write::NonFinalizedWriteFailure {
+            hash: block.hash,
+            kind: NonFinalizedWriteFailureKind::Retryable,
+        })
+        .expect("the state owns the rejection receiver");
+
+    let response = state.call(Request::AwaitUtxo(outpoint));
+    assert!(
+        timeout(Duration::from_millis(50), response).await.is_err(),
+        "the request must wait for a valid output instead of returning the rejected body's output"
+    );
+    assert!(state
+        .non_finalized_block_write_sent_hashes
+        .utxo(&outpoint)
+        .is_none());
+}
+
 #[test]
 fn mined_orphans_finish_without_entering_the_sync_queue() {
     let _init_guard = zakura_test::init();

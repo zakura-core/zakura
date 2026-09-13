@@ -1393,7 +1393,7 @@ fn initial_vct_wire_assignment_arms_the_request_deadline() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn header_serving_reproduction_busy_supplier_retries_without_new_tip_or_session() {
+async fn busy_supplier_waits_for_status_without_a_retry_deadline() {
     let mut fixture = ReadyVctRepairFixture::new();
     let (peers, _outbounds) = fixture.connect(&[0x71], 7);
     let peer = &peers[0];
@@ -1418,24 +1418,97 @@ async fn header_serving_reproduction_busy_supplier_retries_without_new_tip_or_se
     );
     assert!(fixture.reactor.peer_work_queue.active(peer).is_none());
 
-    for _ in 0..300 {
-        time::advance(std::time::Duration::from_secs(1)).await;
-        fixture.reactor.refresh_statuses();
-        if let Some(retry) = fixture.reactor.peer_work_queue.active(peer) {
-            assert_eq!(retry.owner.session_id(), first.owner.session_id());
-            assert_ne!(retry.request_id, first.request_id);
-            assert!(matches!(
-                retry.purpose,
-                HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
-            ));
-            return;
-        }
-    }
-
-    panic!(
-        "no repair retry after 300 seconds with the same connected supplier: {:?}",
-        fixture.reactor.vct_repair.current()
+    assert_eq!(
+        fixture
+            .reactor
+            .vct_repair
+            .current()
+            .unwrap()
+            .next_deadline(),
+        None
     );
+    time::advance(std::time::Duration::from_secs(300)).await;
+    fixture.reactor.refresh_statuses();
+    assert!(fixture.reactor.peer_work_queue.active(peer).is_none());
+
+    fixture.advertise(&peers, 7);
+    let retry = fixture
+        .reactor
+        .peer_work_queue
+        .active(peer)
+        .expect("an unchanged status makes the sole supplier eligible again");
+    assert_eq!(retry.owner.session_id(), first.owner.session_id());
+    assert_ne!(retry.request_id, first.request_id);
+    assert!(matches!(
+        retry.purpose,
+        HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn busy_supplier_retries_on_an_unchanged_status_without_waiting() {
+    let mut fixture = ReadyVctRepairFixture::new();
+    let (peers, _outbounds) = fixture.connect(&[0x71], 7);
+    let peer = &peers[0];
+    fixture.schedule();
+    fixture.advertise(&peers, 7);
+
+    for _ in 0..3 {
+        let first = fixture
+            .reactor
+            .peer_work_queue
+            .active(peer)
+            .unwrap()
+            .clone();
+        fixture.reply_busy(peer);
+        fixture.reactor.refresh_statuses();
+        assert!(fixture.reactor.peer_work_queue.active(peer).is_none());
+
+        fixture.advertise(&peers, 7);
+        let retry = fixture
+            .reactor
+            .peer_work_queue
+            .active(peer)
+            .expect("each later status permits another attempt without advancing time");
+        assert_eq!(retry.owner.session_id(), first.owner.session_id());
+        assert_ne!(retry.request_id, first.request_id);
+    }
+}
+
+#[test]
+fn busy_status_releases_only_the_sending_supplier() {
+    let mut fixture = ReadyVctRepairFixture::new();
+    let (peers, _outbounds) = fixture.connect(&[0x71, 0x72], 7);
+    fixture.schedule();
+    fixture.advertise(&peers, 7);
+    fixture.reply_busy(&peers[0]);
+    fixture.reply_busy(&peers[1]);
+    assert!(peers
+        .iter()
+        .all(|peer| fixture.reactor.peer_work_queue.active(peer).is_none()));
+
+    let mut invalid_status = fixture.status();
+    invalid_status.work_anchor_height = block::Height(invalid_status.selected_tip_height.0 + 1);
+    fixture.reactor.handle_wire_message(
+        peers[0].clone(),
+        7,
+        HeaderSyncMessage::Status(invalid_status),
+    );
+    assert!(peers
+        .iter()
+        .all(|peer| fixture.reactor.peer_work_queue.active(peer).is_none()));
+
+    fixture.advertise(&peers[1..], 8);
+    assert!(fixture.reactor.peer_work_queue.active(&peers[0]).is_none());
+    assert!(fixture.reactor.peer_work_queue.active(&peers[1]).is_some());
+    fixture.reply_busy(&peers[1]);
+    assert!(peers
+        .iter()
+        .all(|peer| fixture.reactor.peer_work_queue.active(peer).is_none()));
+
+    fixture.advertise(&peers[..1], 7);
+    assert!(fixture.reactor.peer_work_queue.active(&peers[0]).is_some());
+    assert!(fixture.reactor.peer_work_queue.active(&peers[1]).is_none());
 }
 
 #[tokio::test(start_paused = true)]
@@ -1500,14 +1573,15 @@ async fn vct_supplier_disconnect_clears_failure_history_before_reconnect() {
         assert!(task.tried_sources.is_empty());
         assert_eq!(
             task.next_deadline(),
-            Some(Instant::now() + std::time::Duration::from_secs(1)),
-            "the new session starts with the initial Busy delay"
+            None,
+            "Busy in the new session waits for another status"
         );
+        assert!(task.supplier_is_waiting_for_status(retry.source));
     }
 }
 
 #[tokio::test(start_paused = true)]
-async fn stale_disconnect_preserves_reconnected_supplier_backoff() {
+async fn stale_events_preserve_reconnected_supplier_status_wait() {
     let mut fixture = ReadyVctRepairFixture::new();
     let (peers, _old_outbounds) = fixture.connect(&[0x71], 7);
     let peer = &peers[0];
@@ -1540,17 +1614,20 @@ async fn stale_disconnect_preserves_reconnected_supplier_backoff() {
         .handle_peer_disconnected(peer, 7, "late old session disconnect");
     assert_eq!(fixture.reactor.peer_state[peer].session.session_id(), 8);
     assert_eq!(fixture.reactor.vct_repair.current(), Some(&before));
-    fixture.advertise(&reconnected, 8);
+    fixture.advertise(&reconnected, 7);
+    assert_eq!(fixture.reactor.vct_repair.current(), Some(&before));
     assert!(fixture.reactor.peer_work_queue.active(peer).is_none());
 
-    time::advance(std::time::Duration::from_secs(1)).await;
+    time::advance(std::time::Duration::from_secs(300)).await;
     fixture.reactor.refresh_statuses();
+    assert!(fixture.reactor.peer_work_queue.active(peer).is_none());
+    fixture.advertise(&reconnected, 8);
     assert_eq!(
         fixture
             .reactor
             .peer_work_queue
             .active(peer)
-            .expect("the new session remains eligible when its own backoff expires")
+            .expect("only the new session's status releases its Busy wait")
             .owner
             .session_id(),
         8
@@ -1681,7 +1758,7 @@ async fn busy_suppliers_give_a_smaller_repair_supplier_its_turn() {
             .expect("each larger supplier gets one turn")
             .clone();
         assert_eq!(active.max_header_count, 2);
-        // Two intervening refusals outlast even the capped 30-second Busy delay.
+        // Waiting suppliers keep their turn even across slow refusals and fresh statuses.
         time::advance(std::time::Duration::from_secs(16)).await;
         fixture.reactor.refresh_statuses();
         assert_eq!(
@@ -1690,6 +1767,10 @@ async fn busy_suppliers_give_a_smaller_repair_supplier_its_turn() {
             "the refusal arrives before the request timeout"
         );
         fixture.reply_busy(peer);
+        let session_id = fixture.reactor.peer_state[peer].session.session_id();
+        for _ in 0..3 {
+            fixture.advertise(std::slice::from_ref(peer), session_id);
+        }
     }
 
     let active = fixture
@@ -2155,22 +2236,24 @@ async fn replacement_session_clears_busy_history_before_the_old_disconnect() {
             .reactor
             .peer_work_queue
             .active(peer)
-            .expect("the replacement can retry before the old Busy delay expires")
+            .expect("the replacement's first status makes it eligible")
             .owner
             .session_id(),
         8
     );
     fixture.reply_busy(peer);
     let before = fixture.reactor.vct_repair.current().unwrap().clone();
-    assert_eq!(
-        before.next_deadline(),
-        Some(Instant::now() + std::time::Duration::from_secs(1))
-    );
+    assert_eq!(before.next_deadline(), None);
     fixture
         .reactor
         .handle_peer_disconnected(peer, 7, "late replaced session");
     assert_eq!(fixture.reactor.vct_repair.current(), Some(&before));
     assert_eq!(fixture.reactor.peer_state[peer].session.session_id(), 8);
+    fixture.advertise(&replacement, 7);
+    assert_eq!(fixture.reactor.vct_repair.current(), Some(&before));
+    assert!(fixture.reactor.peer_work_queue.active(peer).is_none());
+    fixture.advertise(&replacement, 8);
+    assert!(fixture.reactor.peer_work_queue.active(peer).is_some());
 }
 
 #[test]

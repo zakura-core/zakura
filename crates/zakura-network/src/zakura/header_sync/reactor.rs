@@ -513,8 +513,8 @@ struct VctSupplierRejections {
     already_serving: u64,
     /// Peers already tried in the current durable episode.
     already_tried: u64,
-    /// Peers waiting for a retry after a temporary Busy response.
-    supplier_backoff: u64,
+    /// Peers waiting for a later status after a temporary Busy response.
+    supplier_status_wait: u64,
     /// Peers that already supplied a retained rooted payload for this target.
     retained_source: u64,
     /// Peers that already returned semantic input excluded by this episode.
@@ -1100,6 +1100,9 @@ impl HeaderSyncReactor {
         }
         if let Some(state) = self.peer_state.get_mut(&peer) {
             state.last_status = Some(status.clone());
+        }
+        if let Some(task) = self.vct_repair.current_mut() {
+            task.observe_supplier_status(source_id_from_peer(&peer));
         }
         self.request_vct_repair_context();
         self.try_assign_vct_repair();
@@ -2163,7 +2166,7 @@ impl HeaderSyncReactor {
                 .is_some_and(|task| match retry.attribution {
                     VctRepairRetryAttribution::Supplier => {
                         if retry.terminal == HeaderRequestTerminal::Busy {
-                            task.retry_after_busy(source, now).is_ok()
+                            task.wait_for_supplier_status(source).is_ok()
                         } else {
                             task.retry(source).is_ok()
                         }
@@ -2343,7 +2346,7 @@ impl HeaderSyncReactor {
                 rejected_schema = record.rejections.unsupported_schema,
                 rejected_busy = record.rejections.already_serving,
                 rejected_tried = record.rejections.already_tried,
-                supplier_backoff = record.rejections.supplier_backoff,
+                supplier_status_wait = record.rejections.supplier_status_wait,
                 retained_source = record.rejections.retained_source,
                 excluded_input = record.rejections.excluded_input,
                 send_failed = record.rejections.send_failed,
@@ -2410,8 +2413,8 @@ impl HeaderSyncReactor {
                 record.rejections.already_tried.into(),
             );
             row.insert(
-                "supplier_backoff".into(),
-                record.rejections.supplier_backoff.into(),
+                "supplier_status_wait".into(),
+                record.rejections.supplier_status_wait.into(),
             );
             row.insert(
                 hs_trace::BEST_PEER_HEIGHT.into(),
@@ -3335,8 +3338,8 @@ impl HeaderSyncReactor {
                 rejections.already_tried += 1;
                 continue;
             }
-            if task.supplier_is_backing_off(source, now) {
-                rejections.supplier_backoff += 1;
+            if task.supplier_is_waiting_for_status(source) {
+                rejections.supplier_status_wait += 1;
                 continue;
             }
             candidates.push((

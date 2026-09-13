@@ -299,16 +299,17 @@ def update_progress_state(state: dict[str, Any], statuses: list[dict[str, Any]],
             record["controller_run"] = run_id
 
         height = status.get("height")
-        if height is None:
+        if height is None or status.get("height_is_exact") is not True:
             continue
         previous_height = record.get("height")
         record["height"] = height
-        if (
-            record.pop("progress_reset_pending", False)
-            or previous_height is None
-            or height > previous_height
-        ):
+        reset = record.pop("progress_reset_pending", False)
+        if reset or previous_height is None:
             record["last_progress"] = ts
+            record.pop("last_advance", None)
+        elif height > previous_height:
+            record["last_progress"] = ts
+            record["last_advance"] = ts
         else:
             record.setdefault("last_progress", ts)
 
@@ -459,16 +460,24 @@ def run_once(config: dict[str, Any]) -> int:
     last_progress = int(record.get("last_progress", ts))
     age = ts - last_progress
     peer_evidence = []
-    if node_healthy(local_status) and height is not None:
+    if (
+        node_healthy(local_status)
+        and height is not None
+        and local_status.get("height_is_exact") is True
+    ):
         for peer in statuses:
-            if peer["hostname"] == local_host or not node_healthy(peer):
+            if (
+                peer["hostname"] == local_host
+                or not node_healthy(peer)
+                or peer.get("height_is_exact") is not True
+            ):
                 continue
             peer_height = peer.get("height")
             peer_record = state.get("nodes", {}).get(peer["hostname"], {})
             if (
                 peer_height is not None
                 and peer_height > height
-                and int(peer_record.get("last_progress", 0)) > last_progress
+                and int(peer_record.get("last_advance", 0)) > last_progress
             ):
                 peer_evidence.append(f"{peer['hostname']} advanced to height {peer_height}")
     stalled = (
@@ -490,6 +499,7 @@ def run_once(config: dict[str, Any]) -> int:
     local_progressed = (
         isinstance(height, int)
         and isinstance(previous_local_height, int)
+        and local_status.get("height_is_exact") is True
         and height > previous_local_height
     )
     if controller_owns_lifecycle:

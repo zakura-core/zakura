@@ -436,3 +436,9 @@ impl BlockSyncService {
         sender
     }
 }
+
+impl BlockSyncPeerSession {
+    pub(crate) fn close_cause_for_test(&self) -> crate::zakura::CloseCause {
+        self.close_cause.clone()
+    }
+}

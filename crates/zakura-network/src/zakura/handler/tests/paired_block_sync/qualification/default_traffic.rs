@@ -162,6 +162,18 @@ async fn traffic(buffered: bool) -> Result<(), BoxError> {
         89642,
     )
     .await?;
+    await_until("traffic server admitted the requester", DEADLINE, || {
+        server_node.service.peer_count() == 1
+    })
+    .await?;
+    // Keep only the close recorder, without extending the session's ownership.
+    let server_close = server_node
+        .service
+        .sessions_for_transport_test()
+        .pop()
+        .unwrap()
+        .1
+        .close_cause_for_test();
     let started = Instant::now();
     if buffered {
         let held = server_node.handle.hold_serving_capacity_for_test();
@@ -203,7 +215,18 @@ async fn traffic(buffered: bool) -> Result<(), BoxError> {
                     .encode_frame()?,
                 )
                 .await?;
-            exchange(&mut data, start, useful.then(|| bodies[0].hash())).await?;
+            exchange(&mut data, start, useful.then(|| bodies[0].hash()))
+                .await
+                .map_err(|error| {
+                    format!(
+                        "L04 exchange {} of {} failed after {:?}: {error}; server_close={}; transport_close={:?}",
+                        index + 1,
+                        zakura_test::resources::load_rounds() * 64,
+                        started.elapsed(),
+                        server_close.get_or("not recorded"),
+                        transport.connection.close_reason(),
+                    )
+                })?;
         }
     }
     assert!(!cancel.is_cancelled());

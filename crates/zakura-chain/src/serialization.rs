@@ -1,4 +1,4 @@
-//! Consensus-critical serialization.
+//! Read and write the byte formats Zcash uses for blocks, transactions, and messages.
 //!
 //! This module contains four traits: `ZcashSerialize` and `ZcashDeserialize`,
 //! analogs of the Serde `Serialize` and `Deserialize` traits but intended for
@@ -6,20 +6,23 @@
 //! `ReadZcashExt`, extension traits for `io::Read` and `io::Write` with utility functions
 //! for reading and writing data (e.g., the Bitcoin variable-integer format).
 //!
-//! Decode complete, untrusted payloads with
-//! [`ZcashDeserialize::zcash_deserialize_from_slice`]. Its [`ZcashReader`] carries
-//! the actual remaining bytes through nested values and size limits. Collection
-//! decoders reject counts that exceed the protocol cap or cannot fit in that
-//! input before reserving memory. [`TrustedPreallocate::min_serialized_size`]
-//! describes the smallest encoding accepted by the element decoder, including
-//! structurally valid values that later consensus checks might reject.
+//! A message can declare more items than it actually supplies. When all payload
+//! bytes are in memory, use [`ZcashDeserialize::zcash_deserialize_from_slice`] to
+//! reject such counts before reserving memory. Its [`ZcashReader`] tells nested
+//! decoders how many bytes remain. Collections must fit both that input and the
+//! protocol's size limits.
+//!
+//! [`TrustedPreallocate::min_serialized_size`] gives the smallest number of bytes
+//! needed to decode one item. This is a parsing check. It must still accept
+//! encodings that later fail consensus validation.
 //!
 //! Implementations keep their field parsing in
-//! [`ZcashDeserialize::zcash_deserialize_from`] and use the reader's nested-value,
-//! external-count, and byte-string methods to preserve these bounds. Calling the
-//! older `io::Read` entry points inside a bounded decoder loses that guarantee.
+//! [`ZcashDeserialize::zcash_deserialize_from`] and use [`ZcashReader::read_value`],
+//! [`ZcashReader::read_external_count`], and [`ZcashReader::read_bytes`] for nested
+//! data. Calling the older `io::Read` entry points inside a bounded decoder loses
+//! the remaining byte count and its allocation checks.
 //! Existing streaming callers and implementations remain supported, but an
-//! unknown-length stream cannot provide an actual-input preallocation bound.
+//! stream whose length is unknown cannot reject a count based on bytes available.
 
 mod compact_size;
 mod constraint;

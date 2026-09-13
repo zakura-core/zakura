@@ -1,4 +1,8 @@
-//! Actual-input bounds, nested decoding, and streaming compatibility.
+//! Check that decoders reject counts that cannot fit in the supplied bytes.
+//!
+//! These tests cover collections inside other values, limits on nested reads,
+//! and buffer growth. Complete block fixtures must still decode to the same
+//! values as before, leaving any bytes after the block unread.
 
 use std::io::{self, Read};
 

@@ -30,15 +30,18 @@ pub trait ZcashDeserialize: Sized {
         Self::zcash_deserialize_from(&mut ZcashReader::from_stream(reader))
     }
 
-    /// Decode from actual payload bytes, preserving allocation bounds through
-    /// nested values. Advances the slice by the bytes consumed.
+    /// Decode from bytes already in memory, checking that collection counts can
+    /// fit before reserving memory. Leaves the slice pointing to the unread bytes.
     fn zcash_deserialize_from_slice(bytes: &mut &[u8]) -> Result<Self, SerializationError> {
         Self::zcash_deserialize_from(&mut ZcashReader::from_slice(bytes))
     }
 
-    /// Decode one value using the supplied input bounds. Implementations must
-    /// use `read_value`, `read_external_count`, and `read_bytes` for nested data.
-    /// The default rejects types that have only a streaming decoder.
+    /// Decode one value while keeping track of how many input bytes remain.
+    ///
+    /// Implementations must use the reader's `read_value`, `read_external_count`,
+    /// and `read_bytes` methods for nested data, so those decoders can check counts
+    /// before allocating. The default rejects types that only implement the older
+    /// streaming method.
     fn zcash_deserialize_from<R: io::Read>(
         _reader: &mut ZcashReader<R>,
     ) -> Result<Self, SerializationError> {

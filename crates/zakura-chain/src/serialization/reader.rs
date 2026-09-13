@@ -1,13 +1,23 @@
-//! Input bounds shared by nested consensus decoders.
+//! Keep track of the bytes left while decoding a complete message.
+//!
+//! A message can claim to contain more items than its bytes can hold. For example,
+//! two 32-byte hashes need 64 bytes. If only 40 bytes remain, the collection
+//! decoder can reject that count before reserving memory for the hashes.
+//!
+//! [`ZcashReader`] carries the remaining byte count into each nested decoder, so
+//! the same check works for collections inside blocks, transactions, and proofs.
+//! A stream whose length is unknown cannot provide this check. A maximum read
+//! limit alone does not tell us how many bytes are actually present.
 
 use std::io::{self, Read};
 
 use super::{SerializationError, TrustedPreallocate, ZcashDeserialize};
 
-/// A decoder input that distinguishes bytes present from a stream read allowance.
+/// Input for a decoder, with the number of bytes still available when known.
 ///
-/// Construct this from a slice to carry its actual length through nested values
-/// and protocol limits. Streaming callers retain their existing entry points.
+/// [`Self::from_slice`] starts with bytes already in memory. Reading nested
+/// values or applying a smaller read limit preserves the remaining byte count,
+/// so collection decoders can check their sizes before allocating memory.
 #[derive(Debug)]
 pub struct ZcashReader<R> {
     inner: R,
@@ -15,7 +25,8 @@ pub struct ZcashReader<R> {
 }
 
 impl<'a, 'b> ZcashReader<&'a mut &'b [u8]> {
-    /// Read from the supplied bytes, advancing the slice as input is consumed.
+    /// Read from bytes already in memory and track how many remain.
+    /// The supplied slice advances past each byte consumed.
     pub fn from_slice(bytes: &'a mut &'b [u8]) -> Self {
         let remaining = Some(bytes.len());
         Self {
@@ -33,13 +44,13 @@ impl<R: Read> ZcashReader<R> {
         }
     }
 
-    /// Bytes actually available within this reader, or `None` for streaming input.
-    /// A protocol limit alone never turns an unknown stream length into known data.
+    /// Number of bytes still available, or `None` if the input length is unknown.
+    /// A maximum read limit does not make an unknown stream length known.
     pub fn remaining_bytes(&self) -> Option<usize> {
         self.remaining
     }
 
-    /// Decode a nested value without losing this input's allocation bounds.
+    /// Decode one value, letting its decoder see how many bytes remain.
     pub fn read_value<T: ZcashDeserialize>(&mut self) -> Result<T, SerializationError> {
         if self.remaining.is_some() {
             T::zcash_deserialize_from(self)
@@ -48,8 +59,11 @@ impl<R: Read> ZcashReader<R> {
         }
     }
 
-    /// Restrict a nested object while preserving the distinction between actual
-    /// input and a maximum allowance. The parent advances with the child.
+    /// Give a nested decoder permission to read at most `limit` bytes.
+    /// Bytes consumed by that decoder also advance this reader.
+    ///
+    /// If 40 bytes remain and the limit is 100, only 40 bytes are available.
+    /// If the stream length is unknown, the limit does not prove any bytes exist.
     pub fn with_limit(&mut self, limit: u64) -> ZcashReader<io::Take<&mut Self>> {
         let remaining = self
             .remaining
@@ -60,7 +74,9 @@ impl<R: Read> ZcashReader<R> {
         }
     }
 
-    /// Decode an externally counted collection with the same bounds as `Vec<T>`.
+    /// Read `count` items when their count was decoded earlier or supplied by a rule.
+    /// Reject counts that exceed protocol limits or cannot fit in the known input
+    /// before allocating the collection.
     pub fn read_external_count<T: ZcashDeserialize + TrustedPreallocate>(
         &mut self,
         count: usize,
@@ -68,7 +84,8 @@ impl<R: Read> ZcashReader<R> {
         super::zcash_deserialize::read_external_count(count, self)
     }
 
-    /// Decode an externally counted byte string without trusting its count alone.
+    /// Read `count` bytes into a new buffer. Reject counts that exceed protocol
+    /// limits or the known remaining bytes before allocating it.
     pub fn read_bytes(&mut self, count: usize) -> Result<Vec<u8>, SerializationError> {
         super::zcash_deserialize::read_bytes(count, self)
     }

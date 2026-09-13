@@ -1,4 +1,10 @@
-//! Available-input allocation bounds and streaming decoder compatibility.
+//! Check that a message cannot make the decoder reserve memory for missing data.
+//!
+//! For example, a block header can declare 1,024 transactions but supply none.
+//! These tests measure memory requests to check that decoding rejects the count
+//! without allocating that collection. Complete transactions must still decode
+//! to the same values as before. F03 is the allocation property in the message
+//! regulation specification.
 
 use super::*;
 use proptest::prelude::*;

@@ -952,6 +952,7 @@ where
                     common_ancestor: page.common_ancestor,
                     target: page.target,
                     scope: page.scope,
+                    finalized_body_sizes: vec![None; page.headers.len()],
                     headers: page.headers,
                     aux_deliveries: page.aux_deliveries,
                     finalized_tree_aux,
@@ -1481,6 +1482,7 @@ mod tests {
             headers: vec![node.header],
             aux_deliveries: vec![Vec::new()],
             finalized_tree_aux: vec![None],
+            finalized_body_sizes: vec![None],
             complete: true,
         };
 

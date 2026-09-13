@@ -938,3 +938,62 @@ fn retained_page_uses_v1_only_when_every_record_is_available() {
     assert_eq!(served.entries[0].body_size, 321);
     assert_eq!(served.entries[0].tree_aux, Some(tree_aux));
 }
+
+#[test]
+fn port_page_takes_the_size_from_any_retained_delivery_under_v1() {
+    let header = regtest_genesis_block().header.clone();
+    let hash = header.hash();
+    let frontier = zakura_header_chain::Frontier::new(block::Height(0), hash);
+    let scope = || zakura_header_chain::HeaderWorkAuthority {
+        header_generation: zakura_header_chain::HeaderGeneration::new(1),
+        branch: zakura_header_chain::BranchId::new(hash, hash),
+    };
+    let owner: zakura_header_chain::HeaderSyncWorkOwner = scope()
+        .bind(3, std::num::NonZeroU64::new(4).expect("four is nonzero"))
+        .into();
+    let tree_aux = TreeAuxRecordV1 {
+        height: block::Height(0),
+        sapling_root: Default::default(),
+        orchard_root: Default::default(),
+        ironwood_root: Default::default(),
+        sapling_tx_count: 0,
+        orchard_tx_count: 0,
+        ironwood_tx_count: 0,
+        auth_data_root: [0; 32].into(),
+    };
+    let rooted_without_size = zakura_header_chain::AuxDelivery::new(
+        zakura_header_chain::EvidenceId::from_digest([1; 32]),
+        hash,
+        zakura_header_chain::SourceId::from_digest([2; 32]),
+        owner,
+        zakura_header_chain::BodySizeHint::Unknown,
+        Some(tree_aux),
+    );
+    let sized_without_root = zakura_header_chain::AuxDelivery::new(
+        zakura_header_chain::EvidenceId::from_digest([3; 32]),
+        hash,
+        zakura_header_chain::SourceId::from_digest([4; 32]),
+        owner,
+        zakura_header_chain::BodySizeHint::Known(
+            std::num::NonZeroU32::new(555).expect("the hint is nonzero"),
+        ),
+        None,
+    );
+    let page = zakura_node_services::header_chain::RetainedHeaderPathPage {
+        common_ancestor: frontier,
+        target: frontier,
+        scope: scope(),
+        headers: vec![header],
+        aux_deliveries: vec![vec![rooted_without_size, sized_without_root]],
+        finalized_tree_aux: vec![None],
+        finalized_body_sizes: vec![None],
+        complete: true,
+    };
+
+    let served =
+        assemble_port_header_path_page(1, page, AuxSchema::V1).expect("the page is coherent");
+
+    assert_eq!(served.tree_aux_schema, AuxSchema::V1);
+    assert_eq!(served.entries[0].tree_aux, Some(tree_aux));
+    assert_eq!(served.entries[0].body_size, 555);
+}

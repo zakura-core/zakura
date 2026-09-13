@@ -693,12 +693,11 @@ fn assemble_port_header_path_page(
                 let delivery = selected_port_aux_delivery(&deliveries, delivery_schema);
                 HeaderEntry {
                     header,
-                    body_size: finalized_body_size.map(NonZeroU32::get).unwrap_or_else(|| {
-                        delivery.map_or(0, |delivery| match delivery.body_size {
-                            zakura_header_chain::BodySizeHint::Unknown => 0,
-                            zakura_header_chain::BodySizeHint::Known(size) => size.get(),
+                    body_size: finalized_body_size
+                        .or_else(|| {
+                            zakura_header_chain::AuxDelivery::advertised_body_size(&deliveries)
                         })
-                    }),
+                        .map_or(0, NonZeroU32::get),
                     tree_aux: (tree_aux_schema == AuxSchema::V1)
                         .then(|| {
                             finalized_tree_aux.or_else(|| delivery.and_then(|item| item.tree_aux))

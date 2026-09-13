@@ -937,7 +937,7 @@ where
             zakura_state::RetainedPathReadOutcome::Page(page),
         ))) => {
             let finalized_body_sizes =
-                finalized_body_sizes_for_page(read_state.clone(), &page.headers).await?;
+                finalized_body_sizes_for_page(read_state.clone(), &page.headers).await;
             let finalized_tree_aux = if want_tree_aux {
                 finalized_tree_aux_for_page(
                     read_state,
@@ -975,11 +975,13 @@ where
 
 /// Committed serialized sizes for a retained page's headers, looked up by header hash
 /// through [`zakura_state::ReadRequest::BlockSizesByHash`], parallel to `headers`. Zero
-/// sizes are treated as unknown so the wire keeps its "0 = unknown" meaning.
+/// sizes are treated as unknown so the wire keeps its "0 = unknown" meaning. A failed or
+/// misaligned read degrades to unknown sizes: the sizes are scheduling advice and must never
+/// make a servable page unavailable.
 async fn finalized_body_sizes_for_page<ReadState>(
     read_state: ReadState,
     headers: &[Arc<block::Header>],
-) -> Result<Vec<Option<NonZeroU32>>, PortError>
+) -> Vec<Option<NonZeroU32>>
 where
     ReadState: Service<
             zakura_state::ReadRequest,
@@ -991,31 +993,60 @@ where
     ReadState::Future: Send + 'static,
 {
     if headers.is_empty() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
     let hashes: Vec<block::Hash> = headers.iter().map(|header| header.hash()).collect();
-    let sizes = match tokio::time::timeout(
+    match tokio::time::timeout(
         ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
         read_state.oneshot(zakura_state::ReadRequest::BlockSizesByHash { hashes }),
     )
     .await
     {
-        Ok(Ok(zakura_state::ReadResponse::BlockSizesByHash(sizes))) => sizes,
-        Ok(Ok(_)) => return Err(PortError::Unavailable { source: None }),
-        Ok(Err(error)) => {
-            return Err(PortError::Unavailable {
-                source: Some(Arc::from(error)),
-            })
+        Ok(Ok(zakura_state::ReadResponse::BlockSizesByHash(sizes)))
+            if sizes.len() == headers.len() =>
+        {
+            sizes
+                .into_iter()
+                .map(|size| size.and_then(NonZeroU32::new))
+                .collect()
         }
-        Err(_) => return Err(PortError::Timeout),
-    };
-    if sizes.len() != headers.len() {
-        return Err(PortError::Unavailable { source: None });
+        Ok(Ok(zakura_state::ReadResponse::BlockSizesByHash(sizes))) => {
+            let error_or_reason = format!(
+                "state returned {} body sizes for {} headers",
+                sizes.len(),
+                headers.len()
+            );
+            tracing::debug!(
+                ?error_or_reason,
+                "finalized body sizes unavailable; serving unknown sizes"
+            );
+            vec![None; headers.len()]
+        }
+        Ok(Ok(response)) => {
+            let error_or_reason = format!("unexpected state response: {response:?}");
+            tracing::debug!(
+                ?error_or_reason,
+                "finalized body sizes unavailable; serving unknown sizes"
+            );
+            vec![None; headers.len()]
+        }
+        Ok(Err(error)) => {
+            let error_or_reason = error;
+            tracing::debug!(
+                ?error_or_reason,
+                "finalized body sizes unavailable; serving unknown sizes"
+            );
+            vec![None; headers.len()]
+        }
+        Err(error) => {
+            let error_or_reason = error;
+            tracing::debug!(
+                ?error_or_reason,
+                "finalized body sizes unavailable; serving unknown sizes"
+            );
+            vec![None; headers.len()]
+        }
     }
-    Ok(sizes
-        .into_iter()
-        .map(|size| size.and_then(NonZeroU32::new))
-        .collect())
 }
 
 async fn finalized_tree_aux_for_page<ReadState>(
@@ -1848,15 +1879,13 @@ mod tests {
             }
         });
 
-        let sizes = finalized_body_sizes_for_page(read_state, &headers)
-            .await
-            .expect("the size reply is available");
+        let sizes = finalized_body_sizes_for_page(read_state, &headers).await;
 
         assert_eq!(sizes, vec![NonZeroU32::new(1_500), None]);
     }
 
     #[tokio::test]
-    async fn finalized_body_sizes_reject_a_misaligned_state_reply() {
+    async fn finalized_body_sizes_degrade_to_unknown_on_a_misaligned_state_reply() {
         let headers = vec![regtest_genesis_block().header.clone()];
         let read_state = tower::service_fn(move |_: zakura_state::ReadRequest| async move {
             Ok::<_, zakura_state::BoxError>(
@@ -1864,12 +1893,21 @@ mod tests {
             )
         });
 
-        let result = finalized_body_sizes_for_page(read_state, &headers).await;
+        let sizes = finalized_body_sizes_for_page(read_state, &headers).await;
 
-        assert!(matches!(
-            result,
-            Err(PortError::Unavailable { source: None })
-        ));
+        assert_eq!(sizes, vec![None]);
+    }
+
+    #[tokio::test]
+    async fn finalized_body_sizes_degrade_to_unknown_when_the_state_errors() {
+        let headers = vec![regtest_genesis_block().header.clone()];
+        let read_state = tower::service_fn(move |_: zakura_state::ReadRequest| async move {
+            Err::<zakura_state::ReadResponse, zakura_state::BoxError>("state unavailable".into())
+        });
+
+        let sizes = finalized_body_sizes_for_page(read_state, &headers).await;
+
+        assert_eq!(sizes, vec![None]);
     }
 
     #[tokio::test]
@@ -1882,9 +1920,7 @@ mod tests {
             ]))
         });
 
-        let sizes = finalized_body_sizes_for_page(read_state, &[])
-            .await
-            .expect("an empty page has no sizes");
+        let sizes = finalized_body_sizes_for_page(read_state, &[]).await;
 
         assert!(sizes.is_empty());
     }

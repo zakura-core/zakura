@@ -216,6 +216,9 @@ docker run --rm \
 export ZAKURAD_BIN
 ZAKURA_E2E_TRACE_DIR="${ZAKURA_E2E_TRACE_DIR:-${TMPDIR:-${HOME}/.tmp}/zakura-regtest-e2e-traces-${RUN_LABEL}}"
 export ZAKURA_E2E_TRACE_DIR
+if [[ -d "${ZAKURA_E2E_TRACE_DIR}" ]] && [[ -n "$(find "${ZAKURA_E2E_TRACE_DIR}" -mindepth 1 -print -quit)" ]]; then
+  fail "trace directory must be empty for this run: ${ZAKURA_E2E_TRACE_DIR}"
+fi
 mkdir -p \
   "${ZAKURA_E2E_TRACE_DIR}/node1" \
   "${ZAKURA_E2E_TRACE_DIR}/node2" \
@@ -302,18 +305,15 @@ assert_trace_layout() {
 # real leak still surfaces.
 wait_for_trace_flush() {
   trace_dir_has_csv || return 0
-  local deadline=$((SECONDS + TRACE_FLUSH_TIMEOUT)) node file starts finishes pending last leak
+  local deadline=$((SECONDS + TRACE_FLUSH_TIMEOUT)) node file pending last leak
   log "waiting for Zakura traces to flush before the oracle"
   while (( SECONDS < deadline )); do
     pending=0
     for node in node1 node2 node4; do
       file="${ZAKURA_E2E_TRACE_DIR}/${node}/commit_state.csv"
       if [[ -s "${file}" ]]; then
-        starts=$(trace_rows_after "${file}" 0 | jq -sc '[.[] | select(.event == "commit_start")] | length' || true)
-        finishes=$(trace_rows_after "${file}" 0 | jq -sc '[.[] | select(.event == "commit_finish")] | length' || true)
-        if (( finishes < starts )); then
-          printf '  %s commit_state starts=%s finishes=%s (waiting for flush)\n' \
-            "${node}" "${starts}" "${finishes}"
+        if ! python3 "${SCRIPT_DIR}/trace_oracle.py" --check-commit-balance "${file}"; then
+          printf '  %s commit_state has unmatched or malformed records (waiting for flush)\n' "${node}"
           pending=1
         fi
       fi
@@ -341,16 +341,13 @@ wait_for_trace_flush() {
 wait_for_commit_trace_balance() {
   local node="$1" label="$2"
   local file="${ZAKURA_E2E_TRACE_DIR}/${node}/commit_state.csv"
-  local deadline=$((SECONDS + TRACE_FLUSH_TIMEOUT)) starts finishes
+  local deadline=$((SECONDS + TRACE_FLUSH_TIMEOUT))
 
   [[ -s "${file}" ]] || fail "${label} commit trace is missing"
   log "waiting for ${label} commit trace to flush before reset"
   while (( SECONDS < deadline )); do
-    starts=$(trace_rows_after "${file}" 0 | jq -sc '[.[] | select(.event == "commit_start")] | length' || true)
-    finishes=$(trace_rows_after "${file}" 0 | jq -sc '[.[] | select(.event == "commit_finish")] | length' || true)
-    printf '  %s commit_state starts=%s finishes=%s\n' \
-      "${label}" "${starts}" "${finishes}"
-    (( starts == finishes )) && return 0
+    python3 "${SCRIPT_DIR}/trace_oracle.py" --check-commit-balance "${file}" && return 0
+    printf '  %s commit_state has unmatched or malformed records\n' "${label}"
     sleep 3
   done
   fail "${label} commit trace did not balance within ${TRACE_FLUSH_TIMEOUT}s"

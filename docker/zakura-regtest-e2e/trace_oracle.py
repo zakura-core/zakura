@@ -402,12 +402,12 @@ def load_traces(root: Path) -> list[NodeTrace]:
 
     for node_dir in node_dirs:
         candidates = [node_dir]
-        if not has_traces(node_dir):
-            candidates = [
-                child
-                for child in sorted(path for path in node_dir.iterdir() if path.is_dir())
-                if has_traces(child)
-            ]
+        # Inspect children even when stale or partial root traces exist.
+        candidates += [
+            child
+            for child in sorted(path for path in node_dir.iterdir() if path.is_dir())
+            if has_traces(child)
+        ]
 
         for trace_dir in candidates:
             node = node_dir.name if trace_dir == node_dir else f"{node_dir.name}/{trace_dir.name}"
@@ -494,6 +494,28 @@ def check_commit_pairs(node: NodeTrace, options: OracleOptions) -> list[Failure]
 
     failures.extend(check_commit_latency_trend(node, options))
     return failures
+
+
+def commits_balanced(rows: list[TraceRow]) -> bool:
+    """Require one finish per start within the same process generation."""
+    pending: dict[tuple[Any, ...], int] = {}
+    for row in rows:
+        if row.event == "csv_decode_error":
+            return False
+        if row.event not in (COMMIT_START, COMMIT_FINISH):
+            continue
+        identity = row_key(row)
+        if identity is None:
+            return False
+        key = (row.row.get("process_trace_id"), identity)
+        count = pending.get(key, 0)
+        if row.event == COMMIT_START:
+            pending[key] = count + 1
+        elif count == 0:
+            return False
+        else:
+            pending[key] = count - 1
+    return not any(pending.values())
 
 
 def check_required_commit_evidence(node: NodeTrace) -> list[Failure]:
@@ -1140,6 +1162,35 @@ def write_csv(path: Path, rows: Iterable[dict[str, Any]]) -> None:
 
 
 def run_self_test() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        path = root / "node1" / "current" / "commit_state.csv"
+        start = {"event": COMMIT_START, "apply_token": 1,
+                 "process_trace_id": "first", "node": "quoted,\ncommit_finish"}
+        finish = {**start, "event": COMMIT_FINISH}
+        write_csv(path, [start, finish])
+        assert commits_balanced(read_csv(path, "node1", "commit_state"))
+        for bad_rows in (
+            [start],
+            [start, {**finish, "apply_token": 2}],
+            [start, {**finish, "process_trace_id": "second"}],
+            [finish, start],
+            [start, start, finish],
+        ):
+            write_csv(path, bad_rows)
+            assert not commits_balanced(read_csv(path, "node1", "commit_state"))
+        # Rotation must preserve pairing across segments and quoted newlines.
+        write_csv(path, [start])
+        path.rename(path.with_name("commit_state.csv.1"))
+        write_csv(path, [finish])
+        assert commits_balanced(read_csv(path, "node1", "commit_state"))
+        path.with_name("commit_state.csv.1").unlink()
+        write_csv(path, [start])
+        for stale in ("", "invalid header\n"):
+            (root / "node1" / "commit_state.csv").write_text(stale)
+            assert any(f.node == "node1/current" and f.invariant == "commit_start_has_finish"
+                       for f in run_oracle(root))
+
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         node = root / "node1"
@@ -2033,6 +2084,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=[],
         help="node name whose body/header lag progress checks are informational only",
     )
+    parser.add_argument("--check-commit-balance", type=Path, help="check commit identities across CSV segments")
     parser.add_argument("--dump-csv", type=Path, help="decode a CSV table and retained segments to JSON for shell assertions")
     parser.add_argument("--after", type=int, default=0, help="skip this many decoded rows with --dump-csv")
     return parser.parse_args(argv)
@@ -2043,6 +2095,13 @@ def main(argv: list[str]) -> int:
     if args.self_test:
         run_self_test()
         return 0
+
+    if args.check_commit_balance is not None:
+        path = args.check_commit_balance
+        if not csv_segments(path):
+            return 1
+        rows = read_csv(path, path.parent.name, "commit_state")
+        return 0 if commits_balanced(rows) else 1
 
     if args.dump_csv is not None:
         table = args.dump_csv.name.split(".csv", 1)[0]

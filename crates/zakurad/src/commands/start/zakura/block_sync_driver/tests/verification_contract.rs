@@ -81,7 +81,12 @@ async fn check_ingress(case: Case) {
     );
     let (handle, mut actions, reactor) = spawn_block_sync_reactor(startup);
     let _reactor = AbortOnDropHandle::new(reactor);
-    let peers = SyntheticBlockSyncPeers::new(config.clone(), handle.clone(), 4);
+    let peers = SyntheticBlockSyncPeers::new(
+        config.clone(),
+        handle.clone(),
+        4,
+        zakura_chain::serialization::ZcashDecoder::for_network(&Network::Mainnet),
+    );
     let peer_id = ZakuraPeerId::new(vec![0x89; 32]).unwrap();
     let mut peer = peers
         .add_peer(

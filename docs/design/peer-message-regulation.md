@@ -44,6 +44,12 @@ runtime work. Bounded decoder tests still check that untrusted payloads cannot c
 ## Response lifetime and session replacement
 
 The shared requester primitives separate response credit from session lifetime.
+An explicit credit grant can add object and byte allowances within the message's
+outstanding-credit limits. It preserves cumulative consumption and rejects an
+excessive or overflowing grant without changing either counter. The message
+adapter records each grant before publishing it, checks its identity and sequence,
+and prohibits grants after closure. Finite GetBlocks requests receive credit once.
+Renewal supports the future subscription contract.
 `ResponseCredit` counts consumed objects and actual bytes. `ResponseScope` fences
 publication and first writes for one receiver incarnation. Each exchange has one
 `ResponseAuthorization` owner, retained until its validated ending. The writer
@@ -82,7 +88,11 @@ and registry capacities before taking work or publishing expectations. When the
 preferred batch cannot fit, it tries tighter growth and smaller batches. Retained
 buffers keep their charges when emptied, and growth funds old and new storage
 together. These allowances are separate from body storage, decoding, and execution
-budgets. They do not bound total process memory.
+budgets. Other metadata collections, transport setup, stream buffers and
+cancellation children still need aggregate accounting. These limits do not bound
+all protocol metadata or total process memory. The
+[allocation guide](../testing/request-allocation-planning.md) describes the funded
+buffers and their publication contract.
 
 ## Capacity admission and QUIC backpressure
 

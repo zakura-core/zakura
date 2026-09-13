@@ -282,6 +282,23 @@ impl AuxDelivery {
         self.outcome().status() == AuxOutcomeStatus::Rejected
     }
 
+    /// The advisory body size to schedule against from one header's retained deliveries:
+    /// the non-rejected delivery with a known size, preferring authenticated deliveries and
+    /// then the smallest `delivery_id`. `None` when no retained delivery knows the size.
+    /// Scheduling-only: verification never consults it.
+    pub fn advertised_body_size(deliveries: &[Self]) -> Option<NonZeroU32> {
+        deliveries
+            .iter()
+            .copied()
+            .filter(|delivery| !delivery.is_rejected())
+            .filter_map(|delivery| match delivery.body_size {
+                BodySizeHint::Known(size) => Some((delivery, size)),
+                BodySizeHint::Unknown => None,
+            })
+            .min_by_key(|(delivery, _)| (!delivery.is_authenticated(), delivery.delivery_id))
+            .map(|(_, size)| size)
+    }
+
     /// Return whether integrated verification disputed this delivery.
     pub fn is_disputed(self) -> bool {
         self.outcome().status() == AuxOutcomeStatus::Disputed

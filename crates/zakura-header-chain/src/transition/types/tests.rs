@@ -760,3 +760,61 @@ fn transition_domain_codes_are_stable_and_exhaustive() {
     }
     assert_eq!(TransitionDomain::from_code(15), None);
 }
+
+#[test]
+fn advertised_body_size_prefers_authenticated_known_sizes_and_skips_rejected() {
+    let header_hash = block::Hash([6; 32]);
+    let tree_aux = crate::TreeAuxRecordV1 {
+        height: block::Height(1),
+        sapling_root: Default::default(),
+        orchard_root: Default::default(),
+        ironwood_root: Default::default(),
+        sapling_tx_count: 0,
+        orchard_tx_count: 0,
+        ironwood_tx_count: 0,
+        auth_data_root: [0; 32].into(),
+    };
+    // status_code: 0 = fresh (unauthenticated), 1 = authenticated, 2 = rejected.
+    let sized = |marker: u8, size: u32, status_code: u8| {
+        let delivery = AuxDelivery::new(
+            EvidenceId::from_digest([marker; 32]),
+            header_hash,
+            SourceId::from_digest([10; 32]),
+            header_owner(),
+            BodySizeHint::Known(std::num::NonZeroU32::new(size).expect("test sizes are nonzero")),
+            Some(tree_aux),
+        );
+        if status_code == 0 {
+            delivery
+        } else {
+            delivery
+                .promote_recovered_outcome(
+                    status_code,
+                    [Some([marker.wrapping_add(6); 32]), None],
+                    Some(block::Hash([9; 32])),
+                )
+                .expect("the test outcome is coherent")
+        }
+    };
+    let unknown = delivery(
+        EvidenceId::from_digest([1; 32]),
+        header_hash,
+        header_owner(),
+    );
+    let rejected = sized(2, 10, 2);
+    let unauthenticated = sized(3, 20, 0);
+    let authenticated = sized(4, 30, 1);
+
+    assert_eq!(AuxDelivery::advertised_body_size(&[]), None);
+    assert_eq!(AuxDelivery::advertised_body_size(&[unknown]), None);
+    assert_eq!(AuxDelivery::advertised_body_size(&[rejected]), None);
+    assert_eq!(
+        AuxDelivery::advertised_body_size(&[unknown, rejected, unauthenticated]),
+        std::num::NonZeroU32::new(20)
+    );
+    assert_eq!(
+        AuxDelivery::advertised_body_size(&[unauthenticated, authenticated, rejected]),
+        std::num::NonZeroU32::new(30),
+        "an authenticated delivery wins even with a larger delivery id"
+    );
+}

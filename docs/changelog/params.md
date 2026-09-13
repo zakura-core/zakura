@@ -32,6 +32,8 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| Native QUIC receive credit | `crates/zakura-network/src/zakura/handler.rs` | `16 MiB` → `256 KiB` per stream, `32 MiB` → `9.5 MiB` per connection | [#981](https://github.com/zakura-core/zakura/pull/981) | Leave progress credit while 32 sibling consumers are paused, including room for batched credit updates. |
+| Native open stream limit | `crates/zakura-network/src/zakura/handshake.rs` and `handler.rs` | `1024` → `16` | [#981](https://github.com/zakura-core/zakura/pull/981) | Advertise 16 accepted streams and cap remotely initiated bidirectional transport streams at 16. |
 | `NODE_RESPONSE_METADATA_BYTES` / `CONNECTION_RESPONSE_METADATA_BYTES` | `crates/zakura-network/src/zakura/regulation/response_memory.rs` | new → `128 MiB` per node / `16 MiB` per connection | [#979](https://github.com/zakura-core/zakura/pull/979) | Share response bookkeeping limits across services and retain charges until the last owner releases memory. |
 | `BlockSyncService::stream_write_policy` (data) | `crates/zakura-network/src/zakura/block_sync/service.rs` | `10 s` → `32 s` | [#945](https://github.com/zakura-core/zakura/pull/945) | Allow healthy block-data writes to wait for shared connection credit on lossy links with a paused service. |
 | `DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW` | `crates/zakura-network/src/zakura/handler.rs` | `32 MiB` → `16 MiB` | [#943](https://github.com/zakura-core/zakura/pull/943) | Leave connection receive credit for another service while one stream's application reads are paused. |

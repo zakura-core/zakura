@@ -1584,6 +1584,7 @@ struct RegisteredConnectionServeContext {
     conn_id: ZakuraConnId,
     connection_token: CancellationToken,
     close_cause: CloseCause,
+    response_memory: crate::zakura::regulation::ConnectionResponseMemory,
     accepted_capabilities: u64,
     /// Whether this side dialed the connection. The dialer (initiator) opens
     /// ordinary ordered streams. The node-id winner opens block sync (the sole
@@ -1981,6 +1982,7 @@ pub struct ZakuraProtocolHandler {
     supported_capabilities: Arc<AtomicU64>,
     limits: ZakuraLocalLimits,
     registry: Arc<ServiceRegistry>,
+    response_memory: crate::zakura::regulation::ResponseMemory,
     trace: ZakuraTrace,
     next_conn_id: Arc<AtomicU64>,
     next_stream_id: Arc<AtomicU64>,
@@ -2094,6 +2096,7 @@ impl ZakuraProtocolHandler {
             registry,
             trace,
             next_conn_id: Arc::new(AtomicU64::new(1)),
+            response_memory: crate::zakura::regulation::ResponseMemory::default(),
             // Stream session IDs are local correlation generations, not wire
             // sequence numbers. A random process seed prevents preserved traces
             // and late completions from colliding after a node restart.
@@ -2329,6 +2332,7 @@ impl ZakuraProtocolHandler {
         let conn_id = context.conn_id;
         let connection_token = context.connection_token;
         let close_cause = context.close_cause;
+        let response_memory = context.response_memory;
         let accepted_capabilities = context.accepted_capabilities;
         let stream_sem = Arc::new(Semaphore::new(usize::from(limits.max_open_streams)));
         let mut workers = JoinSet::new();
@@ -2441,6 +2445,7 @@ impl ZakuraProtocolHandler {
                     HashMap::new(),
                     connection_token.clone(),
                     close_cause.clone(),
+                    response_memory.clone(),
                 ));
             cleanup_guard.add_admitted_capabilities(accepted_capabilities);
         } else if !connection_token.is_cancelled() {
@@ -2512,6 +2517,7 @@ impl ZakuraProtocolHandler {
                             std::mem::take(&mut service_streams),
                             connection_token.clone(),
                             close_cause.clone(),
+                            response_memory.clone(),
                         ));
                 cleanup_guard.add_admitted_capabilities(admitted_capabilities);
             }
@@ -2650,6 +2656,7 @@ impl ZakuraProtocolHandler {
                                     service_streams,
                                     connection_token.clone(),
                                     close_cause.clone(),
+                                    response_memory.clone(),
                                 ),
                             );
                             cleanup_guard.add_admitted_capabilities(admitted_capabilities);
@@ -2812,6 +2819,7 @@ impl ZakuraProtocolHandler {
                                 service_streams,
                                 connection_token.clone(),
                                 close_cause.clone(),
+                                response_memory.clone(),
                             ),
                         );
                         cleanup_guard.add_admitted_capabilities(admitted_capabilities);
@@ -3322,6 +3330,18 @@ impl ZakuraProtocolHandler {
             return Ok(());
         }
 
+        // Reserve before registration can replace an existing connection.
+        let Some(response_memory) = self.response_memory.try_connection() else {
+            debug!(
+                ?peer_id,
+                "declining connection at local response metadata capacity"
+            );
+            connection.close(
+                VarInt::from_u32(ZAKURA_CLOSE_RESOURCE),
+                b"response metadata",
+            );
+            return Ok(());
+        };
         let (outbound_tx, outbound_rx) =
             mpsc::channel(usize::from(context.limits.max_inbound_queue_depth));
         let close_cause = CloseCause::new();
@@ -3375,6 +3395,7 @@ impl ZakuraProtocolHandler {
                         conn_id,
                         connection_token: disconnect_token,
                         close_cause,
+                        response_memory,
                         accepted_capabilities: context.accepted_capabilities,
                         is_initiator: context.role == "initiator",
                         i_open_collision_winner: context.i_open_collision_winner,
@@ -7356,6 +7377,7 @@ mod tests {
             streams,
             connection_cancel.clone(),
             CloseCause::new(),
+            crate::zakura::regulation::ResponseMemory::default().connection(),
         ));
 
         let frame = tokio::time::timeout(Duration::from_secs(1), outbound_rx.recv())

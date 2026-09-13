@@ -31,8 +31,8 @@ proptest! {
             match action {
                 0 if owners[index].is_none() => {
                     let grant = scopes[generation].authorize();
-                    prop_assert_eq!(grant.is_some(), !closed);
-                    if let Some(grant) = grant {
+                    prop_assert_eq!(grant.is_ok(), !closed);
+                    if let Ok(grant) = grant {
                         if let Some(old_writer) = &writers[index] {
                             prop_assert!(!old_writer.try_start(|| true));
                         }
@@ -93,7 +93,7 @@ proptest! {
                         })
                     });
                     prop_assert_eq!(scopes[generation].retire(), !closed);
-                    prop_assert!(scopes[generation].authorize().is_none());
+                    prop_assert!(scopes[generation].authorize().is_err());
                     if !closed {
                         scopes.push(ResponseScope::new(connection.clone(), cause.clone()));
                     }

@@ -13,7 +13,9 @@ use tokio::sync::Notify;
 use zakura_chain::serialization::ZcashDecoder;
 
 mod sessions;
-use crate::zakura::regulation::{ResponseAuthorization, ResponseScope};
+use crate::zakura::regulation::{
+    ConnectionResponseMemory, ResponseAdmissionError, ResponseAuthorization, ResponseScope,
+};
 pub(super) use sessions::CurrentSessions;
 use sessions::SessionCapacity;
 
@@ -76,6 +78,7 @@ impl BlockSyncPeerSession {
         requests: FramedSend,
         connection_cancel: CancellationToken,
         close_cause: crate::zakura::CloseCause,
+        response_scope: ResponseScope,
     ) -> Self {
         Self {
             peer_id: session.peer_id().clone(),
@@ -85,7 +88,7 @@ impl BlockSyncPeerSession {
             requests,
             remote_status: watch::channel(false).0,
             cancel_token: session.cancel_token(),
-            response_scope: ResponseScope::new(connection_cancel.clone(), close_cause.clone()),
+            response_scope,
             connection_cancel,
             close_cause,
             reactor_ready: Arc::new(Notify::new()),
@@ -156,8 +159,14 @@ impl BlockSyncPeerSession {
         self.cancel_token.cancel();
     }
 
-    pub(super) fn authorize_response(&self) -> Option<ResponseAuthorization> {
+    pub(super) fn authorize_response(
+        &self,
+    ) -> Result<ResponseAuthorization, ResponseAdmissionError> {
         self.response_scope.authorize()
+    }
+
+    pub(super) fn response_memory(&self) -> ConnectionResponseMemory {
+        self.response_scope.memory()
     }
 
     #[cfg(test)]
@@ -695,6 +704,16 @@ impl Service for BlockSyncService {
                 }
             }
 
+            // Prepare before retiring the old receiver or publishing admission.
+            let Ok(response_scope) = ResponseScope::try_with_memory(
+                &connection_cancel_token,
+                &close_cause,
+                peer.response_memory(),
+            ) else {
+                service_cancel_token.cancel();
+                return;
+            };
+
             // Keep the old receiver's publication/start fence inside admission.
             // A started exchange prevents reuse of its connection even if the
             // old routine has not observed its cancellation yet.
@@ -741,6 +760,7 @@ impl Service for BlockSyncService {
                 request_sender,
                 connection_cancel_token.clone(),
                 close_cause.clone(),
+                response_scope,
             );
             let old_record = active_peers.insert(
                 peer_id.clone(),

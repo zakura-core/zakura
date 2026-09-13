@@ -2249,6 +2249,7 @@ mod tests {
             )]),
             cancel_token,
             CloseCause::new(),
+            crate::zakura::regulation::ResponseMemory::default().connection(),
         )
     }
 

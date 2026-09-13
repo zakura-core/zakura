@@ -298,3 +298,11 @@ retries = 0
 slow-timeout = { period = "90s", terminate-after = 1 }
 failure-output = "immediate"
 default-filter = 'test(~regulation::response_scope::) or test(~regulation::response_properties::) or test(~regulation::response::) or test(~block_sync::service::tests::) or test(~work_queue::request_write::tests::)'
+
+# Shared response metadata limits, setup and retained owners, run locally.
+[profile.response-memory]
+fail-fast = false
+retries = 0
+slow-timeout = { period = "90s", terminate-after = 1 }
+failure-output = "immediate"
+default-filter = 'test(~regulation::response_memory::) or test(~regulation::response_scope::) or test(~regulation::response_properties::) or test(~peer_routine::tests::memory::) or test(~block_sync::service::tests::) or test(~transport::registry::tests::)'

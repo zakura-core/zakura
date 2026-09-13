@@ -164,6 +164,7 @@ pub struct Peer {
     cancel_token: CancellationToken,
     service_cancel_token: CancellationToken,
     close_cause: CloseCause,
+    response_memory: crate::zakura::regulation::ConnectionResponseMemory,
 }
 
 impl Peer {
@@ -225,6 +226,9 @@ impl Peer {
             streams,
             cancel_token,
             CloseCause::new(),
+            crate::zakura::regulation::ResponseMemory::default()
+                .try_connection()
+                .expect("default response budget funds a connection"),
         )
     }
 
@@ -238,6 +242,7 @@ impl Peer {
         streams: HashMap<u16, (FramedRecv, FramedSend)>,
         cancel_token: CancellationToken,
         close_cause: CloseCause,
+        response_memory: crate::zakura::regulation::ConnectionResponseMemory,
     ) -> Self {
         let streams = streams
             .into_iter()
@@ -257,6 +262,7 @@ impl Peer {
             streams,
             cancel_token,
             close_cause,
+            response_memory,
         )
     }
 
@@ -270,6 +276,7 @@ impl Peer {
         streams: HashMap<u16, ServiceStream>,
         cancel_token: CancellationToken,
         close_cause: CloseCause,
+        response_memory: crate::zakura::regulation::ConnectionResponseMemory,
     ) -> Self {
         let service_cancel_token = streams
             .values()
@@ -286,6 +293,7 @@ impl Peer {
             cancel_token,
             service_cancel_token,
             close_cause,
+            response_memory,
         )
     }
 
@@ -300,6 +308,7 @@ impl Peer {
         cancel_token: CancellationToken,
         service_cancel_token: CancellationToken,
         close_cause: CloseCause,
+        response_memory: crate::zakura::regulation::ConnectionResponseMemory,
     ) -> Self {
         Self {
             id,
@@ -311,6 +320,7 @@ impl Peer {
             cancel_token,
             service_cancel_token,
             close_cause,
+            response_memory,
         }
     }
 
@@ -362,6 +372,10 @@ impl Peer {
         self.close_cause.clone()
     }
 
+    pub(crate) fn response_memory(&self) -> crate::zakura::regulation::ConnectionResponseMemory {
+        self.response_memory.clone()
+    }
+
     /// Split this peer into fields so the registry can fan streams out by owner.
     pub(crate) fn into_parts(
         self,
@@ -374,6 +388,7 @@ impl Peer {
         HashMap<u16, ServiceStream>,
         CancellationToken,
         CloseCause,
+        crate::zakura::regulation::ConnectionResponseMemory,
     ) {
         (
             self.id,
@@ -384,6 +399,7 @@ impl Peer {
             self.streams,
             self.cancel_token,
             self.close_cause,
+            self.response_memory,
         )
     }
 }
@@ -623,6 +639,16 @@ impl SinkReject {
 
 #[cfg(test)]
 mod tests {
+    impl super::Peer {
+        /// The endpoint supplies one context for the whole connection before fanout.
+        pub(crate) fn with_response_memory(
+            mut self,
+            memory: crate::zakura::regulation::ConnectionResponseMemory,
+        ) -> Self {
+            self.response_memory = memory;
+            self
+        }
+    }
     use super::*;
 
     #[test]

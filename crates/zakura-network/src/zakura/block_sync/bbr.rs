@@ -1462,10 +1462,13 @@ mod bbr_tests {
     /// Two worst-case reservations per 2.5 MB floor deliver two 100 KB bodies per round
     /// trip: a 5 MB/s sample and a 200 KB BDP, so the gain-3 target (600 KB) never reaches
     /// the floor. Twenty-five hinted bodies per round trip sample 62.5 MB/s and a 7.5 MB
-    /// target, but the delay gate still holds the window at the floor: the first per-ack
-    /// sample's size residual is `elapsed - bytes / (bytes / elapsed)` = 0, clamped to the
-    /// 0.1 ms minimum, so every later round trip reads as a standing queue.
-    /// The two floor assertions on the hinted case pin a known defect and must change when the delay-gate baseline is fixed.
+    /// target, but for the first `bbr_rtprop_window` (10 s) the delay gate holds the window
+    /// at the floor: the first per-ack sample's size residual is
+    /// `elapsed - bytes / (bytes / elapsed)` = 0, clamped to the 0.1 ms minimum, so every
+    /// round trip in that window reads as a standing queue. Once that sample ages out the
+    /// ceiling relaxes and the window reaches the target. A single-body round re-arms the
+    /// transient, so it recurs wherever the floor admits only one body.
+    /// The transient assertions must change when the residual baseline is fixed.
     #[test]
     fn worst_case_reservations_and_the_delay_gate_pin_the_byte_window_at_its_floor() {
         use super::super::config::DEFAULT_BS_BBR_MIN_CWND_BYTES;
@@ -1524,5 +1527,34 @@ mod bbr_tests {
             "the delay gate ratchets the ceiling down to the floor"
         );
         assert_eq!(hinted.effective_cwnd(), floor);
+
+        // Keep delivering past the residual window (15 s at 40 ms per round): the first
+        // sample ages out, the ceiling relaxes, and the window reaches the gain-3 target.
+        let (mut recovered, mut now) = settle(25);
+        let started = now;
+        while now.saturating_duration_since(started) < Duration::from_secs(15) {
+            let snapshot = recovered.delivery_snapshot(now);
+            now += rtt;
+            for remaining in (0..25u64).rev() {
+                recovered.record_delivery(
+                    now,
+                    rtt,
+                    1,
+                    body_bytes,
+                    remaining * body_bytes,
+                    snapshot,
+                );
+            }
+        }
+        assert_eq!(
+            recovered.delay_cap(),
+            None,
+            "the ceiling relaxes once the first sample leaves the residual window"
+        );
+        let recovered_window = recovered.effective_cwnd();
+        assert!(
+            recovered_window >= 3 * floor - floor / 10,
+            "the window reaches the gain-3 target after the transient, got {recovered_window}"
+        );
     }
 }

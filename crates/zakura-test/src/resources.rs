@@ -1,23 +1,37 @@
-//! Process observations for declared load fixtures, independent of permit counts.
+//! Measure CPU time, peak memory, and lock delays during load tests.
+//!
+//! Capacity counters show how much work the node has allowed. These helpers let
+//! tests also observe what that work costs. [`ProcessUsage`] reads CPU and memory
+//! totals from the operating system. [`LockProbe`] records how long code waits
+//! for a lock and how long it holds the lock.
+//!
+//! For example, a test can compare CPU totals before and after serving a batch
+//! of requests. Those totals include other work in the same test program, so
+//! they do not isolate one request. Lock timings also depend on thread scheduling.
 
+// The operating system fills a local structure through a raw pointer. Rust
+// requires `unsafe` for that call. We read the structure only if the call succeeds.
 #![allow(
     unsafe_code,
-    reason = "read-only getrusage initializes a local C value"
+    reason = "reading operating system statistics requires a raw pointer call"
 )]
 
 use std::{io, time::Duration};
 
-/// Process-wide observations, including any concurrently running tests.
+/// CPU and memory totals for the entire test program, including other tests.
 #[derive(Clone, Copy, Debug)]
 pub struct ProcessUsage {
-    /// Total user and kernel CPU consumed since this process started.
+    /// CPU time used since the program started, including operating system work
+    /// on its behalf. This is time spent executing, not elapsed wall clock time.
     pub cpu: Duration,
-    /// Process high-water resident memory. This is not current retained memory.
+    /// Highest recorded number of bytes held in RAM for this program.
+    /// This peak does not fall when memory is freed.
     pub peak_resident_bytes: u64,
 }
 
 impl ProcessUsage {
-    /// Sample CPU and peak RSS where the operating system exposes `getrusage`.
+    /// Read the program's CPU and peak memory totals from the operating system.
+    /// Returns an error on unsupported systems or if the query fails.
     pub fn sample() -> io::Result<Self> {
         #[cfg(unix)]
         {
@@ -52,25 +66,29 @@ impl ProcessUsage {
     }
 }
 
-/// Real mutex acquisition/hold times. Waits include scheduling and observation cost.
+/// Time spent waiting for and holding a lock. Timings include scheduling delays.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LockSnapshot {
-    /// Number of acquisitions observed.
+    /// Number of times the lock was acquired.
     pub acquisitions: u64,
-    /// Sum of time spent acquiring the observed mutex.
+    /// Total time spent waiting to acquire the lock.
     pub wait: Duration,
-    /// Longest acquisition interval.
+    /// Longest wait for the lock.
     pub max_wait: Duration,
-    /// Longest observed hold interval.
+    /// Longest time the lock was held.
     pub max_hold: Duration,
 }
 
-/// Opt-in observations around a production lock, shared across test adapters.
+/// Record wait and hold times around a lock used by the code being tested.
 #[derive(Debug, Default)]
 pub struct LockProbe(std::sync::Mutex<LockSnapshot>);
 
 impl LockProbe {
-    /// Call immediately after acquiring the target mutex.
+    /// Record the wait and begin timing how long the lock is held.
+    ///
+    /// Capture `before` just before trying to acquire the lock, then call this
+    /// immediately after acquiring it. Drop the returned guard just before
+    /// releasing the lock.
     pub fn acquired_since(&self, before: std::time::Instant) -> LockHold<'_> {
         let waited = before.elapsed();
         let mut snapshot = self.0.lock().unwrap();
@@ -89,7 +107,8 @@ impl LockProbe {
     }
 }
 
-/// Drop immediately before releasing the mutex being observed.
+/// Record how long the lock was held when this guard is dropped.
+/// Drop it immediately before releasing the lock being measured.
 pub struct LockHold<'a> {
     probe: &'a LockProbe,
     acquired: std::time::Instant,
@@ -102,7 +121,8 @@ impl Drop for LockHold<'_> {
     }
 }
 
-/// Bounded CI default, with an explicit expansion for scheduled qualification.
+/// Number of times a load test repeats its workload. Defaults to four.
+/// `ZAKURA_REGULATION_LOAD_ROUNDS` overrides the default, clamped to 1 through 256.
 pub fn load_rounds() -> usize {
     std::env::var("ZAKURA_REGULATION_LOAD_ROUNDS")
         .ok()

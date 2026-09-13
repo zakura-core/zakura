@@ -1,12 +1,26 @@
-//! Opt-in allocation observations for synchronous tests on one thread.
+//! Check how much memory a function requests during a test.
 //!
-//! Install [`TrackingAllocator`] as the test binary's global allocator, then use
-//! [`measure`] around the production operation. Other threads and the observer's
-//! own bookkeeping are excluded. This is not a process RSS measurement.
+//! A small message can claim to contain many transactions. Tests use this helper
+//! to check whether the decoder reserves memory for data that is missing. It
+//! records the largest request, the most memory held at once, and the memory
+//! still held when the function returns.
+//!
+//! For example, a function that holds an 8 KiB temporary buffer and a 1 KiB result
+//! at the same time, then frees the temporary buffer, has a 9 KiB peak and leaves
+//! 1 KiB allocated at return.
+//!
+//! To use this helper, install [`TrackingAllocator`] as the test program's
+//! allocator, the component that handles memory requests. It passes those
+//! requests to Rust's system allocator and records them while [`measure`] runs.
+//! Only requests on the calling thread count. Other threads and the helper's
+//! own records are excluded. This does not measure the whole program's memory.
 
+// Rust requires `unsafe` to implement its raw memory allocation interface.
+// This wrapper lets System allocate and free memory. It records addresses and
+// sizes but never reads or writes the allocated memory itself.
 #![allow(
     unsafe_code,
-    reason = "test allocator delegates pointer operations unchanged to System"
+    reason = "Rust's allocator interface requires unsafe raw memory operations"
 )]
 
 use std::{
@@ -15,16 +29,16 @@ use std::{
     collections::BTreeMap,
 };
 
-/// Allocation requests and live allocations made inside one measured operation.
+/// Memory requested during one call to [`measure`], including temporary buffers.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AllocationStats {
-    /// Successful allocation/reallocation calls.
+    /// Number of successful requests to allocate or resize memory.
     pub requests: usize,
-    /// Sum of requested sizes, including repeated reallocations.
+    /// Sum of requested sizes. Resizing a buffer counts its full new size again.
     pub requested_bytes: usize,
-    /// Largest individual requested allocation.
+    /// Largest number of bytes requested in a single call.
     pub largest_request: usize,
-    /// Largest simultaneously live allocation total from this operation.
+    /// Most bytes from this operation allocated at the same time.
     pub peak_live_bytes: usize,
     /// Bytes from this operation still allocated when it returned.
     pub retained_bytes: usize,
@@ -42,8 +56,8 @@ thread_local! {
 
 fn observe(operation: impl FnOnce(&mut Observation)) {
     let _ = ACTIVE.try_with(|active| {
-        // Allocating/freeing the bookkeeping map reenters the allocator. Ignore
-        // that operation without borrowing recursively or attributing it to SUT.
+        // Updating our records can itself allocate or free memory. Skip those
+        // requests so the helper does not count its own memory use.
         if let Ok(mut active) = active.try_borrow_mut() {
             if let Some(observation) = active.as_mut() {
                 operation(observation);
@@ -77,7 +91,10 @@ fn freed(pointer: *mut u8) {
     });
 }
 
-/// System allocator with opt-in thread-local observations.
+/// Handle the test program's memory requests and record them during [`measure`].
+///
+/// Install this once with `#[global_allocator]`. Actual allocation and freeing
+/// still use [`System`], whether or not a measurement is active.
 pub struct TrackingAllocator;
 
 // SAFETY: Every pointer/layout operation is delegated to the System allocator.
@@ -114,11 +131,13 @@ unsafe impl GlobalAlloc for TrackingAllocator {
     }
 }
 
-/// Observe allocations made by a synchronous operation on the calling thread.
+/// Run a function and return both its result and its memory measurements.
 ///
-/// Initialize lazy fixtures before calling this function. Do not move measured
-/// allocations across threads or await inside the operation. Nested measurement
-/// is rejected. A panic ends the observation before it propagates.
+/// Set up test input and initialize any shared fixtures before measuring, so
+/// their memory requests do not count as part of the function being tested.
+/// The function must run entirely on this thread, without `await` or moving its
+/// allocations to another thread. Calling `measure` inside another `measure`
+/// panics. If the measured function panics, recording stops before it propagates.
 pub fn measure<T>(operation: impl FnOnce() -> T) -> (T, AllocationStats) {
     struct Reset;
     impl Drop for Reset {

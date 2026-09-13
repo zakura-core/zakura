@@ -26,6 +26,19 @@ version 1. The tests preserve this decision from the implementation stack.
 | Request allocation plans | [Allocation planning](request-allocation-planning.md) |
 | Transport and composed workloads | Requirement map and workload bounds below |
 
+## Known load counterexample
+
+The local 64-round run attempts 4,096 sequential legal exchanges. The continuous
+traffic property closes at exchange 2,049 instead of finishing them. Four rounds
+complete successfully. The longer failure remains enabled with the same request
+sequence, default limits and assertion. Diagnostics record the exchange number
+and both peers' close causes.
+
+The client records `ordered_read_error`. This identifies the reader/admission path,
+but does not distinguish its underlying errors. That cause still needs diagnosis.
+Fixing this should preserve the intended resource and cadence rules across message
+classes. Raising this fixture's rate limit would hide the counterexample.
+
 ## Deferred requirements
 
 The stack uses published transport packages without overrides. The receive policy

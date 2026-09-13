@@ -3189,7 +3189,7 @@ async fn check_template_rejection_recovery(reject_before_poll: bool) {
         preparation.take().unwrap().respond_error(rejection());
         tokio::time::timeout(
             Duration::from_secs(1),
-            rpc.wait_for_mining_template_rejection(&work_id),
+            rpc.wait_for_mining_template_withdrawal(Some(&work_id)),
         )
         .await
         .unwrap();
@@ -3219,7 +3219,7 @@ async fn check_template_rejection_recovery(reject_before_poll: bool) {
     }
     tokio::time::timeout(
         Duration::from_secs(1),
-        rpc.wait_for_mining_template_rejection(&work_id),
+        rpc.wait_for_mining_template_withdrawal(Some(&work_id)),
     )
     .await
     .unwrap();
@@ -4601,4 +4601,542 @@ async fn rpc_getchaintips_empty_state() {
     );
 
     read_state.expect_no_requests().await;
+}
+
+/// Builds a server mining template on `parent` for the preparation tests.
+fn speculative_test_template(parent: Hash) -> BlockTemplateResponse {
+    let network = Mainnet;
+    let miner_params = types::get_block_template::MinerParams::new(
+        &network,
+        mining::Config {
+            miner_address: Some(ZcashAddress::from_transparent_p2pkh(
+                NetworkType::Main,
+                [0x7e; 20],
+            )),
+            ..Default::default()
+        },
+    )
+    .expect("the test miner address is valid");
+    let height = NetworkUpgrade::Nu5
+        .activation_height(&network)
+        .expect("Nu5 activates on Mainnet");
+    let chain_info = GetBlockTemplateChainInfo {
+        expected_difficulty: CompactDifficulty::from(ExpandedDifficulty::from(U256::one())),
+        tip_height: height,
+        tip_hash: parent,
+        cur_time: 1654008617.into(),
+        min_time: 1654008606.into(),
+        max_time: 1654008728.into(),
+        chain_history_root: fake_history_tree(&network).hash(),
+    };
+    let long_poll_id = types::long_poll::LongPollInput::new(
+        chain_info.tip_height,
+        chain_info.tip_hash,
+        chain_info.max_time,
+        vec![],
+    )
+    .generate_id();
+
+    BlockTemplateResponse::new_internal(
+        &network,
+        None,
+        &miner_params,
+        &chain_info,
+        long_poll_id,
+        vec![],
+        None,
+    )
+}
+
+/// A request whose tip went stale must not erase the current parent's withdrawals.
+///
+/// `set_parent` clears every rejection recorded for the parent it replaces, so a request that no
+/// longer agrees with the chain tip must return without writing anything.
+#[tokio::test]
+async fn a_stale_request_does_not_erase_the_current_parent_withdrawals() {
+    let _init_guard = zakura_test::init();
+    let current = Hash([1; 32]);
+    let stale = Hash([2; 32]);
+    let (tip, tip_sender) = MockChainTip::new();
+    tip_sender.send_best_tip_height(Height(1));
+    tip_sender.send_best_tip_hash(current);
+
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let verifier: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _queue) = RpcImpl::new(
+        Mainnet,
+        mining::Config {
+            miner_address: Some(ZcashAddress::from_transparent_p2pkh(
+                NetworkType::Main,
+                [0x7e; 20],
+            )),
+            ..Default::default()
+        },
+        false,
+        "0.0.1",
+        "stale tracking test",
+        Buffer::new(mempool, 1),
+        Buffer::new(state, 1),
+        Buffer::new(read_state, 1),
+        Buffer::new(verifier, 1),
+        MockSyncStatus::default(),
+        tip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    let mut rejections = rpc.gbt.template_rejections.subscribe();
+    rpc.track_template_parent(current, &mut rejections)
+        .expect("the current tip is tracked");
+    let withdrawal = rpc.wait_for_mining_template_withdrawal(Some("work"));
+    tokio::pin!(withdrawal);
+    assert!(futures::poll!(&mut withdrawal).is_pending());
+    rpc.gbt
+        .template_rejections
+        .send_if_modified(|state| state.reject(current, "work"));
+
+    assert!(
+        rpc.track_template_parent(stale, &mut rejections).is_none(),
+        "a request built on a parent the chain has left is told to fetch the tip again",
+    );
+    assert!(
+        rpc.mining_template_withdrawn("work"),
+        "the stale request must not clear the current parent's rejections",
+    );
+
+    let tracked = rpc
+        .track_template_parent(current, &mut rejections)
+        .expect("the current tip is still tracked");
+    assert_eq!(tracked.parent, Some(current));
+    assert!(tracked.contains("work"));
+
+    tip_sender.send_best_tip_hash(stale);
+    rpc.track_template_parent(stale, &mut rejections)
+        .expect("the new tip is tracked");
+    assert!(!rpc.mining_template_withdrawn("work"));
+    assert!(
+        futures::poll!(&mut withdrawal).is_ready(),
+        "a parent change must not erase a rejection the waiter has not read",
+    );
+}
+
+/// A preparation deadline classifies the cost; it does not stop the computation.
+///
+/// Dropping the future that awaits a tower call does not cancel what the call already dispatched,
+/// so the join handle is the only honest signal that a preparation is over. If the deadline
+/// released the preparation worker, every tip change during a slow verification would start
+/// another one on top of the last, and speculative work would accumulate without bound.
+#[tokio::test(start_paused = true)]
+async fn a_preparation_deadline_does_not_stop_its_computation() {
+    let _init_guard = zakura_test::init();
+    let parent = Hash([1; 32]);
+    let template = speculative_test_template(parent);
+
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let verifier = {
+        let calls = calls.clone();
+        let released = Arc::new(tokio::sync::Mutex::new(Some(released)));
+        tower::service_fn(move |_request| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let released = released.clone();
+            async move {
+                let receiver = released.lock().await.take();
+                if let Some(receiver) = receiver {
+                    let _ = receiver.await;
+                }
+                Ok::<_, zakura_consensus::BoxError>(Hash([2; 32]))
+            }
+        })
+    };
+
+    let (tip, tip_sender) = MockChainTip::new();
+    tip_sender.send_best_tip_hash(parent);
+    tip_sender.send_best_tip_height(Height(1));
+
+    let computation =
+        start_speculative_preparation(Buffer::new(verifier, 1), &template, tip, &Mainnet)
+            .expect("the template's parent is the chain tip, so verification is dispatched");
+
+    tokio::time::advance(TEMPLATE_PREPARATION_TIMEOUT + Duration::from_secs(1)).await;
+    assert!(
+        !computation.is_finished(),
+        "the deadline must not be read as the computation having stopped",
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    release.send(()).expect("the verification is still running");
+    assert!(
+        matches!(
+            computation
+                .await
+                .expect("the abandoned computation finishes once its verifier answers"),
+            Preparation::Prepared
+        ),
+        "an answer that arrives after the deadline is still an answer",
+    );
+}
+
+/// A template rejected past the deadline is still withdrawn.
+///
+/// The node cannot stop a verification it dispatched, so a rejection that arrives late is the
+/// only rejection it will ever get. Discarding it would leave miners working on a template the
+/// node already knows is invalid.
+#[tokio::test(start_paused = true)]
+async fn a_rejection_that_arrives_after_the_deadline_still_withdraws_the_template() {
+    let _init_guard = zakura_test::init();
+    let parent = Hash([1; 32]);
+    let (tip, tip_sender) = MockChainTip::new();
+    let height = NetworkUpgrade::Nu5.activation_height(&Mainnet).unwrap();
+    tip_sender.send_best_tip_height(height);
+    tip_sender.send_best_tip_hash(parent);
+    tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    let mut sync = MockSyncStatus::default();
+    sync.set_is_close_to_tip(true);
+    let mempool = tower::service_fn(move |_| async move {
+        Ok::<_, BoxError>(mempool::Response::FullTransactions {
+            transactions: vec![],
+            transaction_dependencies: Default::default(),
+            last_seen_tip_hash: parent,
+        })
+    });
+    let chain_info = GetBlockTemplateChainInfo {
+        expected_difficulty: CompactDifficulty::from(ExpandedDifficulty::from(U256::one())),
+        tip_height: height,
+        tip_hash: parent,
+        cur_time: 1654008617.into(),
+        min_time: 1654008606.into(),
+        max_time: 1654008728.into(),
+        chain_history_root: fake_history_tree(&Mainnet).hash(),
+    };
+    let read_state = tower::service_fn(move |request| {
+        let chain_info = chain_info.clone();
+        async move {
+            assert!(matches!(request, ReadRequest::ChainInfo));
+            Ok::<_, BoxError>(ReadResponse::ChainInfo(chain_info))
+        }
+    });
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut verifier: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _queue) = RpcImpl::new(
+        Mainnet,
+        mining::Config {
+            miner_address: Some(ZcashAddress::from_transparent_p2pkh(
+                NetworkType::Main,
+                [0x7e; 20],
+            )),
+            ..Default::default()
+        },
+        false,
+        "0.0.1",
+        "late rejection test",
+        Buffer::new(mempool, 1),
+        Buffer::new(state, 1),
+        Buffer::new(read_state, 1),
+        Buffer::new(verifier.clone(), 1),
+        sync,
+        tip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    let template = rpc
+        .get_block_template(None)
+        .await
+        .expect("the first template is returned");
+    let work_id = match &template {
+        GetBlockTemplateResponse::TemplateMode(template) => template.work_id().clone(),
+        GetBlockTemplateResponse::ProposalMode(_) => unreachable!("template mode was requested"),
+    };
+    let preparation = verifier
+        .expect_request_that(|request| matches!(request, zakura_consensus::Request::Prepare { .. }))
+        .await;
+
+    // The verification overruns its deadline, and only then condemns the template.
+    tokio::time::advance(TEMPLATE_PREPARATION_TIMEOUT + Duration::from_secs(1)).await;
+    preparation.respond(Err::<Hash, _>(zakura_consensus::BoxError::from(
+        zakura_consensus::VerifyBlockError::Block {
+            source: zakura_consensus::error::BlockError::MissingHeight(Hash([3; 32])),
+        },
+    )));
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    assert!(
+        rpc.mining_template_withdrawn(&work_id),
+        "a rejection the node waited past its deadline for is still recorded",
+    );
+}
+
+/// One missed deadline stops speculation for that parent, and only for that parent.
+#[test]
+fn a_missed_deadline_stops_speculation_until_the_parent_changes() {
+    let breaker = types::get_block_template::SpeculationBreaker::default();
+    let expensive = Hash([1; 32]);
+    let next = Hash([2; 32]);
+
+    assert!(breaker.allows(expensive));
+
+    breaker.trip(expensive);
+    assert!(
+        !breaker.allows(expensive),
+        "the parent whose template timed out is not speculated on again",
+    );
+    assert!(
+        breaker.allows(next),
+        "a new parent is the recovery condition",
+    );
+
+    breaker.trip(next);
+    assert!(
+        breaker.allows(expensive),
+        "the breaker tracks the newest expensive parent, not every parent ever seen",
+    );
+}
+
+/// A preparation the node stopped waiting for still holds the speculative worker.
+///
+/// A tip change abandons the wait without tripping the breaker, so nothing but the wait on the
+/// previous computation stops the next template starting a second verification on top of the
+/// first. Every tip change during a slow verification is one of these, which is how speculation
+/// accumulates work if the two are not tied together.
+#[tokio::test(start_paused = true)]
+async fn a_stale_preparation_holds_the_worker_until_it_finishes() {
+    let _init_guard = zakura_test::init();
+    let first_parent = Hash([1; 32]);
+    let second_parent = Hash([2; 32]);
+    let height = NetworkUpgrade::Nu5.activation_height(&Mainnet).unwrap();
+    let (tip, tip_sender) = MockChainTip::new();
+    tip_sender.send_best_tip_height(height);
+    tip_sender.send_best_tip_hash(first_parent);
+    tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    let mut sync = MockSyncStatus::default();
+    sync.set_is_close_to_tip(true);
+
+    // The state's tip follows the chain tip, so a template can be built on either parent.
+    let (state_tip, state_tip_rx) = tokio::sync::watch::channel(first_parent);
+    let mempool = {
+        let state_tip_rx = state_tip_rx.clone();
+        tower::service_fn(move |_| {
+            let last_seen_tip_hash = *state_tip_rx.borrow();
+            async move {
+                Ok::<_, BoxError>(mempool::Response::FullTransactions {
+                    transactions: vec![],
+                    transaction_dependencies: Default::default(),
+                    last_seen_tip_hash,
+                })
+            }
+        })
+    };
+    let read_state = tower::service_fn(move |request| {
+        let tip_hash = *state_tip_rx.borrow();
+        async move {
+            assert!(matches!(request, ReadRequest::ChainInfo));
+            Ok::<_, BoxError>(ReadResponse::ChainInfo(GetBlockTemplateChainInfo {
+                expected_difficulty: CompactDifficulty::from(ExpandedDifficulty::from(U256::one())),
+                tip_height: height,
+                tip_hash,
+                cur_time: 1654008617.into(),
+                min_time: 1654008606.into(),
+                max_time: 1654008728.into(),
+                chain_history_root: fake_history_tree(&Mainnet).hash(),
+            }))
+        }
+    });
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut verifier: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _queue) = RpcImpl::new(
+        Mainnet,
+        mining::Config {
+            miner_address: Some(ZcashAddress::from_transparent_p2pkh(
+                NetworkType::Main,
+                [0x7e; 20],
+            )),
+            ..Default::default()
+        },
+        false,
+        "0.0.1",
+        "speculation bound test",
+        Buffer::new(mempool, 1),
+        Buffer::new(state, 1),
+        Buffer::new(read_state, 1),
+        Buffer::new(verifier.clone(), 1),
+        sync,
+        tip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    // One template starts one speculative verification, which this test does not answer yet.
+    rpc.get_block_template(None)
+        .await
+        .expect("the first template is returned");
+    let first = verifier
+        .expect_request_that(|request| matches!(request, zakura_consensus::Request::Prepare { .. }))
+        .await;
+
+    // The chain moves on. The node stops waiting for a preparation built on the old parent, but
+    // that verification is still computing.
+    state_tip.send_replace(second_parent);
+    tip_sender.send_best_tip_hash(second_parent);
+    tokio::task::yield_now().await;
+
+    // A template on the new parent is queued behind it.
+    rpc.get_block_template(None)
+        .await
+        .expect("a template on the new parent is returned");
+    tokio::task::yield_now().await;
+
+    // Panics if the queued template started a second verification alongside the first.
+    verifier.expect_no_requests().await;
+
+    // Once the abandoned verification finishes, the queued template is prepared.
+    first.respond(Hash([3; 32]));
+    let second = verifier
+        .expect_request_that(|request| matches!(request, zakura_consensus::Request::Prepare { .. }))
+        .await;
+    second.respond(Hash([4; 32]));
+}
+
+/// Speculative preparation never runs two verifications at once, however many templates arrive./// A parent whose template missed its deadline is not speculated on again.
+///
+/// Retrying it would pay the cost that just failed to finish for every template built on that
+/// parent, so speculation stops until the chain moves on. Ordinary validation is unaffected.
+#[tokio::test(start_paused = true)]
+async fn a_timed_out_parent_is_not_speculated_on_again() {
+    let _init_guard = zakura_test::init();
+    let parent = Hash([1; 32]);
+    let (tip, tip_sender) = MockChainTip::new();
+    let height = NetworkUpgrade::Nu5.activation_height(&Mainnet).unwrap();
+    tip_sender.send_best_tip_height(height);
+    tip_sender.send_best_tip_hash(parent);
+    tip_sender.send_estimated_distance_to_network_chain_tip(Some(0));
+    let mut sync = MockSyncStatus::default();
+    sync.set_is_close_to_tip(true);
+    let mempool = tower::service_fn(move |_| async move {
+        Ok::<_, BoxError>(mempool::Response::FullTransactions {
+            transactions: vec![],
+            transaction_dependencies: Default::default(),
+            last_seen_tip_hash: parent,
+        })
+    });
+    let chain_info = GetBlockTemplateChainInfo {
+        expected_difficulty: CompactDifficulty::from(ExpandedDifficulty::from(U256::one())),
+        tip_height: height,
+        tip_hash: parent,
+        cur_time: 1654008617.into(),
+        min_time: 1654008606.into(),
+        max_time: 1654008728.into(),
+        chain_history_root: fake_history_tree(&Mainnet).hash(),
+    };
+    let read_state = tower::service_fn(move |request| {
+        let chain_info = chain_info.clone();
+        async move {
+            assert!(matches!(request, ReadRequest::ChainInfo));
+            Ok::<_, BoxError>(ReadResponse::ChainInfo(chain_info))
+        }
+    });
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut verifier: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _queue) = RpcImpl::new(
+        Mainnet,
+        mining::Config {
+            miner_address: Some(ZcashAddress::from_transparent_p2pkh(
+                NetworkType::Main,
+                [0x7e; 20],
+            )),
+            ..Default::default()
+        },
+        false,
+        "0.0.1",
+        "speculation bound test",
+        Buffer::new(mempool, 1),
+        Buffer::new(state, 1),
+        Buffer::new(read_state, 1),
+        Buffer::new(verifier.clone(), 1),
+        sync,
+        tip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    // One template starts one speculative preparation, which this test never answers.
+    rpc.get_block_template(None)
+        .await
+        .expect("the first template is returned");
+    let preparation = verifier
+        .expect_request_that(|request| matches!(request, zakura_consensus::Request::Prepare { .. }))
+        .await;
+
+    // The preparation misses its deadline, so the node stops waiting for an answer it can no
+    // longer use. The verification it dispatched is still running.
+    tokio::time::advance(TEMPLATE_PREPARATION_TIMEOUT + Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+
+    // More templates arrive while that verification is still computing.
+    for _ in 0..3 {
+        rpc.get_block_template(None)
+            .await
+            .expect("a template is returned while a preparation is outstanding");
+    }
+    // Panics if a second verification was dispatched.
+    verifier.expect_no_requests().await;
+
+    // Answering the first one releases the worker, and the parent that missed its deadline is not
+    // speculated on again.
+    preparation.respond(Hash([2; 32]));
+    rpc.get_block_template(None)
+        .await
+        .expect("a template is returned after the preparation finishes");
+    // The parent whose preparation missed its deadline is not speculated on again.
+    verifier.expect_no_requests().await;
+}
+
+/// A template whose parent the chain has already left dispatches no verification at all.
+///
+/// A queued template can go stale while the preceding preparation runs. Preparing it then would
+/// hold the one speculative worker away from a template a miner could still use.
+#[tokio::test(start_paused = true)]
+async fn an_already_stale_template_dispatches_no_verification() {
+    let _init_guard = zakura_test::init();
+    let parent = Hash([1; 32]);
+    let template = speculative_test_template(parent);
+
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let verifier = {
+        let calls = calls.clone();
+        tower::service_fn(move |_request| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { Ok::<_, zakura_consensus::BoxError>(Hash([2; 32])) }
+        })
+    };
+
+    // The chain has moved past the parent this template was built on.
+    let (tip, tip_sender) = MockChainTip::new();
+    tip_sender.send_best_tip_height(Height(2));
+    tip_sender.send_best_tip_hash(Hash([9; 32]));
+
+    let dispatched =
+        start_speculative_preparation(Buffer::new(verifier, 1), &template, tip, &Mainnet);
+
+    assert!(
+        dispatched.is_none(),
+        "a template built on a parent the chain has left starts no preparation",
+    );
+    tokio::task::yield_now().await;
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the verifier is never called for an already-stale template",
+    );
 }

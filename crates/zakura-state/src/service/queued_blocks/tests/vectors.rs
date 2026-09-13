@@ -120,6 +120,10 @@ fn same_hash_replacement_keeps_the_new_body() -> Result<()> {
     Ok(())
 }
 
+/// The orphan queue holds a fixed number of entries.
+///
+/// `MAX_QUEUED_BLOCKS` also sizes the non-finalized write slots, and optimistic relay reads an
+/// idle writer off that count, so this bound is load-bearing beyond the queue itself.
 #[test]
 fn orphan_queue_has_a_fixed_entry_bound() -> Result<()> {
     let block: Arc<Block> =

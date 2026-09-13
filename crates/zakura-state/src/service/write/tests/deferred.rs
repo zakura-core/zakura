@@ -1,5 +1,12 @@
 use super::*;
 
+/// A write slot for a test message, on a semaphore the returned permit keeps alive.
+fn test_write_slot() -> tokio::sync::OwnedSemaphorePermit {
+    std::sync::Arc::new(tokio::sync::Semaphore::new(1))
+        .try_acquire_owned()
+        .expect("a fresh semaphore has a free permit")
+}
+
 struct TestStalledMaintenance {
     stalled_version: Mutex<Option<StateVersion>>,
     clear_on_reevaluation: bool,
@@ -92,6 +99,7 @@ fn state_messages_preempt_the_deferred_deadline() {
             .send(NonFinalizedWriteMessage::Invalidate {
                 hash: block::Hash([7; 32]),
                 rsp_tx,
+                write_slot: test_write_slot(),
             })
             .expect("the delayed state message is queued");
     });
@@ -333,6 +341,7 @@ fn header_insertion_wakes_a_vct_park_but_a_repeat_insertion_does_not() {
         .send(NonFinalizedWriteMessage::Invalidate {
             hash: deferred_hash,
             rsp_tx: invalidate_tx,
+            write_slot: test_write_slot(),
         })
         .expect("the unrelated write message queues");
     let (insert_tx, insert_rx) = oneshot::channel();
@@ -393,6 +402,7 @@ fn header_insertion_wakes_a_vct_park_but_a_repeat_insertion_does_not() {
         .send(NonFinalizedWriteMessage::Invalidate {
             hash: second_deferred_hash,
             rsp_tx: second_invalidate_tx,
+            write_slot: test_write_slot(),
         })
         .expect("the second unrelated write queues");
     drop(sender);

@@ -23,8 +23,6 @@ pub enum Request {
     CommitMined {
         /// The solved block.
         block: Arc<Block>,
-        /// The template work ID supplied by the miner.
-        work_id: Option<String>,
         /// State write-queue admission notification.
         admission: BlockAdmission,
     },
@@ -36,8 +34,6 @@ pub enum Request {
     Prepare {
         /// The unsolved candidate block.
         block: Arc<Block>,
-        /// The template work ID, when one was assigned.
-        work_id: Option<String>,
         /// The source that supplied the candidate.
         source: PreparedCandidateSource,
     },
@@ -62,26 +58,11 @@ impl Request {
         }
     }
 
-    /// Returns true when a successful proposal should populate the prepared-candidate cache.
-    pub fn should_cache(&self) -> bool {
-        matches!(self, Request::Prepare { .. })
-    }
-
     /// Returns the prepared candidate source.
     pub fn prepared_candidate_source(&self) -> Option<PreparedCandidateSource> {
         match self {
             Request::Prepare { source, .. } => Some(*source),
             _ => None,
-        }
-    }
-
-    /// Returns the supplied mining work ID.
-    pub fn work_id(&self) -> Option<&str> {
-        match self {
-            Request::CommitMined { work_id, .. } | Request::Prepare { work_id, .. } => {
-                work_id.as_deref()
-            }
-            Request::Commit(_) | Request::CheckProposal(_) => None,
         }
     }
 

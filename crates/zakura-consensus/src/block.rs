@@ -104,26 +104,11 @@ impl VerifyBlockError {
     /// Returns whether proposal validation proved the candidate invalid.
     /// Local failures and missing proposal context must remain retryable.
     pub fn rejects_template(&self) -> bool {
-        use zakura_header_chain::BodyVerificationClass;
-        let class = match self {
-            Self::ValidateProposal(source) => {
-                let Some(error) = source.downcast_ref::<zs::ValidateContextError>() else {
-                    return false;
-                };
-                // Header failures cannot condemn a peer's body, but the server must
-                // withdraw a template whose default header fails proposal validation.
-                if matches!(
-                    error,
-                    zs::ValidateContextError::NonSequentialBlock { .. }
-                        | zs::ValidateContextError::TimeTooEarly { .. }
-                        | zs::ValidateContextError::TimeTooLate { .. }
-                        | zs::ValidateContextError::InvalidDifficultyThreshold { .. }
-                ) {
-                    return true;
-                }
-                error.body_verification_class()
-            }
-            Self::Time(_) => return true,
+        use zakura_header_chain::BodyVerificationClass::{ConsensusInvalid, PayloadMismatch};
+        let terminal = |class| matches!(class, ConsensusInvalid(_) | PayloadMismatch(_));
+
+        match self {
+            Self::Time(_) => true,
             Self::Block {
                 source:
                     BlockError::InvalidHeaderEncoding(_)
@@ -132,13 +117,23 @@ impl VerifyBlockError {
                     | BlockError::InvalidDifficulty(..)
                     | BlockError::TargetDifficultyLimit(..)
                     | BlockError::DifficultyFilter(..),
-            } => return true,
-            _ => self.body_verification_class(),
-        };
-        matches!(
-            class,
-            BodyVerificationClass::ConsensusInvalid(_) | BodyVerificationClass::PayloadMismatch(_)
-        )
+            } => true,
+            // Header failures cannot condemn a peer's body, but the server must withdraw a
+            // template whose default header fails proposal validation.
+            Self::ValidateProposal(source) => {
+                match source.downcast_ref::<zs::ValidateContextError>() {
+                    None => false,
+                    Some(
+                        zs::ValidateContextError::NonSequentialBlock { .. }
+                        | zs::ValidateContextError::TimeTooEarly { .. }
+                        | zs::ValidateContextError::TimeTooLate { .. }
+                        | zs::ValidateContextError::InvalidDifficultyThreshold { .. },
+                    ) => true,
+                    Some(error) => terminal(error.body_verification_class()),
+                }
+            }
+            _ => terminal(self.body_verification_class()),
+        }
     }
 
     /// Classify semantic verification without treating local failures as invalid bodies.
@@ -309,9 +304,17 @@ where
         let span = tracing::debug_span!("block", height = ?block.coinbase_height());
 
         async move {
+            // Preparing a template costs everything below, not just the contextual check at the
+            // end. The bound on speculative preparation is set from this measurement, so it must
+            // start where the work does.
+            let preparation_start = std::time::Instant::now();
             let hash = zakura_header_chain::validate_encoding_version_hash(&block.header)
                 .map_err(BlockError::from)?;
-            let preparation_start = request.should_cache().then(std::time::Instant::now);
+            let (mined, prepared_source) = match &request {
+                Request::CommitMined { admission, .. } => (Some(admission.clone()), None),
+                Request::Prepare { source, .. } => (None, Some(*source)),
+                Request::Commit(_) | Request::CheckProposal(_) => (None, None),
+            };
             // Check that this block is actually a new block.
             tracing::trace!("checking that block is not already in state");
             match state_service
@@ -353,7 +356,7 @@ where
                 check::equihash_solution_is_valid(&block.header, &network)?;
             }
 
-            if request.is_mined_commit() {
+            if let Some(admission) = &mined {
                 let parent = block.header.previous_block_hash;
                 match state_service
                     .ready()
@@ -371,51 +374,20 @@ where
                     }
                     _ => unreachable!("wrong response to Request::KnownBlock"),
                 }
-            }
 
-            if request.is_mined_commit() {
-                let solved_header_start = std::time::Instant::now();
-                if let Some(prepared::CachedPreparedCandidate {
-                    source,
-                    prepared: cached_prepared_block,
-                }) = prepared_candidates.lookup(&block, request.work_id(), &network)
+                if let Some(committed) = try_prepared_fast_path(
+                    &prepared_candidates,
+                    &mut state_service,
+                    &network,
+                    block.clone(),
+                    hash,
+                    height,
+                    admission,
+                )
+                .await?
                 {
-                    check::time_is_valid_at(&block.header, Utc::now(), &height, &hash)
-                        .map_err(VerifyBlockError::Time)?;
-                    for transaction in &block.transactions {
-                        tx::check::lock_time_has_passed(transaction, height, block.header.time)
-                            .map_err(VerifyBlockError::Transaction)?;
-                    }
-                    check::merkle_root_validity(
-                        &network,
-                        &block,
-                        &cached_prepared_block.transaction_hashes,
-                    )?;
-                    metrics::histogram!("mining.solved_header_check.duration_seconds")
-                        .record(solved_header_start.elapsed().as_secs_f64());
-
-                    let mut prepared_block = cached_prepared_block.as_ref().clone();
-                    prepared_block.block = block;
-                    prepared_block.hash = hash;
-                    prepared_block.height = height;
-                    let admission = request.admission();
-                    if source == PreparedCandidateSource::ServerTemplate {
-                        if let Some(admission) = &admission {
-                            if check_prepared_mined_relay_eligibility(
-                                &mut state_service,
-                                (&prepared_block).into(),
-                            )
-                            .await?
-                                == zs::PreparedMinedRelayEligibility::Authorized
-                            {
-                                admission.authorize_optimistic_relay();
-                            }
-                        }
-                    }
-                    return commit_prepared_block(state_service, prepared_block, admission).await;
+                    return Ok(committed);
                 }
-                metrics::histogram!("mining.solved_header_check.duration_seconds")
-                    .record(solved_header_start.elapsed().as_secs_f64());
             }
 
             // Next, check the Merkle root validity, to ensure that
@@ -490,12 +462,37 @@ where
             let mut sigops = 0;
             let mut block_miner_fees = Ok(Amount::zero());
 
+            // Returning the first error abandons the checks still running, and abandoning a
+            // check does not stop the batch work it already dispatched. A server template's
+            // caller reads this response as the signal that the block's verification is over,
+            // and bounds its speculative work on that, so this path must not report completion
+            // while nested work continues. Every other caller keeps failing fast: they do not
+            // account for the compute, and an invalid block should cost as little as possible.
+            let account_for_dispatched_work = matches!(
+                request,
+                Request::Prepare {
+                    source: PreparedCandidateSource::ServerTemplate,
+                    ..
+                }
+            );
+            let mut first_error = None;
+
             use futures::StreamExt;
             while let Some(result) = async_checks.next().await {
                 tracing::trace!(?result, remaining = async_checks.len());
-                let response = result
-                    .map_err(Into::into)
-                    .map_err(VerifyBlockError::Transaction)?;
+                let response = match result {
+                    Ok(response) => response,
+                    Err(error) => {
+                        let error = VerifyBlockError::Transaction(error.into());
+                        if !account_for_dispatched_work {
+                            return Err(error);
+                        }
+                        // Keep draining, so this block's dispatched work is finished before the
+                        // error goes back. The first error is the one that is reported.
+                        first_error.get_or_insert(error);
+                        continue;
+                    }
+                };
 
                 assert!(
                     matches!(response, tx::Response::Block { .. }),
@@ -509,6 +506,10 @@ where
                 if let Some(miner_fee) = response.miner_fee() {
                     block_miner_fees += miner_fee;
                 }
+            }
+
+            if let Some(error) = first_error {
+                return Err(error);
             }
 
             // Check the summed block totals
@@ -553,44 +554,120 @@ where
 
             // Return early for proposal requests.
             if request.is_proposal() {
-                let cache_copy = request.should_cache().then(|| prepared_block.clone());
-                let response = match state_service
-                    .ready()
-                    .await
-                    .map_err(VerifyBlockError::ValidateProposal)?
-                    .call(zs::Request::CheckBlockProposalValidity(prepared_block))
-                    .await
-                    .map_err(VerifyBlockError::ValidateProposal)?
-                {
-                    zs::Response::ValidBlockProposal => Ok(hash),
-                    _ => unreachable!("wrong response for CheckBlockProposalValidity"),
-                };
-                if let (Ok(_), Some(cache_copy)) = (&response, cache_copy) {
-                    let candidate = cache_copy.block.clone();
-                    prepared_candidates.insert(
-                        &candidate,
-                        request.work_id(),
-                        request
-                            .prepared_candidate_source()
-                            .expect("cached preparation has a candidate source"),
-                        cache_copy,
-                        &network,
-                    );
-                    metrics::histogram!("mining.preparation.duration_seconds").record(
-                        preparation_start
-                            .expect("cached preparation records its start time")
-                            .elapsed()
-                            .as_secs_f64(),
-                    );
-                }
-                return response;
+                return finish_proposal(
+                    &prepared_candidates,
+                    &mut state_service,
+                    &network,
+                    prepared_block,
+                    hash,
+                    prepared_source,
+                    preparation_start,
+                )
+                .await;
             }
 
-            commit_prepared_block(state_service, prepared_block, request.admission()).await
+            commit_prepared_block(state_service, prepared_block, mined).await
         }
         .instrument(span)
         .boxed()
     }
+}
+
+/// Commits a solved block against a candidate this node already verified, if it has one.
+///
+/// Returns `None` when no source prepared this content, so the caller runs full semantic
+/// verification instead. The solved header fields are rechecked here because the cache identity
+/// deliberately ignores them.
+async fn try_prepared_fast_path<S>(
+    prepared_candidates: &prepared::PreparedCandidateCache,
+    state_service: &mut S,
+    network: &Network,
+    block: Arc<block::Block>,
+    hash: block::Hash,
+    height: block::Height,
+    admission: &zs::BlockAdmission,
+) -> Result<Option<block::Hash>, VerifyBlockError>
+where
+    S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    S::Future: Send + 'static,
+{
+    let solved_header_start = std::time::Instant::now();
+    let Some(prepared::CacheHit {
+        source,
+        prepared: cached_prepared_block,
+    }) = prepared_candidates.lookup(&block, network)
+    else {
+        metrics::histogram!("mining.solved_header_check.duration_seconds")
+            .record(solved_header_start.elapsed().as_secs_f64());
+        return Ok(None);
+    };
+
+    check::time_is_valid_at(&block.header, Utc::now(), &height, &hash)
+        .map_err(VerifyBlockError::Time)?;
+    for transaction in &block.transactions {
+        tx::check::lock_time_has_passed(transaction, height, block.header.time)
+            .map_err(VerifyBlockError::Transaction)?;
+    }
+    check::merkle_root_validity(network, &block, &cached_prepared_block.transaction_hashes)?;
+    metrics::histogram!("mining.solved_header_check.duration_seconds")
+        .record(solved_header_start.elapsed().as_secs_f64());
+
+    let mut prepared_block = cached_prepared_block.as_ref().clone();
+    prepared_block.block = block;
+    prepared_block.hash = hash;
+    prepared_block.height = height;
+
+    if source == PreparedCandidateSource::ServerTemplate
+        && check_prepared_mined_relay_eligibility(state_service, (&prepared_block).into()).await?
+            == zs::PreparedMinedRelayEligibility::Authorized
+    {
+        admission.authorize_optimistic_relay();
+    }
+
+    commit_prepared_block(
+        state_service.clone(),
+        prepared_block,
+        Some(admission.clone()),
+    )
+    .await
+    .map(Some)
+}
+
+/// Asks the state to validate a proposal, and caches the verification when a source owns it.
+async fn finish_proposal<S>(
+    prepared_candidates: &prepared::PreparedCandidateCache,
+    state_service: &mut S,
+    network: &Network,
+    prepared_block: zs::SemanticallyVerifiedBlock,
+    hash: block::Hash,
+    prepared_source: Option<PreparedCandidateSource>,
+    preparation_start: std::time::Instant,
+) -> Result<block::Hash, VerifyBlockError>
+where
+    S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
+    S::Future: Send + 'static,
+{
+    let cache_copy = prepared_source.map(|_| prepared_block.clone());
+    let response = match state_service
+        .ready()
+        .await
+        .map_err(VerifyBlockError::ValidateProposal)?
+        .call(zs::Request::CheckBlockProposalValidity(prepared_block))
+        .await
+        .map_err(VerifyBlockError::ValidateProposal)?
+    {
+        zs::Response::ValidBlockProposal => Ok(hash),
+        _ => unreachable!("wrong response for CheckBlockProposalValidity"),
+    };
+
+    if let (Ok(_), Some(source), Some(cache_copy)) = (&response, prepared_source, cache_copy) {
+        let id = prepared::CandidateId::of(&cache_copy.block, network);
+        prepared_candidates.insert(id, source, cache_copy);
+        metrics::histogram!("mining.preparation.duration_seconds")
+            .record(preparation_start.elapsed().as_secs_f64());
+    }
+
+    response
 }
 
 async fn check_prepared_mined_relay_eligibility<S>(

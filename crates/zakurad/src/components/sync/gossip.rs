@@ -219,12 +219,9 @@ where
         // events when the peer set has no ready service.
         let network = broadcast_network.clone();
         let mark_tx = mined_block_mark_sender.clone();
-        // Only a committed broadcast may suppress the committed-tip fallback. Early inventory
-        // advertises a hash whose body this node cannot serve yet, so a peer that follows it can
-        // exhaust `PENDING_BLOCK_WAIT` and receive `notfound`. The fallback is what re-advertises
-        // the hash to that peer when the later committed broadcast also fails, so marking on an
-        // early broadcast would remove the last prompt. Marking here is also redundant: a block
-        // that commits always sends `Committed`, and that broadcast marks the same hash.
+        // Early inventory advertises a hash whose body this node cannot serve yet, so a peer
+        // that follows it can exhaust `PENDING_BLOCK_WAIT` and receive `notfound`. Only a
+        // committed broadcast may therefore suppress the committed-tip fallback.
         let marks_broadcast = is_block_submission && early.is_none();
         tokio::spawn(async move {
             let broadcast = async move {

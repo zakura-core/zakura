@@ -667,6 +667,12 @@ proptest! {
                     .expect("getblockchaininfo should call mock state service with correct request")
                     .respond(Err(BoxError::from("chain info not available")));
 
+                state
+                    .expect_request(zakura_state::ReadRequest::Tip)
+                    .await
+                    .expect("getblockchaininfo should confirm the state is empty")
+                    .respond(zakura_state::ReadResponse::Tip(None));
+
                 }
             };
 
@@ -677,6 +683,7 @@ proptest! {
             prop_assert_eq!(response.best_block_hash, genesis_block.header.hash());
             prop_assert_eq!(response.chain, network.bip70_network_name());
             prop_assert_eq!(response.blocks, Height::MIN);
+            prop_assert_eq!(response.difficulty, 1.0);
             prop_assert_eq!(response.value_pools, GetBlockchainInfoBalance::value_pools(ValueBalance::zero(), None));
 
             let genesis_branch_id = NetworkUpgrade::current(&network, Height::MIN).branch_id().unwrap_or(ConsensusBranchId::RPC_MISSING_ID);

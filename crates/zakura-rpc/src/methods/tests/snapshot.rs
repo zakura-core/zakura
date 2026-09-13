@@ -31,7 +31,7 @@ use zakura_chain::{
     serialization::{DateTime32, ZcashDeserializeInto},
     subtree::NoteCommitmentSubtreeData,
     transaction::Transaction,
-    work::difficulty::CompactDifficulty,
+    work::difficulty::{CompactDifficulty, ParameterDifficulty},
 };
 use zakura_consensus::Request;
 use zakura_network::{

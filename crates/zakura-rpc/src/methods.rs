@@ -77,7 +77,7 @@ use zakura_chain::{
     transparent::{self, Address, OutputIndex},
     value_balance::ValueBalance,
     work::{
-        difficulty::{CompactDifficulty, ExpandedDifficulty, ParameterDifficulty, U256},
+        difficulty::{CompactDifficulty, ExpandedDifficulty, U256},
         equihash::Solution,
     },
 };
@@ -1441,9 +1441,8 @@ where
 
         let relay_fee = zakura_chain::transaction::zip317::MIN_MEMPOOL_TX_FEE_RATE as f64
             / (zakura_chain::amount::COIN as f64);
-        let difficulty = chain_tip_difficulty(self.network.clone(), self.read_state.clone(), true)
-            .await
-            .expect("should always be Ok when `should_use_default` is true");
+        let difficulty =
+            chain_tip_difficulty(self.network.clone(), self.read_state.clone(), true).await?;
 
         let response = GetInfoResponse {
             version,
@@ -1550,8 +1549,7 @@ where
                 Err(_) => ((Height::MIN, network.genesis_hash()), Default::default()),
             };
 
-            let difficulty = chain_tip_difficulty
-                .expect("should always be Ok when `should_use_default` is true");
+            let difficulty = chain_tip_difficulty?;
 
             (
                 size_on_disk,
@@ -5454,10 +5452,7 @@ where
 {
     let request = ReadRequest::ChainInfo;
 
-    // # TODO
-    // - add a separate request like BestChainNextMedianTimePast, but skipping the
-    //   consistency check, because any block's difficulty is ok for display
-    // - return 1.0 for a "not enough blocks in the state" error, like `zcashd`:
+    // Return the minimum difficulty for an empty state, like `zcashd`:
     // <https://github.com/zcash/zcash/blob/7b28054e8b46eb46a9589d0bdc8e29f9fa1dc82d/src/rpc/blockchain.cpp#L40-L41>
     let response = state
         .ready()
@@ -5466,8 +5461,17 @@ where
 
     let response = match (should_use_default, response) {
         (_, Ok(res)) => res,
-        (true, Err(_)) => {
-            return Ok((U256::from(network.target_difficulty_limit()) >> 128).as_u128() as f64);
+        (true, Err(error)) => {
+            let tip_response = state
+                .ready()
+                .and_then(|service| service.call(ReadRequest::Tip))
+                .await;
+
+            match tip_response {
+                Ok(ReadResponse::Tip(None)) => return Ok(1.0),
+                Ok(ReadResponse::Tip(Some(_))) | Err(_) => return Err(error).map_error(0),
+                Ok(_) => unreachable!("unmatched response to a tip request"),
+            }
         }
         (false, Err(error)) => return Err(error).map_error(0),
     };
@@ -5477,44 +5481,11 @@ where
         _ => unreachable!("unmatched response to a chain info request"),
     };
 
-    // This RPC is typically used for display purposes, so it is not consensus-critical.
-    // But it uses the difficulty consensus rules for its calculations.
-    //
-    // Consensus:
-    // https://zips.z.cash/protocol/protocol.pdf#nbits
-    //
-    // The zcashd implementation performs to_expanded() on f64,
-    // and then does an inverse division:
-    // https://github.com/zcash/zcash/blob/d6e2fada844373a8554ee085418e68de4b593a6c/src/rpc/blockchain.cpp#L46-L73
-    //
-    // But in Zebra we divide the high 128 bits of each expanded difficulty. This gives
-    // a similar result, because the lower 128 bits are insignificant after conversion
-    // to `f64` with a 53-bit mantissa.
-    //
-    // `pow_limit >> 128 / difficulty >> 128` is the same as the work calculation
-    // `(2^256 / pow_limit) / (2^256 / difficulty)`, but it's a bit more accurate.
-    //
-    // To simplify the calculation, we don't scale for leading zeroes. (Bitcoin's
-    // difficulty currently uses 68 bits, so even it would still have full precision
-    // using this calculation.)
-
-    // Get expanded difficulties (256 bits), these are the inverse of the work
-    let pow_limit: U256 = network.target_difficulty_limit().into();
-    let Some(difficulty) = chain_info.expected_difficulty.to_expanded() else {
+    if chain_info.expected_difficulty.to_expanded().is_none() {
         return Ok(0.0);
-    };
+    }
 
-    // Shift out the lower 128 bits (256 bits, but the top 128 are all zeroes)
-    let pow_limit = pow_limit >> 128;
-    let difficulty = U256::from(difficulty) >> 128;
-
-    // Convert to u128 then f64.
-    // We could also convert U256 to String, then parse as f64, but that's slower.
-    let pow_limit = pow_limit.as_u128() as f64;
-    let difficulty = difficulty.as_u128() as f64;
-
-    // Invert the division to give approximately: `work(difficulty) / work(pow_limit)`
-    Ok(pow_limit / difficulty)
+    Ok(chain_info.expected_difficulty.relative_to_network(&network))
 }
 
 /// Commands for the `addnode` RPC method.

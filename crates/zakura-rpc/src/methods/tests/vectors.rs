@@ -4023,6 +4023,113 @@ async fn rpc_z_validateaddress_regtest() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn chain_tip_difficulty_uses_minimum_for_empty_state() {
+    let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state_handler = read_state.clone();
+
+    let difficulty_fut = chain_tip_difficulty(Mainnet, read_state, true);
+    let state_error_fut = async move {
+        read_state_handler
+            .expect_request_that(|request| matches!(request, ReadRequest::ChainInfo))
+            .await
+            .respond(Err(BoxError::from("chain info is unavailable")));
+        read_state_handler
+            .expect_request_that(|request| matches!(request, ReadRequest::Tip))
+            .await
+            .respond(ReadResponse::Tip(None));
+    };
+
+    let (difficulty, ()) = tokio::join!(difficulty_fut, state_error_fut);
+
+    assert_eq!(
+        difficulty.expect("the fallback difficulty is available"),
+        1.0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chain_tip_difficulty_propagates_state_error_when_tip_exists() {
+    let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state_handler = read_state.clone();
+
+    let difficulty_fut = chain_tip_difficulty(Mainnet, read_state, true);
+    let state_error_fut = async move {
+        read_state_handler
+            .expect_request_that(|request| matches!(request, ReadRequest::ChainInfo))
+            .await
+            .respond(Err(BoxError::from("chain info is unavailable")));
+        read_state_handler
+            .expect_request_that(|request| matches!(request, ReadRequest::Tip))
+            .await
+            .respond(ReadResponse::Tip(Some((
+                Height::MIN,
+                Mainnet.genesis_hash(),
+            ))));
+    };
+
+    let (difficulty, ()) = tokio::join!(difficulty_fut, state_error_fut);
+    let error = difficulty.expect_err("a non-empty state must not use a fallback difficulty");
+
+    assert!(error.message().contains("chain info is unavailable"));
+}
+
+async fn mock_chain_tip_difficulty(
+    network: zakura_chain::parameters::Network,
+    expected_difficulty: CompactDifficulty,
+) -> f64 {
+    let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state_handler = read_state.clone();
+    let response_network = network.clone();
+
+    let difficulty_fut = chain_tip_difficulty(network, read_state, false);
+    let state_response_fut = async move {
+        read_state_handler
+            .expect_request_that(|request| matches!(request, ReadRequest::ChainInfo))
+            .await
+            .respond(ReadResponse::ChainInfo(GetBlockTemplateChainInfo {
+                expected_difficulty,
+                tip_height: Height::MIN,
+                tip_hash: response_network.genesis_hash(),
+                cur_time: DateTime32::from(1),
+                min_time: DateTime32::from(1),
+                max_time: DateTime32::from(1),
+                chain_history_root: fake_history_tree(&response_network).hash(),
+            }));
+    };
+
+    let (difficulty, ()) = tokio::join!(difficulty_fut, state_response_fut);
+    difficulty.expect("valid chain information has a display difficulty")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chain_tip_difficulty_supports_small_network_limit() {
+    let network = Parameters::build()
+        .with_network_name("small_difficulty_limit")
+        .expect("the custom network name is valid")
+        .with_target_difficulty_limit(U256::from(0x1234_u32))
+        .expect("the target difficulty limit is valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("the custom network parameters are valid");
+    let expected_difficulty = network.target_difficulty_limit().to_compact();
+
+    let difficulty = mock_chain_tip_difficulty(network, expected_difficulty).await;
+
+    assert_eq!(difficulty, 1.0);
+    assert!(difficulty.is_finite());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chain_tip_difficulty_supports_small_expected_target() {
+    let expected_difficulty = ExpandedDifficulty::from(U256::from(0x1234_u32)).to_compact();
+
+    let difficulty = mock_chain_tip_difficulty(Mainnet, expected_difficulty).await;
+
+    assert!(difficulty > 1.0);
+    assert!(difficulty.is_finite());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn rpc_getdifficulty() {
     let _init_guard = zakura_test::init();
 

@@ -26,7 +26,7 @@ jobs:
           import json,os
           from pathlib import Path
           owner=os.environ['OWNER_RUN']
-          nodes=[d for d in json.load(open('/tmp/droplets.json')) if d['name'].startswith('zakura-pr-66e4fc6e37248b788155ab5bd429df1a21837e97-') and d['name'].endswith('-'+owner)]
+          nodes=[d for d in json.load(open('/tmp/droplets.json')) if d['name']=='zakura-pr-66e4fc6e37248b788155ab5bd4-'+owner]
           volumes=[v for v in json.load(open('/tmp/volumes.json')) if v['name']=='zakura-pr-vol-'+owner or v['name'].startswith('zakura-pr-vol-'+owner+'-')]
           assert len(nodes)<=1
           print(json.dumps({'owner_run':owner,'nodes':[{'id':d['id'],'name':d['name'],'volume_ids':d.get('volume_ids',[])} for d in nodes],'volumes':[{'id':v['id'],'name':v['name']} for v in volumes]}))

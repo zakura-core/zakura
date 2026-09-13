@@ -955,14 +955,17 @@ impl<'a> GraphOverlay<'a> {
             }
             _ => None,
         };
-        if let Some(existing) = self
+        if self
             .new_consensus_invalid_body_tombstones_by_hash
             .get(&hash)
             .or_else(|| self.base_graph.consensus_invalid_body_tombstones.get(&hash))
+            .is_some()
         {
-            if tombstone.as_ref() != Some(existing) {
-                return Err(GraphError::PermanentBodyInvalidity(hash));
-            }
+            return if tombstone.is_some() {
+                Ok(false)
+            } else {
+                Err(GraphError::PermanentBodyInvalidity(hash))
+            };
         }
         let (changed, eligibility_changed) = {
             let node = self.stage_header_node(hash)?;
@@ -970,7 +973,7 @@ impl<'a> GraphOverlay<'a> {
                 node.body_validation_state,
                 BodyValidationState::ConsensusInvalid { .. }
             ) {
-                return if node.body_validation_state == body_validation_state {
+                return if tombstone.is_some() {
                     Ok(false)
                 } else {
                     Err(GraphError::PermanentBodyInvalidity(hash))
@@ -1591,6 +1594,52 @@ mod tests {
             .expect("the fixture child inserts")
         {
             InsertResult::Inserted(frontier) | InsertResult::AlreadyPresent(frontier) => frontier,
+        }
+    }
+
+    #[test]
+    fn repeated_invalid_verdict_preserves_first_tombstone_in_staged_and_base_graphs() {
+        let mut base = store();
+        let anchor = base.finalized_frontier();
+        let child = insert_child(&mut base, anchor.hash, 1);
+        let first = BodyValidationState::ConsensusInvalid {
+            evidence: EvidenceId::from_digest([2; 32]),
+            rule: crate::BodyRuleId::new("test.first"),
+        };
+        let second = BodyValidationState::ConsensusInvalid {
+            evidence: EvidenceId::from_digest([3; 32]),
+            rule: crate::BodyRuleId::new("test.second"),
+        };
+
+        for persisted in [false, true] {
+            if persisted {
+                base.set_body_validation_state(child.hash, first.clone())
+                    .expect("the first verdict installs a tombstone");
+            }
+            let mut overlay = GraphOverlay::new(&base);
+            overlay
+                .set_body_validation_state(child.hash, first.clone())
+                .expect("the first verdict is accepted");
+            assert_eq!(
+                overlay.set_body_validation_state(child.hash, second.clone()),
+                Ok(false)
+            );
+            assert_eq!(
+                overlay
+                    .header_node(child.hash)
+                    .unwrap()
+                    .body_validation_state,
+                first
+            );
+            assert_eq!(
+                overlay.set_body_validation_state(
+                    child.hash,
+                    BodyValidationState::Verified {
+                        evidence: EvidenceId::from_digest([4; 32]),
+                    },
+                ),
+                Err(GraphError::PermanentBodyInvalidity(child.hash))
+            );
         }
     }
 

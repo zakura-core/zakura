@@ -3037,6 +3037,24 @@ impl Service<ReadRequest> for ReadStateService {
                 Ok(ReadResponse::BlockRoots(roots))
             }
 
+            ReadRequest::BlockSizesByHash { hashes } => {
+                let cap = usize::try_from(MAX_HEADER_SYNC_HEIGHT_RANGE)
+                    .expect("u32 fits usize on supported targets");
+                if hashes.len() > cap {
+                    Err("BlockSizesByHash exceeds MAX_HEADER_SYNC_HEIGHT_RANGE hashes".into())
+                } else {
+                    let chain = state.latest_best_chain();
+                    let sizes = hashes
+                        .into_iter()
+                        .map(|hash| {
+                            read::block_info(chain.clone(), &state.db, hash.into())
+                                .map(|info| info.size())
+                        })
+                        .collect();
+                    Ok(ReadResponse::BlockSizesByHash(sizes))
+                }
+            }
+
             ReadRequest::BestHeaderTip => {
                 let header_chain_reader = state.header_chain_reader_receiver.borrow().clone();
                 let tip = match header_chain_reader {

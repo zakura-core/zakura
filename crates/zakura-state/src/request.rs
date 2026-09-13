@@ -1886,6 +1886,16 @@ pub enum ReadRequest {
         count: u32,
     },
 
+    /// Returns [`ReadResponse::BlockSizesByHash(Vec<Option<u32>>)`](ReadResponse::BlockSizesByHash)
+    /// with the committed serialized size of each requested block hash, parallel to `hashes`.
+    /// `None` marks a hash that is committed in neither the best chain nor the finalized
+    /// state. Scheduling metadata for header serving; verification never consults it.
+    /// Rejects more than `MAX_HEADER_SYNC_HEIGHT_RANGE` hashes.
+    BlockSizesByHash {
+        /// Block hashes to look up.
+        hashes: Vec<block::Hash>,
+    },
+
     /// Returns the highest header held on disk.
     BestHeaderTip,
 
@@ -2146,6 +2156,7 @@ impl ReadRequest {
             ReadRequest::ReadRetainedHeaderPath { .. } => "read_retained_header_path",
             ReadRequest::ReleaseRetainedHeaderPath { .. } => "release_retained_header_path",
             ReadRequest::BlockRoots { .. } => "block_roots",
+            ReadRequest::BlockSizesByHash { .. } => "block_sizes_by_hash",
             ReadRequest::BestHeaderTip => "best_header_tip",
             ReadRequest::MissingBlockBodyMetadata { .. } => "missing_block_body_metadata",
             ReadRequest::BlocksByHeightRange { .. } => "blocks_by_height_range",

@@ -1465,6 +1465,7 @@ mod bbr_tests {
     /// target, but the delay gate still holds the window at the floor: the first per-ack
     /// sample's size residual is `elapsed - bytes / (bytes / elapsed)` = 0, clamped to the
     /// 0.1 ms minimum, so every later round trip reads as a standing queue.
+    /// The two floor assertions on the hinted case pin a known defect and must change when the delay-gate baseline is fixed.
     #[test]
     fn worst_case_reservations_and_the_delay_gate_pin_the_byte_window_at_its_floor() {
         use super::super::config::DEFAULT_BS_BBR_MIN_CWND_BYTES;

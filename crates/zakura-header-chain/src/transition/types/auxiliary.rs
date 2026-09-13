@@ -282,6 +282,11 @@ impl AuxDelivery {
         self.outcome().status() == AuxOutcomeStatus::Rejected
     }
 
+    /// Return whether integrated verification disputed this delivery.
+    pub fn is_disputed(self) -> bool {
+        self.outcome().status() == AuxOutcomeStatus::Disputed
+    }
+
     /// The advisory body size to schedule against from one header's retained deliveries:
     /// the non-rejected delivery with a known size, preferring authenticated deliveries and
     /// then the smallest `delivery_id`. `None` when no retained delivery knows the size.
@@ -297,11 +302,6 @@ impl AuxDelivery {
             })
             .min_by_key(|(delivery, _)| (!delivery.is_authenticated(), delivery.delivery_id))
             .map(|(_, size)| size)
-    }
-
-    /// Return whether integrated verification disputed this delivery.
-    pub fn is_disputed(self) -> bool {
-        self.outcome().status() == AuxOutcomeStatus::Disputed
     }
 
     /// Return the derived boundary, when an observation changed this delivery.

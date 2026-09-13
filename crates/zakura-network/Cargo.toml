@@ -97,8 +97,8 @@ tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 toml = { workspace = true }
 tracing-subscriber = { workspace = true }
 
-zakura-header-chain = { path = "../zakura-header-chain", version = "2.1.0", features = ["test-support"] }
 zakura-chain = { path = "../zakura-chain", version = "7.0.0", features = ["proptest-impl"] }
+zakura-header-chain = { path = "../zakura-header-chain", version = "2.1.0", features = ["test-support"] }
 zakura-test = { path = "../zakura-test/", version = "2.1.0" }
 
 [lints]

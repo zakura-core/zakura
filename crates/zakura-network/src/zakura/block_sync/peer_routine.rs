@@ -1188,7 +1188,9 @@ impl PeerRoutine {
                 break FillStop::SendError;
             }
             metrics::counter!("sync.block.request.sent").increment(1);
-            let estimate_kind = if reserved_bytes >= block::MAX_BLOCK_BYTES {
+            let estimate_kind = if reserved_bytes
+                >= u64::from(request_count).saturating_mul(block::MAX_BLOCK_BYTES)
+            {
                 "worst_case"
             } else {
                 "hinted"

@@ -359,7 +359,7 @@ pub enum BlockSyncMisbehavior {
     ConsensusBodyInvalid(zakura_header_chain::ConsensusBodyInvalid),
     /// A peer supplied another invalid block payload.
     InvalidBlock,
-    /// A body exceeded its advertised size hint by more than the tolerance. Advisory: the hash-matched body is still accepted.
+    /// A body exceeded its advertised size hint by more than the tolerance. Advisory: the hash-matched body is still accepted. The report names the body's supplier even though the hint may have come from a different header supplier.
     SizeMismatch,
     /// Peer status is internally impossible.
     InvalidStatus,

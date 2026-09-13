@@ -60,7 +60,7 @@ pub(in crate::service::finalized_state) const ZAKURA_HEADER_HEIGHT_BY_HASH: &str
     "zakura_header_height_by_hash";
 pub(in crate::service::finalized_state) const ZAKURA_HEADER_BY_HEIGHT: &str =
     "zakura_header_by_height";
-/// Legacy column family kept registered for on-disk format compatibility (format 27.2.0).
+/// Legacy column family kept registered for on-disk format compatibility.
 /// Its writer was removed with the fork-aware header engine; body-size hints now come from
 /// hash-keyed auxiliary deliveries and committed `BlockInfo`. Nothing reads or writes it.
 pub const ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT: &str = "zakura_header_body_size_by_height";

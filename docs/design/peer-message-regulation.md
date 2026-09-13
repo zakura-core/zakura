@@ -25,6 +25,20 @@ responses can still cause CPU or storage work.
 
 ## Message checks and handler policy
 
+Services declare `MessageRatePolicy` for each stream. The default keeps the shared
+message-rate allowance. `CapacityBounded` names only the message types whose work,
+buffers and response authorization already have their own bounds. Both incoming
+and locally opened streams apply the declaration. Other message types still spend
+the existing allowance, shared across the service's paired streams.
+
+GetBlocks, Block, BlocksDone and RangeUnavailable use capacity admission. For
+example, answering our requests quickly must not use up the allowance for Status
+messages. Status keeps its existing frequency checks. This policy does not bypass
+frame or allocation limits, admit storage work, or authorize unsolicited replies.
+Other production services keep their existing rate behavior until their own
+message contracts are implemented. A discovery test adapter exercises the shared
+policy without changing production discovery.
+
 The implementation may use existing codecs, handlers, and validators. It need not introduce a
 declaration builder, universal filter framework, or one ingress call site per data type.
 

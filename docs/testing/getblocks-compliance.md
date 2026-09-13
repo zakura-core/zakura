@@ -26,18 +26,27 @@ version 1. The tests preserve this decision from the implementation stack.
 | Request allocation plans | [Allocation planning](request-allocation-planning.md) |
 | Transport and composed workloads | Requirement map and workload bounds below |
 
-## Known load counterexample
+## Continuous traffic
 
-The local 64-round run attempts 4,096 sequential legal exchanges. The continuous
-traffic property closes at exchange 2,049 instead of finishing them. Four rounds
-complete successfully. The longer failure remains enabled with the same request
-sequence, default limits and assertion. Diagnostics record the exchange number
-and both peers' close causes.
+The 64-round L04 workload attempts 4,096 sequential legal exchanges with the
+default limits. It exposed a shared rate limiter charging requested responses.
+After enough fast answers, the requester disconnected its serving peer. The
+failure also occurred with the earlier transport windows, so changing receive
+credit did not cause it.
 
-The client records `ordered_read_error`. This identifies the reader/admission path,
-but does not distinguish its underlying errors. That cause still needs diagnosis.
-Fixing this should preserve the intended resource and cadence rules across message
-classes. Raising this fixture's rate limit would hide the counterexample.
+The shared admission policy now uses capacity and authorization for GetBlocks,
+Block, BlocksDone and RangeUnavailable. Status and unconfigured services retain
+their existing frequency checks. The L04 request sequence, workload and assertion
+remain unchanged. Ordered-reader diagnostics record `ordered_rate_limited` before
+teardown can replace the rejection with a generic read error.
+
+`handler::tests::message_admission` checks generated mixtures of message types,
+payload sizes, bursts and refills against an independent count. It runs the same
+oracle with production GetBlocks declarations and a discovery test adapter. Fixed
+controls check that responses preserve metadata credit and continue after its
+exhaustion. A real ordered worker still rejects excess Status traffic and records
+the specific cause. These admission tests supplement response authorization and
+resource-ownership tests in the earlier layers.
 
 ## Deferred requirements
 

@@ -1120,6 +1120,7 @@ fn raw_worker_context(client: &Endpoint, slots: Arc<Semaphore>) -> StreamWorkerC
         inbound_frame_cap: DATA.frame_cap,
         message_payload_limits: &[],
         message_types: None,
+        message_rate_policy: MessageRatePolicy::RateLimited,
         allowed_frame_flags: u16::MAX,
         queue_depths: None,
         write_policy: StreamWritePolicy::UntilCancelled,

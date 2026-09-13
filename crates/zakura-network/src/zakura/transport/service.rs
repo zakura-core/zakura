@@ -106,6 +106,21 @@ pub enum StreamWritePolicy {
     UntilCancelled,
 }
 
+/// Which messages consume the connection's shared rate allowance for this service.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub enum MessageRatePolicy {
+    /// Charge every message. Services keep this behavior unless they opt in below.
+    #[default]
+    RateLimited,
+    /// The listed message types use bounded work and buffers instead of a rate limit.
+    /// All other types still consume the rate allowance.
+    ///
+    /// The service must reserve capacity before work, stop intake when capacity is
+    /// full, and match responses to live authorization. This declaration neither
+    /// admits work nor makes a response valid. Frame and decoder checks still apply.
+    CapacityBounded(&'static [u16]),
+}
+
 /// A service slot held from session setup through the last transport and
 /// application sender owner. The service can release its setup allowance once
 /// all members are ready, while retaining its session allowance through teardown.
@@ -434,6 +449,12 @@ pub trait Service: fmt::Debug + Send + Sync + 'static {
     /// unlisted type from its header, before allocating or reading its payload.
     fn message_types(&self, _stream: Stream) -> Option<&'static [u16]> {
         None
+    }
+
+    /// Select messages whose bounded work and response authorization permit
+    /// continuous traffic. Unlisted messages retain the shared rate limit.
+    fn message_rate_policy(&self, _stream: Stream) -> MessageRatePolicy {
+        MessageRatePolicy::RateLimited
     }
 
     /// Flag bits accepted by this stream's codec. The reader rejects other bits

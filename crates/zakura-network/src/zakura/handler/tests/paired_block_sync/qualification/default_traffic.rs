@@ -69,6 +69,9 @@ impl Service for Client {
     fn message_types(&self, stream: Stream) -> Option<&'static [u16]> {
         self.declarations.message_types(stream)
     }
+    fn message_rate_policy(&self, stream: Stream) -> crate::zakura::MessageRatePolicy {
+        self.declarations.message_rate_policy(stream)
+    }
     fn stream_write_policy(&self, stream: Stream) -> StreamWritePolicy {
         self.declarations.stream_write_policy(stream)
     }

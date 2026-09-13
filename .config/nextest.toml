@@ -318,7 +318,7 @@ default-filter = 'test(~regulation::response_vec::) or test(~regulation::respons
 
 # Run the final transport and verifier composition locally.
 [profile.transport-qualification]
-default-filter = '(test(~handler::tests::paired_block_sync::) and not test(~handler::tests::paired_block_sync::gate::)) or test(~handler::tests::quic_progress::) or test(~paused_ordered_reads_) or test(~stream_cancel_closes_ordered_worker_) or test(~serving::tests::serving_contract::load::) or test(~block_sync_driver::tests::verification_contract::)'
+default-filter = '(test(~handler::tests::paired_block_sync::) and not test(~handler::tests::paired_block_sync::gate::)) or test(~handler::tests::quic_progress::) or test(~paused_ordered_reads_) or test(~stream_cancel_closes_ordered_worker_) or test(~serving::tests::serving_contract::load::) or test(~block_sync_driver::tests::verification_contract::) or test(~handler::tests::message_admission::)'
 fail-fast = false
 retries = 0
 test-threads = 4
@@ -327,7 +327,7 @@ failure-output = "immediate"
 
 # Generated contracts and fixed model controls. Run explicitly for local feedback.
 [profile.regulation-properties]
-default-filter = 'test(~regulation::slot_properties::) or test(~regulation::response_properties::) or test(~regulation::request::properties::) or test(~serving_regulation::properties::) or (test(~serving_regulation::policy::codec_properties::) or test(~serving_regulation::policy::ownership_properties::)) or test(~block_sync::serving::tests::properties::) or test(~service::block_range::tests::properties::) or ((test(~response_contract::) or test(~bounded_decoding::) or test(~frame_codec::)) and (test(~_generated_) or test(~f02_bounded_response_payloads)))'
+default-filter = 'test(~regulation::slot_properties::) or test(~regulation::response_properties::) or test(~regulation::request::properties::) or test(~serving_regulation::properties::) or (test(~serving_regulation::policy::codec_properties::) or test(~serving_regulation::policy::ownership_properties::)) or test(~block_sync::serving::tests::properties::) or test(~service::block_range::tests::properties::) or ((test(~response_contract::) or test(~bounded_decoding::) or test(~frame_codec::)) and (test(~_generated_) or test(~f02_bounded_response_payloads))) or test(~handler::tests::message_admission::)'
 fail-fast = false
 retries = 0
 slow-timeout = { period = "60s", terminate-after = 1 }
@@ -340,7 +340,7 @@ slow-timeout = { period = "5m", terminate-after = 1 }
 
 # Every executable requirement, including the node's real checkpoint verifier.
 [profile.regulation-compliance]
-default-filter = 'test(~response_contract::) or test(~block_sync::wire::bounded_decoding::) or test(~block_sync::wire::frame_codec::) or test(~handler::tests::frame_policy::) or test(~serving::tests::serving_contract::) or test(~paired_block_sync::qualification::) or test(~block_sync_driver::tests::verification_contract::) or (package(zakura-test) and test(~allocations::tests::))'
+default-filter = 'test(~response_contract::) or test(~block_sync::wire::bounded_decoding::) or test(~block_sync::wire::frame_codec::) or test(~handler::tests::frame_policy::) or test(~serving::tests::serving_contract::) or test(~paired_block_sync::qualification::) or test(~block_sync_driver::tests::verification_contract::) or (package(zakura-test) and test(~allocations::tests::)) or test(~handler::tests::message_admission::)'
 fail-fast = false
 retries = 0
 test-threads = 4

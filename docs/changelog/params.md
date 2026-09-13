@@ -32,6 +32,7 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| `message_rate_per_second` applicability | `crates/zakura-network/src/zakura/transport/service.rs` and `block_sync/service.rs` | All types charged → declared capacity-bounded types excluded. Default remains `2048/s`. | [#981](https://github.com/zakura-core/zakura/pull/981) | GetBlocks and its responses use existing work and authorization bounds. Fast replies preserve the rate allowance for Status. |
 | Native QUIC receive credit | `crates/zakura-network/src/zakura/handler.rs` | `16 MiB` → `256 KiB` per stream, `32 MiB` → `9.5 MiB` per connection | [#981](https://github.com/zakura-core/zakura/pull/981) | Leave progress credit while 32 sibling consumers are paused, including room for batched credit updates. |
 | Native open stream limit | `crates/zakura-network/src/zakura/handshake.rs` and `handler.rs` | `1024` → `16` | [#981](https://github.com/zakura-core/zakura/pull/981) | Advertise 16 accepted streams and cap remotely initiated bidirectional transport streams at 16. |
 | `NODE_RESPONSE_METADATA_BYTES` / `CONNECTION_RESPONSE_METADATA_BYTES` | `crates/zakura-network/src/zakura/regulation/response_memory.rs` | new → `128 MiB` per node / `16 MiB` per connection | [#979](https://github.com/zakura-core/zakura/pull/979) | Share response bookkeeping limits across services and retain charges until the last owner releases memory. |

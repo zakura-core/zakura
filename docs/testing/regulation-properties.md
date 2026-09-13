@@ -7,6 +7,13 @@ They do not prove every execution correct or qualify the transport for activatio
 
 ## Shared contracts
 
+Message-rate properties use one independent admission oracle with the production
+GetBlocks declarations and a discovery test adapter. Generated histories mix
+capacity-bounded responses with rate-limited metadata, oversized payloads and
+clock advances. Fixed bursts ensure response traffic neither spends metadata's
+allowance nor fails when it is empty. Unlisted message types and services retain
+the existing rate limit. The discovery adapter does not change production discovery.
+
 Finite requests use the same production admission code. Their tests should share
 the same ownership checks too. `check_request_owners` and `check_admission_waiters`
 accept a production request policy and an encoded request. Both run with GetBlocks

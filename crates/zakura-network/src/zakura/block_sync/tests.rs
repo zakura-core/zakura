@@ -6729,6 +6729,7 @@ async fn add_peer_decode_failure_reports_malformed_and_cancels_connection() {
             flags: 0,
             payload: Vec::new(),
         },
+        None,
     )
     .await;
 }
@@ -6752,14 +6753,17 @@ async fn network_bound_peer_decode_rejects_the_other_networks_block() {
         let mut block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
         Arc::make_mut(&mut Arc::make_mut(&mut block).header).solution =
             Solution::for_proposal_for_network(&other_network);
-        let frame = BlockSyncMessage::Block(block).encode_frame().unwrap();
-        assert_peer_decode_failure(ZcashDecoder::for_network(&network), frame).await;
+        let frame = BlockSyncMessage::Block(block.clone())
+            .encode_frame()
+            .unwrap();
+        assert_peer_decode_failure(ZcashDecoder::for_network(&network), frame, Some(block)).await;
     }
 }
 
 async fn assert_peer_decode_failure(
     decoder: zakura_chain::serialization::ZcashDecoder,
     frame: Frame,
+    requested_block: Option<Arc<block::Block>>,
 ) {
     // Drive the real service and per-peer reader. A decode error must report
     // malformed-message misbehavior and close the connection.
@@ -6780,7 +6784,7 @@ async fn assert_peer_decode_failure(
 
     let peer = peer(3);
     let (inbound_tx, inbound_rx) = framed_channel(4);
-    let (outbound_tx, _outbound_rx) = framed_channel(4);
+    let (outbound_tx, mut outbound_rx) = framed_channel(4);
     let streams = HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (inbound_rx, outbound_tx))]);
     let connection_cancel = CancellationToken::new();
 
@@ -6791,6 +6795,40 @@ async fn assert_peer_decode_failure(
         streams,
         connection_cancel.clone(),
     ));
+
+    if let Some(block) = requested_block {
+        // A block must be requested before the receiver inspects its header.
+        // Otherwise the earlier unsolicited-response guard would hide whether
+        // this service actually uses its configured network when decoding.
+        let height = block.coinbase_height().unwrap();
+        send_inbound(
+            &inbound_tx,
+            BlockSyncMessage::Status(BlockSyncStatus {
+                servable_low: height,
+                servable_high: height,
+                tip_hash: block.hash(),
+                max_blocks_per_response: 1,
+                max_inflight_requests: 1,
+                max_response_bytes: MAX_BS_RESPONSE_BYTES,
+            }),
+        )
+        .await;
+        handle
+            .send(BlockSyncEvent::HeaderTipChanged {
+                height,
+                hash: block.hash(),
+            })
+            .await
+            .unwrap();
+        handle
+            .send(BlockSyncEvent::NeededBlocks(vec![block_meta(&block)]))
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_for_outbound_getblocks(&mut outbound_rx).await,
+            (height, 1)
+        );
+    }
 
     inbound_tx
         .send(frame)

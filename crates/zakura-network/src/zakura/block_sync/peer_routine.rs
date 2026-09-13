@@ -584,7 +584,9 @@ impl PeerRoutine {
                     return Err(error);
                 }
             };
-            let bytes = u64::try_from(frame.payload.len() - 1).expect("frame length fits u64");
+            let bytes =
+                u64::try_from(frame.payload.len() - super::wire::BLOCK_SYNC_MESSAGE_TYPE_BYTES)
+                    .expect("frame length fits u64");
             if let Err(error) = self.window.outstanding[index].response.check(1, bytes) {
                 self.report_misbehavior(BlockSyncMisbehavior::MalformedMessage)
                     .await;

@@ -1,3 +1,4 @@
+import csv
 import importlib.util
 import io
 import json
@@ -239,7 +240,51 @@ class LatencyTests(unittest.TestCase):
         return run_command(digest.cmd_latency, args)
 
     def write_trace(self, tmp, rows):
-        (Path(tmp) / "commit_state.jsonl").write_text("\n".join(rows) + "\n")
+        with (Path(tmp) / "commit_state.csv").open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=["ts", "event", "height", "extra"])
+            writer.writeheader()
+            for line in rows:
+                try:
+                    value = json.loads(line)
+                except ValueError:
+                    writer.writerow({"extra": line})
+                    continue
+                record = {key: value.pop(key) for key in writer.fieldnames[:-1] if key in value}
+                record["extra"] = json.dumps(value)
+                writer.writerow(record)
+
+    def test_csv_trace_round_trip(self):
+        rows = block_lifecycle(1707211, queued_ts=100, start_ts=300,
+                               finish_ts=1000000, elapsed_ms=1000)
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_trace(tmp, rows)
+            path = Path(tmp) / "commit_state.csv"
+            expected = digest.parse_commit_trace(path)
+            with path.with_suffix(".csv").open("w", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=["ts", "event", "height", "extra"])
+                writer.writeheader()
+                for line in rows:
+                    value = json.loads(line)
+                    record = {key: value.pop(key) for key in writer.fieldnames[:-1] if key in value}
+                    record["extra"] = json.dumps(value)
+                    writer.writerow(record)
+            self.assertEqual(digest.parse_commit_trace(path.with_suffix(".csv")), expected)
+
+    def test_latency_reads_retained_csv_segments_oldest_first(self):
+        rows = block_lifecycle(1707211, queued_ts=100, start_ts=300,
+                               finish_ts=1000000, elapsed_ms=1000)
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, selected in (("commit_state.csv.1", rows[:2]), ("commit_state.csv", rows[2:])):
+                with (Path(tmp) / name).open("w", newline="") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=["ts", "event", "height", "extra"])
+                    writer.writeheader()
+                    for line in selected:
+                        value = json.loads(line)
+                        record = {key: value.pop(key) for key in writer.fieldnames[:-1] if key in value}
+                        record["extra"] = json.dumps(value)
+                        writer.writerow(record)
+            output = self.run_latency(traces=tmp)
+        self.assertIn("committed 1 blocks", output)
 
     def test_checkpoint_residence_with_takeaway_and_header_ranges(self):
         rows = []
@@ -409,7 +454,7 @@ class LatencyTests(unittest.TestCase):
     def test_live_head_without_zakura_trace_reports_observed_blocks(self):
         output = self.run_latency(observed_blocks=27)
         self.assertIn("Observed 27 live tip advances", output)
-        self.assertIn("does not emit Zakura JSONL commit events", output)
+        self.assertIn("does not emit Zakura CSV commit events", output)
         self.assertNotIn("blocks/s", output)
 
 

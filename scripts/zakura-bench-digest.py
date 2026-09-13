@@ -15,8 +15,8 @@ Subcommands:
   diff       Compare two folded-stacks files (baseline vs primary) and render
              the largest per-function self-share changes as markdown.
   latency    Render block-processing latency as markdown (+ optional JSON) from
-             a run's Zakura JSONL traces (per-block `commit_start`/`commit_finish`
-             rows in commit_state.jsonl) and a final Prometheus /metrics snapshot
+             a run's Zakura CSV traces (per-block `commit_start`/`commit_finish`
+             rows in commit_state.csv) and a final Prometheus /metrics snapshot
              (cumulative per-stage duration histograms).
 """
 
@@ -366,7 +366,7 @@ def nearest_rank(sorted_values, quantile):
 
 
 def parse_commit_trace(trace_path, min_height=None):
-    """Parse commit_state.jsonl into block, header-range, and stall records.
+    """Parse a CSV commit trace into block, header-range, and stall records.
 
     The trace table is shared by two drivers: the block-sync driver (per-block
     `block_submit_queued`/`commit_start`/`commit_finish` rows keyed by height,
@@ -380,10 +380,26 @@ def parse_commit_trace(trace_path, min_height=None):
     headers = []
     stalls = defaultdict(int)
     non_committed = defaultdict(int)
-    with open(trace_path, encoding="utf-8", errors="replace") as trace:
-        for line in trace:
+    with open(trace_path, encoding="utf-8", errors="replace", newline="") as trace:
+        records = csv.DictReader(trace, strict=True)
+        for line in records:
             try:
-                row = json.loads(line)
+                row = {}
+                extra = {}
+                if None in line or None in line.values():
+                    raise ValueError("CSV field count does not match header")
+                for key, value in line.items():
+                    if not value:
+                        continue
+                    if key == "extra":
+                        extra = json.loads(value)
+                        if not isinstance(extra, dict) or set(extra).intersection(line):
+                            raise ValueError("CSV extra field is invalid or collides with columns")
+                    else:
+                        row[key] = json.loads(value) if key in {
+                            "ts", "height", "range_start", "range_count", "elapsed_ms"
+                        } else value
+                row.update(extra)
             except ValueError:
                 continue
             event = row.get("event")
@@ -418,6 +434,40 @@ def parse_commit_trace(trace_path, min_height=None):
                     float(elapsed),
                     row.get("apply_class") or "unknown",
                 )
+    return queued_ts, start_ts, finishes, headers, dict(stalls), dict(non_committed)
+
+
+def trace_segments(trace_dir, filename):
+    """Return retained trace segments oldest first, followed by the current file."""
+    retained = []
+    for path in Path(trace_dir).glob(f"{filename}.*"):
+        suffix = path.name.rsplit(".", 1)[-1]
+        if suffix.isdigit() and path.is_file():
+            retained.append((int(suffix), path))
+    retained.sort(reverse=True)
+    paths = [path for _, path in retained]
+    current = Path(trace_dir, filename)
+    if current.is_file():
+        paths.append(current)
+    return paths
+
+
+def parse_trace_segments(paths, min_height=None):
+    """Parse multiple trace segments while preserving their chronological order."""
+    queued_ts, start_ts, finishes = {}, {}, {}
+    headers = []
+    stalls = defaultdict(int)
+    non_committed = defaultdict(int)
+    for path in paths:
+        parsed = parse_commit_trace(path, min_height)
+        for target, source in ((queued_ts, parsed[0]), (start_ts, parsed[1]), (finishes, parsed[2])):
+            for key, value in source.items():
+                target.setdefault(key, value)
+        headers.extend(parsed[3])
+        for key, count in parsed[4].items():
+            stalls[key] += count
+        for key, count in parsed[5].items():
+            non_committed[key] += count
     return queued_ts, start_ts, finishes, headers, dict(stalls), dict(non_committed)
 
 
@@ -459,10 +509,10 @@ def cmd_latency(args):
     if observed_blocks is not None:
         report["observed_blocks"] = observed_blocks
 
-    trace_path = Path(args.traces, "commit_state.jsonl") if args.traces else None
-    if trace_path and trace_path.is_file():
+    trace_paths = trace_segments(args.traces, "commit_state.csv") if args.traces else []
+    if trace_paths:
         queued_ts, start_ts, finishes, headers, stalls, non_committed = (
-            parse_commit_trace(trace_path, getattr(args, "min_height", None))
+            parse_trace_segments(trace_paths, getattr(args, "min_height", None))
         )
         by_class = defaultdict(list)  # class -> [(height, ts, elapsed_ms)]
         for height, (ts, elapsed, apply_class) in finishes.items():
@@ -609,7 +659,7 @@ def cmd_latency(args):
             out.write(f"\n_(unclassified block commit rows: {counts})_\n")
 
         if not finishes:
-            out.write("_(commit_state.jsonl has no successful commit_finish rows)_\n")
+            out.write("_(commit_state.csv has no successful commit_finish rows)_\n")
 
         if headers:
             header_ms = sorted(ms for ms, _ in headers)
@@ -645,11 +695,11 @@ def cmd_latency(args):
             out.write(
                 f"Observed {observed_blocks:,} live tip advances. Detailed per-block"
                 " traces are unavailable because this stack does not emit Zakura"
-                " JSONL commit events.\n"
+                " CSV commit events.\n"
             )
         else:
             out.write(
-                "_(no per-block trace: commit_state.jsonl absent — legacy-stack leg"
+                "_(no per-block trace: commit_state.csv absent — legacy-stack leg"
                 " or tracing disabled)_\n"
             )
 
@@ -720,7 +770,7 @@ def main():
     stat.add_argument("--title", default="CPU")
 
     latency = sub.add_parser("latency", help="markdown block-latency digest")
-    latency.add_argument("--traces", default="", help="dir with commit_state.jsonl")
+    latency.add_argument("--traces", default="", help="dir with commit_state.csv")
     latency.add_argument("--metrics", default="", help="final /metrics text snapshot")
     latency.add_argument("--metrics-baseline", default="", help="optional starting /metrics snapshot")
     latency.add_argument("--min-height", type=int, help="ignore trace rows below this height")

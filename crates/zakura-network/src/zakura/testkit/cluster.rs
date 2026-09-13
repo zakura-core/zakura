@@ -44,7 +44,7 @@ impl ZakuraTestCluster {
         Ok(self.nodes.len() - 1)
     }
 
-    /// Spawn one node with a per-node JSONL trace directory.
+    /// Spawn one node with a per-node CSV trace directory.
     pub async fn spawn_traced_node(
         &mut self,
         seed: u64,

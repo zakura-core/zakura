@@ -1,4 +1,4 @@
-//! Typed JSONL events owned by the block-sync subsystem.
+//! Typed CSV events owned by the block-sync subsystem.
 
 use std::time::Duration;
 
@@ -296,7 +296,7 @@ pub(super) enum BoolOrU64 {
     U64(u64),
 }
 
-/// A block-sync JSONL row.
+/// A block-sync CSV row.
 #[derive(Serialize)]
 pub(super) struct BlockTraceEvent {
     event: &'static str,

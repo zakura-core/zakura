@@ -1,12 +1,13 @@
-//! Post-flush JSONL trace reader for Zakura tests.
+//! Post-flush CSV trace reader for Zakura tests.
 
 use std::{
-    fs,
-    io::{self, BufRead},
+    collections::HashSet,
+    fs, io,
     path::{Path, PathBuf},
 };
 
 use serde_json::Value;
+use zakura_jsonl_trace::{ENVELOPE_COLUMNS, EXTRA_COLUMN};
 
 /// Loaded Zakura trace tables.
 #[derive(Clone, Debug, Default)]
@@ -38,12 +39,12 @@ pub enum TraceValue<'a> {
     U64(u64),
     /// A boolean field.
     Bool(bool),
-    /// A null field.
+    /// An empty CSV field (absent or null before serialization).
     Null,
 }
 
 impl TraceReader {
-    /// Load all `*.jsonl` files in `path` and one level of per-node
+    /// Load all `*.csv` and `*.csv.N` files in `path` and one level of per-node
     /// subdirectories.
     pub fn load(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref();
@@ -90,13 +91,11 @@ impl TraceReader {
 
     fn load_dir(&mut self, path: &Path, source_node: Option<String>) -> io::Result<()> {
         let mut files = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
-        files.sort_by_key(|entry| entry.path());
+        files.sort_by_key(|entry| trace_segment(&entry.path()));
 
         for entry in files {
             let path = entry.path();
-            if !entry.file_type()?.is_file()
-                || path.extension().and_then(|ext| ext.to_str()) != Some("jsonl")
-            {
+            if !entry.file_type()?.is_file() || trace_segment(&path).is_none() {
                 continue;
             }
 
@@ -107,29 +106,131 @@ impl TraceReader {
     }
 
     fn load_file(&mut self, path: PathBuf, source_node: Option<String>) -> io::Result<()> {
-        let table = path
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid trace file name"))?
-            .to_string();
-        let file = fs::File::open(path)?;
-
-        for line in io::BufReader::new(file).lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
+        let (table, _) = trace_segment(&path)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid trace file name"))?;
+        let mut reader = csv::Reader::from_path(path)?;
+        let headers = reader.headers()?.clone();
+        let header_columns = validate_csv_headers(&table, &headers)?;
+        for record in reader.records() {
+            let record = record?;
+            let mut row = serde_json::Map::new();
+            let mut extra = None;
+            for (column, value) in headers.iter().zip(record.iter()) {
+                if value.is_empty() {
+                    continue;
+                }
+                if column == EXTRA_COLUMN {
+                    extra = Some(
+                        serde_json::from_str::<serde_json::Map<String, Value>>(value)
+                            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+                    );
+                } else {
+                    // CSV carries no type metadata. Keep identity and label columns textual.
+                    let has_type = |kind: &str| {
+                        trace_schema()[kind]
+                            .as_array()
+                            .expect("schema field list")
+                            .iter()
+                            .any(|field| field.as_str() == Some(column))
+                    };
+                    let integer = has_type("integer_fields");
+                    let boolean = has_type("boolean_fields");
+                    let typed = integer || boolean || has_type("json_fields");
+                    let value = if typed {
+                        serde_json::from_str(value)
+                            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+                    } else {
+                        Value::String(value.to_owned())
+                    };
+                    if (integer && !value.is_u64()) || (boolean && !value.is_boolean()) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("CSV column {column} has an invalid value type"),
+                        ));
+                    }
+                    row.insert(column.to_owned(), value);
+                }
             }
-            let row = serde_json::from_str(&line)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            if let Some(extra) = extra {
+                if let Some(column) = extra
+                    .keys()
+                    .find(|column| header_columns.contains(column.as_str()))
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("CSV extra field collides with column {column:?}"),
+                    ));
+                }
+                row.extend(extra);
+            }
             self.rows.push(TraceRow {
                 table: table.clone(),
                 source_node: source_node.clone(),
-                row,
+                row: Value::Object(row),
             });
         }
-
         Ok(())
     }
+}
+
+fn trace_schema() -> &'static Value {
+    static SCHEMA: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    SCHEMA.get_or_init(|| {
+        serde_json::from_str(zakura_jsonl_trace::SCHEMA_JSON).expect("checked trace schema")
+    })
+}
+
+fn trace_segment(path: &Path) -> Option<(String, std::cmp::Reverse<u64>)> {
+    let name = path.file_name()?.to_str()?;
+    let (table, suffix) = name.split_once(".csv")?;
+    let index = if suffix.is_empty() {
+        0
+    } else {
+        suffix.strip_prefix('.')?.parse().ok()?
+    };
+    Some((table.to_owned(), std::cmp::Reverse(index)))
+}
+
+fn validate_csv_headers(table: &str, headers: &csv::StringRecord) -> io::Result<HashSet<String>> {
+    let columns: HashSet<_> = headers.iter().map(ToOwned::to_owned).collect();
+    if columns.len() != headers.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "CSV header contains duplicate columns",
+        ));
+    }
+    if !headers
+        .iter()
+        .take(ENVELOPE_COLUMNS.len())
+        .eq(ENVELOPE_COLUMNS.iter().copied())
+        || headers.iter().next_back() != Some(EXTRA_COLUMN)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "CSV header is missing the trace envelope or trailing extra column",
+        ));
+    }
+    if let Some(fields) = trace_schema()["tables"]
+        .get(table)
+        .and_then(Value::as_array)
+    {
+        let expected = ENVELOPE_COLUMNS
+            .iter()
+            .copied()
+            .chain(
+                fields
+                    .iter()
+                    .map(|field| field.as_str().expect("schema column")),
+            )
+            .chain(std::iter::once(EXTRA_COLUMN));
+        if !headers.iter().eq(expected) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "CSV header does not match table schema",
+            ));
+        }
+    }
+    Ok(columns)
 }
 
 impl<'a> TraceQuery<'a> {
@@ -178,7 +279,7 @@ impl<'a> TraceQuery<'a> {
     /// Assert that `events` appears as an ordered subsequence in this query.
     ///
     /// Use this for one table and one node. Cross-table and cross-node ordering
-    /// is intentionally not modeled by the batched JSONL writer.
+    /// is intentionally not modeled by the batched CSV writer.
     pub fn assert_sequence(&self, events: &[&str]) {
         let mut next = 0;
 
@@ -205,7 +306,7 @@ impl<'a> TraceQuery<'a> {
 
     /// Assert that this query contains an event row with all expected fields.
     ///
-    /// This is intentionally unordered: JSONL writers batch rows, and e2e
+    /// This is intentionally unordered: CSV writers batch rows, and e2e
     /// tests should only assert ordering when it is part of the protocol.
     pub fn assert_row(&self, event: &str, fields: &[(&str, TraceValue<'_>)]) {
         let matched = self.matching().map(|row| &row.row).any(|row| {
@@ -228,7 +329,7 @@ fn trace_value_matches(actual: Option<&Value>, expected: TraceValue<'_>) -> bool
         TraceValue::Str(expected) => actual.and_then(Value::as_str) == Some(expected),
         TraceValue::U64(expected) => actual.and_then(Value::as_u64) == Some(expected),
         TraceValue::Bool(expected) => actual.and_then(Value::as_bool) == Some(expected),
-        TraceValue::Null => actual.is_some_and(Value::is_null),
+        TraceValue::Null => actual.is_none_or(Value::is_null),
     }
 }
 
@@ -254,22 +355,175 @@ fn source_node_from_dir(path: &Path) -> Option<String> {
 }
 
 #[cfg(test)]
+pub(super) fn write_trace_rows(path: &Path, rows: &[Value]) {
+    let (table, _) = trace_segment(path).expect("CSV path");
+    let fields = trace_schema()["tables"][&table]
+        .as_array()
+        .expect("table schema");
+    let header: Vec<_> = ENVELOPE_COLUMNS
+        .iter()
+        .copied()
+        .chain(fields.iter().map(|field| field.as_str().expect("column")))
+        .chain(std::iter::once(EXTRA_COLUMN))
+        .collect();
+    let mut writer = csv::Writer::from_path(path).expect("CSV file");
+    writer.write_record(&header).expect("CSV header");
+    for row in rows {
+        let object = row.as_object().expect("trace object");
+        let extra: serde_json::Map<_, _> = object
+            .iter()
+            .filter(|(key, _)| !header.contains(&key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        writer
+            .write_record(header.iter().map(|key| {
+                if *key == EXTRA_COLUMN {
+                    return Value::Object(extra.clone()).to_string();
+                }
+                match object.get(*key) {
+                    None | Some(Value::Null) => String::new(),
+                    Some(Value::String(value)) => value.clone(),
+                    Some(value) => value.to_string(),
+                }
+            }))
+            .expect("CSV row");
+    }
+    writer.flush().expect("CSV flush");
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reader_reads_rotated_segments_as_records_and_preserves_types() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (suffix, event) in [(".2", "old"), (".1", "middle"), ("", "new")] {
+            write_trace_rows(
+                &dir.path().join(format!("block_sync.csv{suffix}")),
+                &[
+                    serde_json::json!({"event": event, "height": 42, "hash": "000123",
+                    "ok": false, "received_status": 1, "reason": "comma, and\nnewline"}),
+                ],
+            );
+        }
+        fs::write(dir.path().join("block_sync.csv.lock"), "lock").expect("lock file");
+        let reader = TraceReader::load(dir.path()).expect("CSV segments");
+        reader
+            .table("block_sync")
+            .assert_sequence(&["old", "middle", "new"]);
+        reader.table("block_sync").assert_row(
+            "new",
+            &[
+                ("height", TraceValue::U64(42)),
+                ("hash", TraceValue::Str("000123")),
+                ("ok", TraceValue::Bool(false)),
+                ("received_status", TraceValue::U64(1)),
+                ("reason", TraceValue::Str("comma, and\nnewline")),
+            ],
+        );
+        assert_eq!(reader.table("block_sync").rows().len(), 3);
+    }
+
+    #[test]
+    fn reader_loads_csv_numbers_labels_and_quoted_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut writer = csv::Writer::from_path(dir.path().join("test.csv")).expect("CSV file");
+        writer
+            .write_record([
+                "ts",
+                "wall_ts",
+                "node",
+                "process_trace_id",
+                "event",
+                "height",
+                "hash",
+                "reason",
+                "extra",
+            ])
+            .expect("header");
+        writer
+            .write_record([
+                "1",
+                "2026-09-11T00:00:00Z",
+                "01",
+                "process-1",
+                "commit_finish",
+                "42",
+                "1234",
+                "error, with\na newline",
+                r#"{"new_count":7}"#,
+            ])
+            .expect("row");
+        writer.flush().expect("flush");
+        let reader = TraceReader::load(dir.path()).expect("CSV reader");
+        reader.table("test").assert_row(
+            "commit_finish",
+            &[
+                ("node", TraceValue::Str("01")),
+                ("height", TraceValue::U64(42)),
+                ("hash", TraceValue::Str("1234")),
+                ("reason", TraceValue::Str("error, with\na newline")),
+                ("new_count", TraceValue::U64(7)),
+            ],
+        );
+    }
+
+    #[test]
+    fn reader_rejects_duplicate_csv_columns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            dir.path().join("test.csv"),
+            "ts,wall_ts,node,process_trace_id,event,event,extra\n",
+        )
+        .expect("trace file");
+
+        let error = TraceReader::load(dir.path()).expect_err("duplicate header must fail");
+        assert!(error.to_string().contains("duplicate columns"));
+    }
+
+    #[test]
+    fn reader_rejects_csv_extra_collisions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut writer = csv::Writer::from_path(dir.path().join("test.csv")).expect("CSV file");
+        writer
+            .write_record([
+                "ts",
+                "wall_ts",
+                "node",
+                "process_trace_id",
+                "event",
+                "extra",
+            ])
+            .expect("header");
+        writer
+            .write_record([
+                "1",
+                "2026-09-11T00:00:00Z",
+                "01",
+                "process-1",
+                "commit_start",
+                r#"{"event":"commit_finish"}"#,
+            ])
+            .expect("row");
+        writer.flush().expect("flush");
+
+        let error = TraceReader::load(dir.path()).expect_err("extra collision must fail");
+        assert!(error.to_string().contains("collides with column"));
+    }
 
     #[test]
     fn reader_counts_and_matches_subsequences_within_a_table() {
         let dir = tempfile::tempdir().expect("tempdir");
         let node_dir = dir.path().join("node-01");
         fs::create_dir_all(&node_dir).expect("node dir");
-        fs::write(
-            node_dir.join("handshake.jsonl"),
-            r#"{"node":"01","event":"control.started"}"#.to_string()
-                + "\n"
-                + r#"{"node":"01","event":"control.succeeded"}"#
-                + "\n",
-        )
-        .expect("trace file");
+        write_trace_rows(
+            &node_dir.join("handshake.csv"),
+            &[
+                serde_json::json!({"node": "01", "event": "control.started"}),
+                serde_json::json!({"node": "01", "event": "control.succeeded"}),
+            ],
+        );
 
         let reader = TraceReader::load(dir.path()).expect("reader");
         assert_eq!(
@@ -290,11 +544,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let node_dir = dir.path().join("node-01");
         fs::create_dir_all(&node_dir).expect("node dir");
-        fs::write(
-            node_dir.join("conn.jsonl"),
-            r#"{"node":"wrong","event":"accepted"}"#.to_string() + "\n",
-        )
-        .expect("trace file");
+        write_trace_rows(
+            &node_dir.join("conn.csv"),
+            &[serde_json::json!({"node": "wrong", "event": "accepted"})],
+        );
 
         let reader = TraceReader::load(dir.path()).expect("reader");
         assert_eq!(reader.node("01").table("conn").count("accepted"), 1);
@@ -308,16 +561,14 @@ mod tests {
         let node_a = dir.path().join("node-a");
         fs::create_dir_all(&node_b).expect("node-b dir");
         fs::create_dir_all(&node_a).expect("node-a dir");
-        fs::write(
-            node_b.join("conn.jsonl"),
-            r#"{"node":"b","event":"from-b"}"#.to_string() + "\n",
-        )
-        .expect("node-b trace file");
-        fs::write(
-            node_a.join("conn.jsonl"),
-            r#"{"node":"a","event":"from-a"}"#.to_string() + "\n",
-        )
-        .expect("node-a trace file");
+        write_trace_rows(
+            &node_b.join("conn.csv"),
+            &[serde_json::json!({"node": "b", "event": "from-b"})],
+        );
+        write_trace_rows(
+            &node_a.join("conn.csv"),
+            &[serde_json::json!({"node": "a", "event": "from-a"})],
+        );
 
         let reader = TraceReader::load(dir.path()).expect("reader");
         let events: Vec<_> = reader

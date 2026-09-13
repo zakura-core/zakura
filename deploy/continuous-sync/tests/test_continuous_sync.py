@@ -422,27 +422,21 @@ class ContinuousSyncTests(unittest.TestCase):
             sync.cleanup_retention(config)
             self.assertEqual([path.exists() for path in paths], [True, True, False])
 
-    @unittest.skipUnless(sync.shutil.which("logrotate"), "logrotate is required on the canaries")
-    def test_trace_rotation_preserves_recent_segments_and_open_writer(self):
+    def test_controller_leaves_csv_rotation_to_the_writer(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = make_config(Path(tmp), policy=sync.Policy(trace_file_bytes=64))
             run_dir = config.paths.runs_dir / "current"
             traces = run_dir / "traces"
             traces.mkdir(parents=True)
-            trace = traces / "block_sync.jsonl"
-            with trace.open("ab", buffering=0) as writer:
-                inode = trace.stat().st_ino
-                for batch in range(3):
-                    writer.write((json.dumps({"batch": batch, "detail": "x" * 100}) + "\n").encode())
-                    sync.rotate_run_logs(config, run_dir)
-                    self.assertEqual(trace.stat().st_ino, inode)
-                    self.assertEqual(trace.stat().st_size, 0)
-                writer.write(b'{"batch": 3}\n')
-            history = [json.loads(path.read_text())["batch"] for path in (
-                traces / "block_sync.jsonl.2", traces / "block_sync.jsonl.1", trace,
-            )]
-            self.assertEqual(history, [1, 2, 3])
-            self.assertFalse((traces / "block_sync.jsonl.3").exists())
+            trace = traces / "block_sync.csv"
+            content = "ts,event,extra\n1,state,\n"
+            trace.write_text(content)
+            with patch.object(sync, "run"):
+                sync.rotate_run_logs(config, run_dir)
+            self.assertEqual(trace.read_text(), content)
+            rotation = (run_dir / ".trace-logrotate.conf").read_text()
+            self.assertNotIn(str(traces), rotation)
+            self.assertIn("zebrad.log", rotation)
 
     def test_cleanup_bounds_binary_cache_and_removes_interrupted_builds(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -636,6 +630,10 @@ class ContinuousSyncTests(unittest.TestCase):
             ["temp-zakura-sync-test-2"],
         )
         rendered = deploy.render_files(nodes[0])
+
+        self.assertIn("ZAKURA_TRACE_FILE_BYTES=134217728", rendered["trace-writer.env"])
+        self.assertIn("trace_file_bytes = 134217728", rendered["controller.toml"])
+        self.assertIn("trace-writer.env", rendered["zakura.service"])
 
         self.assertIn('p2p_stack = "zakura"', rendered["zakurad.toml.template"])
         self.assertIn('mode_label = "Zakura/v2-only"', rendered["controller.toml"])

@@ -633,3 +633,45 @@ async fn semantic_child_cannot_end_checkpoint_sync_early() {
         }
     }
 }
+
+#[test]
+fn regtest_checkpoint_boundaries_cover_mandatory_height() {
+    use zakura_chain::parameters::testnet::{
+        ConfiguredActivationHeights, ConfiguredCheckpoints, RegtestParameters,
+    };
+
+    let default_network = Network::new_regtest(Default::default());
+    let delayed_canopy = Network::new_regtest(RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            canopy: Some(10),
+            ..Default::default()
+        },
+        checkpoints: Some(ConfiguredCheckpoints::HeightsAndHashes(vec![
+            (Height(0), default_network.genesis_hash()),
+            (Height(9), block::Hash([1; 32])),
+            (Height(12), block::Hash([2; 32])),
+        ])),
+        ..Default::default()
+    });
+
+    for checkpoint_sync in [true, false] {
+        let config = Config {
+            checkpoint_sync,
+            ..Default::default()
+        };
+        assert_eq!(
+            init_checkpoint_list(config.clone(), &default_network).1,
+            Height(0)
+        );
+        let (_, boundary) = init_checkpoint_list(config, &delayed_canopy);
+        assert_eq!(
+            boundary,
+            if checkpoint_sync {
+                Height(12)
+            } else {
+                Height(9)
+            }
+        );
+        assert!(boundary >= delayed_canopy.mandatory_checkpoint_height());
+    }
+}

@@ -1,4 +1,4 @@
-use std::{future::Future, sync::Arc};
+use std::{future::Future, num::NonZeroU32, sync::Arc};
 
 use color_eyre::eyre::{eyre, Report};
 use sha2::{Digest, Sha256};
@@ -936,6 +936,8 @@ where
         Ok(Ok(zakura_state::ReadResponse::RetainedHeaderPathPage(
             zakura_state::RetainedPathReadOutcome::Page(page),
         ))) => {
+            let finalized_body_sizes =
+                finalized_body_sizes_for_page(read_state.clone(), &page.headers).await?;
             let finalized_tree_aux = if want_tree_aux {
                 finalized_tree_aux_for_page(
                     read_state,
@@ -952,10 +954,10 @@ where
                     common_ancestor: page.common_ancestor,
                     target: page.target,
                     scope: page.scope,
-                    finalized_body_sizes: vec![None; page.headers.len()],
                     headers: page.headers,
                     aux_deliveries: page.aux_deliveries,
                     finalized_tree_aux,
+                    finalized_body_sizes,
                     complete: page.complete,
                 },
             )))
@@ -969,6 +971,51 @@ where
         }),
         Err(_) => Err(PortError::Timeout),
     }
+}
+
+/// Committed serialized sizes for a retained page's headers, looked up by header hash
+/// through [`zakura_state::ReadRequest::BlockSizesByHash`], parallel to `headers`. Zero
+/// sizes are treated as unknown so the wire keeps its "0 = unknown" meaning.
+async fn finalized_body_sizes_for_page<ReadState>(
+    read_state: ReadState,
+    headers: &[Arc<block::Header>],
+) -> Result<Vec<Option<NonZeroU32>>, PortError>
+where
+    ReadState: Service<
+            zakura_state::ReadRequest,
+            Response = zakura_state::ReadResponse,
+            Error = zakura_state::BoxError,
+        > + Clone
+        + Send
+        + 'static,
+    ReadState::Future: Send + 'static,
+{
+    if headers.is_empty() {
+        return Ok(Vec::new());
+    }
+    let hashes: Vec<block::Hash> = headers.iter().map(|header| header.hash()).collect();
+    let sizes = match tokio::time::timeout(
+        ZAKURA_HEADER_SYNC_DRIVER_TIMEOUT,
+        read_state.oneshot(zakura_state::ReadRequest::BlockSizesByHash { hashes }),
+    )
+    .await
+    {
+        Ok(Ok(zakura_state::ReadResponse::BlockSizesByHash(sizes))) => sizes,
+        Ok(Ok(_)) => return Err(PortError::Unavailable { source: None }),
+        Ok(Err(error)) => {
+            return Err(PortError::Unavailable {
+                source: Some(Arc::from(error)),
+            })
+        }
+        Err(_) => return Err(PortError::Timeout),
+    };
+    if sizes.len() != headers.len() {
+        return Err(PortError::Unavailable { source: None });
+    }
+    Ok(sizes
+        .into_iter()
+        .map(|size| size.and_then(NonZeroU32::new))
+        .collect())
 }
 
 async fn finalized_tree_aux_for_page<ReadState>(
@@ -1778,5 +1825,67 @@ mod tests {
             error.attribution,
             zakura_header_chain::Attribution::HeaderPeer(source)
         );
+    }
+
+    #[tokio::test]
+    async fn finalized_body_sizes_follow_the_state_reply_and_drop_zero_sizes() {
+        let genesis = regtest_genesis_block().header.clone();
+        let mut sibling = *genesis;
+        sibling.nonce.0[0] = sibling.nonce.0[0].wrapping_add(1);
+        let headers: Vec<Arc<block::Header>> = vec![genesis, Arc::new(sibling)];
+        let expected_hashes: Vec<block::Hash> =
+            headers.iter().map(|header| header.hash()).collect();
+        let read_state = tower::service_fn(move |request| {
+            let expected_hashes = expected_hashes.clone();
+            async move {
+                Ok::<_, zakura_state::BoxError>(match request {
+                    zakura_state::ReadRequest::BlockSizesByHash { hashes } => {
+                        assert_eq!(hashes, expected_hashes);
+                        zakura_state::ReadResponse::BlockSizesByHash(vec![Some(1_500), Some(0)])
+                    }
+                    request => panic!("unexpected body-size state request: {request:?}"),
+                })
+            }
+        });
+
+        let sizes = finalized_body_sizes_for_page(read_state, &headers)
+            .await
+            .expect("the size reply is available");
+
+        assert_eq!(sizes, vec![NonZeroU32::new(1_500), None]);
+    }
+
+    #[tokio::test]
+    async fn finalized_body_sizes_reject_a_misaligned_state_reply() {
+        let headers = vec![regtest_genesis_block().header.clone()];
+        let read_state = tower::service_fn(move |_: zakura_state::ReadRequest| async move {
+            Ok::<_, zakura_state::BoxError>(
+                zakura_state::ReadResponse::BlockSizesByHash(Vec::new()),
+            )
+        });
+
+        let result = finalized_body_sizes_for_page(read_state, &headers).await;
+
+        assert!(matches!(
+            result,
+            Err(PortError::Unavailable { source: None })
+        ));
+    }
+
+    #[tokio::test]
+    async fn finalized_body_sizes_skip_the_state_for_an_empty_page() {
+        // A one-element reply would be a length mismatch (an error) if the state were
+        // queried, so an `Ok(empty)` result proves the early return.
+        let read_state = tower::service_fn(move |_: zakura_state::ReadRequest| async move {
+            Ok::<_, zakura_state::BoxError>(zakura_state::ReadResponse::BlockSizesByHash(vec![
+                Some(1),
+            ]))
+        });
+
+        let sizes = finalized_body_sizes_for_page(read_state, &[])
+            .await
+            .expect("an empty page has no sizes");
+
+        assert!(sizes.is_empty());
     }
 }

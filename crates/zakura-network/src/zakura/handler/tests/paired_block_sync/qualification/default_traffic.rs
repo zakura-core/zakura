@@ -9,6 +9,7 @@ type ClientSession = (
     FramedSend,
     FramedRecv,
     CancellationToken,
+    crate::zakura::CloseCause,
 );
 
 #[derive(Debug)]
@@ -76,10 +77,18 @@ impl Service for Client {
     }
     fn add_peer(&self, mut peer: Peer) {
         let cancel = peer.service_cancel_token();
+        let close_cause = peer.close_cause();
         let (data_recv, data_send) = peer.take_stream(6).unwrap();
         let (request_recv, request_send) = peer.take_stream(7).unwrap();
         self.sessions
-            .try_send((data_recv, data_send, request_send, request_recv, cancel))
+            .try_send((
+                data_recv,
+                data_send,
+                request_send,
+                request_recv,
+                cancel,
+                close_cause,
+            ))
             .unwrap();
     }
     fn remove_peer(&self, _: &ZakuraPeerId, _: ZakuraConnId) {}
@@ -157,11 +166,12 @@ async fn traffic(buffered: bool) -> Result<(), BoxError> {
             handler(&server_node, server_siblings, server, &limits),
         )
         .spawn();
-    let (_client, transport, (mut data, _status, requests, _request_recv, cancel)) = connect_raw(
-        LocalEndpointFactory::node_addr(router.endpoint()).await,
-        89642,
-    )
-    .await?;
+    let (_client, transport, (mut data, _status, requests, _request_recv, cancel, client_close)) =
+        connect_raw(
+            LocalEndpointFactory::node_addr(router.endpoint()).await,
+            89642,
+        )
+        .await?;
     await_until("traffic server admitted the requester", DEADLINE, || {
         server_node.service.peer_count() == 1
     })
@@ -219,11 +229,12 @@ async fn traffic(buffered: bool) -> Result<(), BoxError> {
                 .await
                 .map_err(|error| {
                     format!(
-                        "L04 exchange {} of {} failed after {:?}: {error}; server_close={}; transport_close={:?}",
+                        "L04 exchange {} of {} failed after {:?}: {error}; server_close={}; client_close={}; transport_close={:?}",
                         index + 1,
                         zakura_test::resources::load_rounds() * 64,
                         started.elapsed(),
                         server_close.get_or("not recorded"),
+                        client_close.get_or("not recorded"),
                         transport.connection.close_reason(),
                     )
                 })?;

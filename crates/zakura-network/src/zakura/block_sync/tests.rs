@@ -14779,7 +14779,7 @@ async fn reactor_publishes_block_sync_candidate_gap() {
 }
 
 #[tokio::test]
-async fn oversize_body_policy_reports_size_mismatch_and_retries_without_buffering() {
+async fn oversize_body_policy_reports_size_mismatch_and_keeps_the_body() {
     let mut config = ZakuraBlockSyncConfig {
         size_deviation_tolerance: 100,
         ..immediate_body_download_config()
@@ -14863,31 +14863,23 @@ async fn oversize_body_policy_reports_size_mismatch_and_retries_without_bufferin
         .await
         .expect("block queues");
 
-    loop {
-        match next_action(&mut actions).await {
-            BlockSyncAction::Misbehavior { reason, .. } => {
-                assert_eq!(reason, BlockSyncMisbehavior::SizeMismatch);
-                break;
-            }
-            BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action during size mismatch test: {action:?}"),
-        }
-    }
-
-    let no_submit = tokio::time::timeout(Duration::from_millis(200), async {
-        while let Some(action) = actions.recv().await {
-            if matches!(action, BlockSyncAction::SubmitBlock { .. }) {
-                return false;
+    let mut saw_mismatch = false;
+    let mut saw_submit = false;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !(saw_mismatch && saw_submit) {
+            match next_action(&mut actions).await {
+                BlockSyncAction::Misbehavior { reason, .. } => {
+                    assert_eq!(reason, BlockSyncMisbehavior::SizeMismatch);
+                    saw_mismatch = true;
+                }
+                BlockSyncAction::SubmitBlock { .. } => saw_submit = true,
+                BlockSyncAction::QueryNeededBlocks { .. } => {}
+                action => panic!("unexpected action during size mismatch test: {action:?}"),
             }
         }
-        true
     })
     .await
-    .unwrap_or(true);
-    assert!(
-        no_submit,
-        "oversize body is not submitted after SizeMismatch"
-    );
+    .expect("the mismatch is reported and the hash-matched body is still submitted");
 
     reactor_task.abort();
 }

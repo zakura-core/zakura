@@ -1458,4 +1458,70 @@ mod bbr_tests {
         assert_eq!(window.available_slots(), 0);
         assert_eq!(window.available_slots_with_bonus(2), 0);
     }
+
+    /// Two worst-case reservations per 2.5 MB floor deliver two 100 KB bodies per round
+    /// trip: a 5 MB/s sample and a 200 KB BDP, so the gain-3 target (600 KB) never reaches
+    /// the floor. Twenty-five hinted bodies per round trip sample 62.5 MB/s and a 7.5 MB
+    /// target, but the delay gate still holds the window at the floor: the first per-ack
+    /// sample's size residual is `elapsed - bytes / (bytes / elapsed)` = 0, clamped to the
+    /// 0.1 ms minimum, so every later round trip reads as a standing queue.
+    #[test]
+    fn worst_case_reservations_and_the_delay_gate_pin_the_byte_window_at_its_floor() {
+        use super::super::config::DEFAULT_BS_BBR_MIN_CWND_BYTES;
+
+        let cfg = ZakuraBlockSyncConfig {
+            bbr_cwnd_unit: CwndUnit::Bytes,
+            bbr_min_cwnd_bytes: DEFAULT_BS_BBR_MIN_CWND_BYTES,
+            bbr_cwnd_gain_percent: 300,
+            ..bbr_test_config()
+        };
+        let floor = usize::try_from(DEFAULT_BS_BBR_MIN_CWND_BYTES)
+            .expect("the default byte floor fits usize on supported targets");
+        let body_bytes: u64 = 100_000;
+        let rtt = Duration::from_millis(40);
+
+        // `requests_per_round` bodies are sent together, share one delivery snapshot, and
+        // all complete one round trip later; five rounds settle the max/min filters.
+        let settle = |requests_per_round: u64| {
+            let mut bbr = BbrState::new(&cfg);
+            let mut now = Instant::now();
+            for _ in 0..5 {
+                let snapshot = bbr.delivery_snapshot(now);
+                now += rtt;
+                for remaining in (0..requests_per_round).rev() {
+                    bbr.record_delivery(now, rtt, 1, body_bytes, remaining * body_bytes, snapshot);
+                }
+            }
+            (bbr, now)
+        };
+        let bdp_target = |bbr: &BbrState, now: Instant| {
+            let rate = bbr
+                .btlbw_units_per_sec(now)
+                .expect("deliveries were recorded");
+            let rtprop =
+                Duration::from_millis(bbr.rtprop_ms(now).expect("deliveries were recorded"));
+            rounded_usize(rate * rtprop.as_secs_f64() * 3.0, 0)
+        };
+
+        let (worst_case, now) = settle(2);
+        let worst_case_target = bdp_target(&worst_case, now);
+        assert!(
+            worst_case_target < floor,
+            "two small bodies per round trip cannot lift the BDP target to the floor: {worst_case_target}"
+        );
+        assert_eq!(worst_case.effective_cwnd(), floor);
+
+        let (hinted, now) = settle(25);
+        let hinted_target = bdp_target(&hinted, now);
+        assert!(
+            hinted_target > 2 * floor,
+            "twenty-five hinted bodies per round trip lift the BDP target well past the floor: {hinted_target}"
+        );
+        assert_eq!(
+            hinted.delay_cap(),
+            Some(floor),
+            "the delay gate ratchets the ceiling down to the floor"
+        );
+        assert_eq!(hinted.effective_cwnd(), floor);
+    }
 }

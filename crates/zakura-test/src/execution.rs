@@ -1,4 +1,13 @@
-//! Controlled real blocking operations and independent execution observations.
+//! Pause background jobs and count how many have started or are still running.
+//!
+//! A database read can continue after its caller stops waiting. Tests use this
+//! helper to pause that read, cancel the caller, and check that the node still
+//! counts the unfinished read against its work limit.
+//!
+//! Call [`ExecutionProbe::start`] inside the job and keep its [`RunningOperation`]
+//! guard until the job ends. The helper counts that guard's lifetime independently
+//! of the node's capacity counters. Jobs can pause at entry or before returning a
+//! result. [`ExecutionProbe::release_on_drop`] releases them if the test panics.
 
 use crate::allocations::AllocationStats;
 use std::{
@@ -7,16 +16,16 @@ use std::{
 };
 use tokio::sync::Notify;
 
-/// Actual starts/completions, distinct from reserved permits or queued tasks.
+/// Counts recorded inside jobs. Reserving capacity or queuing a job does not count.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ExecutionSnapshot {
-    /// Operations that entered their blocking closure.
+    /// Jobs that called [`ExecutionProbe::start`], including jobs paused there.
     pub started: usize,
-    /// Operations whose closure still owns its execution guard.
+    /// Jobs that still hold their [`RunningOperation`] guard.
     pub running: usize,
-    /// Largest simultaneous running count.
+    /// Most jobs counted as running at the same time.
     pub peak_running: usize,
-    /// Execution guards that ended, including cancelled delivery and errors.
+    /// Guards that were dropped, whether the job succeeded, failed, or panicked.
     pub finished: usize,
     /// Largest allocation request observed inside a measured operation.
     pub largest_allocation: usize,
@@ -40,7 +49,10 @@ pub struct ExecutionProbe {
 }
 
 impl ExecutionProbe {
-    /// Construct an independently controlled probe.
+    /// Create a probe that can pause jobs at entry, before returning, or both.
+    ///
+    /// `hold_start` pauses calls to [`Self::start`]. `hold_finish` pauses calls to
+    /// [`RunningOperation::finish`]. [`Self::release`] releases both pause points.
     pub fn new(hold_start: bool, hold_finish: bool) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(State {
@@ -52,7 +64,10 @@ impl ExecutionProbe {
         })
     }
 
-    /// Count a real operation and optionally pause it. Call on a blocking thread.
+    /// Count a job as running, then pause it if `hold_start` was set.
+    ///
+    /// Call inside the blocking job, not when queuing it. Keep the returned guard
+    /// until the job ends. This can block the thread, so do not call on an async worker.
     pub fn start(self: &Arc<Self>) -> RunningOperation {
         {
             let mut state = self.state.lock().unwrap();
@@ -93,7 +108,7 @@ impl ExecutionProbe {
         );
     }
 
-    /// Record allocator evidence gathered on this operation's blocking thread.
+    /// Add memory measurements collected inside a job to the snapshot's maxima.
     pub fn allocations(&self, measured: AllocationStats) {
         let mut state = self.state.lock().unwrap();
         state.snapshot.largest_allocation = state
@@ -106,12 +121,12 @@ impl ExecutionProbe {
             .max(measured.peak_live_bytes);
     }
 
-    /// Read actual operation counts without observing the production permits.
+    /// Read the recorded job counts and memory measurements.
     pub fn snapshot(&self) -> ExecutionSnapshot {
         self.state.lock().unwrap().snapshot
     }
 
-    /// Release every blocked phase.
+    /// Let jobs proceed through both pause points, including future calls.
     pub fn release(&self) {
         let mut state = self.state.lock().unwrap();
         state.hold_start = false;
@@ -119,7 +134,9 @@ impl ExecutionProbe {
         self.released.notify_all();
     }
 
-    /// Ensure a test failure also releases its blocking jobs.
+    /// Return a guard that releases paused jobs when it goes out of scope.
+    ///
+    /// Keep it in the test so a failed assertion does not leave jobs waiting.
     pub fn release_on_drop(self: &Arc<Self>) -> impl Drop {
         struct Release(Arc<ExecutionProbe>);
         impl Drop for Release {
@@ -130,12 +147,12 @@ impl ExecutionProbe {
         Release(self.clone())
     }
 
-    /// Wait for a finite number of actual starts, with a bounded test deadline.
+    /// Wait up to five seconds for at least `count` jobs to call [`Self::start`].
     pub async fn wait_started(&self, count: usize) {
         self.wait_for(count, false).await;
     }
 
-    /// Wait for a finite number of actual completions.
+    /// Wait up to five seconds for at least `count` job guards to be dropped.
     pub async fn wait_finished(&self, count: usize) {
         self.wait_for(count, true).await;
     }
@@ -163,12 +180,16 @@ impl ExecutionProbe {
     }
 }
 
-/// Tracks the actual closure lifetime independently of any production work lease.
+/// Count a job as running until this guard is dropped, including during a panic.
+///
+/// Keep it inside the job for the entire operation being measured.
 #[derive(Debug)]
 pub struct RunningOperation(Arc<ExecutionProbe>);
 
 impl RunningOperation {
-    /// Pause just before returning the completed result, then end execution.
+    /// Pause here if `hold_finish` was set, then stop counting this job as running.
+    ///
+    /// Call just before the job returns its result.
     pub fn finish(self) {
         self.0.wait_blocked(true);
     }

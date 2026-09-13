@@ -325,7 +325,10 @@ impl WorkQueue {
             return Vec::new();
         }
         let mut inner = self.lock();
-        let mut taken: Vec<(block::Height, WorkItem)> = Vec::new();
+        // The requester funds max_count elements before taking work. Avoid
+        // geometric growth beyond that allocation plan, including tiny takes.
+        let mut taken: Vec<(block::Height, WorkItem)> =
+            Vec::with_capacity(max_count.min(inner.pending.len()));
         let mut estimated_bytes = 0u64;
         let mut next_expected: Option<block::Height> = None;
         let mut scope = None;
@@ -1066,15 +1069,24 @@ impl WorkQueue {
         self.lock().owner_for_height(height)
     }
 
-    /// Filter height metadata against current owners under one queue lock.
+    /// Compact height metadata against current owners and return the retained length.
+    /// The caller truncates its collection after this queue lock is released.
     /// `Copy` prevents removed values from dropping request resources under the lock.
     pub(super) fn retain_owned<T: Copy>(
         &self,
-        entries: &mut Vec<(block::Height, T)>,
+        entries: &mut [(block::Height, T)],
         owner_of: impl Fn(&T) -> zakura_header_chain::BodyWorkOwner,
-    ) {
+    ) -> usize {
         let inner = self.lock();
-        entries.retain(|(height, entry)| inner.owner_for_height(*height) == Some(owner_of(entry)));
+        let mut retained = 0;
+        for index in 0..entries.len() {
+            let (height, entry) = &entries[index];
+            if inner.owner_for_height(*height) == Some(owner_of(entry)) {
+                entries[retained] = entries[index];
+                retained += 1;
+            }
+        }
+        retained
     }
 
     pub(super) fn pending_contains(&self, height: block::Height) -> bool {

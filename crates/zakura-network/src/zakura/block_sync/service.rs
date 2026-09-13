@@ -14,7 +14,8 @@ use zakura_chain::serialization::ZcashDecoder;
 
 mod sessions;
 use crate::zakura::regulation::{
-    ConnectionResponseMemory, ResponseAdmissionError, ResponseAuthorization, ResponseScope,
+    ConnectionResponseMemory, ResponseAdmissionError, ResponseAuthorization, ResponseMemoryPermit,
+    ResponseScope,
 };
 pub(super) use sessions::CurrentSessions;
 use sessions::SessionCapacity;
@@ -159,10 +160,13 @@ impl BlockSyncPeerSession {
         self.cancel_token.cancel();
     }
 
-    pub(super) fn authorize_response(
+    pub(super) fn authorize_response_with_retained_memory(
         &self,
-    ) -> Result<ResponseAuthorization, ResponseAdmissionError> {
-        self.response_scope.authorize()
+        metadata_bytes: u64,
+        retained_bytes: u64,
+    ) -> Result<(ResponseAuthorization, Option<ResponseMemoryPermit>), ResponseAdmissionError> {
+        self.response_scope
+            .authorize_with_retained_memory(metadata_bytes, retained_bytes)
     }
 
     pub(super) fn response_memory(&self) -> ConnectionResponseMemory {

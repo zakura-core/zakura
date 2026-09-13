@@ -111,6 +111,83 @@ fn failed_scope_setup_preserves_the_existing_receiver() {
 }
 
 #[test]
+fn jointly_admitted_storage_outlives_the_exchange_and_scope() {
+    let node = ResponseMemory::default();
+    let connection = node.connection();
+    let baseline = node.reserved_for_test();
+    let scope = ResponseScope::with_memory(CancellationToken::new(), CloseCause::new(), connection);
+    let (mut authorization, retained) = scope.authorize_with_retained_memory(128, 256).unwrap();
+    let writer = authorization.write_permission();
+    assert!(writer.publish(|| {}));
+    assert!(writer.try_start(|| true));
+    authorization.finish();
+    drop((authorization, writer, scope));
+    assert_eq!(node.reserved_for_test(), baseline + 256);
+    drop(retained);
+    assert_eq!(node.reserved_for_test(), NODE_SETUP_BYTES);
+}
+
+#[test]
+fn retained_growth_and_request_admission_are_atomic() {
+    let setup = CONNECTION_SETUP_BYTES + ResponseScope::setup_bytes_for_test();
+    let node = pool(setup + 4096, setup + 4096);
+    let connection = node.connection();
+    let scope = ResponseScope::with_memory(CancellationToken::new(), CloseCause::new(), connection);
+    let before = node.reserved_for_test();
+    assert!(matches!(
+        scope.authorize_with_retained_memory(1, 4096),
+        Err(ResponseAdmissionError::MemoryFull)
+    ));
+    assert!(matches!(
+        scope.authorize_with_retained_memory(1, u64::MAX),
+        Err(ResponseAdmissionError::MemoryFull)
+    ));
+    assert_eq!(node.reserved_for_test(), before);
+    assert!(scope.authorize_with_retained_memory(1, 2048).is_ok());
+    assert_eq!(node.reserved_for_test(), before);
+}
+
+#[test]
+fn allocation_plans_are_admitted_as_one_reservation() {
+    let setup = CONNECTION_SETUP_BYTES + ResponseScope::setup_bytes_for_test();
+    let limit = setup + 4096;
+    let node = pool(limit, limit);
+    let connection = node.connection();
+    let scope = ResponseScope::with_memory(
+        CancellationToken::new(),
+        CloseCause::new(),
+        connection.clone(),
+    );
+    let empty = scope.authorize().unwrap();
+    let fixed = node.reserved_for_test() - NODE_SETUP_BYTES - setup;
+    drop(empty);
+    assert_eq!(node.reserved_for_test(), NODE_SETUP_BYTES + setup);
+    assert_eq!(
+        scope.authorize_with_metadata(u64::MAX).unwrap_err(),
+        ResponseAdmissionError::MemoryFull
+    );
+    assert_eq!(node.reserved_for_test(), NODE_SETUP_BYTES + setup);
+    let owner = scope.authorize_with_metadata(4096 - fixed).unwrap();
+    let writer = owner.write_permission();
+    assert_eq!(node.reserved_for_test(), NODE_SETUP_BYTES + limit);
+    assert_eq!(
+        scope.authorize_with_metadata(1).unwrap_err(),
+        ResponseAdmissionError::MemoryFull
+    );
+    drop(owner);
+    assert_eq!(node.reserved_for_test(), NODE_SETUP_BYTES + limit);
+    drop(writer);
+    assert_eq!(node.reserved_for_test(), NODE_SETUP_BYTES + setup);
+    drop(scope);
+    assert_eq!(
+        node.reserved_for_test(),
+        NODE_SETUP_BYTES + CONNECTION_SETUP_BYTES
+    );
+    drop(connection);
+    assert_eq!(node.reserved_for_test(), NODE_SETUP_BYTES);
+}
+
+#[test]
 fn both_limits_apply_across_messages_connections_and_clones() {
     let node = pool(
         2 * CONNECTION_SETUP_BYTES + 100,

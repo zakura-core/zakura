@@ -1029,7 +1029,7 @@ mod bbr_tests {
     fn fill_outstanding(window: &mut DownloadWindow, n: usize) {
         let now = Instant::now();
         for _ in 0..n {
-            window.outstanding.push(OutstandingBlockRange {
+            window.outstanding.push_for_test(OutstandingBlockRange {
                 authorization: crate::zakura::regulation::ResponseAuthorization::for_test(),
                 response: crate::zakura::regulation::ResponseCredit::new(1, u64::MAX),
                 local_work_active: true,
@@ -1139,7 +1139,7 @@ mod bbr_tests {
         for i in 0..count {
             // A `u32` index; the test count is tiny so the cast is safe.
             let height = block::Height(1 + i as u32);
-            window.outstanding.push(OutstandingBlockRange {
+            window.outstanding.push_for_test(OutstandingBlockRange {
                 authorization: crate::zakura::regulation::ResponseAuthorization::for_test(),
                 response: crate::zakura::regulation::ResponseCredit::new(1, u64::MAX),
                 local_work_active: true,

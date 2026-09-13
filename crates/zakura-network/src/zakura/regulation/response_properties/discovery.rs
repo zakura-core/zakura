@@ -61,7 +61,9 @@ impl DiscoveryResponse {
         };
         let connection = CancellationToken::new();
         let scope = ResponseScope::new(connection.clone(), CloseCause::new());
-        let authorization = scope.authorize().unwrap();
+        let authorization = scope
+            .authorize_with_metadata(u64::try_from(std::mem::size_of::<Self>()).unwrap())
+            .unwrap();
         let writer = authorization.write_permission();
         assert!(writer.publish(|| {}));
         Self {

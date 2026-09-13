@@ -22,6 +22,7 @@ const DEADLINE: Duration = Duration::from_secs(2);
 mod identity;
 mod lifetime;
 mod limits;
+mod metadata;
 mod terminal_counts;
 
 struct Fixture {

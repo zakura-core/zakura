@@ -2,6 +2,13 @@ use super::super::tests::mainnet_decoder;
 use super::*;
 
 impl BlockSyncPeerSession {
+    pub(super) fn authorize_response(
+        &self,
+    ) -> Result<ResponseAuthorization, ResponseAdmissionError> {
+        self.authorize_response_with_retained_memory(0, 0)
+            .map(|(authorization, _)| authorization)
+    }
+
     /// Set the pool before a routine publishes its first request.
     pub(in crate::zakura::block_sync) fn with_response_memory_for_test(
         mut self,

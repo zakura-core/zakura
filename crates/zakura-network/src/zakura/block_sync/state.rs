@@ -5,6 +5,7 @@ use super::{
     work_queue::{RequestWriteStatus, WorkQueue},
     *,
 };
+use crate::zakura::regulation::ResponseVec;
 use crate::zakura::{ServicePeerDirection, ServicePeerSnapshot, ZakuraBlockSyncCandidateState};
 use std::num::NonZeroU64;
 
@@ -361,7 +362,7 @@ impl BlockSyncState {
 #[derive(Debug)]
 pub(super) struct DownloadWindow {
     pub(super) max_inflight_requests: u32,
-    pub(super) outstanding: Vec<OutstandingBlockRange>,
+    pub(super) outstanding: ResponseVec<OutstandingBlockRange>,
     /// Per-peer BBR-lite estimators + cwnd — the sole congestion controller. Under
     /// [`CwndUnit::Bytes`] the cwnd is itself a byte budget sourced from header size
     /// hints (no fixed per-request byte weight), so there is no `nominal_request_bytes`.
@@ -395,7 +396,7 @@ impl DownloadWindow {
     pub(super) fn new(config: &ZakuraBlockSyncConfig) -> Self {
         Self {
             max_inflight_requests: config.advertised_max_inflight_requests(),
-            outstanding: Vec::new(),
+            outstanding: ResponseVec::new(),
             bbr: BbrState::new(config),
             cwnd_unit: config.bbr_cwnd_unit,
             startup_request_cap: usize::try_from(config.initial_inflight_requests)

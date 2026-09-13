@@ -98,7 +98,7 @@ fn same_peer_session_replaces_at_the_full_direction_limit() {
 }
 
 #[test]
-fn new_request_replaces_idle_served_path_and_releases_its_lease() {
+fn incomplete_page_releases_capacity_before_the_peer_continues() {
     let mut startup = startup(CancellationToken::new());
     let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
     let snapshot = committed_snapshot(anchor);
@@ -107,50 +107,77 @@ fn new_request_replaces_idle_served_path_and_releases_its_lease() {
     let (_handle, mut actions, mut reactor) =
         build_header_sync_reactor(startup).expect("the serving fixture builds");
     let peer = peer();
-    let old_target = zakura_header_chain::Frontier::new(block::Height(1), block::Hash([0x31; 32]));
-    let old_scope =
-        zakura_header_chain::HeaderWorkAuthority::for_target(&snapshot, old_target.hash);
+    let (send, mut outbound) = framed_channel(8);
+    reactor.handle_peer_connected(PeerSession::from_parts_with_session_id(
+        peer.clone(),
+        7,
+        send,
+        CancellationToken::new(),
+    ));
+    outbound.try_recv().expect("the initial status is sent");
+    let mut header = *regtest_genesis_block().header;
+    header.previous_block_hash = anchor.hash;
+    let header = Arc::new(header);
+    let first = header.hash();
+    let target = zakura_header_chain::Frontier::new(block::Height(2), block::Hash([0x31; 32]));
+    let scope = zakura_header_chain::HeaderWorkAuthority::for_target(&snapshot, target.hash);
+    let request_id = HeaderSyncRequestId::new(1).unwrap();
     reactor.served_paths.insert(
         peer.clone(),
         ServedPathState::Active {
             session_id: 7,
             lease_id: 9,
-            target: old_target,
-            scope: old_scope,
+            target,
+            scope,
             next_after: anchor,
-            pending_request: None,
+            pending_request: PendingServedRequest {
+                request_id,
+                max_header_count: 1,
+                tree_aux_schema: AuxSchema::None,
+            },
         },
     );
     reactor.served_path_deadlines.insert(
         peer.clone(),
         Instant::now() + std::time::Duration::from_secs(30),
     );
-    let new_target = block::Hash([0x32; 32]);
 
-    reactor.handle_get_headers(peer.clone(), 7, request(10, new_target, anchor.hash));
+    reactor.handle_header_path_page_ready(
+        peer.clone(),
+        7,
+        scope,
+        request_id,
+        target.hash,
+        HeaderPathPageResult::Page(Box::new(HeaderPathPage {
+            lease_id: 9,
+            common_ancestor: anchor,
+            target,
+            scope,
+            tree_aux_schema: AuxSchema::None,
+            entries: vec![HeaderEntry {
+                header,
+                body_size: 0,
+                tree_aux: None,
+            }],
+            complete: false,
+        })),
+    );
+    outbound.try_recv().expect("the incomplete page is sent");
+    assert!(
+        matches!(
+            actions.try_recv(),
+            Ok(HeaderPortOperation::ReleaseHeaderPath { lease_id: 9, .. })
+        ),
+        "the peer must not hold state capacity while deciding whether to continue"
+    );
+    assert!(!reactor.served_paths.contains_key(&peer));
+    assert!(!reactor.served_path_deadlines.contains_key(&peer));
 
-    assert!(matches!(
-        actions.try_recv(),
-        Ok(HeaderPortOperation::ReleaseHeaderPath { lease_id: 9, .. })
-    ));
-    assert!(matches!(
-        actions.try_recv(),
-        Ok(HeaderPortOperation::AcquirePath {
-            request: GetHeaders {
-                request_id: 10,
-                target_tip_hash,
-                ..
-            },
-            ..
-        }) if target_tip_hash == new_target
-    ));
-    assert!(matches!(
-        reactor.served_paths.get(&peer),
-        Some(ServedPathState::Acquiring {
-            request_id,
-            target_tip_hash,
-            ..
-        }) if request_id.get() == 10 && *target_tip_hash == new_target
+    reactor.handle_get_headers(peer, 7, request(2, target.hash, first));
+    assert!(matches!(actions.try_recv(),
+        Ok(HeaderPortOperation::AcquirePath { request: GetHeaders {
+            request_id: 2, target_tip_hash, locator_hashes, ..
+        }, .. }) if target_tip_hash == target.hash && locator_hashes == vec![first]
     ));
 }
 
@@ -185,7 +212,7 @@ fn failed_path_acquisition_dispatch_removes_state_and_deadline() {
 }
 
 #[tokio::test]
-async fn retained_path_pages_keep_one_target_and_release_after_completion() {
+async fn retained_path_pages_keep_one_target_and_release_each_page() {
     let shutdown = CancellationToken::new();
     let mut startup = startup(shutdown.clone());
     let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
@@ -340,27 +367,51 @@ async fn retained_path_pages_keep_one_target_and_release_after_completion() {
         }) if target_tip_hash == target.hash && common_ancestor_hash == common.hash
     ));
 
+    assert!(matches!(
+        next_action(&mut actions).await,
+        HeaderPortOperation::ReleaseHeaderPath { lease_id: 9, .. }
+    ));
     let continuation = request(2, target.hash, first);
     handle
         .send(Event::WireMessage {
             peer: peer.clone(),
             session_id: 0,
-            msg: HeaderSyncMessage::GetHeaders(continuation),
+            msg: HeaderSyncMessage::GetHeaders(continuation.clone()),
         })
         .await
         .expect("the continuation reaches the reactor");
+    let scope = match next_action(&mut actions).await {
+        HeaderPortOperation::AcquirePath {
+            request: actual,
+            scope,
+            ..
+        } if actual == continuation => scope,
+        other => panic!("the continuation must acquire a fresh lease, got {other:?}"),
+    };
+    let continuation_ancestor = zakura_header_chain::Frontier::new(block::Height(1), first);
+    handle
+        .send(Event::PathLeaseReady {
+            peer: peer.clone(),
+            session_id: 0,
+            scope,
+            request: continuation,
+            result: HeaderPathLeaseResult::Acquired(HeaderPathLease {
+                lease_id: 10,
+                common_ancestor: continuation_ancestor,
+                target,
+                scope,
+            }),
+        })
+        .await
+        .expect("the continuation lease reaches the reactor");
     assert!(matches!(
         next_action(&mut actions).await,
         HeaderPortOperation::ReadPath {
-            lease_id: 9,
-            request_id,
-            after_hash,
-            tree_aux_schema: AuxSchema::V1,
-            ..
+            lease_id: 10, request_id, after_hash,
+            tree_aux_schema: AuxSchema::V1, ..
         } if request_id.get() == 2 && after_hash == first
     ));
 
-    let continuation_ancestor = zakura_header_chain::Frontier::new(block::Height(1), first);
     let tree_aux = TreeAuxRecordV1 {
         height: block::Height(2),
         sapling_root: Default::default(),
@@ -379,7 +430,7 @@ async fn retained_path_pages_keep_one_target_and_release_after_completion() {
             request_id: HeaderSyncRequestId::new(2).expect("two is nonzero"),
             target_tip_hash: target.hash,
             result: HeaderPathPageResult::Page(Box::new(HeaderPathPage {
-                lease_id: 9,
+                lease_id: 10,
                 common_ancestor: continuation_ancestor,
                 target,
                 scope,
@@ -423,7 +474,7 @@ async fn retained_path_pages_keep_one_target_and_release_after_completion() {
     ));
     assert!(matches!(
         next_action(&mut actions).await,
-        HeaderPortOperation::ReleaseHeaderPath { lease_id: 9, .. }
+        HeaderPortOperation::ReleaseHeaderPath { lease_id: 10, .. }
     ));
 
     shutdown.cancel();

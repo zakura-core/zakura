@@ -225,7 +225,7 @@ enum ServedPathState {
         target: zakura_header_chain::Frontier,
         scope: zakura_header_chain::HeaderWorkAuthority,
         next_after: zakura_header_chain::Frontier,
-        pending_request: Option<PendingServedRequest>,
+        pending_request: PendingServedRequest,
     },
 }
 
@@ -1225,87 +1225,14 @@ impl HeaderSyncReactor {
             return;
         }
 
-        let replaces_idle_path = matches!(
-            self.served_paths.get(&peer),
-            Some(ServedPathState::Active {
-                session_id: owner_session,
-                target,
-                next_after,
-                pending_request: None,
-                ..
-            }) if *owner_session != session_id
-                || target.hash != request.target_tip_hash
-                || request.locator_hashes.first().copied() != Some(next_after.hash)
-        );
-        if replaces_idle_path {
-            self.release_served_path(&peer);
-        }
-
-        if let Some(state) = self.served_paths.get_mut(&peer) {
-            match state {
-                ServedPathState::Acquiring { .. } => {
-                    self.send_headers_outcome(
-                        &peer,
-                        request.request_id,
-                        request.target_tip_hash,
-                        HeadersOutcomeCode::Busy,
-                    );
-                    return;
-                }
-                ServedPathState::Active {
-                    session_id: owner_session,
-                    lease_id,
-                    target,
-                    scope,
-                    next_after,
-                    pending_request,
-                    ..
-                } => {
-                    if *owner_session != session_id
-                        || target.hash != request.target_tip_hash
-                        || request.locator_hashes.first().copied() != Some(next_after.hash)
-                    {
-                        self.send_headers_outcome(
-                            &peer,
-                            request.request_id,
-                            request.target_tip_hash,
-                            HeadersOutcomeCode::Busy,
-                        );
-                        return;
-                    }
-                    if pending_request.is_some() {
-                        self.send_headers_outcome(
-                            &peer,
-                            request.request_id,
-                            request.target_tip_hash,
-                            HeadersOutcomeCode::Busy,
-                        );
-                        return;
-                    }
-                    *pending_request = Some(PendingServedRequest {
-                        request_id,
-                        max_header_count,
-                        tree_aux_schema: request.tree_aux_schema,
-                    });
-                    self.served_path_deadlines
-                        .insert(peer.clone(), Instant::now() + self.startup.request_timeout);
-                    let action = HeaderPortOperation::ReadPath {
-                        peer: peer.clone(),
-                        session_id,
-                        lease_id: *lease_id,
-                        scope: *scope,
-                        request_id,
-                        target_tip_hash: request.target_tip_hash,
-                        after_hash: next_after.hash,
-                        max_header_count,
-                        tree_aux_schema: request.tree_aux_schema,
-                    };
-                    if !self.dispatch_action(action) {
-                        self.release_served_path(&peer);
-                    }
-                    return;
-                }
-            }
+        if self.served_paths.contains_key(&peer) {
+            self.send_headers_outcome(
+                &peer,
+                request.request_id,
+                request.target_tip_hash,
+                HeadersOutcomeCode::Busy,
+            );
+            return;
         }
 
         let Some(local) = self.committed_snapshot.as_ref() else {
@@ -2536,11 +2463,11 @@ impl HeaderSyncReactor {
                 target: lease.target,
                 scope: lease.scope,
                 next_after: lease.common_ancestor,
-                pending_request: Some(PendingServedRequest {
+                pending_request: PendingServedRequest {
                     request_id,
                     max_header_count,
                     tree_aux_schema: request.tree_aux_schema,
-                }),
+                },
             },
         );
         self.served_path_deadlines
@@ -2587,7 +2514,7 @@ impl HeaderSyncReactor {
         if expected_session != session_id
             || expected_scope != scope
             || target.hash != target_tip_hash
-            || pending_request.is_none_or(|pending| pending.request_id != request_id)
+            || pending_request.request_id != request_id
         {
             self.served_paths.insert(
                 peer,
@@ -2617,10 +2544,9 @@ impl HeaderSyncReactor {
             || page.target != target
             || page.scope != expected_scope
             || page.common_ancestor != next_after
-            || pending_request.is_some_and(|pending| {
-                page.entries.len() > usize::try_from(pending.max_header_count).unwrap_or(usize::MAX)
-                    || !pending.tree_aux_schema.admits(page.tree_aux_schema)
-            })
+            || page.entries.len()
+                > usize::try_from(pending_request.max_header_count).unwrap_or(usize::MAX)
+            || !pending_request.tree_aux_schema.admits(page.tree_aux_schema)
         {
             self.served_path_deadlines.remove(&peer);
             self.send_headers_outcome(
@@ -2633,29 +2559,6 @@ impl HeaderSyncReactor {
             return;
         }
 
-        let next_after = if let Some(last) = page.entries.last() {
-            let Some(height) = page
-                .common_ancestor
-                .height
-                .0
-                .checked_add(u32::try_from(page.entries.len()).unwrap_or(u32::MAX))
-                .map(block::Height)
-                .filter(|height| *height <= block::Height::MAX)
-            else {
-                self.served_path_deadlines.remove(&peer);
-                self.send_headers_outcome(
-                    &peer,
-                    request_id.get(),
-                    target_tip_hash,
-                    HeadersOutcomeCode::Busy,
-                );
-                self.release_lease(peer, session_id, lease_id, expected_scope);
-                return;
-            };
-            zakura_header_chain::Frontier::new(height, last.header.hash())
-        } else {
-            page.common_ancestor
-        };
         let complete = page.complete;
         let response = Headers {
             request_id: request_id.get(),
@@ -2704,32 +2607,18 @@ impl HeaderSyncReactor {
                 response_schema,
             );
         }
-        if complete || !sent {
-            self.served_path_deadlines.remove(&peer);
-            if !sent {
-                self.send_headers_outcome(
-                    &peer,
-                    request_id.get(),
-                    target_tip_hash,
-                    HeadersOutcomeCode::Busy,
-                );
-            }
-            self.release_lease(peer, session_id, lease_id, expected_scope);
-        } else {
-            self.served_paths.insert(
-                peer.clone(),
-                ServedPathState::Active {
-                    session_id,
-                    lease_id,
-                    target,
-                    scope: expected_scope,
-                    next_after,
-                    pending_request: None,
-                },
+        self.served_path_deadlines.remove(&peer);
+        if !sent {
+            self.send_headers_outcome(
+                &peer,
+                request_id.get(),
+                target_tip_hash,
+                HeadersOutcomeCode::Busy,
             );
-            self.served_path_deadlines
-                .insert(peer, Instant::now() + self.startup.request_timeout);
         }
+        // The next request reacquires this target by hash. A peer never holds serving
+        // capacity while waiting to request its next page.
+        self.release_lease(peer, session_id, lease_id, expected_scope);
     }
 
     fn finish_header_locator_query(
@@ -3930,14 +3819,12 @@ impl HeaderSyncReactor {
         else {
             return;
         };
-        if let Some(pending) = pending_request {
-            self.send_headers_outcome(
-                peer,
-                pending.request_id.get(),
-                target.hash,
-                HeadersOutcomeCode::Busy,
-            );
-        }
+        self.send_headers_outcome(
+            peer,
+            pending_request.request_id.get(),
+            target.hash,
+            HeadersOutcomeCode::Busy,
+        );
         self.release_lease(peer.clone(), session_id, lease_id, scope);
     }
 

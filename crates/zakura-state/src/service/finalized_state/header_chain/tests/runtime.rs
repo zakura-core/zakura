@@ -1,6 +1,268 @@
 use super::*;
 
 #[test]
+fn cached_finalized_continuation_still_chooses_the_nearest_locator() {
+    let (runtime, db, _, path) = reconciled_store_with_finalized_prefix(7);
+    let reader = runtime.reader();
+    let source = SourceId::from_digest([0xd5; 32]);
+    let target = path[5].hash;
+    let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target);
+    let RetainedPathLeaseOutcome::Acquired(first) = reader
+        .acquire_retained_path(source, 7, target, &[path[2].hash], scope)
+        .unwrap()
+    else {
+        panic!("the initial path is available");
+    };
+    assert!(matches!(
+        reader
+            .read_retained_path(source, 7, first.lease_id, scope, path[2].hash, 1)
+            .unwrap(),
+        RetainedPathReadOutcome::Page(_)
+    ));
+    finalize_serving_test_path(&runtime, &db, &path[3..]);
+    let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target);
+    let RetainedPathLeaseOutcome::Acquired(next) = reader
+        .acquire_retained_path(source, 7, target, &[path[3].hash, path[4].hash], scope)
+        .unwrap()
+    else {
+        panic!("a cache miss can use the nearest finalized locator");
+    };
+    assert_eq!(next.common_ancestor.hash, path[4].hash);
+    let RetainedPathReadOutcome::Page(page) = reader
+        .read_retained_path(source, 7, next.lease_id, scope, path[4].hash, 1)
+        .unwrap()
+    else {
+        panic!("the nearest finalized suffix is available");
+    };
+    assert_eq!(page.headers[0].hash(), target);
+    assert!(page.complete);
+}
+
+#[test]
+fn idle_continuation_indexes_are_bounded_and_cannot_block_new_readers() {
+    let (runtime, _db, _, path) = reconciled_store_with_finalized_prefix(6);
+    let reader = runtime.reader();
+    let target = path[5].hash;
+    let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target);
+    for marker in 0..=MAX_RETAINED_PATH_LEASES {
+        let source = SourceId::from_digest([u8::try_from(marker).unwrap(); 32]);
+        let RetainedPathLeaseOutcome::Acquired(lease) = reader
+            .acquire_retained_path(source, 7, target, &[path[2].hash], scope)
+            .unwrap()
+        else {
+            panic!("idle continuations cannot consume active capacity");
+        };
+        let RetainedPathReadOutcome::Page(page) = reader
+            .read_retained_path(source, 7, lease.lease_id, scope, path[2].hash, 1)
+            .unwrap()
+        else {
+            panic!("the first page is available");
+        };
+        assert!(!page.complete);
+        let leases = runtime.leases.lock().unwrap();
+        assert!(leases.by_peer.is_empty());
+        assert!(leases.continuations.len() <= MAX_RETAINED_PATH_LEASES);
+    }
+    {
+        let leases = runtime.leases.lock().unwrap();
+        assert_eq!(leases.continuations.len(), MAX_RETAINED_PATH_LEASES);
+        assert!(!leases
+            .continuations
+            .contains_key(&SourceId::from_digest([0; 32])));
+    }
+    // An evicted index is only a cache miss, even when the request is a continuation.
+    for marker in 0..MAX_RETAINED_PATH_LEASES - 1 {
+        let source = SourceId::from_digest([u8::try_from(marker).unwrap(); 32]);
+        assert!(matches!(
+            reader
+                .acquire_retained_path(source, 7, target, &[path[3].hash], scope)
+                .unwrap(),
+            RetainedPathLeaseOutcome::Acquired(_)
+        ));
+    }
+    assert_eq!(
+        reader
+            .acquire_retained_path(
+                SourceId::from_digest([0xff; 32]),
+                7,
+                target,
+                &[path[3].hash],
+                scope
+            )
+            .unwrap(),
+        RetainedPathLeaseOutcome::Busy
+    );
+}
+
+#[test]
+fn continuation_cache_matches_session_target_and_first_locator() {
+    let (runtime, _db, _, path) = reconciled_store_with_finalized_prefix(6);
+    let reader = runtime.reader();
+    let source = SourceId::from_digest([0xd3; 32]);
+    let target = path[5].hash;
+    let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target);
+    for (session, next_target, locators, ancestor) in [
+        (8, target, vec![path[3].hash], path[3].hash),
+        (7, path[4].hash, vec![path[3].hash], path[3].hash),
+        (7, target, vec![path[2].hash, path[3].hash], path[2].hash),
+    ] {
+        let RetainedPathLeaseOutcome::Acquired(first) = reader
+            .acquire_retained_path(source, 7, target, &[path[2].hash], scope)
+            .unwrap()
+        else {
+            panic!("the initial page has capacity");
+        };
+        let original = runtime
+            .leases
+            .lock()
+            .unwrap()
+            .get(source, 7, first.lease_id, Instant::now())
+            .unwrap()
+            .retained_path;
+        assert!(matches!(
+            reader
+                .read_retained_path(source, 7, first.lease_id, scope, path[2].hash, 1)
+                .unwrap(),
+            RetainedPathReadOutcome::Page(_)
+        ));
+        let next_scope =
+            HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), next_target);
+        let RetainedPathLeaseOutcome::Acquired(next) = reader
+            .acquire_retained_path(source, session, next_target, &locators, next_scope)
+            .unwrap()
+        else {
+            panic!("a mismatched cache entry must fall back to normal acquisition");
+        };
+        assert_eq!(next.common_ancestor.hash, ancestor);
+        let fresh = runtime
+            .leases
+            .lock()
+            .unwrap()
+            .get(source, session, next.lease_id, Instant::now())
+            .unwrap();
+        assert!(!Arc::ptr_eq(&original, &fresh.retained_path));
+        assert!(!reader
+            .release_retained_path(source, 7, first.lease_id, scope)
+            .unwrap());
+        assert!(reader
+            .release_retained_path(source, session, next.lease_id, next_scope)
+            .unwrap());
+    }
+}
+
+#[test]
+fn continuation_index_survives_its_target_moving_to_finalized_storage() {
+    let (runtime, db, _, path) = reconciled_store_with_finalized_prefix(7);
+    let reader = runtime.reader();
+    let source = SourceId::from_digest([0xd4; 32]);
+    let target = path[5].hash;
+    let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target);
+    let RetainedPathLeaseOutcome::Acquired(first) = reader
+        .acquire_retained_path(source, 7, target, &[path[2].hash], scope)
+        .unwrap()
+    else {
+        panic!("the retained target is available");
+    };
+    let original = runtime
+        .leases
+        .lock()
+        .unwrap()
+        .get(source, 7, first.lease_id, Instant::now())
+        .unwrap()
+        .retained_path;
+    assert!(matches!(
+        reader
+            .read_retained_path(source, 7, first.lease_id, scope, path[2].hash, 1)
+            .unwrap(),
+        RetainedPathReadOutcome::Page(_)
+    ));
+    finalize_serving_test_path(&runtime, &db, &path[3..]);
+    assert!(runtime.store.header_node(target).unwrap().is_none());
+    let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target);
+    let RetainedPathLeaseOutcome::Acquired(next) = reader
+        .acquire_retained_path(source, 7, target, &[path[3].hash], scope)
+        .unwrap()
+    else {
+        panic!("the finalized target can reuse its bounded index");
+    };
+    let resumed = runtime
+        .leases
+        .lock()
+        .unwrap()
+        .get(source, 7, next.lease_id, Instant::now())
+        .unwrap();
+    assert!(Arc::ptr_eq(&original, &resumed.retained_path));
+    let RetainedPathReadOutcome::Page(page) = reader
+        .read_retained_path(source, 7, next.lease_id, scope, path[3].hash, 2)
+        .unwrap()
+    else {
+        panic!("the remaining canonical headers are still available");
+    };
+    assert_eq!(
+        page.headers,
+        vec![path[4].header.clone(), path[5].header.clone()]
+    );
+    assert!(page.complete);
+    assert!(runtime.leases.lock().unwrap().continuations.is_empty());
+}
+
+#[test]
+fn continuations_reuse_the_path_index_through_finality_and_late_cleanup() {
+    let (runtime, db, _, path) = reconciled_store_with_finalized_prefix(64);
+    let reader = runtime.reader();
+    let source = SourceId::from_digest([0xd2; 32]);
+    let target = path.last().unwrap().hash;
+    let mut after = path[2].hash;
+    let mut original_path = None;
+    let mut previous_lease = None;
+    for expected in &path[3..] {
+        if expected.height == block::Height(10) {
+            finalize_serving_test_path(&runtime, &db, &path[3..20]);
+        }
+        let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target);
+        let RetainedPathLeaseOutcome::Acquired(lease) = reader
+            .acquire_retained_path(source, 7, target, &[after], scope)
+            .unwrap()
+        else {
+            panic!("every continuation has capacity");
+        };
+        let cursor = runtime
+            .leases
+            .lock()
+            .unwrap()
+            .get(source, 7, lease.lease_id, Instant::now())
+            .unwrap();
+        if let Some(original) = &original_path {
+            assert!(
+                Arc::ptr_eq(original, &cursor.retained_path),
+                "continuations must reuse the immutable path index, not rebuild it"
+            );
+        } else {
+            original_path = Some(cursor.retained_path.clone());
+        }
+        if let Some((old_id, old_scope)) = previous_lease {
+            assert!(!reader
+                .release_retained_path(source, 7, old_id, old_scope)
+                .unwrap());
+        }
+        let RetainedPathReadOutcome::Page(page) = reader
+            .read_retained_path(source, 7, lease.lease_id, scope, after, 1)
+            .unwrap()
+        else {
+            panic!("the exact next page remains available");
+        };
+        assert_eq!(
+            page.headers.as_slice(),
+            std::slice::from_ref(&expected.header)
+        );
+        assert_eq!(page.complete, expected.hash == target);
+        assert!(runtime.leases.lock().unwrap().by_peer.is_empty());
+        previous_lease = Some((lease.lease_id, scope));
+        after = expected.hash;
+    }
+}
+
+#[test]
 fn completed_page_releases_capacity_before_continuation_and_late_cleanup() {
     let (runtime, _db, _, path) = reconciled_store_with_finalized_prefix(5);
     let reader = runtime.reader();
@@ -2028,6 +2290,36 @@ fn retained_path_rejects_a_target_pruned_before_lease_commit_or_page_capture() {
     let captured = reader.capture_path_read(&cursor, 1).unwrap();
     let ancestry_read = reader.store.audit_snapshot().unwrap();
 
+    let cached_source = SourceId::from_digest([0xb4; 32]);
+    let cached_target = path[4].hash;
+    let cached_scope = HeaderWorkAuthority::for_target(&before, cached_target);
+    let RetainedPathLeaseOutcome::Acquired(cached_lease) = reader
+        .acquire_retained_path(
+            cached_source,
+            8,
+            cached_target,
+            &[path[2].hash],
+            cached_scope,
+        )
+        .unwrap()
+    else {
+        panic!("the longer losing path can prepare a continuation");
+    };
+    let RetainedPathReadOutcome::Page(page) = reader
+        .read_retained_path(
+            cached_source,
+            8,
+            cached_lease.lease_id,
+            cached_scope,
+            path[2].hash,
+            1,
+        )
+        .unwrap()
+    else {
+        panic!("the first losing-path page is available before finality");
+    };
+    assert!(!page.complete);
+
     let pending_source = SourceId::from_digest([0xb2; 32]);
     let reservation_id = runtime
         .leases
@@ -2092,6 +2384,19 @@ fn retained_path_rejects_a_target_pruned_before_lease_commit_or_page_capture() {
         )
         .expect("full state can select the competing verified path");
     finalize_serving_test_path(&runtime, &db, &fork[..2]);
+    assert_eq!(
+        reader
+            .acquire_retained_path(
+                cached_source,
+                8,
+                cached_target,
+                &[path[3].hash],
+                cached_scope
+            )
+            .unwrap(),
+        RetainedPathLeaseOutcome::TargetNotRetained,
+        "a cached path must not resurrect a branch removed by finality"
+    );
     assert!(runtime.store.header_node(target.hash).unwrap().is_none());
     assert!(reader
         .store

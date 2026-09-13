@@ -22,6 +22,7 @@ pub const MAX_RETAINED_PATH_LEASES: usize = zakura_header_chain::MAX_STAGED_TARG
 ///
 /// This lease reserves serving capacity, but does not prevent retention from evicting the path.
 /// A successful page read consumes the lease before returning its coherent snapshot.
+/// State may cache the hash index for a later continuation without retaining the path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RetainedPathLease {
     /// Monotonic process-local lease identity.

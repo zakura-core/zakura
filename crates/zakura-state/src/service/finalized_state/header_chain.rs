@@ -860,6 +860,8 @@ struct RetainedPathLeaseRegistry {
     next_reservation_id: u64,
     by_peer: HashMap<SourceId, CanonicalHeaderPathCursor>,
     reservations: HashMap<SourceId, u64>,
+    // Idle hash indexes hold no serving capacity, retention roots, or disk snapshots.
+    continuations: HashMap<SourceId, CanonicalHeaderPathCursor>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1092,7 +1094,23 @@ impl RetainedPathLeaseRegistry {
         cursor.last_frontier = advance.last_frontier;
         // Consume ownership before exposing the page. Delayed network cleanup cannot
         // keep this peer busy or revoke a lease acquired for its next request.
-        self.remove_peer(peer);
+        let cursor = self
+            .remove_peer(peer)
+            .expect("the completed lease was checked above");
+        if cursor.position != CanonicalHeaderPathPosition::Complete {
+            // Bound cached indexes separately from active leases. Eviction only requires
+            // a later requester to reconstruct its path, so idle peers cannot veto it.
+            if self.continuations.len() >= MAX_RETAINED_PATH_LEASES {
+                let oldest = self
+                    .continuations
+                    .iter()
+                    .min_by_key(|(_, cursor)| cursor.lease_id)
+                    .map(|(peer, _)| *peer)
+                    .expect("a full continuation cache is nonempty");
+                self.continuations.remove(&oldest);
+            }
+            self.continuations.insert(peer, cursor);
+        }
         true
     }
 
@@ -1968,6 +1986,37 @@ impl HeaderChainReader {
             || scope.header_generation > snapshot.header_generation
         {
             return Ok(RetainedPathLeaseOutcome::Busy);
+        }
+        let continuation = self
+            .leases
+            .lock()
+            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
+            .continuations
+            .remove(&peer);
+        if let Some(cursor) = continuation.filter(|cursor| {
+            cursor.session_id == session_id
+                && cursor.target.hash == target_tip_hash
+                && locator_hashes.first() == Some(&cursor.last_frontier.hash)
+                && (capacity == RetainedPathCapacity::General
+                    // Finalized fallback chooses the nearest locator and bounds the full
+                    // remaining range. Multiple locators must use that selection below.
+                    || (locator_hashes.len() == 1
+                        && cursor.target.height.0.saturating_sub(cursor.last_frontier.height.0)
+                            <= crate::constants::MAX_HEADER_SYNC_HEIGHT_RANGE))
+        }) {
+            return self.commit_path_lease(
+                reservation,
+                RetainedPathLeaseSpec {
+                    peer,
+                    session_id,
+                    target: cursor.target,
+                    common_ancestor: cursor.last_frontier,
+                    scope,
+                    position: cursor.position,
+                    retained_ancestor: cursor.retained_ancestor,
+                    retained_path: cursor.retained_path,
+                },
+            );
         }
         let Some(target_node) = target_node else {
             // The header graph holds only the retained suffix. A VCT repair can ask for a bounded

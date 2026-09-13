@@ -6,8 +6,6 @@
 
 use std::sync::Arc;
 
-use std::sync::Arc;
-
 use crate::zakura::transport::ByteBudget;
 
 /// Requested heap size of an Arc, including its reference counts and padding.

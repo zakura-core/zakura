@@ -18,7 +18,10 @@ pub use zakura_header_chain::{
 /// Maximum simultaneous retained target-path leases.
 pub const MAX_RETAINED_PATH_LEASES: usize = zakura_header_chain::MAX_STAGED_TARGETS_V1;
 
-/// Opaque state-owned lease for one exact canonical target path.
+/// Opaque state-owned cursor for one exact canonical target path.
+///
+/// This lease reserves serving capacity, but does not prevent retention from evicting the path.
+/// Each page captures a coherent snapshot if the path is still available.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RetainedPathLease {
     /// Monotonic process-local lease identity.
@@ -76,7 +79,7 @@ pub struct RetainedPathPage {
 pub enum RetainedPathReadOutcome {
     /// State read a bounded page and renewed the lease deadline.
     Page(Box<RetainedPathPage>),
-    /// The lease is absent or expired.
+    /// The lease is absent or expired, or its path was pruned.
     /// A replacement session might own the lease.
     Unavailable,
 }

@@ -1,6 +1,134 @@
 use super::*;
 
 #[test]
+fn serving_leases_do_not_block_a_better_work_branch() {
+    let (engine_config, anchor, metadata) = fixture();
+    let store = HeaderChainStore::new(open(&Config::ephemeral(), engine_config.network()));
+    store.initialize(metadata, anchor.clone()).unwrap();
+    let (runtime, _) = store.startup(&engine_config).unwrap();
+    let reader = runtime.reader();
+    let parent = Frontier::new(anchor.height, anchor.hash);
+    let validation = reader.validation_context(anchor.hash).unwrap().unwrap();
+    let rules = HeaderRules::for_validation_lease(&validation).unwrap();
+    let context = TransitionContext {
+        config: &engine_config,
+        clock: &SystemClock,
+        full_state_authority: None,
+        retention_references: &[],
+    };
+    let insert = |headers: &[Arc<block::Header>]| {
+        let snapshot = runtime.publisher().snapshot();
+        let target = headers.last().unwrap().hash();
+        runtime
+            .apply(
+                TransitionRequest {
+                    expected_version: snapshot.state_version,
+                    event: TransitionEvent::InsertHeaders(Box::new(InsertHeaders {
+                        owner: header_owner(&snapshot, target, 1, 1),
+                        source: SourceId::from_digest([0xee; 32]),
+                        parent_hash: parent.hash,
+                        target_tip_hash: target,
+                        completion: TargetCompletion::TargetComplete {
+                            common_ancestor: parent,
+                        },
+                        batch: zakura_header_chain::prepare_headers(
+                            HeaderBatchInput::new(headers),
+                            parent,
+                            &rules,
+                            &SystemClock,
+                        )
+                        .unwrap(),
+                        aux: Vec::new(),
+                    })),
+                },
+                &context,
+            )
+            .unwrap()
+    };
+    let mut captured_paths = Vec::new();
+    for index in 0..zakura_header_chain::MAX_CANDIDATE_TIPS_V1 {
+        let marker = u8::try_from(index).unwrap();
+        let mut header = *anchor.header;
+        header.previous_block_hash = parent.hash;
+        header.time += chrono::Duration::seconds(1);
+        header.nonce.0[0] = marker;
+        let header = Arc::new(header);
+        assert_eq!(
+            insert(std::slice::from_ref(&header)),
+            ApplyResult::Committed
+        );
+        let source = SourceId::from_digest([marker; 32]);
+        let scope = zakura_header_chain::HeaderWorkAuthority::for_target(
+            &runtime.publisher().snapshot(),
+            header.hash(),
+        );
+        let RetainedPathLeaseOutcome::Acquired(lease) = reader
+            .acquire_retained_path(source, 7, header.hash(), &[parent.hash], scope)
+            .unwrap()
+        else {
+            panic!("every candidate tip fits in the general serving capacity");
+        };
+        let cursor = runtime
+            .leases
+            .lock()
+            .unwrap()
+            .get(source, 7, lease.lease_id, Instant::now())
+            .unwrap();
+        let captured = reader.capture_path_read(&cursor, 1).unwrap();
+        captured_paths.push((cursor, captured));
+    }
+
+    let mut first = *anchor.header;
+    first.previous_block_hash = parent.hash;
+    first.time += chrono::Duration::seconds(1);
+    first.nonce.0[0] = 0xff;
+    let first = Arc::new(first);
+    let mut second = *first;
+    second.previous_block_hash = first.hash();
+    second.time += chrono::Duration::seconds(1);
+    let second = Arc::new(second);
+    let target = Frontier::new(block::Height(2), second.hash());
+    assert_eq!(
+        insert(&[first, second]),
+        ApplyResult::Committed,
+        "peer serving leases must not veto admission of the better-work branch",
+    );
+    let snapshot = runtime.publisher().snapshot();
+    assert_eq!(snapshot.frontiers.header_best, target);
+    assert!(!snapshot.alarms.resource_stalled);
+
+    let (cursor, captured) = captured_paths
+        .iter()
+        .find(|(cursor, _)| {
+            runtime
+                .store
+                .header_node(cursor.target.hash)
+                .unwrap()
+                .is_none()
+        })
+        .expect("retention evicts an old fork to admit the better branch");
+    assert_eq!(
+        reader
+            .read_retained_path(
+                cursor.peer,
+                7,
+                cursor.lease_id,
+                cursor.scope,
+                parent.hash,
+                1
+            )
+            .unwrap(),
+        RetainedPathReadOutcome::Unavailable,
+    );
+    let (page, _, _) = captured.read_page(cursor, 1).unwrap().unwrap();
+    assert_eq!(page.headers[0].hash(), cursor.target.hash);
+    assert!(
+        page.complete,
+        "an already captured page survives pruning coherently"
+    );
+}
+
+#[test]
 fn atomic_finality_context_can_use_a_newly_staged_anchor_path() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
@@ -1418,29 +1546,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
             .expect("capacity refusal is a normal outcome"),
         RetainedPathLeaseOutcome::Busy
     );
-    let active_references = {
-        let mut leases = runtime
-            .leases
-            .lock()
-            .expect("the lease registry mutex is not poisoned");
-        let active_references = leases.active_references(Instant::now());
-        let cached_references = leases.active_references(Instant::now());
-        assert!(Arc::ptr_eq(&active_references, &cached_references));
-        active_references
-    };
-    assert_eq!(
-        active_references.as_ref(),
-        [child.hash],
-        "each lease contributes only its target; retaining that target protects its whole ancestry"
-    );
-
     tokio::time::advance(RETAINED_PATH_LEASE_IDLE + Duration::from_secs(1)).await;
-    assert!(runtime
-        .leases
-        .lock()
-        .expect("the lease registry mutex is not poisoned")
-        .active_references(Instant::now())
-        .is_empty());
     assert!(matches!(
         reader
             .acquire_retained_path(

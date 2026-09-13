@@ -860,9 +860,6 @@ struct RetainedPathLeaseRegistry {
     next_reservation_id: u64,
     by_peer: HashMap<SourceId, CanonicalHeaderPathCursor>,
     reservations: HashMap<SourceId, u64>,
-    reference_counts: HashMap<block::Hash, usize>,
-    cached_references: Arc<[block::Hash]>,
-    references_dirty: bool,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -987,33 +984,8 @@ impl RetainedPathLeaseRegistry {
         }
     }
 
-    fn add_references(&mut self, cursor: &CanonicalHeaderPathCursor) {
-        // The retention algorithm walks from each target to finality.
-        // This registry counts the target hash because it protects the full immutable suffix.
-        // A path-hash entry would grow the bounded owner list with chain length.
-        // That growth would reject ordinary transitions.
-        *self.reference_counts.entry(cursor.target.hash).or_default() += 1;
-        self.references_dirty = true;
-    }
-
     fn remove_peer(&mut self, peer: SourceId) -> Option<CanonicalHeaderPathCursor> {
-        let cursor = self.by_peer.remove(&peer)?;
-        let hash = cursor.target.hash;
-        let remove = {
-            let Some(count) = self.reference_counts.get_mut(&hash) else {
-                panic!("every installed lease target has a registry count");
-            };
-            let Some(next_count) = count.checked_sub(1) else {
-                panic!("a lease target reference count cannot underflow");
-            };
-            *count = next_count;
-            *count == 0
-        };
-        if remove {
-            self.reference_counts.remove(&hash);
-        }
-        self.references_dirty = true;
-        Some(cursor)
+        self.by_peer.remove(&peer)
     }
 
     fn reserve(
@@ -1073,7 +1045,6 @@ impl RetainedPathLeaseRegistry {
             idle_deadline: now + RETAINED_PATH_LEASE_IDLE,
         };
         let lease = cursor.lease();
-        self.add_references(&cursor);
         self.by_peer.insert(spec.peer, cursor);
         RetainedPathLeaseOutcome::Acquired(Box::new(lease))
     }
@@ -1137,17 +1108,6 @@ impl RetainedPathLeaseRegistry {
             self.remove_peer(peer);
         }
         matches
-    }
-
-    fn active_references(&mut self, now: Instant) -> Arc<[block::Hash]> {
-        self.expire(now);
-        if self.references_dirty {
-            let mut references: Vec<_> = self.reference_counts.keys().copied().collect();
-            references.sort_unstable_by_key(|hash| hash.0);
-            self.cached_references = references.into();
-            self.references_dirty = false;
-        }
-        self.cached_references.clone()
     }
 }
 
@@ -1840,7 +1800,7 @@ impl HeaderChainReader {
         Ok(Some(context))
     }
 
-    /// Pin the exact path before a writer can remove it, without requiring a quiet chain.
+    /// Install the cursor only while its exact target is still available.
     fn commit_path_lease(
         &self,
         reservation: RetainedPathReservation,
@@ -1867,8 +1827,8 @@ impl HeaderChainReader {
         {
             return Ok(RetainedPathLeaseOutcome::TargetNotRetained);
         }
-        // Hash ancestry is immutable. A retained target protects the same suffix,
-        // and any prefix finalized since capture is now in immutable canonical storage.
+        // Hash ancestry is immutable, but retention can evict this path before the page read.
+        // Serving cursors never protect peer-selected forks from local retention policy.
         reservation.commit(spec, Instant::now())
     }
 
@@ -2518,11 +2478,6 @@ impl HeaderChainRuntime {
             .transition_engine
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-        let lease_references = self
-            .leases
-            .lock()
-            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
-            .active_references(Instant::now());
 
         // The state writer binds checkpoint finality evidence to the durable version it read,
         // and the auxiliary transition below advances that version. Provenance therefore has
@@ -2550,14 +2505,14 @@ impl HeaderChainRuntime {
         let first_authority = StateIssuedAuthority {
             inner: first_context.full_state_authority,
             validation_leases: &[],
-            active_retention_references: lease_references.as_ref(),
+            active_retention_references: &[],
             full_state_authorization_version: None,
         };
         let first_context = TransitionContext {
             config: first_context.config,
             clock: first_context.clock,
             full_state_authority: Some(&first_authority),
-            retention_references: lease_references.as_ref(),
+            retention_references: &[],
         };
         let checkpoint_parent = match &checkpoint_request.event {
             TransitionEvent::VerifiedChainChanged(event)
@@ -2590,14 +2545,14 @@ impl HeaderChainRuntime {
         let checkpoint_authority = StateIssuedAuthority {
             inner: checkpoint_context.full_state_authority,
             validation_leases: validation_leases.as_slice(),
-            active_retention_references: lease_references.as_ref(),
+            active_retention_references: &[],
             full_state_authorization_version: Some(before.state_version),
         };
         let checkpoint_context = TransitionContext {
             config: checkpoint_context.config,
             clock: checkpoint_context.clock,
             full_state_authority: Some(&checkpoint_authority),
-            retention_references: lease_references.as_ref(),
+            retention_references: &[],
         };
 
         let TransitionEvent::AuxEvidence(first_event) = first_request.event else {
@@ -2874,22 +2829,10 @@ impl HeaderChainRuntime {
         let active_retention_references = if authoritative_full_state_fork_set {
             Vec::new()
         } else {
-            let mut references = self
-                .full_state_retention_references
+            self.full_state_retention_references
                 .lock()
                 .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
-                .to_vec();
-            references.extend(
-                self.leases
-                    .lock()
-                    .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
-                    .active_references(Instant::now())
-                    .iter()
-                    .copied(),
-            );
-            references.sort_unstable_by_key(|hash| hash.0);
-            references.dedup();
-            references
+                .to_vec()
         };
         let retention_references = combined_retention_references(
             context.retention_references,

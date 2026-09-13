@@ -11,6 +11,10 @@ independently.
 
 ## [Unreleased]
 
+### Fixed
+- Zakura block sync now reserves each body's advertised or committed size instead of the 2 MB worst case: suppliers publish committed sizes when serving headers from finalized state, and requesters read the size hints carried by retained header deliveries again ([#NNN](https://github.com/zakura-core/zakura/pull/NNN)).
+- A hash-verified block body that is larger than its advertised size hint is now accepted and only reported, instead of being discarded and re-requested ([#NNN](https://github.com/zakura-core/zakura/pull/NNN)).
+
 ## [1.4.0] - 2026-09-10
 
 ### Added

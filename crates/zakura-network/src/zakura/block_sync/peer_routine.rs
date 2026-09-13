@@ -1188,6 +1188,13 @@ impl PeerRoutine {
                 break FillStop::SendError;
             }
             metrics::counter!("sync.block.request.sent").increment(1);
+            let estimate_kind = if reserved_bytes >= block::MAX_BLOCK_BYTES {
+                "worst_case"
+            } else {
+                "hinted"
+            };
+            metrics::counter!("sync.block.request.size_estimate", "kind" => estimate_kind)
+                .increment(1);
             if in_bypass {
                 // A floor request borrowed a bypass slot while the cwnd was saturated.
                 metrics::counter!("sync.block.request.floor_bypass").increment(1);

@@ -18,8 +18,8 @@
 //! Internals are a brief `std::sync::Mutex` whose critical sections are tiny map
 //! splices held **never across `.await`** (the anti-block rule). `estimated_bytes`
 //! on a [`WorkItem`] is the block's size *estimate* (not its worst-case
-//! reservation); it exists only to carry the `SizeMismatch` tolerance check
-//! through to the reactor's receive path and request budget.
+//! reservation); it feeds the request budget reservation and the advisory
+//! receive-path `SizeMismatch` report, which never discards a hash-matched body.
 
 use std::{
     num::NonZeroU64,
@@ -49,8 +49,7 @@ pub(super) struct WorkItem {
     provisional: bool,
     /// Expected hash of the block at this height (drives the response match).
     pub(super) hash: block::Hash,
-    /// The block's size estimate. Used for request budget reservation and the
-    /// receive-path `SizeMismatch` tolerance check.
+    /// The block's size estimate. Used for request budget reservation and the advisory receive-path `SizeMismatch` report.
     pub(super) estimated_bytes: u64,
     /// Request reservation; received bodies use `Released`.
     pub(super) budget: BlockBudgetLedger,

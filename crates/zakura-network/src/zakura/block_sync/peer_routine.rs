@@ -910,6 +910,10 @@ impl PeerRoutine {
                     break FillStop::SendError;
                 }
             };
+            let Some(authorization) = self.session.authorize_response() else {
+                self.session.cancel_token().cancel();
+                break FillStop::SendError;
+            };
             let Some(request_id) = self.next_request_id else {
                 break FillStop::Internal;
             };
@@ -1127,6 +1131,7 @@ impl PeerRoutine {
                 self.work.clone(),
                 self.budget.clone(),
                 self.session.cancel_token(),
+                authorization.write_permission(),
             );
             let count = match u32::try_from(kept_count) {
                 Ok(count) => count,
@@ -1190,6 +1195,7 @@ impl PeerRoutine {
             let mut delivered = false;
             if !claim.publish(|| {
                 self.window.outstanding.push(OutstandingBlockRange {
+                    authorization,
                     response: ResponseCredit::new(
                         u64::from(request.count),
                         u64::from(self.max_response_bytes),
@@ -1771,7 +1777,8 @@ impl PeerRoutine {
         if index >= self.window.outstanding.len() {
             return;
         }
-        let outstanding = self.window.outstanding.remove(index);
+        let mut outstanding = self.window.outstanding.remove(index);
+        outstanding.authorization.finish();
         self.finish_detached(outstanding, disposition);
     }
 

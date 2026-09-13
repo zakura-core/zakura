@@ -865,6 +865,7 @@ impl PeerBlockState {
 pub(super) struct OutstandingBlockRange {
     pub(super) request: BlockRangeRequest,
     pub(super) response: crate::zakura::regulation::ResponseCredit,
+    pub(super) authorization: crate::zakura::regulation::ResponseAuthorization,
     /// Local work may end while the peer still owns response credit.
     pub(super) local_work_active: bool,
     pub(super) write_status: RequestWriteStatus,

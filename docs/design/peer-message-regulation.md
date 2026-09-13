@@ -41,6 +41,30 @@ Ordinary local failures release resources whose work has ended and return affect
 scheduler. They do not count as peer violations. Universal panic recovery belongs to separate
 runtime work. Bounded decoder tests still check that untrusted payloads cannot cause a panic.
 
+## Response lifetime and session replacement
+
+The shared requester primitives separate response credit from session lifetime.
+`ResponseCredit` counts consumed objects and actual bytes. `ResponseScope` fences
+publication and first writes for one receiver incarnation. Each exchange has one
+`ResponseAuthorization` owner, retained until its validated ending. The writer
+holds a separate permission and cannot complete the response by finishing a write.
+Identity, ordering, legal endings, and useful local work remain message policy.
+
+Session admission retires the predecessor scope before publishing a replacement.
+Retirement waits for a publication already in progress and prevents further
+publications or first writes. A queued request that never started can be skipped.
+If any exchange started and still lacks its ending, retirement closes its
+connection locally before admitting another receiver on that connection.
+Dropping that exchange's owner has the same close behavior. This is not a peer
+protocol fault. A different connection can proceed independently.
+
+For GetBlocks, the work lock is acquired before the response scope lock. Terminal
+handling releases the scope lock before returning local work. Session admission
+holds its session-table lock while retiring the old scope, without taking the
+work lock. This preserves request publication atomicity without an inverse lock
+order. The scope does not yet account for retained metadata. Per-connection and
+node metadata limits remain required before qualification.
+
 ## Capacity admission and QUIC backpressure
 
 The receiver starts response work only when worker capacity and bounded output capacity are

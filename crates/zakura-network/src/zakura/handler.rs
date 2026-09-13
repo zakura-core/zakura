@@ -1603,6 +1603,7 @@ struct StreamWorkerContext {
     inbound_frame_cap: u32,
     message_payload_limits: &'static [(u16, usize)],
     message_types: Option<&'static [u16]>,
+    allowed_frame_flags: u16,
     queue_depths: Option<(usize, usize)>,
     write_policy: StreamWritePolicy,
     session_resources: Option<Arc<dyn crate::zakura::SessionResources>>,
@@ -2877,6 +2878,7 @@ impl ZakuraProtocolHandler {
                                     stream,
                                     self.registry.message_payload_limits(stream),
                                     self.registry.message_types(stream),
+                                    self.registry.allowed_frame_flags(stream),
                                     request_id,
                                     message_type,
                                     flags,
@@ -3227,6 +3229,7 @@ impl ZakuraProtocolHandler {
             inbound_frame_cap: inbound_frame_cap_for_stream(&admission.limits, stream),
             message_payload_limits: self.registry.message_payload_limits(stream),
             message_types: self.registry.message_types(stream),
+            allowed_frame_flags: self.registry.allowed_frame_flags(stream),
             queue_depths: self.registry.stream_queue_depths(stream),
             write_policy: self.registry.stream_write_policy(stream),
             session_resources: resources,
@@ -4154,6 +4157,7 @@ async fn persistent_stream_worker_with_policy(
                     reader_context.inbound_frame_cap,
                     reader_context.message_payload_limits,
                     reader_context.message_types,
+                    reader_context.allowed_frame_flags,
                     reader_context.limits.idle_timeout,
                     // A persistent ordered stream is legitimately quiet between
                     // frames; do not let an inter-frame gap time out and cancel
@@ -4384,6 +4388,7 @@ async fn request_stream_worker(
             context.inbound_frame_cap,
             context.message_payload_limits,
             context.message_types,
+            context.allowed_frame_flags,
             context.limits.idle_timeout,
             // A request stream carries its request frame immediately after the
             // prelude, so a peer that opens one and then goes silent is treated
@@ -4557,6 +4562,7 @@ async fn read_frame(
     max_frame_bytes: u32,
     message_payload_limits: &[(u16, usize)],
     message_types: Option<&[u16]>,
+    allowed_frame_flags: u16,
     read_timeout: Duration,
     first_byte_timeout: Option<Duration>,
 ) -> Result<Frame, ZakuraHandlerError> {
@@ -4590,6 +4596,9 @@ async fn read_frame(
         return Err(ZakuraHandlerError::InvalidMessageType(message_type));
     }
     let flags = reader.read_u16::<LittleEndian>()?;
+    if flags & !allowed_frame_flags != 0 {
+        return Err(ZakuraHandlerError::UnsupportedFrameFlags(flags));
+    }
     let payload_len = usize::try_from(reader.read_u32::<LittleEndian>()?)
         .expect("u32 payload lengths fit usize on supported targets");
     let max_frame_bytes =
@@ -4742,6 +4751,7 @@ async fn write_outbound_request_frame(
     stream: Stream,
     message_payload_limits: &'static [(u16, usize)],
     message_types: Option<&'static [u16]>,
+    allowed_frame_flags: u16,
     request_id: u64,
     message_type: u16,
     flags: u16,
@@ -4755,6 +4765,7 @@ async fn write_outbound_request_frame(
             stream,
             message_payload_limits,
             message_types,
+            allowed_frame_flags,
             request_id,
             message_type,
             flags,
@@ -4772,6 +4783,7 @@ async fn write_outbound_request_frame_inner(
     stream: Stream,
     message_payload_limits: &'static [(u16, usize)],
     message_types: Option<&'static [u16]>,
+    allowed_frame_flags: u16,
     request_id: u64,
     message_type: u16,
     flags: u16,
@@ -4827,6 +4839,7 @@ async fn write_outbound_request_frame_inner(
             inbound_frame_cap,
             message_payload_limits,
             message_types,
+            allowed_frame_flags,
             limits.idle_timeout,
             // This is the requester side of a one-shot legacy request/response:
             // the responder streams its frames promptly, so a silent gap before
@@ -5587,6 +5600,9 @@ pub enum ZakuraHandlerError {
     /// The frame header names a message that is invalid on this stream role.
     #[error("invalid message type {0} for this stream role")]
     InvalidMessageType(u16),
+    /// The frame uses flags outside the service codec's declared mask.
+    #[error("unsupported frame flags {0:#06x}")]
+    UnsupportedFrameFlags(u16),
     /// Two ordered stream roles failed to name one complete session.
     #[error("invalid Zakura service session")]
     InvalidServiceSession,
@@ -5678,6 +5694,7 @@ impl ZakuraHandlerError {
 #[cfg(test)]
 mod tests {
     pub(super) mod connection;
+    mod frame_policy;
     mod paired_block_sync;
     mod quic_progress;
     mod serving_progress;
@@ -8136,6 +8153,7 @@ mod tests {
             inbound_frame_cap: stream.frame_cap,
             message_payload_limits: &[],
             message_types: None,
+            allowed_frame_flags: u16::MAX,
             queue_depths: None,
             write_policy: StreamWritePolicy::Timeout(OUTBOUND_STREAM_WRITE_TIMEOUT),
             session_resources: None,
@@ -8201,6 +8219,7 @@ mod tests {
                 stream.frame_cap,
                 &[],
                 None,
+                u16::MAX,
                 Duration::from_secs(2),
                 None,
             ),
@@ -8342,6 +8361,7 @@ mod tests {
             inbound_frame_cap: inbound_frame_cap_for_stream(&limits, stream),
             message_payload_limits: &[],
             message_types: None,
+            allowed_frame_flags: u16::MAX,
             queue_depths: None,
             write_policy: StreamWritePolicy::Timeout(OUTBOUND_STREAM_WRITE_TIMEOUT),
             session_resources: None,
@@ -8548,6 +8568,7 @@ mod tests {
                 inbound_frame_cap: inbound_frame_cap_for_stream(&limits, stream),
                 message_payload_limits: &[],
                 message_types: None,
+                allowed_frame_flags: u16::MAX,
                 queue_depths: None,
                 write_policy: StreamWritePolicy::Timeout(OUTBOUND_STREAM_WRITE_TIMEOUT),
                 session_resources: None,
@@ -8925,6 +8946,7 @@ mod tests {
                     frame_cap,
                     payload_limits,
                     None,
+                    u16::MAX,
                     Duration::from_secs(5),
                     Some(Duration::from_secs(5)),
                 ),
@@ -8976,6 +8998,7 @@ mod tests {
                     stream.frame_cap,
                     payload_limits,
                     None,
+                    u16::MAX,
                     Duration::from_secs(2),
                     Some(Duration::from_secs(2)),
                 ),
@@ -9088,6 +9111,7 @@ mod tests {
             inbound_cap,
             &[],
             None,
+            u16::MAX,
             Duration::from_secs(2),
             Some(Duration::from_secs(2)),
         )
@@ -9123,6 +9147,7 @@ mod tests {
             raw_cap,
             &[],
             None,
+            u16::MAX,
             Duration::from_secs(2),
             Some(Duration::from_secs(2)),
         )
@@ -9163,6 +9188,7 @@ mod tests {
             inbound_cap,
             &[],
             None,
+            u16::MAX,
             Duration::from_secs(2),
             Some(Duration::from_secs(2)),
         )

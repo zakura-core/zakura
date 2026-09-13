@@ -191,3 +191,6 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod codec_properties;

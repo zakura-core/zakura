@@ -509,6 +509,10 @@ impl Service for HeaderSyncService {
         header_sync_streams()
     }
 
+    fn allowed_frame_flags(&self, _stream: Stream) -> u16 {
+        0
+    }
+
     fn session_policy(&self) -> SessionPolicy {
         SessionPolicy {
             opening: SessionOpening::InitiatorOnly,
@@ -800,6 +804,10 @@ impl Service for HeaderSyncPassthroughService {
 
     fn streams(&self) -> &[Stream] {
         header_sync_streams()
+    }
+
+    fn allowed_frame_flags(&self, _stream: Stream) -> u16 {
+        0
     }
 
     fn session_policy(&self) -> SessionPolicy {

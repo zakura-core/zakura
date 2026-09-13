@@ -282,3 +282,11 @@ retries = 0
 slow-timeout = { period = "90s", terminate-after = 1 }
 failure-output = "immediate"
 default-filter = 'test(~regulation::request::) or test(~regulation::slot_properties::) or test(~serving_regulation::) or test(~block_sync::serving::) or test(~service::block_range::tests::)'
+
+# Response identity, byte limits, endings, and local work changes, run locally.
+[profile.response-lifetime]
+fail-fast = false
+retries = 0
+slow-timeout = { period = "300s", terminate-after = 1 }
+failure-output = "immediate"
+default-filter = 'test(~regulation::response::) or test(~block_sync::peer_routine::) or test(~block_sync::tests::) or test(~block_sync::peer_registry::) or test(~block_sync::work_queue::) or test(~handler::tests::paired_block_sync::paired_receiver_)'

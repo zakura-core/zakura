@@ -16,6 +16,9 @@ pub(crate) use request::{
 mod slots;
 pub(crate) use slots::{SlotBudget, SlotPermit};
 
+mod response;
+pub(crate) use response::ResponseCredit;
+
 #[cfg(test)]
 mod tests;
 

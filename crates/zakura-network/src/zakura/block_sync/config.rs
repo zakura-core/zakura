@@ -277,7 +277,7 @@ pub struct ZakuraBlockSyncConfig {
     /// How often this node sends unsolicited status refreshes after local frontier changes.
     #[serde(with = "humantime_serde")]
     pub status_refresh_interval: Duration,
-    /// Percentage deviation from advertised body-size hints tolerated before soft scoring.
+    /// Retained for configuration compatibility. Size hints no longer define peer obligations.
     pub size_deviation_tolerance: u32,
     /// Steady-state cwnd as a percent of the measured bandwidth-delay product.
     pub bbr_cwnd_gain_percent: u32,

@@ -593,6 +593,10 @@ pub enum SinkReject {
     /// Local sink state prevented delivery; the peer is not at fault.
     #[error("inbound sink could not accept frame locally: {0}")]
     Local(#[source] BoxError),
+
+    /// Local state cannot safely continue on this connection. No peer fault is implied.
+    #[error("inbound sink requires connection closure locally: {0}")]
+    Connection(#[source] BoxError),
 }
 
 impl SinkReject {
@@ -605,6 +609,16 @@ impl SinkReject {
     pub fn local(error: impl Into<BoxError>) -> Self {
         Self::Local(error.into())
     }
+
+    /// Close the connection because local protocol state cannot be retained or drained.
+    pub fn local_connection(error: impl Into<BoxError>) -> Self {
+        Self::Connection(error.into())
+    }
+
+    /// Whether continuing other streams on this connection would be unsafe.
+    pub fn closes_connection(&self) -> bool {
+        matches!(self, Self::Protocol(_) | Self::Connection(_))
+    }
 }
 
 #[cfg(test)]
@@ -615,10 +629,15 @@ mod tests {
     fn sink_reject_constructors_preserve_protocol_and_local_contract() {
         let protocol = SinkReject::protocol("bad frame");
         let local = SinkReject::local("closed queue");
+        let connection = SinkReject::local_connection("response state unavailable");
 
         assert!(matches!(protocol, SinkReject::Protocol(_)));
         assert!(matches!(local, SinkReject::Local(_)));
         assert!(protocol.to_string().contains("protocol-invalid"));
         assert!(local.to_string().contains("locally"));
+        assert!(matches!(connection, SinkReject::Connection(_)));
+        assert!(protocol.closes_connection());
+        assert!(!local.closes_connection());
+        assert!(connection.closes_connection());
     }
 }

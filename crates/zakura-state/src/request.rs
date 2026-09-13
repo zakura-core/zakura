@@ -1848,7 +1848,7 @@ pub enum ReadRequest {
         locator_hashes: Vec<block::Hash>,
     },
 
-    /// Read and renew one bounded hash-keyed page from an immutable lease.
+    /// Read one bounded hash-keyed page and consume its lease on success.
     ReadRetainedHeaderPath {
         /// Stable requesting peer identity.
         peer: zakura_header_chain::SourceId,

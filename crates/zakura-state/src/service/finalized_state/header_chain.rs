@@ -1064,7 +1064,7 @@ impl RetainedPathLeaseRegistry {
         Some(cursor.clone())
     }
 
-    fn advance(
+    fn finish_page(
         &mut self,
         peer: SourceId,
         session_id: u64,
@@ -1090,7 +1090,9 @@ impl RetainedPathLeaseRegistry {
         }
         cursor.position = advance.position;
         cursor.last_frontier = advance.last_frontier;
-        cursor.idle_deadline = advance.now + RETAINED_PATH_LEASE_IDLE;
+        // Consume ownership before exposing the page. Delayed network cleanup cannot
+        // keep this peer busy or revoke a lease acquired for its next request.
+        self.remove_peer(peer);
         true
     }
 
@@ -1905,8 +1907,8 @@ impl HeaderChainReader {
     /// Returns `TargetNotRetained` when neither band holds the target, `NoLocatorIntersection`
     /// when no locator hash is a canonical ancestor of it, `HistoryPruned` when the retained
     /// path no longer reaches the finalized frontier, and `Busy` when the peer already holds a
-    /// lease or capacity is unavailable. On success the peer owns one lease until it
-    /// releases the lease or the idle deadline expires. The finalized fallback limits the
+    /// lease or capacity is unavailable. A successful page read consumes the lease.
+    /// Explicit release and expiry also free unused leases. The finalized fallback limits the
     /// complete historical path to one protocol range.
     pub(crate) fn acquire_retained_path(
         &self,
@@ -2086,7 +2088,7 @@ impl HeaderChainReader {
             .leases
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
-            .advance(
+            .finish_page(
                 peer,
                 session_id,
                 lease_id,

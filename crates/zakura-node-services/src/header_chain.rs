@@ -403,7 +403,7 @@ pub trait Port: Send + Sync + 'static {
 
     /// Retain the target path identified by `request`.
     ///
-    /// An acquired reply reserves serving capacity until the caller releases it.
+    /// An acquired reply reserves capacity until a successful read or explicit release.
     /// Local retention may evict the path before a page snapshot is captured.
     fn acquire_header_path(
         &self,

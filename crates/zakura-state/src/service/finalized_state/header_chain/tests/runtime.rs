@@ -1,6 +1,54 @@
 use super::*;
 
 #[test]
+fn completed_page_releases_capacity_before_continuation_and_late_cleanup() {
+    let (runtime, _db, _, path) = reconciled_store_with_finalized_prefix(5);
+    let reader = runtime.reader();
+    let source = SourceId::from_digest([0xd1; 32]);
+    let target = path[4].hash;
+    let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target);
+    let RetainedPathLeaseOutcome::Acquired(first) = reader
+        .acquire_retained_path(source, 7, target, &[path[2].hash], scope)
+        .unwrap()
+    else {
+        panic!("the first page has capacity");
+    };
+    let RetainedPathReadOutcome::Page(page) = reader
+        .read_retained_path(source, 7, first.lease_id, scope, path[2].hash, 1)
+        .unwrap()
+    else {
+        panic!("the first page remains available");
+    };
+    assert!(!page.complete);
+    let RetainedPathLeaseOutcome::Acquired(second) = reader
+        .acquire_retained_path(source, 7, target, &[path[3].hash], scope)
+        .unwrap()
+    else {
+        panic!("the continuation must acquire before cleanup of the first page runs");
+    };
+    assert_ne!(second.lease_id, first.lease_id);
+    assert!(!reader
+        .release_retained_path(source, 7, first.lease_id, scope)
+        .unwrap());
+    assert_eq!(
+        reader
+            .read_retained_path(source, 7, first.lease_id, scope, path[3].hash, 1)
+            .unwrap(),
+        RetainedPathReadOutcome::Unavailable,
+        "the consumed lease cannot race the new reader",
+    );
+    let RetainedPathReadOutcome::Page(page) = reader
+        .read_retained_path(source, 7, second.lease_id, scope, path[3].hash, 1)
+        .unwrap()
+    else {
+        panic!("late cleanup must not revoke the continuation");
+    };
+    assert_eq!(page.headers[0].hash(), target);
+    assert!(page.complete);
+    assert!(runtime.leases.lock().unwrap().by_peer.is_empty());
+}
+
+#[test]
 fn serving_leases_do_not_block_a_better_work_branch() {
     let (engine_config, anchor, metadata) = fixture();
     let store = HeaderChainStore::new(open(&Config::ephemeral(), engine_config.network()));
@@ -892,7 +940,7 @@ async fn retained_path_serves_a_locator_before_the_header_retention_window() {
         &runtime.publisher().snapshot(),
         target.hash,
     );
-    let RetainedPathLeaseOutcome::Acquired(lease) = reader
+    let RetainedPathLeaseOutcome::Acquired(mut lease) = reader
         .acquire_retained_path(
             SourceId::from_digest([0x71; 32]),
             9,
@@ -925,14 +973,23 @@ async fn retained_path_serves_a_locator_before_the_header_retention_window() {
         assert_eq!(page.aux_deliveries, vec![Vec::new()]);
         assert_eq!(page.complete, complete);
         after = expected.hash;
+        if !complete {
+            let RetainedPathLeaseOutcome::Acquired(next) = reader
+                .acquire_retained_path(owner, 9, target.hash, &[after], scope)
+                .unwrap()
+            else {
+                panic!("the next page can acquire fresh capacity");
+            };
+            lease = next;
+        }
     }
-    assert!(reader
+    assert!(!reader
         .release_retained_path(owner, 9, lease.lease_id, scope)
         .expect("the one-header-page cursor releases"));
 
     for (marker, page_count) in [(0x72, 2), (0x73, 3)] {
         let page_owner = SourceId::from_digest([marker; 32]);
-        let RetainedPathLeaseOutcome::Acquired(lease) = reader
+        let RetainedPathLeaseOutcome::Acquired(mut lease) = reader
             .acquire_retained_path(page_owner, 9, target.hash, &[genesis.hash], scope)
             .expect("the tier-boundary page cursor acquires")
         else {
@@ -956,6 +1013,13 @@ async fn retained_path_serves_a_locator_before_the_header_retention_window() {
                 .last()
                 .expect("an incomplete page contains at least one header")
                 .hash();
+            let RetainedPathLeaseOutcome::Acquired(next) = reader
+                .acquire_retained_path(page_owner, 9, target.hash, &[after], scope)
+                .unwrap()
+            else {
+                panic!("the next page can acquire across the storage boundary");
+            };
+            lease = next;
         }
         assert_eq!(
             served,
@@ -1349,6 +1413,12 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
         "the opaque cursor advances exactly once and cannot be rewound",
     );
 
+    let RetainedPathLeaseOutcome::Acquired(lease) = reader
+        .acquire_retained_path(owner, 7, grandchild.hash, &[child.hash], lease_scope)
+        .unwrap()
+    else {
+        panic!("the next page acquires its own lease");
+    };
     let cursor = runtime
         .leases
         .lock()
@@ -1501,7 +1571,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
     };
     assert!(completed.headers.is_empty());
     assert!(completed.complete);
-    assert!(reader
+    assert!(!reader
         .release_retained_path(
             SourceId::from_digest([2; 32]),
             7,
@@ -1510,7 +1580,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
         )
         .expect("the requester-order test lease releases"));
 
-    assert!(reader
+    assert!(!reader
         .release_retained_path(owner, 7, lease.lease_id, lease_scope)
         .expect("the exact owner can release its lease"));
     for marker in 1..MAX_RETAINED_PATH_LEASES {
@@ -1661,7 +1731,7 @@ async fn retained_path_serves_a_bounded_finalized_range_below_the_header_frontie
     );
     assert_eq!(page.target, target);
     assert!(page.complete);
-    assert!(reader
+    assert!(!reader
         .release_retained_path(owner, 11, lease.lease_id, scope)
         .expect("the finalized target cursor releases"));
 
@@ -1692,7 +1762,7 @@ async fn retained_path_serves_a_bounded_finalized_range_below_the_header_frontie
     );
     assert_eq!(long_path_page.target, target);
     assert!(long_path_page.complete);
-    assert!(reader
+    assert!(!reader
         .release_retained_path(long_path_owner, 11, long_path_lease.lease_id, scope,)
         .expect("the bounded finalized path cursor releases"));
 

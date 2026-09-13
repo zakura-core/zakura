@@ -1639,6 +1639,130 @@ async fn retained_path_serves_a_bounded_finalized_range_below_the_header_frontie
 }
 
 #[test]
+fn retained_path_lookup_stops_at_the_locator_outside_commit_locks() {
+    let (runtime, db, _, path) = reconciled_store_with_finalized_prefix(64);
+    let reader = runtime.reader();
+    let target = path.last().unwrap();
+    let parent = &path[path.len() - 2];
+    let snapshot = runtime.publisher().snapshot();
+    let scope = HeaderWorkAuthority::for_target(&snapshot, target.hash);
+
+    // Make an older, unrequested row unreadable so a walk past the locator fails
+    // deterministically. The target's requested suffix is still intact.
+    let mut batch = DiskWriteBatch::new();
+    runtime
+        .store
+        .delete_raw(&mut batch, HEADER_NODE_BY_HASH, path[3].hash.0)
+        .unwrap();
+    db.write(batch).unwrap();
+    let read = reader.store.audit_snapshot().unwrap();
+    let node = read.retained_path_node(target.hash).unwrap().unwrap();
+    {
+        let _writer = reader.store.writer.lock().unwrap();
+        let _engine = reader.transition_engine.lock().unwrap();
+        let ancestors = read
+            .retained_ancestry_to_locator(node, snapshot.frontiers.finalized, &[parent.hash])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ancestors,
+            vec![
+                Frontier::new(target.height, target.hash),
+                Frontier::new(parent.height, parent.hash),
+            ]
+        );
+    }
+
+    let source = SourceId::from_digest([0xc1; 32]);
+    let RetainedPathLeaseOutcome::Acquired(lease) = reader
+        .acquire_retained_path(source, 7, target.hash, &[parent.hash, path[2].hash], scope)
+        .unwrap()
+    else {
+        panic!("a one-header request only needs the intact suffix");
+    };
+    let RetainedPathReadOutcome::Page(page) = reader
+        .read_retained_path(source, 7, lease.lease_id, scope, parent.hash, 1)
+        .unwrap()
+    else {
+        panic!("the requested suffix can be served");
+    };
+    assert_eq!(page.headers[0].hash(), target.hash);
+    assert!(page.complete);
+    assert!(matches!(
+        reader
+            .acquire_retained_path(
+                SourceId::from_digest([0xc2; 32]),
+                7,
+                target.hash,
+                &[path[2].hash, parent.hash],
+                scope,
+            )
+            .unwrap(),
+        RetainedPathLeaseOutcome::HistoryPruned
+    ));
+}
+
+#[test]
+fn retained_path_lookup_preserves_locator_priority_and_skips_other_branches() {
+    let (runtime, db, genesis, path) = reconciled_store_with_finalized_prefix(6);
+    let reader = runtime.reader();
+    let target = &path[4];
+    let snapshot = runtime.publisher().snapshot();
+    let scope = HeaderWorkAuthority::for_target(&snapshot, target.hash);
+    let mut fork = runtime.store.header_node(path[3].hash).unwrap().unwrap();
+    let mut header = *fork.header;
+    header.nonce.0[0] = 0xff;
+    fork.header = Arc::new(header);
+    fork.hash = fork.header.hash();
+    let mut batch = DiskWriteBatch::new();
+    runtime
+        .store
+        .put_value(
+            &mut batch,
+            HEADER_NODE_BY_HASH,
+            fork.hash.0,
+            &HeaderNodeDisk::from_domain(&fork),
+        )
+        .unwrap();
+    db.write(batch).unwrap();
+    for (index, (locators, ancestor)) in [
+        (vec![path[2].hash, path[3].hash], &path[2]),
+        (vec![path[3].hash, path[2].hash], &path[3]),
+        (vec![genesis.hash, path[3].hash], &genesis),
+        (vec![path[3].hash, genesis.hash], &path[3]),
+        (vec![path[5].hash, path[3].hash], &path[3]),
+        (vec![fork.hash, target.hash], target),
+        (vec![fork.hash, path[3].hash], &path[3]),
+        (vec![fork.hash, genesis.hash], &genesis),
+        (vec![target.hash, path[3].hash], target),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let source = SourceId::from_digest([u8::try_from(index).unwrap(); 32]);
+        let RetainedPathLeaseOutcome::Acquired(lease) = reader
+            .acquire_retained_path(source, 7, target.hash, &locators, scope)
+            .unwrap()
+        else {
+            panic!("each locator list intersects the retained target's ancestry");
+        };
+        assert_eq!(lease.common_ancestor.hash, ancestor.hash);
+        let RetainedPathReadOutcome::Page(page) = reader
+            .read_retained_path(source, 7, lease.lease_id, scope, ancestor.hash, 10)
+            .unwrap()
+        else {
+            panic!("the path from the chosen locator remains contiguous");
+        };
+        assert_eq!(
+            page.headers.len(),
+            usize::try_from(target.height.0 - ancestor.height.0).unwrap()
+        );
+        assert_eq!(page.target.hash, target.hash);
+        assert!(page.complete);
+    }
+}
+
+#[test]
 fn retained_path_survives_finalization_during_and_between_page_reads() {
     let (runtime, db, _, path) = reconciled_store_with_finalized_prefix(6);
     let reader = runtime.reader();
@@ -1659,12 +1783,25 @@ fn retained_path_survives_finalization_during_and_between_page_reads() {
         .get(source, 7, lease.lease_id, Instant::now())
         .unwrap();
     let captured = reader.capture_path_read(&cursor, 1).unwrap();
+    let ancestry_read = reader.store.audit_snapshot().unwrap();
     finalize_serving_test_path(&runtime, &db, &path[3..5]);
     assert!(runtime.publisher().snapshot().header_generation > before.header_generation);
     assert!(
         runtime.store.header_node(target.hash).unwrap().is_none(),
         "finality removes the old retained row"
     );
+    let ancestors = ancestry_read
+        .retained_ancestry_to_locator(
+            ancestry_read
+                .retained_path_node(target.hash)
+                .unwrap()
+                .unwrap(),
+            before.frontiers.finalized,
+            &[path[2].hash],
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(ancestors, vec![target, before.frontiers.finalized]);
     let (page, _, _) = captured.read_page(&cursor, 1).unwrap().unwrap();
     assert_eq!(page.headers[0].hash(), target.hash);
     assert!(page.complete);
@@ -1713,6 +1850,7 @@ fn retained_path_rejects_a_target_pruned_before_lease_commit_or_page_capture() {
         .get(source, 7, lease.lease_id, Instant::now())
         .unwrap();
     let captured = reader.capture_path_read(&cursor, 1).unwrap();
+    let ancestry_read = reader.store.audit_snapshot().unwrap();
 
     let pending_source = SourceId::from_digest([0xb2; 32]);
     let reservation_id = runtime
@@ -1786,6 +1924,19 @@ fn retained_path_rejects_a_target_pruned_before_lease_commit_or_page_capture() {
         .finalized_frontier(target.hash)
         .unwrap()
         .is_none());
+
+    let ancestors = ancestry_read
+        .retained_ancestry_to_locator(
+            ancestry_read
+                .retained_path_node(target.hash)
+                .unwrap()
+                .unwrap(),
+            before.frontiers.finalized,
+            &[path[2].hash],
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(ancestors, vec![target, before.frontiers.finalized]);
 
     let (page, _, _) = captured.read_page(&cursor, 1).unwrap().unwrap();
     assert_eq!(page.headers[0].hash(), target.hash);

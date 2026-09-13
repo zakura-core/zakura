@@ -1,6 +1,60 @@
-//! Short-lived, coherent page reads that can finish while the chain advances.
+//! Short-lived, coherent path and page reads that can finish while the chain advances.
 
 use super::*;
+
+impl audit_snapshot::HeaderChainAuditSnapshot<'_> {
+    /// Read target-first ancestry only as far as the first matching locator needs.
+    /// A finalized locator needs the retained root. Missing required history returns `None`.
+    pub(super) fn retained_ancestry_to_locator(
+        &self,
+        target: HeaderNodeDisk,
+        finalized: Frontier,
+        locator_hashes: &[block::Hash],
+    ) -> Result<Option<Vec<Frontier>>, HeaderChainStoreError> {
+        let target_height = target.height;
+        let mut path = vec![Frontier::new(target.height, target.hash)];
+        let mut current = target;
+        // Preserve locator priority and reuse the parent walk when an earlier
+        // locator is on another branch.
+        for locator_hash in locator_hashes {
+            let boundary = if let Some(node) = self.retained_path_node(*locator_hash)? {
+                Frontier::new(node.height, node.hash)
+            } else if let Some(frontier) = self.finalized_frontier(*locator_hash)? {
+                if frontier.height >= finalized.height {
+                    continue;
+                }
+                finalized
+            } else {
+                continue;
+            };
+            if boundary.height > target_height || boundary.height < finalized.height {
+                continue;
+            }
+            while current.height > boundary.height {
+                let Some(parent) = self.retained_path_node(current.parent_hash)? else {
+                    return Ok(None);
+                };
+                if parent.height.next().ok() != Some(current.height) {
+                    return Err(StoreError::Incoherent(
+                        "retained target path has non-contiguous heights",
+                    )
+                    .into());
+                }
+                path.push(Frontier::new(parent.height, parent.hash));
+                current = parent;
+            }
+            if current.height == finalized.height && path.last().copied() != Some(finalized) {
+                return Ok(None);
+            }
+            let index = usize::try_from(target_height.0 - boundary.height.0)
+                .map_err(|_| StoreError::Incoherent("retained path index overflowed"))?;
+            if path.get(index).copied() == Some(boundary) {
+                break;
+            }
+        }
+        Ok(Some(path))
+    }
+}
 
 pub(super) struct HeaderPathReadSnapshot<'a> {
     disk: audit_snapshot::HeaderChainAuditSnapshot<'a>,

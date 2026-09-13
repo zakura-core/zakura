@@ -1883,13 +1883,12 @@ impl HeaderChainReader {
         reservation: RetainedPathReservation,
         session_id: u64,
         scope: HeaderWorkAuthority,
-        target_tip_hash: block::Hash,
         locator_hashes: &[block::Hash],
         snapshot: &EngineSnapshot,
+        read: &audit_snapshot::HeaderChainAuditSnapshot<'_>,
     ) -> Result<RetainedPathLeaseOutcome, HeaderChainStoreError> {
         let peer = reservation.peer;
-        let read = self.store.audit_snapshot()?;
-        let Some(target) = read.finalized_frontier(target_tip_hash)? else {
+        let Some(target) = read.finalized_frontier(scope.branch.target_tip_hash)? else {
             return Ok(RetainedPathLeaseOutcome::TargetNotRetained);
         };
         if target.height >= snapshot.frontiers.finalized.height {
@@ -1964,25 +1963,25 @@ impl HeaderChainReader {
                 "retained path locator count is outside protocol bounds",
             )));
         }
-        // Capture the bounded in-memory path and disk view under one commit barrier.
-        // Locator disk reads run after releasing it. Lease installation rechecks only
-        // the exact target's availability, not unrelated generation changes.
-        let _writer = self
-            .store
-            .writer
-            .lock()
-            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-        let read = self.store.audit_snapshot()?;
+        // Capture frontiers and durable rows under one short commit barrier. All
+        // ancestry reads run outside both locks, and lease installation rechecks
+        // the exact target's availability after the snapshot read.
+        let (snapshot, read) = {
+            let _writer = self
+                .store
+                .writer
+                .lock()
+                .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+            let engine = self
+                .transition_engine
+                .lock()
+                .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
+            (engine.snapshot(), self.store.audit_snapshot()?)
+        };
+        let target_node = read.retained_path_node(target_tip_hash)?;
         // General paths may occupy all but one registry slot. A target outside the retained graph
         // may use the final slot only when it resolves to the bounded finalized fallback below.
-        let capacity = if self
-            .transition_engine
-            .lock()
-            .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
-            .graph()
-            .header_node(target_tip_hash)
-            .is_some()
-        {
+        let capacity = if target_node.is_some() {
             RetainedPathCapacity::General
         } else {
             RetainedPathCapacity::FinalizedFallback
@@ -2001,43 +2000,14 @@ impl HeaderChainReader {
             reservation_id,
             active: true,
         };
-        let (snapshot, retained_target) = {
-            let engine = self
-                .transition_engine
-                .lock()
-                .map_err(|_| HeaderChainStoreError::WriterPoisoned)?;
-            let snapshot = engine.snapshot();
-            // Serving reads an exact hash, not the selected branch. The captured scope
-            // correlates this lease with its requester and may predate normal head progress.
-            if scope.branch.target_tip_hash != target_tip_hash
-                || scope.header_generation > snapshot.header_generation
-            {
-                return Ok(RetainedPathLeaseOutcome::Busy);
-            }
-            match engine.graph().header_node(target_tip_hash) {
-                None => (snapshot, None),
-                Some(target_node) => {
-                    let target = Frontier::new(target_node.height, target_tip_hash);
-                    let mut reverse_path = vec![target];
-                    let mut current = target_node;
-                    while current.height > snapshot.frontiers.finalized.height {
-                        let Some(parent) = engine.graph().header_node(current.parent_hash) else {
-                            return Ok(RetainedPathLeaseOutcome::HistoryPruned);
-                        };
-                        if parent.height.next().ok() != Some(current.height) {
-                            return Err(HeaderChainStoreError::Store(StoreError::Incoherent(
-                                "retained target path has non-contiguous heights",
-                            )));
-                        }
-                        reverse_path.push(Frontier::new(parent.height, parent.hash));
-                        current = parent;
-                    }
-                    (snapshot, Some((target, reverse_path)))
-                }
-            }
-        };
-        drop(_writer);
-        let Some((target, mut reverse_path)) = retained_target else {
+        // Serving reads an exact hash, not the selected branch. The captured scope
+        // correlates this lease with its requester and may predate normal head progress.
+        if scope.branch.target_tip_hash != target_tip_hash
+            || scope.header_generation > snapshot.header_generation
+        {
+            return Ok(RetainedPathLeaseOutcome::Busy);
+        }
+        let Some(target_node) = target_node else {
             // The header graph holds only the retained suffix. A VCT repair can ask for a bounded
             // range that every peer past it has finalized. The target is absent here but present
             // and immutable in the finalized indexes.
@@ -2045,14 +2015,20 @@ impl HeaderChainReader {
                 reservation,
                 session_id,
                 scope,
-                target_tip_hash,
                 locator_hashes,
                 &snapshot,
+                &read,
             );
         };
-        if reverse_path.last().copied() != Some(snapshot.frontiers.finalized) {
+        let target = Frontier::new(target_node.height, target_tip_hash);
+        let Some(mut reverse_path) = read.retained_ancestry_to_locator(
+            target_node,
+            snapshot.frontiers.finalized,
+            locator_hashes,
+        )?
+        else {
             return Ok(RetainedPathLeaseOutcome::HistoryPruned);
-        }
+        };
         reverse_path.reverse();
         let mut intersection = None;
         for locator_hash in locator_hashes {

@@ -40,6 +40,49 @@ use crate::{
 
 const LAST_BLOCK_HEIGHT: u32 = 10;
 
+#[tokio::test]
+async fn await_utxo_discards_rejected_sent_outputs() {
+    use tower::{Service, ServiceExt};
+
+    let _init_guard = zakura_test::init();
+    let (mut state, _, _, _) =
+        StateService::new(Config::ephemeral(), &Network::Mainnet, Height::MAX, 0)
+            .await
+            .expect("ephemeral state initialization succeeds");
+    let block = Arc::new(
+        zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into::<Block>()
+            .expect("the mainnet height-one block is valid"),
+    )
+    .prepare();
+    let outpoint = *block
+        .new_outputs
+        .keys()
+        .next()
+        .expect("the block has outputs");
+    state.non_finalized_block_write_sent_hashes.add(&block);
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    state.non_finalized_rejected_receiver = receiver;
+
+    state.ready().await.expect("the state service is ready");
+    // Model a writer rejection arriving after poll_ready but before the UTXO request.
+    sender
+        .send(super::write::NonFinalizedWriteFailure {
+            hash: block.hash,
+            kind: NonFinalizedWriteFailureKind::Retryable,
+        })
+        .expect("the rejection receiver is alive");
+    let response = state.call(Request::AwaitUtxo(outpoint));
+    assert!(state
+        .non_finalized_block_write_sent_hashes
+        .utxo(&outpoint)
+        .is_none());
+    assert!(
+        timeout(Duration::from_millis(100), response).await.is_err(),
+        "an output from a rejected block must remain unavailable"
+    );
+}
+
 #[test]
 fn mined_orphans_finish_without_entering_the_sync_queue() {
     let _init_guard = zakura_test::init();

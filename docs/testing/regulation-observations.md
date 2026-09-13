@@ -50,6 +50,5 @@ universal timing limit.
 cargo test --locked -p zakura-test --lib
 ```
 
-The ordinary unit-test workflow runs on stacked `adam/**` PR bases as well as
-the existing base patterns. Each later contract PR adds its own tests and any
-required CI selection.
+Run the controls locally while reviewing the split. Each later contract PR adds
+its own tests and a focused local selection.

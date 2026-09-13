@@ -7,7 +7,7 @@ use tower::{Service, ServiceExt};
 use zakura_chain::block::{self};
 use zakura_chain::parallel::commitment_aux::BlockCommitmentRoots;
 #[cfg(test)]
-use zakura_network::zakura::{AuxSchema, HeaderEntry, HeaderPathPage, ZakuraPeerId};
+use zakura_network::zakura::ZakuraPeerId;
 use zakura_network::zakura::{FullStateFrontiers, ZakuraHeaderSyncDriverStartup};
 use zakura_node_services::header_chain::{self as port, HeaderChainFuture, Port, PortError};
 
@@ -1091,91 +1091,6 @@ fn finalized_tree_aux_record(
     }
 }
 
-#[cfg(test)]
-fn assemble_header_path_page(
-    lease_id: u64,
-    page: port::RetainedHeaderPathPage,
-    requested_schema: AuxSchema,
-) -> Option<HeaderPathPage> {
-    if page.headers.len() != page.aux_deliveries.len()
-        || page.headers.len() != page.finalized_tree_aux.len()
-    {
-        return None;
-    }
-
-    let tree_aux_schema = if requested_schema == AuxSchema::V1
-        && page
-            .aux_deliveries
-            .iter()
-            .zip(&page.finalized_tree_aux)
-            .all(|(deliveries, finalized_tree_aux)| {
-                finalized_tree_aux.is_some()
-                    || selected_aux_delivery(deliveries, AuxSchema::V1).is_some()
-            }) {
-        AuxSchema::V1
-    } else {
-        AuxSchema::None
-    };
-    let entries = page
-        .headers
-        .into_iter()
-        .zip(page.aux_deliveries)
-        .zip(page.finalized_tree_aux)
-        .map(|((header, deliveries), finalized_tree_aux)| {
-            let delivery_schema =
-                if tree_aux_schema == AuxSchema::V1 && finalized_tree_aux.is_none() {
-                    AuxSchema::V1
-                } else {
-                    AuxSchema::None
-                };
-            let delivery = selected_aux_delivery(&deliveries, delivery_schema);
-            HeaderEntry {
-                header,
-                body_size: delivery.map_or(0, |delivery| match delivery.body_size {
-                    zakura_header_chain::BodySizeHint::Unknown => 0,
-                    zakura_header_chain::BodySizeHint::Known(size) => size.get(),
-                }),
-                tree_aux: (tree_aux_schema == AuxSchema::V1)
-                    .then(|| finalized_tree_aux.or_else(|| delivery.and_then(|item| item.tree_aux)))
-                    .flatten(),
-            }
-        })
-        .collect();
-
-    Some(HeaderPathPage {
-        lease_id,
-        common_ancestor: page.common_ancestor,
-        target: page.target,
-        scope: page.scope,
-        tree_aux_schema,
-        entries,
-        complete: page.complete,
-    })
-}
-
-#[cfg(test)]
-fn selected_aux_delivery(
-    deliveries: &[zakura_header_chain::AuxDelivery],
-    schema: AuxSchema,
-) -> Option<zakura_header_chain::AuxDelivery> {
-    deliveries
-        .iter()
-        .copied()
-        .filter(|delivery| {
-            !delivery.is_rejected()
-                && match schema {
-                    AuxSchema::None => {
-                        matches!(
-                            delivery.body_size,
-                            zakura_header_chain::BodySizeHint::Known(_)
-                        )
-                    }
-                    AuxSchema::V1 => delivery.tree_aux.is_some(),
-                }
-        })
-        .min_by_key(|delivery| (!delivery.is_authenticated(), delivery.delivery_id))
-}
-
 async fn release_header_path<ReadState>(
     read_state: ReadState,
     adapter_key: port::AdapterKey,
@@ -1219,10 +1134,7 @@ fn source_id(peer: &ZakuraPeerId) -> zakura_header_chain::SourceId {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        future::pending,
-        num::{NonZeroU32, NonZeroU64},
-    };
+    use std::{future::pending, num::NonZeroU64};
 
     use zakura_chain::block::genesis::regtest_genesis_block;
 
@@ -1380,158 +1292,6 @@ mod tests {
             .await
             .expect("the waiter task remains live")
             .expect("readiness completes the unbounded wait");
-    }
-
-    #[test]
-    fn served_aux_selection_is_deterministic_and_excludes_rejected_evidence() {
-        let owner = owner();
-        let source = zakura_header_chain::SourceId::from_digest([5; 32]);
-        let header_hash = block::Hash([6; 32]);
-        let tree_aux = zakura_header_chain::TreeAuxRecordV1 {
-            height: block::Height(1),
-            sapling_root: Default::default(),
-            orchard_root: Default::default(),
-            ironwood_root: Default::default(),
-            sapling_tx_count: 0,
-            orchard_tx_count: 0,
-            ironwood_tx_count: 0,
-            auth_data_root: [0; 32].into(),
-        };
-        let delivery = |marker, body_size, tree_aux, status_code| {
-            let delivery = zakura_header_chain::AuxDelivery::new(
-                zakura_header_chain::EvidenceId::from_digest([marker; 32]),
-                header_hash,
-                source,
-                owner,
-                body_size,
-                tree_aux,
-            );
-            if status_code == 0 {
-                delivery
-            } else {
-                delivery
-                    .test_only_with_outcome(
-                        status_code,
-                        [Some([marker.wrapping_add(6); 32]), None],
-                        Some(block::Hash([9; 32])),
-                    )
-                    .expect("the test outcome is coherent")
-            }
-        };
-        let rejected = delivery(
-            1,
-            zakura_header_chain::BodySizeHint::Known(NonZeroU32::new(10).expect("ten is nonzero")),
-            Some(tree_aux),
-            2,
-        );
-        let unauthenticated = delivery(
-            2,
-            zakura_header_chain::BodySizeHint::Known(
-                NonZeroU32::new(20).expect("twenty is nonzero"),
-            ),
-            Some(tree_aux),
-            0,
-        );
-        let authenticated = delivery(
-            3,
-            zakura_header_chain::BodySizeHint::Known(
-                NonZeroU32::new(30).expect("thirty is nonzero"),
-            ),
-            Some(tree_aux),
-            1,
-        );
-        let deliveries = [rejected, unauthenticated, authenticated];
-
-        assert_eq!(
-            selected_aux_delivery(&deliveries, AuxSchema::V1),
-            Some(authenticated)
-        );
-        assert_eq!(
-            selected_aux_delivery(&deliveries, AuxSchema::None),
-            Some(authenticated)
-        );
-        assert_eq!(selected_aux_delivery(&[rejected], AuxSchema::V1), None);
-    }
-
-    #[test]
-    fn retained_page_uses_v1_only_when_every_record_is_available() {
-        let header = regtest_genesis_block().header.clone();
-        let hash = header.hash();
-        let work = header
-            .difficulty_threshold
-            .to_work()
-            .expect("the genesis target has defined work");
-        let node = zakura_header_chain::HeaderNode::from_durable_parts(
-            header,
-            hash,
-            regtest_genesis_block().header.previous_block_hash,
-            block::Height(0),
-            work,
-            zakura_header_chain::WorkCoordinate::new(hash, work.as_u256()),
-            zakura_header_chain::HeaderValidationState::Valid,
-            Default::default(),
-            Default::default(),
-            Vec::new(),
-        )
-        .expect("the canonical genesis fields form a durable node");
-        let frontier = zakura_header_chain::Frontier::new(block::Height(0), hash);
-        let mut page = port::RetainedHeaderPathPage {
-            common_ancestor: frontier,
-            target: frontier,
-            scope: owner().header_authority(),
-            headers: vec![node.header],
-            aux_deliveries: vec![Vec::new()],
-            finalized_tree_aux: vec![None],
-            finalized_body_sizes: vec![None],
-            complete: true,
-        };
-
-        let fallback = assemble_header_path_page(1, page.clone(), AuxSchema::V1)
-            .expect("the coherent parallel page assembles");
-        assert_eq!(fallback.tree_aux_schema, AuxSchema::None);
-        assert_eq!(fallback.entries[0].body_size, 0);
-        assert_eq!(fallback.entries[0].tree_aux, None);
-
-        let tree_aux = zakura_header_chain::TreeAuxRecordV1 {
-            height: block::Height(0),
-            sapling_root: Default::default(),
-            orchard_root: Default::default(),
-            ironwood_root: Default::default(),
-            sapling_tx_count: 0,
-            orchard_tx_count: 0,
-            ironwood_tx_count: 0,
-            auth_data_root: [0; 32].into(),
-        };
-        page.finalized_tree_aux[0] = Some(tree_aux);
-        let served_from_finalized_state = assemble_header_path_page(1, page.clone(), AuxSchema::V1)
-            .expect("the coherent finalized-state page assembles");
-        assert_eq!(served_from_finalized_state.tree_aux_schema, AuxSchema::V1);
-        assert_eq!(served_from_finalized_state.entries[0].body_size, 0);
-        assert_eq!(
-            served_from_finalized_state.entries[0].tree_aux,
-            Some(tree_aux)
-        );
-        page.finalized_tree_aux[0] = None;
-
-        page.aux_deliveries[0].push(zakura_header_chain::AuxDelivery::new(
-            zakura_header_chain::EvidenceId::from_digest([10; 32]),
-            hash,
-            zakura_header_chain::SourceId::from_digest([11; 32]),
-            owner(),
-            zakura_header_chain::BodySizeHint::Known(NonZeroU32::new(321).expect("321 is nonzero")),
-            Some(tree_aux),
-        ));
-        let no_aux = assemble_header_path_page(1, page.clone(), AuxSchema::None)
-            .expect("the coherent parallel page assembles");
-        assert_eq!(no_aux.tree_aux_schema, AuxSchema::None);
-        assert_eq!(no_aux.entries[0].body_size, 321);
-        assert_eq!(no_aux.entries[0].tree_aux, None);
-
-        let served = assemble_header_path_page(1, page, AuxSchema::V1)
-            .expect("the coherent parallel page assembles");
-        assert_eq!(served.tree_aux_schema, AuxSchema::V1);
-        assert_eq!(served.entries[0].body_size, 321);
-        assert_eq!(served.entries[0].tree_aux, Some(tree_aux));
     }
 
     #[tokio::test]

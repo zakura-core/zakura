@@ -150,11 +150,19 @@ pub const ZAKURA_DUPLICATE_EVICT_MIN_AGE: Duration = Duration::from_secs(300);
 /// resolution (milliseconds) so a genuine race keeps the transcript-tiebreak
 /// winner instead of flapping.
 pub const ZAKURA_SAME_IP_DUPLICATE_EVICT_MIN_AGE: Duration = Duration::from_secs(5);
-/// A paused stream may consume at most half the connection receive window,
-/// leaving credit for another service stream.
-pub const DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW: u32 = 16 * 1024 * 1024;
-/// QUIC connection receive window used by Zakura endpoints.
-pub const DEFAULT_ZAKURA_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;
+/// Maximum retained remotely initiated bidirectional transport streams.
+pub const DEFAULT_ZAKURA_REMOTE_BIDI_STREAMS: u32 = 16;
+/// Receive credit available to one stream, including before application admission.
+pub const DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW: u32 = 256 * 1024;
+// Qualification pauses 32 sibling streams, including locally opened streams.
+const QUALIFIED_PAUSED_SIBLING_STREAMS: u32 = 32;
+// Credit updates are batched. Six extra stream windows let another stream keep
+// receiving while the sibling consumers remain stopped.
+const CONNECTION_PROGRESS_HEADROOM: u32 = 6 * DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW;
+/// Receive credit for paused siblings plus independent service progress.
+pub const DEFAULT_ZAKURA_RECEIVE_WINDOW: u32 = QUALIFIED_PAUSED_SIBLING_STREAMS
+    * DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW
+    + CONNECTION_PROGRESS_HEADROOM;
 /// QUIC send window used by Zakura endpoints.
 pub const DEFAULT_ZAKURA_SEND_WINDOW: u64 = 32 * 1024 * 1024;
 /// Initial backoff before re-dialing a configured Zakura bootstrap peer.
@@ -484,7 +492,9 @@ impl ZakuraLocalLimits {
     fn transport_config_builder(&self) -> iroh::endpoint::QuicTransportConfigBuilder {
         QuicTransportConfig::builder()
             .max_remote_nat_traversal_addresses(0)
-            .max_concurrent_bidi_streams(VarInt::from_u32(u32::from(self.max_open_streams)))
+            .max_concurrent_bidi_streams(VarInt::from_u32(
+                u32::from(self.max_open_streams).min(DEFAULT_ZAKURA_REMOTE_BIDI_STREAMS),
+            ))
             .max_concurrent_uni_streams(VarInt::from_u32(0))
             .stream_receive_window(VarInt::from_u32(DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW))
             .receive_window(VarInt::from_u32(DEFAULT_ZAKURA_RECEIVE_WINDOW))
@@ -5727,6 +5737,12 @@ mod tests {
     mod quic_progress;
     mod serving_progress;
 
+    // These witnesses require unpublished transport APIs and their native
+    // integration. `ignore` alone still type-checks unavailable constructors.
+    // Restore both before enabling this module. See native-transport-capacity.md.
+    #[cfg(any())]
+    mod transport_ownership;
+
     use super::*;
     use crate::{
         protocol::internal::{InventoryResponse, Response},
@@ -8165,6 +8181,8 @@ mod tests {
             mode: StreamMode::Persistent,
         };
         let encoded = frame.encode(stream.frame_cap)?;
+        let buffered_frames =
+            2 + usize::try_from(DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW).unwrap() / encoded.len();
         // Opening a QUIC stream becomes visible to the receiver after the first bytes.
         sender.write_all(&encoded[..1]).await?;
         let (send, recv) = timeout(Duration::from_secs(5), stream_rx.recv())
@@ -8216,7 +8234,7 @@ mod tests {
             sender
         }));
         timeout(Duration::from_secs(10), async {
-            while *progress_rx.borrow_and_update() < 16 {
+            while *progress_rx.borrow_and_update() < buffered_frames {
                 progress_rx.changed().await.unwrap();
             }
         })

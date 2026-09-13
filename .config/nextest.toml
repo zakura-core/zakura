@@ -248,7 +248,8 @@ default-filter = 'package(zakura) and test(~zcashd_compat)'
 
 # Also selected by ordinary unit-test profiles; isolate the fixed regression checks.
 [profile.blocksync-regression]
-default-filter = 'test(~message_payload_limits_) or test(~inbound_frame_cap_rejects_) or test(~paused_ordered_reads_) or test(~stream_cancel_closes_ordered_worker_) or test(~block_sync::service::tests::) or test(~transport::io::) or test(~reconciliation_rejects_stale_admissions_) or test(~regulation::request::) or test(~serving_regulation::) or test(~block_sync::serving::) or test(~work_queue::request_write::tests::) or test(~handler::service_session::tests::) or test(~service::block_range::tests::) or (test(~handler::tests::paired_block_sync::) and not test(~handler::tests::paired_block_sync::gate::))'
+fail-fast = false
+default-filter = '(test(~peer_registry::) or test(~block_sync::tests::) or test(~block_sync::bbr::) or test(~regulation::response_memory::) or test(~regulation::response_scope::) or test(~regulation::response_vec::) or test(~transport::registry::tests::response_memory_) or test(~regulation::response::) or test(~authorized_late_body_claims_) or test(~peer_routine::tests::) or test(~transport::pipe::tests::local_) or test(~transport::pipe::tests::protocol_pipe_exit_) or test(~transport::service::tests::sink_reject_) or test(~peer_routine::tests::cancelled_session_settles_) or test(~peer_routine::tests::buffered_responses_are_) or test(~peer_routine::tests::malformed_blocks_are_) or test(~native_block_cap_) or test(~terminal_codecs_) or test(~frame_tag_mismatch_) or test(~message_payload_limits_) or test(~inbound_frame_cap_rejects_) or test(~paused_ordered_reads_) or test(~stream_cancel_closes_ordered_worker_) or test(~block_sync::service::tests::) or test(~transport::io::) or test(~reconciliation_rejects_stale_admissions_) or test(~regulation::request::) or test(~regulation::response_properties::) or test(~serving_regulation::) or test(~block_sync::serving::) or test(~work_queue::request_write::tests::) or test(~handler::service_session::tests::) or test(~service::block_range::tests::) or (test(~handler::tests::paired_block_sync::) and not test(~handler::tests::paired_block_sync::gate::))) and not (test(~regulation::response_properties::) or test(~regulation::request::properties::) or test(~serving_regulation::response_properties::) or test(~serving_regulation::policy::properties::) or test(~block_sync::serving::tests::properties::) or test(~service::block_range::tests::properties::))'
 retries = 0
 slow-timeout = { period = "60s", terminate-after = 1 }
 
@@ -314,3 +315,45 @@ retries = 0
 slow-timeout = { period = "300s", terminate-after = 1 }
 failure-output = "immediate"
 default-filter = 'test(~regulation::response_vec::) or test(~regulation::response_memory::) or test(~regulation::response_scope::) or test(~regulation::response_properties::) or test(~peer_routine::tests::memory::) or test(~peer_routine::response_contract::) or test(~work_queue::request_write::tests::) or test(~block_sync::service::tests::) or test(~block_sync::peer_registry::)'
+
+# Run the final transport and verifier composition locally.
+[profile.transport-qualification]
+default-filter = '(test(~handler::tests::paired_block_sync::) and not test(~handler::tests::paired_block_sync::gate::)) or test(~handler::tests::quic_progress::) or test(~paused_ordered_reads_) or test(~stream_cancel_closes_ordered_worker_) or test(~serving::tests::serving_contract::load::) or test(~block_sync_driver::tests::verification_contract::)'
+fail-fast = false
+retries = 0
+test-threads = 4
+slow-timeout = { period = "90s", terminate-after = 1 }
+failure-output = "immediate"
+
+# Generated contracts and fixed model controls. Run explicitly for local feedback.
+[profile.regulation-properties]
+default-filter = 'test(~regulation::slot_properties::) or test(~regulation::response_properties::) or test(~regulation::request::properties::) or test(~serving_regulation::properties::) or test(~serving_regulation::policy::properties::) or test(~block_sync::serving::tests::properties::) or test(~service::block_range::tests::properties::) or ((test(~response_contract::) or test(~bounded_decoding::) or test(~frame_codec::)) and (test(~_generated_) or test(~f02_bounded_response_payloads)))'
+fail-fast = false
+retries = 0
+slow-timeout = { period = "60s", terminate-after = 1 }
+
+# This generated history decodes real blocks in every case. Its per-event waits
+# remain two seconds even when a local run requests 2,048 histories.
+[[profile.regulation-properties.overrides]]
+filter = 'test(~r09_r10_generated_local_changes_preserve_live_authorization)'
+slow-timeout = { period = "5m", terminate-after = 1 }
+
+# Every executable requirement, including the node's real checkpoint verifier.
+[profile.regulation-compliance]
+default-filter = 'test(~response_contract::) or test(~block_sync::wire::bounded_decoding::) or test(~block_sync::wire::frame_codec::) or test(~handler::tests::frame_policy::) or test(~serving::tests::serving_contract::) or test(~paired_block_sync::qualification::) or test(~block_sync_driver::tests::verification_contract::) or (package(zakura-test) and test(~allocations::tests::))'
+fail-fast = false
+retries = 0
+test-threads = 4
+slow-timeout = { period = "90s", terminate-after = 1 }
+failure-output = "immediate"
+
+# Isolate load measurements. Set ZAKURA_REGULATION_LOAD_ROUNDS=64 locally for
+# sustained qualification. Nothing here schedules CI or dispatches a workflow.
+[profile.regulation-load]
+default-filter = 'test(~serving::tests::serving_contract::load::) or test(~paired_block_sync::qualification::) or test(~serving::tests::serving_contract::ownership::c05_)'
+fail-fast = false
+retries = 0
+test-threads = 1
+slow-timeout = { period = "10m", terminate-after = 1 }
+success-output = "immediate"
+failure-output = "immediate"

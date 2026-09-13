@@ -98,6 +98,13 @@ existing stream credit, it cannot send more data on that stream. Already authori
 count toward the resource bound. Account for both stream and connection credit.
 See [QUIC flow control](https://www.rfc-editor.org/rfc/rfc9000.html#section-4.1).
 
+The current implementation uses published transport packages. It bounds application work and
+requester metadata, but does not yet fund transport state through handshakes and final cleanup.
+Transport send capacity must eventually count retained payload, including acknowledged tails
+behind a missing prefix. Stream and fragment limits must cover locally opened and retiring state.
+The dependency changes needed for these bounds are reviewed separately. Their blocked witnesses
+and re-enable conditions are recorded in the [transport capacity plan](native-transport-capacity.md).
+
 Pausing request intake must not trap responses or control messages needed to finish active work.
 A mixed ordered stream can create that dependency even when every queue is bounded. The concrete
 stream layout must demonstrate simultaneous bidirectional serving and control progress before

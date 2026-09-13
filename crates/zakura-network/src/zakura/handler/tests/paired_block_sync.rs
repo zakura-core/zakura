@@ -25,8 +25,15 @@ const LOSS_DEADLINE: Duration = Duration::from_secs(240);
 mod gate;
 mod link;
 mod paused;
+mod qualification;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_policy_keeps_progress_with_all_sibling_streams_unread() -> Result<(), BoxError> {
+    gate::transport_windows::check_native_policy_headroom().await
+}
 
 struct Workload {
+    transport: Option<QuicTransportConfig>,
     peer_limit: Option<usize>,
     pressure: bool,
     impaired: bool,
@@ -39,6 +46,7 @@ struct Workload {
 impl Default for Workload {
     fn default() -> Self {
         Self {
+            transport: None,
             peer_limit: None,
             pressure: false,
             impaired: false,
@@ -118,6 +126,7 @@ struct Node {
     _tip: watch::Sender<(block::Height, block::Hash)>,
     received: watch::Receiver<u32>,
     _capture: Option<crate::zakura::testkit::TraceCapture>,
+    _serving_status: Option<watch::Sender<crate::zakura::block_sync::BlockSyncStatus>>,
 }
 
 impl Node {
@@ -140,6 +149,17 @@ impl Node {
         source: Option<Arc<dyn BlockRangeSource>>,
         cooldown: Option<Duration>,
     ) -> Self {
+        Self::with_download_mode(blocks, serving, peer_limit, source, cooldown, false)
+    }
+
+    fn with_download_mode(
+        blocks: Arc<Vec<Arc<Block>>>,
+        serving: bool,
+        peer_limit: Option<usize>,
+        source: Option<Arc<dyn BlockRangeSource>>,
+        cooldown: Option<Duration>,
+        duplex: bool,
+    ) -> Self {
         let genesis = Block::zcash_deserialize(&BLOCK_MAINNET_GENESIS_BYTES[..])
             .unwrap()
             .hash();
@@ -156,6 +176,12 @@ impl Node {
         }
         config.peer_limits.inbound_queue_depth = 8;
         config.peer_limits.outbound_queue_depth = 8;
+        if duplex {
+            config.initial_inflight_requests = COUNT;
+            config.initial_block_probe_requests = COUNT;
+            config.bbr_min_cwnd = COUNT;
+            config.bbr_min_cwnd_bytes = 128 * 1024 * 1024;
+        }
         if let Some(limit) = peer_limit {
             config.peer_limits.max_inbound_peers = limit;
             config.peer_limits.max_outbound_peers = limit;
@@ -189,11 +215,15 @@ impl Node {
         let (handle, mut actions, reactor) = spawn_block_sync_reactor(startup);
         let handle = handle
             .with_range_source(source.unwrap_or_else(|| Arc::new(MemorySource(blocks.clone()))));
-        let service = BlockSyncService::new_with_handle(
+        let mut service = BlockSyncService::new_with_handle(
             config,
             handle.clone(),
             zakura_chain::serialization::ZcashDecoder::for_network(&Network::Mainnet),
         );
+        // The transport fixture has an independently populated serving cache.
+        // Both verification pipelines still begin at genesis and need bodies.
+        let serving_status =
+            duplex.then(|| service.with_serving_status_for_test(qualification::cache_status()));
         let (progress_tx, received) = watch::channel(0);
         let driver_handle = handle.clone();
         let driver = tokio::spawn(async move {
@@ -251,6 +281,7 @@ impl Node {
             _tip: tip_tx,
             received,
             _capture: capture,
+            _serving_status: serving_status,
         }
     }
 }
@@ -305,8 +336,55 @@ async fn download_rounds(
     .await
 }
 
+async fn start_request_pressure(
+    send: FramedSend,
+) -> Result<AbortOnDropHandle<Result<(), BoxError>>, BoxError> {
+    const REQUESTS: usize = 32_000;
+    let (progress, mut observed) = watch::channel(0);
+    let writer = send.clone();
+    let task = AbortOnDropHandle::new(tokio::spawn(async move {
+        for queued in 1..=REQUESTS {
+            writer
+                .send(
+                    crate::zakura::block_sync::BlockSyncMessage::GetBlocks {
+                        start_height: block::Height(1),
+                        count: 1,
+                    }
+                    .encode_frame()?,
+                )
+                .await?;
+            progress.send_replace(queued);
+        }
+        Ok(())
+    }));
+    timeout(DEADLINE, async {
+        loop {
+            let queued = *observed.borrow_and_update();
+            if queued == REQUESTS {
+                break;
+            }
+            match timeout(Duration::from_millis(100), observed.changed()).await {
+                Ok(result) => result?,
+                Err(_) if queued > 0 && send.capacity() == 0 => break,
+                Err(_) => continue,
+            }
+        }
+        Ok::<_, BoxError>(())
+    })
+    .await
+    .map_err(|_| std::io::Error::other("request pressure setup timed out"))??;
+    // Keep offering the same bounded burst during the independent download.
+    // A full transport window must not prevent the download from starting.
+    eprintln!(
+        "pressure burst: {} of {REQUESTS} requests queued",
+        *observed.borrow()
+    );
+    Ok(task)
+}
+
 async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
     let Workload {
+        transport,
         peer_limit,
         pressure,
         impaired,
@@ -324,11 +402,29 @@ async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
     let mut serving_service = server_node.service.clone();
     let mut limits = ZakuraLocalLimits::from_config(&Config::default());
     // Let the declared request burst test serving pressure, not rate rejection.
-    limits.message_rate_per_second = 40_000;
-    let server = LocalEndpointFactory::with_transport_config(limits.transport_config())
+    if pressure {
+        limits.message_rate_per_second = 40_000;
+    }
+    const SATURATED_STREAM_WINDOW: u32 = 16 * 1024 * 1024;
+    let constrained_credit = resume_after.is_some() || recover_on_fresh_peer;
+    assert!(!constrained_credit || transport.is_none());
+    let transport_config = transport.unwrap_or_else(|| {
+        if constrained_credit {
+            // Recovery tests deliberately exhaust connection credit. The native
+            // policy instead reserves enough credit for independent progress.
+            limits
+                .transport_config_builder()
+                .stream_receive_window(SATURATED_STREAM_WINDOW.into())
+                .receive_window((2 * SATURATED_STREAM_WINDOW).into())
+                .build()
+        } else {
+            limits.transport_config()
+        }
+    });
+    let server = LocalEndpointFactory::with_transport_config(transport_config.clone())
         .endpoint(94101)
         .await?;
-    let client = LocalEndpointFactory::with_transport_config(limits.transport_config())
+    let client = LocalEndpointFactory::with_transport_config(transport_config.clone())
         .endpoint(94102)
         .await?;
     let handler =
@@ -373,11 +469,20 @@ async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
     .await?;
     let mut paused_receivers = Vec::new();
     let mut paused_senders = Vec::new();
+    let sibling_window = if constrained_credit {
+        SATURATED_STREAM_WINDOW
+    } else {
+        DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW
+    };
     let before_siblings = connection.stats().udp_rx.bytes;
     for _ in 0..paused_siblings {
         let sender = paused::PausedSession::receive(&mut server_siblings).await?;
         let receiver = paused::PausedSession::receive(&mut client_siblings).await?;
-        sender.fill_window().await?;
+        if constrained_credit {
+            sender.fill_window_bytes(SATURATED_STREAM_WINDOW).await?;
+        } else {
+            sender.fill_window().await?;
+        }
         paused_senders.push(sender);
         paused_receivers.push(receiver);
     }
@@ -391,7 +496,7 @@ async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
                     .udp_rx
                     .bytes
                     .saturating_sub(before_siblings)
-                    >= u64::from(paused_siblings) * u64::from(DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW)
+                    >= u64::from(paused_siblings) * u64::from(sibling_window)
             },
         )
         .await?;
@@ -410,27 +515,11 @@ async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
             .sessions_for_transport_test()
             .pop()
             .unwrap();
-        if pressure {
-            // All requests precede the download. Their receiver waits for capacity;
-            // only A's download below must complete.
-            timeout(DEADLINE, async {
-                for _ in 0..32_000 {
-                    server_session
-                        .2
-                        .send(
-                            crate::zakura::block_sync::BlockSyncMessage::GetBlocks {
-                                start_height: block::Height(1),
-                                count: 1,
-                            }
-                            .encode_frame()?,
-                        )
-                        .await?;
-                }
-                Ok::<_, BoxError>(())
-            })
-            .await
-            .map_err(|_| std::io::Error::other("request pressure setup timed out"))??;
-        }
+        let request_pressure = if pressure {
+            Some(start_request_pressure(server_session.2.clone()).await?)
+        } else {
+            None
+        };
         let mut start = Instant::now();
         downloader
             ._tip
@@ -518,7 +607,7 @@ async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
 
             let fresh_node = Node::new(blocks.clone(), true);
             let fresh_endpoint =
-                LocalEndpointFactory::with_transport_config(limits.transport_config())
+                LocalEndpointFactory::with_transport_config(transport_config.clone())
                     .endpoint(94103)
                     .await?;
             let (fresh_sibling, fresh_siblings) = paused::PausedService::new(paused_siblings);
@@ -585,12 +674,23 @@ async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
         })??;
         await_until(
             "all matched requests consume their ending",
-            DEADLINE,
-            || downloader.handle.outstanding_requests_for_test() == 0,
+            Duration::from_secs(3),
+            || {
+                let (published, ended) = downloader.handle.exchange_counts_for_test();
+                published > 0 && ended == published
+            },
         )
         .await?;
         let elapsed = start.elapsed();
         total += elapsed;
+        if let Some(task) = request_pressure {
+            task.abort();
+            match task.await {
+                Ok(result) => result?,
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         if rounds > 1 {
             eprintln!("matched round {}/{}: {:?}", round + 1, rounds, elapsed);
         }
@@ -688,7 +788,7 @@ async fn paired_download_matches_every_block_and_ending() -> Result<(), BoxError
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn paired_download_completes_while_serving_capacity_is_full() -> Result<(), BoxError> {
     eprintln!(
-        "paired matched download under 32000-request pressure: {:?}",
+        "paired matched download with an offered 32000-request burst: {:?}",
         download(true).await?
     );
     Ok(())

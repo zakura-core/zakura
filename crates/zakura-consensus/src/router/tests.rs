@@ -483,3 +483,153 @@ async fn verify_fail_add_block_checkpoint() -> Result<(), Report> {
 
     Ok(())
 }
+
+/// A semantic child must not end checkpoint sync before the configured boundary,
+/// even when its parent is the last durably committed checkpoint.
+#[tokio::test(flavor = "multi_thread")]
+async fn semantic_child_cannot_end_checkpoint_sync_early() {
+    use zakura_chain::{
+        local_genesis::{generate_local_testnet_with_funded_keys, LocalTestnetGenesisOptions},
+        parameters::{subsidy::block_subsidy, NetworkUpgrade},
+        transaction::{LockTime, Transaction},
+        transparent,
+    };
+
+    let _guard = zakura_test::init();
+    let generated = generate_local_testnet_with_funded_keys(
+        vec!["checkpoint_fixture".to_owned()],
+        LocalTestnetGenesisOptions {
+            latest_network_upgrade: NetworkUpgrade::Nu5,
+            maturity_padding_blocks: 1,
+            ..Default::default()
+        },
+    )
+    .expect("the custom network has valid genesis and checkpoint blocks");
+    let network = generated.network;
+    let (_, boundary) = init_checkpoint_list(Config::default(), &network);
+    assert_eq!(boundary, Height(2));
+    assert_eq!(network.mandatory_checkpoint_height(), boundary);
+
+    for mined in [true, false] {
+        let mut state_config = zs::Config::ephemeral();
+        state_config.vct_fast_sync = false;
+        let (state, _read, _tip, _change) = zs::init(state_config, &network, boundary, 0)
+            .await
+            .expect("ephemeral state opens");
+        let state = Buffer::new(state, 32);
+        let transaction = Buffer::new(
+            BoxService::new(transaction::Verifier::new_for_tests(
+                &network,
+                state.clone(),
+            )),
+            8,
+        );
+        let router = BlockVerifierRouter {
+            checkpoint: CheckpointVerifier::from_checkpoint_list(
+                network.checkpoint_list(),
+                &network,
+                None,
+                boundary,
+                state.clone(),
+            ),
+            max_checkpoint_height: boundary,
+            block: SemanticBlockVerifier::new(&network, state.clone(), transaction),
+        };
+        let mut router =
+            TimeoutLayer::new(Duration::from_secs(VERIFY_TIMEOUT_SECONDS)).layer(router);
+        let genesis = Arc::new(generated.blocks[0].clone());
+        assert_eq!(
+            router
+                .ready()
+                .await
+                .unwrap()
+                .call(Request::Commit(genesis.clone()))
+                .await
+                .unwrap(),
+            genesis.hash()
+        );
+
+        // Both heights and the Merkle root agree, so this block passes semantic checks.
+        // Its height gap is only detectable using the parent, after the state queues it.
+        let height = Height(3);
+        let coinbase = Transaction::V5 {
+            network_upgrade: NetworkUpgrade::Nu5,
+            lock_time: LockTime::unlocked(),
+            expiry_height: height,
+            inputs: vec![transparent::Input::Coinbase {
+                height,
+                data: b"checkpoint handoff".to_vec(),
+                sequence: u32::MAX,
+            }],
+            outputs: vec![transparent::Output {
+                value: block_subsidy(height, &network).unwrap(),
+                lock_script: transparent::Script::new(&[0]),
+            }],
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+        };
+        let mut candidate = generated.blocks[0].clone();
+        candidate.transactions = vec![Arc::new(coinbase)];
+        let merkle_root = candidate.transactions.iter().collect();
+        let header = Arc::make_mut(&mut candidate.header);
+        header.previous_block_hash = genesis.hash();
+        header.merkle_root = merkle_root;
+        let candidate = Arc::new(candidate);
+        let candidate_outpoint = transparent::OutPoint {
+            hash: candidate.transactions[0].hash(),
+            index: 0,
+        };
+        let request = if mined {
+            Request::CommitMined {
+                block: candidate,
+                work_id: None,
+                admission: zs::BlockAdmission::pending(),
+            }
+        } else {
+            Request::Commit(candidate)
+        };
+        let candidate_response = tokio::spawn(router.ready().await.unwrap().call(request));
+
+        if mined {
+            let error = candidate_response.await.unwrap().unwrap_err();
+            let error = error.downcast_ref::<RouterError>().unwrap();
+            assert!(
+                matches!(error, RouterError::Block { source }
+                    if matches!(source.as_ref(), VerifyBlockError::Commit(zs::CommitBlockError::MissingMinedParent))),
+                "mined admission must reject a parent that cannot drain the queue: {error:?}"
+            );
+        } else {
+            // AwaitUtxo observes outputs once semantic verification submits the child to state.
+            tokio::time::timeout(
+                Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
+                state
+                    .clone()
+                    .oneshot(zs::Request::AwaitUtxo(candidate_outpoint)),
+            )
+            .await
+            .expect("the semantically verified child reaches state")
+            .expect("state exposes the queued child's output");
+            assert!(
+                !candidate_response.is_finished(),
+                "the child must wait for checkpoint completion"
+            );
+            // Dropping a caller must not change the queued child's effect on the handoff.
+            candidate_response.abort();
+        }
+
+        for block in &generated.blocks[1..] {
+            let block = Arc::new(block.clone());
+            assert_eq!(
+                router
+                    .ready()
+                    .await
+                    .unwrap()
+                    .call(Request::Commit(block.clone()))
+                    .await
+                    .unwrap(),
+                block.hash(),
+                "checkpoint sync must reach its configured boundary after the invalid child"
+            );
+        }
+    }
+}

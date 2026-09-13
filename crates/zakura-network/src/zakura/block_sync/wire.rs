@@ -1,4 +1,4 @@
-use super::{config::*, error::*, *};
+use super::{config::*, declaration::GET_BLOCKS, error::*, *};
 
 /// Zakura stream kind reserved for native block sync.
 pub const ZAKURA_STREAM_BLOCK_SYNC: u16 = 6;
@@ -84,8 +84,12 @@ impl BlockSyncMessage {
             Self::GetBlocks {
                 start_height,
                 count,
+            } => {
+                GET_BLOCKS.validate(*start_height, *count)?;
+                write_height(&mut bytes, *start_height)?;
+                bytes.write_u32::<LittleEndian>(*count)?;
             }
-            | Self::RangeUnavailable {
+            Self::RangeUnavailable {
                 start_height,
                 count,
             } => {
@@ -122,7 +126,7 @@ impl BlockSyncMessage {
             MSG_BS_GET_BLOCKS => {
                 let start_height = read_height(&mut reader)?;
                 let count = reader.read_u32::<LittleEndian>()?;
-                validate_block_count(count)?;
+                GET_BLOCKS.validate(start_height, count)?;
                 Self::GetBlocks {
                     start_height,
                     count,

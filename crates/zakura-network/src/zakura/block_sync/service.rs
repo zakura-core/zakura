@@ -1,4 +1,6 @@
-use super::{config::*, events::*, peer_registry::SessionAdmission, wire::*, *};
+use super::{
+    config::*, declaration::GET_BLOCKS, events::*, peer_registry::SessionAdmission, wire::*, *,
+};
 use crate::zakura::{
     handle_pipe_exit, spawn_supervised_pipe, FramedRecv, FramedSend, OrderedSendError, Peer,
     PeerStreamSession, Service, ServicePeerSnapshot, SessionDemand, SessionOpening, SessionPolicy,
@@ -32,6 +34,23 @@ const BLOCK_SYNC_SERVICE_STREAMS: [Stream; 1] = [Stream {
 /// Service-declared streams for native block sync.
 pub(crate) fn block_sync_streams() -> &'static [Stream] {
     &BLOCK_SYNC_SERVICE_STREAMS
+}
+
+/// Payload limits that block sync declares for its stream, checked from the frame header.
+const BLOCK_SYNC_MESSAGE_PAYLOAD_LIMITS: [(u16, usize); 1] = [(
+    // A one-byte message type always fits in the frame's u16 field.
+    MSG_BS_GET_BLOCKS as u16,
+    // A u32 payload cap always fits usize on supported targets.
+    GET_BLOCKS.payload_cap as usize,
+)];
+
+/// Return the payload limits for one block-sync stream.
+pub(super) fn block_sync_message_payload_limits(stream: Stream) -> &'static [(u16, usize)] {
+    if block_sync_streams().contains(&stream) {
+        &BLOCK_SYNC_MESSAGE_PAYLOAD_LIMITS
+    } else {
+        &[]
+    }
 }
 
 /// Cloneable typed stream-6 sender.
@@ -453,6 +472,10 @@ impl Service for BlockSyncService {
 
     fn streams(&self) -> &[Stream] {
         block_sync_streams()
+    }
+
+    fn message_payload_limits(&self, stream: Stream) -> &'static [(u16, usize)] {
+        block_sync_message_payload_limits(stream)
     }
 
     fn session_policy(&self) -> SessionPolicy {

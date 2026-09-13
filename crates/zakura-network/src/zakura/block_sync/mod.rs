@@ -35,11 +35,14 @@ mod bbr;
 #[cfg(feature = "internal-bench")]
 mod bench;
 mod config;
+mod declaration;
 mod error;
 mod events;
 mod peer_registry;
 mod peer_routine;
 mod pipe;
+#[cfg(test)]
+mod property_tests;
 mod reactor;
 mod reorder;
 mod request;

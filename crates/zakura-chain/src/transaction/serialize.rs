@@ -1303,8 +1303,14 @@ pub const MIN_TRANSPARENT_TX_V5_SIZE: u64 = MIN_TRANSPARENT_TX_SIZE + 4 + 4;
 /// block size.
 impl TrustedPreallocate for Transaction {
     fn min_serialized_size() -> u64 {
-        // V1 permits empty input/output arrays at the codec layer.
-        4 + 1 + 1 + 4
+        const VERSION_HEADER_BYTES: u64 = 4;
+        const EMPTY_INPUT_COUNT_BYTES: u64 = 1;
+        const EMPTY_OUTPUT_COUNT_BYTES: u64 = 1;
+        const LOCK_TIME_BYTES: u64 = 4;
+
+        // The decoder can read a V1 transaction with no inputs or outputs.
+        // Each empty collection still encodes its zero count in one byte.
+        VERSION_HEADER_BYTES + EMPTY_INPUT_COUNT_BYTES + EMPTY_OUTPUT_COUNT_BYTES + LOCK_TIME_BYTES
     }
 
     fn max_allocation() -> u64 {

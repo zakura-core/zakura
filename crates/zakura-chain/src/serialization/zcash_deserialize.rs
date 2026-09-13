@@ -292,9 +292,17 @@ pub trait TrustedPreallocate {
     /// which can possibly be received from an honest peer.
     fn max_allocation() -> u64;
 
-    /// Lower bound on bytes consumed by one successfully decoded item, excluding
-    /// fields stored in separate arrays. Zero means no bounded decoder contract
-    /// has been supplied, and counted decoding from a slice rejects the type.
+    /// Minimum bytes one item needs in the input, so collection counts can be
+    /// checked before reserving memory. For example, two 32-byte hashes need at
+    /// least 64 remaining bytes.
+    ///
+    /// Use encoded field sizes, counting only fields this item's decoder reads.
+    /// Fields stored in separate arrays are checked with those arrays. The bound
+    /// must allow every encoding the decoder accepts, even if later consensus
+    /// checks reject the value.
+    ///
+    /// Zero means no minimum was supplied. Counted decoding from a slice then
+    /// rejects nonempty collections of this type.
     fn min_serialized_size() -> u64 {
         0
     }

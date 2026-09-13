@@ -370,7 +370,8 @@ impl TrustedPreallocate for SpendPrefixInTransactionV5 {
 
 impl TrustedPreallocate for redjubjub::Signature<SpendAuth> {
     fn min_serialized_size() -> u64 {
-        64
+        const SPEND_AUTH_SIGNATURE_BYTES: u64 = 64;
+        SPEND_AUTH_SIGNATURE_BYTES
     }
 
     fn max_allocation() -> u64 {

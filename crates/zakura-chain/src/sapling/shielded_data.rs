@@ -423,7 +423,8 @@ where
 
 impl TrustedPreallocate for Groth16Proof {
     fn min_serialized_size() -> u64 {
-        192
+        const GROTH16_PROOF_BYTES: u64 = 192;
+        GROTH16_PROOF_BYTES
     }
 
     fn max_allocation() -> u64 {

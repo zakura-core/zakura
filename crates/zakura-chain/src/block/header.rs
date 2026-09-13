@@ -9,7 +9,10 @@ use crate::{
     fmt::HexDebug,
     parameters::Network,
     serialization::{TrustedPreallocate, MAX_HEADERS_PER_MESSAGE},
-    work::{difficulty::CompactDifficulty, equihash::Solution},
+    work::{
+        difficulty::CompactDifficulty,
+        equihash::{Solution, REGTEST_SOLUTION_SIZE},
+    },
 };
 
 use super::{merkle, Commitment, CommitmentError, Hash, Height};
@@ -159,9 +162,20 @@ pub const ZCASH_BLOCK_VERSION: u32 = 4;
 
 impl TrustedPreallocate for CountedHeader {
     fn min_serialized_size() -> u64 {
-        // Fixed header fields, the shortest supported (Regtest) solution,
-        // and the trailing transaction count.
-        4 + 3 * 32 + 4 + 4 + 32 + 1 + 36 + 1
+        // The Equihash input contains the version, hashes, timestamp, and difficulty.
+        const HEADER_FIELDS_BEFORE_NONCE_BYTES: usize = Solution::INPUT_LENGTH;
+        const NONCE_BYTES: usize = 32;
+        const REGTEST_SOLUTION_LENGTH_BYTES: usize = 1;
+        const ZERO_TRANSACTION_COUNT_BYTES: usize = 1;
+
+        // Regtest has the shortest solution the decoder accepts. Its length
+        // prefix and the trailing zero transaction count each occupy one byte.
+        let minimum_bytes = HEADER_FIELDS_BEFORE_NONCE_BYTES
+            + NONCE_BYTES
+            + REGTEST_SOLUTION_LENGTH_BYTES
+            + REGTEST_SOLUTION_SIZE
+            + ZERO_TRANSACTION_COUNT_BYTES;
+        u64::try_from(minimum_bytes).expect("the fixed counted header size fits in u64")
     }
 
     /// Cap `CountedHeader` preallocation at the existing protocol-level

@@ -181,6 +181,7 @@ async fn r03_servable_height_does_not_authorize_an_unsolicited_body() {
     .await;
 }
 
+#[tokio::test]
 async fn r03_another_peers_request_does_not_authorize_this_peer() {
     let mut a = Fixture::for_peer(100, 3, 1);
     a.publish().await;
@@ -231,7 +232,6 @@ async fn r05_separately_authorized_peers_can_deliver_the_same_block() {
     b.assert_no_peer_fault();
 }
 
-#[tokio::test]
 #[tokio::test]
 async fn r08_done_cannot_be_consumed_twice_after_a_full_response() {
     let mut f = Fixture::new(100, 1);

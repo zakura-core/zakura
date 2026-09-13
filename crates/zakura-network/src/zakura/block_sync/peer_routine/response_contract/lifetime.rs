@@ -117,7 +117,7 @@ async fn r11_terminals_pending_still_occupy_protocol_inflight_capacity() {
         f.body(index).await;
     }
     f.routine.work.extend(
-        super::super::test_work_scope(),
+        crate::zakura::block_sync::test_work_scope(),
         fake_blocks_in_range(103, 103).iter().map(|body| {
             (
                 block::Height(103),

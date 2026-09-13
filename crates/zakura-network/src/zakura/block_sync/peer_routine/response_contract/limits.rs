@@ -14,7 +14,7 @@ async fn check_receiver_byte_cap(excess: bool, underestimated: bool) {
     f.routine.work = Arc::new(WorkQueue::new(block::Height(99)));
     f.routine.work.set_estimate_floor_for_tests(1);
     f.routine.work.extend(
-        super::super::test_work_scope(),
+        crate::zakura::block_sync::test_work_scope(),
         f.blocks.iter().map(|body| {
             (
                 body.coinbase_height().unwrap(),

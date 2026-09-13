@@ -12,6 +12,10 @@ use crate::serialization::{
 };
 
 impl TrustedPreallocate for u8 {
+    fn min_serialized_size() -> u64 {
+        1
+    }
+
     fn max_allocation() -> u64 {
         // MAX_PROTOCOL_MESSAGE_LEN takes up 5 bytes when encoded as a CompactSize.
         (MAX_PROTOCOL_MESSAGE_LEN - 5)
@@ -131,9 +135,8 @@ impl std::io::Read for TruncatedReader {
 /// This proxy has one blind spot: it can not see a `Vec::with_capacity(external_count)`
 /// that is followed by chunked reads, because that reserves the full length while still
 /// handing the reader small buffers. Safe Rust can not observe the capacity from the
-/// reader side, and a counting global allocator needs `unsafe`, which this workspace
-/// denies. So the deserializer carries a matching comment telling the reader never to
-/// pre-reserve the declared length.
+/// reader side. This regression covers unknown-length streams. Bounded slice
+/// decoding checks actual available bytes before reserving the declared length.
 fn u8_deser_does_not_preallocate_declared_length() {
     /// The number of body bytes the peer actually sends.
     const SUPPLIED_LEN: usize = 512;

@@ -255,4 +255,3 @@ fn terminal_codecs_agree_on_height_boundaries() {
         }
     }
 }
-

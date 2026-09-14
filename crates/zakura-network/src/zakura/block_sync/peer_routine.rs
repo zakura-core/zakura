@@ -2071,7 +2071,7 @@ mod tests {
             verified_block_hash: block::Hash([0; 32]),
         }));
         let routine = PeerRoutine::new(
-            super::tests::mainnet_decoder(),
+            crate::zakura::block_sync::tests::mainnet_decoder(),
             peer.clone(),
             0,
             session,
@@ -2382,7 +2382,7 @@ mod tests {
             verified_block_hash: block::Hash([0; 32]),
         }));
         let mut routine = PeerRoutine::new(
-            super::super::tests::mainnet_decoder(),
+            super::crate::zakura::block_sync::tests::mainnet_decoder(),
             peer,
             0,
             session,
@@ -2485,7 +2485,7 @@ mod tests {
         }));
 
         let mut routine = PeerRoutine::new(
-            super::super::tests::mainnet_decoder(),
+            super::crate::zakura::block_sync::tests::mainnet_decoder(),
             peer,
             0,
             session,
@@ -2624,7 +2624,7 @@ mod tests {
             verified_block_hash: block::Hash([0; 32]),
         }));
         let mut routine = PeerRoutine::new(
-            super::super::tests::mainnet_decoder(),
+            super::crate::zakura::block_sync::tests::mainnet_decoder(),
             peer.clone(),
             0,
             session,
@@ -2884,7 +2884,7 @@ mod tests {
             verified_block_hash: block::Hash([0; 32]),
         }));
         let mut routine = PeerRoutine::new(
-            super::super::tests::mainnet_decoder(),
+            super::crate::zakura::block_sync::tests::mainnet_decoder(),
             peer.clone(),
             0,
             session,
@@ -3067,7 +3067,7 @@ mod tests {
         }));
 
         let mut routine = PeerRoutine::new(
-            super::super::tests::mainnet_decoder(),
+            super::crate::zakura::block_sync::tests::mainnet_decoder(),
             peer,
             0,
             session,
@@ -3383,7 +3383,7 @@ mod tests {
             verified_block_hash: block::Hash([0; 32]),
         }));
         let mut routine = PeerRoutine::new(
-            super::super::tests::mainnet_decoder(),
+            super::crate::zakura::block_sync::tests::mainnet_decoder(),
             peer.clone(),
             0,
             session,

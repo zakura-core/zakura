@@ -509,6 +509,7 @@ fn p2p_v2_old_config_without_zakura_fields_uses_safe_defaults() {
         config.zakura.bootstrap_peers,
         default_testnet_zakura_bootstrap_peers()
     );
+    assert!(!config.zakura.nat_traversal);
     assert!(config.zakura.max_connections > 0);
     assert_eq!(
         config.zakura.max_connections_per_ip,
@@ -585,6 +586,7 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
 
         [zakura]
         bootstrap_peers = ["ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6@127.0.0.1:8233"]
+        nat_traversal = true
         max_connections = 7
         max_connections_per_ip = 5
         max_pending_handshakes = 3
@@ -608,6 +610,8 @@ fn p2p_v2_config_roundtrip_keeps_dconfig_zakura_fields() {
     assert!(serialized.contains("p2p_stack = \"dual\""));
     assert!(serialized.contains("[zakura]"));
     assert!(serialized.contains("bootstrap_peers"));
+    assert!(config.zakura.nat_traversal);
+    assert!(serialized.contains("nat_traversal = true"));
     assert!(serialized.contains("max_connections = 7"));
     assert!(serialized.contains("max_connections_per_ip = 5"));
     assert!(serialized.contains("trace_dir = \"target/zakura-test-traces\""));

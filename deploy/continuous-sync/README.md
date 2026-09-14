@@ -365,6 +365,40 @@ The relevant loopback endpoints are only bound locally:
 - readiness: `http://127.0.0.1:8080/ready`
 - liveness: `http://127.0.0.1:8080/healthy`
 
+## Retained sync data
+
+Dual (mixed) and Zakura-only runs add these fields to their existing
+`/var/log/zakura/runs/<run-id>/samples.jsonl`, at the normal 30-second polling
+interval plus the time spent checking status. The adjacent `run.json` identifies
+the run, binary commit, networking mode, and start/completion times.
+
+| Sample field | Meaning |
+| --- | --- |
+| `elapsed_seconds` | Monotonic seconds since completion polling started. Use differences between samples to calculate rates. |
+| `zcash_chain_verified_block_height` | Committed block height for assigning chain regions. |
+| `sync.block.applying.unsubmitted` | Apply queue depth: downloaded, ordered blocks waiting to enter verification. |
+| `sync.block.payload.received.bytes`, `sync.block.payload.committed.bytes` | Cumulative downloaded and successfully committed Zakura block-sync payload bytes. Download bytes can include retries and exclude transport overhead. |
+| `state.vct.fast.block.count`, `state.vct.legacy.block.count` | Fast-path and fallback tree updates within the native run. |
+| `sync.report.sapling.height`, `sync.report.ironwood.height`, `sync.report.checkpoint.height` | Effective phase boundaries and checkpoint limit from the running binary. |
+
+For download or commit MB/s, divide the byte-counter increase by the increase in
+`elapsed_seconds`, then by 1,000,000. Missing metrics are omitted, including when
+an older binary does not expose them. Leave gaps for missing samples, counter
+resets, or unusually long sampling intervals. For region shading, the
+initial Sandblast window is heights 1,707,211–2,000,000 inclusive.
+
+Copy a run's data to generate charts, replacing `HOST` and `RUN_ID`:
+
+```bash
+scp root@HOST:/var/log/zakura/runs/RUN_ID/run.json .
+scp root@HOST:/var/log/zakura/runs/RUN_ID/samples.jsonl .
+```
+
+The samples use the existing run retention described below and survive detailed
+trace rotation. Collection adds no chart generation or Slack delivery step.
+Legacy keeps its existing samples. Ordinary nodes expose the added counters and
+queue gauge through their existing metrics endpoint, which is disabled by default.
+
 ## Retention
 
 Detailed traces stay enabled so a failure can be investigated without reproducing

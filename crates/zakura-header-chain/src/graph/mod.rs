@@ -639,10 +639,9 @@ impl MemHeaderStore {
     ///
     /// Returns `true` when the state changes and `false` when it is unchanged.
     /// A consensus-invalid body-validation state makes the node and its
-    /// descendants ineligible. Replaying the same consensus-invalid
-    /// body-validation state leaves the node unchanged. This method rejects a
-    /// different consensus-invalid body-validation state. It also rejects any
-    /// later non-invalid body-validation state.
+    /// descendants ineligible. Further consensus-invalid verdicts leave the
+    /// first verdict unchanged, even if their evidence or rule differs.
+    /// This method rejects any later non-invalid body-validation state.
     /// Consensus invalidity is permanent.
     ///
     /// This method does not enforce transitions between non-invalid
@@ -669,10 +668,12 @@ impl MemHeaderStore {
             }
             _ => None,
         };
-        if let Some(existing) = self.consensus_invalid_body_tombstones.get(&hash) {
-            if tombstone.as_ref() != Some(existing) {
-                return Err(GraphError::PermanentBodyInvalidity(hash));
-            }
+        if self.consensus_invalid_body_tombstones.contains_key(&hash) {
+            return if tombstone.is_some() {
+                Ok(false)
+            } else {
+                Err(GraphError::PermanentBodyInvalidity(hash))
+            };
         }
         let (changed, eligibility_changed) = {
             let node = self
@@ -683,7 +684,7 @@ impl MemHeaderStore {
                 node.body_validation_state,
                 BodyValidationState::ConsensusInvalid { .. }
             ) {
-                return if node.body_validation_state == body_validation_state {
+                return if tombstone.is_some() {
                     Ok(false)
                 } else {
                     Err(GraphError::PermanentBodyInvalidity(hash))
@@ -2047,7 +2048,7 @@ mod tests {
                     rule: BodyRuleId::new("test.conflicting-invalid"),
                 },
             ),
-            Err(GraphError::PermanentBodyInvalidity(target.hash))
+            Ok(false)
         );
         assert_eq!(
             store.set_body_validation_state(target.hash, BodyValidationState::Unknown),

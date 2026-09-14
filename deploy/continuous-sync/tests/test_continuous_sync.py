@@ -234,6 +234,80 @@ class ContinuousSyncTests(unittest.TestCase):
         self.assertEqual(status["sync.downloads.in_flight"], 17)
         self.assertEqual(status["sync.downloads.verifying"], 4)
 
+    def test_sample_counters_accept_scientific_notation_and_ignore_invalid_values(self):
+        key = "sync.block.payload.received.bytes"
+        for name in (key, key.replace(".", "_"), key.replace(".", "_") + "_total"):
+            self.assertEqual(sync.metric_value(f"{name} 1.25e+8", key), 125000000)
+        for value in ("NaN", "+Inf", "-Inf", "1e999", "invalid"):
+            self.assertIsNone(sync.metric_value(f"{key} {value}", key))
+        self.assertIsNone(sync.metric_value(f'{key}{{peer="private"}} 99', key))
+
+    def test_chart_samples_are_collected_only_for_dual_and_zakura(self):
+        metrics = "\n".join([
+            "zcash_chain_verified_block_height 900",
+            "sync_downloads_verifying 4",
+            "sync_block_applying_unsubmitted 123",
+            "sync_block_payload_received_bytes_total 1.25e8",
+            "sync_block_payload_committed_bytes_total 1e8",
+            "state_vct_fast_block_count_total 10",
+            "state_vct_legacy_block_count_total 20",
+            "sync_report_sapling_height 419200",
+            "sync_report_ironwood_height 3428143",
+            "sync_report_checkpoint_height 3400000",
+            'sync_block_applying_unsubmitted{peer="private"} 999',
+        ])
+        expected = {
+            "sync.block.applying.unsubmitted": 123,
+            "sync.block.payload.received.bytes": 125000000,
+            "sync.block.payload.committed.bytes": 100000000,
+            "state.vct.fast.block.count": 10,
+            "state.vct.legacy.block.count": 20,
+            "sync.report.sapling.height": 419200,
+            "sync.report.ironwood.height": 3428143,
+            "sync.report.checkpoint.height": 3400000,
+        }
+        for mode in ("dual", "zakura", "legacy", "zebra"):
+            with self.subTest(mode=mode):
+                config = make_config(Path("/tmp"), policy=sync.Policy(p2p_stack=mode))
+                with patch.object(sync, "service_active", return_value=True), \
+                     patch.object(sync, "fetch_text", return_value=metrics), \
+                     patch.object(sync, "fetch_ready", return_value=(False, "syncing")):
+                    status = sync.sample_status(config)
+                self.assertEqual(status["height"], 900)
+                self.assertEqual(status["sync.downloads.verifying"], 4)
+                collected = {key: status[key] for key in sync.SYNC_SAMPLE_METRICS if key in status}
+                self.assertEqual(collected, expected if mode in ("dual", "zakura") else {})
+
+    def test_existing_sample_file_retains_monotonic_timing_and_queue_values(self):
+        for mode in ("dual", "zakura", "legacy"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                config = make_config(Path(tmp), policy=sync.Policy(p2p_stack=mode, ready_samples=2))
+                run_dir = Path(tmp) / "run"
+                run_dir.mkdir()
+                metrics = "zcash_chain_verified_block_height 100\nsync_block_applying_unsubmitted 0\n"
+                with (
+                    patch.object(sync, "service_active", return_value=True),
+                    patch.object(sync, "check_free_space"),
+                    patch.object(sync, "rotate_run_logs"),
+                    patch.object(sync, "now", side_effect=[1000, 1001, 999]),
+                    patch.object(sync.time, "monotonic", side_effect=[10, 10.25, 40.75]) as clock,
+                    patch.object(sync.time, "sleep") as sleep,
+                    patch.object(sync, "fetch_text", return_value=metrics),
+                    patch.object(sync, "fetch_ready", return_value=(True, "ready")),
+                ):
+                    sync.wait_for_completion(config, run_dir, {}, {})
+                rows = [json.loads(line) for line in (run_dir / "samples.jsonl").read_text().splitlines()]
+                self.assertEqual(len(rows), 2)
+                sleep.assert_called_once_with(30)
+                if mode in ("dual", "zakura"):
+                    self.assertEqual([row["elapsed_seconds"] for row in rows], [0.25, 30.75])
+                    self.assertTrue(all(row["sync.block.applying.unsubmitted"] == 0 for row in rows))
+                    self.assertTrue(all("sync.block.payload.received.bytes" not in row for row in rows))
+                else:
+                    clock.assert_not_called()
+                    self.assertTrue(all("elapsed_seconds" not in row for row in rows))
+                    self.assertTrue(all("sync.block.applying.unsubmitted" not in row for row in rows))
+
     def test_final_ready_sample_supplies_confirmed_height_without_stale_fallback(self):
         for final_height in (101, None, -1, True, 2**32):
             with self.subTest(final_height=final_height), tempfile.TemporaryDirectory() as tmp:

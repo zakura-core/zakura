@@ -495,7 +495,7 @@ mod tests {
         version: 1,
         frame_cap: CUSTOM_FRAME_CAP_BYTES,
         capability: CUSTOM_FRAME_CAP_CAPABILITY,
-        mode: StreamMode::Ordered,
+        mode: StreamMode::Persistent,
     }];
 
     #[derive(Debug, Default)]

@@ -781,6 +781,7 @@ impl SequencerTask {
         // toward commit throughput (the apply rate the download path is racing).
         if matches!(result, BlockApplyResult::Committed) {
             self.committed_throughput.record(applying.bytes);
+            metrics::counter!("sync.block.payload.committed.bytes").increment(applying.bytes);
         }
         self.sequencer
             .finish_submission(owner, source, token, height, hash);

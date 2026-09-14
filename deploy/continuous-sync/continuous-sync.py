@@ -13,6 +13,7 @@ import argparse
 import errno
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -28,6 +29,17 @@ from typing import Any
 
 STATE_VERSION = 1
 COMPLETION_HISTORY_LIMIT = 256
+NATIVE_SYNC_MODES = ("dual", "zakura")
+SYNC_SAMPLE_METRICS = (
+    "sync.block.applying.unsubmitted",
+    "sync.block.payload.received.bytes",
+    "sync.block.payload.committed.bytes",
+    "state.vct.fast.block.count",
+    "state.vct.legacy.block.count",
+    "sync.report.sapling.height",
+    "sync.report.ironwood.height",
+    "sync.report.checkpoint.height",
+)
 
 
 class ControllerError(Exception):
@@ -469,11 +481,15 @@ def metric_value(metrics: str, name: str) -> float | None:
     prometheus_name = re.escape(name.replace(".", "_"))
     dotted_name = re.escape(name)
     pattern = re.compile(
-        rf"^(?:{dotted_name}|{prometheus_name})\s+(-?\d+(?:\.\d+)?)$",
+        rf"^(?:{dotted_name}|{prometheus_name})(?:_total)?[ \t]+(\S+)[ \t]*$",
         re.MULTILINE,
     )
     match = pattern.search(metrics)
-    return float(match.group(1)) if match else None
+    try:
+        value = float(match.group(1)) if match else None
+    except ValueError:
+        return None
+    return value if value is not None and math.isfinite(value) else None
 
 
 def sample_status(config: Config) -> dict[str, Any]:
@@ -481,6 +497,11 @@ def sample_status(config: Config) -> dict[str, Any]:
     try:
         metrics = fetch_text(config.policy.metrics_url)
         status["metrics_status"] = "ok"
+        if config.policy.p2p_stack in NATIVE_SYNC_MODES:
+            for key in SYNC_SAMPLE_METRICS:
+                value = metric_value(metrics, key)
+                if value is not None and value >= 0:
+                    status[key] = int(value)
         for key in (
             "state.memory.best.committed.block.height",
             "state.memory.committed.block.height",
@@ -553,6 +574,7 @@ def wait_for_completion(
     config: Config, run_dir: Path, run_state: dict[str, Any], state: dict[str, Any]
 ) -> None:
     started = now()
+    sample_started = time.monotonic() if config.policy.p2p_stack in NATIVE_SYNC_MODES else None
     last_height: int | None = None
     last_progress = started
     ready_samples = 0
@@ -573,6 +595,8 @@ def wait_for_completion(
         rotate_run_logs(config, run_dir)
         sample = sample_status(config)
         sample["time"] = utc_stamp(ts)
+        if sample_started is not None:
+            sample["elapsed_seconds"] = round(time.monotonic() - sample_started, 3)
         with samples_path.open("a", encoding="utf-8") as samples:
             samples.write(json.dumps(sample, sort_keys=True) + "\n")
 

@@ -142,6 +142,18 @@ async fn serve_loop(
             continue;
         }
 
+        // Unreliable serving: a legal empty answer instead of bodies.
+        let unavailable_p = spec.serve.unavailable_probability.clamp(0.0, 1.0);
+        if unavailable_p > 0.0 && rng.gen_bool(unavailable_p) {
+            let _ = peer
+                .send(BlockSyncMessage::RangeUnavailable {
+                    start_height,
+                    count,
+                })
+                .await;
+            continue;
+        }
+
         // Withheld range: this peer is missing it.
         if let Some((low, high)) = spec.serve.withhold {
             if start_height >= low && start_height <= high {

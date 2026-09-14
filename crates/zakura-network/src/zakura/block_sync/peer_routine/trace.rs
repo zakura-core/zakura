@@ -32,6 +32,15 @@ impl PeerRoutine {
         });
     }
 
+    /// Trace the protocol-invalid message that is tearing this connection down.
+    pub(super) fn trace_protocol_reject(&self, error: &str) {
+        self.emit(bs_trace::BLOCK_PEER_PROTOCOL_REJECT, |row| {
+            row.peer = Some(trace_peer(&self.peer));
+            row.error = Some(error.to_string());
+            row.outstanding = Some(saturating_usize(self.window.outstanding.len()));
+        });
+    }
+
     /// Trace a decoded inbound message (the previous reactor's `trace_message_received`,
     /// now emitted in the routine that decoded it). Records the message kind only;
     /// the per-variant field detail lives on the reactor's heavier trace path.

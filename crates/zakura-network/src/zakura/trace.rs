@@ -374,6 +374,8 @@ pub mod block_sync_trace {
     pub const BLOCK_PEER_BBR: &str = "block_peer_bbr";
     /// Block-sync service session locally parked for a liveness reason.
     pub const BLOCK_PEER_PARKED: &str = "block_peer_parked";
+    /// Block-sync peer sent a protocol-invalid message; its connection is torn down.
+    pub const BLOCK_PEER_PROTOCOL_REJECT: &str = "block_peer_protocol_reject";
 }
 
 /// Shared discovery trace event names and field keys.

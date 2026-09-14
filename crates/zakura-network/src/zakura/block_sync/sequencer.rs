@@ -612,6 +612,25 @@ impl Sequencer {
         }
     }
 
+    /// Read the cached wire size only for the exact live submission identity.
+    /// The record survives applying-queue cleanup until its completion arrives.
+    #[cfg(feature = "sync-metrics")]
+    pub(super) fn submission_bytes(
+        &self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        source: zakura_header_chain::SourceId,
+        token: BlockApplyToken,
+        height: block::Height,
+        hash: block::Hash,
+    ) -> Option<u64> {
+        let submission = self.in_flight_submissions.get(&token)?;
+        (submission.owner == owner
+            && submission.source == source
+            && submission.height == height
+            && submission.hash == hash)
+            .then_some(submission.bytes)
+    }
+
     /// Release one driver-retained decoded submission only when its completion
     /// exactly matches the token identity assigned at dispatch.
     pub(super) fn finish_submission(

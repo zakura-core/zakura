@@ -1105,6 +1105,14 @@ impl ThroughputMeter {
         self.blocks = self.blocks.saturating_add(1);
     }
 
+    /// Keep frequent queue updates from draining an incomplete rate window.
+    #[cfg(feature = "sync-metrics")]
+    pub(super) fn sample_at_interval(&mut self, now: Instant, interval: Duration) {
+        if now.saturating_duration_since(self.window_start) >= interval {
+            self.sample(now);
+        }
+    }
+
     /// Recompute the cached per-second rates from the bytes/blocks accumulated
     /// since the last sample, then reset the window. A non-positive interval
     /// (clock not advanced between samples) leaves the cached rates untouched.

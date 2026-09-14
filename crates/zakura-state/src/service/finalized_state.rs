@@ -446,14 +446,17 @@ impl FinalizedState {
         // source to resume. Without it, the legacy committer would refuse every
         // remaining checkpoint block.
         if enforce_resume_guard
+            && !read_only
             && new_state.vct.is_below_last_checkpoint()
-            && new_state.vct.source().is_none()
+            && (new_state.vct.source().is_none()
+                || !config.enable_zakura_header_seed_from_committed_blocks)
         {
             panic!(
                 "this database was previously synced in verified commitment tree mode that was \
                  interrupted below the last checkpoint height. the fast path that supplies \
                  the verified roots needed to resume the VCT sync is disabled. Set \
-                 `consensus.checkpoint_sync = true` and `consensus.vct_fast_sync = true` to \
+                 `consensus.checkpoint_sync = true`, `consensus.vct_fast_sync = true`, and \
+                 `network.p2p_stack = \"zakura\"` or `\"dual\"` to \
                  finish the VCT sync, or delete the cache directory and re-sync from genesis"
             );
         }
@@ -1402,6 +1405,11 @@ impl FinalizedState {
         self.vct
             .source()
             .is_some_and(|v| v.accepts_exact_roots_at(height))
+    }
+
+    /// Whether the saved frontiers can still be advanced when VCT metadata is unavailable.
+    pub(crate) fn vct_can_recompute_trees(&self) -> bool {
+        !self.vct.is_below_last_checkpoint()
     }
 
     /// Clears any cached successor prevalidation.

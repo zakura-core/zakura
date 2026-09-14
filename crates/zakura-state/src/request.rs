@@ -1842,13 +1842,13 @@ pub enum ReadRequest {
         session_id: u64,
         /// Exact target named by the peer's status.
         target_tip_hash: block::Hash,
-        /// Exact generation and branch captured before the state read.
+        /// Request correlation scope. Head progress does not stale this read-only lease.
         scope: zakura_header_chain::HeaderWorkAuthority,
         /// Locator hashes in requester order.
         locator_hashes: Vec<block::Hash>,
     },
 
-    /// Read and renew one bounded hash-keyed page from an immutable lease.
+    /// Read one bounded hash-keyed page and consume its lease on success.
     ReadRetainedHeaderPath {
         /// Stable requesting peer identity.
         peer: zakura_header_chain::SourceId,
@@ -1900,6 +1900,9 @@ pub enum ReadRequest {
     /// Returns contiguous committed blocks by height, in ascending order.
     ///
     /// The response stops before the first height without a committed body.
+    /// Callers that charge resources to the database job should instead use
+    /// [`crate::ReadStateService::read_owned_block_range`] so cancellation of
+    /// the caller cannot release those resources during a running read.
     BlocksByHeightRange {
         /// First height to read.
         start: block::Height,

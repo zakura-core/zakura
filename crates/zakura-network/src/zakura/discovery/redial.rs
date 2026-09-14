@@ -2,7 +2,7 @@
 
 use std::{future::Future, pin::Pin, time::Duration};
 
-use iroh::NodeAddr;
+use iroh::EndpointAddr;
 use tokio::time::Instant;
 
 use crate::zakura::{ZakuraEndpoint, ZakuraLocalLimits, ZakuraPeerId};
@@ -87,11 +87,11 @@ enum DialResult {
 /// supplies the real dial attempt and the supervisor's registration watch.
 pub(crate) async fn native_dial_supervised(
     endpoint: ZakuraEndpoint,
-    node_addr: NodeAddr,
+    node_addr: EndpointAddr,
     limits: ZakuraLocalLimits,
     policy: RedialPolicy,
 ) {
-    let Ok(peer_id) = ZakuraPeerId::new(node_addr.node_id.as_bytes().to_vec()) else {
+    let Ok(peer_id) = ZakuraPeerId::new(node_addr.id.as_bytes().to_vec()) else {
         tracing::warn!(?node_addr, "invalid Zakura bootstrap node id; not dialing");
         return;
     };

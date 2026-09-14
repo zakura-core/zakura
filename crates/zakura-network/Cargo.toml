@@ -1,6 +1,6 @@
 [package]
 name = "zakura-network"
-version = "7.1.1"
+version = "8.0.0"
 authors.workspace = true
 description = "Networking code for the Zakura node. Internal crate, published to support cargo install zakura"
 # # Legal
@@ -27,6 +27,9 @@ categories = ["asynchronous", "cryptography::cryptocurrencies", "encoding", "net
 
 [features]
 default = []
+
+# Completion-based commit throughput for opt-in sync reports.
+sync-metrics = []
 
 # Production features that activate extra dependencies, or extra features in dependencies
 

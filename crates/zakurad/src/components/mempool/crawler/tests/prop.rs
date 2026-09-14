@@ -1,7 +1,8 @@
 //! Randomised property tests for the mempool crawler.
 
-use std::{collections::HashSet, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
+use chrono::Utc;
 use proptest::{
     collection::{hash_set, vec},
     prelude::*,
@@ -9,11 +10,14 @@ use proptest::{
 use tokio::{sync::oneshot, time};
 
 use zakura_chain::{
-    chain_sync_status::ChainSyncStatus, parameters::Network, transaction::UnminedTxId,
+    block::{self, Height},
+    chain_sync_status::ChainSyncStatus,
+    parameters::Network,
+    transaction::UnminedTxId,
 };
 use zakura_network as zn;
 use zakura_node_services::mempool::Gossip;
-use zakura_state::ChainTipSender;
+use zakura_state::{ChainTipBlock, ChainTipSender};
 use zakura_test::mock_service::{MockService, PropTestAssertion};
 
 use crate::{
@@ -266,8 +270,9 @@ fn setup_crawler() -> (
     let (sync_status, recent_sync_lengths) = SyncStatus::new();
 
     // the network should be irrelevant here
-    let (chain_tip_sender, _latest_chain_tip, chain_tip_change) =
+    let (mut chain_tip_sender, _latest_chain_tip, chain_tip_change) =
         ChainTipSender::new(None, &Network::Mainnet);
+    chain_tip_sender.set_finalized_tip(Some(current_chain_tip()));
 
     Crawler::spawn(
         &Config::default(),
@@ -284,6 +289,75 @@ fn setup_crawler() -> (
         recent_sync_lengths,
         chain_tip_sender,
     )
+}
+
+fn current_chain_tip() -> ChainTipBlock {
+    ChainTipBlock {
+        hash: block::Hash([1; 32]),
+        height: Height(3_000_000),
+        time: Utc::now(),
+        transactions: Vec::new(),
+        transaction_hashes: Arc::new([]),
+        previous_block_hash: block::Hash([0; 32]),
+    }
+}
+
+#[tokio::test]
+async fn crawler_yields_until_stale_tip_catches_up() {
+    let peer_set: MockPeerSet = MockService::build().for_prop_tests();
+    let mempool: MockMempool = MockService::build().for_prop_tests();
+    let (sync_status, mut syncs) = SyncStatus::new();
+    SyncStatus::sync_close_to_tip(&mut syncs);
+    let (mut sender, _latest, chain_tip_change) = ChainTipSender::new(None, &Network::Mainnet);
+    let mut stale_tip = current_chain_tip();
+    stale_tip.time -= chrono::Duration::days(1);
+    sender.set_finalized_tip(Some(stale_tip));
+    let mut crawler = Crawler {
+        peer_set: tower::timeout::Timeout::new(peer_set, Duration::from_secs(1)),
+        mempool,
+        sync_status,
+        chain_tip_change,
+        debug_enable_at_height: None,
+    };
+
+    assert!(
+        time::timeout(Duration::from_millis(20), crawler.wait_until_enabled())
+            .await
+            .is_err()
+    );
+    let mut current_tip = current_chain_tip();
+    current_tip.hash = block::Hash([2; 32]);
+    current_tip.height = Height(3_000_001);
+    sender.set_finalized_tip(Some(current_tip));
+    time::timeout(Duration::from_secs(1), crawler.wait_until_enabled())
+        .await
+        .expect("tip update wakes the crawler")
+        .expect("tip channel stays open");
+}
+
+#[tokio::test]
+async fn sparse_testnet_crawler_accepts_old_tip() {
+    let peer_set: MockPeerSet = MockService::build().for_prop_tests();
+    let mempool: MockMempool = MockService::build().for_prop_tests();
+    let (sync_status, mut syncs) = SyncStatus::new();
+    let (mut sender, _latest, chain_tip_change) =
+        ChainTipSender::new(None, &Network::new_default_testnet());
+    let mut tip = current_chain_tip();
+    tip.time -= chrono::Duration::days(30);
+    sender.set_finalized_tip(Some(tip));
+    let mut crawler = Crawler {
+        peer_set: tower::timeout::Timeout::new(peer_set, Duration::from_secs(1)),
+        mempool,
+        sync_status,
+        chain_tip_change,
+        debug_enable_at_height: None,
+    };
+    assert!(!crawler.is_caught_up_to_start());
+    SyncStatus::sync_close_to_tip(&mut syncs);
+    time::timeout(Duration::from_secs(1), crawler.wait_until_enabled())
+        .await
+        .expect("testnet ignores the clock estimate")
+        .expect("tip channel stays open");
 }
 
 /// Intercept a request for mempool transaction IDs and respond with the `transaction_ids` list.

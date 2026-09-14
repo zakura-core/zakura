@@ -332,6 +332,7 @@ impl StartCmd {
         &self,
         config: Arc<ZakuradConfig>,
         custom_services: Vec<zakura_network::zakura::CustomService>,
+        ready: Option<tokio::sync::oneshot::Sender<crate::node::NodeServices>>,
         shutdown: CancellationToken,
         shutdown_cleanup_required: CancellationToken,
     ) -> Result<(), Report> {
@@ -407,6 +408,35 @@ impl StartCmd {
             config.consensus.clone(),
             &config.network.network,
         );
+
+        if config.network.v2_p2p() {
+            // Report boundaries from this binary's effective network configuration.
+            for (upgrade, metric) in [
+                (
+                    zakura_chain::parameters::NetworkUpgrade::Sapling,
+                    "sync.report.sapling.height",
+                ),
+                (
+                    zakura_chain::parameters::NetworkUpgrade::Nu6_3,
+                    "sync.report.ironwood.height",
+                ),
+            ] {
+                if let Some(height) = upgrade.activation_height(&config.network.network) {
+                    metrics::gauge!(metric).set(f64::from(height.0));
+                }
+            }
+            metrics::gauge!("sync.report.checkpoint.height")
+                .set(f64::from(max_checkpoint_height.0));
+            for metric in [
+                "sync.block.payload.received.bytes",
+                "state.vct.fast.block.count",
+                "state.vct.legacy.block.count",
+            ] {
+                metrics::counter!(metric).increment(0);
+            }
+            #[cfg(feature = "sync-metrics")]
+            metrics::counter!("sync.block.payload.committed.bytes").increment(0);
+        }
 
         info!("opening database, this may take a few minutes");
 
@@ -706,6 +736,14 @@ impl StartCmd {
             sync::end_of_support::end_of_support_height(&config.network.network),
         );
 
+        let node_services = ready.as_ref().map(|_| crate::node::NodeServices {
+            read_state: read_only_state_service.clone(),
+            latest_chain_tip: latest_chain_tip.clone(),
+            chain_tip_change: chain_tip_change.clone(),
+            sync_status: sync_status.clone(),
+            mempool: mempool.clone(),
+        });
+
         let rpc_task_handle = if config.rpc.listen_addr.is_some() {
             RpcServer::start(rpc_impl.clone(), config.rpc.clone())
                 .await
@@ -951,6 +989,10 @@ impl StartCmd {
         // The supervisor may own a child after this point, so shutdown must
         // await cleanup. Do not add a yield between the spawn and this marker.
         shutdown_cleanup_required.cancel();
+
+        if let Some((ready, services)) = ready.zip(node_services) {
+            let _ = ready.send(services);
+        }
 
         // TODO: put tasks into an ongoing FuturesUnordered and a startup FuturesUnordered?
 
@@ -1283,6 +1325,7 @@ impl Runnable for StartCmd {
                 self.start(
                     APPLICATION.config(),
                     Vec::new(),
+                    None,
                     shutdown,
                     shutdown_cleanup_required,
                 )

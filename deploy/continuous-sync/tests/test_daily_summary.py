@@ -70,6 +70,26 @@ class DailySummaryTests(unittest.TestCase):
         _, post = self.deliver(self.due + 60)
         post.assert_not_called()
 
+    def test_daily_report_keeps_each_unreported_archive_link_on_retry(self):
+        data = self.data(4)
+        controller = data["controller_state"]
+        for item in controller["completion_history"]:
+            item["trace_archive_url"] = f"https://traces.invalid/run{item['number']}?signature=test&expires=604800"
+        controller["last_success_trace_archive_url"] = controller["completion_history"][-1]["trace_archive_url"]
+        before = self.path.read_text()
+        with self.assertRaisesRegex(deploy.DeployError, "delivery failed"):
+            self.deliver(self.due, posted=False, statuses={"node": data})
+        self.assertEqual(self.path.read_text(), before)
+        _, post = self.deliver(self.due + 60, statuses={"node": data})
+        text = post.call_args.args[0]
+        self.assertIn("2 completed", text)
+        for number in (3, 4):
+            self.assertIn(f"<https://traces.invalid/run{number}?signature=test&expires=604800|Download traces (7 days)>", text)
+        self.assertNotIn("traces.invalid/run2", text)
+        self.assertLess(text.index("traces.invalid/run3"), text.index("traces.invalid/run4"))
+        _, post = self.deliver(self.due + 86400, statuses={"node": data})
+        self.assertNotIn("Download traces", post.call_args.args[0])
+
     def test_spring_and_fall_dst_keep_five_pm_local(self):
         for deadline in ["2026-03-08T00:00:00+00:00", "2026-03-08T23:00:00+00:00",
                          "2026-10-31T23:00:00+00:00", "2026-11-02T00:00:00+00:00"]:

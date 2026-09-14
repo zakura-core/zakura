@@ -365,7 +365,7 @@ The relevant loopback endpoints are only bound locally:
 - readiness: `http://127.0.0.1:8080/ready`
 - liveness: `http://127.0.0.1:8080/healthy`
 
-## Manual chart data
+## Retained sync data
 
 Dual (mixed) and Zakura-only runs add these fields to their existing
 `/var/log/zakura/runs/<run-id>/samples.jsonl`, at the normal 30-second polling
@@ -384,10 +384,10 @@ the run, binary commit, networking mode, and start/completion times.
 For download or commit MB/s, divide the byte-counter increase by the increase in
 `elapsed_seconds`, then by 1,000,000. Missing metrics are omitted, including when
 an older binary does not expose them. Leave gaps for missing samples, counter
-resets, or unusually long sampling intervals. For manual region shading, the
+resets, or unusually long sampling intervals. For region shading, the
 initial Sandblast window is heights 1,707,211–2,000,000 inclusive.
 
-Copy a run's data for local plotting, replacing `HOST` and `RUN_ID`:
+Copy a run's data to generate charts, replacing `HOST` and `RUN_ID`:
 
 ```bash
 scp root@HOST:/var/log/zakura/runs/RUN_ID/run.json .

@@ -14,8 +14,10 @@ plus its one-byte message tag.
 Each service declares its message types, payload limits and allowed flag bits.
 The shared reader checks those declarations before allocating the payload. The
 negotiated stream cap can tighten a message's limit, but cannot enlarge it.
-Block sync, header sync and discovery currently allow no flag bits. A custom
-service can declare its own mask. Omitting a mask preserves its existing behavior.
+Block sync, header sync, discovery and legacy gossip currently allow no flag
+bits. The legacy declaration covers both gossip and request/response streams.
+A custom service can declare its own mask. Omitting a mask preserves its existing
+behavior.
 
 The Block codec checks that the frame's message type matches the payload's tag
 before decoding or retaining the Block. It keeps the configured network decoder
@@ -26,7 +28,7 @@ check their height when encoding, so we cannot send a height our decoder rejects
 
 | Requirement | What the tests establish | Test module |
 | --- | --- | --- |
-| F01 | Message and negotiated caps reject absent oversized payloads. Unsupported flags reject before a payload wait. Custom flag masks still work. | `handler::tests::frame_policy` |
+| F01 | Message and negotiated caps reject absent oversized payloads. Unsupported flags reject before a payload wait, including both legacy stream roles. Valid zero-flag frames and custom flag masks still work. | `handler::tests::frame_policy` |
 | F02 requests | Generated legal requests round trip. Malformed fields, tags, flags and lengths match independent acceptance rules. | `serving_regulation::policy::codec_properties` |
 | F02 responses | Both terminal encoders and decoders accept legal fields only. Blocks reject truncation, noncanonical counts and excess bytes. | `block_sync::wire::frame_codec` |
 | F04 frame checks | Conflicting frame and payload tags fail without allocating a decoded Block. | `block_sync::wire::frame_codec` |

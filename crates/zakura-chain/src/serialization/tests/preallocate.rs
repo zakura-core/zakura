@@ -11,6 +11,38 @@ use crate::serialization::{
     MAX_PROTOCOL_MESSAGE_LEN,
 };
 
+/// A declared count that the input could hold is still only credible, not proven:
+/// an element can cost several times its minimum encoding once decoded. Reserving
+/// it in full would make the bound proportional to the message instead of constant,
+/// which is the deserializer-level case of GHSA-xr93-pcq3-pxf8.
+#[test]
+fn a_fitting_count_still_reserves_within_the_initial_cap() {
+    use crate::{serialization::ZcashReader, transparent};
+
+    /// Enough outputs that an eager reservation would dwarf the cap.
+    const COUNT: usize = 100_000;
+
+    let minimum = usize::try_from(transparent::Output::min_serialized_size()).unwrap();
+    // Exactly enough bytes for the declared count, so the input-size check passes.
+    let mut payload = vec![0u8; COUNT * minimum];
+    // An amount above the money supply, so element zero fails after eight bytes
+    // and the rest of the input is never read.
+    payload[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+
+    let (result, allocations) = zakura_test::allocations::measure(|| {
+        ZcashReader::from_slice(&mut payload.as_slice())
+            .read_external_count::<transparent::Output>(COUNT)
+    });
+
+    assert!(result.is_err(), "the first amount is not a valid value");
+    let capped = MAX_INITIAL_ALLOCATION * std::mem::size_of::<transparent::Output>();
+    assert!(
+        allocations.peak_live_bytes <= capped,
+        "reserved {} bytes for a declared {COUNT} elements; the cap allows {capped}",
+        allocations.peak_live_bytes,
+    );
+}
+
 impl TrustedPreallocate for u8 {
     fn min_serialized_size() -> u64 {
         1
@@ -135,8 +167,10 @@ impl std::io::Read for TruncatedReader {
 /// This proxy has one blind spot: it can not see a `Vec::with_capacity(external_count)`
 /// that is followed by chunked reads, because that reserves the full length while still
 /// handing the reader small buffers. Safe Rust can not observe the capacity from the
-/// reader side. This regression covers unknown-length streams. Bounded slice
-/// decoding checks actual available bytes before reserving the declared length.
+/// reader side. Counted collections cap that reservation at `MAX_INITIAL_ALLOCATION`
+/// whether or not the length is known, and bounded slice decoding additionally rejects
+/// counts the input cannot hold; `a_fitting_count_still_reserves_within_the_initial_cap`
+/// measures the reservation directly.
 fn u8_deser_does_not_preallocate_declared_length() {
     /// The number of body bytes the peer actually sends.
     const SUPPLIED_LEN: usize = 512;

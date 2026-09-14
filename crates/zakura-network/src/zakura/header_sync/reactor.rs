@@ -200,6 +200,8 @@ struct PeerState {
     session: PeerSession,
     status_publisher: Option<StatusPublisher>,
     last_status: Option<Status>,
+    waiting_for_serving_slot: bool,
+    capacity_signal: Option<zakura_node_services::header_chain::ServingCapacitySignal>,
     /// Consecutive requests this session answered with nothing usable.
     unproductive_requests: u32,
 }
@@ -747,6 +749,7 @@ impl HeaderSyncReactor {
                 self.startup.shutdown.cancelled().await;
                 break HeaderRequestTerminal::Shutdown;
             }
+            self.schedule_capacity_notifications();
             let maintenance = self.next_maintenance_deadline();
             metrics::counter!("sync.header.reactor.iterations").increment(1);
             tokio::select! {
@@ -763,6 +766,7 @@ impl HeaderSyncReactor {
                         self.handle_port_completion(completion);
                     }
                 }
+                _ = Self::wait_for_capacity(&self.peer_state) => {},
                 _ = time::sleep_until(maintenance) => self.refresh_statuses(),
                 event = self.lifecycle.recv() => match event {
                     Some(event) => self.handle_event(event),
@@ -970,6 +974,8 @@ impl HeaderSyncReactor {
                 session,
                 status_publisher,
                 last_status: None,
+                waiting_for_serving_slot: false,
+                capacity_signal: None,
                 unproductive_requests: 0,
             },
         ) {
@@ -1226,6 +1232,9 @@ impl HeaderSyncReactor {
         }
 
         if self.served_paths.contains_key(&peer) {
+            if let Some(state) = self.peer_state.get_mut(&peer) {
+                state.waiting_for_serving_slot = true;
+            }
             self.send_headers_outcome(
                 &peer,
                 request.request_id,
@@ -2424,6 +2433,21 @@ impl HeaderSyncReactor {
         }
 
         let lease = match result {
+            HeaderPathLeaseResult::CapacityBusy(signal) => {
+                self.served_path_deadlines.remove(&peer);
+                if let Some(state) = self.peer_state.get_mut(&peer) {
+                    if state.session.session_id() == session_id {
+                        state.capacity_signal = Some(signal);
+                    }
+                }
+                self.send_headers_outcome(
+                    &peer,
+                    request.request_id,
+                    request.target_tip_hash,
+                    HeadersOutcomeCode::Busy,
+                );
+                return;
+            }
             HeaderPathLeaseResult::Outcome(outcome) => {
                 self.served_path_deadlines.remove(&peer);
                 self.send_headers_outcome(
@@ -3494,6 +3518,56 @@ impl HeaderSyncReactor {
         }
     }
 
+    async fn wait_for_capacity(peers: &HashMap<ZakuraPeerId, PeerState>) {
+        let waiting = {
+            let mut signals = peers
+                .values()
+                .filter(|state| state.status_publisher.is_some())
+                .filter_map(|state| state.capacity_signal.as_ref())
+                .peekable();
+            if signals.peek().is_none() {
+                None
+            } else {
+                Some(
+                    signals
+                        .map(|signal| signal.released())
+                        .collect::<FuturesUnordered<_>>(),
+                )
+            }
+        };
+        match waiting {
+            Some(mut waiting) => {
+                waiting.next().await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    }
+
+    fn schedule_capacity_notifications(&mut self) {
+        let now = Instant::now();
+        for (peer, state) in &mut self.peer_state {
+            let Some(publisher) = state.status_publisher.as_mut() else {
+                continue;
+            };
+            let slot_available =
+                state.waiting_for_serving_slot && !self.served_paths.contains_key(peer);
+            let state_available = state
+                .capacity_signal
+                .as_ref()
+                .is_some_and(|signal| signal.is_released());
+            if slot_available {
+                state.waiting_for_serving_slot = false;
+            }
+            if state_available {
+                state.capacity_signal = None;
+            }
+            if slot_available || state_available {
+                // The Busy send precedes this publication on the ordered outbound queue.
+                publisher.request_refresh(now);
+            }
+        }
+    }
+
     fn refresh_statuses(&mut self) {
         let now = Instant::now();
         if self.report_fatal_vct_local_operation(now) {
@@ -3503,6 +3577,7 @@ impl HeaderSyncReactor {
         self.retry_pending_lease_releases(now);
         self.retire_timed_out_requests(now);
         self.release_idle_served_paths(now);
+        self.schedule_capacity_notifications();
         if self.prune_unproductive_cooldowns(now) {
             self.publish_peer_state();
         }
@@ -4250,6 +4325,9 @@ impl HeaderSyncReactor {
                                 Some((lease_id, path)),
                             )
                         }
+                        Ok(port::AcquirePathReply::CapacityBusy(signal)) => {
+                            (HeaderPathLeaseResult::CapacityBusy(signal), None)
+                        }
                         Ok(reply) => (
                             HeaderPathLeaseResult::Outcome(match reply {
                                 port::AcquirePathReply::TargetNotRetained => {
@@ -4262,8 +4340,11 @@ impl HeaderSyncReactor {
                                     HeadersOutcomeCode::HistoryPruned
                                 }
                                 port::AcquirePathReply::Busy => HeadersOutcomeCode::Busy,
-                                port::AcquirePathReply::Acquired(_) => {
-                                    unreachable!("acquired paths are handled above")
+                                port::AcquirePathReply::Acquired(_)
+                                | port::AcquirePathReply::CapacityBusy(_) => {
+                                    unreachable!(
+                                        "acquired paths and capacity signals are handled above"
+                                    )
                                 }
                             }),
                             None,

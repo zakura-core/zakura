@@ -80,7 +80,7 @@ fn idle_continuation_indexes_are_bounded_and_cannot_block_new_readers() {
             RetainedPathLeaseOutcome::Acquired(_)
         ));
     }
-    assert_eq!(
+    assert!(matches!(
         reader
             .acquire_retained_path(
                 SourceId::from_digest([0xff; 32]),
@@ -90,8 +90,8 @@ fn idle_continuation_indexes_are_bounded_and_cannot_block_new_readers() {
                 scope
             )
             .unwrap(),
-        RetainedPathLeaseOutcome::Busy
-    );
+        RetainedPathLeaseOutcome::CapacityBusy(_)
+    ));
 }
 
 #[test]
@@ -1627,19 +1627,18 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
             .expect("a stale acquisition scope is a normal refusal"),
         RetainedPathLeaseOutcome::Busy
     );
-    assert_eq!(
+    assert!(matches!(
         reader
             .acquire_retained_path(owner, 7, grandchild.hash, &[anchor.hash], lease_scope,)
             .expect("the lease bound is a normal outcome"),
-        RetainedPathLeaseOutcome::Busy
-    );
-    assert_eq!(
+        RetainedPathLeaseOutcome::CapacityBusy(_)
+    ));
+    assert!(matches!(
         reader
             .acquire_retained_path(owner, 8, grandchild.hash, &[anchor.hash], lease_scope)
             .expect("a new session cannot replace a live lease"),
-        RetainedPathLeaseOutcome::Busy,
-        "same-peer replacement requires exact release or expiry"
-    );
+        RetainedPathLeaseOutcome::CapacityBusy(_)
+    ));
     assert_eq!(
         reader
             .read_retained_path(owner, 8, lease.lease_id, lease_scope, anchor.hash, 1)
@@ -1863,7 +1862,7 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
             RetainedPathLeaseOutcome::Acquired(_)
         ));
     }
-    assert_eq!(
+    assert!(matches!(
         reader
             .acquire_retained_path(
                 SourceId::from_digest([0xff; 32]),
@@ -1876,8 +1875,8 @@ async fn retained_path_leases_are_exact_bounded_session_scoped_and_expiring() {
                 ),
             )
             .expect("capacity refusal is a normal outcome"),
-        RetainedPathLeaseOutcome::Busy
-    );
+        RetainedPathLeaseOutcome::CapacityBusy(_)
+    ));
     tokio::time::advance(RETAINED_PATH_LEASE_IDLE + Duration::from_secs(1)).await;
     assert!(matches!(
         reader
@@ -2493,4 +2492,184 @@ fn finalize_serving_test_path(
             || {},
         )
         .expect("the authoritative test path finalizes");
+}
+
+#[test]
+fn capacity_signals_follow_reservations_and_capacity_classes() {
+    let mut leases = RetainedPathLeaseRegistry::default();
+    let now = Instant::now();
+    let first = SourceId::from_digest([0; 32]);
+    let first_id = leases
+        .reserve(first, now, RetainedPathCapacity::General)
+        .unwrap();
+    let Err(RetainedPathLeaseOutcome::CapacityBusy(peer_wait)) =
+        leases.reserve(first, now, RetainedPathCapacity::General)
+    else {
+        panic!("the reservation occupies this peer's slot")
+    };
+    for marker in 1..MAX_RETAINED_PATH_LEASES - 1 {
+        leases
+            .reserve(
+                SourceId::from_digest([u8::try_from(marker).unwrap(); 32]),
+                now,
+                RetainedPathCapacity::General,
+            )
+            .unwrap();
+    }
+    let waiting = SourceId::from_digest([0xfe; 32]);
+    let Err(RetainedPathLeaseOutcome::CapacityBusy(general_wait)) =
+        leases.reserve(waiting, now, RetainedPathCapacity::General)
+    else {
+        panic!("general capacity is full")
+    };
+    let Err(RetainedPathLeaseOutcome::CapacityBusy(other_wait)) = leases.reserve(
+        SourceId::from_digest([0xfd; 32]),
+        now,
+        RetainedPathCapacity::General,
+    ) else {
+        panic!("another peer shares the same full capacity class")
+    };
+    assert_eq!(general_wait, other_wait);
+    let fallback = SourceId::from_digest([0xff; 32]);
+    let fallback_id = leases
+        .reserve(fallback, now, RetainedPathCapacity::FinalizedFallback)
+        .unwrap();
+    let Err(RetainedPathLeaseOutcome::CapacityBusy(fallback_wait)) =
+        leases.reserve(waiting, now, RetainedPathCapacity::FinalizedFallback)
+    else {
+        panic!("fallback capacity is full")
+    };
+    leases.release_reservation(fallback, fallback_id + 1);
+    assert!(!fallback_wait.is_released());
+    leases.release_reservation(fallback, fallback_id);
+    assert!(fallback_wait.is_released());
+    assert!(!general_wait.is_released());
+    assert!(!peer_wait.is_released());
+    leases.release_reservation(first, first_id);
+    assert!(general_wait.is_released());
+    assert!(other_wait.is_released());
+    assert!(peer_wait.is_released());
+    let replacement = leases
+        .reserve(first, now, RetainedPathCapacity::General)
+        .unwrap();
+    let Err(RetainedPathLeaseOutcome::CapacityBusy(next_wait)) =
+        leases.reserve(first, now, RetainedPathCapacity::General)
+    else {
+        panic!("the replacement occupies this peer's slot")
+    };
+    leases.release_reservation(first, first_id);
+    assert!(!next_wait.is_released());
+    leases.release_reservation(first, replacement);
+    assert!(next_wait.is_released());
+}
+
+#[test]
+fn capacity_signal_survives_reservation_commit_and_page_release() {
+    let (runtime, _db, _, path) = reconciled_store_with_finalized_prefix(6);
+    let reader = runtime.reader();
+    let source = SourceId::from_digest([0xd8; 32]);
+    let target = path[5].hash;
+    let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target);
+    let RetainedPathLeaseOutcome::Acquired(lease) = reader
+        .acquire_retained_path(source, 7, target, &[path[2].hash], scope)
+        .unwrap()
+    else {
+        panic!("the target is retained")
+    };
+    let RetainedPathLeaseOutcome::CapacityBusy(signal) = reader
+        .acquire_retained_path(source, 8, target, &[path[2].hash], scope)
+        .unwrap()
+    else {
+        panic!("the first session holds this peer's slot")
+    };
+    assert!(!reader
+        .release_retained_path(source, 8, lease.lease_id, scope)
+        .unwrap());
+    assert!(!signal.is_released());
+    assert!(matches!(
+        reader
+            .read_retained_path(source, 7, lease.lease_id, scope, path[2].hash, 1)
+            .unwrap(),
+        RetainedPathReadOutcome::Page(_)
+    ));
+    assert!(signal.is_released());
+    assert!(!reader
+        .release_retained_path(source, 7, lease.lease_id, scope)
+        .unwrap());
+}
+
+#[test]
+fn dropped_reservation_notifies_waiters() {
+    let leases = Arc::new(Mutex::new(RetainedPathLeaseRegistry::default()));
+    let peer = SourceId::from_digest([0xd9; 32]);
+    let id = leases
+        .lock()
+        .unwrap()
+        .reserve(peer, Instant::now(), RetainedPathCapacity::General)
+        .unwrap();
+    let reservation = RetainedPathReservation {
+        leases: leases.clone(),
+        peer,
+        reservation_id: id,
+        active: true,
+    };
+    let Err(RetainedPathLeaseOutcome::CapacityBusy(signal)) =
+        leases
+            .lock()
+            .unwrap()
+            .reserve(peer, Instant::now(), RetainedPathCapacity::General)
+    else {
+        panic!("the reservation occupies this peer's slot")
+    };
+    assert!(!signal.is_released());
+    drop(reservation);
+    assert!(signal.is_released());
+}
+
+#[test]
+fn reservation_commit_keeps_the_waiter_until_exact_release_or_expiry() {
+    for expire in [false, true] {
+        let mut leases = RetainedPathLeaseRegistry::default();
+        let peer = SourceId::from_digest([0xda; 32]);
+        let now = Instant::now();
+        let reservation = leases
+            .reserve(peer, now, RetainedPathCapacity::General)
+            .unwrap();
+        let Err(RetainedPathLeaseOutcome::CapacityBusy(signal)) =
+            leases.reserve(peer, now, RetainedPathCapacity::General)
+        else {
+            panic!("the reservation occupies this peer's slot")
+        };
+        let frontier = Frontier::new(block::Height(0), block::Hash([0; 32]));
+        let scope = HeaderWorkAuthority {
+            header_generation: zakura_header_chain::HeaderGeneration::new(1),
+            branch: zakura_header_chain::BranchId::new(frontier.hash, frontier.hash),
+        };
+        let RetainedPathLeaseOutcome::Acquired(lease) = leases.commit_reservation(
+            peer,
+            reservation,
+            RetainedPathLeaseSpec {
+                peer,
+                session_id: 7,
+                target: frontier,
+                common_ancestor: frontier,
+                scope,
+                position: CanonicalHeaderPathPosition::Complete,
+                retained_ancestor: None,
+                retained_path: Arc::from([]),
+            },
+            now,
+        ) else {
+            panic!("the reservation commits its lease")
+        };
+        assert!(!signal.is_released());
+        assert!(!leases.release(peer, 8, lease.lease_id, scope));
+        assert!(!signal.is_released());
+        if expire {
+            leases.expire(now + RETAINED_PATH_LEASE_IDLE);
+        } else {
+            assert!(leases.release(peer, 7, lease.lease_id, scope));
+        }
+        assert!(signal.is_released());
+    }
 }

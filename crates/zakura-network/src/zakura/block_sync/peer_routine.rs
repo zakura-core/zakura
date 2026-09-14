@@ -437,7 +437,6 @@ impl PeerRoutine {
         // `self.work`.
         let budget = self.budget.clone();
         let work = self.work.clone();
-        let response_memory = self.session.response_memory();
         // Per-peer BBR heartbeat cadence. `Skip` so a routine busy past a tick emits one
         // fresh sample rather than a catch-up burst. Observability only.
         let mut bbr_trace_ticks = time::interval(BBR_TRACE_INTERVAL);
@@ -453,13 +452,10 @@ impl PeerRoutine {
             // would be lost if we registered after — the routine would stall.
             let capacity = budget.subscribe_capacity().notified();
             let available = work.subscribe_available().notified();
-            let response_capacity = response_memory.subscribe_capacity().notified();
             tokio::pin!(capacity);
             tokio::pin!(available);
-            tokio::pin!(response_capacity);
             Notified::enable(capacity.as_mut());
             Notified::enable(available.as_mut());
-            Notified::enable(response_capacity.as_mut());
 
             let retry_filter_deadline = if self.session.outbound_capacity() > 0 {
                 self.try_fill().await
@@ -467,6 +463,10 @@ impl PeerRoutine {
                 self.gc_skipped_outstanding();
                 None
             };
+            // This waiter subscribes and rechecks internally, including when
+            // memory was released between the failed fill and its first poll.
+            let response_capacity = self.session.wait_for_response_capacity();
+            tokio::pin!(response_capacity);
             let outbound_queue_has_capacity = self.session.outbound_capacity() > 0;
             // Track the start of the current continuous outbound-full stretch so the
             // liveness check can bound the write-congestion grace: a peer that stopped

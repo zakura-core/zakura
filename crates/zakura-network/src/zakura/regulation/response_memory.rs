@@ -125,18 +125,37 @@ impl ConnectionResponseMemory {
             return None;
         }
         if !memory.0.pool.node.clone().try_reserve(bytes) {
+            // Only connection capacity changed. Its release wakes local waiters.
             memory.0.connection.clone().release(bytes);
-            // A smaller waiter can now fit the connection even though node
-            // bytes did not change. Stable exhaustion returns before reserving.
-            memory.0.pool.node.subscribe_capacity().notify_waiters();
             return None;
         }
         Some(ResponseMemoryPermit { memory, bytes })
     }
 
-    /// Releases in either domain release node bytes and wake all affected sessions.
-    pub(crate) fn subscribe_capacity(&self) -> &tokio::sync::Notify {
-        self.0.pool.node.subscribe_capacity()
+    /// Wait for room in both limits. This does not reserve bytes, so the caller
+    /// must retry admission. Register before rechecking to avoid a missed release.
+    pub(crate) async fn wait_for_capacity(&self, bytes: u64) {
+        assert!(
+            bytes > 0,
+            "capacity waits are for nonempty metadata allocations"
+        );
+        loop {
+            // Other connections cannot help a full connection. Only listen to
+            // node releases once this connection has enough room of its own.
+            let budget = if bytes > self.0.connection.available() {
+                &self.0.connection
+            } else if bytes > self.0.pool.node.available() {
+                &self.0.pool.node
+            } else {
+                return;
+            };
+            let changed = budget.subscribe_capacity().notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if bytes > budget.available() {
+                changed.await;
+            }
+        }
     }
 }
 

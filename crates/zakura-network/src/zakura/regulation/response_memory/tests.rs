@@ -7,6 +7,8 @@ use crate::zakura::{
 };
 use tokio_util::sync::CancellationToken;
 
+mod wakeups;
+
 impl ResponseMemory {
     pub(crate) fn connection(&self) -> ConnectionResponseMemory {
         self.try_connection()
@@ -251,9 +253,8 @@ async fn another_connection_release_wakes_a_registered_waiter() {
     let first = node.connection();
     let second = node.connection();
     let owner = first.try_reserve(10).unwrap();
-    let changed = second.subscribe_capacity().notified();
+    let changed = second.wait_for_capacity(10);
     tokio::pin!(changed);
-    changed.as_mut().enable();
     assert!(second.try_reserve(1).is_none());
     assert!(poll!(&mut changed).is_pending());
     drop(owner);

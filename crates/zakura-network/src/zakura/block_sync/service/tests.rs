@@ -1,5 +1,6 @@
 use super::super::tests::mainnet_decoder;
 use super::*;
+use crate::zakura::regulation::ConnectionResponseMemory;
 
 impl BlockSyncPeerSession {
     /// Set the pool before a routine publishes its first request.

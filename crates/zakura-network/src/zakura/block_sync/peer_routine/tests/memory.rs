@@ -7,6 +7,11 @@ use crate::zakura::{
     regulation::{ConnectionResponseMemory, ResponseMemory, ResponseScope},
     FramedRecv, FramedSend, SinkReject,
 };
+use std::{
+    future::Future,
+    sync::atomic::{AtomicUsize, Ordering},
+    task::{Context, Poll, Wake, Waker},
+};
 
 struct Fixture {
     routine: PeerRoutine,
@@ -147,4 +152,72 @@ async fn idle_receiver_does_not_spin_on_its_own_provisional_memory_release() {
         .unwrap()
         .is_ok());
     assert!(memory.try_reserve(4096).is_some());
+}
+
+/// Count scheduler wakeups, including ones that merely retry a still-full pool.
+#[derive(Default)]
+struct WakeCount(AtomicUsize);
+
+impl Wake for WakeCount {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn connection_exhaustion_ignores_other_connections_memory_releases() {
+    let setup = ResponseMemory::node_setup_bytes_for_test()
+        + 2 * ResponseMemory::setup_bytes_for_test()
+        + ResponseScope::setup_bytes_for_test();
+    let connection_limit =
+        ResponseMemory::setup_bytes_for_test() + ResponseScope::setup_bytes_for_test() + 4096;
+    let node = ResponseMemory::new(setup + 8192, connection_limit);
+    let memory = node.connection();
+    let other_connection = node.connection();
+    let mut f = Fixture::new(memory.clone(), true);
+    let held = memory.try_reserve(4096).unwrap();
+    let wake_count = Arc::new(WakeCount::default());
+    let waker = Waker::from(wake_count.clone());
+    let mut context = Context::from_waker(&waker);
+    let running = f.routine.run();
+    tokio::pin!(running);
+    assert!(running.as_mut().poll(&mut context).is_pending());
+    assert_eq!(f.work.pending_len(), 1);
+    assert_eq!(f.budget.reserved(), 0);
+    assert!(f.output.try_recv().is_err());
+    wake_count.0.store(0, Ordering::SeqCst);
+
+    // This connection has no room, but the node does. Completions elsewhere
+    // cannot help it and must not schedule this real receiver for another poll.
+    for _ in 0..32 {
+        drop(other_connection.try_reserve(1024).unwrap());
+        assert_eq!(
+            wake_count.0.load(Ordering::SeqCst),
+            0,
+            "an unrelated metadata release must not wake a connection-full receiver"
+        );
+    }
+
+    drop(held);
+    assert!(wake_count.0.load(Ordering::SeqCst) > 0);
+    assert!(running.as_mut().poll(&mut context).is_pending());
+    let request = f.output.try_recv().unwrap();
+    assert_eq!(request.message_type, u16::from(MSG_BS_GET_BLOCKS));
+    assert_eq!(f.work.pending_len(), 0);
+    assert!(f.budget.reserved() > 0);
+    while let Ok(report) = f.reports.try_recv() {
+        assert!(!matches!(report, RoutineToReactor::Misbehavior { .. }));
+    }
+    f.session.cancel_token().cancel();
+    // The request was written above. Cancelling its unfinished response closes
+    // the connection locally, without accusing the peer of a protocol fault.
+    let completion = running.as_mut().poll(&mut context);
+    assert!(
+        matches!(completion, Poll::Ready(Err(SinkReject::Connection(_)))),
+        "{completion:?}"
+    );
 }

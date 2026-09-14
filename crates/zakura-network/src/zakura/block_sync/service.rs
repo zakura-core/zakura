@@ -13,9 +13,7 @@ use tokio::sync::Notify;
 use zakura_chain::serialization::ZcashDecoder;
 
 mod sessions;
-use crate::zakura::regulation::{
-    ConnectionResponseMemory, ResponseAdmissionError, ResponseAuthorization, ResponseScope,
-};
+use crate::zakura::regulation::{ResponseAdmissionError, ResponseAuthorization, ResponseScope};
 pub(super) use sessions::CurrentSessions;
 use sessions::SessionCapacity;
 
@@ -165,8 +163,10 @@ impl BlockSyncPeerSession {
         self.response_scope.authorize()
     }
 
-    pub(super) fn response_memory(&self) -> ConnectionResponseMemory {
-        self.response_scope.memory()
+    pub(super) fn wait_for_response_capacity(
+        &self,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        self.response_scope.wait_for_capacity()
     }
 
     #[cfg(test)]

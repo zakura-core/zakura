@@ -43,6 +43,11 @@ pub(crate) struct InvariantReport {
     pub(crate) protocol_rejects: usize,
     /// Block-sync service sessions locally parked by no-progress liveness.
     pub(crate) session_parks: usize,
+    /// Block-sync peer sessions that ended. Counts every disconnect, so a scenario reads
+    /// it as "the liveness close fired" only when it scripts no churn of its own: a peer
+    /// holding started responses is disconnected rather than parked, which is what the
+    /// wedge/silent scenarios assert.
+    pub(crate) session_disconnects: usize,
     /// Total `block_get_blocks_sent` requests issued over the run. Exceeds the chain
     /// length when blocks are re-requested (a peer dropped/withheld a height), so it is
     /// the non-vacuous signal that a timeout/re-request scenario actually re-requested.
@@ -137,6 +142,7 @@ pub(crate) fn report(reader: &TraceReader) -> InvariantReport {
         .table("block_sync")
         .count("block_peer_protocol_reject");
     let session_parks = reader.table("block_sync").count("block_peer_parked");
+    let session_disconnects = reader.table("block_sync").count("block_peer_disconnected");
     let total_requests = reader.table("block_sync").count("block_get_blocks_sent");
     let max_requests_without_block_progress = max_requests_without_block_progress(reader);
     let max_unproven_requests_without_block_progress =
@@ -209,6 +215,7 @@ pub(crate) fn report(reader: &TraceReader) -> InvariantReport {
         final_budget_reserved,
         protocol_rejects,
         session_parks,
+        session_disconnects,
         total_requests,
         max_requests_without_block_progress,
         max_unproven_requests_without_block_progress,
@@ -279,13 +286,14 @@ pub(crate) fn assert_core(
     // hash-correct committed prefix `1..=target`.
     assert!(
         outcome.reached_target(),
-        "sync stalled at {} of {} (state_samples={}, max_outstanding={}, rejects={}, parks={})",
+        "sync stalled at {} of {} (state_samples={}, max_outstanding={}, rejects={}, parks={}, disconnects={})",
         outcome.committed_tip.0,
         outcome.target.0,
         report.state_samples,
         report.max_outstanding,
         report.protocol_rejects,
         report.session_parks,
+        report.session_disconnects,
     );
 
     // Tracing actually produced the rows the analysis scripts consume.

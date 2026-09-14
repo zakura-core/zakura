@@ -296,10 +296,29 @@ def unpack(report: dict) -> list[dict]:
     return [dict(zip(COLUMNS, row)) for row in report.get("samples", [])]
 
 
+def max_sample_gap(report: dict) -> float:
+    """Do not infer rates, queue averages, or phase timing across longer gaps."""
+    return max(90, 3 * report.get("metadata", {}).get("interval", 10))
+
+
+def apply_queue_stats(report: dict) -> tuple[float | None, float | None]:
+    """Time-weighted waiting depth across valid intervals, plus the sampled peak."""
+    rows = unpack(report)
+    values = [row["apply_ready"] for row in rows if finite(row["apply_ready"])]
+    area, observed_seconds = 0, 0
+    for left, right in zip(rows, rows[1:]):
+        seconds = right["t"] - left["t"]
+        if (0 < seconds <= max_sample_gap(report)
+                and finite(left["apply_ready"]) and finite(right["apply_ready"])):
+            area += seconds * (left["apply_ready"] + right["apply_ready"]) / 2
+            observed_seconds += seconds
+    return area / observed_seconds if observed_seconds else None, max(values, default=None)
+
+
 def rates(report: dict) -> list[dict]:
     """Counter resets and scrape gaps are gaps, not zero rates or interpolated work."""
     samples = unpack(report)
-    maximum_gap = max(90, 3 * report.get("metadata", {}).get("interval", 10))
+    maximum_gap = max_sample_gap(report)
     result = []
     for previous, current in zip(samples, samples[1:]):
         elapsed = current["t"] - previous["t"]
@@ -343,7 +362,7 @@ def region_durations(report: dict, settings: dict) -> dict[str, float]:
     duration = report.get("metadata", {}).get("duration")
     if not samples or not finite(duration):
         return {}
-    maximum_gap = max(90, 3 * report["metadata"].get("interval", 10))
+    maximum_gap = max_sample_gap(report)
     ready_since = report["metadata"].get("ready_since")
     end = min(duration, ready_since) if finite(ready_since) else duration
     totals = {"Startup / unobserved": min(end, samples[0]["t"])}

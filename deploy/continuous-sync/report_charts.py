@@ -8,7 +8,8 @@ import math
 from pathlib import Path
 from statistics import median
 
-from sync_report import REPORT_MODES, boundaries, comparison_key, finite, rates, region_durations, unpack
+from sync_report import (REPORT_MODES, apply_queue_stats, boundaries, comparison_key,
+                         finite, max_sample_gap, rates, region_durations, unpack)
 
 COLORS = {
     "Sprout": "#c8d8e5", "Sapling": "#78bea1", "Sandblast": "#efbb67",
@@ -16,9 +17,7 @@ COLORS = {
     "Startup / unobserved": "#e2e5e9", "Unobserved": "#e2e5e9",
     "Readiness / stop": "#b8bfc9",
 }
-QUEUES = [("apply_ready", "Ready to submit", "#2367a0"),
-          ("apply_submitted", "Submitted", "#bd5170"),
-          ("reorder", "Behind a gap", "#d08d21")]
+APPLY_COLOR = "#e82d80"
 
 
 def scales(reports: list[dict]) -> dict:
@@ -30,9 +29,8 @@ def scales(reports: list[dict]) -> dict:
                 if finite(row[key]):
                     limits["rate"] = max(limits["rate"], row[key])
         for row in unpack(report):
-            for key, _, _ in QUEUES:
-                if finite(row[key]):
-                    limits["queue"] = max(limits["queue"], row[key])
+            if finite(row["apply_ready"]):
+                limits["queue"] = max(limits["queue"], row["apply_ready"])
             if finite(row["height"]):
                 limits["height"] = max(limits["height"], row["height"] / 1e6)
             limits["time"] = max(limits["time"], row["t"] / 3600)
@@ -51,7 +49,7 @@ def baseline_record(report: dict, settings: dict) -> dict:
     heights = [row["height"] for row in rows if finite(row["height"])]
     covered = {}
     if heights and metadata.get("phase") == "complete" and not metadata.get("collection_error"):
-        maximum_gap = max(90, 3 * metadata.get("interval", 10))
+        maximum_gap = max_sample_gap(report)
         previous_heights, next_heights = [], []
         value = 0
         for row in rows:
@@ -93,19 +91,19 @@ def baseline(report: dict, history: list[dict], settings: dict) -> str:
     return max(deltas)[1] if deltas else "No matched baseline yet (needs 3 runs)"
 
 
-def _bands(axis, report, settings, view):
+def _bands(axis, report, settings, view, *, labels=False):
     regions = boundaries(report, settings)
+    spans = []
     if view == "height":
         upper = axis.get_xlim()[1] * 1e6
         for index, (start, name) in enumerate(regions):
             end = regions[index + 1][0] if index + 1 < len(regions) else upper
             if start < upper:
-                axis.axvspan(start / 1e6, min(end, upper) / 1e6, color=COLORS[name], alpha=.22, lw=0)
+                spans.append((start / 1e6, min(end, upper) / 1e6, name))
     else:
         # Shade contiguous observations together, leaving long scrape gaps blank.
         samples = unpack(report)
-        spans = []
-        maximum_gap = max(90, 3 * report.get("metadata", {}).get("interval", 10))
+        maximum_gap = max_sample_gap(report)
         for left, right in zip(samples, samples[1:]):
             if not regions or not finite(left["height"]) or right["t"] - left["t"] > maximum_gap:
                 continue
@@ -114,8 +112,19 @@ def _bands(axis, report, settings, view):
                 spans[-1] = (spans[-1][0], right["t"], name)
             else:
                 spans.append((left["t"], right["t"], name))
-        for start, end, name in spans:
-            axis.axvspan(start / 3600, end / 3600, color=COLORS[name], alpha=.22, lw=0)
+        spans = [(start / 3600, end / 3600, name) for start, end, name in spans]
+    largest = {}
+    for start, end, name in spans:
+        axis.axvspan(start, end, color=COLORS[name], alpha=.22, lw=0)
+        previous = largest.get(name)
+        if previous is None or end - start > previous[1] - previous[0]:
+            largest[name] = (start, end)
+    if labels:
+        width = axis.get_xlim()[1] - axis.get_xlim()[0]
+        for name, (start, end) in largest.items():
+            if end - start >= width * .12:
+                axis.text((start + end) / 2, .78, name, transform=axis.get_xaxis_transform(),
+                          ha="center", va="center", fontsize=9, color="#536273")
 
 
 def render(reports: list[dict], title: str, output: Path, settings: dict,
@@ -125,22 +134,23 @@ def render(reports: list[dict], title: str, output: Path, settings: dict,
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.patches import Patch
+    from matplotlib.ticker import FuncFormatter, MaxNLocator, StrMethodFormatter
 
     if not 1 <= len(reports) <= 3:
         raise ValueError("render one to three runs per image")
     modes = (report.get("metadata", {}).get("mode", report.get("mode")) for report in reports)
     if any(mode is not None and mode not in REPORT_MODES for mode in modes):
         raise ValueError("charts support only Dual and Zakura networking modes")
-    view = settings.get("chart_axis", "height")
+    view = settings.get("chart_axis", "time")
     if view not in ("height", "time"):
         raise ValueError("chart_axis must be height or time")
     limits = limits or scales(reports)
     plt.rcParams.update({"font.size": 10, "font.family": "DejaVu Sans", "axes.spines.top": False,
                          "axes.spines.right": False, "axes.edgecolor": "#c0c7d1",
                          "text.color": "#26364b", "axes.labelcolor": "#26364b"})
-    figure = plt.figure(figsize=(max(10, 5 * len(reports)), 9.5), facecolor="white")
-    grid = figure.add_gridspec(4, len(reports), height_ratios=[1.15, 1.6, 1.6, .65],
-                              left=.085, right=.975, top=.86, bottom=.16, hspace=.75, wspace=.28)
+    figure = plt.figure(figsize=(max(10, 5 * len(reports)), 11), facecolor="white")
+    grid = figure.add_gridspec(4, len(reports), height_ratios=[.9, 2.3, 1.4, .6],
+                              left=.09, right=.975, top=.86, bottom=.18, hspace=.9, wspace=.28)
     figure.suptitle(title, x=.055, y=.975, ha="left", fontsize=19, weight="bold")
     figure.legend(handles=[Patch(color=color, label="Sprout (no VCT)" if name == "Sprout" else name) for name, color in COLORS.items()
                            if name != "Startup / unobserved"], loc="upper left",
@@ -174,46 +184,56 @@ def render(reports: list[dict], title: str, output: Path, settings: dict,
             axis.set_xlim(0, limits[view] * 1.02)
             axis.grid(axis="y", color="#d6dce3", alpha=.45, lw=.7)
             axis.set_axisbelow(True)
-            _bands(axis, report, settings, view)
-        rate_axis, queue_axis, vct_axis = axes
+            _bands(axis, report, settings, view, labels=axis is axes[0])
+            if view == "time":
+                axis.xaxis.set_major_formatter(FuncFormatter(
+                    lambda hours, _: f"{round(hours * 60) // 60}:{round(hours * 60) % 60:02d}"))
+        queue_axis, rate_axis, vct_axis = axes
         rate_axis.set_ylim(0, limits["rate"] * 1.08)
-        queue_axis.set_ylim(0, limits["queue"] * 1.08)
+        queue_axis.set_ylim(0, limits["queue"] * 1.15)
+        queue_axis.yaxis.set_major_locator(MaxNLocator(nbins=4, integer=True))
+        queue_axis.yaxis.set_major_formatter(StrMethodFormatter("{x:,.0f}"))
         if index == 0:
             rate_axis.set_ylabel("Payload MB/s")
-            queue_axis.set_ylabel("Blocks")
+            queue_axis.set_ylabel("Blocks ready to apply")
             vct_axis.set_ylabel("VCT %")
         sha = str(metadata.get("sha") or "unknown")[:9]
         floor = next((row["request_floor_bytes"] for row in rows if finite(row["request_floor_bytes"])), None)
         tuning = f" • min window {floor / 1048576:.2f} MiB" if floor is not None else ""
-        rate_axis.set_title(f"Run {index + 1} • {sha}{tuning}\n{run_id}", loc="left", fontsize=9, pad=9)
+        queue_axis.set_title(f"Apply queue depth\nRun {index + 1} • {sha}{tuning}\n{run_id}",
+                             loc="left", fontsize=10, pad=10)
 
-        def plot(axis, points, key, label, color):
+        def plot(axis, points, key, label, color, *, width=1.1):
             # Explicit NaNs break lines across missing values and counter resets.
             xs, ys, previous = [], [], None
             for row in points:
-                if previous is not None and row["t"] - previous > max(90, 3 * metadata.get("interval", 10)):
+                if previous is not None and row["t"] - previous > max_sample_gap(report):
                     xs.append(math.nan)
                     ys.append(math.nan)
                 xs.append(row[xkey] / factor if finite(row[xkey]) else math.nan)
                 ys.append(row[key] if finite(row[key]) else math.nan)
                 previous = row["t"]
-            axis.plot(xs, ys, label=label, color=color, lw=1.1)
+            axis.plot(xs, ys, label=label, color=color, lw=width)
 
         for key, label, color in (("download", "Download", "#2367a0"), ("commit", "Commit", "#bf5771")):
             plot(rate_axis, series, key, label, color)
-        for key, label, color in QUEUES:
-            plot(queue_axis, rows, key, label, color)
-        for axis in (rate_axis, queue_axis):
-            axis.legend(loc="upper right", frameon=False, fontsize=8)
-            axis.tick_params(axis="x", labelbottom=False)
+        plot(queue_axis, rows, "apply_ready", "Blocks ready to apply", APPLY_COLOR, width=1.8)
+        average, peak = apply_queue_stats(report)
+        if peak is not None:
+            average_text = f"{average:,.0f}" if average is not None else "unavailable"
+            queue_axis.text(.015, .95, f"Ready blocks: avg {average_text} • peak {peak:,.0f}",
+                            transform=queue_axis.transAxes, va="top", fontsize=9,
+                            bbox={"facecolor": "white", "edgecolor": "#bdc6d0", "alpha": .95, "pad": 4})
+        rate_axis.legend(loc="upper right", frameon=False, fontsize=8)
+        rate_axis.tick_params(axis="x", labelbottom=False)
         if not any(finite(point["download"]) for point in series):
             rate_axis.text(.5, .5, "Download rate unavailable", transform=rate_axis.transAxes,
                            ha="center", fontsize=10)
         if not any(finite(point["commit"]) for point in series):
             rate_axis.text(.5, .32, "Commit rate unavailable", transform=rate_axis.transAxes,
                            ha="center", fontsize=9)
-        if not any(finite(row[key]) for row in rows for key, _, _ in QUEUES):
-            queue_axis.text(.5, .5, "Queue telemetry unavailable", transform=queue_axis.transAxes, ha="center")
+        if peak is None:
+            queue_axis.text(.5, .5, "Apply queue depth unavailable", transform=queue_axis.transAxes, ha="center")
         vct_axis.set_ylim(-5, 105)
         vct_axis.set_yticks([0, 100])
         if any(finite(row["vct_share"]) for row in series):
@@ -226,14 +246,18 @@ def render(reports: list[dict], title: str, output: Path, settings: dict,
             for axis in axes:
                 if checkpoint / factor <= limits[view]:
                     axis.axvline(checkpoint / factor, ls=":", color="#475569", lw=.9)
-        vct_axis.set_xlabel("Committed height (millions)" if view == "height" else "Elapsed hours")
-        queue_axis.set_title(baseline(report, list(history), settings), loc="left", fontsize=9, pad=8)
+        xlabel = "Committed height (millions)" if view == "height" else "Elapsed time (h:mm)"
+        queue_axis.set_xlabel(xlabel)
+        vct_axis.set_xlabel(xlabel)
+        rate_axis.set_title("Download and commit rate\n" + baseline(report, list(history), settings),
+                            loc="left", fontsize=9, pad=8)
 
     duration_axis.set_yticks(range(len(reports)), run_labels)
     duration_axis.invert_yaxis()
     duration_axis.set_xlim(0, limits["duration"] * 1.3)
     duration_axis.set_xlabel("Elapsed hours by committed-height region", fontsize=9)
     figure.text(.055, .025,
+                "Apply queue = downloaded, ordered blocks waiting to enter verification. Stats exclude missing data.\n"
                 "Download and commit measure Zakura block-sync payloads. 1 MB = 1,000,000 bytes. Missing samples and resets are gaps.\n"
                 "Region crossings are sampled estimates. Grey time includes startup, missing coverage and readiness checks.\n"
                 f"Sandblast: {settings['sandblast_start']:,}–{settings['sandblast_end']:,} inclusive. "
@@ -249,7 +273,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("reports", type=Path, help="JSON list of retained report responses")
     parser.add_argument("output", type=Path)
-    parser.add_argument("--axis", choices=("height", "time"), default="height")
+    parser.add_argument("--axis", choices=("height", "time"), default="time")
     parser.add_argument("--sandblast-start", type=int, default=1707211)
     parser.add_argument("--sandblast-end", type=int, default=2000000)
     args = parser.parse_args()

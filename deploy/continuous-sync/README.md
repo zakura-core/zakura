@@ -227,15 +227,21 @@ Charts do not reconstruct earlier runs from partial diagnostic logs.
 The duration bars show where the time went by committed block height. For example,
 an illustrative Dual run taking two extra hours in Sandblast gets a longer
 Sandblast segment even if its final BPS looks similar to yesterday's run.
-Below the bars, both modes use the same height, MB/s, and queue scales for that
-daily snapshot. Set `chart_axis = "time"` to spread stalls along elapsed time.
+Below the bars, a dedicated **Apply queue depth** panel shows one line for
+**Blocks ready to apply**, with average and peak depth. For example, 20,000 means
+20,000 downloaded, ordered blocks are waiting to enter verification. Submitted
+blocks and bodies behind a missing block remain in the retained diagnostic data.
+
+Both modes use the same time, MB/s, and apply-depth scales for that daily snapshot.
+The default `chart_axis = "time"` shows elapsed time as hours and minutes, so stalls
+remain visible. Set `chart_axis = "height"` to compare by committed block height.
 The duration bars remain visible in either view.
 
 | Layer | Meaning |
 | --- | --- |
 | Sprout, Sapling, Sandblast, post-Sandblast, Ironwood | Sapling and Ironwood boundaries come from the running binary. Ironwood appears when its activation is known and in range. Sandblast is a reporting window, initially **1,707,211 through 2,000,000 inclusive**, configured in `nodes.toml`. |
 | Download and commit MB/s | Deltas of cumulative serialized block payload bytes divided by monotonic elapsed seconds and 1,000,000. Both modes measure Zakura block-sync payloads. These exclude Legacy networking traffic, transport overhead, and request-budget estimates. Downloads can include retries. Commit bytes count successful submissions. |
-| Dual / Zakura queues | Contiguous blocks ready to submit, blocks submitted to the verifier, and bodies buffered behind a gap. These are separate counts. |
+| Apply queue depth | One line for downloaded, ordered blocks waiting to enter verification. Its scale uses only this queue. Average depth is weighted by elapsed time between valid samples, and peak depth is the largest observed sample. |
 | VCT strip | VCT tree updates as a share of all tree updates. The total includes fallback updates within Dual and Zakura runs. The dotted height line is this binary's checkpoint limit. |
 
 No missing value becomes zero. Counter decreases and scrape gaps over
@@ -244,6 +250,8 @@ crossings are interpolated between samples, so region timing is an estimate at
 the sampling resolution. Startup, unknown coverage, and readiness/shutdown time
 remain visible in grey. Chart duration uses a monotonic clock; the text summary
 retains its existing whole-second wall-clock duration.
+Queue averages exclude missing samples and long scrape gaps, so they describe
+observed intervals. No adjacent valid samples means the average is unavailable.
 
 The inventory configures Dual and Zakura controllers to sample every 10 seconds,
 plus the time to perform their status checks. Legacy keeps its existing 30-second
@@ -258,8 +266,9 @@ The node byte counters remain available even when diagnostic tracing is disabled
 
 Retained metadata includes the commit, mode, host CPU count/architecture/kernel,
 allowlisted public tuning, observed minimum request window, upgrade/checkpoint
-heights, and VCT counters. Samples also include queue bytes, request-budget bytes,
-peer count, the next missing height's oldest active request age, process RSS,
+heights, and VCT counters. Samples also include counts of submitted blocks and
+bodies behind a gap, queue bytes, request-budget bytes, peer count,
+the next missing height's oldest active request age, process RSS,
 and host CPU/IO-wait ticks for later diagnosis. No controller credentials, peer
 identities, or raw configuration text are included. The forced SSH status command
 accepts only normal status or `--report <run-id>` from this fixed directory.

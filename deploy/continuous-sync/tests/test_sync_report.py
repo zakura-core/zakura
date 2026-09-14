@@ -192,8 +192,35 @@ unrelated_secret 3
             with self.subTest(mode=mode):
                 data = fixture(mode=mode)
                 report.validate_report(data)
-                self.assertEqual(charts.scales([data])["queue"], 200)
+                self.assertEqual(charts.scales([data])["queue"], 50)
                 self.assertEqual(charts.scales([data])["rate"], 10)
+
+    def test_other_queues_do_not_hide_apply_depth_or_replace_missing_values(self):
+        data = fixture()
+        for row in data["samples"]:
+            row[report.INDEX["apply_submitted"]] = 100000
+            row[report.INDEX["reorder"]] = 200000
+        self.assertEqual(charts.scales([data])["queue"], 50)
+        for row in data["samples"]:
+            row[report.INDEX["apply_ready"]] = None
+        self.assertEqual(charts.scales([data])["queue"], 1)
+        self.assertEqual(report.apply_queue_stats(data), (None, None))
+
+    def test_apply_queue_average_weights_time_and_excludes_long_gaps(self):
+        data = fixture(heights=(0, 1, 2, 3), times=(0, 10, 50, 200))
+        for row, depth in zip(data["samples"], (0, 10, 20, 1000)):
+            row[report.INDEX["apply_ready"]] = depth
+        # 5 blocks for 10s and 15 blocks for 40s. The 150s gap is unobserved.
+        self.assertEqual(report.apply_queue_stats(data), (13, 1000))
+
+    def test_apply_queue_stats_distinguish_missing_intervals_from_empty_queues(self):
+        data = fixture(heights=(0, 1, 2, 3), times=(0, 10, 20, 30))
+        for row, depth in zip(data["samples"], (None, 40, None, 90)):
+            row[report.INDEX["apply_ready"]] = depth
+        self.assertEqual(report.apply_queue_stats(data), (None, 90))
+        for row in data["samples"]:
+            row[report.INDEX["apply_ready"]] = 0
+        self.assertEqual(report.apply_queue_stats(data), (0, 0))
 
     def test_reports_exclude_legacy_networking_but_keep_fallback_tree_updates(self):
         for mode in ("legacy", "zebra"):

@@ -61,7 +61,7 @@ charts = false # Enable after binding the Slack bot to the existing channel.
 channel_id = "C0BG341Q9TQ"
 sandblast_start = 1707211
 sandblast_end = 2000000 # Inclusive. This is a reporting window, not an upgrade.
-chart_axis = "height"
+chart_axis = "time"
 
 [[nodes]]
 name = "temp-zakura-sync-test-1"

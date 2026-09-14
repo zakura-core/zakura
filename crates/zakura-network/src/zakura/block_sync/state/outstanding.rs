@@ -12,8 +12,8 @@ use crate::zakura::regulation::{
 
 pub(in crate::zakura::block_sync) struct OutstandingCapacityPlan {
     ranges: Option<CapacityPlan<OutstandingBlockRange>>,
-    hashes: Option<ResponseIndexPlan>,
-    starts: Option<ResponseIndexPlan>,
+    hashes: Option<ResponseIndexPlan<[u8; 32]>>,
+    starts: Option<ResponseIndexPlan<block::Height>>,
 }
 
 impl OutstandingCapacityPlan {

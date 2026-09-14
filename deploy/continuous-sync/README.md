@@ -367,6 +367,20 @@ The relevant loopback endpoints are only bound locally:
 
 ## Retained sync data
 
+Native runs build with the opt-in `sync-metrics` feature when the selected ref
+supports it. This enables completion-based commit-byte accounting and corrects
+the commit rates in detailed traces. Normal builds omit that instrumentation.
+The existing `commit-metrics` feature controls separate state timing histograms.
+Build-cache metadata records the selected features so a default binary cannot
+silently replace an instrumented binary at the same commit.
+
+Committed bytes are counted once per successful native submission, even when a
+chain-frontier update removes its applying entry before the callback arrives.
+Duplicates and failed submissions do not count. The counter uses the wire size
+already retained for the submission, without reserializing blocks or reading the
+database. It measures block payload rather than physical disk writes. Without
+`sync-metrics`, the commit-byte counter is absent rather than a misleading zero.
+
 Dual (mixed) and Zakura-only runs add these fields to their existing
 `/var/log/zakura/runs/<run-id>/samples.jsonl`, at the normal 30-second polling
 interval plus the time spent checking status. The adjacent `run.json` identifies

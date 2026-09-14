@@ -284,13 +284,26 @@ def binary_runnable(path: Path) -> bool:
     return result.returncode == 0
 
 
+def build_features(config: Config, sha: str) -> list[str]:
+    """Opt native runs into commit accounting when the selected ref supports it."""
+    if config.policy.p2p_stack not in NATIVE_SYNC_MODES:
+        return []
+    result = run(["git", "show", f"{sha}:crates/zakurad/Cargo.toml"],
+                 cwd=config.paths.repo_dir, capture=True)
+    manifest = tomllib.loads(result.stdout)
+    return ["sync-metrics"] if "sync-metrics" in manifest.get("features", {}) else []
+
+
 def build_binary(config: Config, sha: str) -> Path:
     config.paths.build_cache_dir.mkdir(parents=True, exist_ok=True)
     target = cached_binary(config, sha)
     meta = target.with_suffix(".json")
+    features = build_features(config, sha)
     if binary_runnable(target) and meta.exists():
-        log(config, f"build-cache-hit sha={sha}")
-        return target
+        metadata = json.loads(meta.read_text(encoding="utf-8"))
+        if metadata.get("features", []) == features:
+            log(config, f"build-cache-hit sha={sha} features={features}")
+            return target
 
     worktree = config.paths.build_cache_dir / f"worktree-{sha[:12]}"
     if worktree.exists():
@@ -298,7 +311,10 @@ def build_binary(config: Config, sha: str) -> Path:
         shutil.rmtree(worktree, ignore_errors=True)
     try:
         run(["git", "worktree", "add", "--detach", str(worktree), sha], cwd=config.paths.repo_dir)
-        run(["cargo", "build", "--release", "--locked", "-p", "zakura"], cwd=worktree)
+        build_command = ["cargo", "build", "--release", "--locked", "-p", "zakura"]
+        if features:
+            build_command.extend(["--features", ",".join(features)])
+        run(build_command, cwd=worktree)
         built = worktree / "target" / "release" / "zakurad"
         if not built.is_file():
             raise ControllerError(f"build completed but binary is missing: {built}")
@@ -312,6 +328,7 @@ def build_binary(config: Config, sha: str) -> Path:
                 {
                     "sha": sha,
                     "binary_sha256": sha256_file(target),
+                    "features": features,
                     "built_at": utc_stamp(),
                 },
                 indent=2,

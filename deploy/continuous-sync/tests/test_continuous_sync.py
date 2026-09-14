@@ -39,6 +39,52 @@ alert_status = load_module("continuous_sync_alert_status", ALERT_STATUS_PATH)
 
 
 class ContinuousSyncTests(unittest.TestCase):
+    def test_sync_metrics_build_features_follow_mode_and_selected_ref(self):
+        for mode in ("dual", "zakura", "legacy"):
+            for supported in (False, True):
+                with self.subTest(mode=mode, supported=supported), tempfile.TemporaryDirectory() as tmp:
+                    config = make_config(Path(tmp), policy=sync.Policy(p2p_stack=mode))
+                    manifest = '[features]\nsync-metrics = []\n' if supported else '[features]\n'
+                    with patch.object(sync, "run", return_value=subprocess.CompletedProcess([], 0, manifest)) as command:
+                        self.assertEqual(sync.build_features(config, "a" * 40),
+                                         ["sync-metrics"] if supported and mode != "legacy" else [])
+                        if mode == "legacy":
+                            command.assert_not_called()
+                        else:
+                            self.assertEqual(command.call_args.args[0],
+                                             ["git", "show", "a" * 40 + ":crates/zakurad/Cargo.toml"])
+
+    def test_sync_metrics_rebuilds_default_cache_and_reuses_matching_features(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(Path(tmp), policy=sync.Policy(p2p_stack="zakura"))
+            config.paths.build_cache_dir.mkdir()
+            sha = "a" * 40
+            target = sync.cached_binary(config, sha)
+            target.write_bytes(b"default binary")
+            target.with_suffix(".json").write_text(json.dumps({"sha": sha}))
+            commands = []
+
+            def command(args, **kwargs):
+                commands.append(args)
+                if args[:2] == ["cargo", "build"]:
+                    built = kwargs["cwd"] / "target/release/zakurad"
+                    built.parent.mkdir(parents=True)
+                    built.write_bytes(b"instrumented binary")
+                return subprocess.CompletedProcess(args, 0, "")
+
+            with patch.object(sync, "build_features", return_value=["sync-metrics"]), \
+                 patch.object(sync, "binary_runnable", return_value=True), \
+                 patch.object(sync, "run", side_effect=command):
+                self.assertEqual(sync.build_binary(config, sha), target)
+                self.assertEqual(target.read_bytes(), b"instrumented binary")
+                self.assertIn(["cargo", "build", "--release", "--locked", "-p", "zakura",
+                               "--features", "sync-metrics"], commands)
+                self.assertEqual(json.loads(target.with_suffix(".json").read_text())["features"],
+                                 ["sync-metrics"])
+                commands.clear()
+                self.assertEqual(sync.build_binary(config, sha), target)
+                self.assertEqual(commands, [])
+
     def test_retention_archive_failure_reports_halt_during_disk_recovery(self):
         for restarting in (False, True):
             with self.subTest(restarting=restarting), tempfile.TemporaryDirectory() as tmp:

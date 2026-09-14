@@ -696,6 +696,19 @@ impl SequencerTask {
         )>,
     ) -> (bool, bool) {
         let result = outcome.result();
+        // Frontier updates can remove applying entries before their completions.
+        // Every committed exit below retires the exact submission, so a repeated
+        // completion cannot count its cached wire size again.
+        #[cfg(feature = "sync-metrics")]
+        if matches!(result, BlockApplyResult::Committed) {
+            if let Some(bytes) = self
+                .sequencer
+                .submission_bytes(owner, source, token, height, hash)
+            {
+                self.committed_throughput.record(bytes);
+                metrics::counter!("sync.block.payload.committed.bytes").increment(bytes);
+            }
+        }
         // A stale completion (no live applying entry, or token/hash mismatch)
         // releases only its exact token-aware in-flight-submission charge and
         // returns; there is no query/schedule tail here, so it needs no reaction.
@@ -779,9 +792,8 @@ impl SequencerTask {
 
         // A `Committed` result is a body that newly extended the chain; count it
         // toward commit throughput (the apply rate the download path is racing).
-        if matches!(result, BlockApplyResult::Committed) {
+        if !cfg!(feature = "sync-metrics") && matches!(result, BlockApplyResult::Committed) {
             self.committed_throughput.record(applying.bytes);
-            metrics::counter!("sync.block.payload.committed.bytes").increment(applying.bytes);
         }
         self.sequencer
             .finish_submission(owner, source, token, height, hash);
@@ -1239,6 +1251,8 @@ fn view_schedulable_ne(a: &SequencerView, b: &SequencerView) -> bool {
 
 #[cfg(test)]
 mod tests {
+    mod commit_metrics;
+
     use zakura_chain::serialization::ZcashDeserializeInto;
     use zakura_test::vectors::BLOCK_MAINNET_1_BYTES;
 

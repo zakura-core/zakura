@@ -100,6 +100,11 @@ debug/
 target/
 
 # Local cargo-fuzz inputs and findings are generated during campaigns.
+/fuzz/orchard-merkle/artifacts/
+/fuzz/orchard-merkle/corpus/
+/fuzz/orchard-merkle/coverage/
+/fuzz/orchard-merkle/*.profdata
+/fuzz/orchard-merkle/*.profraw
 /qa/fuzz/header-chain/artifacts/
 /qa/fuzz/header-chain/corpus/
 /qa/fuzz/header-chain/coverage/

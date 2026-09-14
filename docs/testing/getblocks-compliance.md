@@ -96,7 +96,7 @@ Shared admission and writer models supplement the message-specific witnesses.
 | R01 | Exact hash authorization before first write, immediate response, generated legal prefixes | `block_sync::peer_routine::response_contract`, existing request-write regressions |
 | R02 | No overlapping retry on the same connection, buffered overlap shapes admitted only after the old terminal write | Receiver `response_contract` and serving `serving_contract` |
 | R03 | Needed, servable, obsolete, or another peer's work cannot authorize a body | `block_sync::peer_routine::response_contract` |
-| R04 | Exact next hash and height, out-of-order bodies spend a part and are discarded, excess bodies rejected before delivery | `block_sync::peer_routine::response_contract` |
+| R04 | Exact next hash and height, out-of-order bodies spend a part and are discarded, a body with no open response rejected before delivery | `block_sync::peer_routine::response_contract` |
 | R05 | Duplicate parts discarded before the ending and after local finality, rejected after the ending, separately authorized peers as legal control | `block_sync::peer_routine::response_contract` |
 | R06 | Done start/count equal the consumed nonempty prefix, suffix requeued on legal partial completion | `block_sync::peer_routine::response_contract` |
 | R07 | Unavailable has the original start/count and zero bodies, retries honor the local floor | `block_sync::peer_routine::response_contract` |

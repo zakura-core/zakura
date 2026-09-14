@@ -49,6 +49,7 @@ mod service;
 mod serving;
 mod serving_regulation;
 mod state;
+mod status;
 #[cfg(test)]
 mod tests;
 mod trace;

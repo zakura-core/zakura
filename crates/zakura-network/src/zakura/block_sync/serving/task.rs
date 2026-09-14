@@ -54,7 +54,10 @@ pub(in crate::zakura::block_sync) async fn serve_requests(
                     return Ok(());
                 }
                 let status = *local_status.borrow();
-                let count = if request.start_height < status.servable_low {
+                let count = if request.start_height == block::Height::MIN && status.servable_low > block::Height::MIN {
+                    // Genesis is retained separately. Do not cross the pruned gap after it.
+                    request.count.min(1)
+                } else if request.start_height < status.servable_low {
                     0
                 } else {
                     status.servable_high.0.checked_sub(request.start_height.0)

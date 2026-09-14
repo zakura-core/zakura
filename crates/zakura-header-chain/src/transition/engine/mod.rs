@@ -385,13 +385,28 @@ impl HeaderChainEngine {
 
     /// Return slots that speculative input can use without consuming the commit reserve.
     pub fn speculative_auxiliary_capacity(&self, limits: crate::EngineLimits) -> usize {
+        limits
+            .max_aux_deliveries_total
+            .get()
+            .saturating_sub(self.reserved_auxiliary_capacity(limits))
+            .saturating_sub(self.aux_delivery_count())
+    }
+
+    /// Check whether retained input leaves the selected commit window's reserve available.
+    pub fn auxiliary_reserve_is_satisfied(&self, limits: crate::EngineLimits) -> bool {
+        self.aux_delivery_count()
+            .saturating_add(self.reserved_auxiliary_capacity(limits))
+            <= limits.max_aux_deliveries_total.get()
+    }
+
+    fn reserved_auxiliary_capacity(&self, limits: crate::EngineLimits) -> usize {
         let occupied = self
             .selected_projection
             .iter()
             .take(3)
             .map(|frontier| self.aux_deliveries(frontier.hash).len())
             .sum::<usize>();
-        let reserve = if self.metadata.mode == crate::EngineMode::Integrated {
+        if self.metadata.mode == crate::EngineMode::Integrated {
             limits
                 .max_aux_deliveries_per_header
                 .get()
@@ -399,12 +414,7 @@ impl HeaderChainEngine {
                 .saturating_sub(occupied)
         } else {
             0
-        };
-        limits
-            .max_aux_deliveries_total
-            .get()
-            .saturating_sub(reserve)
-            .saturating_sub(self.aux_delivery_count())
+        }
     }
 
     /// Check one new input against the planner's bucket, aggregate, and reserve limits.

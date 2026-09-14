@@ -763,7 +763,7 @@ fn settle_before_publication(
     has_due_deferred: bool,
 ) -> Result<HeaderChainEngine, HeaderChainStoreError> {
     let mut engine = load_transition_engine(store)?;
-    if !has_due_deferred && config.mode != EngineMode::Integrated {
+    if !has_due_deferred && engine.auxiliary_reserve_is_satisfied(config.limits) {
         return Ok(engine);
     }
     let before = engine.snapshot();

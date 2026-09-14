@@ -8311,7 +8311,7 @@ async fn reactor_discards_unmatched_body_for_ownerless_queued_height() {
     assert_eq!(
         service.peer_count(),
         2,
-        "a fork answer keeps both connections",
+        "an unmatched queued-height body keeps both connections",
     );
 
     let (start_height, _count) = wait_for_outbound_getblocks(&mut fresh_outbound).await;
@@ -12092,7 +12092,8 @@ async fn reactor_discards_duplicate_buffered_body_and_keeps_first_receipt() {
     // This peer completed `(2, 1)`, so `floor_has_preferred_unsaturated_server`
     // keeps it the preferred carrier for the floor height: it re-takes the
     // returned height 1 once its `RETRY_AVOID_BACKOFF` bias lapses. The count of
-    // 1 is the first receipt kept — block 2 stays buffered and is not re-asked.
+    // 1 is structural (`max_blocks_per_response`); what proves the kept receipt
+    // is the re-take covering height 1 alone and the ordered commit below.
     assert_eq!(
         wait_for_outbound_getblocks(&mut outbound_rx).await,
         (block::Height(1), 1)

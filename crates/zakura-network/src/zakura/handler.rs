@@ -149,16 +149,27 @@ pub const ZAKURA_SAME_IP_DUPLICATE_EVICT_MIN_AGE: Duration = Duration::from_secs
 /// Maximum retained remotely initiated bidirectional transport streams.
 pub const DEFAULT_ZAKURA_REMOTE_BIDI_STREAMS: u32 = 16;
 /// Receive credit available to one stream, including before application admission.
-pub const DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW: u32 = 256 * 1024;
-// Qualification pauses 32 sibling streams, including locally opened streams.
-const QUALIFIED_PAUSED_SIBLING_STREAMS: u32 = 32;
-// Credit updates are batched. Six extra stream windows let another stream keep
-// receiving while the sibling consumers remain stopped.
-const CONNECTION_PROGRESS_HEADROOM: u32 = 6 * DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW;
-/// Receive credit for paused siblings plus independent service progress.
-pub const DEFAULT_ZAKURA_RECEIVE_WINDOW: u32 = QUALIFIED_PAUSED_SIBLING_STREAMS
-    * DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW
-    + CONNECTION_PROGRESS_HEADROOM;
+///
+/// One block-sync data stream carries a peer's bodies, so its throughput is bounded
+/// by this window divided by the round trip. 8 MiB keeps a 100 ms peer above
+/// 60 MB/s; 256 KiB measured at 0.17 of the 16 MiB baseline at 100 ms and 1 MiB at
+/// 0.59 (`gate::transport_windows`, delay-only link). The specification requires
+/// regulation to preserve throughput, so this stays large.
+pub const DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
+/// Receive credit shared by every stream on a connection.
+pub const DEFAULT_ZAKURA_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;
+/// Paused sibling streams that still leave another stream enough connection credit
+/// to progress. The transport sends a connection credit update only after an eighth
+/// of the window is consumed, so that eighth is reserved as headroom. Beyond this
+/// count a connection can stall until the write, setup or download deadlines close
+/// it; bounding total credit node-wide is deferred transport work.
+pub const SUPPORTED_PAUSED_SIBLING_STREAMS: u32 = (DEFAULT_ZAKURA_RECEIVE_WINDOW
+    - DEFAULT_ZAKURA_RECEIVE_WINDOW / 8)
+    / DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW;
+const _: () = assert!(
+    SUPPORTED_PAUSED_SIBLING_STREAMS >= 2,
+    "the T02 qualification pauses two sibling streams"
+);
 /// QUIC send window used by Zakura endpoints.
 pub const DEFAULT_ZAKURA_SEND_WINDOW: u64 = 32 * 1024 * 1024;
 /// Initial backoff before re-dialing a configured Zakura bootstrap peer.

@@ -63,7 +63,7 @@ verify that the next open waits while those streams remain live.
 ## Deferred requirements
 
 The stack uses published transport packages without overrides. The receive policy
-allows 16 remotely initiated bidirectional streams, 256 KiB per stream and 9.5 MiB
+allows 16 remotely initiated bidirectional streams, 8 MiB per stream and 32 MiB
 per connection. Fixed progress tests exercise these settings. They do not bound
 arbitrary local stream churn or all transport allocations.
 
@@ -175,11 +175,11 @@ It holds real worker and output capacity, observes independent service traffic,
 then releases the dependencies. Storage and final verification are controlled
 fixtures there. R13 separately exercises the real checkpoint verifier.
 
-The headroom tests use the native 256 KiB stream and 9.5 MiB connection receive
+The headroom tests use the native 8 MiB stream and 32 MiB connection receive
 windows. They require an independent service's frame to arrive within three
 seconds while sibling consumers remain stopped. They then resume those consumers
-and require useful body completion on the original connection. The fixed
-full-occupancy regression pauses 32 sibling consumers and transfers 19 MiB through
+and require useful body completion on the original connection. The sibling
+regression pauses the supported three consumers and transfers 64 MiB through
 another stream before draining the originals. The separate recovery fixture
 explicitly selects the former 16/32 MiB windows to reproduce a connection stall.
 A reset or timeout cannot stand in for independent progress.

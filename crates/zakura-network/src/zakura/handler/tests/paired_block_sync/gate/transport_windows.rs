@@ -54,6 +54,59 @@ const CANDIDATES: [Windows; 3] = [
     },
 ];
 
+/// The shipped policy. Update this when the production constants change.
+const PRODUCTION: Windows = Windows {
+    name: "production",
+    stream_bytes: DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW,
+    connection_bytes: DEFAULT_ZAKURA_RECEIVE_WINDOW,
+    remote_streams: DEFAULT_ZAKURA_REMOTE_BIDI_STREAMS,
+};
+
+/// Delay-only links expose a window bound; the lossy fixture is loss-bound at
+/// about 200 seconds for every window and cannot see it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "standalone five-sample throughput gate on 50 ms and 100 ms delay-only links"]
+async fn production_windows_keep_ninety_percent_throughput_on_delay_only_links(
+) -> Result<(), BoxError> {
+    let _guard = zakura_test::init();
+    for one_way_delay_ms in [25u64, 50u64] {
+        let mut samples = [[Duration::ZERO; 2]; SAMPLES];
+        for (sample, durations) in samples.iter_mut().enumerate() {
+            let policies = [BASELINE, PRODUCTION];
+            for offset in 0..policies.len() {
+                let index = (sample + offset) % policies.len();
+                durations[index] = run_download(Workload {
+                    transport: Some(policies[index].config()),
+                    impaired: true,
+                    link_one_way_delay: Duration::from_millis(one_way_delay_ms),
+                    link_loss: false,
+                    ..Workload::default()
+                })
+                .await?;
+            }
+        }
+        let median = |policy: usize| {
+            let mut durations: [Duration; SAMPLES] =
+                std::array::from_fn(|sample| samples[sample][policy]);
+            durations.sort_unstable();
+            durations[SAMPLES / 2]
+        };
+        let ratio = median(0).as_secs_f64() / median(1).as_secs_f64();
+        eprintln!(
+            "production window gate: rtt_ms={} baseline={:?} production={:?} ratio={ratio:.3}",
+            2 * one_way_delay_ms,
+            median(0),
+            median(1)
+        );
+        assert!(
+            ratio >= 0.9,
+            "production windows must keep 90% of baseline throughput at {} ms RTT, got {ratio:.3}",
+            2 * one_way_delay_ms
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "standalone five-sample window experiment on lossless and impaired links"]
 async fn compare_uniform_receive_windows() -> Result<(), BoxError> {
@@ -70,10 +123,16 @@ async fn compare_uniform_receive_windows() -> Result<(), BoxError> {
         )?;
     }
     for impaired in [false, true] {
-        let mut samples = [[Duration::ZERO; 4]; SAMPLES];
+        let mut samples = [[Duration::ZERO; 5]; SAMPLES];
         for (sample, durations) in samples.iter_mut().enumerate() {
             // Rotate order so one configuration is not always measured first.
-            let policies = [BASELINE, CANDIDATES[0], CANDIDATES[1], CANDIDATES[2]];
+            let policies = [
+                BASELINE,
+                PRODUCTION,
+                CANDIDATES[0],
+                CANDIDATES[1],
+                CANDIDATES[2],
+            ];
             for offset in 0..policies.len() {
                 let index = (sample + offset) % policies.len();
                 let policy = policies[index];
@@ -105,16 +164,21 @@ async fn compare_uniform_receive_windows() -> Result<(), BoxError> {
                 }
             }
         }
-        let medians: [Duration; 4] = std::array::from_fn(|policy| {
+        let medians: [Duration; 5] = std::array::from_fn(|policy| {
             let mut durations: [Duration; SAMPLES] =
                 std::array::from_fn(|sample| samples[sample][policy]);
             durations.sort_unstable();
             durations[SAMPLES / 2]
         });
+        // Each sample transfers the same useful bytes and consumes every
+        // ending on its original connection, so this is a throughput ratio.
+        eprintln!(
+            "window median: impaired={impaired} policy={} throughput_ratio={:.6}",
+            PRODUCTION.name,
+            medians[0].as_secs_f64() / medians[1].as_secs_f64(),
+        );
         for (index, policy) in CANDIDATES.iter().enumerate() {
-            // Each sample transfers the same useful bytes and consumes every
-            // ending on its original connection, so this is a throughput ratio.
-            let ratio = medians[0].as_secs_f64() / medians[index + 1].as_secs_f64();
+            let ratio = medians[0].as_secs_f64() / medians[index + 2].as_secs_f64();
             eprintln!(
                 "window median: impaired={impaired} policy={} throughput_ratio={ratio:.6} meets_90_percent={}",
                 policy.name,
@@ -170,14 +234,16 @@ async fn headroom_covers_all_candidate_streams_and_one_extra_local_stream() -> R
 
 pub(crate) async fn check_native_policy_headroom() -> Result<(), BoxError> {
     let limits = ZakuraLocalLimits::from_config(&Config::default());
+    let paused = usize::try_from(SUPPORTED_PAUSED_SIBLING_STREAMS)?;
     assert!(
         unread_headroom_with_config(
-            32,
+            paused,
             limits.transport_config(),
             DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW,
             DEFAULT_ZAKURA_RECEIVE_WINDOW,
         )
-        .await?
+        .await?,
+        "{paused} paused siblings leave the production connection window room to progress"
     );
     Ok(())
 }

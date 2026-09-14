@@ -28,7 +28,8 @@ mod paused;
 mod qualification;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn native_policy_keeps_progress_with_all_sibling_streams_unread() -> Result<(), BoxError> {
+async fn native_policy_keeps_progress_with_supported_sibling_streams_unread() -> Result<(), BoxError>
+{
     gate::transport_windows::check_native_policy_headroom().await
 }
 
@@ -37,6 +38,8 @@ struct Workload {
     peer_limit: Option<usize>,
     pressure: bool,
     impaired: bool,
+    link_one_way_delay: Duration,
+    link_loss: bool,
     rounds: u32,
     paused_siblings: u16,
     resume_after: Option<Duration>,
@@ -50,6 +53,8 @@ impl Default for Workload {
             peer_limit: None,
             pressure: false,
             impaired: false,
+            link_one_way_delay: Duration::from_millis(25),
+            link_loss: true,
             rounds: 1,
             paused_siblings: 0,
             resume_after: None,
@@ -388,6 +393,8 @@ async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
         peer_limit,
         pressure,
         impaired,
+        link_one_way_delay,
+        link_loss,
         rounds,
         paused_siblings,
         resume_after,
@@ -453,7 +460,7 @@ async fn run_download(workload: Workload) -> Result<Duration, BoxError> {
             .ip_addrs()
             .find(|address| address.is_ipv4())
             .unwrap();
-        let link = link::ImpairedLink::new(server_address).await?;
+        let link = link::ImpairedLink::new(server_address, link_one_way_delay, link_loss).await?;
         address = EndpointAddr::new(address.id).with_addrs([iroh::TransportAddr::Ip(link.address)]);
         Some(link)
     } else {

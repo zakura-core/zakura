@@ -124,10 +124,14 @@ Production advertisements obtain their numeric ceilings from immutable config.
 
 ## Flow control
 
-Keep the existing 16 MiB receive window per stream, 32 MiB shared connection
-receive ceiling, and 32 MiB connection send window. Opening a stream does not
-reserve dedicated connection credit. Other services can consume the shared
-allowance; bounded application queues do not prevent that.
+Each stream has an 8 MiB receive window and a connection shares a 32 MiB receive
+window and a 32 MiB send window. A body stream's throughput is bounded by its
+window divided by the round trip, so the stream window stays large enough for a
+100 ms peer to exceed 60 MB/s. Opening a stream does not reserve dedicated
+connection credit. Other services can consume the shared allowance; bounded
+application queues do not prevent that. Up to three paused sibling streams leave
+the connection enough credit for another stream to progress, because the
+transport issues connection credit only after an eighth of the window is used.
 
 Temporary pauses can clear naturally. Sustained stalls use the existing write,
 setup, and download deadlines. Cleanup returns unreceived work for retry and

@@ -8,15 +8,15 @@ maintained transport forks. The node's application work and requester metadata
 budgets remain enabled. Complete transport memory and cleanup bounds are deferred.
 
 The published APIs support the enabled receive policy: at most 16 remotely
-initiated bidirectional streams, 256 KiB per stream and 9.5 MiB per connection.
+initiated bidirectional streams, 8 MiB per stream and 32 MiB per connection.
 Unidirectional application streams are disabled. Locally initiated stream state
 does not yet have the proposed transport lifetime limit.
 
-For the fixed scenario with 32 paused sibling receive windows, 8 MiB remains
-unread and 1.5 MiB remains available for independent progress. This exceeds the
-transport's connection-credit update threshold of 9.5 MiB / 8. T02 and the
-32-sibling regression remain enabled because they use published APIs. Passing
-these scenarios does not establish a bound over arbitrary local stream churn.
+Three paused sibling receive windows consume 24 MiB and leave 8 MiB, which is
+more than the transport's connection-credit update threshold of 32 MiB / 8. T02
+and the sibling regression use that count. A larger paused set can stall the
+connection until the existing deadlines close it; bounding total credit node-wide
+is the deferred transport work below.
 
 ## Dependency-blocked witnesses
 

@@ -3,14 +3,14 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use blake2b_simd::Params as Blake2bParams;
-use iroh::{endpoint::TransportConfig, Endpoint, NodeAddr, SecretKey, Watcher as _};
+use iroh::{endpoint::QuicTransportConfig, Endpoint, EndpointAddr, SecretKey};
 
 use crate::{zakura::direct_endpoint_builder, BoxError};
 
 /// Factory for deterministic relay-free loopback Iroh endpoints.
 #[derive(Debug)]
 pub struct LocalEndpointFactory {
-    transport_config: Option<TransportConfig>,
+    transport_config: Option<QuicTransportConfig>,
 }
 
 impl LocalEndpointFactory {
@@ -22,7 +22,7 @@ impl LocalEndpointFactory {
     }
 
     /// Create a factory with a caller-supplied transport configuration.
-    pub fn with_transport_config(transport_config: TransportConfig) -> Self {
+    pub fn with_transport_config(transport_config: QuicTransportConfig) -> Self {
         Self {
             transport_config: Some(transport_config),
         }
@@ -46,7 +46,7 @@ impl LocalEndpointFactory {
     /// Bind a relay-free endpoint to an OS-assigned loopback port.
     pub async fn endpoint(self, seed: u64) -> Result<Endpoint, BoxError> {
         let mut builder = direct_endpoint_builder(Self::secret_key(seed))
-            .bind_addr_v4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+            .bind_addr(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
         if let Some(transport_config) = self.transport_config {
             builder = builder.transport_config(transport_config);
         }
@@ -56,14 +56,8 @@ impl LocalEndpointFactory {
     }
 
     /// Return a fully initialized direct node address.
-    pub async fn node_addr(endpoint: &Endpoint) -> NodeAddr {
-        endpoint.node_addr().initialized().await
-    }
-
-    /// Teach `a` how to reach `b` directly.
-    pub async fn wire(a: &Endpoint, b: &Endpoint) -> Result<(), BoxError> {
-        a.add_node_addr(Self::node_addr(b).await)?;
-        Ok(())
+    pub async fn node_addr(endpoint: &Endpoint) -> EndpointAddr {
+        endpoint.addr()
     }
 }
 
@@ -99,10 +93,10 @@ mod tests {
         let endpoint = LocalEndpointFactory::new().endpoint(1).await?;
         let node_addr = LocalEndpointFactory::node_addr(&endpoint).await;
 
-        assert_eq!(node_addr.node_id, endpoint.node_id());
-        assert!(node_addr.relay_url().is_none());
-        assert!(node_addr.direct_addresses().next().is_some());
-        assert!(endpoint.discovery().is_none());
+        assert_eq!(node_addr.id, endpoint.id());
+        assert!(node_addr.relay_urls().next().is_none());
+        assert!(node_addr.ip_addrs().next().is_some());
+        assert!(endpoint.address_lookup()?.is_empty());
 
         endpoint.close().await;
         Ok(())
@@ -115,11 +109,10 @@ mod tests {
         let server = LocalEndpointFactory::new().endpoint(10).await?;
         let router = Router::builder(server).accept(ALPN, Noop).spawn();
         let client = LocalEndpointFactory::new().endpoint(11).await?;
-        let server_addr = router.endpoint().node_addr().initialized().await;
-        client.add_node_addr(server_addr.clone())?;
+        let server_addr = router.endpoint().addr();
 
         let connection = client.connect(server_addr, ALPN).await?;
-        assert_eq!(connection.remote_node_id()?, router.endpoint().node_id());
+        assert_eq!(connection.remote_id(), router.endpoint().id());
 
         connection.close(0u32.into(), b"done");
         client.close().await;

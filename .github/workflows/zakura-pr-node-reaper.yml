@@ -6,7 +6,7 @@ name: PR node reaper
 # resource) on a TTL so nothing accrues cost indefinitely:
 #   - zakura-pr-node and zakura-mempool-load droplets older than
 #     max_age_hours (default 24h)
-#   - zakura-image-bake droplets older than 6h (failed bakes)
+#   - zakura-image-bake droplets older than 10h (failed bakes)
 #   - detached zakura-pr-* volumes older than 2h (run/bake leftovers)
 #   - zakura-pr-node-* images beyond the newest 2
 #   - mainnet/testnet state snapshots beyond their retention windows, while
@@ -67,7 +67,7 @@ jobs:
             done
           }
           reap_tag zakura-pr-node    $(( MAX_AGE_HOURS * 3600 ))
-          reap_tag zakura-image-bake $(( 6 * 3600 ))
+          reap_tag zakura-image-bake $(( 10 * 3600 ))
           # Mempool-load droplets normally tear themselves down at the end of
           # the run; this is the backstop for a cancelled or crashed job.
           reap_tag zakura-mempool-load $(( MAX_AGE_HOURS * 3600 ))
@@ -99,81 +99,31 @@ jobs:
           done
 
       - name: Prune old images and volume snapshots
+        id: artifacts
         run: |
           set -euo pipefail
-          doctl compute image list-user --format ID,Name --no-header | \
-            awk '$2 ~ /^zakura-pr-node-/ {print $2, $1}' | sort | head -n -2 | \
-            while read -r name id; do
-              echo "deleting image $name (id $id)"
-              doctl compute image delete "$id" -f || true
-            done
           MAINNET_C=$(tail -1 crates/zakura-chain/src/parameters/checkpoint/main-checkpoints.txt | cut -d' ' -f1)
-          [[ "$MAINNET_C" =~ ^[0-9]+$ ]] || {
-            echo "could not determine the current Mainnet handoff height" >&2
-            exit 1
-          }
-          for NET in mainnet testnet; do
-            case "$NET" in
-              mainnet) KEEP=6 ;;
-              testnet) KEEP=3 ;;
-            esac
-            SNAPSHOTS=$(mktemp)
-            KEEP_NAMES=$(mktemp)
-            doctl compute snapshot list --resource volume --format ID,Name --no-header | \
-              awk -v pre="zakura-pr-state-${NET}-" 'index($2, pre) == 1 {print $2, $1}' | \
-              sort > "$SNAPSHOTS"
-            tail -n "$KEEP" "$SNAPSHOTS" | awk '{print $1}' > "$KEEP_NAMES"
+          python3 .github/workflows/scripts/do_artifact_retention.py --checkpoint "$MAINNET_C" --apply
 
-            # This dynamically pins one approach snapshot. When checkpoints
-            # advance, the newest retained snapshot below the new handoff
-            # replaces the old pin without duplicating the large volume.
-            if [ "$NET" = "mainnet" ]; then
-              PINNED_NAME=""
-              while read -r name _id; do
-                height=$(printf '%s' "$name" | sed -n 's/.*-h\([0-9][0-9]*\)$/\1/p')
-                if [ -n "$height" ] && [ "$height" -lt "$MAINNET_C" ]; then
-                  PINNED_NAME="$name"
-                fi
-              done < "$SNAPSHOTS"
-              if [ -n "$PINNED_NAME" ]; then
-                echo "$PINNED_NAME" >> "$KEEP_NAMES"
-                echo "pinning Mainnet approach snapshot $PINNED_NAME below handoff $MAINNET_C"
-              else
-                APPROACH_AVAILABLE=false
-                while read -r name _id; do
-                  height=$(printf '%s' "$name" | sed -n 's/.*-h\([0-9][0-9]*\)$/\1/p')
-                  if [ -n "$height" ] && [ "$height" -lt "$MAINNET_C" ]; then
-                    APPROACH_AVAILABLE=true
-                  fi
-                done < <(
-                  doctl compute snapshot list --resource volume --format ID,Name --no-header | \
-                    awk '$2 ~ /^zakura-vct-approach-mainnet-/ {print $2, $1}'
-                )
-                if [ "$APPROACH_AVAILABLE" != "true" ]; then
-                  LEGACY_NAME=$(awk '$1 !~ /-h[0-9]+$/ { print $1; exit }' "$SNAPSHOTS")
-                  if [ -n "$LEGACY_NAME" ]; then
-                    echo "$LEGACY_NAME" >> "$KEEP_NAMES"
-                    echo "pinning transition snapshot $LEGACY_NAME until a verified approach exists"
-                  else
-                    echo "::warning::no Mainnet snapshot exists below handoff $MAINNET_C"
-                  fi
-                fi
-              fi
-            fi
-
-            while read -r name id; do
-              if awk -v name="$name" '$0 == name { found=1 } END { exit !found }' "$KEEP_NAMES"; then
-                continue
-              fi
-                echo "deleting volume snapshot $name (id $id)"
-                doctl compute snapshot delete "$id" -f || true
-            done < "$SNAPSHOTS"
-            rm -f "$SNAPSHOTS" "$KEEP_NAMES"
-          done
-          doctl compute snapshot list --resource volume --format ID,Name --no-header | \
-            awk '$2 ~ /^zakura-vct-approach-mainnet-/ {print $2, $1}' | \
-            sort | head -n -2 | \
-            while read -r name id; do
-              echo "deleting old VCT approach snapshot $name (id $id)"
-              doctl compute snapshot delete "$id" -f || true
-            done
+      - name: Report stale regional images once daily
+        if: >-
+          github.event_name == 'schedule'
+          && steps.artifacts.outputs.notify_stale == 'true'
+          && steps.artifacts.outputs.stale_regions != ''
+        env:
+          SLACK_WEB_HOOK: ${{ secrets.SLACK_WEB_HOOK }}
+          REGIONS: ${{ steps.artifacts.outputs.stale_regions }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'PYTHON'
+          import json
+          import os
+          import urllib.request
+          text = ("Zakura CI images missing or older than 14 days in " + os.environ["REGIONS"]
+              + ". Repair the regional bake. " + os.environ["RUN_URL"])
+          request = urllib.request.Request(os.environ["SLACK_WEB_HOOK"],
+              data=json.dumps({"text": text}).encode(), headers={"Content-Type": "application/json"})
+          with urllib.request.urlopen(request, timeout=8) as response:
+              if response.read().decode().strip() != "ok":
+                  raise SystemExit("Slack did not acknowledge the stale-image alert")
+          PYTHON

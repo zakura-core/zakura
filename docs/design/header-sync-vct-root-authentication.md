@@ -1052,13 +1052,16 @@ Body commit exposes the consequences of insufficient lead:
   present in the authenticated index;
 - `state.vct.root.await_successor.count`: the root existed but lacked its
   authenticated successor witness;
-- `state.vct.root.retry.count`: write-loop retry polls. One stall can
-  increment this many times, so use it as a rate rather than an incident
-  count;
+- `state.vct.root.retry.count`: parked-block retry attempts. Missing-root
+  repair uses insertion wakeups instead of a periodic poll;
+- `state.vct.root.wait.seconds`: time a block waits for VCT metadata;
 - `state.vct.root.stalled.height`: zero normally; after a prolonged retry
   episode it contains the blocked body height;
 - `state.vct.root.repair.requested`: bounded repair requests sent back to
   header sync;
+- `sync.header.vct.repair.requested.headers` and
+  `sync.header.vct.repair.admitted.headers`: requested and admitted repair
+  volume;
 - `state.vct.fast_path.hit` and `state.vct.fast_path.miss`: whether finalized
   body commits used the authenticated-root fast path.
 

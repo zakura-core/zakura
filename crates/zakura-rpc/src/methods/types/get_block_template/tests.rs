@@ -24,7 +24,86 @@ use zakura_chain::{
 use crate::client::TransactionTemplate;
 use crate::config::mining::{default_miner_address, MinerAddressType};
 
-use super::MinerParams;
+use super::{MinerParams, TemplatePreparationQueue};
+
+#[test]
+fn template_rejection_targets_work_and_ignores_old_parents() {
+    let parent = zakura_chain::block::Hash([1; 32]);
+    let next_parent = zakura_chain::block::Hash([2; 32]);
+    let mut state = super::TemplateRejections::default();
+    state.set_parent(parent);
+    state.mark_prepared(parent, "new");
+    assert!(state.reject(parent, "old"));
+    assert!(state.contains("old"));
+    assert!(!state.contains("new"));
+    assert!(state.is_prepared("new"));
+    assert!(!state.is_prepared("unknown"));
+    assert!(!state.withdrawn("new"));
+    assert!(state.withdrawn("unknown"));
+    assert!(!state.reject(parent, "old"));
+    assert_eq!(state.revision, 1);
+    state.set_parent(next_parent);
+    assert!(!state.needs_fallback());
+    assert!(!state.is_prepared("new"));
+    assert!(!state.reject(parent, "late"));
+    assert_eq!(state.revision, 1);
+    assert!(state.reject(next_parent, "new"));
+    assert_eq!(state.revision, 2);
+}
+
+#[test]
+fn template_rejection_storage_fails_closed_at_capacity() {
+    let parent = zakura_chain::block::Hash([1; 32]);
+    let mut state = super::TemplateRejections::default();
+    state.set_parent(parent);
+    for id in 0..100 {
+        state.reject(parent, &id.to_string());
+    }
+    assert_eq!(state.rejected.len(), 64);
+    assert!(state.contains("unknown"));
+    assert!(state.needs_fallback());
+}
+
+#[test]
+fn prepared_template_tracking_keeps_new_recovery_work_at_capacity() {
+    let parent = zakura_chain::block::Hash([1; 32]);
+    let mut state = super::TemplateRejections::default();
+    state.set_parent(parent);
+    state.reject(parent, "invalid");
+    for id in 0..100 {
+        state.mark_prepared(parent, &id.to_string());
+    }
+    assert_eq!(state.prepared.len(), 64);
+    assert!(!state.withdrawn("99"));
+    assert!(state.withdrawn("0"));
+}
+
+#[tokio::test]
+async fn template_rejection_retains_notifications_for_late_subscribers() {
+    let parent = zakura_chain::block::Hash([1; 32]);
+    let mut state = super::TemplateRejections::default();
+    state.set_parent(parent);
+    let sender = tokio::sync::watch::channel(state).0;
+    let mut early = sender.subscribe();
+    sender.send_if_modified(|state| state.reject(parent, "work"));
+    tokio::time::timeout(std::time::Duration::from_secs(1), early.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(early.borrow_and_update().contains("work"));
+    assert!(sender.subscribe().borrow().contains("work"));
+}
+
+#[test]
+fn template_preparation_queue_keeps_the_latest_pending_template() {
+    let queue = TemplatePreparationQueue::<u8>::default();
+
+    assert_eq!(queue.enqueue(1), Some(1));
+    assert_eq!(queue.enqueue(2), None);
+    assert_eq!(queue.enqueue(3), None);
+    assert_eq!(queue.next_or_finish(), Some(3));
+    assert_eq!(queue.next_or_finish(), None);
+}
 
 /// Tests transparent coinbase generation at every configured Sapling-and-later
 /// network upgrade activation.

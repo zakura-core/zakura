@@ -385,6 +385,7 @@ jobs:
         run: echo "name=release/checkpoint-update-$(date -u +%F)" >> "$GITHUB_OUTPUT"
 
       - name: Open or update the draft pull request
+        id: pull-request
         if: steps.import.outputs.has_changes == 'true'
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 #v8.1.1
         with:
@@ -403,13 +404,28 @@ jobs:
             - Frontier grid: `${{ needs.publish-assets.outputs.crate_name }} ${{ needs.publish-assets.outputs.crate_version }}`, ${{ steps.import.outputs.frontier_grid_entries }} entries, SHA-256 `${{ steps.import.outputs.frontier_grid_sha256 }}`
 
             The checkpoint diff is append-only over the committed list, the frontier grid extends the previously published one byte for byte, and CI re-derives the provenance digests from the embedded data on every PR. Review before merging: checkpoints are consensus-critical, so spot-check a few new heights and the terminal hash against an independent node or explorer.
-          # `A-release-state` marks this as an automated release-state refresh rather than the
-          # release PR itself, so the changelog gate does not require it to consume every
-          # pending fragment. `A-release` stays for the release CI paths.
-          labels: |
-            A-release
-            A-release-state
           commit-message: "chore(chain): update Mainnet release state"
           sign-commits: true
           draft: always-true
           delete-branch: true
+
+      - name: Add missing release labels once
+        if: steps.pull-request.outputs.pull-request-number != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pull-request.outputs.pull-request-number }}
+        run: |
+          python3 - <<'PYTHON'
+          import json
+          import os
+          import subprocess
+          number = os.environ["PR_NUMBER"]
+          result = subprocess.run(["gh", "pr", "view", number, "--json", "labels"],
+              check=True, capture_output=True, text=True, timeout=30)
+          existing = {label["name"] for label in json.loads(result.stdout)["labels"]}
+          missing = [label for label in ("A-release", "A-release-state") if label not in existing]
+          if missing:
+              subprocess.run(["gh", "pr", "edit", number, "--add-label", ",".join(missing)],
+                  check=True, timeout=30)
+          PYTHON

@@ -158,9 +158,34 @@ pub(super) fn admit_prepared_headers(
                 )
                 .into());
             }
-            if event.batch.headers().len() != 1
-                || event.aux.len() != 1
-                || event.aux[0].tree_aux.is_none()
+            // The selected projection is ordered by height, so the repair range must occupy one
+            // contiguous slice of it. Locating that slice once keeps the check linear in the
+            // repair range instead of scanning the whole projection for every repaired header.
+            let repair_range: Vec<_> = event
+                .batch
+                .headers()
+                .iter()
+                .map(|header| Frontier::new(header.height, header.hash))
+                .collect();
+            let selected_range_matches = repair_range.first().is_some_and(|first| {
+                event_context
+                    .old_selected
+                    .binary_search_by_key(&first.height, |frontier| frontier.height)
+                    .is_ok_and(|start| {
+                        event_context
+                            .old_selected
+                            .get(start..start.saturating_add(repair_range.len()))
+                            == Some(repair_range.as_slice())
+                    })
+            });
+            if event.batch.headers().is_empty()
+                || event.aux.len() != event.batch.headers().len()
+                || event.aux.iter().any(|delivery| delivery.tree_aux.is_none())
+                || event
+                    .aux
+                    .iter()
+                    .zip(event.batch.headers())
+                    .any(|(delivery, header)| delivery.header_hash != header.hash)
                 || selected_target != parent
                 || event.owner.header_authority().branch.target_tip_hash
                     != event_context
@@ -168,12 +193,7 @@ pub(super) fn admit_prepared_headers(
                         .frontiers
                         .header_best
                         .hash
-                || event_context
-                    .old_selected
-                    .iter()
-                    .find(|frontier| frontier.height == selected_target.height)
-                    .map(|frontier| frontier.hash)
-                    != Some(selected_target.hash)
+                || !selected_range_matches
                 || projected.graph().view_header_ancestor(
                     event.owner.header_authority().branch.target_tip_hash,
                     selected_target.height,
@@ -210,6 +230,8 @@ pub(super) fn admit_prepared_headers(
         .map(|header| (header.hash, header.height))
         .collect();
     let mut delivery_ids = HashSet::new();
+    let mut admitted_semantic_payloads = HashSet::new();
+    let mut admitted_root_sources = HashSet::new();
     for delivery in &event.aux {
         let expected_height = batch_headers.get(&delivery.header_hash).copied();
         if !delivery_ids.insert(delivery.delivery_id)
@@ -245,7 +267,29 @@ pub(super) fn admit_prepared_headers(
                 .into());
             }
         }
+        let semantic_fingerprint = delivery.semantic_fingerprint();
+        let semantic_payload_exists = admitted_semantic_payloads
+            .contains(&(delivery.header_hash, semantic_fingerprint))
+            || engine
+                .aux_deliveries(delivery.header_hash)
+                .iter()
+                .any(|existing| existing.semantic_fingerprint() == semantic_fingerprint);
+        let rooted_source_exists = delivery.tree_aux.is_some()
+            && (admitted_root_sources.contains(&(delivery.header_hash, delivery.source))
+                || engine
+                    .aux_deliveries(delivery.header_hash)
+                    .iter()
+                    .any(|existing| {
+                        existing.tree_aux.is_some() && existing.source == delivery.source
+                    }));
+        if semantic_payload_exists || rooted_source_exists {
+            continue;
+        }
         projected.record_aux_delivery(*delivery)?;
+        admitted_semantic_payloads.insert((delivery.header_hash, semantic_fingerprint));
+        if delivery.tree_aux.is_some() {
+            admitted_root_sources.insert((delivery.header_hash, delivery.source));
+        }
     }
     Ok(())
 }

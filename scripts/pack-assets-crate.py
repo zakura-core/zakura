@@ -234,7 +234,7 @@ def _self_test() -> int:
             (self.crate / "src").mkdir(parents=True)
             (self.crate / "Cargo.toml").write_text(
                 '[package]\nname = "example-assets"\nversion = "0.0.0"\n'
-                'rust-version = "1.91"\n',
+                'rust-version = "1.97"\n',
                 encoding="utf-8",
             )
             self.grid_path = Path(self.temp.name) / GRID_NAME
@@ -259,7 +259,7 @@ def _self_test() -> int:
             )
             # The stamp must not disturb the neighbouring rust-version key.
             self.assertIn(
-                'rust-version = "1.91"',
+                'rust-version = "1.97"',
                 (self.crate / "Cargo.toml").read_text(encoding="utf-8"),
             )
 

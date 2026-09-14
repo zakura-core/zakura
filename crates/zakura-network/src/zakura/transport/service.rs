@@ -1,6 +1,13 @@
 //! Zakura protocol service trait surface.
 
-use std::{collections::HashMap, fmt, future::Future, net::IpAddr, pin::Pin, time::Instant};
+use std::{
+    collections::HashMap,
+    fmt,
+    future::Future,
+    net::IpAddr,
+    pin::Pin,
+    time::{Duration, Instant},
+};
 
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -20,41 +27,41 @@ pub type BoxRunFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum StreamMode {
     /// A long-lived ordered stream between connected peers.
-    Ordered,
+    Persistent,
     /// A short-lived request/response stream opened per request.
     RequestResponse,
 }
 
-/// Which endpoint may proactively open an ordered service stream.
+/// Which endpoint may proactively open a service session.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum OrderedStreamOpening {
+pub enum SessionOpening {
     /// Only the endpoint that initiated the authenticated connection opens the stream.
     InitiatorOnly,
     /// Either endpoint may open the stream; simultaneous opens use the transport tiebreak.
     EitherSide,
 }
 
-/// Static transport policy for one ordered service stream.
+/// Static transport policy for one persistent service session.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct OrderedStreamPolicy {
+pub struct SessionPolicy {
     /// Which endpoint may proactively open the stream.
-    pub opening: OrderedStreamOpening,
+    pub opening: SessionOpening,
     /// Whether a locally ended session may be re-admitted on the same connection.
     pub reopen: bool,
 }
 
-impl Default for OrderedStreamPolicy {
+impl Default for SessionPolicy {
     fn default() -> Self {
         Self {
-            opening: OrderedStreamOpening::InitiatorOnly,
+            opening: SessionOpening::InitiatorOnly,
             reopen: false,
         }
     }
 }
 
-/// A service's current decision for an absent ordered session.
-pub enum OrderedSessionDemand {
-    /// Open and admit the ordered stream now.
+/// A service's current decision for an absent service session.
+pub enum SessionDemand {
+    /// Open and admit the complete session now.
     OpenNow,
     /// Re-check demand at this instant.
     RetryAt(Instant),
@@ -64,7 +71,7 @@ pub enum OrderedSessionDemand {
     Retire,
 }
 
-impl fmt::Debug for OrderedSessionDemand {
+impl fmt::Debug for SessionDemand {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::OpenNow => formatter.write_str("OpenNow"),
@@ -90,7 +97,29 @@ pub struct Stream {
     pub mode: StreamMode,
 }
 
-/// Transport state for one ordered service stream.
+/// A persistent stream's write deadline within its service session.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum StreamWritePolicy {
+    /// Retire the session if a complete frame cannot be written within this time.
+    Timeout(Duration),
+    /// Let the service's progress policy or session cancellation end the wait.
+    UntilCancelled,
+}
+
+/// A service slot held from session setup through the last transport and
+/// application sender owner. The service can release its setup allowance once
+/// all members are ready, while retaining its session allowance through teardown.
+pub trait SessionResources: fmt::Debug + Send + Sync {
+    /// All required streams have completed setup. Called once per session.
+    fn admitted(&self);
+}
+
+/// The service has no capacity for another establishing or retiring session.
+#[derive(Debug, Error)]
+#[error("service session capacity is full")]
+pub struct SessionFull;
+
+/// Transport state for one persistent stream within a service session.
 #[derive(Debug)]
 pub(crate) struct ServiceStream {
     pub(crate) session_id: u64,
@@ -285,14 +314,14 @@ impl Peer {
         }
     }
 
-    /// Take ownership of a stream pair for `kind`.
+    /// Take ownership of a stream's receive and send handles for `kind`.
     pub fn take_stream(&mut self, kind: u16) -> Option<(FramedRecv, FramedSend)> {
         self.streams
             .remove(&kind)
             .map(|stream| (stream.recv, stream.send))
     }
 
-    /// Take ownership of a stream pair and its owning ordered-stream generation.
+    /// Take ownership of a stream's receive and send handles and its owning session identity.
     pub fn take_stream_with_session_id(
         &mut self,
         kind: u16,
@@ -302,7 +331,7 @@ impl Peer {
             .map(|stream| (stream.session_id, stream.recv, stream.send))
     }
 
-    /// Take ownership of a stream pair, its version, and ordered-stream generation.
+    /// Take ownership of a stream's receive and send handles, its version, and session identity.
     pub fn take_versioned_stream_with_session_id(
         &mut self,
         kind: u16,
@@ -364,34 +393,96 @@ pub trait Service: fmt::Debug + Send + Sync + 'static {
     /// Stable service name for logs and diagnostics.
     fn name(&self) -> &'static str;
 
-    /// Streams this service owns.
+    /// Stream types this service owns.
+    ///
+    /// Persistent streams with the same capability form one complete session
+    /// layout. The transport admits every member together and retires the
+    /// session when any member ends. Request/response streams open per request
+    /// and do not participate in session setup.
+    ///
+    /// Alternative layouts use distinct capabilities and the same lowest stream
+    /// kind. That stream's version ranks complete layouts during negotiation.
+    /// Advance its version whenever the session layout changes.
     fn streams(&self) -> &[Stream];
 
-    /// Return the transport-owned opening and re-admission policy for `kind`.
+    /// Payload size limits for this stream, as `(message_type, maximum_bytes)` pairs.
     ///
-    /// The default preserves the legacy one-shot initiator-opens behavior.
-    fn ordered_stream_policy(&self, _kind: u16) -> OrderedStreamPolicy {
-        OrderedStreamPolicy::default()
+    /// The reader checks these limits before allocating a payload. Limits exclude
+    /// the frame header and may only tighten the stream's existing cap. Unlisted
+    /// message types keep that cap; message validity is checked by the codec.
+    fn message_payload_limits(&self, _stream: Stream) -> &'static [(u16, usize)] {
+        &[]
     }
 
-    /// Return this service's current demand for an absent ordered session.
+    /// Optional message types accepted on this role. The transport rejects an
+    /// unlisted type from its header, before allocating or reading its payload.
+    fn message_types(&self, _stream: Stream) -> Option<&'static [u16]> {
+        None
+    }
+
+    /// Optional per-stream inbound and outbound application queue limits.
+    /// The transport also applies its connection-wide inbound queue allowance.
+    fn stream_queue_depths(&self, _stream: Stream) -> Option<(usize, usize)> {
+        None
+    }
+
+    /// Reserve service capacity before starting a persistent session. The returned
+    /// owner lives through incomplete setup and all workers' eventual teardown.
+    fn reserve_session(
+        &self,
+        _direction: ServicePeerDirection,
+    ) -> Result<Option<std::sync::Arc<dyn SessionResources>>, SessionFull> {
+        Ok(None)
+    }
+
+    /// Control writes independently for each persistent stream.
     ///
-    /// Services that opt into [`OrderedStreamPolicy::reopen`] should override
+    /// Services that allow indefinite writes must enforce their own bounded
+    /// progress policy. Cancelling the session always interrupts a pending write.
+    fn stream_write_policy(&self, _stream: Stream) -> StreamWritePolicy {
+        StreamWritePolicy::Timeout(Duration::from_secs(10))
+    }
+
+    /// Return the opening and re-admission policy for the whole service session.
+    ///
+    /// The default preserves the legacy one-shot initiator-opens behavior.
+    fn session_policy(&self) -> SessionPolicy {
+        SessionPolicy::default()
+    }
+
+    /// Return this service's current demand for an absent service session.
+    ///
+    /// Services that opt into [`SessionPolicy::reopen`] should override
     /// this method so local cooldowns, capacity, and usefulness remain
-    /// reactor-owned. [`OrderedSessionDemand::WaitForChange`] avoids periodic
+    /// reactor-owned. [`SessionDemand::WaitForChange`] avoids periodic
     /// transport polling while the service is full or has no useful work.
-    fn ordered_session_demand(
+    fn session_demand(
         &self,
         _conn_id: ZakuraConnId,
         peer: &ZakuraPeerId,
         negotiated: u64,
         direction: ServicePeerDirection,
-    ) -> OrderedSessionDemand {
+    ) -> SessionDemand {
         if self.wants_peer(peer, negotiated, direction) {
-            OrderedSessionDemand::OpenNow
+            SessionDemand::OpenNow
         } else {
-            OrderedSessionDemand::Retire
+            SessionDemand::Retire
         }
+    }
+
+    /// Recheck demand for a complete session that already owns its setup reservation.
+    ///
+    /// Services with session reservations must retain cooldown and usefulness
+    /// checks here without requiring capacity for a second reservation. The
+    /// default preserves ordinary demand checks for services without reservations.
+    fn reserved_session_demand(
+        &self,
+        conn_id: ZakuraConnId,
+        peer: &ZakuraPeerId,
+        negotiated: u64,
+        direction: ServicePeerDirection,
+    ) -> SessionDemand {
+        self.session_demand(conn_id, peer, negotiated, direction)
     }
 
     /// Return whether this service currently wants a new session for `peer`.

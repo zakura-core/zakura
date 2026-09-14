@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_in_result)]
 
 use crate::{
-    amount::{Amount, NegativeAllowed, NonNegative},
+    amount::{Amount, NegativeAllowed, NonNegative, MAX_MONEY},
     value_balance::{ValueBalance, ValueBalanceError},
 };
 
@@ -112,4 +112,74 @@ fn value_balance_bytes_report_invalid_tail_pool() {
         ValueBalance::<NonNegative>::from_bytes(&bytes[..47]),
         Err(ValueBalanceError::Unparsable)
     );
+}
+
+#[test]
+fn chain_pool_total_limit_includes_every_pool() {
+    let _init_guard = zakura_test::init();
+
+    // Every pool contributes to a total exactly at the cap.
+    let share = Amount::<NonNegative>::try_from(MAX_MONEY / 6).unwrap();
+    let at_cap = ValueBalance {
+        transparent: share,
+        sprout: share,
+        sapling: share,
+        orchard: share,
+        deferred: share,
+        ironwood: share,
+    };
+    assert_eq!(at_cap.total(), Ok(Amount::try_from(MAX_MONEY).unwrap()));
+    assert_eq!(
+        at_cap.add_chain_value_pool_change(ValueBalance::zero()),
+        Ok(at_cap)
+    );
+
+    let one = Amount::<NegativeAllowed>::try_from(1).unwrap();
+    let mut deferred_change = ValueBalance::zero();
+    deferred_change.set_deferred_amount(one);
+    for change in [
+        ValueBalance::from_transparent_amount(one),
+        ValueBalance::from_sprout_amount(one),
+        ValueBalance::from_sapling_amount(one),
+        ValueBalance::from_orchard_amount(one),
+        deferred_change,
+        ValueBalance::from_ironwood_amount(one),
+    ] {
+        // Every individual pool remains valid, but the combined total is one zatoshi over.
+        assert!(matches!(
+            at_cap.add_chain_value_pool_change(change),
+            Err(ValueBalanceError::Total(_))
+        ));
+        let below_cap = at_cap.add_chain_value_pool_change(-change).unwrap();
+        assert_eq!(
+            below_cap.total(),
+            Ok(Amount::try_from(MAX_MONEY - 1).unwrap())
+        );
+        assert_eq!(below_cap.add_chain_value_pool_change(change), Ok(at_cap));
+    }
+}
+
+#[test]
+fn chain_pool_transfer_at_total_limit_is_valid() {
+    let _init_guard = zakura_test::init();
+
+    let initial =
+        ValueBalance::from_transparent_amount(Amount::<NonNegative>::try_from(MAX_MONEY).unwrap());
+    let one = Amount::<NegativeAllowed>::try_from(1).unwrap();
+    let mut transfer = ValueBalance::from_transparent_amount(-one);
+    transfer.set_ironwood_value_balance(ValueBalance::from_ironwood_amount(one));
+    let updated = initial.add_chain_value_pool_change(transfer).unwrap();
+    assert_eq!(updated.total(), initial.total());
+    assert_eq!(updated.add_chain_value_pool_change(-transfer), Ok(initial));
+}
+
+#[test]
+fn total_sums_signed_balances_before_applying_the_constraint() {
+    let _init_guard = zakura_test::init();
+
+    let max = Amount::<NegativeAllowed>::try_from(MAX_MONEY).unwrap();
+    let mut balance = ValueBalance::from_transparent_amount(max);
+    balance.set_sprout_value_balance(ValueBalance::from_sprout_amount(max));
+    balance.set_ironwood_value_balance(ValueBalance::from_ironwood_amount(-max));
+    assert_eq!(balance.total(), Ok(max));
 }

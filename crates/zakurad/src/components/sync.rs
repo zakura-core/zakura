@@ -1681,10 +1681,7 @@ where
 
                         let refreshed =
                             timeout(SYNC_RESTART_DELAY, self.obtain_tips(checkpoint_bootstrap))
-                                .await
-                                .map_err(Into::into)
-                                // TODO: replace with flatten() when it stabilises (#70142)
-                                .and_then(convert::identity)?;
+                                .await;
 
                         // A refresh is not progress, even when it returns hashes.
                         //
@@ -1696,7 +1693,12 @@ where
                         // would refresh every `TIP_REFRESH_INTERVAL` instead of restarting the round
                         // and re-downloading. Only a completed block or a finished extension counts,
                         // which is what the arms below record.
-                        reserve.extend(refreshed);
+                        match refreshed {
+                            Ok(hashes) => reserve.extend(hashes?),
+                            Err(_) => info!(
+                                "tip refresh timed out while blocks remain in flight; retrying"
+                            ),
+                        }
                         self.update_metrics();
                     }
                 }

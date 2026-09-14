@@ -260,7 +260,7 @@ impl SyncCoordinator {
         }
         let raw_id = self
             .next_operation_id
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::SeqCst,
                 std::sync::atomic::Ordering::SeqCst,
                 |id| id.checked_add(1),

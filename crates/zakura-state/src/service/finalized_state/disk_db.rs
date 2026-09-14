@@ -17,7 +17,7 @@ use std::{
     ops::RangeBounds,
     path::Path,
     sync::{
-        atomic::{self, AtomicBool},
+        atomic::{self, AtomicBool, AtomicU64},
         Arc,
     },
 };
@@ -27,7 +27,9 @@ use rlimit::increase_nofile_limit;
 
 use rocksdb::{ColumnFamilyDescriptor, ErrorKind, Options, ReadOptions};
 use semver::Version;
-use zakura_chain::{parameters::Network, primitives::byte_array::increment_big_endian};
+use zakura_chain::{
+    block::Height, parameters::Network, primitives::byte_array::increment_big_endian,
+};
 
 use crate::{
     database_format_version_on_disk,
@@ -136,6 +138,12 @@ pub struct DiskDb {
     //
     // Everything contained in this state must be shared by all clones, or read-only.
     //
+    /// Database startup and each metrics export update this cached disk size.
+    cached_size: Arc<AtomicU64>,
+
+    /// Durable body floor, published before a successful write returns to its caller.
+    retained_block_height: tokio::sync::watch::Sender<Height>,
+
     /// The shared inner RocksDB database.
     ///
     /// RocksDB allows reads and writes via a shared reference.
@@ -705,15 +713,21 @@ impl DiskDb {
         let mut total_disk: u64 = 0;
         let mut total_live: u64 = 0;
         let mut total_mem: u64 = 0;
+        let mut measured_column_family = false;
+        let mut complete_disk_measurement = true;
 
         for cf_descriptor in column_families {
             let cf_name = cf_descriptor.name().to_string();
             if let Some(cf_handle) = db.cf_handle(&cf_name) {
-                let disk = db
-                    .property_int_value_cf(cf_handle, "rocksdb.total-sst-files-size")
-                    .ok()
-                    .flatten()
-                    .unwrap_or(0);
+                measured_column_family = true;
+                let disk = match db.property_int_value_cf(cf_handle, "rocksdb.total-sst-files-size")
+                {
+                    Ok(Some(disk)) => disk,
+                    _ => {
+                        complete_disk_measurement = false;
+                        0
+                    }
+                };
                 let live = db
                     .property_int_value_cf(cf_handle, "rocksdb.estimate-live-data-size")
                     .ok()
@@ -733,10 +747,16 @@ impl DiskDb {
                     .set(disk as f64);
                 metrics::gauge!("zakura.state.rocksdb.cf_memory_size_bytes", "cf" => cf_name)
                     .set(mem as f64);
+            } else {
+                complete_disk_measurement = false;
             }
         }
 
         metrics::gauge!("zakura.state.rocksdb.total_disk_size_bytes").set(total_disk as f64);
+        if measured_column_family && complete_disk_measurement {
+            self.cached_size
+                .store(total_disk, atomic::Ordering::Relaxed);
+        }
         metrics::gauge!("zakura.state.rocksdb.live_data_size_bytes").set(total_live as f64);
         metrics::gauge!("zakura.state.rocksdb.total_memory_size_bytes").set(total_mem as f64);
 
@@ -765,23 +785,43 @@ impl DiskDb {
 
     /// Returns the estimated total disk space usage of the database.
     pub fn size(&self) -> u64 {
+        self.measure_size().0
+    }
+
+    /// Returns the most recently cached disk space estimate.
+    pub(crate) fn cached_size(&self) -> u64 {
+        self.cached_size.load(atomic::Ordering::Relaxed)
+    }
+
+    /// Refreshes the cached estimate of the database's disk usage.
+    fn refresh_cached_size(&self) {
+        let (size, complete) = self.measure_size();
+        if complete {
+            self.cached_size.store(size, atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Measures the estimated disk usage and reports whether every property was available.
+    fn measure_size(&self) -> (u64, bool) {
         let db: &Arc<DB> = &self.db;
         let db_options = DiskDb::options();
         let mut total_size_on_disk = 0;
+        let mut measured_column_family = false;
+        let mut complete = true;
         for cf_descriptor in DiskDb::construct_column_families(db_options, db.path(), [], false) {
             let cf_name = &cf_descriptor.name();
             let cf_handle = db
                 .cf_handle(cf_name)
-                .expect("Column family handle must exist");
+                .expect("column family handle exists because RocksDB opened every descriptor");
+            measured_column_family = true;
 
-            total_size_on_disk += db
-                .property_int_value_cf(cf_handle, "rocksdb.total-sst-files-size")
-                .ok()
-                .flatten()
-                .unwrap_or(0);
+            match db.property_int_value_cf(cf_handle, "rocksdb.total-sst-files-size") {
+                Ok(Some(size)) => total_size_on_disk += size,
+                _ => complete = false,
+            }
         }
 
-        total_size_on_disk
+        (total_size_on_disk, measured_column_family && complete)
     }
 
     /// Sets `finished_format_upgrades` to true to indicate that Zebra has
@@ -799,7 +839,9 @@ impl DiskDb {
 
     /// When called with a secondary DB instance, tries to catch up with the primary DB instance
     pub fn try_catch_up_with_primary(&self) -> Result<(), rocksdb::Error> {
-        self.db.try_catch_up_with_primary()
+        self.db.try_catch_up_with_primary()?;
+        self.publish_retained_block_height();
+        Ok(())
     }
 
     /// Compact the given key range in `cf`, including `from` and excluding
@@ -1177,9 +1219,13 @@ impl DiskDb {
                     db: Arc::new(db),
                     _secondary_dir: secondary_dir,
                     finished_format_upgrades: Arc::new(AtomicBool::new(false)),
+                    cached_size: Arc::new(AtomicU64::new(0)),
+                    retained_block_height: tokio::sync::watch::channel(Height::MIN).0,
                 };
 
+                db.publish_retained_block_height();
                 db.assert_default_cf_is_empty();
+                db.refresh_cached_size();
 
                 Ok(db)
             }
@@ -1356,9 +1402,37 @@ impl DiskDb {
     // Write methods
     // Low-level write methods are located in the WriteDisk trait
 
-    /// Writes `batch` to the database.
+    /// Writes `batch` to the database and publishes its retained-body floor.
+    /// Body pruning must use this path so the floor is visible before callers publish a new tip.
     pub(crate) fn write(&self, batch: DiskWriteBatch) -> Result<(), rocksdb::Error> {
-        self.db.write(batch.batch)
+        self.db.write(batch.batch)?;
+        // Header/full-state callers publish their new tip after this returns.
+        // Publishing the floor first prevents a new tip using the previous floor.
+        self.publish_retained_block_height();
+        Ok(())
+    }
+
+    pub(super) fn lowest_retained_height(&self) -> Option<Height> {
+        let metadata = self.cf_handle(super::PRUNING_METADATA)?;
+        self.zs_get(&metadata, &())
+    }
+
+    pub(super) fn subscribe_retained_block_height(&self) -> tokio::sync::watch::Receiver<Height> {
+        self.retained_block_height.subscribe()
+    }
+
+    fn publish_retained_block_height(&self) {
+        // Read under the publication lock so concurrent writers cannot publish
+        // an older observation after a newer one. Offline pruning can also lower
+        // a stale marker when older bodies still exist.
+        self.retained_block_height.send_if_modified(|current| {
+            let retained = self.lowest_retained_height().unwrap_or(Height::MIN);
+            if *current == retained {
+                return false;
+            }
+            *current = retained;
+            true
+        });
     }
 
     /// Flushes pending writes to SST files.

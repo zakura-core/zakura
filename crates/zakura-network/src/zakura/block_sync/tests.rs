@@ -1,3 +1,5 @@
+mod retention;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future,
@@ -18,8 +20,8 @@ use super::{
     },
     peer_registry::{OutstandingMeta, PeerRegistry},
     reactor::{
-        node_id_from_block_peer_id, EMPTY_STATE_HEADER_QUIET_MIN_LAG,
-        EMPTY_STATE_HEADER_QUIET_PERIOD,
+        node_id_from_block_peer_id, BS_ACTION_CONTROL_RESERVE, EMPTY_STATE_HEADER_QUIET_MIN_LAG,
+        EMPTY_STATE_HEADER_QUIET_PERIOD, NEEDED_BLOCK_QUERY_RETRY_DELAY,
     },
     reorder::*,
     request::*,
@@ -28,12 +30,12 @@ use super::{
     state::*,
     work_queue::WorkQueue,
 };
-use crate::zakura::OrderedSessionDemand;
 use crate::zakura::{
     framed_channel,
     testkit::{await_until, TraceCapture, TraceValue},
-    FramedRecv, FramedSend, Peer, Service, ServicePeerSnapshot, ServiceRegistry, StreamMode,
-    ZakuraBlockSyncCandidateState,
+    trace::BlockBodySource,
+    FramedRecv, FramedSend, Peer, Service, ServicePeerSnapshot, ServiceRegistry, SessionDemand,
+    StreamMode, ZakuraBlockSyncCandidateState,
 };
 use zakura_chain::{
     fmt::HexDebug,
@@ -1118,6 +1120,8 @@ fn window_request(height: u32) -> OutstandingBlockRange {
     let byte = u8::try_from(height).expect("test heights fit in u8");
     let now = Instant::now();
     OutstandingBlockRange {
+        write_status: work_queue::RequestWriteStatus::written_for_tests(),
+        charged_for_liveness: true,
         request: BlockRangeRequest {
             owner: test_work_owner(),
             start_height: block::Height(height),
@@ -1142,6 +1146,8 @@ fn window_request_range(start: u32, count: u32) -> OutstandingBlockRange {
     let byte = u8::try_from(start).expect("test heights fit in u8");
     let now = Instant::now();
     OutstandingBlockRange {
+        write_status: work_queue::RequestWriteStatus::written_for_tests(),
+        charged_for_liveness: true,
         request: BlockRangeRequest {
             owner: test_work_owner(),
             start_height: block::Height(start),
@@ -1371,7 +1377,7 @@ fn view_reset_reclears_probe_streak_so_unproven_peer_can_reprobe() {
     // A destructive reset returns the peer's outstanding to the queue on our
     // initiative, then runs the reset hook.
     window.outstanding.clear();
-    window.note_view_reset();
+    window.note_locally_returned_requests();
 
     // The peer can probe again (streak below the cap) and is not left as a zombie
     // (liveness cleared, so `check_liveness` is `Ok`, and proof state is untouched).
@@ -1409,7 +1415,7 @@ fn view_reset_preserves_proof_but_reclears_streak() {
     assert_eq!(window.no_progress_request_cap(), 8);
 
     window.outstanding.clear();
-    window.note_view_reset();
+    window.note_locally_returned_requests();
 
     assert_eq!(window.requests_without_block_progress, 0);
     assert!(
@@ -3091,6 +3097,134 @@ fn floor_watchdog_skips_received_heights() {
     assert_eq!(queue.advance_floor(block::Height(1)), 0);
 }
 
+#[tokio::test]
+async fn floor_watchdog_only_avoids_requests_that_started_writing() {
+    use super::work_queue::RequestWrite;
+    use crate::zakura::transport::FrameWriteClaim;
+
+    #[derive(Clone, Copy, Debug)]
+    enum WriteState {
+        Queued,
+        Started,
+        Written,
+        Dropped,
+    }
+
+    for write_state in [
+        WriteState::Queued,
+        WriteState::Started,
+        WriteState::Written,
+        WriteState::Dropped,
+    ] {
+        let config = immediate_body_download_config();
+        let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+        let startup = BlockSyncStartup::new(
+            BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(0),
+                verified_block_hash: block::Hash([0; 32]),
+            },
+            (block::Height(0), block::Hash([0; 32])),
+            tip_rx,
+            config.clone(),
+        );
+        let (handle, _actions, reactor_task) = spawn_block_sync_reactor(startup);
+        let wiring = handle.routine_wiring.as_ref().unwrap();
+        let now = Instant::now();
+        let mut generation = 0;
+        // Register three servable peers without routines, so only the running
+        // reactor can expire the claim and apply floor avoidance.
+        for id in 1..=3 {
+            let current = wiring
+                .registry
+                .admit_session(&peer(id), ServicePeerDirection::Outbound, &config, 0, now)
+                .generation();
+            wiring.registry.upsert_status(&peer(id), current, status());
+            if id == 1 {
+                generation = current;
+            }
+        }
+        assert_eq!(wiring.registry.floor_gap_servable(block::Height(1)).0, 3);
+        wiring.work.set_estimate_floor_for_tests(1);
+        wiring.work.extend(
+            test_work_scope(),
+            [(
+                block::Height(1),
+                block::Hash([1; 32]),
+                BlockSizeEstimate::Confirmed(100),
+            )],
+        );
+        let items = wiring.work.take_for_request(
+            block::Height(1),
+            block::Height(1),
+            1,
+            100,
+            generation,
+            std::num::NonZeroU64::new(1).unwrap(),
+        );
+        assert_eq!(items.len(), 1);
+        let owner = items[0].1.owner.unwrap();
+        assert!(wiring.budget.clone().try_reserve(100));
+        let write = RequestWrite::new(
+            owner,
+            items,
+            wiring.work.clone(),
+            wiring.budget.clone(),
+            CancellationToken::new(),
+        );
+        assert!(write.publish(|| {
+            wiring.registry.set_outstanding(
+                &peer(1),
+                generation,
+                BTreeMap::from([(
+                    block::Height(1),
+                    OutstandingMeta {
+                        owner,
+                        hash: block::Hash([1; 32]),
+                        estimated_bytes: 100,
+                        queued_at: now,
+                        deadline: now,
+                    },
+                )]),
+            );
+        }));
+        let started = matches!(write_state, WriteState::Started | WriteState::Written);
+        if started {
+            assert!(write.try_start());
+        }
+        if matches!(write_state, WriteState::Written) {
+            write.written();
+        }
+        let write_status = write.status();
+        let write = if matches!(write_state, WriteState::Dropped) {
+            drop(write);
+            None
+        } else {
+            Some(write)
+        };
+
+        await_until(
+            "watchdog settles the expired floor claim",
+            Duration::from_secs(2),
+            || wiring.registry.total_unreceived() == 0 && wiring.budget.reserved() == 0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(write_status.was_skipped(), !started, "{write_state:?}");
+        assert_eq!(wiring.work.reserved_bytes(), 0);
+        assert!(wiring.work.pending_contains(block::Height(1)));
+        assert_eq!(
+            wiring
+                .registry
+                .is_floor_height_avoided(&peer(1), block::Height(1), Instant::now()),
+            started,
+            "floor avoidance must reflect the settled write: {write_state:?}",
+        );
+        reactor_task.abort();
+        drop(write);
+    }
+}
+
 #[test]
 fn late_body_does_not_resurrect_charge() {
     let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Advertised(100))]);
@@ -4067,8 +4201,15 @@ async fn block_liveness_parks_silent_peer_and_traces_reason() {
 
 #[tokio::test]
 async fn late_unowned_body_is_rejected_and_the_session_is_parked() {
-    // A body cannot count as progress after its request ownership expires.
-    // Verify both the missing submission and the local park.
+    check_cold_probe_deadline(true).await;
+}
+
+#[tokio::test]
+async fn cold_probe_can_finish_after_the_short_floor_rescue_deadline() {
+    check_cold_probe_deadline(false).await;
+}
+
+async fn check_cold_probe_deadline(expired: bool) {
     let mut config = immediate_body_download_config();
     // Short request/floor-rescue leash so the probe times out fast; the liveness
     // deadline (request_timeout * 4 = 1.2s) is what a false disconnect would trip.
@@ -4138,12 +4279,10 @@ async fn late_unowned_body_is_rejected_and_the_session_is_parked() {
     assert_eq!(start_height, block::Height(1));
     assert_eq!(count, 1);
 
-    // Let that probe time out on the floor-rescue leash: height 1 returns to the
-    // queue and, being unproven, the peer is now gated at its one-probe cap.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // An unmeasured peer gets the normal deadline for its only probe. Deliver
+    // after the short rescue deadline, or after the normal deadline has expired.
+    tokio::time::sleep(Duration::from_millis(if expired { 500 } else { 200 })).await;
 
-    // The body arrives after retirement of its request owner.
-    // Do not submit it to the verifier or count it as timely progress.
     inbound_tx
         .send(
             BlockSyncMessage::Block(blocks[0].clone())
@@ -4153,20 +4292,27 @@ async fn late_unowned_body_is_rejected_and_the_session_is_parked() {
         .await
         .expect("late block frame queues");
 
-    assert!(
-        tokio::time::timeout(Duration::from_millis(200), async {
-            loop {
-                if matches!(
-                    next_action(&mut actions).await,
-                    BlockSyncAction::SubmitBlock { .. }
-                ) {
-                    break;
-                }
+    let submitted = tokio::time::timeout(Duration::from_millis(200), async {
+        loop {
+            if matches!(
+                next_action(&mut actions).await,
+                BlockSyncAction::SubmitBlock { .. }
+            ) {
+                break;
             }
-        })
-        .await
-        .is_err(),
-        "a completion whose request owner retired must not reach the verifier",
+        }
+    })
+    .await;
+    if !expired {
+        submitted.expect("the still-owned cold probe must reach the verifier");
+        assert_eq!(handle.peer_snapshot().outbound_peers, 1);
+        assert!(!connection_cancel.is_cancelled());
+        reactor_task.abort();
+        return;
+    }
+    assert!(
+        submitted.is_err(),
+        "a retired owner cannot reach the verifier"
     );
     await_until(
         "late unowned body does not prevent the session park",
@@ -5788,6 +5934,8 @@ fn outstanding_three_block_range(budget: &mut ByteBudget) -> OutstandingBlockRan
     assert!(budget.try_reserve(request.estimated_bytes));
     let now = Instant::now();
     OutstandingBlockRange {
+        write_status: work_queue::RequestWriteStatus::written_for_tests(),
+        charged_for_liveness: true,
         request,
         queued_at: now,
         deadline: now,
@@ -6184,6 +6332,8 @@ fn underestimated_body_is_buffered_and_releases_only_its_estimate() {
     assert!(budget.try_reserve(request.estimated_bytes));
     let now = Instant::now();
     let mut outstanding = OutstandingBlockRange {
+        write_status: work_queue::RequestWriteStatus::written_for_tests(),
+        charged_for_liveness: true,
         request,
         queued_at: now,
         deadline: now,
@@ -6232,7 +6382,7 @@ fn block_sync_stream_declares_kind_capability_version_and_frame_cap() {
     assert_eq!(stream.kind, ZAKURA_STREAM_BLOCK_SYNC);
     assert_eq!(stream.version, ZAKURA_BLOCK_SYNC_STREAM_VERSION);
     assert_eq!(stream.capability, ZAKURA_CAP_BLOCK_SYNC);
-    assert_eq!(stream.mode, StreamMode::Ordered);
+    assert_eq!(stream.mode, StreamMode::Persistent);
     assert_eq!(stream.frame_cap, MAX_BS_FRAME_BYTES);
 }
 
@@ -6255,14 +6405,14 @@ async fn service_registry_routes_block_sync_by_exact_capability_and_version() {
         .is_none());
     assert_eq!(
         registry
-            .ordered_streams_for_negotiated(ZAKURA_CAP_BLOCK_SYNC)
+            .persistent_streams_for_negotiated(ZAKURA_CAP_BLOCK_SYNC)
             .iter()
             .map(|stream| stream.kind)
             .collect::<Vec<_>>(),
         vec![ZAKURA_STREAM_BLOCK_SYNC]
     );
-    assert!(registry.ordered_streams_for_negotiated(0).is_empty());
-    assert!(registry.wants_ordered_stream(
+    assert!(registry.persistent_streams_for_negotiated(0).is_empty());
+    assert!(registry.wants_session(
         ZAKURA_STREAM_BLOCK_SYNC,
         ZAKURA_CAP_BLOCK_SYNC,
         &peer,
@@ -6422,12 +6572,14 @@ async fn lifecycle_events_bypass_full_bounded_wire_queue() {
         })
         .expect("test fills bounded wire queue");
     let (lifecycle, mut lifecycle_rx) = mpsc::unbounded_channel();
+    let (needed_query_failures, _needed_query_failure_rx) = mpsc::unbounded_channel();
     let (_peers_tx, peers) = watch::channel(ServicePeerSnapshot::new(0, 0, config.peer_limits));
     let (_status_tx, status) = watch::channel(config.initial_status());
     let (_candidates_tx, candidates) = watch::channel(ZakuraBlockSyncCandidateState::default());
     let handle = BlockSyncHandle {
         events,
         lifecycle,
+        needed_query_failures,
         peers,
         status,
         candidates,
@@ -6535,6 +6687,78 @@ async fn add_peer_decode_failure_reports_malformed_and_cancels_connection() {
 }
 
 #[tokio::test]
+async fn add_peer_connection_shutdown_cancels_pending_block_validation() {
+    use crate::zakura::transport::{OrderedStreamFailure, OrderedStreamFailureCause};
+
+    let config = ZakuraBlockSyncConfig::default();
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (block::Height(0), block::Hash([0; 32])),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, _actions, _reactor_task) = spawn_block_sync_reactor(startup);
+    let input = &handle.routine_wiring.as_ref().unwrap().sequencer_input;
+    let held_capacity: Vec<_> = (0..input.max_capacity())
+        .map(|_| input.clone().try_reserve_owned().unwrap())
+        .collect();
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (inbound_tx, inbound_rx) = framed_channel(4);
+    let (outbound_tx, _outbound_rx) = framed_channel(4);
+    let cause = OrderedStreamFailureCause::default();
+    let streams = HashMap::from([(
+        ZAKURA_STREAM_BLOCK_SYNC,
+        (inbound_rx.with_failure_cause(cause.clone()), outbound_tx),
+    )]);
+    let connection_cancel = CancellationToken::new();
+    let remote = Peer::new(
+        peer(3),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC,
+        streams,
+        connection_cancel.clone(),
+    );
+    let session_cancel = remote.service_cancel_token();
+    inbound_tx
+        .send(Frame {
+            message_type: u16::from(MSG_BS_BLOCK),
+            flags: 0,
+            payload: vec![MSG_BS_BLOCK],
+        })
+        .await
+        .unwrap();
+    service.add_peer(remote);
+    cause.record(OrderedStreamFailure::RemoteClose);
+    session_cancel.cancel();
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while inbound_tx.capacity() != inbound_tx.max_capacity() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the failed session takes its pending frame for validation");
+    assert_eq!(service.peer_count(), 1, "validation still owns the session");
+    assert!(!connection_cancel.is_cancelled());
+
+    connection_cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while service.peer_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("connection shutdown releases the session without decode capacity");
+    assert_eq!(input.capacity(), 0);
+    drop(held_capacity);
+}
+
+#[tokio::test]
 async fn registry_add_peer_requires_negotiated_block_sync_capability() {
     let (service, mut events) = BlockSyncService::new_for_test(ZakuraBlockSyncConfig::default());
     let registry = ServiceRegistry::new(vec![Arc::new(service)])
@@ -6628,7 +6852,7 @@ async fn wants_peer_rejects_when_configured_slot_cap_is_reached() {
 async fn reactor_drives_tip_to_getblocks_to_submit_over_framed_path() {
     let config = immediate_body_download_config();
     let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
-    let startup = BlockSyncStartup::new(
+    let mut startup = BlockSyncStartup::new(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(0),
@@ -6638,6 +6862,8 @@ async fn reactor_drives_tip_to_getblocks_to_submit_over_framed_path() {
         tip_rx,
         config.clone(),
     );
+    let trace = ZakuraTrace::noop();
+    startup.trace = trace.clone();
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
     let peer = peer(40);
@@ -6748,6 +6974,10 @@ async fn reactor_drives_tip_to_getblocks_to_submit_over_framed_path() {
             action => panic!("unexpected action before submit: {action:?}"),
         }
     }
+    assert_eq!(
+        trace.first_block_body_source(block_hash),
+        Some(BlockBodySource::Zakura)
+    );
     reactor_task.abort();
 }
 
@@ -13380,6 +13610,134 @@ async fn stale_needed_block_completion_cannot_clear_a_newer_query() {
     reactor_task.abort();
 }
 
+#[tokio::test]
+async fn failed_needed_block_query_retries_without_losing_newer_query_ownership() {
+    let best_header_tip = block::Height(10);
+    let (_tip_tx, tip_rx) = watch::channel((best_header_tip, block::Hash([10; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (best_header_tip, block::Hash([10; 32])),
+        tip_rx,
+        ZakuraBlockSyncConfig::default(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+
+    let BlockSyncAction::QueryNeededBlocks {
+        query_id: first_query_id,
+        scope,
+        ..
+    } = next_action(&mut actions).await
+    else {
+        panic!("startup must query needed blocks");
+    };
+    handle
+        .send_needed_blocks_query_failure(first_query_id, scope)
+        .expect("query failure queues");
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), actions.recv())
+            .await
+            .is_err(),
+        "a failed state query must use the bounded retry delay",
+    );
+
+    let BlockSyncAction::QueryNeededBlocks {
+        query_id: second_query_id,
+        scope: second_scope,
+        ..
+    } = next_action(&mut actions).await
+    else {
+        panic!("the failed query must retry");
+    };
+    assert_ne!(first_query_id, second_query_id);
+    assert_eq!(scope, second_scope);
+
+    handle
+        .send_needed_blocks_query_failure(first_query_id, scope)
+        .expect("stale failure queues");
+    handle
+        .send_needed_blocks_query_failure(second_query_id, second_scope)
+        .expect("current failure queues");
+
+    assert!(matches!(
+        next_action(&mut actions).await,
+        BlockSyncAction::QueryNeededBlocks { query_id, .. }
+            if query_id != first_query_id && query_id != second_query_id
+    ));
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn failed_needed_block_query_keeps_retrying_when_action_queue_is_full() {
+    let best_header_tip = block::Height(10);
+    let (_tip_tx, tip_rx) = watch::channel((best_header_tip, block::Hash([10; 32])));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        },
+        (best_header_tip, block::Hash([10; 32])),
+        tip_rx,
+        ZakuraBlockSyncConfig::default(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+
+    let BlockSyncAction::QueryNeededBlocks {
+        query_id: first_query_id,
+        scope,
+        ..
+    } = next_action(&mut actions).await
+    else {
+        panic!("startup must query needed blocks");
+    };
+    handle
+        .send_needed_blocks_query_failure(first_query_id, scope)
+        .expect("query failure queues");
+
+    let action_sender = &handle
+        .routine_wiring
+        .as_ref()
+        .expect("the spawned reactor exposes its shared test wiring")
+        .actions;
+    while action_sender.capacity() > 0 {
+        action_sender
+            .try_send(BlockSyncAction::Misbehavior {
+                peer: peer(0xfe),
+                reason: BlockSyncMisbehavior::InvalidBlock,
+            })
+            .expect("the test fills one available action slot");
+    }
+    tokio::time::sleep(NEEDED_BLOCK_QUERY_RETRY_DELAY + Duration::from_millis(50)).await;
+
+    let _ = actions.recv().await.expect("one filler action drains");
+    tokio::time::timeout(
+        NEEDED_BLOCK_QUERY_RETRY_DELAY + Duration::from_secs(1),
+        async {
+            loop {
+                match actions.recv().await {
+                    Some(BlockSyncAction::QueryNeededBlocks { query_id, .. })
+                        if query_id != first_query_id =>
+                    {
+                        break;
+                    }
+                    Some(_) => {}
+                    None => panic!("the action stream closed before the retry"),
+                }
+            }
+        },
+    )
+    .await
+    .expect("the failed dispatch retains a bounded retry obligation");
+
+    reactor_task.abort();
+}
+
 /// The bounded-refill window must advance past the already-claimed heights rather
 /// than re-scanning from the download floor every time.
 ///
@@ -13874,6 +14232,234 @@ async fn reactor_backpressures_serving_slots_without_scoring_peer() {
         })
         .await
         .expect("serving slot release queues");
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn serving_flood_cannot_consume_needed_query_retry() {
+    let blocks = mainnet_blocks_1_to_3();
+    let mut config = ZakuraBlockSyncConfig {
+        request_timeout: Duration::from_secs(2),
+        ..ZakuraBlockSyncConfig::default()
+    };
+    config.peer_limits.outbound_queue_depth = 16;
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(1),
+            verified_block_hash: blocks[0].hash(),
+        },
+        (block::Height(1), blocks[0].hash()),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (peer_id, inbound_tx, _outbound_rx) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        62,
+        block::Height(1),
+        blocks[0].hash(),
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+
+    let wiring = handle
+        .routine_wiring
+        .as_ref()
+        .expect("the spawned reactor exposes its shared test wiring");
+    await_until(
+        "the peer status reaches the registry",
+        Duration::from_secs(1),
+        || wiring.registry.has_received_status(&peer_id),
+    )
+    .await
+    .expect("the valid serving peer becomes ready");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    while wiring.actions.capacity() > 0 {
+        wiring
+            .actions
+            .try_send(BlockSyncAction::Misbehavior {
+                peer: peer(0xfe),
+                reason: BlockSyncMisbehavior::InvalidBlock,
+            })
+            .expect("the test fills one available action slot");
+    }
+
+    handle
+        .send(BlockSyncEvent::HeaderTipChanged {
+            height: block::Height(2),
+            hash: blocks[1].hash(),
+        })
+        .await
+        .expect("the higher header tip queues");
+    let (barrier_send, _barrier_recv) = framed_channel(1);
+    handle
+        .send(BlockSyncEvent::PeerConnected(
+            BlockSyncPeerSession::for_test(peer(0xfd), barrier_send, CancellationToken::new()),
+        ))
+        .await
+        .expect("the event-order barrier queues");
+    await_until(
+        "the reactor handles the full-queue refill attempt",
+        Duration::from_secs(1),
+        || handle.peer_snapshot().outbound_peers == 2,
+    )
+    .await
+    .expect("the peer event follows the header-tip event");
+    assert_eq!(
+        wiring.actions.capacity(),
+        0,
+        "the first needed-body query loses to the full action queue",
+    );
+
+    let _ = actions.recv().await.expect("one flooded action drains");
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::GetBlocks {
+            start_height: block::Height(1),
+            count: 1,
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match actions.recv().await {
+                Some(BlockSyncAction::QueryNeededBlocks {
+                    from: block::Height(2),
+                    best_header_tip: block::Height(2),
+                    ..
+                }) => break,
+                Some(BlockSyncAction::QueryBlocksByHeightRange { .. }) => {
+                    panic!("peer serving consumed the refill control reservation")
+                }
+                Some(_) => {}
+                None => panic!("the action stream closed before the refill retry"),
+            }
+        }
+    })
+    .await
+    .expect("the local tick retries the needed-body query");
+
+    reactor_task.abort();
+}
+
+#[tokio::test]
+async fn misbehavior_flood_cannot_consume_needed_query_capacity() {
+    let blocks = mainnet_blocks_1_to_3();
+    let mut config = ZakuraBlockSyncConfig {
+        request_timeout: Duration::from_secs(2),
+        ..ZakuraBlockSyncConfig::default()
+    };
+    config.peer_limits.outbound_queue_depth = 16;
+    let (_tip_tx, tip_rx) = watch::channel((block::Height(1), blocks[0].hash()));
+    let startup = BlockSyncStartup::new(
+        BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(1),
+            verified_block_hash: blocks[0].hash(),
+        },
+        (block::Height(1), blocks[0].hash()),
+        tip_rx,
+        config.clone(),
+    );
+    let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
+    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let (peer_id, inbound_tx, mut outbound_rx) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        63,
+        block::Height(1),
+        blocks[0].hash(),
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+
+    let wiring = handle
+        .routine_wiring
+        .as_ref()
+        .expect("the spawned reactor exposes its shared test wiring");
+    await_until(
+        "the peer status reaches the registry",
+        Duration::from_secs(1),
+        || wiring.registry.has_received_status(&peer_id),
+    )
+    .await
+    .expect("the peer becomes ready");
+    wait_for_outbound_status(&mut outbound_rx).await;
+
+    while wiring.actions.capacity() > BS_ACTION_CONTROL_RESERVE {
+        wiring
+            .actions
+            .try_send(BlockSyncAction::Misbehavior {
+                peer: peer(0xfe),
+                reason: BlockSyncMisbehavior::InvalidBlock,
+            })
+            .expect("the test fills one unreserved action slot");
+    }
+
+    send_inbound(&inbound_tx, BlockSyncMessage::Block(blocks[1].clone())).await;
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::Status(BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(2),
+            tip_hash: blocks[1].hash(),
+            max_blocks_per_response: 16,
+            max_inflight_requests: 1,
+            max_response_bytes: MAX_BS_RESPONSE_BYTES,
+        }),
+    )
+    .await;
+    await_until(
+        "the download routine handles the unsolicited body before its status barrier",
+        Duration::from_secs(1),
+        || {
+            wiring.registry.candidate_snapshot().iter().any(
+                |(peer, received_status, _, servable_high)| {
+                    peer == &peer_id && *received_status && *servable_high == block::Height(2)
+                },
+            )
+        },
+    )
+    .await
+    .expect("the download routine reports the attacker-controlled body");
+    assert_eq!(
+        wiring.actions.capacity(),
+        BS_ACTION_CONTROL_RESERVE,
+        "peer-triggered misbehavior retained the refill control reservation",
+    );
+
+    handle
+        .send(BlockSyncEvent::HeaderTipChanged {
+            height: block::Height(2),
+            hash: blocks[1].hash(),
+        })
+        .await
+        .expect("the higher header tip queues");
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match actions.recv().await {
+                Some(BlockSyncAction::QueryNeededBlocks {
+                    from: block::Height(2),
+                    best_header_tip: block::Height(2),
+                    ..
+                }) => break,
+                Some(_) => {}
+                None => panic!("the action stream closed before the needed-body query"),
+            }
+        }
+    })
+    .await
+    .expect("the needed-body query uses the reserved capacity");
 
     reactor_task.abort();
 }
@@ -14398,7 +14984,7 @@ async fn reactor_accepts_unmatched_body_for_height_active_on_another_request() {
     let config = immediate_body_download_config();
     let blocks = mainnet_blocks_1_to_3();
     let (_tip_tx, tip_rx) = watch::channel((block::Height(2), blocks[1].hash()));
-    let startup = BlockSyncStartup::new(
+    let mut startup = BlockSyncStartup::new(
         BlockSyncFrontiers {
             finalized_height: block::Height(0),
             verified_block_tip: block::Height(1),
@@ -14408,6 +14994,8 @@ async fn reactor_accepts_unmatched_body_for_height_active_on_another_request() {
         tip_rx,
         config.clone(),
     );
+    let trace = ZakuraTrace::noop();
+    startup.trace = trace.clone();
     let (handle, mut actions, reactor_task) = spawn_block_sync_reactor(startup);
     let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
 
@@ -14486,6 +15074,10 @@ async fn reactor_accepts_unmatched_body_for_height_active_on_another_request() {
     .await
     .expect("late active body is accepted and submitted");
     assert_eq!(submitted, blocks[1].hash());
+    assert_eq!(
+        trace.first_block_body_source(submitted),
+        Some(BlockBodySource::Zakura)
+    );
 
     send_inbound(
         &late_inbound,
@@ -14941,24 +15533,24 @@ async fn parked_connection_cleanup_allows_a_fresh_connection_after_cooldown() {
     handle.park_session_for_test(&peer, old_conn_id, Duration::ZERO);
 
     assert!(matches!(
-        service.ordered_session_demand(
+        service.session_demand(
             old_conn_id,
             &peer,
             ZAKURA_CAP_BLOCK_SYNC,
             ServicePeerDirection::Outbound,
         ),
-        OrderedSessionDemand::WaitForChange(_),
+        SessionDemand::WaitForChange(_),
     ));
 
     service.remove_peer(&peer, old_conn_id);
     assert!(matches!(
-        service.ordered_session_demand(
+        service.session_demand(
             new_conn_id,
             &peer,
             ZAKURA_CAP_BLOCK_SYNC,
             ServicePeerDirection::Outbound,
         ),
-        OrderedSessionDemand::OpenNow
+        SessionDemand::OpenNow
     ));
     reactor_task.abort();
 }
@@ -14983,13 +15575,13 @@ async fn same_connection_block_sync_session_waits_at_tip_then_reopens_for_new_wo
     let conn_id = 17;
     handle.park_session_for_test(&peer, conn_id, Duration::ZERO);
 
-    let demand = service.ordered_session_demand(
+    let demand = service.session_demand(
         conn_id,
         &peer,
         ZAKURA_CAP_BLOCK_SYNC,
         ServicePeerDirection::Outbound,
     );
-    let OrderedSessionDemand::WaitForChange(changed) = demand else {
+    let SessionDemand::WaitForChange(changed) = demand else {
         panic!("a locally parked session must stay absent while block sync is at tip");
     };
 
@@ -15005,13 +15597,13 @@ async fn same_connection_block_sync_session_waits_at_tip_then_reopens_for_new_wo
         .expect("new block work wakes the parked session demand");
 
     assert!(matches!(
-        service.ordered_session_demand(
+        service.session_demand(
             conn_id,
             &peer,
             ZAKURA_CAP_BLOCK_SYNC,
             ServicePeerDirection::Outbound,
         ),
-        OrderedSessionDemand::OpenNow,
+        SessionDemand::OpenNow,
     ));
     reactor_task.abort();
 }
@@ -15050,7 +15642,7 @@ async fn serving_only_coordinator_demand_keeps_block_session_available_during_fa
     let conn_id = 18;
     handle.park_session_for_test(&peer, conn_id, Duration::ZERO);
 
-    let OrderedSessionDemand::WaitForChange(changed) = service.ordered_session_demand(
+    let SessionDemand::WaitForChange(changed) = service.session_demand(
         conn_id,
         &peer,
         ZAKURA_CAP_BLOCK_SYNC,
@@ -15070,13 +15662,13 @@ async fn serving_only_coordinator_demand_keeps_block_session_available_during_fa
         .await
         .expect("fallback service demand wakes the parked ordered session");
     assert!(matches!(
-        service.ordered_session_demand(
+        service.session_demand(
             conn_id,
             &peer,
             ZAKURA_CAP_BLOCK_SYNC,
             ServicePeerDirection::Outbound,
         ),
-        OrderedSessionDemand::OpenNow,
+        SessionDemand::OpenNow,
     ));
     reactor_task.abort();
 }

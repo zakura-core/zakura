@@ -30,6 +30,16 @@ impl PeerProfile {
         Self::Zakura(PinnedZakuraProfile::v1())
     }
 
+    /// The Iroh 1.x cohort deliberately does not offer the old native transport.
+    pub fn zakura_v2() -> Self {
+        Self::Zakura(PinnedZakuraProfile {
+            protocol_min: crate::zakura::ZAKURA_PROTOCOL_VERSION_CURRENT,
+            protocol_max: crate::zakura::ZAKURA_PROTOCOL_VERSION_CURRENT,
+            alpns: vec![P2P_V2_ALPN.to_vec()],
+            ..PinnedZakuraProfile::v1()
+        })
+    }
+
     /// A synthetic v2-capable profile that still offers v1 for rolling upgrades.
     pub fn zakura_v2_offering_v1() -> Self {
         Self::Zakura(PinnedZakuraProfile {
@@ -39,7 +49,7 @@ impl PeerProfile {
             control_version: CONTROL_VERSION,
             capabilities: 0,
             required_capabilities: 0,
-            alpns: vec![b"p2p-v2/2".to_vec(), P2P_V2_ALPN.to_vec()],
+            alpns: vec![b"p2p-v2/2".to_vec(), b"p2p-v2/1".to_vec()],
         })
     }
 
@@ -108,7 +118,7 @@ impl PinnedZakuraProfile {
             control_version: CONTROL_VERSION,
             capabilities: 0,
             required_capabilities: 0,
-            alpns: vec![P2P_V2_ALPN.to_vec()],
+            alpns: vec![b"p2p-v2/1".to_vec()],
         }
     }
 
@@ -263,7 +273,7 @@ mod tests {
             v2.negotiate(&v1),
             PinnedNegotiation::Upgrade {
                 selected_protocol: 1,
-                alpn: P2P_V2_ALPN.to_vec(),
+                alpn: b"p2p-v2/1".to_vec(),
             }
         );
 

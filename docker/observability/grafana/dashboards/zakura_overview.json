@@ -45,7 +45,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 3, "w": 8, "x": 0, "y": 1 },
+      "gridPos": { "h": 3, "w": 6, "x": 0, "y": 1 },
       "id": 1,
       "options": {
         "colorMode": "value",
@@ -84,7 +84,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 3, "w": 8, "x": 8, "y": 1 },
+      "gridPos": { "h": 3, "w": 6, "x": 6, "y": 1 },
       "id": 2,
       "options": {
         "colorMode": "value",
@@ -122,7 +122,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 3, "w": 8, "x": 16, "y": 1 },
+      "gridPos": { "h": 3, "w": 6, "x": 12, "y": 1 },
       "id": 3,
       "options": {
         "colorMode": "value",
@@ -142,6 +142,49 @@
         }
       ],
       "title": "Total Supply (ZEC)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
+      "description": "Blocks left before this release reaches its end of service and halts. Mainnet only: other networks report NOT ENFORCED.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "decimals": 0,
+          "mappings": [],
+          "noValue": "NOT ENFORCED",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 1152 },
+              { "color": "green", "value": 3456 }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 3, "w": 6, "x": 18, "y": 1 },
+      "id": 4,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.0.0",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "zakura-prometheus" },
+          "expr": "end_of_support_remaining_blocks",
+          "legendFormat": "Blocks",
+          "refId": "A"
+        }
+      ],
+      "title": "Blocks Until End of Service",
       "type": "stat"
     },
     {

@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use iroh::{endpoint, Endpoint, NodeAddr, NodeId, RelayMode, SecretKey};
+use iroh::{endpoint, Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -22,6 +22,7 @@ mod handshake;
 mod header_sync;
 mod ip;
 mod legacy_gossip;
+mod regulation;
 #[cfg(any(test, feature = "zakura-testkit"))]
 pub mod testkit;
 mod trace;
@@ -198,12 +199,12 @@ const ZAKURA_LIVENESS_REFRESH_INTERVAL: Duration = Duration::from_secs(45);
 
 /// Returns an iroh endpoint builder with relays and external address lookup disabled.
 ///
-/// Callers must add direct bind addresses before binding if they do not want the
-/// endpoint to listen on iroh's default unspecified sockets.
+/// Callers must add explicit direct bind addresses before binding.
 pub fn direct_endpoint_builder(secret_key: SecretKey) -> endpoint::Builder {
-    Endpoint::builder()
+    Endpoint::builder(endpoint::presets::Minimal)
         .relay_mode(RelayMode::Disabled)
-        .clear_discovery()
+        .clear_address_lookup()
+        .clear_ip_transports()
         .secret_key(secret_key)
 }
 
@@ -467,9 +468,9 @@ impl ZakuraHandshakeConnector {
 /// by configured bootstrap peers), so each entry is parsed back into a
 /// `SocketAddr`. Returns `None` if the node id is malformed or no direct address
 /// parses, since a peer with no reachable address cannot be dialed.
-fn node_addr_from_hints(node_id: &[u8], direct_addresses: &[Vec<u8>]) -> Option<NodeAddr> {
+fn node_addr_from_hints(node_id: &[u8], direct_addresses: &[Vec<u8>]) -> Option<EndpointAddr> {
     let node_id_bytes: [u8; 32] = node_id.try_into().ok()?;
-    let node_id = NodeId::from_bytes(&node_id_bytes).ok()?;
+    let node_id = EndpointId::from_bytes(&node_id_bytes).ok()?;
 
     let direct: Vec<std::net::SocketAddr> = direct_addresses
         .iter()
@@ -480,7 +481,7 @@ fn node_addr_from_hints(node_id: &[u8], direct_addresses: &[Vec<u8>]) -> Option<
         return None;
     }
 
-    Some(NodeAddr::new(node_id).with_direct_addresses(direct))
+    Some(EndpointAddr::new(node_id).with_addrs((direct).into_iter().map(iroh::TransportAddr::Ip)))
 }
 
 /// Refresh an upgraded peer's legacy `Responded` liveness while its maintained
@@ -526,7 +527,7 @@ mod tests {
     use iroh::{
         endpoint::Connection,
         protocol::{AcceptError, ProtocolHandler, Router},
-        SecretKey, Watcher as _,
+        SecretKey,
     };
 
     use super::*;
@@ -546,7 +547,7 @@ mod tests {
         let secret_key = SecretKey::from_bytes(&[7; 32]);
 
         let endpoint = direct_endpoint_builder(secret_key)
-            .bind_addr_v4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .bind_addr(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?
             .bind()
             .await?;
 
@@ -554,12 +555,12 @@ mod tests {
             .accept(b"/zakura/smoke/0", SmokeProtocolHandler)
             .spawn();
 
-        let addr = router.endpoint().node_addr().initialized().await;
+        let addr = router.endpoint().addr();
 
-        assert_eq!(addr.node_id, router.endpoint().node_id());
-        assert!(addr.direct_addresses().next().is_some());
-        assert!(addr.relay_url().is_none());
-        assert!(router.endpoint().discovery().is_none());
+        assert_eq!(addr.id, router.endpoint().id());
+        assert!(addr.ip_addrs().next().is_some());
+        assert!(addr.relay_urls().next().is_none());
+        assert!(router.endpoint().address_lookup()?.is_empty());
 
         router.shutdown().await?;
 

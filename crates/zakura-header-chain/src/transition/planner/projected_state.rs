@@ -246,6 +246,48 @@ pub(super) struct SettledProjectedState<'a> {
 }
 
 impl<'a> SettledProjectedState<'a> {
+    /// Validate auxiliary bounds against the exact post-retention projection.
+    pub(super) fn validate_auxiliary_limits(
+        &self,
+        engine: &HeaderChainEngine,
+        limits: EngineLimits,
+    ) -> Result<(), TransitionFailure> {
+        let deleted = self
+            .aux_changes
+            .iter()
+            .filter(|change| matches!(change, AuxDelta::Delete { .. }))
+            .count();
+        let inserted = self
+            .aux_changes
+            .iter()
+            .filter_map(|change| match change {
+                AuxDelta::Put(delivery) => Some(delivery),
+                AuxDelta::Delete { .. } => None,
+            })
+            .filter(|delivery| engine.aux_delivery(delivery.delivery_id).is_none())
+            .count();
+        let projected_total = engine
+            .aux_delivery_count()
+            .saturating_sub(deleted)
+            .saturating_add(inserted);
+        if projected_total > limits.max_aux_deliveries_total.get() {
+            return Err(TransitionFailure::AuxiliaryLimitExceeded);
+        }
+        for delivery in self.aux_changes.iter().filter_map(|change| match change {
+            AuxDelta::Put(delivery) => Some(delivery),
+            AuxDelta::Delete { .. } => None,
+        }) {
+            let count = self
+                .graph
+                .view_header_node(delivery.header_hash)
+                .map_or(0, |node| node.aux_delivery_ids.len());
+            if count > limits.max_aux_deliveries_per_header.get() {
+                return Err(TransitionFailure::AuxiliaryLimitExceeded);
+            }
+        }
+        Ok(())
+    }
+
     /// Atomically expose the graph and its matching final delta to write derivation.
     pub(super) fn into_write_parts(
         self,

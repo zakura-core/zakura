@@ -56,7 +56,7 @@ pub enum PortError {
     },
 }
 
-/// Result of resolving an exact selected-header auxiliary repair.
+/// Result of resolving an exact selected-range auxiliary repair.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VctRepairContextReply {
     /// The requested owner and height still identify the selected branch.

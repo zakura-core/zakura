@@ -390,12 +390,14 @@ def run_once(config: dict[str, Any]) -> int:
 
     if local_status is None:
         log(config, f"local-status-missing host={local_host}")
+        state.get("nodes", {}).get(local_host, {}).pop("peer_ahead_since", None)
         reset_down_confirmation(state, local_host)
         save_state(state_file, state)
         return 0
 
     if local_status.get("query_error"):
         log(config, f"local-query-failed host={local_host} err={local_status.get('query_error')}")
+        state.get("nodes", {}).get(local_host, {}).pop("peer_ahead_since", None)
         reset_down_confirmation(state, local_host)
         save_state(state_file, state)
         return 0
@@ -458,7 +460,6 @@ def run_once(config: dict[str, Any]) -> int:
     record = state.get("nodes", {}).get(local_host, {})
     height = local_status.get("height")
     last_progress = int(record.get("last_progress", ts))
-    age = ts - last_progress
     peer_evidence = []
     if (
         node_healthy(local_status)
@@ -468,6 +469,7 @@ def run_once(config: dict[str, Any]) -> int:
         for peer in statuses:
             if (
                 peer["hostname"] == local_host
+                or peer.get("query_error")
                 or not node_healthy(peer)
                 or peer.get("height_is_exact") is not True
             ):
@@ -480,6 +482,12 @@ def run_once(config: dict[str, Any]) -> int:
                 and int(peer_record.get("last_advance", 0)) > last_progress
             ):
                 peer_evidence.append(f"{peer['hostname']} advanced to height {peer_height}")
+    if peer_evidence and not controller_owns_lifecycle:
+        if int(record.get("peer_ahead_since", 0)) <= last_progress:
+            record["peer_ahead_since"] = ts
+    else:
+        record.pop("peer_ahead_since", None)
+    age = ts - int(record.get("peer_ahead_since", ts))
     stalled = (
         not controller_failed(local_status)
         and expects_node_service(local_status)
@@ -489,7 +497,8 @@ def run_once(config: dict[str, Any]) -> int:
         and bool(peer_evidence)
     )
     reason = (
-        f"no local height progress for {age}s (threshold {stall_seconds}s); "
+        f"no local height progress for {age}s since observing a peer advance ahead "
+        f"(threshold {stall_seconds}s); "
         f"peer evidence: {', '.join(peer_evidence)}"
     )
     stall_key = f"local-sync-stall:{local_host}"

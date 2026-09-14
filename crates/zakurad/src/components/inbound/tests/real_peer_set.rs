@@ -969,6 +969,7 @@ async fn setup(
     let state_service = ServiceBuilder::new().buffer(10).service(state_service);
 
     // Network
+    let identity_dir = tempfile::tempdir().expect("temporary network identity directory");
     let network_config = NetworkConfig {
         network: network.clone(),
         listen_addr: config_listen_addr,
@@ -977,10 +978,16 @@ async fn setup(
         initial_mainnet_peers: IndexSet::new(),
         initial_testnet_peers: IndexSet::new(),
         cache_dir: CacheDir::disabled(),
+        identity_dir: identity_dir.path().to_path_buf(),
 
         // Optionally run the Zakura P2P-v2 endpoint alongside the legacy TCP
         // stack so the dual-stack wiring is exercised (coexistence tests).
         p2p_stack,
+        zakura: zakura_network::zakura::ZakuraConfig {
+            listen_addr: Some(config_listen_addr),
+            bootstrap_peers: Vec::new(),
+            ..Default::default()
+        },
 
         ..NetworkConfig::default()
     };
@@ -1130,7 +1137,7 @@ async fn setup(
 mod submitblock_test {
     use tracing::{Instrument, Level};
     use tracing_subscriber::fmt;
-    use zakura_rpc::SubmitBlockChannel;
+    use zakura_rpc::{MinedBlockEvent, SubmitBlockChannel};
 
     use super::*;
 
@@ -1201,8 +1208,10 @@ mod submitblock_test {
         // Send a block to the channel
         submitblock_channel
             .sender()
-            .send((block::Hash([1; 32]), block::Height(1)))
-            .await
+            .send(MinedBlockEvent::Committed {
+                hash: block::Hash([1; 32]),
+                height: block::Height(1),
+            })
             .unwrap();
         let gossip_task_handle = tokio::spawn(
             sync::gossip_best_tip_block_hashes(
@@ -1222,7 +1231,7 @@ mod submitblock_test {
                 let sent_mined_block = {
                     let captured_logs = logs.lock().unwrap();
                     String::from_utf8_lossy(&captured_logs)
-                        .contains("sending mined block broadcast")
+                        .contains("sending committed mined block broadcast")
                 };
 
                 if sent_mined_block {
@@ -1242,7 +1251,7 @@ mod submitblock_test {
         };
 
         assert!(log_output.contains("initializing block gossip task"));
-        assert!(log_output.contains("sending mined block broadcast"));
+        assert!(log_output.contains("sending committed mined block broadcast"));
 
         gossip_task_handle.abort();
         let gossip_task_error = gossip_task_handle

@@ -34,12 +34,13 @@ status_unavailable_seconds = 600
 max_run_seconds = 172800
 ready_samples = 6
 ready_sample_interval_seconds = 30
+health_min_connected_peers = 1
 min_free_bytes = 10737418240
-retention_runs = 3
+retention_runs = 10
 cooldown_seconds = 60
 wipe_entries = ["state", "non_finalized_state"]
 preserve_entries = ["network"]
-tracing_filter = "info,zakura_network::zakura=debug,zakura_network::zakura::transport::guard=error,zebrad::commands::start::zakura=debug,iroh=error,iroh::magicsock=error,iroh_quinn_udp=error"
+tracing_filter = "info,iroh=error,iroh::magicsock=error,iroh_quinn_udp=error"
 
 # Public mainnet Zakura peers used by today's temporary nodes.
 bootstrap_peers = [
@@ -51,6 +52,12 @@ bootstrap_peers = [
     "291323d78eb7186c3fa225ef5e305e95363e0ef06d42dca91bd4ef0254aed1ae@139.59.64.115:8234",
     "85e425233a68697d4be91dd5d542305a8a327cd06d992d53c0913cef2fa75084@168.144.173.250:8234",
 ]
+
+[summary]
+hostname = "temp-zakura-sync-test-1"
+timezone = "America/Denver"
+time = "17:00"
+state_file = "/var/lib/zakura-sync-summary/state.json"
 
 [[nodes]]
 name = "temp-zakura-sync-test-1"
@@ -69,6 +76,7 @@ alias = "temp-zakura-sync-test-2"
 public_ip = "138.197.218.91"
 mode_label = "Zakura/v2-only"
 p2p_stack = "zakura"
+health_min_connected_peers = 0
 
 [[nodes]]
 name = "temp-zakura-sync-test-5"

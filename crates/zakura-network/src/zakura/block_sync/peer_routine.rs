@@ -41,11 +41,12 @@ use super::{
         DownloadWindow, LivenessOutcome, OutstandingBlockRange, ReceivedBlockTracker,
         ThroughputMeter,
     },
-    work_queue::{WorkItem, WorkQueue, WorkReturnOutcome},
-    BlockSyncAction, BlockSyncMessage, BlockSyncMisbehavior, BlockSyncPeerSession, BlockSyncStatus,
+    work_queue::{RequestWrite, WorkItem, WorkQueue, WorkReturnOutcome},
+    BlockSyncMessage, BlockSyncMisbehavior, BlockSyncPeerSession, BlockSyncStatus,
     ZakuraBlockSyncConfig, ZakuraPeerId, ZakuraTrace, MSG_BS_BLOCK,
 };
-use crate::zakura::{Admit, FramedRecv, OrderedSendError, SinkReject, ZakuraConnId};
+use crate::zakura::transport::OrderedStreamFailure;
+use crate::zakura::{trace::BlockBodySource, Admit, FramedRecv, SinkReject, ZakuraConnId};
 use std::{sync::Arc, time::Duration, time::Instant};
 use tokio::time;
 use zakura_chain::{block, serialization::ZcashSerialize};
@@ -287,10 +288,12 @@ pub(super) struct PeerRoutine {
     /// The reply decision is routine-local; the actual send stays reactor-side via
     /// `RoutineToReactor::StatusReceived`.
     status_reply_meter: super::state::RateMeter,
-    /// Rate meter gating how often this peer's `Status` frames are applied at all,
-    /// so a status flood cannot spin the routine. A status that grows the servable
-    /// range bypasses the meter.
+    /// Rate meter for status application, with one extra range change per window.
     inbound_status_meter: super::state::RateMeter,
+    /// Allows one immediate range change without permitting an unbounded bypass.
+    status_range_bypass_available: bool,
+    /// Latest deferred range change. Applying it on a timer preserves one-shot updates.
+    pending_status: Option<BlockSyncStatus>,
     /// Heights this routine recently returned on a failure, mapped to the instant
     /// after which it may re-take them. While avoided, the routine leaves the
     /// height `pending` (contestable by any other peer) but does not re-grab it
@@ -315,7 +318,6 @@ pub(super) struct PeerRoutine {
     sequencer_input: mpsc::Sender<SequencedBody>,
     sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
     sequencer_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
-    actions: mpsc::Sender<BlockSyncAction>,
     /// Shared routine-to-reactor channel for serving, status, re-query, and misbehavior events.
     /// Bounded `try_send` prevents a busy reactor from stalling the transport decode loop.
     routine_to_reactor: mpsc::Sender<RoutineToReactor>,
@@ -355,7 +357,6 @@ impl PeerRoutine {
         sequencer_input: mpsc::Sender<SequencedBody>,
         sequencer_input_bytes: Arc<std::sync::atomic::AtomicU64>,
         sequencer_input_decoded_attributed_memory_bytes: Arc<std::sync::atomic::AtomicU64>,
-        actions: mpsc::Sender<BlockSyncAction>,
         routine_to_reactor: mpsc::Sender<RoutineToReactor>,
         sequencer_view: watch::Receiver<SequencerView>,
         cancel: CancellationToken,
@@ -389,6 +390,8 @@ impl PeerRoutine {
             max_response_bytes,
             status_reply_meter,
             inbound_status_meter,
+            status_range_bypass_available: false,
+            pending_status: None,
             retry_avoid: BTreeMap::new(),
             fill_stop_trace_at: BTreeMap::new(),
             generation,
@@ -400,7 +403,6 @@ impl PeerRoutine {
             sequencer_input,
             sequencer_input_bytes,
             sequencer_input_decoded_attributed_memory_bytes,
-            actions,
             routine_to_reactor,
             sequencer_view,
             last_reset_epoch,
@@ -414,6 +416,27 @@ impl PeerRoutine {
     /// reject. A reject returns `Err(SinkReject::protocol(..))` so the supervised
     /// pipe tears the whole connection down.
     pub(super) async fn run(mut self) -> Result<(), SinkReject> {
+        let mut guard = block_sync_guard();
+        let result = self.run_inner(&mut guard).await;
+        // A transport failure can cancel the session before its queued responses
+        // reach us. Validate them under the existing decode-capacity bound before
+        // scoring unanswered work. Connection shutdown can still stop this drain.
+        if result.is_ok() {
+            if let Some(failure) = self.recv.failure() {
+                self.recv.close();
+                while let Ok(frame) = self.recv.try_recv() {
+                    self.handle_frame(&mut guard, frame).await?;
+                }
+                return self.handle_stream_failure(Instant::now(), failure);
+            }
+        }
+        result
+    }
+
+    async fn run_inner(
+        &mut self,
+        guard: &mut crate::zakura::SessionGuard,
+    ) -> Result<(), SinkReject> {
         // Local clones so the `Notified` futures below borrow these handles, not
         // `self` — `self.try_fill()` needs `&mut self` while the notifications are
         // pinned. The clones share the same underlying `Arc`, so the wakes still
@@ -421,13 +444,14 @@ impl PeerRoutine {
         // `self.work`.
         let budget = self.budget.clone();
         let work = self.work.clone();
-        // The per-connection oversize guard applied to inbound frames at ingress.
-        let mut guard = block_sync_guard();
         // Per-peer BBR heartbeat cadence. `Skip` so a routine busy past a tick emits one
         // fresh sample rather than a catch-up burst. Observability only.
         let mut bbr_trace_ticks = time::interval(BBR_TRACE_INTERVAL);
         bbr_trace_ticks.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         loop {
+            if self.cancel.is_cancelled() {
+                return Ok(());
+            }
             // missed-wake safety: register both `Notify`s via
             // `Notified::enable()` BEFORE the fill attempt. The budget/work
             // `Notify`s use `notify_waiters` (no stored permit), so a
@@ -440,9 +464,11 @@ impl PeerRoutine {
             Notified::enable(capacity.as_mut());
             Notified::enable(available.as_mut());
 
+            self.flush_pending_status();
             let retry_filter_deadline = if self.session.outbound_capacity() > 0 {
                 self.try_fill().await
             } else {
+                self.gc_skipped_outstanding();
                 None
             };
             let outbound_queue_has_capacity = self.session.outbound_capacity() > 0;
@@ -471,12 +497,15 @@ impl PeerRoutine {
                         // in this same task. A protocol reject propagates out so
                         // the supervised pipe cancels the connection; the `Drop`
                         // guard returns unreceived work on the way out.
-                        Some(frame) => self.handle_frame(&mut guard, frame).await?,
+                        Some(frame) => self.handle_frame(guard, frame).await?,
                         // Stream closed by the peer. With no outstanding work this
                         // is a clean exit; with unanswered requests it is a
                         // no-progress stall (park or disconnect). `Drop` returns
                         // unreceived outstanding heights and releases their budget.
-                        None => return self.handle_remote_stream_closed(Instant::now()),
+                        None => return self.handle_stream_failure(
+                            Instant::now(),
+                            self.recv.failure().unwrap_or(OrderedStreamFailure::RemoteClose),
+                        ),
                     }
                 }
                 changed = self.sequencer_view.changed() => {
@@ -509,6 +538,7 @@ impl PeerRoutine {
         guard: &mut crate::zakura::SessionGuard,
         frame: crate::zakura::Frame,
     ) -> Result<(), SinkReject> {
+        self.gc_skipped_outstanding();
         match guard.admit(&frame) {
             Admit::Pass => {}
             Admit::Throttle => {
@@ -526,7 +556,20 @@ impl PeerRoutine {
 
         let frame_payload_bytes = frame.payload.len();
         let body_permit = if is_block_frame(&frame) {
-            Some(self.reserve_body_decode_permit().await?)
+            let permit = self.reserve_body_decode_permit();
+            tokio::pin!(permit);
+            Some(tokio::select! {
+                biased;
+                () = self.cancel.cancelled() => {
+                    if self.recv.failure().is_none() {
+                        return Ok(());
+                    }
+                    // A remote close cannot excuse an unvalidated body. Keep
+                    // this bounded raw frame until its decode slot is available.
+                    permit.await?
+                }
+                permit = &mut permit => permit?,
+            })
         } else {
             None
         };
@@ -587,6 +630,24 @@ impl PeerRoutine {
         Ok(())
     }
 
+    /// Return only unreceived work still owned by this routine. A body already
+    /// handed to the sequencer keeps its ownership and cannot be requeued here.
+    fn return_unreceived_requests(&mut self, reason: &'static str) {
+        let outstanding_ranges = std::mem::take(&mut self.window.outstanding);
+        for outstanding in outstanding_ranges {
+            let unreceived: Vec<_> = unreceived_heights(&outstanding).collect();
+            let outcome = self
+                .work
+                .release_reserved_and_return_items_detailed_for_owner(
+                    outstanding.request.owner,
+                    unreceived.iter().copied(),
+                );
+            self.budget.release(outcome.released_bytes);
+            self.trace_work_returned(reason, &outstanding, unreceived.len(), outcome);
+        }
+        self.registry.clear_outstanding(&self.peer, self.generation);
+    }
+
     async fn reserve_body_decode_permit(
         &self,
     ) -> Result<mpsc::OwnedPermit<SequencedBody>, SinkReject> {
@@ -617,16 +678,23 @@ impl PeerRoutine {
             return;
         }
         let now = Instant::now();
-        // A status is applied if the rate meter allows it OR it grows our servable
-        // range (so a peer that just extended its range is never throttled out).
-        let grows =
-            status.servable_high > self.servable_high || status.servable_low < self.servable_low;
-        if !self.inbound_status_meter.try_take(now) && !grows {
+        let range_changed =
+            status.servable_high != self.servable_high || status.servable_low != self.servable_low;
+        if self.inbound_status_meter.try_take(now) {
+            self.status_range_bypass_available = true;
+        } else if range_changed && self.status_range_bypass_available {
+            // Allow prompt pruning updates, but only once per window so a peer
+            // cannot flood registry/reactor work by oscillating its range.
+            self.status_range_bypass_available = false;
+        } else {
+            // Keep only the latest changed range. A return to the applied range
+            // cancels an older pending change without causing a status reply loop.
+            self.pending_status = range_changed.then_some(status);
             return;
         }
-        // The reply is best-effort: if both the connect-time Status and this
-        // first reply are dropped by a full outbound queue, recovery depends on
-        // the remote's later Status retry arriving after this meter reopens.
+        self.pending_status = None;
+        // Replies have their own allowance. The reactor also retries any local
+        // status that has not entered this peer's outbound queue.
         let send_reply = self.status_reply_meter.try_take(now);
         self.received_status = true;
         self.servable_low = status.servable_low;
@@ -654,6 +722,15 @@ impl PeerRoutine {
             });
     }
 
+    fn flush_pending_status(&mut self) {
+        if !self.inbound_status_meter.is_ready(Instant::now()) {
+            return;
+        }
+        if let Some(status) = self.pending_status.take() {
+            self.handle_status(status);
+        }
+    }
+
     /// React to a committed-view change: refresh the floor/tip the routine reads,
     /// and on a destructive `reset_epoch` bump clear this routine's outstanding
     /// **in place** (return unreceived heights to `work.pending`, release their
@@ -675,18 +752,7 @@ impl PeerRoutine {
         // dropped successor heights. Return our unreceived outstanding to
         // `work.pending` (a no-op for heights already dropped from `in_flight` by
         // `reset_above`) and release their reservations exactly once.
-        let outstanding = std::mem::take(&mut self.window.outstanding);
-        for outstanding in outstanding {
-            let unreceived: Vec<_> = unreceived_heights(&outstanding).collect();
-            let outcome = self
-                .work
-                .release_reserved_and_return_items_detailed_for_owner(
-                    outstanding.request.owner,
-                    unreceived.iter().copied(),
-                );
-            self.budget.release(outcome.released_bytes);
-            self.trace_work_returned("view_reset", &outstanding, unreceived.len(), outcome);
-        }
+        self.return_unreceived_requests("view_reset");
         self.retry_avoid.clear();
         // Clear our (now-empty) registry outstanding and refresh slot diagnostics.
         self.publish_outstanding();
@@ -694,7 +760,7 @@ impl PeerRoutine {
         // no-progress probe streak must not stay charged: reset it (and clear the idle
         // liveness deadline) so an unproven peer whose only probe was in flight at the
         // reset can probe again instead of wedging at its cap.
-        self.window.note_view_reset();
+        self.window.note_locally_returned_requests();
         // Ping the producer immediately: `reset_above` emptied `pending`, and the
         // reactor's post-reset query may have run while our (now cleared) outstanding
         // still inflated the low-water gate. Without this ping a routine that then
@@ -708,8 +774,8 @@ impl PeerRoutine {
 
     /// Sleep future resolving at the earliest wake the routine schedules for
     /// itself: the soonest outstanding request deadline (own-timeout), block
-    /// liveness deadline, **or** the soonest retry-avoid expiry (local failure bias
-    /// or registry-owned floor-watchdog hard exclude), so a routine that quiet-returned
+    /// liveness deadline, pending status refresh, or the soonest retry-avoid expiry
+    /// (local failure bias or registry-owned floor-watchdog hard exclude), so a routine that quiet-returned
     /// its only work re-runs want-work once the bias lifts even if no external event
     /// arrives. Defaults to a long idle sleep when none exists.
     fn earliest_deadline_sleep(&self, retry_filter_deadline: Option<Instant>) -> time::Sleep {
@@ -731,6 +797,8 @@ impl PeerRoutine {
             floor_watchdog_avoid,
             body_retry_avoid,
             retry_filter_deadline,
+            self.pending_status
+                .map(|_| self.inbound_status_meter.next_allowed),
         ]
         .into_iter()
         .flatten()
@@ -752,6 +820,7 @@ impl PeerRoutine {
     /// There is no floor gate: downloads are governed by the byte budget and
     /// per-peer slots, never floor-distance / near-tip lag.
     async fn try_fill(&mut self) -> Option<Instant> {
+        self.gc_skipped_outstanding();
         // The BBR cwnd is clamped to the peer's advertised hard cap inside
         // `available_slots`, so there is no separate window to reconcile on a
         // `Status` change.
@@ -774,6 +843,7 @@ impl PeerRoutine {
         // `&'static str` reason via `break`; a pass that issues nothing (`fill_sent == 0`)
         // is a candidate bubble.
         let mut fill_sent = 0u32;
+        let request_sender = self.session.request_sender();
         let fill_stop: FillStop = loop {
             // Floor bypass scaled by reliability: a healthy saturated carrier keeps the
             // full bypass so the floor keeps moving; a failing/sealed peer earns *no*
@@ -800,6 +870,27 @@ impl PeerRoutine {
             if floor_slots == 0 {
                 break FillStop::CwndSaturated;
             }
+            // Reserve transport capacity before taking work or charging bytes.
+            let slot = match request_sender.try_reserve_guarded() {
+                Ok(slot) => slot,
+                Err(crate::zakura::transport::GuardedReserveError::Full) => {
+                    break FillStop::OutboundFull
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        peer = ?self.peer,
+                        generation = self.generation,
+                        ?error,
+                        "could not reserve guarded block request transport capacity"
+                    );
+                    self.session.cancel_token().cancel();
+                    break FillStop::SendError;
+                }
+            };
+            let Some(request_id) = self.next_request_id else {
+                break FillStop::Internal;
+            };
+            self.next_request_id = request_id.get().checked_add(1).and_then(NonZeroU64::new);
             let in_bypass = normal_slots == 0;
             let (servable_low, servable_high) = (self.servable_low, self.servable_high);
 
@@ -855,11 +946,13 @@ impl PeerRoutine {
                                 .window
                                 .cwnd_byte_headroom_at(floor_bonus, now)
                                 .unwrap_or(u64::MAX);
-                            items = self.work.take_in_range_budgeted(
+                            items = self.work.take_for_request(
                                 servable_low,
                                 grant.take_high,
                                 max_count,
                                 grant.max_request_bytes.min(floor_cwnd_cap).max(1),
+                                self.generation,
+                                request_id,
                             );
                         }
                         AdmissionOutcome::LookaheadAtCap => break FillStop::LookaheadCap,
@@ -900,11 +993,13 @@ impl PeerRoutine {
                             .window
                             .cwnd_byte_headroom_at(0, now)
                             .unwrap_or(u64::MAX);
-                        items = self.work.take_in_range_budgeted(
+                        items = self.work.take_for_request(
                             servable_low,
                             grant.take_high,
                             max_count,
                             grant.max_request_bytes.min(above_cwnd_cap),
+                            self.generation,
+                            request_id,
                         );
                     }
                     // A floor-priority start while the floor arm deferred to a
@@ -925,7 +1020,7 @@ impl PeerRoutine {
             // with heights this routine recently *failed* (RangeUnavailable /
             // timeout / send-failure), quietly put those back so another peer can
             // contest them first, and only keep the suffix this routine is allowed
-            // to re-take. `return_items_quiet` does NOT notify (the other peers were
+            // to re-take. `return_unpublished` does NOT notify (the other peers were
             // already woken by the original failure return), so this cannot
             // self-wake into a take/return spin. If the whole chunk is still
             // avoided, break — the routine wakes to retry when the avoid window
@@ -943,22 +1038,20 @@ impl PeerRoutine {
                 let Some(keep) =
                     first_allowed_run(&items, |(height, item)| is_allowed(height, item))
                 else {
-                    let avoided: Vec<_> = items.iter().map(|(h, _)| *h).collect();
-                    self.work.return_items_quiet(avoided);
+                    self.work.return_unpublished(&items);
                     retry_filter_deadline = Some(self.retry_filter_wake_deadline(now));
                     break FillStop::RetryAvoid;
                 };
                 let keep_len = keep.len();
                 let mut returned_avoided = false;
                 if keep.start > 0 {
-                    let avoided: Vec<_> = items.drain(..keep.start).map(|(h, _)| h).collect();
-                    self.work.return_items_quiet(avoided);
+                    let avoided: Vec<_> = items.drain(..keep.start).collect();
+                    self.work.return_unpublished(&avoided);
                     returned_avoided = true;
                 }
                 if keep_len < items.len() {
                     let avoided = items.split_off(keep_len);
-                    self.work
-                        .return_items_quiet(avoided.into_iter().map(|(height, _)| height));
+                    self.work.return_unpublished(&avoided);
                     returned_avoided = true;
                 }
                 if returned_avoided {
@@ -1000,39 +1093,17 @@ impl PeerRoutine {
                 self.return_taken_items(&items);
                 break FillStop::Budget;
             }
-            let Some(request_id) = self.next_request_id else {
-                self.budget.release(reserved_bytes);
-                self.return_taken_items(&items);
-                break FillStop::Internal;
-            };
-            self.next_request_id = request_id.get().checked_add(1).and_then(NonZeroU64::new);
             let owner = scope.bind(self.generation, request_id);
-            let marked = self
-                .work
-                .mark_reserved_for_owner(owner, items.iter().map(|(height, _)| *height));
-            if marked != reserved_bytes {
-                self.budget.release(reserved_bytes);
-                let _ = self
-                    .work
-                    .release_reserved_and_return_items_detailed_for_owner(
-                        owner,
-                        items.iter().map(|(height, _)| *height),
-                    );
-                break FillStop::Internal;
-            }
-
+            let claim = RequestWrite::new(
+                owner,
+                items.clone(),
+                self.work.clone(),
+                self.budget.clone(),
+                self.session.cancel_token(),
+            );
             let count = match u32::try_from(kept_count) {
                 Ok(count) => count,
-                Err(_) => {
-                    let released = self
-                        .work
-                        .release_reserved_and_return_items_detailed_for_owner(
-                            owner,
-                            items.iter().map(|(height, _)| *height),
-                        );
-                    self.budget.release(released.released_bytes);
-                    break FillStop::Internal;
-                }
+                Err(_) => break FillStop::Internal,
             };
             let request = BlockRangeRequest {
                 owner,
@@ -1058,62 +1129,69 @@ impl PeerRoutine {
                 start_height: request.start_height,
                 count: request.count,
             };
-            if let Err(error) = self
-                .session
-                .try_send_get_blocks(request.start_height, request.count)
-            {
-                tracing::debug!(
-                    peer = ?self.peer,
-                    start_height = ?request.start_height,
-                    count = request.count,
-                    ?error,
-                    "failed to queue Zakura block-sync GetBlocks"
-                );
-                self.trace_queue_send_failed(&msg, &error);
-                // Return every still-reserved height to the queue. A competing
-                // peer's late body may have claimed a taken height and released its
-                // request reservation during the reserve await; leave that height
-                // in flight rather than re-queueing or releasing it twice.
-                let released = self
-                    .work
-                    .release_reserved_and_return_items_detailed_for_owner(
-                        request.owner,
-                        items.iter().map(|(height, _)| *height),
-                    );
-                self.budget.release(released.released_bytes);
-                if matches!(error, OrderedSendError::Full) {
-                    break FillStop::OutboundFull;
+            let frame = match msg.encode_frame() {
+                Ok(frame) => frame,
+                Err(_) => {
+                    self.session.cancel_token().cancel();
+                    break FillStop::SendError;
                 }
-                self.session.cancel_token().cancel();
-                break FillStop::SendError;
-            }
+            };
 
+            // A block-count delivery sample proves progress even though it cannot
+            // supply a byte rate for estimating transfer time.
+            let byte_rate = self.window.bbr_btlbw_bytes_per_sec(queued_at);
+            let has_delivery_measurement =
+                byte_rate.is_some() || self.window.bbr_btlbw_milliblocks(queued_at).is_some();
             let deadline = request_deadline(
                 request_priority,
                 queued_at,
                 self.config.request_timeout,
                 self.config.effective_floor_rescue_timeout(),
-                reserved_bytes,
+                // Responses share an ordered stream. Include earlier unreceived
+                // work so this request cannot expire while those bodies arrive.
+                self.window
+                    .outstanding_reserved_bytes()
+                    .saturating_add(reserved_bytes),
                 // Filter BtlBw by the request's send time so a stale-high rate from a
                 // now-slow peer cannot tighten the deadline below what it can meet.
-                self.window.bbr_btlbw_bytes_per_sec(queued_at),
+                byte_rate,
+                has_delivery_measurement,
             );
+            let request_start_height = request.start_height;
+            let request_count = request.count;
+            let request_estimated_bytes = request.estimated_bytes;
+            let mut delivered = false;
+            if !claim.publish(|| {
+                self.window.outstanding.push(OutstandingBlockRange {
+                    request,
+                    write_status: claim.status(),
+                    charged_for_liveness: false,
+                    queued_at,
+                    deadline,
+                    delivery_snapshot: self.window.delivery_snapshot(queued_at),
+                    delivered_bytes: 0,
+                    received: ReceivedBlockTracker::default(),
+                });
+                delivered = slot.send_request(frame, claim.clone());
+            }) {
+                break FillStop::Internal;
+            }
+            if !delivered {
+                tracing::debug!(
+                    peer = ?self.peer,
+                    generation = self.generation,
+                    start_height = ?request_start_height,
+                    count = request_count,
+                    "block request transport closed during publication"
+                );
+                claim.delivery_failed();
+                break FillStop::SendError;
+            }
             metrics::counter!("sync.block.request.sent").increment(1);
             if in_bypass {
                 // A floor request borrowed a bypass slot while the cwnd was saturated.
                 metrics::counter!("sync.block.request.floor_bypass").increment(1);
             }
-            let request_start_height = request.start_height;
-            let request_count = request.count;
-            let request_estimated_bytes = request.estimated_bytes;
-            self.window.outstanding.push(OutstandingBlockRange {
-                request,
-                queued_at,
-                deadline,
-                delivery_snapshot: self.window.delivery_snapshot(queued_at),
-                delivered_bytes: 0,
-                received: ReceivedBlockTracker::default(),
-            });
             self.window
                 .arm_liveness(queued_at, self.config.effective_liveness_timeout());
             self.publish_outstanding();
@@ -1220,8 +1298,7 @@ impl PeerRoutine {
     /// not re-wake its own want-work arm into a take/return spin, and any other
     /// peer waiting on budget capacity is woken by the matching `budget.release`.
     fn return_taken_items(&self, items: &[(block::Height, WorkItem)]) {
-        self.work
-            .return_items_quiet(items.iter().map(|(height, _)| *height));
+        self.work.return_unpublished(items);
     }
 
     /// Record heights this routine just returned on a failure so it will not
@@ -1245,6 +1322,23 @@ impl PeerRoutine {
     }
 
     fn expire_due_timeouts(&mut self, now: Instant) -> bool {
+        self.gc_skipped_outstanding();
+        // Arbitrate due queued frames against writer startup before charging
+        // failures. Keep started requests outstanding while refunding skipped
+        // probes so their liveness deadline cannot be cleared as idle.
+        let mut skipped = Vec::new();
+        let mut index = 0;
+        while index < self.window.outstanding.len() {
+            let outstanding = &self.window.outstanding[index];
+            if outstanding.deadline <= now
+                && (outstanding.write_status.expire_unwritten()
+                    || outstanding.write_status.was_skipped())
+            {
+                skipped.push(self.window.retire_locally(index));
+            } else {
+                index += 1;
+            }
+        }
         let mut timed_out = Vec::new();
         let mut index = 0;
         while index < self.window.outstanding.len() {
@@ -1254,11 +1348,13 @@ impl PeerRoutine {
                 index += 1;
             }
         }
-        if timed_out.is_empty() {
+        if skipped.is_empty() && timed_out.is_empty() {
             return false;
         }
-        self.window.record_timeout(timed_out.len());
-        for outstanding in &timed_out {
+        if !timed_out.is_empty() {
+            self.window.record_timeout(timed_out.len());
+        }
+        for outstanding in skipped.iter().chain(&timed_out) {
             // Return only the unreceived heights — received ones are buffered (in
             // `in_flight` until committed); re-queuing them would re-fetch a body
             // we already hold (the WorkQueue single-owner invariant forbids it).
@@ -1341,29 +1437,30 @@ impl PeerRoutine {
         Err(SinkReject::local(error))
     }
 
-    /// Handle the peer closing its send side of the stream. Honest peers close
-    /// *connections*, not lone streams; a stream-only EOF while block-progress
-    /// liveness is still armed is the same signal as the liveness stall and must
-    /// not reset the park/second-stall state machine — otherwise a peer could
-    /// take work, deliver nothing, let its requests time out (which drains
-    /// `outstanding` without disarming liveness), EOF before the liveness
-    /// deadline, and be readmitted fresh forever. An armed deadline with empty
-    /// `outstanding` can only mean charged requests were consumed without
-    /// accepted progress — every answered-everything path disarms it — and
-    /// `DownloadWindow::check_liveness` parks at that deadline
-    /// regardless of `outstanding`, so parking here only moves the already
-    /// scheduled outcome earlier. Frames are processed in-order in this task, so
-    /// at EOF everything the peer sent has already been counted. The liveness
-    /// grace does not apply: it waits for in-flight frames stuck behind our full
-    /// outbound queue, and a closed stream has none.
-    fn handle_remote_stream_closed(&mut self, now: Instant) -> Result<(), SinkReject> {
+    /// Retiring a failed session must not erase unanswered download work.
+    /// Request expiry can empty `outstanding` without disarming liveness, so
+    /// that pending no-progress deadline must also survive stream replacement.
+    fn handle_stream_failure(
+        &mut self,
+        now: Instant,
+        failure: OrderedStreamFailure,
+    ) -> Result<(), SinkReject> {
+        // Local reset may have withdrawn the requests while decoding waited
+        // for capacity. It must remain neutral when the failed stream retires.
+        self.on_view_changed();
+        self.gc_skipped_outstanding();
         if self.window.outstanding.is_empty() && self.window.block_liveness_deadline.is_none() {
             return Ok(());
         }
-        self.no_progress_stall(
-            now,
-            "block-sync peer closed the stream with its requests unanswered",
-        )
+        let error = match failure {
+            OrderedStreamFailure::RemoteClose => {
+                "block-sync peer closed the stream with its requests unanswered"
+            }
+            OrderedStreamFailure::WriteTimeout => {
+                "block-sync stream write stalled with download requests unanswered"
+            }
+        };
+        self.no_progress_stall(now, error)
     }
 
     /// Drop this routine's outstanding requests whose whole range is at or below
@@ -1381,7 +1478,7 @@ impl PeerRoutine {
         let mut index = 0;
         while index < self.window.outstanding.len() {
             if self.window.outstanding[index].request.end_height() <= floor {
-                let outstanding = self.window.outstanding.remove(index);
+                let outstanding = self.window.retire_locally(index);
                 // Release only estimates whose per-height ledger is still
                 // `Reserved`. A competing delivery changes that ledger to
                 // `Released` at receipt, so floor GC must not release it again.
@@ -1403,6 +1500,14 @@ impl PeerRoutine {
         }
     }
 
+    /// A skipped frame ends the peer obligation independently of any received
+    /// body whose owner must remain available to the sequencer.
+    fn gc_skipped_outstanding(&mut self) {
+        if self.window.discard_skipped_requests() {
+            self.publish_outstanding();
+        }
+    }
+
     /// Free request slots after the central queue retires their exact owners.
     /// Queue retirement already released their reservations.
     /// The cleanup path drops only routine-local and registry bookkeeping.
@@ -1421,7 +1526,7 @@ impl PeerRoutine {
             if still_owned {
                 index += 1;
             } else {
-                self.window.outstanding.remove(index);
+                self.window.retire_locally(index);
                 removed = true;
             }
         }
@@ -1503,6 +1608,8 @@ impl PeerRoutine {
                 return;
             }
         }
+        self.trace
+            .record_block_body_received(hash, BlockBodySource::Zakura);
         let outstanding_owner = outstanding.request.owner;
         if self.work.owner_for_height(height) != Some(outstanding_owner) {
             metrics::counter!("sync.block.stale_completion.total", "kind" => "body_range")
@@ -1713,7 +1820,6 @@ impl PeerRoutine {
         if !self.received_status || height < self.servable_low || height > self.servable_high {
             return false;
         }
-
         let serialized_bytes = match body_wire_bytes {
             Some(bytes) => bytes,
             None => match block.zcash_serialize_to_vec() {
@@ -1737,6 +1843,8 @@ impl PeerRoutine {
         if reserved_in_flight.is_none() && !is_pending {
             return false;
         }
+        self.trace
+            .record_block_body_received(hash, BlockBodySource::Zakura);
         let Some(owner) = self.work.owner_for_height(height) else {
             // Pending work has no active request owner.
             // Accepting a body here would create an unowned completion.
@@ -2019,7 +2127,7 @@ impl PeerRoutine {
         if index >= self.window.outstanding.len() {
             return;
         }
-        self.window.outstanding.remove(index);
+        self.window.retire_locally(index);
         self.publish_outstanding();
         self.window.disarm_liveness_after_progress_if_idle();
     }
@@ -2101,24 +2209,34 @@ impl PeerRoutine {
     /// `work.in_flight` instead — the producer's `!in_flight_contains` clause
     /// already keeps them out of `pending`.
     fn publish_outstanding(&self) {
-        let mut map: BTreeMap<block::Height, super::peer_registry::OutstandingMeta> =
-            BTreeMap::new();
+        let mut unreceived = Vec::new();
         for outstanding in &self.window.outstanding {
             for expected in &outstanding.request.expected_blocks {
                 if !outstanding.has_received(expected.height) {
-                    map.insert(
-                        expected.height,
-                        super::peer_registry::OutstandingMeta {
-                            owner: outstanding.request.owner,
-                            hash: expected.hash,
-                            estimated_bytes: expected.estimated_bytes,
-                            queued_at: outstanding.queued_at,
-                            deadline: outstanding.deadline,
-                        },
-                    );
+                    unreceived.push((expected.height, (outstanding, expected)));
                 }
             }
         }
+        // Filter before combining overlapping heights so a stale request cannot
+        // hide the current owner's metadata.
+        self.work.retain_owned(&mut unreceived, |(outstanding, _)| {
+            outstanding.request.owner
+        });
+        let map = unreceived
+            .into_iter()
+            .map(|(height, (outstanding, expected))| {
+                (
+                    height,
+                    super::peer_registry::OutstandingMeta {
+                        owner: outstanding.request.owner,
+                        hash: expected.hash,
+                        estimated_bytes: expected.estimated_bytes,
+                        queued_at: outstanding.queued_at,
+                        deadline: outstanding.deadline,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         if map.is_empty() {
             self.registry.clear_outstanding(&self.peer, self.generation);
         } else {
@@ -2150,11 +2268,15 @@ impl PeerRoutine {
         // Misbehavior is record-only: observe and forward it, but never cancel the
         // session. Peer scoring no longer drives disconnects.
         metrics::counter!("sync.block.peer.violation").increment(1);
-        // `Misbehavior` is best-effort: never block the routine.
-        let _ = self.actions.try_send(BlockSyncAction::Misbehavior {
-            peer: self.peer.clone(),
-            reason,
-        });
+        // `Misbehavior` is best-effort: never block the routine. The reactor owns
+        // action dispatch so attacker-triggered reports cannot bypass its reserved
+        // control capacity.
+        let _ = self
+            .routine_to_reactor
+            .try_send(RoutineToReactor::Misbehavior {
+                peer: self.peer.clone(),
+                reason,
+            });
     }
 
     // ===================== view reads ======================================
@@ -2164,6 +2286,8 @@ impl PeerRoutine {
     }
 
     fn record_received(&self, bytes: u64) {
+        // Count accepted serialized block payloads, excluding transport framing.
+        metrics::counter!("sync.block.payload.received.bytes").increment(bytes);
         if let Ok(mut meter) = self.received_throughput.lock() {
             meter.record(bytes);
         }
@@ -2219,25 +2343,7 @@ impl Drop for PeerRoutine {
     /// The reactor owns entry insert (on connect) and remove (on disconnect/
     /// admission-reject); see `handle_peer_disconnected`.
     fn drop(&mut self) {
-        let outstanding_ranges = std::mem::take(&mut self.window.outstanding);
-        for outstanding in outstanding_ranges {
-            let unreceived: Vec<_> = outstanding
-                .request
-                .expected_blocks
-                .iter()
-                .filter(|expected| !outstanding.has_received(expected.height))
-                .map(|expected| expected.height)
-                .collect();
-            let outcome = self
-                .work
-                .release_reserved_and_return_items_detailed_for_owner(
-                    outstanding.request.owner,
-                    unreceived.iter().copied(),
-                );
-            self.budget.release(outcome.released_bytes);
-            self.trace_work_returned("peer_routine_drop", &outstanding, unreceived.len(), outcome);
-        }
-        self.registry.clear_outstanding(&self.peer, self.generation);
+        self.return_unreceived_requests("peer_routine_drop");
     }
 }
 
@@ -2257,8 +2363,12 @@ mod tests {
     use super::super::sequencer_task::initial_view;
     use super::super::state::{ByteBudget, ThroughputMeter};
     use super::super::work_queue::WorkQueue;
-    use super::super::{BlockSyncFrontiers, BlockSyncPeerSession, ZakuraBlockSyncConfig};
+    use super::super::{
+        BlockSyncFrontiers, BlockSyncMessage, BlockSyncPeerSession, BlockSyncStatus, CwndUnit,
+        ZakuraBlockSyncConfig,
+    };
     use super::PeerRoutine;
+    use super::RoutineToReactor;
     use crate::zakura::framed_channel;
     use crate::zakura::trace::ZakuraTrace;
     use crate::zakura::ZakuraPeerId;
@@ -2270,6 +2380,242 @@ mod tests {
             .take_while(|allowed| **allowed)
             .count();
         Some(start..start + len)
+    }
+
+    fn status_test_routine() -> (
+        PeerRoutine,
+        crate::zakura::FramedRecv,
+        mpsc::Receiver<RoutineToReactor>,
+    ) {
+        let config = ZakuraBlockSyncConfig::default();
+        let peer = ZakuraPeerId::new(vec![7u8; 32]).expect("test peer id is within bounds");
+        let cancel = CancellationToken::new();
+        let (out_send, out_recv) = framed_channel(16);
+        let (_in_send, in_recv) = framed_channel(16);
+        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
+        let registry = Arc::new(PeerRegistry::new());
+        let generation = registry
+            .admit_session(&peer, session.direction(), &config, 0, Instant::now())
+            .generation();
+        let work = Arc::new(WorkQueue::new(block::Height(0)));
+        let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
+        let (routine_to_reactor_tx, routine_to_reactor_rx) = mpsc::channel(16);
+        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        }));
+        let routine = PeerRoutine::new(
+            peer.clone(),
+            0,
+            session,
+            in_recv,
+            config.clone(),
+            true,
+            generation,
+            ByteBudget::new(config.max_inflight_block_bytes),
+            Arc::clone(&work),
+            Arc::clone(&registry),
+            Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
+            sequencer_input_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            routine_to_reactor_tx,
+            view_rx,
+            cancel,
+            ZakuraTrace::noop(),
+        );
+        (routine, out_recv, routine_to_reactor_rx)
+    }
+
+    #[tokio::test]
+    async fn status_flood_cannot_republish_ranges_or_caps_without_a_bound() {
+        let (mut routine, _outbound, mut reactor_events) = status_test_routine();
+        let mut status = BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(3),
+            tip_hash: block::Hash([3; 32]),
+            max_blocks_per_response: routine.config.advertised_max_blocks_per_response(),
+            max_inflight_requests: routine.config.advertised_max_inflight_requests(),
+            max_response_bytes: routine.config.advertised_max_response_bytes(),
+        };
+        routine.handle_status(status);
+        let _ = reactor_events
+            .try_recv()
+            .expect("initial status is published");
+        let next_allowed = Instant::now() + Duration::from_secs(60);
+        routine.inbound_status_meter.next_allowed = next_allowed;
+        routine.status_reply_meter.next_allowed = next_allowed;
+
+        status.servable_low = block::Height(2);
+        routine.handle_status(status);
+        assert!(matches!(
+            reactor_events.try_recv(),
+            Ok(RoutineToReactor::StatusReceived {
+                send_reply: false,
+                ..
+            })
+        ));
+        let immediate_range = routine.registry.candidate_snapshot();
+        let immediate_caps = routine.max_response_bytes;
+        status.max_response_bytes /= 2;
+        for (low, high) in [(1, 3), (2, 4), (0, 0), (3, 3)]
+            .into_iter()
+            .cycle()
+            .take(256)
+        {
+            status.servable_low = block::Height(low);
+            status.servable_high = block::Height(high);
+            routine.handle_status(status);
+            assert!(
+                reactor_events.try_recv().is_err(),
+                "range oscillation must not bypass the meter indefinitely"
+            );
+            assert_eq!(routine.registry.candidate_snapshot(), immediate_range);
+            assert_eq!(routine.max_response_bytes, immediate_caps);
+        }
+        routine.flush_pending_status();
+        assert!(reactor_events.try_recv().is_err());
+
+        routine.inbound_status_meter.next_allowed = Instant::now();
+        routine.flush_pending_status();
+        assert_eq!(
+            (routine.servable_low, routine.servable_high),
+            (block::Height(3), block::Height(3)),
+            "the final range must apply after the window opens"
+        );
+        assert_eq!(routine.max_response_bytes, status.max_response_bytes);
+        assert!(matches!(
+            reactor_events.try_recv(),
+            Ok(RoutineToReactor::StatusReceived {
+                send_reply: false,
+                ..
+            })
+        ));
+
+        // A newer return to the applied range must cancel an older deferred change.
+        routine.inbound_status_meter.next_allowed = next_allowed;
+        status.servable_low = block::Height(1);
+        routine.handle_status(status);
+        let _ = reactor_events
+            .try_recv()
+            .expect("one new bypass is available");
+        status.servable_low = block::Height(2);
+        routine.handle_status(status);
+        status.servable_low = block::Height(1);
+        routine.handle_status(status);
+        routine.inbound_status_meter.next_allowed = Instant::now();
+        routine.flush_pending_status();
+        assert!(reactor_events.try_recv().is_err());
+        assert_eq!(routine.servable_low, block::Height(1));
+    }
+
+    #[tokio::test]
+    async fn status_range_changes_bypass_throttle_without_extra_replies() {
+        let (mut routine, mut out_recv, mut routine_to_reactor_rx) = status_test_routine();
+        let config = routine.config.clone();
+        let work = Arc::clone(&routine.work);
+        let registry = Arc::clone(&routine.registry);
+        let peer = routine.peer.clone();
+        let mut status = BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(3),
+            tip_hash: block::Hash([3; 32]),
+            max_blocks_per_response: config.advertised_max_blocks_per_response(),
+            max_inflight_requests: config.advertised_max_inflight_requests(),
+            max_response_bytes: config.advertised_max_response_bytes(),
+        };
+        routine.handle_status(status);
+        assert!(matches!(
+            routine_to_reactor_rx.try_recv(),
+            Ok(RoutineToReactor::StatusReceived {
+                send_reply: true,
+                ..
+            })
+        ));
+
+        // Keep both windows closed without depending on the test's runtime speed.
+        let next_allowed = Instant::now() + Duration::from_secs(60);
+        routine.inbound_status_meter.next_allowed = next_allowed;
+        routine.status_reply_meter.next_allowed = next_allowed;
+        for (index, (low, high)) in [(2, 3), (1, 3), (1, 2), (1, 3), (0, 3), (0, 0), (2, 3)]
+            .into_iter()
+            .enumerate()
+        {
+            if index > 0 {
+                routine.inbound_status_meter.next_allowed = Instant::now();
+                routine.handle_status(status);
+                let _ = routine_to_reactor_rx
+                    .try_recv()
+                    .expect("new status window opens");
+                routine.inbound_status_meter.next_allowed = next_allowed;
+            }
+            status.servable_low = block::Height(low);
+            status.servable_high = block::Height(high);
+            routine.handle_status(status);
+            assert_eq!(
+                (routine.servable_low, routine.servable_high),
+                (status.servable_low, status.servable_high),
+                "range changes must apply while the inbound meter is closed"
+            );
+            assert_eq!(
+                registry.candidate_snapshot(),
+                vec![(
+                    peer.clone(),
+                    true,
+                    status.servable_low,
+                    status.servable_high
+                )]
+            );
+            assert!(matches!(
+                routine_to_reactor_rx.try_recv(),
+                Ok(RoutineToReactor::StatusReceived {
+                    send_reply: false,
+                    ..
+                })
+            ));
+        }
+
+        let old_response_bytes = routine.max_response_bytes;
+        status.max_response_bytes /= 2;
+        routine.handle_status(status);
+        assert_eq!(routine.max_response_bytes, old_response_bytes);
+        assert!(
+            routine_to_reactor_rx.try_recv().is_err(),
+            "unchanged ranges must still be rate limited"
+        );
+
+        work.extend(
+            super::super::test_work_scope(),
+            [
+                (
+                    block::Height(1),
+                    block::Hash([1; 32]),
+                    BlockSizeEstimate::Advertised(1_000),
+                ),
+                (
+                    block::Height(2),
+                    block::Hash([2; 32]),
+                    BlockSizeEstimate::Advertised(1_000),
+                ),
+            ],
+        );
+        let _ = routine.try_fill().await;
+        let frame = timeout(Duration::from_secs(5), out_recv.recv())
+            .await
+            .expect("retained block request is sent")
+            .expect("outbound stream remains open");
+        assert!(matches!(
+            BlockSyncMessage::decode_frame(frame).expect("request decodes"),
+            BlockSyncMessage::GetBlocks {
+                start_height: block::Height(2),
+                count: 1,
+            }
+        ));
+        assert!(
+            work.pending_contains(block::Height(1)),
+            "the pruned block must remain available for another peer"
+        );
     }
 
     #[test]
@@ -2363,7 +2709,6 @@ mod tests {
         );
 
         let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
-        let (actions_tx, _actions_rx) = mpsc::channel(16);
         let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
         let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
             finalized_height: block::Height(0),
@@ -2385,7 +2730,6 @@ mod tests {
             sequencer_input_tx,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
-            actions_tx,
             routine_to_reactor_tx,
             view_rx,
             cancel,
@@ -2425,7 +2769,19 @@ mod tests {
     /// and is sent without a sequencer round trip.
     #[tokio::test]
     async fn floor_overdraft_is_bounded_and_immediate() {
-        let config = ZakuraBlockSyncConfig::default();
+        for unit in [CwndUnit::Bytes, CwndUnit::Blocks] {
+            for measurement_age in [None, Some(Duration::ZERO), Some(Duration::from_secs(11))] {
+                check_floor_overdraft_and_deadline(unit, measurement_age).await;
+            }
+        }
+    }
+
+    async fn check_floor_overdraft_and_deadline(unit: CwndUnit, measurement_age: Option<Duration>) {
+        let config = ZakuraBlockSyncConfig {
+            bbr_cwnd_unit: unit,
+            bbr_delivery_rate_window: Duration::from_secs(10),
+            ..ZakuraBlockSyncConfig::default()
+        };
 
         // A byte budget reserved down to exactly zero free: the case that used to wedge.
         let mut budget = ByteBudget::new(8_192);
@@ -2454,7 +2810,6 @@ mod tests {
         let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
 
         let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
-        let (actions_tx, _actions_rx) = mpsc::channel(16);
         let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
         let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
             finalized_height: block::Height(0),
@@ -2477,7 +2832,6 @@ mod tests {
             sequencer_input_tx,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
-            actions_tx,
             routine_to_reactor_tx,
             view_rx,
             cancel,
@@ -2489,7 +2843,31 @@ mod tests {
         routine.servable_low = block::Height(1);
         routine.servable_high = block::Height(10);
 
+        if let Some(age) = measurement_age {
+            let delivered_at = Instant::now() - age;
+            let elapsed = Duration::from_secs(1);
+            let snapshot = routine.window.delivery_snapshot(delivered_at - elapsed);
+            routine
+                .window
+                .record_delivery(delivered_at, elapsed, 1, 256 * 1024, snapshot);
+        }
         let _ = routine.try_fill().await;
+
+        let outstanding = &routine.window.outstanding[0];
+        let base = if measurement_age == Some(Duration::ZERO) {
+            routine.config.effective_floor_rescue_timeout()
+        } else {
+            routine.config.request_timeout
+        };
+        let transfer = Duration::from_secs_f64(
+            f64::from(u32::try_from(outstanding.request.estimated_bytes).unwrap())
+                / (256.0 * 1024.0),
+        );
+        assert_eq!(
+            outstanding.deadline,
+            outstanding.queued_at + base + transfer,
+            "unit={unit:?}, measurement_age={measurement_age:?}"
+        );
 
         // The floor request went out synchronously (no funding round trip)…
         let frame = timeout(Duration::from_secs(5), out_recv.recv())
@@ -2517,8 +2895,465 @@ mod tests {
         );
     }
 
-    /// Routine teardown must not release or requeue a height already received
-    /// through first-completion-wins.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum DeadlineWriteState {
+        Queued,
+        Started,
+        Written,
+    }
+
+    #[tokio::test]
+    async fn deadline_expiry_only_penalizes_requests_that_started() {
+        use DeadlineWriteState::*;
+
+        for writes in [
+            vec![Queued],
+            vec![Started],
+            vec![Written],
+            vec![Started, Queued],
+            vec![Written, Queued],
+            vec![Written, Started, Queued],
+        ] {
+            for progress_after_first in [false, true] {
+                check_deadline_write_states(&writes, progress_after_first).await;
+            }
+        }
+    }
+
+    async fn check_deadline_write_states(
+        writes: &[DeadlineWriteState],
+        progress_after_first: bool,
+    ) {
+        let config = ZakuraBlockSyncConfig {
+            initial_block_probe_requests: u32::try_from(writes.len()).unwrap(),
+            ..ZakuraBlockSyncConfig::default()
+        };
+        let liveness_timeout = config.effective_liveness_timeout();
+        let mut expected_window = super::DownloadWindow::new(&config);
+        let budget = ByteBudget::new(1_000_000);
+        let work = Arc::new(WorkQueue::new(block::Height(0)));
+        work.set_estimate_floor_for_tests(1);
+        let cancel = CancellationToken::new();
+        let (out_send, mut out_recv) = crate::zakura::transport::worker_framed_channel(16);
+        let (_in_send, in_recv) = framed_channel(16);
+        let peer = ZakuraPeerId::new(vec![9u8; 32]).unwrap();
+        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
+        let registry = Arc::new(PeerRegistry::new());
+        let generation = registry
+            .admit_session(
+                &peer,
+                crate::zakura::ServicePeerDirection::Outbound,
+                &config,
+                0,
+                Instant::now(),
+            )
+            .generation();
+        let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
+        let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
+        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        }));
+        let mut routine = PeerRoutine::new(
+            peer.clone(),
+            0,
+            session,
+            in_recv,
+            config,
+            true,
+            generation,
+            budget.clone(),
+            work.clone(),
+            registry.clone(),
+            Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
+            sequencer_input_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            routine_to_reactor_tx,
+            view_rx,
+            cancel.clone(),
+            ZakuraTrace::noop(),
+        );
+        routine.handle_status(super::BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(10),
+            max_blocks_per_response: 1,
+            ..super::BlockSyncStatus::default()
+        });
+
+        let mut started_writes = Vec::new();
+        let mut peer_timeouts = Vec::new();
+        for (index, state) in writes.iter().enumerate() {
+            let height = u8::try_from(index + 2).unwrap();
+            work.extend(
+                super::super::test_work_scope(),
+                [(
+                    block::Height(u32::from(height)),
+                    block::Hash([height; 32]),
+                    BlockSizeEstimate::Confirmed(1_000),
+                )],
+            );
+            routine.try_fill().await;
+            assert_eq!(routine.window.outstanding.len(), index + 1);
+            match state {
+                DeadlineWriteState::Queued => {}
+                DeadlineWriteState::Started => {
+                    let frame = out_recv.recv().await.unwrap();
+                    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                    let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+                    let writer = tokio::spawn(frame.write_with(move |_| async move {
+                        started_tx.send(()).unwrap();
+                        finish_rx.await.unwrap();
+                        Ok::<_, ()>(())
+                    }));
+                    timeout(Duration::from_secs(1), started_rx)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    started_writes.push((finish_tx, writer));
+                    peer_timeouts.push(block::Height(u32::from(height)));
+                }
+                DeadlineWriteState::Written => {
+                    out_recv
+                        .recv()
+                        .await
+                        .unwrap()
+                        .write_with(|_| async { Ok::<_, ()>(()) })
+                        .await
+                        .unwrap();
+                    peer_timeouts.push(block::Height(u32::from(height)));
+                }
+            }
+            if progress_after_first && index == 0 {
+                routine
+                    .window
+                    .note_block_progress(Instant::now(), liveness_timeout);
+            }
+        }
+        let first_owner = routine.window.outstanding[0].request.owner;
+        let liveness_deadline = routine.window.block_liveness_deadline.unwrap();
+        let deadline = routine
+            .window
+            .outstanding
+            .iter()
+            .map(|request| request.deadline)
+            .max()
+            .unwrap();
+        assert!(routine.expire_due_timeouts(deadline));
+        if !peer_timeouts.is_empty() {
+            expected_window.record_timeout(peer_timeouts.len());
+        }
+        assert_eq!(
+            routine.window.bbr_reliability_permille(),
+            expected_window.bbr_reliability_permille(),
+            "only started writes count as peer failures: {writes:?}, progress={progress_after_first}"
+        );
+        assert_eq!(
+            routine.window.bbr_effective_cwnd(),
+            expected_window.bbr_effective_cwnd(),
+            "queued-only expiry must not dip the congestion window"
+        );
+        assert_eq!(
+            routine.window.requests_without_block_progress,
+            u32::try_from(peer_timeouts.len())
+                .unwrap()
+                .saturating_sub(u32::from(
+                    progress_after_first && writes[0] != DeadlineWriteState::Queued
+                )),
+        );
+        assert_eq!(
+            routine.retry_avoid.keys().copied().collect::<Vec<_>>(),
+            peer_timeouts,
+        );
+        assert!(routine.window.outstanding.is_empty());
+        assert_eq!(budget.reserved(), 0);
+        assert_eq!(work.reserved_bytes(), 0);
+        assert_eq!(work.pending_len(), writes.len());
+        for index in 0..writes.len() {
+            let height = block::Height(u32::try_from(index + 2).unwrap());
+            assert!(work.pending_contains(height));
+            assert!(!registry.peer_has_outstanding_height(&peer, height));
+        }
+        assert_eq!(
+            routine.window.check_liveness(liveness_deadline),
+            if peer_timeouts.is_empty() {
+                super::LivenessOutcome::Ok
+            } else {
+                super::LivenessOutcome::Park
+            },
+        );
+        assert!(!cancel.is_cancelled());
+
+        if peer_timeouts.is_empty() {
+            // Reissue before the old queued frame is drained. Its later drop
+            // must preserve the replacement's ownership and byte charge.
+            routine.try_fill().await;
+            assert_eq!(routine.window.outstanding.len(), 1);
+            assert_ne!(routine.window.outstanding[0].request.owner, first_owner);
+        }
+        for (finish, writer) in started_writes {
+            finish.send(()).unwrap();
+            timeout(Duration::from_secs(1), writer)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        for state in writes {
+            if *state == DeadlineWriteState::Queued {
+                out_recv
+                    .recv()
+                    .await
+                    .unwrap()
+                    .write_with(|_| async {
+                        panic!("a request expired before writer startup must not reach the wire");
+                        #[allow(unreachable_code)]
+                        Ok::<_, ()>(())
+                    })
+                    .await
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            budget.reserved(),
+            if peer_timeouts.is_empty() { 1_000 } else { 0 }
+        );
+        assert_eq!(budget.reserved(), work.reserved_bytes());
+        assert!(!cancel.is_cancelled());
+    }
+
+    #[derive(Clone, Copy)]
+    enum ReceiptCleanup {
+        BeforeWriter,
+        Writer,
+        CommittedGc,
+        ObsoleteGc,
+    }
+
+    #[tokio::test]
+    async fn skipped_write_retires_only_its_own_peer_obligation() {
+        for order in [
+            ReceiptCleanup::Writer,
+            ReceiptCleanup::CommittedGc,
+            ReceiptCleanup::ObsoleteGc,
+        ] {
+            for (other_request, progress_before_other) in
+                [(false, false), (true, false), (true, true)]
+            {
+                check_skipped_write_obligation(order, other_request, progress_before_other).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn competing_receipt_retires_unwritable_request_before_writer_reaches_it() {
+        check_skipped_write_obligation(ReceiptCleanup::BeforeWriter, false, false).await;
+    }
+
+    async fn check_skipped_write_obligation(
+        order: ReceiptCleanup,
+        other_request: bool,
+        progress_before_other: bool,
+    ) {
+        let config = ZakuraBlockSyncConfig {
+            request_timeout: if matches!(order, ReceiptCleanup::BeforeWriter) {
+                Duration::from_secs(1)
+            } else {
+                ZakuraBlockSyncConfig::default().request_timeout
+            },
+            initial_block_probe_requests: if other_request { 2 } else { 1 },
+            ..ZakuraBlockSyncConfig::default()
+        };
+        let liveness_timeout = config.effective_liveness_timeout();
+        let mut budget = ByteBudget::new(1_000_000);
+        let work = Arc::new(WorkQueue::new(block::Height(0)));
+        work.set_estimate_floor_for_tests(1);
+        let add_work = |height: u8| {
+            work.extend(
+                super::super::test_work_scope(),
+                [(
+                    block::Height(u32::from(height)),
+                    block::Hash([height; 32]),
+                    BlockSizeEstimate::Confirmed(
+                        if matches!(order, ReceiptCleanup::BeforeWriter) {
+                            1_000_000
+                        } else {
+                            1_000
+                        },
+                    ),
+                )],
+            );
+        };
+        // Height 1 stays missing, so the competing body at height 2 cannot move
+        // the committed floor and conceal a stale outstanding request.
+        add_work(2);
+        let cancel = CancellationToken::new();
+        let (out_send, mut out_recv) = crate::zakura::transport::worker_framed_channel(16);
+        let (_in_send, in_recv) = framed_channel(16);
+        let peer = ZakuraPeerId::new(vec![9u8; 32]).unwrap();
+        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
+        let registry = Arc::new(PeerRegistry::new());
+        let generation = registry
+            .admit_session(
+                &peer,
+                crate::zakura::ServicePeerDirection::Outbound,
+                &config,
+                0,
+                Instant::now(),
+            )
+            .generation();
+        let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
+        let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
+        let (view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        }));
+        let mut routine = PeerRoutine::new(
+            peer.clone(),
+            0,
+            session,
+            in_recv,
+            config,
+            true,
+            generation,
+            budget.clone(),
+            work.clone(),
+            registry.clone(),
+            Arc::new(Mutex::new(ThroughputMeter::new(Instant::now()))),
+            sequencer_input_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            routine_to_reactor_tx,
+            view_rx,
+            cancel.clone(),
+            ZakuraTrace::noop(),
+        );
+        routine.handle_status(super::BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(10),
+            max_blocks_per_response: 1,
+            ..super::BlockSyncStatus::default()
+        });
+        routine.try_fill().await;
+        assert_eq!(routine.window.outstanding.len(), 1);
+        let owner = routine.window.outstanding[0].request.owner;
+        let deadline = routine.window.outstanding[0].deadline;
+        let queued = out_recv.recv().await.unwrap();
+        assert!(registry.peer_has_outstanding_height(&peer, block::Height(2)));
+
+        if progress_before_other {
+            routine
+                .window
+                .note_block_progress(Instant::now(), liveness_timeout);
+        }
+        if other_request {
+            add_work(3);
+            routine.try_fill().await;
+            assert_eq!(routine.window.outstanding.len(), 2);
+        }
+        let skipped = work.subscribe_available().notified();
+        tokio::pin!(skipped);
+        skipped.as_mut().enable();
+        // Another peer wins height 2 before this writer starts. Its body retains
+        // this exact owner until the sequencer consumes it.
+        budget.release(
+            work.release_active_reserved_height_for_owner(owner, block::Height(2))
+                .unwrap(),
+        );
+        match order {
+            ReceiptCleanup::BeforeWriter => {
+                let liveness_deadline = routine.window.block_liveness_deadline.unwrap();
+                assert!(
+                    liveness_deadline < deadline,
+                    "transfer allowance outlasts liveness"
+                );
+                assert_eq!(work.owner_for_height(block::Height(2)), Some(owner));
+                assert_eq!(budget.reserved(), 0);
+                routine.gc_obsolete_outstanding();
+                let result = routine.handle_deadlines(liveness_deadline).await;
+                assert!(
+                    result.is_ok(),
+                    "a request made unwritable by receipt must not park its peer: {result:?}"
+                );
+                assert!(routine.window.outstanding.is_empty());
+                return;
+            }
+            ReceiptCleanup::Writer => {}
+            ReceiptCleanup::CommittedGc => {
+                budget.release(work.advance_floor(block::Height(2)));
+                view_tx.send_modify(|view| view.download_floor = block::Height(2));
+                routine.gc_committed_outstanding();
+            }
+            ReceiptCleanup::ObsoleteGc => {
+                budget.release(work.advance_floor(block::Height(2)));
+                routine.gc_obsolete_outstanding();
+            }
+        }
+        queued
+            .write_with(|_| async {
+                panic!("a superseded request must not reach the wire");
+                #[allow(unreachable_code)]
+                Ok::<_, ()>(())
+            })
+            .await
+            .unwrap();
+        if matches!(order, ReceiptCleanup::Writer) {
+            timeout(Duration::from_secs(1), skipped)
+                .await
+                .expect("receipt retirement must wake its routine");
+        }
+        if other_request {
+            out_recv
+                .recv()
+                .await
+                .unwrap()
+                .write_with(|_| async { Ok::<_, ()>(()) })
+                .await
+                .unwrap();
+        }
+
+        // Deadline handling must reconcile the skipped write before scoring a
+        // timeout, even if it was the event that woke the routine.
+        routine.handle_deadlines(deadline).await.unwrap();
+        assert!(!registry.peer_has_outstanding_height(&peer, block::Height(2)));
+        assert_eq!(
+            work.owner_for_height(block::Height(2)),
+            matches!(order, ReceiptCleanup::Writer).then_some(owner),
+        );
+        assert!(!work.pending_contains(block::Height(2)));
+        assert!(routine.retry_avoid.is_empty());
+        assert!(!cancel.is_cancelled());
+        if other_request {
+            assert_eq!(routine.window.outstanding.len(), 1);
+            assert_eq!(routine.window.requests_without_block_progress, 1);
+            assert!(registry.peer_has_outstanding_height(&peer, block::Height(3)));
+            let liveness_deadline = routine.window.block_liveness_deadline.unwrap();
+            assert_eq!(
+                routine.window.check_liveness(liveness_deadline),
+                super::LivenessOutcome::Park
+            );
+            assert_eq!(budget.reserved(), 1_000);
+        } else {
+            assert!(routine.window.outstanding.is_empty());
+            assert_eq!(routine.window.requests_without_block_progress, 0);
+            assert!(routine.window.block_liveness_deadline.is_none());
+            routine
+                .handle_deadlines(deadline + liveness_timeout)
+                .await
+                .unwrap();
+            assert_eq!(budget.reserved(), 0);
+            add_work(3);
+            routine.try_fill().await;
+            assert_eq!(
+                routine.window.outstanding.len(),
+                1,
+                "the cold peer can probe again"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn routine_drop_leaves_a_body_won_by_another_peer_to_the_sequencer() {
         let config = ZakuraBlockSyncConfig::default();
@@ -2550,7 +3385,6 @@ mod tests {
         let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
 
         let (sequencer_input_tx, _sequencer_input_rx) = mpsc::channel(16);
-        let (actions_tx, _actions_rx) = mpsc::channel(16);
         let (routine_to_reactor_tx, _routine_to_reactor_rx) = mpsc::channel(16);
         let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
             finalized_height: block::Height(0),
@@ -2573,7 +3407,6 @@ mod tests {
             sequencer_input_tx,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
-            actions_tx,
             routine_to_reactor_tx,
             view_rx,
             cancel,
@@ -2670,6 +3503,423 @@ mod tests {
             now,
             request_timeout
         ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_session_settles_peer_failures_before_reopening() {
+        for failure in [
+            super::OrderedStreamFailure::RemoteClose,
+            super::OrderedStreamFailure::WriteTimeout,
+        ] {
+            check_cancelled_session_policy(Some(failure), true, false, false).await;
+            check_cancelled_session_policy(Some(failure), true, false, true).await;
+            check_cancelled_session_policy(Some(failure), true, true, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn local_cancel_and_idle_write_timeout_do_not_park_peers() {
+        check_cancelled_session_policy(None, true, false, false).await;
+        for buffered in [
+            BufferedResponse::Backpressured,
+            BufferedResponse::AlreadyProcessing,
+        ] {
+            check_cancelled_session_with_buffered_response(None, true, false, false, buffered)
+                .await;
+        }
+        check_cancelled_session_policy(
+            Some(super::OrderedStreamFailure::WriteTimeout),
+            false,
+            false,
+            false,
+        )
+        .await;
+    }
+
+    async fn check_cancelled_session_policy(
+        failure: Option<super::OrderedStreamFailure>,
+        unanswered: bool,
+        readmitted: bool,
+        expired: bool,
+    ) {
+        check_cancelled_session_with_buffered_response(
+            failure,
+            unanswered,
+            readmitted,
+            expired,
+            BufferedResponse::None,
+        )
+        .await;
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum BufferedResponse {
+        None,
+        Complete,
+        CompleteWhileOutboundFull,
+        StatusOnly,
+        Malformed,
+        MalformedBlock,
+        MalformedBlockBackpressured,
+        MalformedBlockAlreadyProcessing,
+        Backpressured,
+        AlreadyProcessing,
+        ResetDuringBackpressure,
+    }
+
+    #[tokio::test]
+    async fn malformed_blocks_are_validated_before_stream_failure_settlement() {
+        for failure in [
+            super::OrderedStreamFailure::RemoteClose,
+            super::OrderedStreamFailure::WriteTimeout,
+        ] {
+            for readmitted in [false, true] {
+                for buffered in [
+                    BufferedResponse::MalformedBlock,
+                    BufferedResponse::MalformedBlockBackpressured,
+                    BufferedResponse::MalformedBlockAlreadyProcessing,
+                ] {
+                    check_cancelled_session_with_buffered_response(
+                        Some(failure),
+                        true,
+                        readmitted,
+                        false,
+                        buffered,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_responses_are_considered_before_stream_failure() {
+        for failure in [
+            super::OrderedStreamFailure::RemoteClose,
+            super::OrderedStreamFailure::WriteTimeout,
+        ] {
+            for readmitted in [false, true] {
+                for buffered in [
+                    BufferedResponse::Complete,
+                    BufferedResponse::CompleteWhileOutboundFull,
+                    BufferedResponse::StatusOnly,
+                    BufferedResponse::Malformed,
+                    BufferedResponse::Backpressured,
+                    BufferedResponse::ResetDuringBackpressure,
+                ] {
+                    check_cancelled_session_with_buffered_response(
+                        Some(failure),
+                        true,
+                        readmitted,
+                        false,
+                        buffered,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_local_body_backpressure_does_not_charge_a_stall() {
+        for readmitted in [false, true] {
+            check_cancelled_session_with_buffered_response(
+                Some(super::OrderedStreamFailure::RemoteClose),
+                true,
+                readmitted,
+                false,
+                BufferedResponse::AlreadyProcessing,
+            )
+            .await;
+        }
+    }
+
+    async fn check_cancelled_session_with_buffered_response(
+        failure: Option<super::OrderedStreamFailure>,
+        unanswered: bool,
+        readmitted: bool,
+        expired: bool,
+        buffered: BufferedResponse,
+    ) {
+        use super::super::peer_registry::SessionAdmission;
+        use crate::zakura::transport::OrderedStreamFailureCause;
+        use crate::zakura::{ServicePeerDirection, SinkReject};
+
+        use zakura_chain::serialization::ZcashDeserializeInto;
+        let body: Arc<block::Block> = Arc::new(
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+                .zcash_deserialize_into()
+                .unwrap(),
+        );
+        let config = ZakuraBlockSyncConfig::default();
+        let budget = ByteBudget::new(1_000_000);
+        let work = Arc::new(WorkQueue::new(block::Height(0)));
+        work.set_estimate_floor_for_tests(1);
+        if unanswered {
+            work.extend(
+                super::super::test_work_scope(),
+                [(
+                    block::Height(1),
+                    body.hash(),
+                    BlockSizeEstimate::Confirmed(
+                        u32::try_from(zakura_test::vectors::BLOCK_MAINNET_1_BYTES.len()).unwrap(),
+                    ),
+                )],
+            );
+        }
+        let peer = ZakuraPeerId::new(vec![19; 32]).unwrap();
+        let registry = Arc::new(PeerRegistry::new());
+        let now = Instant::now();
+        let mut generation = registry
+            .admit_session(&peer, ServicePeerDirection::Outbound, &config, 0, now)
+            .generation();
+        if readmitted {
+            assert!(registry.park_session(&peer, 0, generation, now));
+            let admission =
+                registry.admit_session(&peer, ServicePeerDirection::Outbound, &config, 0, now);
+            assert!(matches!(admission, SessionAdmission::Readmitted { .. }));
+            generation = admission.generation();
+        }
+        let cancel = CancellationToken::new();
+        let (out_send, mut out_recv) = crate::zakura::transport::worker_framed_channel(4);
+        let fill_outbound = out_send.clone();
+        let (in_send, in_recv) = framed_channel(4);
+        let cause = OrderedStreamFailureCause::default();
+        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
+        let (sequencer_input, mut sequencer_recv) = mpsc::channel(4);
+        let mut held_capacity = Vec::new();
+        if matches!(
+            buffered,
+            BufferedResponse::Backpressured
+                | BufferedResponse::AlreadyProcessing
+                | BufferedResponse::ResetDuringBackpressure
+                | BufferedResponse::MalformedBlockBackpressured
+                | BufferedResponse::MalformedBlockAlreadyProcessing
+        ) {
+            for _ in 0..4 {
+                held_capacity.push(sequencer_input.clone().try_reserve_owned().unwrap());
+            }
+        }
+        let (reactor_input, _reactor_recv) = mpsc::channel(4);
+        let (view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        }));
+        let mut routine = PeerRoutine::new(
+            peer.clone(),
+            0,
+            session,
+            in_recv.with_failure_cause(cause.clone()),
+            config.clone(),
+            !readmitted,
+            generation,
+            budget.clone(),
+            work.clone(),
+            registry.clone(),
+            Arc::new(Mutex::new(ThroughputMeter::new(now))),
+            sequencer_input,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            reactor_input,
+            view_rx,
+            cancel.clone(),
+            ZakuraTrace::noop(),
+        );
+        if unanswered {
+            routine.handle_status(super::BlockSyncStatus {
+                servable_low: block::Height(1),
+                servable_high: block::Height(1),
+                max_blocks_per_response: 1,
+                ..super::BlockSyncStatus::default()
+            });
+            routine.try_fill().await;
+            assert_eq!(routine.window.outstanding.len(), 1);
+            timeout(Duration::from_secs(1), out_recv.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .write_with(|_| async { Ok::<_, std::convert::Infallible>(()) })
+                .await
+                .unwrap();
+            assert!(work.in_flight_contains(block::Height(1)));
+            if expired {
+                let after_deadline =
+                    routine.window.outstanding[0].deadline + Duration::from_millis(1);
+                routine.expire_due_timeouts(after_deadline);
+                assert!(routine.window.outstanding.is_empty());
+                assert!(routine.window.block_liveness_deadline.is_some());
+            }
+        }
+        match buffered {
+            BufferedResponse::Complete
+            | BufferedResponse::CompleteWhileOutboundFull
+            | BufferedResponse::Backpressured
+            | BufferedResponse::AlreadyProcessing
+            | BufferedResponse::ResetDuringBackpressure => {
+                in_send
+                    .send(
+                        super::BlockSyncMessage::Block(body.clone())
+                            .encode_frame()
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                in_send
+                    .send(
+                        super::BlockSyncMessage::BlocksDone {
+                            start_height: block::Height(1),
+                            returned: 1,
+                        }
+                        .encode_frame()
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            BufferedResponse::StatusOnly => {
+                in_send
+                    .send(
+                        super::BlockSyncMessage::Status(super::BlockSyncStatus::default())
+                            .encode_frame()
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            BufferedResponse::Malformed => {
+                in_send
+                    .send(crate::zakura::Frame {
+                        message_type: u16::MAX,
+                        flags: 0,
+                        payload: vec![],
+                    })
+                    .await
+                    .unwrap();
+            }
+            BufferedResponse::MalformedBlock
+            | BufferedResponse::MalformedBlockBackpressured
+            | BufferedResponse::MalformedBlockAlreadyProcessing => {
+                let frame = crate::zakura::Frame {
+                    message_type: u16::from(super::MSG_BS_BLOCK),
+                    flags: 0,
+                    payload: vec![super::MSG_BS_BLOCK],
+                };
+                assert!(super::BlockSyncMessage::decode_frame(frame.clone()).is_err());
+                in_send.send(frame).await.unwrap();
+            }
+            BufferedResponse::None => {}
+        }
+        if buffered == BufferedResponse::CompleteWhileOutboundFull {
+            for _ in 0..4 {
+                fill_outbound
+                    .try_send(
+                        super::BlockSyncMessage::Status(super::BlockSyncStatus::default())
+                            .encode_frame()
+                            .unwrap(),
+                    )
+                    .unwrap();
+            }
+            assert_eq!(routine.session.outbound_capacity(), 0);
+        }
+        let mut running = Box::pin(routine.run());
+        if matches!(
+            buffered,
+            BufferedResponse::AlreadyProcessing | BufferedResponse::MalformedBlockAlreadyProcessing
+        ) {
+            // Poll until the body leaves the frame queue and waits for local
+            // capacity. Cancellation must not turn that wait into a peer fault.
+            assert!(futures::poll!(running.as_mut()).is_pending());
+            assert_eq!(
+                in_send.capacity(),
+                if buffered == BufferedResponse::MalformedBlockAlreadyProcessing {
+                    4
+                } else {
+                    3
+                }
+            );
+        }
+        if let Some(failure) = failure {
+            cause.record(failure);
+        }
+        cancel.cancel();
+        if failure.is_some() && !held_capacity.is_empty() {
+            assert!(
+                futures::poll!(running.as_mut()).is_pending(),
+                "a failed stream must retain its unvalidated response until decode capacity returns"
+            );
+            assert!(work.in_flight_contains(block::Height(1)));
+            assert!(budget.reserved() > 0);
+            assert!(sequencer_recv.try_recv().is_err());
+            assert!(!registry.is_peer_parked(&peer, Instant::now()));
+            if buffered == BufferedResponse::ResetDuringBackpressure {
+                budget.clone().release(work.reset_above(block::Height(0)));
+                view_tx.send_modify(|view| view.reset_epoch += 1);
+            }
+            drop(held_capacity);
+        }
+        let result = timeout(Duration::from_secs(1), running).await.unwrap();
+        if matches!(
+            buffered,
+            BufferedResponse::Malformed
+                | BufferedResponse::MalformedBlock
+                | BufferedResponse::MalformedBlockBackpressured
+                | BufferedResponse::MalformedBlockAlreadyProcessing
+        ) {
+            assert!(matches!(result, Err(SinkReject::Protocol(_))), "{result:?}");
+            assert!(!registry.is_peer_parked(&peer, Instant::now()));
+        } else if failure.is_some()
+            && unanswered
+            && matches!(
+                buffered,
+                BufferedResponse::None | BufferedResponse::StatusOnly
+            )
+        {
+            if readmitted {
+                assert!(matches!(result, Err(SinkReject::Protocol(_))), "{result:?}");
+            } else {
+                assert!(matches!(result, Err(SinkReject::Local(_))), "{result:?}");
+                assert!(matches!(
+                    registry.admit_session(
+                        &peer,
+                        ServicePeerDirection::Outbound,
+                        &config,
+                        0,
+                        Instant::now()
+                    ),
+                    SessionAdmission::Parked,
+                ));
+                assert!(matches!(
+                    registry.admit_session(
+                        &peer,
+                        ServicePeerDirection::Outbound,
+                        &config,
+                        0,
+                        Instant::now() + config.effective_no_progress_peer_cooldown()
+                    ),
+                    SessionAdmission::Readmitted { .. },
+                ));
+            }
+        } else {
+            assert!(result.is_ok(), "{result:?}");
+            assert!(!registry.is_peer_parked(&peer, Instant::now()));
+        }
+        assert_eq!(budget.reserved(), 0);
+        let received = failure.is_some()
+            && matches!(
+                buffered,
+                BufferedResponse::Complete
+                    | BufferedResponse::CompleteWhileOutboundFull
+                    | BufferedResponse::Backpressured
+                    | BufferedResponse::AlreadyProcessing
+            );
+        assert_eq!(
+            work.pending_contains(block::Height(1)),
+            unanswered && !received && buffered != BufferedResponse::ResetDuringBackpressure
+        );
+        assert_eq!(work.in_flight_contains(block::Height(1)), received);
+        assert_eq!(sequencer_recv.try_recv().is_ok(), received);
+        assert!(sequencer_recv.try_recv().is_err());
     }
 
     #[test]

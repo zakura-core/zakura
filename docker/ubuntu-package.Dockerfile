@@ -4,7 +4,7 @@ ARG UBUNTU_IMAGE=ubuntu:22.04
 FROM ${UBUNTU_IMAGE} AS build
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG RUST_VERSION=1.91
+ARG RUST_VERSION=1.97
 ARG FEATURES="default-release-binaries"
 
 RUN apt-get update && \

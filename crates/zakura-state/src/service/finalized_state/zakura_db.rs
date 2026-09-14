@@ -474,6 +474,11 @@ impl ZakuraDb {
     pub fn size(&self) -> u64 {
         self.db.size()
     }
+
+    /// Returns the most recently cached disk space estimate.
+    pub(crate) fn cached_size(&self) -> u64 {
+        self.db.cached_size()
+    }
 }
 
 /// The first database format version whose Mainnet VCT databases are guaranteed to hold the

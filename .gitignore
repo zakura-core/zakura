@@ -100,11 +100,11 @@ debug/
 target/
 
 # Local cargo-fuzz inputs and findings are generated during campaigns.
-/fuzz/header-chain/artifacts/
-/fuzz/header-chain/corpus/
-/fuzz/header-chain/coverage/
-/fuzz/header-chain/*.profdata
-/fuzz/header-chain/*.profraw
+/qa/fuzz/header-chain/artifacts/
+/qa/fuzz/header-chain/corpus/
+/qa/fuzz/header-chain/coverage/
+/qa/fuzz/header-chain/*.profdata
+/qa/fuzz/header-chain/*.profraw
 
 # Remove Cargo.lock from gitignore if creating an executable, leave it for libraries
 # More information here https://doc.rust-lang.org/cargo/guide/cargo-toml-vs-cargo-lock.html
@@ -170,9 +170,6 @@ __pycache__/
 !.agents/rules
 local_data/**
 
-# fuzzing artifacts
-crates/zakura-chain/fuzz/artifacts
-crates/zakura-chain/fuzz/corpus
 stako/**/*
 perf-artifacts/**/*
 

@@ -42,5 +42,6 @@ expression: block_template
   "bits": "20055554",
   "height": 1842421,
   "maxtime": 1654008728,
+  "workid": "[WorkId]",
   "submitold": false
 }

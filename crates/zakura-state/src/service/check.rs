@@ -62,9 +62,31 @@ where
     C::Item: Borrow<Block>,
     C::IntoIter: ExactSizeIterator,
 {
+    block_is_valid_for_recent_chain_data(
+        &semantically_verified.block,
+        semantically_verified.height,
+        network,
+        finalized_tip_height,
+        relevant_chain,
+    )
+}
+
+/// Checks the recent-chain rules required for prepared mined-block relay.
+pub(crate) fn block_is_valid_for_recent_chain_data<C>(
+    candidate_block: &Block,
+    candidate_height: block::Height,
+    network: &Network,
+    finalized_tip_height: Option<block::Height>,
+    relevant_chain: C,
+) -> Result<(), ValidateContextError>
+where
+    C: IntoIterator,
+    C::Item: Borrow<Block>,
+    C::IntoIter: ExactSizeIterator,
+{
     let finalized_tip_height = finalized_tip_height
         .expect("finalized state must contain at least one block to do contextual validation");
-    check::block_is_not_orphaned(finalized_tip_height, semantically_verified.height)?;
+    check::block_is_not_orphaned(finalized_tip_height, candidate_height)?;
 
     let relevant_chain: Vec<_> = relevant_chain
         .into_iter()
@@ -73,7 +95,7 @@ where
 
     let Some(parent_block) = relevant_chain.first() else {
         warn!(
-            ?semantically_verified,
+            ?candidate_height,
             ?finalized_tip_height,
             "state must contain parent block to do contextual validation"
         );
@@ -85,7 +107,7 @@ where
     let parent_height = parent_block
         .coinbase_height()
         .expect("valid blocks have a coinbase height");
-    check::height_one_more_than_parent_height(parent_height, semantically_verified.height)?;
+    check::height_one_more_than_parent_height(parent_height, candidate_height)?;
 
     // skip this check during tests if we don't have enough blocks in the chain
     // process_queued also checks the chain length, so we can skip this assertion during testing
@@ -126,10 +148,10 @@ where
         )
     });
     let difficulty_adjustment =
-        AdjustedDifficulty::new_from_block(&semantically_verified.block, network, relevant_data)
+        AdjustedDifficulty::new_from_block(candidate_block, network, relevant_data)
             .map_err(|_| ValidateContextError::NotReadyToBeCommitted)?;
     check::difficulty_threshold_and_time_are_valid(
-        semantically_verified.block.header.difficulty_threshold,
+        candidate_block.header.difficulty_threshold,
         difficulty_adjustment,
     )?;
 

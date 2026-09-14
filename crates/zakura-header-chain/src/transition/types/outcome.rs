@@ -223,7 +223,9 @@ pub struct CommittedStallReceipt {
 /// These must not be collapsed:
 ///
 /// 1. **[`crate::TransitionFailure::AuxiliaryLimitExceeded`]** — planner refuses
-///    before any durable mutation; no resource-stall alarm.
+///    event-local bounds or post-retention retained bounds before any durable
+///    mutation; no resource-stall alarm. A graph-retention resource stall can
+///    take precedence because no settled projection exists in that case.
 /// 2. **Verified `resource_stalled` → [`Self::ResourceStalled`]** — retention could
 ///    not enforce limits without breaking protected paths; the durable
 ///    resource-stall alarm may be recorded or retained.

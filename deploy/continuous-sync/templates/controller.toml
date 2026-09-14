@@ -13,6 +13,7 @@ monitor_log = "{{MONITOR_LOG}}"
 trace_link = "{{TRACE_LINK}}"
 
 [policy]
+archive_traces = true
 branch = "{{BRANCH}}"
 remote = "{{REMOTE}}"
 service_name = "{{SERVICE_NAME}}"

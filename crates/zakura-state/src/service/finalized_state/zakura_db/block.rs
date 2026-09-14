@@ -308,6 +308,19 @@ impl ZakuraDb {
         Some(header)
     }
 
+    /// Returns block headers in height order.
+    #[cfg(feature = "indexer")]
+    pub fn block_headers_by_height_range<R>(
+        &self,
+        range: R,
+    ) -> impl Iterator<Item = (Height, Arc<block::Header>)> + '_
+    where
+        R: RangeBounds<Height>,
+    {
+        let block_header_by_height = self.db.cf_handle("block_header_by_height").unwrap();
+        self.db.zs_forward_range_iter(block_header_by_height, range)
+    }
+
     /// Returns the raw [`block::Header`] with [`block::Hash`] or [`Height`], if
     /// it exists in the finalized chain.
     #[allow(clippy::unwrap_in_result)]
@@ -688,6 +701,19 @@ impl ZakuraDb {
         self.db.zs_get(&hash_by_tx_loc, &location)
     }
 
+    /// Returns transaction hashes in block and transaction order.
+    #[cfg(feature = "indexer")]
+    pub fn transaction_hashes_by_location_range<R>(
+        &self,
+        range: R,
+    ) -> impl Iterator<Item = (TransactionLocation, transaction::Hash)> + '_
+    where
+        R: RangeBounds<TransactionLocation>,
+    {
+        let hash_by_tx_loc = self.db.cf_handle("hash_by_tx_loc").unwrap();
+        self.db.zs_forward_range_iter(hash_by_tx_loc, range)
+    }
+
     /// Returns the [`transaction::Hash`] of the transaction that spent or revealed the given
     /// [`transparent::OutPoint`] or nullifier, if it is spent or revealed in the finalized state.
     #[cfg(feature = "indexer")]
@@ -753,8 +779,12 @@ impl ZakuraDb {
     /// Returns `None` if the database has never pruned any data (it is
     /// effectively an archive database).
     pub fn lowest_retained_height(&self) -> Option<Height> {
-        let pruning_metadata = self.db.cf_handle(PRUNING_METADATA)?;
-        self.db.zs_get(&pruning_metadata, &())
+        self.db.lowest_retained_height()
+    }
+
+    /// Subscribe to the durable body floor before commit callers publish their new tip.
+    pub(crate) fn subscribe_retained_block_height(&self) -> tokio::sync::watch::Receiver<Height> {
+        self.db.subscribe_retained_block_height()
     }
 
     /// Returns `true` if the database has pruned historical data, and therefore

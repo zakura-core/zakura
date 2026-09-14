@@ -5774,7 +5774,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-header-chain"
-version = "1.0.0-rc0"
+version = "2.1.0"
 dependencies = [
  "chrono",
  "rayon",

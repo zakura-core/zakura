@@ -2,7 +2,8 @@
 /var/log/zakura/monitor.log
 {
     daily
-    rotate 5
+    maxsize 64M
+    rotate 7
     compress
     delaycompress
     missingok

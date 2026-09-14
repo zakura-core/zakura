@@ -89,8 +89,8 @@ See [jaeger/README.md](jaeger/README.md) for tracing details.
 
 Automated notifications for operational issues:
 
-- Critical: Negative value pools (ZIP-209 violation)
-- Warning: High RPC latency, sync stalls, peer connection issues
+- Critical: Negative value pools (ZIP-209 violation), release within 1 day of its end of service
+- Warning: High RPC latency, sync stalls, peer connection issues, release within 3 days of its end of service
 
 Configure alert destinations in [alertmanager/alertmanager.yml](alertmanager/alertmanager.yml).
 

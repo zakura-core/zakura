@@ -59,6 +59,26 @@ groups:
           summary: "High error rate"
           description: "Zakura is experiencing elevated error rates (> 0.1/s for 5 minutes)."
 
+      # This release stops running when the tip passes its end of service height.
+      # 1152 blocks is one day at the 75 second target spacing.
+      - alert: ZakuraEndOfServiceApproaching
+        expr: end_of_support_remaining_blocks < 3456
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Release reaches end of service in under 3 days"
+          description: "This Zakura release halts in {{ $value }} blocks. Install the latest release before then."
+
+      - alert: ZakuraEndOfServiceImminent
+        expr: end_of_support_remaining_blocks < 1152
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Release reaches end of service in under 1 day"
+          description: "This Zakura release halts in {{ $value }} blocks. Install the latest release now."
+
   # Value Pool Alerts (Monitoring)
   - name: zakura-value-pools
     rules:

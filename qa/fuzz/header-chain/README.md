@@ -20,7 +20,7 @@ When libFuzzer reports a failure, reproduce and minimize the artifact:
 
 ```console
 cargo +nightly-2026-07-15 fuzz run header_codec path/to/crash-artifact
-cargo xtask minimize-header-fuzz fuzz/header-chain/artifacts/<target>/crash-…
+cargo xtask minimize-header-fuzz qa/fuzz/header-chain/artifacts/<target>/crash-…
 ```
 
 Turn every confirmed bug into a normal deterministic test in the owning crate.

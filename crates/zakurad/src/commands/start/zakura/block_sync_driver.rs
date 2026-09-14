@@ -455,16 +455,30 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                 match query_block_sync_needed_blocks(read_state.clone(), from, limit).await {
                     Ok((body_anchor, blocks)) => {
                         trace.trace_needed_blocks_query_succeeded(blocks.len(), started);
-                        let _ = block_sync.send_control(BlockSyncEvent::ScopedNeededBlocks {
-                            query_id,
-                            scope,
-                            body_anchor,
-                            blocks,
-                        });
+                        if block_sync
+                            .send_control(BlockSyncEvent::ScopedNeededBlocks {
+                                query_id,
+                                scope,
+                                body_anchor,
+                                blocks,
+                            })
+                            .is_err()
+                        {
+                            error!("block-sync reactor closed before needed-body query completion");
+                            return;
+                        }
                         trace.trace_block_reactor_event("needed_blocks");
                     }
                     Err(error) => {
                         trace.trace_needed_blocks_query_failed(&format!("{error}"), started);
+                        if block_sync
+                            .send_needed_blocks_query_failure(query_id, scope)
+                            .is_err()
+                        {
+                            error!("block-sync reactor closed before needed-body query failure");
+                            return;
+                        }
+                        trace.trace_block_reactor_event("needed_blocks_query_failed");
                         warn!(
                             ?from,
                             ?limit,

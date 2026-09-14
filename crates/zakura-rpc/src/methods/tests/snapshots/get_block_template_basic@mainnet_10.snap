@@ -41,5 +41,6 @@ expression: block_template
   "curtime": 1654008617,
   "bits": "1f055554",
   "height": 1687105,
-  "maxtime": 1654008728
+  "maxtime": 1654008728,
+  "workid": "[WorkId]"
 }

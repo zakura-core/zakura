@@ -28,6 +28,7 @@ use zakura_header_chain::{
     TransitionInput, TransitionRequest, UntrustedAuxDeliveryRow, ValidationContextRecord,
     ValidationLease, VerifiedChainChanged, VerifiedChangeCause, VerifiedHeaderRef,
 };
+use zakura_node_services::header_chain::ServingCapacitySignal;
 
 use crate::{
     RetainedPathLease, RetainedPathLeaseOutcome, RetainedPathPage, RetainedPathReadOutcome,
@@ -859,7 +860,9 @@ struct RetainedPathLeaseRegistry {
     next_lease_id: u64,
     next_reservation_id: u64,
     by_peer: HashMap<SourceId, CanonicalHeaderPathCursor>,
-    reservations: HashMap<SourceId, u64>,
+    reservations: HashMap<SourceId, (u64, Option<ServingCapacitySignal>)>,
+    general_capacity: Option<ServingCapacitySignal>,
+    fallback_capacity: Option<ServingCapacitySignal>,
     // Idle hash indexes hold no serving capacity, retention roots, or disk snapshots.
     continuations: HashMap<SourceId, CanonicalHeaderPathCursor>,
 }
@@ -893,6 +896,7 @@ enum CanonicalHeaderPathPosition {
 
 #[derive(Clone, Debug)]
 struct CanonicalHeaderPathCursor {
+    capacity: Option<ServingCapacitySignal>,
     lease_id: u64,
     peer: SourceId,
     session_id: u64,
@@ -987,7 +991,26 @@ impl RetainedPathLeaseRegistry {
     }
 
     fn remove_peer(&mut self, peer: SourceId) -> Option<CanonicalHeaderPathCursor> {
-        self.by_peer.remove(&peer)
+        let mut cursor = self.by_peer.remove(&peer)?;
+        if let Some(signal) = cursor.capacity.take() {
+            signal.release();
+        }
+        self.notify_capacity();
+        Some(cursor)
+    }
+
+    fn notify_capacity(&mut self) {
+        let occupied = self.by_peer.len().saturating_add(self.reservations.len());
+        if occupied < RetainedPathCapacity::General.limit() {
+            if let Some(signal) = self.general_capacity.take() {
+                signal.release();
+            }
+        }
+        if occupied < RetainedPathCapacity::FinalizedFallback.limit() {
+            if let Some(signal) = self.fallback_capacity.take() {
+                signal.release();
+            }
+        }
     }
 
     fn reserve(
@@ -995,23 +1018,50 @@ impl RetainedPathLeaseRegistry {
         peer: SourceId,
         now: Instant,
         capacity: RetainedPathCapacity,
-    ) -> Option<u64> {
+    ) -> Result<u64, RetainedPathLeaseOutcome> {
         self.expire(now);
-        if self.by_peer.contains_key(&peer)
-            || self.reservations.contains_key(&peer)
-            || self.by_peer.len().saturating_add(self.reservations.len()) >= capacity.limit()
-        {
-            return None;
+        if let Some(cursor) = self.by_peer.get_mut(&peer) {
+            return Err(RetainedPathLeaseOutcome::CapacityBusy(
+                cursor.capacity.get_or_insert_default().clone(),
+            ));
         }
-        let reservation_id = self.next_reservation_id.checked_add(1)?;
+        if let Some((_, signal)) = self.reservations.get_mut(&peer) {
+            return Err(RetainedPathLeaseOutcome::CapacityBusy(
+                signal.get_or_insert_default().clone(),
+            ));
+        }
+        if self.by_peer.len().saturating_add(self.reservations.len()) >= capacity.limit() {
+            let signal = match capacity {
+                RetainedPathCapacity::General => &mut self.general_capacity,
+                RetainedPathCapacity::FinalizedFallback => &mut self.fallback_capacity,
+            };
+            return Err(RetainedPathLeaseOutcome::CapacityBusy(
+                signal.get_or_insert_default().clone(),
+            ));
+        }
+        let reservation_id = self
+            .next_reservation_id
+            .checked_add(1)
+            .ok_or(RetainedPathLeaseOutcome::Busy)?;
         self.next_reservation_id = reservation_id;
-        self.reservations.insert(peer, reservation_id);
-        Some(reservation_id)
+        self.reservations.insert(peer, (reservation_id, None));
+        Ok(reservation_id)
     }
 
     fn release_reservation(&mut self, peer: SourceId, reservation_id: u64) {
-        if self.reservations.get(&peer) == Some(&reservation_id) {
-            self.reservations.remove(&peer);
+        if self
+            .reservations
+            .get(&peer)
+            .is_some_and(|(id, _)| *id == reservation_id)
+        {
+            let (_, signal) = self
+                .reservations
+                .remove(&peer)
+                .expect("the reservation matches");
+            if let Some(signal) = signal {
+                signal.release();
+            }
+            self.notify_capacity();
         }
     }
 
@@ -1022,18 +1072,29 @@ impl RetainedPathLeaseRegistry {
         spec: RetainedPathLeaseSpec,
         now: Instant,
     ) -> RetainedPathLeaseOutcome {
-        if peer != spec.peer || self.reservations.get(&peer) != Some(&reservation_id) {
+        if peer != spec.peer
+            || !self
+                .reservations
+                .get(&peer)
+                .is_some_and(|(id, _)| *id == reservation_id)
+        {
             return RetainedPathLeaseOutcome::Busy;
         }
-        self.reservations.remove(&peer);
         if self.by_peer.contains_key(&peer) {
+            self.release_reservation(peer, reservation_id);
             return RetainedPathLeaseOutcome::Busy;
         }
         let Some(lease_id) = self.next_lease_id.checked_add(1) else {
+            self.release_reservation(peer, reservation_id);
             return RetainedPathLeaseOutcome::Busy;
         };
         self.next_lease_id = lease_id;
+        let (_, capacity) = self
+            .reservations
+            .remove(&peer)
+            .expect("the reservation matches");
         let cursor = CanonicalHeaderPathCursor {
+            capacity,
             lease_id,
             peer: spec.peer,
             session_id: spec.session_id,
@@ -1971,8 +2032,9 @@ impl HeaderChainReader {
             .lock()
             .map_err(|_| HeaderChainStoreError::WriterPoisoned)?
             .reserve(peer, Instant::now(), capacity);
-        let Some(reservation_id) = reservation_id else {
-            return Ok(RetainedPathLeaseOutcome::Busy);
+        let reservation_id = match reservation_id {
+            Ok(id) => id,
+            Err(outcome) => return Ok(outcome),
         };
         let reservation = RetainedPathReservation {
             leases: self.leases.clone(),

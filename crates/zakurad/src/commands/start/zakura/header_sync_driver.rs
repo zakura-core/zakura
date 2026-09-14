@@ -884,6 +884,9 @@ where
                 Ok(port::AcquirePathReply::HistoryPruned)
             }
             zakura_state::RetainedPathLeaseOutcome::Busy => Ok(port::AcquirePathReply::Busy),
+            zakura_state::RetainedPathLeaseOutcome::CapacityBusy(signal) => {
+                Ok(port::AcquirePathReply::CapacityBusy(signal))
+            }
         },
         Ok(Ok(_)) => Err(PortError::Unavailable { source: None }),
         Ok(Err(error)) => Err(PortError::Unavailable {

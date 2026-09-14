@@ -341,6 +341,7 @@ async fn parked_admission_leaves_the_incumbent_session_untouched() {
 
     let (replacement, _second_input, _second_output) =
         fence_peer(&peer, 2, CancellationToken::new());
+    let replacement_cancel = replacement.service_cancel_token();
     std::thread::scope(|scope| {
         let admitted = service.inner.sessions.active.lock().unwrap();
         let admitting = scope.spawn(|| service.add_peer(replacement));
@@ -377,5 +378,9 @@ async fn parked_admission_leaves_the_incumbent_session_untouched() {
         active[&peer].session_id,
         incumbent.session_id(),
         "the parked replacement is declined"
+    );
+    assert!(
+        replacement_cancel.is_cancelled(),
+        "a declined replacement's own session token is cancelled"
     );
 }

@@ -5,7 +5,12 @@
 //! midway through a frame must never produce a complete message.
 
 use super::*;
-use crate::zakura::BlockSyncMessage;
+use crate::zakura::{
+    legacy_gossip::{
+        LegacyGossipFrame, LegacyGossipSink, ZAKURA_STREAM_GOSSIP, ZAKURA_STREAM_LEGACY_REQUESTS,
+    },
+    BlockSyncMessage,
+};
 
 const ALPN: &[u8] = b"/zakura/test/compliance-frames/1";
 const DEADLINE: Duration = Duration::from_secs(5);
@@ -160,6 +165,87 @@ async fn f01_nonzero_flags_fail_before_payload_allocation_or_wait() -> Result<()
         failures.is_empty(),
         "F01 header flags must reject before reading payload: {failures:#?}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn f01_legacy_gossip_flags_reject_headers_before_payload_reads() -> Result<(), BoxError> {
+    let service = Arc::new(LegacyGossipSink::spawn(
+        tower::service_fn(|_| std::future::ready(Ok::<_, BoxError>(Response::Nil))),
+        ZakuraSupervisorHandle::new(1),
+    ));
+    let registry = ServiceRegistry::new(vec![service])?;
+    let hash = block::Hash([1; 32]);
+    let frames = [
+        (
+            ZAKURA_STREAM_GOSSIP,
+            LegacyGossipFrame::AdvertiseBlock(hash).encode_frame()?,
+        ),
+        (
+            ZAKURA_STREAM_LEGACY_REQUESTS,
+            LegacyRequestFrame::BlocksByHash(vec![hash]).encode_frame()?,
+        ),
+    ];
+    let mut pair = Pair::new().await?;
+    let mut failures = Vec::new();
+    for (stream_kind, frame) in frames {
+        let stream = registry
+            .stream_for_kind(stream_kind)
+            .ok_or("legacy gossip stream is not registered")?;
+        let largest_payload = stream.frame_cap - u32::try_from(FRAME_HEADER_BYTES)?;
+        for flags in (0..u16::BITS)
+            .map(|bit| 1u16 << bit)
+            .chain(std::iter::once(u16::MAX))
+        {
+            for length in [1, largest_payload] {
+                let (_send, mut recv) = pair
+                    .begin(&header(frame.message_type, flags, length))
+                    .await?;
+                let result = timeout(
+                    Duration::from_millis(100),
+                    read_frame(
+                        &mut recv,
+                        stream.frame_cap,
+                        registry.message_payload_limits(stream),
+                        registry.message_types(stream),
+                        registry.allowed_frame_flags(stream),
+                        DEADLINE,
+                        None,
+                    ),
+                )
+                .await;
+                if !matches!(result, Ok(Err(ZakuraHandlerError::UnsupportedFrameFlags(actual))) if actual == flags)
+                {
+                    failures.push(format!(
+                        "stream={stream_kind}, flags={flags}, length={length}: {result:?}"
+                    ));
+                }
+            }
+        }
+
+        // The same production declarations must still admit a valid frame.
+        let mut encoded = header(frame.message_type, 0, u32::try_from(frame.payload.len())?);
+        encoded.extend_from_slice(&frame.payload);
+        let (_send, mut recv) = pair.begin(&encoded).await?;
+        let decoded = timeout(
+            DEADLINE,
+            read_frame(
+                &mut recv,
+                stream.frame_cap,
+                registry.message_payload_limits(stream),
+                registry.message_types(stream),
+                registry.allowed_frame_flags(stream),
+                DEADLINE,
+                None,
+            ),
+        )
+        .await??;
+        assert_eq!(decoded.message_type, frame.message_type);
+        assert_eq!(decoded.flags, 0);
+        assert_eq!(decoded.payload, frame.payload);
+    }
+    pair.finish().await?;
+    assert!(failures.is_empty(), "F01 legacy flags: {failures:#?}");
     Ok(())
 }
 

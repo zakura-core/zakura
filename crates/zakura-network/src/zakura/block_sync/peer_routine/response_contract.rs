@@ -20,8 +20,10 @@ use std::sync::{atomic::AtomicU64, Mutex};
 const DEADLINE: Duration = Duration::from_secs(2);
 
 mod identity;
+mod indexed_matching;
 mod lifetime;
 mod limits;
+mod retention;
 mod terminal_counts;
 
 struct Fixture {

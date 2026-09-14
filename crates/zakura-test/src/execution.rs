@@ -137,6 +137,7 @@ impl ExecutionProbe {
     /// Return a guard that releases paused jobs when it goes out of scope.
     ///
     /// Keep it in the test so a failed assertion does not leave jobs waiting.
+    #[must_use = "an unbound guard drops here and releases every paused job at once"]
     pub fn release_on_drop(self: &Arc<Self>) -> impl Drop {
         struct Release(Arc<ExecutionProbe>);
         impl Drop for Release {
@@ -176,7 +177,13 @@ impl ExecutionProbe {
             }
         })
         .await
-        .expect("controlled operations reach the requested phase");
+        .unwrap_or_else(|_| {
+            let phase = if finished { "finish" } else { "start" };
+            panic!(
+                "waited 5s for {count} controlled operation(s) to {phase}, observed {:?}",
+                self.snapshot()
+            )
+        });
     }
 }
 
@@ -184,6 +191,7 @@ impl ExecutionProbe {
 ///
 /// Keep it inside the job for the entire operation being measured.
 #[derive(Debug)]
+#[must_use = "an unbound guard drops here and counts the job as finished before it runs"]
 pub struct RunningOperation(Arc<ExecutionProbe>);
 
 impl RunningOperation {

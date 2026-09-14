@@ -238,11 +238,11 @@ jobs:
           # mode the shards run. The run-time-only filters (`--profile`,
           # `--partition`, `--run-ignored`) are applied by the shard jobs, not here.
           if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
-            cargo nextest archive --locked --release --features default-release-binaries --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
+            cargo nextest archive --locked --release --features default-release-binaries,sync-metrics --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
           elif [[ "${FULL_COVERAGE}" == "true" ]]; then
-            cargo nextest archive --locked --cargo-profile ci-tests --features default-release-binaries --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
+            cargo nextest archive --locked --cargo-profile ci-tests --features default-release-binaries,sync-metrics --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
           else
-            cargo nextest archive --locked --features default-release-binaries --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
+            cargo nextest archive --locked --features default-release-binaries,sync-metrics --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
           fi
         env:
           FULL_COVERAGE: ${{ github.event_name != 'pull_request' }}

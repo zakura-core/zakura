@@ -36,7 +36,7 @@ use super::{
     BlockSyncMessage, BlockSyncMisbehavior, BlockSyncPeerSession, BlockSyncStatus,
     ZakuraBlockSyncConfig, ZakuraPeerId, ZakuraTrace, MSG_BS_BLOCK,
 };
-use crate::zakura::regulation::ResponseCredit;
+use crate::zakura::regulation::{ResponseCredit, ResponseMatch};
 use crate::zakura::transport::OrderedStreamFailure;
 use crate::zakura::{trace::BlockBodySource, Admit, FramedRecv, SinkReject, ZakuraConnId};
 use std::{sync::Arc, time::Duration, time::Instant};
@@ -1182,7 +1182,7 @@ impl PeerRoutine {
             let request_estimated_bytes = request.estimated_bytes;
             let mut delivered = false;
             if !claim.publish(|| {
-                self.window.outstanding.push(OutstandingBlockRange {
+                self.window.push_outstanding(OutstandingBlockRange {
                     response: ResponseCredit::new(
                         u64::from(request.count),
                         u64::from(self.max_response_bytes),
@@ -1498,29 +1498,13 @@ impl PeerRoutine {
 
     /// Match the next unconsumed header of exactly one original range.
     fn response_index(&self, hash: block::Hash) -> Result<usize, SinkReject> {
-        let mut matches =
-            self.window
-                .outstanding
-                .iter()
-                .enumerate()
-                .filter_map(|(index, range)| {
-                    let consumed = usize::try_from(range.response.consumed_objects()).ok()?;
-                    range
-                        .request
-                        .expected_blocks
-                        .get(consumed)
-                        .filter(|expected| expected.hash == hash)
-                        .map(|_| index)
-                });
-        let index = matches
-            .next()
-            .ok_or_else(|| SinkReject::protocol("block has no next expected hash"))?;
-        if matches.next().is_some() {
-            return Err(SinkReject::protocol(
+        match self.window.response_for_hash(hash) {
+            ResponseMatch::Unique(index) => Ok(index),
+            ResponseMatch::Missing => Err(SinkReject::protocol("block has no next expected hash")),
+            ResponseMatch::Ambiguous => Err(SinkReject::protocol(
                 "block matches ambiguous response authorization",
-            ));
+            )),
         }
-        Ok(index)
     }
 
     async fn handle_body(
@@ -1559,11 +1543,10 @@ impl PeerRoutine {
         let elapsed = outstanding.queued_at.elapsed();
         let delivery_snapshot = outstanding.delivery_snapshot;
         let was_detached = !outstanding.local_work_active;
-        let outstanding = &mut self.window.outstanding[index];
-        outstanding
-            .response
-            .consume(1, serialized_bytes)
+        self.window
+            .consume_response(index, serialized_bytes)
             .map_err(SinkReject::protocol)?;
+        let outstanding = &mut self.window.outstanding[index];
         outstanding.mark_received(height);
         outstanding.record_body_bytes(serialized_bytes);
         let complete = outstanding.is_complete();
@@ -1776,7 +1759,7 @@ impl PeerRoutine {
         if index >= self.window.outstanding.len() {
             return;
         }
-        let outstanding = self.window.outstanding.remove(index);
+        let outstanding = self.window.remove_outstanding(index);
         self.finish_detached(outstanding, disposition);
     }
 

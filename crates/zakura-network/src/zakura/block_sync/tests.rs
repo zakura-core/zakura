@@ -1101,7 +1101,7 @@ fn window_request(height: u32) -> OutstandingBlockRange {
     }
 }
 
-fn window_request_range(start: u32, count: u32) -> OutstandingBlockRange {
+pub(super) fn window_request_range(start: u32, count: u32) -> OutstandingBlockRange {
     let byte = u8::try_from(start).expect("test heights fit in u8");
     let now = Instant::now();
     OutstandingBlockRange {
@@ -1139,7 +1139,7 @@ fn block_liveness_disconnects_silent_active_peer_after_default_timeout() {
 
     let now = Instant::now();
     let mut window = download_window();
-    window.outstanding.push(window_request(1));
+    window.push_outstanding(window_request(1));
     window.arm_liveness(now, timeout);
 
     assert_eq!(
@@ -1204,7 +1204,7 @@ fn block_liveness_progress_before_deadline_keeps_peer_alive() {
     let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
     let mut now = Instant::now();
     let mut window = download_window();
-    window.outstanding.push(window_request(1));
+    window.push_outstanding(window_request(1));
     window.arm_liveness(now, timeout);
 
     for _ in 0..4 {
@@ -1220,10 +1220,10 @@ fn block_liveness_disconnects_silent_peer_after_outstanding_drains() {
     let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
     let now = Instant::now();
     let mut window = download_window();
-    window.outstanding.push(window_request(1));
+    window.push_outstanding(window_request(1));
     window.arm_liveness(now, timeout);
 
-    window.outstanding.clear();
+    window.clear_outstanding();
     window.disarm_liveness_after_progress_if_idle();
 
     assert_eq!(window.block_liveness_deadline, Some(now + timeout));
@@ -1235,10 +1235,10 @@ fn block_liveness_disarms_when_satisfied_request_drains() {
     let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
     let now = Instant::now();
     let mut window = download_window();
-    window.outstanding.push(window_request(1));
+    window.push_outstanding(window_request(1));
     window.arm_liveness(now, timeout);
     window.note_block_progress(now + Duration::from_millis(1), timeout);
-    window.outstanding.clear();
+    window.clear_outstanding();
     window.disarm_liveness_after_progress_if_idle();
 
     assert_eq!(window.block_liveness_deadline, None);
@@ -1259,7 +1259,7 @@ fn block_liveness_uses_probe_cap_until_first_accepted_body() {
     assert!(!window.has_block_progress());
     assert_eq!(window.no_progress_request_cap(), 1);
 
-    window.outstanding.push(window_request(1));
+    window.push_outstanding(window_request(1));
     window.arm_liveness(now, timeout);
 
     assert_eq!(window.requests_without_block_progress, 1);
@@ -1277,14 +1277,14 @@ fn block_liveness_resuming_after_idle_gets_fresh_deadline() {
     let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
     let now = Instant::now();
     let mut window = download_window();
-    window.outstanding.push(window_request(1));
+    window.push_outstanding(window_request(1));
     window.arm_liveness(now, timeout);
     window.note_block_progress(now + Duration::from_millis(1), timeout);
-    window.outstanding.clear();
+    window.clear_outstanding();
     window.disarm_liveness_after_progress_if_idle();
 
     let resumed = now + Duration::from_secs(60);
-    window.outstanding.push(window_request(2));
+    window.push_outstanding(window_request(2));
     window.arm_liveness(resumed, timeout);
 
     assert_eq!(window.block_liveness_deadline, Some(resumed + timeout));
@@ -1295,7 +1295,7 @@ fn block_liveness_multi_block_range_progress_resets_each_body() {
     let timeout = ZakuraBlockSyncConfig::default().effective_liveness_timeout();
     let start = Instant::now();
     let mut window = download_window();
-    window.outstanding.push(window_request_range(1, 3));
+    window.push_outstanding(window_request_range(1, 3));
     window.arm_liveness(start, timeout);
 
     let first = start + Duration::from_secs(4);
@@ -1330,14 +1330,14 @@ fn view_reset_reclears_probe_streak_so_unproven_peer_can_reprobe() {
     let now = Instant::now();
     let mut window = DownloadWindow::new(&config);
 
-    window.outstanding.push(window_request(1));
+    window.push_outstanding(window_request(1));
     window.arm_liveness(now, timeout);
     assert_eq!(window.requests_without_block_progress, 1);
     assert_eq!(window.no_progress_request_cap(), 1);
 
     // A destructive reset returns the peer's outstanding to the queue on our
     // initiative, then runs the reset hook.
-    window.outstanding.clear();
+    window.clear_outstanding();
     window.note_locally_returned_requests();
 
     // The peer can probe again (streak below the cap) and is not left as a zombie
@@ -1366,16 +1366,16 @@ fn view_reset_preserves_proof_but_reclears_streak() {
     let now = Instant::now();
     let mut window = DownloadWindow::new(&config);
 
-    window.outstanding.push(window_request(1));
+    window.push_outstanding(window_request(1));
     window.arm_liveness(now, timeout);
     window.note_block_progress(now + Duration::from_millis(1), timeout);
     // Prove, then issue further requests that go unanswered before the reset.
-    window.outstanding.push(window_request(2));
+    window.push_outstanding(window_request(2));
     window.arm_liveness(now + Duration::from_millis(2), timeout);
     assert!(window.has_block_progress());
     assert_eq!(window.no_progress_request_cap(), 8);
 
-    window.outstanding.clear();
+    window.clear_outstanding();
     window.note_locally_returned_requests();
 
     assert_eq!(window.requests_without_block_progress, 0);
@@ -1399,7 +1399,7 @@ fn backpressure_extends_liveness_instead_of_disconnecting() {
     let now = Instant::now();
     let mut window = download_window();
 
-    window.outstanding.push(window_request(1));
+    window.push_outstanding(window_request(1));
     window.arm_liveness(now, timeout);
     assert_eq!(
         window.check_liveness(now + timeout),

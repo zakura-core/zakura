@@ -361,7 +361,11 @@ impl BlockSyncState {
 #[derive(Debug)]
 pub(super) struct DownloadWindow {
     pub(super) max_inflight_requests: u32,
+    /// Storage order can change when a range ends. Insert, consume and remove
+    /// through the window methods so both response indexes stay synchronized.
     pub(super) outstanding: Vec<OutstandingBlockRange>,
+    next_response_hashes: crate::zakura::regulation::ResponseIndex<[u8; 32]>,
+    response_starts: crate::zakura::regulation::ResponseIndex<block::Height>,
     /// Per-peer BBR-lite estimators + cwnd — the sole congestion controller. Under
     /// [`CwndUnit::Bytes`] the cwnd is itself a byte budget sourced from header size
     /// hints (no fixed per-request byte weight), so there is no `nominal_request_bytes`.
@@ -396,6 +400,8 @@ impl DownloadWindow {
         Self {
             max_inflight_requests: config.advertised_max_inflight_requests(),
             outstanding: Vec::new(),
+            next_response_hashes: crate::zakura::regulation::ResponseIndex::new(),
+            response_starts: crate::zakura::regulation::ResponseIndex::new(),
             bbr: BbrState::new(config),
             cwnd_unit: config.bbr_cwnd_unit,
             startup_request_cap: usize::try_from(config.initial_inflight_requests)
@@ -785,7 +791,7 @@ impl DownloadWindow {
     /// End a locally retired obligation before discarding its write status. If
     /// transport has not started, it must skip the frame and refund this probe.
     pub(super) fn retire_locally(&mut self, index: usize) -> OutstandingBlockRange {
-        let outstanding = self.outstanding.remove(index);
+        let outstanding = self.remove_outstanding(index);
         outstanding.write_status.expire_unwritten();
         if outstanding.write_status.was_skipped() && outstanding.charged_for_liveness {
             self.requests_without_block_progress =
@@ -827,11 +833,14 @@ impl DownloadWindow {
     }
 
     pub(super) fn outstanding_index_for_start(&self, start_height: block::Height) -> Option<usize> {
-        self.outstanding
-            .iter()
-            .position(|outstanding| outstanding.request.start_height == start_height)
+        match self.response_starts.find(start_height) {
+            crate::zakura::regulation::ResponseMatch::Unique(index) => Some(index),
+            _ => None,
+        }
     }
 }
+
+mod outstanding;
 
 /// Thin per-peer handle the reactor keeps to serve inbound
 /// `GetBlocks` (the session clone + serving meters), advertise our `Status`, count

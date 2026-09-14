@@ -23,6 +23,19 @@ does not fit, we still count the response part, but drop the body and return our
 own work for retry. Work already taken by another peer stays with that peer. The
 fixed checkpoint window remains exempt so verification can finish its range.
 
+## Response lookup
+
+`ResponseIndex` is a shared index from matching keys to request positions. GetBlocks
+uses it for each range's next hash and its starting height. Finding a response
+takes logarithmic work instead of checking every outstanding range. Duplicate
+keys remain visible so an ambiguous response is rejected before body decoding.
+
+Consuming a body advances only that range's hash key. Local deadlines leave the
+key intact. Completing or skipping a range removes its keys. The last stored
+range moves into the vacant position and updates its own keys, so removal does
+not shift the entire request list. A completed body range keeps its starting
+height indexed until its ending arrives.
+
 ## Properties
 
 The receiver fixture sends requests through the real writer queue and decodes
@@ -31,6 +44,7 @@ real frames. Tests are grouped under `peer_routine::response_contract`.
 | File | Contract |
 | --- | --- |
 | `identity.rs` | R01 and R03–R08. Only the next requested hash is valid. Duplicate or unrelated bodies and endings cannot consume another response. |
+| `indexed_matching.rs` | Publication installs lookup keys before writes. Different completion orders and local detachment preserve matching. Skipped writes remove keys. Ambiguous hashes fail before decoding. |
 | `lifetime.rs` | R02 and R09–R11. Deadlines, finality, reorganization and reassignment preserve the original response. Endings retain protocol slots. Connection closure cleans up unfinished work. |
 | `limits.rs` | R12, F04 and C06. Count actual body bytes, reject unauthorized bodies before decoding or handler waits, and distinguish local handler failure from peer faults. A valid-body control verifies the allocation observer. |
 | `retention.rs` | R12. Check exact-fit and one-byte-over retention with other reservations and buffered bytes. Bursts of underestimated bodies stop entering the backlog. Local refusal preserves response counts, retries and reassigned ownership. |
@@ -39,6 +53,13 @@ real frames. Tests are grouped under `peer_routine::response_contract`.
 Generated local-change histories cover counts 1–128 and prefixes from empty to
 complete. Fixed witnesses cover the boundaries and the production receiver's
 liveness, work ownership and connection cleanup paths.
+
+The shared index properties compare generated updates and removals with an
+independent owner map. A 32,768-request case counts key comparisons to catch a
+return to linear lookup, and lookup allocation observations cover missing,
+unique and ambiguous keys. Window properties cover advancing keys, failed byte
+charges, moved entries and endings retained after the last body. These checks
+measure the index, not whole receiver throughput.
 
 ## Local execution
 
@@ -50,3 +71,5 @@ transition still has a two-second deadline.
 This layer does not claim session replacement is atomic or that all request
 metadata is funded. Those are separate contracts above this layer. It also does
 not claim verifier, transport or whole-stack qualification.
+The allocation-planning layer must include the new index storage when the stack
+is updated. Each live range adds at most one next-hash entry and one ending entry.

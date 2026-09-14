@@ -380,7 +380,7 @@ pub enum HeaderPathLeaseResult {
 pub struct HeaderPathLease {
     /// State-issued lease identity.
     pub lease_id: u64,
-    /// First requester-order locator intersection.
+    /// Nearest locator ancestor on the target’s chain.
     pub common_ancestor: zakura_header_chain::Frontier,
     /// Exact retained target fixed by the lease.
     pub target: zakura_header_chain::Frontier,

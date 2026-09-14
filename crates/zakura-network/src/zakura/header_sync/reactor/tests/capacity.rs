@@ -155,6 +155,69 @@ async fn replaced_session_discards_capacity_notification() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn delayed_capacity_refusal_preserves_the_replacement_request() {
+    let signal = port::ServingCapacitySignal::default();
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let (_tx, rx) = watch::channel(Some(committed_snapshot(anchor)));
+    startup.committed_snapshots = Some(rx);
+    startup.header_chain_port = Arc::new(CapacityPort(signal.clone()));
+    startup.port_dispatch = PortDispatch::Direct;
+    let (_handle, _actions, mut reactor) = build_header_sync_reactor(startup).unwrap();
+    let peer = peer();
+    let (send, _outbound) = framed_channel(8);
+    reactor.handle_peer_connected(PeerSession::from_parts_with_session_id(
+        peer.clone(),
+        7,
+        send,
+        CancellationToken::new(),
+    ));
+    reactor.handle_get_headers(peer.clone(), 7, request(1, anchor.hash, anchor.hash));
+    let stale_completion = reactor.pending_port_operations.next().await.unwrap();
+
+    let (send, mut outbound) = framed_channel(8);
+    reactor.handle_peer_connected(PeerSession::from_parts_with_session_id(
+        peer.clone(),
+        8,
+        send,
+        CancellationToken::new(),
+    ));
+    outbound.try_recv().unwrap();
+    reactor.handle_get_headers(peer.clone(), 8, request(1, anchor.hash, anchor.hash));
+    signal.release();
+    reactor.handle_port_completion(stale_completion);
+    time::advance(std::time::Duration::from_secs(1)).await;
+    reactor.refresh_statuses();
+    assert!(outbound.try_recv().is_err());
+    assert!(reactor.peer_state[&peer].capacity_signal.is_none());
+    assert!(matches!(
+        reactor.served_paths[&peer],
+        ServedPathState::Acquiring { session_id: 8, .. }
+    ));
+
+    let current_completion = reactor.pending_port_operations.next().await.unwrap();
+    reactor.handle_port_completion(current_completion);
+    reactor.refresh_statuses();
+    assert!(matches!(
+        reactor
+            .codec
+            .decode_frame(outbound.try_recv().unwrap(), None)
+            .unwrap(),
+        HeaderSyncMessage::HeadersOutcome(HeadersOutcome {
+            outcome: HeadersOutcomeCode::Busy,
+            ..
+        })
+    ));
+    assert!(matches!(
+        reactor
+            .codec
+            .decode_frame(outbound.try_recv().unwrap(), None)
+            .unwrap(),
+        HeaderSyncMessage::Status(_)
+    ));
+}
+
+#[tokio::test(start_paused = true)]
 async fn serving_slot_release_wakes_only_its_waiting_peer() {
     let mut startup = startup(CancellationToken::new());
     let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);

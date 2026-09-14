@@ -56,10 +56,8 @@ impl StatusPublisher {
             .last_sent_at
             .map_or(now, |sent| sent + MIN_PUBLICATION_INTERVAL)
             .max(now);
-        self.pending_at = Some(
-            self.pending_at
-                .map_or(earliest, |pending| pending.min(earliest)),
-        );
+        // An existing publication covers this release, including after a failed send.
+        self.pending_at.get_or_insert(earliest);
     }
 
     pub(in crate::zakura::header_sync) fn next_deadline(&self) -> Instant {
@@ -153,6 +151,8 @@ mod tests {
         assert_eq!(publisher.desired(), status(1));
         publisher.record_failed(now + MIN_PUBLICATION_INTERVAL);
         let retry = now + MIN_PUBLICATION_INTERVAL + PUBLICATION_RETRY_DELAY;
+        assert_eq!(publisher.next_deadline(), retry);
+        publisher.request_refresh(now + MIN_PUBLICATION_INTERVAL + Duration::from_millis(1));
         assert_eq!(publisher.next_deadline(), retry);
         publisher.request_refresh(retry + Duration::from_millis(50));
         assert_eq!(publisher.next_deadline(), retry);

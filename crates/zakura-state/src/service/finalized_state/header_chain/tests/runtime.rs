@@ -2552,6 +2552,12 @@ fn capacity_signals_follow_reservations_and_capacity_classes() {
     let replacement = leases
         .reserve(first, now, RetainedPathCapacity::General)
         .unwrap();
+    let Err(RetainedPathLeaseOutcome::CapacityBusy(next_general_wait)) =
+        leases.reserve(waiting, now, RetainedPathCapacity::General)
+    else {
+        panic!("another peer acquired the available general slot")
+    };
+    assert_ne!(general_wait, next_general_wait);
     let Err(RetainedPathLeaseOutcome::CapacityBusy(next_wait)) =
         leases.reserve(first, now, RetainedPathCapacity::General)
     else {
@@ -2559,8 +2565,10 @@ fn capacity_signals_follow_reservations_and_capacity_classes() {
     };
     leases.release_reservation(first, first_id);
     assert!(!next_wait.is_released());
+    assert!(!next_general_wait.is_released());
     leases.release_reservation(first, replacement);
     assert!(next_wait.is_released());
+    assert!(next_general_wait.is_released());
 }
 
 #[test]

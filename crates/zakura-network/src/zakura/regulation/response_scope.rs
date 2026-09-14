@@ -120,9 +120,7 @@ impl ResponseScope {
         if state.retired || self.0.connection_cancel.is_cancelled() {
             return Err(ResponseAdmissionError::Retired);
         }
-        let bytes = shared_allocation_bytes::<Authorization>()
-            .checked_add(metadata_bytes)
-            .and_then(|bytes| bytes.checked_add(retained_bytes))
+        let bytes = Self::admission_bytes(metadata_bytes, retained_bytes)
             .ok_or(ResponseAdmissionError::MemoryFull)?;
         let mut memory = self
             .0
@@ -144,19 +142,24 @@ impl ResponseScope {
         self.0.memory.clone()
     }
 
-    /// Wait for enough metadata space to retry one authorization. The future
-    /// owns its connection handle so callers can keep processing other events.
+    /// Bytes one admission of `metadata_bytes` plus `retained_bytes` reserves,
+    /// including the shared authorization record itself.
+    pub(crate) fn admission_bytes(metadata_bytes: u64, retained_bytes: u64) -> Option<u64> {
+        shared_allocation_bytes::<Authorization>()
+            .checked_add(metadata_bytes)?
+            .checked_add(retained_bytes)
+    }
+
+    /// Wait until `bytes` of metadata capacity may fit, then let the caller retry
+    /// admission. The future owns its connection handle so callers can keep
+    /// processing other events. See `admission_bytes` for the amount to pass.
     pub(crate) fn wait_for_capacity(
         &self,
-        metadata_bytes: u64,
+        bytes: u64,
     ) -> impl std::future::Future<Output = ()> + Send + 'static {
         let memory = self.memory();
         async move {
-            memory
-                .wait_for_capacity(
-                    shared_allocation_bytes::<Authorization>().saturating_add(metadata_bytes),
-                )
-                .await;
+            memory.wait_for_capacity(bytes.max(1)).await;
         }
     }
 

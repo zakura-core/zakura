@@ -602,6 +602,8 @@ pub struct ZakuraHeaderSyncDriverStartup {
     pub committed_snapshots: watch::Receiver<Option<zakura_header_chain::EngineSnapshot>>,
     /// Atomic committed snapshots and body-work epochs.
     pub committed_views: watch::Receiver<Option<zakura_header_chain::CommittedHeaderChainView>>,
+    /// Durable retained-body floor, published before each corresponding committed view.
+    pub retained_block_height: watch::Receiver<block::Height>,
     /// Coordinator-owned capability and ordered-service demand epochs.
     pub service_demand: watch::Receiver<zakura_node_services::sync_lifecycle::SyncServiceDemand>,
     /// VCT metadata repair needs published by the finalized writer.
@@ -3728,7 +3730,10 @@ async fn spawn_zakura_endpoint_inner(
             );
             startup.shutdown = header_sync_shutdown.clone();
             startup.trace = trace.clone();
-            let (handle, actions, task) = spawn_block_sync_reactor(startup);
+            let (handle, actions, task) = spawn_block_sync_reactor(startup.with_retention(
+                driver_startup.retained_block_height.clone(),
+                config.network.genesis_hash(),
+            ));
             (Some(handle), Some(actions), Some(task))
         } else {
             (None, None, None)

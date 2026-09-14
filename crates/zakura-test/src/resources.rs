@@ -111,6 +111,7 @@ impl LockProbe {
 
 /// Record how long the lock was held when this guard is dropped.
 /// Drop it immediately before releasing the lock being measured.
+#[must_use = "an unbound guard drops here and times the bookkeeping, not the lock"]
 pub struct LockHold<'a> {
     probe: &'a LockProbe,
     acquired: std::time::Instant,

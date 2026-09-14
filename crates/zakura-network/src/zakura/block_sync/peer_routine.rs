@@ -253,6 +253,7 @@ pub(super) struct PeerRoutine {
     /// Authoritative for the routine's own want-work decision (mirrored into the
     /// registry for the reactor's serving-side reads).
     max_blocks_per_response: u32,
+    /// Complete denied plan, excluding the scope's fixed authorization record.
     response_memory_waiting: Option<u64>,
     max_response_bytes: u32,
     /// Rate meter for sending our `Status` reply to this peer's inbound `Status`.

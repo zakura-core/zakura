@@ -374,3 +374,46 @@ async fn connection_exhaustion_ignores_other_connections_memory_releases() {
         "{completion:?}"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn partial_capacity_waits_for_the_complete_request_plan() {
+    let setup = ResponseMemory::node_setup_bytes_for_test()
+        + ResponseMemory::setup_bytes_for_test()
+        + ResponseScope::setup_bytes_for_test();
+    let node = ResponseMemory::new(setup + 8192, setup + 8192);
+    let memory = node.connection();
+    let mut f = Fixture::new(memory.clone(), true);
+    // A record fits in the remaining 1024 bytes, but its buffers and indexes do not.
+    let mut held = memory.try_reserve(8192 - 1024).unwrap();
+    f.routine.try_fill().await;
+    let needed = f
+        .routine
+        .response_memory_waiting
+        .expect("the complete plan is blocked");
+    assert!(needed > 1024);
+    let wake_count = Arc::new(WakeCount::default());
+    let waker = Waker::from(wake_count);
+    let mut context = Context::from_waker(&waker);
+    let ready = f.session.wait_for_response_capacity(needed);
+    tokio::pin!(ready);
+    assert!(
+        ready.as_mut().poll(&mut context).is_pending(),
+        "space for the record alone must not cause an immediate retry"
+    );
+    drop(held.split_off(512));
+    assert!(
+        ready.as_mut().poll(&mut context).is_pending(),
+        "a partial release still cannot fund the whole request"
+    );
+    assert_eq!(f.work.pending_len(), 1);
+    assert_eq!(f.work.in_flight_len(), 0);
+    drop(held);
+    assert!(ready.as_mut().poll(&mut context).is_ready());
+    f.routine.try_fill().await;
+    assert_eq!(
+        f.output.try_recv().unwrap().message_type,
+        u16::from(MSG_BS_GET_BLOCKS)
+    );
+    assert_eq!(f.work.pending_len(), 0);
+    assert!(!f.session.connection_is_closed_for_test());
+}

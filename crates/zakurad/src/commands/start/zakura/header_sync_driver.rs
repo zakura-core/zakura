@@ -110,6 +110,7 @@ where
         verified_block_tip_hash: verified_block_tip.1,
         committed_snapshots,
         committed_views,
+        retained_block_height: read_state.subscribe_retained_block_height(),
         service_demand: coordinator.subscribe_service_demand(),
         vct_root_repairs: Some(vct_root_repairs),
         header_chain_port: Arc::new(HeaderChainServicePort::new(

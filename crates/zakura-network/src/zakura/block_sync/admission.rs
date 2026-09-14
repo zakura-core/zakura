@@ -7,16 +7,10 @@ use super::{
     state::next_height,
 };
 
-/// Delivery rate assumed when sizing an above-floor deadline for a peer whose
-/// measured BtlBw is still near zero, so the patience window is bounded rather than
-/// unbounded. A worst-case `MAX_BLOCK_BYTES` body at this rate transfers in ~8 s, so
-/// with the `request_timeout` base the above-floor deadline tops out near 16 s — the
-/// "a block every ~16 s is fine" tolerance the directive sets for speculative work.
-const ABOVE_FLOOR_DEADLINE_MIN_BYTES_PER_SEC: u64 = 256 * 1024;
-/// Delivery rate assumed for floor rescue before a peer has a fresh byte-rate
-/// sample. This keeps the rescue leash short while allowing a full 2 MB body roughly
-/// two seconds of transfer time.
-const FLOOR_DEADLINE_MIN_BYTES_PER_SEC: u64 = 1024 * 1024;
+/// Minimum rate used for deadline estimates. One maximum-size body adds about
+/// eight seconds; earlier unreceived bodies add their bounded transfer estimates.
+/// A session with no accepted progress still reaches its separate liveness limit.
+const DEADLINE_MIN_BYTES_PER_SEC: u64 = 256 * 1024;
 
 /// Estimated resident-memory multiple of a *decoded* block body's serialized size.
 ///
@@ -114,43 +108,36 @@ pub(super) fn request_priority(
     }
 }
 
-/// The per-request network deadline (the one sanctioned timer), set by priority:
+/// A bounded request deadline including estimated transfer time.
 ///
-/// - **Floor**: a short rescue leash plus the expected transfer time. On expiry the
-///   lowest missing height is rescued to a faster carrier (returned to the queue + the
-///   peer retry-avoided), so the contiguous floor never waits on a slow peer — and the
-///   peer is *not* disconnected.
-/// - **Above-floor**: the base `request_timeout` plus the size-expected transfer time
-///   (`estimated_bytes / BtlBw`), so a legitimately slow large-body fetch runs to
-///   completion. These deadlines never gate the floor, so they can afford to be
-///   patient; `btlbw_bytes_per_sec` is the peer's measured rate (`None` cold-start),
-///   floored at [`ABOVE_FLOOR_DEADLINE_MIN_BYTES_PER_SEC`].
+/// A floor request uses the short rescue deadline only with a fresh delivery-rate
+/// measurement. Without one, it gets the normal deadline: prematurely expiring a
+/// cold peer's only probe prevents its first body from establishing progress.
+/// Block-count measurements qualify for rescue but use the byte-rate fallback
+/// when estimating transfer time.
+/// Above-floor requests always use the normal deadline. Transfer bytes include
+/// earlier unreceived responses on the ordered data stream. Expiry returns work
+/// for retry; the separate block-progress deadline still bounds a silent session.
 pub(super) fn request_deadline(
     priority: RequestPriority,
     queued_at: Instant,
     request_timeout: Duration,
     floor_rescue_timeout: Duration,
-    estimated_bytes: u64,
+    expected_transfer_bytes: u64,
     btlbw_bytes_per_sec: Option<u64>,
+    has_delivery_measurement: bool,
 ) -> Instant {
-    match priority {
-        RequestPriority::Floor => {
-            let rate = btlbw_bytes_per_sec
-                .unwrap_or(0)
-                .max(FLOOR_DEADLINE_MIN_BYTES_PER_SEC);
-            let transfer = Duration::from_secs_f64(estimated_bytes as f64 / rate as f64);
-            queued_at + floor_rescue_timeout + transfer
-        }
-        RequestPriority::AboveFloor => {
-            let rate = btlbw_bytes_per_sec
-                .unwrap_or(0)
-                .max(ABOVE_FLOOR_DEADLINE_MIN_BYTES_PER_SEC);
-            // One body per request, so `estimated_bytes / rate` is at most
-            // `MAX_BLOCK_BYTES / rate` (~8 s): finite and non-negative.
-            let transfer = Duration::from_secs_f64(estimated_bytes as f64 / rate as f64);
-            queued_at + request_timeout + transfer
-        }
-    }
+    let base = if priority == RequestPriority::Floor && has_delivery_measurement {
+        floor_rescue_timeout
+    } else {
+        request_timeout
+    };
+    let rate = btlbw_bytes_per_sec
+        .unwrap_or(0)
+        .max(DEADLINE_MIN_BYTES_PER_SEC);
+    // Peer and node admission bound these values well within f64's exact integer range.
+    let transfer = Duration::from_secs_f64(expected_transfer_bytes as f64 / rate as f64);
+    queued_at + base + transfer
 }
 
 /// Heights within one worst-case checkpoint range above the verified tip bypass
@@ -385,12 +372,59 @@ mod tests {
             TIMEOUT,
             RESCUE,
             2_000_000,
-            None,
+            Some(1024 * 1024),
+            true,
         );
         assert_eq!(
             deadline,
             now + RESCUE + Duration::from_secs_f64(2_000_000_f64 / (1024_f64 * 1024_f64))
         );
+    }
+
+    #[test]
+    fn unmeasured_floor_probe_gets_the_normal_bounded_deadline() {
+        let now = Instant::now();
+        for size in [1, 2_000_000] {
+            let deadline = request_deadline(
+                RequestPriority::Floor,
+                now,
+                TIMEOUT,
+                RESCUE,
+                size,
+                None,
+                false,
+            );
+            assert_eq!(
+                deadline,
+                request_deadline(
+                    RequestPriority::AboveFloor,
+                    now,
+                    TIMEOUT,
+                    RESCUE,
+                    size,
+                    None,
+                    false,
+                )
+            );
+            assert!(deadline > now + TIMEOUT);
+            assert!(deadline < now + Duration::from_secs(16));
+        }
+    }
+
+    #[test]
+    fn floor_rescue_allows_the_measured_large_body_transfer_time() {
+        let now = Instant::now();
+        let deadline = request_deadline(
+            RequestPriority::Floor,
+            now,
+            TIMEOUT,
+            RESCUE,
+            2 * 1024 * 1024,
+            Some(512 * 1024),
+            true,
+        );
+        assert_eq!(deadline, now + RESCUE + Duration::from_secs(4));
+        assert!(deadline < now + TIMEOUT);
     }
 
     #[test]
@@ -405,6 +439,7 @@ mod tests {
             RESCUE,
             256 * 1024,
             None,
+            false,
         );
         let large = request_deadline(
             RequestPriority::AboveFloor,
@@ -413,6 +448,7 @@ mod tests {
             RESCUE,
             2 * 1024 * 1024,
             None,
+            false,
         );
         assert_eq!(small, now + TIMEOUT + Duration::from_secs(1));
         assert_eq!(large, now + TIMEOUT + Duration::from_secs(8));
@@ -431,6 +467,7 @@ mod tests {
             RESCUE,
             2 * 1024 * 1024,
             Some(64 * 1024 * 1024),
+            true,
         );
         assert!(fast > now + TIMEOUT);
         assert!(fast < now + TIMEOUT + Duration::from_millis(100));

@@ -22,6 +22,7 @@ impl BlockSyncReactor {
             row.estimated_bytes = Some(claim.meta.estimated_bytes);
             row.released_bytes = Some(released.released_bytes);
             row.returned_count = Some(released.returned_count);
+            row.committed_count = Some(released.committed_count);
             row.already_pending_count = Some(released.already_pending_count);
             row.released_count = Some(released.released_count);
             row.missing_count = Some(released.missing_count);

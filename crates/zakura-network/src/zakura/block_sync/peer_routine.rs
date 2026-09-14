@@ -2399,6 +2399,7 @@ mod tests {
             verified_block_hash: block::Hash([0; 32]),
         }));
         let routine = PeerRoutine::new(
+            super::tests::mainnet_decoder(),
             peer.clone(),
             0,
             session,

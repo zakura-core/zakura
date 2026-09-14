@@ -251,6 +251,30 @@ impl Fixture {
         );
     }
 
+    /// A legal but useless body spends one part of the current response and is
+    /// dropped without a peer fault or a handler delivery.
+    async fn discards(&mut self, message: BlockSyncMessage, consumed_after: u64, rule: &str) {
+        let before = self.bodies.len();
+        let result = self.deliver(message).await;
+        assert!(
+            result.is_ok(),
+            "{rule}: a mismatched body inside a range is not a fault, got {result:?}"
+        );
+        assert_eq!(
+            self.bodies.len(),
+            before,
+            "{rule}: a discarded body never reaches the handler"
+        );
+        assert_eq!(
+            self.routine.window.outstanding[0]
+                .response
+                .consumed_objects(),
+            consumed_after,
+            "{rule}: the discarded body spends response credit"
+        );
+        self.assert_no_peer_fault();
+    }
+
     fn done(&self, returned: u32) -> BlockSyncMessage {
         BlockSyncMessage::BlocksDone {
             start_height: self.blocks[0].coinbase_height().unwrap(),

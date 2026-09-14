@@ -139,7 +139,8 @@ pub(super) fn read_external_count<R: io::Read, T: ZcashDeserialize + TrustedPrea
         // for 128 bit memory spaces.)
         Err(_) => return Err(SerializationError::Parse("Vector longer than u64::MAX")),
     }
-    let initial_capacity = if let Some(remaining) = reader.remaining_bytes() {
+    // Reject a count the known input cannot hold, before allocating anything.
+    if let Some(remaining) = reader.remaining_bytes() {
         let minimum = T::min_serialized_size_for(reader.decoder());
         if external_count != 0
             && (minimum == 0
@@ -148,12 +149,15 @@ pub(super) fn read_external_count<R: io::Read, T: ZcashDeserialize + TrustedPrea
         {
             return Err(SerializationError::Parse("Vector exceeds available input"));
         }
-        external_count
-    } else {
-        external_count.min(MAX_INITIAL_ALLOCATION)
-    };
+    }
 
-    let mut vec = Vec::with_capacity(initial_capacity);
+    // Cap the upfront reservation even when the count fits. `reserve_bounded` grows
+    // the vector as elements arrive, so a peer-supplied count cannot size an
+    // allocation before its data is read: the deserializer-level case of
+    // GHSA-xr93-pcq3-pxf8. Fitting is not proof, and an element can cost several
+    // times its minimum encoding in memory, so the check above bounds the
+    // reservation only in proportion to the message rather than by a constant.
+    let mut vec = Vec::with_capacity(external_count.min(MAX_INITIAL_ALLOCATION));
     for _ in 0..external_count {
         let item = reader.read_value()?;
         reserve_bounded(&mut vec, 1, external_count);

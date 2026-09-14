@@ -1,6 +1,32 @@
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(feature = "sync-metrics")]
+#[test]
+fn committed_rate_survives_frequent_queue_updates() {
+    let start = Instant::now();
+    let interval = Duration::from_secs(1);
+    let mut meter = ThroughputMeter::new(start);
+    for elapsed_ms in 1..1000 {
+        if elapsed_ms == 1 || elapsed_ms == 500 {
+            meter.record(1_000_000);
+        }
+        meter.sample_at_interval(start + Duration::from_millis(elapsed_ms), interval);
+    }
+    meter.sample_at_interval(start + interval, interval);
+    assert_eq!(meter.bytes_per_sec(), 2_000_000);
+    assert_eq!(meter.blocks_per_sec(), 2);
+
+    // A queue update with no completion keeps the last full window visible.
+    meter.sample_at_interval(start + Duration::from_millis(1001), interval);
+    assert_eq!(meter.bytes_per_sec(), 2_000_000);
+    assert_eq!(meter.blocks_per_sec(), 2);
+
+    meter.sample_at_interval(start + Duration::from_secs(2), interval);
+    assert_eq!(meter.bytes_per_sec(), 0);
+    assert_eq!(meter.blocks_per_sec(), 0);
+}
+
 #[derive(Default)]
 struct CommitRecorder {
     bytes: Arc<AtomicU64>,

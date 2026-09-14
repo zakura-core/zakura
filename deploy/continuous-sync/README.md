@@ -369,7 +369,9 @@ The relevant loopback endpoints are only bound locally:
 
 Native runs build with the opt-in `sync-metrics` feature when the selected ref
 supports it. This enables completion-based commit-byte accounting and corrects
-the commit rates in detailed traces. Normal builds omit that instrumentation.
+the commit rates in detailed traces. Commit rates accumulate at least one second
+of activity between samples instead of resetting on each queue update.
+Normal builds omit that instrumentation.
 The existing `commit-metrics` feature controls separate state timing histograms.
 Build-cache metadata records the selected features so a default binary cannot
 silently replace an instrumented binary at the same commit.

@@ -1108,6 +1108,10 @@ impl SequencerTask {
     }
 
     fn publish_view(&mut self) {
+        #[cfg(feature = "sync-metrics")]
+        self.committed_throughput
+            .sample_at_interval(Instant::now(), Duration::from_secs(1));
+        #[cfg(not(feature = "sync-metrics"))]
         self.committed_throughput.sample(Instant::now());
         let reorder_buffered_bytes = self.sequencer.reorder_buffered_bytes();
         let applying_buffered_bytes = self.sequencer.applying_buffered_bytes();

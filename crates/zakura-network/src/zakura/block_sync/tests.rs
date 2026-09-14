@@ -12097,6 +12097,40 @@ async fn reactor_discards_duplicate_buffered_body_and_keeps_first_receipt() {
         wait_for_outbound_getblocks(&mut outbound_rx).await,
         (block::Height(1), 1)
     );
+
+    // Answering the re-take commits both heights in order, the buffered
+    // successor without ever being requested again.
+    send_inbound(&inbound_tx, BlockSyncMessage::Block(blocks[0].clone())).await;
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(1),
+            returned: 1,
+        },
+    )
+    .await;
+    let mut submitted = Vec::new();
+    while submitted.len() < 2 {
+        match next_action(&mut actions).await {
+            BlockSyncAction::SubmitBlock { block, .. } => {
+                submitted.push(block.coinbase_height().unwrap())
+            }
+            BlockSyncAction::QueryNeededBlocks { .. } => {}
+            action => panic!("accepted bodies must survive the discarded duplicate: {action:?}"),
+        }
+    }
+    assert_eq!(submitted, vec![block::Height(1), block::Height(2)]);
+    while let Ok(Some(action)) =
+        tokio::time::timeout(Duration::from_millis(100), actions.recv()).await
+    {
+        assert!(
+            !matches!(
+                action,
+                BlockSyncAction::SubmitBlock { .. } | BlockSyncAction::Misbehavior { .. }
+            ),
+            "the accepted successor must be submitted only once: {action:?}"
+        );
+    }
     reactor_task.abort();
 }
 

@@ -3,8 +3,8 @@
 //! A transaction can fail verification because of this node's own view of the
 //! chain: its tip can lag the relaying peer's tip, or sit on the other side of a
 //! network upgrade activation. The failure is then not evidence that the peer
-//! misbehaved. So the mempool never bans a peer for an invalid transaction.
-//! Instead, it ignores that peer's transactions for a while. Lock time and
+//! misbehaved. The mempool ignores that peer's transactions for a while.
+//! Stateless failures use the ban path instead. Lock time and
 //! coinbase maturity failures only depend on the tip, so they start no
 //! cooldown.
 //!
@@ -15,7 +15,7 @@
 //! already in verification when the cooldown started still get verified. That
 //! is up to `MAX_INBOUND_CONCURRENCY_PER_PEER` advertised or pushed
 //! transactions, or up to `MAX_INBOUND_CONCURRENCY` transactions the crawler
-//! requested. Repeated failures double the cooldown.
+//! requested. Repeated failures double the cooldown and disconnect the peer.
 
 use std::{
     collections::{BTreeSet, HashMap},

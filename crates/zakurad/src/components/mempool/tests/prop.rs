@@ -483,6 +483,7 @@ fn setup(
         sync_status,
         latest_chain_tip,
         chain_tip_change,
+        tokio::sync::mpsc::channel(1).0,
     );
 
     let mut transaction_receiver = mempool_transaction_subscriber.subscribe();

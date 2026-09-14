@@ -177,6 +177,41 @@ where
     (peer_set, address_book, misbehavior_tx)
 }
 
+/// Routes local disconnects around the buffer that waits for ready peers.
+pub(super) fn with_disconnect_requests(
+    peer_set: Buffer<BoxService<Request, Response, BoxError>, Request>,
+    disconnect_tx: mpsc::Sender<(PeerSocketAddr, tokio::sync::oneshot::Sender<()>)>,
+) -> Buffer<BoxService<Request, Response, BoxError>, Request> {
+    let service = tower::service_fn(move |request| match request {
+        Request::DisconnectPeer(addr) => {
+            let disconnect_tx = disconnect_tx.clone();
+            // Keep a buffered request alive until the control is acknowledged.
+            // An idle Buffer worker otherwise never polls the peer set.
+            let wake = peer_set
+                .clone()
+                .oneshot(Request::DisconnectPeer(addr))
+                .boxed();
+            async move {
+                let (done, received) = tokio::sync::oneshot::channel();
+                disconnect_tx
+                    .send((addr, done))
+                    .await
+                    .map_err(BoxError::from)?;
+                tokio::select! {
+                    result = received => {
+                        result.map_err(BoxError::from)?;
+                        Ok(Response::Nil)
+                    }
+                    result = wake => result,
+                }
+            }
+            .boxed()
+        }
+        request => peer_set.clone().oneshot(request).boxed(),
+    });
+    Buffer::new(BoxService::new(service), constants::PEERSET_BUFFER_SIZE)
+}
+
 /// Initialize a peer set and optionally expose a real-driver Zakura header-sync endpoint.
 pub async fn init_with_zakura_header_sync<S, C>(
     config: Config,
@@ -376,6 +411,7 @@ where
         MinimumPeerVersion::new(latest_chain_tip, &config.network),
         None,
     );
+    let disconnect_tx = peer_set.disconnect_sender();
     let shutdown = zakura_endpoint
         .as_ref()
         .map(ZakuraEndpoint::background_shutdown_token)
@@ -535,6 +571,8 @@ where
     if let Some(shutdown) = zakura_startup_shutdown {
         shutdown.disarm();
     }
+
+    let peer_set = with_disconnect_requests(peer_set, disconnect_tx);
 
     Ok((
         peer_set,

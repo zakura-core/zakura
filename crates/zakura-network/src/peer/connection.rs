@@ -1010,6 +1010,7 @@ where
         self.update_state_metrics(format!("Out::Req::{}", request.command()));
 
         let new_handler = match (&self.state, request) {
+            (_, DisconnectPeer(_)) => unreachable!("the peer set handles disconnect requests"),
             (Failed, request) => panic!(
                 "failed connection cannot handle new request: {:?}, client_receiver: {:?}",
                 request,

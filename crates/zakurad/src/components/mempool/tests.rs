@@ -80,7 +80,12 @@ fn lock_time_and_maturity_failures_start_no_cooldown() {
     };
 
     assert_eq!(
-        transaction_cooldown_peer(&invalid(TransactionError::WrongVersion), tip_height),
+        transaction_cooldown_peer(
+            &invalid(TransactionError::Script(
+                zakura_script::Error::ScriptInvalid
+            )),
+            tip_height
+        ),
         Some(peer)
     );
 

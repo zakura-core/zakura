@@ -48,7 +48,7 @@ fn policy_rejection_does_not_start_a_cooldown() {
     assert_eq!(transaction_cooldown_peer(&policy_error, None), None);
 
     let advertiser_addr = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
-    let consensus_error = zakura_consensus::error::TransactionError::WrongVersion;
+    let consensus_error = TransactionError::Script(zakura_script::Error::ScriptInvalid);
     assert_ne!(
         consensus_error.mempool_misbehavior_score(),
         0,
@@ -69,7 +69,7 @@ fn policy_rejection_does_not_start_a_cooldown() {
 fn stale_verification_failures_do_not_start_cooldowns() {
     let peer = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
     let error = TransactionDownloadVerifyError::Invalid {
-        error: TransactionError::WrongVersion,
+        error: TransactionError::Script(zakura_script::Error::ScriptInvalid),
         advertiser_addr: Some(peer),
         tip_height: Some(block::Height(100)),
     };
@@ -106,23 +106,129 @@ fn context_dependent_failures_do_not_start_cooldowns() {
 }
 
 #[test]
-fn invalid_shielded_proof_sizes_start_a_cooldown() {
+fn stateless_failures_ban_without_a_current_tip() {
     let advertiser_addr = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
 
     for consensus_error in [
         TransactionError::OrchardProofSize,
         TransactionError::IronwoodProofSize,
+        TransactionError::Halo2VerificationFailed,
+        TransactionError::WrongVersion,
+        TransactionError::Groth16("invalid proof".into()),
+        TransactionError::MalformedGroth16("invalid point".into()),
+        TransactionError::SmallOrder,
+        TransactionError::NoInputs,
+        TransactionError::NoOutputs,
+        TransactionError::BothVPubsNonZero,
     ] {
         let invalid_error = TransactionDownloadVerifyError::Invalid {
             error: consensus_error,
             advertiser_addr: Some(advertiser_addr),
-            tip_height: Some(block::Height(100)),
+            tip_height: None,
         };
 
         assert_eq!(
-            transaction_cooldown_peer(&invalid_error, Some(block::Height(100))),
-            Some(advertiser_addr),
+            transaction_stateless_misbehavior(&invalid_error),
+            Some((advertiser_addr, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE))
         );
+        assert_eq!(
+            transaction_cooldown_peer(&invalid_error, Some(block::Height(100))),
+            None,
+        );
+    }
+}
+
+#[test]
+fn context_dependent_errors_do_not_ban() {
+    for error in [
+        TransactionError::Script(zakura_script::Error::ScriptInvalid),
+        TransactionError::SaplingVerificationFailed,
+        TransactionError::WrongConsensusBranchId,
+        TransactionError::WrongConsensusBranchIdNu6_3GracePeriod,
+        TransactionError::LockedUntilAfterBlockHeight(block::Height(101)),
+        TransactionError::LockedUntilAfterBlockTime(chrono::Utc::now()),
+    ] {
+        let failure = TransactionDownloadVerifyError::Invalid {
+            error,
+            advertiser_addr: Some(PeerSocketAddr::from(([203, 0, 113, 7], 8233))),
+            tip_height: Some(block::Height(100)),
+        };
+        assert_eq!(transaction_stateless_misbehavior(&failure), None);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stateless_ban_and_repeated_cooldown_disconnect() {
+    for stateless in [true, false] {
+        let network = Network::Mainnet;
+        let transaction = network
+            .unmined_transactions_in_blocks(2..)
+            .next()
+            .unwrap()
+            .transaction
+            .clone();
+        let (mut mempool, mut peer_set, _state, _tip, mut verifier, mut recent_syncs, _receiver) =
+            setup(&network, u64::MAX, true).await;
+        let (misbehavior_sender, mut misbehavior_receiver) = tokio::sync::mpsc::channel(1);
+        mempool.misbehavior_sender = misbehavior_sender;
+        let _current_tip = (!stateless).then(|| mempool.use_current_chain_tip(&network));
+        mempool.enable(&mut recent_syncs).await;
+        let peer = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
+        if !stateless {
+            mempool.peer_cooldowns.record_invalid_transaction(
+                peer.ip(),
+                Instant::now() - peer_cooldown::BASE_COOLDOWN - Duration::from_secs(1),
+            );
+        }
+        let tx_id = transaction.id();
+        mempool
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::QueueFromPeer {
+                transactions: vec![transaction.into()],
+                source: QueueSource::LegacySocket(peer.remove_socket_addr_privacy()),
+            })
+            .await
+            .unwrap();
+        verifier.expect_request_that(|request| matches!(request, tx::Request::Mempool { transaction, .. } if transaction.id() == tx_id)).await.respond(Err(if stateless {
+            TransactionError::Groth16("invalid proof".into())
+        } else {
+            TransactionError::Script(zakura_script::Error::ScriptInvalid)
+        }));
+        timeout(Duration::from_secs(3), async {
+            while !mempool.storage().contains_rejected(&tx_id) {
+                mempool.dummy_call().await;
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        if stateless {
+            assert_eq!(
+                misbehavior_receiver.try_recv().unwrap(),
+                (peer, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE)
+            );
+            assert!(!mempool
+                .peer_cooldowns
+                .is_cooling_down(peer.ip(), Instant::now()));
+            peer_set.expect_no_requests().await;
+        } else {
+            peer_set
+                .expect_request_that(|request| {
+                    matches!(request,
+                zn::Request::DisconnectPeer(addr) if *addr == peer)
+                })
+                .await
+                .respond(zn::Response::Nil);
+            assert!(mempool
+                .peer_cooldowns
+                .is_cooling_down(peer.ip(), Instant::now()));
+            assert!(matches!(
+                misbehavior_receiver.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+        }
     }
 }
 
@@ -134,7 +240,12 @@ fn invalid_shielded_proof_sizes_start_a_cooldown() {
 /// banned every honest peer that relayed them.
 #[tokio::test(flavor = "multi_thread")]
 async fn stale_mempool_rejects_invalid_peer_transaction_without_cooldown() -> Result<(), Report> {
-    assert_peer_error_starts_no_cooldown(None, false, TransactionError::WrongVersion).await
+    assert_peer_error_starts_no_cooldown(
+        None,
+        false,
+        TransactionError::Script(zakura_script::Error::ScriptInvalid),
+    )
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -152,7 +263,7 @@ async fn caught_up_mempool_does_not_cool_down_stale_verification() -> Result<(),
     assert_peer_error_starts_no_cooldown(
         Some(chrono::Utc::now() - chrono::Duration::minutes(300)),
         true,
-        TransactionError::WrongVersion,
+        TransactionError::Script(zakura_script::Error::ScriptInvalid),
     )
     .await
 }
@@ -308,6 +419,8 @@ async fn invalid_peer_transaction_starts_a_cooldown_instead_of_a_ban() -> Result
         mut recent_syncs,
         _mempool_transaction_receiver,
     ) = setup_with_mempool_config(&network, mempool_config, true).await;
+    let (misbehavior_sender, mut misbehavior_receiver) = tokio::sync::mpsc::channel(1);
+    mempool.misbehavior_sender = misbehavior_sender;
     // Cooldowns only start when the mempool's validation context is current.
     let _chain_tip_sender = mempool.use_current_chain_tip(&network);
     mempool.enable(&mut recent_syncs).await;
@@ -392,7 +505,9 @@ async fn invalid_peer_transaction_starts_a_cooldown_instead_of_a_ban() -> Result
             )
         })
         .await
-        .respond(Err(TransactionError::WrongVersion));
+        .respond(Err(TransactionError::Script(
+            zakura_script::Error::ScriptInvalid,
+        )));
 
     timeout(Duration::from_secs(3), async {
         while !mempool.storage().contains_rejected(&at_limit_id) {
@@ -430,6 +545,10 @@ async fn invalid_peer_transaction_starts_a_cooldown_instead_of_a_ban() -> Result
         .any(|(request, _)| request.id() == later_transaction.id()));
     peer_set.expect_no_requests().await;
 
+    assert!(matches!(
+        misbehavior_receiver.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
     Ok(())
 }
 
@@ -491,7 +610,7 @@ async fn crawled_transaction_from_cooling_down_peer_is_not_verified() -> Result<
                     )
                 })
                 .await
-                .respond(Err(TransactionError::WrongVersion));
+                .respond(Err(TransactionError::Script(zakura_script::Error::ScriptInvalid)));
         }
 
         timeout(Duration::from_secs(3), async {
@@ -2999,6 +3118,7 @@ async fn setup_with_mempool_config(
         sync_status,
         latest_chain_tip,
         chain_tip_change.clone(),
+        tokio::sync::mpsc::channel(1).0,
     );
 
     let mut mempool_transaction_receiver = mempool_transaction_subscriber.subscribe();

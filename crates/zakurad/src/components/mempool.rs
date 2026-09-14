@@ -28,12 +28,12 @@ use std::{
 };
 
 use futures::{future::FutureExt, stream::Stream};
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tower::{
     buffer::Buffer,
     timeout::Timeout,
     util::{BoxCloneService, BoxService},
-    Service,
+    Service, ServiceExt,
 };
 
 use zakura_chain::{
@@ -146,10 +146,54 @@ pub(crate) fn is_estimated_close_to_network_tip(chain_tip_change: &ChainTipChang
         .is_some_and(|(distance, _height)| distance <= MAX_ESTIMATED_DISTANCE_TO_ENABLE)
 }
 
+/// Returns a ban score only for failures established from transaction data alone.
+/// Signature errors and combined proof/signature errors can depend on the branch
+/// used for the sighash. Halo2 only runs for v5/v6 transactions after the
+/// verifier matches their encoded branch ID to the selected upgrade.
+fn transaction_stateless_misbehavior(
+    error: &TransactionDownloadVerifyError,
+) -> Option<(PeerSocketAddr, u32)> {
+    let TransactionDownloadVerifyError::Invalid {
+        error,
+        advertiser_addr: Some(peer),
+        ..
+    } = error
+    else {
+        return None;
+    };
+
+    use TransactionError::*;
+    matches!(
+        error,
+        WrongVersion
+            | NoInputs
+            | NoOutputs
+            | BadBalance
+            | SmallOrder
+            | Halo2VerificationFailed
+            | Groth16(_)
+            | MalformedGroth16(_)
+            | BothVPubsNonZero
+            | NotEnoughFlags
+            | NotEnoughIronwoodFlags
+            | OrchardHasEnableCrossAddress
+            | OrchardProofSize
+            | IronwoodProofSize
+            | CoinbaseHasJoinSplit
+            | CoinbaseHasSpend
+            | CoinbaseHasEnableSpendsOrchard
+            | CoinbaseHasEnableSpendsIronwood
+            | CoinbaseInMempool
+            | NonCoinbaseHasCoinbaseInput
+    )
+    .then_some((*peer, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE))
+}
+
 /// Returns the peer to put in a transaction cooldown for `error`, if any.
 ///
 /// Only consensus failures that would otherwise count as peer misbehavior
-/// start a cooldown. Policy rejections, duplicate spends, failures without a
+/// start a cooldown unless the stateless ban path handles them.
+/// Policy rejections, duplicate spends, failures without a
 /// legacy advertiser address, and failures verified against a tip other than
 /// `best_tip_height` do not. Branch ID and lock time failures do not either,
 /// because they depend on this node's tip, which can lag the relaying peer's.
@@ -157,6 +201,10 @@ fn transaction_cooldown_peer(
     error: &TransactionDownloadVerifyError,
     best_tip_height: Option<block::Height>,
 ) -> Option<PeerSocketAddr> {
+    if transaction_stateless_misbehavior(error).is_some() {
+        return None;
+    }
+
     let TransactionDownloadVerifyError::Invalid {
         error,
         advertiser_addr: Some(advertiser_addr),
@@ -365,6 +413,9 @@ pub struct Mempool {
     /// resets and deactivations.
     peer_cooldowns: peer_cooldown::PeerCooldowns,
 
+    /// Reports peers that relay transactions with stateless failures.
+    misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
+
     // Diagnostics
     //
     /// Queued transactions pending download or verification transmitter.
@@ -400,6 +451,7 @@ impl Mempool {
         sync_status: SyncStatus,
         latest_chain_tip: zs::LatestChainTip,
         chain_tip_change: ChainTipChange,
+        misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
     ) -> (Self, MempoolTxSubscriber) {
         let (transaction_sender, _) =
             tokio::sync::broadcast::channel(gossip::MEMPOOL_CHANGE_CHANNEL_CAPACITY);
@@ -419,6 +471,7 @@ impl Mempool {
             tx_verifier,
             transaction_sender,
             peer_cooldowns: peer_cooldown::PeerCooldowns::default(),
+            misbehavior_sender,
             #[cfg(feature = "progress-bar")]
             queued_count_bar: None,
             #[cfg(feature = "progress-bar")]
@@ -848,6 +901,10 @@ impl Service<Request> for Mempool {
                     }
                     Ok(Err(boxed_err)) => {
                         let (tx_id, error) = *boxed_err;
+                        // Stateless invalidity does not depend on tip freshness.
+                        if let Some(report) = transaction_stateless_misbehavior(&error) {
+                            let _ = self.misbehavior_sender.try_send(report);
+                        }
                         // Only start cooldowns while this node's validation context is
                         // current. A stale node verifies transactions against old rules.
                         let cooldown_peer = is_current_enough_for_mempool
@@ -858,6 +915,25 @@ impl Service<Request> for Mempool {
                                 .peer_cooldowns
                                 .record_invalid_transaction(advertiser_addr.ip(), Instant::now())
                             {
+                                // A second cooldown represents a new failure after the
+                                // first cooldown expired, not the initial in-flight batch.
+                                if cooldown > peer_cooldown::BASE_COOLDOWN {
+                                    let disconnect = self
+                                        .outbound
+                                        .clone()
+                                        .oneshot(zn::Request::DisconnectPeer(advertiser_addr))
+                                        .boxed();
+                                    tokio::spawn(async move {
+                                        let result = tokio::time::timeout(
+                                            std::time::Duration::from_secs(5),
+                                            disconnect,
+                                        )
+                                        .await;
+                                        if !matches!(result, Ok(Ok(_))) {
+                                            tracing::debug!("could not disconnect peer after repeated transaction failures");
+                                        }
+                                    });
+                                }
                                 tracing::debug!(
                                     ?tx_id,
                                     peer = %legacy_peer_log_label(

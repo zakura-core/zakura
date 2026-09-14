@@ -66,6 +66,7 @@ alias = "temp-zakura-sync-test-1"
 public_ip = "138.68.43.212"
 mode_label = "dual-stack"
 p2p_stack = "dual"
+poll_interval_seconds = 10
 
 [[nodes]]
 name = "temp-zakura-sync-test-2"
@@ -75,6 +76,7 @@ alias = "temp-zakura-sync-test-2"
 public_ip = "138.197.218.91"
 mode_label = "Zakura/v2-only"
 p2p_stack = "zakura"
+poll_interval_seconds = 10
 health_min_connected_peers = 0
 
 [[nodes]]

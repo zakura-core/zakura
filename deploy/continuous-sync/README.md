@@ -384,8 +384,10 @@ database. It measures block payload rather than physical disk writes. Without
 `sync-metrics`, the commit-byte counter is absent rather than a misleading zero.
 
 Dual (mixed) and Zakura-only runs add these fields to their existing
-`/var/log/zakura/runs/<run-id>/samples.jsonl`, at the normal 30-second polling
-interval plus the time spent checking status. The adjacent `run.json` identifies
+`/var/log/zakura/runs/<run-id>/samples.jsonl`, at a 10-second polling interval
+plus the time spent checking status. Their `poll_interval_seconds` overrides live
+in `nodes.toml`. Readiness confirmation uses its separate 30-second interval.
+The adjacent `run.json` identifies
 the run, binary commit, networking mode, and start/completion times.
 
 | Sample field | Meaning |
@@ -424,7 +426,8 @@ run are protected, including their traces, metadata, samples, and log tail.
 Protected runs may exceed the target; cleanup never discards them to meet it.
 
 During sync, the controller checks trace files with logrotate every polling
-interval (normally 30 seconds). Each stream rotates at 128 MiB and keeps two older
+interval (10 seconds for native runs, 30 seconds for legacy). Each stream rotates
+at 128 MiB and keeps two older
 segments beside the current file. Files can exceed that size between checks.
 This preserves recent detailed history, not necessarily the entire sync.
 `copytruncate` keeps the existing append-only writer working without a restart;

@@ -137,7 +137,9 @@ unsafe impl GlobalAlloc for TrackingAllocator {
 /// their memory requests do not count as part of the function being tested.
 /// The function must run entirely on this thread, without `await` or moving its
 /// allocations to another thread. Calling `measure` inside another `measure`
-/// panics. If the measured function panics, recording stops before it propagates.
+/// panics, as does calling it in a program that never installed
+/// [`TrackingAllocator`]. If the measured function panics, recording stops
+/// before it propagates.
 pub fn measure<T>(operation: impl FnOnce() -> T) -> (T, AllocationStats) {
     struct Reset;
     impl Drop for Reset {
@@ -150,6 +152,25 @@ pub fn measure<T>(operation: impl FnOnce() -> T) -> (T, AllocationStats) {
         *active = Some(Observation::default());
     });
     let reset = Reset;
+    // The hooks above only run when `TrackingAllocator` is this program's
+    // allocator. Record one deliberate allocation to prove they do: without them
+    // every field below stays zero, so a bound like "this requested no memory"
+    // would hold for a program that never measured anything. Checking the
+    // recorded count must not borrow `ACTIVE`, because `observe` skips its work
+    // while the cell is already borrowed and the probe would look unrecorded.
+    const PROBE_BYTES: usize = 64;
+    let probe = std::hint::black_box(Vec::<u8>::with_capacity(PROBE_BYTES));
+    let tracking = ACTIVE.with_borrow(|active| {
+        active
+            .as_ref()
+            .is_some_and(|observation| observation.stats.requests > 0)
+    });
+    drop(probe);
+    assert!(
+        tracking,
+        "install `TrackingAllocator` with #[global_allocator] to measure allocations"
+    );
+    ACTIVE.with_borrow_mut(|active| *active = Some(Observation::default()));
     let result = operation();
     let stats = ACTIVE.with_borrow(|active| active.as_ref().unwrap().stats);
     drop(reset);

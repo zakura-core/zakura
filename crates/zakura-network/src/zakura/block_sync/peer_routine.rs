@@ -1669,6 +1669,7 @@ impl PeerRoutine {
     /// The response a mismatched body belongs to. Serving is sequential, so it
     /// is the earliest queued started range that still awaits parts. Vector
     /// order is not request order: `remove_outstanding` swaps the last entry in.
+    /// That premise is the spec's request-order rule (`docs/specs/blocksync/stream-pair.md`).
     fn current_response_index(&self) -> Option<usize> {
         self.window
             .outstanding
@@ -1717,6 +1718,7 @@ impl PeerRoutine {
             "discarding a block-sync body from another chain"
         );
         metrics::counter!("sync.block.body.discarded", "reason" => "hash_mismatch").increment(1);
+        self.trace_body_discarded(height, requested, delivered);
         // The peer answered, so give the exchange the same bounded grace a live
         // request gets. Accepted-body accounting stays put: a peer that only ever
         // answers from another fork must not read as a proven supplier, which

@@ -123,7 +123,7 @@ pub(crate) struct ServeProfile {
     /// Inclusive height window this peer refuses to serve (answers `RangeUnavailable`),
     /// modelling a peer that is missing a range.
     pub(crate) withhold: Option<(block::Height, block::Height)>,
-    /// Serve the blocks of a response in reverse order, exercising the reorder buffer.
+    /// Serve a response's blocks in reverse order; each mismatch spends a part and is discarded.
     pub(crate) reorder: bool,
     /// Optional mid-run degradation (wedge or slow-down) applied once the peer has been
     /// connected for [`Degrade::at`].

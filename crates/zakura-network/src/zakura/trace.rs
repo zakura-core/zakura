@@ -324,6 +324,8 @@ pub mod block_sync_trace {
     pub const BLOCK_ACTION_DISPATCHED: &str = "block_action_dispatched";
     /// Body received from a peer.
     pub const BLOCK_BODY_RECEIVED: &str = "block_body_received";
+    /// Body whose hash was not the next expected one; it spent a part undecoded.
+    pub const BLOCK_BODY_DISCARDED: &str = "block_body_discarded";
     /// Body handed from a peer routine to the sequencer input channel.
     pub const BLOCK_BODY_SEQUENCER_SENT: &str = "block_body_sequencer_sent";
     /// A peer routine acquired body input capacity before decoding a body.

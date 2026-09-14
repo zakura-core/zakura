@@ -287,6 +287,10 @@ pub(super) struct BlockTraceFields {
     pub floor_bypass: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_block_age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivered_hash: Option<String>,
 }
 
 #[derive(Serialize)]

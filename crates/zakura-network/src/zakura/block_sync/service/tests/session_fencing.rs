@@ -69,25 +69,34 @@ impl PreparedRequest {
     }
 }
 
+/// Build the download-only peer a fencing test admits, keeping both stream ends.
+fn fence_peer(
+    peer: &ZakuraPeerId,
+    conn_id: ZakuraConnId,
+    cancel: CancellationToken,
+) -> (Peer, FramedSend, FramedWorkerRecv) {
+    let (input, recv) = crate::zakura::framed_channel(4);
+    let (send, output) = worker_framed_channel(4);
+    let peer = crate::zakura::testkit::DownloadOnlyPeer::create_with_conn_id_and_direction(
+        conn_id,
+        peer.clone(),
+        None,
+        ZAKURA_CAP_BLOCK_SYNC,
+        ServicePeerDirection::Outbound,
+        HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (recv, send))]),
+        cancel,
+    );
+    (peer, input, output)
+}
+
 fn add_fence_peer(
     service: &BlockSyncService,
     peer: &ZakuraPeerId,
     conn_id: ZakuraConnId,
     cancel: CancellationToken,
 ) -> (FramedSend, FramedWorkerRecv) {
-    let (input, recv) = crate::zakura::framed_channel(4);
-    let (send, output) = worker_framed_channel(4);
-    service.add_peer(
-        crate::zakura::testkit::DownloadOnlyPeer::create_with_conn_id_and_direction(
-            conn_id,
-            peer.clone(),
-            None,
-            ZAKURA_CAP_BLOCK_SYNC,
-            ServicePeerDirection::Outbound,
-            HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (recv, send))]),
-            cancel,
-        ),
-    );
+    let (peer, input, output) = fence_peer(peer, conn_id, cancel);
+    service.add_peer(peer);
     (input, output)
 }
 
@@ -276,4 +285,97 @@ async fn removing_a_session_fences_writers_before_erasing_its_record() {
             assert_eq!(connection.is_cancelled(), started);
         }
     }
+}
+
+#[tokio::test]
+async fn a_session_closed_by_its_own_fence_leaves_no_gap_claim() {
+    let service = BlockSyncService::new_for_test(ZakuraBlockSyncConfig::default());
+    let peer = ZakuraPeerId::new(vec![75; 32]).unwrap();
+    let connection = CancellationToken::new();
+    let (_input, _output) = add_fence_peer(&service, &peer, 1, connection.clone());
+    let session = service.current_sessions_for_test().snapshot()[&peer].clone();
+    let request = PreparedRequest::new(&session);
+    request.queue(&session);
+    assert!(request.write.try_start());
+
+    assert!(service.inner.finish_session(&peer, 1, session.session_id()));
+
+    assert!(
+        connection.is_cancelled(),
+        "retiring an unfinished started response closes the connection"
+    );
+    assert!(
+        !service.owns_connection_for_peer(&peer, 1),
+        "no gap claim survives for a connection retire already closed"
+    );
+}
+
+/// A park that lands after `add_peer`'s entry-point check is only honored at
+/// admission, so this drives one into that window: the peer-map lock is the
+/// single wait between the two checks, and holding it stalls an `add_peer` that
+/// has already passed the entry check.
+#[tokio::test]
+async fn parked_admission_leaves_the_incumbent_session_untouched() {
+    // `new_for_test` has no registry wiring, so admission can never return Parked
+    // there; the production constructor spawns an inert reactor with wiring.
+    let service = BlockSyncService::new(ZakuraBlockSyncConfig::default(), mainnet_decoder());
+    let peer = ZakuraPeerId::new(vec![0x5a; 32]).unwrap();
+    let _first = add_fence_peer(&service, &peer, 1, CancellationToken::new());
+    let incumbent = service.current_sessions_for_test().snapshot()[&peer].clone();
+    let registry = service
+        .inner
+        .routine_wiring
+        .as_ref()
+        .expect("BlockSyncService::new wires a registry")
+        .registry
+        .clone();
+
+    // The entry-point check collects expired connection-less parks, so this
+    // probe disappearing means the replacement is past that check. Sampling it
+    // against an earlier instant keeps the probe itself from collecting it.
+    let probe = ZakuraPeerId::new(vec![0x5b; 32]).unwrap();
+    let expired = Instant::now();
+    let before_expiry = expired - Duration::from_millis(1);
+    registry.park_peer_until(&probe, expired);
+    assert!(registry.peer_park_deadline(&probe, before_expiry).is_some());
+
+    let (replacement, _second_input, _second_output) =
+        fence_peer(&peer, 2, CancellationToken::new());
+    std::thread::scope(|scope| {
+        let admitted = service.inner.sessions.active.lock().unwrap();
+        let admitting = scope.spawn(|| service.add_peer(replacement));
+        let give_up = Instant::now() + Duration::from_secs(10);
+        while registry.peer_park_deadline(&probe, before_expiry).is_some() {
+            assert!(
+                Instant::now() < give_up,
+                "the replacement never reached the entry-point park check"
+            );
+            std::thread::yield_now();
+        }
+        assert!(registry.park_session(
+            &peer,
+            1,
+            incumbent.session_id(),
+            Instant::now() + Duration::from_secs(60)
+        ));
+        drop(admitted);
+        admitting.join().unwrap();
+    });
+
+    assert!(
+        !incumbent.cancel_token().is_cancelled(),
+        "a parked admission must not cancel the incumbent"
+    );
+    // `authorize_response` also covers the incumbent's connection staying open.
+    assert!(
+        incumbent.authorize_response().is_ok(),
+        "a parked admission must not retire the incumbent"
+    );
+    let active = service.inner.sessions.active.lock().unwrap();
+    assert_eq!(active[&peer].conn_id, 1, "the incumbent record survives");
+    assert_eq!(
+        active[&peer].session_id,
+        incumbent.session_id(),
+        "the parked replacement is declined"
+    );
 }

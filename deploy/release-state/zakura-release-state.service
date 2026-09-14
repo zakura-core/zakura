@@ -12,7 +12,8 @@ Wants=docker.service
 
 [Service]
 Type=oneshot
-# Supplies RELEASE_STATE_ARCHIVE_CACHE, and optionally RELEASE_STATE_KEEP or
+# Supplies RELEASE_STATE_ARCHIVE_CACHE, RELEASE_STATE_ORACLE_SOURCE, and
+# RELEASE_STATE_ORACLE_ID, and optionally RELEASE_STATE_KEEP or
 # RELEASE_STATE_GRID_COST_MS. The publisher refuses to run without the cache path.
 #
 # R2 credentials reach the publisher one of two ways, chosen by this same file.
@@ -22,9 +23,8 @@ Type=oneshot
 # The wrapper is therefore no longer baked into ExecStart.
 EnvironmentFile=/etc/zakura-release-state.env
 ExecStart=/opt/zakura-release-state/bin/publish-from-archive-host.sh
-# A whole-band frontier grid replay takes hours on a fast-synced archive
-# database. A legacy archive database reads the grid instead and finishes in
-# minutes, but the ceiling has to cover both.
-TimeoutStartSec=6h
+# Initial generation replays two ordinary archive states and audits transparent state.
+# Six helpers can each consume 48 hours; leave two days for export and upload.
+TimeoutStartSec=14d
 Nice=10
 IOSchedulingClass=idle

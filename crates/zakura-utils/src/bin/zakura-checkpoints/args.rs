@@ -138,6 +138,15 @@ pub struct Args {
     #[arg(long)]
     pub mainnet_frontier_output: Option<PathBuf>,
 
+    /// Generate a spentness artifact and JSON sidecars at the same terminal checkpoint.
+    /// Requires all treestate outputs and a separate ordinary replay cache.
+    #[arg(long)]
+    pub mainnet_spentness_output: Option<PathBuf>,
+
+    /// Persistent exact-checkpoint archive replay cache for spentness generation.
+    #[arg(long)]
+    pub spentness_replay_cache: Option<PathBuf>,
+
     /// Offline mode: write the completed-subtree artifact for the last emitted
     /// checkpoint height to this path.
     ///
@@ -215,6 +224,21 @@ impl Args {
     /// Offline and RPC modes are mutually exclusive, and the full-list output
     /// only makes sense when extending the embedded checkpoint list.
     pub fn validate_mode(&self) -> Result<(), String> {
+        if self.mainnet_spentness_output.is_some() != self.spentness_replay_cache.is_some() {
+            return Err(
+                "--mainnet-spentness-output requires --spentness-replay-cache and vice versa"
+                    .to_string(),
+            );
+        }
+        if self.mainnet_spentness_output.is_some()
+            && (self.state_cache_dir.is_none()
+                || self.mainnet_frontier_output.is_none()
+                || self.mainnet_frontier_grid_checkpoint.is_some())
+        {
+            return Err(
+                "spentness generation requires a coupled offline release-state export".to_string(),
+            );
+        }
         if self.mainnet_frontier_grid_output.is_none()
             && (self.frontier_grid_spacing.is_some() || self.frontier_grid_target_cost_ms.is_some())
         {
@@ -345,6 +369,16 @@ impl Args {
     }
 
     /// The artifact output flags and their paths, in the order errors report them.
+    /// The spentness artifact and its JSON sidecars, when spentness export is enabled.
+    pub fn spentness_outputs(&self) -> Option<SpentnessOutputs> {
+        let artifact = self.mainnet_spentness_output.clone()?;
+        Some(SpentnessOutputs {
+            commitment: artifact.with_extension("commitment.json"),
+            verification: artifact.with_extension("verification.json"),
+            artifact,
+        })
+    }
+
     fn artifact_outputs(&self) -> [(&'static str, &Option<PathBuf>); 3] {
         [
             ("--mainnet-frontier-output", &self.mainnet_frontier_output),
@@ -363,8 +397,13 @@ impl Args {
     /// bundle expects two.
     fn reject_aliased_artifact_outputs(&self) -> Result<(), String> {
         let mut resolved: Vec<(&'static str, PathBuf)> = Vec::new();
-        for (flag, path) in self.artifact_outputs() {
-            let Some(path) = path else { continue };
+        let spentness = self.spentness_outputs();
+        let outputs = self
+            .artifact_outputs()
+            .into_iter()
+            .filter_map(|(flag, path)| Some((flag, path.as_deref()?)))
+            .chain(spentness.iter().flat_map(SpentnessOutputs::labeled));
+        for (flag, path) in outputs {
             let destination = resolved_output_destination(path)?;
             if let Some((earlier, _)) = resolved
                 .iter()
@@ -375,7 +414,53 @@ impl Args {
             resolved.push((flag, destination));
         }
 
+        if let Some(replay) = &self.spentness_replay_cache {
+            // Appending a component makes the resolver canonicalize the cache itself.
+            let replay = resolved_output_destination(&replay.join(".path-check"))?
+                .parent()
+                .expect("resolved path has a parent")
+                .to_path_buf();
+            if let Some(state) = &self.state_cache_dir {
+                let state = resolved_output_destination(&state.join(".path-check"))?
+                    .parent()
+                    .expect("resolved path has a parent")
+                    .to_path_buf();
+                if replay.starts_with(&state) || state.starts_with(&replay) {
+                    return Err(
+                        "--spentness-replay-cache must not overlap --state-cache-dir".into(),
+                    );
+                }
+            }
+            for (flag, destination) in &resolved {
+                if destination.starts_with(&replay) || replay.starts_with(destination) {
+                    return Err(format!("{flag} must not overlap --spentness-replay-cache"));
+                }
+            }
+        }
+
         Ok(())
+    }
+}
+
+/// Files written by a coupled spentness export.
+///
+/// The sidecar names derive from the artifact path, so the release publisher finds them.
+pub struct SpentnessOutputs {
+    /// The membership artifact.
+    pub artifact: PathBuf,
+    /// The commitment descriptor for review.
+    pub commitment: PathBuf,
+    /// The independent verification report.
+    pub verification: PathBuf,
+}
+
+impl SpentnessOutputs {
+    fn labeled(&self) -> [(&'static str, &Path); 3] {
+        [
+            ("--mainnet-spentness-output", &self.artifact),
+            ("spentness commitment sidecar", &self.commitment),
+            ("spentness verification sidecar", &self.verification),
+        ]
     }
 }
 
@@ -435,6 +520,8 @@ mod tests {
             last_checkpoint: None,
             state_cache_dir: None,
             mainnet_frontier_output: None,
+            mainnet_spentness_output: None,
+            spentness_replay_cache: None,
             mainnet_subtree_output: None,
             mainnet_frontier_grid_output: None,
             mainnet_frontier_grid_input: None,
@@ -626,6 +713,42 @@ mod tests {
         resume_without_full_list.full_list = false;
         resume_without_full_list.last_checkpoint = Some(Height(100));
         assert_eq!(resume_without_full_list.validate_mode(), Ok(()));
+    }
+
+    #[test]
+    fn rejects_spentness_cache_output_aliases() {
+        let mut args = offline_args();
+        args.mainnet_spentness_output = Some("spentness.bin".into());
+        args.spentness_replay_cache = Some("replay".into());
+        assert!(args.validate_mode().is_ok());
+        for replay in [
+            "frontier.bin",
+            "spentness.commitment.json",
+            "state",
+            "state/replay",
+            ".",
+        ] {
+            args.spentness_replay_cache = Some(replay.into());
+            assert!(args.validate_mode().is_err(), "accepted {replay}");
+        }
+        args.spentness_replay_cache = Some("replay".into());
+        args.mainnet_frontier_output = Some("replay/frontier.bin".into());
+        assert!(args.validate_mode().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_spentness_cache_symlink_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let mut args = offline_args();
+        args.mainnet_spentness_output = Some("spentness.bin".into());
+        args.spentness_replay_cache = Some(alias);
+        args.mainnet_frontier_output = Some(real.join("frontier.bin"));
+        assert!(args.validate_mode().is_err());
     }
 
     #[test]

@@ -24,6 +24,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import spentness_release
+
 # The exact hosts release-state bundles may be fetched from. Editing this list
 # is a reviewed change; the repository variable only picks the latest.json URL.
 ALLOWED_HOSTS = (
@@ -41,6 +43,12 @@ FILE_LIMITS = {
     # uniform-spacing run, which is larger, without accepting an unbounded download.
     "mainnet-frontier-grid.bin": 32 * 1024 * 1024,
 }
+SPENTNESS_FILE_LIMITS = {
+    spentness_release.ARTIFACT: spentness_release.MAX_BYTES,
+    spentness_release.COMMITMENT: 16 * 1024,
+    spentness_release.VERIFICATION: 32 * 1024,
+}
+SUPPORTED_SCHEMAS = (1, spentness_release.BUNDLE_SCHEMA)
 LATEST_REQUIRED_KEYS = {
     "schema_version",
     "network",
@@ -58,7 +66,7 @@ META_REQUIRED_KEYS = {
     "generated_at",
     "files",
 }
-META_OPTIONAL_KEYS = {"generator"}
+META_OPTIONAL_KEYS = {"generator", "spentness"}
 FUTURE_SKEW = timedelta(minutes=10)
 
 
@@ -196,7 +204,8 @@ def resolve_bundle(
 
     latest = _parse_json(fetch(latest_url, LATEST_MAX_BYTES), "latest pointer")
     _check_keys(latest, LATEST_REQUIRED_KEYS, set(), "latest pointer")
-    if _integer(latest["schema_version"], "latest.schema_version") != 1:
+    schema = _integer(latest["schema_version"], "latest.schema_version")
+    if schema not in SUPPORTED_SCHEMAS:
         raise BundleError("unsupported latest pointer schema version")
     if latest["network"] != "Mainnet":
         raise BundleError("latest.network must be Mainnet")
@@ -210,7 +219,7 @@ def resolve_bundle(
     if (meta_parts.scheme, meta_parts.netloc) != (latest_parts.scheme, latest_parts.netloc):
         raise BundleError("latest pointer and meta must use the same origin")
     prefix = latest_url.removesuffix("latest.json")
-    if meta_url != f"{prefix}v1/{height}/meta.json":
+    if meta_url != f"{prefix}v{schema}/{height}/meta.json":
         raise BundleError("meta URL is not the expected immutable bundle path")
 
     return _resolve_from_meta(
@@ -222,6 +231,7 @@ def resolve_bundle(
         now=now,
         max_age_hours=max_age_hours,
         expected={
+            "schema_version": schema,
             "height": height,
             "block_hash": block_hash,
             "generated_at": _string(latest["generated_at"], "latest.generated_at"),
@@ -279,13 +289,16 @@ def _resolve_from_meta(
         raise BundleError("meta digest does not match the latest pointer")
     meta = _parse_json(meta_bytes, "meta")
     _check_keys(meta, META_REQUIRED_KEYS, META_OPTIONAL_KEYS, "meta")
-    if _integer(meta["schema_version"], "meta.schema_version") != 1:
+    schema = _integer(meta["schema_version"], "meta.schema_version")
+    if schema not in SUPPORTED_SCHEMAS:
         raise BundleError("unsupported meta schema version")
     if meta["network"] != "Mainnet":
         raise BundleError("meta.network must be Mainnet")
     height = _integer(meta["height"], "meta.height")
     block_hash = _hex_digest(meta["block_hash"], "meta.block_hash")
     if expected is not None:
+        if schema != expected["schema_version"]:
+            raise BundleError("latest pointer and meta identify different schemas")
         if height != expected["height"]:
             raise BundleError("latest pointer and meta identify different heights")
         if block_hash != expected["block_hash"]:
@@ -294,7 +307,7 @@ def _resolve_from_meta(
             raise BundleError("latest pointer and meta have different generation times")
     # Checked against the meta's own height, so the immutable path shape holds whether the bundle
     # was reached through the pointer or named directly by digest.
-    if not meta_url.endswith(f"/v1/{height}/meta.json"):
+    if not meta_url.endswith(f"/v{schema}/{height}/meta.json"):
         raise BundleError("meta URL is not the expected immutable bundle path")
 
     generated_at = _timestamp(meta["generated_at"], "meta.generated_at")
@@ -307,9 +320,12 @@ def _resolve_from_meta(
         raise BundleError(f"release-state bundle is older than {max_age_hours} hours")
 
     files = _object(meta["files"], "meta.files")
-    _check_keys(files, set(FILE_LIMITS), set(), "meta.files")
+    required_limits = dict(FILE_LIMITS)
+    if schema == spentness_release.BUNDLE_SCHEMA:
+        required_limits.update(SPENTNESS_FILE_LIMITS)
+    _check_keys(files, set(required_limits), set(), "meta.files")
     validated: dict[str, dict[str, Any]] = {}
-    for name, max_size in FILE_LIMITS.items():
+    for name, max_size in required_limits.items():
         entry = _object(files[name], f"meta.files.{name}")
         _check_keys(entry, {"size", "sha256"}, set(), f"meta.files.{name}")
         size = _integer(entry["size"], f"meta.files.{name}.size", maximum=max_size)
@@ -333,6 +349,11 @@ def _resolve_from_meta(
             if hashlib.sha256(data).hexdigest() != entry["sha256"]:
                 raise BundleError(f"{name} digest does not match the bundle meta")
             (staging / name).write_bytes(data)
+        if schema == spentness_release.BUNDLE_SCHEMA:
+            try:
+                spentness_release.validate_bundle(staging, meta)
+            except (ValueError, OSError) as error:
+                raise BundleError(f"invalid spentness release: {error}") from error
         os.replace(staging, output_dir)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)

@@ -120,7 +120,7 @@ From a trusted checkout of this repository:
 deploy/release-state/deploy-snapshot-host.sh <snapshot-host-ssh-target>
 ```
 
-The script builds `zakura-checkpoints` with `zakura-checkpoints-offline` at the commit checked out
+The script builds `zakura-checkpoints` and `zakura-spentness` with `zakura-spentness` at the commit checked out
 in the trusted source tree. It verifies that commit is on `origin/main`, then installs the binary
 and publisher scripts under `/opt/zakura-release-state`, removes any leftover
 `zakura-snapshot-pruned.service` drop-in from the previous topology, installs
@@ -183,8 +183,9 @@ curl -fsS https://zakura-release.valargroup.dev/release-state/latest.json | jq .
 Confirm the pointer height advanced, fetch its `meta_url`, verify
 `meta_sha256`, and verify the listed size and SHA-256 for
 `main-checkpoints.txt`, `mainnet-frontier.bin`, `mainnet-treestate-subtrees.bin`, and
-`mainnet-frontier-grid.bin`. The publisher keeps the newest four immutable
-`release-state/v1/<height>/` bundles by default.
+`mainnet-frontier-grid.bin` and the spentness artifact with its sidecars.
+The publisher retains version 2 bundles for recovery. Only legacy
+`release-state/v1/<height>/` bundles use newest-four retention.
 
 Direct invocation is available for diagnostics. It takes the same publisher lock as the timer,
 so it is safe alongside a scheduled run, and it leaves both containers alone:
@@ -235,3 +236,22 @@ incident. Keep bootstrap and current R2 objects intact, so GitHub safely takes t
 when no newer bundle is available. A publisher run mutates nothing on the host beyond its own
 lock file and a temporary staging directory, so an interrupted run needs no container recovery.
 Preserve the service journal.
+
+# Spentness generation
+
+The service allows 14 days for a run. Six helpers can each consume their 48-hour
+deadline. The remaining two days cover export and upload work.
+
+The schema 2 publisher requires a second independently synchronized archive source.
+Configure `RELEASE_STATE_ORACLE_SOURCE` and `RELEASE_STATE_ORACLE_ID` in the host
+environment before enabling the timer. The deployment script installs both
+`zakura-checkpoints` and `zakura-spentness` at the pinned exporter revision.
+
+Set `RELEASE_STATE_DATA_DIR` on persistent disk with room for two ordinary archive
+replay states. The publisher advances those states to the selected checkpoint.
+It leaves both running source nodes unchanged. Verification uses temporary disk
+under `$TMPDIR`; configure that variable on real disk for the service account.
+
+Keep version 2 bundles while supported nodes may need their artifacts for recovery.
+Provision reviewed artifacts on seeds and test a client with only those seeds
+before rollout. See [the spentness design](../../docs/design/spentness-hints.md).

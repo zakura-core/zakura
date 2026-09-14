@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Export a Mainnet release-state bundle from an archive node's state and publish
-# it to R2: an immutable release-state/v1/<height>/ bundle plus the mutable
+# it to R2: an immutable release-state/v2/<height>/ bundle plus the mutable
 # latest.json pointer consumed by the update-release-state workflow.
 #
 # The exporter opens the database as a read-only RocksDB secondary, so the node
@@ -18,7 +18,7 @@
 #                             "https://zakura-release.valargroup.dev/release-state"
 # Optional environment:
 #   ZAKURA_CHECKPOINTS_BIN    zakura-checkpoints binary (default: on PATH),
-#                             built with --features zakura-checkpoints-offline
+#                             built with --features zakura-spentness
 #   RELEASE_STATE_GRID_COST_MS
 #                             per-entry frontier grid cost budget in ms
 #                             (default: whatever the exporter defaults to). Only
@@ -32,7 +32,9 @@
 #                             pins, so the first bundle extends that grid by
 #                             construction instead of relying on a fresh genesis
 #                             walk reproducing it byte for byte.
-#   RELEASE_STATE_KEEP        immutable bundles to retain (default 4)
+#   RELEASE_STATE_KEEP        legacy v1 bundles to retain (default 4)
+#   RELEASE_STATE_SPENTNESS_TIMEOUT
+#                             deadline for each spentness replay step (default 48h)
 #   RELEASE_STATE_LOCK_FILE   host-local publisher lock
 #                             (default: /tmp/zakura-release-state-publish.lock)
 
@@ -42,6 +44,38 @@ STATE_DIR=${1:?usage: publish-release-state.sh <archive-node-zakura-cache-dir>}
 : "${RELEASE_STATE_R2_REMOTE:?set RELEASE_STATE_R2_REMOTE to an rclone destination}"
 : "${RELEASE_STATE_PUBLIC_BASE:?set RELEASE_STATE_PUBLIC_BASE to the public HTTPS base URL}"
 BIN=${ZAKURA_CHECKPOINTS_BIN:-zakura-checkpoints}
+SPENTNESS_BIN=${ZAKURA_SPENTNESS_BIN:-zakura-spentness}
+export ZAKURA_SPENTNESS_BIN="$SPENTNESS_BIN"
+DATA_DIR=${RELEASE_STATE_DATA_DIR:-"${STATE_DIR%/}-release-state"}
+BUNDLE_SCHEMA=2
+LEGACY_BUNDLE_SCHEMA=1
+# The exporter derives both sidecar names from the artifact name.
+SPENTNESS_ARTIFACT=mainnet-spentness-hints.bin
+SPENTNESS_COMMITMENT=mainnet-spentness-hints.commitment.json
+SPENTNESS_VERIFICATION=mainnet-spentness-hints.verification.json
+# Bundle data files in upload order. meta.json is uploaded after all of them.
+BUNDLE_FILES=(
+    main-checkpoints.txt
+    mainnet-frontier.bin
+    mainnet-treestate-subtrees.bin
+    mainnet-frontier-grid.bin
+    "$SPENTNESS_ARTIFACT"
+    "$SPENTNESS_COMMITMENT"
+    "$SPENTNESS_VERIFICATION"
+)
+SPENTNESS_TIMEOUT=${RELEASE_STATE_SPENTNESS_TIMEOUT:-48h}
+: "${RELEASE_STATE_ORACLE_SOURCE:?set RELEASE_STATE_ORACLE_SOURCE to an independently synchronized archive cache}"
+: "${RELEASE_STATE_ORACLE_ID:?identify the independently synchronized source and its validation software}"
+: "${RELEASE_STATE_GENERATOR_REVISION:?set RELEASE_STATE_GENERATOR_REVISION to the generator git revision}"
+if ! [[ "$RELEASE_STATE_GENERATOR_REVISION" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "spentness generator revision must contain 40 lowercase hexadecimal characters" >&2
+    exit 1
+fi
+if [ "$(realpath "$STATE_DIR")" = "$(realpath "$RELEASE_STATE_ORACLE_SOURCE")" ]; then
+    echo "spentness reproduction requires a separate independently synchronized source" >&2
+    exit 1
+fi
+mkdir -p "$DATA_DIR"
 KEEP=${RELEASE_STATE_KEEP:-4}
 LOCK_FILE=${RELEASE_STATE_LOCK_FILE:-/tmp/zakura-release-state-publish.lock}
 # A zero or malformed KEEP would make `head -n -"$KEEP"` select every bundle,
@@ -128,15 +162,20 @@ if [ -n "$POINTER_LISTING" ]; then
     # A bundle published before the grid joined the release state has no grid to
     # resume from. That is not an error: the run falls back to a full walk, which
     # is what the first grid-bearing export has to do anyway.
-    PREVIOUS_GRID="$REMOTE_PREFIX/v1/$POINTER_HEIGHT/mainnet-frontier-grid.bin"
+    POINTER_SCHEMA=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["schema_version"])' "$STAGE/existing-latest.json")
+    if [[ "$POINTER_SCHEMA" != "$LEGACY_BUNDLE_SCHEMA" && "$POINTER_SCHEMA" != "$BUNDLE_SCHEMA" ]]; then
+        echo "unsupported existing release-state schema" >&2
+        exit 1
+    fi
+    PREVIOUS_GRID="$REMOTE_PREFIX/v$POINTER_SCHEMA/$POINTER_HEIGHT/mainnet-frontier-grid.bin"
     if [ "$SEEDED_GRID" = 1 ]; then
         : # already resuming from the seed
     elif [ -n "$(list_remote_object "$PREVIOUS_GRID")" ]; then
         rclone copyto "$PREVIOUS_GRID" "$STAGE/previous-frontier-grid.bin"
         GRID_ARGS+=(--mainnet-frontier-grid-input "$STAGE/previous-frontier-grid.bin")
-        echo "resuming the frontier grid from bundle v1/$POINTER_HEIGHT" >&2
+        echo "resuming the frontier grid from bundle v$POINTER_SCHEMA/$POINTER_HEIGHT" >&2
     else
-        echo "bundle v1/$POINTER_HEIGHT has no frontier grid; building one from genesis" >&2
+        echo "bundle v$POINTER_SCHEMA/$POINTER_HEIGHT has no frontier grid; building one from genesis" >&2
     fi
 fi
 
@@ -148,12 +187,26 @@ fi
     --mainnet-frontier-output "$STAGE/mainnet-frontier.bin" \
     --mainnet-subtree-output "$STAGE/mainnet-treestate-subtrees.bin" \
     --mainnet-frontier-grid-output "$STAGE/mainnet-frontier-grid.bin" \
+    --mainnet-spentness-output "$STAGE/$SPENTNESS_ARTIFACT" \
+    --spentness-replay-cache "$DATA_DIR/spentness-primary" \
     ${GRID_ARGS[@]+"${GRID_ARGS[@]}"} \
     > "$STAGE/main-checkpoints.txt"
 
 HEIGHT=$(tail -1 "$STAGE/main-checkpoints.txt" | cut -d' ' -f1)
 BLOCK_HASH=$(tail -1 "$STAGE/main-checkpoints.txt" | cut -d' ' -f2)
 GENERATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# Reproduce from a separate validated source, then check complete entries with the
+# tooling-only transparent replay oracle and fresh salted multiset accumulator.
+timeout "$SPENTNESS_TIMEOUT" "$SPENTNESS_BIN" replay --source "$RELEASE_STATE_ORACLE_SOURCE" \
+    --destination "$DATA_DIR/spentness-independent" --height "$HEIGHT" --block-hash "$BLOCK_HASH"
+timeout "$SPENTNESS_TIMEOUT" "$SPENTNESS_BIN" generate --state "$DATA_DIR/spentness-independent" \
+    --height "$HEIGHT" --block-hash "$BLOCK_HASH" \
+    --output "$STAGE/independent-spentness.bin" --commitment "$STAGE/independent-commitment.json"
+cmp "$STAGE/$SPENTNESS_ARTIFACT" "$STAGE/independent-spentness.bin"
+timeout "$SPENTNESS_TIMEOUT" "$SPENTNESS_BIN" verify --state "$DATA_DIR/spentness-independent" \
+    --artifact "$STAGE/$SPENTNESS_ARTIFACT" \
+    --commitment "$STAGE/$SPENTNESS_COMMITMENT"
 
 # Never move the pointer backwards: an export from stale state would regress
 # latest.json, and retention could then purge the very bundle it points at.
@@ -163,32 +216,53 @@ if [ -n "$POINTER_HEIGHT" ] && [ "$POINTER_HEIGHT" -gt "$HEIGHT" ]; then
 fi
 
 HEIGHT="$HEIGHT" BLOCK_HASH="$BLOCK_HASH" GENERATED_AT="$GENERATED_AT" \
-    python3 - "$STAGE" <<'PY'
+    BUNDLE_SCHEMA="$BUNDLE_SCHEMA" \
+    RELEASE_STATE_GENERATOR_REVISION="$RELEASE_STATE_GENERATOR_REVISION" \
+    RELEASE_STATE_ORACLE_ID="$RELEASE_STATE_ORACLE_ID" \
+    SPENTNESS_ARTIFACT="$SPENTNESS_ARTIFACT" SPENTNESS_VERIFICATION="$SPENTNESS_VERIFICATION" \
+    python3 - "$STAGE" "${BUNDLE_FILES[@]}" <<'PY'
 import hashlib, json, os, sys
 
-stage = sys.argv[1]
+stage, *bundle_files = sys.argv[1:]
+limits = {
+    "main-checkpoints.txt": 4 * 1024 * 1024,
+    "mainnet-frontier.bin": 1024 * 1024,
+    "mainnet-treestate-subtrees.bin": 8 * 1024 * 1024,
+    "mainnet-frontier-grid.bin": 32 * 1024 * 1024,
+    "mainnet-spentness-hints.bin": 512 * 1024 * 1024,
+    "mainnet-spentness-hints.commitment.json": 16 * 1024,
+    "mainnet-spentness-hints.verification.json": 32 * 1024,
+}
 files = {}
-for name in (
-    "main-checkpoints.txt",
-    "mainnet-frontier.bin",
-    "mainnet-treestate-subtrees.bin",
-    "mainnet-frontier-grid.bin",
-):
-    data = open(os.path.join(stage, name), "rb").read()
-    files[name] = {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+for name in bundle_files:
+    path = os.path.join(stage, name)
+    size = os.path.getsize(path)
+    if not 0 < size <= limits[name]:
+        raise SystemExit(f"{name} exceeds the release fetcher's size limit")
+    with open(path, "rb") as source:
+        digest = hashlib.file_digest(source, "sha256").hexdigest()
+    files[name] = {"size": size, "sha256": digest}
 
 meta = {
-    "schema_version": 1,
+    "schema_version": int(os.environ["BUNDLE_SCHEMA"]),
     "network": "Mainnet",
     "height": int(os.environ["HEIGHT"]),
     "block_hash": os.environ["BLOCK_HASH"],
     "generated_at": os.environ["GENERATED_AT"],
     "files": files,
     "generator": {"name": "zakura-checkpoints", "mode": "offline"},
+    "spentness": {
+        "verification": json.load(open(os.path.join(stage, os.environ["SPENTNESS_VERIFICATION"]))),
+        "generator_revision": os.environ["RELEASE_STATE_GENERATOR_REVISION"],
+        "independent_source": os.environ["RELEASE_STATE_ORACLE_ID"],
+        "reproduced_sha256": files[os.environ["SPENTNESS_ARTIFACT"]]["sha256"],
+    },
 }
-with open(os.path.join(stage, "meta.json"), "w", encoding="utf-8") as out:
-    json.dump(meta, out, indent=2)
-    out.write("\n")
+encoded = (json.dumps(meta, indent=2) + "\n").encode()
+if len(encoded) > 64 * 1024:
+    raise SystemExit("meta.json exceeds the release fetcher's size limit")
+with open(os.path.join(stage, "meta.json"), "wb") as out:
+    out.write(encoded)
 PY
 
 # Immutability with idempotence: a bundle directory is written once. A
@@ -196,7 +270,7 @@ PY
 # the meta timestamp differs), so an existing bundle whose file digests match
 # is reused as-is and only the pointer is refreshed; different contents at the
 # same height mean timestamp-free determinism broke and a human should look.
-BUNDLE_REMOTE="$REMOTE_PREFIX/v1/$HEIGHT"
+BUNDLE_REMOTE="$REMOTE_PREFIX/v$BUNDLE_SCHEMA/$HEIGHT"
 BUNDLE_LISTING=$(list_remote_object "$BUNDLE_REMOTE/meta.json")
 if [ -n "$BUNDLE_LISTING" ]; then
     rclone copyto "$BUNDLE_REMOTE/meta.json" "$STAGE/existing-meta.json"
@@ -212,38 +286,39 @@ if existing.get("files") != staged["files"] or existing.get("block_hash") != sta
 PY
     cp "$STAGE/existing-meta.json" "$STAGE/meta.json"
     GENERATED_AT=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["generated_at"])' "$STAGE/meta.json")
-    echo "bundle v1/$HEIGHT already published; refreshing the pointer" >&2
+    echo "bundle v$BUNDLE_SCHEMA/$HEIGHT already published; refreshing the pointer" >&2
 else
     # Data files first, meta.json last, so a partially uploaded bundle is
     # never resolvable through a pointer.
-    rclone copyto "$STAGE/main-checkpoints.txt" "$BUNDLE_REMOTE/main-checkpoints.txt"
-    rclone copyto "$STAGE/mainnet-frontier.bin" "$BUNDLE_REMOTE/mainnet-frontier.bin"
-    rclone copyto "$STAGE/mainnet-treestate-subtrees.bin" "$BUNDLE_REMOTE/mainnet-treestate-subtrees.bin"
-    rclone copyto "$STAGE/mainnet-frontier-grid.bin" "$BUNDLE_REMOTE/mainnet-frontier-grid.bin"
+    for name in "${BUNDLE_FILES[@]}"; do
+        rclone copyto "$STAGE/$name" "$BUNDLE_REMOTE/$name"
+    done
     rclone copyto "$STAGE/meta.json" "$BUNDLE_REMOTE/meta.json"
-    echo "published bundle v1/$HEIGHT ($BLOCK_HASH)" >&2
+    echo "published bundle v$BUNDLE_SCHEMA/$HEIGHT ($BLOCK_HASH)" >&2
 fi
 META_SHA256=$(sha256_of "$STAGE/meta.json")
 
 cat > "$STAGE/latest.json" <<EOF
 {
-  "schema_version": 1,
+  "schema_version": $BUNDLE_SCHEMA,
   "network": "Mainnet",
   "height": $HEIGHT,
   "block_hash": "$BLOCK_HASH",
   "generated_at": "$GENERATED_AT",
-  "meta_url": "${RELEASE_STATE_PUBLIC_BASE%/}/v1/$HEIGHT/meta.json",
+  "meta_url": "${RELEASE_STATE_PUBLIC_BASE%/}/v$BUNDLE_SCHEMA/$HEIGHT/meta.json",
   "meta_sha256": "$META_SHA256"
 }
 EOF
 rclone copyto "$STAGE/latest.json" "$REMOTE_PREFIX/latest.json"
 echo "pointer now at height $HEIGHT" >&2
 
-# Retention: keep the newest $KEEP immutable bundles.
-rclone lsf --dirs-only "$REMOTE_PREFIX/v1/" 2>/dev/null \
-    | tr -d '/' | grep -E '^[0-9]+$' | sort -n | head -n -"$KEEP" \
+# Current-schema bundles remain available for supported incomplete hinted runs.
+# Only legacy bundles without spentness artifacts use the newest-N policy.
+LEGACY_LISTING=$(list_remote_object "$REMOTE_PREFIX/v$LEGACY_BUNDLE_SCHEMA/")
+printf '%s\n' "$LEGACY_LISTING" \
+    | tr -d '/' | awk '/^[0-9]+$/' | sort -n | head -n -"$KEEP" \
     | while read -r old_height; do
         [ -n "$old_height" ] || continue
-        echo "pruning bundle v1/$old_height" >&2
-        rclone purge "$REMOTE_PREFIX/v1/$old_height"
+        echo "pruning bundle v$LEGACY_BUNDLE_SCHEMA/$old_height" >&2
+        rclone purge "$REMOTE_PREFIX/v$LEGACY_BUNDLE_SCHEMA/$old_height"
     done

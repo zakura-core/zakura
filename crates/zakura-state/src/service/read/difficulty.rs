@@ -382,9 +382,12 @@ mod tests {
             .zcash_deserialize_into()
             .expect("the genesis vector is valid");
 
+        // ZIP 218 widens the span in `nu7-experimental` builds.
+        let span = u32::try_from(POW_ADJUSTMENT_BLOCK_SPAN).unwrap();
+
         for network in [Network::Mainnet, Network::new_default_testnet()] {
-            for tip in [0, 1, 26, 27, 28, 3_474_810] {
-                let required = usize::try_from((tip + 1).min(28)).unwrap();
+            for tip in [0, 1, span - 2, span - 1, span, 3_474_810] {
+                let required = usize::try_from((tip + 1).min(span)).unwrap();
                 for count in 0..=required {
                     let result = difficulty_time_and_history_tree(
                         vec![block.clone(); count],

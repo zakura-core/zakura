@@ -718,9 +718,13 @@ and terminal response match exactly one range despite version 2's missing reques
   [`block::check`][block-check].
 
 The receiver matches a `Block` by hashing its header and comparing that hash with the committed
-header hashes expected by live ranges. A block that does not match the next expected hash of exactly
-one live range MUST return `Disconnect`. The publisher MUST send the blocks of a range in ascending
-height order. The reservation identity commits to a header that header sync already validated, so
+header hashes expected by live ranges. A block whose hash is the next expected hash of exactly one
+live range consumes that part. A block whose hash matches no live range while a response is still
+open spends that part of the earliest open range without being decoded and is not a violation: a
+reorganization on either side must not fault a peer. A block with no open response, a hash expected
+next by more than one live range, or a byte overrun MUST return `Disconnect`. The publisher MUST
+send the blocks of a range in ascending height order and MUST answer the ranges of one connection
+in request order. The reservation identity commits to a header that header sync already validated, so
 Verify re-checks Equihash and the target only as defense in depth. An implementation MAY skip both
 checks when the header bytes hash to the expected identity. Block sync takes that option today: it
 matches the hash at [`peer_routine`][bs-expected-hash] and leaves

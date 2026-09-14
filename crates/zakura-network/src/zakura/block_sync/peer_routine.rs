@@ -1567,10 +1567,10 @@ impl PeerRoutine {
         }
     }
 
-    /// The response a mismatched body belongs to. Serving is sequential, so it
+    /// The response a mismatched body belongs to. Serving is sequential (the
+    /// spec's request-order rule, `docs/specs/blocksync/stream-pair.md`), so it
     /// is the earliest queued started range that still awaits parts. Vector
     /// order is not request order: `remove_outstanding` swaps the last entry in.
-    /// That premise is the spec's request-order rule (`docs/specs/blocksync/stream-pair.md`).
     fn current_response_index(&self) -> Option<usize> {
         self.window
             .outstanding

@@ -126,23 +126,60 @@ impl Drop for LockHold<'_> {
 ///
 /// # Panics
 ///
-/// Panics if the override cannot be parsed as a `usize`. The failure message
-/// includes the variable name, its value, and the parse error.
+/// Panics if the override is not Unicode text or cannot be parsed as a `usize`.
+/// The failure message includes the variable name, its value, and the reason.
 pub fn load_rounds() -> usize {
-    std::env::var("ZAKURA_REGULATION_LOAD_ROUNDS")
-        .ok()
-        .map(|rounds| {
-            rounds.parse::<usize>().unwrap_or_else(|error| {
-                panic!("invalid ZAKURA_REGULATION_LOAD_ROUNDS value {rounds:?}: {error}")
-            })
+    parse_load_rounds(std::env::var("ZAKURA_REGULATION_LOAD_ROUNDS"))
+}
+
+// Separate environment access so tests can supply invalid values without
+// changing the settings of other tests running in the same process.
+fn parse_load_rounds(value: Result<String, std::env::VarError>) -> usize {
+    let rounds = match value {
+        Ok(rounds) => rounds,
+        Err(std::env::VarError::NotPresent) => return 4,
+        Err(std::env::VarError::NotUnicode(rounds)) => {
+            panic!("invalid ZAKURA_REGULATION_LOAD_ROUNDS value {rounds:?}: expected Unicode text")
+        }
+    };
+
+    rounds
+        .parse::<usize>()
+        .unwrap_or_else(|error| {
+            panic!("invalid ZAKURA_REGULATION_LOAD_ROUNDS value {rounds:?}: {error}")
         })
-        .unwrap_or(4)
         .clamp(1, 256)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_rounds_defaults_only_when_absent_and_clamps_integers() {
+        assert_eq!(parse_load_rounds(Err(std::env::VarError::NotPresent)), 4);
+        for (value, expected) in [("0", 1), ("1", 1), ("64", 64), ("256", 256), ("257", 256)] {
+            assert_eq!(parse_load_rounds(Ok(value.to_owned())), expected);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid ZAKURA_REGULATION_LOAD_ROUNDS value \"abc\":")]
+    fn load_rounds_rejects_invalid_integers() {
+        parse_load_rounds(Ok("abc".to_owned()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[should_panic(
+        expected = "invalid ZAKURA_REGULATION_LOAD_ROUNDS value \"64\\xFF\": expected Unicode text"
+    )]
+    fn load_rounds_rejects_non_unicode_overrides() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let value = std::ffi::OsString::from_vec(b"64\xff".to_vec());
+        parse_load_rounds(Err(std::env::VarError::NotUnicode(value)));
+    }
 
     #[test]
     fn lock_observation_ends_with_the_actual_guard() {

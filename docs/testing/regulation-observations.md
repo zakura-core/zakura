@@ -60,9 +60,11 @@ returned `resources::LockHold` immediately before releasing the lock. These
 timings include delays from thread scheduling and the measurement itself. They
 describe the tested workload, rather than a timing limit that holds on any machine.
 
-`resources::load_rounds` defaults to four rounds. The
-`ZAKURA_REGULATION_LOAD_ROUNDS` override is clamped to 1–256.
-Malformed values fail the test with the variable name, value and parse error.
+`resources::load_rounds` defaults to four rounds only when
+`ZAKURA_REGULATION_LOAD_ROUNDS` is absent. A valid integer override is clamped
+to 1–256.
+Malformed integers and non-Unicode values fail the test with the variable name,
+value and reason.
 
 ## Running the controls
 

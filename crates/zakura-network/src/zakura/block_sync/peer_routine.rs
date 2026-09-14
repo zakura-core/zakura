@@ -592,6 +592,19 @@ impl PeerRoutine {
                     return Err(SinkReject::protocol(error));
                 }
             };
+            // GetBlocks names heights, so a peer on another fork legally answers
+            // with a different block at this position. The specification forbids
+            // turning a reorganization into a violation: spend the response's
+            // credit on it and drop it unread. An ambiguous hash is not that
+            // case: two live ranges expect it next, so it stays a fault below.
+            if matches!(
+                self.window.response_for_hash(header.hash()),
+                ResponseMatch::Missing
+            ) {
+                return self
+                    .discard_mismatched_body(header.hash(), frame_payload_bytes)
+                    .await;
+            }
             let index = match self.response_index(header.hash()) {
                 Ok(index) => index,
                 Err(error) => {
@@ -1655,6 +1668,65 @@ impl PeerRoutine {
                 "block matches ambiguous response authorization",
             )),
         }
+    }
+
+    /// The response a mismatched body belongs to. Serving is sequential, so it
+    /// is the earliest queued started range that still awaits parts. Vector
+    /// order is not request order: `remove_outstanding` swaps the last entry in.
+    fn current_response_index(&self) -> Option<usize> {
+        self.window
+            .outstanding
+            .iter()
+            .enumerate()
+            .filter(|(_, range)| {
+                !range.write_status.was_skipped()
+                    && range.response.consumed_objects() < u64::from(range.request.count)
+            })
+            .min_by_key(|(_, range)| range.queued_at)
+            .map(|(index, _)| index)
+    }
+
+    /// Spend one part of the current response on a body whose hash is not the
+    /// next expected one, without decoding it. No started response, or credit
+    /// exhaustion, is still a protocol fault.
+    async fn discard_mismatched_body(
+        &mut self,
+        delivered: block::Hash,
+        frame_payload_bytes: usize,
+    ) -> Result<(), SinkReject> {
+        let Some(index) = self.current_response_index() else {
+            self.report_misbehavior(BlockSyncMisbehavior::UnsolicitedBlock)
+                .await;
+            return Err(SinkReject::protocol("Block has no started response"));
+        };
+        let bytes = u64::try_from(frame_payload_bytes - super::wire::BLOCK_SYNC_MESSAGE_TYPE_BYTES)
+            .expect("frame length fits u64");
+        let position = usize::try_from(self.window.outstanding[index].response.consumed_objects())
+            .expect("consumption cannot exceed the bounded request count");
+        // `consume_response` also moves the range's lookup key to its next hash.
+        if let Err(error) = self.window.consume_response(index, bytes) {
+            self.report_misbehavior(BlockSyncMisbehavior::MalformedMessage)
+                .await;
+            return Err(SinkReject::protocol(error));
+        }
+        let (height, requested) = {
+            let expected = &self.window.outstanding[index].request.expected_blocks[position];
+            (expected.height, expected.hash)
+        };
+        tracing::debug!(
+            peer = ?self.peer,
+            ?height,
+            ?requested,
+            ?delivered,
+            "discarding a block-sync body from another chain"
+        );
+        metrics::counter!("sync.block.body.discarded", "reason" => "hash_mismatch").increment(1);
+        // The peer is responsive; only its usefulness is in question.
+        self.window
+            .note_block_progress(Instant::now(), self.config.effective_liveness_timeout());
+        self.note_retry_avoid([height]);
+        self.publish_outstanding();
+        Ok(())
     }
 
     async fn handle_body(

@@ -971,6 +971,27 @@ async fn wait_for_outbound_getblocks(outbound: &mut FramedRecv) -> (block::Heigh
     }
 }
 
+/// Same as [`wait_for_outbound_getblocks`], but patient enough for another peer's
+/// request deadline (`request_timeout`, 8 s by default) to lapse first, which is
+/// what reoffers that peer's unreceived heights.
+async fn wait_for_reoffered_getblocks(outbound: &mut FramedRecv) -> (block::Height, u32) {
+    tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            let frame = outbound.recv().await.expect("outbound channel is live");
+            match BlockSyncMessage::decode_frame(frame).expect("outbound frame decodes") {
+                BlockSyncMessage::GetBlocks {
+                    start_height,
+                    count,
+                } => return (start_height, count),
+                BlockSyncMessage::Status(_) => {}
+                msg => panic!("unexpected outbound message before GetBlocks: {msg:?}"),
+            }
+        }
+    })
+    .await
+    .expect("a lapsed request deadline reoffers its unreceived heights")
+}
+
 /// Wait for the node's `Status` advertisement on this peer's real outbound — the
 /// connect status the reactor sends on `PeerConnected`, and later refreshes.
 /// Replaces the mirror-based `wait_for_connect_status`; the peer is implicit in
@@ -8188,7 +8209,7 @@ async fn reactor_rejects_unmatched_body_even_when_locally_needed() {
 }
 
 #[tokio::test]
-async fn reactor_rejects_unmatched_body_for_ownerless_queued_height() {
+async fn reactor_discards_unmatched_body_for_ownerless_queued_height() {
     let blocks = mainnet_blocks_1_to_3();
     let block1_size = block_size(&blocks[0]);
     let block2_size = block_size(&blocks[1]);
@@ -8208,7 +8229,7 @@ async fn reactor_rejects_unmatched_body_for_ownerless_queued_height() {
     let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     // One request slot and a response byte cap of one block-1 hint, so the single
     // GetBlocks below covers only height 1 and height 2 stays queued without an
-    // outstanding request — the gap the unmatched-queued acceptance path fills.
+    // outstanding request — the ownerless queued height this test needs.
     // (The old setup starved the request on the byte budget with an oversized
     // hint; the floor overdraft now funds a floor request regardless, so the gap
     // is created on slots/response bytes instead.)
@@ -8245,9 +8266,9 @@ async fn reactor_rejects_unmatched_body_for_ownerless_queued_height() {
         "the byte-capped request must cover only height 1",
     );
 
-    // Height 2 arrives without a matching request.
-    // A pending height has no request owner.
-    // Do not enter that body into the commit pipeline.
+    // Height 2 arrives without a matching request. Its hash is not the next
+    // expected hash of any range, so it spends the started `(1, 1)` response
+    // and is dropped unread rather than entering the commit pipeline.
     inbound_tx
         .send(
             BlockSyncMessage::Block(blocks[1].clone())
@@ -8257,26 +8278,58 @@ async fn reactor_rejects_unmatched_body_for_ownerless_queued_height() {
         .await
         .expect("unmatched queued block queues");
 
-    loop {
-        match next_action(&mut actions).await {
-            BlockSyncAction::Misbehavior { reason, .. } => {
-                assert_eq!(reason, BlockSyncMisbehavior::UnsolicitedBlock);
-                break;
+    // The discard spends height 1, which is retry-avoided here, so a follow-up
+    // request to this peer (height 2 is still queued) must start above it.
+    let quiet = tokio::time::timeout(Duration::from_millis(250), async {
+        loop {
+            tokio::select! {
+                action = actions.recv() => match action {
+                    Some(BlockSyncAction::QueryNeededBlocks { .. }) => {}
+                    Some(action) => {
+                        panic!("a discarded body is neither misconduct nor a commit: {action:?}")
+                    }
+                    None => panic!("the action channel must outlive a discard"),
+                },
+                frame = outbound_rx.recv() => {
+                    let frame = frame.expect("the peer's outbound must outlive a discard");
+                    if let BlockSyncMessage::GetBlocks { start_height, .. } =
+                        BlockSyncMessage::decode_frame(frame).expect("outbound frame decodes")
+                    {
+                        assert_ne!(
+                            start_height,
+                            block::Height(1),
+                            "the spent height must not be re-requested from this peer",
+                        );
+                    }
+                }
             }
-            BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("an unauthorized body must not reach verification: {action:?}"),
         }
-    }
-    await_until(
-        "unauthorized body closes its receiver",
-        Duration::from_secs(1),
-        || service.peer_count() == 0,
+    })
+    .await;
+    assert!(quiet.is_err());
+    assert_eq!(
+        service.peer_count(),
+        1,
+        "a fork answer keeps its connection",
+    );
+
+    // The spent height is not lost: it returns to `pending` once this peer's
+    // request deadline lapses. A fresh peer that serves only height 1 asks for
+    // exactly that range.
+    let (_fresh_peer, _fresh_inbound, mut fresh_outbound) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        144,
+        block::Height(1),
+        blocks[0].hash(),
+        1,
+        MAX_BS_RESPONSE_BYTES,
     )
-    .await
-    .unwrap();
-    while let Ok(action) = actions.try_recv() {
-        assert!(!matches!(action, BlockSyncAction::SubmitBlock { .. }));
-    }
+    .await;
+    assert_eq!(
+        wait_for_reoffered_getblocks(&mut fresh_outbound).await,
+        (block::Height(1), 1),
+    );
     reactor_task.abort();
 }
 
@@ -11934,7 +11987,7 @@ async fn reactor_legacy_commit_dedups_inflight_request_and_reuses_budget() {
 }
 
 #[tokio::test]
-async fn reactor_rejects_duplicate_buffered_body_and_keeps_first_receipt() {
+async fn reactor_discards_duplicate_buffered_body_and_keeps_first_receipt() {
     let config = ZakuraBlockSyncConfig {
         max_blocks_per_response: 1,
         ..fill_loop_mechanics_config()
@@ -12014,25 +12067,39 @@ async fn reactor_rejects_duplicate_buffered_body_and_keeps_first_receipt() {
         (block::Height(2), 1)
     );
 
+    // The first block 2 fills `(2, 1)` and buffers awaiting its parent. The
+    // second has no next expected hash left, so it spends the `(1, 1)` part and
+    // is dropped unread: no fault, no commit before the parent, and no
+    // re-request of the spent height 1 here.
     send_inbound(&inbound_tx, BlockSyncMessage::Block(blocks[1].clone())).await;
     send_inbound(&inbound_tx, BlockSyncMessage::Block(blocks[1].clone())).await;
-    loop {
-        match next_action(&mut actions).await {
-            BlockSyncAction::Misbehavior { reason, .. } => {
-                assert_eq!(reason, BlockSyncMisbehavior::UnsolicitedBlock);
-                break;
+    let quiet = tokio::time::timeout(Duration::from_millis(250), async {
+        loop {
+            tokio::select! {
+                action = actions.recv() => match action {
+                    Some(BlockSyncAction::QueryNeededBlocks { .. }) => {}
+                    Some(action) => {
+                        panic!("a discarded duplicate is neither misconduct nor a commit: {action:?}")
+                    }
+                    None => panic!("the action channel must outlive a discard"),
+                },
+                frame = outbound_rx.recv() => panic!(
+                    "the spent height must not be re-requested from this peer: {:?}",
+                    BlockSyncMessage::decode_frame(
+                        frame.expect("the peer's outbound must outlive a discard"),
+                    )
+                    .expect("outbound frame decodes"),
+                ),
             }
-            BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("the buffered successor must wait for its parent: {action:?}"),
         }
-    }
-    await_until(
-        "duplicate body closes its connection",
-        Duration::from_secs(1),
-        || service.peer_count() == 0,
-    )
-    .await
-    .unwrap();
+    })
+    .await;
+    assert!(quiet.is_err());
+    assert_eq!(
+        service.peer_count(),
+        1,
+        "a discarded duplicate keeps its connection",
+    );
     let (_, fresh_inbound, mut fresh_outbound) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -12043,8 +12110,10 @@ async fn reactor_rejects_duplicate_buffered_body_and_keeps_first_receipt() {
         MAX_BS_RESPONSE_BYTES,
     )
     .await;
+    // The spent height returns to `pending` once peer 44's request deadline
+    // lapses, and this peer is offered it.
     assert_eq!(
-        wait_for_outbound_getblocks(&mut fresh_outbound).await,
+        wait_for_reoffered_getblocks(&mut fresh_outbound).await,
         (block::Height(1), 1)
     );
     send_inbound(&fresh_inbound, BlockSyncMessage::Block(blocks[0].clone())).await;
@@ -12206,7 +12275,7 @@ async fn reactor_ignores_redundant_status_burst_without_spam_score() {
 }
 
 #[tokio::test]
-async fn reactor_rejects_block_with_no_expected_header_hash() {
+async fn reactor_discards_block_whose_hash_differs_from_its_expected_header() {
     let (tip_tx, tip_rx) = watch::channel((block::Height(0), block::Hash([0; 32])));
     let startup = BlockSyncStartup::new(
         BlockSyncFrontiers {
@@ -12279,6 +12348,9 @@ async fn reactor_rejects_block_with_no_expected_header_hash() {
         BlockSyncMessage::GetBlocks { .. }
     ) {}
 
+    // The request authorized hash [9; 32] at height 1; this body is that height
+    // on another chain, so it spends the `(1, 1)` response and is dropped
+    // unread: no fault, no commit, and no re-request of height 1 here.
     inbound_tx
         .send(
             BlockSyncMessage::Block(mainnet_block(&BLOCK_MAINNET_1_BYTES))
@@ -12288,16 +12360,50 @@ async fn reactor_rejects_block_with_no_expected_header_hash() {
         .await
         .expect("block queues");
 
-    loop {
-        match next_action(&mut actions).await {
-            BlockSyncAction::Misbehavior { reason, .. } => {
-                assert_eq!(reason, BlockSyncMisbehavior::UnsolicitedBlock);
-                break;
+    let quiet = tokio::time::timeout(Duration::from_millis(250), async {
+        loop {
+            tokio::select! {
+                action = actions.recv() => match action {
+                    Some(BlockSyncAction::QueryNeededBlocks { .. }) => {}
+                    Some(action) => {
+                        panic!("a fork answer is neither misconduct nor a commit: {action:?}")
+                    }
+                    None => panic!("the action channel must outlive a discard"),
+                },
+                frame = outbound_rx.recv() => panic!(
+                    "the spent height must not be re-requested from this peer: {:?}",
+                    BlockSyncMessage::decode_frame(
+                        frame.expect("the peer's outbound must outlive a discard"),
+                    )
+                    .expect("outbound frame decodes"),
+                ),
             }
-            BlockSyncAction::QueryNeededBlocks { .. } => {}
-            action => panic!("unexpected action before invalid-block report: {action:?}"),
         }
-    }
+    })
+    .await;
+    assert!(quiet.is_err());
+    assert_eq!(
+        service.peer_count(),
+        1,
+        "a fork answer keeps its connection",
+    );
+
+    // The spent height returns to `pending` once this peer's request deadline
+    // lapses, and the next peer is offered it.
+    let (_fresh_peer, _fresh_inbound, mut fresh_outbound) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        42,
+        block::Height(1),
+        block::Hash([1; 32]),
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+    assert_eq!(
+        wait_for_reoffered_getblocks(&mut fresh_outbound).await,
+        (block::Height(1), 1),
+    );
     reactor_task.abort();
 }
 

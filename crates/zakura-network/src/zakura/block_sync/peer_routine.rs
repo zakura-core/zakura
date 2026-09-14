@@ -593,20 +593,18 @@ impl PeerRoutine {
                     return Err(SinkReject::protocol(error));
                 }
             };
+            let hash = header.hash();
             // GetBlocks names heights, so a peer on another fork legally answers
             // with a different block at this position. The specification forbids
             // turning a reorganization into a violation: spend the response's
             // credit on it and drop it unread. An ambiguous hash is not that
             // case: two live ranges expect it next, so it stays a fault below.
-            if matches!(
-                self.window.response_for_hash(header.hash()),
-                ResponseMatch::Missing
-            ) {
+            if matches!(self.window.response_for_hash(hash), ResponseMatch::Missing) {
                 return self
-                    .discard_mismatched_body(header.hash(), frame_payload_bytes)
+                    .discard_mismatched_body(hash, frame_payload_bytes)
                     .await;
             }
-            let index = match self.response_index(header.hash()) {
+            let index = match self.response_index(hash) {
                 Ok(index) => index,
                 Err(error) => {
                     self.report_misbehavior(BlockSyncMisbehavior::UnsolicitedBlock)
@@ -1719,9 +1717,12 @@ impl PeerRoutine {
             "discarding a block-sync body from another chain"
         );
         metrics::counter!("sync.block.body.discarded", "reason" => "hash_mismatch").increment(1);
-        // The peer is responsive; only its usefulness is in question.
+        // The peer answered, so give the exchange the same bounded grace a live
+        // request gets. Accepted-body accounting stays put: a peer that only ever
+        // answers from another fork must not read as a proven supplier, which
+        // would lift both its unproven-peer request cap and its stall count.
         self.window
-            .note_block_progress(Instant::now(), self.config.effective_liveness_timeout());
+            .extend_liveness_deadline(Instant::now(), self.config.effective_liveness_timeout());
         self.note_retry_avoid([height]);
         self.publish_outstanding();
         Ok(())

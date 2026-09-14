@@ -1594,6 +1594,7 @@ impl PeerRoutine {
             "discarding a block-sync body from another chain"
         );
         metrics::counter!("sync.block.body.discarded", "reason" => "hash_mismatch").increment(1);
+        self.trace_body_discarded(height, requested, delivered);
         // The peer answered, so give the exchange the same bounded grace a live
         // request gets. Accepted-body accounting stays put: a peer that only ever
         // answers from another fork must not read as a proven supplier, which

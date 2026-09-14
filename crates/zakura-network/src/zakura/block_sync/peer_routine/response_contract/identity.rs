@@ -1,4 +1,5 @@
-//! Reject bodies or endings that do not match this connection's original request.
+//! Answer bodies or endings that do not match this connection's original
+//! request: unauthorized ones are rejected, fork answers only discarded.
 
 use super::*;
 
@@ -115,34 +116,71 @@ async fn r08_different_second_terminal_is_invalid() {
 async fn r04_later_correct_hash_is_not_the_next_expected_part() {
     let mut f = Fixture::new(100, 3);
     f.publish().await;
-    f.rejects(
+    // Block 101 arrives first: not the next part, so it spends a part and is dropped.
+    f.discards(
         BlockSyncMessage::Block(f.blocks[1].clone()),
+        1,
         "R04 out of order",
     )
     .await;
+    // Block 100 now arrives at position two, whose expected hash is block 101's.
+    f.discards(
+        BlockSyncMessage::Block(f.blocks[0].clone()),
+        2,
+        "R04 out of order",
+    )
+    .await;
+    f.assert_live(0, "R04 discarded parts are not received parts");
 }
 
 #[tokio::test]
-async fn r04_wrong_hash_must_disconnect_before_handler() {
+async fn r04_wrong_hash_inside_the_range_is_consumed_and_discarded() {
     let mut f = Fixture::new(100, 3);
     f.publish().await;
     let mut wrong = (*f.blocks[0]).clone();
     Arc::make_mut(&mut wrong.header).nonce[0] ^= 1;
-    f.rejects(
+    f.discards(
         BlockSyncMessage::Block(Arc::new(wrong)),
-        "R04 wrong expected hash",
+        1,
+        "R04 wrong expected hash is a fork answer, not misconduct",
     )
     .await;
+    // The range ends by the peer's own count and every height returns for another peer.
+    f.deliver(f.done(1)).await.unwrap();
+    assert!(
+        f.routine.window.outstanding.is_empty(),
+        "R06 the ending retires the exchange"
+    );
+    assert_eq!(
+        f.routine.work.pending_len(),
+        3,
+        "R04 discarded heights are still needed"
+    );
+    f.assert_no_peer_fault();
 }
 
 #[tokio::test]
-async fn r05_duplicate_body_cannot_consume_a_part_twice() {
+async fn r05_duplicate_body_spends_a_part_without_a_second_delivery() {
     let mut f = Fixture::new(100, 3);
+    f.publish().await;
+    f.body(0).await;
+    f.discards(
+        BlockSyncMessage::Block(f.blocks[0].clone()),
+        2,
+        "R05 duplicate body",
+    )
+    .await;
+    f.assert_live(1, "R05 the duplicate is not a second received part");
+}
+
+#[tokio::test]
+async fn r12_a_body_after_the_last_part_exceeds_credit_and_disconnects() {
+    let mut f = Fixture::new(100, 1);
     f.publish().await;
     f.body(0).await;
     f.rejects(
         BlockSyncMessage::Block(f.blocks[0].clone()),
-        "R05 duplicate body",
+        "R12 no unconsumed part remains",
     )
     .await;
 }
@@ -208,13 +246,18 @@ async fn r03_local_floor_does_not_authorize_an_unsolicited_body() {
 }
 
 #[tokio::test]
-async fn r04_body_beyond_the_authorized_range_is_invalid() {
+async fn r04_body_beyond_the_authorized_range_spends_a_part_and_is_dropped() {
     let mut f = Fixture::new(100, 3);
     f.publish().await;
     f.routine.servable_high = block::Height(200);
     let extra = fake_blocks_in_range(103, 103).pop().unwrap();
-    f.rejects(BlockSyncMessage::Block(extra), "R04 body beyond range")
-        .await;
+    f.discards(
+        BlockSyncMessage::Block(extra),
+        1,
+        "R04 body beyond range is a wrong answer at position one, not a fault",
+    )
+    .await;
+    f.assert_live(0, "R04 a body outside the range is never a received part");
 }
 
 #[tokio::test]
@@ -257,15 +300,17 @@ async fn r07_unavailable_cannot_close_another_start() {
 }
 
 #[tokio::test]
-async fn r05_duplicate_body_remains_invalid_after_local_finality_advances() {
+async fn r05_duplicate_body_spends_the_same_part_after_local_finality_advances() {
     let mut f = Fixture::new(100, 3);
     f.publish().await;
     f.body(0).await;
     f.view
         .send_modify(|view| view.download_floor = block::Height(100));
-    f.rejects(
+    f.discards(
         BlockSyncMessage::Block(f.blocks[0].clone()),
-        "R05 consumed part below local floor",
+        2,
+        "R05 a consumed part below the local floor keeps its wire outcome",
     )
     .await;
+    f.assert_live(1, "R05 the duplicate is not a second received part");
 }

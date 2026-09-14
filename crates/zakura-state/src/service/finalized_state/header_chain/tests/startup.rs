@@ -1,5 +1,155 @@
 use super::*;
 
+#[test]
+fn startup_reclaims_auxiliary_reserve_without_due_deferrals() {
+    for reconciled in [false, true] {
+        let cache = tempfile::tempdir().expect("the test cache directory is created");
+        let db_config = Config {
+            cache_dir: cache.path().to_owned(),
+            ephemeral: false,
+            debug_skip_non_finalized_state_backup_task: true,
+            ..Config::default()
+        };
+        let (mut engine_config, anchor, metadata) = fixture();
+        let network = engine_config.network().clone();
+        let finalized = Frontier::new(anchor.height, anchor.hash);
+        let store = HeaderChainStore::new(open(&db_config, &network));
+        store.initialize(metadata, anchor.clone()).unwrap();
+
+        // An older store retained auxiliary rows on a branch that lost fork selection.
+        let mut batch = DiskWriteBatch::new();
+        stage_full_state_canonical_hash(&store, &mut batch, finalized);
+        let mut obsolete = vec![anchor.clone()];
+        let mut selected = Vec::new();
+        for (branch, length) in [(1_u8, 4_u32), (2, 5)] {
+            let mut parent = anchor.clone();
+            for height in 1..=length {
+                let mut header = *parent.header;
+                header.previous_block_hash = parent.hash;
+                header.time += chrono::Duration::seconds(1);
+                header.nonce.0[0] = branch;
+                let header = Arc::new(header);
+                let node = HeaderNode::from_durable_parts(
+                    header.clone(),
+                    header.hash(),
+                    parent.hash,
+                    block::Height(height),
+                    parent.block_work,
+                    parent
+                        .work_coordinate()
+                        .checked_add(parent.block_work)
+                        .unwrap(),
+                    HeaderValidationState::Valid,
+                    Default::default(),
+                    BodyValidationState::Unknown,
+                    Vec::new(),
+                )
+                .unwrap();
+                store
+                    .put_value(
+                        &mut batch,
+                        HEADER_NODE_BY_HASH,
+                        node.hash.0,
+                        &HeaderNodeDisk::from_domain(&node),
+                    )
+                    .unwrap();
+                parent = node.clone();
+                if branch == 1 {
+                    obsolete.push(node);
+                } else {
+                    selected.push(node);
+                }
+            }
+        }
+        store.db.write(batch).unwrap();
+        let (runtime, _) = store.startup(&engine_config).unwrap();
+        let before = runtime.publisher().snapshot();
+        assert_eq!(before.frontiers.finalized, finalized);
+        assert_eq!(before.frontiers.verified_best, finalized);
+        assert_eq!(
+            before.frontiers.header_best.hash,
+            selected.last().unwrap().hash
+        );
+        let mut batch = DiskWriteBatch::new();
+        for (index, node) in obsolete.iter_mut().enumerate() {
+            let delivery = AuxDelivery::new(
+                EvidenceId::from_digest([u8::try_from(index).unwrap(); 32]),
+                node.hash,
+                SourceId::from_digest([0x91; 32]),
+                body_owner(&before, 1, 1).into(),
+                zakura_header_chain::BodySizeHint::Unknown,
+                None,
+            );
+            node.aux_delivery_ids.push(delivery.delivery_id);
+            runtime
+                .store
+                .put_value(
+                    &mut batch,
+                    HEADER_NODE_BY_HASH,
+                    node.hash.0,
+                    &HeaderNodeDisk::from_domain(node),
+                )
+                .unwrap();
+            runtime
+                .store
+                .put_value(
+                    &mut batch,
+                    HEADER_AUX_DELIVERY,
+                    HeaderAuxDeliveryKey {
+                        header: node.hash,
+                        delivery: delivery.delivery_id,
+                    }
+                    .as_bytes(),
+                    &delivery,
+                )
+                .unwrap();
+        }
+        runtime.store.db.write(batch).unwrap();
+        assert!(runtime.store.deferred_entries().unwrap().is_empty());
+        assert!(audit_store(&runtime.store, &engine_config)
+            .unwrap()
+            .is_clean());
+        drop(runtime);
+
+        engine_config.limits.max_aux_deliveries_per_header = NonZeroUsize::new(1).unwrap();
+        engine_config.limits.max_aux_deliveries_total = NonZeroUsize::new(5).unwrap();
+        let store = HeaderChainStore::new(open(&db_config, &network));
+        let (runtime, report) = if reconciled {
+            store.startup_reconciled(&engine_config, finalized, Vec::new(), Vec::new())
+        } else {
+            store.startup(&engine_config)
+        }
+        .expect("startup reclaims the reserve before publication");
+        assert!(report.repairs.is_empty());
+        assert_eq!(runtime.store.load_aux_deliveries().unwrap().len(), 1);
+        assert_eq!(runtime.publisher().snapshot(), report.current);
+        assert_eq!(report.current.frontiers, before.frontiers);
+        for node in obsolete.iter().skip(1) {
+            assert!(runtime.store.header_node(node.hash).unwrap().is_none());
+        }
+        let reader = runtime.reader();
+        let owner = body_owner(&report.current, 2, 2);
+        for node in selected.iter().take(2) {
+            assert!(
+                reader
+                    .vct_repair_context(owner, node.height)
+                    .unwrap()
+                    .unwrap()
+                    .admission_capacity_available
+            );
+        }
+        drop(reader);
+        drop(runtime);
+
+        let (runtime, second_report) = HeaderChainStore::new(open(&db_config, &network))
+            .startup(&engine_config)
+            .expect("reserve cleanup survives a second database reopen");
+        assert!(second_report.repairs.is_empty());
+        assert_eq!(second_report.current, report.current);
+        assert_eq!(runtime.store.load_aux_deliveries().unwrap().len(), 1);
+    }
+}
+
 /// Commit one deferred header at `insertion_time`, then return the closed database.
 fn commit_deferral(
     header_generation: HeaderGeneration,

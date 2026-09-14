@@ -752,20 +752,18 @@ fn any_deferral_is_due(plan: &zakura_header_chain::RecoveryPlan) -> bool {
     plan.deferred_entries.iter().any(|(until, _)| *until <= now)
 }
 
-/// Reevaluate due recovered deferrals before constructing a publisher.
+/// Restore the integrated auxiliary reserve and reevaluate due deferrals before publication.
 ///
-/// The function uses the normal planner and durable commit path. It leaves the recovered engine
-/// unchanged when no deferral is due or when the planner derives no change. It propagates planner
-/// failures because the runtime would immediately repeat the due transition. Any retryable
-/// planning failure needs an explicit classification and a bounded retry policy. On success, the
-/// returned engine matches the durable state that the caller may publish.
-fn settle_deferred_before_publication(
+/// The planner reclaims unprotected branches even when full-state reconciliation changed nothing
+/// and no deferral is due. The durable commit precedes publisher construction. Planner failures
+/// prevent publication; a no-change plan leaves the recovered engine unchanged.
+fn settle_before_publication(
     store: &HeaderChainStore,
     config: &EngineConfig,
     has_due_deferred: bool,
 ) -> Result<HeaderChainEngine, HeaderChainStoreError> {
     let mut engine = load_transition_engine(store)?;
-    if !has_due_deferred {
+    if !has_due_deferred && config.mode != EngineMode::Integrated {
         return Ok(engine);
     }
     let before = engine.snapshot();
@@ -4007,8 +4005,7 @@ impl HeaderChainStore {
             fault(FaultPoint::AfterCommit)?;
         }
         let has_due_deferred = any_deferral_is_due(&plan);
-        let transition_engine =
-            settle_deferred_before_publication(&self, config, has_due_deferred)?;
+        let transition_engine = settle_before_publication(&self, config, has_due_deferred)?;
         let current = transition_engine.snapshot();
         let transition_engine = Arc::new(Mutex::new(transition_engine));
         let report = StartupReport {
@@ -4094,7 +4091,7 @@ impl HeaderChainStore {
         }
         let has_due_deferred = any_deferral_is_due(&target);
         let transition_engine =
-            settle_deferred_before_publication(&self, integrated_config, has_due_deferred)?;
+            settle_before_publication(&self, integrated_config, has_due_deferred)?;
         let current = transition_engine.snapshot();
         let transition_engine = Arc::new(Mutex::new(transition_engine));
         let report = StartupReport {
@@ -4172,8 +4169,7 @@ impl HeaderChainStore {
             self.db.write(self.recovery_batch(&final_audit)?)?;
         }
         let has_due_deferred = any_deferral_is_due(&final_audit);
-        let transition_engine =
-            settle_deferred_before_publication(&self, config, has_due_deferred)?;
+        let transition_engine = settle_before_publication(&self, config, has_due_deferred)?;
         let current = transition_engine.snapshot();
         let transition_engine = Arc::new(Mutex::new(transition_engine));
         let report = StartupReport {
@@ -4389,8 +4385,7 @@ impl HeaderChainStore {
         }
         self.clear_reconstruction_progress()?;
         let has_due_deferred = any_deferral_is_due(&final_audit);
-        let transition_engine =
-            settle_deferred_before_publication(&self, config, has_due_deferred)?;
+        let transition_engine = settle_before_publication(&self, config, has_due_deferred)?;
         let current = transition_engine.snapshot();
         let transition_engine = Arc::new(Mutex::new(transition_engine));
         let report = StartupReport {

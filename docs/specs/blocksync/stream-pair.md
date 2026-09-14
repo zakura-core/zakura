@@ -107,13 +107,18 @@ A body must match the next unconsumed hash of exactly one range. Check the
 bounded header and remaining credit before waiting for full-body decode
 capacity. Consume its object and actual serialized body bytes before local
 handling, including when the data has become obsolete. Tags and endings do not
-spend body-byte credit. Size estimates remain local scheduling inputs.
+spend body-byte credit. Size estimates remain local scheduling inputs. A body
+whose hash is not the next expected one while a response is still open spends
+that part of the earliest open range without being decoded and is not a
+violation; a body with no open response, an ambiguous match, or a byte
+overrun is.
 
 The last body leaves the range pending its ending and keeps its protocol slot.
 `BlocksDone` must report exactly the consumed nonempty prefix.
 `RangeUnavailable` must match the original count with no consumed bodies.
-Different ranges may interleave, but each range is ordered. A retry on the same
-connection cannot overlap a range still awaiting its ending.
+A responder answers the ranges of one connection in request order; each range
+is ordered. A retry on the same connection cannot overlap a range still
+awaiting its ending.
 
 Numeric Status ceilings stay fixed for a connection in this wire version.
 The two streams carry no limit generation or acknowledgement to correlate a

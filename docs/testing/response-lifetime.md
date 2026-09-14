@@ -43,7 +43,7 @@ real frames. Tests are grouped under `peer_routine::response_contract`.
 
 | File | Contract |
 | --- | --- |
-| `identity.rs` | R01 and R03–R08. Only the next requested hash is valid. Duplicate or unrelated bodies and endings cannot consume another response. |
+| `identity.rs` | R01 and R03–R08. Only the next requested hash is valid. A duplicate or unrelated body spends one part of the earliest open response and is discarded. An unrelated ending cannot consume another response, and a body with no open response is a fault. |
 | `indexed_matching.rs` | Publication installs lookup keys before writes. Different completion orders and local detachment preserve matching. Skipped writes remove keys. Ambiguous hashes fail before decoding. |
 | `lifetime.rs` | R02 and R09–R11. Deadlines, finality, reorganization and reassignment preserve the original response. Endings retain protocol slots. Connection closure cleans up unfinished work. |
 | `limits.rs` | R12, F04 and C06. Count actual body bytes, reject unauthorized bodies before decoding or handler waits, and distinguish local handler failure from peer faults. A valid-body control verifies the allocation observer. |

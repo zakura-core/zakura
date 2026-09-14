@@ -38,7 +38,7 @@ use super::{
 };
 use crate::zakura::regulation::{
     collection_allocation_bytes, ResponseAdmissionError, ResponseAuthorization, ResponseCredit,
-    ResponseMatch, ResponseVec,
+    ResponseMatch, ResponseScope, ResponseVec,
 };
 use crate::zakura::transport::OrderedStreamFailure;
 use crate::zakura::{trace::BlockBodySource, Admit, FramedRecv, SinkReject, ZakuraConnId};
@@ -253,7 +253,7 @@ pub(super) struct PeerRoutine {
     /// Authoritative for the routine's own want-work decision (mirrored into the
     /// registry for the reactor's serving-side reads).
     max_blocks_per_response: u32,
-    /// Complete denied plan, excluding the scope's fixed authorization record.
+    /// Complete denied plan, as `ResponseScope::admission_bytes` counts it.
     response_memory_waiting: Option<u64>,
     max_response_bytes: u32,
     /// Rate meter for sending our `Status` reply to this peer's inbound `Status`.
@@ -931,9 +931,10 @@ impl PeerRoutine {
                         .into_iter()
                         .try_fold(0u64, u64::checked_add)
                         .ok_or(ResponseAdmissionError::MemoryFull)?;
+                        // The smallest plan is the last one tried, so a denial
+                        // leaves the wait threshold at what that plan needs.
                         self.response_memory_waiting = Some(
-                            bytes
-                                .checked_add(retained_bytes)
+                            ResponseScope::admission_bytes(bytes, retained_bytes)
                                 .ok_or(ResponseAdmissionError::MemoryFull)?,
                         );
                         let (authorization, mut funding) = self

@@ -168,11 +168,12 @@ impl BlockSyncPeerSession {
             .authorize_with_retained_memory(metadata_bytes, retained_bytes)
     }
 
+    /// Wait for `bytes` of response metadata capacity before retrying admission.
     pub(super) fn wait_for_response_capacity(
         &self,
-        metadata_bytes: u64,
+        bytes: u64,
     ) -> impl std::future::Future<Output = ()> + Send + 'static {
-        self.response_scope.wait_for_capacity(metadata_bytes)
+        self.response_scope.wait_for_capacity(bytes)
     }
 
     #[cfg(test)]

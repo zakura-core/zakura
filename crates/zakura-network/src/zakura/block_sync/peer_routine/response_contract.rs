@@ -256,6 +256,12 @@ impl Fixture {
     /// dropped without a peer fault or a handler delivery.
     async fn discards(&mut self, message: BlockSyncMessage, consumed_after: u64, rule: &str) {
         let before = self.bodies.len();
+        let body_bytes = u64::try_from(
+            message.encode_frame().unwrap().payload.len()
+                - super::super::wire::BLOCK_SYNC_MESSAGE_TYPE_BYTES,
+        )
+        .unwrap();
+        let bytes_before = self.routine.window.outstanding[0].response.consumed_bytes();
         let result = self.deliver(message).await;
         assert!(
             result.is_ok(),
@@ -272,6 +278,11 @@ impl Fixture {
                 .consumed_objects(),
             consumed_after,
             "{rule}: the discarded body spends response credit"
+        );
+        assert_eq!(
+            self.routine.window.outstanding[0].response.consumed_bytes(),
+            bytes_before + body_bytes,
+            "{rule}: the discarded body is charged its own wire bytes"
         );
         self.assert_no_peer_fault();
     }

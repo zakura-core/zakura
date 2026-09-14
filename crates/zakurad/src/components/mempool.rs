@@ -149,9 +149,7 @@ pub(crate) fn is_estimated_close_to_network_tip(chain_tip_change: &ChainTipChang
 /// Returns the peer to ban for `error`, if the failure does not depend on this
 /// node's chain tip.
 ///
-/// Failures in [`depends_only_on_transaction`] ban for every transaction
-/// version. Failures in [`depends_on_verifying_upgrade`] ban only for v5 and
-/// later transactions. See those functions for the reasons.
+/// [`ban_scope`] decides which transaction versions ban for each failure.
 fn transaction_ban_peer(error: &TransactionDownloadVerifyError) -> Option<PeerSocketAddr> {
     let TransactionDownloadVerifyError::Invalid {
         error,
@@ -163,64 +161,136 @@ fn transaction_ban_peer(error: &TransactionDownloadVerifyError) -> Option<PeerSo
         return None;
     };
 
-    let is_tip_independent = depends_only_on_transaction(error)
-        || (*transaction_version >= 5 && depends_on_verifying_upgrade(error));
+    let bans = match ban_scope(error) {
+        BanScope::EveryVersion => true,
+        BanScope::V5AndLater => *transaction_version >= 5,
+        BanScope::Never => false,
+    };
 
-    is_tip_independent.then_some(*advertiser_addr)
+    bans.then_some(*advertiser_addr)
 }
 
-/// Returns true for failures that only depend on the transaction's own data:
-/// its structure, its encodings, its Sprout proofs, and its proof sizes.
-fn depends_only_on_transaction(error: &TransactionError) -> bool {
-    use TransactionError::*;
+/// The transaction versions for which a verification failure bans the
+/// relaying peer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BanScope {
+    /// The failure only depends on the transaction and the outputs it spends.
+    EveryVersion,
 
-    matches!(
-        error,
-        WrongVersion
-            | NoInputs
-            | NoOutputs
-            | BadBalance
-            | SmallOrder
-            | Groth16(_)
-            | MalformedGroth16(_)
-            | BothVPubsNonZero
-            | NotEnoughFlags
-            | NotEnoughIronwoodFlags
-            | OrchardHasEnableCrossAddress
-            | OrchardProofSize
-            | IronwoodProofSize
-            | CoinbaseHasJoinSplit
-            | CoinbaseHasSpend
-            | CoinbaseHasEnableSpendsOrchard
-            | CoinbaseHasEnableSpendsIronwood
-            | CoinbaseInMempool
-            | NonCoinbaseHasCoinbaseInput
-    )
+    /// The failure depends on the network upgrade that this node verifies the
+    /// transaction under.
+    ///
+    /// A v4 transaction does not encode a consensus branch ID. A node whose
+    /// tip lags the network at an upgrade activation verifies it under the
+    /// wrong upgrade, so these failures can reject a valid v4 transaction.
+    ///
+    /// A v5 or later transaction encodes its branch ID. The verifier rejects a
+    /// branch ID that differs from this node's upgrade, or a transaction
+    /// version that the upgrade does not support, before it runs these checks.
+    /// So these failures only reach a v5 or later transaction that this node
+    /// verifies under the upgrade the transaction declares.
+    V5AndLater,
+
+    /// The failure does not show that the relaying peer misbehaved.
+    Never,
 }
 
-/// Returns true for failures that depend on the network upgrade that this node
-/// verifies the transaction under.
+/// Returns the transaction versions for which `error` bans the relaying peer.
 ///
-/// Signature hashes commit to that upgrade's consensus branch ID, and Halo2
-/// proofs use that upgrade's verifying key. The Sapling verifier checks proofs
-/// and signatures together, so its failures depend on the upgrade too.
-///
-/// A v4 transaction does not encode a branch ID. A node whose tip lags the
-/// network at an upgrade activation verifies it under the wrong upgrade, so
-/// these failures can reject a valid v4 transaction.
-///
-/// A v5 or later transaction encodes its branch ID. The verifier rejects a
-/// branch ID that differs from this node's upgrade, or a transaction version
-/// that the upgrade does not support, before it runs these checks. So these
-/// failures only reach a v5 or later transaction that this node verifies under
-/// the upgrade the transaction declares.
-fn depends_on_verifying_upgrade(error: &TransactionError) -> bool {
+/// The match lists every error, so each new verification failure needs a
+/// decision.
+fn ban_scope(error: &TransactionError) -> BanScope {
+    use BanScope::*;
     use TransactionError::*;
 
     match error {
-        Script(script_error) => script_error.is_script_failure(),
-        SaplingVerificationFailed | Halo2VerificationFailed | RedJubjub(_) | RedPallas(_) => true,
-        _ => false,
+        // The transaction's structure, encodings, Sprout proofs, proof sizes,
+        // and value balance. An outpoint fixes the value of the output it
+        // spends, so the fee does not depend on the tip either.
+        WrongVersion
+        | NoInputs
+        | NoOutputs
+        | BadBalance
+        | IncorrectFee
+        | SmallOrder
+        | Groth16(_)
+        | MalformedGroth16(_)
+        | BothVPubsNonZero
+        | NotEnoughFlags
+        | NotEnoughIronwoodFlags
+        | OrchardHasEnableCrossAddress
+        | OrchardProofSize
+        | IronwoodProofSize
+        | CoinbaseInMempool
+        | NonCoinbaseHasCoinbaseInput => EveryVersion,
+
+        // Signature hashes commit to the verifying upgrade's branch ID, and
+        // Halo2 proofs use that upgrade's verifying key. The Sapling verifier
+        // checks proofs and signatures together. Only v4 transactions have
+        // Sprout signatures, so Ed25519 failures never ban.
+        Script(script_error) if script_error.is_script_failure() => V5AndLater,
+        SaplingVerificationFailed
+        | Halo2VerificationFailed
+        | Ed25519(_)
+        | RedJubjub(_)
+        | RedPallas(_) => V5AndLater,
+
+        // These rules depend on the tip's height, time, or network upgrade.
+        WrongConsensusBranchId
+        | WrongConsensusBranchIdNu6_3GracePeriod
+        | MissingConsensusBranchId
+        | UnsupportedByNetworkUpgrade(..)
+        | DisabledAddToSproutPool
+        | DisabledAddToOrchardPool
+        | LockedUntilAfterBlockHeight(_)
+        | LockedUntilAfterBlockTime(_)
+        | ValidateMempoolLockTimeError(_)
+        | ExpiredTransaction { .. }
+        | ImmatureTransparentCoinbaseSpend { .. }
+        | UnshieldedTransparentCoinbaseSpend { .. } => Never,
+
+        // These rules depend on the chain state.
+        TransparentInputNotFound | ValidateContextError(_) => Never,
+
+        // Policy rejections: blocks can contain these transactions.
+        Zip317(_)
+        | NonStandardScriptSigSize { .. }
+        | NonStandardScriptSigNotPushOnly { .. }
+        | NonStandardInputs => Never,
+
+        // The mempool has never banned for these rules, although they only
+        // depend on the transaction.
+        DuplicateTransparentSpend(_)
+        | DuplicateSproutNullifier(_)
+        | DuplicateSaplingNullifier(_)
+        | DuplicateOrchardNullifier(_)
+        | DuplicateIronwoodNullifier(_)
+        | MaximumExpiryHeight { .. } => Never,
+
+        // Only block verification returns these. The mempool rejects coinbase
+        // transactions before their coinbase checks.
+        CoinbasePosition
+        | CoinbaseAfterFirst
+        | CoinbaseHasJoinSplit
+        | CoinbaseHasSpend
+        | CoinbaseHasOutputPreHeartwood
+        | CoinbaseHasEnableSpendsOrchard
+        | CoinbaseHasEnableSpendsIronwood
+        | CoinbaseHasOrchardShieldedData
+        | CoinbaseOutputsNotDecryptable
+        | NotCoinbase
+        | CoinbaseExpiryBlockHeight { .. }
+        | CoinbaseConstruction(_)
+        | Subsidy(_) => Never,
+
+        // The verifier failed, or the error does not name the rule that failed.
+        Script(_)
+        | InternalDowncastError(_)
+        | Io(_)
+        | TryFromSlice(_)
+        | Amount(_)
+        | Balance(_)
+        | Other(_) => Never,
     }
 }
 

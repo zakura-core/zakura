@@ -129,15 +129,22 @@ fn test_peer() -> PeerSocketAddr {
 #[test]
 fn transaction_data_failures_ban_every_version() {
     for error in [
-        TransactionError::OrchardProofSize,
-        TransactionError::IronwoodProofSize,
         TransactionError::WrongVersion,
-        TransactionError::Groth16("invalid proof".into()),
-        TransactionError::MalformedGroth16("invalid point".into()),
-        TransactionError::SmallOrder,
         TransactionError::NoInputs,
         TransactionError::NoOutputs,
+        TransactionError::BadBalance,
+        TransactionError::IncorrectFee,
+        TransactionError::SmallOrder,
+        TransactionError::Groth16("invalid proof".into()),
+        TransactionError::MalformedGroth16("invalid point".into()),
         TransactionError::BothVPubsNonZero,
+        TransactionError::NotEnoughFlags,
+        TransactionError::NotEnoughIronwoodFlags,
+        TransactionError::OrchardHasEnableCrossAddress,
+        TransactionError::OrchardProofSize,
+        TransactionError::IronwoodProofSize,
+        TransactionError::CoinbaseInMempool,
+        TransactionError::NonCoinbaseHasCoinbaseInput,
     ] {
         for transaction_version in [4, 5, 6] {
             let failure = relayed_transaction_failure(error.clone(), transaction_version);
@@ -161,12 +168,13 @@ fn transaction_data_failures_ban_every_version() {
 /// its upgrade, and the verifier rejects a mismatch before these checks.
 #[test]
 fn upgrade_dependent_failures_ban_only_v5_and_later() {
-    use zakura_chain::primitives::{reddsa, redjubjub};
+    use zakura_chain::primitives::{ed25519, reddsa, redjubjub};
 
     for error in [
         TransactionError::Script(zakura_script::Error::ScriptInvalid),
         TransactionError::SaplingVerificationFailed,
         TransactionError::Halo2VerificationFailed,
+        TransactionError::Ed25519(ed25519::Error::InvalidSignature),
         TransactionError::RedJubjub(redjubjub::Error::InvalidSignature),
         TransactionError::RedPallas(reddsa::Error::InvalidSignature),
     ] {
@@ -196,6 +204,9 @@ fn tip_dependent_failures_never_ban() {
         TransactionError::WrongConsensusBranchIdNu6_3GracePeriod,
         TransactionError::LockedUntilAfterBlockHeight(block::Height(101)),
         TransactionError::LockedUntilAfterBlockTime(chrono::Utc::now()),
+        // An honest peer whose tip is before the upgrade can relay these.
+        TransactionError::DisabledAddToSproutPool,
+        TransactionError::DisabledAddToOrchardPool,
         // The verifier failed to run the script, so the script is not at fault.
         TransactionError::Script(zakura_script::Error::TxIndex),
     ] {

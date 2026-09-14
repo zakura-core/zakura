@@ -30,7 +30,10 @@ use zs::CheckpointVerifiedBlock;
 
 use crate::components::{
     mempool::tests::standard_verified_unmined_tx_strategy,
-    mempool::{config::Config, Mempool, MAX_ESTIMATED_DISTANCE_TO_ENABLE},
+    mempool::{
+        config::Config, downloads::TransactionDownloadVerifyError, transaction_ban_peer, Mempool,
+        MAX_ESTIMATED_DISTANCE_TO_ENABLE,
+    },
     sync::{RecentSyncLengths, SyncStatus},
 };
 
@@ -255,6 +258,61 @@ proptest! {
             Ok(())
         })?;
     }
+}
+
+proptest! {
+    // The check is cheap, and enough cases generate every error variant.
+    #![proptest_config(proptest::test_runner::Config::with_cases(2048))]
+
+    /// Checks that every failure with a mempool misbehavior score bans the
+    /// relaying peer, except the failures in [`is_scored_but_never_bans`].
+    ///
+    /// The strategy skips script and signature errors.
+    /// `upgrade_dependent_failures_ban_only_v5_and_later` covers them.
+    #[test]
+    fn scored_failures_ban_unless_they_depend_on_the_tip(error in any::<TransactionError>()) {
+        let peer = zn::PeerSocketAddr::from(([203, 0, 113, 7], 8233));
+        let failure = TransactionDownloadVerifyError::Invalid {
+            error: error.clone(),
+            advertiser_addr: Some(peer),
+            tip_height: Some(block::Height(100)),
+            transaction_version: 5,
+        };
+
+        let should_ban = error.mempool_misbehavior_score() != 0 && !is_scored_but_never_bans(&error);
+        prop_assert_eq!(transaction_ban_peer(&failure), should_ban.then_some(peer), "{:?}", error);
+    }
+}
+
+/// Returns true for failures that have a mempool misbehavior score but never
+/// ban the relaying peer.
+fn is_scored_but_never_bans(error: &TransactionError) -> bool {
+    use TransactionError::*;
+
+    matches!(
+        error,
+        // These rules depend on the tip's height, time, or network upgrade.
+        WrongConsensusBranchId
+            | MissingConsensusBranchId
+            | DisabledAddToSproutPool
+            | DisabledAddToOrchardPool
+            | LockedUntilAfterBlockHeight(_)
+            | LockedUntilAfterBlockTime(_)
+            | ImmatureTransparentCoinbaseSpend { .. }
+            | UnshieldedTransparentCoinbaseSpend { .. }
+            // Only block verification returns these.
+            | CoinbasePosition
+            | CoinbaseAfterFirst
+            | CoinbaseHasJoinSplit
+            | CoinbaseHasSpend
+            | CoinbaseHasOutputPreHeartwood
+            | CoinbaseHasEnableSpendsOrchard
+            | CoinbaseHasEnableSpendsIronwood
+            | CoinbaseHasOrchardShieldedData
+            | CoinbaseOutputsNotDecryptable
+            | CoinbaseExpiryBlockHeight { .. }
+            | Subsidy(_)
+    )
 }
 
 #[tokio::test]

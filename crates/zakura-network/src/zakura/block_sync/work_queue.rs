@@ -900,11 +900,19 @@ impl WorkQueue {
         self.lock().in_flight.len()
     }
 
-    pub(super) fn reserved_above(&self, floor: block::Height) -> (u64, u64) {
+    /// Count outstanding estimates above the floor. At receipt, exclude that
+    /// height because admission replaces its current estimate with actual bytes.
+    /// Select the estimate and total under one lock, even after reassignment.
+    pub(super) fn reserved_above(
+        &self,
+        floor: block::Height,
+        received_height: Option<block::Height>,
+    ) -> (u64, u64) {
         let inner = self.lock();
         inner
             .in_flight
             .range((std::ops::Bound::Excluded(floor), std::ops::Bound::Unbounded))
+            .filter(|(height, _)| Some(**height) != received_height)
             .fold((0u64, 0u64), |(bytes, count), (_, item)| {
                 let charge = item.budget.reserved_charge();
                 if charge == 0 {

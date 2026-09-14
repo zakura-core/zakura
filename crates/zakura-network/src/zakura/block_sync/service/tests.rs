@@ -1,7 +1,12 @@
 use super::super::tests::mainnet_decoder;
 use super::*;
+use crate::zakura::regulation::ConnectionResponseMemory;
 
 impl BlockSyncPeerSession {
+    pub(in crate::zakura::block_sync) fn response_memory(&self) -> ConnectionResponseMemory {
+        self.response_scope.memory()
+    }
+
     pub(super) fn authorize_response(
         &self,
     ) -> Result<ResponseAuthorization, ResponseAdmissionError> {

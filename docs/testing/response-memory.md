@@ -26,15 +26,25 @@ including the shared reference counts and alignment padding.
 Setup must succeed before retiring an existing receiver or replacing a registered
 connection. This keeps a failed local admission from disrupting working traffic.
 
+## Capacity waits
+
+A connection that has spent its allowance waits for its own owners to release
+memory. Completions on other connections cannot help it and do not wake it.
+Once the connection has room, it waits on the node pool if that limit is full.
+The shared waiter rechecks both limits after each wake and registers before its
+final capacity check so a concurrent release cannot be missed. The caller still
+retries admission because another request can take the available bytes.
+
 ## Properties
 
 | Test group | Contract |
 | --- | --- |
 | `response_memory::tests` | Both limits, failed reservation rollback, integer boundaries, racing connections, final-owner release and capacity wakeups. |
+| `response_memory::tests::wakeups` | Releases before polling, partial releases, switching between full limits, and allocation-free wait registration and cancellation. |
 | `response_properties::memory` | Generated histories independently sum live allocations across four connections and sixteen owners. Cold allocation observations include setup, authorization, transitions and cleanup. Denied admissions allocate nothing. |
 | `transport::registry::tests::response_memory_survives_service_fanout_and_escalation` | Services and later stream activation share the original connection and node pools. |
 | `service::tests::replacement_budget` | A replacement denied setup memory leaves its predecessor active and able to make requests. |
-| `peer_routine::tests::memory` | Exhaustion leaves work pending without a peer fault. Another connection's release wakes the receiver. An idle receiver does not spin on its own releases. |
+| `peer_routine::tests::memory` | Exhaustion leaves work pending without a peer fault. Another connection's release wakes a receiver blocked by the node limit, but does not schedule a receiver blocked by its own connection limit. An idle receiver does not spin on its own releases. |
 
 The same response lifecycle, discovery and subscription properties run against
 the funded scopes. The `response-memory` nextest profile selects these checks

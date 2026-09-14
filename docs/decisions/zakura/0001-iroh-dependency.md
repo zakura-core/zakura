@@ -77,13 +77,26 @@ Automatic UPnP, NAT-PMP and PCP port mapping is not compiled in. Operators behin
 a router must forward the native UDP port manually and advertise a reachable
 address. Public-IP nodes do not need this mapping.
 
-QUIC NAT traversal is explicitly disabled with
+QUIC NAT traversal is disabled by default with
 `max_remote_nat_traversal_addresses(0)`. The rc1 fork allows zero to disable the
 extension, preventing its interface-address exchange and peer-directed UDP
 probes even when the other endpoint enables it. Relay configuration alone does
 not disable this extension. Direct connections remain available.
 
-With relays and external discovery disabled, connectivity is limited to
+Operators can opt in to QUIC NAT traversal with:
+
+```toml
+[network.zakura]
+nat_traversal = true
+```
+
+This uses Iroh's bounded defaults for candidate-address exchange and UDP probes
+with all native peers, including untrusted peers. Both endpoints must allow the
+extension. This is not a paired-device mode and does not enable relays, external
+address lookup, or automatic router port mapping. It does not provide initial
+connectivity between otherwise unreachable peers by itself.
+
+With relays and external discovery disabled, initial connectivity is limited to
 directly reachable peers, local networks, forwarded ports, and addresses
 supplied by Zakura's discovery or legacy-upgrade address hints. Hard-NAT peers
 remain out of scope until a future relay/discovery decision.

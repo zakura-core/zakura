@@ -14,8 +14,7 @@ use zakura_chain::serialization::ZcashDecoder;
 
 mod sessions;
 use crate::zakura::regulation::{
-    ConnectionResponseMemory, ResponseAdmissionError, ResponseAuthorization, ResponseMemoryPermit,
-    ResponseScope,
+    ResponseAdmissionError, ResponseAuthorization, ResponseMemoryPermit, ResponseScope,
 };
 pub(super) use sessions::CurrentSessions;
 use sessions::SessionCapacity;
@@ -169,8 +168,11 @@ impl BlockSyncPeerSession {
             .authorize_with_retained_memory(metadata_bytes, retained_bytes)
     }
 
-    pub(super) fn response_memory(&self) -> ConnectionResponseMemory {
-        self.response_scope.memory()
+    pub(super) fn wait_for_response_capacity(
+        &self,
+        metadata_bytes: u64,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        self.response_scope.wait_for_capacity(metadata_bytes)
     }
 
     #[cfg(test)]

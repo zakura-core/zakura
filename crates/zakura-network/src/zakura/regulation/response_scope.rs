@@ -144,6 +144,22 @@ impl ResponseScope {
         self.0.memory.clone()
     }
 
+    /// Wait for enough metadata space to retry one authorization. The future
+    /// owns its connection handle so callers can keep processing other events.
+    pub(crate) fn wait_for_capacity(
+        &self,
+        metadata_bytes: u64,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let memory = self.memory();
+        async move {
+            memory
+                .wait_for_capacity(
+                    shared_allocation_bytes::<Authorization>().saturating_add(metadata_bytes),
+                )
+                .await;
+        }
+    }
+
     /// Fence old publishers and writers before removing or replacing their session.
     /// Returns whether this connection can host a replacement receiver.
     pub(crate) fn retire(&self) -> bool {

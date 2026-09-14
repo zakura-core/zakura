@@ -82,7 +82,7 @@ impl RetentionHarness {
             reads: Mutex::new(Vec::new()),
         });
         let handle = handle.with_range_source(source.clone());
-        let service = BlockSyncService::new_with_handle(config, handle.clone());
+        let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
         Self {
             retained: Some(retained),
             handle,
@@ -134,6 +134,7 @@ impl RetentionHarness {
                 ]),
                 cancel,
                 CloseCause::new(),
+                crate::zakura::regulation::ResponseMemory::default().connection(),
             ));
         let advertised = wait_for_outbound_status(&mut outbound).await;
         inbound
@@ -584,7 +585,7 @@ async fn retention_advertisement_keeps_pruned_heights_out_of_download_requests()
         config.clone(),
     );
     let (handle, mut actions, task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let (_, _inbound, mut outbound) = connect_peer_with_status_message(
         &service,
         &mut actions,
@@ -620,7 +621,7 @@ async fn retention_deferred_status_applies_after_peer_goes_quiet() {
     let config = ZakuraBlockSyncConfig::default();
     let (handle, mut actions, task) =
         spawn_block_sync_reactor(BlockSyncStartup::inert(config.clone()));
-    let service = BlockSyncService::new_with_handle(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone(), mainnet_decoder());
     let mut advertised = BlockSyncStatus {
         servable_low: block::Height(1),
         servable_high: block::Height(3),

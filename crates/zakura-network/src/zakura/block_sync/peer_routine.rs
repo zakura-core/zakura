@@ -923,7 +923,7 @@ impl PeerRoutine {
             // for the commit-window exemption, the resident gate, and take sizing
             // (geometry included — an exempt grant is clamped at the window top, so
             // no above-window height can ride an exempt request past the gate).
-            let snapshot = self.admission_snapshot(&view);
+            let snapshot = self.admission_snapshot(&view, None);
             let mut items = Vec::new();
             if servable_low <= floor_high {
                 if let Some(floor_start) = self
@@ -1264,9 +1264,14 @@ impl PeerRoutine {
             .unwrap_or(now)
     }
 
-    fn admission_snapshot(&self, view: &SequencerView) -> AdmissionSnapshot {
-        let (reserved_above_floor_bytes, reserved_above_floor_blocks) =
-            self.work.reserved_above(view.download_floor);
+    fn admission_snapshot(
+        &self,
+        view: &SequencerView,
+        received_height: Option<block::Height>,
+    ) -> AdmissionSnapshot {
+        let (reserved_above_floor_bytes, reserved_above_floor_blocks) = self
+            .work
+            .reserved_above(view.download_floor, received_height);
         AdmissionSnapshot {
             download_floor: view.download_floor,
             verified_block_tip: view.verified_tip,
@@ -1591,12 +1596,19 @@ impl PeerRoutine {
             self.budget.release(released);
             return Ok(());
         }
-        if self.work.pending_contains(height) {
-            let view = *self.sequencer_view.borrow();
-            let snapshot = self.admission_snapshot(&view);
-            if !admit_received_body(&self.config, &snapshot, height, serialized_bytes) {
-                return Ok(());
-            }
+        // Actual bytes replace this height's estimate, including when another
+        // request now owns the work. Every useful body needs retention space.
+        let view = *self.sequencer_view.borrow();
+        let snapshot = self.admission_snapshot(&view, Some(height));
+        if !admit_received_body(&self.config, &snapshot, height, serialized_bytes) {
+            // The wire response was consumed above. Retry our discarded work,
+            // but leave any replacement request's ownership and budget intact.
+            let outcome = self
+                .work
+                .release_reserved_and_return_items_detailed_for_owner(original_owner, [height]);
+            self.budget.release(outcome.released_bytes);
+            self.note_retry_avoid([height]);
+            return Ok(());
         }
         let Some(request_id) = self.next_request_id else {
             let released = self

@@ -17,6 +17,12 @@ estimates help schedule work but do not create extra obligations for the peer.
 Numeric Status limits remain fixed for a connection. A change closes locally
 without treating the peer as malicious. Availability ranges may still change.
 
+Local retention uses actual body bytes for both active and late responses. The
+body's size replaces its current work estimate in the backlog calculation. If it
+does not fit, we still count the response part, but drop the body and return our
+own work for retry. Work already taken by another peer stays with that peer. The
+fixed checkpoint window remains exempt so verification can finish its range.
+
 ## Properties
 
 The receiver fixture sends requests through the real writer queue and decodes
@@ -27,6 +33,7 @@ real frames. Tests are grouped under `peer_routine::response_contract`.
 | `identity.rs` | R01 and R03–R08. Only the next requested hash is valid. Duplicate or unrelated bodies and endings cannot consume another response. |
 | `lifetime.rs` | R02 and R09–R11. Deadlines, finality, reorganization and reassignment preserve the original response. Endings retain protocol slots. Connection closure cleans up unfinished work. |
 | `limits.rs` | R12, F04 and C06. Count actual body bytes, reject unauthorized bodies before decoding or handler waits, and distinguish local handler failure from peer faults. A valid-body control verifies the allocation observer. |
+| `retention.rs` | R12. Check exact-fit and one-byte-over retention with other reservations and buffered bytes. Bursts of underestimated bodies stop entering the backlog. Local refusal preserves response counts, retries and reassigned ownership. |
 | `terminal_counts.rs` | Generated R06–R07 request, prefix and ending counts, including the saved failing seed. |
 
 Generated local-change histories cover counts 1–128 and prefixes from empty to

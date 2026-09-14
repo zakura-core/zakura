@@ -9,6 +9,7 @@ use super::ResponseIndex;
 use crate::zakura::regulation::{
     collection_allocation_bytes, ResponseAdmissionError, ResponseMemoryPermit,
 };
+use std::marker::PhantomData;
 
 // The supported standard library uses at most 11 key slots and 12 child links
 // per node. Sixteen slots of each also cover the parent link, counters and
@@ -18,12 +19,13 @@ use crate::zakura::regulation::{
 const NODE_SLOT_ALLOWANCE: usize = 16;
 
 #[derive(Debug)]
-pub(crate) struct ResponseIndexPlan {
+pub(crate) struct ResponseIndexPlan<K> {
     entries: usize,
     bytes: u64,
+    key: PhantomData<K>,
 }
 
-impl ResponseIndexPlan {
+impl<K> ResponseIndexPlan<K> {
     pub(crate) fn bytes(&self) -> u64 {
         self.bytes
     }
@@ -35,7 +37,7 @@ impl<K: Copy + Ord> ResponseIndex<K> {
         &self,
         required: usize,
         geometric: bool,
-    ) -> Result<Option<ResponseIndexPlan>, ResponseAdmissionError> {
+    ) -> Result<Option<ResponseIndexPlan<K>>, ResponseAdmissionError> {
         if required <= self.funded_entries {
             return Ok(None);
         }
@@ -50,14 +52,18 @@ impl<K: Copy + Ord> ResponseIndex<K> {
             })
             .and_then(|node| node.checked_mul(u64::try_from(entries.checked_add(1)?).ok()?))
             .ok_or(ResponseAdmissionError::MemoryFull)?;
-        Ok(Some(ResponseIndexPlan { entries, bytes }))
+        Ok(Some(ResponseIndexPlan {
+            entries,
+            bytes,
+            key: PhantomData,
+        }))
     }
 
     /// Keep the old allowance until its replacement is fully funded. Inserting,
     /// consuming or removing keys never has to acquire another permit.
     pub(crate) fn apply_capacity_from(
         &mut self,
-        plan: Option<ResponseIndexPlan>,
+        plan: Option<ResponseIndexPlan<K>>,
         funding: &mut Option<ResponseMemoryPermit>,
     ) {
         let Some(plan) = plan else {

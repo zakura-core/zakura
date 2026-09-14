@@ -1,4 +1,4 @@
-//! Typed JSONL events for legacy request compatibility.
+//! Typed CSV events for legacy request compatibility.
 
 use serde::Serialize;
 

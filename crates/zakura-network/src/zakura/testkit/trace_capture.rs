@@ -1,4 +1,4 @@
-//! Capture-and-discard JSONL traces for Zakura tests.
+//! Capture-and-discard CSV traces for Zakura tests.
 
 use std::{
     fs, io,
@@ -145,7 +145,7 @@ impl TraceCapture {
         tracing::info!(
             test = %self.test_name,
             path = %self.persist_dir.display(),
-            "persisted Zakura JSONL trace"
+            "persisted Zakura CSV trace"
         );
         Ok(())
     }
@@ -248,7 +248,7 @@ mod tests {
         );
 
         assert_eq!(capture.finish().await.unwrap(), Some(persisted.clone()));
-        assert!(persisted.join("node-01").join("conn.jsonl").exists());
+        assert!(persisted.join("node-01").join("conn.csv").exists());
         let _ = fs::remove_dir_all(persisted);
     }
 
@@ -269,8 +269,8 @@ mod tests {
         let reader = capture.reader().unwrap();
         assert_eq!(reader.node("01").table("conn").count("accepted"), 1);
         assert_eq!(reader.node("02").table("conn").count("accepted"), 1);
-        assert!(capture.path().join("node-01").join("conn.jsonl").exists());
-        assert!(capture.path().join("node-02").join("conn.jsonl").exists());
+        assert!(capture.path().join("node-01").join("conn.csv").exists());
+        assert!(capture.path().join("node-02").join("conn.csv").exists());
 
         assert!(capture.finish().await.unwrap().is_none());
     }
@@ -287,11 +287,10 @@ mod tests {
             )
             .unwrap();
             *shared_path.lock().unwrap() = Some(capture.persisted_path().to_path_buf());
-            fs::write(
-                capture.path().join("conn.jsonl"),
-                r#"{"node":"01","event":"accepted","conn":1}"#.to_string() + "\n",
-            )
-            .unwrap();
+            super::super::trace_reader::write_trace_rows(
+                &capture.path().join("conn.csv"),
+                &[serde_json::json!({"node": "01", "event": "accepted", "conn": 1})],
+            );
 
             panic!("exercise TraceCapture drop persistence");
         }));
@@ -303,7 +302,7 @@ mod tests {
             .unwrap()
             .clone()
             .expect("test stored persisted path before panicking");
-        assert!(persisted.join("conn.jsonl").exists());
+        assert!(persisted.join("conn.csv").exists());
 
         let reader = TraceReader::load(&persisted).unwrap();
         assert_eq!(reader.node("01").table("conn").count("accepted"), 1);

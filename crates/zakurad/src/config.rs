@@ -176,6 +176,9 @@ fn filtered_env_vars(env_prefix: &str) -> Result<HashMap<String, String>, config
     let required_prefix = format!("{env_prefix}_");
 
     for (key, value) in std::env::vars() {
+        if zakura_jsonl_trace::RUNTIME_ENV_VARS.contains(&key.as_str()) {
+            continue;
+        }
         if let Some(without_prefix) = key.strip_prefix(&required_prefix) {
             // Check for sensitive keys on the stripped key.
             let parts: Vec<&str> = without_prefix.split("__").collect();

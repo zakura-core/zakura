@@ -44,7 +44,7 @@ const VCT_LOCAL_OPERATION_FATAL_AFTER: std::time::Duration =
 /// Minimum interval between repeated stalled-repair trace rows for one repair generation.
 ///
 /// The reactor emits the first row immediately, then samples while nothing changes. The bound
-/// keeps a long stalled repair from dominating the header-sync JSONL trace.
+/// keeps a long stalled repair from dominating the header-sync CSV trace.
 const VCT_REPAIR_STALL_TRACE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 /// Time one repair generation may stay stalled before the reactor reports it at error level.
 const VCT_REPAIR_STALL_REPORT_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
@@ -52,7 +52,7 @@ const VCT_REPAIR_STALL_REPORT_AFTER: std::time::Duration = std::time::Duration::
 ///
 /// The trace records every frontier advance and reanchor.
 /// Metrics and the committed snapshot remain exact.
-/// The trace samples identical refresh diagnostics to bound long-running JSONL traces.
+/// The trace samples identical refresh diagnostics to bound long-running CSV traces.
 const SNAPSHOT_REFRESH_TRACE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn snapshot_refresh_trace_due(last: Option<Instant>, now: Instant) -> bool {

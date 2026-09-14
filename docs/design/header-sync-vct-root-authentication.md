@@ -980,7 +980,7 @@ automatically an error at the chain tip or during startup, but zero combined
 with body-sync root retries means the authentication lane has failed to stay
 ahead.
 
-Each `header_root_auth_diagnostics` JSONL trace row records:
+Each `header_root_auth_diagnostics` CSV trace row records:
 
 - `best_header_tip`;
 - `root_auth_hole_heights`: the exact confirmable missing-root count between

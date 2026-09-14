@@ -328,7 +328,7 @@ impl ZakuraTestNodeBuilder {
         self
     }
 
-    /// Reserve the JSONL tracer hook used by the trace-introspection plan.
+    /// Reserve the CSV tracer hook used by the trace-introspection plan.
     pub fn tracer(mut self, tracer: JsonlTracer) -> Self {
         self.tracer = tracer;
         self

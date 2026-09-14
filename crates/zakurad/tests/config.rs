@@ -197,6 +197,22 @@ fn config_nonexistent_file_errors() {
 // --- Environment variable precedence ---
 
 #[test]
+fn config_leaves_trace_runtime_environment_to_the_writer() {
+    let env = EnvGuard::new();
+    env.set_var("ZAKURA_TRACE_FILE_BYTES", "1024");
+    env.set_var("ZAKURA_TRACE_CAPTURE_RUN", "capture-test");
+    env.set_var("ZEBRA_NODE_ID", "node1");
+    env.set_var("ZAKURA_NETWORK__NETWORK", "Testnet");
+
+    let config = ZakuradConfig::load(None).expect("trace runtime variables are not TOML fields");
+    assert_eq!(config.network.network.to_string(), "Testnet");
+    let trace = zakura_jsonl_trace::JsonlTraceConfig::from_environment();
+    assert_eq!(trace.csv_rotation_bytes, 1024);
+    assert_eq!(trace.csv_rotation_segments, 0);
+    assert_eq!(trace.capture_run_id.as_deref(), Some("capture-test"));
+}
+
+#[test]
 fn config_env_override_defaults() {
     let env = EnvGuard::new();
 

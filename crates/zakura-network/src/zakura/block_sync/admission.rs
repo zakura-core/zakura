@@ -268,6 +268,7 @@ fn remaining_lookahead_wire_bytes(
 /// released at receipt), so unlike [`admit`] this never consults
 /// `budget_available`: only the commit-window exemption and the resident
 /// look-ahead gate — the two rules that bound retention — apply.
+/// The snapshot excludes this height's estimate because actual bytes replace it.
 pub(super) fn admit_received_body(
     config: &ZakuraBlockSyncConfig,
     snapshot: &AdmissionSnapshot,

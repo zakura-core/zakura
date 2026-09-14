@@ -37,6 +37,7 @@ pub(super) struct NeededBlocksQueryFailure {
 /// Startup inputs for the dependency-neutral block-sync reactor.
 #[derive(Clone, Debug)]
 pub struct BlockSyncStartup {
+    pub(super) body_retention: Option<BodyRetention>,
     /// Cached state frontiers at startup.
     pub frontiers: BlockSyncFrontiers,
     /// Durable best header tip at startup.
@@ -58,6 +59,8 @@ pub struct BlockSyncStartup {
 
 impl BlockSyncStartup {
     /// Build block-sync startup config from durable/frontier facts.
+    ///
+    /// This assumes archive storage unless [`Self::with_retention`] is supplied.
     pub fn new(
         frontiers: BlockSyncFrontiers,
         best_header_tip: (block::Height, block::Hash),
@@ -65,6 +68,7 @@ impl BlockSyncStartup {
         config: ZakuraBlockSyncConfig,
     ) -> Self {
         Self {
+            body_retention: None,
             frontiers,
             best_header_tip,
             header_tip: Some(header_tip),
@@ -77,6 +81,8 @@ impl BlockSyncStartup {
     }
 
     /// Build production block sync from the sole committed frontier publisher.
+    ///
+    /// Pruned storage must also supply [`Self::with_retention`].
     pub fn new_with_committed_views(
         frontiers: BlockSyncFrontiers,
         best_header_tip: (block::Height, block::Hash),
@@ -84,6 +90,7 @@ impl BlockSyncStartup {
         config: ZakuraBlockSyncConfig,
     ) -> Self {
         Self {
+            body_retention: None,
             frontiers,
             best_header_tip,
             header_tip: None,
@@ -95,8 +102,26 @@ impl BlockSyncStartup {
         }
     }
 
+    /// Attach the storage-owned retained-body floor and the network's genesis hash.
+    ///
+    /// The floor must be initialized from disk and updated after pruning commits,
+    /// before publishing the corresponding verified tip. Genesis remains servable
+    /// separately when checkpoint retention is ahead of that tip.
+    pub fn with_retention(
+        mut self,
+        retained_height: watch::Receiver<block::Height>,
+        genesis_hash: block::Hash,
+    ) -> Self {
+        self.body_retention = Some(BodyRetention {
+            retained_height,
+            genesis_hash,
+        });
+        self
+    }
+
     pub(super) fn inert(config: ZakuraBlockSyncConfig) -> Self {
         Self {
+            body_retention: None,
             frontiers: BlockSyncFrontiers {
                 finalized_height: block::Height::MIN,
                 verified_block_tip: block::Height::MIN,
@@ -110,6 +135,26 @@ impl BlockSyncStartup {
             state_queries_enabled: false,
             trace: ZakuraTrace::noop(),
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct BodyRetention {
+    pub(super) retained_height: watch::Receiver<block::Height>,
+    pub(super) genesis_hash: block::Hash,
+}
+
+impl BodyRetention {
+    pub(super) fn apply(&self, mut status: BlockSyncStatus) -> BlockSyncStatus {
+        let retained_height = *self.retained_height.borrow();
+        if retained_height > status.servable_high {
+            status.servable_low = block::Height::MIN;
+            status.servable_high = block::Height::MIN;
+            status.tip_hash = self.genesis_hash;
+        } else {
+            status.servable_low = retained_height;
+        }
+        status
     }
 }
 
@@ -257,12 +302,13 @@ impl BlockSyncHandle {
             .park_session_for_test(peer, conn_id, std::time::Instant::now() + cooldown);
     }
 
-    /// Subscribe to local block-sync status advertisements.
+    /// Subscribe to the reactor's current local serving status.
+    /// Peer delivery is tracked separately and can lag while outbound queues are full.
     pub fn subscribe_status(&self) -> watch::Receiver<BlockSyncStatus> {
         self.status.clone()
     }
 
-    /// Return the currently cached local status advertisement.
+    /// Return the reactor's current local serving status, independent of peer delivery.
     pub fn local_status(&self) -> BlockSyncStatus {
         *self.status.borrow()
     }
@@ -299,9 +345,6 @@ pub(super) struct BlockSyncState {
     pub(super) work_queue: Arc<WorkQueue>,
     pub(super) budget: ByteBudget,
     pub(super) needed_heights: Vec<block::Height>,
-    pub(super) status_refresh: RateMeter,
-    pub(super) pending_status_refresh: bool,
-    pub(super) last_advertised_status: BlockSyncStatus,
     /// Throughput of bodies received off the wire (the download rate). Shared
     /// with the per-peer routines (they `record` on receipt); the reactor samples
     /// it each trace tick. Compared against the Sequencer task's committed
@@ -311,15 +354,6 @@ pub(super) struct BlockSyncState {
 
 impl BlockSyncState {
     pub(super) fn new(startup: &BlockSyncStartup) -> Self {
-        let last_advertised_status = BlockSyncStatus {
-            servable_low: block::Height::MIN,
-            servable_high: startup.frontiers.verified_block_tip,
-            tip_hash: startup.frontiers.verified_block_hash,
-            max_blocks_per_response: startup.config.advertised_max_blocks_per_response(),
-            max_inflight_requests: startup.config.advertised_max_inflight_requests(),
-            max_response_bytes: startup.config.advertised_max_response_bytes(),
-        };
-
         Self {
             finalized_height: startup.frontiers.finalized_height,
             verified_block_hash: startup.frontiers.verified_block_hash,
@@ -331,12 +365,20 @@ impl BlockSyncState {
             work_queue: Arc::new(WorkQueue::new(startup.frontiers.verified_block_tip)),
             budget: ByteBudget::new(startup.config.max_inflight_block_bytes),
             needed_heights: Vec::new(),
-            status_refresh: RateMeter::new(startup.config.status_refresh_interval),
-            pending_status_refresh: false,
-            last_advertised_status,
             received_throughput: Arc::new(std::sync::Mutex::new(ThroughputMeter::new(
                 Instant::now(),
             ))),
+        }
+    }
+
+    pub(super) fn local_status(&self, config: &ZakuraBlockSyncConfig) -> BlockSyncStatus {
+        BlockSyncStatus {
+            servable_low: block::Height::MIN,
+            servable_high: self.servable_high,
+            tip_hash: self.servable_hash,
+            max_blocks_per_response: config.advertised_max_blocks_per_response(),
+            max_inflight_requests: config.advertised_max_inflight_requests(),
+            max_response_bytes: config.advertised_max_response_bytes(),
         }
     }
 
@@ -361,7 +403,11 @@ impl BlockSyncState {
 #[derive(Debug)]
 pub(super) struct DownloadWindow {
     pub(super) max_inflight_requests: u32,
+    /// Storage order can change when a range ends. Insert, consume and remove
+    /// through the window methods so both response indexes stay synchronized.
     pub(super) outstanding: Vec<OutstandingBlockRange>,
+    next_response_hashes: crate::zakura::regulation::ResponseIndex<[u8; 32]>,
+    response_starts: crate::zakura::regulation::ResponseIndex<block::Height>,
     /// Per-peer BBR-lite estimators + cwnd — the sole congestion controller. Under
     /// [`CwndUnit::Bytes`] the cwnd is itself a byte budget sourced from header size
     /// hints (no fixed per-request byte weight), so there is no `nominal_request_bytes`.
@@ -396,6 +442,8 @@ impl DownloadWindow {
         Self {
             max_inflight_requests: config.advertised_max_inflight_requests(),
             outstanding: Vec::new(),
+            next_response_hashes: crate::zakura::regulation::ResponseIndex::new(),
+            response_starts: crate::zakura::regulation::ResponseIndex::new(),
             bbr: BbrState::new(config),
             cwnd_unit: config.bbr_cwnd_unit,
             startup_request_cap: usize::try_from(config.initial_inflight_requests)
@@ -785,7 +833,7 @@ impl DownloadWindow {
     /// End a locally retired obligation before discarding its write status. If
     /// transport has not started, it must skip the frame and refund this probe.
     pub(super) fn retire_locally(&mut self, index: usize) -> OutstandingBlockRange {
-        let outstanding = self.outstanding.remove(index);
+        let outstanding = self.remove_outstanding(index);
         outstanding.write_status.expire_unwritten();
         if outstanding.write_status.was_skipped() && outstanding.charged_for_liveness {
             self.requests_without_block_progress =
@@ -827,11 +875,14 @@ impl DownloadWindow {
     }
 
     pub(super) fn outstanding_index_for_start(&self, start_height: block::Height) -> Option<usize> {
-        self.outstanding
-            .iter()
-            .position(|outstanding| outstanding.request.start_height == start_height)
+        match self.response_starts.find(start_height) {
+            crate::zakura::regulation::ResponseMatch::Unique(index) => Some(index),
+            _ => None,
+        }
     }
 }
+
+mod outstanding;
 
 /// Thin per-peer handle the reactor keeps to serve inbound
 /// `GetBlocks` (the session clone + serving meters), advertise our `Status`, count
@@ -843,12 +894,7 @@ impl DownloadWindow {
 pub(super) struct PeerBlockState {
     pub(super) session: BlockSyncPeerSession,
     pub(super) direction: ServicePeerDirection,
-    /// Per-peer rate meter for the reactor's `Status` *advertisement* refresh
-    /// (serving-tip change broadcast + retry to peers that have not acknowledged
-    /// our Status). The inbound-status *reply* half lives on the routine's
-    /// `status_reply_meter`; this half stays reactor-side because the reactor owns
-    /// serving-tip advertisement.
-    pub(super) refresh_meter: RateMeter,
+    pub(super) status_delivery: super::status::StatusDelivery,
 }
 
 impl PeerBlockState {
@@ -856,7 +902,10 @@ impl PeerBlockState {
         Self {
             direction: session.direction(),
             session,
-            refresh_meter: RateMeter::new(config.status_refresh_interval),
+            status_delivery: super::status::StatusDelivery::new(
+                config.status_refresh_interval,
+                Instant::now(),
+            ),
         }
     }
 }

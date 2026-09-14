@@ -17,7 +17,10 @@ mod slots;
 pub(crate) use slots::{SlotBudget, SlotPermit};
 
 mod response;
-pub(crate) use response::ResponseCredit;
+pub(crate) use response::{ResponseCredit, ResponseCreditExceeded};
+
+mod response_index;
+pub(crate) use response_index::{ResponseIndex, ResponseMatch};
 
 mod response_scope;
 pub(crate) use response_scope::{

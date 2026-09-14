@@ -2075,7 +2075,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_flood_cannot_republish_ranges_or_caps_without_a_bound() {
+    async fn status_flood_cannot_republish_ranges_without_a_bound() {
         let (mut routine, _outbound, mut reactor_events) = status_test_routine();
         let mut status = BlockSyncStatus {
             servable_low: block::Height(1),
@@ -2103,8 +2103,9 @@ mod tests {
             })
         ));
         let immediate_range = routine.registry.candidate_snapshot();
+        // Numeric caps stay fixed for the connection. Reconnect behavior for
+        // changed caps is covered by the response lifetime properties.
         let immediate_caps = routine.max_response_bytes;
-        status.max_response_bytes /= 2;
         for (low, high) in [(1, 3), (2, 4), (0, 0), (3, 3)]
             .into_iter()
             .cycle()
@@ -2223,7 +2224,6 @@ mod tests {
         }
 
         let old_response_bytes = routine.max_response_bytes;
-        status.max_response_bytes /= 2;
         routine.handle_status(status);
         assert_eq!(routine.max_response_bytes, old_response_bytes);
         assert!(

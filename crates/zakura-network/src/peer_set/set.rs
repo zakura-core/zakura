@@ -209,10 +209,6 @@ where
     /// A shared list of banned IP addresses.
     bans: BannedIps,
 
-    /// Delivers local disconnects even when no peer is ready for requests.
-    disconnect_rx: tokio_mpsc::Receiver<(PeerSocketAddr, tokio::sync::oneshot::Sender<()>)>,
-    disconnect_tx: tokio_mpsc::Sender<(PeerSocketAddr, tokio::sync::oneshot::Sender<()>)>,
-
     /// Tracks peers returning empty `FindBlocks`/`FindHeaders` responses.
     /// Mutated only from [`Self::poll_ready`] via [`Self::stall_event_rx`].
     find_response_stalls: FindResponseStallTracker,
@@ -377,16 +373,12 @@ where
         max_conns_per_ip: Option<usize>,
     ) -> Self {
         let (stall_event_tx, stall_event_rx) = tokio_mpsc::unbounded_channel();
-        let (disconnect_tx, disconnect_rx) =
-            tokio_mpsc::channel(config.peerset_total_connection_limit().max(1));
         Self {
             // New peers
             discover,
             demand_signal,
             // Banned peers
             bans,
-            disconnect_rx,
-            disconnect_tx,
 
             // Stall tracking
             find_response_stalls: FindResponseStallTracker::new(),
@@ -847,13 +839,6 @@ where
                 StallOutcome::Clear => self.find_response_stalls.clear(addr),
             }
         }
-    }
-
-    /// Returns the sender for local disconnects that bypass request readiness.
-    pub(super) fn disconnect_sender(
-        &self,
-    ) -> tokio_mpsc::Sender<(PeerSocketAddr, tokio::sync::oneshot::Sender<()>)> {
-        self.disconnect_tx.clone()
     }
 
     /// Remove the service corresponding to `key` from the peer set.
@@ -1694,10 +1679,6 @@ where
         // Drain stall events first, so disconnects free up slots that
         // `poll_discover` can fill in the same poll cycle.
         self.drain_stall_events(cx);
-        while let Poll::Ready(Some((addr, done))) = self.disconnect_rx.poll_recv(cx) {
-            self.remove(&addr);
-            let _ = done.send(());
-        }
 
         // Check for new peers, and register a task wakeup when the next new peers arrive. New peers
         // can be infrequent if our connection slots are full, or we're connected to all

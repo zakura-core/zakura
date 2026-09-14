@@ -24,7 +24,7 @@ use std::{
     iter,
     pin::{pin, Pin},
     task::{Context, Poll},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use futures::{future::FutureExt, stream::Stream};
@@ -146,23 +146,34 @@ pub(crate) fn is_estimated_close_to_network_tip(chain_tip_change: &ChainTipChang
         .is_some_and(|(distance, _height)| distance <= MAX_ESTIMATED_DISTANCE_TO_ENABLE)
 }
 
-/// Returns a ban score only for failures established from transaction data alone.
-/// Signature errors and combined proof/signature errors can depend on the branch
-/// used for the sighash. Halo2 only runs for v5/v6 transactions after the
-/// verifier matches their encoded branch ID to the selected upgrade.
-fn transaction_stateless_misbehavior(
-    error: &TransactionDownloadVerifyError,
-) -> Option<(PeerSocketAddr, u32)> {
+/// Returns the peer to ban for `error`, if the failure does not depend on this
+/// node's chain tip.
+///
+/// Failures in [`depends_only_on_transaction`] ban for every transaction
+/// version. Failures in [`depends_on_verifying_upgrade`] ban only for v5 and
+/// later transactions. See those functions for the reasons.
+fn transaction_ban_peer(error: &TransactionDownloadVerifyError) -> Option<PeerSocketAddr> {
     let TransactionDownloadVerifyError::Invalid {
         error,
-        advertiser_addr: Some(peer),
+        advertiser_addr: Some(advertiser_addr),
+        transaction_version,
         ..
     } = error
     else {
         return None;
     };
 
+    let is_tip_independent = depends_only_on_transaction(error)
+        || (*transaction_version >= 5 && depends_on_verifying_upgrade(error));
+
+    is_tip_independent.then_some(*advertiser_addr)
+}
+
+/// Returns true for failures that only depend on the transaction's own data:
+/// its structure, its encodings, its Sprout proofs, and its proof sizes.
+fn depends_only_on_transaction(error: &TransactionError) -> bool {
     use TransactionError::*;
+
     matches!(
         error,
         WrongVersion
@@ -170,7 +181,6 @@ fn transaction_stateless_misbehavior(
             | NoOutputs
             | BadBalance
             | SmallOrder
-            | Halo2VerificationFailed
             | Groth16(_)
             | MalformedGroth16(_)
             | BothVPubsNonZero
@@ -186,22 +196,47 @@ fn transaction_stateless_misbehavior(
             | CoinbaseInMempool
             | NonCoinbaseHasCoinbaseInput
     )
-    .then_some((*peer, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE))
+}
+
+/// Returns true for failures that depend on the network upgrade that this node
+/// verifies the transaction under.
+///
+/// Signature hashes commit to that upgrade's consensus branch ID, and Halo2
+/// proofs use that upgrade's verifying key. The Sapling verifier checks proofs
+/// and signatures together, so its failures depend on the upgrade too.
+///
+/// A v4 transaction does not encode a branch ID. A node whose tip lags the
+/// network at an upgrade activation verifies it under the wrong upgrade, so
+/// these failures can reject a valid v4 transaction.
+///
+/// A v5 or later transaction encodes its branch ID. The verifier rejects a
+/// branch ID that differs from this node's upgrade, or a transaction version
+/// that the upgrade does not support, before it runs these checks. So these
+/// failures only reach a v5 or later transaction that this node verifies under
+/// the upgrade the transaction declares.
+fn depends_on_verifying_upgrade(error: &TransactionError) -> bool {
+    use TransactionError::*;
+
+    match error {
+        Script(script_error) => script_error.is_script_failure(),
+        SaplingVerificationFailed | Halo2VerificationFailed | RedJubjub(_) | RedPallas(_) => true,
+        _ => false,
+    }
 }
 
 /// Returns the peer to put in a transaction cooldown for `error`, if any.
 ///
 /// Only consensus failures that would otherwise count as peer misbehavior
-/// start a cooldown unless the stateless ban path handles them.
-/// Policy rejections, duplicate spends, failures without a
-/// legacy advertiser address, and failures verified against a tip other than
-/// `best_tip_height` do not. Branch ID and lock time failures do not either,
-/// because they depend on this node's tip, which can lag the relaying peer's.
+/// start a cooldown. Failures that ban the peer do not, and neither do policy
+/// rejections, duplicate spends, failures without a legacy advertiser address,
+/// and failures verified against a tip other than `best_tip_height`. Branch ID
+/// and lock time failures do not either, because they depend on this node's
+/// tip, which can lag the relaying peer's.
 fn transaction_cooldown_peer(
     error: &TransactionDownloadVerifyError,
     best_tip_height: Option<block::Height>,
 ) -> Option<PeerSocketAddr> {
-    if transaction_stateless_misbehavior(error).is_some() {
+    if transaction_ban_peer(error).is_some() {
         return None;
     }
 
@@ -209,6 +244,7 @@ fn transaction_cooldown_peer(
         error,
         advertiser_addr: Some(advertiser_addr),
         tip_height,
+        ..
     } = error
     else {
         return None;
@@ -233,6 +269,51 @@ fn transaction_cooldown_peer(
     }
 
     (error.mempool_misbehavior_score() != 0).then_some(*advertiser_addr)
+}
+
+/// The longest time the mempool waits for the peer set to accept a disconnect.
+const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Starts a transaction cooldown for `peer`.
+///
+/// Also disconnects `peer`, without banning it, when this is not its first
+/// cooldown. The first cooldown can come from transactions that were already
+/// queued when the first failure arrived. A later cooldown only starts after an
+/// earlier one ends, so the peer kept relaying invalid transactions.
+fn start_peer_cooldown(
+    peer_cooldowns: &peer_cooldown::PeerCooldowns,
+    outbound: &Outbound,
+    peer: PeerSocketAddr,
+    tx_id: UnminedTxId,
+    expose_peer_addresses: bool,
+) {
+    let Some(cooldown) = peer_cooldowns.record_invalid_transaction(peer.ip(), Instant::now())
+    else {
+        return;
+    };
+
+    tracing::debug!(
+        ?tx_id,
+        peer = %legacy_peer_log_label(peer, expose_peer_addresses),
+        ?cooldown,
+        "ignoring peer transaction advertisements after an invalid transaction"
+    );
+    metrics::counter!("mempool.peer_cooldown.started.total").increment(1);
+
+    if cooldown > peer_cooldown::BASE_COOLDOWN {
+        // Boxing works around a compiler limitation: without it, `tokio::spawn`
+        // cannot prove that the buffer's error conversion holds for every lifetime.
+        let disconnect = outbound
+            .clone()
+            .oneshot(zn::Request::DisconnectPeer(peer))
+            .boxed();
+        tokio::spawn(async move {
+            let result = tokio::time::timeout(DISCONNECT_TIMEOUT, disconnect).await;
+            if !matches!(result, Ok(Ok(_))) {
+                tracing::debug!("could not disconnect a peer after repeated transaction failures");
+            }
+        });
+    }
 }
 
 /// The state of the mempool.
@@ -413,7 +494,8 @@ pub struct Mempool {
     /// resets and deactivations.
     peer_cooldowns: peer_cooldown::PeerCooldowns,
 
-    /// Reports peers that relay transactions with stateless failures.
+    /// Bans peers that relay transactions whose verification failures do not
+    /// depend on this node's tip.
     misbehavior_sender: mpsc::Sender<(PeerSocketAddr, u32)>,
 
     // Diagnostics
@@ -901,51 +983,25 @@ impl Service<Request> for Mempool {
                     }
                     Ok(Err(boxed_err)) => {
                         let (tx_id, error) = *boxed_err;
-                        // Stateless invalidity does not depend on tip freshness.
-                        if let Some(report) = transaction_stateless_misbehavior(&error) {
-                            let _ = self.misbehavior_sender.try_send(report);
+                        if let Some(peer) = transaction_ban_peer(&error) {
+                            let _ = self
+                                .misbehavior_sender
+                                .try_send((peer, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE));
                         }
+
                         // Only start cooldowns while this node's validation context is
                         // current. A stale node verifies transactions against old rules.
                         let cooldown_peer = is_current_enough_for_mempool
                             .then(|| transaction_cooldown_peer(&error, best_tip_height))
                             .flatten();
-                        if let Some(advertiser_addr) = cooldown_peer {
-                            if let Some(cooldown) = self
-                                .peer_cooldowns
-                                .record_invalid_transaction(advertiser_addr.ip(), Instant::now())
-                            {
-                                // A second cooldown represents a new failure after the
-                                // first cooldown expired, not the initial in-flight batch.
-                                if cooldown > peer_cooldown::BASE_COOLDOWN {
-                                    let disconnect = self
-                                        .outbound
-                                        .clone()
-                                        .oneshot(zn::Request::DisconnectPeer(advertiser_addr))
-                                        .boxed();
-                                    tokio::spawn(async move {
-                                        let result = tokio::time::timeout(
-                                            std::time::Duration::from_secs(5),
-                                            disconnect,
-                                        )
-                                        .await;
-                                        if !matches!(result, Ok(Ok(_))) {
-                                            tracing::debug!("could not disconnect peer after repeated transaction failures");
-                                        }
-                                    });
-                                }
-                                tracing::debug!(
-                                    ?tx_id,
-                                    peer = %legacy_peer_log_label(
-                                        advertiser_addr,
-                                        self.expose_peer_addresses,
-                                    ),
-                                    ?cooldown,
-                                    "ignoring peer transaction advertisements after an invalid transaction"
-                                );
-                                metrics::counter!("mempool.peer_cooldown.started.total")
-                                    .increment(1);
-                            }
+                        if let Some(peer) = cooldown_peer {
+                            start_peer_cooldown(
+                                &self.peer_cooldowns,
+                                &self.outbound,
+                                peer,
+                                tx_id,
+                                self.expose_peer_addresses,
+                            );
                         }
 
                         let peer_label =

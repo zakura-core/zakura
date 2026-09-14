@@ -6,8 +6,8 @@ use tower::ServiceExt;
 
 use super::{
     downloads::TransactionDownloadVerifyError, error::MempoolError, queue_source_log_label,
-    storage::Storage, transaction_cooldown_peer, transaction_error_peer_log_label, ActiveState,
-    InboundTxDownloads, Mempool, Request,
+    storage::Storage, transaction_ban_peer, transaction_cooldown_peer,
+    transaction_error_peer_log_label, ActiveState, InboundTxDownloads, Mempool, Request,
 };
 use crate::{
     components::sync::{RecentSyncLengths, SyncStatus},
@@ -47,6 +47,7 @@ fn transaction_error_peer_log_labels_require_explicit_opt_in() {
         error: zakura_consensus::error::TransactionError::WrongVersion,
         advertiser_addr: Some("192.0.2.1:8233".parse().expect("valid test socket")),
         tip_height: None,
+        transaction_version: 4,
     };
 
     assert_eq!(
@@ -77,6 +78,7 @@ fn lock_time_and_maturity_failures_start_no_cooldown() {
         error,
         advertiser_addr: Some(peer),
         tip_height,
+        transaction_version: 4,
     };
 
     assert_eq!(
@@ -142,15 +144,23 @@ fn lock_time_and_maturity_failures_start_no_cooldown() {
     }
 
     // Unattributed failures start nothing.
+    let unattributed = |error| TransactionDownloadVerifyError::Invalid {
+        error,
+        advertiser_addr: None,
+        tip_height,
+        transaction_version: 4,
+    };
     assert_eq!(
         transaction_cooldown_peer(
-            &TransactionDownloadVerifyError::Invalid {
-                error: TransactionError::WrongVersion,
-                advertiser_addr: None,
-                tip_height,
-            },
+            &unattributed(TransactionError::Script(
+                zakura_script::Error::ScriptInvalid
+            )),
             tip_height,
         ),
+        None
+    );
+    assert_eq!(
+        transaction_ban_peer(&unattributed(TransactionError::WrongVersion)),
         None
     );
 }

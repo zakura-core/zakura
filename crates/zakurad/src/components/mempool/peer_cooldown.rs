@@ -3,9 +3,9 @@
 //! A transaction can fail verification because of this node's own view of the
 //! chain: its tip can lag the relaying peer's tip, or sit on the other side of a
 //! network upgrade activation. The failure is then not evidence that the peer
-//! misbehaved. The mempool ignores that peer's transactions for a while.
-//! Stateless failures use the ban path instead. Lock time and
-//! coinbase maturity failures only depend on the tip, so they start no
+//! misbehaved. So the mempool ignores that peer's transactions for a while.
+//! A failure that does not depend on the tip bans the peer instead. Lock time
+//! and coinbase maturity failures only depend on the tip, so they start no
 //! cooldown.
 //!
 //! A cooldown still bounds the verification work a malicious peer can cause.

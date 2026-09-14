@@ -58,6 +58,7 @@ fn policy_rejection_does_not_start_a_cooldown() {
         error: consensus_error,
         advertiser_addr: Some(advertiser_addr),
         tip_height: Some(block::Height(100)),
+        transaction_version: 4,
     };
     assert_eq!(
         transaction_cooldown_peer(&invalid_error, Some(block::Height(100))),
@@ -72,6 +73,7 @@ fn stale_verification_failures_do_not_start_cooldowns() {
         error: TransactionError::Script(zakura_script::Error::ScriptInvalid),
         advertiser_addr: Some(peer),
         tip_height: Some(block::Height(100)),
+        transaction_version: 4,
     };
 
     assert_eq!(
@@ -97,6 +99,7 @@ fn context_dependent_failures_do_not_start_cooldowns() {
             error,
             advertiser_addr: Some(PeerSocketAddr::from(([203, 0, 113, 7], 8233))),
             tip_height: Some(block::Height(100)),
+            transaction_version: 5,
         };
         assert_eq!(
             transaction_cooldown_peer(&error, Some(block::Height(100))),
@@ -105,14 +108,29 @@ fn context_dependent_failures_do_not_start_cooldowns() {
     }
 }
 
-#[test]
-fn stateless_failures_ban_without_a_current_tip() {
-    let advertiser_addr = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
+/// Returns a verification failure for a transaction that [`test_peer`] relayed.
+fn relayed_transaction_failure(
+    error: TransactionError,
+    transaction_version: u32,
+) -> TransactionDownloadVerifyError {
+    TransactionDownloadVerifyError::Invalid {
+        error,
+        advertiser_addr: Some(test_peer()),
+        tip_height: Some(block::Height(100)),
+        transaction_version,
+    }
+}
 
-    for consensus_error in [
+/// Returns a legacy peer address for transaction failure tests.
+fn test_peer() -> PeerSocketAddr {
+    PeerSocketAddr::from(([203, 0, 113, 7], 8233))
+}
+
+#[test]
+fn transaction_data_failures_ban_every_version() {
+    for error in [
         TransactionError::OrchardProofSize,
         TransactionError::IronwoodProofSize,
-        TransactionError::Halo2VerificationFailed,
         TransactionError::WrongVersion,
         TransactionError::Groth16("invalid proof".into()),
         TransactionError::MalformedGroth16("invalid point".into()),
@@ -121,115 +139,186 @@ fn stateless_failures_ban_without_a_current_tip() {
         TransactionError::NoOutputs,
         TransactionError::BothVPubsNonZero,
     ] {
-        let invalid_error = TransactionDownloadVerifyError::Invalid {
-            error: consensus_error,
-            advertiser_addr: Some(advertiser_addr),
-            tip_height: None,
-        };
+        for transaction_version in [4, 5, 6] {
+            let failure = relayed_transaction_failure(error.clone(), transaction_version);
 
+            assert_eq!(
+                transaction_ban_peer(&failure),
+                Some(test_peer()),
+                "{error:?}"
+            );
+            assert_eq!(
+                transaction_cooldown_peer(&failure, Some(block::Height(100))),
+                None,
+                "a banned peer does not also start a cooldown"
+            );
+        }
+    }
+}
+
+/// A lagging tip can verify a v4 transaction under the wrong network upgrade,
+/// so these failures only start a cooldown. A v5 or later transaction encodes
+/// its upgrade, and the verifier rejects a mismatch before these checks.
+#[test]
+fn upgrade_dependent_failures_ban_only_v5_and_later() {
+    use zakura_chain::primitives::{reddsa, redjubjub};
+
+    for error in [
+        TransactionError::Script(zakura_script::Error::ScriptInvalid),
+        TransactionError::SaplingVerificationFailed,
+        TransactionError::Halo2VerificationFailed,
+        TransactionError::RedJubjub(redjubjub::Error::InvalidSignature),
+        TransactionError::RedPallas(reddsa::Error::InvalidSignature),
+    ] {
+        let v4_failure = relayed_transaction_failure(error.clone(), 4);
+        assert_eq!(transaction_ban_peer(&v4_failure), None, "{error:?}");
         assert_eq!(
-            transaction_stateless_misbehavior(&invalid_error),
-            Some((advertiser_addr, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE))
+            transaction_cooldown_peer(&v4_failure, Some(block::Height(100))),
+            Some(test_peer()),
+            "{error:?}"
         );
-        assert_eq!(
-            transaction_cooldown_peer(&invalid_error, Some(block::Height(100))),
-            None,
-        );
+
+        for transaction_version in [5, 6] {
+            let failure = relayed_transaction_failure(error.clone(), transaction_version);
+            assert_eq!(
+                transaction_ban_peer(&failure),
+                Some(test_peer()),
+                "{error:?}"
+            );
+        }
     }
 }
 
 #[test]
-fn context_dependent_errors_do_not_ban() {
+fn tip_dependent_failures_never_ban() {
     for error in [
-        TransactionError::Script(zakura_script::Error::ScriptInvalid),
-        TransactionError::SaplingVerificationFailed,
         TransactionError::WrongConsensusBranchId,
         TransactionError::WrongConsensusBranchIdNu6_3GracePeriod,
         TransactionError::LockedUntilAfterBlockHeight(block::Height(101)),
         TransactionError::LockedUntilAfterBlockTime(chrono::Utc::now()),
+        // The verifier failed to run the script, so the script is not at fault.
+        TransactionError::Script(zakura_script::Error::TxIndex),
     ] {
-        let failure = TransactionDownloadVerifyError::Invalid {
-            error,
-            advertiser_addr: Some(PeerSocketAddr::from(([203, 0, 113, 7], 8233))),
-            tip_height: Some(block::Height(100)),
-        };
-        assert_eq!(transaction_stateless_misbehavior(&failure), None);
+        for transaction_version in [4, 5, 6] {
+            let failure = relayed_transaction_failure(error.clone(), transaction_version);
+            assert_eq!(transaction_ban_peer(&failure), None, "{error:?}");
+        }
     }
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn stateless_ban_and_repeated_cooldown_disconnect() {
-    for stateless in [true, false] {
-        let network = Network::Mainnet;
-        let transaction = network
-            .unmined_transactions_in_blocks(2..)
-            .next()
-            .unwrap()
-            .transaction
-            .clone();
-        let (mut mempool, mut peer_set, _state, _tip, mut verifier, mut recent_syncs, _receiver) =
-            setup(&network, u64::MAX, true).await;
-        let (misbehavior_sender, mut misbehavior_receiver) = tokio::sync::mpsc::channel(1);
-        mempool.misbehavior_sender = misbehavior_sender;
-        let _current_tip = (!stateless).then(|| mempool.use_current_chain_tip(&network));
-        mempool.enable(&mut recent_syncs).await;
-        let peer = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
-        if !stateless {
-            mempool.peer_cooldowns.record_invalid_transaction(
-                peer.ip(),
-                Instant::now() - peer_cooldown::BASE_COOLDOWN - Duration::from_secs(1),
-            );
-        }
-        let tx_id = transaction.id();
-        mempool
-            .ready()
-            .await
-            .unwrap()
-            .call(Request::QueueFromPeer {
-                transactions: vec![transaction.into()],
-                source: QueueSource::LegacySocket(peer.remove_socket_addr_privacy()),
-            })
-            .await
-            .unwrap();
-        verifier.expect_request_that(|request| matches!(request, tx::Request::Mempool { transaction, .. } if transaction.id() == tx_id)).await.respond(Err(if stateless {
-            TransactionError::Groth16("invalid proof".into())
-        } else {
-            TransactionError::Script(zakura_script::Error::ScriptInvalid)
-        }));
-        timeout(Duration::from_secs(3), async {
-            while !mempool.storage().contains_rejected(&tx_id) {
-                mempool.dummy_call().await;
-                time::sleep(Duration::from_millis(10)).await;
-            }
+async fn transaction_data_failure_bans_peer_without_a_current_tip() {
+    let network = Network::Mainnet;
+    let (mut mempool, mut peer_set, _state, _tip, mut tx_verifier, mut recent_syncs, _receiver) =
+        setup(&network, u64::MAX, true).await;
+    let (misbehavior_sender, mut misbehavior_receiver) = tokio::sync::mpsc::channel(1);
+    mempool.misbehavior_sender = misbehavior_sender;
+    mempool.enable(&mut recent_syncs).await;
+    assert!(!mempool.is_current_enough_for_mempool());
+
+    reject_pushed_transaction(
+        &mut mempool,
+        &mut tx_verifier,
+        &network,
+        TransactionError::Groth16("invalid proof".into()),
+    )
+    .await;
+
+    assert_eq!(
+        misbehavior_receiver.try_recv(),
+        Ok((test_peer(), zn::constants::MAX_PEER_MISBEHAVIOR_SCORE))
+    );
+    assert!(!mempool
+        .peer_cooldowns
+        .is_cooling_down(test_peer().ip(), Instant::now()));
+    peer_set.expect_no_requests().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repeated_cooldown_disconnects_peer_without_banning() {
+    let network = Network::Mainnet;
+    let (mut mempool, mut peer_set, _state, _tip, mut tx_verifier, mut recent_syncs, _receiver) =
+        setup(&network, u64::MAX, true).await;
+    let (misbehavior_sender, mut misbehavior_receiver) = tokio::sync::mpsc::channel(1);
+    mempool.misbehavior_sender = misbehavior_sender;
+    // Cooldowns only start when the mempool's validation context is current.
+    let _chain_tip_sender = mempool.use_current_chain_tip(&network);
+    mempool.enable(&mut recent_syncs).await;
+
+    // The peer's first cooldown has already ended.
+    mempool.peer_cooldowns.record_invalid_transaction(
+        test_peer().ip(),
+        Instant::now() - peer_cooldown::BASE_COOLDOWN - Duration::from_secs(1),
+    );
+
+    reject_pushed_transaction(
+        &mut mempool,
+        &mut tx_verifier,
+        &network,
+        TransactionError::Script(zakura_script::Error::ScriptInvalid),
+    )
+    .await;
+
+    peer_set
+        .expect_request_that(
+            |request| matches!(request, zn::Request::DisconnectPeer(addr) if *addr == test_peer()),
+        )
+        .await
+        .respond(zn::Response::Nil);
+    assert!(mempool
+        .peer_cooldowns
+        .is_cooling_down(test_peer().ip(), Instant::now()));
+    assert_eq!(
+        misbehavior_receiver.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    );
+}
+
+/// Pushes an early Mainnet transaction from [`test_peer`], fails its
+/// verification with `error`, and waits until the mempool rejects it.
+///
+/// The transaction version is below 5.
+async fn reject_pushed_transaction(
+    mempool: &mut Mempool,
+    tx_verifier: &mut MockTxVerifier,
+    network: &Network,
+    error: TransactionError,
+) {
+    let transaction = network
+        .unmined_transactions_in_blocks(2..)
+        .next()
+        .expect("mainnet test vectors contain an unmined transaction")
+        .transaction
+        .clone();
+    assert!(transaction.transaction().version() < 5);
+    let tx_id = transaction.id();
+
+    mempool
+        .ready()
+        .await
+        .expect("mempool service becomes ready")
+        .call(Request::QueueFromPeer {
+            transactions: vec![transaction.into()],
+            source: QueueSource::LegacySocket(test_peer().remove_socket_addr_privacy()),
         })
         .await
-        .unwrap();
-        if stateless {
-            assert_eq!(
-                misbehavior_receiver.try_recv().unwrap(),
-                (peer, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE)
-            );
-            assert!(!mempool
-                .peer_cooldowns
-                .is_cooling_down(peer.ip(), Instant::now()));
-            peer_set.expect_no_requests().await;
-        } else {
-            peer_set
-                .expect_request_that(|request| {
-                    matches!(request,
-                zn::Request::DisconnectPeer(addr) if *addr == peer)
-                })
-                .await
-                .respond(zn::Response::Nil);
-            assert!(mempool
-                .peer_cooldowns
-                .is_cooling_down(peer.ip(), Instant::now()));
-            assert!(matches!(
-                misbehavior_receiver.try_recv(),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-            ));
+        .expect("mempool service queues the pushed transaction");
+
+    tx_verifier
+        .expect_request_that(|request| {
+            matches!(request, tx::Request::Mempool { transaction, .. } if transaction.id() == tx_id)
+        })
+        .await
+        .respond(Err(error));
+
+    timeout(Duration::from_secs(3), async {
+        while !mempool.storage().contains_rejected(&tx_id) {
+            mempool.dummy_call().await;
+            time::sleep(Duration::from_millis(10)).await;
         }
-    }
+    })
+    .await
+    .expect("the mempool rejects the transaction");
 }
 
 /// Check that a mempool far behind the network tip rejects invalid peer

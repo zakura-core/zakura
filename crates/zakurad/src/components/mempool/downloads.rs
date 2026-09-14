@@ -168,6 +168,8 @@ pub enum TransactionDownloadVerifyError {
         error: zakura_consensus::error::TransactionError,
         advertiser_addr: Option<PeerSocketAddr>,
         tip_height: Option<Height>,
+        /// The version of the transaction that failed verification.
+        transaction_version: u32,
     },
 
     #[error("transaction was served by a peer in a transaction cooldown")]
@@ -549,6 +551,7 @@ where
                 return Err(TransactionDownloadVerifyError::PeerCoolingDown);
             }
 
+            let transaction_version = tx.transaction().version();
             let result = verifier
                 .oneshot(tx::Request::Mempool {
                     transaction: tx.clone(),
@@ -566,7 +569,12 @@ where
             // Hide the transaction data to avoid filling the logs
             trace!(?txid, result = ?result.as_ref().map(|_tx| ()), "verified transaction for the mempool");
 
-            result.map_err(|e| TransactionDownloadVerifyError::Invalid { error: e.into(), advertiser_addr, tip_height } )
+            result.map_err(|e| TransactionDownloadVerifyError::Invalid {
+                error: e.into(),
+                advertiser_addr,
+                tip_height,
+                transaction_version,
+            })
         }
         .map_ok(|(tx, spent_mempool_outpoints, tip_height)| {
             metrics::counter!(
@@ -1260,9 +1268,9 @@ mod tests {
     }
 
     /// A directly pushed transaction from a legacy-socket peer must keep that
-    /// peer's address on the `Invalid` verification error, so the mempool can
-    /// start a cooldown for that peer. Regression test for the push-path
-    /// attribution gap.
+    /// peer's address and the transaction version on the `Invalid` verification
+    /// error, so the mempool can ban or cool down that peer. Regression test for
+    /// the push-path attribution gap.
     #[tokio::test]
     async fn pushed_transaction_attributes_invalid_error_to_peer() {
         use zakura_consensus::error::TransactionError;
@@ -1275,7 +1283,7 @@ mod tests {
             BoxCloneService::new(service_fn(|_request| async move {
                 panic!("pushed transactions must not be downloaded");
             })),
-            // Reject with a consensus error that starts a peer cooldown.
+            // Reject with a consensus error that penalizes the peer.
             BoxCloneService::new(service_fn(|_request| async move {
                 Err(Box::new(TransactionError::WrongVersion) as BoxError)
             })),
@@ -1315,10 +1323,11 @@ mod tests {
                 error,
                 TransactionDownloadVerifyError::Invalid {
                     advertiser_addr: Some(addr),
+                    transaction_version: 5,
                     ..
                 } if addr == peer_addr
             ),
-            "expected the pushed transaction failure to carry the peer address, got {error:?}"
+            "expected the pushed transaction failure to carry the peer address and version, got {error:?}"
         );
     }
 

@@ -389,7 +389,8 @@ impl PeerRoutine {
     pub(super) async fn run(mut self) -> Result<(), SinkReject> {
         let result = self.run_download().await;
         match &result {
-            Err(SinkReject::Protocol(_)) => {
+            Err(SinkReject::Protocol(error)) => {
+                self.trace_protocol_reject(&error.to_string());
                 self.session.close_connection("service_protocol_reject")
             }
             Err(SinkReject::Connection(_)) => self

@@ -2027,6 +2027,8 @@ impl PeerRoutine {
     }
 
     fn record_received(&self, bytes: u64) {
+        // Count accepted serialized block payloads, excluding transport framing.
+        metrics::counter!("sync.block.payload.received.bytes").increment(bytes);
         if let Ok(mut meter) = self.received_throughput.lock() {
             meter.record(bytes);
         }

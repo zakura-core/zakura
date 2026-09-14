@@ -3,6 +3,21 @@
 use super::*;
 use tokio_util::task::AbortOnDropHandle;
 
+/// Keep a raw connection open so tests can control its streams directly.
+#[derive(Debug)]
+pub(in crate::zakura::handler) struct RawConnection(pub mpsc::Sender<Connection>);
+
+impl ProtocolHandler for RawConnection {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        self.0
+            .send(connection.clone())
+            .await
+            .map_err(AcceptError::from_err)?;
+        connection.closed().await;
+        Ok(())
+    }
+}
+
 impl ZakuraProtocolHandler {
     /// Drive both setup phases directly in tests that isolate admission rules.
     pub(in crate::zakura::handler) async fn admit_bi_stream(

@@ -414,7 +414,8 @@ pub struct ZakuraLocalLimits {
     pub max_frame_bytes: u32,
     /// Maximum reassembled message bytes accepted locally.
     pub max_message_bytes: u32,
-    /// Maximum concurrent admitted streams per connection.
+    /// Maximum concurrent admitted streams per connection, clamped to 1..=16.
+    /// Negotiation and QUIC use the same ceiling to preserve the receive budget.
     pub max_open_streams: u16,
     /// Maximum inbound queue depth per stream kind.
     pub max_inbound_queue_depth: u16,
@@ -444,7 +445,7 @@ impl ZakuraLocalLimits {
     pub fn clamp(&self, negotiated: &ZakuraAcceptedLimits) -> ZakuraConnectionLimits {
         let max_open_streams = negotiated
             .max_open_streams
-            .min(self.max_open_streams)
+            .min(self.effective_max_open_streams())
             .max(1);
         let idle_timeout = Duration::from_millis(
             u64::from(negotiated.idle_timeout_millis)
@@ -476,7 +477,7 @@ impl ZakuraLocalLimits {
         ZakuraLimits {
             max_frame_bytes: self.max_frame_bytes,
             max_message_bytes: self.max_message_bytes,
-            max_open_streams: self.max_open_streams,
+            max_open_streams: self.effective_max_open_streams(),
             max_inbound_queue_depth: self.max_inbound_queue_depth,
             idle_timeout_millis: self.quic_idle_timeout.as_millis().saturating_sub(1) as u32,
         }
@@ -487,12 +488,19 @@ impl ZakuraLocalLimits {
         self.transport_config_builder().build()
     }
 
+    /// Never offer more streams than the qualified QUIC receive budget supports.
+    fn effective_max_open_streams(&self) -> u16 {
+        let transport_ceiling = u16::try_from(DEFAULT_ZAKURA_REMOTE_BIDI_STREAMS)
+            .expect("the qualified transport stream limit fits in u16");
+        self.max_open_streams.clamp(1, transport_ceiling)
+    }
+
     fn transport_config_builder(&self) -> iroh::endpoint::QuicTransportConfigBuilder {
         QuicTransportConfig::builder()
             .max_remote_nat_traversal_addresses(0)
-            .max_concurrent_bidi_streams(VarInt::from_u32(
-                u32::from(self.max_open_streams).min(DEFAULT_ZAKURA_REMOTE_BIDI_STREAMS),
-            ))
+            .max_concurrent_bidi_streams(VarInt::from_u32(u32::from(
+                self.effective_max_open_streams(),
+            )))
             .max_concurrent_uni_streams(VarInt::from_u32(0))
             .stream_receive_window(VarInt::from_u32(DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW))
             .receive_window(VarInt::from_u32(DEFAULT_ZAKURA_RECEIVE_WINDOW))
@@ -2258,7 +2266,7 @@ impl ZakuraProtocolHandler {
                 .min(self.limits.max_message_bytes),
             max_open_streams: remote_limits
                 .max_open_streams
-                .min(self.limits.max_open_streams),
+                .min(self.limits.effective_max_open_streams()),
             max_inbound_queue_depth: remote_limits
                 .max_inbound_queue_depth
                 .min(self.limits.max_inbound_queue_depth),
@@ -5689,6 +5697,7 @@ mod tests {
     mod paired_block_sync;
     mod quic_progress;
     mod serving_progress;
+    mod stream_limits;
 
     // These witnesses require unpublished transport APIs and their native
     // integration. `ignore` alone still type-checks unavailable constructors.

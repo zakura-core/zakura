@@ -48,6 +48,18 @@ exhaustion. A real ordered worker still rejects excess Status traffic and record
 the specific cause. These admission tests supplement response authorization and
 resource-ownership tests in the earlier layers.
 
+## Stream limits
+
+The hello, handshake acknowledgement and application admission use the same
+16-stream ceiling as QUIC. Lower configured limits still apply. For example,
+configuring 32 advertises 16, so a service layout requiring 17 streams is rejected
+before it can wait for transport capacity that will never arrive. The ceiling
+keeps the qualified receive-window budget valid.
+
+`handler::tests::stream_limits` checks generated local and remote limits and fixed
+boundaries. Real QUIC peers open every advertised stream in both directions and
+verify that the next open waits while those streams remain live.
+
 ## Deferred requirements
 
 The stack uses published transport packages without overrides. The receive policy

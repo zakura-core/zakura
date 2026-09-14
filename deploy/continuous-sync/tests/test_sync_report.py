@@ -26,7 +26,7 @@ def fixture(heights=(0, 100, 200, 301, 401), times=(0, 10, 20, 30, 40), mode="du
     rows = []
     for height, timestamp in zip(heights, times):
         values = {"t": timestamp, "height": height, "download_zakura": timestamp * 10_000_000,
-                  "download_legacy": 0, "commit_zakura": timestamp * 8_000_000, "commit_legacy": 0,
+                  "commit_zakura": timestamp * 8_000_000,
                   "sapling_height": 100, "ironwood_height": 400, "checkpoint_height": 450,
                   "request_floor_bytes": 2524288, "vct_fast": max(0, height - 100) if height is not None else None,
                   "vct_legacy": min(height, 100) if height is not None else None,
@@ -58,6 +58,13 @@ class ReportTests(unittest.TestCase):
     def test_metrics_ignore_labels_secrets_nan_and_wrong_height(self):
         values = report.sample_metrics('''
 sync_block_payload_received_bytes_total 1.25e8
+sync_legacy_payload_received_bytes_total 2.5e8
+sync_legacy_payload_committed_bytes_total 2.5e8
+sync_downloads_waiting_network 9
+sync_downloads_downloading 8
+sync_downloads_waiting_verifier 7
+sync_downloads_verifying 99999
+state_vct_legacy_block_count_total 42
 sync.block.applying.unsubmitted 3
 sync_block_applying_unsubmitted{peer="secret"} 99
 sync_block_payload_committed_bytes_total NaN
@@ -66,15 +73,16 @@ sync_estimated_network_tip_height 999999
 zcash_chain_verified_block_height 123
 unrelated_secret 3
 ''')
-        self.assertEqual(values, {"download_zakura": 125000000, "apply_ready": 3, "height": 123})
+        self.assertEqual(values, {"download_zakura": 125000000, "apply_ready": 3, "height": 123, "vct_legacy": 42})
 
-    def test_bytes_per_second_resets_missing_lane_and_gaps(self):
+    def test_bytes_per_second_resets_missing_counters_and_gaps(self):
         data = fixture()
         self.assertEqual(report.rates(data)[0]["download"], 10)
         self.assertEqual(report.rates(data)[0]["commit"], 8)
-        data["samples"][2][report.INDEX["download_legacy"]] = None
+        data["samples"][2][report.INDEX["download_zakura"]] = None
         self.assertIsNone(report.rates(data)[1]["download"])
         self.assertIsNone(report.rates(data)[2]["download"])
+        self.assertEqual(report.rates(data)[1]["commit"], 8)
         data["samples"][1][report.INDEX["download_zakura"]] = 0
         data["samples"][0][report.INDEX["download_zakura"]] = 100
         self.assertIsNone(report.rates(data)[0]["download"])
@@ -116,7 +124,7 @@ unrelated_secret 3
             config.write_text('[network]\nnetwork = "Mainnet"\nsecret = "do not retain"\n'
                               '[network.zakura.block_sync]\nbbr_min_cwnd_bytes = 8388608\nsecret_number = 987\n')
             with patch.object(report.time, "monotonic", side_effect=[100, 100, 110, 120]):
-                recorder = report.Recorder(root / "reports", {"run_id": "test-run", "p2p_stack": "legacy"}, config, 10)
+                recorder = report.Recorder(root / "reports", {"run_id": "test-run", "p2p_stack": "dual"}, config, 10)
                 recorder.record({"report": {"height": 0}})
                 recorder.record({"report": {"height": 100}})
                 recorder.finish("complete")
@@ -179,19 +187,38 @@ unrelated_secret 3
         partial = fixture(heights=(0, 100, None, 301, 401))
         self.assertNotIn("Sandblast", charts.baseline_record(partial, SETTINGS)["times"])
 
-    def test_mode_scales_and_queue_stages_are_distinct(self):
-        self.assertEqual(charts.scales([fixture()])["queue"], 200)
-        self.assertEqual(charts.scales([fixture()])["rate"], 10)
-        self.assertNotIn("reorder", [key for key, _, _ in charts.queue_series("legacy")])
+    def test_dual_and_zakura_use_block_sync_rates_and_queues(self):
+        for mode in ("dual", "zakura"):
+            with self.subTest(mode=mode):
+                data = fixture(mode=mode)
+                report.validate_report(data)
+                self.assertEqual(charts.scales([data])["queue"], 200)
+                self.assertEqual(charts.scales([data])["rate"], 10)
+
+    def test_reports_exclude_legacy_networking_but_keep_fallback_tree_updates(self):
+        for mode in ("legacy", "zebra"):
+            with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, "schema"):
+                report.validate_report(fixture(mode=mode))
+        shares = [row["vct_share"] for row in report.rates(fixture())]
+        self.assertEqual(shares, [0, 1, 1, 1])
 
     @unittest.skipUnless(importlib.util.find_spec("matplotlib"), "renderer dependencies not installed")
-    def test_render_height_and_time_with_missing_and_legacy_data(self):
+    def test_render_height_and_time_for_dual_zakura_and_missing_data(self):
         with tempfile.TemporaryDirectory() as tmp:
             for view in ("height", "time"):
                 output = Path(tmp) / f"{view}.png"
-                charts.render([fixture(), fixture(mode="legacy"), {"run_id": "old-run"}], "Test report", output,
+                charts.render([fixture(), fixture(mode="zakura"), {"run_id": "old-run"}], "Test report", output,
                               {**SETTINGS, "chart_axis": view})
                 self.assertEqual(output.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
+
+    @unittest.skipUnless(importlib.util.find_spec("matplotlib"), "renderer dependencies not installed")
+    def test_render_rejects_legacy_samples_and_placeholders(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "legacy.png"
+            for data in (fixture(mode="legacy"), {"mode": "legacy", "unavailable": "no retained report"}):
+                with self.assertRaisesRegex(ValueError, "only Dual and Zakura"):
+                    charts.render([data], "Legacy", output, SETTINGS)
+            self.assertFalse(output.exists())
 
 
 class SlackDeliveryTests(unittest.TestCase):

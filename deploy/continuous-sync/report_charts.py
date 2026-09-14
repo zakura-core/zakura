@@ -8,7 +8,7 @@ import math
 from pathlib import Path
 from statistics import median
 
-from sync_report import boundaries, comparison_key, finite, rates, region_durations, unpack
+from sync_report import REPORT_MODES, boundaries, comparison_key, finite, rates, region_durations, unpack
 
 COLORS = {
     "Sprout": "#c8d8e5", "Sapling": "#78bea1", "Sandblast": "#efbb67",
@@ -19,12 +19,6 @@ COLORS = {
 QUEUES = [("apply_ready", "Ready to submit", "#2367a0"),
           ("apply_submitted", "Submitted", "#bd5170"),
           ("reorder", "Behind a gap", "#d08d21")]
-LEGACY_QUEUES = [("legacy_waiting_verifier", "Waiting for verifier", "#2367a0"),
-                 ("legacy_verifying", "Verifying / committing", "#bd5170")]
-
-
-def queue_series(mode: str) -> list:
-    return LEGACY_QUEUES if mode == "legacy" else QUEUES
 
 
 def scales(reports: list[dict]) -> dict:
@@ -36,7 +30,7 @@ def scales(reports: list[dict]) -> dict:
                 if finite(row[key]):
                     limits["rate"] = max(limits["rate"], row[key])
         for row in unpack(report):
-            for key, _, _ in QUEUES + LEGACY_QUEUES:
+            for key, _, _ in QUEUES:
                 if finite(row[key]):
                     limits["queue"] = max(limits["queue"], row[key])
             if finite(row["height"]):
@@ -134,6 +128,9 @@ def render(reports: list[dict], title: str, output: Path, settings: dict,
 
     if not 1 <= len(reports) <= 3:
         raise ValueError("render one to three runs per image")
+    modes = (report.get("metadata", {}).get("mode", report.get("mode")) for report in reports)
+    if any(mode is not None and mode not in REPORT_MODES for mode in modes):
+        raise ValueError("charts support only Dual and Zakura networking modes")
     view = settings.get("chart_axis", "height")
     if view not in ("height", "time"):
         raise ValueError("chart_axis must be height or time")
@@ -152,7 +149,6 @@ def render(reports: list[dict], title: str, output: Path, settings: dict,
     run_labels = []
     for index, report in enumerate(reports):
         metadata = report.get("metadata", {})
-        mode = metadata.get("mode", report.get("mode"))
         run_id = metadata.get("run_id", report.get("run_id", "unavailable"))
         run_labels.append(f"Run {index + 1}")
         duration = metadata.get("duration")
@@ -205,7 +201,7 @@ def render(reports: list[dict], title: str, output: Path, settings: dict,
 
         for key, label, color in (("download", "Download", "#2367a0"), ("commit", "Commit", "#bf5771")):
             plot(rate_axis, series, key, label, color)
-        for key, label, color in queue_series(mode):
+        for key, label, color in QUEUES:
             plot(queue_axis, rows, key, label, color)
         for axis in (rate_axis, queue_axis):
             axis.legend(loc="upper right", frameon=False, fontsize=8)
@@ -216,13 +212,11 @@ def render(reports: list[dict], title: str, output: Path, settings: dict,
         if not any(finite(point["commit"]) for point in series):
             rate_axis.text(.5, .32, "Commit rate unavailable", transform=rate_axis.transAxes,
                            ha="center", fontsize=9)
-        if not any(finite(row[key]) for row in rows for key, _, _ in queue_series(mode)):
+        if not any(finite(row[key]) for row in rows for key, _, _ in QUEUES):
             queue_axis.text(.5, .5, "Queue telemetry unavailable", transform=queue_axis.transAxes, ha="center")
         vct_axis.set_ylim(-5, 105)
         vct_axis.set_yticks([0, 100])
-        if mode == "legacy":
-            vct_axis.text(.5, .5, "Legacy • VCT not used", transform=vct_axis.transAxes, ha="center", fontsize=9)
-        elif any(finite(row["vct_share"]) for row in series):
+        if any(finite(row["vct_share"]) for row in series):
             plot(vct_axis, [{**row, "vct_share": row["vct_share"] * 100 if finite(row["vct_share"]) else None}
                             for row in series], "vct_share", "Observed VCT share", "#487c5c")
         else:
@@ -240,7 +234,7 @@ def render(reports: list[dict], title: str, output: Path, settings: dict,
     duration_axis.set_xlim(0, limits["duration"] * 1.3)
     duration_axis.set_xlabel("Elapsed hours by committed-height region", fontsize=9)
     figure.text(.055, .025,
-                "Download and commit count serialized block payloads, 1 MB = 1,000,000 bytes. Missing samples and resets are gaps.\n"
+                "Download and commit measure Zakura block-sync payloads. 1 MB = 1,000,000 bytes. Missing samples and resets are gaps.\n"
                 "Region crossings are sampled estimates. Grey time includes startup, missing coverage and readiness checks.\n"
                 f"Sandblast: {settings['sandblast_start']:,}–{settings['sandblast_end']:,} inclusive. "
                 "Height view dotted line: checkpoint limit. VCT % measures tree updates using the fast path.", fontsize=9, linespacing=1.5)

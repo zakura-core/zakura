@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from sync_report import Recorder, sample_metrics
+from sync_report import REPORT_MODES, Recorder, sample_metrics
 
 STATE_VERSION = 1
 COMPLETION_HISTORY_LIMIT = 256
@@ -70,7 +70,7 @@ class Policy:
     metrics_url: str = "http://127.0.0.1:9999/metrics"
     ready_url: str = "http://127.0.0.1:8080/ready"
     healthy_url: str = "http://127.0.0.1:8080/healthy"
-    poll_interval_seconds: int = 10
+    poll_interval_seconds: int = 30
     startup_timeout_seconds: int = 600
     stall_seconds: int = 600
     max_run_seconds: int = 172800
@@ -483,7 +483,8 @@ def sample_status(config: Config) -> dict[str, Any]:
     try:
         metrics = fetch_text(config.policy.metrics_url)
         status["metrics_status"] = "ok"
-        status["report"] = sample_metrics(metrics)
+        if config.policy.p2p_stack in REPORT_MODES:
+            status["report"] = sample_metrics(metrics)
         for key in (
             "state.memory.best.committed.block.height",
             "state.memory.committed.block.height",
@@ -858,8 +859,10 @@ def one_cycle(config: Config, state_path: Path, state: dict[str, Any]) -> dict[s
     write_run_json(run_dir, run_state)
     state.update({"phase": "syncing", "running_sha": sha, "current_run": run_id})
     save_state(state_path, state)
-    report = Recorder(config.paths.state_dir / "reports", run_state,
-                      config.paths.zakurad_config, config.policy.poll_interval_seconds)
+    report = None
+    if config.policy.p2p_stack in REPORT_MODES:
+        report = Recorder(config.paths.state_dir / "reports", run_state,
+                          config.paths.zakurad_config, config.policy.poll_interval_seconds)
     try:
         try:
             start_service(config)
@@ -871,7 +874,8 @@ def one_cycle(config: Config, state_path: Path, state: dict[str, Any]) -> dict[s
             finally:
                 stop_service(config)
     except BaseException:
-        report.finish("failed")
+        if report is not None:
+            report.finish("failed")
         raise
     rotate_run_logs(config, run_dir)
 
@@ -886,7 +890,8 @@ def one_cycle(config: Config, state_path: Path, state: dict[str, Any]) -> dict[s
         }
     )
     write_run_json(run_dir, run_state)
-    report.finish("complete", run_state.get("report_ready_since"))
+    if report is not None:
+        report.finish("complete", run_state.get("report_ready_since"))
     archive_traces(config, run_dir, run_state)
     completion_history = state.get("completion_history", [])
     if not isinstance(completion_history, list):

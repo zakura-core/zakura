@@ -318,7 +318,7 @@ class ChartSummaryTests(unittest.TestCase):
     def test_prepare_keeps_failed_runs_missing_data_and_unavailable_nodes_visible(self):
         self.enable()
         from test_sync_report import fixture
-        self.config["nodes"].append({"name": "absent", "hostname": "absent", "ssh_string": "root@absent", "p2p_stack": "legacy"})
+        self.config["nodes"].append({"name": "absent", "hostname": "absent", "ssh_string": "root@absent", "p2p_stack": "zakura"})
         cursors = {**self.state["cursors"], "absent": {"number": 0, "run_id": ""}}
         snapshot = self.data(total=4)
         snapshot["controller_state"].update(failed=True, last_failed_run="failed-run")
@@ -337,7 +337,49 @@ class ChartSummaryTests(unittest.TestCase):
         self.assertEqual(rendered[0][0]["run_id"], "run3")
         self.assertEqual(rendered[0][1]["metadata"]["run_id"], "run4")
         self.assertEqual(rendered[0][2]["run_id"], "failed-run")
-        self.assertEqual(rendered[1], [{"mode": "legacy", "unavailable": "status unavailable"}])
+        self.assertEqual(rendered[1], [{"mode": "zakura", "unavailable": "status unavailable"}])
+
+    def test_chart_delivery_keeps_legacy_text_and_cursor_without_collecting_its_report(self):
+        self.enable()
+        from test_sync_report import fixture
+        self.config["nodes"].append({"name": "legacy", "hostname": "legacy", "p2p_stack": "legacy"})
+        self.state["cursors"]["legacy"] = {"number": 2, "run_id": "run2"}
+        summary.save_state(self.path, self.state)
+        client = Mock()
+        client.destination.return_value = "bound"
+        current = fixture()
+        current["metadata"]["run_id"] = "run3"
+        report_nodes = []
+        def read(_config, node, *, report_id=None):
+            if report_id is not None:
+                report_nodes.append(node["name"])
+                return current
+            return self.data()
+        def render(_reports, _title, path, *_args, **_kwargs):
+            path.write_bytes(b"png")
+        with patch.object(summary, "Client", return_value=client), \
+             patch.object(summary.monitor, "query_node", side_effect=read), \
+             patch.object(summary.report_charts, "render", side_effect=render) as rendered, \
+             patch.object(summary, "send_pending") as send:
+            summary.deliver(self.config, self.path, self.due)
+        self.assertEqual(report_nodes, ["node"])
+        rendered.assert_called_once()
+        pending = send.call_args.args[2]
+        self.assertIn("Legacy networking only (legacy) · 1 completed", pending["text"])
+        self.assertEqual(len(pending["files"]), 1)
+        self.assertIn("Dual", pending["files"][0]["title"])
+        saved = json.loads(self.path.read_text())
+        self.assertEqual(saved["cursors"]["legacy"], {"number": 3, "run_id": "run3"})
+
+    def test_legacy_has_no_placeholder_chart_when_unavailable(self):
+        self.enable()
+        self.config["nodes"] = [{"name": "node", "p2p_stack": "legacy"}]
+        with patch.object(summary.monitor, "query_node") as query, \
+             patch.object(summary.report_charts, "render") as render:
+            files = summary.prepare_charts(self.config, {}, self.state["cursors"], self.path.parent / "charts-test")
+        self.assertEqual(files, [])
+        query.assert_not_called()
+        render.assert_not_called()
 
     def test_chart_dry_run_does_not_authenticate_or_advance_state(self):
         self.enable()

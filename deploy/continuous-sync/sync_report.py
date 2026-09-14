@@ -18,6 +18,7 @@ import time
 import tomllib
 
 VERSION = 1
+REPORT_MODES = ("dual", "zakura")
 MAX_REPORT_BYTES = 32 * 1024**2
 MAX_REPORTS = 256
 RETENTION_SECONDS = 30 * 86400
@@ -28,8 +29,6 @@ METRICS = {
     "height": "zcash_chain_verified_block_height",
     "download_zakura": "sync_block_payload_received_bytes",
     "commit_zakura": "sync_block_payload_committed_bytes",
-    "download_legacy": "sync_legacy_payload_received_bytes",
-    "commit_legacy": "sync_legacy_payload_committed_bytes",
     "apply_ready": "sync_block_applying_unsubmitted",
     "apply_submitted": "sync_block_applying_submitted",
     "reorder": "sync_block_reorder_blocks",
@@ -41,10 +40,6 @@ METRICS = {
     "peers": "sync_block_peers_with_status",
     "gap_height": "sync_block_floor_gap_height",
     "gap_request_age": "sync_block_floor_gap_oldest_request_seconds",
-    "legacy_waiting_network": "sync_downloads_waiting_network",
-    "legacy_downloading": "sync_downloads_downloading",
-    "legacy_waiting_verifier": "sync_downloads_waiting_verifier",
-    "legacy_verifying": "sync_downloads_verifying",
     "vct_fast": "state_vct_fast_block_count",
     "vct_legacy": "state_vct_legacy_block_count",
     "sapling_height": "sync_report_sapling_height",
@@ -270,6 +265,7 @@ def validate_report(report: dict) -> None:
     """Validate remote samples before storing or rendering them."""
     metadata = report.get("metadata", {})
     if (metadata.get("version") != VERSION or metadata.get("columns") != COLUMNS
+            or metadata.get("mode") not in REPORT_MODES
             or not RUN_ID.fullmatch(metadata.get("run_id", ""))
             or not finite(metadata.get("interval")) or not 0 < metadata["interval"] <= 86400
             or not isinstance(metadata.get("host"), dict)
@@ -310,10 +306,10 @@ def rates(report: dict) -> list[dict]:
         point = {**current, "download": None, "commit": None, "vct_share": None}
         if 0 < elapsed <= maximum_gap:
             for kind in ("download", "commit"):
-                keys = [kind + "_zakura", kind + "_legacy"]
-                if all(finite(previous[key]) and finite(current[key])
-                       and current[key] >= previous[key] for key in keys):
-                    point[kind] = sum(current[key] - previous[key] for key in keys) / elapsed / 1_000_000
+                key = kind + "_zakura"
+                if (finite(previous[key]) and finite(current[key])
+                        and current[key] >= previous[key]):
+                    point[kind] = (current[key] - previous[key]) / elapsed / 1_000_000
             keys = ("vct_fast", "vct_legacy")
             if all(finite(previous[key]) and finite(current[key]) and current[key] >= previous[key] for key in keys):
                 fast, legacy = (current[key] - previous[key] for key in keys)
@@ -378,10 +374,11 @@ def comparison_key(report: dict) -> str | None:
     """Keep tuning, hardware, and network differences out of a shared baseline."""
     metadata = report.get("metadata", {})
     settings = metadata.get("settings", {})
-    if not settings.get("available") or not settings.get("tuning_complete", True):
+    if (metadata.get("mode") not in REPORT_MODES
+            or not settings.get("available") or not settings.get("tuning_complete", True)):
         return None
     floors = sorted({row["request_floor_bytes"] for row in unpack(report) if finite(row["request_floor_bytes"])})
-    if metadata.get("mode") != "legacy" and len(floors) != 1:
+    if len(floors) != 1:
         return None
     identity = {key: metadata.get(key) for key in ("mode", "settings", "host")}
     identity["request_floor_bytes"] = floors

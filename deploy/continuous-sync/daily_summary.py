@@ -24,7 +24,7 @@ from zoneinfo import ZoneInfo
 from deploy import DeployError, Node, completion_updates, post_slack, slack_webhook_url, sync_label
 import report_charts
 from slack_report import Client, send_pending
-from sync_report import RETENTION_SECONDS, RUN_ID, validate_report
+from sync_report import REPORT_MODES, RETENTION_SECONDS, RUN_ID, validate_report
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -173,6 +173,8 @@ def prepare_charts(config: dict, statuses: dict, cursors: dict, directory: Path)
         except (OSError, ValueError, TypeError):
             continue
     for node in config["nodes"]:
+        if node.get("p2p_stack") not in REPORT_MODES:
+            continue
         name = node["name"]
         state = statuses.get(name, {}).get("controller_state", {})
         total = state.get("runs", cursors[name]["number"])
@@ -197,6 +199,8 @@ def prepare_charts(config: dict, statuses: dict, cursors: dict, directory: Path)
                 validate_report(report)
                 if report["metadata"]["run_id"] != run_id:
                     raise ValueError("wrong run returned")
+                if report["metadata"]["mode"] != node["p2p_stack"]:
+                    raise ValueError("wrong networking mode returned")
                 report["metadata"]["host"]["node"] = name
             except (ValueError, TypeError, KeyError):
                 report = {"run_id": run_id, "mode": node.get("p2p_stack"),

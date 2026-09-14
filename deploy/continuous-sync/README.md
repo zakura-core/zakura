@@ -216,7 +216,8 @@ The Slack summary also retains host IDs and current status for troubleshooting.
 #### Charts
 
 With `[summary].charts = true`, the sender posts the text summary through a Slack
-bot, then uploads a chart reply for each networking section in the same thread.
+bot, then uploads chart replies for Dual (mixed) and Zakura-only in the same
+thread. Legacy keeps its existing text summary without added chart telemetry.
 Each image holds up to three runs, oldest first. Longer catch-up summaries use
 multiple images, capped at the latest 12 completions per node plus its current
 failed run. The title names any earlier completions without charts. Old binaries,
@@ -224,19 +225,18 @@ expired reports, missing samples, and unavailable nodes are shown explicitly.
 Charts do not reconstruct earlier runs from partial diagnostic logs.
 
 The duration bars show where the time went by committed block height. For example,
-an illustrative Legacy run taking two extra hours in Sandblast gets a longer
+an illustrative Dual run taking two extra hours in Sandblast gets a longer
 Sandblast segment even if its final BPS looks similar to yesterday's run.
-Below the bars, every mode uses the same height, MB/s, and queue scales for that
+Below the bars, both modes use the same height, MB/s, and queue scales for that
 daily snapshot. Set `chart_axis = "time"` to spread stalls along elapsed time.
 The duration bars remain visible in either view.
 
 | Layer | Meaning |
 | --- | --- |
 | Sprout, Sapling, Sandblast, post-Sandblast, Ironwood | Sapling and Ironwood boundaries come from the running binary. Ironwood appears when its activation is known and in range. Sandblast is a reporting window, initially **1,707,211 through 2,000,000 inclusive**, configured in `nodes.toml`. |
-| Download and commit MB/s | Deltas of cumulative serialized block payload bytes divided by monotonic elapsed seconds and 1,000,000. Both networking lanes are summed in dual mode. These exclude transport overhead and request-budget estimates. Downloads can include retries. Commit bytes count successful submissions. |
+| Download and commit MB/s | Deltas of cumulative serialized block payload bytes divided by monotonic elapsed seconds and 1,000,000. Both modes measure Zakura block-sync payloads. These exclude Legacy networking traffic, transport overhead, and request-budget estimates. Downloads can include retries. Commit bytes count successful submissions. |
 | Dual / Zakura queues | Contiguous blocks ready to submit, blocks submitted to the verifier, and bodies buffered behind a gap. These are separate counts. |
-| Legacy queues | Blocks waiting for verifier readiness and blocks verifying or waiting for a state commit. These do not claim identical stages to Zakura's queues. |
-| VCT strip | Observed share of tree updates using VCT. Legacy is labelled as not using VCT. The dotted height line is this binary's checkpoint limit. |
+| VCT strip | VCT tree updates as a share of all tree updates. The total includes fallback updates within Dual and Zakura runs. The dotted height line is this binary's checkpoint limit. |
 
 No missing value becomes zero. Counter decreases and scrape gaps over
 `max(90 seconds, 3 × configured polling interval)` break rate lines. Valid region
@@ -245,16 +245,16 @@ the sampling resolution. Startup, unknown coverage, and readiness/shutdown time
 remain visible in grey. Chart duration uses a monotonic clock; the text summary
 retains its existing whole-second wall-clock duration.
 
-The controller samples every 10 seconds by default, plus the time to perform its
-status checks. The existing readiness confirmation interval stays at 30 seconds.
-It retains compact numeric samples and allowlisted run metadata in
+The inventory configures Dual and Zakura controllers to sample every 10 seconds,
+plus the time to perform their status checks. Legacy keeps its existing 30-second
+polling interval and does not collect compact reports. The existing readiness
+confirmation interval stays at 30 seconds for all modes.
+Dual and Zakura retain compact numeric samples and allowlisted run metadata in
 `/var/lib/zakura-continuous-sync/reports/<run-id>.json` and `.jsonl.gz`.
 Active runs use `.jsonl`. Reports are independent of trace rotation and trace
 uploads. Cleanup keeps 30 days, capped at 256 runs and 32 MiB of uncompressed
 samples per run. Collection errors are logged and recorded without halting sync.
 The node byte counters remain available even when diagnostic tracing is disabled.
-Legacy obtains the payload size with a counting serializer without allocating
-another block buffer.
 
 Retained metadata includes the commit, mode, host CPU count/architecture/kernel,
 allowlisted public tuning, observed minimum request window, upgrade/checkpoint

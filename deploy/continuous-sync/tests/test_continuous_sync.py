@@ -3,6 +3,7 @@ import contextlib
 import hashlib
 import importlib.util
 import io
+import itertools
 import json
 import os
 import subprocess
@@ -257,6 +258,25 @@ class ContinuousSyncTests(unittest.TestCase):
                 self.assertEqual(run_state["end_height"], 101 if final_height == 101 else None)
                 # Progress tracking can still use estimates; throughput cannot.
                 self.assertEqual(run_state["height"], 105)
+
+    def test_compact_metrics_are_collected_only_for_dual_and_zakura(self):
+        metrics = "zcash_chain_verified_block_height 900\nsync_downloads_verifying 4\n"
+        for mode in ("dual", "zakura", "legacy", "zebra"):
+            with self.subTest(mode=mode):
+                config = make_config(Path("/tmp"), policy=sync.Policy(p2p_stack=mode))
+                with patch.object(sync, "service_active", return_value=True), \
+                     patch.object(sync, "fetch_text", return_value=metrics), \
+                     patch.object(sync, "fetch_ready", return_value=(False, "syncing")), \
+                     patch.object(sync, "sample_metrics", wraps=sync.sample_metrics) as collect:
+                    status = sync.sample_status(config)
+                self.assertEqual(status["height"], 900)
+                self.assertEqual(status["sync.downloads.verifying"], 4)
+                if mode in ("dual", "zakura"):
+                    collect.assert_called_once_with(metrics)
+                    self.assertEqual(status["report"]["height"], 900)
+                else:
+                    collect.assert_not_called()
+                    self.assertNotIn("report", status)
 
     def test_alert_status_falls_back_to_estimated_height(self):
         metrics = "\n".join(
@@ -719,6 +739,15 @@ p2p_stack = "zakura"
                 f'hostname = "temp-zakura-sync-test-{index}"',
                 rendered["alert-monitor.toml"],
             )
+
+    def test_faster_polling_applies_only_to_dual_and_zakura(self):
+        self.assertEqual(sync.Policy(p2p_stack="legacy").poll_interval_seconds, 30)
+        for node in deploy.load_nodes(SYNC_PATH.with_name("nodes.toml"), None):
+            with self.subTest(mode=node.raw["p2p_stack"]):
+                config = tomllib.loads(deploy.render_files(node)["controller.toml"])
+                expected = 30 if node.raw["p2p_stack"] == "legacy" else 10
+                self.assertEqual(config["policy"]["poll_interval_seconds"], expected)
+                self.assertEqual(config["policy"]["ready_sample_interval_seconds"], 30)
 
     def test_deploy_does_not_stop_node_before_restarting_controller(self):
         self.assertNotIn('systemctl stop "$node_service"', deploy.INSTALL_SCRIPT)
@@ -2073,10 +2102,12 @@ class NotificationTests(unittest.TestCase):
         valid_history = [
             {"number": n, "run_id": f"old-{n}", "duration": 100} for n in range(5, 261)
         ]
-        for persisted_history in (valid_history, None, {}, "bad", 7, [None]):
-            with self.subTest(history_type=type(persisted_history)):
+        for mode, persisted_history in itertools.product(
+            ("dual", "zakura", "legacy", "zebra"), (valid_history, None, {}, "bad", 7, [None])
+        ):
+            with self.subTest(mode=mode, history_type=type(persisted_history)):
                 with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as stack:
-                    config = make_config(Path(tmp))
+                    config = make_config(Path(tmp), policy=sync.Policy(p2p_stack=mode))
                     for name in (
                         "preflight", "build_binary", "sha256_file", "install_binary", "stop_service",
                         "safe_wipe_state", "render_config", "start_service",
@@ -2110,6 +2141,27 @@ class NotificationTests(unittest.TestCase):
                     self.assertEqual(state["last_success_end_height"], 3469999)
                     self.assertEqual(state["completion_digest_start_runs"], 260)
                     self.assertEqual(sync.load_state(path)["last_success_run"], state["current_run"])
+                    reports = config.paths.state_dir / "reports"
+                    if mode in ("dual", "zakura"):
+                        metadata = json.loads((reports / f"{state['current_run']}.json").read_text())
+                        self.assertEqual(metadata["mode"], mode)
+                        self.assertEqual(metadata["phase"], "complete")
+                    else:
+                        self.assertFalse(reports.exists())
+
+    def test_legacy_sync_failure_keeps_original_error_without_creating_a_report(self):
+        with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as stack:
+            config = make_config(Path(tmp), policy=sync.Policy(p2p_stack="legacy"))
+            for name in ("preflight", "build_binary", "sha256_file", "install_binary", "stop_service",
+                         "safe_wipe_state", "render_config", "start_service", "cleanup_retention"):
+                stack.enter_context(patch.object(sync, name, return_value="test"))
+            stack.enter_context(patch.object(sync, "resolve_sha", return_value="a" * 40))
+            stack.enter_context(patch.object(sync, "wait_for_completion", side_effect=sync.ControllerError("stalled")))
+            recorder = stack.enter_context(patch.object(sync, "Recorder"))
+            with self.assertRaisesRegex(sync.ControllerError, "stalled"):
+                sync.one_cycle(config, config.paths.state_dir / "state.json", {})
+            recorder.assert_not_called()
+            self.assertFalse((config.paths.state_dir / "reports").exists())
 
 
 class CanaryNotificationTests(unittest.TestCase):

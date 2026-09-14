@@ -59,6 +59,8 @@ Capture the time before trying to acquire the lock, then call
 returned `resources::LockHold` immediately before releasing the lock. These
 timings include delays from thread scheduling and the measurement itself. They
 describe the tested workload, rather than a timing limit that holds on any machine.
+Hold timing begins when `acquired_since` is called, so waiting for the probe's own
+lock is included while the measured lock remains held.
 
 `resources::load_rounds` defaults to four rounds only when
 `ZAKURA_REGULATION_LOAD_ROUNDS` is absent. A valid integer override is clamped

@@ -88,16 +88,18 @@ impl LockProbe {
     ///
     /// Capture `before` just before trying to acquire the lock, then call this
     /// immediately after acquiring it. Drop the returned guard just before
-    /// releasing the lock.
+    /// releasing the lock. Hold time includes delays in the probe's bookkeeping,
+    /// because the measured lock remains held during those delays.
     pub fn acquired_since(&self, before: std::time::Instant) -> LockHold<'_> {
-        let waited = before.elapsed();
+        let acquired = std::time::Instant::now();
+        let waited = acquired.duration_since(before);
         let mut snapshot = self.0.lock().unwrap();
         snapshot.acquisitions += 1;
         snapshot.wait += waited;
         snapshot.max_wait = snapshot.max_wait.max(waited);
         LockHold {
             probe: self,
-            acquired: std::time::Instant::now(),
+            acquired,
         }
     }
 
@@ -196,6 +198,18 @@ mod tests {
         drop(observation);
         drop(guard);
         assert!(probe.snapshot().max_hold >= held);
+    }
+
+    #[test]
+    fn lock_observation_has_no_gap_between_wait_and_hold() {
+        let probe = LockProbe::default();
+        let before = std::time::Instant::now();
+        let observation = probe.acquired_since(before);
+
+        // Bookkeeping runs while the measured lock is held. Its time must not
+        // disappear between the end of the wait and the start of the hold.
+        let wait_ended = before + probe.snapshot().wait;
+        assert_eq!(observation.acquired, wait_ended);
     }
 
     #[cfg(unix)]

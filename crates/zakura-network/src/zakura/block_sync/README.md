@@ -35,6 +35,40 @@ The distinction matters: anything anchored to the download floor is self-propell
 (downloading moves the floor, which permits more downloading),
 while anything anchored to the verified tip is pinned until real progress commits.
 
+## Retained serving range
+
+Native block-sync status advertises the range of retained, verified block bodies.
+The node initializes its lower bound from the persisted pruning marker. Storage
+publishes each new floor after the durable write and before the corresponding tip,
+so even a tip notification handled first uses the current floor. Archive nodes
+advertise from height zero. Requests for pruned heights return `RangeUnavailable`
+without querying storage. Genesis remains servable separately, and a request starting
+there stops before the pruned gap.
+
+Incoming status changes allow one extra range update per rate-limit window.
+Further range changes are coalesced and applied when the window expires, even
+if no new message arrives. Status replies remain rate limited.
+Each peer tracks the last status queued on its ordered stream. Changes that raise
+the lower bound or reduce the upper bound use a separate window of at most one
+second, including when pruning and tip growth happen together. All other changes
+use the configured refresh interval, so pruning does not wait behind tip-only growth.
+Further changes coalesce into the latest range. Full queues back off for at most
+100 ms without consuming a range-change allowance. One deadline calculation schedules
+range changes, queue retries, and incomplete status exchanges.
+
+Checkpoint retention can put the lower bound above the verified tip. Until retained
+bodies reach that height, the node advertises only genesis, which is always retained.
+This storage boundary does not advance the node's download floor or discard blocks
+it still needs from other peers. Embedders using pruned state should pass its retained
+height watch in `ZakuraHeaderSyncDriverStartup`, which every production endpoint
+initializer forwards. Direct reactor users attach it with
+`BlockSyncStartup::with_retention`.
+
+Advertisements describe current availability and do not reserve block bodies.
+A request already in flight can overlap pruning before its database read. That
+pre-existing race can still return `RangeUnavailable`; preventing it requires a
+separate serving/read reservation contract.
+
 ## The two lanes: Floor vs AboveFloor
 
 `RequestPriority` classifies a request by its start height

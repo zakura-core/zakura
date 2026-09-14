@@ -28,6 +28,9 @@ categories = ["asynchronous", "cryptography::cryptocurrencies", "encoding", "net
 [features]
 default = []
 
+# Completion-based commit throughput for opt-in sync reports.
+sync-metrics = []
+
 # Production features that activate extra dependencies, or extra features in dependencies
 
 progress-bar = [

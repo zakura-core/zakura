@@ -216,6 +216,8 @@ docker run --rm \
 export ZAKURAD_BIN
 ZAKURA_E2E_TRACE_DIR="${ZAKURA_E2E_TRACE_DIR:-${TMPDIR:-${HOME}/.tmp}/zakura-regtest-e2e-traces-${RUN_LABEL}}"
 export ZAKURA_E2E_TRACE_DIR
+ZAKURA_TRACE_CAPTURE_RUN="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+export ZAKURA_TRACE_CAPTURE_RUN
 if [[ -d "${ZAKURA_E2E_TRACE_DIR}" ]] && [[ -n "$(find "${ZAKURA_E2E_TRACE_DIR}" -mindepth 1 -print -quit)" ]]; then
   fail "trace directory must be empty for this run: ${ZAKURA_E2E_TRACE_DIR}"
 fi
@@ -353,6 +355,19 @@ wait_for_commit_trace_balance() {
   fail "${label} commit trace did not balance within ${TRACE_FLUSH_TIMEOUT}s"
 }
 
+seal_trace_capture() {
+  local directory="$1" deadline=$((SECONDS + TRACE_FLUSH_TIMEOUT))
+  python3 "${SCRIPT_DIR}/trace_oracle.py" --seal-capture "${ZAKURA_TRACE_CAPTURE_RUN}" "${directory}" \
+    || { printf 'could not request trace capture seal\n' >&2; return 1; }
+  while ! python3 "${SCRIPT_DIR}/trace_oracle.py" --check-capture "${ZAKURA_TRACE_CAPTURE_RUN}" "${directory}"; do
+    if (( SECONDS >= deadline )); then
+      printf 'trace capture did not seal completely: %s\n' "${directory}" >&2
+      return 1
+    fi
+    sleep 1
+  done
+}
+
 run_trace_oracle() {
   trace_dir_has_csv || return 0
   ORACLE_RAN=1
@@ -364,6 +379,10 @@ run_trace_oracle() {
     "--handoff-stall-seconds" "${ZAKURA_E2E_ORACLE_HANDOFF_STALL_SECONDS:-180}"
     "--require-commit-node" "node2"
     "--require-commit-node" "node4"
+    "--require-sync-node" "node1"
+    "--require-sync-node" "node2"
+    "--require-sync-node" "node4"
+    "--capture-run-id" "${ZAKURA_TRACE_CAPTURE_RUN}"
   )
   if [[ "${ZAKURA_E2E_REQUIRE_HANDOFF}" == "1" ]]; then
     oracle_args+=("--require-handoff-boundary")
@@ -374,6 +393,7 @@ run_trace_oracle() {
   if ! strict_upgrade; then
     oracle_args+=("--optional-lag-node" "node4")
   fi
+  seal_trace_capture "${ZAKURA_E2E_TRACE_DIR}" || return 1
   python3 "${SCRIPT_DIR}/trace_oracle.py" "${oracle_args[@]}" "${ZAKURA_E2E_TRACE_DIR}"
 }
 
@@ -836,6 +856,7 @@ wait_ready() {
 
 stop_node2_for_reset() {
   local label="$1"
+  seal_trace_capture "${ZAKURA_E2E_TRACE_DIR}/node2"
   docker compose -f "${COMPOSE_FILE}" stop zakura-node-2 \
     || fail "could not stop node2 for ${label}"
   if [[ "${ZAKURA_E2E_RESTART_MATRIX}" == "1" ]]; then
@@ -874,6 +895,7 @@ reset_node2_from_scratch() {
 
 restart_node2_preserving_state() {
   local label="$1"
+  seal_trace_capture "${ZAKURA_E2E_TRACE_DIR}/node2"
   docker compose -f "${COMPOSE_FILE}" stop zakura-node-2 \
     || fail "could not stop node2 for ${label}"
   docker compose -f "${COMPOSE_FILE}" start zakura-node-2 \
@@ -1088,6 +1110,7 @@ quiesce_optional_node4_before_extended_work() {
     || fail "node1 trace did not contain exactly two active header sessions before stopping node4"
   disconnects_before=$(trace_rows_after "${header_file}" 0 | jq -sc '[.[] | select(.event == "header_peer_disconnected")] | length' || true)
 
+  seal_trace_capture "${ZAKURA_E2E_TRACE_DIR}/node4"
   docker compose -f "${COMPOSE_FILE}" stop zakura-node-4 \
     || fail "could not stop optional node4 before extended work"
 

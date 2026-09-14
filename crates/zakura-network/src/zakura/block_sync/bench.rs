@@ -320,14 +320,14 @@ impl BenchCommitter {
         });
     }
 
-    /// Emit one `block_sync_state` snapshot row into `block_sync.csv`, mirroring the
-    /// periodic row the full block-sync reactor writes in production (the row the
+    /// Emit one `block_sync_pipeline_state` row into `block_sync.csv`, containing
+    /// the pipeline counters from the production reactor (the fields the
     /// zakura-trace-plots skill reads: `verified_block_tip`, `applying`, `reorder`,
     /// `submitted_applies`, and the in-flight byte counters). Cheap and non-blocking;
     /// a no-op when tracing is disabled. Call it on a cadence from the bench driver.
     pub fn emit_state_snapshot(&self) {
         self.trace.emit_event(|| {
-            BlockTraceEvent::build(bs_trace::BLOCK_SYNC_STATE, |row| {
+            BlockTraceEvent::build(bs_trace::BLOCK_SYNC_PIPELINE_STATE, |row| {
                 let view = *self.view.borrow();
                 let sequencer_input_decoded_attributed_memory_bytes = self
                     .body_input_decoded_attributed_memory_bytes

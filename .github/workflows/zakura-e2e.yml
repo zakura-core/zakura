@@ -95,7 +95,7 @@ jobs:
             fi
           fi
 
-          if printf '%s\n' "$changed" | grep -qE '^(crates/zakura-network/|crates/zakurad/src/components/sync/|crates/zakurad/tests/zakura_regtest_e2e\.rs|docker/zakura-regtest-e2e/|docker/docker-compose\.zakura-regtest-e2e\.yml|\.github/workflows/zakura-e2e\.yml)'; then
+          if printf '%s\n' "$changed" | grep -qE '^(crates/zakura-jsonl-trace/|scripts/zakura_trace\.py|scripts/tests/test_zakura_trace\.py|crates/zakura-network/|crates/zakurad/src/components/sync/|crates/zakurad/tests/zakura_regtest_e2e\.rs|docker/zakura-regtest-e2e/|docker/docker-compose\.zakura-regtest-e2e\.yml|\.github/workflows/zakura-e2e\.yml)'; then
             echo "zakura=true" >> "$GITHUB_OUTPUT"
           else
             echo "zakura=false" >> "$GITHUB_OUTPUT"
@@ -139,6 +139,11 @@ jobs:
           # This is the only writer for the shared e2e debug cache.
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: ./.github/actions/setup-zakura-build
+      - name: Check trace input and evidence contracts
+        run: |
+          python3 docker/zakura-regtest-e2e/trace_oracle.py --self-test
+          python3 -m unittest discover -s scripts/tests -p 'test_zakura_trace*.py'
+          python3 -m unittest discover -s scripts/tests -p test_zakura_bench_digest.py
       # Compile the e2e once. `cargo test --no-run` builds both the integration
       # test binary and the `zakurad` bin (cargo always builds a package's
       # binaries so its integration tests can find them via CARGO_BIN_EXE_*); the

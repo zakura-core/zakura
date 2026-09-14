@@ -3,16 +3,20 @@
 use std::{
     collections::HashSet,
     fs, io,
+    io::Read,
     path::{Path, PathBuf},
 };
 
 use serde_json::Value;
-use zakura_jsonl_trace::{ENVELOPE_COLUMNS, EXTRA_COLUMN};
+use zakura_jsonl_trace::{decode, files::open_regular, ENVELOPE_COLUMNS, EXTRA_COLUMN};
 
 /// Loaded Zakura trace tables.
 #[derive(Clone, Debug, Default)]
 pub struct TraceReader {
     rows: Vec<TraceRow>,
+    input_bytes: u64,
+    input_files: usize,
+    input_entries: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -53,10 +57,22 @@ impl TraceReader {
             return Ok(reader);
         }
 
+        if fs::symlink_metadata(path)?.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "trace directory must not be a symlink",
+            ));
+        }
         reader.load_dir(path, None)?;
-        let mut dirs = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
+        let mut dirs = directory_entries(path, &mut reader.input_entries)?;
         dirs.sort_by_key(|entry| entry.path());
         for entry in dirs {
+            if entry.file_type()?.is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "trace directory entry must not be a symlink",
+                ));
+            }
             if entry.file_type()?.is_dir() {
                 let source_node = source_node_from_dir(&entry.path());
                 reader.load_dir(&entry.path(), source_node)?;
@@ -90,13 +106,19 @@ impl TraceReader {
     }
 
     fn load_dir(&mut self, path: &Path, source_node: Option<String>) -> io::Result<()> {
-        let mut files = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
+        let mut files = directory_entries(path, &mut self.input_entries)?;
         files.sort_by_key(|entry| trace_segment(&entry.path()));
 
         for entry in files {
             let path = entry.path();
-            if !entry.file_type()?.is_file() || trace_segment(&path).is_none() {
+            if trace_segment(&path).is_none() {
                 continue;
+            }
+            if !entry.file_type()?.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "trace entry must be a regular file",
+                ));
             }
 
             self.load_file(path, source_node.clone())?;
@@ -108,11 +130,34 @@ impl TraceReader {
     fn load_file(&mut self, path: PathBuf, source_node: Option<String>) -> io::Result<()> {
         let (table, _) = trace_segment(&path)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid trace file name"))?;
-        let mut reader = csv::Reader::from_path(path)?;
+        let file = open_regular(&path, fs::OpenOptions::new().read(true))?;
+        let size = file.metadata()?.len();
+        self.input_bytes = self.input_bytes.saturating_add(size);
+        self.input_files += 1;
+        if self.input_bytes > decode::MAX_CAPTURE_BYTES
+            || self.input_files > decode::MAX_CAPTURE_FILES
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "trace byte/file budget exceeded",
+            ));
+        }
+        let mut reader = csv::Reader::from_reader(file.take(size));
         let headers = reader.headers()?.clone();
         let header_columns = validate_csv_headers(&table, &headers)?;
         for record in reader.records() {
             let record = record?;
+            if self.rows.len() >= decode::MAX_CAPTURE_ROWS
+                || record.as_slice().len() > decode::MAX_RECORD_BYTES
+                || record
+                    .iter()
+                    .any(|field| field.len() > decode::MAX_FIELD_BYTES)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "trace row/field budget exceeded",
+                ));
+            }
             let mut row = serde_json::Map::new();
             let mut extra = None;
             for (column, value) in headers.iter().zip(record.iter()) {
@@ -120,10 +165,9 @@ impl TraceReader {
                     continue;
                 }
                 if column == EXTRA_COLUMN {
-                    extra = Some(
-                        serde_json::from_str::<serde_json::Map<String, Value>>(value)
-                            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
-                    );
+                    extra = Some(decode::json(value)?.as_object().cloned().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "CSV extra must be an object")
+                    })?);
                 } else {
                     // CSV carries no type metadata. Keep identity and label columns textual.
                     let has_type = |kind: &str| {
@@ -137,8 +181,7 @@ impl TraceReader {
                     let boolean = has_type("boolean_fields");
                     let typed = integer || boolean || has_type("json_fields");
                     let value = if typed {
-                        serde_json::from_str(value)
-                            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+                        decode::json(value)?
                     } else {
                         Value::String(value.to_owned())
                     };
@@ -163,6 +206,7 @@ impl TraceReader {
                 }
                 row.extend(extra);
             }
+            decode::row(&row)?;
             self.rows.push(TraceRow {
                 table: table.clone(),
                 source_node: source_node.clone(),
@@ -171,6 +215,20 @@ impl TraceReader {
         }
         Ok(())
     }
+}
+
+fn directory_entries(path: &Path, visited: &mut usize) -> io::Result<Vec<fs::DirEntry>> {
+    let entries = fs::read_dir(path)?
+        .take(1025)
+        .collect::<Result<Vec<_>, _>>()?;
+    *visited = visited.saturating_add(entries.len());
+    if entries.len() > 1024 || *visited > 4096 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trace directory entry budget exceeded",
+        ));
+    }
+    Ok(entries)
 }
 
 fn trace_schema() -> &'static Value {
@@ -369,7 +427,30 @@ pub(super) fn write_trace_rows(path: &Path, rows: &[Value]) {
     let mut writer = csv::Writer::from_path(path).expect("CSV file");
     writer.write_record(&header).expect("CSV header");
     for row in rows {
-        let object = row.as_object().expect("trace object");
+        let mut object = row.as_object().expect("trace object").clone();
+        if let Some(required) = trace_schema()["required_event_fields"]
+            .get(object["event"].as_str().expect("fixture event"))
+            .and_then(Value::as_array)
+        {
+            for field in required {
+                let field = field.as_str().expect("schema field");
+                let numeric = trace_schema()["integer_fields"]
+                    .as_array()
+                    .expect("integer fields")
+                    .iter()
+                    .any(|name| name == field);
+                object.entry(field.to_owned()).or_insert_with(|| {
+                    if numeric {
+                        Value::from(0)
+                    } else {
+                        Value::from("fixture")
+                    }
+                });
+            }
+        }
+        for (key, value) in serde_json::json!({"trace_version": 2, "ts": 0, "node": "fixture", "process_trace_id": "fixture", "wall_ts": "2026-09-13T00:00:00.000Z"}).as_object().expect("fixture envelope") {
+            object.entry(key.clone()).or_insert_with(|| value.clone());
+        }
         let extra: serde_json::Map<_, _> = object
             .iter()
             .filter(|(key, _)| !header.contains(&key.as_str()))
@@ -435,6 +516,7 @@ mod tests {
                 "wall_ts",
                 "node",
                 "process_trace_id",
+                "trace_version",
                 "event",
                 "height",
                 "hash",
@@ -448,6 +530,7 @@ mod tests {
                 "2026-09-11T00:00:00Z",
                 "01",
                 "process-1",
+                "2",
                 "commit_finish",
                 "42",
                 "1234",
@@ -492,6 +575,7 @@ mod tests {
                 "wall_ts",
                 "node",
                 "process_trace_id",
+                "trace_version",
                 "event",
                 "extra",
             ])
@@ -502,6 +586,7 @@ mod tests {
                 "2026-09-11T00:00:00Z",
                 "01",
                 "process-1",
+                "2",
                 "commit_start",
                 r#"{"event":"commit_finish"}"#,
             ])
@@ -579,5 +664,25 @@ mod tests {
             .collect();
 
         assert_eq!(events, ["from-a", "from-b"]);
+    }
+    #[test]
+    fn reader_matches_shared_csv_contract() {
+        let fixtures: Value =
+            serde_json::from_str(decode::CSV_READER_FIXTURES).expect("shared fixtures are JSON");
+        let dir = tempfile::tempdir().expect("fixture directory");
+        for fixture in fixtures.as_array().expect("fixtures form an array") {
+            fs::write(
+                dir.path().join("commit_state.csv"),
+                fixture["csv"].as_str().expect("fixture CSV is text"),
+            )
+            .expect("fixture is writable");
+            let result = TraceReader::load(dir.path());
+            assert_eq!(
+                result.is_ok(),
+                fixture["valid"].as_bool().expect("validity is boolean"),
+                "{}: {result:?}",
+                fixture["name"]
+            );
+        }
     }
 }

@@ -3,7 +3,8 @@
     "ts",
     "wall_ts",
     "node",
-    "process_trace_id"
+    "process_trace_id",
+    "trace_version"
   ],
   "tables": {
     "handshake": [
@@ -538,7 +539,8 @@
     "unsubmitted_applying_count",
     "verified_block_tip",
     "verified_generation",
-    "work_anchor_height"
+    "work_anchor_height",
+    "trace_version"
   ],
   "boolean_fields": [
     "local_frontier",
@@ -548,5 +550,49 @@
   "json_fields": [
     "received_status",
     "tasks"
-  ]
+  ],
+  "version": 2,
+  "required_event_fields": {
+    "block_sync_state": [
+      "applying",
+      "outstanding",
+      "reorder",
+      "budget_reserved",
+      "best_header_tip",
+      "verified_block_tip"
+    ],
+    "header_snapshot_observed": [
+      "state_version",
+      "header_generation",
+      "verified_generation",
+      "new_selected_height",
+      "new_selected_hash"
+    ],
+    "header_request_sent": [
+      "session_id",
+      "request_id",
+      "stream_version"
+    ],
+    "block_get_blocks_sent": [
+      "range_start",
+      "range_count"
+    ],
+    "block_apply_finished": [
+      "apply_token",
+      "height",
+      "result"
+    ],
+    "sync_frontier_transition": [
+      "old_finalized_height",
+      "new_finalized_height",
+      "old_verified_body_height",
+      "new_verified_body_height",
+      "cause"
+    ],
+    "block_sync_pipeline_state": [
+      "applying",
+      "reorder",
+      "verified_block_tip"
+    ]
+  }
 }

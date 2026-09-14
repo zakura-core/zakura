@@ -1,12 +1,20 @@
 //! Shared non-blocking CSV tracing support for Zebra components.
 
+pub mod decode;
+pub mod files;
+
+use files::{open_regular, TraceLock};
+
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    fs::{self, File, OpenOptions},
-    io::{self, BufRead, BufReader, Write},
+    fs::{self, OpenOptions},
+    io::{self, BufRead, BufReader, Read, Write},
     path::PathBuf,
-    sync::OnceLock,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, OnceLock,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -55,8 +63,16 @@ pub const DEFAULT_CSV_ROTATION_SEGMENTS: usize = 2;
 /// Env var used to label every CSV trace record with a stable node identifier.
 pub const NODE_ID_ENV: &str = "ZEBRA_NODE_ID";
 
+/// Environment variables consumed by this runtime, rather than TOML config.
+pub const RUNTIME_ENV_VARS: &[&str] = &[
+    NODE_ID_ENV,
+    "ZAKURA_TRACE_FILE_BYTES",
+    "ZAKURA_TRACE_CAPTURE_RUN",
+];
+
 /// Envelope columns written for every trace row, in output order.
-pub const ENVELOPE_COLUMNS: &[&str] = &["ts", "wall_ts", "node", "process_trace_id"];
+pub const ENVELOPE_COLUMNS: &[&str] =
+    &["ts", "wall_ts", "node", "process_trace_id", "trace_version"];
 
 /// Column names and value types for the node's structured CSV traces.
 pub const SCHEMA_JSON: &str = include_str!("../schema.json");
@@ -299,7 +315,6 @@ macro_rules! impl_jsonl_trace_event {
 pub struct JsonlEventEmitter {
     tracer: JsonlTracer,
     node: std::sync::Arc<str>,
-    started: Instant,
 }
 
 impl JsonlEventEmitter {
@@ -313,7 +328,6 @@ impl JsonlEventEmitter {
         Self {
             tracer,
             node: node.into(),
-            started: Instant::now(),
         }
     }
 
@@ -342,7 +356,8 @@ impl JsonlEventEmitter {
 
         let event = build();
         let row = JsonlEventEnvelope {
-            ts: elapsed_micros(self.started.elapsed()),
+            ts: process_elapsed_micros(),
+            trace_version: 2,
             wall_ts: WallClock::now(),
             node: &self.node,
             process_trace_id: process_trace_id(),
@@ -357,6 +372,8 @@ impl JsonlEventEmitter {
                 header: E::TABLE.header(),
                 line,
             });
+        } else {
+            permit.counts.dropped.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -367,10 +384,8 @@ impl JsonlEventEmitter {
         };
 
         let mut row = Map::new();
-        row.insert(
-            "ts".to_string(),
-            Value::from(elapsed_micros(self.started.elapsed())),
-        );
+        row.insert("trace_version".to_owned(), Value::from(2));
+        row.insert("ts".to_string(), Value::from(process_elapsed_micros()));
         row.insert(
             "wall_ts".to_string(),
             Value::String(WallClock::now().to_string()),
@@ -406,6 +421,7 @@ impl Default for JsonlEventEmitter {
 
 #[derive(Serialize)]
 struct JsonlEventEnvelope<'a, E> {
+    trace_version: u64,
     ts: u64,
     wall_ts: WallClock,
     node: &'a str,
@@ -416,17 +432,9 @@ struct JsonlEventEnvelope<'a, E> {
 
 /// An absolute UTC timestamp, rendered as RFC 3339 with millisecond precision.
 ///
-/// [`JsonlEventEnvelope::ts`] counts microseconds since its emitter was
-/// constructed, and a node builds several emitters with independent origins, so
-/// `ts` orders rows only within one emitter. Comparing rows across emitters — or
-/// across nodes, which is the whole point of a propagation measurement — needs
-/// an absolute clock.
-///
-/// This reads the system clock per event rather than deriving it from the
-/// monotonic origin: NTP keeps the system clock disciplined for the length of a
-/// run, whereas an offset applied to a monotonic origin accumulates the local
-/// crystal's drift (tens of ppm, so hundreds of milliseconds over a few hours —
-/// the same order as the propagation delays being measured).
+/// [`JsonlEventEnvelope::ts`] counts microseconds from one process-wide origin.
+/// Compare `ts` only within the same `process_trace_id`. Use `wall_ts` for
+/// cross-process correlation; wall-clock adjustments can change those durations.
 #[derive(Copy, Clone, Debug)]
 struct WallClock(chrono::DateTime<chrono::Utc>);
 
@@ -449,6 +457,11 @@ impl Serialize for WallClock {
     {
         serializer.collect_str(&self.0.format("%Y-%m-%dT%H:%M:%S%.3fZ"))
     }
+}
+
+fn process_elapsed_micros() -> u64 {
+    static STARTED: OnceLock<std::time::Instant> = OnceLock::new();
+    elapsed_micros(STARTED.get_or_init(std::time::Instant::now).elapsed())
 }
 
 fn elapsed_micros(elapsed: Duration) -> u64 {
@@ -479,7 +492,7 @@ pub fn node_id() -> &'static str {
 /// Returns an opaque identifier shared by every CSV emitter in this process.
 ///
 /// The identifier disambiguates appended trace rows across process restarts.
-/// Emitter-local monotonic timestamps restart from zero after each restart.
+/// Process-local monotonic timestamps restart from zero after each restart.
 /// The identifier provides only a correlation label.
 /// The identifier does not provide randomness or security identity.
 pub fn process_trace_id() -> &'static str {
@@ -515,6 +528,8 @@ pub struct JsonlWriteEvent {
 pub struct JsonlTraceConfig {
     /// Bounded queue capacity.
     pub channel_capacity: usize,
+    /// Require an unrotated validation capture attributed to this run.
+    pub capture_run_id: Option<String>,
     /// Maximum number of events to write in a single batch.
     pub max_batch_events: usize,
     /// How long to wait for more events after receiving the first batch event.
@@ -533,6 +548,7 @@ impl Default for JsonlTraceConfig {
     fn default() -> Self {
         Self {
             channel_capacity: DEFAULT_CHANNEL_CAPACITY,
+            capture_run_id: None,
             max_batch_events: DEFAULT_MAX_BATCH_EVENTS,
             batch_linger: DEFAULT_BATCH_LINGER,
             buffer_flush_bytes: DEFAULT_BUFFER_FLUSH_BYTES,
@@ -554,13 +570,27 @@ impl JsonlTraceConfig {
                 }
             }
         }
+        if let Ok(run_id) = std::env::var("ZAKURA_TRACE_CAPTURE_RUN") {
+            if !run_id.is_empty() {
+                config.capture_run_id = Some(run_id);
+                config.csv_rotation_segments = 0;
+            }
+        }
         config
     }
+}
+
+#[derive(Debug, Default)]
+struct TraceCounts {
+    accepted: AtomicU64,
+    dropped: AtomicU64,
+    sealed: AtomicBool,
 }
 
 #[derive(Clone)]
 struct TraceRuntime {
     tx: mpsc::Sender<JsonlWriteEvent>,
+    counts: Arc<TraceCounts>,
 }
 
 /// A non-blocking handle for emitting CSV trace records.
@@ -613,11 +643,13 @@ pub enum JsonlTraceSendError {
 #[derive(Debug)]
 pub struct JsonlTracePermit {
     permit: mpsc::OwnedPermit<JsonlWriteEvent>,
+    counts: Arc<TraceCounts>,
 }
 
 impl JsonlTracePermit {
     /// Send a record into the reserved queue slot.
     pub fn send(self, event: JsonlWriteEvent) {
+        self.counts.accepted.fetch_add(1, Ordering::SeqCst);
         self.permit.send(event);
     }
 }
@@ -626,7 +658,10 @@ impl JsonlTracer {
     /// Create a tracer backed by the supplied sender.
     pub fn new(tx: mpsc::Sender<JsonlWriteEvent>) -> Self {
         Self {
-            inner: TraceState::Enabled(TraceRuntime { tx }),
+            inner: TraceState::Enabled(TraceRuntime {
+                tx,
+                counts: Arc::default(),
+            }),
         }
     }
 
@@ -681,12 +716,15 @@ impl JsonlTracer {
 
         let (tx, rx) = mpsc::channel(config.channel_capacity);
         let writer = TraceWriter::new(trace_dir.clone(), config);
+        let counts = writer.counts.clone();
         let shutdown = CancellationToken::new();
         let writer = handle.spawn(run_trace_writer(rx, writer, shutdown.clone()));
         tracing::info!(?trace_dir, "CSV tracing enabled");
 
         JsonlTraceGuard {
-            tracer: Self::new(tx),
+            tracer: Self {
+                inner: TraceState::Enabled(TraceRuntime { tx, counts }),
+            },
             shutdown,
             writer: Some(writer),
         }
@@ -699,7 +737,9 @@ impl JsonlTracer {
     pub fn is_enabled(&self) -> bool {
         match &self.inner {
             TraceState::Disabled => false,
-            TraceState::Enabled(runtime) => !runtime.tx.is_closed(),
+            TraceState::Enabled(runtime) => {
+                !runtime.tx.is_closed() && !runtime.counts.sealed.load(Ordering::SeqCst)
+            }
         }
     }
 
@@ -718,27 +758,39 @@ impl JsonlTracer {
             return Err(JsonlTraceReserveError::Disabled);
         };
 
+        if runtime.counts.sealed.load(Ordering::SeqCst) {
+            return Err(JsonlTraceReserveError::Disabled);
+        }
         runtime
             .tx
             .clone()
             .try_reserve_owned()
-            .map(|permit| JsonlTracePermit { permit })
-            .map_err(|error| match error {
-                TrySendError::Full(_) => JsonlTraceReserveError::Full,
-                TrySendError::Closed(_) => JsonlTraceReserveError::Closed,
+            .map(|permit| JsonlTracePermit {
+                permit,
+                counts: runtime.counts.clone(),
+            })
+            .map_err(|error| {
+                if !runtime.counts.sealed.load(Ordering::SeqCst) {
+                    runtime.counts.dropped.fetch_add(1, Ordering::SeqCst);
+                }
+                match error {
+                    TrySendError::Full(_) => JsonlTraceReserveError::Full,
+                    TrySendError::Closed(_) => JsonlTraceReserveError::Closed,
+                }
             })
     }
 
     /// Try to send a trace record without blocking.
     pub fn try_send(&self, event: JsonlWriteEvent) -> Result<(), JsonlTraceSendError> {
-        let TraceState::Enabled(runtime) = &self.inner else {
-            return Err(JsonlTraceSendError::Disabled(event));
-        };
-
-        runtime.tx.try_send(event).map_err(|error| match error {
-            TrySendError::Full(event) => JsonlTraceSendError::Full(event),
-            TrySendError::Closed(event) => JsonlTraceSendError::Closed(event),
-        })
+        match self.try_reserve() {
+            Ok(permit) => {
+                permit.send(event);
+                Ok(())
+            }
+            Err(JsonlTraceReserveError::Full) => Err(JsonlTraceSendError::Full(event)),
+            Err(JsonlTraceReserveError::Closed) => Err(JsonlTraceSendError::Closed(event)),
+            Err(JsonlTraceReserveError::Disabled) => Err(JsonlTraceSendError::Disabled(event)),
+        }
     }
 }
 
@@ -771,7 +823,9 @@ impl JsonlTraceGuard {
         self.shutdown.cancel();
 
         if let Some(writer) = self.writer.take() {
-            let _ = writer.await;
+            if time::timeout(Duration::from_secs(5), writer).await.is_err() {
+                tracing::warn!("trace writer did not finish within the shutdown deadline");
+            }
         }
     }
 }
@@ -810,14 +864,14 @@ impl TableWriter {
 
     fn append_lines(&self, lines: &[Vec<u8>], sync_file: bool) -> io::Result<()> {
         fs::create_dir_all(&self.trace_dir)?;
-        let _lock = TableLock::acquire(&self.trace_dir.join(format!("{}.lock", self.file_name)))?;
+        let _lock = TraceLock::acquire(&self.trace_dir.join(format!("{}.lock", self.file_name)))?;
         let path = self.trace_dir.join(self.file_name);
 
         if self.format == TraceFormat::Csv {
             self.validate_csv_segments()?;
         }
 
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut file = open_regular(&path, OpenOptions::new().create(true).append(true))?;
         let mut length = file.metadata()?.len();
         let header = render_csv_header(self.header);
         let header_length = u64::try_from(header.len() + 1).unwrap_or(u64::MAX);
@@ -838,7 +892,7 @@ impl TableWriter {
                 file.sync_data()?;
                 drop(file);
                 self.rotate_csv_segments()?;
-                file = OpenOptions::new().create(true).append(true).open(&path)?;
+                file = open_regular(&path, OpenOptions::new().create(true).append(true))?;
                 file.write_all(&header)?;
                 file.write_all(b"\n")?;
                 length = header_length;
@@ -865,11 +919,16 @@ impl TableWriter {
         }
 
         for path in paths {
-            if !path.exists() || path.metadata()?.len() == 0 {
+            let file = match open_regular(&path, OpenOptions::new().read(true)) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if file.metadata()?.len() == 0 {
                 continue;
             }
-            let file = File::open(&path)?;
-            let mut reader = BufReader::new(file);
+            let mut reader =
+                BufReader::new(file.take(saturating_count(expected.len()).saturating_add(2)));
             let mut header = Vec::new();
             let read = reader.read_until(b'\n', &mut header)?;
             if read == 0 || header.strip_suffix(b"\n") != Some(expected.as_slice()) {
@@ -914,39 +973,32 @@ impl TableWriter {
     }
 }
 
-struct TableLock {
-    _file: File,
-}
-
-impl TableLock {
-    fn acquire(path: &std::path::Path) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path)?;
-        file.lock()?;
-        Ok(Self { _file: file })
-    }
-}
-
 struct TraceWriter {
     trace_dir: PathBuf,
     config: JsonlTraceConfig,
     tables: HashMap<&'static str, TableWriter>,
     disabled_tables: HashSet<&'static str>,
     last_file_flush: Instant,
+    counts: Arc<TraceCounts>,
+    capture_id: u64,
+    table_counts: HashMap<&'static str, u64>,
 }
 
 impl TraceWriter {
-    fn new(trace_dir: PathBuf, config: JsonlTraceConfig) -> Self {
+    fn new(trace_dir: PathBuf, mut config: JsonlTraceConfig) -> Self {
+        if config.capture_run_id.is_some() {
+            config.csv_rotation_segments = 0;
+        }
+        static NEXT_CAPTURE_ID: AtomicU64 = AtomicU64::new(0);
         Self {
             trace_dir,
             config,
             tables: HashMap::new(),
             disabled_tables: HashSet::new(),
             last_file_flush: Instant::now(),
+            counts: Arc::default(),
+            capture_id: NEXT_CAPTURE_ID.fetch_add(1, Ordering::Relaxed),
+            table_counts: HashMap::new(),
         }
     }
 
@@ -955,8 +1007,25 @@ impl TraceWriter {
     }
 
     async fn write_batch(&mut self, batch: Vec<JsonlWriteEvent>, force_flush: bool) {
-        let sync_file =
-            force_flush || self.last_file_flush.elapsed() >= self.config.file_flush_interval;
+        let trace_dir = self.trace_dir.clone();
+        let lock = tokio::task::spawn_blocking(move || {
+            fs::create_dir_all(&trace_dir)?;
+            TraceLock::acquire(&trace_dir.join(".trace.lock"))
+        })
+        .await;
+        let _lock = match lock {
+            Ok(Ok(lock)) => lock,
+            _ => {
+                self.counts
+                    .dropped
+                    .fetch_add(saturating_count(batch.len()), Ordering::SeqCst);
+                tracing::warn!("could not lock trace directory");
+                return;
+            }
+        };
+        let sync_file = force_flush
+            || self.config.capture_run_id.is_some()
+            || self.last_file_flush.elapsed() >= self.config.file_flush_interval;
         let mut grouped: HashMap<&'static str, Vec<Vec<u8>>> = HashMap::new();
         for event in batch {
             if self.disabled_tables.contains(event.table) {
@@ -989,6 +1058,7 @@ impl TraceWriter {
             let Some(table_writer) = self.tables.get(&table_name).cloned() else {
                 continue;
             };
+            let row_count = saturating_count(lines.len());
             let result =
                 tokio::task::spawn_blocking(move || table_writer.append_lines(&lines, sync_file))
                     .await;
@@ -1003,6 +1073,8 @@ impl TraceWriter {
                     "disabling trace table after write failure"
                 );
                 failed_tables.push(table_name);
+            } else {
+                *self.table_counts.entry(table_name).or_default() += row_count;
             }
         }
 
@@ -1013,6 +1085,69 @@ impl TraceWriter {
         for table in failed_tables {
             self.disable_table(table);
         }
+        if let Some(run_id) = &self.config.capture_run_id {
+            let status = serde_json::json!({
+                "version": 2,
+                "run_id": run_id,
+                "process_trace_id": process_trace_id(),
+                "accepted": self.counts.accepted.load(Ordering::SeqCst),
+                "sealed": self.counts.sealed.load(Ordering::SeqCst),
+                "dropped": self.counts.dropped.load(Ordering::SeqCst),
+                "tables": self.table_counts,
+                "failed_tables": self.disabled_tables,
+                "rotation_segments": self.config.csv_rotation_segments,
+            });
+            let path = self.trace_dir.join(format!(
+                "capture-{}-{}.json",
+                process_trace_id(),
+                self.capture_id
+            ));
+            if let Err(error) = tokio::task::spawn_blocking(move || -> io::Result<()> {
+                let temporary = path.with_extension("pending");
+                let mut file =
+                    open_regular(&temporary, OpenOptions::new().create_new(true).write(true))?;
+                serde_json::to_writer(&mut file, &status)?;
+                file.sync_all()?;
+                fs::rename(temporary, path)?;
+                Ok(())
+            })
+            .await
+            .map_err(|error| io::Error::other(error.to_string()))
+            .and_then(|result| result)
+            {
+                tracing::warn!(?error, "could not publish trace capture status");
+            }
+        }
+    }
+
+    async fn seal_requested(&self) -> bool {
+        if self.config.capture_run_id.is_none() {
+            return false;
+        }
+        let path = self.trace_dir.join(format!(".seal-{}", process_trace_id()));
+        matches!(
+            tokio::task::spawn_blocking(move || open_regular(&path, OpenOptions::new().read(true)))
+                .await,
+            Ok(Ok(_))
+        )
+    }
+
+    async fn seal(&mut self, rx: &mut mpsc::Receiver<JsonlWriteEvent>) {
+        self.counts.sealed.store(true, Ordering::SeqCst);
+        rx.close();
+        let mut batch = Vec::new();
+        // Closing the receiver also waits for outstanding reserved permits.
+        if time::timeout(Duration::from_secs(2), async {
+            while let Some(event) = rx.recv().await {
+                batch.push(event);
+            }
+        })
+        .await
+        .is_err()
+        {
+            self.counts.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+        self.write_batch(batch, true).await;
     }
 
     async fn flush_all(&mut self) {
@@ -1034,6 +1169,10 @@ async fn run_trace_writer(
     flush_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
+        if writer.seal_requested().await {
+            writer.seal(&mut rx).await;
+            break;
+        }
         let mut batch = Vec::with_capacity(writer.config.max_batch_events);
         let mut receiver_closed = false;
         let mut force_flush = false;
@@ -1066,6 +1205,7 @@ async fn run_trace_writer(
                 batch.push(event);
             }
             writer.write_batch(batch, true).await;
+            writer.seal(&mut rx).await;
             break;
         }
 
@@ -1125,7 +1265,7 @@ async fn run_trace_writer(
         }
 
         if receiver_closed {
-            writer.flush_all().await;
+            writer.seal(&mut rx).await;
             break;
         }
     }
@@ -1197,7 +1337,7 @@ mod tests {
                     if field.is_empty() || key == EXTRA_COLUMN {
                         return None;
                     }
-                    let value = if matches!(key, "ts" | "value" | "optional") {
+                    let value = if matches!(key, "ts" | "trace_version" | "value" | "optional") {
                         serde_json::from_str(&field).expect("numeric field")
                     } else {
                         Value::String(field)
@@ -1305,16 +1445,16 @@ mod tests {
 
         assert_eq!(
             header,
-            "ts,wall_ts,node,process_trace_id,event,value,optional,extra"
+            "ts,wall_ts,node,process_trace_id,trace_version,event,value,optional,extra"
         );
         assert_eq!(fields.len(), csv_fields(&header).len());
         assert_eq!(fields[2], "node-csv");
         assert_eq!(fields[3], process_trace_id());
-        assert_eq!(fields[4], "csv_event");
-        assert_eq!(fields[5], "7");
+        assert_eq!(fields[5], "csv_event");
+        assert_eq!(fields[6], "7");
         // `None` renders as an empty field, which DuckDB and pandas read as null.
-        assert_eq!(fields[6], "");
         assert_eq!(fields[7], "");
+        assert_eq!(fields[8], "");
     }
 
     #[test]
@@ -1336,9 +1476,9 @@ mod tests {
         let fields = csv_fields(&line);
 
         assert_eq!(fields[2], "n1");
-        assert_eq!(fields[4], "7");
-        assert_eq!(fields[5], "2");
-        assert_eq!(fields[6], "", "no undeclared fields remain");
+        assert_eq!(fields[5], "7");
+        assert_eq!(fields[6], "2");
+        assert_eq!(fields[7], "", "no undeclared fields remain");
     }
 
     #[test]
@@ -1352,9 +1492,9 @@ mod tests {
         let line = String::from_utf8(render_csv_row(TABLE.header(), row)).expect("utf-8");
         let fields = csv_fields(&line);
 
-        assert_eq!(fields[4], "known");
+        assert_eq!(fields[5], "known");
         assert_eq!(
-            serde_json::from_str::<Value>(&fields[5]).expect("extra holds a JSON object"),
+            serde_json::from_str::<Value>(&fields[6]).expect("extra holds a JSON object"),
             serde_json::json!({"added_later": 9}),
             "a field the header does not name must survive, not vanish"
         );
@@ -1387,16 +1527,16 @@ mod tests {
         );
 
         let fields = csv_fields(&line);
-        assert_eq!(fields[4], "peer:1");
-        assert_eq!(fields[5], "a,b");
-        assert_eq!(fields[6], "say \"hi\"");
-        assert_eq!(fields[7], "[1,2]", "arrays are stored as embedded JSON");
+        assert_eq!(fields[5], "peer:1");
+        assert_eq!(fields[6], "a,b");
+        assert_eq!(fields[7], "say \"hi\"");
+        assert_eq!(fields[8], "[1,2]", "arrays are stored as embedded JSON");
     }
 
     #[tokio::test]
     async fn writer_preserves_existing_csv_with_a_different_or_partial_header() {
         for existing in [
-            "ts,wall_ts,node,process_trace_id,old_field,extra\n1,t,n,p,old,\n",
+            "ts,wall_ts,node,process_trace_id,trace_version,old_field,extra\n1,t,n,p,old,\n",
             "ts,wall_ts,node",
         ] {
             let dir = tempfile::tempdir().expect("tempdir");
@@ -1456,7 +1596,10 @@ mod tests {
         let lines: Vec<_> = written.lines().collect();
 
         assert_eq!(lines.len(), 3, "one header plus two rows: {written}");
-        assert_eq!(lines[0], "ts,wall_ts,node,process_trace_id,event,extra");
+        assert_eq!(
+            lines[0],
+            "ts,wall_ts,node,process_trace_id,trace_version,event,extra"
+        );
         assert_eq!(lines[1], "1,t,n,process,run0,");
         assert_eq!(
             lines[2], "1,t,n,process,run1,",
@@ -1488,7 +1631,7 @@ mod tests {
             .append_lines(&lines, true)
             .expect("CSV write and rotation should succeed");
 
-        let expected_header = "ts,wall_ts,node,process_trace_id,event,extra";
+        let expected_header = "ts,wall_ts,node,process_trace_id,trace_version,event,extra";
         for suffix in ["", ".1", ".2", ".3"] {
             let path = trace_dir.join(format!("csv.csv{suffix}"));
             let content = std::fs::read_to_string(path).expect("retained CSV segment");
@@ -1552,7 +1695,7 @@ mod tests {
         let content = std::fs::read_to_string(trace_dir.join("csv.csv")).expect("CSV");
         assert_eq!(
             content
-                .matches("ts,wall_ts,node,process_trace_id,event,extra\n")
+                .matches("ts,wall_ts,node,process_trace_id,trace_version,event,extra\n")
                 .count(),
             1
         );
@@ -1588,7 +1731,7 @@ mod tests {
         let content = std::fs::read_to_string(trace_dir.join("csv.csv")).expect("CSV");
         assert_eq!(
             content
-                .matches("ts,wall_ts,node,process_trace_id,event,extra\n")
+                .matches("ts,wall_ts,node,process_trace_id,trace_version,event,extra\n")
                 .count(),
             1
         );
@@ -1644,7 +1787,7 @@ mod tests {
             file_name: "alpha.csv",
             format: TraceFormat::Csv,
             header: &["value"],
-            line: b",,,,1,".to_vec(),
+            line: b",,,,,1,".to_vec(),
         })
         .await
         .expect("send should succeed");
@@ -1654,7 +1797,7 @@ mod tests {
             file_name: "beta.csv",
             format: TraceFormat::Csv,
             header: &["value"],
-            line: b",,,,2,".to_vec(),
+            line: b",,,,,2,".to_vec(),
         })
         .await
         .expect("send should succeed");
@@ -1671,11 +1814,11 @@ mod tests {
 
         assert_eq!(
             alpha,
-            "ts,wall_ts,node,process_trace_id,value,extra\n,,,,1,\n"
+            "ts,wall_ts,node,process_trace_id,trace_version,value,extra\n,,,,,1,\n"
         );
         assert_eq!(
             beta,
-            "ts,wall_ts,node,process_trace_id,value,extra\n,,,,2,\n"
+            "ts,wall_ts,node,process_trace_id,trace_version,value,extra\n,,,,,2,\n"
         );
     }
 
@@ -1700,7 +1843,7 @@ mod tests {
             file_name: "alpha.csv",
             format: TraceFormat::Csv,
             header: &["value"],
-            line: b",,,,1,".to_vec(),
+            line: b",,,,,1,".to_vec(),
         })
         .await
         .expect("send should succeed");
@@ -1713,7 +1856,7 @@ mod tests {
 
         assert_eq!(
             alpha,
-            "ts,wall_ts,node,process_trace_id,value,extra\n,,,,1,\n"
+            "ts,wall_ts,node,process_trace_id,trace_version,value,extra\n,,,,,1,\n"
         );
 
         drop(tx);
@@ -1734,7 +1877,7 @@ mod tests {
             file_name: "alpha.csv",
             format: TraceFormat::Csv,
             header: &["value"],
-            line: b",,,,1,".to_vec(),
+            line: b",,,,,1,".to_vec(),
         });
 
         assert!(matches!(send_result, Err(JsonlTraceSendError::Disabled(_))));
@@ -1759,7 +1902,7 @@ mod tests {
                 file_name: "alpha.csv",
                 format: TraceFormat::Csv,
                 header: &["value"],
-                line: b",,,,1,".to_vec(),
+                line: b",,,,,1,".to_vec(),
             })
             .expect("queued row");
 
@@ -1770,7 +1913,7 @@ mod tests {
             .expect("alpha file");
         assert_eq!(
             alpha,
-            "ts,wall_ts,node,process_trace_id,value,extra\n,,,,1,\n"
+            "ts,wall_ts,node,process_trace_id,trace_version,value,extra\n,,,,,1,\n"
         );
     }
 
@@ -1806,7 +1949,7 @@ mod tests {
                 file_name: "alpha.csv",
                 format: TraceFormat::Csv,
                 header: &["value"],
-                line: b",,,,1,".to_vec(),
+                line: b",,,,,1,".to_vec(),
             })
             .expect("first row fits");
         let full = tracer.try_send(JsonlWriteEvent {
@@ -1814,7 +1957,7 @@ mod tests {
             file_name: "alpha.csv",
             format: TraceFormat::Csv,
             header: &["value"],
-            line: b",,,,2,".to_vec(),
+            line: b",,,,,2,".to_vec(),
         });
 
         assert!(matches!(full, Err(JsonlTraceSendError::Full(_))));
@@ -1831,7 +1974,7 @@ mod tests {
                 file_name: "alpha.csv",
                 format: TraceFormat::Csv,
                 header: &["value"],
-                line: b",,,,0,".to_vec(),
+                line: b",,,,,0,".to_vec(),
             })
             .expect("first row fits");
 
@@ -1843,7 +1986,7 @@ mod tests {
                 file_name: "alpha.csv",
                 format: TraceFormat::Csv,
                 header: &["value"],
-                line: format!(",,,,{value},").into_bytes(),
+                line: format!(",,,,,{value},").into_bytes(),
             });
             if matches!(result, Err(JsonlTraceSendError::Full(_))) {
                 full += 1;
@@ -1855,5 +1998,163 @@ mod tests {
             start.elapsed() < Duration::from_secs(1),
             "full queue path should not block the emitter"
         );
+    }
+    #[test]
+    fn independent_emitters_share_one_monotonic_clock() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let first = JsonlEventEmitter::new(JsonlTracer::new(tx.clone()), "node");
+        first.emit_event(|| CsvEvent {
+            event: "first",
+            value: 1,
+            optional: None,
+        });
+        let before = decoded_test_row(&rx.try_recv().expect("first event was enqueued"));
+        std::thread::sleep(Duration::from_millis(2));
+        let second = JsonlEventEmitter::new(JsonlTracer::new(tx), "node");
+        second.emit_event(|| CsvEvent {
+            event: "second",
+            value: 2,
+            optional: None,
+        });
+        let after = decoded_test_row(&rx.try_recv().expect("second event was enqueued"));
+        assert!(
+            after["ts"].as_u64().expect("timestamp is numeric")
+                >= before["ts"].as_u64().expect("timestamp is numeric") + 1_000
+        );
+        assert_eq!(after["trace_version"], 2);
+    }
+
+    #[tokio::test]
+    async fn validation_capture_records_drops_and_disables_rotation() {
+        let dir = tempfile::tempdir().expect("temporary capture directory");
+        let config = JsonlTraceConfig {
+            capture_run_id: Some("test-run".to_owned()),
+            channel_capacity: 1,
+            csv_rotation_bytes: 1,
+            ..JsonlTraceConfig::default()
+        };
+        let guard = JsonlTracer::spawn_guard_with_config(dir.path().to_owned(), config);
+        let emitter = JsonlEventEmitter::new(guard.tracer(), "node");
+        emitter.emit_event(|| CsvEvent {
+            event: "first",
+            value: 1,
+            optional: None,
+        });
+        emitter.emit_event(|| CsvEvent {
+            event: "dropped",
+            value: 2,
+            optional: None,
+        });
+        guard.shutdown().await;
+        let path = fs::read_dir(dir.path())
+            .expect("capture directory exists")
+            .map(|entry| entry.expect("directory entry is readable").path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .expect("writer publishes capture status");
+        let status: Value =
+            serde_json::from_str(&fs::read_to_string(path).expect("status is readable"))
+                .expect("status is JSON");
+        assert_eq!(status["run_id"], "test-run");
+        assert_eq!(status["accepted"], 1);
+        assert_eq!(status["dropped"], 1);
+        assert_eq!(status["rotation_segments"], 0);
+        assert_eq!(status["tables"]["csv"], 1);
+        assert_eq!(status["failed_tables"], serde_json::json!([]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_rejects_symlinked_current_retained_and_lock_entries() {
+        use std::os::unix::fs::symlink;
+        for name in ["csv.csv", "csv.csv.1", "csv.csv.lock"] {
+            let dir = tempfile::tempdir().expect("temporary trace directory");
+            let target = dir.path().join("outside");
+            fs::write(&target, "").expect("fixture target is writable");
+            symlink(&target, dir.path().join(name)).expect("fixture symlink");
+            let writer = TableWriter::new(
+                dir.path().to_owned(),
+                "csv.csv",
+                TraceFormat::Csv,
+                &["event"],
+                JsonlTraceConfig::default(),
+            );
+            assert!(
+                writer.append_lines(&[b"row".to_vec()], true).is_err(),
+                "{name}"
+            );
+            assert_eq!(fs::read(&target).expect("target is readable"), b"");
+        }
+    }
+    #[tokio::test]
+    async fn requested_seal_drains_rows_and_stops_recording() {
+        let dir = tempfile::tempdir().expect("temporary capture directory");
+        let guard = JsonlTracer::spawn_guard_with_config(
+            dir.path().to_owned(),
+            JsonlTraceConfig {
+                capture_run_id: Some("run".to_owned()),
+                file_flush_interval: Duration::from_millis(10),
+                ..JsonlTraceConfig::default()
+            },
+        );
+        let emitter = JsonlEventEmitter::new(guard.tracer(), "node");
+        emitter.emit_event(|| CsvEvent {
+            event: "before",
+            value: 1,
+            optional: None,
+        });
+        fs::write(dir.path().join(format!(".seal-{}", process_trace_id())), "")
+            .expect("seal request is writable");
+        time::timeout(Duration::from_secs(3), async {
+            while !guard
+                .writer
+                .as_ref()
+                .expect("writer was spawned")
+                .is_finished()
+            {
+                time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("writer acknowledges the seal");
+        assert!(!emitter.is_enabled());
+        emitter.emit_event::<CsvEvent>(|| panic!("sealed emitters must not build another row"));
+        let status_path = fs::read_dir(dir.path())
+            .expect("capture directory exists")
+            .map(|entry| entry.expect("directory entry is readable").path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .expect("writer publishes capture status");
+        let status: Value =
+            serde_json::from_str(&fs::read_to_string(status_path).expect("status is readable"))
+                .expect("status is JSON");
+        assert_eq!(status["sealed"], true);
+        assert_eq!(status["accepted"], 1);
+        assert_eq!(status["dropped"], 0);
+        assert_eq!(status["tables"]["csv"], 1);
+        guard.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_rejects_fifo_without_waiting_for_a_peer() {
+        let dir = tempfile::tempdir().expect("temporary trace directory");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(dir.path().join("csv.csv"))
+            .status()
+            .expect("POSIX mkfifo is installed")
+            .success());
+        let writer = TableWriter::new(
+            dir.path().to_owned(),
+            "csv.csv",
+            TraceFormat::Csv,
+            &["event"],
+            JsonlTraceConfig::default(),
+        );
+        assert!(writer.append_lines(&[b"row".to_vec()], true).is_err());
     }
 }

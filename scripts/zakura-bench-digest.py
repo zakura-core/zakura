@@ -29,6 +29,9 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import zakura_trace as trace
+
 # ---------------------------------------------------------------------------
 # collapse
 # ---------------------------------------------------------------------------
@@ -376,99 +379,69 @@ def parse_commit_trace(trace_path, min_height=None):
     `finishes` maps height to `(ts, elapsed_ms, apply_class)` for committed
     blocks and `headers` lists `(elapsed_ms, range_count)` per committed range.
     """
+    with trace.locked_directory(Path(trace_path).parent):
+        rows = list(trace.read_segment(trace_path, "commit_state", trace.Budget()))
+    return parse_commit_rows(rows, min_height)
+
+
+def parse_commit_rows(rows, min_height=None):
     queued_ts, start_ts, finishes = {}, {}, {}
     headers = []
     stalls = defaultdict(int)
     non_committed = defaultdict(int)
-    with open(trace_path, encoding="utf-8", errors="replace", newline="") as trace:
-        records = csv.DictReader(trace, strict=True)
-        for line in records:
-            try:
-                row = {}
-                extra = {}
-                if None in line or None in line.values():
-                    raise ValueError("CSV field count does not match header")
-                for key, value in line.items():
-                    if not value:
-                        continue
-                    if key == "extra":
-                        extra = json.loads(value)
-                        if not isinstance(extra, dict) or set(extra).intersection(line):
-                            raise ValueError("CSV extra field is invalid or collides with columns")
-                    else:
-                        row[key] = json.loads(value) if key in {
-                            "ts", "height", "range_start", "range_count", "elapsed_ms"
-                        } else value
-                row.update(extra)
-            except ValueError:
-                continue
-            event = row.get("event")
-            if row.get("source") == "header_sync_driver":
-                range_start = row.get("range_start")
-                if min_height is not None and isinstance(range_start, int):
-                    if range_start < min_height:
-                        continue
-                if event == "commit_finish" and row.get("result") == "committed":
-                    elapsed = row.get("elapsed_ms")
-                    if isinstance(elapsed, (int, float)):
-                        headers.append((float(elapsed), int(row.get("range_count") or 0)))
-                continue
-            height = row.get("height")
-            if min_height is not None and isinstance(height, int) and height < min_height:
-                continue
-            if event == "block_submit_queued" and height is not None:
-                queued_ts.setdefault(height, row.get("ts"))
-            elif event == "commit_start" and height is not None:
-                start_ts.setdefault(height, row.get("ts"))
-            elif event == "commit_stalled":
-                stalls[row.get("commit_stall_reason", "unknown")] += 1
-            elif event == "commit_finish":
-                if row.get("result") != "committed":
-                    non_committed[row.get("result") or "unknown"] += 1
+    # Monotonic timestamps from restarted processes cannot share a latency series.
+    process = rows[-1]["process_trace_id"] if rows else None
+    for row in rows:
+        if row["process_trace_id"] != process:
+            continue
+        event = row.get("event")
+        if row.get("source") == "header_sync_driver":
+            range_start = row.get("range_start")
+            if min_height is not None and isinstance(range_start, int):
+                if range_start < min_height:
                     continue
+            if event == "commit_finish" and row.get("result") == "committed":
                 elapsed = row.get("elapsed_ms")
-                if height is None or not isinstance(elapsed, (int, float)):
-                    continue
-                finishes[height] = (
-                    row.get("ts"),
-                    float(elapsed),
-                    row.get("apply_class") or "unknown",
-                )
+                if isinstance(elapsed, (int, float)):
+                    headers.append((float(elapsed), int(row.get("range_count") or 0)))
+            continue
+        height = row.get("height")
+        if min_height is not None and isinstance(height, int) and height < min_height:
+            continue
+        if event == "block_submit_queued" and height is not None:
+            queued_ts.setdefault(height, row.get("ts"))
+        elif event == "commit_start" and height is not None:
+            start_ts.setdefault(height, row.get("ts"))
+        elif event == "commit_stalled":
+            stalls[row.get("commit_stall_reason", "unknown")] += 1
+        elif event == "commit_finish":
+            if row.get("result") != "committed":
+                non_committed[row.get("result") or "unknown"] += 1
+                continue
+            elapsed = row.get("elapsed_ms")
+            if height is None or not isinstance(elapsed, (int, float)):
+                continue
+            finishes[height] = (
+                row.get("ts"),
+                float(elapsed),
+                row.get("apply_class") or "unknown",
+            )
     return queued_ts, start_ts, finishes, headers, dict(stalls), dict(non_committed)
 
 
 def trace_segments(trace_dir, filename):
-    """Return retained trace segments oldest first, followed by the current file."""
-    retained = []
-    for path in Path(trace_dir).glob(f"{filename}.*"):
-        suffix = path.name.rsplit(".", 1)[-1]
-        if suffix.isdigit() and path.is_file():
-            retained.append((int(suffix), path))
-    retained.sort(reverse=True)
-    paths = [path for _, path in retained]
-    current = Path(trace_dir, filename)
-    if current.is_file():
-        paths.append(current)
-    return paths
+    return trace.segments(Path(trace_dir) / filename)
 
 
 def parse_trace_segments(paths, min_height=None):
-    """Parse multiple trace segments while preserving their chronological order."""
-    queued_ts, start_ts, finishes = {}, {}, {}
-    headers = []
-    stalls = defaultdict(int)
-    non_committed = defaultdict(int)
-    for path in paths:
-        parsed = parse_commit_trace(path, min_height)
-        for target, source in ((queued_ts, parsed[0]), (start_ts, parsed[1]), (finishes, parsed[2])):
-            for key, value in source.items():
-                target.setdefault(key, value)
-        headers.extend(parsed[3])
-        for key, count in parsed[4].items():
-            stalls[key] += count
-        for key, count in parsed[5].items():
-            non_committed[key] += count
-    return queued_ts, start_ts, finishes, headers, dict(stalls), dict(non_committed)
+    """Analyze the latest process in a consistent, bounded CSV snapshot."""
+    if not paths:
+        return parse_commit_rows([], min_height)
+    budget = trace.Budget()
+    with trace.locked_directory(Path(paths[0]).parent):
+        # Rediscover under the lock because rotation can rename the input paths.
+        rows = list(trace.read_table(Path(paths[0]).parent / "commit_state.csv", budget))
+    return parse_commit_rows(rows, min_height)
 
 
 def latency_stats(values):
@@ -509,11 +482,18 @@ def cmd_latency(args):
     if observed_blocks is not None:
         report["observed_blocks"] = observed_blocks
 
-    trace_paths = trace_segments(args.traces, "commit_state.csv") if args.traces else []
+    try:
+        trace_paths = trace_segments(args.traces, "commit_state.csv") if args.traces else []
+    except (OSError, ValueError) as error:
+        out.write(f"Trace analysis unavailable: {error}\n")
+        return 0
     if trace_paths:
-        queued_ts, start_ts, finishes, headers, stalls, non_committed = (
-            parse_trace_segments(trace_paths, getattr(args, "min_height", None))
-        )
+        try:
+            queued_ts, start_ts, finishes, headers, stalls, non_committed = parse_trace_segments(trace_paths, getattr(args, "min_height", None))
+        except (ValueError, OSError) as error:
+            out.write(f"Trace analysis unavailable: {error}\n")
+            return 0
+        out.write("Trace latency uses the latest process generation.\n\n")
         by_class = defaultdict(list)  # class -> [(height, ts, elapsed_ms)]
         for height, (ts, elapsed, apply_class) in finishes.items():
             by_class[apply_class].append((height, ts, elapsed))

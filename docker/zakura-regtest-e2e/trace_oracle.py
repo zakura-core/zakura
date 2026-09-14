@@ -22,9 +22,13 @@ import sys
 import tempfile
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Iterable
 
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+import zakura_trace as trace
 
 COMMIT_START = "commit_start"
 COMMIT_STALLED = "commit_stalled"
@@ -66,9 +70,7 @@ APPLY_CLASS_FULL = "full"
 LEGACY_ROUND_FINISH = "round_finish"
 LEGACY_CHECKPOINT_HANDOFF = "checkpoint_handoff"
 
-TRACE_SCHEMA = json.loads(
-    (Path(__file__).resolve().parents[2] / "crates/zakura-jsonl-trace/schema.json").read_text()
-)
+TRACE_SCHEMA = trace.SCHEMA
 CSV_ENVELOPE_COLUMNS = tuple(TRACE_SCHEMA["envelope"])
 CSV_SCHEMAS = {
     table: CSV_ENVELOPE_COLUMNS + tuple(columns) + ("extra",)
@@ -210,12 +212,19 @@ class OracleOptions:
     optional_lag_nodes: tuple[str, ...] = ()
     require_v7_request_ids: bool = False
     required_commit_nodes: tuple[str, ...] = ()
+    required_sync_nodes: tuple[str, ...] = ()
+    capture_run_id: str | None = None
 
 
 class NodeTrace:
-    def __init__(self, node: str, tables: dict[str, list[TraceRow]]) -> None:
+    def __init__(self, node: str, tables: dict[str, list[TraceRow]], capture_error: str | None = None) -> None:
         self.node = node
         self.tables = tables
+        self.capture_error = capture_error
+        self.event_rows = defaultdict(list)
+        for table, rows in tables.items():
+            for row in rows:
+                self.event_rows[(table, row.event)].append(row)
         self.rows = sorted(
             [row for rows in tables.values() for row in rows],
             key=lambda row: (row.ts if row.ts is not None else -1, row.table, row.index),
@@ -225,7 +234,7 @@ class NodeTrace:
         return self.tables.get(name, [])
 
     def events(self, table: str, event: str) -> list[TraceRow]:
-        return [row for row in self.table(table) if row.event == event]
+        return self.event_rows[(table, event)]
 
     def latest(self, table: str, event: str | None = None) -> TraceRow | None:
         rows = self.table(table)
@@ -280,144 +289,103 @@ def compact_row(row: TraceRow | None) -> dict[str, Any] | None:
         "index": row.index,
         "event": row.event,
         "ts": row.ts,
-        "row": row.row,
+        "row": {key: (value[:256] if isinstance(value, str) else value)
+                for key, value in list(row.row.items())[:64]
+                if value is None or isinstance(value, (str, int, float, bool))},
     }
 
 
-def json_object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    value: dict[str, Any] = {}
-    for key, item in pairs:
-        if key in value:
-            raise ValueError(f"duplicate JSON key: {key}")
-        value[key] = item
-    return value
-
-
 def load_json(value: str) -> Any:
-    return json.loads(value, object_pairs_hook=json_object_without_duplicates)
+    return trace.load_json(value)
 
 
 def validate_trace_row(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise ValueError("trace row must contain a JSON object")
-
-    event = value.get("event")
-    if not isinstance(event, str) or not event:
-        raise ValueError("trace row event must be a non-empty string")
-
-    for field in TEXT_FIELDS:
-        if field in value and value[field] is not None and not isinstance(value[field], str):
-            raise ValueError(f"trace row {field} must be a string")
-    for field in NUMERIC_FIELDS:
-        if field in value and value[field] is not None and int_field(value, field) is None:
-            raise ValueError(f"trace row {field} must be an integer")
-    for field in BOOLEAN_FIELDS:
-        if field in value and value[field] is not None and not isinstance(value[field], bool):
-            raise ValueError(f"trace row {field} must be a boolean")
-
-    return value
+    return trace.validate_row(value)
 
 
 def validate_csv_header(table: str, fieldnames: list[str] | None) -> tuple[str, ...]:
-    if not fieldnames:
-        raise ValueError("CSV header is missing")
-    if len(fieldnames) != len(set(fieldnames)):
-        raise ValueError("CSV header contains duplicate columns")
-
-    header = tuple(fieldnames)
-    expected = CSV_SCHEMAS.get(table)
-    if expected is not None and header != expected:
-        raise ValueError(f"CSV header does not match the {table} schema")
-    return header
+    return trace.validate_header(table, fieldnames)
 
 
-def read_csv_segment(path: Path, node: str, table: str) -> list[TraceRow]:
-    csv_path = path
-    if csv_path.exists():
-        rows = []
-        index = 0
-        try:
-            with csv_path.open(newline="", encoding="utf-8") as handle:
-                reader = csv.DictReader(handle, strict=True)
-                header = validate_csv_header(table, reader.fieldnames)
-                for index, record in enumerate(reader, start=1):
-                    if None in record or None in record.values():
-                        raise ValueError("CSV row has a different field count from its header")
-                    value = {}
-                    extra: dict[str, Any] = {}
-                    for key, field in record.items():
-                        if not field:
-                            continue
-                        if key == "extra":
-                            extra = load_json(field)
-                            if not isinstance(extra, dict):
-                                raise ValueError("CSV extra field must contain a JSON object")
-                        else:
-                            value[key] = (
-                                load_json(field)
-                                if key in NUMERIC_FIELDS or key in BOOLEAN_FIELDS or key in JSON_FIELDS
-                                else field
-                            )
-                    collisions = sorted(set(header).intersection(extra))
-                    if collisions:
-                        raise ValueError(
-                            f"CSV extra field collides with columns: {', '.join(collisions)}"
-                        )
-                    value.update(extra)
-                    rows.append(TraceRow(node, table, index, validate_trace_row(value)))
-        except (csv.Error, RecursionError, ValueError) as error:
-            rows.append(TraceRow(node, table, index + 1, {
-                "event": "csv_decode_error", "path": str(csv_path), "error": str(error),
-            }))
-        return rows
-    return []
+def decode_error(node: str, table: str, error: Exception) -> TraceRow:
+    return TraceRow(node, table, 0, {"event": "csv_decode_error", "error": str(error)[:200]})
+
+
+def read_csv_segment(path: Path, node: str, table: str, budget: trace.Budget | None = None) -> list[TraceRow]:
+    try:
+        return [TraceRow(node, table, index, value)
+                for index, value in enumerate(trace.read_segment(path, table, budget or trace.Budget()), 1)]
+    except (ValueError, OSError) as error:
+        return [decode_error(node, table, error)]
 
 
 def csv_segments(path: Path) -> list[Path]:
-    segments = [item for item in path.parent.glob(path.name + ".*")
-                if item.name.removeprefix(path.name + ".").isdigit()]
-    segments.sort(key=lambda item: int(item.suffix[1:]), reverse=True)
-    if path.is_file():
-        segments.append(path)
-    return segments
+    return trace.segments(path)
 
 
-def read_csv(path: Path, node: str, table: str) -> list[TraceRow]:
-    rows: list[TraceRow] = []
-    for segment in csv_segments(path):
-        for row in read_csv_segment(segment, node, table):
-            rows.append(TraceRow(node, table, len(rows) + 1, row.row))
-    return rows
+def read_csv(path: Path, node: str, table: str, budget: trace.Budget | None = None) -> list[TraceRow]:
+    try:
+        return [TraceRow(node, table, index, value)
+                for index, value in enumerate(trace.read_table(path, budget), 1)]
+    except (ValueError, OSError) as error:
+        return [decode_error(node, table, error)]
 
 
 def has_traces(path: Path) -> bool:
     return any(csv_segments(path / name) for name in trace_files())
 
 
-def load_traces(root: Path) -> list[NodeTrace]:
+def capture_error(path: Path, tables: dict[str, list[TraceRow]], run_id: str, budget: trace.Budget) -> str | None:
+    statuses = [trace.read_status(item, budget) for item in trace.entries(path)
+                if item.name.startswith("capture-") and item.suffix == ".json"]
+    if not statuses:
+        return "capture writer status is missing"
+    expected = defaultdict(int)
+    for status in statuses:
+        if (not isinstance(status, dict) or status.get("version") != 2
+                or status.get("run_id") != run_id or status.get("rotation_segments") != 0
+                or status.get("dropped") != 0 or status.get("failed_tables") != [] or status.get("sealed") is not True):
+            return "capture has stale, dropped, rotated, or failed writer evidence"
+        counts = status.get("tables")
+        process = status.get("process_trace_id")
+        if not isinstance(counts, dict) or not isinstance(process, str) or not process:
+            return "capture writer identity/counts are invalid"
+        if any(table not in CSV_SCHEMAS or type(count) is not int or count < 0
+               for table, count in counts.items()):
+            return "capture writer table counts are invalid"
+        if type(status.get("accepted")) is not int or status["accepted"] != sum(counts.values()):
+            return "capture writer has unflushed events"
+        for table, count in counts.items():
+            expected[(process, table)] += count
+    observed = defaultdict(int)
+    for table, rows in tables.items():
+        for row in rows:
+            observed[(row.row.get("process_trace_id"), table)] += 1
+    if dict(expected) != dict(observed):
+        return "capture rows do not match the writer's persisted counts"
+    return None
+
+
+def load_traces(root: Path, run_id: str | None = None) -> list[NodeTrace]:
     nodes: list[NodeTrace] = []
-    node_dirs = sorted(path for path in root.iterdir() if path.is_dir() and path.name.startswith("node"))
+    budget = trace.Budget()
+    node_dirs = [path for path in trace.entries(root, budget) if path.name.startswith("node") and (path.is_dir() or path.is_symlink())]
     if not node_dirs and has_traces(root):
         node_dirs = [root]
-
     for node_dir in node_dirs:
+        if node_dir.is_symlink():
+            raise trace.TraceInputError("node directory must not be a symlink")
         candidates = [node_dir]
-        # Inspect children even when stale or partial root traces exist.
-        candidates += [
-            child
-            for child in sorted(path for path in node_dir.iterdir() if path.is_dir())
-            if has_traces(child)
-        ]
-
+        candidates += [child for child in trace.entries(node_dir, budget)
+                       if child.is_dir() and has_traces(child)]
         for trace_dir in candidates:
             node = node_dir.name if trace_dir == node_dir else f"{node_dir.name}/{trace_dir.name}"
-            tables = {
-                table: read_csv(trace_dir / f"{table}.csv", node, table)
-                for table in CSV_SCHEMAS
-            }
-            if any(tables.values()) or has_traces(trace_dir):
-                nodes.append(NodeTrace(node, tables))
-
+            with trace.locked_directory(trace_dir):
+                tables = {table: read_csv(trace_dir / f"{table}.csv", node, table, budget)
+                          for table in CSV_SCHEMAS}
+                error = capture_error(trace_dir, tables, run_id, budget) if run_id else None
+                if any(tables.values()) or has_traces(trace_dir):
+                    nodes.append(NodeTrace(node, tables, error))
     return nodes
 
 
@@ -426,96 +394,70 @@ def trace_files() -> Iterable[str]:
         yield f"{table}.csv"
 
 
-def check_commit_pairs(node: NodeTrace, options: OracleOptions) -> list[Failure]:
-    failures: list[Failure] = []
-    finishes: dict[tuple[str, Any], list[TraceRow]] = {}
-    for finish in node.events("commit_state", COMMIT_FINISH):
-        key = row_key(finish)
-        if key is not None:
-            finishes.setdefault(key, []).append(finish)
+@dataclass
+class CommitMatches:
+    pairs: list[tuple[TraceRow, TraceRow]]
+    errors: list[tuple[str, TraceRow]]
 
-    for start in node.events("commit_state", COMMIT_START):
-        key = row_key(start)
-        if key is None:
-            failures.append(
-                failure(node, "commit_start_has_match_key", start, {"reason": "missing apply_token and height/hash"})
-            )
+
+def match_commits(rows: list[TraceRow]) -> CommitMatches:
+    pending = defaultdict(deque)
+    stalled = defaultdict(list)
+    pairs = []
+    errors = []
+    for row in rows:
+        if row.event == "csv_decode_error":
+            errors.append(("trace_csv_is_valid", row))
             continue
-
-        candidates = [
-            finish
-            for finish in finishes.get(key, [])
-            if finish.index > start.index or later_ts(finish, start)
-        ]
-        if not candidates:
-            failures.append(failure(node, "commit_start_has_finish", start, {"key": key}))
+        if row.event not in (COMMIT_START, COMMIT_FINISH, COMMIT_STALLED):
             continue
-
-        finish = candidates[0]
-        if finish.index - start.index > options.commit_event_window:
-            failures.append(
-                failure(
-                    node,
-                    "commit_finish_within_event_window",
-                    start,
-                    {"key": key, "finish": compact_row(finish), "event_delta": finish.index - start.index},
-                )
-            )
-        elif start.ts is not None and finish.ts is not None and finish.ts - start.ts > options.commit_elapsed_micros:
-            failures.append(
-                failure(
-                    node,
-                    "commit_finish_within_elapsed_window",
-                    start,
-                    {"key": key, "finish": compact_row(finish), "elapsed_us": finish.ts - start.ts},
-                )
-            )
+        identity = row_key(row)
+        if identity is None:
+            errors.append((f"{row.event}_has_match_key", row))
+            continue
+        key = (row.row.get("process_trace_id"), row.row.get("source"), identity)
+        if row.event == COMMIT_START:
+            if pending[key]:
+                errors.append(("commit_start_is_unique", row))
+            pending[key].append(row)
+        elif row.event == COMMIT_STALLED:
+            stalled[key].append(row)
+        elif not pending[key]:
+            errors.append(("commit_finish_has_start", row))
         else:
-            elapsed_ms = int_field(finish.row, "elapsed_ms")
-            if elapsed_ms is not None and elapsed_ms * 1_000 > options.commit_elapsed_micros:
-                failures.append(
-                    failure(
-                        node,
-                        "commit_finish_within_elapsed_window",
-                        start,
-                        {"key": key, "finish": compact_row(finish), "elapsed_ms": elapsed_ms},
-                    )
-                )
+            pairs.append((pending[key].popleft(), row))
+            stalled.pop(key, None)
+    for starts in pending.values():
+        errors.extend(("commit_start_has_finish", row) for row in starts)
+    for rows in stalled.values():
+        errors.extend(("commit_stalled_not_terminal", row) for row in rows)
+    return CommitMatches(pairs, errors)
 
-    for stalled in node.events("commit_state", COMMIT_STALLED):
-        key = row_key(stalled)
-        later_finish = [
-            finish
-            for finish in finishes.get(key, [])
-            if key is not None and (finish.index > stalled.index or later_ts(finish, stalled))
-        ]
-        if not later_finish:
-            failures.append(failure(node, "commit_stalled_not_terminal", stalled, {"key": key}))
 
+def check_commit_pairs(node: NodeTrace, options: OracleOptions) -> list[Failure]:
+    matches = match_commits(node.table("commit_state"))
+    failures = [failure(node, invariant, row, {"key": row_key(row)})
+                for invariant, row in matches.errors[:100]]
+    for start, finish in matches.pairs:
+        if len(failures) >= 100:
+            break
+        if finish.index - start.index > options.commit_event_window:
+            failures.append(failure(node, "commit_finish_within_event_window", start,
+                                    {"finish": compact_row(finish), "event_delta": finish.index - start.index}))
+        elif (start.ts is not None and finish.ts is not None
+              and (finish.ts < start.ts or finish.ts - start.ts > options.commit_elapsed_micros)):
+            failures.append(failure(node, "commit_finish_within_elapsed_window", start,
+                                    {"finish": compact_row(finish), "elapsed_us": finish.ts - start.ts}))
+        elif (int_field(finish.row, "elapsed_ms") or 0) * 1_000 > options.commit_elapsed_micros:
+            failures.append(failure(node, "commit_finish_within_elapsed_window", start,
+                                    {"finish": compact_row(finish), "elapsed_ms": finish.row["elapsed_ms"]}))
     failures.extend(check_commit_latency_trend(node, options))
     return failures
 
 
 def commits_balanced(rows: list[TraceRow]) -> bool:
-    """Require one finish per start within the same process generation."""
-    pending: dict[tuple[Any, ...], int] = {}
-    for row in rows:
-        if row.event == "csv_decode_error":
-            return False
-        if row.event not in (COMMIT_START, COMMIT_FINISH):
-            continue
-        identity = row_key(row)
-        if identity is None:
-            return False
-        key = (row.row.get("process_trace_id"), identity)
-        count = pending.get(key, 0)
-        if row.event == COMMIT_START:
-            pending[key] = count + 1
-        elif count == 0:
-            return False
-        else:
-            pending[key] = count - 1
-    return not any(pending.values())
+    """Require one finish per start within each process and operation namespace."""
+    return not match_commits(rows).errors
 
 
 def check_required_commit_evidence(node: NodeTrace) -> list[Failure]:
@@ -620,6 +562,8 @@ def later_ts(candidate: TraceRow, previous: TraceRow) -> bool:
 def check_frontiers(node: NodeTrace) -> list[Failure]:
     failures: list[Failure] = []
     for row in node.events("commit_state", SYNC_FRONTIER_TRANSITION):
+        if len(failures) >= 100:
+            break
         old_finalized = int_field(row.row, "old_finalized_height")
         new_finalized = int_field(row.row, "new_finalized_height")
         if old_finalized is not None and new_finalized is not None and new_finalized < old_finalized:
@@ -967,6 +911,8 @@ def failure(node: NodeTrace, invariant: str, row: TraceRow | None, detail: dict[
 
 
 def diagnostics(node: NodeTrace) -> dict[str, Any]:
+    if hasattr(node, "_diagnostics"):
+        return node._diagnostics
     starts = node.events("commit_state", COMMIT_START)
     finishes_by_key = {row_key(row) for row in node.events("commit_state", COMMIT_FINISH)}
     unmatched = []
@@ -983,7 +929,7 @@ def diagnostics(node: NodeTrace) -> dict[str, Any]:
         if row.row.get("action") in {QUERY_NEEDED_BLOCKS, "needed_blocks"}
     ]
 
-    return {
+    node._diagnostics = {
         "last_frontier_transition": compact_row(node.latest("commit_state", SYNC_FRONTIER_TRANSITION)),
         "unmatched_commit_starts": unmatched,
         "latest_needed_blocks": compact_row(needed_rows[-1] if needed_rows else None),
@@ -994,14 +940,25 @@ def diagnostics(node: NodeTrace) -> dict[str, Any]:
         "latest_header_reanchor": compact_row(node.latest("header_sync", HEADER_FRONTIER_REANCHORED)),
     }
 
+    return node._diagnostics
+
 
 def run_oracle(root: Path, options: OracleOptions = OracleOptions()) -> list[Failure]:
-    nodes = load_traces(root)
+    try:
+        nodes = load_traces(root, options.capture_run_id)
+    except (ValueError, OSError) as error:
+        return [Failure("<capture>", "trace_input_is_complete", None, {"error": str(error)[:200]})]
     if not nodes:
         return [Failure("<none>", "trace_files_exist", None, {"root": str(root)})]
 
     failures: list[Failure] = []
     for node in nodes:
+        if node.capture_error:
+            failures.append(failure(node, "trace_input_is_complete", None, {"error": node.capture_error}))
+        if node.node in options.required_sync_nodes:
+            for table, event in (("block_sync", BLOCK_SYNC_STATE), ("header_sync", "header_snapshot_observed")):
+                if not node.events(table, event):
+                    failures.append(failure(node, "required_sync_evidence_exists", None, {"table": table, "event": event}))
         for row in node.rows:
             if row.event == "json_decode_error":
                 failures.append(failure(node, "trace_csv_is_valid", row, {}))
@@ -1009,14 +966,21 @@ def run_oracle(root: Path, options: OracleOptions = OracleOptions()) -> list[Fai
                 failures.append(failure(node, "trace_csv_is_valid", row, {}))
         if node.node in options.required_commit_nodes:
             failures.extend(check_required_commit_evidence(node))
-        failures.extend(check_commit_pairs(node, options))
-        failures.extend(check_frontiers(node))
-        failures.extend(check_block_sync_activity(node, options))
-        if node.node not in options.optional_lag_nodes:
-            failures.extend(check_header_recovery(node, options))
+        processes = defaultdict(lambda: defaultdict(list))
+        for table, rows in node.tables.items():
+            for row in rows:
+                group = processes[row.row.get("process_trace_id", "")][table]
+                group.append(TraceRow(node.node, table, len(group) + 1, row.row))
+        for tables in processes.values():
+            process_node = NodeTrace(node.node, tables)
+            failures.extend(check_commit_pairs(process_node, options))
+            failures.extend(check_frontiers(process_node))
+            failures.extend(check_block_sync_activity(process_node, options))
+            if node.node not in options.optional_lag_nodes:
+                failures.extend(check_header_recovery(process_node, options))
 
     loaded_nodes = {node.node for node in nodes}
-    for required_node in options.required_commit_nodes:
+    for required_node in set(options.required_commit_nodes + options.required_sync_nodes):
         if required_node not in loaded_nodes:
             failures.append(
                 Failure(required_node, "commit_state_has_events", None, {"root": str(root)})
@@ -1135,7 +1099,7 @@ def check_v7_request_ids(nodes: list[NodeTrace]) -> list[Failure]:
 
 
 def print_failures(failures: list[Failure]) -> None:
-    for item in failures:
+    for item in failures[:100]:
         payload = {
             "node": item.node,
             "invariant": item.invariant,
@@ -1153,6 +1117,13 @@ def write_csv(path: Path, rows: Iterable[dict[str, Any]]) -> None:
         writer = csv.DictWriter(handle, fieldnames=header)
         writer.writeheader()
         for row in rows:
+            for field in TRACE_SCHEMA["required_event_fields"].get(row.get("event"), []):
+                row.setdefault(field, 0 if field in NUMERIC_FIELDS else "fixture")
+            row.setdefault("trace_version", 2)
+            row.setdefault("ts", 0)
+            row.setdefault("process_trace_id", "fixture-process")
+            row.setdefault("node", path.parent.name)
+            row.setdefault("wall_ts", "2026-09-13T00:00:00.000Z")
             record = {
                 key: value if isinstance(value, str) else json.dumps(value)
                 for key, value in row.items() if key in header and value is not None
@@ -1329,7 +1300,7 @@ def run_self_test() -> None:
             (
                 "v7_missing_version",
                 {"stream_version": None},
-                "v7_header_request_version_attributed",
+                "trace_csv_is_valid",
             ),
             ("v7_zero_id", {"request_id": 0}, "v7_header_request_ids_nonzero"),
         ):
@@ -1346,7 +1317,7 @@ def run_self_test() -> None:
             write_csv(directory / "header_sync.csv", [row])
             assert any(
                 failure.invariant == expected
-                for failure in check_v7_request_ids(load_traces(root / name))
+                for failure in run_oracle(root / name, OracleOptions(require_v7_request_ids=True))
             )
 
         duplicate_ids = root / "v7_duplicate_ids" / "node2"
@@ -1399,6 +1370,7 @@ def run_self_test() -> None:
                     "ts": 3,
                     "event": COMMIT_START,
                     "apply_token": 11,
+                    "process_trace_id": "handoff-process",
                     "apply_class": APPLY_CLASS_FULL,
                     "height": 81,
                     "hash": "dd",
@@ -2084,6 +2056,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=[],
         help="node name whose body/header lag progress checks are informational only",
     )
+    parser.add_argument("--seal-capture", help="ask each capture writer to drain and stop recording")
+    parser.add_argument("--check-capture", help="poll writer capture status without evaluating sync invariants")
+    parser.add_argument("--capture-run-id", help="require complete writer evidence for this run")
+    parser.add_argument("--require-sync-node", action="append", default=[], help="node requiring block and header evidence")
     parser.add_argument("--check-commit-balance", type=Path, help="check commit identities across CSV segments")
     parser.add_argument("--dump-csv", type=Path, help="decode a CSV table and retained segments to JSON for shell assertions")
     parser.add_argument("--after", type=int, default=0, help="skip this many decoded rows with --dump-csv")
@@ -2096,16 +2072,49 @@ def main(argv: list[str]) -> int:
         run_self_test()
         return 0
 
+    if (args.seal_capture is not None or args.check_capture is not None) and args.trace_dir is None:
+        print("trace_oracle.py: capture commands require a trace directory", file=sys.stderr)
+        return 2
+
+    if args.seal_capture is not None:
+        directories = [args.trace_dir] + [path for path in trace.entries(args.trace_dir) if path.is_dir()]
+        found = False
+        for directory in directories:
+            with trace.locked_directory(directory):
+                for path in trace.entries(directory):
+                    if not path.name.startswith("capture-") or path.suffix != ".json":
+                        continue
+                    status = trace.read_status(path, trace.Budget())
+                    process = status.get("process_trace_id", "")
+                    if status.get("run_id") != args.seal_capture or not process or not all(c.isascii() and (c.isalnum() or c in "-_") for c in process):
+                        raise trace.TraceInputError("cannot seal a foreign or invalid capture")
+                    marker = directory / f".seal-{process}"
+                    if not marker.exists():
+                        marker.touch(exist_ok=False)
+                    found = True
+        return 0 if found else 1
+
+    if args.check_capture is not None:
+        nodes = load_traces(args.trace_dir, args.check_capture)
+        for node in nodes:
+            if node.capture_error:
+                print(f"trace capture incomplete: {node.node}: {node.capture_error}", file=sys.stderr)
+        return 0 if nodes and all(not node.capture_error for node in nodes) else 1
+
     if args.check_commit_balance is not None:
         path = args.check_commit_balance
         if not csv_segments(path):
             return 1
-        rows = read_csv(path, path.parent.name, "commit_state")
+        with trace.locked_directory(path.parent):
+            rows = read_csv(path, path.parent.name, "commit_state")
         return 0 if commits_balanced(rows) else 1
 
     if args.dump_csv is not None:
         table = args.dump_csv.name.split(".csv", 1)[0]
-        rows = read_csv(args.dump_csv, args.dump_csv.parent.name, table)
+        with trace.locked_directory(args.dump_csv.parent):
+            if args.after and len(csv_segments(args.dump_csv)) > 1:
+                raise trace.TraceInputError("row-count cursors require an unrotated capture")
+            rows = read_csv(args.dump_csv, args.dump_csv.parent.name, table)
         if any(row.event == "csv_decode_error" for row in rows):
             print("trace_oracle.py: malformed CSV input", file=sys.stderr)
             return 1
@@ -2125,6 +2134,8 @@ def main(argv: list[str]) -> int:
             require_handoff_boundary=args.require_handoff_boundary,
             require_v7_request_ids=args.require_v7_request_ids,
             required_commit_nodes=tuple(args.require_commit_node),
+            required_sync_nodes=tuple(args.require_sync_node),
+            capture_run_id=args.capture_run_id,
             handoff_stall_micros=args.handoff_stall_seconds * 1_000_000,
             commit_trend_min_ms=args.commit_trend_min_ms,
             commit_trend_factor=args.commit_trend_factor,
@@ -2133,11 +2144,24 @@ def main(argv: list[str]) -> int:
     )
     if failures:
         print_failures(failures)
+        incomplete = {"trace_input_is_complete", "trace_csv_is_valid", "trace_files_exist",
+                      "commit_state_has_events", "required_sync_evidence_exists",
+                      "commit_state_has_commit_start", "commit_state_has_commit_finish"}
+        if any(item.invariant in incomplete for item in failures):
+            print("trace_oracle: INCOMPLETE", file=sys.stderr)
+            return 2
         return 1
 
+    if not args.capture_run_id:
+        print(f"trace_oracle: INCOMPLETE (checks passed, capture completeness not established: {args.trace_dir})")
+        return 2
     print(f"trace_oracle: PASS ({args.trace_dir})")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except (OSError, trace.TraceInputError) as error:
+        print(f"trace_oracle: INCOMPLETE ({error})", file=sys.stderr)
+        raise SystemExit(2)

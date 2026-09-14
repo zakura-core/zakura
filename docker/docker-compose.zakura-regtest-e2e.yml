@@ -26,6 +26,8 @@ x-zakura-node: &zakura-node
   image: debian:trixie-slim
   network_mode: host
   restart: "no"
+  environment:
+    ZAKURA_TRACE_CAPTURE_RUN: ${ZAKURA_TRACE_CAPTURE_RUN:-}
   stop_grace_period: 5s
   cpu_shares: 256
   mem_swappiness: 0

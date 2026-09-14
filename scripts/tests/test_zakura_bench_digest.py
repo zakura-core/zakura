@@ -241,17 +241,40 @@ class LatencyTests(unittest.TestCase):
 
     def write_trace(self, tmp, rows):
         with (Path(tmp) / "commit_state.csv").open("w", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=["ts", "event", "height", "extra"])
+            writer = csv.DictWriter(handle, fieldnames=digest.trace.HEADERS["commit_state"])
             writer.writeheader()
             for line in rows:
                 try:
                     value = json.loads(line)
+                    value.setdefault("ts", 0)
+                    value.setdefault("trace_version", 2)
+                    value.setdefault("process_trace_id", "fixture")
+                    value.setdefault("node", "fixture")
+                    value.setdefault("wall_ts", "2026-09-13T00:00:00.000Z")
                 except ValueError:
                     writer.writerow({"extra": line})
                     continue
                 record = {key: value.pop(key) for key in writer.fieldnames[:-1] if key in value}
                 record["extra"] = json.dumps(value)
                 writer.writerow(record)
+
+    def test_restart_does_not_pair_old_process_start_with_new_finish(self):
+        rows = [
+            json.dumps({"event": "commit_start", "height": 12, "ts": 9000,
+                        "process_trace_id": "old"}),
+            commit_row(height=12, ts=100, process_trace_id="new"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_trace(tmp, rows)
+            parsed = digest.parse_commit_trace(Path(tmp) / "commit_state.csv")
+        self.assertEqual(parsed[1], {})
+        self.assertEqual(parsed[2][12][0], 100)
+
+    def test_malformed_trace_reports_unavailable_analysis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_trace(tmp, [commit_row(), "invalid JSON"])
+            output = self.run_latency(traces=tmp)
+        self.assertIn("Trace analysis unavailable:", output)
 
     def test_csv_trace_round_trip(self):
         rows = block_lifecycle(1707211, queued_ts=100, start_ts=300,
@@ -261,10 +284,11 @@ class LatencyTests(unittest.TestCase):
             path = Path(tmp) / "commit_state.csv"
             expected = digest.parse_commit_trace(path)
             with path.with_suffix(".csv").open("w", newline="") as handle:
-                writer = csv.DictWriter(handle, fieldnames=["ts", "event", "height", "extra"])
+                writer = csv.DictWriter(handle, fieldnames=digest.trace.HEADERS["commit_state"])
                 writer.writeheader()
                 for line in rows:
                     value = json.loads(line)
+                    value.update(trace_version=2, process_trace_id="fixture", node="fixture", wall_ts="2026-09-13T00:00:00.000Z")
                     record = {key: value.pop(key) for key in writer.fieldnames[:-1] if key in value}
                     record["extra"] = json.dumps(value)
                     writer.writerow(record)
@@ -276,10 +300,11 @@ class LatencyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             for name, selected in (("commit_state.csv.1", rows[:2]), ("commit_state.csv", rows[2:])):
                 with (Path(tmp) / name).open("w", newline="") as handle:
-                    writer = csv.DictWriter(handle, fieldnames=["ts", "event", "height", "extra"])
+                    writer = csv.DictWriter(handle, fieldnames=digest.trace.HEADERS["commit_state"])
                     writer.writeheader()
                     for line in selected:
                         value = json.loads(line)
+                        value.update(trace_version=2, process_trace_id="fixture", node="fixture", wall_ts="2026-09-13T00:00:00.000Z")
                         record = {key: value.pop(key) for key in writer.fieldnames[:-1] if key in value}
                         record["extra"] = json.dumps(value)
                         writer.writerow(record)
@@ -308,7 +333,6 @@ class LatencyTests(unittest.TestCase):
                     "commit_stall_reason": "contiguous_head",
                 }
             ),
-            "not json at all",
         ]
         with tempfile.TemporaryDirectory() as tmp:
             self.write_trace(tmp, rows)

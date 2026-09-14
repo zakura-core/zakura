@@ -691,6 +691,8 @@ pub mod block_sync_trace {
     pub const BLOCK_FRONTIER_RESET_CLASSIFIED: &str = "block_frontier_reset_classified";
     /// Periodic reactor state snapshot (the key stall-diagnosis row).
     pub const BLOCK_SYNC_STATE: &str = "block_sync_state";
+    /// Pipeline-only view update without peer/request diagnostics.
+    pub const BLOCK_SYNC_PIPELINE_STATE: &str = "block_sync_pipeline_state";
     /// Periodic per-peer BBR controller heartbeat, emitted on a fixed cadence even while
     /// the peer is idle (unlike the per-delivery `block_body_received` row), so a trace can
     /// tell a settled controller (cwnd stable, reliability ≈ 1.0) from an oscillating one.

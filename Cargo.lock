@@ -7782,6 +7782,7 @@ name = "zakura-jsonl-trace"
 version = "2.0.0"
 dependencies = [
  "chrono",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

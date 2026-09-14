@@ -54,7 +54,12 @@ impl BlockSyncReactor {
     }
 
     pub(super) fn trace_sync_state(&self, include_diagnostics: bool) {
-        self.emit_block(bs_trace::BLOCK_SYNC_STATE, |row| {
+        let event = if include_diagnostics {
+            bs_trace::BLOCK_SYNC_STATE
+        } else {
+            bs_trace::BLOCK_SYNC_PIPELINE_STATE
+        };
+        self.emit_block(event, |row| {
             let floor_gap = include_diagnostics
                 .then(|| self.floor_gap_diagnostics(Instant::now()))
                 .flatten();

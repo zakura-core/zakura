@@ -10,6 +10,7 @@ use iroh::EndpointId;
 use rand::{rngs::OsRng, RngCore};
 use std::num::NonZeroU64;
 
+mod gauge;
 mod trace;
 
 /// Upper bound on how long the Sequencer task will wait to enqueue a verifier
@@ -2258,8 +2259,9 @@ impl BlockSyncReactor {
             .set(self.state.budget.available() as f64);
         metrics::gauge!("sync.block.bbr.min_cwnd_bytes")
             .set(self.startup.config.bbr_min_cwnd_bytes as f64);
-        metrics::gauge!("sync.block.peers.with_status")
-            .set(self.registry.peers_with_status() as f64);
+        gauge::set_lazy(metrics::gauge!("sync.block.peers.with_status"), || {
+            self.registry.peers_with_status() as f64
+        });
         // Outstanding (unreceived in-flight) heights summed across peers from the
         // registry (the routines own the per-peer outstanding now).
         metrics::gauge!("sync.block.outstanding").set(self.registry.total_unreceived() as f64);

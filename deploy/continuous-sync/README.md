@@ -224,6 +224,13 @@ failed run. The title names any earlier completions without charts. Old binaries
 expired reports, missing samples, and unavailable nodes are shown explicitly.
 Charts do not reconstruct earlier runs from partial diagnostic logs.
 
+For ordinary node use, the metrics endpoint is disabled by default. The new
+metrics use the existing `[metrics].endpoint_addr` setting. Extra peer-count and
+download-gap scans run only when their metrics are recorded. Explicitly enabled
+diagnostic tracing keeps its existing collection path. The continuous-sync
+controller's sample retention is separate from `[summary].charts`, which only
+controls chart delivery.
+
 The duration bars show where the time went by committed block height. For example,
 an illustrative Dual run taking two extra hours in Sandblast gets a longer
 Sandblast segment even if its final BPS looks similar to yesterday's run.

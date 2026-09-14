@@ -1,5 +1,5 @@
-//! Answer bodies or endings that do not match this connection's original
-//! request: unauthorized ones are rejected, fork answers only discarded.
+//! Bodies or endings that do not match this connection's original request:
+//! unauthorized ones are rejected, fork answers are only discarded.
 
 use super::*;
 
@@ -160,6 +160,29 @@ async fn r04_wrong_hash_inside_the_range_is_consumed_and_discarded() {
 }
 
 #[tokio::test]
+async fn r04_a_discarded_body_does_not_prove_this_peer_supplies_blocks() {
+    let mut f = Fixture::new(100, 3);
+    f.publish().await;
+    let stalled_requests = f.routine.window.requests_without_block_progress;
+    let mut wrong = (*f.blocks[0]).clone();
+    Arc::make_mut(&mut wrong.header).nonce[0] ^= 1;
+    f.discards(
+        BlockSyncMessage::Block(Arc::new(wrong)),
+        1,
+        "R04 a fork answer is responsive, not useful",
+    )
+    .await;
+    assert!(
+        !f.routine.window.has_block_progress(),
+        "R04 a discarded body must not lift the unproven-peer request cap"
+    );
+    assert_eq!(
+        f.routine.window.requests_without_block_progress, stalled_requests,
+        "R04 a discarded body must not clear the no-progress request count"
+    );
+}
+
+#[tokio::test]
 async fn r05_duplicate_body_spends_a_part_without_a_second_delivery() {
     let mut f = Fixture::new(100, 3);
     f.publish().await;
@@ -174,13 +197,13 @@ async fn r05_duplicate_body_spends_a_part_without_a_second_delivery() {
 }
 
 #[tokio::test]
-async fn r12_a_body_after_the_last_part_exceeds_credit_and_disconnects() {
+async fn r12_a_body_after_the_last_part_has_no_started_response_and_disconnects() {
     let mut f = Fixture::new(100, 1);
     f.publish().await;
     f.body(0).await;
     f.rejects(
         BlockSyncMessage::Block(f.blocks[0].clone()),
-        "R12 no unconsumed part remains",
+        "R12 the only range is fully consumed, so no response is still started",
     )
     .await;
 }

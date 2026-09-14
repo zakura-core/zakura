@@ -1182,6 +1182,7 @@ impl ZakuraControlAck {
         if self.accepted_limits.max_frame_bytes > requested_limits.max_frame_bytes
             || self.accepted_limits.max_message_bytes > requested_limits.max_message_bytes
             || self.accepted_limits.max_open_streams > requested_limits.max_open_streams
+            || self.accepted_limits.max_open_streams > local.max_open_streams
             || self.accepted_limits.max_inbound_queue_depth
                 > requested_limits.max_inbound_queue_depth
             || self.accepted_limits.idle_timeout_millis > requested_limits.idle_timeout_millis
@@ -1634,13 +1635,15 @@ fn validate_resource_limits(
     if max_control_frame_bytes == 0
         || max_control_frame_bytes > local.max_control_frame_bytes
         || max_open_streams == 0
-        || max_open_streams > local.max_open_streams
     {
         return Err(ZakuraRejectReason::ResourceLimit);
     }
     Ok(())
 }
 
+// A peer that accepts more open streams than we do is not a resource fault:
+// `accepted_limits_for` and `ZakuraLocalLimits::clamp` take the minimum of both
+// sides, so a larger advertisement never raises what this node opens or admits.
 fn validate_initial_limits(
     limits: ZakuraInitialLimits,
     local: &ZakuraHandshakeConfig,
@@ -1652,7 +1655,6 @@ fn validate_initial_limits(
         || limits.max_message_bytes == 0
         || limits.max_message_bytes > local.max_message_bytes
         || limits.max_open_streams == 0
-        || limits.max_open_streams > local.max_open_streams
         || limits.max_inbound_queue_depth == 0
         || limits.max_inbound_queue_depth > local.max_inbound_queue_depth
         || limits.idle_timeout_millis == 0
@@ -2359,6 +2361,42 @@ mod tests {
                 Err(ZakuraValidationError::ResourceLimit)
             );
         }
+    }
+
+    #[test]
+    fn hello_advertising_more_streams_than_local_is_accepted() {
+        let local = ZakuraHandshakeConfig::for_network(&Network::Mainnet);
+        for advertised in [local.max_open_streams + 1, 1024, u16::MAX] {
+            let limits = ZakuraInitialLimits {
+                max_frame_bytes: local.max_message_bytes,
+                max_message_bytes: local.max_message_bytes,
+                max_open_streams: advertised,
+                max_inbound_queue_depth: local.max_inbound_queue_depth,
+                idle_timeout_millis: local.max_idle_timeout_millis,
+            };
+            assert_eq!(
+                validate_initial_limits(limits, &local),
+                Ok(()),
+                "a peer that accepts more streams than we open is not a resource fault ({advertised})"
+            );
+            assert_eq!(
+                validate_resource_limits(local.max_control_frame_bytes, advertised, &local),
+                Ok(())
+            );
+        }
+        assert_eq!(
+            validate_initial_limits(
+                ZakuraInitialLimits {
+                    max_frame_bytes: local.max_message_bytes,
+                    max_message_bytes: local.max_message_bytes,
+                    max_open_streams: 0,
+                    max_inbound_queue_depth: local.max_inbound_queue_depth,
+                    idle_timeout_millis: local.max_idle_timeout_millis,
+                },
+                &local
+            ),
+            Err(ZakuraRejectReason::ResourceLimit)
+        );
     }
 
     #[test]

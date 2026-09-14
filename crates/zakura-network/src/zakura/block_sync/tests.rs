@@ -973,7 +973,8 @@ async fn wait_for_outbound_getblocks(outbound: &mut FramedRecv) -> (block::Heigh
 
 /// Same as [`wait_for_outbound_getblocks`], but patient enough for another peer's
 /// request deadline (`request_timeout`, 8 s by default) to lapse first, which is
-/// what reoffers that peer's unreceived heights.
+/// what reoffers that peer's unreceived heights when no other peer is eligible to
+/// take them sooner.
 async fn wait_for_reoffered_getblocks(outbound: &mut FramedRecv) -> (block::Height, u32) {
     tokio::time::timeout(Duration::from_secs(12), async {
         loop {
@@ -8266,9 +8267,23 @@ async fn reactor_discards_unmatched_body_for_ownerless_queued_height() {
         "the byte-capped request must cover only height 1",
     );
 
+    // A second peer that serves only height 1, so it cannot take the queued
+    // height 2 and has nothing to do until height 1 comes back.
+    let (_fresh_peer, _fresh_inbound, mut fresh_outbound) = connect_peer_with_status(
+        &service,
+        &mut actions,
+        144,
+        block::Height(1),
+        blocks[0].hash(),
+        1,
+        MAX_BS_RESPONSE_BYTES,
+    )
+    .await;
+
     // Height 2 arrives without a matching request. Its hash is not the next
     // expected hash of any range, so it spends the started `(1, 1)` response
-    // and is dropped unread rather than entering the commit pipeline.
+    // and is dropped unread rather than entering the commit pipeline. The
+    // ending closes that range and returns the spent height 1 to `pending`.
     inbound_tx
         .send(
             BlockSyncMessage::Block(blocks[1].clone())
@@ -8277,9 +8292,17 @@ async fn reactor_discards_unmatched_body_for_ownerless_queued_height() {
         )
         .await
         .expect("unmatched queued block queues");
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(1),
+            returned: 1,
+        },
+    )
+    .await;
 
-    // The discard spends height 1, which is retry-avoided here, so a follow-up
-    // request to this peer (height 2 is still queued) must start above it.
+    // The return wakes the waiting peer, which takes height 1 while this peer's
+    // retry bias defers, so no request here may cover it.
     let quiet = tokio::time::timeout(Duration::from_millis(250), async {
         loop {
             tokio::select! {
@@ -8292,13 +8315,13 @@ async fn reactor_discards_unmatched_body_for_ownerless_queued_height() {
                 },
                 frame = outbound_rx.recv() => {
                     let frame = frame.expect("the peer's outbound must outlive a discard");
-                    if let BlockSyncMessage::GetBlocks { start_height, .. } =
+                    if let BlockSyncMessage::GetBlocks { start_height, count } =
                         BlockSyncMessage::decode_frame(frame).expect("outbound frame decodes")
                     {
-                        assert_ne!(
-                            start_height,
-                            block::Height(1),
-                            "the spent height must not be re-requested from this peer",
+                        assert!(
+                            !(start_height.0..start_height.0.saturating_add(count)).contains(&1),
+                            "the spent height must not be re-requested from this peer: \
+                             ({start_height:?}, {count})",
                         );
                     }
                 }
@@ -8309,26 +8332,15 @@ async fn reactor_discards_unmatched_body_for_ownerless_queued_height() {
     assert!(quiet.is_err());
     assert_eq!(
         service.peer_count(),
-        1,
-        "a fork answer keeps its connection",
+        2,
+        "a fork answer keeps both connections",
     );
 
-    // The spent height is not lost: it returns to `pending` once this peer's
-    // request deadline lapses. A fresh peer that serves only height 1 asks for
-    // exactly that range.
-    let (_fresh_peer, _fresh_inbound, mut fresh_outbound) = connect_peer_with_status(
-        &service,
-        &mut actions,
-        144,
-        block::Height(1),
-        blocks[0].hash(),
-        1,
-        MAX_BS_RESPONSE_BYTES,
-    )
-    .await;
+    let (start_height, _count) = wait_for_outbound_getblocks(&mut fresh_outbound).await;
     assert_eq!(
-        wait_for_reoffered_getblocks(&mut fresh_outbound).await,
-        (block::Height(1), 1),
+        start_height,
+        block::Height(1),
+        "the returned height is offered to the peer waiting for it",
     );
     reactor_task.abort();
 }
@@ -12110,8 +12122,9 @@ async fn reactor_discards_duplicate_buffered_body_and_keeps_first_receipt() {
         MAX_BS_RESPONSE_BYTES,
     )
     .await;
-    // The spent height returns to `pending` once peer 44's request deadline
-    // lapses, and this peer is offered it.
+    // Peer 44 delivered a measured body for `(2, 1)`, so it stays the preferred
+    // floor carrier over this unmeasured peer: the spent height is reoffered
+    // here only once peer 44's `(1, 1)` request deadline lapses.
     assert_eq!(
         wait_for_reoffered_getblocks(&mut fresh_outbound).await,
         (block::Height(1), 1)
@@ -12348,48 +12361,8 @@ async fn reactor_discards_block_whose_hash_differs_from_its_expected_header() {
         BlockSyncMessage::GetBlocks { .. }
     ) {}
 
-    // The request authorized hash [9; 32] at height 1; this body is that height
-    // on another chain, so it spends the `(1, 1)` response and is dropped
-    // unread: no fault, no commit, and no re-request of height 1 here.
-    inbound_tx
-        .send(
-            BlockSyncMessage::Block(mainnet_block(&BLOCK_MAINNET_1_BYTES))
-                .encode_frame()
-                .expect("block encodes"),
-        )
-        .await
-        .expect("block queues");
-
-    let quiet = tokio::time::timeout(Duration::from_millis(250), async {
-        loop {
-            tokio::select! {
-                action = actions.recv() => match action {
-                    Some(BlockSyncAction::QueryNeededBlocks { .. }) => {}
-                    Some(action) => {
-                        panic!("a fork answer is neither misconduct nor a commit: {action:?}")
-                    }
-                    None => panic!("the action channel must outlive a discard"),
-                },
-                frame = outbound_rx.recv() => panic!(
-                    "the spent height must not be re-requested from this peer: {:?}",
-                    BlockSyncMessage::decode_frame(
-                        frame.expect("the peer's outbound must outlive a discard"),
-                    )
-                    .expect("outbound frame decodes"),
-                ),
-            }
-        }
-    })
-    .await;
-    assert!(quiet.is_err());
-    assert_eq!(
-        service.peer_count(),
-        1,
-        "a fork answer keeps its connection",
-    );
-
-    // The spent height returns to `pending` once this peer's request deadline
-    // lapses, and the next peer is offered it.
+    // A second peer, which has nothing to take while peer 41 holds height 1,
+    // and is woken when the ending returns it.
     let (_fresh_peer, _fresh_inbound, mut fresh_outbound) = connect_peer_with_status(
         &service,
         &mut actions,
@@ -12400,8 +12373,64 @@ async fn reactor_discards_block_whose_hash_differs_from_its_expected_header() {
         MAX_BS_RESPONSE_BYTES,
     )
     .await;
+
+    // The request authorized hash [9; 32] at height 1; this body is that height
+    // on another chain, so it spends the `(1, 1)` response and is dropped
+    // unread. The ending closes that range and returns height 1 to `pending`.
+    inbound_tx
+        .send(
+            BlockSyncMessage::Block(mainnet_block(&BLOCK_MAINNET_1_BYTES))
+                .encode_frame()
+                .expect("block encodes"),
+        )
+        .await
+        .expect("block queues");
+    send_inbound(
+        &inbound_tx,
+        BlockSyncMessage::BlocksDone {
+            start_height: block::Height(1),
+            returned: 1,
+        },
+    )
+    .await;
+
+    // No fault, no commit, and the returned height goes to the waiting peer
+    // rather than back to this one.
+    let quiet = tokio::time::timeout(Duration::from_millis(250), async {
+        loop {
+            tokio::select! {
+                action = actions.recv() => match action {
+                    Some(BlockSyncAction::QueryNeededBlocks { .. }) => {}
+                    Some(action) => {
+                        panic!("a fork answer is neither misconduct nor a commit: {action:?}")
+                    }
+                    None => panic!("the action channel must outlive a discard"),
+                },
+                frame = outbound_rx.recv() => {
+                    let frame = frame.expect("the peer's outbound must outlive a discard");
+                    if let BlockSyncMessage::GetBlocks { start_height, count } =
+                        BlockSyncMessage::decode_frame(frame).expect("outbound frame decodes")
+                    {
+                        assert!(
+                            !(start_height.0..start_height.0.saturating_add(count)).contains(&1),
+                            "the spent height must not be re-requested from this peer: \
+                             ({start_height:?}, {count})",
+                        );
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    assert!(quiet.is_err());
     assert_eq!(
-        wait_for_reoffered_getblocks(&mut fresh_outbound).await,
+        service.peer_count(),
+        2,
+        "a fork answer keeps both connections",
+    );
+
+    assert_eq!(
+        wait_for_outbound_getblocks(&mut fresh_outbound).await,
         (block::Height(1), 1),
     );
     reactor_task.abort();

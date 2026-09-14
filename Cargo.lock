@@ -8147,7 +8147,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-state"
-version = "8.0.0"
+version = "8.1.0"
 dependencies = [
  "bincode",
  "chrono",

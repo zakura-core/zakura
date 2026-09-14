@@ -136,6 +136,10 @@ impl<T> ResponseVec<T> {
         self.values.remove(index)
     }
 
+    pub(crate) fn swap_remove(&mut self, index: usize) -> T {
+        self.values.swap_remove(index)
+    }
+
     /// Split this buffer's share from an admitted group of allocation plans.
     pub(crate) fn apply_capacity_from(
         &mut self,

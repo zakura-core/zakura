@@ -11,7 +11,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -231,6 +231,123 @@ class DailySummaryTests(unittest.TestCase):
         self.assertNotIn("systemctl stop zakura-sync-summary.service", commands)
         self.assertNotIn("enable --now", commands)
         self.assertIn("zakura-sync-summary.timer", commands)
+
+
+class ChartSummaryTests(unittest.TestCase):
+    setUp = DailySummaryTests.setUp
+    data = DailySummaryTests.data
+
+    def enable(self):
+        self.config["summary"].update(charts=True, channel_id="C0123456789", sandblast_start=200,
+                                      sandblast_end=300, chart_axis="height")
+        self.state["chart_destination"] = "bound"
+        summary.save_state(self.path, self.state)
+
+    def test_partial_delivery_freezes_cursors_and_retries_without_a_new_snapshot(self):
+        self.enable()
+        client = Mock()
+        client.destination.return_value = "bound"
+        snapshot = {"node": self.data()}
+        cursors = {"node": {"number": 3, "run_id": "run3"}}
+        def render(*args):
+            args[-1].mkdir()
+            return [{"name": "chart.png", "title": "Dual"}]
+        def send(_client, channel, pending, directory, persist):
+            self.assertEqual(channel, "C0123456789")
+            pending["parent_ts"] = "1.123"
+            persist()
+            raise deploy.DeployError("image transfer failed")
+        with patch.object(summary, "Client", return_value=client), \
+             patch.object(summary, "collect_statuses", return_value=(snapshot, cursors)) as collect, \
+             patch.object(summary, "prepare_charts", side_effect=render) as prepare, \
+             patch.object(summary, "send_pending", side_effect=send), \
+             self.assertRaises(deploy.DeployError):
+            summary.deliver(self.config, self.path, self.due)
+        collect.assert_called_once()
+        prepare.assert_called_once()
+        saved = json.loads(self.path.read_text())
+        self.assertEqual(saved["cursors"]["node"]["number"], 2)
+        self.assertEqual(saved["pending"]["parent_ts"], "1.123")
+        with patch.object(summary, "Client", return_value=client), \
+             patch.object(summary, "collect_statuses") as collect, \
+             patch.object(summary, "prepare_charts") as prepare, \
+             patch.object(summary, "send_pending") as send:
+            summary.deliver(self.config, self.path, self.due + 86400)
+        collect.assert_not_called()
+        prepare.assert_not_called()
+        self.assertEqual(send.call_args.args[2]["parent_ts"], "1.123")
+        saved = json.loads(self.path.read_text())
+        self.assertNotIn("pending", saved)
+        self.assertEqual(saved["cursors"]["node"]["number"], 3)
+        self.assertEqual(saved["last_slot"], "2026-09-08")
+
+    def test_unbound_channel_cannot_send(self):
+        self.enable()
+        client = Mock()
+        client.destination.return_value = "other-channel"
+        with patch.object(summary, "Client", return_value=client), \
+             patch.object(summary, "collect_statuses") as collect, self.assertRaisesRegex(deploy.DeployError, "not bound"):
+            summary.deliver(self.config, self.path, self.due)
+        collect.assert_not_called()
+
+    def test_binding_preserves_cursors_and_requires_original_destination(self):
+        self.enable()
+        args = argparse.Namespace(command="bind-bot")
+        client = Mock()
+        client.destination.return_value = "new-binding"
+        with patch.object(summary, "Client", return_value=client), \
+             patch.object(summary, "slack_webhook_url", return_value=self.webhook):
+            summary.recover_delivery(self.config, self.path, self.due, args)
+        saved = json.loads(self.path.read_text())
+        self.assertEqual(saved["cursors"], self.state["cursors"])
+        self.assertEqual(saved["last_posted_at"], self.last)
+        self.assertEqual(saved["chart_destination"], "new-binding")
+        with patch.object(summary, "slack_webhook_url", return_value="changed"), self.assertRaises(deploy.DeployError):
+            summary.recover_delivery(self.config, self.path, self.due, args)
+
+    def test_pending_delivery_cannot_be_bypassed_by_disabling_charts(self):
+        self.state["pending"] = {"text": "frozen", "timestamp": self.due, "slot": "2026-09-08",
+                                 "cursors": self.state["cursors"], "unavailable": [],
+                                 "files": [{"name": "chart.png", "title": "Dual"}]}
+        summary.save_state(self.path, self.state)
+        with patch.object(summary, "slack_webhook_url", return_value=self.webhook), \
+             patch.object(summary, "post_slack") as post, self.assertRaisesRegex(deploy.DeployError, "finish pending"):
+            summary.deliver(self.config, self.path, self.due)
+        post.assert_not_called()
+
+    def test_prepare_keeps_failed_runs_missing_data_and_unavailable_nodes_visible(self):
+        self.enable()
+        from test_sync_report import fixture
+        self.config["nodes"].append({"name": "absent", "hostname": "absent", "ssh_string": "root@absent", "p2p_stack": "legacy"})
+        cursors = {**self.state["cursors"], "absent": {"number": 0, "run_id": ""}}
+        snapshot = self.data(total=4)
+        snapshot["controller_state"].update(failed=True, last_failed_run="failed-run")
+        current = fixture()
+        current["metadata"]["run_id"] = "run4"
+        def read(_config, _node, *, report_id):
+            return current if report_id == "run4" else {"unavailable": "no retained report"}
+        rendered = []
+        def render(reports, title, path, *_args, **_kwargs):
+            rendered.append(reports)
+            path.write_bytes(b"png")
+        with patch.object(summary.monitor, "query_node", side_effect=read), \
+             patch.object(summary.report_charts, "render", side_effect=render):
+            files = summary.prepare_charts(self.config, {"node": snapshot}, cursors, self.path.parent / "charts-test")
+        self.assertEqual(len(files), 2)
+        self.assertEqual(rendered[0][0]["run_id"], "run3")
+        self.assertEqual(rendered[0][1]["metadata"]["run_id"], "run4")
+        self.assertEqual(rendered[0][2]["run_id"], "failed-run")
+        self.assertEqual(rendered[1], [{"mode": "legacy", "unavailable": "status unavailable"}])
+
+    def test_chart_dry_run_does_not_authenticate_or_advance_state(self):
+        self.enable()
+        before = self.path.read_text()
+        with patch.object(summary, "Client") as client, patch.object(summary, "prepare_charts") as prepare, \
+             patch.object(summary.monitor, "query_node", return_value=self.data()), contextlib.redirect_stdout(io.StringIO()):
+            summary.deliver(self.config, self.path, self.due, dry_run=True)
+        client.assert_not_called()
+        prepare.assert_not_called()
+        self.assertEqual(self.path.read_text(), before)
 
 
 if __name__ == "__main__":

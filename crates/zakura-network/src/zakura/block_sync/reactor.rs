@@ -2246,6 +2246,20 @@ impl BlockSyncReactor {
                 .saturating_add(view.applying_decoded_attributed_memory_bytes) as f64,
         );
         metrics::gauge!("sync.block.applying").set(self.last_view.applying_len as f64);
+        // Keep contiguous work awaiting submission separate from bodies held at a gap.
+        metrics::gauge!("sync.block.applying.unsubmitted")
+            .set(view.unsubmitted_applying_count as f64);
+        metrics::gauge!("sync.block.applying.submitted")
+            .set(view.in_flight_submission_count as f64);
+        metrics::gauge!("sync.block.applying.buffered_bytes")
+            .set(view.applying_buffered_bytes as f64);
+        metrics::gauge!("sync.block.reorder.blocks").set(view.reorder_len as f64);
+        metrics::gauge!("sync.block.budget.available_bytes")
+            .set(self.state.budget.available() as f64);
+        metrics::gauge!("sync.block.bbr.min_cwnd_bytes")
+            .set(self.startup.config.bbr_min_cwnd_bytes as f64);
+        metrics::gauge!("sync.block.peers.with_status")
+            .set(self.registry.peers_with_status() as f64);
         // Outstanding (unreceived in-flight) heights summed across peers from the
         // registry (the routines own the per-peer outstanding now).
         metrics::gauge!("sync.block.outstanding").set(self.registry.total_unreceived() as f64);

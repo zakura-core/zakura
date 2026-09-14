@@ -27,7 +27,7 @@ cluster_stall_seconds = 600
 metrics_url = "http://127.0.0.1:9999/metrics"
 ready_url = "http://127.0.0.1:8080/ready"
 healthy_url = "http://127.0.0.1:8080/healthy"
-poll_interval_seconds = 30
+poll_interval_seconds = 10
 startup_timeout_seconds = 600
 stall_seconds = 600
 max_run_seconds = 172800
@@ -57,6 +57,11 @@ hostname = "temp-zakura-sync-test-1"
 timezone = "America/Denver"
 time = "17:00"
 state_file = "/var/lib/zakura-sync-summary/state.json"
+charts = false # Enable after binding the Slack bot to the existing channel.
+channel_id = "C0BG341Q9TQ"
+sandblast_start = 1707211
+sandblast_end = 2000000 # Inclusive. This is a reporting window, not an upgrade.
+chart_axis = "height"
 
 [[nodes]]
 name = "temp-zakura-sync-test-1"

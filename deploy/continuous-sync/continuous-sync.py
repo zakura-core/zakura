@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from sync_report import Recorder, sample_metrics
+
 STATE_VERSION = 1
 COMPLETION_HISTORY_LIMIT = 256
 
@@ -68,7 +70,7 @@ class Policy:
     metrics_url: str = "http://127.0.0.1:9999/metrics"
     ready_url: str = "http://127.0.0.1:8080/ready"
     healthy_url: str = "http://127.0.0.1:8080/healthy"
-    poll_interval_seconds: int = 30
+    poll_interval_seconds: int = 10
     startup_timeout_seconds: int = 600
     stall_seconds: int = 600
     max_run_seconds: int = 172800
@@ -481,6 +483,7 @@ def sample_status(config: Config) -> dict[str, Any]:
     try:
         metrics = fetch_text(config.policy.metrics_url)
         status["metrics_status"] = "ok"
+        status["report"] = sample_metrics(metrics)
         for key in (
             "state.memory.best.committed.block.height",
             "state.memory.committed.block.height",
@@ -550,7 +553,8 @@ def rotate_run_logs(config: Config, run_dir: Path) -> None:
 
 
 def wait_for_completion(
-    config: Config, run_dir: Path, run_state: dict[str, Any], state: dict[str, Any]
+    config: Config, run_dir: Path, run_state: dict[str, Any], state: dict[str, Any],
+    report: Recorder | None = None,
 ) -> None:
     started = now()
     last_height: int | None = None
@@ -573,6 +577,8 @@ def wait_for_completion(
         rotate_run_logs(config, run_dir)
         sample = sample_status(config)
         sample["time"] = utc_stamp(ts)
+        if report is not None:
+            report.record(sample)
         with samples_path.open("a", encoding="utf-8") as samples:
             samples.write(json.dumps(sample, sort_keys=True) + "\n")
 
@@ -598,6 +604,8 @@ def wait_for_completion(
             )
 
         if sample.get("ready") is True:
+            if ready_samples == 0 and report is not None:
+                run_state["report_ready_since"] = time.monotonic() - report.started
             ready_samples += 1
             if ready_samples >= config.policy.ready_samples:
                 # Use the final readiness sample, not a stale progress height or
@@ -610,6 +618,7 @@ def wait_for_completion(
             time.sleep(config.policy.ready_sample_interval_seconds)
         else:
             ready_samples = 0
+            run_state.pop("report_ready_since", None)
             time.sleep(config.policy.poll_interval_seconds)
 
 
@@ -849,15 +858,21 @@ def one_cycle(config: Config, state_path: Path, state: dict[str, Any]) -> dict[s
     write_run_json(run_dir, run_state)
     state.update({"phase": "syncing", "running_sha": sha, "current_run": run_id})
     save_state(state_path, state)
+    report = Recorder(config.paths.state_dir / "reports", run_state,
+                      config.paths.zakurad_config, config.policy.poll_interval_seconds)
     try:
-        start_service(config)
-        wait_for_completion(config, run_dir, run_state, state)
-    finally:
-        state["phase"] = "stopping"
         try:
-            save_state(state_path, state)
+            start_service(config)
+            wait_for_completion(config, run_dir, run_state, state, report)
         finally:
-            stop_service(config)
+            state["phase"] = "stopping"
+            try:
+                save_state(state_path, state)
+            finally:
+                stop_service(config)
+    except BaseException:
+        report.finish("failed")
+        raise
     rotate_run_logs(config, run_dir)
 
     completed_at_epoch = now()
@@ -871,6 +886,7 @@ def one_cycle(config: Config, state_path: Path, state: dict[str, Any]) -> dict[s
         }
     )
     write_run_json(run_dir, run_state)
+    report.finish("complete", run_state.get("report_ready_since"))
     archive_traces(config, run_dir, run_state)
     completion_history = state.get("completion_history", [])
     if not isinstance(completion_history, list):
@@ -890,6 +906,7 @@ def one_cycle(config: Config, state_path: Path, state: dict[str, Any]) -> dict[s
             "completion_history": (completion_history + [{
                 "number": int(state.get("runs", 0)) + 1,
                 "run_id": run_id,
+                "sha": sha,
                 "duration": run_state["sync_duration_seconds"],
                 "end_height": run_state.get("end_height"),
                 "trace_archive_url": run_state.get("trace_archive_url"),

@@ -27,6 +27,7 @@ use tracing::Instrument;
 use zakura_chain::{
     block::{self, Height, HeightDiff},
     chain_tip::ChainTip,
+    serialization::ZcashSerialize,
 };
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state as zs;
@@ -731,6 +732,11 @@ where
                     download_start.elapsed(),
                     advertiser_addr,
                 );
+                // Count without allocating another payload. Retain the size through
+                // verification so failures never increase committed throughput.
+                let payload_bytes = u64::try_from(block.zcash_serialized_size())
+                    .expect("a downloaded block is bounded by the protocol message size");
+                metrics::counter!("sync.legacy.payload.received.bytes").increment(payload_bytes);
                 Self::transition_task(
                     &task_states,
                     &trace,
@@ -852,6 +858,7 @@ where
 
                 if verification.is_ok() {
                     metrics::counter!("sync.verified.block.count").increment(1);
+                    metrics::counter!("sync.legacy.payload.committed.bytes").increment(payload_bytes);
                 }
 
                 verification

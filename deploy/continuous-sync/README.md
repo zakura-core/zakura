@@ -185,7 +185,7 @@ keeps the host ID for troubleshooting, and includes hosts with zero completions.
 It shows one row per completed run, with duration and average blocks
 per second (BPS), oldest first, plus the currently observed controller phase.
 Sync duration excludes the build and state cleanup; it includes startup, readiness
-confirmation, shutdown, and log archiving. Failures still alert immediately.
+confirmation, shutdown, and log rotation. Trace upload happens afterward. Failures still alert immediately.
 
 Each cycle starts with empty chain state. The BPS calculation uses the confirmed height
 from the final readiness sample plus one for genesis, using the committed-block
@@ -212,6 +212,114 @@ Legacy networking only · 1 completed
 ```
 
 The Slack summary also retains host IDs and current status for troubleshooting.
+
+#### Charts
+
+With `[summary].charts = true`, the sender posts the text summary through a Slack
+bot, then uploads a chart reply for each networking section in the same thread.
+Each image holds up to three runs, oldest first. Longer catch-up summaries use
+multiple images, capped at the latest 12 completions per node plus its current
+failed run. The title names any earlier completions without charts. Old binaries,
+expired reports, missing samples, and unavailable nodes are shown explicitly.
+Charts do not reconstruct earlier runs from partial diagnostic logs.
+
+The duration bars show where the time went by committed block height. For example,
+an illustrative Legacy run taking two extra hours in Sandblast gets a longer
+Sandblast segment even if its final BPS looks similar to yesterday's run.
+Below the bars, every mode uses the same height, MB/s, and queue scales for that
+daily snapshot. Set `chart_axis = "time"` to spread stalls along elapsed time.
+The duration bars remain visible in either view.
+
+| Layer | Meaning |
+| --- | --- |
+| Sprout, Sapling, Sandblast, post-Sandblast, Ironwood | Sapling and Ironwood boundaries come from the running binary. Ironwood appears when its activation is known and in range. Sandblast is a reporting window, initially **1,707,211 through 2,000,000 inclusive**, configured in `nodes.toml`. |
+| Download and commit MB/s | Deltas of cumulative serialized block payload bytes divided by monotonic elapsed seconds and 1,000,000. Both networking lanes are summed in dual mode. These exclude transport overhead and request-budget estimates. Downloads can include retries. Commit bytes count successful submissions. |
+| Dual / Zakura queues | Contiguous blocks ready to submit, blocks submitted to the verifier, and bodies buffered behind a gap. These are separate counts. |
+| Legacy queues | Blocks waiting for verifier readiness and blocks verifying or waiting for a state commit. These do not claim identical stages to Zakura's queues. |
+| VCT strip | Observed share of tree updates using VCT. Legacy is labelled as not using VCT. The dotted height line is this binary's checkpoint limit. |
+
+No missing value becomes zero. Counter decreases and scrape gaps over
+`max(90 seconds, 3 × configured polling interval)` break rate lines. Valid region
+crossings are interpolated between samples, so region timing is an estimate at
+the sampling resolution. Startup, unknown coverage, and readiness/shutdown time
+remain visible in grey. Chart duration uses a monotonic clock; the text summary
+retains its existing whole-second wall-clock duration.
+
+The controller samples every 10 seconds by default, plus the time to perform its
+status checks. The existing readiness confirmation interval stays at 30 seconds.
+It retains compact numeric samples and allowlisted run metadata in
+`/var/lib/zakura-continuous-sync/reports/<run-id>.json` and `.jsonl.gz`.
+Active runs use `.jsonl`. Reports are independent of trace rotation and trace
+uploads. Cleanup keeps 30 days, capped at 256 runs and 32 MiB of uncompressed
+samples per run. Collection errors are logged and recorded without halting sync.
+The node byte counters remain available even when diagnostic tracing is disabled.
+Legacy obtains the payload size with a counting serializer without allocating
+another block buffer.
+
+Retained metadata includes the commit, mode, host CPU count/architecture/kernel,
+allowlisted public tuning, observed minimum request window, upgrade/checkpoint
+heights, and VCT counters. Samples also include queue bytes, request-budget bytes,
+peer count, the next missing height's oldest active request age, process RSS,
+and host CPU/IO-wait ticks for later diagnosis. No controller credentials, peer
+identities, or raw configuration text are included. The forced SSH status command
+accepts only normal status or `--report <run-id>` from this fixed directory.
+
+The sender keeps small region summaries for up to 30 days / 256 reports. With at
+least three earlier matches, it labels the largest regional duration change
+against the median of up to 20 prior matches. Matches require the same node,
+recorded host/configuration, mode, observed request minimum, and region boundaries.
+Only fully covered fixed height regions qualify. Different commits remain
+comparable and their SHAs stay visible; an unrecorded binary default can still
+change between commits, so this is a diagnostic baseline, not a controlled A/B test.
+
+#### Enabling chart delivery
+
+Chart delivery is staged off in `nodes.toml`. Roll it out after the controller,
+status helper, and new node binary have been installed. Controller deployment is
+a separate operation that can stop an active sync; sender deployment does not
+restart controllers. `deploy-summary --no-start` installs the sender and its
+`python3-matplotlib` package while leaving the timer stopped.
+
+Create or reuse a workspace bot with `chat:write`, `files:write`, and `files:read`,
+invite it to the existing report channel, and provision `SLACK_BOT_TOKEN` through
+the operator's secret manager into `/etc/zakura-sync-summary.env` (root, mode 0600)
+on the sender only. Verify `channel_id` in `nodes.toml`.
+Keep `/etc/zakura-alerts.env` and the existing summary state for migration.
+With both environment files loaded, run on the configured sender:
+
+```bash
+/usr/bin/python3 /opt/zakura-sync-summary/daily_summary.py bind-bot
+/usr/bin/python3 /opt/zakura-sync-summary/daily_summary.py run --dry-run
+```
+
+Binding checks the bot identity, ties the workspace/channel to the existing
+delivery history, and preserves all cursors. It does not post a message.
+Set `charts = true` in the tracked inventory, deploy the sender configuration,
+then enable its timer. Token rotation within the same workspace/channel does not
+reset delivery history. `run --dry-run` prints text without bot calls or writes.
+To preview images locally, save one to three `--report` responses as a JSON list:
+
+```bash
+python3 report_charts.py reports.json preview.png --axis height
+python3 report_charts.py reports.json elapsed.png --axis time
+```
+
+Delivery freezes the text, images, and numeric snapshot before posting. The sender
+flushes the returned parent timestamp and each image's progress to disk. Cursors
+advance only after every chart is confirmed. Retries after known errors reuse the
+parent. Slack uploads use
+[`files.getUploadURLExternal`](https://docs.slack.dev/reference/methods/files.getUploadURLExternal/)
+and [`files.completeUploadExternal`](https://docs.slack.dev/reference/methods/files.completeUploadExternal/).
+An uncertain finalization is reconciled with `files.info` in the exact thread.
+
+If a response is lost and delivery cannot be confirmed, `status` shows the pending
+bundle and the timer fails visibly rather than guessing. Inspect Slack first.
+For an existing parent use `recover-parent --ts <confirmed-parent-ts>`.
+Only after confirming absence, use `recover-parent --confirmed-absent` or
+`recover-image --name <pending-png-name> --confirmed-absent`. These commands only
+repair the journal; the next timer tick sends remaining work. Stop the timer while
+investigating an uncertain response. Finish a pending bundle before disabling
+charts or changing channels. Do not delete or reinitialize the delivery state.
 
 Controllers retain the latest 256 completion durations and ending heights in their
 state, independently of run-log cleanup. The sender reads these on each delivery

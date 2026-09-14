@@ -5,12 +5,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shlex
 import socket
 import subprocess
 import tomllib
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+from sync_report import read_report
 
 # Full /metrics scrapes can exceed several MB during long syncs when historical
 # per-peer series accumulate. Prefer a generous timeout and read the whole body
@@ -163,12 +167,30 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("/etc/zakura-continuous-sync/alert-monitor.toml"),
     )
+    parser.add_argument("--report", help="read one retained compact report by run ID")
+    parser.add_argument("--ssh", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    print(json.dumps(status(load_config(args.config)), sort_keys=True))
+    if args.ssh:
+        original = shlex.split(os.environ.get("SSH_ORIGINAL_COMMAND", ""))
+        command = "/usr/local/sbin/zakura-monitor-status.py"
+        if original in ([], [command]):
+            args.report = None
+        elif len(original) == 3 and original[:2] == [command, "--report"]:
+            args.report = original[2]
+        else:
+            raise ValueError("unsupported monitor command")
+    config = load_config(args.config)
+    if args.report is not None:
+        state_path = Path(config.get("defaults", {}).get(
+            "controller_state_path", "/var/lib/zakura-continuous-sync/state.json"))
+        data = read_report(state_path.parent / "reports", args.report)
+    else:
+        data = status(config)
+    print(json.dumps(data, sort_keys=True, separators=(",", ":"), allow_nan=False))
     return 0
 
 

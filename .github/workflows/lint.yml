@@ -225,6 +225,12 @@ jobs:
       - name: Daily sync summary tests
         if: ${{ !cancelled() }}
         run: python3 deploy/continuous-sync/tests/test_daily_summary.py
+      - name: Sync report collection, charts, and delivery tests
+        if: ${{ !cancelled() }}
+        run: |
+          python3 -m venv "$RUNNER_TEMP/sync-report-tests"
+          "$RUNNER_TEMP/sync-report-tests/bin/pip" install 'matplotlib==3.10.6'
+          "$RUNNER_TEMP/sync-report-tests/bin/python" deploy/continuous-sync/tests/test_sync_report.py
 
       - name: Cluster dashboard and watchdog tests
         if: ${{ !cancelled() }}

@@ -20,6 +20,7 @@ DEPLOY_PATH = ROOT / "deploy" / "continuous-sync" / "deploy.py"
 ALERT_PATH = ROOT / "deploy" / "continuous-sync" / "alert-monitor.py"
 ALERT_STATUS_PATH = ROOT / "deploy" / "continuous-sync" / "alert-status.py"
 STATUS_WRAPPER_PATH = ROOT / "deploy" / "continuous-sync" / "monitor-status-wrapper.sh"
+sys.path.insert(0, str(SYNC_PATH.parent))
 
 
 def load_module(name: str, path: Path):
@@ -2083,7 +2084,7 @@ class NotificationTests(unittest.TestCase):
                     ):
                         stack.enter_context(patch.object(sync, name, return_value="test"))
                     stack.enter_context(patch.object(sync, "wait_for_completion",
-                        side_effect=lambda _config, _run_dir, run_state, _state: run_state.update(end_height=3469999)))
+                        side_effect=lambda _config, _run_dir, run_state, _state, _report: run_state.update(end_height=3469999)))
                     stack.enter_context(patch.object(sync, "resolve_sha", return_value="a" * 40))
                     stack.enter_context(patch.object(sync, "now", return_value=1000))
                     post = stack.enter_context(patch.object(sync, "post_slack"))
@@ -2103,6 +2104,7 @@ class NotificationTests(unittest.TestCase):
                     self.assertEqual(history[-1], {
                         "number": 261, "run_id": state["current_run"], "duration": 0,
                         "end_height": 3469999,
+                        "sha": "a" * 40,
                         "trace_archive_url": None,
                     })
                     self.assertEqual(state["last_success_end_height"], 3469999)

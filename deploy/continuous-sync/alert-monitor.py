@@ -95,19 +95,12 @@ def run_json(cmd: list[str], timeout: int = 20) -> tuple[dict[str, Any] | None, 
         return None, f"bad-json: {exc}"
 
 
-def query_node(config: dict[str, Any], node: dict[str, Any], *, report_id: str | None = None) -> dict[str, Any]:
+def query_node(config: dict[str, Any], node: dict[str, Any]) -> dict[str, Any]:
     defaults = config.get("defaults", {})
     local = socket.gethostname().split(".", 1)[0]
     status_cmd = str(defaults.get("alert_status_command", "/usr/local/sbin/zakura-monitor-status.py"))
-    arguments = []
-    if report_id is not None:
-        # The remote forced command independently validates this identifier.
-        from sync_report import RUN_ID
-        if not RUN_ID.fullmatch(report_id):
-            raise ValueError("invalid report run ID")
-        arguments = ["--report", report_id]
     if node["hostname"] == local:
-        cmd = [status_cmd, *arguments]
+        cmd = [status_cmd]
     else:
         cmd = [
             "ssh",
@@ -123,7 +116,6 @@ def query_node(config: dict[str, Any], node: dict[str, Any], *, report_id: str |
             "UserKnownHostsFile=/root/.ssh/known_hosts",
             str(node["ssh_string"]),
             status_cmd,
-            *arguments,
         ]
     data, error = run_json(cmd)
     if data is not None:

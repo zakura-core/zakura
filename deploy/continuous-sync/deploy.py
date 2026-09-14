@@ -263,7 +263,6 @@ install -d -m 755 "$(dirname "$controller_config")" "$(dirname "$alert_config")"
   /var/lib/zakura-monitor
 
 install -m 755 /tmp/zakura-continuous-sync.py /usr/local/sbin/zakura-continuous-sync.py
-install -m 644 /tmp/zakura-sync-report.py /usr/local/sbin/sync_report.py
 install -m 755 /tmp/zakura-monitor.py /usr/local/sbin/zakura-monitor.py
 install -m 755 /tmp/zakura-monitor-status.py /usr/local/sbin/zakura-monitor-status.py
 install -m 755 /tmp/zakura-monitor-status.sh /usr/local/sbin/zakura-monitor-status.sh
@@ -282,7 +281,6 @@ chmod 644 "$wipe_sentinel"
 touch "$log_file" "$monitor_log"
 
 rm -f /tmp/zakura-continuous-sync.py \
-  /tmp/zakura-sync-report.py \
   /tmp/zakura-monitor.py \
   /tmp/zakura-monitor-status.py \
   /tmp/zakura-monitor-status.sh \
@@ -320,7 +318,6 @@ def deploy_node(node: Node, args: argparse.Namespace) -> tuple[str, bool, str]:
     tmp_dir.mkdir(parents=True, exist_ok=True)
     staged = {
         "continuous-sync.py": SCRIPT_DIR / "continuous-sync.py",
-        "sync_report.py": SCRIPT_DIR / "sync_report.py",
         "alert-monitor.py": SCRIPT_DIR / "alert-monitor.py",
         "alert-status.py": SCRIPT_DIR / "alert-status.py",
         "monitor-status-wrapper.sh": SCRIPT_DIR / "monitor-status-wrapper.sh",
@@ -339,7 +336,6 @@ def deploy_node(node: Node, args: argparse.Namespace) -> tuple[str, bool, str]:
 
     uploads = [
         (staged["continuous-sync.py"], "/tmp/zakura-continuous-sync.py"),
-        (staged["sync_report.py"], "/tmp/zakura-sync-report.py"),
         (staged["alert-monitor.py"], "/tmp/zakura-monitor.py"),
         (staged["alert-status.py"], "/tmp/zakura-monitor-status.py"),
         (staged["monitor-status-wrapper.sh"], "/tmp/zakura-monitor-status.sh"),
@@ -418,9 +414,8 @@ def cmd_deploy_summary(args: argparse.Namespace) -> int:
         'case "$(systemctl show --value --property=ActiveState zakura-sync-summary.service)" in '
         "inactive|failed) ;; *) echo 'sender still running; wait for completion and retry installation' >&2; exit 1;; esac; fi"
     ), timeout=30)
-    run(node.ssh_cmd("apt-get update -qq && apt-get install -y python3-matplotlib && install -d -m 755 /opt/zakura-sync-summary"), timeout=180)
-    for name in ("daily_summary.py", "deploy.py", "alert-monitor.py", "sync_report.py",
-                 "report_charts.py", "slack_report.py"):
+    run(node.ssh_cmd("install -d -m 755 /opt/zakura-sync-summary"), timeout=30)
+    for name in ("daily_summary.py", "deploy.py", "alert-monitor.py"):
         run(node.scp_to(SCRIPT_DIR / name, f"/opt/zakura-sync-summary/{name}"), timeout=30)
     run(node.scp_to(args.config, "/opt/zakura-sync-summary/nodes.toml"), timeout=30)
     for name in ("zakura-sync-summary.service", "zakura-sync-summary.timer"):

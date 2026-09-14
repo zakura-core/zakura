@@ -52,15 +52,6 @@ impl BlockSyncReactor {
         if let Ok(mut meter) = self.state.received_throughput.lock() {
             meter.sample(now);
         }
-        let gap = std::cell::LazyCell::new(|| self.floor_gap_diagnostics(now));
-        gauge::set_lazy(metrics::gauge!("sync.block.floor_gap.height"), || {
-            gap.as_ref().map_or(0.0, |gap| f64::from(gap.height.0))
-        });
-        // Gauge-only conversion of elapsed milliseconds, independent of tracing.
-        gauge::set_lazy(
-            metrics::gauge!("sync.block.floor_gap.oldest_request_seconds"),
-            || gap.and_then(|gap| gap.oldest_outstanding_ms).unwrap_or(0) as f64 / 1_000.0,
-        );
     }
 
     pub(super) fn trace_sync_state(&self, include_diagnostics: bool) {

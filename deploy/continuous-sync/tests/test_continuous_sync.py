@@ -3,7 +3,6 @@ import contextlib
 import hashlib
 import importlib.util
 import io
-import itertools
 import json
 import os
 import subprocess
@@ -21,7 +20,6 @@ DEPLOY_PATH = ROOT / "deploy" / "continuous-sync" / "deploy.py"
 ALERT_PATH = ROOT / "deploy" / "continuous-sync" / "alert-monitor.py"
 ALERT_STATUS_PATH = ROOT / "deploy" / "continuous-sync" / "alert-status.py"
 STATUS_WRAPPER_PATH = ROOT / "deploy" / "continuous-sync" / "monitor-status-wrapper.sh"
-sys.path.insert(0, str(SYNC_PATH.parent))
 
 
 def load_module(name: str, path: Path):
@@ -236,6 +234,80 @@ class ContinuousSyncTests(unittest.TestCase):
         self.assertEqual(status["sync.downloads.in_flight"], 17)
         self.assertEqual(status["sync.downloads.verifying"], 4)
 
+    def test_sample_counters_accept_scientific_notation_and_ignore_invalid_values(self):
+        key = "sync.block.payload.received.bytes"
+        for name in (key, key.replace(".", "_"), key.replace(".", "_") + "_total"):
+            self.assertEqual(sync.metric_value(f"{name} 1.25e+8", key), 125000000)
+        for value in ("NaN", "+Inf", "-Inf", "1e999", "invalid"):
+            self.assertIsNone(sync.metric_value(f"{key} {value}", key))
+        self.assertIsNone(sync.metric_value(f'{key}{{peer="private"}} 99', key))
+
+    def test_chart_samples_are_collected_only_for_dual_and_zakura(self):
+        metrics = "\n".join([
+            "zcash_chain_verified_block_height 900",
+            "sync_downloads_verifying 4",
+            "sync_block_applying_unsubmitted 123",
+            "sync_block_payload_received_bytes_total 1.25e8",
+            "sync_block_payload_committed_bytes_total 1e8",
+            "state_vct_fast_block_count_total 10",
+            "state_vct_legacy_block_count_total 20",
+            "sync_report_sapling_height 419200",
+            "sync_report_ironwood_height 3428143",
+            "sync_report_checkpoint_height 3400000",
+            'sync_block_applying_unsubmitted{peer="private"} 999',
+        ])
+        expected = {
+            "sync.block.applying.unsubmitted": 123,
+            "sync.block.payload.received.bytes": 125000000,
+            "sync.block.payload.committed.bytes": 100000000,
+            "state.vct.fast.block.count": 10,
+            "state.vct.legacy.block.count": 20,
+            "sync.report.sapling.height": 419200,
+            "sync.report.ironwood.height": 3428143,
+            "sync.report.checkpoint.height": 3400000,
+        }
+        for mode in ("dual", "zakura", "legacy", "zebra"):
+            with self.subTest(mode=mode):
+                config = make_config(Path("/tmp"), policy=sync.Policy(p2p_stack=mode))
+                with patch.object(sync, "service_active", return_value=True), \
+                     patch.object(sync, "fetch_text", return_value=metrics), \
+                     patch.object(sync, "fetch_ready", return_value=(False, "syncing")):
+                    status = sync.sample_status(config)
+                self.assertEqual(status["height"], 900)
+                self.assertEqual(status["sync.downloads.verifying"], 4)
+                collected = {key: status[key] for key in sync.SYNC_SAMPLE_METRICS if key in status}
+                self.assertEqual(collected, expected if mode in ("dual", "zakura") else {})
+
+    def test_existing_sample_file_retains_monotonic_timing_and_queue_values(self):
+        for mode in ("dual", "zakura", "legacy"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                config = make_config(Path(tmp), policy=sync.Policy(p2p_stack=mode, ready_samples=2))
+                run_dir = Path(tmp) / "run"
+                run_dir.mkdir()
+                metrics = "zcash_chain_verified_block_height 100\nsync_block_applying_unsubmitted 0\n"
+                with (
+                    patch.object(sync, "service_active", return_value=True),
+                    patch.object(sync, "check_free_space"),
+                    patch.object(sync, "rotate_run_logs"),
+                    patch.object(sync, "now", side_effect=[1000, 1001, 999]),
+                    patch.object(sync.time, "monotonic", side_effect=[10, 10.25, 40.75]) as clock,
+                    patch.object(sync.time, "sleep") as sleep,
+                    patch.object(sync, "fetch_text", return_value=metrics),
+                    patch.object(sync, "fetch_ready", return_value=(True, "ready")),
+                ):
+                    sync.wait_for_completion(config, run_dir, {}, {})
+                rows = [json.loads(line) for line in (run_dir / "samples.jsonl").read_text().splitlines()]
+                self.assertEqual(len(rows), 2)
+                sleep.assert_called_once_with(30)
+                if mode in ("dual", "zakura"):
+                    self.assertEqual([row["elapsed_seconds"] for row in rows], [0.25, 30.75])
+                    self.assertTrue(all(row["sync.block.applying.unsubmitted"] == 0 for row in rows))
+                    self.assertTrue(all("sync.block.payload.received.bytes" not in row for row in rows))
+                else:
+                    clock.assert_not_called()
+                    self.assertTrue(all("elapsed_seconds" not in row for row in rows))
+                    self.assertTrue(all("sync.block.applying.unsubmitted" not in row for row in rows))
+
     def test_final_ready_sample_supplies_confirmed_height_without_stale_fallback(self):
         for final_height in (101, None, -1, True, 2**32):
             with self.subTest(final_height=final_height), tempfile.TemporaryDirectory() as tmp:
@@ -258,25 +330,6 @@ class ContinuousSyncTests(unittest.TestCase):
                 self.assertEqual(run_state["end_height"], 101 if final_height == 101 else None)
                 # Progress tracking can still use estimates; throughput cannot.
                 self.assertEqual(run_state["height"], 105)
-
-    def test_compact_metrics_are_collected_only_for_dual_and_zakura(self):
-        metrics = "zcash_chain_verified_block_height 900\nsync_downloads_verifying 4\n"
-        for mode in ("dual", "zakura", "legacy", "zebra"):
-            with self.subTest(mode=mode):
-                config = make_config(Path("/tmp"), policy=sync.Policy(p2p_stack=mode))
-                with patch.object(sync, "service_active", return_value=True), \
-                     patch.object(sync, "fetch_text", return_value=metrics), \
-                     patch.object(sync, "fetch_ready", return_value=(False, "syncing")), \
-                     patch.object(sync, "sample_metrics", wraps=sync.sample_metrics) as collect:
-                    status = sync.sample_status(config)
-                self.assertEqual(status["height"], 900)
-                self.assertEqual(status["sync.downloads.verifying"], 4)
-                if mode in ("dual", "zakura"):
-                    collect.assert_called_once_with(metrics)
-                    self.assertEqual(status["report"]["height"], 900)
-                else:
-                    collect.assert_not_called()
-                    self.assertNotIn("report", status)
 
     def test_alert_status_falls_back_to_estimated_height(self):
         metrics = "\n".join(
@@ -739,15 +792,6 @@ p2p_stack = "zakura"
                 f'hostname = "temp-zakura-sync-test-{index}"',
                 rendered["alert-monitor.toml"],
             )
-
-    def test_faster_polling_applies_only_to_dual_and_zakura(self):
-        self.assertEqual(sync.Policy(p2p_stack="legacy").poll_interval_seconds, 30)
-        for node in deploy.load_nodes(SYNC_PATH.with_name("nodes.toml"), None):
-            with self.subTest(mode=node.raw["p2p_stack"]):
-                config = tomllib.loads(deploy.render_files(node)["controller.toml"])
-                expected = 30 if node.raw["p2p_stack"] == "legacy" else 10
-                self.assertEqual(config["policy"]["poll_interval_seconds"], expected)
-                self.assertEqual(config["policy"]["ready_sample_interval_seconds"], 30)
 
     def test_deploy_does_not_stop_node_before_restarting_controller(self):
         self.assertNotIn('systemctl stop "$node_service"', deploy.INSTALL_SCRIPT)
@@ -2102,12 +2146,10 @@ class NotificationTests(unittest.TestCase):
         valid_history = [
             {"number": n, "run_id": f"old-{n}", "duration": 100} for n in range(5, 261)
         ]
-        for mode, persisted_history in itertools.product(
-            ("dual", "zakura", "legacy", "zebra"), (valid_history, None, {}, "bad", 7, [None])
-        ):
-            with self.subTest(mode=mode, history_type=type(persisted_history)):
+        for persisted_history in (valid_history, None, {}, "bad", 7, [None]):
+            with self.subTest(history_type=type(persisted_history)):
                 with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as stack:
-                    config = make_config(Path(tmp), policy=sync.Policy(p2p_stack=mode))
+                    config = make_config(Path(tmp))
                     for name in (
                         "preflight", "build_binary", "sha256_file", "install_binary", "stop_service",
                         "safe_wipe_state", "render_config", "start_service",
@@ -2115,7 +2157,7 @@ class NotificationTests(unittest.TestCase):
                     ):
                         stack.enter_context(patch.object(sync, name, return_value="test"))
                     stack.enter_context(patch.object(sync, "wait_for_completion",
-                        side_effect=lambda _config, _run_dir, run_state, _state, _report: run_state.update(end_height=3469999)))
+                        side_effect=lambda _config, _run_dir, run_state, _state: run_state.update(end_height=3469999)))
                     stack.enter_context(patch.object(sync, "resolve_sha", return_value="a" * 40))
                     stack.enter_context(patch.object(sync, "now", return_value=1000))
                     post = stack.enter_context(patch.object(sync, "post_slack"))
@@ -2135,33 +2177,11 @@ class NotificationTests(unittest.TestCase):
                     self.assertEqual(history[-1], {
                         "number": 261, "run_id": state["current_run"], "duration": 0,
                         "end_height": 3469999,
-                        "sha": "a" * 40,
                         "trace_archive_url": None,
                     })
                     self.assertEqual(state["last_success_end_height"], 3469999)
                     self.assertEqual(state["completion_digest_start_runs"], 260)
                     self.assertEqual(sync.load_state(path)["last_success_run"], state["current_run"])
-                    reports = config.paths.state_dir / "reports"
-                    if mode in ("dual", "zakura"):
-                        metadata = json.loads((reports / f"{state['current_run']}.json").read_text())
-                        self.assertEqual(metadata["mode"], mode)
-                        self.assertEqual(metadata["phase"], "complete")
-                    else:
-                        self.assertFalse(reports.exists())
-
-    def test_legacy_sync_failure_keeps_original_error_without_creating_a_report(self):
-        with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as stack:
-            config = make_config(Path(tmp), policy=sync.Policy(p2p_stack="legacy"))
-            for name in ("preflight", "build_binary", "sha256_file", "install_binary", "stop_service",
-                         "safe_wipe_state", "render_config", "start_service", "cleanup_retention"):
-                stack.enter_context(patch.object(sync, name, return_value="test"))
-            stack.enter_context(patch.object(sync, "resolve_sha", return_value="a" * 40))
-            stack.enter_context(patch.object(sync, "wait_for_completion", side_effect=sync.ControllerError("stalled")))
-            recorder = stack.enter_context(patch.object(sync, "Recorder"))
-            with self.assertRaisesRegex(sync.ControllerError, "stalled"):
-                sync.one_cycle(config, config.paths.state_dir / "state.json", {})
-            recorder.assert_not_called()
-            self.assertFalse((config.paths.state_dir / "reports").exists())
 
 
 class CanaryNotificationTests(unittest.TestCase):

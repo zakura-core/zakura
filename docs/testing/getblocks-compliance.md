@@ -96,8 +96,8 @@ Shared admission and writer models supplement the message-specific witnesses.
 | R01 | Exact hash authorization before first write, immediate response, generated legal prefixes | `block_sync::peer_routine::response_contract`, existing request-write regressions |
 | R02 | No overlapping retry on the same connection, buffered overlap shapes admitted only after the old terminal write | Receiver `response_contract` and serving `serving_contract` |
 | R03 | Needed, servable, obsolete, or another peer's work cannot authorize a body | `block_sync::peer_routine::response_contract` |
-| R04 | Exact next hash and height, out-of-order and excess bodies rejected before delivery | `block_sync::peer_routine::response_contract` |
-| R05 | Duplicate parts before/after ending or finality, separately authorized peers as legal control | `block_sync::peer_routine::response_contract` |
+| R04 | Exact next hash and height, out-of-order bodies spend a part and are discarded, excess bodies rejected before delivery | `block_sync::peer_routine::response_contract` |
+| R05 | Duplicate parts discarded before the ending and after local finality, rejected after the ending, separately authorized peers as legal control | `block_sync::peer_routine::response_contract` |
 | R06 | Done start/count equal the consumed nonempty prefix, suffix requeued on legal partial completion | `block_sync::peer_routine::response_contract` |
 | R07 | Unavailable has the original start/count and zero bodies, retries honor the local floor | `block_sync::peer_routine::response_contract` |
 | R08 | Last body leaves a terminal obligation, exactly one terminal, no duplicate ending | Receiver `response_contract` and paired QUIC `qualification` |
@@ -181,8 +181,8 @@ seconds while sibling consumers remain stopped. They then resume those consumers
 and require useful body completion on the original connection. The sibling
 regression pauses the supported three consumers and transfers 64 MiB through
 another stream before draining the originals. The separate recovery fixture
-explicitly selects the former 16/32 MiB windows to reproduce a connection stall.
-A reset or timeout cannot stand in for independent progress.
+explicitly selects the former 16 MiB stream window to reproduce a connection
+stall. A reset or timeout cannot stand in for independent progress.
 
 Process CPU and high-water RSS include other tests in the same process. They are
 reported evidence, not universal CPU/RSS limits. Run the load profile alone for

@@ -13,10 +13,10 @@ Unidirectional application streams are disabled. Locally initiated stream state
 does not yet have the proposed transport lifetime limit.
 
 Three paused sibling receive windows consume 24 MiB and leave 8 MiB, which is
-more than the transport's connection-credit update threshold of 32 MiB / 8. T02
-and the sibling regression use that count. A larger paused set can stall the
-connection until the existing deadlines close it; bounding total credit node-wide
-is the deferred transport work below.
+more than the transport's connection-credit update threshold of 32 MiB / 8. The
+sibling regression uses that count; T02 stays within it. A larger paused set can
+stall the connection until the existing deadlines close it; bounding total credit
+node-wide is the deferred transport work below.
 
 ## Dependency-blocked witnesses
 

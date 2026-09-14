@@ -94,6 +94,9 @@ indexer = ["zakura-state/indexer", "zakura-rpc/indexer"]
 # Per-block commit-phase timing histograms (zakura.state.write.*), for perf profiling
 commit-metrics = ["zakura-state/commit-metrics"]
 
+# Accurate committed payload counters for continuous-sync reports.
+sync-metrics = ["zakura-network/sync-metrics"]
+
 # Experimental internal miner support
 internal-miner = [
     "thread-priority",

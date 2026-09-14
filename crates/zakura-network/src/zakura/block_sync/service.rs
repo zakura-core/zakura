@@ -298,7 +298,7 @@ impl BlockSyncServiceInner {
         }
 
         // Fence publication and first writes before another session can enter.
-        active_peers[peer].session.response_scope.retire();
+        let reusable = active_peers[peer].session.response_scope.retire();
 
         let removed = active_peers
             .remove(peer)
@@ -311,18 +311,22 @@ impl BlockSyncServiceInner {
 
         // The connection may outlive this session while the transport backs off
         // before reopening the stream; remember the claim so ownership checks
-        // bridge the gap. The claim is written while still holding the peer-map
-        // lock so a concurrent `remove_peer` for the closing connection cannot
-        // clear claims between the removal above and this insert, which would
-        // leak a claim for a dead connection.
-        if let Ok(mut claims) = self.session_gap_claims.lock() {
-            claims.insert(
-                peer.clone(),
-                SessionGapClaim {
-                    conn_id,
-                    direction: removed.direction,
-                },
-            );
+        // bridge the gap. Only a connection the fence above left reusable can be
+        // claimed — retiring an unfinished started response closes it. The claim
+        // is written while still holding the peer-map lock so a concurrent
+        // `remove_peer` for the closing connection cannot clear claims between
+        // the removal above and this insert, which would leak a claim for a dead
+        // connection.
+        if reusable {
+            if let Ok(mut claims) = self.session_gap_claims.lock() {
+                claims.insert(
+                    peer.clone(),
+                    SessionGapClaim {
+                        conn_id,
+                        direction: removed.direction,
+                    },
+                );
+            }
         }
         self.sessions.notify();
         true
@@ -714,19 +718,6 @@ impl Service for BlockSyncService {
                 return;
             };
 
-            // Keep the old receiver's publication/start fence inside admission.
-            // A started exchange prevents reuse of its connection even if the
-            // old routine has not observed its cancellation yet.
-            if let Some(old) = active_peers.get(&peer_id) {
-                let reusable = old.session.response_scope.retire();
-                old.cancel_token.cancel();
-                if old.conn_id == conn_id && !reusable {
-                    connection_cancel_token.cancel();
-                    service_cancel_token.cancel();
-                    return;
-                }
-            }
-
             // Admission is atomic with the park state: a park recorded by the
             // predecessor routine after the entry-point `peer_is_parked` check
             // is honored here instead of being silently bypassed.
@@ -749,6 +740,28 @@ impl Service for BlockSyncService {
                 } else {
                     (None, false)
                 };
+
+            // Keep the old receiver's publication/start fence under the session-table
+            // lock, but only once admission has accepted this replacement: a peer
+            // parked between the entry check and admission keeps its incumbent.
+            // A started exchange prevents reuse of its connection even if the
+            // old routine has not observed its cancellation yet; that bail path
+            // hands the generation admission just took back to the registry.
+            if let Some(old) = active_peers.get(&peer_id) {
+                let reusable = old.session.response_scope.retire();
+                old.cancel_token.cancel();
+                if old.conn_id == conn_id && !reusable {
+                    if let (Some(wiring), Some(generation)) =
+                        (&self.inner.routine_wiring, routine_generation)
+                    {
+                        wiring.registry.remove_session(&peer_id, generation);
+                    }
+                    connection_cancel_token.cancel();
+                    service_cancel_token.cancel();
+                    return;
+                }
+            }
+
             // Production uses the registry's globally unique routine generation.
             // Handle-less tests use the service-local fallback.
             let session_id = routine_generation

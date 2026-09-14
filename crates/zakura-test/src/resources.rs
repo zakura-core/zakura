@@ -123,13 +123,18 @@ impl Drop for LockHold<'_> {
 
 /// Number of times a load test repeats its workload. Defaults to four.
 /// `ZAKURA_REGULATION_LOAD_ROUNDS` overrides the default, clamped to 1 through 256.
+///
+/// # Panics
+///
+/// Panics if the override cannot be parsed as a `usize`. The failure message
+/// includes the variable name, its value, and the parse error.
 pub fn load_rounds() -> usize {
     std::env::var("ZAKURA_REGULATION_LOAD_ROUNDS")
         .ok()
         .map(|rounds| {
-            rounds
-                .parse::<usize>()
-                .expect("load rounds must be an integer")
+            rounds.parse::<usize>().unwrap_or_else(|error| {
+                panic!("invalid ZAKURA_REGULATION_LOAD_ROUNDS value {rounds:?}: {error}")
+            })
         })
         .unwrap_or(4)
         .clamp(1, 256)

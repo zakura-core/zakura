@@ -62,6 +62,7 @@ describe the tested workload, rather than a timing limit that holds on any machi
 
 `resources::load_rounds` defaults to four rounds. The
 `ZAKURA_REGULATION_LOAD_ROUNDS` override is clamped to 1–256.
+Malformed values fail the test with the variable name, value and parse error.
 
 ## Running the controls
 

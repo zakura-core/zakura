@@ -4454,7 +4454,7 @@ async fn v5_with_duplicate_orchard_action() {
 
 /// The mempool rejects a transaction whose Orchard and Ironwood actions exceed
 /// the ZIP 218 Orchard limit, because no block can include it. The check runs
-/// before any state service query, and only an NU7 build enforces it.
+/// before any state service query, and only at or after NU7 activation.
 #[tokio::test]
 async fn mempool_applies_the_orchard_limit_to_ironwood_actions() {
     let _init_guard = zakura_test::init();
@@ -4473,7 +4473,7 @@ async fn mempool_applies_the_orchard_limit_to_ironwood_actions() {
     let limit = usize::try_from(ORCHARD_BLOCK_ACTION_LIMIT).expect("the limit fits in usize");
     let orchard_half = limit / 2;
     let over_limit = || {
-        cfg!(feature = "nu7").then_some(TransactionError::OrchardActionsExceedBlockLimit {
+        Some(TransactionError::OrchardActionsExceedBlockLimit {
             actions: ORCHARD_BLOCK_ACTION_LIMIT + 1,
             limit: ORCHARD_BLOCK_ACTION_LIMIT,
         })

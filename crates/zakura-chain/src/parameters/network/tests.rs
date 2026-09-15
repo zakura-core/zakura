@@ -351,14 +351,12 @@ fn check_height_for_num_halvings() {
 /// Tests `halving` against ZIP 218's `Halving` formula on a configured Testnet
 /// whose Blossom height is below `SlowStartShift`, with and without NU7.
 ///
-/// On such a network the formula's pre-Blossom term is negative. A build
-/// without the `nu7` feature treats NU7 as inactive, so it follows the
-/// formula's Blossom case at every height.
+/// On such a network the formula's pre-Blossom term is negative.
 #[test]
 fn halving_matches_zip_218_when_blossom_is_below_the_slow_start_shift() {
     use crate::parameters::{
         testnet::{self, ConfiguredActivationHeights},
-        NU7_POW_TARGET_SPACING_RATIO, ZIP218_ENABLED,
+        NU7_POW_TARGET_SPACING_RATIO,
     };
 
     let _init_guard = zakura_test::init();
@@ -385,7 +383,7 @@ fn halving_matches_zip_218_when_blossom_is_below_the_slow_start_shift() {
         let pre_blossom_interval = i128::from(network.pre_blossom_halving_interval());
         let post_blossom_interval = i128::from(network.post_blossom_halving_interval());
         let post_nu7_interval = post_blossom_interval * i128::from(NU7_POW_TARGET_SPACING_RATIO);
-        let nu7_activation = configured_nu7.filter(|_| ZIP218_ENABLED).map(i128::from);
+        let nu7_activation = configured_nu7.map(i128::from);
 
         // `Halving(height)` from ZIP 218, as an exact fraction over the product
         // of the three halving intervals. A negative index has no meaning, so
@@ -450,7 +448,6 @@ fn halving_matches_zip_218_when_blossom_is_below_the_slow_start_shift() {
 /// Tests the ZIP 218 target spacing, halving, and block subsidy across the NU7
 /// activation boundary on a configured Testnet.
 #[test]
-#[cfg(feature = "nu7")]
 fn post_nu7_spacing_halving_and_subsidy() -> Result<(), Report> {
     use crate::parameters::{
         testnet::{self, ConfiguredActivationHeights},
@@ -539,14 +536,13 @@ fn post_nu7_spacing_halving_and_subsidy() -> Result<(), Report> {
     Ok(())
 }
 
-/// Tests that the ZIP 218 difficulty averaging window widens at the NU7
-/// activation height.
+/// Tests that the averaging window widens at NU7 and that every build retains
+/// enough context for the wider window.
 #[test]
-#[cfg(feature = "nu7")]
 fn averaging_window_changes_at_nu7_activation_height() -> Result<(), Report> {
     use crate::parameters::{
         testnet::{self, ConfiguredActivationHeights},
-        POST_NU7_POW_AVERAGING_WINDOW, PRE_NU7_POW_AVERAGING_WINDOW,
+        MAX_POW_AVERAGING_WINDOW, POST_NU7_POW_AVERAGING_WINDOW, PRE_NU7_POW_AVERAGING_WINDOW,
     };
 
     let _init_guard = zakura_test::init();
@@ -561,6 +557,8 @@ fn averaging_window_changes_at_nu7_activation_height() -> Result<(), Report> {
         .clear_funding_streams()
         .to_network()
         .expect("configured testnet is valid");
+
+    assert_eq!(POST_NU7_POW_AVERAGING_WINDOW, MAX_POW_AVERAGING_WINDOW);
 
     assert_eq!(
         PRE_NU7_POW_AVERAGING_WINDOW,

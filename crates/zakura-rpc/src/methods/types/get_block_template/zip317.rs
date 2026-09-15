@@ -384,7 +384,7 @@ impl BlockTemplateLimits {
         height: Height,
         coinbase: ShieldedActionCounts,
     ) -> RemainingShieldedLimits {
-        if !NetworkUpgrade::is_zip218_active(network, height) {
+        if !NetworkUpgrade::is_nu7_active(network, height) {
             return RemainingShieldedLimits {
                 orchard_and_ironwood_actions: u32::MAX,
                 sapling_ios: u32::MAX,

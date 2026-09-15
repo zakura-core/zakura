@@ -173,7 +173,7 @@ pub fn check(tip_height: Height, network: &Network) {
 
 #[cfg(test)]
 mod tests {
-    use zakura_chain::parameters::{testnet::ConfiguredActivationHeights, ZIP218_ENABLED};
+    use zakura_chain::parameters::testnet::ConfiguredActivationHeights;
 
     use super::*;
 
@@ -214,12 +214,6 @@ mod tests {
     fn end_of_support_height_counts_25_second_blocks_after_nu7() {
         let _init_guard = zakura_test::init();
 
-        let post_nu7_blocks_per_day = if ZIP218_ENABLED {
-            POST_NU7_BLOCKS_PER_DAY
-        } else {
-            PRE_NU7_BLOCKS_PER_DAY
-        };
-
         // NU7 activates after the support window.
         let network = regtest_with_nu7(ESTIMATED_RELEASE_HEIGHT + 30 * PRE_NU7_BLOCKS_PER_DAY);
         assert_eq!(
@@ -232,18 +226,18 @@ mod tests {
         let network = regtest_with_nu7(nu7);
         assert_eq!(
             estimated_height_after_release(&network, EOS_PANIC_AFTER),
-            Height(nu7 + (EOS_PANIC_AFTER - 7) * post_nu7_blocks_per_day),
+            Height(nu7 + (EOS_PANIC_AFTER - 7) * POST_NU7_BLOCKS_PER_DAY),
         );
 
         // NU7 activates before the release.
         let network = regtest_with_nu7(ESTIMATED_RELEASE_HEIGHT - 1_000);
         assert_eq!(
             estimated_height_after_release(&network, EOS_PANIC_AFTER),
-            Height(ESTIMATED_RELEASE_HEIGHT + EOS_PANIC_AFTER * post_nu7_blocks_per_day),
+            Height(ESTIMATED_RELEASE_HEIGHT + EOS_PANIC_AFTER * POST_NU7_BLOCKS_PER_DAY),
         );
         assert_eq!(
             estimated_height_after_release(&network, EOS_WARN_AFTER),
-            Height(ESTIMATED_RELEASE_HEIGHT + EOS_WARN_AFTER * post_nu7_blocks_per_day),
+            Height(ESTIMATED_RELEASE_HEIGHT + EOS_WARN_AFTER * POST_NU7_BLOCKS_PER_DAY),
         );
     }
 }

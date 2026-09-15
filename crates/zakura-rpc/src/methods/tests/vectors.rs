@@ -391,11 +391,7 @@ fn end_of_service_estimate_follows_target_spacing() {
         }
         .into(),
     );
-    let post_nu7_spacing = if zakura_chain::parameters::ZIP218_ENABLED {
-        25
-    } else {
-        75
-    };
+    let post_nu7_spacing = 25;
 
     // 10 blocks before NU7, and 20 blocks from NU7 onwards.
     let expected = 10 * 75 + 20 * post_nu7_spacing;
@@ -3130,11 +3126,7 @@ async fn rpc_getnetworksolps_uses_averaging_window_at_height() {
         .into(),
     );
     let pre_nu7_window = 17;
-    let post_nu7_window = if zakura_chain::parameters::ZIP218_ENABLED {
-        102
-    } else {
-        pre_nu7_window
-    };
+    let post_nu7_window = 102;
 
     let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();

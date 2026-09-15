@@ -294,10 +294,9 @@ mod zip218_template_limits {
         );
 
         let mut post_activation = template_limits(&network, Height(2));
-        assert_eq!(
-            post_activation.try_add(&over_limit_tx),
-            !cfg!(feature = "nu7"),
-            "an NU7 build rejects Orchard actions above the per-block limit at NU7"
+        assert!(
+            !post_activation.try_add(&over_limit_tx),
+            "Orchard actions above the per-block limit are rejected at NU7"
         );
     }
 
@@ -315,19 +314,8 @@ mod zip218_template_limits {
             },
         );
 
-        let expected_sapling_ios = if cfg!(feature = "nu7") {
-            SAPLING_BLOCK_IO_LIMIT - 1
-        } else {
-            u32::MAX
-        };
-        let expected_cost = if cfg!(feature = "nu7") {
-            GLOBAL_SHIELDED_BUDGET - 1
-        } else {
-            u32::MAX
-        };
-
-        assert_eq!(limits.sapling_ios, expected_sapling_ios);
-        assert_eq!(limits.cost, expected_cost);
+        assert_eq!(limits.sapling_ios, SAPLING_BLOCK_IO_LIMIT - 1);
+        assert_eq!(limits.cost, GLOBAL_SHIELDED_BUDGET - 1);
     }
 
     /// Coinbase Ironwood actions consume the Orchard capacity and the global
@@ -339,14 +327,11 @@ mod zip218_template_limits {
         let limits =
             BlockTemplateLimits::remaining_shielded_limits(&network, Height(1), coinbase_counts);
 
-        let (expected_actions, expected_cost) = if cfg!(feature = "nu7") {
-            (ORCHARD_BLOCK_ACTION_LIMIT - 2, GLOBAL_SHIELDED_BUDGET - 2)
-        } else {
-            (u32::MAX, u32::MAX)
-        };
-
-        assert_eq!(limits.orchard_and_ironwood_actions, expected_actions);
-        assert_eq!(limits.cost, expected_cost);
+        assert_eq!(
+            limits.orchard_and_ironwood_actions,
+            ORCHARD_BLOCK_ACTION_LIMIT - 2
+        );
+        assert_eq!(limits.cost, GLOBAL_SHIELDED_BUDGET - 2);
     }
 
     fn ironwood_tx(orchard_actions: usize, ironwood_actions: usize) -> Arc<Transaction> {

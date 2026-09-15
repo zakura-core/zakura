@@ -83,13 +83,9 @@ default = ["default-release-binaries"]
 
 # Production features that activate extra dependencies, or extra features in dependencies
 
-# NU7 consensus rules. Off by default until NU7 has activation heights.
-nu7 = [
-    "zakura-consensus/nu7",
-    "zakura-chain/nu7",
-    "zakura-state/nu7",
-    "zakura-rpc/nu7",
-    "zakura-header-chain/nu7",
+# Experimental candidate NU7 consensus rules, dormant until NU7 activates.
+nu7-experimental = [
+    "zakura-consensus/nu7-experimental",
 ]
 
 # Indexer support

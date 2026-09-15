@@ -1215,23 +1215,34 @@ impl PeerRoutine {
                     first_allowed_run(&items, |(height, item)| is_allowed(height, item))
                 else {
                     self.work.return_unpublished(&items);
-                    retry_filter_deadline = Some(self.retry_filter_wake_deadline(now));
+                    retry_filter_deadline = self
+                        .retry_filter_wake_deadline(now, items.iter().map(|(height, _)| *height));
                     break FillStop::RetryAvoid;
                 };
                 let keep_len = keep.len();
-                let mut returned_avoided = false;
+                // Read the refused heights before the returns below reshape `items`,
+                // so the wake costs no allocation of its own.
+                let suffix_start = keep.start + keep_len;
+                let avoided_deadline = if keep.start > 0 || suffix_start < items.len() {
+                    self.retry_filter_wake_deadline(
+                        now,
+                        items[..keep.start]
+                            .iter()
+                            .chain(&items[suffix_start..])
+                            .map(|(height, _)| *height),
+                    )
+                } else {
+                    None
+                };
                 if keep.start > 0 {
                     self.work.return_unpublished(&items[..keep.start]);
                     items.drain(..keep.start);
-                    returned_avoided = true;
                 }
                 if keep_len < items.len() {
                     self.work.return_unpublished(&items[keep_len..]);
                     items.truncate(keep_len);
-                    returned_avoided = true;
                 }
-                if returned_avoided {
-                    let deadline = self.retry_filter_wake_deadline(now);
+                if let Some(deadline) = avoided_deadline {
                     retry_filter_deadline = Some(
                         retry_filter_deadline
                             .map_or(deadline, |current: Instant| current.min(deadline)),
@@ -1415,15 +1426,30 @@ impl PeerRoutine {
 
     /// Capture the retry deadline against the same time snapshot that rejected
     /// the work. If shared state changed after filtering, retry immediately.
-    fn retry_filter_wake_deadline(&self, now: Instant) -> Instant {
+    ///
+    /// Returns no deadline when a retained range is the only thing refusing the
+    /// work: that overlap clears when the response ends or the connection
+    /// closes, and both wake this routine on their own. Retrying on a timer
+    /// instead would take and return the same heights until the liveness
+    /// deadline fired.
+    fn retry_filter_wake_deadline(
+        &self,
+        now: Instant,
+        refused: impl IntoIterator<Item = block::Height>,
+    ) -> Option<Instant> {
         let local = self.retry_avoid.values().min().copied();
         let floor = self.registry.next_floor_avoid_deadline(&self.peer, now);
         let body = self.registry.next_body_retry_deadline(&self.peer, now);
-        [local, floor, body]
-            .into_iter()
-            .flatten()
-            .min()
-            .unwrap_or(now)
+        if let Some(deadline) = [local, floor, body].into_iter().flatten().min() {
+            return Some(deadline);
+        }
+        let retained_overlap = refused.into_iter().any(|height| {
+            self.window
+                .outstanding
+                .iter()
+                .any(|range| range.request.contains(height))
+        });
+        (!retained_overlap).then_some(now)
     }
 
     fn admission_snapshot(

@@ -1911,3 +1911,162 @@ mod zip218_shielded_action_limits {
         })
     }
 }
+
+/// A deficit that pays a nonzero ZIP 234 bonus.
+#[cfg(feature = "nu7-experimental")]
+const ZIP234_TEST_DEFICIT: i64 = 400_000_000;
+
+/// `ceil(ZIP234_TEST_DEFICIT * 4126 / 10^10)`, rounded up from 165.04.
+#[cfg(feature = "nu7-experimental")]
+const ZIP234_TEST_BONUS: i64 = 166;
+
+/// Returns the chain value pools after `parent` on `network`, `deficit` zatoshi behind the
+/// halving schedule.
+#[cfg(feature = "nu7-experimental")]
+fn zip234_parent_pools(
+    network: &Network,
+    parent: Height,
+    deficit: i64,
+) -> zakura_chain::value_balance::ValueBalance<zakura_chain::amount::NonNegative> {
+    let scheduled_supply: i64 = (1..=parent.0)
+        .map(|height| {
+            i64::from(
+                zakura_chain::parameters::subsidy::halving_block_subsidy(Height(height), network)
+                    .expect("valid halving subsidy"),
+            )
+        })
+        .sum();
+
+    zakura_chain::value_balance::ValueBalance::from_transparent_amount(
+        Amount::try_from(scheduled_supply - deficit).expect("the issued supply is valid"),
+    )
+}
+
+/// Semantic verification checks the coinbase against the ZIP 234 subsidy, which depends on
+/// the parent's chain value pools.
+#[cfg(feature = "nu7-experimental")]
+#[tokio::test]
+async fn zip234_block_verification_checks_the_reissuance_bonus() {
+    use zakura_chain::{block_info::BlockInfo, parameters::subsidy::halving_block_subsidy};
+
+    let _init_guard = zakura_test::init();
+
+    let start = Height(3);
+    let network = zip234_test_network(start);
+    let parent = start.previous().expect("the start is above genesis");
+    let halving_subsidy = halving_block_subsidy(start, &network).expect("valid halving subsidy");
+    let with_bonus = (halving_subsidy + Amount::try_from(ZIP234_TEST_BONUS).expect("valid bonus"))
+        .expect("valid subsidy");
+
+    let verify =
+        |parent_deficit: i64, coinbase_value: Amount<zakura_chain::amount::NonNegative>| {
+            let network = network.clone();
+            let parent_pools = zip234_parent_pools(&network, parent, parent_deficit);
+
+            let state = service_fn(move |request: zs::Request| async move {
+                let response = match request {
+                    zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+                    zs::Request::AwaitBlockInfo(_) => {
+                        zs::Response::BlockInfo(Some(BlockInfo::new(parent_pools, 0)))
+                    }
+                    zs::Request::CommitSemanticallyVerifiedBlock(block) => {
+                        zs::Response::Committed(block.hash)
+                    }
+                    _ => panic!("ZIP 234 test received an unexpected state request: {request:?}"),
+                };
+                Ok::<_, BoxError>(response)
+            });
+            // The real transaction verifier rejects every NU7 transaction until NU7 has a
+            // production consensus branch ID, so this test accepts them unchecked.
+            let transaction = service_fn(|request| async move {
+                Ok::<_, BoxError>(accept_block_transaction(request))
+            });
+            let verifier = SemanticBlockVerifier::new(&network, state, transaction);
+            let block = zip234_test_block(&network, start, coinbase_value);
+
+            verifier.oneshot(Request::Commit(Arc::new(block)))
+        };
+
+    // The coinbase claims the halving subsidy plus the reissuance bonus.
+    let block = zip234_test_block(&network, start, with_bonus);
+    assert_eq!(
+        verify(ZIP234_TEST_DEFICIT, with_bonus)
+            .await
+            .expect("the coinbase claims the ZIP 234 subsidy"),
+        block.hash(),
+    );
+
+    // A coinbase without the bonus does not balance.
+    assert!(matches!(
+        verify(ZIP234_TEST_DEFICIT, halving_subsidy).await,
+        Err(VerifyBlockError::Block {
+            source: BlockError::Transaction(TransactionError::Subsidy(
+                SubsidyError::InvalidMinerFees
+            )),
+        }),
+    ));
+
+    // A parent that issued more than the schedule makes the deficit negative.
+    assert!(matches!(
+        verify(-1, halving_subsidy).await,
+        Err(VerifyBlockError::Subsidy(
+            SubsidyError::NegativeIssuanceDeficit
+        )),
+    ));
+}
+
+/// A network with NU7 at height 1 and ZIP 234 reissuance from `start`.
+#[cfg(feature = "nu7-experimental")]
+fn zip234_test_network(start: Height) -> Network {
+    let genesis_block =
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+            .expect("genesis block should deserialize");
+    let target_difficulty_limit = genesis_block
+        .header
+        .difficulty_threshold
+        .to_expanded()
+        .expect("genesis difficulty threshold should be valid");
+
+    Parameters::build()
+        .with_genesis_hash(genesis_block.hash())
+        .expect("failed to set genesis hash")
+        .with_checkpoints(ConfiguredCheckpoints::HeightsAndHashes(vec![(
+            Height(0),
+            genesis_block.hash(),
+        )]))
+        .expect("failed to set genesis checkpoint")
+        .with_activation_heights(ConfiguredActivationHeights {
+            nu7: Some(1),
+            ..Default::default()
+        })
+        .expect("failed to set test activation heights")
+        .with_zip234_start_height(start)
+        .clear_funding_streams()
+        .with_slow_start_interval(Height::MIN)
+        .with_disable_pow(true)
+        .disable_temporary_orchard_disabling_soft_fork()
+        .with_target_difficulty_limit(target_difficulty_limit)
+        .expect("failed to set target difficulty limit")
+        .to_network()
+        .expect("failed to build configured network")
+}
+
+/// A block at `height` whose coinbase pays `coinbase_value`.
+#[cfg(feature = "nu7-experimental")]
+fn zip234_test_block(
+    network: &Network,
+    height: Height,
+    coinbase_value: Amount<zakura_chain::amount::NonNegative>,
+) -> Block {
+    let mut block =
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+            .expect("the genesis block deserializes");
+    let mut coinbase = v5_coinbase_transaction(NetworkUpgrade::Nu7, height, network);
+    if let Transaction::V5 { outputs, .. } = &mut coinbase {
+        outputs[0].value = coinbase_value;
+    }
+    block.transactions = vec![Arc::new(coinbase)];
+    Arc::make_mut(&mut block.header).merkle_root = block.transactions.iter().collect();
+
+    block
+}

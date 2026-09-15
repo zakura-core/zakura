@@ -1598,3 +1598,345 @@ fn state_commit_context_errors_keep_misbehavior_scores() {
     let router_error = crate::router::RouterError::from(err);
     assert_eq!(router_error.misbehavior_score(), 100);
 }
+
+/// Tests for the ZIP 218 per-block shielded action limits.
+///
+/// The limits only apply once NU7 is active.
+mod zip218_shielded_action_limits {
+    use std::sync::Arc;
+
+    use proptest::{
+        arbitrary::any,
+        strategy::{Strategy, ValueTree},
+        test_runner::TestRunner,
+    };
+    use zakura_chain::{
+        block::{Block, Height},
+        parameters::{
+            testnet::{ConfiguredActivationHeights, Parameters},
+            Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET, ORCHARD_BLOCK_ACTION_LIMIT,
+            SAPLING_BLOCK_IO_LIMIT, SPROUT_BLOCK_JOINSPLIT_LIMIT,
+        },
+        primitives::Groth16Proof,
+        serialization::{ZcashDeserialize, ZcashDeserializeInto},
+        transaction::{
+            arbitrary::{
+                fake_v5_with_orchard_actions, fake_v5_with_sapling_outputs,
+                fake_v6_with_orchard_and_ironwood_actions,
+            },
+            JoinSplitData, LockTime, Transaction,
+        },
+    };
+
+    use crate::block::check;
+    use crate::error::TransactionError;
+
+    /// Every historical block satisfies the limits, because NU7 is not active on
+    /// Mainnet. A block with no shielded data also satisfies them once NU7 is
+    /// active.
+    #[test]
+    fn historical_blocks_satisfy_the_limits() {
+        let _init_guard = zakura_test::init();
+
+        for block in zakura_test::vectors::BLOCKS.iter() {
+            let block = block
+                .zcash_deserialize_into::<Block>()
+                .expect("block is structurally valid");
+
+            check::shielded_action_limits_are_valid(
+                &block.transactions,
+                block
+                    .coinbase_height()
+                    .expect("block has a coinbase height"),
+                &Network::Mainnet,
+            )
+            .expect("a historical Mainnet block satisfies the shielded action limits");
+        }
+
+        let genesis =
+            Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+                .expect("mainnet genesis deserializes");
+
+        check::shielded_action_limits_are_valid(
+            &genesis.transactions,
+            Height(1),
+            &nu7_active_testnet(),
+        )
+        .expect("a block with no shielded data satisfies the post-NU7 limits");
+    }
+
+    #[test]
+    fn limits_activate_at_the_nu7_height() {
+        let network = nu7_activation_testnet(2);
+        let over_limit_tx =
+            fake_v5_with_orchard_actions(limit_plus_one(ORCHARD_BLOCK_ACTION_LIMIT));
+
+        check::shielded_action_limits_are_valid(
+            [over_limit_tx.clone()].iter(),
+            Height(1),
+            &network,
+        )
+        .expect("the limits are inactive below the NU7 activation height");
+
+        let err =
+            check::shielded_action_limits_are_valid([over_limit_tx].iter(), Height(2), &network)
+                .expect_err("the limits are enforced at the NU7 activation height");
+
+        assert_eq!(
+            err,
+            TransactionError::OrchardActionsExceedBlockLimit {
+                actions: ORCHARD_BLOCK_ACTION_LIMIT + 1,
+                limit: ORCHARD_BLOCK_ACTION_LIMIT,
+            }
+        );
+    }
+
+    #[test]
+    fn counts_at_the_per_pool_limits_are_accepted() {
+        let cases: [(&str, Arc<Transaction>); 3] = [
+            (
+                "Orchard actions",
+                fake_v5_with_orchard_actions(limit_as_usize(ORCHARD_BLOCK_ACTION_LIMIT)),
+            ),
+            (
+                "Sapling spends and outputs",
+                fake_v5_with_sapling_outputs(limit_as_usize(SAPLING_BLOCK_IO_LIMIT)),
+            ),
+            (
+                "Sprout JoinSplits",
+                fake_v4_with_sprout_joinsplits(limit_as_usize(SPROUT_BLOCK_JOINSPLIT_LIMIT)),
+            ),
+        ];
+
+        for (pool, tx) in cases {
+            check::shielded_action_limits_are_valid([tx].iter(), Height(1), &nu7_active_testnet())
+                .unwrap_or_else(|error| {
+                    panic!("{pool} exactly at the per-block limit must pass, got {error}")
+                });
+        }
+    }
+
+    #[test]
+    fn a_cost_at_the_global_budget_is_accepted() {
+        // One JoinSplit costs 2, so the rest of the budget can hold that many
+        // fewer Orchard actions.
+        let orchard_actions = limit_as_usize(
+            GLOBAL_SHIELDED_BUDGET
+                .checked_sub(2)
+                .expect("the global shielded budget covers at least one JoinSplit"),
+        );
+
+        check::shielded_action_limits_are_valid(
+            [
+                fake_v5_with_orchard_actions(orchard_actions),
+                fake_v4_with_sprout_joinsplits(1),
+            ]
+            .iter(),
+            Height(1),
+            &nu7_active_testnet(),
+        )
+        .expect("a combined shielded cost exactly at the global budget must pass");
+    }
+
+    #[test]
+    fn sapling_ios_above_the_limit_are_rejected() {
+        let err = check::shielded_action_limits_are_valid(
+            [fake_v5_with_sapling_outputs(limit_plus_one(
+                SAPLING_BLOCK_IO_LIMIT,
+            ))]
+            .iter(),
+            Height(1),
+            &nu7_active_testnet(),
+        )
+        .expect_err("Sapling spends and outputs above the per-block limit must fail");
+
+        assert_eq!(
+            err,
+            TransactionError::SaplingIOsExceedBlockLimit {
+                ios: SAPLING_BLOCK_IO_LIMIT + 1,
+                limit: SAPLING_BLOCK_IO_LIMIT,
+            }
+        );
+    }
+
+    #[test]
+    fn sprout_joinsplits_above_the_limit_are_rejected() {
+        let err = check::shielded_action_limits_are_valid(
+            [fake_v4_with_sprout_joinsplits(limit_plus_one(
+                SPROUT_BLOCK_JOINSPLIT_LIMIT,
+            ))]
+            .iter(),
+            Height(1),
+            &nu7_active_testnet(),
+        )
+        .expect_err("Sprout JoinSplits above the per-block limit must fail");
+
+        assert_eq!(
+            err,
+            TransactionError::SproutJoinSplitsExceedBlockLimit {
+                joinsplits: SPROUT_BLOCK_JOINSPLIT_LIMIT + 1,
+                limit: SPROUT_BLOCK_JOINSPLIT_LIMIT,
+            }
+        );
+    }
+
+    /// A block can satisfy every per-pool limit and still exceed the global
+    /// budget.
+    #[test]
+    fn a_cost_above_the_global_budget_is_rejected() {
+        let err = check::shielded_action_limits_are_valid(
+            [
+                fake_v5_with_orchard_actions(limit_as_usize(ORCHARD_BLOCK_ACTION_LIMIT)),
+                fake_v5_with_sapling_outputs(1),
+            ]
+            .iter(),
+            Height(1),
+            &nu7_active_testnet(),
+        )
+        .expect_err("a combined shielded cost above the global budget must fail");
+
+        assert_eq!(
+            err,
+            TransactionError::ShieldedCostExceedsBlockBudget {
+                cost: GLOBAL_SHIELDED_BUDGET + 1,
+                limit: GLOBAL_SHIELDED_BUDGET,
+            }
+        );
+    }
+
+    /// Ironwood actions count against the Orchard limit, alone or mixed with
+    /// Orchard actions, in one transaction or across transactions.
+    #[test]
+    fn ironwood_actions_above_the_orchard_limit_are_rejected() {
+        let over_limit = limit_plus_one(ORCHARD_BLOCK_ACTION_LIMIT);
+        let orchard_half = over_limit / 2;
+        let ironwood_half = over_limit - orchard_half;
+
+        let cases: [(&str, Vec<Arc<Transaction>>); 3] = [
+            ("Ironwood actions alone", vec![ironwood_tx(0, over_limit)]),
+            (
+                "Orchard and Ironwood actions in one transaction",
+                vec![ironwood_tx(orchard_half, ironwood_half)],
+            ),
+            (
+                "Orchard and Ironwood actions in separate transactions",
+                vec![
+                    fake_v5_with_orchard_actions(orchard_half),
+                    ironwood_tx(0, ironwood_half),
+                ],
+            ),
+        ];
+
+        for (case, transactions) in cases {
+            let err = check::shielded_action_limits_are_valid(
+                transactions.iter(),
+                Height(1),
+                &nu7_active_testnet(),
+            )
+            .expect_err("Ironwood actions above the Orchard limit must fail");
+
+            assert_eq!(
+                err,
+                TransactionError::OrchardActionsExceedBlockLimit {
+                    actions: ORCHARD_BLOCK_ACTION_LIMIT + 1,
+                    limit: ORCHARD_BLOCK_ACTION_LIMIT,
+                },
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn ironwood_actions_at_the_orchard_limit_are_accepted() {
+        let limit = limit_as_usize(ORCHARD_BLOCK_ACTION_LIMIT);
+        let orchard_half = limit / 2;
+
+        for tx in [
+            ironwood_tx(0, limit),
+            ironwood_tx(orchard_half, limit - orchard_half),
+        ] {
+            check::shielded_action_limits_are_valid([tx].iter(), Height(1), &nu7_active_testnet())
+                .expect("Orchard and Ironwood actions exactly at the Orchard limit must pass");
+        }
+    }
+
+    /// Ironwood actions add to the global budget like Orchard actions.
+    #[test]
+    fn ironwood_actions_count_in_the_global_budget() {
+        let err = check::shielded_action_limits_are_valid(
+            [
+                ironwood_tx(0, limit_as_usize(ORCHARD_BLOCK_ACTION_LIMIT)),
+                fake_v5_with_sapling_outputs(1),
+            ]
+            .iter(),
+            Height(1),
+            &nu7_active_testnet(),
+        )
+        .expect_err("Ironwood actions plus a Sapling output above the global budget must fail");
+
+        assert_eq!(
+            err,
+            TransactionError::ShieldedCostExceedsBlockBudget {
+                cost: GLOBAL_SHIELDED_BUDGET + 1,
+                limit: GLOBAL_SHIELDED_BUDGET,
+            }
+        );
+    }
+
+    /// Returns a V6 transaction with `orchard_actions` Orchard actions and
+    /// `ironwood_actions` Ironwood actions.
+    fn ironwood_tx(orchard_actions: usize, ironwood_actions: usize) -> Arc<Transaction> {
+        fake_v6_with_orchard_and_ironwood_actions(
+            NetworkUpgrade::Nu7,
+            orchard_actions,
+            ironwood_actions,
+        )
+    }
+
+    fn nu7_active_testnet() -> Network {
+        nu7_activation_testnet(1)
+    }
+
+    fn nu7_activation_testnet(nu7_activation_height: u32) -> Network {
+        Parameters::build()
+            .with_slow_start_interval(Height(0))
+            .with_activation_heights(ConfiguredActivationHeights {
+                nu7: Some(nu7_activation_height),
+                ..Default::default()
+            })
+            .expect("activation heights are valid")
+            .clear_funding_streams()
+            .to_network()
+            .expect("configured testnet is valid")
+    }
+
+    fn limit_as_usize(limit: u32) -> usize {
+        usize::try_from(limit).expect("a shielded action limit fits in usize")
+    }
+
+    fn limit_plus_one(limit: u32) -> usize {
+        usize::try_from(limit + 1).expect("a shielded action limit fits in usize")
+    }
+
+    /// Returns a V4 transaction containing `count` Sprout JoinSplits.
+    fn fake_v4_with_sprout_joinsplits(count: usize) -> Arc<Transaction> {
+        let mut runner = TestRunner::default();
+        let mut joinsplit_data = any::<JoinSplitData<Groth16Proof>>()
+            .new_tree(&mut runner)
+            .expect("sprout JoinSplit data strategy is valid")
+            .current();
+        let rest_len = count
+            .checked_sub(1)
+            .expect("a Sprout JoinSplit test count is at least one");
+        joinsplit_data.rest = vec![joinsplit_data.first.clone(); rest_len];
+
+        Arc::new(Transaction::V4 {
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            lock_time: LockTime::unlocked(),
+            expiry_height: Height(100),
+            joinsplit_data: Some(joinsplit_data),
+            sapling_shielded_data: None,
+        })
+    }
+}

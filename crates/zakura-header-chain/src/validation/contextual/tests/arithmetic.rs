@@ -5,7 +5,8 @@ use zakura_chain::{
     work::difficulty::{ExpandedDifficulty, ParameterDifficulty as _, U256},
 };
 
-use super::super::AdjustedDifficulty;
+use super::super::{AdjustedDifficulty, POW_ADJUSTMENT_BLOCK_SPAN};
+use zakura_chain::parameters::NetworkUpgrade;
 
 #[test]
 fn custom_target_scaling_clamps_before_overflowing_u256() {
@@ -17,10 +18,16 @@ fn custom_target_scaling_clamps_before_overflowing_u256() {
         .expect("the maximum compact-representable target is valid")
         .to_network()
         .expect("the custom network parameters are valid");
-    let mut context = vec![(compact, candidate_time - Duration::seconds(1)); 17];
+    // The recent averaging window is tightly spaced and everything older is far
+    // apart, so the actual timespan is large enough to clamp the scaled mean.
+    // The context always spans `POW_ADJUSTMENT_BLOCK_SPAN` blocks, which can be
+    // wider than the averaging window in force at this height.
+    let candidate_height = block::Height(700_000);
+    let averaging_window = NetworkUpgrade::averaging_window_for_height(&network, candidate_height);
+    let mut context = vec![(compact, candidate_time - Duration::seconds(1)); averaging_window];
     context.extend(vec![
         (compact, candidate_time - Duration::seconds(100_000));
-        11
+        POW_ADJUSTMENT_BLOCK_SPAN - averaging_window
     ]);
     let adjustment = AdjustedDifficulty::new_from_header_time(
         candidate_time,

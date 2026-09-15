@@ -20,6 +20,7 @@ use tower::{timeout::Timeout, Service};
 use zakura_chain::{
     block::{self, Block, Height},
     chain_tip::mock::{MockChainTip, MockChainTipSender},
+    parameters::{testnet::ConfiguredActivationHeights, Network},
     serialization::ZcashDeserializeInto,
 };
 use zakura_consensus::{
@@ -3406,6 +3407,7 @@ async fn empty_block_response_is_retryable_download_failure() {
         chain_tip,
         past_lookahead_limit_sender,
         sync::MIN_CONCURRENCY_LIMIT,
+        Network::Mainnet,
         Height(0),
         LegacySyncTrace::new(None, false),
     );
@@ -3453,6 +3455,7 @@ async fn block_download_network_readiness_times_out() {
         chain_tip,
         past_lookahead_limit_sender,
         sync::MIN_CONCURRENCY_LIMIT,
+        Network::Mainnet,
         Height(0),
         LegacySyncTrace::new(None, false),
     );
@@ -3486,6 +3489,7 @@ fn setup_downloads(
         chain_tip,
         past_lookahead_limit_sender,
         sync::MIN_CONCURRENCY_LIMIT,
+        Network::Mainnet,
         Height(0),
         LegacySyncTrace::new(None, false),
     )
@@ -3889,4 +3893,83 @@ async fn tip_height_without_a_tip_hash_keeps_the_behind_tip_policy() {
     );
 
     verifier.expect_no_requests().await;
+}
+
+/// Returns the syncer's lookahead limit on `network` when the verified tip is `tip`.
+fn lookahead_limit_at(network: &Network, max_checkpoint_height: Height, tip: Height) -> usize {
+    let config = ZakuradConfig {
+        network: zn::Config {
+            network: network.clone(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let (chain_tip, chain_tip_sender) = MockChainTip::new();
+    chain_tip_sender.send_best_tip_height(tip);
+
+    let (misbehavior_tx, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
+    let (chain_sync, _sync_status): (TestChainSync, _) = ChainSync::new(
+        &config,
+        max_checkpoint_height,
+        MockService::build().for_unit_tests(),
+        MockService::build().for_unit_tests(),
+        MockService::build().for_unit_tests(),
+        chain_tip,
+        misbehavior_tx,
+    );
+
+    chain_sync.lookahead_limit(0)
+}
+
+/// ZIP 218 scales the block-count lookahead limits where the target spacing is 25 seconds.
+#[tokio::test]
+async fn lookahead_limit_scales_with_target_spacing() {
+    let _init_guard = zakura_test::init();
+
+    const NU7: u32 = 5_000;
+    let regtest = Network::new_regtest(
+        ConfiguredActivationHeights {
+            nu7: Some(NU7),
+            ..Default::default()
+        }
+        .into(),
+    );
+    let multiplier = 3;
+
+    let sync_config = ZakuradConfig::default().sync;
+    let checkpoint_limit = sync_config.checkpoint_verify_concurrency_limit;
+    let full_limit = sync_config.full_verify_concurrency_limit;
+
+    // Mainnet has no NU7 height, so its limits stay unscaled.
+    let mainnet_checkpoint = Height(3_000_000);
+    assert_eq!(
+        lookahead_limit_at(&Network::Mainnet, mainnet_checkpoint, Height(2_000_000)),
+        checkpoint_limit
+    );
+    assert_eq!(
+        lookahead_limit_at(&Network::Mainnet, mainnet_checkpoint, Height(3_500_000)),
+        full_limit
+    );
+
+    // Checkpoint verification continues past NU7.
+    let checkpoint = Height(NU7 * 2);
+    assert_eq!(
+        lookahead_limit_at(&regtest, checkpoint, Height(NU7 - 1)),
+        checkpoint_limit
+    );
+    assert_eq!(
+        lookahead_limit_at(&regtest, checkpoint, Height(NU7)),
+        checkpoint_limit * multiplier
+    );
+
+    // Full verification starts at genesis.
+    assert_eq!(
+        lookahead_limit_at(&regtest, Height(0), Height(NU7 - 1)),
+        full_limit
+    );
+    assert_eq!(
+        lookahead_limit_at(&regtest, Height(0), Height(NU7)),
+        full_limit * multiplier
+    );
 }

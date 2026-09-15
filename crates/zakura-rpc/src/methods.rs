@@ -68,8 +68,7 @@ use zakura_chain::{
             block_subsidy, founders_reward, funding_stream_values, miner_subsidy,
             FundingStreamReceiver,
         },
-        ConsensusBranchId, Network, NetworkUpgrade, POST_BLOSSOM_POW_TARGET_SPACING,
-        POW_AVERAGING_WINDOW,
+        ConsensusBranchId, Network, NetworkUpgrade,
     },
     serialization::{BytesInDisplayOrder, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
     subtree::NoteCommitmentSubtreeIndex,
@@ -755,7 +754,7 @@ pub trait Rpc {
     /// `height`.
     ///
     /// If `num_blocks` is not supplied, uses 120 blocks. If it is 0 or -1, uses the difficulty
-    /// averaging window.
+    /// averaging window at `height`, which ZIP 218 widens at NU7.
     /// If `height` is not supplied or is -1, uses the tip height.
     ///
     /// zcashd reference: [`getnetworksolps`](https://zcash.github.io/rpc/getnetworksolps.html)
@@ -1477,12 +1476,14 @@ where
                     .latest_chain_tip
                     .best_tip_height()
                     .unwrap_or_else(|| self.network.checkpoint_list().max_height());
-                let remaining_blocks = i64::from(end_of_support_height.0) - i64::from(tip_height.0);
+                let remaining_seconds = target_seconds_between_heights(
+                    &self.network,
+                    tip_height,
+                    end_of_support_height,
+                );
                 let estimated_time = Utc::now()
                     .timestamp()
-                    .saturating_add(
-                        remaining_blocks.saturating_mul(i64::from(POST_BLOSSOM_POW_TARGET_SPACING)),
-                    )
+                    .saturating_add(remaining_seconds)
                     .saturating_sub(END_OF_SERVICE_ESTIMATE_SAFETY_MARGIN)
                     .max(0);
 
@@ -3370,18 +3371,25 @@ where
         num_blocks: Option<i32>,
         height: Option<i32>,
     ) -> Result<u64> {
-        // Default number of blocks is 120 if not supplied.
-        let mut num_blocks = num_blocks.unwrap_or(DEFAULT_SOLUTION_RATE_WINDOW_SIZE);
-        // But if it is 0 or negative, it uses the proof of work averaging window.
-        if num_blocks < 1 {
-            num_blocks = i32::try_from(POW_AVERAGING_WINDOW).expect("fits in i32");
-        }
-        let num_blocks =
-            usize::try_from(num_blocks).expect("just checked for negatives, i32 fits in usize");
-
         // Default height is the tip height if not supplied. Negative values also mean the tip
         // height. Since negative values aren't valid heights, we can just use the conversion.
         let height = height.and_then(|height| height.try_into_height().ok());
+
+        // Default number of blocks is 120 if not supplied.
+        let num_blocks = num_blocks.unwrap_or(DEFAULT_SOLUTION_RATE_WINDOW_SIZE);
+        let num_blocks = match usize::try_from(num_blocks) {
+            Ok(num_blocks) if num_blocks >= 1 => num_blocks,
+            // But if it is 0 or negative, it uses the proof of work averaging window at the
+            // requested height. The state starts at the tip if the height is above it.
+            _ => {
+                let window_height = height
+                    .into_iter()
+                    .chain(self.latest_chain_tip.best_tip_height())
+                    .min()
+                    .unwrap_or(Height(0));
+                NetworkUpgrade::averaging_window_for_height(&self.network, window_height)
+            }
+        };
 
         let mut read_state = self.read_state.clone();
 
@@ -4004,6 +4012,38 @@ impl GetInfoResponse {
 /// Block times vary, so the halt can happen earlier than a spacing-based
 /// estimate. Reporting it a day early gives consumers time to act.
 const END_OF_SERVICE_ESTIMATE_SAFETY_MARGIN: i64 = 24 * 60 * 60;
+
+/// Returns the target time to mine the blocks above `from` up to `to` on `network`, in seconds.
+///
+/// Each block counts with the target spacing at its height, so ZIP 218's 25 second spacing after
+/// NU7 shortens the time. The result is negative when `to` is below `from`.
+fn target_seconds_between_heights(network: &Network, from: Height, to: Height) -> i64 {
+    let low = i64::from(from.0.min(to.0));
+    let high = i64::from(from.0.max(to.0));
+
+    let target_spacings: Vec<_> = NetworkUpgrade::target_spacings(network).collect();
+    let seconds: i64 = target_spacings
+        .iter()
+        .enumerate()
+        .map(|(index, (start_height, target_spacing))| {
+            // The heights in `low + 1..=high` that use this target spacing.
+            let first = i64::from(start_height.0).max(low + 1);
+            let last = target_spacings
+                .get(index + 1)
+                .map_or(high, |(next_height, _)| {
+                    (i64::from(next_height.0) - 1).min(high)
+                });
+
+            (last - first + 1).max(0) * target_spacing.num_seconds()
+        })
+        .sum();
+
+    if to < from {
+        -seconds
+    } else {
+        seconds
+    }
+}
 
 /// Response to a `getdeprecationinfo` RPC request.
 ///

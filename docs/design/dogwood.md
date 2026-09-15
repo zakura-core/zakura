@@ -16,106 +16,65 @@ The [experiment report](dogwood-experiments.md) records the local codec and
 congestion-control estimates and connected-relay tests. They do not establish
 overlay convergence or sustained throughput at the planning target.
 
-## Throughput target
+## Performance targets
 
-Assume an initial post-Tachyon workload of 50,000 TPS with every transaction
-aggregated to 2 KiB. We need 102.4 MB/s (819.2 Mbps) of block-body throughput,
-or roughly 1 Gbps after 25% parity: 1.024 Gbps before proofs, transport,
-challenges, and recovery. This is a planning assumption, not a consensus limit.
+We aim to carry 50,000 TPS, replicate each block to 90% of nodes in about
+400 ms, and sustain good performance as the network changes.
+These are rough design targets, not measured results or consensus parameters.
 
-For body rate `R`, requested parity/data ratio `r`, additional traffic fraction
-`h` relative to body plus parity, and usable-link utilization target `u`:
+**Throughput.** Assuming 2 KiB per aggregated transaction after Tachyon,
+50,000 TPS requires `50,000 × 2,048 × 8 = 819.2 Mbps` of block-body traffic.
+Adding 25% parity brings that to 1.024 Gbps, so roughly 1 Gbps is our starting
+point before transport overhead and recovery.
+Relays also need upload capacity for each forwarding copy.
+This is a sustained rate: delivering a block accumulated over `T` seconds in
+`D` seconds requires at least `819.2 × T / D Mbps` of body ingress.
+We must size blocks and links together to meet the latency target.
 
-```text
-required usable bandwidth >= R * (1 + r) * (1 + h) / u
-```
+**Latency.** We aim to replicate a block to 90% of nodes within about 400 ms,
+and keep that target below 500 ms.
+For a rough geographic baseline, uniformly distributed nodes have a median
+surface separation of about 10,000 km.
+Light takes about 33 ms to cover that distance in vacuum, or 50 ms in fiber.
+Allowing three such overlay hops gives about 150 ms of propagation.
+We provisionally budget another 250 ms for indirect physical routes,
+serialization, queueing, verification, and reconstruction.
+That gives a 400 ms target; actual geography, topology, and block size will
+determine whether we can meet it for 90% of nodes.
+In traditional proof of work, propagation consumes part of the block interval
+and increases competing-block risk.
+Keeping propagation near 10% of the interval would put a 400 ms delay against
+roughly four-second blocks.
+This is a sizing heuristic, not a prediction of the orphan rate.
 
-For example, 25% parity, a provisional 5% traffic allowance, and 80% utilization
-require about 1.344 Gbps of usable ingress. The allowance and utilization are
-experiment inputs, not measured production values. Canceling unneeded parity
-can reduce delivered bytes, but capacity planning should reserve the requested
-load. Every forwarding copy also consumes upload capacity.
-Duplicate-heavy policies need a larger allowance; use their measured total
-wire/body ratio in the capacity budget.
-The concurrent experiment's busiest relay averaged about three body copies
-per body with two-supplier startup routes: roughly 2.46 Gbps before additional
-overhead and headroom. A network-wide average does not size that relay.
-
-Average throughput does not set block latency. At a block interval of `T`
-seconds, this workload produces about `102.4 * T` MB per body. Delivering that
-body within `D` seconds needs at least `819.2 * T / D` Mbps before redundancy.
-The present GF(2^16) profile also limits one codeword to 65,535 parts.
-At 64 KiB and 25% parity, at most 52,428 data parts hold about 3.2 GiB.
-This workload reaches that bound in about 33.55 seconds. A larger body would
-require a revised profile, such as multiple committed stripes, and new tests.
-
-These example burst budgets separate the missing sizing decisions. They assume
-that body propagation starts after block release and that the proposer seeds
-one codeword. They exclude framing, integer padding, CPU, and relay delay.
-The intervals and deadlines are examples, not proposed consensus parameters.
-
-| Block interval | Body bytes | Propagation deadline | Minimum receiver body ingress | Proposer upload for 25% parity | Fits W1 field bound |
-| --- | --- | --- | --- | --- | --- |
-| 1 s | 102.4 MB | 1 s | 0.8192 Gbps | 1.024 Gbps | Yes |
-| 10 s | 1.024 GB | 1 s | 8.192 Gbps | 10.24 Gbps | Yes |
-| 30 s | 3.072 GB | 1 s | 24.576 Gbps | 30.72 Gbps | Yes |
-| 75 s | 7.68 GB | 5 s | 12.288 Gbps | 15.36 Gbps | No |
-| 75 s | 7.68 GB | 1 s | 61.44 Gbps | 76.8 Gbps | No |
-
-A 1.344 Gbps proposer needs at least 57.14 seconds to send the 75-second
-example's codeword. That link can satisfy the average source budget but cannot
-satisfy a five-second propagation deadline. Stripes remove the single-codeword
-field limit; they do not reduce the source's byte count. Fitting the field
-limit also does not establish an affordable decoder.
-
-The design needs a selected block interval and propagation deadline before it
-can select the large-body profile and a meaningful burst experiment. The
-50,000 TPS assumption fixes neither value. The synthetic 2 MiB releases in the
-concurrent experiment cannot substitute for that decision. Until those values
-are selected, this document claims capacity bounds and measured reference
-behavior, not a complete post-Tachyon performance design.
-
-Peers will have widely different usable upload rates after other traffic.
-The controller must allocate against observed delivery and aggregate receiver
-capacity. A high advertised link rate does not establish either quantity.
-Full nodes below the required sustained ingress rate cannot keep up through
-congestion control alone.
+**Robustness.** Any node can propose the next block.
+Bandwidth, peer connections, and topology change without central control.
+Dogwood should perform well from any entry point relative to the capacity and
+paths available at that moment.
+Nodes continuously measure delivery, explore other peers, and shift
+subscriptions toward peers that deliver more data.
+Redundancy and recovery should preserve delivery while those subscriptions adapt.
 
 ## Tradeoffs
 
 ### Topology and the normal propagation path
 
-The throughput design assumes that participating relay nodes remain connected
-after removing the proposer. The intended network has multiple relay paths
-and enough aggregate upload to carry standing subscriptions. A star whose
-leaves can communicate only through the proposer falls outside this operating
-assumption. Its source-cut cost remains a useful failure test, not a reason to
-budget several body copies for normal proposer seeding.
+The robustness target requires multiple relay paths and enough aggregate
+upload to carry subscriptions after removing the proposer.
+Each part also needs a subscription path from its seed to its receivers.
+Physical connectivity alone does not provide that path.
 
-Physical connectivity does not ensure that every per-part subscription graph
-has a path from its seed. Normal propagation must establish useful standing
-routes and distribute seeds within the initial source budget. Experiments must
-measure completion before repair on connected relay graphs, including unfamiliar
-proposers. They must not use successful repair to claim that those routes work.
+Nodes normally push verified parts without waiting for requests or reconstruction.
+A stalled receiver uses `FullBlock` announcements to find peers that can serve
+missing parts through bounded block-specific subscriptions.
+This fallback costs a request delay and extra upload, so normal routes must
+meet the latency target without frequent repair.
+Recovery attempts must retain finite grants and a bounded proposer seed budget.
 
-`FullBlock`-triggered requests for missing parts form a strict fallback.
-A stalled receiver can request enough distinct missing indices from a peer
-that advertises completion. That peer serves retained or regenerated parts
-through bounded block-scoped subscriptions. Normal forwarding continues to
-push verified parts without requests or reconstruction delays.
+### Routing choices
 
-Fallback pays a request delay and additional upload. Frequent fallback would
-make the system behave like pull-based block distribution and defeat the
-throughput goal. Reports must separate normal completion, fallback frequency,
-fallback bytes, and eventual completion. Attackers and topology failures must
-not turn fallback into unlimited grants or unbounded proposer reseeding.
-
-### Latency, throughput, and robustness
-
-Block propagation balances latency, throughput, and robustness.
-
-We include scalability under robustness: a larger network should not require
-each node to serve more peers. Like
+To preserve robustness as the network grows, each node bounds its forwarding
+peers. Like
 [Gossipsub](https://github.com/libp2p/specs/blob/master/pubsub/gossipsub/gossipsub-v1.0.md#gossipsub-the-gossiping-mesh-router),
 Dogwood uses bounded local forwarding, with a separate subscription graph for
 each part.
@@ -213,9 +172,10 @@ Incoming masks record what it requests. Outgoing masks record what peers
 request from it. When a block arrives, the node resolves these masks into
 peer-by-part bitmaps.
 
-Default masks serve unfamiliar proposers. The steady-state throughput model
-uses one supplier per part. The draft retains bounded two-supplier startup
-coverage until routes demonstrate delivery. Startup traffic must fit its own
+Default masks provide initial routes for unfamiliar proposers.
+Steady-state routes use one supplier per part where coverage permits.
+The draft retains bounded two-supplier startup coverage until routes demonstrate
+delivery. Startup traffic must fit its own
 byte budget. Here, each checkmark shows a steady-state request for an announced
 block:
 
@@ -624,20 +584,20 @@ block for consensus validation.
 
 The [spec parameter registry](../specs/dogwood.md#parameter-registry) owns the
 definitions, starting values, and change rules. These values make experiments
-comparable; they are not tuned production defaults. We should select a joint
-operating point against proposer upload, receiver throughput, latency, and
-failure recovery. Optimizing one parameter in isolation can move cost elsewhere.
+comparable; they are not tuned production defaults. We should tune them together
+against the [performance targets](#performance-targets), accounting for proposer
+and relay upload as well as receiver capacity.
 
 | Parameter group | Starting point and rationale | What could change it |
 | --- | --- | --- |
-| Workload and utilization | 50,000 TPS at 2 KiB; 80% usable-link utilization and 5% extra traffic are planning inputs. | Measured transaction sizes, forwarding fanout, transport overhead, and burst size. |
+| Workload and capacity | Use the throughput assumptions in [Performance targets](#performance-targets). | Transaction sizes, forwarding copies, overhead, and block size determine required link capacity. |
 | Part size and mask width | 64 KiB parts; 16 mask bits in experiments bound proof work and route state. | Smaller parts or more bits permit smaller assignment changes but increase overhead. |
 | Codec, parity, and subscribed coverage | Systematic GF(2^16) Reed–Solomon with 25% parity; compare 12.5–100% and duplicate subscriptions. | Proposer seeding time, encoding cost, receiver bytes, and recovery latency jointly determine the ratio. A codec change requires a profile revision. |
 | Proposer seed budget, peers, and portions | Compare one-codeword seeding with repair and ordinary demand; one part per scheduling portion. | Receiver credit, proposer upload, and downstream component coverage can require more copies or a different assignment. |
 | Small-block parity | Keep `ceil(k/4)` in the draft; test 100% parity at `k<=8`. | Absolute upload cost, rounding, and avoided repair delay determine whether a new deterministic profile is useful. |
 | Failure model and startup copies | Test any one supplier loss; zero extra safety parts in the experiment; two selected startup copies where affordable. | Correlated failures and cold-route measurements can justify more coverage. Learned routes may use one copy or retain duplicates. |
 | Decode schedule | Eager on-arrival elimination is a candidate; verify every part before use. | CPU backlog and memory measurements may favor another equivalent schedule. |
-| Delivery and recovery deadlines | 400 ms and 1,200 ms for the 2 MiB reference experiment. | Body size, burst concurrency, and achievable service determine production deadlines. |
+| Delivery and recovery deadlines | Aim for 90% replication around 400 ms, below 500 ms; bound recovery separately. | Geography, topology, block size, and concurrent traffic determine achievable latency. |
 | Assignment budget | Start at 20 parts; test additive steps of one part and a 0.75 decrease factor. | Loaded delivery, queue delay, and eligible misses guide changes across all blocks on a connection. |
 | Observation and migration | Require three race votes and a two-thirds win share; move at most four parts per trial. | Noise, part-mask granularity, and measured settling time constrain faster adaptation. |
 | Challenge funding | Fund extra traffic at 1/32 of completed encoded bytes; use one mask bit per trial. | Ordinary-delivery telemetry or existing duplicates may reduce the needed challenge traffic. |
@@ -711,8 +671,8 @@ resource bounds are selected. W1 fixes candidate payload bytes and signatures.
   grant, and cancellation rules omitted by the reduced simulations.
 - [x] Measure equal-body reference codec scaling from 2 MiB stripes to one
   64 MiB codeword; separate the field bound from practical CPU cost.
-- [ ] **Large bodies:** obtain the intended block interval and propagation
-  deadline; select the committed-stripe profile and test the resulting burst
+- [ ] **Large bodies:** choose the block interval and body size against the
+  latency target; select the committed-stripe profile and test the resulting burst
   with measured coding work, bounded memory, and separately measured fallback.
 - [x] Specify W1 payload encoding, tagged hashes, Merkle proofs, signatures,
   and separate seed cancellation; test bounds and signature context binding.
@@ -743,5 +703,6 @@ ordinary block recovery.
 
 The [W1 payload profile](../specs/dogwood.md#candidate-payload-profile-w1) fixes
 canonical bytes and cryptographic commitments. The spec leaves the production
-chain adapter, service negotiation, and aggregate resource limits open. Controller simulations and codec measurements must establish the
-latency and throughput this design can achieve.
+chain adapter, service negotiation, and aggregate resource limits open.
+Network experiments with realistic geography, workloads, and changing peer
+capacity must establish whether the design meets its performance targets.

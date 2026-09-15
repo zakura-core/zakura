@@ -244,8 +244,8 @@ result.
 
 ## Burst capacity calculation
 
-`capacity_budget.py` records the arithmetic behind the design's example burst
-table in `results/2026-09-09-capacity-decision`. It uses 50,000 TPS, 2 KiB per
+`capacity_budget.py` records internal burst-capacity examples in
+`results/2026-09-09-capacity-decision`. It uses 50,000 TPS, 2 KiB per
 transaction, and 25% parity. It excludes the transaction-vector prefix, coding
 rounding, proofs, transport, and CPU. This calculation is not an experiment.
 
@@ -254,8 +254,8 @@ At the planning rate, that holds about 33.55392 seconds of transaction bytes.
 A 75-second example exceeds the field bound. Sending its codeword within five
 seconds requires at least 15.36 Gbps of source upload. The 1.344 Gbps average
 capacity example needs at least 57.14 seconds for that transfer. Stripes cannot
-remove this serialization time. The user must select the intended block
-interval and propagation deadline before a burst result can meet the target.
+remove this serialization time. We must select the block interval and body size
+before testing the [latency target](dogwood.md#performance-targets) under the resulting burst load.
 
 ## Reference codec scaling
 

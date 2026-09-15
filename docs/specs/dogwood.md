@@ -36,13 +36,13 @@ and time limits to this pending state.
 Header admission does not validate the block body. Reconstructed blocks MUST
 enter the existing consensus block-validation path.
 
-The planning workload is 50,000 TPS after Tachyon, assuming 2 KiB per aggregated
-transaction. This requires 819.2 Mbps of body throughput and 1.024 Gbps with
-25% parity, before proofs, transport, challenges, and recovery. This assumption
-does not change consensus limits. The [design throughput budget](../design/dogwood.md#throughput-target)
-separates average rate, burst latency, forwarding load, and codeword limits.
-The intended block interval and propagation deadline remain required sizing
-inputs. A frame-valid codeword is not evidence that decoding fits a work budget.
+The [design targets](../design/dogwood.md#performance-targets) define the
+planning workload, latency goal, and adaptation requirements.
+They assume 50,000 TPS at 2 KiB per transaction and aim for replication to 90%
+of nodes in about 400 ms, below 500 ms, as bandwidth and topology change.
+These estimates do not change consensus limits or establish measured guarantees.
+The block interval and body size remain required sizing inputs.
+A frame-valid codeword is not evidence that decoding fits a work budget.
 The [reference scaling experiment](../design/dogwood-experiments.md#reference-codec-scaling)
 supports testing smaller stripes; W1 does not yet encode them.
 

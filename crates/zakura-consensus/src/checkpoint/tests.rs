@@ -256,7 +256,7 @@ async fn generated_local_seed_chain_passes_checkpoint_verification() -> Result<(
     Ok(())
 }
 
-/// A checkpoint after NU7 must wait for the activation block's parent state.
+/// A checkpoint at the ZIP 234 start height must wait for its parent's state.
 #[cfg(feature = "nu7-experimental")]
 #[tokio::test(flavor = "multi_thread")]
 async fn checkpoint_sync_crosses_zip234_activation() -> Result<(), Report> {
@@ -287,6 +287,7 @@ async fn checkpoint_sync_crosses_zip234_activation() -> Result<(), Report> {
             nu7: Some(1),
             ..Default::default()
         })?
+        .with_zip234_start_height(block::Height(1))
         .clear_funding_streams()
         .with_slow_start_interval(block::Height::MIN)
         .with_disable_pow(true)

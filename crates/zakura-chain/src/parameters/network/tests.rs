@@ -506,42 +506,159 @@ fn averaging_window_changes_at_nu7_activation_height() -> Result<(), Report> {
     Ok(())
 }
 
-/// Checks the ZIP 234 activation height, reissuance bonus, and cumulative schedule.
+/// Checks the ZIP 234 crossing rule on the 75-second schedule.
+#[test]
+fn zip234_crossing_height() {
+    use crate::parameters::subsidy::{zip234_crossing_height, ZIP234_START_HALVING};
+
+    let _init_guard = zakura_test::init();
+
+    assert_eq!(
+        zip234_crossing_height(&Network::Mainnet, ZIP234_START_HALVING),
+        Some(Height(5_342_746)),
+    );
+    assert_eq!(
+        zip234_crossing_height(&Network::new_default_testnet(), ZIP234_START_HALVING),
+        Some(Height(5_412_346)),
+    );
+
+    // ZIP 234's own rule, after the second halving, gives its planned Mainnet start in
+    // February 2027.
+    assert_eq!(
+        zip234_crossing_height(&Network::Mainnet, 2),
+        Some(Height(3_662_746)),
+    );
+
+    // Regtest's short halving interval issues too little for the reserve to fall below
+    // the crossing threshold.
+    assert_eq!(
+        zip234_crossing_height(
+            &Network::new_regtest(Default::default()),
+            ZIP234_START_HALVING
+        ),
+        None,
+    );
+}
+
+/// Returns the default Testnet parameters with NU7 at `nu7`.
+fn testnet_with_nu7(nu7: Option<u32>) -> testnet::ParametersBuilder {
+    let mut activation_heights: ConfiguredActivationHeights = Network::new_default_testnet()
+        .parameters()
+        .expect("Testnet has parameters")
+        .activation_heights()
+        .into();
+    activation_heights.nu7 = nu7;
+
+    testnet::Parameters::build()
+        .with_activation_heights(activation_heights)
+        .expect("activation heights are valid")
+}
+
+/// Checks where ZIP 234 reissuance starts relative to NU7 and the crossing height.
+#[test]
+fn zip234_start_height_follows_nu7_and_the_crossing_rule() {
+    use crate::parameters::{subsidy::zip234_start_height, ZIP218_ENABLED};
+
+    let _init_guard = zakura_test::init();
+
+    const TESTNET_CROSSING: u32 = 5_412_346;
+
+    // A network without NU7 never starts reissuance.
+    assert_eq!(zip234_start_height(&Network::Mainnet), None);
+    assert_eq!(zip234_start_height(&Network::new_default_testnet()), None);
+    let no_nu7 = testnet_with_nu7(None)
+        .to_network()
+        .expect("configured testnet is valid");
+    assert_eq!(zip234_start_height(&no_nu7), None);
+
+    // NU7 before the crossing height maps the crossing height through the halving clock.
+    // Each 75-second block after NU7 is three 25-second blocks.
+    for nu7 in [4_200_000, 4_500_000, 5_000_000, TESTNET_CROSSING - 1] {
+        let network = testnet_with_nu7(Some(nu7))
+            .to_network()
+            .expect("configured testnet is valid");
+        let expected = if ZIP218_ENABLED {
+            nu7 + 3 * (TESTNET_CROSSING - nu7)
+        } else {
+            TESTNET_CROSSING
+        };
+
+        assert_eq!(
+            zip234_start_height(&network),
+            Some(Height(expected)),
+            "NU7 at {nu7}",
+        );
+    }
+
+    // NU7 at or after the crossing height starts reissuance at NU7.
+    for nu7 in [TESTNET_CROSSING, 6_000_000] {
+        let network = testnet_with_nu7(Some(nu7))
+            .to_network()
+            .expect("configured testnet is valid");
+
+        assert_eq!(
+            zip234_start_height(&network),
+            Some(Height(nu7)),
+            "NU7 at {nu7}",
+        );
+    }
+
+    // A configured start height replaces the crossing height, but not NU7.
+    let configured = |nu7, start| {
+        testnet_with_nu7(Some(nu7))
+            .with_zip234_start_height(Height(start))
+            .to_network()
+            .expect("configured testnet is valid")
+    };
+    assert_eq!(
+        zip234_start_height(&configured(4_200_000, 4_200_010)),
+        Some(Height(4_200_010)),
+    );
+    assert_eq!(
+        zip234_start_height(&configured(4_200_000, 1)),
+        Some(Height(4_200_000)),
+    );
+
+    let regtest = |zip234_start_height| {
+        Network::new_regtest(testnet::RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu7: Some(10),
+                ..Default::default()
+            },
+            zip234_start_height,
+            ..Default::default()
+        })
+    };
+    assert_eq!(zip234_start_height(&regtest(None)), None);
+    assert_eq!(
+        zip234_start_height(&regtest(Some(Height(20)))),
+        Some(Height(20)),
+    );
+}
+
+/// Checks the ZIP 234 reissuance bonus and cumulative schedule.
 #[test]
 fn zip234_issuance() {
     use crate::{
-        parameters::{
-            subsidy::{cumulative_halving_subsidies_for_tests, zip234_start_height},
-            ZIP234_ENABLED,
-        },
+        parameters::{subsidy::cumulative_halving_subsidies_for_tests, ZIP234_ENABLED},
         value_balance::ValueBalance,
     };
 
     let _init_guard = zakura_test::init();
 
-    // A network that does not activate NU7 never reaches ZIP 234.
-    let no_nu7 = testnet::Parameters::build()
-        .to_network()
-        .expect("configured testnet is valid");
-    assert_eq!(zip234_start_height(&no_nu7), None);
-    assert_eq!(zip234_start_height(&Network::Mainnet), None);
-
-    let nu7 = 1_000_000;
+    let start = Height(1_000_000);
     let network = testnet::Parameters::build()
         .with_activation_heights(ConfiguredActivationHeights {
             blossom: Some(1),
             canopy: Some(2),
-            nu7: Some(nu7),
+            nu7: Some(start.0),
             ..Default::default()
         })
         .expect("activation heights are valid")
         .clear_funding_streams()
+        .with_zip234_start_height(start)
         .to_network()
         .expect("configured testnet is valid");
-
-    let start = zip234_start_height(&network).expect("NU7 is configured");
-
-    assert_eq!(start, Height(nu7));
 
     // `cumulative_halving_subsidies` walks halving and spacing boundaries rather than
     // every height, so check it against the sum it is standing in for.
@@ -574,7 +691,7 @@ fn zip234_issuance() {
         return;
     }
 
-    // ZIP 234 needs the money reserve at its activation height.
+    // ZIP 234 needs the money reserve at its start height.
     assert_eq!(
         block_subsidy(start, &network, None),
         Err(SubsidyError::MissingMoneyReserve),

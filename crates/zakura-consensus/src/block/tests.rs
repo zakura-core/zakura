@@ -1732,6 +1732,170 @@ async fn ordinary_auth_failures_require_matching_commitments_and_allow_a_correct
     }
 }
 
+/// A deterministic failure on an NU5 body condemns the header only when the
+/// header's authorization commitment binds the delivered bytes. Rules whose
+/// inputs the transaction ID fixes, such as expiry, are deliberately not carved
+/// out: a partially bound body is a payload mismatch, and a header whose bodies
+/// never bind is handled by the body-unavailable retry episode (LC-AVAIL-01/02),
+/// exactly like a withheld body.
+#[tokio::test]
+async fn partially_bound_deterministic_failures_are_payload_mismatches() {
+    use zakura_chain::block::{ChainHistoryBlockTxAuthCommitmentHash, CommitmentError};
+    use zakura_header_chain::{BodyCommitmentKind, BodyRuleId, BodyVerificationClass};
+
+    #[derive(Clone, Copy)]
+    enum Failure {
+        /// A transaction rule whose inputs the transaction ID fixes.
+        ExpiredTransaction,
+        /// A block rule whose inputs include authorization bytes.
+        TooManySigops,
+    }
+
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let canonical = zakura_test::vectors::MAINNET_BLOCKS
+        .range(1_687_104..)
+        .map(|(_, bytes)| Block::zcash_deserialize(&bytes[..]).unwrap())
+        .find(|block| {
+            block.transactions.iter().any(|tx| {
+                matches!(
+                    tx.as_ref(),
+                    Transaction::V5 {
+                        sapling_shielded_data: Some(_),
+                        ..
+                    }
+                )
+            })
+        })
+        .expect("a NU5 vector contains Sapling authorization data");
+
+    for (failure, commits_delivered_auth) in [
+        (Failure::ExpiredTransaction, false),
+        (Failure::ExpiredTransaction, true),
+        (Failure::TooManySigops, false),
+        (Failure::TooManySigops, true),
+    ] {
+        // Deliver the canonical transactions with one binding-signature bit
+        // flipped: same transaction IDs and Merkle root, different auth bytes.
+        let mut canonical = canonical.clone();
+        let mut delivered = canonical.clone();
+        let mutated = delivered
+            .transactions
+            .iter_mut()
+            .find(|tx| {
+                matches!(
+                    tx.as_ref(),
+                    Transaction::V5 {
+                        sapling_shielded_data: Some(_),
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let mutated_id = mutated.hash();
+        let Transaction::V5 {
+            sapling_shielded_data: Some(data),
+            ..
+        } = Arc::make_mut(mutated)
+        else {
+            unreachable!("the selected transaction has Sapling data");
+        };
+        let mut signature = <[u8; 64]>::from(data.binding_sig);
+        signature[0] ^= 1;
+        data.binding_sig = signature.into();
+        assert_eq!(mutated.hash(), mutated_id);
+        let history_root = [0x42; 32].into();
+        let auth_root = if commits_delivered_auth {
+            delivered.auth_data_root()
+        } else {
+            canonical.auth_data_root()
+        };
+        let commitment: [u8; 32] =
+            ChainHistoryBlockTxAuthCommitmentHash::from_commitments(&history_root, &auth_root)
+                .into();
+        Arc::make_mut(&mut canonical.header).commitment_bytes = commitment.into();
+        delivered.header = canonical.header.clone();
+        let delivered =
+            Block::zcash_deserialize(&delivered.zcash_serialize_to_vec().unwrap()[..]).unwrap();
+        assert_eq!(canonical.hash(), delivered.hash());
+        let height = delivered.coinbase_height().unwrap();
+        let failing_id = delivered
+            .transactions
+            .iter()
+            .find(|tx| !tx.is_coinbase())
+            .unwrap()
+            .hash();
+
+        let state = service_fn(move |request| async move {
+            match request {
+                zs::Request::KnownBlock(_) => Ok(zs::Response::KnownBlock(None)),
+                zs::Request::CheckBlockCommitment(commitment) => {
+                    let expected: [u8; 32] =
+                        ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+                            &history_root,
+                            &commitment.auth_data_root.unwrap(),
+                        )
+                        .into();
+                    let actual = *commitment.block.header.commitment_bytes;
+                    if actual == expected {
+                        Ok(zs::Response::BlockCommitmentValidity(
+                            zs::BlockCommitmentValidity::Valid,
+                        ))
+                    } else {
+                        Err(Box::new(zs::ValidateContextError::InvalidBlockCommitment(
+                            CommitmentError::InvalidChainHistoryBlockTxAuthCommitment {
+                                actual,
+                                expected,
+                            },
+                        )) as BoxError)
+                    }
+                }
+                request => panic!("a failed body must not reach the state: {request:?}"),
+            }
+        });
+        let transactions = service_fn(move |request: tx::Request| async move {
+            let is_failing = request.transaction().hash() == failing_id;
+            if is_failing && matches!(failure, Failure::ExpiredTransaction) {
+                return Err(Box::new(TransactionError::ExpiredTransaction {
+                    expiry_height: Height(height.0 - 1),
+                    block_height: height,
+                    transaction_hash: failing_id,
+                }) as BoxError);
+            }
+            let mut response = accept_block_transaction(request);
+            if let tx::Response::Block {
+                miner_fee, sigops, ..
+            } = &mut response
+            {
+                if is_failing {
+                    // Cover the coinbase outputs so the fee check passes.
+                    *miner_fee = Some(Amount::try_from(MAX_MONEY / 2).unwrap());
+                    if matches!(failure, Failure::TooManySigops) {
+                        *sigops = MAX_BLOCK_SIGOPS + 1;
+                    }
+                }
+            }
+            Ok::<_, BoxError>(response)
+        });
+        let error = SemanticBlockVerifier::new(&network, state, transactions)
+            .oneshot(Request::CheckProposal(Arc::new(delivered)))
+            .await
+            .expect_err("both failures reject the delivery");
+        let rule = match failure {
+            Failure::ExpiredTransaction => "transaction.expired",
+            Failure::TooManySigops => "block.too_many_transparent_signature_operations",
+        };
+        assert_body_verification_class(
+            error,
+            if commits_delivered_auth {
+                BodyVerificationClass::ConsensusInvalid(BodyRuleId::new(rule))
+            } else {
+                BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::AuthDataRoot)
+            },
+        );
+    }
+}
+
 #[test]
 fn merkle_root_attribution_distinguishes_padding_from_intrinsic_duplicates() -> Result<(), Report> {
     use zakura_header_chain::{BodyCommitmentKind, BodyRuleId, BodyVerificationClass};

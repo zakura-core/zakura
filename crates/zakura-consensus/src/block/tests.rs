@@ -1699,8 +1699,8 @@ async fn authorizing_data_mismatch_rejects_before_transaction_dispatch() {
         observed.fetch_add(1, Ordering::SeqCst);
         async { Err::<transaction::Response, BoxError>("unexpected transaction dispatch".into()) }
     });
-    let verifier = SemanticBlockVerifier::new(&Network::Mainnet, state, transactions);
-    let error = verifier
+    let mut verifier = SemanticBlockVerifier::new(&Network::Mainnet, state, transactions);
+    let error = (&mut verifier)
         .oneshot(Request::CheckProposal(Arc::new(poisoned)))
         .await
         .unwrap_err();
@@ -1710,21 +1710,19 @@ async fn authorizing_data_mismatch_rejects_before_transaction_dispatch() {
     );
     assert_eq!(error.misbehavior_score(), 100);
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    // A rejected alternate body cannot poison a hash-only cache.
-    zs::check::block_commitment_is_valid_for_chain_history(
-        canonical.clone(),
-        &Network::Mainnet,
-        &HistoryTree::from_block(
-            &Network::Mainnet,
-            parent,
-            &sapling::tree::NoteCommitmentTree::default().root(),
-            &orchard::tree::NoteCommitmentTree::default().root(),
-            &ironwood::tree::NoteCommitmentTree::default().root(),
-        )
-        .unwrap(),
-        None,
-    )
-    .unwrap();
+    // The same verifier must admit the honest body's authorizing data after rejection.
+    let error = verifier
+        .oneshot(Request::CheckProposal(canonical))
+        .await
+        .unwrap_err();
+    assert!(
+        !matches!(error, VerifyBlockError::BodyCommitment(_)),
+        "{error:?}"
+    );
+    assert!(
+        calls.load(Ordering::SeqCst) > 0,
+        "the honest body must reach transaction verification: {error:?}"
+    );
 }
 
 #[tokio::test]

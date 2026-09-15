@@ -745,14 +745,31 @@ where
                     .map_err(|e| (e.into(), None))?;
             }
 
-            let _source_guard = match source_lock {
-                Some(source_lock) => Some(source_lock.lock_owned().await),
-                None => None,
+            let context_deadline = tokio::time::Instant::now()
+                + crate::components::sync::BLOCK_VERIFY_TIMEOUT;
+            let verified = loop {
+                let result = {
+                    let _source_guard = match &source_lock {
+                        Some(source_lock) => Some(source_lock.clone().lock_owned().await),
+                        None => None,
+                    };
+                    verifier.clone().oneshot(zakura_consensus::Request::Commit(block.clone())).await
+                };
+                let missing_context = result.as_ref().err().is_some_and(|error| {
+                    matches!(error.downcast_ref::<zakura_consensus::RouterError>(),
+                        Some(zakura_consensus::RouterError::Block { source })
+                        if matches!(source.as_ref(), zakura_consensus::VerifyBlockError::MissingParentContext(_)))
+                });
+                if !missing_context || tokio::time::Instant::now() >= context_deadline {
+                    break result;
+                }
+                // Retain this bounded download slot and body. Release the source gate so
+                // the same supplier's parent can commit before we retry the child.
+                tokio::time::sleep_until(context_deadline.min(
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(1)
+                )).await;
             };
-
-            verifier
-                .oneshot(zakura_consensus::Request::Commit(block))
-                .await
+            verified
                 .map(|hash| (hash, block_height))
                 .map_err(|e| {
                     let payload_mismatch = e
@@ -1467,6 +1484,84 @@ mod tests {
             assert_eq!(mismatch.expected_height, block::Height(1_687_107));
             assert_eq!(supplier, Some(addr));
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missing_parent_retries_retained_gossip_body_without_holding_source_gate() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        let hash = block.hash();
+        let parent = block.header.previous_block_hash;
+        let supplier: PeerSocketAddr = "192.0.2.1:8233".parse().unwrap();
+        let (_sender, tip) = chain_tip_at(block::Height(1_687_106), parent);
+        let mut downloads = downloads_returning(block.clone(), supplier, tip);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let (called, mut received) = tokio::sync::mpsc::unbounded_channel();
+        downloads.verifier =
+            BoxCloneService::new(service_fn(move |request: zakura_consensus::Request| {
+                assert!(Arc::ptr_eq(&request.block(), &block));
+                let attempt = observed.fetch_add(1, Ordering::SeqCst);
+                called.send(()).unwrap();
+                async move {
+                    if attempt == 0 {
+                        Err(BoxError::from(zakura_consensus::RouterError::from(
+                            zakura_consensus::VerifyBlockError::MissingParentContext(parent),
+                        )))
+                    } else {
+                        Ok(hash)
+                    }
+                }
+            }));
+        assert_eq!(
+            downloads.download_and_verify(hash, Some(supplier.into())),
+            DownloadAction::AddedToQueue
+        );
+        let gate = downloads.source_locks.values().next().unwrap().clone();
+        received.recv().await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            gate.try_lock().is_ok(),
+            "the parent must be able to acquire the source gate"
+        );
+        assert_eq!(downloads.next().await.unwrap().unwrap(), hash);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(downloads.cancel_handles.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unavailable_gossip_parent_releases_slot_after_deadline() {
+        let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        let hash = block.hash();
+        let parent = block.header.previous_block_hash;
+        let supplier: PeerSocketAddr = "192.0.2.1:8233".parse().unwrap();
+        let (_sender, tip) = chain_tip_at(block::Height(1_687_106), parent);
+        let mut downloads = downloads_returning(block, supplier, tip);
+        downloads.verifier = BoxCloneService::new(service_fn(move |_| async move {
+            Err(BoxError::from(zakura_consensus::RouterError::from(
+                zakura_consensus::VerifyBlockError::MissingParentContext(parent),
+            )))
+        }));
+        let started = tokio::time::Instant::now();
+        downloads.download_and_verify(hash, Some(supplier.into()));
+        let (error, _) = downloads.next().await.unwrap().unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<zakura_consensus::RouterError>()
+                .unwrap()
+                .misbehavior_score(),
+            0
+        );
+        assert_eq!(
+            started.elapsed(),
+            crate::components::sync::BLOCK_VERIFY_TIMEOUT
+        );
+        assert!(downloads.cancel_handles.is_empty());
+        assert!(downloads.source_locks.is_empty());
     }
 
     #[tokio::test]

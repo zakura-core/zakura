@@ -32,6 +32,7 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| Gossip missing-parent retry | `zakurad/src/components/inbound/downloads.rs` | immediate drop → retain body, retry every 1 second for at most the existing 8-minute verification window | [#33](https://github.com/zakura-core/zakura-private/pull/33) | Keep queue and source limits in force. Release the source verification gate while waiting for the parent. |
 | `MAX_POISONED_BLOCK_RETRY_HASHES` | `crates/zakurad/src/components/sync.rs` | new → `4096` | #31 | Bound rejected-body retry budgets retained per sync round. |
 | Block supplier exclusions | `crates/zakura-network/src/block_feedback.rs` | new → 4096 pairs, 16 minutes | #31 | Exclude a rejected supplier before retrying its block hash on TCP or v2. Successful bodies consume no exclusion slots. |
 | Parent commitment context and retries | `crates/zakura-consensus/src/block.rs`, `crates/zakurad/src/components/sync.rs` | new → 5-second lookup; 4,096 retained retry hashes; 1–30-second backoff; 8-minute lifetime | [#33](https://github.com/zakura-core/zakura-private/pull/33) | Bound missing-parent recovery without holding bodies or proof permits. |

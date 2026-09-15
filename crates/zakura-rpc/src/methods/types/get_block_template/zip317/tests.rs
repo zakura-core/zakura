@@ -96,6 +96,7 @@ fn reserves_serialized_block_and_pool_tag_overhead() {
             vec![transaction],
             TransactionDependencies::default(),
         )
+        .expect("test coinbase template is valid")
     };
 
     assert_eq!(
@@ -132,7 +133,8 @@ fn excludes_tx_with_unselected_dependencies() {
             None,
             vec![unmined_tx],
             mempool_tx_deps,
-        ),
+        )
+        .expect("test coinbase template is valid"),
         vec![],
         "should not select any transactions when dependencies are unavailable"
     );
@@ -172,7 +174,8 @@ fn includes_tx_with_selected_dependencies() {
         None,
         unmined_txs.clone(),
         mempool_tx_deps.clone(),
-    );
+    )
+    .expect("test coinbase template is valid");
 
     assert_eq!(
         selected_txs.len(),

@@ -380,6 +380,12 @@ pub enum SubsidyError {
 
     #[error("ZIP 234 block subsidy needs the money reserve after the parent block")]
     MissingMoneyReserve,
+
+    #[error(
+        "issued supply exceeds the scheduled supply, so the ZIP 234 issuance deficit is negative"
+    )]
+    NegativeIssuanceDeficit,
+
     #[error("addition of amounts overflowed")]
     Overflow,
 
@@ -455,8 +461,8 @@ pub const BLOCK_SUBSIDY_FRACTION_NUMERATOR: u128 = 4_126;
 ///
 /// At the 75-second post-Blossom target spacing, the fraction satisfies
 /// `(1 - BLOCK_SUBSIDY_FRACTION) ^ PostBlossomHalvingInterval` is approximately
-/// one half. [`reissuance_amount`] scales it with the target spacing when ZIP 218
-/// enables 25-second blocks.
+/// one half. zips#1354 applies the fraction once per block at every target spacing,
+/// so ZIP 218's 25-second blocks halve the deficit about every 1.33 years instead.
 pub const BLOCK_SUBSIDY_FRACTION_DENOMINATOR: u128 = 10_000_000_000;
 
 /// Returns the NU7 activation height when [ZIP 234] starts to apply on `network`.
@@ -464,6 +470,11 @@ pub const BLOCK_SUBSIDY_FRACTION_DENOMINATOR: u128 = 10_000_000_000;
 /// [ZIP 234]: https://zips.z.cash/zip-0234
 pub fn zip234_start_height(network: &Network) -> Option<Height> {
     NetworkUpgrade::Nu7.activation_height(network)
+}
+
+/// Converts a non-negative amount to a `u128`.
+fn amount_to_u128(amount: Amount<NonNegative>) -> u128 {
+    u128::try_from(i64::from(amount)).expect("non-negative amounts fit in u128")
 }
 
 /// Returns whether ZIP 234 is compiled in and applies to `network` at `height`.
@@ -476,33 +487,14 @@ pub fn is_zip234_active(network: &Network, height: Height) -> bool {
     ZIP234_ENABLED && zip234_start_height(network).is_some_and(|start| height >= start)
 }
 
-/// Applies the ZIP 234 reissuance fraction to `amount`.
-///
-/// # Consensus
-///
-/// ZIP 218 triples the block rate. When both features are active, this calculation
-/// multiplies the fraction by `25 / 75` to preserve the wall-clock reissuance rate.
+/// Applies the [ZIP 234] reissuance fraction to `amount`, rounding up.
 ///
 /// [ZIP 234]: https://zips.z.cash/zip-0234
-fn reissuance_amount(
-    height: Height,
-    net: &Network,
-    amount: Amount<NonNegative>,
-) -> Result<Amount<NonNegative>, SubsidyError> {
-    let amount = u128::try_from(i64::from(amount)).map_err(|_| SubsidyError::Underflow)?;
-    let current_spacing =
-        NetworkUpgrade::target_spacing_for_height(net, height).num_seconds() as u128;
-    let post_blossom_spacing = NetworkUpgrade::Blossom.target_spacing().num_seconds() as u128;
-
-    let subsidy = amount
+fn reissuance_amount(amount: Amount<NonNegative>) -> Result<Amount<NonNegative>, SubsidyError> {
+    let subsidy = amount_to_u128(amount)
         .checked_mul(BLOCK_SUBSIDY_FRACTION_NUMERATOR)
-        .and_then(|amount| amount.checked_mul(current_spacing))
         .ok_or(SubsidyError::Overflow)?
-        .div_ceil(
-            BLOCK_SUBSIDY_FRACTION_DENOMINATOR
-                .checked_mul(post_blossom_spacing)
-                .ok_or(SubsidyError::Overflow)?,
-        );
+        .div_ceil(BLOCK_SUBSIDY_FRACTION_DENOMINATOR);
 
     let subsidy = i64::try_from(subsidy).map_err(|_| SubsidyError::Overflow)?;
 
@@ -531,13 +523,14 @@ fn reissuance_bonus(
     let scheduled_supply = cumulative_halving_subsidies(parent, net)?;
     let issued_supply = (max_money - money_reserve)?;
 
-    // A chain can be ahead of its own schedule if its chain pools contain more value than
-    // the scheduled supply. Saturating at zero leaves nothing to reissue in that case.
-    let Ok(deficit) = scheduled_supply - issued_supply else {
-        return Ok(Amount::zero());
-    };
+    // zips#1354 rejects a block that makes the issuance deficit negative. The money
+    // reserve comes from the parent, so this check rejects the first block built on such
+    // a chain. The coinbase balance rule caps each block's issuance at its subsidy, so no
+    // valid block can make the deficit negative.
+    let deficit =
+        (scheduled_supply - issued_supply).map_err(|_| SubsidyError::NegativeIssuanceDeficit)?;
 
-    reissuance_amount(height, net, deficit)
+    reissuance_amount(deficit)
 }
 
 /// Returns the total block subsidy the halving schedule issues for blocks `1..=height`.
@@ -604,8 +597,10 @@ fn cumulative_halving_subsidies(
         block = run_end + 1;
     }
 
-    // The consensus amount type cannot represent a supply above `MAX_MONEY`.
-    // The block subsidy reaches this cap before maximum height because of integer rounding.
+    // The Mainnet and Testnet schedules issue less than `MAX_MONEY` in total, so this clamp
+    // never applies there. A configured testnet that activates Blossom before its slow start
+    // ends pays the slow start at the pre-Blossom rate, so its schedule can exceed
+    // `MAX_MONEY`, which the amount type cannot represent.
     let max_money = u128::try_from(MAX_MONEY).map_err(|_| SubsidyError::Overflow)?;
     let total = i64::try_from(total.min(max_money)).map_err(|_| SubsidyError::Overflow)?;
 
@@ -670,9 +665,8 @@ pub fn block_subsidy(
 
         let halving_subsidy = halving_block_subsidy(height, net)?;
         let bonus = reissuance_bonus(height, net, money_reserve)?;
-        let subsidy = (halving_subsidy + bonus)?;
 
-        return Ok(subsidy.min(money_reserve));
+        return Ok((halving_subsidy + bonus)?);
     }
 
     halving_block_subsidy(height, net)

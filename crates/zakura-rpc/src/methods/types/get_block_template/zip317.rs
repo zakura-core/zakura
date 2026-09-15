@@ -26,7 +26,7 @@ use zakura_chain::{
     },
     work::equihash::Solution,
 };
-use zakura_consensus::MAX_BLOCK_SIGOPS;
+use zakura_consensus::{error::TransactionError, MAX_BLOCK_SIGOPS};
 use zakura_node_services::mempool::TransactionDependencies;
 use zcash_transparent::coinbase::MAX_COINBASE_SCRIPT_LEN;
 
@@ -104,7 +104,8 @@ fn max_coinbase_bytes(fake_coinbase: &TransactionTemplate<amount::NegativeOrZero
 /// coinbase transaction depends on the total fees from the transactions
 /// returned by this function.)
 ///
-/// Returns selected transactions from `mempool_txs`.
+/// Returns selected transactions from `mempool_txs`, or an error if the fake coinbase
+/// transaction cannot be built.
 ///
 /// [ZIP-317]: https://zips.z.cash/zip-0317#block-production
 #[allow(clippy::too_many_arguments)]
@@ -115,12 +116,16 @@ pub fn select_mempool_transactions(
     money_reserve: Option<Amount<amount::NonNegative>>,
     mempool_txs: Vec<VerifiedUnminedTx>,
     mempool_tx_deps: TransactionDependencies,
-) -> Vec<SelectedMempoolTx> {
+) -> Result<Vec<SelectedMempoolTx>, TransactionError> {
     // Use a fake coinbase transaction to break the dependency between transaction
     // selection, the miner fee, and the fee payment in the coinbase transaction.
-    let fake_coinbase_tx =
-        TransactionTemplate::new_coinbase(net, height, miner_params, Amount::zero(), money_reserve)
-            .expect("valid coinbase transaction template");
+    let fake_coinbase_tx = TransactionTemplate::new_coinbase(
+        net,
+        height,
+        miner_params,
+        Amount::zero(),
+        money_reserve,
+    )?;
 
     let tx_dependencies = mempool_tx_deps.dependencies();
     let (independent_mempool_txs, mut dependent_mempool_txs): (HashMap<_, _>, HashMap<_, _>) =
@@ -168,7 +173,7 @@ pub fn select_mempool_transactions(
         );
     }
 
-    selected_txs
+    Ok(selected_txs)
 }
 
 /// Returns a fee-weighted index and the total weight of `transactions`.

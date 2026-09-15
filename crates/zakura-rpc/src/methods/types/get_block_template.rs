@@ -41,7 +41,9 @@ use zcash_script::{opcode::PushValue, pv::push_value};
 #[allow(unused_imports)]
 use zakura_chain::serialization::BytesInDisplayOrder;
 
-use zakura_consensus::{router::service_trait::BlockVerifierService, MAX_BLOCK_SIGOPS};
+use zakura_consensus::{
+    error::TransactionError, router::service_trait::BlockVerifierService, MAX_BLOCK_SIGOPS,
+};
 use zakura_node_services::mempool::{self, TransactionDependencies};
 use zakura_state::GetBlockTemplateChainInfo;
 
@@ -378,6 +380,9 @@ impl BlockTemplateResponse {
     /// Returns a new [`BlockTemplateResponse`] struct, based on the supplied arguments and defaults.
     ///
     /// The result of this method only depends on the supplied arguments and constants.
+    ///
+    /// Returns an error if the coinbase transaction cannot be built, for example because
+    /// the chain tip's value pools make the ZIP 234 issuance deficit negative.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_internal(
         net: &Network,
@@ -388,7 +393,7 @@ impl BlockTemplateResponse {
         #[cfg(not(test))] mempool_txs: Vec<VerifiedUnminedTx>,
         #[cfg(test)] mempool_txs: Vec<(InBlockTxDependenciesDepth, VerifiedUnminedTx)>,
         submit_old: Option<bool>,
-    ) -> Self {
+    ) -> Result<Self, TransactionError> {
         // Determine the next block height.
         let height = chain_info
             .tip_height
@@ -437,20 +442,18 @@ impl BlockTemplateResponse {
             .sum::<amount::Result<Amount<NonNegative>>>()
             .expect("mempool tx fees must be non-negative");
 
-        let coinbase_txn = precomputed_coinbase.unwrap_or_else(|| {
+        let coinbase_txn = match precomputed_coinbase {
+            Some(coinbase_txn) => coinbase_txn,
             // ZIP 234 derives the subsidy from the money reserve after the parent, which
             // is the chain tip this template builds on.
-            let money_reserve = chain_info.value_pools.money_reserve();
-
-            TransactionTemplate::new_coinbase(
+            None => TransactionTemplate::new_coinbase(
                 net,
                 height,
                 miner_params,
                 txs_fee,
-                Some(money_reserve),
-            )
-            .expect("valid coinbase tx")
-        });
+                Some(chain_info.value_pools.money_reserve()),
+            )?,
+        };
 
         let default_roots = DefaultRoots::from_coinbase(
             net,
@@ -478,7 +481,7 @@ impl BlockTemplateResponse {
             "creating template ... "
         );
 
-        BlockTemplateResponse {
+        Ok(BlockTemplateResponse {
             capabilities,
 
             version: ZCASH_BLOCK_VERSION,
@@ -518,7 +521,7 @@ impl BlockTemplateResponse {
             work_id: new_work_id(),
 
             submit_old,
-        }
+        })
     }
 }
 

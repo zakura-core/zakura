@@ -1240,7 +1240,8 @@ where
                 long_poll_id,
                 vec![],
                 submit_old,
-            );
+            )
+            .map_misc_error()?;
             let block =
                 proposal_block_from_template(&template, None, &self.network).map_misc_error()?;
             tokio::time::timeout(
@@ -3085,7 +3086,8 @@ where
                         server_long_poll_id,
                         vec![],
                         submit_old,
-                    );
+                    )
+                    .map_misc_error()?;
                     return self.finish_mining_template(template, &chain_info, miner_params).await;
                 }
 
@@ -3110,7 +3112,7 @@ where
         //
         // Apart from random weighted transaction selection,
         // the template only depends on the previously fetched data.
-        // This processing never fails.
+        // This processing fails only if the coinbase transaction cannot be built.
 
         tracing::debug!(
             mempool_tx_hashes = ?mempool_txs
@@ -3130,7 +3132,8 @@ where
             Some(chain_info.value_pools.money_reserve()),
             mempool_txs,
             mempool_tx_deps,
-        );
+        )
+        .map_misc_error()?;
 
         tracing::debug!(
             selected_mempool_tx_hashes = ?mempool_txs
@@ -3150,7 +3153,8 @@ where
             server_long_poll_id,
             mempool_txs,
             submit_old,
-        );
+        )
+        .map_misc_error()?;
         self.finish_mining_template(template, &chain_info, miner_params)
             .await
     }

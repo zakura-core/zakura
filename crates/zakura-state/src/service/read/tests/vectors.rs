@@ -2127,3 +2127,36 @@ fn chain_tips_measure_a_header_fork_from_the_active_chain() {
         "the header branch should be measured from block1, not the active tip"
     );
 }
+
+#[tokio::test]
+async fn parent_context_is_bound_to_the_requested_committed_parent() {
+    let blocks: Vec<Arc<Block>> = zakura_test::vectors::CONTINUOUS_MAINNET_BLOCKS
+        .values()
+        .take(2)
+        .map(|bytes| bytes.zcash_deserialize_into().unwrap())
+        .collect();
+    let (state, read_state, _, _) = populated_state(blocks.clone(), &Mainnet).await;
+    let parent = blocks.last().unwrap();
+    let response = state
+        .clone()
+        .oneshot(crate::Request::BlockParentContext(parent.hash()))
+        .await
+        .unwrap();
+    let crate::Response::BlockParentContext(Some(context)) = response else {
+        panic!("committed tip has context")
+    };
+    assert_eq!(context.parent, parent.hash());
+    assert_eq!(Some(context.height), parent.coinbase_height());
+    assert!(context.history_tree.hash().is_none());
+    for hash in [blocks[0].hash(), zakura_chain::block::Hash([42; 32])] {
+        assert_eq!(
+            read_state
+                .clone()
+                .oneshot(ReadRequest::BlockParentContext(hash))
+                .await
+                .unwrap(),
+            ReadResponse::BlockParentContext(None),
+            "unavailable history must not substitute the current tip"
+        );
+    }
+}

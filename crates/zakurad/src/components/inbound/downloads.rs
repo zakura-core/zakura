@@ -44,6 +44,15 @@ pub struct GossipedParentHeightMismatch {
     pub hash: block::Hash,
 }
 
+/// A verifier-proven body mismatch, retained with its requested hash for recovery.
+#[derive(Debug, thiserror::Error)]
+#[error("gossiped body does not match its header: {source}")]
+pub struct GossipedBodyMismatch {
+    pub hash: block::Hash,
+    #[source]
+    pub source: BoxError,
+}
+
 /// Source key used for inbound block download ordering.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum AdvertiserSource {
@@ -745,7 +754,25 @@ where
                 .oneshot(zakura_consensus::Request::Commit(block))
                 .await
                 .map(|hash| (hash, block_height))
-                .map_err(|e| (e, advertiser_addr))
+                .map_err(|e| {
+                    let payload_mismatch = e
+                        .downcast_ref::<zakura_consensus::RouterError>()
+                        .is_some_and(|error| {
+                            matches!(
+                                error.body_verification_class(),
+                                zakura_header_chain::BodyVerificationClass::PayloadMismatch(_)
+                            )
+                        });
+                    let e = if payload_mismatch {
+                        if let Some(feedback) = &supplier_feedback {
+                            feedback.reject();
+                        }
+                        BoxError::from(GossipedBodyMismatch { hash, source: e })
+                    } else {
+                        e
+                    };
+                    (e, advertiser_addr)
+                })
         }
         .map_ok(|(hash, height)| {
             info!(?height, "downloaded and verified gossiped block");
@@ -1440,6 +1467,39 @@ mod tests {
             assert_eq!(mismatch.expected_height, block::Height(1_687_107));
             assert_eq!(supplier, Some(addr));
         }
+    }
+
+    #[tokio::test]
+    async fn gossiped_authorizing_mismatch_retains_hash_and_supplier() {
+        let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        let hash = block.hash();
+        let supplier: PeerSocketAddr = "192.0.2.1:8233".parse().unwrap();
+        let (_sender, tip) =
+            chain_tip_at(block::Height(1_687_106), block.header.previous_block_hash);
+        let mut downloads = downloads_returning(block, supplier, tip);
+        downloads.verifier = BoxCloneService::new(service_fn(|_| async {
+            let error = zakura_consensus::VerifyBlockError::BodyCommitment(
+                zs::ValidateContextError::InvalidBlockCommitment(
+                    block::CommitmentError::InvalidChainHistoryBlockTxAuthCommitment {
+                        actual: [0; 32],
+                        expected: [1; 32],
+                    },
+                ),
+            );
+            Err(BoxError::from(zakura_consensus::RouterError::from(error)))
+        }));
+        assert_eq!(
+            downloads.download_and_verify(hash, None),
+            DownloadAction::AddedToQueue
+        );
+        let (error, addr) = downloads.next().await.unwrap().unwrap_err();
+        assert_eq!(addr, Some(supplier));
+        assert_eq!(
+            error.downcast_ref::<GossipedBodyMismatch>().unwrap().hash,
+            hash
+        );
     }
 
     /// A gossiped block that is not a tip child keeps the existing behind-tip policy, and stays

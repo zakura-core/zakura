@@ -59,6 +59,21 @@ pub struct SemanticBlockVerifier<S, V> {
 #[allow(missing_docs)]
 #[derive(Debug, Error)]
 pub enum VerifyBlockError {
+    /// The actual parent is not yet committed or its context is unavailable.
+    #[error("commitment context is unavailable for parent {0}")]
+    MissingParentContext(block::Hash),
+
+    /// The body height contradicts its committed parent.
+    #[error("body height {claimed:?} contradicts committed parent child height {expected:?}")]
+    ParentHeightMismatch {
+        claimed: Option<block::Height>,
+        expected: block::Height,
+    },
+
+    /// The body does not match the header commitment under its committed parent.
+    #[error("body commitment mismatch: {0}")]
+    BodyCommitment(#[source] zs::ValidateContextError),
+
     #[error("unable to verify depth for block {hash} from chain state during block verification")]
     Depth { source: BoxError, hash: block::Hash },
 
@@ -149,8 +164,14 @@ impl VerifyBlockError {
 
         let consensus = |rule| BodyVerificationClass::ConsensusInvalid(BodyRuleId::new(rule));
         match self {
-            Self::Depth { .. } => {
+            Self::MissingParentContext(_) | Self::Depth { .. } => {
                 BodyVerificationClass::Retryable(TransientBodyFailureKind::MissingContext)
+            }
+            Self::BodyCommitment(_) => {
+                BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::AuthDataRoot)
+            }
+            Self::ParentHeightMismatch { .. } => {
+                BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::Other("coinbase_height"))
             }
             Self::Block { source } => match source {
                 BlockError::BadMerkleRoot { .. } => BodyVerificationClass::PayloadMismatch(
@@ -212,7 +233,7 @@ impl VerifyBlockError {
         use VerifyBlockError::*;
         match self {
             Block { source } => source.misbehavior_score(),
-            Equihash { .. } | Subsidy(_) => 100,
+            Equihash { .. } | Subsidy(_) | BodyCommitment(_) | ParentHeightMismatch { .. } => 100,
             Transaction(err) => err.mempool_misbehavior_score(),
             Commit(err) => err.misbehavior_score(),
             _other => 0,
@@ -373,6 +394,45 @@ where
                 }
             }
 
+            // V4 transaction IDs bind their authorizing data. A V5+ body also needs
+            // its ZIP-244 commitment before transaction verification.
+            let context = if block.transactions.iter().any(|tx| tx.version() >= 5) {
+                let parent = block.header.previous_block_hash;
+                let context = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    state_service
+                        .clone()
+                        .oneshot(zs::Request::BlockParentContext(parent)),
+                )
+                .await
+                .map_err(|_| VerifyBlockError::MissingParentContext(parent))?
+                .map_err(|source| {
+                    tracing::debug!(?source, ?parent, "parent context lookup failed");
+                    VerifyBlockError::MissingParentContext(parent)
+                })?;
+                let context = match context {
+                    zs::Response::BlockParentContext(Some(context)) if context.parent == parent => {
+                        context
+                    }
+                    zs::Response::BlockParentContext(_) => {
+                        return Err(VerifyBlockError::MissingParentContext(parent))
+                    }
+                    _ => unreachable!("BlockParentContext returns parent context"),
+                };
+                let expected =
+                    (context.height + 1).ok_or(VerifyBlockError::MissingParentContext(parent))?;
+                if block.coinbase_height() != Some(expected) {
+                    return Err(VerifyBlockError::ParentHeightMismatch {
+                        claimed: block.coinbase_height(),
+                        expected,
+                    });
+                }
+
+                Some(context)
+            } else {
+                None
+            };
+
             if request.is_mined_commit() {
                 let solved_header_start = std::time::Instant::now();
                 if let Some(prepared::CachedPreparedCandidate {
@@ -426,6 +486,28 @@ where
                 block.transactions.iter().map(|t| t.hash()).collect();
 
             check::merkle_root_validity(&network, &block, &transaction_hashes)?;
+            // Authenticate authorizing data before dispatching scripts or proofs.
+            let auth_data_root = if let Some(context) = context {
+                let commitment_block = block.clone();
+                let commitment_network = network.clone();
+                Some(
+                    tokio::task::spawn_blocking(move || {
+                        let root = commitment_block.auth_data_root();
+                        zs::check::block_commitment_is_valid_for_chain_history(
+                            commitment_block,
+                            &commitment_network,
+                            &context.history_tree,
+                            Some(root),
+                        )
+                        .map_err(VerifyBlockError::BodyCommitment)?;
+                        Ok::<_, VerifyBlockError>(root)
+                    })
+                    .await
+                    .expect("commitment calculation must not panic")?,
+                )
+            } else {
+                None
+            };
 
             // Since errors cause an early exit, try to do the
             // quick checks first.
@@ -548,7 +630,7 @@ where
                 new_outputs,
                 transaction_hashes,
                 deferred_pool_balance_change: Some(deferred_pool_balance_change),
-                auth_data_root: None,
+                auth_data_root,
             };
 
             // Return early for proposal requests.

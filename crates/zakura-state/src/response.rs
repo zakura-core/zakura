@@ -35,6 +35,17 @@ use crate::{
 #[cfg(test)]
 mod tests;
 
+/// Immutable commitment context for a child of one committed parent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockParentContext {
+    /// The committed parent's hash.
+    pub parent: block::Hash,
+    /// The committed parent's height.
+    pub height: block::Height,
+    /// The history tree through the parent, including the parent itself.
+    pub history_tree: Arc<zakura_chain::history_tree::HistoryTree>,
+}
+
 /// State's decision for a prepared mined block's optimistic relay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PreparedMinedRelayEligibility {
@@ -85,6 +96,9 @@ pub enum Response {
     // TODO: remove this request, and replace it with a call to
     //       `LatestChainTip::best_tip_height_and_hash()`
     Tip(Option<(block::Height, block::Hash)>),
+
+    /// Context for an actual committed parent, or None when unavailable.
+    BlockParentContext(Option<BlockParentContext>),
 
     /// Response to [`Request::BlockLocator`] with a block locator object.
     BlockLocator(Vec<block::Hash>),
@@ -430,6 +444,9 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::Tip`] with the current best chain tip.
     Tip(Option<(block::Height, block::Hash)>),
 
+    /// Context for an actual committed parent, or None when unavailable.
+    BlockParentContext(Option<BlockParentContext>),
+
     /// Response to [`ReadRequest::FinalizedTip`] with the durable finalized chain tip.
     FinalizedTip(Option<(block::Height, block::Hash)>),
 
@@ -680,6 +697,7 @@ impl TryFrom<ReadResponse> for Response {
     fn try_from(response: ReadResponse) -> Result<Response, Self::Error> {
         match response {
             ReadResponse::Tip(height_and_hash) => Ok(Response::Tip(height_and_hash)),
+            ReadResponse::BlockParentContext(context) => Ok(Response::BlockParentContext(context)),
             ReadResponse::FinalizedTip(_) => {
                 Err("there is no corresponding Response for this ReadResponse")
             }

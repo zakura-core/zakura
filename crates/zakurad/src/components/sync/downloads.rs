@@ -844,7 +844,12 @@ where
                     .map(|hash| (block_height, hash))
                     .map_err(|err| {
                         match err.downcast::<zakura_consensus::router::RouterError>() {
-                            Ok(error) => BlockDownloadVerifyError::Invalid { error: *error, height: block_height, hash, advertiser_addr },
+                            Ok(error) => {
+                                if matches!(error.body_verification_class(), zakura_header_chain::BodyVerificationClass::PayloadMismatch(_)) {
+                                    if let Some(feedback) = &supplier_feedback { feedback.reject(); }
+                                }
+                                BlockDownloadVerifyError::Invalid { error: *error, height: block_height, hash, advertiser_addr }
+                            },
                             Err(error) => BlockDownloadVerifyError::ValidationRequestError { error, height: block_height, hash },
                         }
                     })

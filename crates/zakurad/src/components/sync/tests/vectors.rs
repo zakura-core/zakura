@@ -3956,3 +3956,49 @@ async fn poisoned_body_budget_table_is_bounded() {
     );
     peer_set.expect_no_requests().await;
 }
+
+#[tokio::test]
+async fn payload_retry_exhaustion_does_not_restart_unrelated_sync() {
+    let (mut sync, _, _, _, _, _) = setup_chain_sync();
+    let hash = block::Hash([42; 32]);
+    sync.poisoned_block_retry_counts
+        .insert(hash, sync::POISONED_BLOCK_RETRY_LIMIT);
+    let error = VerifyBlockError::BodyCommitment(zs::ValidateContextError::InvalidBlockCommitment(
+        block::CommitmentError::InvalidChainHistoryBlockTxAuthCommitment {
+            actual: [0; 32],
+            expected: [1; 32],
+        },
+    ));
+    sync.handle_block_response_with_missing_retry(Err(BlockDownloadVerifyError::Invalid {
+        error: error.into(),
+        height: Height(1_687_107),
+        hash,
+        advertiser_addr: None,
+    }))
+    .await
+    .expect("one alternate body must not restart the sync round");
+    assert_eq!(
+        sync.poisoned_block_retry_counts[&hash],
+        sync::POISONED_BLOCK_RETRY_LIMIT
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn missing_parent_context_releases_body_and_schedules_unscored_retry() {
+    let (mut sync, _, _, _, _, _) = setup_chain_sync();
+    let hash = block::Hash([42; 32]);
+    let (sender, mut scores) = tokio::sync::mpsc::channel(1);
+    sync.misbehavior_sender = sender;
+    sync.handle_block_response_with_missing_retry(Err(BlockDownloadVerifyError::Invalid {
+        error: VerifyBlockError::MissingParentContext(block::Hash([41; 32])).into(),
+        height: Height(1_687_107),
+        hash,
+        advertiser_addr: Some("192.0.2.1:8233".parse().unwrap()),
+    }))
+    .await
+    .unwrap();
+    assert!(scores.try_recv().is_err());
+    assert_eq!(sync.downloads.in_flight(), 0);
+    assert!(sync.registry_miss_retry.contains_key(&hash));
+    assert!(sync.parent_context_wait_started.contains_key(&hash));
+}

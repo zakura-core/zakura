@@ -135,6 +135,23 @@ static INVALID_COINBASE_TRANSCRIPT: Lazy<
     ]
 });
 
+fn activation_parent_context(parent: block::Hash) -> zs::Response {
+    zs::Response::BlockParentContext(Some(zs::BlockParentContext {
+        parent,
+        height: Height(0),
+        history_tree: Default::default(),
+    }))
+}
+
+fn set_activation_commitment(block: &mut Block) {
+    let commitment: [u8; 32] = block::ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+        &block::CHAIN_HISTORY_ACTIVATION_RESERVED.into(),
+        &block.auth_data_root(),
+    )
+    .into();
+    Arc::make_mut(&mut block.header).commitment_bytes = commitment.into();
+}
+
 fn prepared_test_verifier(
     network: &Network,
 ) -> impl Service<Request, Response = block::Hash, Error = VerifyBlockError> {
@@ -144,6 +161,7 @@ fn prepared_test_verifier(
                 (hash == block::Hash([0; 32]) || hash == block::Hash([1; 32]))
                     .then_some(zs::KnownBlock::Finalized),
             ),
+            zs::Request::BlockParentContext(parent) => activation_parent_context(parent),
             zs::Request::CheckBlockProposalValidity(_) => zs::Response::ValidBlockProposal,
             _ => panic!("prepared-path test received an unexpected state request: {request:?}"),
         };
@@ -213,6 +231,7 @@ fn nu5_prepared_test_block(network: &Network, lock_time: Option<LockTime>) -> Bl
         }));
     }
     Arc::make_mut(&mut block.header).merkle_root = block.transactions.iter().collect();
+    set_activation_commitment(&mut block);
     block
 }
 
@@ -396,6 +415,7 @@ async fn failed_preparation_does_not_populate_the_cache() {
             zs::Request::KnownBlock(hash) => Ok(zs::Response::KnownBlock(
                 (hash == block::Hash([0; 32])).then_some(zs::KnownBlock::Finalized),
             )),
+            zs::Request::BlockParentContext(parent) => Ok(activation_parent_context(parent)),
             zs::Request::CheckBlockProposalValidity(_) => {
                 Err(std::io::Error::other("proposal rejected").into())
             }
@@ -461,6 +481,7 @@ async fn proposal_validation_succeeds_when_cache_insertion_conflicts() {
                 (hash == block::Hash([0; 32]) || hash == block::Hash([1; 32]))
                     .then_some(zs::KnownBlock::Finalized),
             ),
+            zs::Request::BlockParentContext(parent) => activation_parent_context(parent),
             zs::Request::CheckBlockProposalValidity(_) => zs::Response::ValidBlockProposal,
             zs::Request::CommitSemanticallyVerifiedBlockWithAdmission { block, .. } => {
                 zs::Response::Committed(block.hash)
@@ -1045,8 +1066,18 @@ async fn block_rejects_transactions_failing_librustzcash_conversion() {
 
     for case in cases {
         let network = librustzcash_conversion_test_network(case.network_upgrade);
-        let block = block_with_librustzcash_conversion_failure(case, &network);
+        let mut block = block_with_librustzcash_conversion_failure(case, &network);
+        let genesis: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        Arc::make_mut(&mut block.header).previous_block_hash = genesis.hash();
+        set_activation_commitment(&mut block);
         let state_service = zakura_state::init_test(&network).await;
+        state_service
+            .clone()
+            .oneshot(zs::Request::CommitCheckpointVerifiedBlock(genesis.into()))
+            .await
+            .unwrap();
         let transaction = transaction::Verifier::new_for_tests(&network, state_service.clone());
         let transaction = Buffer::new(BoxService::new(transaction), 1);
         let block_verifier =
@@ -1597,4 +1628,164 @@ fn state_commit_context_errors_keep_misbehavior_scores() {
 
     let router_error = crate::router::RouterError::from(err);
     assert_eq!(router_error.misbehavior_score(), 100);
+}
+
+#[tokio::test]
+async fn authorizing_data_mismatch_rejects_before_transaction_dispatch() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use zakura_chain::{history_tree::HistoryTree, sapling, transparent};
+    let parent: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687106_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let mut canonical: Block = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let tree = Arc::new(
+        HistoryTree::from_block(
+            &Network::Mainnet,
+            parent.clone(),
+            &sapling::tree::NoteCommitmentTree::default().root(),
+            &orchard::tree::NoteCommitmentTree::default().root(),
+            &ironwood::tree::NoteCommitmentTree::default().root(),
+        )
+        .unwrap(),
+    );
+    // Build a proposal fixture whose commitment matches this test's parent context.
+    let commitment: [u8; 32] = block::ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+        &tree.hash().unwrap(),
+        &canonical.auth_data_root(),
+    )
+    .into();
+    Arc::make_mut(&mut canonical.header).commitment_bytes = commitment.into();
+    let canonical = Arc::new(canonical);
+    zs::check::block_commitment_is_valid_for_chain_history(
+        canonical.clone(),
+        &Network::Mainnet,
+        &tree,
+        None,
+    )
+    .unwrap();
+    let mut poisoned = canonical.as_ref().clone();
+    let coinbase = Arc::make_mut(&mut poisoned.transactions[0]);
+    match &mut coinbase.inputs_mut()[0] {
+        transparent::Input::Coinbase { data, .. } => data.push(0x42),
+        _ => panic!("fixture has a coinbase"),
+    }
+    assert_eq!(poisoned.hash(), canonical.hash());
+    assert_eq!(
+        poisoned.transactions[0].hash(),
+        canonical.transactions[0].hash()
+    );
+    let context = zs::BlockParentContext {
+        parent: parent.hash(),
+        height: parent.coinbase_height().unwrap(),
+        history_tree: tree,
+    };
+    let state = service_fn(move |request| {
+        let context = context.clone();
+        async move {
+            match request {
+                zs::Request::KnownBlock(_) => Ok(zs::Response::KnownBlock(None)),
+                zs::Request::BlockParentContext(hash) if hash == context.parent => {
+                    Ok(zs::Response::BlockParentContext(Some(context)))
+                }
+                _ => panic!("a rejected body must not reach state commit"),
+            }
+        }
+    });
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let transactions = service_fn(move |_request: transaction::Request| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        async { Err::<transaction::Response, BoxError>("unexpected transaction dispatch".into()) }
+    });
+    let verifier = SemanticBlockVerifier::new(&Network::Mainnet, state, transactions);
+    let error = verifier
+        .oneshot(Request::CheckProposal(Arc::new(poisoned)))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, VerifyBlockError::BodyCommitment(_)),
+        "{error:?}"
+    );
+    assert_eq!(error.misbehavior_score(), 100);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    // A rejected alternate body cannot poison a hash-only cache.
+    zs::check::block_commitment_is_valid_for_chain_history(
+        canonical.clone(),
+        &Network::Mainnet,
+        &HistoryTree::from_block(
+            &Network::Mainnet,
+            parent,
+            &sapling::tree::NoteCommitmentTree::default().root(),
+            &orchard::tree::NoteCommitmentTree::default().root(),
+            &ironwood::tree::NoteCommitmentTree::default().root(),
+        )
+        .unwrap(),
+        None,
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn unavailable_parent_does_not_dispatch_transactions_or_score_supplier() {
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let state = service_fn(|request| async move {
+        match request {
+            zs::Request::KnownBlock(_) => Ok(zs::Response::KnownBlock(None)),
+            zs::Request::BlockParentContext(_) => Ok(zs::Response::BlockParentContext(None)),
+            _ => panic!("unexpected state request"),
+        }
+    });
+    let tx = service_fn(|_: transaction::Request| async {
+        panic!("missing context must not reach transaction verification");
+        #[allow(unreachable_code)]
+        Err::<transaction::Response, BoxError>("unexpected dispatch".into())
+    });
+    let error = SemanticBlockVerifier::new(&Network::Mainnet, state, tx)
+        .oneshot(Request::Commit(block))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, VerifyBlockError::MissingParentContext(_)));
+    assert_eq!(error.misbehavior_score(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn parent_lookup_failure_and_timeout_remain_retryable() {
+    for pending in [false, true] {
+        let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        let state = service_fn(move |request| async move {
+            match request {
+                zs::Request::KnownBlock(_) => Ok(zs::Response::KnownBlock(None)),
+                zs::Request::BlockParentContext(_) => {
+                    if pending {
+                        std::future::pending::<()>().await;
+                    }
+                    Err::<zs::Response, BoxError>("local lookup failure".into())
+                }
+                _ => panic!("unexpected state request"),
+            }
+        });
+        let tx = service_fn(|_: transaction::Request| async {
+            panic!("unavailable context must not dispatch proofs");
+            #[allow(unreachable_code)]
+            Err::<transaction::Response, BoxError>("unexpected dispatch".into())
+        });
+        let error = SemanticBlockVerifier::new(&Network::Mainnet, state, tx)
+            .oneshot(Request::Commit(block))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, VerifyBlockError::MissingParentContext(_)));
+        assert_eq!(error.misbehavior_score(), 0);
+        assert!(matches!(
+            error.body_verification_class(),
+            zakura_header_chain::BodyVerificationClass::Retryable(
+                zakura_header_chain::TransientBodyFailureKind::MissingContext
+            )
+        ));
+    }
 }

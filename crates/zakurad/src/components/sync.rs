@@ -930,6 +930,8 @@ where
     /// and tip extension continue concurrently during the backoff. A map so that a second block missing while the first is still
     /// backing off isn't dropped: every registry-missed required block stays scheduled.
     registry_miss_retry: HashMap<block::Hash, tokio::time::Instant>,
+    /// Missing-parent retries retain hashes, not bodies or verifier permits.
+    parent_context_wait_started: HashMap<block::Hash, tokio::time::Instant>,
 
     /// Receiver that is `true` when the downloader is past the lookahead limit.
     /// This is based on the downloaded block height and the state tip height.
@@ -1079,6 +1081,7 @@ where
             poisoned_block_retry_counts: HashMap::new(),
             registry_miss_retry_counts: HashMap::new(),
             registry_miss_retry: HashMap::new(),
+            parent_context_wait_started: HashMap::new(),
             past_lookahead_limit_receiver,
             misbehavior_sender,
             trace,
@@ -1440,6 +1443,7 @@ where
         self.poisoned_block_retry_counts.clear();
         self.registry_miss_retry_counts.clear();
         self.registry_miss_retry.clear();
+        self.parent_context_wait_started.clear();
         let state_tip = self.latest_chain_tip.best_tip_height();
         self.trace.round_start(state_tip);
 
@@ -1534,6 +1538,7 @@ where
                 reserve.clear();
                 self.prospective_tips.clear();
                 self.registry_miss_retry.clear();
+                self.parent_context_wait_started.clear();
 
                 while let Some(response) = self.downloads.next().await {
                     if let Err(error) = response {
@@ -1609,7 +1614,10 @@ where
             // waiting on its registry-miss backoff, pause *new* speculative dispatch so in-flight
             // downloads drain and free up ready-peer slots. Otherwise lookahead work can keep every
             // peer busy and starve the critical retry. This is inert in healthy sync.
-            let head_of_line_starved = !self.registry_miss_retry.is_empty();
+            let head_of_line_starved = self
+                .registry_miss_retry
+                .keys()
+                .any(|hash| !self.parent_context_wait_started.contains_key(hash));
 
             if !past_lookahead && !head_of_line_starved && !reserve.is_empty() {
                 debug!(
@@ -2540,6 +2548,30 @@ where
             self.poisoned_block_retry_counts.remove(hash);
             self.registry_miss_retry_counts.remove(hash);
             self.registry_miss_retry.remove(hash);
+            self.parent_context_wait_started.remove(hash);
+        }
+
+        if let Err(BlockDownloadVerifyError::Invalid { error, hash, .. }) = &response {
+            if matches!(error, zakura_consensus::RouterError::Block { source }
+                if matches!(source.as_ref(), zakura_consensus::VerifyBlockError::MissingParentContext(_)))
+            {
+                if self.parent_context_wait_started.len() >= 4096
+                    && !self.parent_context_wait_started.contains_key(hash)
+                {
+                    return Ok(());
+                }
+                let started = self
+                    .parent_context_wait_started
+                    .entry(*hash)
+                    .or_insert_with(tokio::time::Instant::now);
+                if started.elapsed() < BLOCK_VERIFY_TIMEOUT {
+                    let delay = Duration::from_secs(1 + started.elapsed().as_secs() / 2)
+                        .min(Duration::from_secs(30));
+                    self.registry_miss_retry
+                        .insert(*hash, tokio::time::Instant::now() + delay);
+                }
+                return Ok(());
+            }
         }
 
         if let Some((hash, advertiser_addr)) = response.as_ref().err().and_then(|error| match error
@@ -2549,6 +2581,18 @@ where
                 advertiser_addr,
                 ..
             } => Some((*hash, *advertiser_addr)),
+            BlockDownloadVerifyError::Invalid {
+                error,
+                hash,
+                advertiser_addr,
+                ..
+            } if matches!(
+                error.body_verification_class(),
+                zakura_header_chain::BodyVerificationClass::PayloadMismatch(_)
+            ) =>
+            {
+                Some((*hash, *advertiser_addr))
+            }
             _ => None,
         }) {
             // Score every proven mismatch, including the response that exhausts the budget.

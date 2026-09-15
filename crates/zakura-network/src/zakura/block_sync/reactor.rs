@@ -2246,6 +2246,8 @@ impl BlockSyncReactor {
                 .saturating_add(view.applying_decoded_attributed_memory_bytes) as f64,
         );
         metrics::gauge!("sync.block.applying").set(self.last_view.applying_len as f64);
+        metrics::gauge!("sync.block.applying.unsubmitted")
+            .set(view.unsubmitted_applying_count as f64);
         // Outstanding (unreceived in-flight) heights summed across peers from the
         // registry (the routines own the per-peer outstanding now).
         metrics::gauge!("sync.block.outstanding").set(self.registry.total_unreceived() as f64);

@@ -91,7 +91,7 @@ pub struct RetainedHeaderPath {
     pub common_ancestor: Frontier,
     /// Exact retained target.
     pub target: Frontier,
-    /// Exact generation and branch fixed at acquisition.
+    /// Original request scope, retained for correlation across local head updates.
     pub scope: HeaderWorkAuthority,
 }
 
@@ -195,7 +195,7 @@ pub struct RetainedHeaderPathPage {
     pub common_ancestor: Frontier,
     /// Exact retained target.
     pub target: Frontier,
-    /// Exact generation and branch fixed at acquisition.
+    /// Original request scope, retained for correlation across local head updates.
     pub scope: HeaderWorkAuthority,
     /// Canonical headers in parent-first order.
     pub headers: Vec<Arc<block::Header>>,
@@ -403,7 +403,8 @@ pub trait Port: Send + Sync + 'static {
 
     /// Retain the target path identified by `request`.
     ///
-    /// An acquired reply pins the path until the caller releases it.
+    /// An acquired reply reserves capacity until a successful read or explicit release.
+    /// Local retention may evict the path before a page snapshot is captured.
     fn acquire_header_path(
         &self,
         request: AcquirePath,

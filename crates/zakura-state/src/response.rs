@@ -137,9 +137,6 @@ pub enum Response {
     /// Response to [`Request::CheckBlockCommitment`].
     BlockCommitmentValidity(BlockCommitmentValidity),
 
-    /// Response to [`Request::CheckBlockValidity`].
-    ValidBlock,
-
     /// Response to [`Request::CheckPreparedMinedRelayEligibility`].
     PreparedMinedRelayEligibility(PreparedMinedRelayEligibility),
 
@@ -612,9 +609,6 @@ pub enum ReadResponse {
     /// Response to [`ReadRequest::CheckBlockCommitment`].
     BlockCommitmentValidity(BlockCommitmentValidity),
 
-    /// Response to [`ReadRequest::CheckBlockValidity`].
-    ValidBlock,
-
     /// Response to [`ReadRequest::CheckPreparedMinedRelayEligibility`].
     PreparedMinedRelayEligibility(PreparedMinedRelayEligibility),
 
@@ -776,7 +770,6 @@ impl TryFrom<ReadResponse> for Response {
             }
 
             ReadResponse::ValidBlockProposal => Ok(Response::ValidBlockProposal),
-            ReadResponse::ValidBlock => Ok(Response::ValidBlock),
             ReadResponse::BlockCommitmentValidity(validity) => Ok(Response::BlockCommitmentValidity(validity)),
 
             ReadResponse::SolutionRate(_)

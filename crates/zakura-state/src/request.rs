@@ -1560,12 +1560,6 @@ pub enum Request {
     /// Returns [`Response::ValidBlockProposal`] when successful.
     /// See `[ReadRequest::CheckBlockProposalValidity]` for details.
     CheckBlockProposalValidity(SemanticallyVerifiedBlock),
-
-    /// Contextually validates a semantically verified block against its stored parent.
-    /// Uses a private state snapshot, including side branches, without committing or
-    /// requiring the current best tip. Returns an error when parent context is missing.
-    /// Returns [`Response::ValidBlock`] on success.
-    CheckBlockValidity(SemanticallyVerifiedBlock),
 }
 
 impl Request {
@@ -1611,7 +1605,6 @@ impl Request {
             Request::InvalidateBlock(_) => "invalidate_block",
             Request::ReconsiderBlock(_) => "reconsider_block",
             Request::CheckBlockProposalValidity(_) => "check_block_proposal_validity",
-            Request::CheckBlockValidity(_) => "check_block_validity",
             Request::CheckBlockCommitment(_) => "check_block_commitment",
         }
     }
@@ -2101,12 +2094,6 @@ pub enum ReadRequest {
     /// the block fails contextual validation.
     CheckBlockProposalValidity(SemanticallyVerifiedBlock),
 
-    /// Contextually validates a semantically verified block against its stored parent.
-    /// Uses a private state snapshot, including side branches, without committing or
-    /// requiring the current best tip. Returns an error when parent context is missing.
-    /// Returns [`ReadResponse::ValidBlock`] on success.
-    CheckBlockValidity(SemanticallyVerifiedBlock),
-
     /// Returns [`ReadResponse::TipBlockSize(usize)`](ReadResponse::TipBlockSize)
     /// with the current best chain tip block size in bytes.
     TipBlockSize,
@@ -2199,7 +2186,6 @@ impl ReadRequest {
             ReadRequest::ChainInfo => "chain_info",
             ReadRequest::SolutionRate { .. } => "solution_rate",
             ReadRequest::CheckBlockProposalValidity(_) => "check_block_proposal_validity",
-            ReadRequest::CheckBlockValidity(_) => "check_block_validity",
             ReadRequest::CheckBlockCommitment(_) => "check_block_commitment",
             ReadRequest::TipBlockSize => "tip_block_size",
             ReadRequest::ChainTips => "chain_tips",
@@ -2254,7 +2240,6 @@ impl TryFrom<Request> for ReadRequest {
                 Ok(ReadRequest::CheckBestChainTipNullifiersAndAnchors(tx))
             }
             Request::CheckBlockCommitment(block) => Ok(ReadRequest::CheckBlockCommitment(block)),
-            Request::CheckBlockValidity(block) => Ok(ReadRequest::CheckBlockValidity(block)),
             Request::CheckPreparedMinedRelayEligibility(block) => {
                 Ok(ReadRequest::CheckPreparedMinedRelayEligibility(block))
             }

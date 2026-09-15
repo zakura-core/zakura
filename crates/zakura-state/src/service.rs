@@ -2107,7 +2107,6 @@ impl Service<Request> for StateService {
             | Request::FindBlockHeaders { .. }
             | Request::CheckBestChainTipNullifiersAndAnchors(_)
             | Request::CheckBlockCommitment(_)
-            | Request::CheckBlockValidity(_)
             | Request::CheckPreparedMinedRelayEligibility(_)
             | Request::CheckBlockProposalValidity(_) => {
                 // Redirect the request to the concurrent ReadStateService
@@ -3351,11 +3350,6 @@ impl Service<ReadRequest> for ReadStateService {
                 Ok(ReadResponse::BlockCommitmentValidity(validity))
             }
 
-            ReadRequest::CheckBlockValidity(block) => {
-                validate_block_for_state(&state.db, state.latest_non_finalized_state(), block)?;
-                Ok(ReadResponse::ValidBlock)
-            }
-
             ReadRequest::CheckPreparedMinedRelayEligibility(commitment) => {
                 let latest_non_finalized_state = state.latest_non_finalized_state();
                 let eligibility = check_prepared_mined_relay_eligibility_for_state(
@@ -3437,7 +3431,7 @@ impl Service<ReadRequest> for ReadStateService {
                     "attempting to validate and commit block proposal \
                          onto a cloned non-finalized state"
                 );
-                let latest_non_finalized_state = state.latest_non_finalized_state();
+                let mut latest_non_finalized_state = state.latest_non_finalized_state();
 
                 // The previous block of a valid proposal must be on the best chain tip.
                 let Some((_best_tip_height, best_tip_hash)) =
@@ -3455,9 +3449,16 @@ impl Service<ReadRequest> for ReadStateService {
                         .into());
                 }
 
-                validate_block_for_state(
+                // This clone of the non-finalized state is dropped when this closure returns.
+                // The non-finalized state that's used in the rest of the state (including finalizing
+                // blocks into the db) is not mutated here.
+                //
+                // TODO: Convert `CommitSemanticallyVerifiedError` to a new `ValidateProposalError`?
+                latest_non_finalized_state.disable_metrics();
+
+                write::validate_and_commit_non_finalized(
                     &state.db,
-                    latest_non_finalized_state,
+                    &mut latest_non_finalized_state,
                     semantically_verified,
                 )?;
 
@@ -3529,22 +3530,6 @@ impl Service<ReadRequest> for ReadStateService {
 
         timed_span.spawn_blocking(request_handler)
     }
-}
-
-/// Validate against the actual parent on a private snapshot. Mining proposals add
-/// their best-tip restriction at the caller, while downloaded candidates can fork.
-fn validate_block_for_state(
-    db: &ZakuraDb,
-    mut non_finalized_state: NonFinalizedState,
-    block: SemanticallyVerifiedBlock,
-) -> Result<(), ValidateContextError> {
-    // The write path has already committed genesis before contextual validation.
-    // Read-only callers can arrive before that context exists.
-    if db.finalized_tip_height().is_none() {
-        return Err(ValidateContextError::NotReadyToBeCommitted);
-    }
-    non_finalized_state.disable_metrics();
-    write::validate_and_commit_non_finalized(db, &mut non_finalized_state, block)
 }
 
 /// Check only the body commitment, without mining policy or recent-work checks.

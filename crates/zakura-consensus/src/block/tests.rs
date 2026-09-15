@@ -2152,6 +2152,14 @@ fn verify_block_error_misbehavior_scores() {
         location: zakura_state::KnownBlock::BestChain,
     };
     assert_eq!(VerifyBlockError::Commit(dup_err).misbehavior_score(), 0);
+    // Legacy sync and inbound gossip score peers by this value. A body whose
+    // authorization bytes do not match its header is as attributable as a bad
+    // Merkle root, and a header that commits to duplicates is an invalid block.
+    assert_eq!(VerifyBlockError::AuthDataMismatch.misbehavior_score(), 100);
+    assert_eq!(
+        VerifyBlockError::NonMalleableDuplicateTransaction.misbehavior_score(),
+        100
+    );
 }
 
 /// Duplicate block errors must stay classified as duplicate requests after the

@@ -230,6 +230,7 @@ impl VerifyBlockError {
         match self {
             Block { source } => source.misbehavior_score(),
             Equihash { .. } | Subsidy(_) => 100,
+            AuthDataMismatch | NonMalleableDuplicateTransaction => 100,
             Transaction(err) => err.mempool_misbehavior_score(),
             Commit(err) => err.misbehavior_score(),
             _other => 0,

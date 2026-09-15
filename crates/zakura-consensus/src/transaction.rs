@@ -1016,8 +1016,12 @@ where
         //
         // https://zips.z.cash/zip-2003
         //
-        // Use NU7's exact activation height: a later configured upgrade must
-        // not substitute its height when this network omits NU7.
+        // The `nu7` feature gates this rule until NU7 has activation heights,
+        // so default builds accept V4 at NU7.
+        //
+        // `activation_height` falls back to the next upgrade's height when this
+        // network omits NU7. The only later upgrade is `ZFuture`, which exists
+        // only under `cfg(zcash_unstable = "zfuture")`.
         if cfg!(feature = "nu7")
             && NetworkUpgrade::Nu7
                 .activation_height(network)

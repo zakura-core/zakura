@@ -4,6 +4,7 @@
 //! runs the real per-peer routine, WorkQueue, byte budget, and Sequencer path.
 
 use std::collections::HashMap;
+use zakura_chain::serialization::ZcashDecoder;
 
 use tokio::time::{timeout, Duration};
 use tokio_util::sync::CancellationToken;
@@ -82,9 +83,14 @@ pub struct SyntheticBlockSyncPeers {
 
 impl SyntheticBlockSyncPeers {
     /// Attach synthetic peers to an already-spawned block-sync reactor handle.
-    pub fn new(config: ZakuraBlockSyncConfig, handle: BlockSyncHandle, queue_depth: usize) -> Self {
+    pub fn new(
+        config: ZakuraBlockSyncConfig,
+        handle: BlockSyncHandle,
+        queue_depth: usize,
+        decoder: ZcashDecoder,
+    ) -> Self {
         Self {
-            service: BlockSyncService::new_with_handle(config, handle),
+            service: BlockSyncService::new_with_handle(config, handle, decoder),
             queue_depth: queue_depth.max(1),
         }
     }

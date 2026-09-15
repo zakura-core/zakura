@@ -5,6 +5,7 @@
 //! operations, which return values, arithmetic on [`Amount`]s returns
 //! [`Result`](std::result::Result)s.
 
+use crate::serialization::ZcashReader;
 use std::{
     cmp::Ordering,
     fmt,
@@ -633,8 +634,8 @@ impl ZcashSerialize for Amount<NegativeAllowed> {
 }
 
 impl ZcashDeserialize for Amount<NegativeAllowed> {
-    fn zcash_deserialize<R: std::io::Read>(
-        mut reader: R,
+    fn zcash_deserialize_from<R: std::io::Read>(
+        reader: &mut ZcashReader<R>,
     ) -> Result<Self, crate::serialization::SerializationError> {
         Ok(reader.read_i64::<LittleEndian>()?.try_into()?)
     }
@@ -653,8 +654,8 @@ impl ZcashSerialize for Amount<NonNegative> {
 }
 
 impl ZcashDeserialize for Amount<NonNegative> {
-    fn zcash_deserialize<R: std::io::Read>(
-        mut reader: R,
+    fn zcash_deserialize_from<R: std::io::Read>(
+        reader: &mut ZcashReader<R>,
     ) -> Result<Self, crate::serialization::SerializationError> {
         Ok(reader.read_u64::<LittleEndian>()?.try_into()?)
     }

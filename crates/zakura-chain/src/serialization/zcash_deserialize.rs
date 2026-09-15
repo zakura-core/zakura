@@ -1,8 +1,12 @@
 //! Converting bytes into Zcash consensus-critical data structures.
 
+use std::io::Read as _;
 use std::{io, net::Ipv6Addr, sync::Arc};
 
-use super::{AtLeastOne, CompactSizeMessage, SerializationError, MAX_PROTOCOL_MESSAGE_LEN};
+use super::{
+    AtLeastOne, CompactSizeMessage, SerializationError, ZcashDecoder, ZcashReader,
+    MAX_PROTOCOL_MESSAGE_LEN,
+};
 
 /// Initial-allocation cap for `zcash_deserialize_external_count`.
 ///
@@ -23,7 +27,29 @@ pub trait ZcashDeserialize: Sized {
     /// This function has a `zcash_` prefix to alert the reader that the
     /// serialization in use is consensus-critical serialization, rather than
     /// some other kind of serialization.
-    fn zcash_deserialize<R: io::Read>(reader: R) -> Result<Self, SerializationError>;
+    fn zcash_deserialize<R: io::Read>(reader: R) -> Result<Self, SerializationError> {
+        Self::zcash_deserialize_from(&mut ZcashReader::from_stream(reader))
+    }
+
+    /// Decode from bytes already in memory, checking that collection counts can
+    /// fit before reserving memory. Leaves the slice pointing to the unread bytes.
+    /// Accepts encodings from any network. Use [`ZcashDecoder::decode`] for live
+    /// messages so their counts and formats follow the configured network.
+    fn zcash_deserialize_from_slice(bytes: &mut &[u8]) -> Result<Self, SerializationError> {
+        Self::zcash_deserialize_from(&mut ZcashReader::from_slice(bytes))
+    }
+
+    /// Decode one value while keeping track of how many input bytes remain.
+    ///
+    /// Implementations must use the reader's `read_value`, `read_external_count`,
+    /// and `read_bytes` methods for nested data, so those decoders keep the same
+    /// network rules and check counts before allocating. The default rejects
+    /// types that only implement the older streaming method.
+    fn zcash_deserialize_from<R: io::Read>(
+        _reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
+        Err(SerializationError::Parse("type has no bounded decoder"))
+    }
 }
 
 /// Deserialize a `Vec`, where the number of items is set by a CompactSize
@@ -32,17 +58,21 @@ pub trait ZcashDeserialize: Sized {
 /// See `zcash_deserialize_external_count` for more details, and usage
 /// information.
 impl<T: ZcashDeserialize + TrustedPreallocate> ZcashDeserialize for Vec<T> {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
-        let len: CompactSizeMessage = (&mut reader).zcash_deserialize_into()?;
-        zcash_deserialize_external_count(len.into(), reader)
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
+        let len: CompactSizeMessage = reader.read_value()?;
+        reader.read_external_count(len.into())
     }
 }
 
 /// Deserialize an `AtLeastOne` vector, where the number of items is set by a
 /// CompactSize prefix in the data. This is the most common format in Zcash.
 impl<T: ZcashDeserialize + TrustedPreallocate> ZcashDeserialize for AtLeastOne<T> {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
-        let v: Vec<T> = (&mut reader).zcash_deserialize_into()?;
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
+        let v: Vec<T> = reader.read_value()?;
         let at_least_one: AtLeastOne<T> = v.try_into()?;
         Ok(at_least_one)
     }
@@ -55,9 +85,11 @@ impl<T: ZcashDeserialize + TrustedPreallocate> ZcashDeserialize for AtLeastOne<T
 /// Note that we don't implement TrustedPreallocate for u8.
 /// This allows the optimization without relying on specialization.
 impl ZcashDeserialize for Vec<u8> {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
-        let len: CompactSizeMessage = (&mut reader).zcash_deserialize_into()?;
-        zcash_deserialize_bytes_external_count(len.into(), reader)
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
+        let len: CompactSizeMessage = reader.read_value()?;
+        reader.read_bytes(len.into())
     }
 }
 
@@ -86,7 +118,14 @@ impl ZcashDeserialize for Vec<u8> {
 /// some other kind of serialization.
 pub fn zcash_deserialize_external_count<R: io::Read, T: ZcashDeserialize + TrustedPreallocate>(
     external_count: usize,
-    mut reader: R,
+    reader: R,
+) -> Result<Vec<T>, SerializationError> {
+    ZcashReader::from_stream(reader).read_external_count(external_count)
+}
+
+pub(super) fn read_external_count<R: io::Read, T: ZcashDeserialize + TrustedPreallocate>(
+    external_count: usize,
+    reader: &mut ZcashReader<R>,
 ) -> Result<Vec<T>, SerializationError> {
     match u64::try_from(external_count) {
         Ok(external_count) if external_count > T::max_allocation() => {
@@ -100,13 +139,29 @@ pub fn zcash_deserialize_external_count<R: io::Read, T: ZcashDeserialize + Trust
         // for 128 bit memory spaces.)
         Err(_) => return Err(SerializationError::Parse("Vector longer than u64::MAX")),
     }
-    // Cap the upfront reservation. The Vec grows via push() as elements
-    // arrive, so a peer-supplied `external_count` can't force a large
-    // allocation before any data is read. Fixes the deserializer-level
-    // case of GHSA-xr93-pcq3-pxf8.
+    // Reject a count the known input cannot hold, before allocating anything.
+    if let Some(remaining) = reader.remaining_bytes() {
+        let minimum = T::min_serialized_size_for(reader.decoder());
+        if external_count != 0
+            && (minimum == 0
+                || u64::try_from(external_count).unwrap_or(u64::MAX)
+                    > u64::try_from(remaining).unwrap_or(u64::MAX) / minimum)
+        {
+            return Err(SerializationError::Parse("Vector exceeds available input"));
+        }
+    }
+
+    // Cap the upfront reservation even when the count fits. `reserve_bounded` grows
+    // the vector as elements arrive, so a peer-supplied count cannot size an
+    // allocation before its data is read: the deserializer-level case of
+    // GHSA-xr93-pcq3-pxf8. Fitting is not proof, and an element can cost several
+    // times its minimum encoding in memory, so the check above bounds the
+    // reservation only in proportion to the message rather than by a constant.
     let mut vec = Vec::with_capacity(external_count.min(MAX_INITIAL_ALLOCATION));
     for _ in 0..external_count {
-        vec.push(T::zcash_deserialize(&mut reader)?);
+        let item = reader.read_value()?;
+        reserve_bounded(&mut vec, 1, external_count);
+        vec.push(item);
     }
     Ok(vec)
 }
@@ -121,7 +176,14 @@ pub fn zcash_deserialize_external_count<R: io::Read, T: ZcashDeserialize + Trust
 /// some other kind of serialization.
 pub fn zcash_deserialize_bytes_external_count<R: io::Read>(
     external_count: usize,
-    mut reader: R,
+    reader: R,
+) -> Result<Vec<u8>, SerializationError> {
+    ZcashReader::from_stream(reader).read_bytes(external_count)
+}
+
+pub(super) fn read_bytes<R: io::Read>(
+    external_count: usize,
+    reader: &mut ZcashReader<R>,
 ) -> Result<Vec<u8>, SerializationError> {
     if external_count > MAX_U8_ALLOCATION {
         return Err(SerializationError::Parse(
@@ -129,31 +191,40 @@ pub fn zcash_deserialize_bytes_external_count<R: io::Read>(
         ));
     }
 
-    // Grow the buffer as the bytes arrive, rather than reserving `external_count`
-    // up front. A peer can declare a length near `MAX_U8_ALLOCATION` in a message
-    // that ends after a few hundred bytes, so an upfront reservation lets a small
-    // message force a multi-megabyte allocation. `resize()` below grows the capacity
-    // by doubling, so this bounds the allocation to about twice the bytes the peer
-    // actually sends, matching the `Vec<T>` path. Fixes the byte-vector case of
-    // GHSA-xr93-pcq3-pxf8.
-    //
-    // Never reserve `external_count` here, even as an optimisation to avoid the
-    // reallocations: that reintroduces the vulnerability, and
-    // `u8_deser_does_not_preallocate_declared_length` can not catch it, because it
-    // observes the read buffer size rather than the capacity.
-    let mut vec = Vec::with_capacity(external_count.min(MAX_INITIAL_ALLOCATION));
-
-    while vec.len() < external_count {
-        let chunk_end = (vec.len() + MAX_INITIAL_ALLOCATION).min(external_count);
-        let chunk_start = vec.len();
-
-        vec.resize(chunk_end, 0);
-        // Returns `UnexpectedEof` if the reader runs out before `external_count`,
-        // which is the same error the single `read_exact()` call used to return.
-        reader.read_exact(&mut vec[chunk_start..])?;
+    if let Some(remaining) = reader.remaining_bytes() {
+        if external_count > remaining {
+            return Err(SerializationError::Parse(
+                "Byte vector exceeds available input",
+            ));
+        }
+        let mut vec = vec![0; external_count];
+        reader.read_exact(&mut vec)?;
+        return Ok(vec);
     }
 
+    // Unknown streams grow as input arrives. Cap each growth at the declared
+    // count, so Vec's geometric growth cannot overshoot the protocol bound.
+    let mut vec = Vec::with_capacity(external_count.min(MAX_INITIAL_ALLOCATION));
+    while vec.len() < external_count {
+        let chunk_end = vec
+            .len()
+            .saturating_add(MAX_INITIAL_ALLOCATION)
+            .min(external_count);
+        let chunk_start = vec.len();
+        reserve_bounded(&mut vec, chunk_end - chunk_start, external_count);
+        vec.resize(chunk_end, 0);
+        reader.read_exact(&mut vec[chunk_start..])?;
+    }
     Ok(vec)
+}
+
+// Reserve enough for this read without doubling past the validated count.
+fn reserve_bounded<T>(vec: &mut Vec<T>, additional: usize, count: usize) {
+    let required = vec.len().saturating_add(additional);
+    if required > vec.capacity() {
+        let capacity = vec.capacity().saturating_mul(2).max(required).min(count);
+        vec.reserve_exact(capacity - vec.len());
+    }
 }
 
 /// `zcash_deserialize_external_count`, specialised for [`String`].
@@ -176,9 +247,12 @@ pub fn zcash_deserialize_string_external_count<R: io::Read>(
 
 /// Read a Bitcoin-encoded UTF-8 string.
 impl ZcashDeserialize for String {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
-        let byte_count: CompactSizeMessage = (&mut reader).zcash_deserialize_into()?;
-        zcash_deserialize_string_external_count(byte_count.into(), reader)
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
+        let byte_count: CompactSizeMessage = reader.read_value()?;
+        String::from_utf8(reader.read_bytes(byte_count.into())?)
+            .map_err(|_| SerializationError::Parse("invalid utf-8"))
     }
 }
 
@@ -187,7 +261,9 @@ impl ZcashDeserialize for String {
 
 /// Read a Bitcoin-encoded IPv6 address.
 impl ZcashDeserialize for Ipv6Addr {
-    fn zcash_deserialize<R: io::Read>(mut reader: R) -> Result<Self, SerializationError> {
+    fn zcash_deserialize_from<R: io::Read>(
+        reader: &mut ZcashReader<R>,
+    ) -> Result<Self, SerializationError> {
         let mut ipv6_addr = [0u8; 16];
         reader.read_exact(&mut ipv6_addr)?;
 
@@ -222,6 +298,28 @@ pub trait TrustedPreallocate {
     /// Provides a ***loose upper bound*** on the size of the `Vec<T: TrustedPreallocate>`
     /// which can possibly be received from an honest peer.
     fn max_allocation() -> u64;
+
+    /// Minimum bytes one item needs in the input, so collection counts can be
+    /// checked before reserving memory. For example, two 32-byte hashes need at
+    /// least 64 remaining bytes.
+    ///
+    /// Use encoded field sizes, counting only fields this item's decoder reads.
+    /// Fields stored in separate arrays are checked with those arrays. The bound
+    /// must allow every encoding the decoder accepts, even if later consensus
+    /// checks reject the value.
+    ///
+    /// Zero means no minimum was supplied. Counted decoding from a slice then
+    /// rejects nonempty collections of this type.
+    fn min_serialized_size() -> u64 {
+        0
+    }
+
+    /// Minimum bytes under this decoder's rules. Types whose encoding does not
+    /// vary by network keep the default. An override must use the same rules
+    /// as its decoder, so every accepted encoding still fits this minimum.
+    fn min_serialized_size_for(_decoder: ZcashDecoder) -> u64 {
+        Self::min_serialized_size()
+    }
 }
 
 impl<T> TrustedPreallocate for Arc<T>
@@ -230,6 +328,14 @@ where
 {
     fn max_allocation() -> u64 {
         T::max_allocation()
+    }
+
+    fn min_serialized_size() -> u64 {
+        T::min_serialized_size()
+    }
+
+    fn min_serialized_size_for(decoder: ZcashDecoder) -> u64 {
+        T::min_serialized_size_for(decoder)
     }
 }
 

@@ -189,7 +189,11 @@ impl Node {
         let (handle, mut actions, reactor) = spawn_block_sync_reactor(startup);
         let handle = handle
             .with_range_source(source.unwrap_or_else(|| Arc::new(MemorySource(blocks.clone()))));
-        let service = BlockSyncService::new_with_handle(config, handle.clone());
+        let service = BlockSyncService::new_with_handle(
+            config,
+            handle.clone(),
+            zakura_chain::serialization::ZcashDecoder::for_network(&Network::Mainnet),
+        );
         let (progress_tx, received) = watch::channel(0);
         let driver_handle = handle.clone();
         let driver = tokio::spawn(async move {
@@ -766,7 +770,10 @@ async fn reset_during_a_frame_is_stream_local_but_truncated_fin_is_invalid() -> 
 
 #[tokio::test]
 async fn paired_roles_reject_wrong_messages_before_reading_payloads() -> Result<(), BoxError> {
-    let service = Arc::new(BlockSyncService::new(ZakuraBlockSyncConfig::default()));
+    let service = Arc::new(BlockSyncService::new(
+        ZakuraBlockSyncConfig::default(),
+        zakura_chain::serialization::ZcashDecoder::for_network(&Network::Mainnet),
+    ));
     let data = service.streams()[0];
     let requests = service.streams()[1];
     let registry = ServiceRegistry::new(vec![service.clone()])?;

@@ -1,0 +1,236 @@
+//! Check that a message cannot make the decoder reserve memory for missing data.
+//!
+//! For example, a block header can declare 1,024 transactions but supply none.
+//! These tests measure memory requests to check that decoding rejects the count
+//! without allocating that collection. Complete transactions must still decode
+//! to the same values as before. F03 is the allocation property in the message
+//! regulation specification.
+
+use super::*;
+use proptest::prelude::*;
+use zakura_chain::{
+    parameters::Network,
+    primitives::{Groth16Proof, Halo2Proof},
+    serialization::{CompactSizeMessage, TrustedPreallocate, ZcashReader, MAX_HEADERS_PER_MESSAGE},
+    transaction::Transaction,
+    transparent::{Input, Output, Script},
+    work::equihash::Solution,
+};
+use zakura_test::allocations::measure;
+
+#[test]
+fn network_bound_blocks_keep_their_rules_for_buffered_replay() {
+    use super::super::reorder::BufferedBlockBody;
+
+    for network in [
+        Network::Mainnet,
+        Network::new_default_testnet(),
+        Network::new_regtest(Default::default()),
+    ] {
+        let decoder = ZcashDecoder::for_network(&network);
+        let mut block =
+            block::Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES[..])
+                .unwrap();
+        Arc::make_mut(&mut block.header).solution = Solution::for_proposal_for_network(&network);
+        let block = Arc::new(block);
+        let frame = BlockSyncMessage::Block(block.clone())
+            .encode_frame()
+            .unwrap();
+        let (message, payload) =
+            BlockSyncMessage::decode_frame_with_raw_block_payload(frame, decoder).unwrap();
+        assert_eq!(message, BlockSyncMessage::Block(block.clone()));
+        let mut buffered =
+            BufferedBlockBody::from_decoded_block(block.clone(), payload).retain_for_backlog();
+        assert_eq!(buffered.decoded_block(), block);
+        buffered.retain_for_backlog_in_place();
+        assert_eq!(buffered.decoded_block(), block);
+
+        let other_network = if network.is_regtest() {
+            Network::Mainnet
+        } else {
+            Network::new_regtest(Default::default())
+        };
+        let frame = BlockSyncMessage::Block(block).encode_frame().unwrap();
+        assert!(BlockSyncMessage::decode_frame_with_raw_block_payload(
+            frame,
+            ZcashDecoder::for_network(&other_network)
+        )
+        .is_err());
+    }
+}
+
+proptest! {
+    #[test]
+    fn f03_network_header_counts_reject_missing_bytes_without_allocating(
+        network_index in 0usize..3,
+        count in 1usize..=MAX_HEADERS_PER_MESSAGE,
+        missing in 1usize..=1_488,
+    ) {
+        let network = match network_index {
+            0 => Network::Mainnet,
+            1 => Network::new_default_testnet(),
+            _ => Network::new_regtest(Default::default()),
+        };
+        let decoder = ZcashDecoder::for_network(&network);
+        let block = block::Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES[..]).unwrap();
+        let mut header = *block.header;
+        header.solution = Solution::for_proposal_for_network(&network);
+        let encoded = block::CountedHeader { header: Arc::new(header) }.zcash_serialize_to_vec().unwrap();
+        let data = vec![0; count * encoded.len() - missing.min(encoded.len())];
+        let mut bytes = data.as_slice();
+        let (result, allocations) = measure(|| decoder.reader(&mut bytes)
+            .with_limit(u64::MAX)
+            .read_external_count::<Arc<block::CountedHeader>>(count));
+        prop_assert!(matches!(result, Err(SerializationError::Parse("Vector exceeds available input"))));
+        prop_assert_eq!(bytes.len(), data.len());
+        prop_assert_eq!(allocations.requested_bytes, 0);
+    }
+}
+
+fn assert_unfunded_collection<T: ZcashDeserialize + TrustedPreallocate>(
+    count: usize,
+    minimum_wire_bytes: usize,
+    missing: usize,
+) {
+    let data = vec![0; count * minimum_wire_bytes - missing.min(minimum_wire_bytes)];
+    let (result, allocations) =
+        measure(|| ZcashReader::from_slice(&mut data.as_slice()).read_external_count::<T>(count));
+    assert!(result.is_err());
+    assert_eq!(
+        allocations.requested_bytes,
+        0,
+        "F03: {} cannot reserve {count} elements from {} bytes: {allocations:?}",
+        std::any::type_name::<T>(),
+        data.len(),
+    );
+}
+
+fn terminal(tag: u8, height: u32, count: u32) -> Vec<u8> {
+    let mut bytes = vec![tag];
+    bytes.extend_from_slice(&height.to_le_bytes());
+    bytes.extend_from_slice(&count.to_le_bytes());
+    bytes
+}
+
+#[test]
+fn f03_fixed_request_and_terminal_fields_do_not_allocate() {
+    for tag in [2, 4, 5] {
+        for count in [1, 128] {
+            let bytes = terminal(tag, block::Height::MAX.0 - 127, count);
+            let (result, stats) = measure(|| BlockSyncMessage::decode(&bytes));
+            assert!(result.is_ok());
+            assert_eq!(stats.requested_bytes, 0, "F03 fixed fields: {stats:?}");
+            assert_eq!(stats.retained_bytes, 0);
+        }
+    }
+}
+
+#[test]
+fn f03_missing_transactions_do_not_allocate_a_peer_selected_collection() {
+    let block =
+        block::Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES[..]).unwrap();
+    let mut bytes = vec![3];
+    block.header.zcash_serialize(&mut bytes).unwrap();
+    // Observe the same complete header followed by an empty or a large declared
+    // transaction vector, with zero transaction bytes available in both cases.
+    let mut empty = bytes.clone();
+    empty.push(0);
+    let (_, baseline) = measure(|| BlockSyncMessage::decode(&empty));
+    bytes.extend_from_slice(&[253, 0, 4]); // canonical CompactSize(1024)
+    let (result, measured) = measure(|| BlockSyncMessage::decode(&bytes));
+    assert!(result.is_err());
+    assert!(measured.largest_request <= baseline.largest_request,
+        "F03: zero remaining transactions cannot fund a collection allocation: baseline={baseline:?}, actual={measured:?}");
+}
+
+#[test]
+fn f03_actual_retained_decode_allocations_are_observed_separately_from_wire_bytes() {
+    let bytes = BlockSyncMessage::Block(Arc::new(
+        block::Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES[..]).unwrap(),
+    ))
+    .encode()
+    .unwrap();
+    let (result, stats) = measure(|| BlockSyncMessage::decode(&bytes));
+    let BlockSyncMessage::Block(body) = result.unwrap() else {
+        panic!("Block fixture");
+    };
+    assert!(
+        stats.requests > 0,
+        "the allocator must actually be installed"
+    );
+    assert!(stats.retained_bytes > 0);
+    assert!(stats.peak_live_bytes >= stats.retained_bytes);
+    // The attributed-size API explicitly excludes Arc control blocks. This V1
+    // fixture owns one Block, its Header, and its transaction Arc allocations.
+    let arc_overhead = (2 + body.transactions.len()) * 2 * std::mem::size_of::<usize>();
+    let bound = body.attributed_memory_size_bytes() + u64::try_from(arc_overhead).unwrap();
+    assert!(u64::try_from(stats.retained_bytes).unwrap() <= bound,
+        "F03: measured retained allocations exceed decoded objects plus Arc controls: {stats:?}, bound={bound}");
+}
+
+proptest! {
+    #[test]
+    fn f03_generated_complete_transactions_preserve_decoder_results(tx in any::<Transaction>()) {
+        let encoded = tx.zcash_serialize_to_vec().unwrap();
+        let mut streamed_bytes = encoded.as_slice();
+        let mut bounded_bytes = encoded.as_slice();
+        let streamed = Transaction::zcash_deserialize(&mut streamed_bytes);
+        let bounded = Transaction::zcash_deserialize_from_slice(&mut bounded_bytes);
+        prop_assert_eq!(bounded.is_ok(), streamed.is_ok());
+        if let Ok(expected) = streamed {
+            prop_assert_eq!(bounded.unwrap(), expected);
+            prop_assert_eq!(bounded_bytes, streamed_bytes);
+        }
+    }
+
+    #[test]
+    fn f03_generated_collections_reject_missing_input_before_allocation(
+        count in 1usize..=64,
+        missing in 1usize..=400,
+    ) {
+        // Codec minima from the wire layout, independent of production's
+        // TrustedPreallocate declarations. V5 split arrays use their own sizes.
+        assert_unfunded_collection::<Transaction>(count, 10, missing);
+        assert_unfunded_collection::<Input>(count, 41, missing);
+        assert_unfunded_collection::<Output>(count, 9, missing);
+        assert_unfunded_collection::<Groth16Proof>(count, 192, missing);
+        assert_unfunded_collection::<zakura_chain::sapling::Spend<zakura_chain::sapling::PerSpendAnchor>>(count, 384, missing);
+        assert_unfunded_collection::<zakura_chain::sapling::SpendPrefixInTransactionV5>(count, 96, missing);
+        assert_unfunded_collection::<zakura_chain::sapling::OutputInTransactionV4>(count, 948, missing);
+        assert_unfunded_collection::<zakura_chain::sapling::OutputPrefixInTransactionV5>(count, 756, missing);
+        assert_unfunded_collection::<zakura_chain::orchard::Action>(count, 820, missing);
+    }
+
+    #[test]
+    fn f03_generated_nested_byte_strings_reject_before_allocation(
+        declared in 1usize..=8_193,
+        supplied_fraction in 0usize..=99,
+    ) {
+        let supplied = declared * supplied_fraction / 100;
+        let mut bytes = Vec::new();
+        CompactSizeMessage::try_from(declared).unwrap().zcash_serialize(&mut bytes).unwrap();
+        bytes.resize(bytes.len() + supplied, 0);
+        let (script, script_alloc) = measure(|| Script::zcash_deserialize_from_slice(&mut bytes.as_slice()));
+        let (proof, proof_alloc) = measure(|| Halo2Proof::zcash_deserialize_from_slice(&mut bytes.as_slice()));
+        let (string, string_alloc) = measure(|| String::zcash_deserialize_from_slice(&mut bytes.as_slice()));
+        prop_assert!(script.is_err() && proof.is_err() && string.is_err());
+        for observed in [script_alloc, proof_alloc, string_alloc] {
+            prop_assert_eq!(observed.requested_bytes, 0, "F03 nested byte string: {:?}", observed);
+        }
+    }
+
+    #[test]
+    fn f03_generated_complete_proof_arrays_bound_allocation_at_growth_edges(
+        count in prop_oneof![0usize..=2_049, proptest::sample::select(vec![0usize, 1, 1_023, 1_024, 1_025, 2_047, 2_048, 2_049])],
+    ) {
+        let bytes = vec![0; count * 192];
+        let (proofs, observed) = measure(|| {
+            ZcashReader::from_slice(&mut bytes.as_slice()).read_external_count::<Groth16Proof>(count)
+        });
+        let proofs = proofs.unwrap();
+        prop_assert_eq!(proofs.len(), count);
+        prop_assert!(observed.largest_request <= count * std::mem::size_of::<Groth16Proof>());
+        prop_assert!(observed.peak_live_bytes <= count * std::mem::size_of::<Groth16Proof>());
+    }
+
+}

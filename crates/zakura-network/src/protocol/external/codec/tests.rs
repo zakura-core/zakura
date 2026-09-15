@@ -2,4 +2,5 @@
 
 use super::*;
 
+mod network_bounds;
 mod vectors;

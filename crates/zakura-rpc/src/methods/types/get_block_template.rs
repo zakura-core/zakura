@@ -382,8 +382,9 @@ impl BlockTemplateResponse {
     /// The result of this method only depends on the supplied arguments and constants.
     ///
     /// Returns an error if the coinbase transaction cannot be built, for example because
-    /// the chain tip's value pools make the ZIP 234 issuance deficit negative.
-    #[allow(clippy::too_many_arguments)]
+    /// the chain tip's value pools make the ZIP 234 issuance deficit negative. Its `expect`s
+    /// check invariants that the caller already guarantees.
+    #[allow(clippy::too_many_arguments, clippy::unwrap_in_result)]
     pub(crate) fn new_internal(
         net: &Network,
         precomputed_coinbase: Option<TransactionTemplate<amount::NegativeOrZero>>,

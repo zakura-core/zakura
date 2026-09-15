@@ -380,7 +380,79 @@ impl HeaderChainEngine {
 
     /// Return the total number of retained auxiliary deliveries.
     pub fn aux_delivery_count(&self) -> usize {
-        self.aux_deliveries.values().map(Vec::len).sum()
+        self.aux_delivery_index.len()
+    }
+
+    /// Return slots that speculative input can use without consuming the commit reserve.
+    pub fn speculative_auxiliary_capacity(&self, limits: crate::EngineLimits) -> usize {
+        limits
+            .max_aux_deliveries_total
+            .get()
+            .saturating_sub(self.reserved_auxiliary_capacity(limits))
+            .saturating_sub(self.aux_delivery_count())
+    }
+
+    /// Check whether retained input leaves the selected commit window's reserve available.
+    pub fn auxiliary_reserve_is_satisfied(&self, limits: crate::EngineLimits) -> bool {
+        self.aux_delivery_count()
+            .saturating_add(self.reserved_auxiliary_capacity(limits))
+            <= limits.max_aux_deliveries_total.get()
+    }
+
+    /// Return the largest retained input plus commit reserve that a transition may leave.
+    ///
+    /// An older store can hold protected input inside the reserve. Transitions from that store
+    /// may keep or reduce the deficit, so finality can drain it, but they may not increase it.
+    pub(crate) fn auxiliary_reserve_ceiling(&self, limits: crate::EngineLimits) -> usize {
+        self.aux_delivery_count()
+            .saturating_add(self.commit_window_reserve(limits))
+            .max(limits.max_aux_deliveries_total.get())
+    }
+
+    fn reserved_auxiliary_capacity(&self, limits: crate::EngineLimits) -> usize {
+        if self.metadata.mode == crate::EngineMode::Integrated {
+            self.commit_window_reserve(limits)
+        } else {
+            0
+        }
+    }
+
+    fn commit_window_reserve(&self, limits: crate::EngineLimits) -> usize {
+        let occupied = self
+            .selected_projection
+            .iter()
+            .take(3)
+            .map(|frontier| self.aux_deliveries(frontier.hash).len())
+            .sum::<usize>();
+        limits
+            .max_aux_deliveries_per_header
+            .get()
+            .saturating_mul(3)
+            .saturating_sub(occupied)
+    }
+
+    /// Check one new input against the planner's bucket, aggregate, and reserve limits.
+    /// Retention may free more space before admission; this read grants no admission authority.
+    pub fn auxiliary_admission_capacity(
+        &self,
+        hash: block::Hash,
+        limits: crate::EngineLimits,
+    ) -> bool {
+        let deliveries = self.aux_deliveries(hash);
+        if deliveries.len() >= limits.max_aux_deliveries_per_header.get() {
+            return deliveries
+                .iter()
+                .any(|delivery| !delivery.is_authenticated())
+                && self.aux_delivery_count() <= limits.max_aux_deliveries_total.get();
+        }
+        if self.aux_delivery_count() >= limits.max_aux_deliveries_total.get() {
+            return false;
+        }
+        self.selected_projection
+            .iter()
+            .take(3)
+            .any(|frontier| frontier.hash == hash)
+            || self.speculative_auxiliary_capacity(limits) > 0
     }
 
     /// Return the retained auxiliary delivery with the exact global identity.

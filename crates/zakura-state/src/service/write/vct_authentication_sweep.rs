@@ -109,6 +109,26 @@ impl VctAuthenticationSweeper {
                 return;
             }
         };
+        let speculative_capacity = match writer.runtime.reader().speculative_auxiliary_capacity() {
+            Ok(capacity) => capacity,
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "VCT: authentication sweep could not read auxiliary capacity"
+                );
+                return;
+            }
+        };
+        // At the reserve boundary only the next commit and its successor may request
+        // input. Finality will release speculative capacity for later sweep heights.
+        let commit_successor_height = first_uncommitted_height.next().unwrap_or(Height::MAX);
+        if speculative_capacity == 0
+            && repair_manager
+                .sweep_repair_height()
+                .is_some_and(|height| height > commit_successor_height)
+        {
+            repair_manager.clear_sweep_repair();
+        }
         let selected_frontier_at_height = |height: Height| {
             captured_projection
                 .frontiers
@@ -164,6 +184,9 @@ impl VctAuthenticationSweeper {
                 break;
             }
             let selected_height = selected_frontier.height;
+            if speculative_capacity == 0 && selected_height > first_uncommitted_height {
+                break;
+            }
             let selected_hash = selected_frontier.hash;
             remaining_height_budget -= 1;
             if !finalized_state.vct_requires_exact_roots(selected_height) {

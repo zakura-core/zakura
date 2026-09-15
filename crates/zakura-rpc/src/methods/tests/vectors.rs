@@ -364,6 +364,55 @@ async fn rpc_getdeprecationinfo_estimates_time_from_tip_with_safety_margin() {
     assert!(end_of_service.estimated_time <= after + expected_offset);
 }
 
+/// The end-of-service estimate counts each block with the target spacing at its height.
+#[test]
+fn end_of_service_estimate_follows_target_spacing() {
+    let _init_guard = zakura_test::init();
+
+    // Mainnet has no NU7 height, so it keeps 75 second blocks after Blossom.
+    assert_eq!(
+        target_seconds_between_heights(&Mainnet, Height(3_000_000), Height(3_000_100)),
+        100 * 75,
+    );
+    assert_eq!(
+        target_seconds_between_heights(&Mainnet, Height(3_000_100), Height(3_000_000)),
+        -100 * 75,
+    );
+    assert_eq!(
+        target_seconds_between_heights(&Mainnet, Height(653_589), Height(653_609)),
+        10 * 150 + 10 * 75,
+    );
+
+    const NU7: u32 = 1_000;
+    let network = Network::new_regtest(
+        testnet::ConfiguredActivationHeights {
+            nu7: Some(NU7),
+            ..Default::default()
+        }
+        .into(),
+    );
+    let post_nu7_spacing = if zakura_chain::parameters::ZIP218_ENABLED {
+        25
+    } else {
+        75
+    };
+
+    // 10 blocks before NU7, and 20 blocks from NU7 onwards.
+    let expected = 10 * 75 + 20 * post_nu7_spacing;
+    assert_eq!(
+        target_seconds_between_heights(&network, Height(NU7 - 11), Height(NU7 + 19)),
+        expected,
+    );
+    assert_eq!(
+        target_seconds_between_heights(&network, Height(NU7 + 19), Height(NU7 - 11)),
+        -expected,
+    );
+    assert_eq!(
+        target_seconds_between_heights(&network, Height(NU7), Height(NU7)),
+        0,
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_getdeprecationinfo_omits_end_of_service_off_mainnet() {
     let _init_guard = zakura_test::init();

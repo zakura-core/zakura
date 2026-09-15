@@ -14,7 +14,7 @@ use zakura_chain::{
     chain_sync_status::ChainSyncStatus,
     chain_tip::ChainTip,
     fmt::humantime_seconds,
-    parameters::{Network, NetworkUpgrade, POST_BLOSSOM_POW_TARGET_SPACING},
+    parameters::{Network, NetworkUpgrade},
 };
 use zakura_state::MAX_BLOCK_REORG_HEIGHT;
 
@@ -87,30 +87,6 @@ pub async fn show_block_chain_progress(
         .max_height()
         .add(min_after_checkpoint_blocks)
         .expect("hard-coded checkpoint height is far below Height::MAX");
-
-    let target_block_spacing = NetworkUpgrade::target_spacing_for_height(&network, Height::MAX);
-    let max_block_spacing =
-        NetworkUpgrade::minimum_difficulty_spacing_for_height(&network, Height::MAX);
-
-    // We expect the state height to increase at least once in this interval.
-    //
-    // Most chain forks are 1-7 blocks long.
-    //
-    // TODO: remove the target_block_spacing multiplier,
-    //       after fixing slow syncing near tip (#3375)
-    let min_state_block_interval = max_block_spacing.unwrap_or(target_block_spacing * 4) * 2;
-
-    // Formatted strings for logging.
-    let target_block_spacing = humantime_seconds(
-        target_block_spacing
-            .to_std()
-            .expect("constant fits in std::Duration"),
-    );
-    let max_block_spacing = max_block_spacing
-        .map(|duration| {
-            humantime_seconds(duration.to_std().expect("constant fits in std::Duration"))
-        })
-        .unwrap_or_else(|| "None".to_string());
 
     // The last time we downloaded and verified at least one block.
     //
@@ -198,6 +174,27 @@ pub async fn show_block_chain_progress(
 
             // TODO: split logging / status updates into their own function.
 
+            // The block spacing at the estimated network tip sets how often the state height
+            // increases near the tip. ZIP 218 shortens it at NU7.
+            let target_block_spacing =
+                NetworkUpgrade::target_spacing_for_height(&network, estimated_height);
+            let max_block_spacing =
+                NetworkUpgrade::minimum_difficulty_spacing_for_height(&network, estimated_height);
+            let min_state_block_interval =
+                min_state_block_interval(target_block_spacing, max_block_spacing);
+
+            // Formatted strings for logging.
+            let target_block_spacing = humantime_seconds(
+                target_block_spacing
+                    .to_std()
+                    .expect("constant fits in std::Duration"),
+            );
+            let max_block_spacing = max_block_spacing
+                .map(|duration| {
+                    humantime_seconds(duration.to_std().expect("constant fits in std::Duration"))
+                })
+                .unwrap_or_else(|| "None".to_string());
+
             // Work out the sync progress towards the estimated tip.
             let sync_progress = f64::from(current_height.0) / f64::from(estimated_height.0);
             let sync_percent = format!(
@@ -259,9 +256,8 @@ pub async fn show_block_chain_progress(
             } else if is_syncer_stopped && current_height <= after_checkpoint_height {
                 // We've stopped syncing blocks,
                 // but we're below the minimum height estimated from our checkpoints.
-                let min_minutes_after_checkpoint_update = (MIN_BLOCKS_MINED_AFTER_CHECKPOINT_UPDATE
-                    * POST_BLOSSOM_POW_TARGET_SPACING)
-                    .div_ceil(60);
+                let min_minutes_after_checkpoint_update =
+                    min_minutes_after_checkpoint_update(&network, estimated_height);
 
                 warn!(
                     %sync_percent,
@@ -357,5 +353,87 @@ pub async fn show_block_chain_progress(
         }
 
         tokio::time::sleep(min(LOG_INTERVAL, PROGRESS_BAR_INTERVAL)).await;
+    }
+}
+
+/// Returns the interval where we expect the state height to increase at least once.
+///
+/// The `max_block_spacing` is the Testnet minimum difficulty gap, or `None` where that rule is
+/// inactive. Most chain forks are 1-7 blocks long.
+///
+/// TODO: remove the target_block_spacing multiplier,
+///       after fixing slow syncing near tip (#3375)
+fn min_state_block_interval(
+    target_block_spacing: chrono::Duration,
+    max_block_spacing: Option<chrono::Duration>,
+) -> chrono::Duration {
+    max_block_spacing.unwrap_or(target_block_spacing * 4) * 2
+}
+
+/// Returns the minimum number of minutes between a checkpoint list update and a test that depends
+/// on it, based on the target spacing at the estimated network tip `height`.
+fn min_minutes_after_checkpoint_update(network: &Network, height: Height) -> u64 {
+    let target_spacing =
+        u64::try_from(NetworkUpgrade::target_spacing_for_height(network, height).num_seconds())
+            .expect("target spacings are positive");
+
+    (u64::from(MIN_BLOCKS_MINED_AFTER_CHECKPOINT_UPDATE) * target_spacing).div_ceil(60)
+}
+
+#[cfg(test)]
+mod tests {
+    use zakura_chain::parameters::{testnet::ConfiguredActivationHeights, ZIP218_ENABLED};
+
+    use super::*;
+
+    /// Returns the stall warning interval, in seconds, when the estimated network tip is `height`.
+    fn stall_interval_seconds(network: &Network, height: Height) -> i64 {
+        min_state_block_interval(
+            NetworkUpgrade::target_spacing_for_height(network, height),
+            NetworkUpgrade::minimum_difficulty_spacing_for_height(network, height),
+        )
+        .num_seconds()
+    }
+
+    #[test]
+    fn progress_timing_follows_tip_target_spacing() {
+        let _init_guard = zakura_test::init();
+
+        // Mainnet and Testnet have no NU7 height, so their values stay unchanged.
+        let tip = Height(3_500_000);
+        assert_eq!(stall_interval_seconds(&Network::Mainnet, tip), 600);
+        assert_eq!(
+            min_minutes_after_checkpoint_update(&Network::Mainnet, tip),
+            13
+        );
+
+        let testnet = Network::new_default_testnet();
+        assert_eq!(stall_interval_seconds(&testnet, tip), 900);
+        assert_eq!(min_minutes_after_checkpoint_update(&testnet, tip), 13);
+
+        const NU7: u32 = 1_000;
+        let regtest = Network::new_regtest(
+            ConfiguredActivationHeights {
+                nu7: Some(NU7),
+                ..Default::default()
+            }
+            .into(),
+        );
+        let pre_nu7 = Height(NU7 - 1);
+        let post_nu7 = Height(NU7);
+
+        assert_eq!(stall_interval_seconds(&regtest, pre_nu7), 600);
+        assert_eq!(min_minutes_after_checkpoint_update(&regtest, pre_nu7), 13);
+
+        let (post_nu7_interval, post_nu7_minutes) =
+            if ZIP218_ENABLED { (200, 5) } else { (600, 13) };
+        assert_eq!(
+            stall_interval_seconds(&regtest, post_nu7),
+            post_nu7_interval
+        );
+        assert_eq!(
+            min_minutes_after_checkpoint_update(&regtest, post_nu7),
+            post_nu7_minutes
+        );
     }
 }

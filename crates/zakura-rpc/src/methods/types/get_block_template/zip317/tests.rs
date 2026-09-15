@@ -214,11 +214,14 @@ mod zip218_template_limits {
     use zakura_chain::{
         parameters::{
             testnet::{ConfiguredActivationHeights, Parameters},
-            Network, GLOBAL_SHIELDED_BUDGET, ORCHARD_BLOCK_ACTION_LIMIT, SAPLING_BLOCK_IO_LIMIT,
-            SPROUT_BLOCK_JOINSPLIT_LIMIT,
+            Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET, ORCHARD_BLOCK_ACTION_LIMIT,
+            SAPLING_BLOCK_IO_LIMIT, SPROUT_BLOCK_JOINSPLIT_LIMIT,
         },
         transaction::{
-            arbitrary::{fake_v5_with_orchard_actions, fake_v5_with_sapling_outputs},
+            arbitrary::{
+                fake_v5_with_orchard_actions, fake_v5_with_sapling_outputs,
+                fake_v6_with_orchard_and_ironwood_actions,
+            },
             ShieldedActionCounts, Transaction, UnminedTx, VerifiedUnminedTx,
         },
     };
@@ -253,6 +256,34 @@ mod zip218_template_limits {
         );
     }
 
+    /// Ironwood actions share the Orchard capacity, so a template cannot
+    /// exceed the Orchard limit by mixing Orchard and Ironwood transactions.
+    #[test]
+    fn ironwood_actions_share_the_orchard_capacity() {
+        let limit = usize::try_from(ORCHARD_BLOCK_ACTION_LIMIT).expect("the limit fits in usize");
+        let orchard_half = limit / 2;
+        let mut limits = nu7_template_limits();
+
+        let orchard_tx = verified_unmined_tx(fake_v5_with_orchard_actions(orchard_half));
+        let over_limit_ironwood_tx = verified_unmined_tx(ironwood_tx(0, limit + 1 - orchard_half));
+        let at_limit_ironwood_tx = verified_unmined_tx(ironwood_tx(0, limit - orchard_half));
+
+        assert!(limits.try_add(&orchard_tx));
+        assert!(
+            !limits.try_add(&over_limit_ironwood_tx),
+            "Ironwood actions past the remaining Orchard capacity must not be selected"
+        );
+        assert!(
+            limits.try_add(&at_limit_ironwood_tx),
+            "Ironwood actions that fill the remaining Orchard capacity fit"
+        );
+        assert_eq!(limits.remaining_orchard_and_ironwood_actions, 0);
+        assert_eq!(
+            limits.remaining_shielded_cost,
+            GLOBAL_SHIELDED_BUDGET - ORCHARD_BLOCK_ACTION_LIMIT
+        );
+    }
+
     /// The shielded limits only bind once ZIP 218 is active, so a pre-NU7
     /// template accepts a transaction that a post-NU7 template rejects.
     #[test]
@@ -271,8 +302,8 @@ mod zip218_template_limits {
         let mut post_activation = template_limits(&network, Height(2));
         assert_eq!(
             post_activation.try_add(&over_limit_tx),
-            !cfg!(feature = "nu7-experimental"),
-            "an experimental NU7 build rejects Orchard actions above the per-block limit at NU7"
+            !cfg!(feature = "nu7"),
+            "an NU7 build rejects Orchard actions above the per-block limit at NU7"
         );
     }
 
@@ -290,12 +321,12 @@ mod zip218_template_limits {
             },
         );
 
-        let expected_sapling_ios = if cfg!(feature = "nu7-experimental") {
+        let expected_sapling_ios = if cfg!(feature = "nu7") {
             SAPLING_BLOCK_IO_LIMIT - 1
         } else {
             u32::MAX
         };
-        let expected_cost = if cfg!(feature = "nu7-experimental") {
+        let expected_cost = if cfg!(feature = "nu7") {
             GLOBAL_SHIELDED_BUDGET - 1
         } else {
             u32::MAX
@@ -303,6 +334,33 @@ mod zip218_template_limits {
 
         assert_eq!(limits.sapling_ios, expected_sapling_ios);
         assert_eq!(limits.cost, expected_cost);
+    }
+
+    /// Coinbase Ironwood actions consume the Orchard capacity and the global
+    /// budget.
+    #[test]
+    fn the_coinbase_ironwood_actions_consume_orchard_capacity() {
+        let network = nu7_activation_testnet(1);
+        let coinbase_counts = ironwood_tx(0, 2).shielded_action_counts();
+        let limits =
+            BlockTemplateLimits::remaining_shielded_limits(&network, Height(1), coinbase_counts);
+
+        let (expected_actions, expected_cost) = if cfg!(feature = "nu7") {
+            (ORCHARD_BLOCK_ACTION_LIMIT - 2, GLOBAL_SHIELDED_BUDGET - 2)
+        } else {
+            (u32::MAX, u32::MAX)
+        };
+
+        assert_eq!(limits.orchard_and_ironwood_actions, expected_actions);
+        assert_eq!(limits.cost, expected_cost);
+    }
+
+    fn ironwood_tx(orchard_actions: usize, ironwood_actions: usize) -> Arc<Transaction> {
+        fake_v6_with_orchard_and_ironwood_actions(
+            NetworkUpgrade::Nu7,
+            orchard_actions,
+            ironwood_actions,
+        )
     }
 
     fn template_limits(network: &Network, height: Height) -> BlockTemplateLimits {
@@ -329,7 +387,7 @@ mod zip218_template_limits {
             remaining_bytes: usize::MAX,
             remaining_sigops: u32::MAX,
             remaining_unpaid_actions: u32::MAX,
-            remaining_orchard_actions: ORCHARD_BLOCK_ACTION_LIMIT,
+            remaining_orchard_and_ironwood_actions: ORCHARD_BLOCK_ACTION_LIMIT,
             remaining_sapling_ios: SAPLING_BLOCK_IO_LIMIT,
             remaining_sprout_joinsplits: SPROUT_BLOCK_JOINSPLIT_LIMIT,
             remaining_shielded_cost: GLOBAL_SHIELDED_BUDGET,

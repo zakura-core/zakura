@@ -7,19 +7,13 @@ use color_eyre::Report;
 use zakura_chain::{
     block::Height,
     chain_tip::ChainTip,
-    parameters::{Network, POST_BLOSSOM_POW_TARGET_SPACING},
+    parameters::{Network, NetworkUpgrade},
 };
 
 use crate::application::release_version;
 
 /// The estimated height that this release will be published.
 pub const ESTIMATED_RELEASE_HEIGHT: u32 = 3_480_539;
-
-/// The estimated number of blocks per day after Blossom.
-///
-/// All Zakura releases ship after Blossom, so this matches the spacing seen at
-/// every reachable tip height.
-pub const ESTIMATED_BLOCKS_PER_DAY: u32 = 24 * 60 * 60 / POST_BLOSSOM_POW_TARGET_SPACING;
 
 /// The maximum number of days after `ESTIMATED_RELEASE_HEIGHT` where a Zebra server will run
 /// without halting.
@@ -103,9 +97,40 @@ pub async fn start(
 /// The node runs at this height and halts when the tip goes past it. This
 /// matches zcashd's `end_of_service.block_height` threshold semantics.
 pub fn end_of_support_height(network: &Network) -> Option<Height> {
-    (network == &Network::Mainnet).then_some(Height(
-        ESTIMATED_RELEASE_HEIGHT + (EOS_PANIC_AFTER * ESTIMATED_BLOCKS_PER_DAY),
-    ))
+    (network == &Network::Mainnet).then(|| estimated_height_after_release(network, EOS_PANIC_AFTER))
+}
+
+/// Returns the estimated height `days` after [`ESTIMATED_RELEASE_HEIGHT`] on `network`.
+///
+/// The estimate follows the target spacing at each height, so ZIP 218's 25 second
+/// spacing after NU7 fits three times as many blocks into each day.
+fn estimated_height_after_release(network: &Network, days: u32) -> Height {
+    let mut height = i64::from(ESTIMATED_RELEASE_HEIGHT);
+    let mut remaining_seconds = i64::from(days) * 24 * 60 * 60;
+
+    let target_spacings: Vec<_> = NetworkUpgrade::target_spacings(network).collect();
+    for (index, (_, target_spacing)) in target_spacings.iter().enumerate() {
+        let target_spacing = target_spacing.num_seconds();
+        let remaining_blocks = remaining_seconds / target_spacing;
+
+        // The number of blocks from `height` to the start of the next target spacing.
+        let blocks_until_next_spacing = target_spacings
+            .get(index + 1)
+            .map(|(next_height, _)| (i64::from(next_height.0) - height).max(0));
+
+        match blocks_until_next_spacing {
+            Some(blocks) if blocks < remaining_blocks => {
+                height += blocks;
+                remaining_seconds -= blocks * target_spacing;
+            }
+            _ => {
+                height += remaining_blocks;
+                break;
+            }
+        }
+    }
+
+    Height(u32::try_from(height).expect("the support window ends far below the maximum height"))
 }
 
 /// Returns the number of blocks left before this release halts, or `None` when
@@ -126,8 +151,7 @@ pub fn check(tip_height: Height, network: &Network) {
         info!("Release always valid outside Mainnet");
         return;
     };
-    let warn_height =
-        Height(ESTIMATED_RELEASE_HEIGHT + (EOS_WARN_AFTER * ESTIMATED_BLOCKS_PER_DAY));
+    let warn_height = estimated_height_after_release(network, EOS_WARN_AFTER);
 
     if tip_height > panic_height {
         panic!(
@@ -144,5 +168,82 @@ pub fn check(tip_height: Height, network: &Network) {
         );
     } else {
         info!("Zakura release is supported until block {}, please report bugs at https://github.com/zakura-core/zakura/issues", panic_height.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use zakura_chain::parameters::{testnet::ConfiguredActivationHeights, ZIP218_ENABLED};
+
+    use super::*;
+
+    /// The number of blocks per day at 75 second spacing.
+    const PRE_NU7_BLOCKS_PER_DAY: u32 = 1_152;
+
+    /// The number of blocks per day at 25 second spacing.
+    const POST_NU7_BLOCKS_PER_DAY: u32 = 3_456;
+
+    /// Returns a Regtest network with NU7 at `nu7`.
+    fn regtest_with_nu7(nu7: u32) -> Network {
+        Network::new_regtest(
+            ConfiguredActivationHeights {
+                nu7: Some(nu7),
+                ..Default::default()
+            }
+            .into(),
+        )
+    }
+
+    #[test]
+    fn mainnet_end_of_support_height_counts_75_second_blocks() {
+        let _init_guard = zakura_test::init();
+
+        assert_eq!(
+            end_of_support_height(&Network::Mainnet),
+            Some(Height(
+                ESTIMATED_RELEASE_HEIGHT + EOS_PANIC_AFTER * PRE_NU7_BLOCKS_PER_DAY
+            )),
+        );
+        assert_eq!(
+            estimated_height_after_release(&Network::Mainnet, EOS_WARN_AFTER),
+            Height(ESTIMATED_RELEASE_HEIGHT + EOS_WARN_AFTER * PRE_NU7_BLOCKS_PER_DAY),
+        );
+    }
+
+    #[test]
+    fn end_of_support_height_counts_25_second_blocks_after_nu7() {
+        let _init_guard = zakura_test::init();
+
+        let post_nu7_blocks_per_day = if ZIP218_ENABLED {
+            POST_NU7_BLOCKS_PER_DAY
+        } else {
+            PRE_NU7_BLOCKS_PER_DAY
+        };
+
+        // NU7 activates after the support window.
+        let network = regtest_with_nu7(ESTIMATED_RELEASE_HEIGHT + 30 * PRE_NU7_BLOCKS_PER_DAY);
+        assert_eq!(
+            estimated_height_after_release(&network, EOS_PANIC_AFTER),
+            Height(ESTIMATED_RELEASE_HEIGHT + EOS_PANIC_AFTER * PRE_NU7_BLOCKS_PER_DAY),
+        );
+
+        // NU7 activates 7 days into the support window.
+        let nu7 = ESTIMATED_RELEASE_HEIGHT + 7 * PRE_NU7_BLOCKS_PER_DAY;
+        let network = regtest_with_nu7(nu7);
+        assert_eq!(
+            estimated_height_after_release(&network, EOS_PANIC_AFTER),
+            Height(nu7 + (EOS_PANIC_AFTER - 7) * post_nu7_blocks_per_day),
+        );
+
+        // NU7 activates before the release.
+        let network = regtest_with_nu7(ESTIMATED_RELEASE_HEIGHT - 1_000);
+        assert_eq!(
+            estimated_height_after_release(&network, EOS_PANIC_AFTER),
+            Height(ESTIMATED_RELEASE_HEIGHT + EOS_PANIC_AFTER * post_nu7_blocks_per_day),
+        );
+        assert_eq!(
+            estimated_height_after_release(&network, EOS_WARN_AFTER),
+            Height(ESTIMATED_RELEASE_HEIGHT + EOS_WARN_AFTER * post_nu7_blocks_per_day),
+        );
     }
 }

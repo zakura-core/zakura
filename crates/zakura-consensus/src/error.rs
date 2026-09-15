@@ -272,7 +272,9 @@ pub enum TransactionError {
     #[error("wrong tx format: tx version is ≥ 5, but `nConsensusBranchId` is missing")]
     MissingConsensusBranchId,
 
-    #[error("Orchard action count {actions} exceeds the per-block limit of {limit}")]
+    #[error(
+        "Orchard and Ironwood action count {actions} exceeds the per-block Orchard limit of {limit}"
+    )]
     OrchardActionsExceedBlockLimit { actions: u32, limit: u32 },
 
     #[error("Sapling spends + outputs count {ios} exceeds the per-block limit of {limit}")]
@@ -283,7 +285,7 @@ pub enum TransactionError {
 
     #[error(
         "shielded cost {cost} \
-         (Orchard actions + Sapling spends + Sapling outputs + 2 * Sprout JoinSplits) \
+         (Orchard and Ironwood actions + Sapling spends + Sapling outputs + 2 * Sprout JoinSplits) \
          exceeds the per-block global shielded budget of {limit}"
     )]
     ShieldedCostExceedsBlockBudget { cost: u32, limit: u32 },
@@ -575,6 +577,10 @@ impl TransactionError {
             | IronwoodProofSize
             | WrongConsensusBranchId
             | MissingConsensusBranchId
+            // ZIP 218 does not specify a mempool rejection. The transaction
+            // verifier rejects a transaction that exceeds a per-block limit on
+            // its own, because no block can include it. The peer that sent it
+            // gets the full score.
             | OrchardActionsExceedBlockLimit { .. }
             | SaplingIOsExceedBlockLimit { .. }
             | SproutJoinSplitsExceedBlockLimit { .. }

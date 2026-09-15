@@ -156,6 +156,10 @@ pub const MIN_PEER_RECONNECTION_DELAY: Duration = Duration::from_secs(59 + 20 + 
 /// Zebra rotates its peer inventory registry every time this interval elapses.
 ///
 /// After 2 of these intervals, Zebra's local available and missing inventory entries expire.
+///
+/// After ZIP 218 shortens the target block interval to 25 seconds at NU7, entries last for
+/// 2-4 blocks instead of 1-2 blocks. The entries track how inventory reaches peers, and that
+/// takes the same time at any block interval, so this interval does not change at NU7.
 pub const INVENTORY_ROTATION_INTERVAL: Duration = Duration::from_secs(53);
 
 /// The default peer address crawler interval.

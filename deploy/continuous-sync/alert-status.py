@@ -52,23 +52,20 @@ def service_active(service: str) -> bool:
     return active_state in {"active", "reloading", "refreshing"}
 
 
-def metric_height(text: str) -> int | None:
-    # Prefer finalized/verified block progress over header-only metrics.
-    priority = [
+def metric_height_observation(text: str) -> tuple[int | None, str | None]:
+    # Finalized and verifier-only gauges can trail or lead the best committed
+    # tip, so they cannot prove node progress.
+    exact = [
         "state_memory_best_committed_block_height",
         "state_memory_committed_block_height",
-        "state_finalized_block_height",
-        "state_checkpoint_finalized_block_height",
         "zcash_chain_verified_block_height",
         "sync_block_verified_tip_height",
-        "checkpoint_verified_height",
-        "checkpoint_processing_next_height",
     ]
     estimated = [
         "sync_estimated_network_tip_height",
         "sync_estimated_distance_to_tip",
     ]
-    values = {name: [] for name in priority + estimated}
+    values = {name: [] for name in exact + estimated}
     for line in text.splitlines():
         if not line or line.startswith("#"):
             continue
@@ -83,15 +80,19 @@ def metric_height(text: str) -> int | None:
             values[dotted_base].append(int(float(parts[1])))
         except ValueError:
             continue
-    for name in priority:
+    for name in exact:
         if values[name]:
-            return max(values[name])
+            return max(values[name]), name
     if all(values[name] for name in estimated):
         tip = max(values["sync_estimated_network_tip_height"])
         distance = min(values["sync_estimated_distance_to_tip"])
         if 0 <= distance <= tip:
-            return tip - distance
-    return None
+            return tip - distance, "estimated_tip_minus_distance"
+    return None, None
+
+
+def metric_height(text: str) -> int | None:
+    return metric_height_observation(text)[0]
 
 
 def node_info(config: dict[str, Any], hostname: str) -> dict[str, Any]:
@@ -131,11 +132,12 @@ def status(config: dict[str, Any]) -> dict[str, Any]:
 
     metrics_status = "unavailable"
     height = None
+    height_source = None
     try:
         with urllib.request.urlopen(metrics_url, timeout=METRICS_TIMEOUT_SECONDS) as response:
             metrics = response.read().decode("utf-8", "replace")
         metrics_status = "ok"
-        height = metric_height(metrics)
+        height, height_source = metric_height_observation(metrics)
     except Exception as exc:
         metrics_status = f"unavailable: {type(exc).__name__}"
 
@@ -147,6 +149,8 @@ def status(config: dict[str, Any]) -> dict[str, Any]:
         "service_active": service_active(service),
         "metrics_status": metrics_status,
         "height": height,
+        "height_source": height_source,
+        "height_is_exact": height_source not in (None, "estimated_tip_minus_distance"),
         "controller_state": controller_state(controller_state_path),
         "connection": node.get("ssh_string", f"root@{node.get('public_ip', 'unknown')}"),
         "alias_connection": f"ssh {node.get('alias', hostname)}",

@@ -331,10 +331,109 @@ fn check_height_for_num_halvings() {
     }
 }
 
+/// Tests `halving` against ZIP 218's `Halving` formula on a configured Testnet
+/// whose Blossom height is below `SlowStartShift`, with and without NU7.
+///
+/// On such a network the formula's pre-Blossom term is negative. A build
+/// without the `nu7` feature treats NU7 as inactive, so it follows the
+/// formula's Blossom case at every height.
+#[test]
+fn halving_matches_zip_218_when_blossom_is_below_the_slow_start_shift() {
+    use crate::parameters::{
+        testnet::{self, ConfiguredActivationHeights},
+        NU7_POW_TARGET_SPACING_RATIO, ZIP218_ENABLED,
+    };
+
+    let _init_guard = zakura_test::init();
+
+    let blossom = 4;
+    let nu7 = 2_000_000;
+
+    for configured_nu7 in [None, Some(nu7)] {
+        let network = testnet::Parameters::build()
+            .with_activation_heights(ConfiguredActivationHeights {
+                blossom: Some(blossom),
+                canopy: Some(blossom + 2),
+                nu7: configured_nu7,
+                ..Default::default()
+            })
+            .expect("activation heights are valid")
+            .clear_funding_streams()
+            .to_network()
+            .expect("configured testnet is valid");
+
+        let slow_start_shift = i128::from(network.slow_start_shift().0);
+        assert!(i128::from(blossom) < slow_start_shift);
+
+        let pre_blossom_interval = i128::from(network.pre_blossom_halving_interval());
+        let post_blossom_interval = i128::from(network.post_blossom_halving_interval());
+        let post_nu7_interval = post_blossom_interval * i128::from(NU7_POW_TARGET_SPACING_RATIO);
+        let nu7_activation = configured_nu7.filter(|_| ZIP218_ENABLED).map(i128::from);
+
+        // `Halving(height)` from ZIP 218, as an exact fraction over the product
+        // of the three halving intervals. A negative index has no meaning, so
+        // `halving` returns zero there.
+        let zip_halving = |height: Height| -> u32 {
+            let height = i128::from(height.0);
+            let blossom = i128::from(blossom);
+            let (pre_blossom_blocks, post_blossom_blocks, post_nu7_blocks) = if height < blossom {
+                (height - slow_start_shift, 0, 0)
+            } else {
+                match nu7_activation {
+                    Some(nu7) if height >= nu7 => {
+                        (blossom - slow_start_shift, nu7 - blossom, height - nu7)
+                    }
+                    _ => (blossom - slow_start_shift, height - blossom, 0),
+                }
+            };
+
+            let numerator = pre_blossom_blocks * post_blossom_interval * post_nu7_interval
+                + post_blossom_blocks * pre_blossom_interval * post_nu7_interval
+                + post_nu7_blocks * pre_blossom_interval * post_blossom_interval;
+            let denominator = pre_blossom_interval * post_blossom_interval * post_nu7_interval;
+
+            numerator
+                .div_euclid(denominator)
+                .max(0)
+                .try_into()
+                .expect("the test halving index fits in u32")
+        };
+
+        let slow_start_shift = network.slow_start_shift();
+        let mut heights = vec![
+            slow_start_shift,
+            (slow_start_shift + 1).expect("the height is valid"),
+            Height(nu7 - 1),
+            Height(nu7),
+            Height(nu7 + 1),
+            Height(Height::MAX.0 / 2),
+        ];
+        for halving_index in 1..=4 {
+            let halving_height =
+                height_for_halving(halving_index, &network).expect("the halving has a height");
+            heights.push(halving_height);
+            heights.push(
+                halving_height
+                    .previous()
+                    .expect("the halving is above genesis"),
+            );
+            assert_eq!(halving_index, zip_halving(halving_height));
+        }
+
+        for height in heights {
+            assert_eq!(
+                zip_halving(height),
+                halving(height, &network),
+                "halving at {height:?} with NU7 at {configured_nu7:?}",
+            );
+        }
+    }
+}
+
 /// Tests the ZIP 218 target spacing, halving, and block subsidy across the NU7
 /// activation boundary on a configured Testnet.
 #[test]
-#[cfg(feature = "nu7-experimental")]
+#[cfg(feature = "nu7")]
 fn post_nu7_spacing_halving_and_subsidy() -> Result<(), Report> {
     use crate::parameters::{
         testnet::{self, ConfiguredActivationHeights},
@@ -425,7 +524,7 @@ fn post_nu7_spacing_halving_and_subsidy() -> Result<(), Report> {
 
 /// Tests funding stream periods before the first period anchor on a configured Testnet.
 #[test]
-#[cfg(feature = "nu7-experimental")]
+#[cfg(feature = "nu7")]
 fn funding_stream_period_before_anchor_uses_floor_division() -> Result<(), Report> {
     use crate::parameters::{
         subsidy::funding_stream_address_period,
@@ -470,7 +569,7 @@ fn funding_stream_period_before_anchor_uses_floor_division() -> Result<(), Repor
 /// Tests that the ZIP 218 difficulty averaging window widens at the NU7
 /// activation height.
 #[test]
-#[cfg(feature = "nu7-experimental")]
+#[cfg(feature = "nu7")]
 fn averaging_window_changes_at_nu7_activation_height() -> Result<(), Report> {
     use crate::parameters::{
         testnet::{self, ConfiguredActivationHeights},

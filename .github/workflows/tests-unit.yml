@@ -238,11 +238,11 @@ jobs:
           # mode the shards run. The run-time-only filters (`--profile`,
           # `--partition`, `--run-ignored`) are applied by the shard jobs, not here.
           if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
-            cargo nextest archive --locked --release --features default-release-binaries --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
+            cargo nextest archive --locked --release --features default-release-binaries,sync-metrics --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
           elif [[ "${FULL_COVERAGE}" == "true" ]]; then
-            cargo nextest archive --locked --cargo-profile ci-tests --features default-release-binaries --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
+            cargo nextest archive --locked --cargo-profile ci-tests --features default-release-binaries,sync-metrics --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
           else
-            cargo nextest archive --locked --features default-release-binaries --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
+            cargo nextest archive --locked --features default-release-binaries,sync-metrics --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst"
           fi
         env:
           FULL_COVERAGE: ${{ github.event_name != 'pull_request' }}
@@ -336,8 +336,8 @@ jobs:
       - name: Check generated zakurad config compatibility
         run: cargo nextest run --profile zakura-config --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst" --no-fail-fast
 
-  nu7-experimental:
-    name: Experimental NU7 feature tests
+  nu7:
+    name: NU7 feature tests
     needs: changes
     # Compiles its own binaries, because the shared nextest archive is built
     # without this feature.
@@ -356,13 +356,13 @@ jobs:
         with:
           toolchain: stable
       - uses: ./.github/actions/setup-zakura-build
-      - name: Test experimental NU7 builds
+      - name: Test NU7 builds
         run: |
-          cargo test --locked --features zakura-chain/nu7-experimental \
+          cargo test --locked --features zakura-chain/nu7 \
             -p zakura-chain -p zakura-header-chain --lib
-          cargo test --locked --features nu7-experimental \
+          cargo test --locked --features nu7 \
             -p zakura-consensus -p zakura-rpc -p zakura-state --lib
-          cargo check --locked -p zakura --features nu7-experimental
+          cargo check --locked -p zakura --features nu7
 
   network-dependent:
     name: network-dependent acceptance tests
@@ -492,7 +492,7 @@ jobs:
       - build-tests
       - unit-tests
       - zakura-config
-      - nu7-experimental
+      - nu7
       - network-dependent
       - pruned-storage
       - check-no-git-dependencies
@@ -510,7 +510,7 @@ jobs:
           # check-no-git-dependencies is A-release-label only, publish-graph
           # skips on PRs that do not touch Cargo manifests or this check.
           # Failed, non-skipped jobs still fail this aggregate status.
-          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, network-dependent, nu7-experimental, publish-graph
+          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, network-dependent, nu7, publish-graph
 
   report-nightly-result:
     name: report nightly release test result

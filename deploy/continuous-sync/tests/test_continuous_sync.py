@@ -39,6 +39,52 @@ alert_status = load_module("continuous_sync_alert_status", ALERT_STATUS_PATH)
 
 
 class ContinuousSyncTests(unittest.TestCase):
+    def test_sync_metrics_build_features_follow_mode_and_selected_ref(self):
+        for mode in ("dual", "zakura", "legacy"):
+            for supported in (False, True):
+                with self.subTest(mode=mode, supported=supported), tempfile.TemporaryDirectory() as tmp:
+                    config = make_config(Path(tmp), policy=sync.Policy(p2p_stack=mode))
+                    manifest = '[features]\nsync-metrics = []\n' if supported else '[features]\n'
+                    with patch.object(sync, "run", return_value=subprocess.CompletedProcess([], 0, manifest)) as command:
+                        self.assertEqual(sync.build_features(config, "a" * 40),
+                                         ["sync-metrics"] if supported and mode != "legacy" else [])
+                        if mode == "legacy":
+                            command.assert_not_called()
+                        else:
+                            self.assertEqual(command.call_args.args[0],
+                                             ["git", "show", "a" * 40 + ":crates/zakurad/Cargo.toml"])
+
+    def test_sync_metrics_rebuilds_default_cache_and_reuses_matching_features(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_config(Path(tmp), policy=sync.Policy(p2p_stack="zakura"))
+            config.paths.build_cache_dir.mkdir()
+            sha = "a" * 40
+            target = sync.cached_binary(config, sha)
+            target.write_bytes(b"default binary")
+            target.with_suffix(".json").write_text(json.dumps({"sha": sha}))
+            commands = []
+
+            def command(args, **kwargs):
+                commands.append(args)
+                if args[:2] == ["cargo", "build"]:
+                    built = kwargs["cwd"] / "target/release/zakurad"
+                    built.parent.mkdir(parents=True)
+                    built.write_bytes(b"instrumented binary")
+                return subprocess.CompletedProcess(args, 0, "")
+
+            with patch.object(sync, "build_features", return_value=["sync-metrics"]), \
+                 patch.object(sync, "binary_runnable", return_value=True), \
+                 patch.object(sync, "run", side_effect=command):
+                self.assertEqual(sync.build_binary(config, sha), target)
+                self.assertEqual(target.read_bytes(), b"instrumented binary")
+                self.assertIn(["cargo", "build", "--release", "--locked", "-p", "zakura",
+                               "--features", "sync-metrics"], commands)
+                self.assertEqual(json.loads(target.with_suffix(".json").read_text())["features"],
+                                 ["sync-metrics"])
+                commands.clear()
+                self.assertEqual(sync.build_binary(config, sha), target)
+                self.assertEqual(commands, [])
+
     def test_retention_archive_failure_reports_halt_during_disk_recovery(self):
         for restarting in (False, True):
             with self.subTest(restarting=restarting), tempfile.TemporaryDirectory() as tmp:
@@ -231,8 +277,225 @@ class ContinuousSyncTests(unittest.TestCase):
 
         self.assertEqual(status["height"], 900)
         self.assertEqual(status["height_source"], "estimated_tip_minus_distance")
+        self.assertIsNone(status["committed_height"])
+        self.assertIsNone(status["header_height"])
         self.assertEqual(status["sync.downloads.in_flight"], 17)
         self.assertEqual(status["sync.downloads.verifying"], 4)
+
+    def test_sample_status_reports_exact_committed_and_header_heights(self):
+        metrics = "\n".join(
+            [
+                "state_memory_best_committed_block_height 42",
+                "sync_header_chain_frontier_header_best_height 45",
+                "sync_zakura_legacy_fallback_active 1",
+                "sync_estimated_network_tip_height 1000",
+                "sync_estimated_distance_to_tip 100",
+            ]
+        )
+        config = make_config(Path("/tmp"))
+
+        with (
+            patch.object(sync, "service_active", return_value=True),
+            patch.object(sync, "fetch_text", return_value=metrics),
+            patch.object(sync, "fetch_ready", return_value=(False, "syncing")),
+        ):
+            status = sync.sample_status(config)
+
+        self.assertEqual(status["committed_height"], 42)
+        self.assertEqual(
+            status["committed_height_source"],
+            "state.memory.best.committed.block.height",
+        )
+        self.assertEqual(status["header_height"], 45)
+        self.assertEqual(
+            status["header_height_source"],
+            "sync.header_chain.frontier.header_best_height",
+        )
+        self.assertEqual(status["height"], 42)
+        self.assertEqual(status["sync.zakura.legacy_fallback.active"], 1)
+        self.assertEqual(status["stall_evidence"], "legacy_fallback")
+
+    def test_sample_status_classifies_metrics_timeout_as_unknown(self):
+        config = make_config(Path("/tmp"))
+
+        with (
+            patch.object(sync, "service_active", return_value=True),
+            patch.object(sync, "fetch_text", side_effect=TimeoutError("timed out")),
+            patch.object(sync, "fetch_ready", return_value=(False, "syncing")),
+        ):
+            status = sync.sample_status(config)
+
+        self.assertEqual(status["metrics_status"], "TimeoutError: timed out")
+        self.assertEqual(status["stall_evidence"], "unknown")
+        self.assertIn("TimeoutError", status["stall_evidence_detail"])
+
+    def test_lagging_height_metrics_are_not_committed_tip_progress(self):
+        for metric in (
+            "state_finalized_block_height",
+            "state_checkpoint_finalized_block_height",
+            "checkpoint_verified_height",
+        ):
+            with self.subTest(metric=metric):
+                config = make_config(Path("/tmp"))
+                with (
+                    patch.object(sync, "service_active", return_value=True),
+                    patch.object(sync, "fetch_text", return_value=f"{metric} 42"),
+                    patch.object(sync, "fetch_ready", return_value=(False, "syncing")),
+                ):
+                    status = sync.sample_status(config)
+
+                self.assertIsNone(status["committed_height"])
+                self.assertEqual(status["stall_evidence"], "unknown")
+
+    def test_natural_block_gap_does_not_create_stall_evidence(self):
+        policy = sync.Policy(p2p_stack="zakura", stall_seconds=600)
+        progress = sync.SyncProgress(started_at=100)
+        sample = exact_sync_sample(42, 42)
+
+        self.assertEqual(progress.observe(sample, policy, 100), (True, None))
+        self.assertEqual(progress.observe(sample, policy, 701), (False, None))
+        self.assertEqual(sample["stall_evidence"], "no_local_header_backlog")
+        self.assertIsNone(progress.backlog_since)
+
+    def test_committed_height_above_header_height_has_no_local_backlog(self):
+        policy = sync.Policy(p2p_stack="zakura", status_unavailable_seconds=600)
+        progress = sync.SyncProgress(started_at=100)
+        sample = exact_sync_sample(45, 42)
+
+        self.assertEqual(progress.observe(sample, policy, 100), (True, None))
+        self.assertEqual(progress.observe(sample, policy, 701), (False, None))
+        self.assertEqual(sample["stall_evidence"], "no_local_header_backlog")
+        self.assertIsNone(progress.status_unavailable_since)
+
+    def test_active_legacy_fallback_stops_the_run_immediately(self):
+        policy = sync.Policy(p2p_stack="dual", stall_seconds=600)
+        progress = sync.SyncProgress(started_at=100)
+        sample = exact_sync_sample(42, 45)
+        sample[sync.LEGACY_FALLBACK_ACTIVE_METRIC] = 1
+
+        progressed, failure = progress.observe(sample, policy, 100)
+
+        self.assertTrue(progressed)
+        self.assertEqual(sample["stall_evidence"], "legacy_fallback")
+        self.assertIn("handed off to legacy fallback at committed height 42", failure)
+
+    def test_legacy_fallback_stops_the_run_even_while_committed_height_advances(self):
+        policy = sync.Policy(p2p_stack="dual", stall_seconds=600)
+        progress = sync.SyncProgress(started_at=100)
+
+        def fallback_sample(committed_height: int) -> dict[str, object]:
+            sample = exact_sync_sample(committed_height, 45)
+            sample[sync.LEGACY_FALLBACK_ACTIVE_METRIC] = 1
+            return sample
+
+        _, failure = progress.observe(fallback_sample(43), policy, 700)
+
+        self.assertIn("handed off to legacy fallback", failure)
+
+    def test_continuous_local_header_backlog_reaches_stall_deadline(self):
+        policy = sync.Policy(p2p_stack="zakura", stall_seconds=600)
+        progress = sync.SyncProgress(started_at=100)
+
+        self.assertEqual(progress.observe(exact_sync_sample(42, 45), policy, 100), (True, None))
+        self.assertEqual(progress.observe(exact_sync_sample(42, 45), policy, 699), (False, None))
+        progressed, failure = progress.observe(exact_sync_sample(42, 45), policy, 700)
+
+        self.assertFalse(progressed)
+        self.assertIn("local header height 45 is ahead", failure)
+        self.assertIn("for 600s", failure)
+
+    def test_new_backlog_starts_a_fresh_deadline_after_a_long_block_gap(self):
+        policy = sync.Policy(p2p_stack="zakura", stall_seconds=600)
+        progress = sync.SyncProgress(started_at=100)
+
+        progress.observe(exact_sync_sample(42, 42), policy, 100)
+        self.assertEqual(progress.observe(exact_sync_sample(42, 42), policy, 1000), (False, None))
+        self.assertEqual(progress.observe(exact_sync_sample(42, 43), policy, 1001), (False, None))
+        self.assertEqual(progress.observe(exact_sync_sample(42, 43), policy, 1600), (False, None))
+        _, failure = progress.observe(exact_sync_sample(42, 43), policy, 1601)
+
+        self.assertIn("for 600s", failure)
+
+    def test_committed_progress_restarts_an_existing_backlog_deadline(self):
+        policy = sync.Policy(p2p_stack="zakura", stall_seconds=600)
+        progress = sync.SyncProgress(started_at=100)
+
+        progress.observe(exact_sync_sample(42, 44), policy, 100)
+        self.assertEqual(progress.observe(exact_sync_sample(43, 44), policy, 600), (True, None))
+        self.assertEqual(progress.observe(exact_sync_sample(43, 44), policy, 1199), (False, None))
+        _, failure = progress.observe(exact_sync_sample(43, 44), policy, 1200)
+
+        self.assertIn("for 600s", failure)
+
+    def test_query_error_uses_a_separate_status_deadline(self):
+        policy = sync.Policy(p2p_stack="zakura", status_unavailable_seconds=600)
+        progress = sync.SyncProgress(started_at=100)
+        sample = {"metrics_status": "TimeoutError: timed out"}
+
+        self.assertEqual(progress.observe(sample, policy, 100), (False, None))
+        self.assertEqual(progress.observe(sample, policy, 699), (False, None))
+        _, failure = progress.observe(sample, policy, 700)
+
+        self.assertIn("sync status evidence unavailable for 600s", failure)
+        self.assertIn("TimeoutError", failure)
+
+    def test_status_recovery_clears_the_unavailable_deadline(self):
+        policy = sync.Policy(p2p_stack="zakura", status_unavailable_seconds=600)
+        progress = sync.SyncProgress(started_at=100)
+        unavailable = {"metrics_status": "TimeoutError: timed out"}
+
+        progress.observe(unavailable, policy, 100)
+        progress.observe(exact_sync_sample(42, 42), policy, 600)
+        progress.observe(unavailable, policy, 1000)
+        self.assertEqual(progress.observe(unavailable, policy, 1599), (False, None))
+        _, failure = progress.observe(unavailable, policy, 1600)
+
+        self.assertIn("sync status evidence unavailable for 600s", failure)
+
+    def test_query_error_pauses_but_does_not_erase_the_backlog_deadline(self):
+        policy = sync.Policy(
+            p2p_stack="zakura",
+            stall_seconds=600,
+            status_unavailable_seconds=600,
+        )
+        progress = sync.SyncProgress(started_at=100)
+        unavailable = {"metrics_status": "TimeoutError: timed out"}
+
+        progress.observe(exact_sync_sample(42, 45), policy, 100)
+        progress.observe(unavailable, policy, 650)
+        self.assertEqual(progress.observe(exact_sync_sample(42, 45), policy, 700), (False, None))
+        _, failure = progress.observe(exact_sync_sample(42, 45), policy, 750)
+
+        self.assertIn("for 600s", failure)
+
+    def test_estimated_tip_fields_do_not_supply_stall_evidence(self):
+        policy = sync.Policy(p2p_stack="zakura", status_unavailable_seconds=600)
+        progress = sync.SyncProgress(started_at=100)
+        sample = {
+            "metrics_status": "ok",
+            "height": 900,
+            "height_source": "estimated_tip_minus_distance",
+            "sync.estimated_network_tip_height": 1000,
+            "sync.estimated_distance_to_tip": 100,
+        }
+
+        self.assertEqual(progress.observe(sample, policy, 100), (False, None))
+        _, failure = progress.observe(sample, policy, 700)
+
+        self.assertEqual(sample["stall_evidence"], "unknown")
+        self.assertIn("committed block height is missing", failure)
+
+    def test_legacy_node_keeps_its_height_only_deadline(self):
+        policy = sync.Policy(p2p_stack="legacy", stall_seconds=1800)
+        progress = sync.SyncProgress(started_at=100)
+        sample = {"metrics_status": "ok", "committed_height": 42}
+
+        self.assertEqual(progress.observe(sample, policy, 100), (True, None))
+        self.assertEqual(progress.observe(sample, policy, 1899), (False, None))
+        _, failure = progress.observe(sample, policy, 1900)
+
+        self.assertIn("legacy committed height 42", failure)
+        self.assertIn("for 1800s", failure)
 
     def test_sample_counters_accept_scientific_notation_and_ignore_invalid_values(self):
         key = "sync.block.payload.received.bytes"
@@ -314,7 +577,7 @@ class ContinuousSyncTests(unittest.TestCase):
                 config = make_config(Path(tmp))
                 run_dir = Path(tmp) / "run"
                 run_dir.mkdir()
-                early = {"ready": True, "height": 100, "zcash_chain_verified_block_height": 100}
+                early = {"ready": True, "committed_height": 100, "height": 100, "zcash_chain_verified_block_height": 100}
                 final = {"ready": True, "height": 105, "height_source": "estimated_tip_minus_distance",
                          "zcash_chain_verified_block_height": final_height}
                 run_state = {}
@@ -328,8 +591,8 @@ class ContinuousSyncTests(unittest.TestCase):
                 ):
                     sync.wait_for_completion(config, run_dir, run_state, {})
                 self.assertEqual(run_state["end_height"], 101 if final_height == 101 else None)
-                # Progress tracking can still use estimates; throughput cannot.
-                self.assertEqual(run_state["height"], 105)
+                # An estimated height cannot replace committed progress.
+                self.assertEqual(run_state["height"], 100)
 
     def test_alert_status_falls_back_to_estimated_height(self):
         metrics = "\n".join(
@@ -340,6 +603,10 @@ class ContinuousSyncTests(unittest.TestCase):
         )
 
         self.assertEqual(alert_status.metric_height(metrics), 900)
+        self.assertEqual(
+            alert_status.metric_height_observation(metrics),
+            (900, "estimated_tip_minus_distance"),
+        )
 
     def test_alert_status_distinguishes_active_and_inactive_service(self):
         for active_state, expected in (("active", True), ("inactive", False), ("failed", False)):
@@ -713,12 +980,27 @@ class ContinuousSyncTests(unittest.TestCase):
 
         self.assertIn('p2p_stack = "zakura"', rendered["zakurad.toml.template"])
         self.assertIn('mode_label = "Zakura/v2-only"', rendered["controller.toml"])
+        self.assertIn("stall_seconds = 600", rendered["controller.toml"])
+        self.assertIn("status_unavailable_seconds = 600", rendered["controller.toml"])
         self.assertIn("[[nodes]]", rendered["alert-monitor.toml"])
         self.assertIn('hostname = "temp-zakura-sync-test-1"', rendered["alert-monitor.toml"])
         self.assertIn("zakura-monitor.py", rendered["zakura-monitor.service"])
         self.assertIn("OnUnitActiveSec=1m", rendered["zakura-monitor.timer"])
         self.assertIn("down_confirmation_samples = 2", rendered["alert-monitor.toml"])
         self.assertIn("zakura.service", rendered)
+
+    def test_deploy_keeps_the_dual_stack_stall_deadline_at_the_fleet_default(self):
+        nodes = deploy.load_nodes(
+            ROOT / "deploy" / "continuous-sync" / "nodes.toml",
+            ["temp-zakura-sync-test-1"],
+        )
+        rendered = deploy.render_files(nodes[0])
+
+        # The deadline deliberately matches the node's own 600-second fallback
+        # threshold: PR #732 established that catching a v2 stall before legacy
+        # takes over is the point of this canary.
+        self.assertIn('p2p_stack = "dual"', rendered["zakurad.toml.template"])
+        self.assertIn("stall_seconds = 600", rendered["controller.toml"])
 
     def test_deploy_renders_each_node_public_ip_as_external_address(self):
         nodes = deploy.load_nodes(
@@ -1195,11 +1477,13 @@ p2p_stack = "zakura"
             with (
                 patch.object(alert, "query_node", side_effect=lambda _, node: statuses[node["hostname"]]),
                 patch.object(alert.socket, "gethostname", return_value=local),
-                patch.object(alert, "now", side_effect=[100, 111, 112, 113]),
+                patch.object(alert, "now", side_effect=[100, 101, 111, 112, 113]),
                 patch.object(alert, "post_alert", return_value=True) as post_alert,
             ):
                 alert.run_once(config)
                 statuses[peer]["height"] = 12
+                alert.run_once(config)
+                post_alert.assert_not_called()
                 alert.run_once(config)
                 statuses[local]["height"] = 0
                 statuses[peer]["height"] = 13
@@ -1212,6 +1496,56 @@ p2p_stack = "zakura"
                 [call.args[1] for call in post_alert.call_args_list],
                 ["SYNC STALLED", "SYNC RECOVERED"],
             )
+
+    def test_cluster_stall_timer_excludes_idle_gap_and_restarts_without_evidence(self):
+        local, peer = "local", "peer"
+        for reset in (None, "progress", "peer-unavailable", "local-unavailable", "caught-up"):
+            with self.subTest(reset=reset), tempfile.TemporaryDirectory() as tmp:
+                statuses = {
+                    host: alert_status_fixture(host, service_active=True, height=42)
+                    for host in (local, peer)
+                }
+                config = alert_config(Path(tmp), [local, peer], cluster_stall_seconds=600)
+                timestamp = 100
+                with (
+                    patch.object(alert, "query_node", side_effect=lambda _, node: statuses[node["hostname"]]),
+                    patch.object(alert.socket, "gethostname", return_value=local),
+                    patch.object(alert, "now", side_effect=lambda: timestamp),
+                    patch.object(alert, "post_alert", return_value=True) as post_alert,
+                ):
+                    alert.run_once(config)
+                    timestamp = 767
+                    statuses[peer]["height"] = 43
+                    alert.run_once(config)
+                    timestamp = 1366
+                    alert.run_once(config)
+                    post_alert.assert_not_called()
+                    if reset is None:
+                        timestamp = 1367
+                        alert.run_once(config)
+                        self.assertEqual(post_alert.call_count, 1)
+                        continue
+                    if reset == "progress":
+                        statuses[local]["height"] = 43
+                    elif reset == "peer-unavailable":
+                        statuses[peer]["query_error"] = "timeout"
+                    elif reset == "local-unavailable":
+                        statuses[local]["query_error"] = "timeout"
+                    else:
+                        statuses[peer]["height"] = 42
+                    alert.run_once(config)
+                    timestamp = 1367
+                    statuses[local].pop("query_error", None)
+                    statuses[peer].pop("query_error", None)
+                    statuses[peer]["height"] = 44
+                    alert.run_once(config)
+                    timestamp = 1966
+                    alert.run_once(config)
+                    post_alert.assert_not_called()
+                    timestamp = 1967
+                    alert.run_once(config)
+                    self.assertEqual(post_alert.call_count, 1)
+                    self.assertIn("600s since observing a peer advance ahead", post_alert.call_args.args[4])
 
     def test_stationary_higher_peer_does_not_prove_local_stall(self):
         local = "temp-zakura-sync-test-1"
@@ -1232,6 +1566,38 @@ p2p_stack = "zakura"
                 alert.run_once(config)
 
             post_alert.assert_not_called()
+
+    def test_estimated_height_does_not_supply_cluster_stall_evidence(self):
+        local = "temp-zakura-sync-test-1"
+        peer = "temp-zakura-sync-test-2"
+        statuses = {
+            local: alert_status_fixture(local, service_active=True, height=10),
+            peer: alert_status_fixture(peer, service_active=True, height=11),
+        }
+        statuses[peer]["height_is_exact"] = False
+        statuses[peer]["height_source"] = "estimated_tip_minus_distance"
+        with tempfile.TemporaryDirectory() as tmp:
+            config = alert_config(Path(tmp), [local, peer], cluster_stall_seconds=10)
+            with (
+                patch.object(alert, "query_node", side_effect=lambda _, node: statuses[node["hostname"]]),
+                patch.object(alert.socket, "gethostname", return_value=local),
+                patch.object(alert, "now", side_effect=[100, 111, 112, 113, 123]),
+                patch.object(alert, "post_alert", return_value=True) as post_alert,
+            ):
+                alert.run_once(config)
+                statuses[peer]["height"] = 12
+                alert.run_once(config)
+                statuses[peer]["height_is_exact"] = True
+                statuses[peer]["height_source"] = "state_memory_best_committed_block_height"
+                alert.run_once(config)
+                post_alert.assert_not_called()
+
+                statuses[peer]["height"] = 13
+                alert.run_once(config)
+                post_alert.assert_not_called()
+                alert.run_once(config)
+
+            self.assertEqual([call.args[1] for call in post_alert.call_args_list], ["SYNC STALLED"])
 
     def test_regressing_higher_peer_does_not_prove_local_stall(self):
         local = "temp-zakura-sync-test-1"
@@ -1284,11 +1650,12 @@ p2p_stack = "zakura"
             with (
                 patch.object(alert, "query_node", side_effect=lambda _, node: statuses[node["hostname"]]),
                 patch.object(alert.socket, "gethostname", return_value=local),
-                patch.object(alert, "now", side_effect=[100, 111, 112, 113, 124]),
+                patch.object(alert, "now", side_effect=[100, 101, 111, 112, 113, 124, 134]),
                 patch.object(alert, "post_alert", return_value=True) as post_alert,
             ):
                 alert.run_once(config)
                 statuses[peer]["height"] = 21
+                alert.run_once(config)
                 alert.run_once(config)
 
                 statuses[local]["controller_state"].update({"phase": "failed", "failed": True})
@@ -1300,6 +1667,8 @@ p2p_stack = "zakura"
                 self.assertEqual(post_alert.call_count, 1)
 
                 statuses[peer]["height"] = 22
+                alert.run_once(config)
+                self.assertEqual(post_alert.call_count, 1)
                 alert.run_once(config)
 
             self.assertEqual(
@@ -1320,11 +1689,13 @@ p2p_stack = "zakura"
             with (
                 patch.object(alert, "query_node", side_effect=lambda _, node: statuses[node["hostname"]]),
                 patch.object(alert.socket, "gethostname", return_value=local),
-                patch.object(alert, "now", side_effect=[100, 111, 112, 113]),
+                patch.object(alert, "now", side_effect=[100, 101, 111, 112, 113]),
                 patch.object(alert, "post_alert", side_effect=[True, False, True]) as post_alert,
             ):
                 alert.run_once(config)
                 statuses[peer]["height"] = 12
+                alert.run_once(config)
+                post_alert.assert_not_called()
                 alert.run_once(config)
                 statuses[local]["height"] = 11
                 statuses[peer]["height"] = 13
@@ -1340,6 +1711,42 @@ p2p_stack = "zakura"
             self.assertNotIn(
                 "recovery_pending",
                 state["alerts"][f"local-sync-stall:{local}"],
+            )
+
+    def test_estimated_local_progress_does_not_recover_a_stall_alert(self):
+        local = "temp-zakura-sync-test-1"
+        peer = "temp-zakura-sync-test-2"
+        statuses = {
+            local: alert_status_fixture(local, service_active=True, height=10),
+            peer: alert_status_fixture(peer, service_active=True, height=11),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            config = alert_config(Path(tmp), [local, peer], cluster_stall_seconds=10)
+            with (
+                patch.object(alert, "query_node", side_effect=lambda _, node: statuses[node["hostname"]]),
+                patch.object(alert.socket, "gethostname", return_value=local),
+                patch.object(alert, "now", side_effect=[100, 101, 111, 112, 113]),
+                patch.object(alert, "post_alert", return_value=True) as post_alert,
+            ):
+                alert.run_once(config)
+                statuses[peer]["height"] = 12
+                alert.run_once(config)
+                post_alert.assert_not_called()
+                alert.run_once(config)
+
+                statuses[local]["height"] = 11
+                statuses[local]["height_is_exact"] = False
+                statuses[local]["height_source"] = "estimated_tip_minus_distance"
+                alert.run_once(config)
+                self.assertEqual(post_alert.call_count, 1)
+
+                statuses[local]["height_is_exact"] = True
+                statuses[local]["height_source"] = "state_memory_best_committed_block_height"
+                alert.run_once(config)
+
+            self.assertEqual(
+                [call.args[1] for call in post_alert.call_args_list],
+                ["SYNC STALLED", "SYNC RECOVERED"],
             )
 
     def test_legacy_alert_state_migrates_without_recovery(self):
@@ -2258,12 +2665,22 @@ def alert_status_fixture(
         "service_active": service_active,
         "metrics_status": "ok" if service_active else "unavailable",
         "height": height,
+        "height_source": "state_memory_best_committed_block_height" if height is not None else None,
+        "height_is_exact": height is not None,
         "connection": "root@138.68.43.212",
         "alias_connection": f"ssh {hostname}",
         "log_path": "/tmp/zebrad.log",
         "trace_path": "/tmp/traces",
         "monitor_log_path": "/tmp/monitor.log",
         "controller_state": {"phase": phase, "failed": False},
+    }
+
+
+def exact_sync_sample(committed_height: int, header_height: int) -> dict[str, object]:
+    return {
+        "metrics_status": "ok",
+        "committed_height": committed_height,
+        "header_height": header_height,
     }
 
 

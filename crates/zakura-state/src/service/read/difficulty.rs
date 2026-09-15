@@ -382,7 +382,7 @@ mod tests {
             .zcash_deserialize_into()
             .expect("the genesis vector is valid");
 
-        // ZIP 218 widens the span in `nu7-experimental` builds.
+        // ZIP 218 widens the span in `nu7` builds.
         let span = u32::try_from(POW_ADJUSTMENT_BLOCK_SPAN).unwrap();
 
         for network in [Network::Mainnet, Network::new_default_testnet()] {

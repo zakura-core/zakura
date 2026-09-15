@@ -351,7 +351,7 @@ fn check_height_for_num_halvings() {
 /// Tests the ZIP 218 target spacing, halving, and block subsidy across the NU7
 /// activation boundary on a configured Testnet.
 #[test]
-#[cfg(feature = "nu7-experimental")]
+#[cfg(feature = "nu7")]
 fn post_nu7_spacing_halving_and_subsidy() -> Result<(), Report> {
     use crate::parameters::{
         testnet::{self, ConfiguredActivationHeights},
@@ -443,7 +443,7 @@ fn post_nu7_spacing_halving_and_subsidy() -> Result<(), Report> {
 /// Tests that the ZIP 218 difficulty averaging window widens at the NU7
 /// activation height.
 #[test]
-#[cfg(feature = "nu7-experimental")]
+#[cfg(feature = "nu7")]
 fn averaging_window_changes_at_nu7_activation_height() -> Result<(), Report> {
     use crate::parameters::{
         testnet::{self, ConfiguredActivationHeights},

@@ -13,9 +13,9 @@ rust-version.workspace = true
 
 [features]
 
-# Experimental candidate NU7 consensus rules, dormant until NU7 activates.
-nu7-experimental = [
-    "zakura-chain/nu7-experimental",
+# NU7 consensus rules. Off by default until NU7 has activation heights.
+nu7 = [
+    "zakura-chain/nu7",
 ]
 
 fuzz-impl = []

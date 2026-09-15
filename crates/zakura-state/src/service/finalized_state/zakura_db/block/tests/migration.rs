@@ -32,7 +32,7 @@ use crate::{
     Config,
 };
 
-#[cfg(feature = "nu7-experimental")]
+#[cfg(feature = "nu7")]
 use crate::service::finalized_state::HEADER_VALIDATION_CONTEXT;
 
 fn engine_config(network: Network, genesis: &Arc<block::Block>) -> EngineConfig {
@@ -210,7 +210,7 @@ fn predecessor_overlay_is_atomically_replaced_from_finalized_state() {
 }
 
 #[test]
-#[cfg(feature = "nu7-experimental")]
+#[cfg(feature = "nu7")]
 fn zip218_build_backfills_an_existing_validation_context_before_startup() {
     let _init_guard = zakura_test::init();
     let network = Network::Mainnet;

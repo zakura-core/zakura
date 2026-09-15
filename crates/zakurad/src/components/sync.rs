@@ -9,7 +9,7 @@ use std::{
     future::Future,
     pin::Pin,
     task::Poll,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use color_eyre::eyre::{eyre, Report};
@@ -21,7 +21,7 @@ use indexmap::IndexSet;
 use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{mpsc, watch},
-    time::{sleep, sleep_until, timeout},
+    time::{sleep, sleep_until, timeout, timeout_at},
 };
 use tower::{
     builder::ServiceBuilder, hedge::Hedge, limit::ConcurrencyLimit, timeout::Timeout, Service,
@@ -889,7 +889,7 @@ where
     /// The cached block chain state.
     state: ZS,
     discovery: discovery::Discovery,
-    last_verified_progress: Instant,
+    last_verified_progress: tokio::time::Instant,
 
     /// Allows efficient access to the best tip of the blockchain.
     latest_chain_tip: ZSTip,
@@ -1069,7 +1069,7 @@ where
             downloads,
             state,
             discovery: Default::default(),
-            last_verified_progress: Instant::now(),
+            last_verified_progress: tokio::time::Instant::now(),
             latest_chain_tip,
             prospective_tips: HashSet::new(),
             recent_syncs,
@@ -1527,7 +1527,7 @@ where
         let mut extend: Option<Pin<Box<dyn Future<Output = ExtendOutput> + Send>>> = None;
 
         // Candidate arrivals and retries cannot postpone the verified-progress deadline.
-        self.last_verified_progress = Instant::now();
+        self.last_verified_progress = tokio::time::Instant::now();
 
         'sync_round: loop {
             self.discovery.expire();
@@ -1548,7 +1548,7 @@ where
                         )))
                     ) {
                         self.discovery.committed(hash);
-                        self.last_verified_progress = Instant::now();
+                        self.last_verified_progress = tokio::time::Instant::now();
                     }
                 }
             })
@@ -1579,7 +1579,12 @@ where
                 // Handle completed block tasks. Missing blocks may be requeued; duplicate,
                 // cancelled, behind-tip, above-lookahead, and no-height blocks are treated as
                 // non-fatal. Other download or verification errors restart this sync round.
-                let result = self.handle_block_response_with_missing_retry(rsp).await;
+                let result = timeout_at(
+                    self.last_verified_progress + BLOCK_VERIFY_TIMEOUT,
+                    self.handle_block_response_with_missing_retry(rsp),
+                )
+                .await
+                .map_err(Report::from)?;
                 if header_runtime_status
                     .as_ref()
                     .is_some_and(|status| status.borrow().is_ready())
@@ -1594,6 +1599,13 @@ where
                     continue 'sync_round;
                 }
                 result?;
+            }
+            let progress_deadline = self.last_verified_progress + BLOCK_VERIFY_TIMEOUT;
+            if tokio::time::Instant::now() >= progress_deadline {
+                self.trace_sync_snapshot("round_stalled", reserve.len());
+                return Err(eyre!(
+                    "sync round stalled: no verified block progress within timeout"
+                ));
             }
             metrics::gauge!("sync.reserve.depth").set(reserve.len() as f64);
             self.update_metrics();
@@ -1647,8 +1659,8 @@ where
                     "requesting more blocks",
                 );
 
-                let response = timeout(
-                    BLOCK_VERIFY_TIMEOUT,
+                let response = timeout_at(
+                    progress_deadline,
                     self.request_blocks(std::mem::take(&mut reserve)),
                 )
                 .await
@@ -1670,11 +1682,20 @@ where
             {
                 // Give the in-flight blocks a chance to finish on their own first, so a healthy
                 // sync doesn't re-run the fanout.
-                let completed = timeout(TIP_REFRESH_INTERVAL, self.downloads.next()).await;
+                let completed = timeout_at(
+                    progress_deadline.min(tokio::time::Instant::now() + TIP_REFRESH_INTERVAL),
+                    self.downloads.next(),
+                )
+                .await;
 
                 match completed {
                     Ok(Some(rsp)) => {
-                        let result = self.handle_block_response_with_missing_retry(rsp).await;
+                        let result = timeout_at(
+                            self.last_verified_progress + BLOCK_VERIFY_TIMEOUT,
+                            self.handle_block_response_with_missing_retry(rsp),
+                        )
+                        .await
+                        .map_err(Report::from)?;
                         if header_runtime_status
                             .as_ref()
                             .is_some_and(|status| status.borrow().is_ready())
@@ -1697,7 +1718,7 @@ where
                     Err(_) => {
                         if self.last_verified_progress.elapsed() >= BLOCK_VERIFY_TIMEOUT {
                             return Err(eyre!(
-                                "sync round stalled: no block completed or tips extended within timeout"
+                                "sync round stalled: no verified block progress within timeout"
                             ));
                         }
 
@@ -1708,9 +1729,11 @@ where
                         );
                         metrics::counter!("sync.tip.refresh").increment(1);
 
-                        let refreshed =
-                            timeout(SYNC_RESTART_DELAY, self.obtain_tips(checkpoint_bootstrap))
-                                .await;
+                        let refreshed = timeout_at(
+                            progress_deadline.min(tokio::time::Instant::now() + SYNC_RESTART_DELAY),
+                            self.obtain_tips(checkpoint_bootstrap),
+                        )
+                        .await;
 
                         // A refresh is not progress, even when it returns hashes.
                         //
@@ -1720,8 +1743,7 @@ where
                         // `request_blocks` drops them as duplicates. Treating that as progress would
                         // hold off the stall detector forever, so a range that can never complete
                         // would refresh every `TIP_REFRESH_INTERVAL` instead of restarting the round
-                        // and re-downloading. Only a completed block or a finished extension counts,
-                        // which is what the arms below record.
+                        // and re-downloading. Only a verified block counts as progress.
                         match refreshed {
                             Ok(hashes) => reserve.extend(hashes?),
                             Err(_) => info!(
@@ -1754,7 +1776,7 @@ where
             // Copy the earliest backoff deadline out so the timer future doesn't borrow `self`
             // across the `select!` while other arms borrow `self.downloads`.
             let registry_retry_at = self.registry_miss_retry.values().min().copied();
-            let step = timeout(BLOCK_VERIFY_TIMEOUT, async {
+            let step = timeout_at(progress_deadline, async {
                 tokio::select! {
                     biased;
 
@@ -1788,7 +1810,10 @@ where
 
                     rsp = self.downloads.next(), if has_inflight => {
                         let rsp = rsp.expect("downloads is nonempty");
-                        let result = self.handle_block_response_with_missing_retry(rsp).await;
+                        let result = timeout_at(
+                    self.last_verified_progress + BLOCK_VERIFY_TIMEOUT,
+                    self.handle_block_response_with_missing_retry(rsp),
+                ).await.map_err(Report::from)?;
                         if header_runtime_status
                             .as_ref()
                             .is_some_and(|status| status.borrow().is_ready())
@@ -1838,7 +1863,7 @@ where
                     if self.last_verified_progress.elapsed() >= BLOCK_VERIFY_TIMEOUT {
                         self.trace_sync_snapshot("round_stalled", reserve.len());
                         return Err(eyre!(
-                            "sync round stalled: no block completed or tips extended within timeout"
+                            "sync round stalled: no verified block progress within timeout"
                         ));
                     }
                 }
@@ -2596,7 +2621,7 @@ where
     ) -> Result<(), Report> {
         if let Ok((_height, hash)) = response.as_ref() {
             self.discovery.committed(*hash);
-            self.last_verified_progress = Instant::now();
+            self.last_verified_progress = tokio::time::Instant::now();
             self.missing_block_retry_counts.remove(hash);
             self.transient_block_retry_counts.remove(hash);
             self.poisoned_block_retry_counts.remove(hash);

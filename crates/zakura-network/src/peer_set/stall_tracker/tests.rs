@@ -147,3 +147,31 @@ async fn verified_completion_wins_against_later_expiry() {
     assert!(tracker.eligible(&addr));
     assert!(!tracker.counts.contains_key(&addr));
 }
+
+#[tokio::test(start_paused = true)]
+async fn deadlines_wake_an_idle_owner() {
+    use std::sync::atomic::AtomicBool;
+    struct WakeFlag(AtomicBool);
+    impl futures::task::ArcWake for WakeFlag {
+        fn wake_by_ref(flag: &Arc<Self>) {
+            flag.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let flag = Arc::new(WakeFlag(AtomicBool::new(false)));
+    let waker = futures::task::waker(flag.clone());
+    let cx = Context::from_waker(&waker);
+    let mut tracker = FindResponseStallTracker::new();
+    let addr = test_addr(1);
+    tracker.connection(addr, 1);
+    let _retained = tracker.start(addr).unwrap();
+    tracker.drain(&cx);
+    tokio::time::advance(FEEDBACK_LIFETIME).await;
+    tokio::task::yield_now().await;
+    assert!(flag.0.swap(false, Ordering::SeqCst));
+    tracker.drain(&cx);
+    assert!(!tracker.eligible(&addr));
+    tokio::time::advance(REPROBE_DELAY).await;
+    tokio::task::yield_now().await;
+    assert!(flag.0.load(Ordering::SeqCst));
+    assert!(tracker.eligible(&addr));
+}

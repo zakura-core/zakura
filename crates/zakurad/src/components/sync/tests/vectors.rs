@@ -3933,3 +3933,38 @@ async fn tip_height_without_a_tip_hash_keeps_the_behind_tip_policy() {
 
     verifier.expect_no_requests().await;
 }
+
+/// Regular retry responses cannot extend the deadline without a committed block.
+#[tokio::test(start_paused = true)]
+async fn active_registry_retries_do_not_postpone_verified_progress_deadline() {
+    let (mut syncer, _status, _verifier, mut peers, _state, _tip) =
+        setup_chain_sync_with_options(Height(0), STALLED_SERVICE_REQUEST_DELAY);
+    let hash = block::Hash([0xCE; 32]);
+    let started = tokio::time::Instant::now();
+    let mut requests = 0;
+    let result = {
+        let round = syncer.sync_round([hash].into_iter().collect(), None);
+        tokio::pin!(round);
+        loop {
+            tokio::select! {
+                result = &mut round => break result,
+                response = peers.expect_request(zn::Request::BlocksByHash([hash].into_iter().collect())) => {
+                    requests += 1;
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    response.respond(Err(not_found_registry_error(hash)));
+                }
+            }
+        }
+    };
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("no verified block progress"));
+    assert!(
+        requests > 10,
+        "the round must receive repeated non-progress responses"
+    );
+    assert!(requests < sync::MISSING_BLOCK_REGISTRY_RETRY_LIMIT);
+    assert!(started.elapsed() <= sync::BLOCK_VERIFY_TIMEOUT + Duration::from_secs(10));
+    syncer.downloads.cancel_all();
+}

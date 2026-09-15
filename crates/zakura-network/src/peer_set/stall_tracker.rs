@@ -6,6 +6,8 @@ use super::discovery_feedback::{
 use futures::task::AtomicWaker;
 use std::{
     collections::{HashMap, VecDeque},
+    future::Future,
+    pin::Pin,
     sync::{
         atomic::{AtomicU8, Ordering},
         Arc,
@@ -39,6 +41,7 @@ pub(super) struct FindResponseStallTracker {
     connections: HashMap<PeerSocketAddr, Connection>,
     wake: Arc<AtomicWaker>,
     selection: u64,
+    deadline: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl FindResponseStallTracker {
@@ -159,6 +162,28 @@ impl FindResponseStallTracker {
                 }
                 _ => {}
             }
+        }
+        // The owner must wake even when no network or consumer event arrives.
+        let next_deadline = self
+            .connections
+            .values()
+            .flat_map(|connection| {
+                connection
+                    .pending
+                    .front()
+                    .map(|(at, _)| *at)
+                    .into_iter()
+                    .chain(connection.reprobe_at.filter(|at| *at > Instant::now()))
+            })
+            .min();
+        if let Some(at) = next_deadline {
+            let timer = self
+                .deadline
+                .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(at)));
+            timer.as_mut().reset(at);
+            let _ = timer.as_mut().poll(&mut Context::from_waker(cx.waker()));
+        } else {
+            self.deadline = None;
         }
         disconnect
     }

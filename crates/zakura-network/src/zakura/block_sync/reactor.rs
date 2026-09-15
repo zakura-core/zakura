@@ -82,6 +82,7 @@ struct PendingNeededQuery {
     limit: u32,
     best_header_tip: block::Height,
     best_header_hash: block::Hash,
+    hint_revision: Option<u64>,
 }
 
 fn synchronize_persisted_body_alarm(
@@ -268,6 +269,7 @@ pub fn spawn_block_sync_reactor(
         verified_block_tip: startup.frontiers.verified_block_tip,
         request_floor: startup.frontiers.verified_block_tip,
         pending_needed_query: None,
+        hint_refresh: None,
         needed_query_retry_at: None,
         pending_body_supplier_restart: None,
         pending_operator_body_retry: None,
@@ -366,6 +368,8 @@ pub(super) struct BlockSyncReactor {
     request_floor: block::Height,
     /// Identity and scope of the state query awaiting a response.
     pending_needed_query: Option<PendingNeededQuery>,
+    /// Revision and bounded height interval of queued hints being refreshed.
+    hint_refresh: Option<(u64, block::Height, block::Height)>,
     /// Earliest time to retry the last failed body-missing metadata query.
     needed_query_retry_at: Option<Instant>,
     /// Supplier-set restart submitted against the current durable version.
@@ -960,7 +964,59 @@ impl BlockSyncReactor {
             Some(_) => {}
         }
 
-        if header_changed || current_scope != previous_scope {
+        if body_work_epoch_changed {
+            self.hint_refresh = None;
+        }
+        let hints_changed = previous
+            .as_ref()
+            .is_some_and(|old| old.body_size_hint_revision != view.body_size_hint_revision);
+        let refresh_pending_query = hints_changed && self.pending_needed_query.is_some();
+        if hints_changed {
+            // An older query can carry sizes from before this correction.
+            self.clear_pending_needed_query();
+            let old_revision = previous
+                .as_ref()
+                .expect("a hint change has a previous view")
+                .body_size_hint_revision;
+            let batches = view.body_size_hint_batches.as_deref().unwrap_or_default();
+            let first_revision = batches.first().map(|batch| batch.revision);
+            if first_revision.is_some_and(|first| first <= old_revision.saturating_add(1)) {
+                if let Some(scope) = current_scope {
+                    self.state.work_queue.refresh_size_estimates(
+                        scope,
+                        batches
+                            .iter()
+                            .filter(|batch| batch.revision > old_revision)
+                            .flat_map(|batch| batch.updates.iter().copied())
+                            .map(|(height, hash, hint)| {
+                                (
+                                    height,
+                                    hash,
+                                    match hint {
+                                        zakura_header_chain::BodySizeHint::Known(size) => {
+                                            BlockSizeEstimate::Advertised(size.get())
+                                        }
+                                        zakura_header_chain::BodySizeHint::Unknown => {
+                                            BlockSizeEstimate::Unknown
+                                        }
+                                    },
+                                )
+                            }),
+                    );
+                }
+            } else {
+                self.hint_refresh = self
+                    .state
+                    .work_queue
+                    .queued_bounds()
+                    .map(|(from, through)| (view.body_size_hint_revision, from, through));
+            }
+        }
+        if header_changed
+            || current_scope != previous_scope
+            || refresh_pending_query
+            || (hints_changed && self.hint_refresh.is_some())
+        {
             self.query_needed_blocks_with_options(true).await;
         }
     }
@@ -1251,6 +1307,9 @@ impl BlockSyncReactor {
                 .increment(1);
             return;
         }
+        let completed_query = self
+            .pending_needed_query
+            .expect("the completion matched above");
         self.clear_pending_needed_query();
 
         if self.body_work_scope() != Some(scope) {
@@ -1274,7 +1333,24 @@ impl BlockSyncReactor {
             }
             return;
         }
+        if completed_query.hint_revision.is_some() {
+            self.state.work_queue.refresh_size_estimates(
+                scope,
+                blocks
+                    .iter()
+                    .map(|block| (block.height, block.hash, block.size)),
+            );
+        }
         self.handle_needed_blocks(scope, blocks).await;
+        if let Some((revision, from, through)) = self.hint_refresh {
+            if completed_query.hint_revision == Some(revision) && completed_query.from == from {
+                let next = block::Height(from.0.saturating_add(completed_query.limit));
+                self.hint_refresh = (next <= through).then_some((revision, next, through));
+            }
+            if self.hint_refresh.is_some() {
+                self.query_needed_blocks_with_options(true).await;
+            }
+        }
     }
 
     fn handle_needed_blocks_query_failed(
@@ -1735,13 +1811,35 @@ impl BlockSyncReactor {
             self.clear_pending_needed_query();
             return true;
         }
-        let Some(from) = self.next_needed_block_query_start() else {
+        if self
+            .hint_refresh
+            .is_some_and(|(_, _, through)| through <= self.request_floor)
+        {
+            self.hint_refresh = None;
+        }
+        let refresh = self.hint_refresh;
+        let Some(from) = refresh
+            .map(|(_, from, _)| from)
+            .or_else(|| self.next_needed_block_query_start())
+        else {
             return true;
         };
-        if !force && self.local_body_work_blocks() >= self.refill_low_water_blocks() {
+        if !force
+            && refresh.is_none()
+            && self.local_body_work_blocks() >= self.refill_low_water_blocks()
+        {
             return true;
         }
-        let limit = self.refill_query_limit_blocks(from);
+        let limit = refresh.map_or_else(
+            || self.refill_query_limit_blocks(from),
+            |(_, _, through)| {
+                through
+                    .0
+                    .saturating_sub(from.0)
+                    .saturating_add(1)
+                    .min(NEEDED_BLOCK_REFILL_LIMIT)
+            },
+        );
         let Some(scope) = self.body_work_scope() else {
             tracing::error!("cannot schedule Zakura body work without a committed engine snapshot");
             return false;
@@ -1757,9 +1855,11 @@ impl BlockSyncReactor {
             limit,
             best_header_tip: self.state.best_header_tip,
             best_header_hash: self.state.best_header_hash,
+            hint_revision: refresh.map(|(revision, _, _)| revision),
         };
         if self.pending_needed_query.is_some_and(|pending| {
-            pending.scope == query.scope
+            pending.hint_revision == query.hint_revision
+                && pending.scope == query.scope
                 && pending.from == query.from
                 && pending.limit == query.limit
                 && pending.best_header_tip == query.best_header_tip

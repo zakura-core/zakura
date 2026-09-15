@@ -274,3 +274,18 @@ borrowed a bypass slot.
 - **Block gate does not count the sequencer input channel** (its bytes are charged, its
   count is not); the channel is bounded by the submit window (401 by default), which is
   noise against the 262,144 default cap.
+
+## Size corrections
+
+A later known hint for the same header and auxiliary payload can replace an unknown
+or stale size. Unknown never erases known. State keeps the correction in a sparse
+`header_aux_body_size_v1` row beside the original delivery evidence and removes it
+when that delivery is pruned. Committed block sizes still take precedence.
+
+Committed corrections publish bounded batches of affected hashes. The queue updates
+matching pending items and saves newer hints for retries without changing issued
+reservations. A local measured size remains a minimum for a pressure retry. If a
+consumer misses the retained update history, it refreshes its existing queued window
+in bounded state queries. Accurate first deliveries add no correction writes or
+refresh queries. Size-only changes leave verification observations, header generations,
+and body-work epochs intact.

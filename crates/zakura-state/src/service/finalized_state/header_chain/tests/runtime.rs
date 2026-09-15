@@ -2078,7 +2078,7 @@ async fn retained_path_serves_a_bounded_finalized_range_below_the_header_frontie
 
 #[test]
 fn body_size_hints_by_hash_read_known_sizes_from_retained_deliveries() {
-    let (runtime, _db, _genesis, path) = reconciled_store_with_finalized_prefix(5);
+    let (runtime, db, _genesis, path) = reconciled_store_with_finalized_prefix(5);
     let parent = Frontier::new(path[2].height, path[2].hash);
     let target = Frontier::new(path[3].height, path[3].hash);
     let successor = Frontier::new(path[4].height, path[4].hash);
@@ -2141,6 +2141,7 @@ fn body_size_hints_by_hash_read_known_sizes_from_retained_deliveries() {
             )],
         })),
     };
+    let original_request = request.clone();
     let context = TransitionContext {
         config: &runtime.config,
         clock: &SystemClock,
@@ -2160,6 +2161,58 @@ fn body_size_hints_by_hash_read_known_sizes_from_retained_deliveries() {
         .expect("the delivery hints read");
 
     assert_eq!(hints, vec![None, Some(known_size), None]);
+    assert!(runtime
+        .store
+        .scan_raw(HEADER_AUX_BODY_SIZE)
+        .unwrap()
+        .is_empty());
+    let before = runtime.publisher().view();
+    let mut correction = original_request;
+    correction.expected_version = before.state_version;
+    let TransitionEvent::InsertHeaders(insert) = &mut correction.event else {
+        unreachable!()
+    };
+    let new_owner = HeaderWorkAuthority::for_target(&before.snapshot, target.hash)
+        .bind(27, NonZeroU64::new(29).unwrap());
+    insert.owner = new_owner.into();
+    insert.completion = TargetCompletion::TargetPrefix {
+        common_ancestor: parent,
+    };
+    insert.aux[0].owner = new_owner.into();
+    insert.aux[0].delivery_id = EvidenceId::from_digest([0xc4; 32]);
+    insert.aux[0].body_size = zakura_header_chain::BodySizeHint::new(3_146).unwrap();
+    let corrected = runtime.apply(correction, &context).unwrap();
+    assert!(matches!(corrected, ApplyResult::Committed), "{corrected:?}");
+    let after = runtime.publisher().view();
+    assert_eq!(after.header_generation, before.header_generation);
+    assert_eq!(after.body_work_epoch, before.body_work_epoch);
+    assert_eq!(
+        after.body_size_hint_revision,
+        before.body_size_hint_revision + 1
+    );
+    assert_eq!(
+        runtime.store.scan_raw(HEADER_AUX_DELIVERY).unwrap().len(),
+        1
+    );
+    assert_eq!(
+        runtime.store.scan_raw(HEADER_AUX_BODY_SIZE).unwrap().len(),
+        1
+    );
+    let persisted = runtime.store.untrusted_aux_deliveries(target.hash).unwrap();
+    assert_eq!(
+        persisted[0].delivery().body_size,
+        zakura_header_chain::BodySizeHint::Known(known_size)
+    );
+    let config = runtime.config.clone();
+    drop(runtime);
+    let (reopened, _) = HeaderChainStore::new(db).startup(&config).unwrap();
+    assert_eq!(
+        reopened
+            .reader()
+            .body_size_hints_by_hash(&[target.hash])
+            .unwrap(),
+        vec![std::num::NonZeroU32::new(3_146)]
+    );
 }
 
 #[test]

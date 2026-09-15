@@ -1142,3 +1142,136 @@ fn auxiliary_resource_limits_reject_equal_plus_one_without_effects() {
     assert!(!store.metadata.alarms.resource_stalled);
     assert!(store.aux.is_empty());
 }
+
+#[test]
+fn duplicate_hints_refresh_scheduling_without_replacing_evidence() {
+    for original_size in [0, 2_000_000] {
+        let (mut store, config) = TestStore::new(EngineMode::Integrated);
+        let clock = ManualClock(Utc::now());
+        let anchor = store.lease.parent;
+        let mut initial = insertion(&store, 2, EvidenceId::from_digest([0x60; 32]));
+        let TransitionEvent::InsertHeaders(insert) = &mut initial.event else {
+            unreachable!()
+        };
+        let mut original = unauthenticated_delivery(insert, EvidenceId::from_digest([0x61; 32]));
+        original.body_size = crate::BodySizeHint::new(original_size).unwrap();
+        original.tree_aux = Some(crate::TreeAuxRecordV1 {
+            height: insert.batch.headers()[0].height,
+            sapling_root: Default::default(),
+            orchard_root: Default::default(),
+            ironwood_root: Default::default(),
+            sapling_tx_count: 1,
+            orchard_tx_count: 0,
+            ironwood_tx_count: 0,
+            auth_data_root: [0x62; 32].into(),
+        });
+        insert.aux = vec![original];
+        let template = insert.clone();
+        let first = apply_transition(&store, initial, &context(&config, &clock, None)).unwrap();
+        store.commit(&first);
+        // Prepare verification against the original evidence before any correction.
+        let observation = crate::AuxObservationV1::from_vct(
+            body_owner(&store.snapshot(), 8, 1),
+            vec![original],
+            crate::AuxVerificationFactV1::current_delivery_verified(),
+            Some([0x62; 32].into()),
+        )
+        .unwrap();
+        let generations = (
+            store.metadata.header_generation,
+            store.metadata.verified_generation,
+        );
+        let mut current_size = original_size;
+        for (index, sizes) in [
+            vec![3_146],
+            vec![7_000],
+            vec![0],
+            vec![7_000],
+            vec![2_000_000, 3_146],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            store.lease.parent = anchor;
+            let mut replay = template.clone();
+            let marker = u8::try_from(index).unwrap() + 0x70;
+            replay.owner = crate::HeaderWorkOwner {
+                authority: crate::HeaderWorkAuthority::for_target(
+                    &store.snapshot(),
+                    replay.target_tip_hash,
+                ),
+                session_id: u64::from(marker),
+                request_id: NonZeroU64::new(1).unwrap(),
+            }
+            .into();
+            replay.source = SourceId::from_digest([marker; 32]);
+            replay.aux = sizes
+                .iter()
+                .enumerate()
+                .map(|(offset, size)| {
+                    crate::AuxDelivery::new(
+                        EvidenceId::from_digest([marker + u8::try_from(offset).unwrap() + 16; 32]),
+                        original.header_hash,
+                        replay.source,
+                        replay.owner,
+                        crate::BodySizeHint::new(*size).unwrap(),
+                        original.tree_aux,
+                    )
+                })
+                .collect();
+            let expected_size = sizes
+                .iter()
+                .rev()
+                .copied()
+                .find(|size| *size != 0)
+                .unwrap_or(current_size);
+            let plan = apply_transition(
+                &store,
+                TransitionRequest {
+                    expected_version: store.metadata.state_version,
+                    event: TransitionEvent::InsertHeaders(replay),
+                },
+                &context(&config, &clock, None),
+            )
+            .unwrap();
+            assert_eq!(plan.is_no_change(), current_size == expected_size);
+            assert!(
+                plan.change_set.aux_changes.len() <= 1,
+                "same-batch corrections coalesce"
+            );
+            assert!(!plan.effect().invalidates_body_work());
+            store.commit(&plan);
+            current_size = expected_size;
+            assert_eq!(store.aux.len(), 1);
+            assert_eq!(store.aux[0].without_scheduling_body_size(), original);
+            assert_eq!(
+                store.aux[0].effective_body_size(),
+                crate::BodySizeHint::new(expected_size).unwrap()
+            );
+            assert_eq!(
+                (
+                    store.metadata.header_generation,
+                    store.metadata.verified_generation
+                ),
+                generations
+            );
+        }
+        let authenticated = apply_transition(
+            &store,
+            TransitionRequest {
+                expected_version: store.metadata.state_version,
+                event: TransitionEvent::AuxEvidence(Box::new(crate::AuxEvidence::observed(
+                    observation,
+                ))),
+            },
+            &context(&config, &clock, Some(&Authority)),
+        )
+        .unwrap();
+        store.commit(&authenticated);
+        assert!(store.aux[0].is_authenticated());
+        assert_eq!(
+            crate::AuxDelivery::advertised_body_size(&store.aux),
+            std::num::NonZeroU32::new(3_146)
+        );
+    }
+}

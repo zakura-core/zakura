@@ -22,8 +22,14 @@ pub(crate) use response::{ResponseCredit, ResponseCreditExceeded};
 mod response_index;
 pub(crate) use response_index::{ResponseIndex, ResponseMatch};
 
+mod response_scope;
+pub(crate) use response_scope::{ResponseAuthorization, ResponseScope, ResponseWritePermission};
+
 #[cfg(test)]
 mod tests;
 
 #[cfg(test)]
 mod slot_properties;
+
+#[cfg(test)]
+mod response_properties;

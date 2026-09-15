@@ -1,6 +1,8 @@
 use super::super::tests::mainnet_decoder;
 use super::*;
 
+mod session_fencing;
+
 #[test]
 fn inbound_half_pairs_leave_an_outbound_setup_slot() {
     let limits = ServicePeerLimits::default();

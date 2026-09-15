@@ -13,6 +13,7 @@ use tokio::sync::Notify;
 use zakura_chain::serialization::ZcashDecoder;
 
 mod sessions;
+use crate::zakura::regulation::{ResponseAuthorization, ResponseScope};
 pub(super) use sessions::CurrentSessions;
 use sessions::SessionCapacity;
 
@@ -62,6 +63,7 @@ pub struct BlockSyncPeerSession {
     cancel_token: CancellationToken,
     connection_cancel: CancellationToken,
     close_cause: crate::zakura::CloseCause,
+    response_scope: ResponseScope,
     /// One stored wake released after the reactor installs this serving handle.
     reactor_ready: Arc<Notify>,
 }
@@ -83,6 +85,7 @@ impl BlockSyncPeerSession {
             requests,
             remote_status: watch::channel(false).0,
             cancel_token: session.cancel_token(),
+            response_scope: ResponseScope::new(connection_cancel.clone(), close_cause.clone()),
             connection_cancel,
             close_cause,
             reactor_ready: Arc::new(Notify::new()),
@@ -109,6 +112,8 @@ impl BlockSyncPeerSession {
         send: FramedSend,
         cancel_token: CancellationToken,
     ) -> Self {
+        let connection_cancel = CancellationToken::new();
+        let close_cause = crate::zakura::CloseCause::new();
         Self {
             peer_id,
             session_id,
@@ -117,8 +122,9 @@ impl BlockSyncPeerSession {
             send,
             remote_status: watch::channel(false).0,
             cancel_token,
-            connection_cancel: CancellationToken::new(),
-            close_cause: crate::zakura::CloseCause::new(),
+            response_scope: ResponseScope::new(connection_cancel.clone(), close_cause.clone()),
+            connection_cancel,
+            close_cause,
             reactor_ready: Arc::new(Notify::new()),
         }
     }
@@ -148,6 +154,10 @@ impl BlockSyncPeerSession {
         self.close_cause.record(reason);
         self.connection_cancel.cancel();
         self.cancel_token.cancel();
+    }
+
+    pub(super) fn authorize_response(&self) -> Option<ResponseAuthorization> {
+        self.response_scope.authorize()
     }
 
     #[cfg(test)]
@@ -278,6 +288,9 @@ impl BlockSyncServiceInner {
             return false;
         }
 
+        // Fence publication and first writes before another session can enter.
+        let reusable = active_peers[peer].session.response_scope.retire();
+
         let removed = active_peers
             .remove(peer)
             .expect("record exists because the ownership check just matched it");
@@ -289,18 +302,22 @@ impl BlockSyncServiceInner {
 
         // The connection may outlive this session while the transport backs off
         // before reopening the stream; remember the claim so ownership checks
-        // bridge the gap. The claim is written while still holding the peer-map
-        // lock so a concurrent `remove_peer` for the closing connection cannot
-        // clear claims between the removal above and this insert, which would
-        // leak a claim for a dead connection.
-        if let Ok(mut claims) = self.session_gap_claims.lock() {
-            claims.insert(
-                peer.clone(),
-                SessionGapClaim {
-                    conn_id,
-                    direction: removed.direction,
-                },
-            );
+        // bridge the gap. Only a connection the fence above left reusable can be
+        // claimed — retiring an unfinished started response closes it. The claim
+        // is written while still holding the peer-map lock so a concurrent
+        // `remove_peer` for the closing connection cannot clear claims between
+        // the removal above and this insert, which would leak a claim for a dead
+        // connection.
+        if reusable {
+            if let Ok(mut claims) = self.session_gap_claims.lock() {
+                claims.insert(
+                    peer.clone(),
+                    SessionGapClaim {
+                        conn_id,
+                        direction: removed.direction,
+                    },
+                );
+            }
         }
         self.sessions.notify();
         true
@@ -652,6 +669,10 @@ impl Service for BlockSyncService {
                 service_cancel_token.cancel();
                 return;
             }
+            if connection_cancel_token.is_cancelled() {
+                service_cancel_token.cancel();
+                return;
+            }
 
             // A peer registered for this direction may replace its session.
             // A connection-symmetry collision replaces the losing session with the winning stream.
@@ -700,6 +721,28 @@ impl Service for BlockSyncService {
                 } else {
                     (None, false)
                 };
+
+            // Keep the old receiver's publication/start fence under the session-table
+            // lock, but only once admission has accepted this replacement: a peer
+            // parked between the entry check and admission keeps its incumbent.
+            // A started exchange prevents reuse of its connection even if the
+            // old routine has not observed its cancellation yet; that bail path
+            // hands the generation admission just took back to the registry.
+            if let Some(old) = active_peers.get(&peer_id) {
+                let reusable = old.session.response_scope.retire();
+                old.cancel_token.cancel();
+                if old.conn_id == conn_id && !reusable {
+                    if let (Some(wiring), Some(generation)) =
+                        (&self.inner.routine_wiring, routine_generation)
+                    {
+                        wiring.registry.remove_session(&peer_id, generation);
+                    }
+                    connection_cancel_token.cancel();
+                    service_cancel_token.cancel();
+                    return;
+                }
+            }
+
             // Production uses the registry's globally unique routine generation.
             // Handle-less tests use the service-local fallback.
             let session_id = routine_generation
@@ -919,7 +962,10 @@ impl Service for BlockSyncService {
                 .lock()
                 .expect("block-sync peer map mutex is never poisoned");
             let removed = match active_peers.get(peer) {
-                Some(record) if record.conn_id == conn_id => active_peers.remove(peer),
+                Some(record) if record.conn_id == conn_id => {
+                    record.session.response_scope.retire();
+                    active_peers.remove(peer)
+                }
                 Some(_) | None => None,
             };
             // The claim is cleared while still holding the peer-map lock so it

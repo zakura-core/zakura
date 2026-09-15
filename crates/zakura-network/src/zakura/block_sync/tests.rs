@@ -1079,6 +1079,7 @@ fn window_request(height: u32) -> OutstandingBlockRange {
     let byte = u8::try_from(height).expect("test heights fit in u8");
     let now = Instant::now();
     OutstandingBlockRange {
+        authorization: crate::zakura::regulation::ResponseAuthorization::for_test(),
         response: crate::zakura::regulation::ResponseCredit::new(1, u64::MAX),
         local_work_active: true,
         write_status: work_queue::RequestWriteStatus::written_for_tests(),
@@ -1107,6 +1108,7 @@ pub(super) fn window_request_range(start: u32, count: u32) -> OutstandingBlockRa
     let byte = u8::try_from(start).expect("test heights fit in u8");
     let now = Instant::now();
     OutstandingBlockRange {
+        authorization: crate::zakura::regulation::ResponseAuthorization::for_test(),
         response: crate::zakura::regulation::ResponseCredit::new(u64::from(count), u64::MAX),
         local_work_active: true,
         write_status: work_queue::RequestWriteStatus::written_for_tests(),
@@ -3152,12 +3154,19 @@ async fn floor_watchdog_only_avoids_requests_that_started_writing() {
         assert_eq!(items.len(), 1);
         let owner = items[0].1.owner.unwrap();
         assert!(wiring.budget.clone().try_reserve(100));
+        let authorization = crate::zakura::regulation::ResponseScope::new(
+            CancellationToken::new(),
+            crate::zakura::CloseCause::new(),
+        )
+        .authorize()
+        .unwrap();
         let write = RequestWrite::new(
             owner,
             items,
             wiring.work.clone(),
             wiring.budget.clone(),
             CancellationToken::new(),
+            authorization.write_permission(),
         );
         assert!(write.publish(|| {
             wiring.registry.set_outstanding(
@@ -5909,6 +5918,7 @@ fn outstanding_three_block_range(budget: &mut ByteBudget) -> OutstandingBlockRan
     assert!(budget.try_reserve(request.estimated_bytes));
     let now = Instant::now();
     OutstandingBlockRange {
+        authorization: crate::zakura::regulation::ResponseAuthorization::for_test(),
         response: crate::zakura::regulation::ResponseCredit::new(3, u64::MAX),
         local_work_active: true,
         write_status: work_queue::RequestWriteStatus::written_for_tests(),
@@ -6314,6 +6324,7 @@ fn underestimated_body_is_buffered_and_releases_only_its_estimate() {
     assert!(budget.try_reserve(request.estimated_bytes));
     let now = Instant::now();
     let mut outstanding = OutstandingBlockRange {
+        authorization: crate::zakura::regulation::ResponseAuthorization::for_test(),
         response: crate::zakura::regulation::ResponseCredit::new(1, u64::MAX),
         local_work_active: true,
         write_status: work_queue::RequestWriteStatus::written_for_tests(),

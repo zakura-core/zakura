@@ -210,69 +210,23 @@ that connection.
 Arrival times alone cannot reveal unused capacity: a peer might be slow because
 it received the part late, or because its connection is congested. The receiver
 instead tests an alternative under load. It requests the same parts from two
-peers and compares verified arrivals on its own clock. No sender timestamp or
-RTT estimate is needed for that comparison. Ordinary deliveries help select
-candidates. Different-part comparisons alone can confuse peer performance with
+peers and compares verified arrivals on its own clock. Ordinary deliveries help
+select candidates. Different-part comparisons alone can confuse peer performance with
 upstream part availability.
 
-### Delivery feedback and sender timestamps
+### Delivery feedback
 
-We should test ordinary-delivery feedback as a way to reduce challenge traffic.
-A candidate negotiated extension attaches a connection-local sequence and a
-monotonic send timestamp to each `BlockPart`. The sender records the timestamp
-when it submits the part to the transport. The receiver records local receipt
-time. The sender regenerates these fields at each hop outside the immutable part
-commitment.
+The receiver measures delivered bytes over local arrival intervals and filters
+that rate to guide supplier assignments. It excludes the first part's bytes
+when the interval starts at that part's arrival.
 
-Subtracting a remote timestamp from local arrival time does not give one-way
-delay without a clock-offset estimate. Clock error affects one-way measurement
-as described in
-[RFC 7679](https://www.rfc-editor.org/rfc/rfc7679.html#section-3.7). Differences
-within one connection cancel a constant offset, but drift, batching, and
-queueing remain. A timestamp at transport submission also precedes actual packet
-transmission. It measures neither upstream propagation nor unused capacity. A
-peer can lie about any timestamp it supplies.
+Delivery measurements describe active routes. To discover unused capacity, the
+receiver increases assignments within a bounded exploration budget and measures
+the resulting delivery. It reduces future assignments after repeated deadline
+misses. A shared ingress budget limits total demand across peers and active
+blocks. Finite grants bound the traffic each peer may send.
 
-For a contiguous sample of delivered bytes, compare the sender span and the
-receiver span. Dividing bytes by the larger span provides a conservative
-delivery-rate sample under honest timing. Exclude the first part's bytes when
-the span starts at that part's arrival. Keep sample age and application-limited
-state. This estimates achieved delivery, not total available bandwidth.
-Transport ACK, RTT, loss, ECN, and pacing measurements provide stronger local
-signals where the transport exposes them; see
-[RFC 9002](https://www.rfc-editor.org/rfc/rfc9002.html#section-7).
-
-The receiver can use a filtered delivery rate to distribute unique parts and
-bound outstanding bytes across active blocks. Test bounded increases under load
-to discover additional capacity. Reduce future assignments when queue delay
-grows or eligible deliveries miss their deadline. Keep a node-wide ingress
-budget so several peers do not overload the same receiver. Expose the sample
-window, utilization target, queue-delay target, and maximum assignment change as
-local experiment parameters. Finite grants remain the hard limit.
-
-The local experiment compares this allocation direction with the existing
-challenge baseline. Its timestamps mark idealized link service, so its estimate
-is more favorable than application submission timestamps may be in practice. It
-does not justify replacing all challenges. Ordinary deliveries measure active
-routes; bounded exploration still tests unused routes and changed upstream
-availability. Holding the allocator fixed and using only receiver arrival spans
-gave almost the same latency in the local traces. The experiment therefore
-supports testing delivery-aware allocation, but does not establish that sender
-timestamps are worth their wire cost. The subsequent real TCP experiment also
-found no consistent benefit from sender spans. Keep sender timestamps out of the
-baseline wire profile. Receiver-local delivery feedback still needs joint tests
-with the full subscription controller.
-
-The
-[submission-timestamp and nonce-echo experiment](dogwood-experiments.md#submission-timestamps-nonce-echoes-and-shared-credit)
-adds separate proposer routes and shared connection credit over real TCP. It
-improves one upstream-delay case but shows no consistent advantage during
-capacity drops. Echo calibration rejects a large future timestamp shift while
-accepting an 8 ms shift. Deliberately delayed echoes also inflate the learned
-credit. Treat remote timing as optional telemetry. Require actual delivery for
-credit increases and retain hard limits independently of clock calibration.
-
-### Baseline challenge controller
+### Supplier exploration
 
 The controller follows five rules:
 
@@ -325,14 +279,7 @@ latency. The learned budget guides allocation; finite grants and queue limits
 bound resource use.
 
 [Section 7 of the spec](../specs/dogwood.md#7-redundancy-and-route-control)
-defines the measurements and update rules. The
-[standing-route experiment](dogwood-experiments.md#feedback-driven-standing-routes)
-now tests paired route changes and occasional probes of unassigned peers. At
-1,250 Mbps relay upload and 819.2 Mbps body load, adaptation raises completion
-within 400 ms from 12.53% to 100% in the tested traces. It does so partly by
-removing duplicate routes, which reduces failure coverage. The experiment does
-not implement the shared connection-budget controller. That controller and
-coverage-preserving route changes still need an integrated test.
+defines the measurements and update rules.
 
 ## Proposer subscriptions and seeding
 
@@ -411,12 +358,10 @@ seeding budget of one codeword cannot meet every such topology.
 Real sparse subscriptions have different graphs for different parts. The
 proposer also does not know global relay connectivity. The normal design assumes
 one connected relay component and tests standing routes within it. A stalled
-receiver uses bounded `FullBlock`-based pull repair as a fallback. The earlier
-parent-tree repair experiment is not the selected normal propagation path. Fixed
-byte caps, deadlines, failed suppliers, and correlated paths still bound what
+receiver uses bounded `FullBlock`-based pull repair as a fallback. Fixed byte
+caps, deadlines, failed suppliers, and correlated paths bound what
 fallback can recover. The receiver must report degraded service when it cannot
-meet them. All-part relay subscriptions are a correctness baseline, not a
-selected production fanout policy.
+meet them.
 
 ### Large-body stripe candidate
 
@@ -599,16 +544,16 @@ and relay upload as well as receiver capacity.
 | Observation and migration | Require three race votes and a two-thirds win share; move at most four parts per trial. | Noise, part-mask granularity, and measured settling time constrain faster adaptation. |
 | Challenge funding | Fund extra traffic at 1/32 of completed encoded bytes; use one mask bit per trial. | Ordinary-delivery telemetry or existing duplicates may reduce the needed challenge traffic. |
 | Challenge cadence and retention | Start no faster than 250 ms plus jitter; retain at most two trials, 12 blocks, or 20 seconds. | Rare proposers need a longer bounded opportunity window, not faster empty trials. |
-| Candidate delivery-rate estimator | Test 100 ms samples, at least four deliveries, and an EWMA weight of 0.5. | Application-limited traffic, transport batching, clock drift, and shared ingress require further tests. |
+| Candidate delivery-rate estimator | Test 100 ms samples, at least four deliveries, and an EWMA weight of 0.5. | Application-limited traffic, transport batching and shared ingress require further tests. |
 | Queue and recovery reserves | Test 256 queued parts per link and at most `2k` repair copies per block. | Production needs aggregate byte/work caps and fair service under concurrent assemblies. |
 | History, grants, and retained work | Keep finite height, byte, state, and time limits; production values remain open. | Resource measurements set these caps before interoperability. Idle time or new proposer keys must not reset budgets. |
-| Wire and authentication | Hashes, mapping hash, signature, chain binding, frame caps, and optional telemetry format remain open. | These choices require an agreed profile; a receiver cannot tune them unilaterally. |
+| Wire and authentication | Hashes, mapping hash, signature, chain binding, and frame caps require an agreed profile. | These choices require an agreed profile; a receiver cannot tune them unilaterally. |
 
 Local policies can evolve within the spec's bounds as observations accumulate.
 They must record parameter versions with results and avoid interpreting stale
 samples across material workload changes. Wire parameters require negotiation
 before use. Existing grants retain their original authority during a policy
-change. No automatic parity tuner or timestamp extension is selected yet.
+change.
 
 ## Open problems and TODOs
 
@@ -663,9 +608,7 @@ resource bounds are selected. W1 fixes candidate payload bytes and signatures.
   The initial sweep is complete; test correlated loss and joint CPU/network
   costs before selecting a body-size threshold or changing the profile.
 - [ ] **Congestion feedback:** integrate receiver-local feedback with standing
-  push, grants, and receiver-wide queue control. The bounded TCP experiment is
-  complete. Sender timestamps remain omitted; adopting them would require
-  separate clock-drift and dishonest-sender tests.
+  push, grants, and receiver-wide queue control.
 - [ ] **Controller completeness:** implement settling, migration, stale-history,
   grant, and cancellation rules omitted by the reduced simulations.
 - [x] Measure equal-body reference codec scaling from 2 MiB stripes to one

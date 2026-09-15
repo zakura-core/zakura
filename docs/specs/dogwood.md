@@ -833,24 +833,9 @@ block size, topology, or proposer.
 
 ### Measure opportunity and delay
 
-All timestamps in this section come from the receiver's monotonic clock. The
-baseline MUST NOT depend on a sender timestamp, synchronized clocks, an
-application RTT estimate, or an inferred bandwidth-delay product.
-
-This baseline restriction does not preclude a future negotiated telemetry
-extension. A candidate `BlockPart` envelope could carry a connection-local
-sequence and a monotonic transport-submission timestamp. These fields would
-change at each hop outside the part commitment. Their units, precision,
-reset/wrap behavior, authentication, and byte limits remain profile choices.
-They are not wire fields in this draft.
-
-Such an estimator MUST NOT treat remote-clock subtraction as measured one-way
-delay without accounting for clock error. It MUST NOT treat achieved delivery
-rate as unused capacity or grant authority. It MUST tolerate absent, stale,
-reordered, or dishonest telemetry without affecting part validity. Local arrival
-and verification measurements remain available when telemetry fails. The
-[design](../design/dogwood.md#delivery-feedback-and-sender-timestamps) describes
-the candidate estimator and its limits.
+The receiver MUST measure arrival and verification intervals using its local
+monotonic clock. Delivery measurements guide allocation; finite grants define
+how much traffic a peer may send.
 
 Let `t0[b]` be local metadata admission. Local policy MUST select a bounded
 observation duration `D[b]` from the admitted block size and a configured
@@ -1426,9 +1411,7 @@ production defaults or amend the codec and wire profile.
 W1 below owns payload choices. Its codec field bound does not authorize that
 much memory or change `MAX_BLOCK_BYTES`. Production implementations MUST also
 select chain admission, transport negotiation, aggregate work budgets, and
-retention limits. Optional sender telemetry remains outside W1. A future profile
-MUST define timestamp units, sequence reset/wrap rules, queue-residence bounds,
-and an authenticated envelope before enabling telemetry.
+retention limits.
 
 A size-dependent parity profile MUST define a deterministic function of admitted
 coding inputs, such as `parity_parts(k)`, and its maximum output. Receivers MUST

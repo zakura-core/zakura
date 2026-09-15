@@ -322,7 +322,14 @@ async fn a_session_closed_by_its_own_fence_leaves_no_gap_claim() {
 async fn parked_admission_leaves_the_incumbent_session_untouched() {
     // `new_for_test` has no registry wiring, so admission can never return Parked
     // there; the production constructor spawns an inert reactor with wiring.
-    let service = BlockSyncService::new(ZakuraBlockSyncConfig::default(), mainnet_decoder());
+    // Shared so the admitting side can move into a task this test can time out.
+    // A scoped thread cannot be bounded: its join, and the scope exit itself, wait
+    // forever, so the ordering regression this test exists to catch would hang
+    // rather than fail under plain `cargo test`.
+    let service = Arc::new(BlockSyncService::new(
+        ZakuraBlockSyncConfig::default(),
+        mainnet_decoder(),
+    ));
     let peer = ZakuraPeerId::new(vec![0x5a; 32]).unwrap();
     let _first = add_fence_peer(&service, &peer, 1, CancellationToken::new());
     let incumbent = service.current_sessions_for_test().snapshot()[&peer].clone();
@@ -346,9 +353,14 @@ async fn parked_admission_leaves_the_incumbent_session_untouched() {
     let (replacement, _second_input, _second_output) =
         fence_peer(&peer, 2, CancellationToken::new());
     let replacement_cancel = replacement.service_cancel_token();
-    std::thread::scope(|scope| {
+    let admitting = {
+        // Hold the active map first, so the admitting task blocks on it exactly as a
+        // real replacement racing an incumbent would.
         let admitted = service.inner.sessions.active.lock().unwrap();
-        let admitting = scope.spawn(|| service.add_peer(replacement));
+        let admitting = {
+            let service = Arc::clone(&service);
+            tokio::task::spawn_blocking(move || service.add_peer(replacement))
+        };
         let give_up = Instant::now() + Duration::from_secs(10);
         while registry.peer_park_deadline(&probe, before_expiry).is_some() {
             assert!(
@@ -364,8 +376,9 @@ async fn parked_admission_leaves_the_incumbent_session_untouched() {
             Instant::now() + Duration::from_secs(60)
         ));
         drop(admitted);
-        admitting.join().unwrap();
-    });
+        admitting
+    };
+    time::timeout(DEADLINE, admitting).await.unwrap().unwrap();
 
     assert!(
         !incumbent.cancel_token().is_cancelled(),

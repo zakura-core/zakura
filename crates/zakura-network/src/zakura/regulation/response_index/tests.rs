@@ -4,7 +4,7 @@ use std::{cell::Cell, cmp::Ordering, collections::HashMap};
 
 #[test]
 fn duplicate_keys_remain_ambiguous_until_one_owner_remains() {
-    let mut index = ResponseIndex::new();
+    let mut index = funded_index();
     index.insert(7, 0);
     index.insert(7, 4);
     index.insert(7, 9);
@@ -23,7 +23,7 @@ proptest! {
     fn generated_updates_and_removals_match_live_owners(
         history in prop::collection::vec((0usize..64, 0u8..16, any::<bool>()), 0..256),
     ) {
-        let mut index = ResponseIndex::new();
+        let mut index = funded_index();
         let mut owners = HashMap::new();
         for (owner, key, insert) in history {
             if let Some(old) = owners.remove(&owner) {
@@ -71,7 +71,7 @@ impl PartialOrd for CountedKey {
 fn full_window_lookups_and_removals_do_not_scan_every_owner() {
     // Count key comparisons instead of relying on machine speed or wall time.
     const REQUESTS: u32 = 32_768;
-    let mut index = ResponseIndex::new();
+    let mut index = funded_index();
     for owner in 0..REQUESTS {
         index.insert(CountedKey(owner), usize::try_from(owner).unwrap());
     }
@@ -97,7 +97,7 @@ fn full_window_lookups_and_removals_do_not_scan_every_owner() {
 
 #[test]
 fn response_lookup_does_not_allocate() {
-    let mut index = ResponseIndex::new();
+    let mut index = funded_index();
     index.insert(7, 0);
     index.insert(8, 1);
     index.insert(8, 2);
@@ -113,3 +113,16 @@ fn response_lookup_does_not_allocate() {
     );
     assert_eq!(allocations.requests, 0);
 }
+
+fn funded_index<K: Copy + Ord>() -> ResponseIndex<K> {
+    let mut index = ResponseIndex::new();
+    let memory =
+        crate::zakura::regulation::ResponseMemory::new(128 * 1024 * 1024, 128 * 1024 * 1024)
+            .connection();
+    let plan = index.plan_capacity(32_768, false).unwrap();
+    let mut funding = Some(memory.try_reserve(plan.as_ref().unwrap().bytes()).unwrap());
+    index.apply_capacity_from(plan, &mut funding);
+    index
+}
+
+mod funding;

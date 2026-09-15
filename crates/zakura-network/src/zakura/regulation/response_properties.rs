@@ -12,3 +12,5 @@ mod lifecycle;
 mod subscription;
 
 mod memory;
+
+mod collection;

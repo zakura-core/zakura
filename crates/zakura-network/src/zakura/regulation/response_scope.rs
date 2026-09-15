@@ -109,38 +109,57 @@ impl ResponseScope {
         Ok(Self(Arc::new(scope)))
     }
 
-    /// Prepare before taking local work or allocating message-specific expectations.
-    pub(crate) fn authorize(&self) -> Result<ResponseAuthorization, ResponseAdmissionError> {
+    /// Admit the exchange and retained container growth atomically. The caller
+    /// transfers the separate permit to that storage before publishing work.
+    pub(crate) fn authorize_with_retained_memory(
+        &self,
+        metadata_bytes: u64,
+        retained_bytes: u64,
+    ) -> Result<(ResponseAuthorization, Option<ResponseMemoryPermit>), ResponseAdmissionError> {
         let state = self.0.lock();
         if state.retired || self.0.connection_cancel.is_cancelled() {
             return Err(ResponseAdmissionError::Retired);
         }
-        let memory = self
+        let bytes = Self::admission_bytes(metadata_bytes, retained_bytes)
+            .ok_or(ResponseAdmissionError::MemoryFull)?;
+        let mut memory = self
             .0
             .memory
-            .try_reserve(shared_allocation_bytes::<Authorization>())
+            .try_reserve(bytes)
             .ok_or(ResponseAdmissionError::MemoryFull)?;
-        Ok(ResponseAuthorization(Arc::new(Authorization {
-            scope: self.clone(),
-            phase: AtomicU8::new(PREPARED),
-            _memory: memory,
-        })))
+        let retained = (retained_bytes > 0).then(|| memory.split_off(retained_bytes));
+        Ok((
+            ResponseAuthorization(Arc::new(Authorization {
+                scope: self.clone(),
+                phase: AtomicU8::new(PREPARED),
+                _memory: memory,
+            })),
+            retained,
+        ))
     }
 
     pub(crate) fn memory(&self) -> ConnectionResponseMemory {
         self.0.memory.clone()
     }
 
-    /// Wait for enough metadata space to retry one authorization. The future
-    /// owns its connection handle so callers can keep processing other events.
+    /// Bytes one admission of `metadata_bytes` plus `retained_bytes` reserves,
+    /// including the shared authorization record itself.
+    pub(crate) fn admission_bytes(metadata_bytes: u64, retained_bytes: u64) -> Option<u64> {
+        shared_allocation_bytes::<Authorization>()
+            .checked_add(metadata_bytes)?
+            .checked_add(retained_bytes)
+    }
+
+    /// Wait until `bytes` of metadata capacity may fit, then let the caller retry
+    /// admission. The future owns its connection handle so callers can keep
+    /// processing other events. See `admission_bytes` for the amount to pass.
     pub(crate) fn wait_for_capacity(
         &self,
+        bytes: u64,
     ) -> impl std::future::Future<Output = ()> + Send + 'static {
         let memory = self.memory();
         async move {
-            memory
-                .wait_for_capacity(shared_allocation_bytes::<Authorization>())
-                .await;
+            memory.wait_for_capacity(bytes.max(1)).await;
         }
     }
 

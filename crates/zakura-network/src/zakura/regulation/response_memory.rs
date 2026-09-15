@@ -17,6 +17,11 @@ pub(crate) fn shared_allocation_bytes<T>() -> u64 {
         .expect("shared allocation size fits the byte counter")
 }
 
+/// Bound a collection allocation before constructing its elements.
+pub(crate) fn collection_allocation_bytes<T>(count: usize) -> Option<u64> {
+    u64::try_from(std::alloc::Layout::array::<T>(count).ok()?.size()).ok()
+}
+
 /// Retained response metadata is separate from body, decoder, and worker budgets.
 const NODE_RESPONSE_METADATA_BYTES: u64 = 128 * 1024 * 1024;
 const CONNECTION_RESPONSE_METADATA_BYTES: u64 = 16 * 1024 * 1024;
@@ -155,6 +160,24 @@ impl ConnectionResponseMemory {
             if bytes > budget.available() {
                 changed.await;
             }
+        }
+    }
+}
+
+impl ResponseMemoryPermit {
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Transfer part of one admission to storage with a different lifetime.
+    pub(crate) fn split_off(&mut self, bytes: u64) -> Self {
+        self.bytes = self
+            .bytes
+            .checked_sub(bytes)
+            .expect("split memory is part of the original reservation");
+        Self {
+            memory: self.memory.clone(),
+            bytes,
         }
     }
 }

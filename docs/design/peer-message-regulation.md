@@ -77,10 +77,12 @@ peaks. A receiver replacement that cannot fund its setup leaves the current
 receiver active. Connection setup is funded before registration can replace an
 existing connection.
 
-This accounting currently covers setup and authorization records. Expected hashes,
-request-write copies, and retained window and registry capacities still need
-charges before these limits bound all protocol metadata. These allowances are
-separate from body storage, decoding, and execution budgets.
+GetBlocks also reserves its expected hashes, request writer and retained window
+and registry capacities before taking work or publishing expectations. When the
+preferred batch cannot fit, it tries tighter growth and smaller batches. Retained
+buffers keep their charges when emptied, and growth funds old and new storage
+together. These allowances are separate from body storage, decoding, and execution
+budgets. They do not bound total process memory.
 
 ## Capacity admission and QUIC backpressure
 

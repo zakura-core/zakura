@@ -5,6 +5,7 @@ use super::{
     work_queue::{RequestWriteStatus, WorkQueue},
     *,
 };
+use crate::zakura::regulation::ResponseVec;
 use crate::zakura::{ServicePeerDirection, ServicePeerSnapshot, ZakuraBlockSyncCandidateState};
 use std::num::NonZeroU64;
 
@@ -405,7 +406,7 @@ pub(super) struct DownloadWindow {
     pub(super) max_inflight_requests: u32,
     /// Storage order can change when a range ends. Insert, consume and remove
     /// through the window methods so both response indexes stay synchronized.
-    pub(super) outstanding: Vec<OutstandingBlockRange>,
+    pub(super) outstanding: ResponseVec<OutstandingBlockRange>,
     /// Bumped whenever a range is added or removed. Consuming a part or receiving a
     /// body does not change the set, so publishing can skip rebuilding the
     /// registry's sorted copy on the frames that only move credit.
@@ -445,7 +446,7 @@ impl DownloadWindow {
     pub(super) fn new(config: &ZakuraBlockSyncConfig) -> Self {
         Self {
             max_inflight_requests: config.advertised_max_inflight_requests(),
-            outstanding: Vec::new(),
+            outstanding: ResponseVec::new(),
             outstanding_revision: 0,
             next_response_hashes: crate::zakura::regulation::ResponseIndex::new(),
             response_starts: crate::zakura::regulation::ResponseIndex::new(),

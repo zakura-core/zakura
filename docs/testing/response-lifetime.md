@@ -71,5 +71,6 @@ transition still has a two-second deadline.
 This layer does not claim session replacement is atomic or that all request
 metadata is funded. Those are separate contracts above this layer. It also does
 not claim verifier, transport or whole-stack qualification.
-The allocation-planning layer must include the new index storage when the stack
-is updated. Each live range adds at most one next-hash entry and one ending entry.
+The allocation-planning layer funds the index storage before publishing a range
+and retains its allowance until the index drops. Each live range adds at most one
+next-hash entry and one ending entry.

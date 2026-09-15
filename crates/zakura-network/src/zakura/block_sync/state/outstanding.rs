@@ -5,13 +5,67 @@
 //! moves the last vector entry into its place, avoiding a shift of every range.
 
 use super::{DownloadWindow, OutstandingBlockRange};
-use crate::zakura::regulation::{ResponseCreditExceeded, ResponseMatch};
+use crate::zakura::regulation::{
+    CapacityPlan, ResponseAdmissionError, ResponseCreditExceeded, ResponseIndexPlan, ResponseMatch,
+    ResponseMemoryPermit,
+};
+
+pub(in crate::zakura::block_sync) struct OutstandingCapacityPlan {
+    ranges: Option<CapacityPlan<OutstandingBlockRange>>,
+    hashes: Option<ResponseIndexPlan<[u8; 32]>>,
+    starts: Option<ResponseIndexPlan<block::Height>>,
+}
+
+impl OutstandingCapacityPlan {
+    pub(in crate::zakura::block_sync) fn bytes(&self) -> Result<u64, ResponseAdmissionError> {
+        [
+            self.ranges.as_ref().map_or(0, CapacityPlan::bytes),
+            self.hashes.as_ref().map_or(0, ResponseIndexPlan::bytes),
+            self.starts.as_ref().map_or(0, ResponseIndexPlan::bytes),
+        ]
+        .into_iter()
+        .try_fold(0u64, u64::checked_add)
+        .ok_or(ResponseAdmissionError::MemoryFull)
+    }
+}
 use zakura_chain::block;
 
 #[cfg(test)]
 mod tests;
 
 impl DownloadWindow {
+    /// Fund both lookup keys for every range, even after its last body arrives.
+    pub(in crate::zakura::block_sync) fn plan_outstanding_capacity(
+        &self,
+        geometric: bool,
+    ) -> Result<OutstandingCapacityPlan, ResponseAdmissionError> {
+        let required = self
+            .outstanding
+            .len()
+            .checked_add(1)
+            .ok_or(ResponseAdmissionError::MemoryFull)?;
+        Ok(OutstandingCapacityPlan {
+            ranges: self.outstanding.plan_capacity(1, geometric)?,
+            hashes: self
+                .next_response_hashes
+                .plan_capacity(required, geometric)?,
+            starts: self.response_starts.plan_capacity(required, geometric)?,
+        })
+    }
+
+    pub(in crate::zakura::block_sync) fn apply_outstanding_capacity(
+        &mut self,
+        plan: OutstandingCapacityPlan,
+        funding: &mut Option<ResponseMemoryPermit>,
+    ) -> Result<(), ResponseAdmissionError> {
+        self.outstanding.apply_capacity_from(plan.ranges, funding)?;
+        self.next_response_hashes
+            .apply_capacity_from(plan.hashes, funding);
+        self.response_starts
+            .apply_capacity_from(plan.starts, funding);
+        Ok(())
+    }
+
     pub(in crate::zakura::block_sync) fn push_outstanding(&mut self, range: OutstandingBlockRange) {
         let index = self.outstanding.len();
         self.response_starts

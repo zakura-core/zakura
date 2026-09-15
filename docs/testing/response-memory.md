@@ -50,10 +50,10 @@ The same response lifecycle, discovery and subscription properties run against
 the funded scopes. The `response-memory` nextest profile selects these checks
 locally without retries or a workflow trigger.
 
-## Remaining allocation work
+## Request buffers
 
-This layer funds shared setup and authorization records. Expected hashes, request
-writer copies and retained collection capacity still need their allocation plans.
-The shared funded-vector helper belongs with those consumers and their growth
-properties in the next layer. These limits do not yet bound all GetBlocks metadata
-or total process memory.
+This layer funds shared setup and authorization records. The
+[allocation-planning layer](request-allocation-planning.md) adds expected hashes,
+request writers and retained collection capacity, together with the shared
+funded-vector helper and its growth properties. Neither layer claims to bound
+total process memory.

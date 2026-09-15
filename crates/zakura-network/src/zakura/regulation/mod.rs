@@ -20,7 +20,7 @@ mod response;
 pub(crate) use response::{ResponseCredit, ResponseCreditExceeded};
 
 mod response_index;
-pub(crate) use response_index::{ResponseIndex, ResponseMatch};
+pub(crate) use response_index::{ResponseIndex, ResponseIndexPlan, ResponseMatch};
 
 mod response_scope;
 pub(crate) use response_scope::{
@@ -28,7 +28,13 @@ pub(crate) use response_scope::{
 };
 
 mod response_memory;
-pub(crate) use response_memory::{ConnectionResponseMemory, ResponseMemory};
+pub(crate) use response_memory::{
+    collection_allocation_bytes, shared_allocation_bytes, ConnectionResponseMemory, ResponseMemory,
+    ResponseMemoryPermit,
+};
+
+mod response_vec;
+pub(crate) use response_vec::{CapacityPlan, ResponseVec};
 
 #[cfg(test)]
 mod tests;

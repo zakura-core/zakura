@@ -23,6 +23,7 @@ mod identity;
 mod indexed_matching;
 mod lifetime;
 mod limits;
+mod metadata;
 mod retention;
 mod terminal_counts;
 

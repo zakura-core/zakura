@@ -9,11 +9,11 @@ use std::collections::BTreeMap;
 #[test]
 fn advancing_keys_preserves_ambiguity_and_the_original_ending() {
     let mut window = DownloadWindow::new(&ZakuraBlockSyncConfig::default());
-    window.push_outstanding(window_request_range(1, 2));
+    window.push_outstanding_for_test(window_request_range(1, 2));
     let mut other = window_request_range(4, 1);
     other.request.expected_blocks[0].hash = block::Hash([2; 32]);
     other.response = ResponseCredit::new(1, 5);
-    window.push_outstanding(other);
+    window.push_outstanding_for_test(other);
     // A later part of the first range is not yet its next response key.
     assert_eq!(
         window.response_for_hash(block::Hash([2; 32])),
@@ -55,11 +55,11 @@ fn advancing_keys_preserves_ambiguity_and_the_original_ending() {
 fn removing_an_earlier_range_repairs_the_moved_ranges_keys() {
     let mut window = DownloadWindow::new(&ZakuraBlockSyncConfig::default());
     for start in [1, 4, 7] {
-        window.push_outstanding(window_request_range(start, 2));
+        window.push_outstanding_for_test(window_request_range(start, 2));
     }
     window.consume_response(2, 1).unwrap();
     window.remove_outstanding(0);
-    window.push_outstanding(window_request_range(10, 1));
+    window.push_outstanding_for_test(window_request_range(10, 1));
     assert_eq!(window.outstanding_index_for_start(block::Height(1)), None);
     assert_eq!(
         window.outstanding_index_for_start(block::Height(10)),
@@ -126,7 +126,7 @@ proptest! {
                 expected.hash = block::Hash([*key; 32]);
             }
             remaining.insert(block::Height(start), keys);
-            window.push_outstanding(range);
+            window.push_outstanding_for_test(range);
         }
         let starts: Vec<_> = remaining.keys().copied().collect();
         for (choice, action) in history {
@@ -169,5 +169,24 @@ proptest! {
                 }
             }
         }
+    }
+}
+
+impl DownloadWindow {
+    pub(in crate::zakura::block_sync) fn push_outstanding_for_test(
+        &mut self,
+        range: OutstandingBlockRange,
+    ) {
+        let plan = self.plan_outstanding_capacity(true).unwrap();
+        let memory = crate::zakura::regulation::ResponseMemory::default().connection();
+        let mut funding =
+            (plan.bytes().unwrap() > 0).then(|| memory.try_reserve(plan.bytes().unwrap()).unwrap());
+        self.apply_outstanding_capacity(plan, &mut funding).unwrap();
+        self.push_outstanding(range);
+    }
+
+    pub(in crate::zakura::block_sync) fn index_funding_for_test(&self) -> u64 {
+        self.next_response_hashes.funded_bytes_for_test()
+            + self.response_starts.funded_bytes_for_test()
     }
 }

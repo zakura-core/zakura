@@ -33,10 +33,16 @@ use super::{
     state::EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER,
     BlockSyncStatus, ServicePeerDirection, ZakuraPeerId,
 };
-use crate::zakura::ZakuraConnId;
+use crate::zakura::{
+    regulation::{ResponseAdmissionError, ResponseVec},
+    ZakuraConnId,
+};
+
+#[cfg(test)]
+mod test_helpers;
 
 /// Per-peer facts the reactor needs globally and the routine reads back.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(super) struct Entry {
     pub(super) direction: ServicePeerDirection,
     pub(super) servable_low: block::Height,
@@ -51,9 +57,9 @@ pub(super) struct Entry {
     /// producer filter's `!has_outstanding_request` home, now routine-owned and
     /// independent of `work.in_flight`, so it structurally closes the
     /// reject-rollback window.
-    pub(super) outstanding: BTreeMap<block::Height, OutstandingMeta>,
+    outstanding: ResponseVec<(block::Height, OutstandingMeta)>,
     /// Sorted original response ranges, including locally detached and terminal-pending work.
-    response_ranges: Vec<(block::Height, block::Height)>,
+    response_ranges: ResponseVec<(block::Height, block::Height)>,
     /// Routine-published slot and BBR diagnostics. The reactor summarizes this for
     /// the periodic `BLOCK_SYNC_STATE` row, and peer routines read it for cross-peer
     /// floor-bias decisions. Updated whenever the routine issues/finishes/times out
@@ -86,8 +92,8 @@ impl Entry {
             max_blocks_per_response: config.advertised_max_blocks_per_response(),
             max_inflight_requests: config.advertised_max_inflight_requests(),
             max_response_bytes: config.advertised_max_response_bytes(),
-            outstanding: BTreeMap::new(),
-            response_ranges: Vec::new(),
+            outstanding: ResponseVec::new(),
+            response_ranges: ResponseVec::new(),
             slots: SlotDiagnostics::default(),
             floor_watchdog_avoid: BTreeMap::new(),
             generation,
@@ -578,8 +584,8 @@ impl PeerRegistry {
             .entry(peer.clone())
             .and_modify(|entry| {
                 entry.direction = direction;
-                entry.outstanding.clear();
-                entry.response_ranges.clear();
+                entry.outstanding = ResponseVec::new();
+                entry.response_ranges = ResponseVec::new();
                 entry.floor_watchdog_avoid.clear();
                 entry.generation = generation;
                 entry.conn_id = Some(conn_id);
@@ -655,40 +661,32 @@ impl PeerRegistry {
         entry.received_status = true;
     }
 
-    /// Replace the peer's outstanding height→hash set (routine-owned), but only if
-    /// the routine's `generation` still owns the entry. A write from a routine
-    /// that has been superseded by a respawn is dropped.
-    pub(super) fn set_outstanding(
+    /// Prepare retained buffers while this generation still owns the registry entry.
+    /// The callback may reserve scope memory, but must not acquire the work queue lock.
+    pub(super) fn prepare_response_storage<R>(
         &self,
         peer: &ZakuraPeerId,
         generation: u64,
-        outstanding: BTreeMap<block::Height, OutstandingMeta>,
-    ) {
+        prepare: impl FnOnce(
+            &mut ResponseVec<(block::Height, OutstandingMeta)>,
+            &mut ResponseVec<(block::Height, block::Height)>,
+        ) -> Result<R, ResponseAdmissionError>,
+    ) -> Result<R, ResponseAdmissionError> {
         let mut peers = self.lock();
-        if let Some(entry) = peers.get_mut(peer) {
-            if entry.generation == generation {
-                entry.outstanding = outstanding;
-            }
-        }
+        let entry = peers
+            .get_mut(peer)
+            .filter(|entry| entry.generation == generation)
+            .ok_or(ResponseAdmissionError::Retired)?;
+        prepare(&mut entry.outstanding, &mut entry.response_ranges)
     }
 
-    /// Clear the peer's outstanding set (it has no live requests), generation-gated
-    /// as in [`set_outstanding`](Self::set_outstanding).
-    pub(super) fn clear_outstanding(&self, peer: &ZakuraPeerId, generation: u64) {
-        let mut peers = self.lock();
-        if let Some(entry) = peers.get_mut(peer) {
-            if entry.generation == generation {
-                entry.outstanding.clear();
-            }
-        }
-    }
-
-    /// Publish the routine's download-window diagnostics, generation-gated like the
-    /// outstanding writers. These feed both trace summaries and floor-bias decisions.
-    pub(super) fn publish_slots(
+    /// Swap in an already funded, sorted snapshot and return the old backing buffer.
+    /// Later publication cannot allocate or fail for lack of response memory.
+    pub(super) fn publish_response_snapshot(
         &self,
         peer: &ZakuraPeerId,
         generation: u64,
+        outstanding: &mut ResponseVec<(block::Height, OutstandingMeta)>,
         slots: SlotDiagnostics,
         // `None` leaves the published ranges untouched, for the frames that move
         // credit without changing the set. Rebuilding sorts the whole list while
@@ -696,15 +694,31 @@ impl PeerRegistry {
         response_ranges: Option<impl IntoIterator<Item = (block::Height, block::Height)>>,
     ) {
         let mut peers = self.lock();
-        if let Some(entry) = peers.get_mut(peer) {
-            if entry.generation == generation {
-                entry.slots = slots;
-                if let Some(ranges) = response_ranges {
-                    entry.response_ranges.clear();
-                    entry.response_ranges.extend(ranges);
-                    entry.response_ranges.sort_unstable();
+        if let Some(entry) = peers
+            .get_mut(peer)
+            .filter(|entry| entry.generation == generation)
+        {
+            std::mem::swap(&mut entry.outstanding, outstanding);
+            if let Some(ranges) = response_ranges {
+                entry.response_ranges.clear();
+                for range in ranges {
+                    entry.response_ranges.push(range);
                 }
+                entry.response_ranges.sort_unstable();
             }
+            entry.slots = slots;
+        }
+        outstanding.clear();
+    }
+
+    /// Clear live entries without refunding retained backing capacity.
+    pub(super) fn clear_outstanding(&self, peer: &ZakuraPeerId, generation: u64) {
+        let mut peers = self.lock();
+        if let Some(entry) = peers
+            .get_mut(peer)
+            .filter(|entry| entry.generation == generation)
+        {
+            entry.outstanding.clear();
         }
     }
 
@@ -740,8 +754,7 @@ impl PeerRegistry {
         let peers = self.lock();
         peers.values().any(|entry| {
             entry
-                .outstanding
-                .get(&height)
+                .outstanding_at(height)
                 .is_some_and(|meta| meta.hash == hash)
         })
     }
@@ -756,7 +769,7 @@ impl PeerRegistry {
         let peers = self.lock();
         peers
             .get(peer)
-            .is_some_and(|entry| entry.outstanding.contains_key(&height))
+            .is_some_and(|entry| entry.outstanding_at(height).is_some())
     }
 
     /// Total unreceived in-flight heights summed across peers — *per request*,
@@ -775,8 +788,8 @@ impl PeerRegistry {
         peers.values().any(|entry| {
             entry
                 .outstanding
-                .keys()
-                .any(|height| *height >= at_or_above)
+                .last()
+                .is_some_and(|(height, _)| *height >= at_or_above)
         })
     }
 
@@ -791,8 +804,7 @@ impl PeerRegistry {
         let peers = self.lock();
         peers.values().any(|entry| {
             entry
-                .outstanding
-                .get(&height)
+                .outstanding_at(height)
                 .is_some_and(|expected| expected.hash != hash)
         })
     }
@@ -867,7 +879,7 @@ impl PeerRegistry {
             {
                 servable = servable.saturating_add(1);
             }
-            if entry.outstanding.contains_key(&height) {
+            if entry.outstanding_at(height).is_some() {
                 outstanding = outstanding.saturating_add(1);
             }
         }
@@ -884,7 +896,7 @@ impl PeerRegistry {
         let peers = self.lock();
         peers
             .values()
-            .filter_map(|entry| entry.outstanding.get(&height).map(|meta| meta.deadline))
+            .filter_map(|entry| entry.outstanding_at(height).map(|meta| meta.deadline))
             .min()
     }
 
@@ -931,7 +943,7 @@ impl PeerRegistry {
         peers
             .iter()
             .filter_map(|(peer, entry)| {
-                entry.outstanding.get(&height).map(|meta| OutstandingClaim {
+                entry.outstanding_at(height).map(|meta| OutstandingClaim {
                     peer: peer.clone(),
                     height,
                     meta: *meta,
@@ -951,10 +963,14 @@ impl PeerRegistry {
         let Some(entry) = peers.get_mut(peer) else {
             return false;
         };
-        if entry.outstanding.get(&height).map(|meta| meta.owner) != Some(owner) {
+        if entry.outstanding_at(height).map(|meta| meta.owner) != Some(owner) {
             return false;
         }
-        entry.outstanding.remove(&height);
+        let index = entry
+            .outstanding
+            .binary_search_by_key(&height, |(height, _)| *height)
+            .expect("the matching owner has a published height");
+        entry.outstanding.remove(index);
         true
     }
 
@@ -1005,6 +1021,13 @@ impl PeerRegistry {
 }
 
 impl Entry {
+    fn outstanding_at(&self, height: block::Height) -> Option<&OutstandingMeta> {
+        self.outstanding
+            .binary_search_by_key(&height, |(height, _)| *height)
+            .ok()
+            .map(|index| &self.outstanding[index].1)
+    }
+
     fn can_serve_with_room(&self, height: block::Height) -> bool {
         let earlier_ranges = self
             .response_ranges
@@ -1091,7 +1114,7 @@ mod floor_bias_tests {
                 bbr_rtprop_ms,
                 ..SlotDiagnostics::default()
             },
-            Some([]),
+            [],
         );
     }
 
@@ -1365,14 +1388,14 @@ mod floor_bias_tests {
             &fast,
             generation,
             slots,
-            Some([
+            [
                 (block::Height(104), block::Height(106)),
                 (block::Height(100), block::Height(101)),
-            ]),
+            ],
         );
         reg.clear_outstanding(&fast, generation);
         // A retired generation cannot erase the replacement's response exclusions.
-        reg.publish_slots(&fast, generation.saturating_sub(1), slots, Some([]));
+        reg.publish_slots(&fast, generation.saturating_sub(1), slots, []);
         for height in [100, 101, 104, 106] {
             assert!(!reg.floor_has_preferred_unsaturated_server(
                 block::Height(height),
@@ -1389,7 +1412,7 @@ mod floor_bias_tests {
                 false,
             ));
         }
-        reg.publish_slots(&fast, generation, slots, Some([]));
+        reg.publish_slots(&fast, generation, slots, []);
         assert!(reg.floor_has_preferred_unsaturated_server(
             block::Height(100),
             &slow,

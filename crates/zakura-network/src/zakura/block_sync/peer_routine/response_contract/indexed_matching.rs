@@ -72,7 +72,7 @@ async fn ambiguous_indexed_hash_is_rejected_before_body_decoding() {
     // because it appears first in the request vector or the index.
     let mut other = f.routine.window.remove_outstanding(1);
     other.request.expected_blocks[0].hash = f.blocks[0].hash();
-    f.routine.window.push_outstanding(other);
+    f.routine.window.push_outstanding_for_test(other);
     let probe = zakura_test::execution::ExecutionProbe::new(false, false);
     f.routine.decode_probe = Some(probe.clone());
     let result = f

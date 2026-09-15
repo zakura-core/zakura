@@ -6,6 +6,10 @@
 
 use std::collections::BTreeSet;
 
+mod funding;
+use super::ResponseMemoryPermit;
+pub(crate) use funding::ResponseIndexPlan;
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum ResponseMatch {
     Missing,
@@ -21,16 +25,25 @@ mod tests;
 #[derive(Debug)]
 pub(crate) struct ResponseIndex<K> {
     entries: BTreeSet<(K, usize)>,
+    funded_entries: usize,
+    // Drop the tree before releasing the allowance for its nodes.
+    funding: Option<ResponseMemoryPermit>,
 }
 
 impl<K: Copy + Ord> ResponseIndex<K> {
     pub(crate) fn new() -> Self {
         Self {
             entries: BTreeSet::new(),
+            funded_entries: 0,
+            funding: None,
         }
     }
 
     pub(crate) fn insert(&mut self, key: K, position: usize) {
+        assert!(
+            self.entries.len() < self.funded_entries,
+            "index growth is funded before publication"
+        );
         assert!(
             self.entries.insert((key, position)),
             "each response key is indexed once per owner"

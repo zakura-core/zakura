@@ -37,6 +37,34 @@ struct Fixture {
     blocks: Vec<Arc<block::Block>>,
 }
 
+#[tokio::test]
+async fn work_refused_only_by_a_retained_range_gets_no_retry_deadline() {
+    // A retained range clears on its ending or on connection close, and both wake
+    // the routine on their own. Scheduling a timer instead spins: the fill loop
+    // takes the covered height, the overlap refuses it, and the deadline is now.
+    let mut fixture = Fixture::new(1, 4);
+    fixture.publish().await;
+    let covered = fixture.routine.window.outstanding[0].request.start_height;
+    assert!(
+        fixture.routine.retry_avoid.is_empty(),
+        "nothing has failed yet"
+    );
+
+    let now = Instant::now();
+    assert_eq!(
+        fixture.routine.retry_filter_wake_deadline(now, [covered]),
+        None,
+        "a retained range must not schedule an immediate retry",
+    );
+    assert_eq!(
+        fixture
+            .routine
+            .retry_filter_wake_deadline(now, [block::Height(10_000)]),
+        Some(now),
+        "work refused for any other reason still retries at once",
+    );
+}
+
 impl Fixture {
     fn new(start: u32, count: u32) -> Self {
         Self::for_peer(start, count, 0x47)

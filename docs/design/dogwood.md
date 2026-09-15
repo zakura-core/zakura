@@ -53,21 +53,7 @@ should preserve delivery while those subscriptions adapt.
 
 ## Tradeoffs
 
-### Topology and the normal propagation path
-
-The robustness target requires multiple relay paths and enough aggregate upload
-to carry subscriptions after removing the proposer. Each part also needs a
-subscription path from its seed to its receivers. Physical connectivity alone
-does not provide that path.
-
-Nodes normally push verified parts without waiting for requests or
-reconstruction. A stalled receiver uses `FullBlock` announcements to find peers
-that can serve missing parts through bounded block-specific subscriptions. This
-fallback costs a request delay and extra upload, so normal routes must meet the
-latency target without frequent repair. Recovery attempts must retain finite
-grants and a bounded proposer seed budget.
-
-### Routing choices
+### Comparing and Contrasting Protocols w/ Dogwood
 
 Each node limits its forwarding peers as the network grows. Like
 [Gossipsub](https://github.com/libp2p/specs/blob/master/pubsub/gossipsub/gossipsub-v1.0.md#gossipsub-the-gossiping-mesh-router),
@@ -355,13 +341,11 @@ parts. More generally, `c` isolated downstream components need at least `c*k*S`
 payload bytes across the proposer cut, even if they request the same indices. A
 seeding budget of one codeword cannot meet every such topology.
 
-Real sparse subscriptions have different graphs for different parts. The
-proposer also does not know global relay connectivity. The normal design assumes
-one connected relay component and tests standing routes within it. A stalled
-receiver uses bounded `FullBlock`-based pull repair as a fallback. Fixed byte
-caps, deadlines, failed suppliers, and correlated paths bound what
-fallback can recover. The receiver must report degraded service when it cannot
-meet them.
+Sparse subscriptions have different graphs for different parts. The proposer
+cannot observe global relay connectivity. The design assumes that relays remain
+connected after removing the proposer and have enough upload to carry their
+subscriptions. Each part also needs a subscription path from its seed to its
+receivers; physical connectivity alone does not provide that path.
 
 ### Large-body stripe candidate
 
@@ -479,12 +463,16 @@ one subscription per part; they do not establish that more parity is better than
 duplicate subscriptions.
 
 Coverage describes assignments, not guaranteed availability. A subscription
-cycle may have no source for its parts. When progress stalls, the receiver
-requests missing parts from additional peers. Existing full-block download
-provides final recovery. Sparse subscriptions alone do not guarantee delivery
-from every entry point. The first authenticated header supplier is one repair
-candidate, not proof of part availability. Learned routes avoid request latency;
-unfamiliar entry points may still pay discovery or repair latency.
+cycle may have no source for its parts. When progress stalls, the receiver uses
+`FullBlock` announcements to find peers that can serve missing parts through
+bounded block-specific subscriptions. Existing full-block download provides
+final recovery.
+
+Repair costs a request delay and extra upload, so normal routes must meet the
+latency target without frequent repair. Repair retains finite grants, a bounded
+proposer seed budget, and fixed deadlines. The receiver reports degraded service
+when it cannot recover within those limits. Unfamiliar entry points may still
+pay discovery or repair latency while nodes learn routes.
 
 ## Encoding and verification
 

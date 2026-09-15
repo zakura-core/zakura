@@ -472,7 +472,9 @@ where
             check::sapling_point_encodings_are_valid(&tx)?;
 
             // A transaction whose own shielded counts exceed a per-block ZIP 218
-            // limit can never be mined, so reject it on submission.
+            // limit can never be mined, so reject it on submission. ZIP 218 does
+            // not specify this rejection. The error's mempool misbehavior score
+            // is 100.
             crate::block::check::shielded_action_limits_are_valid(
                 std::iter::once(&tx),
                 req.height(),

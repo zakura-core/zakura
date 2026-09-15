@@ -577,6 +577,10 @@ impl TransactionError {
             | IronwoodProofSize
             | WrongConsensusBranchId
             | MissingConsensusBranchId
+            // ZIP 218 does not specify a mempool rejection. The transaction
+            // verifier rejects a transaction that exceeds a per-block limit on
+            // its own, because no block can include it. The peer that sent it
+            // gets the full score.
             | OrchardActionsExceedBlockLimit { .. }
             | SaplingIOsExceedBlockLimit { .. }
             | SproutJoinSplitsExceedBlockLimit { .. }

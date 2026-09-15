@@ -686,6 +686,8 @@ impl NonFinalizedState {
             "state.contextual.mined.transparent_spend.duration_seconds",
             transparent_spend_start.elapsed(),
         );
+        // Free the snapshot before the rest of validation clones and extends the chain.
+        drop(unspent_utxos);
         let spent_utxos = spent_utxos?;
 
         // Reads from disk

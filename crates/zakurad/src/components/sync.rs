@@ -21,7 +21,6 @@ use indexmap::IndexSet;
 use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{mpsc, watch},
-    task::JoinError,
     time::{sleep, sleep_until, timeout},
 };
 use tower::{
@@ -40,6 +39,7 @@ use crate::{
     components::sync::downloads::BlockDownloadVerifyError, config::ZakuradConfig, BoxError,
 };
 
+mod discovery;
 mod downloads;
 pub mod end_of_support;
 mod gossip;
@@ -888,6 +888,8 @@ where
 
     /// The cached block chain state.
     state: ZS,
+    discovery: discovery::Discovery,
+    last_verified_progress: Instant,
 
     /// Allows efficient access to the best tip of the blockchain.
     latest_chain_tip: ZSTip,
@@ -1066,6 +1068,8 @@ where
             tip_network,
             downloads,
             state,
+            discovery: Default::default(),
+            last_verified_progress: Instant::now(),
             latest_chain_tip,
             prospective_tips: HashSet::new(),
             recent_syncs,
@@ -1092,6 +1096,7 @@ where
         loop {
             if self.try_to_sync(None).await.is_err() {
                 self.downloads.cancel_all();
+                self.discovery = Default::default();
             }
 
             self.update_metrics();
@@ -1301,6 +1306,7 @@ where
         };
         if self.try_to_sync(None).await.is_err() {
             self.downloads.cancel_all();
+            self.discovery = Default::default();
         }
         self.update_metrics();
         drop(lease);
@@ -1353,18 +1359,16 @@ where
                 tokio::task::yield_now().await;
             }
             let ready_tip_network = self.tip_network.ready().await.ok()?;
-            requests.push(tokio::spawn(ready_tip_network.call(
-                zn::Request::FindHeaders {
-                    known_blocks: block_locator.clone(),
-                    stop: None,
-                },
-            )));
+            requests.push(ready_tip_network.call(zn::Request::FindHeaders {
+                known_blocks: block_locator.clone(),
+                stop: None,
+            }));
         }
 
         let mut best_ahead: Option<HeightDiff> = None;
         while let Some(res) = requests.next().await {
             let headers = match res {
-                Ok(Ok(zn::Response::BlockHeaders(headers))) => headers,
+                Ok(zn::Response::BlockHeaders(headers)) => headers,
                 // Best-effort: ignore failed/cancelled fanout requests and any
                 // unexpected response, exactly like the obtain_tips fanout does.
                 _ => continue,
@@ -1505,7 +1509,15 @@ where
         let checkpoint_bootstrap = header_runtime_status.is_some();
 
         // The type of the in-flight tip-extension future.
-        type ExtendOutput = Result<(IndexSet<block::Hash>, HashSet<CheckedTip>, usize), Report>;
+        type ExtendOutput = Result<
+            (
+                IndexSet<block::Hash>,
+                HashSet<CheckedTip>,
+                usize,
+                Vec<discovery::Evidence>,
+            ),
+            Report,
+        >;
 
         // The currently running request for more block hashes, if any.
         //
@@ -1514,14 +1526,34 @@ where
         // syncer cannot build up an unbounded backlog of undispatched hashes.
         let mut extend: Option<Pin<Box<dyn Future<Output = ExtendOutput> + Send>>> = None;
 
-        // The last time this sync round made observable progress.
-        //
-        // Progress means a block finished verification, a background hash
-        // extension finished, or more full-block downloads were queued. If none
-        // of those happen for `BLOCK_VERIFY_TIMEOUT`, restart the round.
-        let mut last_progress = Instant::now();
+        // Candidate arrivals and retries cannot postpone the verified-progress deadline.
+        self.last_verified_progress = Instant::now();
 
         'sync_round: loop {
+            self.discovery.expire();
+            let batch = self.discovery.reconciliation_batch();
+            let _ = tokio::time::timeout(Duration::from_millis(50), async {
+                for hash in batch {
+                    let response = self
+                        .state
+                        .clone()
+                        .oneshot(zs::Request::KnownBlock(hash))
+                        .await;
+                    if matches!(
+                        response,
+                        Ok(zs::Response::KnownBlock(Some(
+                            zs::KnownBlock::Finalized
+                                | zs::KnownBlock::BestChain
+                                | zs::KnownBlock::SideChain
+                        )))
+                    ) {
+                        self.discovery.committed(hash);
+                        self.last_verified_progress = Instant::now();
+                    }
+                }
+            })
+            .await;
+
             if header_runtime_status
                 .as_ref()
                 .is_some_and(|status| status.borrow().is_ready())
@@ -1562,7 +1594,6 @@ where
                     continue 'sync_round;
                 }
                 result?;
-                last_progress = Instant::now();
             }
             metrics::gauge!("sync.reserve.depth").set(reserve.len() as f64);
             self.update_metrics();
@@ -1623,7 +1654,6 @@ where
                 .await
                 .map_err(Report::from)?;
                 reserve = Self::handle_hash_response(response, self.expose_peer_addresses)?;
-                last_progress = Instant::now();
                 continue;
             }
 
@@ -1659,14 +1689,13 @@ where
                             continue 'sync_round;
                         }
                         result?;
-                        last_progress = Instant::now();
                         self.update_metrics();
                     }
                     // `downloads` only yields `None` when nothing is in flight, which we just ruled
                     // out. Loop around and re-check rather than relying on that.
                     Ok(None) => {}
                     Err(_) => {
-                        if last_progress.elapsed() >= BLOCK_VERIFY_TIMEOUT {
+                        if self.last_verified_progress.elapsed() >= BLOCK_VERIFY_TIMEOUT {
                             return Err(eyre!(
                                 "sync round stalled: no block completed or tips extended within timeout"
                             ));
@@ -1755,8 +1784,7 @@ where
                             }
                         }
 
-                        last_progress = Instant::now();
-                    }
+                            }
 
                     rsp = self.downloads.next(), if has_inflight => {
                         let rsp = rsp.expect("downloads is nonempty");
@@ -1775,12 +1803,11 @@ where
                             return Ok(());
                         }
                         result?;
-                        last_progress = Instant::now();
-                        self.update_metrics();
+                                self.update_metrics();
                     }
 
                     extended = OptionFuture::from(extend.as_mut()), if extend.is_some() => {
-                        let (mut download_set, mut new_tips, _discovered) =
+                        let (mut download_set, mut new_tips, _discovered, evidence) =
                             extended.expect("only polled while an extension is in flight")?;
                         let reached_checkpoint = self.cap_checkpoint_bootstrap_downloads(
                             &mut download_set,
@@ -1795,10 +1822,10 @@ where
                         // security: use the actual number of new downloads from all peers, so the
                         // last peer to respond can't toggle our mempool.
                         self.recent_syncs.push_extend_tips_length(discovered);
+                        self.discovery.admit(evidence, &download_set);
                         reserve.extend(download_set);
                         extend = None;
-                        last_progress = Instant::now();
-                    }
+                            }
                 }
 
                 Ok::<(), Report>(())
@@ -1808,7 +1835,7 @@ where
             match step {
                 Ok(result) => result?,
                 Err(_elapsed) => {
-                    if last_progress.elapsed() >= BLOCK_VERIFY_TIMEOUT {
+                    if self.last_verified_progress.elapsed() >= BLOCK_VERIFY_TIMEOUT {
                         self.trace_sync_snapshot("round_stalled", reserve.len());
                         return Err(eyre!(
                             "sync round stalled: no block completed or tips extended within timeout"
@@ -1976,32 +2003,29 @@ where
             }
 
             let ready_tip_network = self.tip_network.ready().await;
-            requests.push(tokio::spawn(ready_tip_network.map_err(|e| eyre!(e))?.call(
-                zn::Request::FindBlocks {
-                    known_blocks: block_locator.clone(),
-                    stop: None,
-                },
-            )));
+            requests.push(
+                ready_tip_network
+                    .map_err(|e| eyre!(e))?
+                    .call(zn::Request::FindBlocks {
+                        known_blocks: block_locator.clone(),
+                        stop: None,
+                    }),
+            );
         }
 
         let mut download_set = IndexSet::new();
+        let mut evidence = Vec::new();
         while let Some(res) = requests.next().await {
-            match res
-                .unwrap_or_else(|e @ JoinError { .. }| {
-                    if e.is_panic() {
-                        panic!("panic in obtain tips task: {e:?}");
-                    } else {
-                        info!(
-                            "task error during obtain tips task: {e:?},\
-                     is Zakura shutting down?"
-                        );
-                        Err(e.into())
-                    }
-                })
-                .map_err::<Report, _>(|e| eyre!(e))
-            {
-                Ok(zn::Response::BlockHashes(hashes)) => {
+            match res.map_err::<Report, _>(|e| eyre!(e)) {
+                Ok(zn::Response::BlockHashes { hashes, feedback }) => {
                     trace!(?hashes);
+                    let raw_len = hashes.len();
+                    if raw_len > MAX_TIPS_RESPONSE_HASH_COUNT + 1 {
+                        if let Some(feedback) = feedback {
+                            feedback.no_progress();
+                        }
+                        continue;
+                    }
 
                     // zcashd sometimes appends an unrelated hash at the start
                     // or end of its response.
@@ -2052,8 +2076,16 @@ where
                     let unknown_hashes = if let Some(index) = first_unknown {
                         &hashes[index..]
                     } else {
+                        if raw_len != 1 {
+                            if let Some(feedback) = feedback {
+                                feedback.no_progress();
+                            }
+                        }
                         continue;
                     };
+                    if let Some(feedback) = feedback {
+                        evidence.push((unknown_hashes.to_vec(), feedback));
+                    }
 
                     trace!(?unknown_hashes);
 
@@ -2106,13 +2138,18 @@ where
 
         debug!(?self.prospective_tips);
 
-        // Check that the new tips we got are actually unknown.
-        for hash in &download_set {
-            debug!(?hash, "checking if state contains hash");
-            if self.state_contains(*hash).await? {
-                return Err(eyre!("queued download of hash behind our chain tip"));
+        self.discovery.admit(evidence, &download_set);
+        let mut known = Vec::new();
+        for &hash in &download_set {
+            if self.state_contains(hash).await? {
+                known.push(hash);
             }
         }
+        for hash in known {
+            download_set.shift_remove(&hash);
+        }
+        self.prospective_tips
+            .retain(|tip| download_set.contains(&tip.expected_next));
 
         let new_downloads = download_set.len();
         debug!(new_downloads, "queueing new downloads");
@@ -2163,11 +2200,20 @@ where
         mut tip_network: Timeout<ZN>,
         mut state: ZS,
         tips: HashSet<CheckedTip>,
-    ) -> Result<(IndexSet<block::Hash>, HashSet<CheckedTip>, usize), Report> {
+    ) -> Result<
+        (
+            IndexSet<block::Hash>,
+            HashSet<CheckedTip>,
+            usize,
+            Vec<discovery::Evidence>,
+        ),
+        Report,
+    > {
         let stage_start = std::time::Instant::now();
 
         let mut prospective_tips: HashSet<CheckedTip> = HashSet::new();
         let mut download_set = IndexSet::new();
+        let mut evidence = Vec::new();
         debug!(tips = ?tips.len(), "trying to extend chain tips");
         for tip in tips {
             debug!(?tip, "asking peers to extend chain tip");
@@ -2181,22 +2227,26 @@ where
                 }
 
                 let ready_tip_network = tip_network.ready().await;
-                responses.push(tokio::spawn(ready_tip_network.map_err(|e| eyre!(e))?.call(
+                responses.push(ready_tip_network.map_err(|e| eyre!(e))?.call(
                     zn::Request::FindBlocks {
                         known_blocks: vec![tip.tip],
                         stop: None,
                     },
-                )));
+                ));
             }
             while let Some(res) = responses.next().await {
-                match res
-                    .expect("panic in spawned extend tips request")
-                    .map_err::<Report, _>(|e| eyre!(e))
-                {
-                    Ok(zn::Response::BlockHashes(hashes)) => {
+                match res.map_err::<Report, _>(|e| eyre!(e)) {
+                    Ok(zn::Response::BlockHashes { hashes, feedback }) => {
                         debug!(first = ?hashes.first(), len = ?hashes.len());
                         trace!(?hashes);
 
+                        let raw_len = hashes.len();
+                        if raw_len > MAX_TIPS_RESPONSE_HASH_COUNT + 3 {
+                            if let Some(feedback) = feedback {
+                                feedback.no_progress();
+                            }
+                            continue;
+                        }
                         // zcashd sometimes appends an unrelated hash at the
                         // start or end of its response. Check the first hash
                         // against the previous response, and discard mismatches.
@@ -2208,10 +2258,20 @@ where
                         )
                         .await?
                         else {
+                            if raw_len != 1 {
+                                if let Some(feedback) = feedback {
+                                    feedback.no_progress();
+                                }
+                            }
                             continue;
                         };
 
                         if unknown_hashes.is_empty() {
+                            if raw_len != 1 {
+                                if let Some(feedback) = feedback {
+                                    feedback.no_progress();
+                                }
+                            }
                             debug!(
                                 ?tip.tip,
                                 "response contained no new hashes after the expected overlap"
@@ -2219,6 +2279,11 @@ where
                             continue;
                         }
 
+                        if let Some(feedback) = feedback {
+                            if evidence.len() < 64 {
+                                evidence.push((unknown_hashes.to_vec(), feedback));
+                            }
+                        }
                         trace!(?unknown_hashes);
 
                         if let Some(end) = unknown_hashes.rchunks_exact(2).next() {
@@ -2272,7 +2337,7 @@ where
 
         // The caller records `new_downloads` via `recent_syncs.push_extend_tips_length` on
         // write-back, preserving the "last peer can't toggle our mempool" security property.
-        Ok((download_set, prospective_tips, new_downloads))
+        Ok((download_set, prospective_tips, new_downloads, evidence))
     }
 
     /// Download and verify the genesis block, if it isn't currently known to
@@ -2530,6 +2595,8 @@ where
         response: Result<(Height, block::Hash), BlockDownloadVerifyError>,
     ) -> Result<(), Report> {
         if let Ok((_height, hash)) = response.as_ref() {
+            self.discovery.committed(*hash);
+            self.last_verified_progress = Instant::now();
             self.missing_block_retry_counts.remove(hash);
             self.transient_block_retry_counts.remove(hash);
             self.poisoned_block_retry_counts.remove(hash);

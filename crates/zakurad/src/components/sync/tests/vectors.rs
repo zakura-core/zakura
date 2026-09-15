@@ -202,11 +202,14 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![
-            block1_hash, // tip
-            block2_hash, // expected_next
-            block3_hash, // (discarded - last hash, possibly incorrect)
-        ]));
+        .respond(zn::Response::BlockHashes {
+            hashes: vec![
+                block1_hash, // tip
+                block2_hash, // expected_next
+                block3_hash, // (discarded - last hash, possibly incorrect)
+            ],
+            feedback: None,
+        });
 
     // State is checked for each candidate hash before it is queued.
     state_service
@@ -291,12 +294,15 @@ async fn sync_blocks_ok() -> Result<(), crate::BoxError> {
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![
-            block2_hash, // tip (discarded - already fetched)
-            block3_hash, // expected_next
-            block4_hash,
-            block5_hash, // (discarded - last hash, possibly incorrect)
-        ]));
+        .respond(zn::Response::BlockHashes {
+            hashes: vec![
+                block2_hash, // tip (discarded - already fetched)
+                block3_hash, // expected_next
+                block4_hash,
+                block5_hash, // (discarded - last hash, possibly incorrect)
+            ],
+            feedback: None,
+        });
 
     for hash in [block3_hash, block4_hash] {
         state_service
@@ -431,7 +437,10 @@ async fn sync_singleton_obtain_tips_ok() -> Result<(), crate::BoxError> {
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![block1_hash]));
+        .respond(zn::Response::BlockHashes {
+            hashes: vec![block1_hash],
+            feedback: None,
+        });
 
     state_service
         .expect_request(zs::Request::KnownBlock(block1_hash))
@@ -549,11 +558,14 @@ async fn sync_singleton_extend_tips_ok() -> Result<(), crate::BoxError> {
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![
-            block1_hash,
-            block2_hash,
-            block3_hash, // discarded trailing zcashd-compatibility hash
-        ]));
+        .respond(zn::Response::BlockHashes {
+            hashes: vec![
+                block1_hash,
+                block2_hash,
+                block3_hash, // discarded trailing zcashd-compatibility hash
+            ],
+            feedback: None,
+        });
 
     state_service
         .expect_request(zs::Request::KnownBlock(block1_hash))
@@ -633,10 +645,13 @@ async fn sync_singleton_extend_tips_ok() -> Result<(), crate::BoxError> {
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![
-            block2_hash, // expected overlap
-            block3_hash, // singleton unknown hash
-        ]));
+        .respond(zn::Response::BlockHashes {
+            hashes: vec![
+                block2_hash, // expected overlap
+                block3_hash, // singleton unknown hash
+            ],
+            feedback: None,
+        });
 
     state_service
         .expect_request(zs::Request::KnownBlock(block3_hash))
@@ -740,9 +755,10 @@ async fn incomplete_checkpoint_range_retries_refresh_timeout_without_verifier_ti
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![
-            hashes[1], hashes[2], hashes[3],
-        ]));
+        .respond(zn::Response::BlockHashes {
+            hashes: vec![hashes[1], hashes[2], hashes[3]],
+            feedback: None,
+        });
     state_service
         .expect_request(zs::Request::KnownBlock(hashes[1]))
         .await
@@ -796,7 +812,10 @@ async fn incomplete_checkpoint_range_retries_refresh_timeout_without_verifier_ti
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![hashes[2], hashes[3]]));
+        .respond(zn::Response::BlockHashes {
+            hashes: vec![hashes[2], hashes[3]],
+            feedback: None,
+        });
     state_service
         .expect_request(zs::Request::KnownBlock(hashes[3]))
         .await
@@ -850,9 +869,10 @@ async fn incomplete_checkpoint_range_retries_refresh_timeout_without_verifier_ti
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![
-            hashes[1], hashes[2], hashes[3], hashes[4], hashes[5],
-        ]));
+        .respond(zn::Response::BlockHashes {
+            hashes: vec![hashes[1], hashes[2], hashes[3], hashes[4], hashes[5]],
+            feedback: None,
+        });
     state_service
         .expect_request(zs::Request::KnownBlock(hashes[1]))
         .await
@@ -898,7 +918,10 @@ async fn incomplete_checkpoint_range_retries_refresh_timeout_without_verifier_ti
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![hashes[4]]));
+        .respond(zn::Response::BlockHashes {
+            hashes: vec![hashes[4]],
+            feedback: None,
+        });
     for _ in 0..(sync::FANOUT - 1) {
         peer_set
             .expect_request(zn::Request::FindBlocks {
@@ -1022,11 +1045,14 @@ async fn sync_blocks_trailing_hashes_ok() -> Result<(), crate::BoxError> {
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![
-            block1_hash, // tip
-            block2_hash, // expected_next
-            block3_hash, // (discarded - last hash, possibly incorrect)
-        ]));
+        .respond(zn::Response::BlockHashes {
+            hashes: vec![
+                block1_hash, // tip
+                block2_hash, // expected_next
+                block3_hash, // (discarded - last hash, possibly incorrect)
+            ],
+            feedback: None,
+        });
 
     // State is checked for each candidate hash before it is queued.
     state_service
@@ -1111,12 +1137,15 @@ async fn sync_blocks_trailing_hashes_ok() -> Result<(), crate::BoxError> {
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![
-            block2_hash, // tip (discarded - already fetched)
-            block3_hash, // expected_next
-            block4_hash,
-            block5_hash, // (discarded - last hash, possibly incorrect)
-        ]));
+        .respond(zn::Response::BlockHashes {
+            hashes: vec![
+                block2_hash, // tip (discarded - already fetched)
+                block3_hash, // expected_next
+                block4_hash,
+                block5_hash, // (discarded - last hash, possibly incorrect)
+            ],
+            feedback: None,
+        });
 
     for hash in [block3_hash, block4_hash] {
         state_service
@@ -1332,12 +1361,15 @@ async fn sync_block_too_high_obtain_tips() -> Result<(), crate::BoxError> {
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![
-            block982k_hash,
-            block1_hash, // tip
-            block2_hash, // expected_next
-            block3_hash, // (discarded - last hash, possibly incorrect)
-        ]));
+        .respond(zn::Response::BlockHashes {
+            hashes: vec![
+                block982k_hash,
+                block1_hash, // tip
+                block2_hash, // expected_next
+                block3_hash, // (discarded - last hash, possibly incorrect)
+            ],
+            feedback: None,
+        });
 
     // State is checked for each candidate hash before it is queued.
     state_service
@@ -1518,11 +1550,14 @@ async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![
-            block1_hash, // tip
-            block2_hash, // expected_next
-            block3_hash, // (discarded - last hash, possibly incorrect)
-        ]));
+        .respond(zn::Response::BlockHashes {
+            hashes: vec![
+                block1_hash, // tip
+                block2_hash, // expected_next
+                block3_hash, // (discarded - last hash, possibly incorrect)
+            ],
+            feedback: None,
+        });
 
     // State is checked for each candidate hash before it is queued.
     state_service
@@ -1607,13 +1642,16 @@ async fn sync_block_too_high_extend_tips() -> Result<(), crate::BoxError> {
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![
-            block2_hash, // tip (discarded - already fetched)
-            block3_hash, // expected_next
-            block4_hash,
-            block982k_hash,
-            block5_hash, // (discarded - last hash, possibly incorrect)
-        ]));
+        .respond(zn::Response::BlockHashes {
+            hashes: vec![
+                block2_hash, // tip (discarded - already fetched)
+                block3_hash, // expected_next
+                block4_hash,
+                block982k_hash,
+                block5_hash, // (discarded - last hash, possibly incorrect)
+            ],
+            feedback: None,
+        });
 
     for hash in [block3_hash, block4_hash, block982k_hash] {
         state_service
@@ -2505,12 +2543,15 @@ async fn build_extend_discovers_hashes_without_dispatching() -> Result<(), crate
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![
-            block2_hash, // expected_next (match anchor, not downloaded)
-            block3_hash,
-            block4_hash,
-            block5_hash, // (discarded - last hash, possibly incorrect)
-        ]));
+        .respond(zn::Response::BlockHashes {
+            hashes: vec![
+                block2_hash, // expected_next (match anchor, not downloaded)
+                block3_hash,
+                block4_hash,
+                block5_hash, // (discarded - last hash, possibly incorrect)
+            ],
+            feedback: None,
+        });
 
     for hash in [block3_hash, block4_hash] {
         state_service
@@ -2530,7 +2571,7 @@ async fn build_extend_discovers_hashes_without_dispatching() -> Result<(), crate
             .respond(Err(zn::BoxError::from("synthetic test extend tips error")));
     }
 
-    let (download_set, prospective_tips, discovered) = extend_handle
+    let (download_set, prospective_tips, discovered, _evidence) = extend_handle
         .await
         .expect("build_extend task should not panic")?;
 
@@ -2593,11 +2634,10 @@ async fn obtain_tips_ignores_known_hash_after_first_unknown() -> Result<(), crat
                 stop: None,
             })
             .await
-            .respond(zn::Response::BlockHashes(vec![
-                unknown,
-                known_not_in_locator,
-                trailing,
-            ]));
+            .respond(zn::Response::BlockHashes {
+                hashes: vec![unknown, known_not_in_locator, trailing],
+                feedback: None,
+            });
 
         state_service
             .expect_request(zs::Request::KnownBlock(unknown))
@@ -2665,12 +2705,10 @@ async fn build_extend_ignores_malformed_find_blocks_responses() -> Result<(), cr
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![
-            expected_next,
-            unknown,
-            known_suffix,
-            trailing,
-        ]));
+        .respond(zn::Response::BlockHashes {
+            hashes: vec![expected_next, unknown, known_suffix, trailing],
+            feedback: None,
+        });
     state_service
         .expect_request(zs::Request::KnownBlock(unknown))
         .await
@@ -2686,21 +2724,22 @@ async fn build_extend_ignores_malformed_find_blocks_responses() -> Result<(), cr
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![
-            expected_next,
-            unknown,
-            unknown,
-            trailing,
-        ]));
+        .respond(zn::Response::BlockHashes {
+            hashes: vec![expected_next, unknown, unknown, trailing],
+            feedback: None,
+        });
     peer_set
         .expect_request(zn::Request::FindBlocks {
             known_blocks: vec![tip],
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![random]));
+        .respond(zn::Response::BlockHashes {
+            hashes: vec![random],
+            feedback: None,
+        });
 
-    let (download_set, prospective_tips, discovered) = extend_handle
+    let (download_set, prospective_tips, discovered, _evidence) = extend_handle
         .await
         .expect("build_extend task should not panic")?;
     assert!(download_set.is_empty());
@@ -2753,7 +2792,10 @@ async fn build_extend_rejects_oversized_response_before_state_queries(
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(response_hashes));
+        .respond(zn::Response::BlockHashes {
+            hashes: response_hashes,
+            feedback: None,
+        });
 
     for _ in 0..(sync::FANOUT - 1) {
         peer_set
@@ -2767,7 +2809,7 @@ async fn build_extend_rejects_oversized_response_before_state_queries(
             )));
     }
 
-    let (download_set, prospective_tips, discovered) = extend_handle
+    let (download_set, prospective_tips, discovered, _evidence) = extend_handle
         .await
         .expect("build_extend task should not panic")?;
     assert!(download_set.is_empty());
@@ -2809,12 +2851,10 @@ async fn build_extend_rejects_locator_echo_before_state_queries() -> Result<(), 
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![
-            expected_next,
-            unknown,
-            tip,
-            trailing,
-        ]));
+        .respond(zn::Response::BlockHashes {
+            hashes: vec![expected_next, unknown, tip, trailing],
+            feedback: None,
+        });
 
     for _ in 0..(sync::FANOUT - 1) {
         peer_set
@@ -2826,7 +2866,7 @@ async fn build_extend_rejects_locator_echo_before_state_queries() -> Result<(), 
             .respond(Err(zn::BoxError::from("synthetic test locator echo error")));
     }
 
-    let (download_set, prospective_tips, discovered) = extend_handle
+    let (download_set, prospective_tips, discovered, _evidence) = extend_handle
         .await
         .expect("build_extend task should not panic")?;
     assert!(download_set.is_empty());
@@ -2869,12 +2909,15 @@ async fn build_extend_ignores_known_trailing_find_blocks_hash() -> Result<(), cr
             stop: None,
         })
         .await
-        .respond(zn::Response::BlockHashes(vec![
-            expected_next,
-            unknown_a,
-            unknown_b,
-            tip, // zcashd can append an unrelated known hash here.
-        ]));
+        .respond(zn::Response::BlockHashes {
+            hashes: vec![
+                expected_next,
+                unknown_a,
+                unknown_b,
+                tip, // zcashd can append an unrelated known hash here.
+            ],
+            feedback: None,
+        });
 
     for hash in [unknown_a, unknown_b] {
         state_service
@@ -2893,7 +2936,7 @@ async fn build_extend_ignores_known_trailing_find_blocks_hash() -> Result<(), cr
             .respond(Err(zn::BoxError::from("synthetic test extend tips error")));
     }
 
-    let (download_set, prospective_tips, discovered) = extend_handle
+    let (download_set, prospective_tips, discovered, _evidence) = extend_handle
         .await
         .expect("build_extend task should not panic")?;
 

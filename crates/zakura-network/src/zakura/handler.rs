@@ -9543,7 +9543,10 @@ mod tests {
                 stop: None,
             },
             LegacyRequestKind::FindBlocks,
-            Response::BlockHashes(vec![block_hash(2)]),
+            Response::BlockHashes {
+                hashes: vec![block_hash(2)],
+                feedback: None,
+            },
         )?;
         assert_codec_frames_validate_at_transport(
             LegacyRequestFrame::FindHeaders {

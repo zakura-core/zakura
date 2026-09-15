@@ -28,12 +28,63 @@ use crate::{
             migration::{initialize_header_chain_reconciled, HeaderChainInitializationError},
             HeaderChainStore,
         },
+        ZakuraDb,
     },
     Config,
 };
 
-#[cfg(feature = "nu7")]
 use crate::service::finalized_state::HEADER_VALIDATION_CONTEXT;
+
+#[cfg(not(feature = "nu7"))]
+use crate::service::finalized_state::disk_format::{
+    header_chain_values::HeaderValidationContextDisk, FallibleDiskValue,
+};
+
+/// Writes a synthetic finalized header chain from `genesis` to `chain_tip`, and
+/// returns its headers indexed by height.
+fn write_synthetic_finalized_headers(
+    state: &ZakuraDb,
+    genesis: &Arc<block::Block>,
+    chain_tip: u32,
+) -> Vec<Arc<block::Header>> {
+    let header_cf = state
+        .db
+        .cf_handle("block_header_by_height")
+        .expect("the full-state header column exists");
+    let hash_cf = state
+        .db
+        .cf_handle("hash_by_height")
+        .expect("the full-state hash column exists");
+    let height_cf = state
+        .db
+        .cf_handle("height_by_hash")
+        .expect("the full-state reverse hash column exists");
+    let mut headers = vec![genesis.header.clone()];
+    let mut full_state = DiskWriteBatch::new();
+    for height in 1..=chain_tip {
+        let previous = headers
+            .last()
+            .expect("the synthetic chain starts at genesis");
+        let mut header = **previous;
+        header.previous_block_hash = previous.hash();
+        header.time += chrono::Duration::seconds(1);
+        header.nonce.0[0] =
+            u8::try_from(height).expect("the synthetic chain is shorter than 256 blocks");
+        let header = Arc::new(header);
+        let hash = header.hash();
+        let height = Height(height);
+        full_state.zs_insert(&header_cf, height, &header);
+        full_state.zs_insert(&hash_cf, height, hash);
+        full_state.zs_insert(&height_cf, hash, height);
+        headers.push(header);
+    }
+    state
+        .db
+        .write(full_state)
+        .expect("the synthetic finalized header chain writes");
+
+    headers
+}
 
 fn engine_config(network: Network, genesis: &Arc<block::Block>) -> EngineConfig {
     let frontier = Frontier::new(Height(0), genesis.hash());
@@ -219,42 +270,7 @@ fn zip218_build_backfills_an_existing_validation_context_before_startup() {
     let predecessor_span = zakura_header_chain::POW_PREDECESSOR_CONTEXT_SPAN;
     let chain_tip = u32::try_from(predecessor_span + 1)
         .expect("the validation context span fits in a block height");
-
-    let header_cf = state
-        .db
-        .cf_handle("block_header_by_height")
-        .expect("the full-state header column exists");
-    let hash_cf = state
-        .db
-        .cf_handle("hash_by_height")
-        .expect("the full-state hash column exists");
-    let height_cf = state
-        .db
-        .cf_handle("height_by_hash")
-        .expect("the full-state reverse hash column exists");
-    let mut headers = vec![genesis.header.clone()];
-    let mut full_state = DiskWriteBatch::new();
-    for height in 1..=chain_tip {
-        let previous = headers
-            .last()
-            .expect("the synthetic chain starts at genesis");
-        let mut header = **previous;
-        header.previous_block_hash = previous.hash();
-        header.time += chrono::Duration::seconds(1);
-        header.nonce.0[0] =
-            u8::try_from(height).expect("the synthetic chain is shorter than 256 blocks");
-        let header = Arc::new(header);
-        let hash = header.hash();
-        let height = Height(height);
-        full_state.zs_insert(&header_cf, height, &header);
-        full_state.zs_insert(&hash_cf, height, hash);
-        full_state.zs_insert(&height_cf, hash, height);
-        headers.push(header);
-    }
-    state
-        .db
-        .write(full_state)
-        .expect("the synthetic finalized header chain writes");
+    write_synthetic_finalized_headers(&state, &genesis, chain_tip);
 
     let config = engine_config(network, &genesis);
     let (runtime, report) = initialize_header_chain_reconciled(&state, &config, Vec::new())
@@ -295,13 +311,93 @@ fn zip218_build_backfills_an_existing_validation_context_before_startup() {
 
     assert_eq!(
         store
-            .backfill_validation_context(&state)
+            .resize_validation_context(&state)
             .expect("authenticated full state backfills the wider context"),
         predecessor_span - old_predecessor_span,
     );
     let (_, startup) = store
         .startup(&config)
         .expect("startup accepts the backfilled validation context");
+    assert!(startup.publication_allowed);
+}
+
+/// A build with a wider averaging window retains more validation context below
+/// the finalized anchor. A narrower build removes the extra rows at startup.
+#[test]
+#[cfg(not(feature = "nu7"))]
+fn narrower_build_trims_a_wider_validation_context_before_startup() {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let genesis = mainnet_block(0);
+    let state = state_with_genesis_config(&network, genesis.clone(), Config::ephemeral());
+    let predecessor_span = zakura_header_chain::POW_PREDECESSOR_CONTEXT_SPAN;
+    // An NU7 build retains 102 averaging-window headers plus 10 additional
+    // median-time headers below the finalized anchor.
+    let wide_predecessor_span = 112;
+    let chain_tip = u32::try_from(wide_predecessor_span + 1)
+        .expect("the validation context span fits in a block height");
+    let headers = write_synthetic_finalized_headers(&state, &genesis, chain_tip);
+
+    let config = engine_config(network, &genesis);
+    let (runtime, report) = initialize_header_chain_reconciled(&state, &config, Vec::new())
+        .expect("the validation context initializes");
+    assert_eq!(report.validation_context_rows, predecessor_span);
+    drop(runtime);
+
+    let context_cf = state
+        .db
+        .cf_handle(HEADER_VALIDATION_CONTEXT)
+        .expect("the validation context column exists");
+    let mut widen = DiskWriteBatch::new();
+    let anchor = usize::try_from(chain_tip).expect("the anchor height fits in usize");
+    for (height, header) in headers
+        .iter()
+        .enumerate()
+        .take(anchor - predecessor_span)
+        .skip(anchor - wide_predecessor_span)
+    {
+        let context = HeaderValidationContextDisk {
+            header: header.clone(),
+            height: Height(u32::try_from(height).expect("the test height fits in u32")),
+        };
+        widen.zs_insert(
+            &context_cf,
+            RawBytes::new_raw_bytes(header.hash().0.to_vec()),
+            RawBytes::new_raw_bytes(context.encode().expect("the context row encodes")),
+        );
+    }
+    state
+        .db
+        .write(widen)
+        .expect("the wider context fixture writes");
+
+    let store = HeaderChainStore::new(state.header_chain_disk_db());
+    assert_eq!(
+        store
+            .resize_validation_context(&state)
+            .expect("authenticated full state trims the wider context"),
+        wide_predecessor_span - predecessor_span,
+    );
+
+    let mut contexts = Vec::new();
+    store
+        .audit_snapshot()
+        .expect("the store has an audit snapshot")
+        .visit_validation_context_records(RowLimit::new(predecessor_span), &mut |record| {
+            contexts.push(record.height);
+            Ok(())
+        })
+        .expect("the trimmed context fits in this build's span");
+    contexts.sort_unstable();
+    let first_height = u32::try_from(anchor - predecessor_span).expect("the height fits in u32");
+    assert_eq!(
+        contexts,
+        (first_height..chain_tip).map(Height).collect::<Vec<_>>()
+    );
+
+    let (_, startup) = store
+        .startup(&config)
+        .expect("startup accepts the trimmed validation context");
     assert!(startup.publication_allowed);
 }
 

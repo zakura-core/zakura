@@ -1483,6 +1483,14 @@ impl FinalizedState {
         error: ValidateContextError,
         failure: crate::error::VctCommitFailure,
     ) -> CommitCheckpointVerifiedError {
+        if matches!(
+            error,
+            ValidateContextError::HistoryTreeError(ref error)
+                if matches!(error.as_ref(), zakura_chain::history_tree::HistoryTreeError::MissingBranchId { .. })
+        ) {
+            return error.into();
+        }
+
         metrics::counter!("state.vct.root.rejected.count").increment(1);
         tracing::warn!(
             ?height,

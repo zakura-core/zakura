@@ -35,11 +35,6 @@ use crate::{
 
 use crate::service::finalized_state::HEADER_VALIDATION_CONTEXT;
 
-#[cfg(not(feature = "nu7"))]
-use crate::service::finalized_state::disk_format::{
-    header_chain_values::HeaderValidationContextDisk, FallibleDiskValue,
-};
-
 /// Writes a synthetic finalized header chain from `genesis` to `chain_tip`, and
 /// returns its headers indexed by height.
 fn write_synthetic_finalized_headers(
@@ -261,8 +256,7 @@ fn predecessor_overlay_is_atomically_replaced_from_finalized_state() {
 }
 
 #[test]
-#[cfg(feature = "nu7")]
-fn zip218_build_backfills_an_existing_validation_context_before_startup() {
+fn existing_narrow_validation_context_is_backfilled_before_startup() {
     let _init_guard = zakura_test::init();
     let network = Network::Mainnet;
     let genesis = mainnet_block(0);
@@ -318,86 +312,6 @@ fn zip218_build_backfills_an_existing_validation_context_before_startup() {
     let (_, startup) = store
         .startup(&config)
         .expect("startup accepts the backfilled validation context");
-    assert!(startup.publication_allowed);
-}
-
-/// A build with a wider averaging window retains more validation context below
-/// the finalized anchor. A narrower build removes the extra rows at startup.
-#[test]
-#[cfg(not(feature = "nu7"))]
-fn narrower_build_trims_a_wider_validation_context_before_startup() {
-    let _init_guard = zakura_test::init();
-    let network = Network::Mainnet;
-    let genesis = mainnet_block(0);
-    let state = state_with_genesis_config(&network, genesis.clone(), Config::ephemeral());
-    let predecessor_span = zakura_header_chain::POW_PREDECESSOR_CONTEXT_SPAN;
-    // An NU7 build retains 102 averaging-window headers plus 10 additional
-    // median-time headers below the finalized anchor.
-    let wide_predecessor_span = 112;
-    let chain_tip = u32::try_from(wide_predecessor_span + 1)
-        .expect("the validation context span fits in a block height");
-    let headers = write_synthetic_finalized_headers(&state, &genesis, chain_tip);
-
-    let config = engine_config(network, &genesis);
-    let (runtime, report) = initialize_header_chain_reconciled(&state, &config, Vec::new())
-        .expect("the validation context initializes");
-    assert_eq!(report.validation_context_rows, predecessor_span);
-    drop(runtime);
-
-    let context_cf = state
-        .db
-        .cf_handle(HEADER_VALIDATION_CONTEXT)
-        .expect("the validation context column exists");
-    let mut widen = DiskWriteBatch::new();
-    let anchor = usize::try_from(chain_tip).expect("the anchor height fits in usize");
-    for (height, header) in headers
-        .iter()
-        .enumerate()
-        .take(anchor - predecessor_span)
-        .skip(anchor - wide_predecessor_span)
-    {
-        let context = HeaderValidationContextDisk {
-            header: header.clone(),
-            height: Height(u32::try_from(height).expect("the test height fits in u32")),
-        };
-        widen.zs_insert(
-            &context_cf,
-            RawBytes::new_raw_bytes(header.hash().0.to_vec()),
-            RawBytes::new_raw_bytes(context.encode().expect("the context row encodes")),
-        );
-    }
-    state
-        .db
-        .write(widen)
-        .expect("the wider context fixture writes");
-
-    let store = HeaderChainStore::new(state.header_chain_disk_db());
-    assert_eq!(
-        store
-            .resize_validation_context(&state)
-            .expect("authenticated full state trims the wider context"),
-        wide_predecessor_span - predecessor_span,
-    );
-
-    let mut contexts = Vec::new();
-    store
-        .audit_snapshot()
-        .expect("the store has an audit snapshot")
-        .visit_validation_context_records(RowLimit::new(predecessor_span), &mut |record| {
-            contexts.push(record.height);
-            Ok(())
-        })
-        .expect("the trimmed context fits in this build's span");
-    contexts.sort_unstable();
-    let first_height = u32::try_from(anchor - predecessor_span).expect("the height fits in u32");
-    assert_eq!(
-        contexts,
-        (first_height..chain_tip).map(Height).collect::<Vec<_>>()
-    );
-
-    let (_, startup) = store
-        .startup(&config)
-        .expect("startup accepts the trimmed validation context");
     assert!(startup.publication_allowed);
 }
 

@@ -251,19 +251,6 @@ const PRE_BLOSSOM_POW_TARGET_SPACING: i64 = 150;
 /// The target block spacing after Blossom activation.
 pub const POST_BLOSSOM_POW_TARGET_SPACING: u32 = 75;
 
-/// Whether the ZIP 218 consensus rules are compiled into this build.
-///
-/// ZIP 218 lowers the block target spacing from 75 to 25 seconds at NU7, widens
-/// the difficulty averaging window to match, divides the block subsidy by the
-/// spacing ratio, and adds per-block shielded action limits. The rules are still
-/// dormant until NU7 activates on the configured network, so a build with this
-/// feature enabled follows today's consensus on any network without an NU7
-/// activation height.
-///
-/// Enabled by the `nu7` feature, which also compiles in ZIP 234's
-/// halving-preserving reissuance, so this constant gates ZIP 234 too.
-pub const ZIP218_ENABLED: bool = cfg!(feature = "nu7");
-
 /// The target block spacing after NU7 activation, in seconds.
 ///
 /// `PostNU7PoWTargetSpacing` in ZIP 218.
@@ -323,13 +310,12 @@ pub const SPROUT_BLOCK_JOINSPLIT_LIMIT: u32 = 25;
 /// JoinSplits count twice because each produces two shielded outputs.
 pub const GLOBAL_SHIELDED_BUDGET: u32 = 330;
 
-/// The largest averaging window this build can use, which bounds the number of
-/// relevant blocks a difficulty adjustment reads.
-pub const MAX_POW_AVERAGING_WINDOW: usize = if ZIP218_ENABLED {
-    POST_NU7_POW_AVERAGING_WINDOW
-} else {
-    PRE_NU7_POW_AVERAGING_WINDOW
-};
+/// The largest consensus averaging window, which bounds the number of relevant
+/// blocks a difficulty adjustment can read.
+///
+/// Every build retains enough validation context for this window. The active
+/// window remains height-dependent; see [`NetworkUpgrade::averaging_window`].
+pub const MAX_POW_AVERAGING_WINDOW: usize = POST_NU7_POW_AVERAGING_WINDOW;
 
 /// The multiplier used to derive the testnet minimum difficulty block time gap
 /// threshold.
@@ -480,10 +466,10 @@ impl NetworkUpgrade {
             Blossom | Heartwood | Canopy | Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 => {
                 POST_BLOSSOM_POW_TARGET_SPACING.into()
             }
-            Nu7 => Self::post_nu7_target_spacing_seconds(),
+            Nu7 => POST_NU7_POW_TARGET_SPACING.into(),
 
             #[cfg(zcash_unstable = "zfuture")]
-            ZFuture => Self::post_nu7_target_spacing_seconds(),
+            ZFuture => POST_NU7_POW_TARGET_SPACING.into(),
         };
 
         Duration::seconds(spacing_seconds)
@@ -506,10 +492,7 @@ impl NetworkUpgrade {
                 NetworkUpgrade::Blossom,
                 POST_BLOSSOM_POW_TARGET_SPACING.into(),
             ),
-            (
-                NetworkUpgrade::Nu7,
-                NetworkUpgrade::post_nu7_target_spacing_seconds(),
-            ),
+            (NetworkUpgrade::Nu7, POST_NU7_POW_TARGET_SPACING.into()),
         ]
         .into_iter()
         .filter_map(move |(upgrade, spacing_seconds)| {
@@ -580,17 +563,6 @@ impl NetworkUpgrade {
         self.target_spacing() * self.averaging_window().try_into().expect("fits in i32")
     }
 
-    /// Returns the post-NU7 target spacing in seconds for this build.
-    ///
-    /// Without the `nu7` feature, NU7 keeps the post-Blossom spacing.
-    fn post_nu7_target_spacing_seconds() -> i64 {
-        if ZIP218_ENABLED {
-            POST_NU7_POW_TARGET_SPACING.into()
-        } else {
-            POST_BLOSSOM_POW_TARGET_SPACING.into()
-        }
-    }
-
     /// Returns the averaging window for difficulty threshold arithmetic mean
     /// calculations.
     ///
@@ -599,10 +571,10 @@ impl NetworkUpgrade {
         match self {
             Genesis | BeforeOverwinter | Overwinter | Sapling | Blossom | Heartwood | Canopy
             | Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 => PRE_NU7_POW_AVERAGING_WINDOW,
-            Nu7 => MAX_POW_AVERAGING_WINDOW,
+            Nu7 => POST_NU7_POW_AVERAGING_WINDOW,
 
             #[cfg(zcash_unstable = "zfuture")]
-            ZFuture => MAX_POW_AVERAGING_WINDOW,
+            ZFuture => POST_NU7_POW_AVERAGING_WINDOW,
         }
     }
 
@@ -623,14 +595,6 @@ impl NetworkUpgrade {
             .values()
             .any(|upgrade| *upgrade == NetworkUpgrade::Nu7)
             && NetworkUpgrade::current(network, height) >= NetworkUpgrade::Nu7
-    }
-
-    /// Returns `true` if the ZIP 218 rules are compiled in and active for
-    /// `network` at `height`.
-    ///
-    /// See [`ZIP218_ENABLED`] and [`NetworkUpgrade::is_nu7_active`].
-    pub fn is_zip218_active(network: &Network, height: block::Height) -> bool {
-        ZIP218_ENABLED && Self::is_nu7_active(network, height)
     }
 
     /// Returns the averaging window timespan for `network` and `height`.

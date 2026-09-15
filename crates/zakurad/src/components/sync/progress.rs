@@ -382,7 +382,7 @@ fn min_minutes_after_checkpoint_update(network: &Network, height: Height) -> u64
 
 #[cfg(test)]
 mod tests {
-    use zakura_chain::parameters::{testnet::ConfiguredActivationHeights, ZIP218_ENABLED};
+    use zakura_chain::parameters::testnet::ConfiguredActivationHeights;
 
     use super::*;
 
@@ -425,15 +425,7 @@ mod tests {
         assert_eq!(stall_interval_seconds(&regtest, pre_nu7), 600);
         assert_eq!(min_minutes_after_checkpoint_update(&regtest, pre_nu7), 13);
 
-        let (post_nu7_interval, post_nu7_minutes) =
-            if ZIP218_ENABLED { (200, 5) } else { (600, 13) };
-        assert_eq!(
-            stall_interval_seconds(&regtest, post_nu7),
-            post_nu7_interval
-        );
-        assert_eq!(
-            min_minutes_after_checkpoint_update(&regtest, post_nu7),
-            post_nu7_minutes
-        );
+        assert_eq!(stall_interval_seconds(&regtest, post_nu7), 200);
+        assert_eq!(min_minutes_after_checkpoint_update(&regtest, post_nu7), 5);
     }
 }

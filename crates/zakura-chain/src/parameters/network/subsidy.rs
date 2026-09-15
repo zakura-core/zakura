@@ -19,7 +19,7 @@ use std::{collections::HashMap, sync::OnceLock};
 use crate::{
     amount::{self, Amount, NonNegative, MAX_MONEY},
     block::{Height, HeightDiff},
-    parameters::{Network, NetworkUpgrade, ZIP218_ENABLED},
+    parameters::{Network, NetworkUpgrade},
     transparent,
 };
 
@@ -283,13 +283,20 @@ pub fn funding_stream_address_period<N: ParameterSubsidy>(
     height: Height,
     network: &N,
 ) -> HeightDiff {
-    // Spec equation: `address_period = floor((height - (height_for_halving(1) - post_blossom_halving_interval))/funding_stream_address_change_interval)`,
+    // Spec equation: `address_period = floor((height -
+    // (height_for_halving(1) - post_blossom_halving_interval)) /
+    // funding_stream_address_change_interval)`,
     // <https://zips.z.cash/protocol/protocol.pdf#fundingstreams>
     //
-    // Note that the brackets make it so the post blossom halving interval is added to the total.
-    //
+    // Note that the brackets make it so the post-Blossom halving interval is
+    // added to the total.
+
     let height_after_first_halving = height - network.height_for_first_halving();
 
+    // `div_euclid` matches the specification's floor because the interval is
+    // positive. The regression test uses a height one block before the
+    // address-period anchor: its numerator is -1, so `/` would truncate it
+    // to 0 rather than floor it to -1.
     (height_after_first_halving + network.post_blossom_halving_interval())
         .div_euclid(network.funding_stream_address_change_interval())
 }
@@ -731,7 +738,7 @@ impl<'a> Pre218Schedule<'a> {
 /// subsidy actually follows ZIP 234, and so whether a caller has to fetch the money
 /// reserve.
 pub fn is_zip234_active(network: &Network, height: Height) -> bool {
-    ZIP218_ENABLED && zip234_start_height(network).is_some_and(|start| height >= start)
+    cfg!(feature = "nu7") && zip234_start_height(network).is_some_and(|start| height >= start)
 }
 
 /// Applies the [ZIP 234] reissuance fraction to `amount`, rounding up.

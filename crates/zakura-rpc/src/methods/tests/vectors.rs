@@ -3216,7 +3216,7 @@ async fn getblocktemplate() {
 
 /// `getblocksubsidy` and `getblocktemplate` include the ZIP 234 reissuance bonus at and
 /// after the start height, and return an error when the deficit is negative.
-#[cfg(feature = "nu7-experimental")]
+#[cfg(feature = "nu7")]
 #[tokio::test(flavor = "multi_thread")]
 async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
     use zakura_chain::{

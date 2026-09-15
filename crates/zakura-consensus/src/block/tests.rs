@@ -2008,16 +2008,16 @@ mod zip218_shielded_action_limits {
 }
 
 /// A deficit that pays a nonzero ZIP 234 bonus.
-#[cfg(feature = "nu7-experimental")]
+#[cfg(feature = "nu7")]
 const ZIP234_TEST_DEFICIT: i64 = 400_000_000;
 
 /// `ceil(ZIP234_TEST_DEFICIT * 4126 / 10^10)`, rounded up from 165.04.
-#[cfg(feature = "nu7-experimental")]
+#[cfg(feature = "nu7")]
 const ZIP234_TEST_BONUS: i64 = 166;
 
 /// Returns the chain value pools after `parent` on `network`, `deficit` zatoshi behind the
 /// halving schedule.
-#[cfg(feature = "nu7-experimental")]
+#[cfg(feature = "nu7")]
 fn zip234_parent_pools(
     network: &Network,
     parent: Height,
@@ -2039,7 +2039,7 @@ fn zip234_parent_pools(
 
 /// Semantic verification checks the coinbase against the ZIP 234 subsidy, which depends on
 /// the parent's chain value pools.
-#[cfg(feature = "nu7-experimental")]
+#[cfg(feature = "nu7")]
 #[tokio::test]
 async fn zip234_block_verification_checks_the_reissuance_bonus() {
     use zakura_chain::{block_info::BlockInfo, parameters::subsidy::halving_block_subsidy};
@@ -2111,7 +2111,7 @@ async fn zip234_block_verification_checks_the_reissuance_bonus() {
 }
 
 /// A network with NU7 at height 1 and ZIP 234 reissuance from `start`.
-#[cfg(feature = "nu7-experimental")]
+#[cfg(feature = "nu7")]
 fn zip234_test_network(start: Height) -> Network {
     let genesis_block =
         Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
@@ -2147,7 +2147,7 @@ fn zip234_test_network(start: Height) -> Network {
 }
 
 /// A block at `height` whose coinbase pays `coinbase_value`.
-#[cfg(feature = "nu7-experimental")]
+#[cfg(feature = "nu7")]
 fn zip234_test_block(
     network: &Network,
     height: Height,

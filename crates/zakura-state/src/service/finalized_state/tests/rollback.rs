@@ -735,7 +735,7 @@ fn rollback_reverses_intra_block_self_spend() {
 
 /// Rolling back blocks at and after the ZIP 234 start height recomputes their subsidies from
 /// each parent's chain value pools.
-#[cfg(feature = "nu7-experimental")]
+#[cfg(feature = "nu7")]
 #[test]
 fn rollback_crosses_the_zip234_start_height() {
     use zakura_chain::parameters::{subsidy::is_zip234_active, testnet::RegtestParameters};

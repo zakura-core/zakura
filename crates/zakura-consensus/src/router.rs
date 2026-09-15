@@ -37,7 +37,7 @@ use zakura_state as zs;
 use crate::{
     block::{Request, SemanticBlockVerifier, VerifyBlockError},
     checkpoint::{CheckpointVerifier, VerifyCheckpointError},
-    error::TransactionError,
+    error::{BlockError, TransactionError},
     transaction, BoxError, Config,
 };
 
@@ -348,7 +348,20 @@ where
                 if let Err(error) =
                     transaction::check::coinbase_height_matches_expiry(&height, coinbase)
                 {
-                    return async { Err(VerifyBlockError::Transaction(error).into()) }.boxed();
+                    // A rewritten expiry changes the coinbase transaction ID. That body fails
+                    // its header commitment, so only the supplier is at fault.
+                    let merkle_root: block::merkle::Root =
+                        block.transactions.iter().map(|tx| tx.hash()).collect();
+                    let error = if merkle_root == block.header.merkle_root {
+                        VerifyBlockError::Transaction(error)
+                    } else {
+                        BlockError::BadMerkleRoot {
+                            actual: merkle_root,
+                            expected: block.header.merkle_root,
+                        }
+                        .into()
+                    };
+                    return async { Err(error.into()) }.boxed();
                 }
             }
         }

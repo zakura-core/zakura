@@ -1813,38 +1813,41 @@ async fn dont_skip_verification_of_block_transactions_in_mempool() {
     };
 
     // Both block requests go through full verification (no mempool bypass), so each
-    // calls AwaitUtxo on the state service.
-    let utxo_clone = utxo.clone();
-    tokio::spawn(async move {
-        state
-            .expect_request(zakura_state::Request::AwaitUtxo(input_outpoint))
-            .await
-            .expect("verifier should call mock state service with correct request")
-            .respond(zakura_state::Response::Utxo(utxo_clone));
-
-        state
-            .expect_request(zakura_state::Request::AwaitUtxo(input_outpoint))
-            .await
-            .expect("verifier should call mock state service with correct request")
-            .respond(zakura_state::Response::Utxo(utxo));
-    });
-
-    // Briefly yield and sleep so the spawned task can first expect the requests.
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-    let crate::transaction::Response::Block { .. } = verifier
-        .clone()
-        .oneshot(make_request.clone()(Arc::new([input_outpoint.hash].into())))
+    // calls AwaitUtxo on the state service. Pair each request with its response before
+    // starting the next request so the mock cannot miss the second call.
+    let first_verification = tokio::spawn(
+        verifier
+            .clone()
+            .oneshot(make_request.clone()(Arc::new([input_outpoint.hash].into()))),
+    );
+    state
+        .expect_request(zakura_state::Request::AwaitUtxo(input_outpoint))
         .await
+        .expect("verifier should call mock state service with correct request")
+        .respond(zakura_state::Response::Utxo(utxo.clone()));
+
+    let crate::transaction::Response::Block { .. } = first_verification
+        .await
+        .expect("block verification task should not panic")
         .expect("should succeed after calling state service")
     else {
         panic!("unexpected response variant from transaction verifier for Block request")
     };
 
-    let crate::transaction::Response::Block { .. } = verifier
-        .clone()
-        .oneshot(make_request.clone()(Arc::new(HashSet::new())))
+    let second_verification = tokio::spawn(
+        verifier
+            .clone()
+            .oneshot(make_request(Arc::new(HashSet::new()))),
+    );
+    state
+        .expect_request(zakura_state::Request::AwaitUtxo(input_outpoint))
         .await
+        .expect("verifier should call mock state service with correct request")
+        .respond(zakura_state::Response::Utxo(utxo));
+
+    let crate::transaction::Response::Block { .. } = second_verification
+        .await
+        .expect("block verification task should not panic")
         .expect("should succeed after calling state service")
     else {
         panic!("unexpected response variant from transaction verifier for Block request")

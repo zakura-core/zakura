@@ -8,8 +8,8 @@ use std::{
 use thiserror::Error;
 
 use super::{
-    Frame, Peer, Service, SessionDemand, SessionPolicy, SinkReject, Stream, StreamMode,
-    StreamWritePolicy,
+    Frame, MessageRatePolicy, Peer, Service, SessionDemand, SessionPolicy, SinkReject, Stream,
+    StreamMode, StreamWritePolicy,
 };
 use crate::zakura::{ServicePeerDirection, ZakuraConnId, ZakuraPeerId};
 
@@ -215,6 +215,13 @@ impl ServiceRegistry {
 
     pub(crate) fn message_types(&self, stream: Stream) -> Option<&'static [u16]> {
         self.service_for_kind(stream.kind)?.message_types(stream)
+    }
+
+    pub(crate) fn message_rate_policy(&self, stream: Stream) -> MessageRatePolicy {
+        self.service_for_kind(stream.kind)
+            .map_or(MessageRatePolicy::RateLimited, |service| {
+                service.message_rate_policy(stream)
+            })
     }
 
     pub(crate) fn allowed_frame_flags(&self, stream: Stream) -> u16 {

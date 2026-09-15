@@ -73,7 +73,7 @@ pub const LOCAL_MAX_CONTROL_FRAME_BYTES: u32 = 1024 * 1024;
 pub const LOCAL_MAX_MESSAGE_BYTES: u32 = 4 * 1024 * 1024;
 
 /// Maximum locally accepted open streams advertised in control hello.
-pub const LOCAL_MAX_OPEN_STREAMS: u16 = 1024;
+pub const LOCAL_MAX_OPEN_STREAMS: u16 = 16;
 
 /// Maximum locally accepted inbound queue depth advertised in control hello.
 pub const LOCAL_MAX_INBOUND_QUEUE_DEPTH: u16 = 4096;
@@ -1182,6 +1182,7 @@ impl ZakuraControlAck {
         if self.accepted_limits.max_frame_bytes > requested_limits.max_frame_bytes
             || self.accepted_limits.max_message_bytes > requested_limits.max_message_bytes
             || self.accepted_limits.max_open_streams > requested_limits.max_open_streams
+            || self.accepted_limits.max_open_streams > local.max_open_streams
             || self.accepted_limits.max_inbound_queue_depth
                 > requested_limits.max_inbound_queue_depth
             || self.accepted_limits.idle_timeout_millis > requested_limits.idle_timeout_millis
@@ -1626,6 +1627,7 @@ fn validate_peer_hints(
     Ok(())
 }
 
+// See `validate_initial_limits` below for why a larger advertisement is accepted.
 fn validate_resource_limits(
     max_control_frame_bytes: u32,
     max_open_streams: u16,
@@ -1634,13 +1636,15 @@ fn validate_resource_limits(
     if max_control_frame_bytes == 0
         || max_control_frame_bytes > local.max_control_frame_bytes
         || max_open_streams == 0
-        || max_open_streams > local.max_open_streams
     {
         return Err(ZakuraRejectReason::ResourceLimit);
     }
     Ok(())
 }
 
+// A peer that accepts more open streams than we do is not a resource fault:
+// `accepted_limits_for` and `ZakuraLocalLimits::clamp` take the minimum of both
+// sides, so a larger advertisement never raises what this node opens or admits.
 fn validate_initial_limits(
     limits: ZakuraInitialLimits,
     local: &ZakuraHandshakeConfig,
@@ -1652,7 +1656,6 @@ fn validate_initial_limits(
         || limits.max_message_bytes == 0
         || limits.max_message_bytes > local.max_message_bytes
         || limits.max_open_streams == 0
-        || limits.max_open_streams > local.max_open_streams
         || limits.max_inbound_queue_depth == 0
         || limits.max_inbound_queue_depth > local.max_inbound_queue_depth
         || limits.idle_timeout_millis == 0
@@ -2359,6 +2362,105 @@ mod tests {
                 Err(ZakuraValidationError::ResourceLimit)
             );
         }
+    }
+
+    #[test]
+    fn control_ack_rejects_open_streams_above_local_cap_regardless_of_requested_ceiling() {
+        // `requested_limits.max_open_streams` is set above the local ceiling, so the
+        // pre-existing `accepted > requested` clause cannot fire here; only the
+        // `accepted > local` clause added for PR 981 can reject this ack.
+        let local = local_config();
+        let requested_limits = ZakuraInitialLimits {
+            max_frame_bytes: local.max_message_bytes,
+            max_message_bytes: local.max_message_bytes,
+            max_open_streams: local.max_open_streams + 4,
+            max_inbound_queue_depth: local.max_inbound_queue_depth,
+            idle_timeout_millis: local.max_idle_timeout_millis,
+        };
+        let ack = ZakuraControlAck {
+            magic: CONTROL_ACK_MAGIC,
+            control_version: CONTROL_VERSION,
+            selected_zakura_protocol: ZAKURA_PROTOCOL_VERSION_CURRENT,
+            peer_nonce: [2; 32],
+            remote_peer_nonce: [1; 32],
+            accepted_capabilities: 0,
+            accepted_channels: 0,
+            accepted_limits: ZakuraAcceptedLimits {
+                max_open_streams: local.max_open_streams + 1,
+                ..requested_limits
+            },
+        };
+        assert_eq!(
+            ack.validate(
+                ZAKURA_PROTOCOL_VERSION_CURRENT,
+                [1; 32],
+                [2; 32],
+                &requested_limits,
+                &local
+            ),
+            Err(ZakuraValidationError::ResourceLimit),
+            "an ack accepting more streams than our local cap is rejected even though it is still below the requested ceiling"
+        );
+
+        // Positive control: accepting exactly the local cap under the same
+        // higher requested ceiling validates.
+        let within_local_cap = ZakuraControlAck {
+            accepted_limits: ZakuraAcceptedLimits {
+                max_open_streams: local.max_open_streams,
+                ..requested_limits
+            },
+            ..ack
+        };
+        assert_eq!(
+            within_local_cap.validate(
+                ZAKURA_PROTOCOL_VERSION_CURRENT,
+                [1; 32],
+                [2; 32],
+                &requested_limits,
+                &local
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn hello_advertising_more_streams_than_local_is_accepted() {
+        let local = local_config();
+        for advertised in [local.max_open_streams + 1, 1024, u16::MAX] {
+            let limits = ZakuraInitialLimits {
+                max_frame_bytes: local.max_message_bytes,
+                max_message_bytes: local.max_message_bytes,
+                max_open_streams: advertised,
+                max_inbound_queue_depth: local.max_inbound_queue_depth,
+                idle_timeout_millis: local.max_idle_timeout_millis,
+            };
+            assert_eq!(
+                validate_initial_limits(limits, &local),
+                Ok(()),
+                "a peer that accepts more streams than we open is not a resource fault ({advertised})"
+            );
+            assert_eq!(
+                validate_resource_limits(local.max_control_frame_bytes, advertised, &local),
+                Ok(())
+            );
+        }
+        assert_eq!(
+            validate_initial_limits(
+                ZakuraInitialLimits {
+                    max_frame_bytes: local.max_message_bytes,
+                    max_message_bytes: local.max_message_bytes,
+                    max_open_streams: 0,
+                    max_inbound_queue_depth: local.max_inbound_queue_depth,
+                    idle_timeout_millis: local.max_idle_timeout_millis,
+                },
+                &local
+            ),
+            Err(ZakuraRejectReason::ResourceLimit)
+        );
+        assert_eq!(
+            validate_resource_limits(local.max_control_frame_bytes, 0, &local),
+            Err(ZakuraRejectReason::ResourceLimit)
+        );
     }
 
     #[test]

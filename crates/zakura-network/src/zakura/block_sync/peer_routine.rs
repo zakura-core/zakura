@@ -1388,6 +1388,9 @@ impl PeerRoutine {
                 break FillStop::SendError;
             }
             metrics::counter!("sync.block.request.sent").increment(1);
+            #[cfg(test)]
+            self.registry
+                .observe_exchange_for_test(&self.peer, self.generation, true);
             if in_bypass {
                 // A floor request borrowed a bypass slot while the cwnd was saturated.
                 metrics::counter!("sync.block.request.floor_bypass").increment(1);
@@ -1979,6 +1982,9 @@ impl PeerRoutine {
         };
         self.charge_short_response_reliability(index, disposition);
         self.finish_outstanding_at(index, disposition);
+        #[cfg(test)]
+        self.registry
+            .observe_exchange_for_test(&self.peer, self.generation, false);
         Ok(())
     }
 
@@ -2007,6 +2013,9 @@ impl PeerRoutine {
         );
         self.charge_short_response_reliability(index, Disposition::RetryOriginal);
         self.finish_outstanding_at(index, Disposition::RetryOriginal);
+        #[cfg(test)]
+        self.registry
+            .observe_exchange_for_test(&self.peer, self.generation, false);
         Ok(())
     }
 

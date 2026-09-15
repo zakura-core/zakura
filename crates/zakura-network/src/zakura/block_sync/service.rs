@@ -1,9 +1,9 @@
 use super::{config::*, peer_registry::SessionAdmission, wire::*, *};
 use crate::zakura::{
-    handle_pipe_exit, spawn_supervised_pipe, FramedRecv, FramedSend, OrderedSendError, Peer,
-    PeerStreamSession, Service, ServicePeerSnapshot, SessionDemand, SessionOpening, SessionPolicy,
-    SinkReject, Stream, StreamMode, StreamWritePolicy, ZakuraBlockSyncCandidateState, ZakuraConnId,
-    ZakuraPeerId, FRAME_HEADER_BYTES,
+    handle_pipe_exit, spawn_supervised_pipe, FramedRecv, FramedSend, MessageRatePolicy,
+    OrderedSendError, Peer, PeerStreamSession, Service, ServicePeerSnapshot, SessionDemand,
+    SessionOpening, SessionPolicy, SinkReject, Stream, StreamMode, StreamWritePolicy,
+    ZakuraBlockSyncCandidateState, ZakuraConnId, ZakuraPeerId, FRAME_HEADER_BYTES,
 };
 use std::{
     sync::atomic::{AtomicU64, Ordering},
@@ -520,6 +520,23 @@ impl Service for BlockSyncService {
 
     fn allowed_frame_flags(&self, _stream: Stream) -> u16 {
         0
+    }
+
+    fn message_rate_policy(&self, stream: Stream) -> MessageRatePolicy {
+        // These u8 discriminators fit in u16 without changing their values.
+        if stream == BLOCK_SYNC_REQUESTS {
+            MessageRatePolicy::CapacityBounded(&[MSG_BS_GET_BLOCKS as u16])
+        } else if stream == BLOCK_SYNC_DATA {
+            // A fast answer to our own request must not consume Status's rate
+            // allowance. The receiver still requires a matching live request.
+            MessageRatePolicy::CapacityBounded(&[
+                MSG_BS_BLOCK as u16,
+                MSG_BS_BLOCKS_DONE as u16,
+                MSG_BS_RANGE_UNAVAILABLE as u16,
+            ])
+        } else {
+            MessageRatePolicy::RateLimited
+        }
     }
 
     fn stream_write_policy(&self, stream: Stream) -> StreamWritePolicy {

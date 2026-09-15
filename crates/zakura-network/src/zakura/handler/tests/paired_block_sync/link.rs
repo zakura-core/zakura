@@ -8,18 +8,22 @@ use std::{
 };
 use tokio::net::UdpSocket;
 
-const ONE_WAY_DELAY: Duration = Duration::from_millis(25);
 const MAX_PENDING_PACKETS: usize = 4096;
 
 pub(super) struct ImpairedLink {
     pub(super) address: SocketAddr,
     response_bytes: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
+    loss: bool,
     _task: AbortOnDropHandle<()>,
 }
 
 impl ImpairedLink {
-    pub(super) async fn new(server: SocketAddr) -> Result<Self, BoxError> {
+    pub(super) async fn new(
+        server: SocketAddr,
+        one_way_delay: Duration,
+        loss: bool,
+    ) -> Result<Self, BoxError> {
         let front = UdpSocket::bind("127.0.0.1:0").await?;
         let back = UdpSocket::bind("127.0.0.1:0").await?;
         let address = front.local_addr()?;
@@ -56,20 +60,20 @@ impl ImpairedLink {
                         client = Some(source);
                         client_packets += 1;
                         // Deterministic 1% loss separately in each direction.
-                        if client_packets.is_multiple_of(100) {
+                        if loss && client_packets.is_multiple_of(100) {
                             lost.fetch_add(1, Ordering::Relaxed);
                         } else {
-                            queue.push_back((Instant::now() + ONE_WAY_DELAY, false, from_client[..len].to_vec()));
+                            queue.push_back((Instant::now() + one_way_delay, false, from_client[..len].to_vec()));
                         }
                     }
                     received = back.recv_from(&mut from_server), if queue.len() < MAX_PENDING_PACKETS => {
                         let (len, source) = received.unwrap();
                         assert_eq!(source, server);
                         server_packets += 1;
-                        if server_packets.is_multiple_of(100) {
+                        if loss && server_packets.is_multiple_of(100) {
                             lost.fetch_add(1, Ordering::Relaxed);
                         } else {
-                            queue.push_back((Instant::now() + ONE_WAY_DELAY, true, from_server[..len].to_vec()));
+                            queue.push_back((Instant::now() + one_way_delay, true, from_server[..len].to_vec()));
                         }
                     }
                 }
@@ -79,6 +83,7 @@ impl ImpairedLink {
             address,
             response_bytes,
             dropped,
+            loss,
             _task: AbortOnDropHandle::new(task),
         })
     }
@@ -99,7 +104,7 @@ impl ImpairedLink {
             "all useful response bytes crossed the proxy"
         );
         assert!(
-            self.dropped.load(Ordering::Relaxed) > 0,
+            !self.loss || self.dropped.load(Ordering::Relaxed) > 0,
             "the test exercised packet loss"
         );
     }

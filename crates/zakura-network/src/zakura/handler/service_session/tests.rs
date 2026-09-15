@@ -1,3 +1,4 @@
+use super::super::tests::connection::RawConnection;
 use super::*;
 use crate::zakura::testkit::LocalEndpointFactory;
 use tokio_util::task::AbortOnDropHandle;
@@ -489,21 +490,6 @@ async fn request_backpressure_survives_write_timeout_and_pair_cancellation() -> 
     let (mut replacement_client, mut replacement_server) = fixture.sessions().await?;
     exchange(&mut replacement_client, &mut replacement_server).await?;
     fixture.close().await
-}
-
-/// Capture only the connection so tests can send exact setup bytes.
-#[derive(Debug)]
-struct RawConnection(mpsc::Sender<Connection>);
-
-impl ProtocolHandler for RawConnection {
-    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        self.0
-            .send(connection.clone())
-            .await
-            .map_err(AcceptError::from_err)?;
-        connection.closed().await;
-        Ok(())
-    }
 }
 
 async fn raw_connection() -> Result<(Router, Endpoint, Connection, Connection), BoxError> {
@@ -1120,6 +1106,7 @@ fn raw_worker_context(client: &Endpoint, slots: Arc<Semaphore>) -> StreamWorkerC
         inbound_frame_cap: DATA.frame_cap,
         message_payload_limits: &[],
         message_types: None,
+        message_rate_policy: MessageRatePolicy::RateLimited,
         allowed_frame_flags: u16::MAX,
         queue_depths: None,
         write_policy: StreamWritePolicy::UntilCancelled,

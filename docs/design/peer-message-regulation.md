@@ -25,6 +25,20 @@ responses can still cause CPU or storage work.
 
 ## Message checks and handler policy
 
+Services declare `MessageRatePolicy` for each stream. The default keeps the shared
+message-rate allowance. `CapacityBounded` names only the message types whose work,
+buffers and response authorization already have their own bounds. Both incoming
+and locally opened streams apply the declaration. Other message types still spend
+the existing allowance, shared across the service's paired streams.
+
+GetBlocks, Block, BlocksDone and RangeUnavailable use capacity admission. For
+example, answering our requests quickly must not use up the allowance for Status
+messages. Status keeps its existing frequency checks. This policy does not bypass
+frame or allocation limits, admit storage work, or authorize unsolicited replies.
+Other production services keep their existing rate behavior until their own
+message contracts are implemented. A discovery test adapter exercises the shared
+policy without changing production discovery.
+
 The implementation may use existing codecs, handlers, and validators. It need not introduce a
 declaration builder, universal filter framework, or one ingress call site per data type.
 
@@ -44,6 +58,12 @@ runtime work. Bounded decoder tests still check that untrusted payloads cannot c
 ## Response lifetime and session replacement
 
 The shared requester primitives separate response credit from session lifetime.
+An explicit credit grant can add object and byte allowances within the message's
+outstanding-credit limits. It preserves cumulative consumption and rejects an
+excessive or overflowing grant without changing either counter. The message
+adapter records each grant before publishing it, checks its identity and sequence,
+and prohibits grants after closure. Finite GetBlocks requests receive credit once.
+Renewal supports the future subscription contract.
 `ResponseCredit` counts consumed objects and actual bytes. `ResponseScope` fences
 publication and first writes for one receiver incarnation. Each exchange has one
 `ResponseAuthorization` owner, retained until its validated ending. The writer
@@ -82,7 +102,11 @@ and registry capacities before taking work or publishing expectations. When the
 preferred batch cannot fit, it tries tighter growth and smaller batches. Retained
 buffers keep their charges when emptied, and growth funds old and new storage
 together. These allowances are separate from body storage, decoding, and execution
-budgets. They do not bound total process memory.
+budgets. Other metadata collections, transport setup, stream buffers and
+cancellation children still need aggregate accounting. These limits do not bound
+all protocol metadata or total process memory. The
+[allocation guide](../testing/request-allocation-planning.md) describes the funded
+buffers and their publication contract.
 
 ## Capacity admission and QUIC backpressure
 
@@ -97,6 +121,13 @@ Stopping application reads must stop draining the QUIC receive buffer. Once the 
 existing stream credit, it cannot send more data on that stream. Already authorized bytes still
 count toward the resource bound. Account for both stream and connection credit.
 See [QUIC flow control](https://www.rfc-editor.org/rfc/rfc9000.html#section-4.1).
+
+The current implementation uses published transport packages. It bounds application work and
+requester metadata, but does not yet fund transport state through handshakes and final cleanup.
+Transport send capacity must eventually count retained payload, including acknowledged tails
+behind a missing prefix. Stream and fragment limits must cover locally opened and retiring state.
+The dependency changes needed for these bounds are reviewed separately. Their blocked witnesses
+and re-enable conditions are recorded in the [transport capacity plan](native-transport-capacity.md).
 
 Pausing request intake must not trap responses or control messages needed to finish active work.
 A mixed ordered stream can create that dependency even when every queue is bounded. The concrete

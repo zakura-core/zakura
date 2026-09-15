@@ -1,7 +1,9 @@
 //! Zakura P2P v2 endpoint, protocol handler, and bounded connection serving.
 
+mod message_admission;
 mod service_session;
 mod trace;
+use message_admission::{admit_inbound_message, InboundMessageAdmission};
 use service_session::{spawn_service_session, PendingSessions, PreparedStream, SetupIo};
 
 use std::{
@@ -59,11 +61,11 @@ use crate::{
         AuthenticatedPeerRegistration, BlockSyncAction, BlockSyncFrontiers, BlockSyncHandle,
         BlockSyncService, BlockSyncStartup, BoxRunFuture, Clock, CloseCause, Frame, FramedRecv,
         FramedSend, FullStateFrontiers, HeaderSyncPassthroughService, HeaderSyncService,
-        HeaderSyncStartup, Peer, RealClock, Service, ServicePeerDirection, ServiceRegistry,
-        ServiceStream, SessionDemand, SessionOpening, SessionPolicy, SinkReject, Stream,
-        StreamMode, StreamPrelude, StreamWritePolicy, ZakuraAcceptedLimits, ZakuraBlockSyncConfig,
-        ZakuraConnId, ZakuraControlAck, ZakuraControlHello, ZakuraControlRole,
-        ZakuraControlValidation, ZakuraHandshakeConfig, ZakuraHandshakePath,
+        HeaderSyncStartup, MessageRatePolicy, Peer, RealClock, Service, ServicePeerDirection,
+        ServiceRegistry, ServiceStream, SessionDemand, SessionOpening, SessionPolicy, SinkReject,
+        Stream, StreamMode, StreamPrelude, StreamWritePolicy, ZakuraAcceptedLimits,
+        ZakuraBlockSyncConfig, ZakuraConnId, ZakuraControlAck, ZakuraControlHello,
+        ZakuraControlRole, ZakuraControlValidation, ZakuraHandshakeConfig, ZakuraHandshakePath,
         ZakuraHeaderSyncConfig, ZakuraInitialLimits, ZakuraLimits, ZakuraPeerId,
         ZakuraPeerSupervisor, ZakuraProtocolError, ZakuraRejectReason, ZakuraServiceId,
         ZakuraUpgradeDialStart, CONTROL_ACK_MAGIC, CONTROL_HELLO_MAGIC, CONTROL_VERSION,
@@ -81,15 +83,9 @@ pub const DEFAULT_ZAKURA_MAX_CONNS_PER_IP: usize = 16;
 pub const DEFAULT_ZAKURA_MAX_PENDING_HANDSHAKES: usize = 32;
 /// Default stream-open churn per connection.
 pub const DEFAULT_ZAKURA_STREAM_OPEN_RATE_PER_SECOND: u32 = 32;
-/// Per-kind inbound message rate per connection.
-///
-/// This is a generous universal cap: block-sync legitimately delivers
-/// hundreds of solicited bodies per second in bursts, so a low limit
-/// starves sync. Exceeding it is a transport-level hard failure rather than a
-/// peer-scoring decision: we never silently drop a solicited frame because a
-/// dropped block body is a permanent gap on a reliable stream. Longer term
-/// this should be split per message type (some unbounded, some near-one-shot)
-/// rather than a single universal value.
+/// Default shared rate for messages without a capacity-bounded policy.
+/// Persistent streams close the connection on excess. Solicited block responses use their
+/// authorization and resource bounds instead, so fast replies do not exhaust it.
 pub const DEFAULT_ZAKURA_MESSAGE_RATE_PER_SECOND: u32 = 2048;
 /// Default native Zakura QUIC listen address.
 pub const DEFAULT_ZAKURA_LISTEN_ADDR: SocketAddr =
@@ -150,11 +146,30 @@ pub const ZAKURA_DUPLICATE_EVICT_MIN_AGE: Duration = Duration::from_secs(300);
 /// resolution (milliseconds) so a genuine race keeps the transcript-tiebreak
 /// winner instead of flapping.
 pub const ZAKURA_SAME_IP_DUPLICATE_EVICT_MIN_AGE: Duration = Duration::from_secs(5);
-/// A paused stream may consume at most half the connection receive window,
-/// leaving credit for another service stream.
-pub const DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW: u32 = 16 * 1024 * 1024;
-/// QUIC connection receive window used by Zakura endpoints.
+/// Maximum retained remotely initiated bidirectional transport streams.
+pub const DEFAULT_ZAKURA_REMOTE_BIDI_STREAMS: u32 = 16;
+/// Receive credit available to one stream, including before application admission.
+///
+/// One block-sync data stream carries a peer's bodies, so its throughput is bounded
+/// by this window divided by the round trip. 8 MiB keeps a 100 ms peer above
+/// 60 MB/s; 256 KiB measured at 0.17 of the 16 MiB baseline at 100 ms and 1 MiB at
+/// 0.59 (`gate::transport_windows`, delay-only link). The specification requires
+/// regulation to preserve throughput, so this stays large.
+pub const DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
+/// Receive credit shared by every stream on a connection.
 pub const DEFAULT_ZAKURA_RECEIVE_WINDOW: u32 = 32 * 1024 * 1024;
+/// Paused sibling streams that still leave another stream enough connection credit
+/// to progress. The transport sends a connection credit update only after an eighth
+/// of the window is consumed, so that eighth is reserved as headroom. Beyond this
+/// count a connection can stall until the write, setup or download deadlines close
+/// it; bounding total credit node-wide is deferred transport work.
+pub const SUPPORTED_PAUSED_SIBLING_STREAMS: u32 = (DEFAULT_ZAKURA_RECEIVE_WINDOW
+    - DEFAULT_ZAKURA_RECEIVE_WINDOW / 8)
+    / DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW;
+const _: () = assert!(
+    SUPPORTED_PAUSED_SIBLING_STREAMS >= 2,
+    "the T02 qualification pauses two sibling streams"
+);
 /// QUIC send window used by Zakura endpoints.
 pub const DEFAULT_ZAKURA_SEND_WINDOW: u64 = 32 * 1024 * 1024;
 /// Initial backoff before re-dialing a configured Zakura bootstrap peer.
@@ -301,7 +316,9 @@ pub struct ZakuraConfig {
     pub max_pending_handshakes: usize,
     /// New streams per second admitted per connection after a valid prelude.
     pub stream_open_rate_per_second: u32,
-    /// Messages per second admitted per stream kind on a connection.
+    /// Messages per second for rate-limited traffic of each stream kind on a connection.
+    /// Capacity-bounded message types do not consume this allowance. Paired streams
+    /// share it, so opening another stream cannot give metadata a fresh allowance.
     pub message_rate_per_second: u32,
     /// Optional directory for structured Zakura JSONL trace tables.
     ///
@@ -412,13 +429,14 @@ pub struct ZakuraLocalLimits {
     pub control_timeout: Duration,
     /// Per-connection stream-open rate.
     pub stream_open_rate_per_second: u32,
-    /// Per-stream-kind message rate.
+    /// Message rate per stream kind or paired service, excluding capacity-bounded types.
     pub message_rate_per_second: u32,
     /// Maximum frame bytes accepted locally.
     pub max_frame_bytes: u32,
     /// Maximum reassembled message bytes accepted locally.
     pub max_message_bytes: u32,
-    /// Maximum concurrent admitted streams per connection.
+    /// Maximum concurrent admitted streams per connection, clamped to 1..=16.
+    /// Negotiation and QUIC use the same ceiling to preserve the receive budget.
     pub max_open_streams: u16,
     /// Maximum inbound queue depth per stream kind.
     pub max_inbound_queue_depth: u16,
@@ -449,7 +467,7 @@ impl ZakuraLocalLimits {
     pub fn clamp(&self, negotiated: &ZakuraAcceptedLimits) -> ZakuraConnectionLimits {
         let max_open_streams = negotiated
             .max_open_streams
-            .min(self.max_open_streams)
+            .min(self.effective_max_open_streams())
             .max(1);
         let idle_timeout = Duration::from_millis(
             u64::from(negotiated.idle_timeout_millis)
@@ -481,7 +499,7 @@ impl ZakuraLocalLimits {
         ZakuraLimits {
             max_frame_bytes: self.max_frame_bytes,
             max_message_bytes: self.max_message_bytes,
-            max_open_streams: self.max_open_streams,
+            max_open_streams: self.effective_max_open_streams(),
             max_inbound_queue_depth: self.max_inbound_queue_depth,
             idle_timeout_millis: self.quic_idle_timeout.as_millis().saturating_sub(1) as u32,
         }
@@ -492,13 +510,22 @@ impl ZakuraLocalLimits {
         self.transport_config_builder().build()
     }
 
+    /// Never offer more streams than the qualified QUIC receive budget supports.
+    fn effective_max_open_streams(&self) -> u16 {
+        let transport_ceiling = u16::try_from(DEFAULT_ZAKURA_REMOTE_BIDI_STREAMS)
+            .expect("the qualified transport stream limit fits in u16");
+        self.max_open_streams.clamp(1, transport_ceiling)
+    }
+
     fn transport_config_builder(&self) -> iroh::endpoint::QuicTransportConfigBuilder {
         let mut builder = QuicTransportConfig::builder();
         if !self.nat_traversal {
             builder = builder.max_remote_nat_traversal_addresses(0);
         }
         builder
-            .max_concurrent_bidi_streams(VarInt::from_u32(u32::from(self.max_open_streams)))
+            .max_concurrent_bidi_streams(VarInt::from_u32(u32::from(
+                self.effective_max_open_streams(),
+            )))
             .max_concurrent_uni_streams(VarInt::from_u32(0))
             .stream_receive_window(VarInt::from_u32(DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW))
             .receive_window(VarInt::from_u32(DEFAULT_ZAKURA_RECEIVE_WINDOW))
@@ -533,7 +560,7 @@ pub struct ZakuraConnectionLimits {
     pub control_timeout: Duration,
     /// Per-connection stream-open rate.
     pub stream_open_rate_per_second: u32,
-    /// Per-stream-kind message rate.
+    /// Message rate per stream kind or paired service, excluding capacity-bounded types.
     pub message_rate_per_second: u32,
 }
 
@@ -1611,7 +1638,7 @@ struct RegisteredConnectionServeContext {
     direction: ServicePeerDirection,
 }
 
-struct StreamWorkerContext {
+struct StreamWorkerContext<C: Clock = RealClock> {
     conn: ZakuraConnTrace,
     peer_id: ZakuraPeerId,
     stream_id: u64,
@@ -1620,12 +1647,13 @@ struct StreamWorkerContext {
     inbound_frame_cap: u32,
     message_payload_limits: &'static [(u16, usize)],
     message_types: Option<&'static [u16]>,
+    message_rate_policy: MessageRatePolicy,
     allowed_frame_flags: u16,
     queue_depths: Option<(usize, usize)>,
     write_policy: StreamWritePolicy,
     session_resources: Option<Arc<dyn crate::zakura::SessionResources>>,
     outbound_frame_cap: u32,
-    message_bucket: SharedMessageBucket,
+    message_bucket: SharedMessageBucket<C>,
     connection_token: CancellationToken,
     stream_token: CancellationToken,
     close_cause: CloseCause,
@@ -1870,65 +1898,6 @@ fn ordered_session_reopen_backoff(attempts: u32) -> Duration {
     ORDERED_STREAM_REOPEN_BACKOFF
         .saturating_mul(1u32 << attempts.min(8))
         .min(ORDERED_STREAM_REOPEN_BACKOFF_CAP)
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum InboundMessageAdmission {
-    Admit,
-    Oversize,
-    Throttled,
-}
-
-fn admit_inbound_message(
-    payload_len: usize,
-    context: &StreamWorkerContext,
-    stream_kind: u16,
-) -> InboundMessageAdmission {
-    let stream_kind = stream_kind_label(stream_kind);
-    let max_message_bytes = usize::try_from(context.limits.max_message_bytes)
-        .expect("u32 message byte limit fits in usize");
-    if payload_len > max_message_bytes {
-        metrics::counter!(
-            "zakura.p2p.ratelimit.message.oversize",
-            "stream_kind" => stream_kind,
-        )
-        .increment(1);
-        context.conn.trace_rate_limit(
-            "message.oversize",
-            context.stream_id,
-            stream_kind,
-            None,
-            None,
-            None,
-        );
-        return InboundMessageAdmission::Oversize;
-    }
-
-    let admitted = {
-        let mut bucket = context
-            .message_bucket
-            .lock()
-            .expect("Zakura message-rate bucket mutex is never poisoned");
-        bucket.try_take()
-    };
-    if !admitted {
-        metrics::counter!(
-            "zakura.p2p.ratelimit.message.throttled",
-            "stream_kind" => stream_kind,
-        )
-        .increment(1);
-        context.conn.trace_rate_limit(
-            "message.throttled",
-            context.stream_id,
-            stream_kind,
-            None,
-            None,
-            None,
-        );
-        return InboundMessageAdmission::Throttled;
-    }
-
-    InboundMessageAdmission::Admit
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -2324,7 +2293,7 @@ impl ZakuraProtocolHandler {
                 .min(self.limits.max_message_bytes),
             max_open_streams: remote_limits
                 .max_open_streams
-                .min(self.limits.max_open_streams),
+                .min(self.limits.effective_max_open_streams()),
             max_inbound_queue_depth: remote_limits
                 .max_inbound_queue_depth
                 .min(self.limits.max_inbound_queue_depth),
@@ -3253,6 +3222,7 @@ impl ZakuraProtocolHandler {
             inbound_frame_cap: inbound_frame_cap_for_stream(&admission.limits, stream),
             message_payload_limits: self.registry.message_payload_limits(stream),
             message_types: self.registry.message_types(stream),
+            message_rate_policy: self.registry.message_rate_policy(stream),
             allowed_frame_flags: self.registry.allowed_frame_flags(stream),
             queue_depths: self.registry.stream_queue_depths(stream),
             write_policy: self.registry.stream_write_policy(stream),
@@ -4137,11 +4107,11 @@ fn bounded_stream_queue_depths(
 struct OrderedFrameWriteTimeout;
 
 #[cfg(test)]
-async fn persistent_stream_worker(
+async fn persistent_stream_worker<C: Clock>(
     send: SendStream,
     recv: RecvStream,
     prelude: StreamPrelude,
-    context: StreamWorkerContext,
+    context: StreamWorkerContext<C>,
     inbound_tx: mpsc::Sender<Frame>,
     outbound_rx: FramedWorkerRecv,
     queue_depth_limit: usize,
@@ -4161,11 +4131,11 @@ async fn persistent_stream_worker(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn persistent_stream_worker_with_policy(
+async fn persistent_stream_worker_with_policy<C: Clock>(
     mut send: SendStream,
     recv: RecvStream,
     prelude: StreamPrelude,
-    context: StreamWorkerContext,
+    context: StreamWorkerContext<C>,
     inbound_tx: mpsc::Sender<Frame>,
     outbound_rx: FramedWorkerRecv,
     queue_depth_limit: usize,
@@ -4212,7 +4182,7 @@ async fn persistent_stream_worker_with_policy(
             let error = match frame {
                 Ok(frame) => {
                     let _ = reader_context.freshness_tx.send(Instant::now());
-                    match admit_inbound_message(frame.payload.len(), &reader_context, stream_kind) {
+                    match admit_inbound_message(&frame, &reader_context, stream_kind) {
                         InboundMessageAdmission::Admit => {
                             let forwarded = tokio::select! {
                                 biased;
@@ -4272,9 +4242,15 @@ async fn persistent_stream_worker_with_policy(
                     cause.record(OrderedStreamFailure::RemoteClose);
                 }
             }
+            if must_disconnect {
+                // Record the specific rejection before waking teardown. The
+                // writer may exit on cancellation before reading this error.
+                reader_context
+                    .close_cause
+                    .record(error.ordered_close_cause());
+            }
             let _ = error_tx.send(error).await;
             if must_disconnect {
-                reader_context.close_cause.record("ordered_read_error");
                 reader_context.connection_token.cancel();
             }
             break;
@@ -4452,7 +4428,7 @@ async fn request_stream_worker(
     };
 
     let _ = context.freshness_tx.send(Instant::now());
-    match admit_inbound_message(frame.payload.len(), &context, prelude.stream_kind) {
+    match admit_inbound_message(&frame, &context, prelude.stream_kind) {
         InboundMessageAdmission::Admit => {}
         InboundMessageAdmission::Oversize => {
             let _ = send.reset(VarInt::from_u32(ZAKURA_CLOSE_OVERSIZE));
@@ -5555,12 +5531,9 @@ fn is_supported_stream(registry: &ServiceRegistry, stream_kind: u16, stream_vers
         .is_some()
 }
 
-/// One message-rate [`TokenBucket`] shared by every stream worker serving the
-/// same stream kind on one connection.
-///
-/// A worker holds this briefly (no `.await` while locked) to spend one token
-/// per decoded frame, so N concurrent same-kind streams draw from a single
-/// per-connection budget instead of N independent ones (FLUP-014).
+/// One rate allowance shared by workers of the same stream kind or paired service.
+/// Rate-limited messages spend one token while briefly holding the mutex, without
+/// awaiting. Capacity-bounded messages leave this allowance for metadata traffic.
 type SharedMessageBucket<C = RealClock> = Arc<std::sync::Mutex<TokenBucket<C>>>;
 
 /// Per-connection collection of message-rate buckets keyed by validated stream
@@ -5720,6 +5693,14 @@ pub enum ZakuraHandlerError {
 }
 
 impl ZakuraHandlerError {
+    fn ordered_close_cause(&self) -> &'static str {
+        match self {
+            Self::RateLimited => "ordered_rate_limited",
+            Self::Oversize | Self::OversizeFrame { .. } => "ordered_oversize",
+            _ => "ordered_read_error",
+        }
+    }
+
     fn oversize_frame_details(&self) -> Option<(u64, u64, u64)> {
         let Self::OversizeFrame {
             payload_len,
@@ -5742,9 +5723,17 @@ impl ZakuraHandlerError {
 mod tests {
     pub(super) mod connection;
     mod frame_policy;
+    mod message_admission;
     mod paired_block_sync;
     mod quic_progress;
     mod serving_progress;
+    mod stream_limits;
+
+    // These witnesses require unpublished transport APIs and their native
+    // integration. `ignore` alone still type-checks unavailable constructors.
+    // Restore both before enabling this module. See native-transport-capacity.md.
+    #[cfg(any())]
+    mod transport_ownership;
 
     use super::*;
     use crate::{
@@ -8184,6 +8173,8 @@ mod tests {
             mode: StreamMode::Persistent,
         };
         let encoded = frame.encode(stream.frame_cap)?;
+        let buffered_frames =
+            2 + usize::try_from(DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW).unwrap() / encoded.len();
         // Opening a QUIC stream becomes visible to the receiver after the first bytes.
         sender.write_all(&encoded[..1]).await?;
         let (send, recv) = timeout(Duration::from_secs(5), stream_rx.recv())
@@ -8201,6 +8192,7 @@ mod tests {
             inbound_frame_cap: stream.frame_cap,
             message_payload_limits: &[],
             message_types: None,
+            message_rate_policy: MessageRatePolicy::RateLimited,
             allowed_frame_flags: u16::MAX,
             queue_depths: None,
             write_policy: StreamWritePolicy::Timeout(OUTBOUND_STREAM_WRITE_TIMEOUT),
@@ -8235,7 +8227,7 @@ mod tests {
             sender
         }));
         timeout(Duration::from_secs(10), async {
-            while *progress_rx.borrow_and_update() < 16 {
+            while *progress_rx.borrow_and_update() < buffered_frames {
                 progress_rx.changed().await.unwrap();
             }
         })
@@ -8409,6 +8401,7 @@ mod tests {
             inbound_frame_cap: inbound_frame_cap_for_stream(&limits, stream),
             message_payload_limits: &[],
             message_types: None,
+            message_rate_policy: MessageRatePolicy::RateLimited,
             allowed_frame_flags: u16::MAX,
             queue_depths: None,
             write_policy: StreamWritePolicy::Timeout(OUTBOUND_STREAM_WRITE_TIMEOUT),
@@ -8616,6 +8609,7 @@ mod tests {
                 inbound_frame_cap: inbound_frame_cap_for_stream(&limits, stream),
                 message_payload_limits: &[],
                 message_types: None,
+                message_rate_policy: MessageRatePolicy::RateLimited,
                 allowed_frame_flags: u16::MAX,
                 queue_depths: None,
                 write_policy: StreamWritePolicy::Timeout(OUTBOUND_STREAM_WRITE_TIMEOUT),

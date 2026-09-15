@@ -109,14 +109,14 @@ counts establishing and retiring sessions as well as current ones;
 
 ## Transport and memory
 
-The transport uses a 16 MiB receive allowance per stream, a 32 MiB shared receive
+The transport uses an 8 MiB receive allowance per stream, a 32 MiB shared receive
 allowance per connection, and a 32 MiB connection send window. It needs no
 per-stream window extension.
 Opening two streams does not allocate or reserve that memory in advance. Paused
 services can consume the shared allowance and delay otherwise-ready streams.
 
 The default advertised burst of 32,000 requests is 544,000 framed bytes. It fits
-alongside one paused 16 MiB sibling in the measured workload. Excessive traffic
+alongside one paused 8 MiB sibling in the measured workload. Excessive traffic
 can fill two stream windows and consume all shared receive credit. Tests require
 natural recovery from a temporary pause and bounded cleanup followed by a
 completed retry for sustained saturation.
@@ -146,7 +146,7 @@ count as a completed download. B's extra requests supply serving pressure.
 
 | Workload | Required result |
 | --- | --- |
-| Ordinary download, serving pressure, and a paused sibling | Complete within 30 seconds, including when A's serving slots are occupied, B sends 32,000 requests, and one sibling retains a full 16 MiB window |
+| Ordinary download, serving pressure, and a paused sibling | Complete within 30 seconds, including when A's serving slots are occupied, B sends 32,000 requests, and one sibling retains a full 8 MiB window |
 | 50 ms RTT and 1% packet loss, including pressure and a paused sibling | Complete within 240 seconds |
 | Throughput comparison | Five-run median useful throughput at least 90% of the original serving path with the same policy fixes |
 | Process memory | Peak resident memory (RSS) at most 512 MiB, including both endpoints |

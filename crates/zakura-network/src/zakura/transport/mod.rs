@@ -32,8 +32,8 @@ pub(crate) use registry::SessionLayout;
 pub use registry::{RegistryError, ServiceRegistry};
 pub(crate) use service::ServiceStream;
 pub use service::{
-    BoxRunFuture, Peer, RequestResponseService, Service, SessionDemand, SessionFull,
-    SessionOpening, SessionPolicy, SessionResources, Sink, SinkReject, Source, Stream, StreamMode,
-    StreamWritePolicy,
+    BoxRunFuture, MessageRatePolicy, Peer, RequestResponseService, Service, SessionDemand,
+    SessionFull, SessionOpening, SessionPolicy, SessionResources, Sink, SinkReject, Source, Stream,
+    StreamMode, StreamWritePolicy,
 };
 pub use session::{OrderedSendError, PeerStreamSession};

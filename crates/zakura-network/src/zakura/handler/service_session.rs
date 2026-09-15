@@ -307,8 +307,8 @@ impl ZakuraProtocolHandler {
         )
         .await
         .map_err(|_| ZakuraHandlerError::Timeout("ordered stream prelude write"))??;
-        // All members spend the same message-rate budget, so splitting a service
-        // across several streams does not double its allowance.
+        // Rate-limited messages on all members spend the same budget, so splitting
+        // a service across several streams does not double its allowance.
         let bucket_kind = self
             .registry
             .session_layout(stream)
@@ -328,6 +328,7 @@ impl ZakuraProtocolHandler {
             inbound_frame_cap: prelude.max_frame_bytes,
             message_payload_limits: self.registry.message_payload_limits(stream),
             message_types: self.registry.message_types(stream),
+            message_rate_policy: self.registry.message_rate_policy(stream),
             allowed_frame_flags: self.registry.allowed_frame_flags(stream),
             queue_depths: self.registry.stream_queue_depths(stream),
             write_policy: self.registry.stream_write_policy(stream),

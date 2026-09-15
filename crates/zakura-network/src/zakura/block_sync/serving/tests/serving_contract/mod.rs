@@ -15,3 +15,5 @@ use fixtures::*;
 mod failures;
 mod ownership;
 mod ranges;
+
+mod load;

@@ -69,6 +69,10 @@ impl PreparedRequest {
     }
 }
 
+/// Every wait in this module is bounded: a fencing regression must fail the test
+/// rather than hang, including under plain `cargo test`, which has no slow timeout.
+const DEADLINE: Duration = Duration::from_secs(1);
+
 /// Build the download-only peer a fencing test admits, keeping both stream ends.
 fn fence_peer(
     peer: &ZakuraPeerId,
@@ -118,9 +122,9 @@ async fn replacement_fences_old_publication_and_queued_first_write() {
         assert!(old.authorize_response().is_none());
         if queued {
             let mut wrote = false;
-            old_output
-                .recv()
+            time::timeout(DEADLINE, old_output.recv())
                 .await
+                .unwrap()
                 .unwrap()
                 .write_with(|_| {
                     wrote = true;
@@ -149,9 +153,9 @@ async fn replacement_fences_old_publication_and_queued_first_write() {
         let mut next = PreparedRequest::new(&new);
         next.queue(&new);
         let mut bytes = 0;
-        new_output
-            .recv()
+        time::timeout(DEADLINE, new_output.recv())
             .await
+            .unwrap()
             .unwrap()
             .write_with(|frame| {
                 bytes = frame.payload.len();
@@ -178,7 +182,10 @@ async fn replacement_closes_started_exchange_even_after_request_write_finishes()
         let old = service.current_sessions_for_test().snapshot()[&peer].clone();
         let request = PreparedRequest::new(&old);
         request.queue(&old);
-        let queued = output.recv().await.unwrap();
+        let queued = time::timeout(DEADLINE, output.recv())
+            .await
+            .unwrap()
+            .unwrap();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (complete_tx, complete_rx) = tokio::sync::oneshot::channel();
         let writer = tokio::spawn(queued.write_with(|_| async move {
@@ -186,13 +193,10 @@ async fn replacement_closes_started_exchange_even_after_request_write_finishes()
             complete_rx.await.unwrap();
             Ok::<(), ()>(())
         }));
-        time::timeout(Duration::from_secs(1), started_rx)
-            .await
-            .unwrap()
-            .unwrap();
+        time::timeout(DEADLINE, started_rx).await.unwrap().unwrap();
         let completion = if written {
             complete_tx.send(()).unwrap();
-            time::timeout(Duration::from_secs(1), writer)
+            time::timeout(DEADLINE, writer)
                 .await
                 .unwrap()
                 .unwrap()
@@ -207,13 +211,13 @@ async fn replacement_closes_started_exchange_even_after_request_write_finishes()
             service.current_sessions_for_test().snapshot()[&peer].session_id(),
             old.session_id()
         );
-        assert!(time::timeout(Duration::from_secs(1), new_output.recv())
+        assert!(time::timeout(DEADLINE, new_output.recv())
             .await
             .unwrap()
             .is_none());
         if let Some((complete_tx, writer)) = completion {
             complete_tx.send(()).unwrap();
-            time::timeout(Duration::from_secs(1), writer)
+            time::timeout(DEADLINE, writer)
                 .await
                 .unwrap()
                 .unwrap()
@@ -236,9 +240,9 @@ async fn finished_exchange_and_new_connection_allow_replacement() {
         let old = service.current_sessions_for_test().snapshot()[&peer].clone();
         let mut request = PreparedRequest::new(&old);
         request.queue(&old);
-        output
-            .recv()
+        time::timeout(DEADLINE, output.recv())
             .await
+            .unwrap()
             .unwrap()
             .write_with(|_| async { Ok::<(), ()>(()) })
             .await

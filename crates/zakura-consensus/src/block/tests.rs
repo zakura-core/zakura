@@ -145,8 +145,8 @@ fn prepared_test_verifier(
                     .then_some(zs::KnownBlock::Finalized),
             ),
             zs::Request::CheckBlockProposalValidity(_) => zs::Response::ValidBlockProposal,
-            zs::Request::CheckBestTipMissingInputs { .. } => {
-                zs::Response::BestTipMissingInput(None)
+            zs::Request::CheckParentInputs { .. } => {
+                zs::Response::ParentInputs(zs::ParentInputs::Inconclusive)
             }
             _ => panic!("prepared-path test received an unexpected state request: {request:?}"),
         };
@@ -160,6 +160,8 @@ fn prepared_test_verifier(
 
 #[tokio::test(start_paused = true)]
 async fn missing_input_requires_committed_parent_evidence() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     let _init_guard = zakura_test::init();
     let block = Arc::new(
         Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_347499_BYTES[..])
@@ -171,41 +173,68 @@ async fn missing_input_requires_committed_parent_evidence() {
         .flat_map(|tx| tx.inputs())
         .find_map(transparent::Input::outpoint)
         .expect("the test block spends an external output");
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug)]
     enum ContextRead {
         Missing,
-        Unknown,
+        ParentUnavailable,
+        Inconclusive,
         Failed,
         TimedOut,
     }
-    for context_read in [
-        ContextRead::Missing,
-        ContextRead::Unknown,
-        ContextRead::Failed,
-        ContextRead::TimedOut,
+    #[derive(Debug)]
+    enum Expected {
+        Missing,
+        ParentUnavailable,
+        Timeout,
+    }
+    use ContextRead::*;
+    // The first read runs before the UTXO wait, and the second runs after the wait expires.
+    for (reads, expected) in [
+        (vec![Missing], Expected::Missing),
+        (vec![Inconclusive, Missing], Expected::Missing),
+        (vec![ParentUnavailable, Missing], Expected::Missing),
+        (
+            vec![ParentUnavailable, ParentUnavailable],
+            Expected::ParentUnavailable,
+        ),
+        (vec![Inconclusive, Inconclusive], Expected::Timeout),
+        (vec![Failed, Failed], Expected::Timeout),
+        (vec![TimedOut, TimedOut], Expected::Timeout),
     ] {
-        let confirms_missing = matches!(context_read, ContextRead::Missing);
-        let state = service_fn(move |request: zs::Request| async move {
-            Ok::<_, BoxError>(match request {
-                zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
-                zs::Request::CheckBestTipMissingInputs { parent, outpoints } => {
-                    assert!(outpoints.contains(&outpoint));
-                    assert_ne!(parent, block::Hash([0; 32]));
-                    match context_read {
-                        ContextRead::Failed => {
-                            return Err(std::io::Error::other("state unavailable").into())
+        let reads = Arc::new(reads);
+        let read_count = Arc::new(AtomicUsize::new(0));
+        let state = service_fn({
+            let reads = reads.clone();
+            let read_count = read_count.clone();
+            move |request: zs::Request| {
+                let reads = reads.clone();
+                let read_count = read_count.clone();
+                async move {
+                    Ok::<_, BoxError>(match request {
+                        zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+                        zs::Request::CheckParentInputs { parent, outpoints } => {
+                            assert!(outpoints.contains(&outpoint));
+                            assert_ne!(parent, block::Hash([0; 32]));
+                            let read = reads[read_count.fetch_add(1, Ordering::SeqCst)];
+                            zs::Response::ParentInputs(match read {
+                                Failed => {
+                                    return Err(std::io::Error::other("state unavailable").into())
+                                }
+                                TimedOut => return std::future::pending().await,
+                                Missing => zs::ParentInputs::Missing(outpoint),
+                                ParentUnavailable => zs::ParentInputs::ParentUnavailable,
+                                Inconclusive => zs::ParentInputs::Inconclusive,
+                            })
                         }
-                        ContextRead::TimedOut => return std::future::pending().await,
-                        ContextRead::Missing | ContextRead::Unknown => {}
-                    }
-                    zs::Response::BestTipMissingInput(confirms_missing.then_some(outpoint))
+                        _ => panic!("unexpected state request: {request:?}"),
+                    })
                 }
-                _ => panic!("unexpected state request: {request:?}"),
-            })
+            }
         });
+        let proven_before_wait = matches!(reads[0], Missing);
         let transaction = service_fn(move |_: tx::Request| async move {
             assert!(
-                !confirms_missing,
+                !proven_before_wait,
                 "proven missing inputs must fail before transaction checks"
             );
             Err::<tx::Response, BoxError>(TransactionError::TransparentInputNotFound.into())
@@ -214,18 +243,36 @@ async fn missing_input_requires_committed_parent_evidence() {
             .oneshot(Request::Commit(block.clone()))
             .await
             .expect_err("the input cannot be resolved");
-        if confirms_missing {
-            assert!(matches!(
-                error,
-                VerifyBlockError::MissingTransparentInput { .. }
-            ));
-            assert_eq!(error.misbehavior_score(), 100);
-        } else {
-            assert!(matches!(
-                error,
-                VerifyBlockError::Transaction(TransactionError::TransparentInputNotFound)
-            ));
-            assert_eq!(error.misbehavior_score(), 0);
+        assert_eq!(read_count.load(Ordering::SeqCst), reads.len(), "{reads:?}");
+        match expected {
+            Expected::Missing => {
+                assert!(
+                    matches!(error, VerifyBlockError::MissingTransparentInput { .. }),
+                    "{reads:?}: {error:?}"
+                );
+                assert_eq!(error.misbehavior_score(), 100);
+            }
+            Expected::ParentUnavailable => {
+                assert!(
+                    matches!(error, VerifyBlockError::ParentUnavailable { .. }),
+                    "{reads:?}: {error:?}"
+                );
+                assert_eq!(error.misbehavior_score(), 0);
+                assert!(matches!(
+                    error.body_verification_class(),
+                    zakura_header_chain::BodyVerificationClass::Retryable(_)
+                ));
+            }
+            Expected::Timeout => {
+                assert!(
+                    matches!(
+                        error,
+                        VerifyBlockError::Transaction(TransactionError::TransparentInputNotFound)
+                    ),
+                    "{reads:?}: {error:?}"
+                );
+                assert_eq!(error.misbehavior_score(), 0);
+            }
         }
     }
 }
@@ -537,8 +584,8 @@ async fn proposal_validation_succeeds_when_cache_insertion_conflicts() {
                     .then_some(zs::KnownBlock::Finalized),
             ),
             zs::Request::CheckBlockProposalValidity(_) => zs::Response::ValidBlockProposal,
-            zs::Request::CheckBestTipMissingInputs { .. } => {
-                zs::Response::BestTipMissingInput(None)
+            zs::Request::CheckParentInputs { .. } => {
+                zs::Response::ParentInputs(zs::ParentInputs::Inconclusive)
             }
             zs::Request::CommitSemanticallyVerifiedBlockWithAdmission { block, .. } => {
                 zs::Response::Committed(block.hash)
@@ -1691,7 +1738,7 @@ async fn pending_commit_retry_waits_for_state_outcome() {
         block.transactions.clear();
         let hash = block.hash();
         let locations = Arc::new(Mutex::new(VecDeque::from([
-            Some(zs::KnownBlock::Queue),
+            Some(zs::KnownBlock::WriteChannel),
             Some(zs::KnownBlock::WriteChannel),
             committed.then_some(zs::KnownBlock::BestChain),
         ])));
@@ -1729,4 +1776,31 @@ async fn pending_commit_retry_waits_for_state_outcome() {
             );
         }
     }
+}
+
+/// A pending commit that never resolves must not hold a caller without its own timeout.
+#[tokio::test(start_paused = true)]
+async fn pending_commit_wait_reports_the_duplicate_after_its_limit() {
+    let block: Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let hash = block.hash();
+    let state = service_fn(move |request| {
+        assert_eq!(request, zs::Request::KnownBlock(hash));
+        async move { Ok::<_, BoxError>(zs::Response::KnownBlock(Some(zs::KnownBlock::WriteChannel))) }
+    });
+    let transaction = service_fn(|_| -> std::future::Ready<Result<tx::Response, BoxError>> {
+        panic!("a pending duplicate cannot reach transaction verification")
+    });
+    let start = tokio::time::Instant::now();
+    let error = SemanticBlockVerifier::new(&Network::Mainnet, state, transaction)
+        .oneshot(Request::Commit(Arc::new(block)))
+        .await
+        .unwrap_err();
+    assert!(start.elapsed() >= super::PENDING_COMMIT_WAIT_LIMIT);
+    assert!(start.elapsed() < super::PENDING_COMMIT_WAIT_LIMIT * 2);
+    assert_eq!(
+        error.duplicate_location(),
+        Some(&zs::KnownBlock::WriteChannel)
+    );
 }

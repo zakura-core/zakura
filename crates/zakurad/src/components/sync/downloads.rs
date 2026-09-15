@@ -921,6 +921,11 @@ where
             .send(false);
     }
 
+    /// Returns true if `hash` has an in-flight download and verify task.
+    pub(super) fn contains(&self, hash: &block::Hash) -> bool {
+        self.cancel_handles.contains_key(hash)
+    }
+
     /// Get the number of currently in-flight download and verify tasks.
     pub fn in_flight(&self) -> usize {
         self.pending.len()

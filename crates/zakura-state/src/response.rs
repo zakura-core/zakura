@@ -95,9 +95,8 @@ pub enum Response {
     /// Response to [`Request::UnspentBestChainUtxo`] with the UTXO
     UnspentBestChainUtxo(Option<transparent::Utxo>),
 
-    /// A missing external input proven against the requested committed parent.
-    /// `None` also covers an unavailable or changed parent context.
-    BestTipMissingInput(Option<transparent::OutPoint>),
+    /// Response to [`Request::CheckParentInputs`].
+    ParentInputs(ParentInputs),
 
     /// Response to [`Request::Block`] with the specified block.
     Block(Option<Arc<Block>>),
@@ -144,6 +143,18 @@ pub enum Response {
 
     /// Response to [`Request::CheckBlockProposalValidity`]
     ValidBlockProposal,
+}
+
+/// The result of checking a candidate block's external inputs against its parent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParentInputs {
+    /// The parent is committed, and this input is not unspent in the parent's chain.
+    Missing(transparent::OutPoint),
+    /// The parent is neither in a non-finalized chain nor the finalized tip,
+    /// so no chain can accept the candidate now.
+    ParentUnavailable,
+    /// Every input is unspent at the parent, or the parent context changed during the read.
+    Inconclusive,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -543,9 +554,8 @@ pub enum ReadResponse {
     /// _best_ non-finalized chain, or the finalized chain.
     UnspentBestChainUtxo(Option<transparent::Utxo>),
 
-    /// A missing external input proven against the requested committed parent.
-    /// `None` also covers an unavailable or changed parent context.
-    BestTipMissingInput(Option<transparent::OutPoint>),
+    /// Response to [`ReadRequest::CheckParentInputs`].
+    ParentInputs(ParentInputs),
 
     /// The response to an `AnyChainUtxo` request, from verified blocks in
     /// _any_ non-finalized chain, or the finalized chain.
@@ -711,7 +721,7 @@ impl TryFrom<ReadResponse> for Response {
                 Err("there is no corresponding Response for this ReadResponse")
             }
             ReadResponse::UnspentBestChainUtxo(utxo) => Ok(Response::UnspentBestChainUtxo(utxo)),
-            ReadResponse::BestTipMissingInput(outpoint) => Ok(Response::BestTipMissingInput(outpoint)),
+            ReadResponse::ParentInputs(inputs) => Ok(Response::ParentInputs(inputs)),
 
 
             ReadResponse::AnyChainUtxo(_) => Err("ReadService does not track pending UTXOs. \

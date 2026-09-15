@@ -2541,6 +2541,9 @@ where
     /// affected hash, bounded by [`BLOCK_VERIFY_TIMEOUT_RETRY_LIMIT`]. The syncer restarts if
     /// a full verification wave times out on UTXO lookups without a successful verification.
     /// A duplicate with a pending commit uses the same per-hash retry budget.
+    /// If the UTXO lookup timed out because the block's parent is neither committed nor in flight,
+    /// the block cannot verify in this round. The syncer drops that block without a restart, so a
+    /// peer cannot force restarts with blocks whose parent never arrives.
     ///
     /// A [`NotFoundKind::Registry`] miss means the peer set found that *every* ready peer is marked
     /// missing the block, so it can't be served right now. Rather than blocking the loop on an inline
@@ -2579,6 +2582,19 @@ where
             self.poisoned_block_retry_counts.remove(hash);
             self.registry_miss_retry_counts.remove(hash);
             self.registry_miss_retry.remove(hash);
+        }
+
+        if let Some((hash, parent)) = response.as_ref().err().and_then(Self::unavailable_parent) {
+            if !self.downloads.contains(&parent) && !self.registry_miss_retry.contains_key(&parent)
+            {
+                debug!(
+                    ?hash,
+                    ?parent,
+                    "block parent is neither committed nor in flight, dropping block"
+                );
+                self.verify_timeout_retry_counts.remove(&hash);
+                return Ok(());
+            }
         }
 
         if let Some(error) = response.as_ref().err().filter(|error| {
@@ -2940,8 +2956,25 @@ where
             } if matches!(
                 **source,
                 VerifyBlockError::Transaction(TransactionError::TransparentInputNotFound)
+                    | VerifyBlockError::ParentUnavailable { .. }
             )
         )
+    }
+
+    /// Returns the block and parent hashes of a UTXO lookup timeout whose parent is not in a
+    /// chain that can accept the block.
+    fn unavailable_parent(error: &BlockDownloadVerifyError) -> Option<(block::Hash, block::Hash)> {
+        match error {
+            BlockDownloadVerifyError::Invalid {
+                error: RouterError::Block { source },
+                hash,
+                ..
+            } => match **source {
+                VerifyBlockError::ParentUnavailable { parent } => Some((*hash, parent)),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// Identifies the short Tokio timeout; the eight-minute Tower timeout has a different type.

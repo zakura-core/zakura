@@ -33,9 +33,9 @@ use crate::{
     },
     tests::setup::{partial_nu5_chain_strategy, transaction_v4_from_coinbase},
     BlockAdmission, BoxError, CheckpointVerifiedBlock, CommitBlockError, Config,
-    HistoricalTreeUnavailable, PruningConfig, Request, Response, SemanticallyVerifiedBlock,
-    StateInitError, StorageMode, ValidateContextError, CHAIN_TIP_UPDATE_WAIT_LIMIT,
-    MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
+    HistoricalTreeUnavailable, ParentInputs, PruningConfig, Request, Response,
+    SemanticallyVerifiedBlock, StateInitError, StorageMode, ValidateContextError,
+    CHAIN_TIP_UPDATE_WAIT_LIMIT, MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
 };
 
 const LAST_BLOCK_HEIGHT: u32 = 10;
@@ -2270,53 +2270,160 @@ async fn known_block_prefers_committed_state_over_sent_cache() {
 }
 
 #[tokio::test]
-async fn missing_input_proof_requires_the_requested_committed_tip() {
-    use tower::{Service, ServiceExt};
+async fn parent_input_check_uses_the_parent_utxo_set() {
     let _init_guard = zakura_test::init();
     let mut config = Config::ephemeral();
     config.vct_fast_sync = false;
     let (mut state, _, _, _) = StateService::new(config, &Network::Mainnet, Height::MAX, 0)
         .await
         .expect("the test state opens");
-    let mut blocks = Vec::new();
-    for bytes in [
+    let blocks: Vec<Arc<Block>> = [
         zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.as_slice(),
         zakura_test::vectors::BLOCK_MAINNET_1_BYTES.as_slice(),
-    ] {
-        let block: Arc<Block> = bytes
+        zakura_test::vectors::BLOCK_MAINNET_2_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_3_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_4_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_5_BYTES.as_slice(),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(height, bytes)| {
+        let mut block: Block = bytes
             .zcash_deserialize_into()
             .expect("the test block deserializes");
-        state
-            .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block.clone()))
-            .await
-            .expect("the writer responds")
-            .expect("the checkpoint commits");
-        blocks.push(block);
-    }
-    let present = transparent::OutPoint {
-        hash: blocks[1].transactions[0].hash(),
+        // Non-finalized blocks need v4+ transactions. The header hash stays the same.
+        if height >= 2 {
+            block.transactions = vec![Arc::new(transaction_v4_from_coinbase(
+                &block.transactions[0],
+            ))];
+        }
+        Arc::new(block)
+    })
+    .collect();
+    let coinbase = |i: usize| transparent::OutPoint {
+        hash: blocks[i].transactions[0].hash(),
         index: 0,
     };
     let missing = transparent::OutPoint {
         hash: transaction::Hash([255; 32]),
         index: 0,
     };
-    for (parent, outpoints, expected) in [
-        (blocks[1].hash(), vec![present], None),
-        (blocks[1].hash(), vec![present, missing], Some(missing)),
-        (blocks[0].hash(), vec![missing], None),
-        (block::Hash([255; 32]), vec![missing], None),
-    ] {
+
+    for block in &blocks[..2] {
+        state
+            .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block.clone()))
+            .await
+            .expect("the writer responds")
+            .expect("the checkpoint commits");
+    }
+    check_parent_inputs(
+        &mut state,
+        [
+            (
+                blocks[1].hash(),
+                vec![coinbase(1)],
+                ParentInputs::Inconclusive,
+            ),
+            (
+                blocks[1].hash(),
+                vec![coinbase(1), missing],
+                ParentInputs::Missing(missing),
+            ),
+            (
+                blocks[0].hash(),
+                vec![missing],
+                ParentInputs::ParentUnavailable,
+            ),
+            (
+                block::Hash([255; 32]),
+                vec![missing],
+                ParentInputs::ParentUnavailable,
+            ),
+        ],
+    )
+    .await;
+
+    for block in &blocks[2..] {
+        state
+            .queue_and_commit_to_non_finalized_state(block.clone().prepare(), None)
+            .await
+            .expect("the writer responds")
+            .expect("the non-finalized block commits");
+    }
+    assert_eq!(
+        state
+            .read_service
+            .latest_non_finalized_state()
+            .best_chain()
+            .map(|chain| chain.blocks.len()),
+        Some(4),
+        "blocks 2..=5 are non-finalized"
+    );
+    check_parent_inputs(
+        &mut state,
+        [
+            (
+                blocks[5].hash(),
+                vec![coinbase(1), coinbase(3), coinbase(5)],
+                ParentInputs::Inconclusive,
+            ),
+            (
+                blocks[5].hash(),
+                vec![coinbase(3), missing],
+                ParentInputs::Missing(missing),
+            ),
+            // A parent below the best tip uses a fork that excludes the outputs above it.
+            (
+                blocks[4].hash(),
+                vec![coinbase(3)],
+                ParentInputs::Inconclusive,
+            ),
+            (
+                blocks[4].hash(),
+                vec![coinbase(5)],
+                ParentInputs::Missing(coinbase(5)),
+            ),
+            // The finalized tip excludes non-finalized outputs.
+            (
+                blocks[1].hash(),
+                vec![coinbase(1)],
+                ParentInputs::Inconclusive,
+            ),
+            (
+                blocks[1].hash(),
+                vec![coinbase(2)],
+                ParentInputs::Missing(coinbase(2)),
+            ),
+            (
+                blocks[0].hash(),
+                vec![missing],
+                ParentInputs::ParentUnavailable,
+            ),
+        ],
+    )
+    .await;
+}
+
+async fn check_parent_inputs(
+    state: &mut StateService,
+    cases: impl IntoIterator<Item = (block::Hash, Vec<transparent::OutPoint>, ParentInputs)>,
+) {
+    use tower::{Service, ServiceExt};
+    for (parent, outpoints, expected) in cases {
         let response = state
             .ready()
             .await
             .expect("state is ready")
-            .call(Request::CheckBestTipMissingInputs {
+            .call(Request::CheckParentInputs {
                 parent,
                 outpoints: outpoints.into(),
             })
             .await
             .expect("the input read succeeds");
-        assert_eq!(response, Response::BestTipMissingInput(expected));
+        assert_eq!(
+            response,
+            Response::ParentInputs(expected),
+            "parent {parent:?}"
+        );
     }
 }

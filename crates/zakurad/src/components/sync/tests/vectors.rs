@@ -2540,6 +2540,63 @@ async fn proven_missing_input_scores_supplier_without_timeout_retries() {
     peers.expect_no_requests().await;
 }
 
+fn parent_unavailable(hash: block::Hash, parent: block::Hash) -> BlockDownloadVerifyError {
+    BlockDownloadVerifyError::Invalid {
+        error: RouterError::Block {
+            source: Box::new(VerifyBlockError::ParentUnavailable { parent }),
+        },
+        height: Height(42),
+        hash,
+        advertiser_addr: Some("127.0.0.1:8233".parse().unwrap()),
+    }
+}
+
+/// A peer cannot force restarts with a block whose parent never arrives.
+#[tokio::test]
+async fn unavailable_parent_drops_block_without_restart() {
+    let (mut chain_sync, _, _, mut peers, _, _) = setup_chain_sync();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    chain_sync.misbehavior_sender = sender;
+    let hash = block::Hash([0xCC; 32]);
+    let parent = block::Hash([0xAA; 32]);
+    chain_sync.utxo_race_drops = 1;
+    assert!(!TestChainSync::should_restart_sync(
+        &parent_unavailable(hash, parent),
+        false
+    ));
+    for _ in 0..=sync::BLOCK_VERIFY_TIMEOUT_RETRY_LIMIT {
+        chain_sync
+            .handle_block_response_with_missing_retry(Err(parent_unavailable(hash, parent)))
+            .await
+            .expect("an unavailable parent does not restart sync");
+    }
+    assert!(receiver.try_recv().is_err(), "the supplier is not scored");
+    assert!(chain_sync.verify_timeout_retry_counts.is_empty());
+    assert_eq!(chain_sync.utxo_race_drops, 1);
+    peers.expect_no_requests().await;
+}
+
+/// A block whose parent is still in flight keeps the bounded UTXO timeout retry.
+#[tokio::test]
+async fn unavailable_parent_retries_while_parent_is_in_flight() -> Result<(), crate::BoxError> {
+    let (mut chain_sync, _, _verifier, mut peers, _state, _tip) = setup_chain_sync();
+    let hash = block::Hash([0xCC; 32]);
+    let parent = block::Hash([0xAA; 32]);
+    chain_sync.downloads.download_and_verify(parent).await?;
+    let _parent_download = peers
+        .expect_request(zn::Request::BlocksByHash(iter::once(parent).collect()))
+        .await;
+    chain_sync
+        .handle_block_response_with_missing_retry(Err(parent_unavailable(hash, parent)))
+        .await?;
+    assert_eq!(chain_sync.verify_timeout_retry_counts.get(&hash), Some(&1));
+    assert_eq!(chain_sync.utxo_race_drops, 1);
+    let _retry = peers
+        .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
+        .await;
+    Ok(())
+}
+
 fn utxo_lookup_timeout(hash: block::Hash) -> BlockDownloadVerifyError {
     BlockDownloadVerifyError::Invalid {
         error: RouterError::Block {

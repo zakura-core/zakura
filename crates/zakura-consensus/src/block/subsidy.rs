@@ -27,12 +27,14 @@ fn funding_stream_address_index(
     let funding_streams = network.funding_streams(height)?;
     let num_addresses = funding_streams.recipient(receiver)?.addresses().len();
 
-    let index = 1u32
+    let index: usize = 1i64
         .checked_add(funding_stream_address_period(height, network))?
         .checked_sub(funding_stream_address_period(
             funding_streams.height_range().start,
             network,
-        ))? as usize;
+        ))?
+        .try_into()
+        .ok()?;
 
     assert!(index > 0 && index <= num_addresses);
     // spec formula will output an index starting at 1 but

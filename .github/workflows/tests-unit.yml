@@ -359,7 +359,7 @@ jobs:
       - name: Test NU7 builds
         run: |
           cargo test --locked --features nu7 \
-            -p zakura-consensus --lib
+            -p zakura-consensus -p zakura-state --lib
           cargo check --locked -p zakura --features nu7
 
   network-dependent:

@@ -15,7 +15,7 @@ use futures::{
 };
 use pin_project::pin_project;
 use tokio::{
-    sync::{oneshot, Mutex},
+    sync::{oneshot, Mutex, Semaphore},
     task::JoinHandle,
 };
 use tower::{Service, ServiceExt};
@@ -274,6 +274,9 @@ where
 
     /// Re-request budgets for gossiped hashes whose body was rejected as poisoned.
     poisoned_retries: PoisonedRetryBudgets,
+
+    /// Reserve at least half the download queue for work that can supply missing parents.
+    missing_parent_slots: Arc<Semaphore>,
 }
 
 impl<ZN, ZV, ZS> Stream for Downloads<ZN, ZV, ZS>
@@ -378,6 +381,7 @@ where
             source_locks: HashMap::new(),
             source_counts: HashMap::new(),
             poisoned_retries: PoisonedRetryBudgets::default(),
+            missing_parent_slots: Arc::new(Semaphore::new(full_verify_concurrency_limit / 2)),
         }
     }
 
@@ -576,6 +580,7 @@ where
 
         let network = self.network.clone();
         let verifier = self.verifier.clone();
+        let missing_parent_slots = self.missing_parent_slots.clone();
         let state = self.state.clone();
         let latest_chain_tip = self.latest_chain_tip.clone();
         let full_verify_concurrency_limit = self.full_verify_concurrency_limit;
@@ -747,6 +752,7 @@ where
 
             let context_deadline = tokio::time::Instant::now()
                 + crate::components::sync::BLOCK_VERIFY_TIMEOUT;
+            let mut missing_parent_slot = None;
             let verified = loop {
                 let result = {
                     let _source_guard = match &source_lock {
@@ -762,6 +768,13 @@ where
                 });
                 if !missing_context || tokio::time::Instant::now() >= context_deadline {
                     break result;
+                }
+                if missing_parent_slot.is_none() {
+                    let Ok(permit) = missing_parent_slots.clone().try_acquire_owned() else {
+                        // Sync recovery can rediscover this hash without retaining its body here.
+                        break result;
+                    };
+                    missing_parent_slot = Some(permit);
                 }
                 // Retain this bounded download slot and body. Release the source gate so
                 // the same supplier's parent can commit before we retry the child.
@@ -1533,35 +1546,59 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn unavailable_gossip_parent_releases_slot_after_deadline() {
-        let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
-            .zcash_deserialize_into()
-            .unwrap();
-        let hash = block.hash();
-        let parent = block.header.previous_block_hash;
-        let supplier: PeerSocketAddr = "192.0.2.1:8233".parse().unwrap();
-        let (_sender, tip) = chain_tip_at(block::Height(1_687_106), parent);
-        let mut downloads = downloads_returning(block, supplier, tip);
-        downloads.verifier = BoxCloneService::new(service_fn(move |_| async move {
-            Err(BoxError::from(zakura_consensus::RouterError::from(
-                zakura_consensus::VerifyBlockError::MissingParentContext(parent),
-            )))
-        }));
-        let started = tokio::time::Instant::now();
-        downloads.download_and_verify(hash, Some(supplier.into()));
-        let (error, _) = downloads.next().await.unwrap().unwrap_err();
-        assert_eq!(
-            error
-                .downcast_ref::<zakura_consensus::RouterError>()
-                .unwrap()
-                .misbehavior_score(),
-            0
-        );
-        assert_eq!(
-            started.elapsed(),
-            crate::components::sync::BLOCK_VERIFY_TIMEOUT
-        );
-        assert!(downloads.cancel_handles.is_empty());
-        assert!(downloads.source_locks.is_empty());
+        for saturated in [false, true] {
+            let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+                .zcash_deserialize_into()
+                .unwrap();
+            let hash = block.hash();
+            let parent = block.header.previous_block_hash;
+            let supplier: PeerSocketAddr = "192.0.2.1:8233".parse().unwrap();
+            let (_sender, tip) = chain_tip_at(block::Height(1_687_106), parent);
+            let mut downloads = downloads_returning(block, supplier, tip);
+            downloads.verifier = BoxCloneService::new(service_fn(move |_| async move {
+                Err(BoxError::from(zakura_consensus::RouterError::from(
+                    zakura_consensus::VerifyBlockError::MissingParentContext(parent),
+                )))
+            }));
+            let capacity = downloads.full_verify_concurrency_limit / 2;
+            assert_eq!(downloads.missing_parent_slots.available_permits(), capacity);
+            let _occupied = if saturated {
+                Some(
+                    downloads
+                        .missing_parent_slots
+                        .clone()
+                        .acquire_many_owned(u32::try_from(capacity).unwrap())
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let started = tokio::time::Instant::now();
+            downloads.download_and_verify(hash, Some(supplier.into()));
+            let (error, _) = downloads.next().await.unwrap().unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<zakura_consensus::RouterError>()
+                    .unwrap()
+                    .misbehavior_score(),
+                0
+            );
+            assert_eq!(
+                started.elapsed(),
+                if saturated {
+                    std::time::Duration::ZERO
+                } else {
+                    crate::components::sync::BLOCK_VERIFY_TIMEOUT
+                }
+            );
+            assert!(downloads.cancel_handles.is_empty());
+            assert!(downloads.source_locks.is_empty());
+            assert_eq!(
+                downloads.missing_parent_slots.available_permits(),
+                if saturated { 0 } else { capacity }
+            );
+        }
     }
 
     #[tokio::test]

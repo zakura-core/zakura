@@ -1564,8 +1564,10 @@ impl PeerRoutine {
 
     /// The response a mismatched body belongs to. Serving is sequential (the
     /// spec's request-order rule, `docs/specs/blocksync/stream-pair.md`), so it
-    /// is the earliest queued started range that still awaits parts. Vector
-    /// order is not request order: `remove_outstanding` swaps the last entry in.
+    /// is the earliest issued range that still awaits parts. Order comes from
+    /// the monotonic request id, not from a clock or from vector position:
+    /// `remove_outstanding` swaps the last entry in, and two requests issued in
+    /// the same clock tick would otherwise be ranked by wherever they landed.
     fn current_response_index(&self) -> Option<usize> {
         self.window
             .outstanding
@@ -1575,7 +1577,7 @@ impl PeerRoutine {
                 !range.write_status.was_skipped()
                     && range.response.consumed_objects() < u64::from(range.request.count)
             })
-            .min_by_key(|(_, range)| range.queued_at)
+            .min_by_key(|(_, range)| range.request.owner.request_id)
             .map(|(index, _)| index)
     }
 

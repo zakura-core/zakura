@@ -149,6 +149,8 @@ impl AdmissionAttempt {
         GetBlocksServingPermit {
             response: self.work.commit(),
             observation: self.metrics.active(),
+            #[cfg(test)]
+            encode_probe: None,
         }
     }
 }
@@ -159,6 +161,9 @@ impl AdmissionAttempt {
 pub(super) struct GetBlocksServingPermit {
     response: ResponsePermit,
     observation: Arc<observations::Active>,
+    /// Pause and measure the real encoder for this request without affecting other tests.
+    #[cfg(test)]
+    pub(super) encode_probe: Option<Arc<zakura_test::execution::ExecutionProbe>>,
 }
 
 impl GetBlocksServingPermit {
@@ -217,3 +222,6 @@ pub(super) struct ServingRegulationSnapshot {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod properties;

@@ -145,18 +145,38 @@ impl Fixture {
             max_blocks_per_response: 2,
             ..ZakuraBlockSyncConfig::default()
         };
-        let registry = Arc::new(PeerRegistry::new());
-        let peer = ZakuraPeerId::new(vec![111; 32]).unwrap();
-        let SessionAdmission::Fresh { generation } = registry.admit_session(
+        let regulator = GetBlocksServingRegulator::new(config.clone());
+        Self::with_resources(
+            source,
+            depth,
+            config,
+            regulator,
+            Arc::new(PeerRegistry::new()),
+            111,
+        )
+    }
+
+    fn with_resources(
+        source: Arc<dyn BlockRangeSource>,
+        depth: usize,
+        config: ZakuraBlockSyncConfig,
+        regulator: GetBlocksServingRegulator,
+        registry: Arc<PeerRegistry>,
+        peer_byte: u8,
+    ) -> Self {
+        let peer = ZakuraPeerId::new(vec![peer_byte; 32]).unwrap();
+        let admitted = registry.admit_session(
             &peer,
             ServicePeerDirection::Inbound,
             &config,
             1,
             Instant::now(),
-        ) else {
-            panic!("fresh fixture")
-        };
-        let regulator = GetBlocksServingRegulator::new(config.clone());
+        );
+        assert!(matches!(
+            admitted,
+            SessionAdmission::Fresh { .. } | SessionAdmission::Readmitted { .. }
+        ));
+        let generation = admitted.generation();
         let admission = regulator.session(peer.clone());
         let (send, data) = worker_framed_channel(depth);
         let session = BlockSyncPeerSession::for_test_with_session_id(
@@ -504,4 +524,26 @@ async fn cancellation_during_storage_suppresses_old_output_and_retains_the_job()
     assert!(time::timeout(Duration::from_millis(20), f.data.recv())
         .await
         .is_err());
+}
+
+mod properties;
+
+mod serving_contract;
+
+/// The real blocking encoder calls this only in tests. A supplied probe can hold
+/// the operation before encoding or keep its finished result from returning.
+/// In either case, the surrounding production closure still owns the work lease.
+pub(super) fn encode_with_probe(
+    message: &BlockSyncMessage,
+    probe: Option<Arc<zakura_test::execution::ExecutionProbe>>,
+) -> Result<crate::zakura::Frame, BlockSyncWireError> {
+    let Some(probe) = probe else {
+        return message.encode_frame();
+    };
+    let operation = probe.start();
+    let (encoded, allocations) = zakura_test::allocations::measure(|| message.encode_frame());
+    probe.allocations(allocations);
+    let frame = encoded?;
+    operation.finish();
+    Ok(frame)
 }

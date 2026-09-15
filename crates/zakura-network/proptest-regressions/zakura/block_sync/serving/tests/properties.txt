@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+# Preserved from the old serving property. The depth-one response regression
+# is also covered explicitly by the fixed sequential-serving matrix.
+cc 327f1c883a4d7508cd17e9b7790fb53a0f6cce38a991248cac56150038a09a57 # original witness: depth = 1, one nonempty response
+cc 0d7c55384f722a2bae5583d18ca62efd72fa8320669623ec572ece9e814339c4 # CI witness 2026-09-14: depth = 3, outcome = 1, requests = [2, 1, 1, 1], cancel_at = Some(0); node slot still held after re-admission (peer slot released first)

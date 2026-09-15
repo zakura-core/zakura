@@ -163,10 +163,13 @@ impl WorkAttempt {
     }
 }
 
+/// Admission reserves the peer slot before the node slot, so fields release in
+/// the opposite order: a waiter admitted by the freed peer slot then finds the
+/// node slot already returned.
 #[derive(Debug)]
 pub(crate) struct WorkResources {
-    _peer: SlotPermit,
     _node: SlotPermit,
+    _peer: SlotPermit,
 }
 
 /// The handler's response ownership.
@@ -271,3 +274,6 @@ impl WorkLease {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) mod properties;

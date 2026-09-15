@@ -399,22 +399,36 @@ impl HeaderChainEngine {
             <= limits.max_aux_deliveries_total.get()
     }
 
+    /// Return the largest retained input plus commit reserve that a transition may leave.
+    ///
+    /// An older store can hold protected input inside the reserve. Transitions from that store
+    /// may keep or reduce the deficit, so finality can drain it, but they may not increase it.
+    pub(crate) fn auxiliary_reserve_ceiling(&self, limits: crate::EngineLimits) -> usize {
+        self.aux_delivery_count()
+            .saturating_add(self.commit_window_reserve(limits))
+            .max(limits.max_aux_deliveries_total.get())
+    }
+
     fn reserved_auxiliary_capacity(&self, limits: crate::EngineLimits) -> usize {
+        if self.metadata.mode == crate::EngineMode::Integrated {
+            self.commit_window_reserve(limits)
+        } else {
+            0
+        }
+    }
+
+    fn commit_window_reserve(&self, limits: crate::EngineLimits) -> usize {
         let occupied = self
             .selected_projection
             .iter()
             .take(3)
             .map(|frontier| self.aux_deliveries(frontier.hash).len())
             .sum::<usize>();
-        if self.metadata.mode == crate::EngineMode::Integrated {
-            limits
-                .max_aux_deliveries_per_header
-                .get()
-                .saturating_mul(3)
-                .saturating_sub(occupied)
-        } else {
-            0
-        }
+        limits
+            .max_aux_deliveries_per_header
+            .get()
+            .saturating_mul(3)
+            .saturating_sub(occupied)
     }
 
     /// Check one new input against the planner's bucket, aggregate, and reserve limits.

@@ -150,6 +150,129 @@ fn startup_reclaims_auxiliary_reserve_without_due_deferrals() {
     }
 }
 
+#[test]
+fn startup_publishes_a_protected_reserve_deficit_without_discarding_evidence() {
+    for reconciled in [false, true] {
+        let cache = tempfile::tempdir().expect("the test cache directory is created");
+        let db_config = Config {
+            cache_dir: cache.path().to_owned(),
+            ephemeral: false,
+            debug_skip_non_finalized_state_backup_task: true,
+            ..Config::default()
+        };
+        let (mut engine_config, anchor, metadata) = fixture();
+        let network = engine_config.network().clone();
+        let finalized = Frontier::new(anchor.height, anchor.hash);
+        let store = HeaderChainStore::new(open(&db_config, &network));
+        store.initialize(metadata, anchor.clone()).unwrap();
+
+        let mut batch = DiskWriteBatch::new();
+        stage_full_state_canonical_hash(&store, &mut batch, finalized);
+        let mut selected = Vec::new();
+        let mut parent = anchor.clone();
+        for height in 1..=5 {
+            let mut header = *parent.header;
+            header.previous_block_hash = parent.hash;
+            header.time += chrono::Duration::seconds(1);
+            let header = Arc::new(header);
+            let node = HeaderNode::from_durable_parts(
+                header.clone(),
+                header.hash(),
+                parent.hash,
+                block::Height(height),
+                parent.block_work,
+                parent
+                    .work_coordinate()
+                    .checked_add(parent.block_work)
+                    .unwrap(),
+                HeaderValidationState::Valid,
+                Default::default(),
+                BodyValidationState::Unknown,
+                Vec::new(),
+            )
+            .unwrap();
+            store
+                .put_value(
+                    &mut batch,
+                    HEADER_NODE_BY_HASH,
+                    node.hash.0,
+                    &HeaderNodeDisk::from_domain(&node),
+                )
+                .unwrap();
+            parent = node.clone();
+            selected.push(node);
+        }
+        store.db.write(batch).unwrap();
+        let (runtime, _) = store.startup(&engine_config).unwrap();
+        let before = runtime.publisher().snapshot();
+        assert_eq!(
+            before.frontiers.header_best.hash,
+            selected.last().unwrap().hash
+        );
+
+        // An older store retained input above the commit window on the protected selected path.
+        let mut batch = DiskWriteBatch::new();
+        for (index, node) in selected.iter_mut().enumerate().skip(2) {
+            let delivery = AuxDelivery::new(
+                EvidenceId::from_digest([u8::try_from(index).unwrap(); 32]),
+                node.hash,
+                SourceId::from_digest([0x92; 32]),
+                body_owner(&before, 1, 1).into(),
+                zakura_header_chain::BodySizeHint::Unknown,
+                None,
+            );
+            node.aux_delivery_ids.push(delivery.delivery_id);
+            runtime
+                .store
+                .put_value(
+                    &mut batch,
+                    HEADER_NODE_BY_HASH,
+                    node.hash.0,
+                    &HeaderNodeDisk::from_domain(node),
+                )
+                .unwrap();
+            runtime
+                .store
+                .put_value(
+                    &mut batch,
+                    HEADER_AUX_DELIVERY,
+                    HeaderAuxDeliveryKey {
+                        header: node.hash,
+                        delivery: delivery.delivery_id,
+                    }
+                    .as_bytes(),
+                    &delivery,
+                )
+                .unwrap();
+        }
+        runtime.store.db.write(batch).unwrap();
+        drop(runtime);
+
+        // Three protected rows plus a three-slot reserve exceed the five-slot limit.
+        engine_config.limits.max_aux_deliveries_per_header = NonZeroUsize::new(1).unwrap();
+        engine_config.limits.max_aux_deliveries_total = NonZeroUsize::new(5).unwrap();
+        let store = HeaderChainStore::new(open(&db_config, &network));
+        let (runtime, report) = if reconciled {
+            store.startup_reconciled(&engine_config, finalized, Vec::new(), Vec::new())
+        } else {
+            store.startup(&engine_config)
+        }
+        .expect("a protected reserve deficit cannot prevent startup");
+        assert_eq!(report.current.frontiers, before.frontiers);
+        assert_eq!(runtime.store.load_aux_deliveries().unwrap().len(), 3);
+        let reader = runtime.reader();
+        let owner = body_owner(&report.current, 2, 2);
+        assert!(
+            reader
+                .vct_repair_context(owner, selected[0].height)
+                .unwrap()
+                .unwrap()
+                .admission_capacity_available,
+            "the empty commit window still admits its own repair"
+        );
+    }
+}
+
 /// Commit one deferred header at `insertion_time`, then return the closed database.
 fn commit_deferral(
     header_generation: HeaderGeneration,

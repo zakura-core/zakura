@@ -110,7 +110,7 @@ pub(crate) fn verify_aux<G: HeaderGraphView>(
             );
         }
         if projected_aux_count.saturating_add(window_capacity.saturating_sub(occupied))
-            > plan.limits.max_aux_deliveries_total.get()
+            > engine_before_commit.auxiliary_reserve_ceiling(plan.limits)
         {
             return Err(InvariantViolation::Limits);
         }
@@ -229,25 +229,46 @@ mod tests {
     #[test]
     fn projected_commit_reserve_includes_missing_successors() {
         let fixture = fixture(EngineMode::Integrated);
-        let anchor = fixture.engine.graph().finalized_frontier();
+        // A side branch holds input outside the selected window. The window's second
+        // successor has not arrived, so its slot stays reserved.
+        let mut side_header = *fixture
+            .engine
+            .graph()
+            .header_node(fixture.child.hash)
+            .unwrap()
+            .header;
+        side_header.nonce.0[0] = 2;
         let mut overlay = GraphOverlay::new(fixture.engine.graph());
-        let mut deliveries = Vec::new();
-        for (hash, marker) in [(anchor.hash, 0x79), (fixture.child.hash, 0x7a)] {
-            let delivery = delivery(&fixture.engine, hash, EvidenceId::from_digest([marker; 32]));
-            overlay
-                .record_auxiliary_evidence_delivery(hash, delivery.delivery_id)
-                .unwrap();
-            deliveries.push(AuxDelta::Put(Box::new(delivery)));
-        }
+        let side = match overlay
+            .insert(
+                std::sync::Arc::new(side_header),
+                crate::HeaderValidationState::Valid,
+                [],
+                crate::BodyValidationState::Unknown,
+            )
+            .unwrap()
+        {
+            crate::InsertResult::Inserted(frontier)
+            | crate::InsertResult::AlreadyPresent(frontier) => frontier,
+        };
+        let row = delivery(
+            &fixture.engine,
+            side.hash,
+            EvidenceId::from_digest([0x79; 32]),
+        );
+        overlay
+            .record_auxiliary_evidence_delivery(side.hash, row.delivery_id)
+            .unwrap();
         let mut plan = candidate_with_delta(&fixture.engine, overlay.delta());
-        plan.change_set.aux_changes = deliveries;
+        plan.change_set.aux_changes = vec![AuxDelta::Put(Box::new(row))];
         plan.limits.max_aux_deliveries_per_header = NonZeroUsize::new(1).unwrap();
-        plan.limits.max_aux_deliveries_total = NonZeroUsize::new(2).unwrap();
+        // The empty store exactly holds the reserve for the anchor, child, and missing successor.
+        plan.limits.max_aux_deliveries_total = NonZeroUsize::new(3).unwrap();
         assert_eq!(
             verify_in_both_modes(&fixture, &plan),
             [Err(InvariantViolation::Limits); 2]
         );
-        plan.limits.max_aux_deliveries_total = NonZeroUsize::new(3).unwrap();
+        plan.limits.max_aux_deliveries_total = NonZeroUsize::new(4).unwrap();
         assert_eq!(verify_in_both_modes(&fixture, &plan), [Ok(()); 2]);
     }
 

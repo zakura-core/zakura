@@ -1338,6 +1338,190 @@ fn commit_window_repairs_resume_finality_at_auxiliary_saturation() {
 }
 
 #[test]
+fn protected_reserve_deficit_refuses_growth_but_drains_through_finality() {
+    let (mut store, mut config) = TestStore::new(EngineMode::Integrated);
+    config.limits.max_aux_deliveries_per_header = std::num::NonZeroUsize::new(2).unwrap();
+    config.limits.max_aux_deliveries_total = std::num::NonZeroUsize::new(8).unwrap();
+    let clock = ManualClock(Utc::now());
+    let anchor = store.metadata.frontiers.finalized;
+    let anchor_lease = store.lease.clone();
+    let initial = insertion(&store, 5, EvidenceId::from_digest([0x81; 32]));
+    let TransitionEvent::InsertHeaders(mut insert) = initial.event.clone() else {
+        unreachable!("the fixture constructs a header insertion");
+    };
+    let headers = insert.batch.headers().to_vec();
+    let plan = apply_transition(&store, initial, &context(&config, &clock, None))
+        .expect("headers without input leave the reserve intact");
+    store.commit(&plan);
+
+    // An older store retained input above the empty commit window on the protected selected
+    // path. Three rows plus the six-slot reserve exceed the eight-slot limit.
+    for (index, header) in headers.iter().enumerate().skip(2) {
+        let delivery = crate::AuxDelivery::new(
+            EvidenceId::from_digest([0x82 + u8::try_from(index).unwrap(); 32]),
+            header.hash,
+            insert.source,
+            insert.owner,
+            crate::BodySizeHint::Unknown,
+            None,
+        );
+        store
+            .graph
+            .record_auxiliary_evidence_delivery(header.hash, delivery.delivery_id)
+            .unwrap();
+        store.aux.push(delivery);
+    }
+
+    store.lease = anchor_lease;
+    insert.owner = crate::HeaderWorkOwner {
+        authority: crate::HeaderWorkAuthority {
+            header_generation: store.metadata.header_generation,
+            branch: BranchId::new(anchor.hash, store.metadata.frontiers.header_best.hash),
+        },
+        session_id: 1,
+        request_id: NonZeroU64::new(2).unwrap(),
+    }
+    .into();
+    insert.aux = vec![crate::AuxDelivery::new(
+        EvidenceId::from_digest([0x88; 32]),
+        headers[4].hash,
+        insert.source,
+        insert.owner,
+        crate::BodySizeHint::Unknown,
+        Some(crate::TreeAuxRecordV1 {
+            height: headers[4].height,
+            sapling_root: Default::default(),
+            orchard_root: Default::default(),
+            ironwood_root: Default::default(),
+            sapling_tx_count: 0,
+            orchard_tx_count: 0,
+            ironwood_tx_count: 0,
+            auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([0; 32]),
+        }),
+    )];
+    insert.batch = PreparedHeaderBatch::new(
+        headers.clone(),
+        anchor,
+        config.network().clone(),
+        config.trust_anchor_digest(),
+        EvidenceId::from_digest([0x89; 32]),
+    )
+    .unwrap();
+    let refused = apply_transition(
+        &store,
+        TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: TransitionEvent::InsertHeaders(insert),
+        },
+        &context(&config, &clock, None),
+    );
+    assert!(
+        matches!(refused, Err(TransitionFailure::AuxiliaryLimitExceeded)),
+        "speculative input cannot deepen the deficit: {refused:?}"
+    );
+    assert_eq!(store.aux.len(), 3);
+
+    // Commit-window input fills reserved slots, so it leaves the deficit unchanged.
+    let owner = body_owner(&store.snapshot(), 8, 9);
+    let source = SourceId::from_digest([0x8a; 32]);
+    let deliveries: Vec<_> = headers[..2]
+        .iter()
+        .enumerate()
+        .map(|(index, header)| {
+            crate::AuxDelivery::new(
+                EvidenceId::from_digest([0x8b + u8::try_from(index).unwrap(); 32]),
+                header.hash,
+                source,
+                owner.into(),
+                crate::BodySizeHint::Unknown,
+                Some(crate::TreeAuxRecordV1 {
+                    height: header.height,
+                    sapling_root: Default::default(),
+                    orchard_root: Default::default(),
+                    ironwood_root: Default::default(),
+                    sapling_tx_count: 0,
+                    orchard_tx_count: 0,
+                    ironwood_tx_count: 0,
+                    auth_data_root: zakura_chain::block::merkle::AuthDataRoot::from([0; 32]),
+                }),
+            )
+        })
+        .collect();
+    let target = Frontier::new(headers[1].height, headers[1].hash);
+    let repair = TransitionRequest {
+        expected_version: store.metadata.state_version,
+        event: TransitionEvent::InsertHeaders(Box::new(crate::InsertHeaders {
+            owner: owner.into(),
+            source,
+            parent_hash: anchor.hash,
+            target_tip_hash: target.hash,
+            completion: TargetCompletion::SelectedAuxiliaryRepair {
+                common_ancestor: anchor,
+                selected_target: target,
+                episode: crate::VctRepairContext::unconstrained(
+                    target,
+                    crate::HeaderLocator::for_continuation(anchor),
+                    None,
+                )
+                .episode,
+            },
+            batch: PreparedHeaderBatch::new(
+                headers[..2].to_vec(),
+                anchor,
+                config.network().clone(),
+                config.trust_anchor_digest(),
+                EvidenceId::from_digest([0x8d; 32]),
+            )
+            .unwrap(),
+            aux: deliveries.clone(),
+        })),
+    };
+    let plan = apply_transition(&store, repair, &context(&config, &clock, None))
+        .expect("the commit window can use its reserve during a deficit");
+    store.commit(&plan);
+    assert_eq!(store.aux.len(), 5);
+
+    let checkpoint = store.selected[1];
+    let plan = apply_transition(
+        &store,
+        TransitionRequest {
+            expected_version: store.metadata.state_version,
+            event: TransitionEvent::VerifiedChainChanged(crate::VerifiedChainChanged {
+                full_state_transition_id: EvidenceId::from_digest([0x8e; 32]),
+                old_tip: anchor,
+                new_path: vec![crate::VerifiedHeaderRef {
+                    height: checkpoint.height,
+                    hash: checkpoint.hash,
+                    header: store
+                        .graph
+                        .header_node(checkpoint.hash)
+                        .unwrap()
+                        .header
+                        .clone(),
+                }],
+                cause: crate::VerifiedChangeCause::CheckpointFinalizedGrow,
+            }),
+        },
+        &context(&config, &clock, Some(&Authority)),
+    )
+    .expect("finality advances while protected input exceeds the reserve");
+    store.commit(&plan);
+    assert_eq!(store.metadata.frontiers.finalized, checkpoint);
+    let engine = crate::HeaderChainEngine::from_test_state(
+        store.graph.clone(),
+        store.metadata.clone(),
+        store.selected.clone(),
+        store.verified.clone(),
+        store.aux.clone(),
+    )
+    .unwrap();
+    assert!(
+        engine.auxiliary_reserve_is_satisfied(config.limits),
+        "the advanced window absorbs the protected rows"
+    );
+}
+
+#[test]
 fn fork_selection_reclaims_displaced_auxiliary_rows_before_using_the_reserve() {
     let (mut store, mut config) = TestStore::new(EngineMode::Integrated);
     let clock = ManualClock(Utc::now());

@@ -398,6 +398,7 @@ impl<'a> SettledProjectedState<'a> {
         }
         // Keep the finalized root and the next commit's two-header authentication window
         // within the hard limit even when speculative deliveries saturate the remaining store.
+        // A store that already lacks the reserve may not deepen its deficit.
         let commit_window = &selected[..selected.len().min(3)];
         if integrated {
             let occupied = commit_window.iter().try_fold(0usize, |count, frontier| {
@@ -412,7 +413,7 @@ impl<'a> SettledProjectedState<'a> {
                 .get()
                 .saturating_mul(3)
                 .saturating_sub(occupied);
-            if projected_total.saturating_add(reserve) > limits.max_aux_deliveries_total.get() {
+            if projected_total.saturating_add(reserve) > engine.auxiliary_reserve_ceiling(limits) {
                 return Err(TransitionFailure::AuxiliaryLimitExceeded);
             }
         }

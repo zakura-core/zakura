@@ -143,7 +143,7 @@ pub use vct_treestate_audit::{
 pub use zakura_db::commitment_roots_db::{CommitmentRootIndexIssue, COMMITMENT_ROOTS_BY_HEIGHT};
 #[allow(unused_imports)]
 pub use zakura_db::highest_completed_checkpoint::*;
-pub use zakura_db::ZakuraDb;
+pub use zakura_db::{DatabaseWriterMetadata, ZakuraDb};
 
 #[cfg(any(test, feature = "proptest-impl"))]
 pub use disk_format::KV;
@@ -220,11 +220,20 @@ pub const STATE_COLUMN_FAMILIES_IN_CODE: &[&str] = &[
     BLOCK_INFO,
     // Verified-commitment-trees serving index
     COMMITMENT_ROOTS_BY_HEIGHT,
+    // Node software metadata
+    NODE_SOFTWARE_METADATA,
     // Storage policy
     PRUNING_METADATA,
     VCT_SYNC_METADATA,
     VCT_UPGRADE_METADATA,
 ];
+
+/// The name of the column family that records the last node software to write
+/// this database.
+///
+/// This column family is a simple key/value store for operational metadata. It
+/// is not consensus data.
+pub const NODE_SOFTWARE_METADATA: &str = "node_software_metadata";
 
 /// Fork-aware header-chain node rows keyed by canonical hash.
 pub const HEADER_NODE_BY_HASH: &str = "header_node_by_hash_v1";
@@ -328,7 +337,29 @@ impl FinalizedState {
     /// Returns an on-disk database instance for `config` and `network`.
     /// If there is no existing database, creates a new database on disk.
     pub fn new(config: &Config, network: &Network) -> Result<Self, StateInitError> {
-        Self::new_with_debug(config, network, false, false)
+        Self::new_with_database_writer_metadata(
+            config,
+            network,
+            DatabaseWriterMetadata::default_zakura(),
+        )
+    }
+
+    /// Returns an on-disk database instance for `config`, `network`, and the
+    /// supplied database writer metadata.
+    ///
+    /// If there is no existing database, creates a new database on disk.
+    pub fn new_with_database_writer_metadata(
+        config: &Config,
+        network: &Network,
+        database_writer_metadata: DatabaseWriterMetadata,
+    ) -> Result<Self, StateInitError> {
+        Self::new_with_debug_and_database_writer_metadata(
+            config,
+            network,
+            database_writer_metadata,
+            false,
+            false,
+        )
     }
 
     /// Opens (or creates) the on-disk finalized state database read-write, for
@@ -354,9 +385,28 @@ impl FinalizedState {
         debug_skip_format_upgrades: bool,
         read_only: bool,
     ) -> Result<Self, StateInitError> {
-        Self::new_with_debug_and_storage_validation(
+        Self::new_with_debug_and_database_writer_metadata(
             config,
             network,
+            DatabaseWriterMetadata::default_zakura(),
+            debug_skip_format_upgrades,
+            read_only,
+        )
+    }
+
+    /// Returns an on-disk database instance with explicit node software metadata.
+    #[allow(clippy::unwrap_in_result)]
+    pub(crate) fn new_with_debug_and_database_writer_metadata(
+        config: &Config,
+        network: &Network,
+        database_writer_metadata: DatabaseWriterMetadata,
+        debug_skip_format_upgrades: bool,
+        read_only: bool,
+    ) -> Result<Self, StateInitError> {
+        Self::new_with_debug_and_database_writer_metadata_and_storage_validation(
+            config,
+            network,
+            database_writer_metadata,
             debug_skip_format_upgrades,
             read_only,
             true,
@@ -385,10 +435,32 @@ impl FinalizedState {
         )
     }
 
+    #[cfg(test)]
     #[allow(clippy::unwrap_in_result)]
     fn new_with_debug_and_storage_validation(
         config: &Config,
         network: &Network,
+        debug_skip_format_upgrades: bool,
+        read_only: bool,
+        validate_storage_mode: bool,
+        enforce_resume_guard: bool,
+    ) -> Result<Self, StateInitError> {
+        Self::new_with_debug_and_database_writer_metadata_and_storage_validation(
+            config,
+            network,
+            DatabaseWriterMetadata::default_zakura(),
+            debug_skip_format_upgrades,
+            read_only,
+            validate_storage_mode,
+            enforce_resume_guard,
+        )
+    }
+
+    #[allow(clippy::unwrap_in_result)]
+    fn new_with_debug_and_database_writer_metadata_and_storage_validation(
+        config: &Config,
+        network: &Network,
+        database_writer_metadata: DatabaseWriterMetadata,
         debug_skip_format_upgrades: bool,
         read_only: bool,
         validate_storage_mode: bool,
@@ -401,7 +473,7 @@ impl FinalizedState {
             }
         }
 
-        let db = ZakuraDb::new(
+        let db = ZakuraDb::new_with_database_writer_metadata(
             config,
             STATE_DATABASE_KIND,
             &state_database_format_version_in_code(),
@@ -411,6 +483,7 @@ impl FinalizedState {
                 .iter()
                 .map(ToString::to_string),
             read_only,
+            Some(&database_writer_metadata),
         )?;
 
         let vct = VctState::from_config(config.checkpoint_sync, config.vct_fast_sync, network);

@@ -75,7 +75,7 @@ pub use service::{
     chain_tip::{ChainTipBlock, ChainTipChange, ChainTipSender, LatestChainTip, TipAction},
     check,
     finalized_state::FinalizedState,
-    init, init_read_only, init_with_header_chain_body_evidence,
+    init, init_read_only, init_with_database_writer_metadata, init_with_header_chain_body_evidence,
     non_finalized_state::NonFinalizedState,
     spawn_init_read_only,
     watch_receiver::WatchReceiver,
@@ -123,7 +123,10 @@ pub use service::read::{
     HistoricalTreeCache, MAX_CACHED_FRONTIERS,
 };
 pub use service::{
-    finalized_state::{DiskWriteBatch, FallibleDiskValue, FromDisk, IntoDisk, WriteDisk, ZakuraDb},
+    finalized_state::{
+        DatabaseWriterMetadata, DiskWriteBatch, FallibleDiskValue, FromDisk, IntoDisk, WriteDisk,
+        ZakuraDb,
+    },
     OwnedBlockRange, ReadStateService, VctRootRepairState, VctRootRepairStatus,
 };
 

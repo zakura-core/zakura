@@ -144,7 +144,11 @@ fn format_upgrades(
         )),
         Box::new(drop_header_root_auth_frontier::Upgrade),
         Box::new(unauthenticated_commitment_roots::Upgrade),
-    ] as [Box<dyn DiskFormatUpgrade>; 10])
+        Box::new(no_migration::NoMigration::new(
+            "add node software metadata column family",
+            Version::new(28, 2, 0),
+        )),
+    ] as [Box<dyn DiskFormatUpgrade>; 11])
         .into_iter()
         .filter(move |upgrade| upgrade.version() > min_version())
 }
@@ -1104,18 +1108,31 @@ fn fast_sync_metadata_cf_upgrade_is_no_migration() {
 }
 
 #[test]
-fn vct_format_changes_include_root_auth_metadata_updates() {
+fn node_software_metadata_cf_upgrade_is_no_migration() {
+    let upgrades: Vec<_> = format_upgrades(Some(Version::new(28, 1, 5))).collect();
+    let upgrade = upgrades
+        .iter()
+        .find(|upgrade| upgrade.version() == Version::new(28, 2, 0))
+        .expect("node software metadata upgrade should be present");
+
+    assert!(!upgrade.needs_migration());
+}
+
+#[test]
+fn vct_format_changes_include_root_auth_and_node_metadata_updates() {
     use crate::constants::state_database_format_version_in_code;
 
     let upgrades: Vec<_> = format_upgrades(Some(Version::new(27, 3, 0))).collect();
 
-    assert_eq!(upgrades.len(), 6);
+    assert_eq!(upgrades.len(), 7);
     assert_eq!(upgrades[0].version(), Version::new(28, 0, 0));
     assert_eq!(upgrades[1].version(), Version::new(28, 0, 1));
     assert_eq!(upgrades[2].version(), Version::new(28, 0, 2));
     assert_eq!(upgrades[3].version(), Version::new(28, 1, 3));
     assert_eq!(upgrades[4].version(), Version::new(28, 1, 4));
     assert_eq!(upgrades[5].version(), Version::new(28, 1, 5));
+    assert_eq!(upgrades[6].version(), Version::new(28, 2, 0));
+    assert!(!upgrades[6].needs_migration());
     assert!(
         !upgrades[3].needs_migration(),
         "the header-chain column families are created on open without rebasing authenticated roots"

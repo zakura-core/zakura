@@ -35,7 +35,7 @@ use crate::{
     service::finalized_state::{
         disk_db::DiskDb,
         disk_format::{tests::KV, RawBytes},
-        FinalizedState, COMMITMENT_ROOTS_BY_HEIGHT, VCT_UPGRADE_METADATA,
+        FinalizedState, COMMITMENT_ROOTS_BY_HEIGHT, NODE_SOFTWARE_METADATA, VCT_UPGRADE_METADATA,
     },
     Config, ReadDisk,
 };
@@ -150,5 +150,8 @@ fn snapshot_raw_rocksdb_column_family_data(db: &DiskDb, original_cf_names: &[Str
 }
 
 fn skip_raw_data_snapshot(cf_name: &str) -> bool {
-    matches!(cf_name, COMMITMENT_ROOTS_BY_HEIGHT | VCT_UPGRADE_METADATA)
+    matches!(
+        cf_name,
+        COMMITMENT_ROOTS_BY_HEIGHT | NODE_SOFTWARE_METADATA | VCT_UPGRADE_METADATA
+    )
 }

@@ -160,6 +160,48 @@ async fn r04_wrong_hash_inside_the_range_is_consumed_and_discarded() {
 }
 
 #[tokio::test]
+async fn r04_a_discarded_body_buys_write_grace_not_a_full_liveness_interval() {
+    // A zero congestion window seals a useless peer and hands eviction to the
+    // liveness timer. Renewing a full interval per discarded part would let a peer
+    // spend credit banked before it was sealed to stay connected for hours.
+    let mut f = Fixture::new(100, 3);
+    f.publish().await;
+    let before = f
+        .routine
+        .window
+        .block_liveness_deadline
+        .expect("publishing a request arms the liveness deadline");
+
+    let mut wrong = (*f.blocks[0]).clone();
+    Arc::make_mut(&mut wrong.header).nonce[0] ^= 1;
+    f.discards(
+        BlockSyncMessage::Block(Arc::new(wrong)),
+        1,
+        "R04 a fork answer earns write grace",
+    )
+    .await;
+
+    let after = f
+        .routine
+        .window
+        .block_liveness_deadline
+        .expect("the deadline stays armed");
+    let granted = after.saturating_duration_since(std::time::Instant::now());
+    assert!(
+        granted <= f.routine.config.request_timeout,
+        "R04 a discard grants one request timeout, got {granted:?}"
+    );
+    assert!(
+        granted < f.routine.config.effective_liveness_timeout(),
+        "R04 a discard must not renew the full liveness interval"
+    );
+    assert!(
+        after >= before || granted > Duration::ZERO,
+        "the deadline is live"
+    );
+}
+
+#[tokio::test]
 async fn r04_a_discarded_body_does_not_prove_this_peer_supplies_blocks() {
     let mut f = Fixture::new(100, 3);
     f.publish().await;

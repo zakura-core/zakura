@@ -1539,6 +1539,12 @@ impl PeerRoutine {
     fn gc_obsolete_outstanding(&mut self) {
         for index in (0..self.window.outstanding.len()).rev() {
             let outstanding = &self.window.outstanding[index];
+            // `detach_local_work` returns immediately for a range that is already
+            // detached, so scanning one costs a work-queue lock per unreceived height
+            // to reach a no-op. Retained wire authorization must not sit on this path.
+            if !outstanding.local_work_active {
+                continue;
+            }
             let owner = outstanding.request.owner;
             let still_owned = unreceived_heights(outstanding)
                 .any(|height| self.work.owner_for_height(height) == Some(owner));
@@ -1617,12 +1623,20 @@ impl PeerRoutine {
         );
         metrics::counter!("sync.block.body.discarded", "reason" => "hash_mismatch").increment(1);
         self.trace_body_discarded(height, requested, delivered);
-        // The peer answered, so give the exchange the same bounded grace a live
-        // request gets. Accepted-body accounting stays put: a peer that only ever
-        // answers from another fork must not read as a proven supplier, which
-        // would lift both its unproven-peer request cap and its stall count.
-        self.window
-            .extend_liveness_deadline(Instant::now(), self.config.effective_liveness_timeout());
+        // The peer answered, so give the exchange a bounded grace. Accepted-body
+        // accounting stays put: a peer that only ever answers from another fork must
+        // not read as a proven supplier, which would lift both its unproven-peer
+        // request cap and its stall count.
+        //
+        // The grace is one request timeout, not a full liveness interval, and a range
+        // whose local work is already detached buys none at all. A full interval per
+        // discarded part would let a peer spend credit banked before it was sealed to
+        // renew the deadline for hours, which is the eviction a zero congestion window
+        // deliberately hands to this timer.
+        if self.window.outstanding[index].local_work_active {
+            self.window
+                .extend_liveness_deadline(Instant::now(), self.config.request_timeout);
+        }
         self.note_retry_avoid([height]);
         self.publish_outstanding();
         Ok(())
@@ -1686,9 +1700,6 @@ impl PeerRoutine {
                 delivery_snapshot,
             );
         }
-        if was_detached {
-            self.window.credit_late_delivery();
-        }
         self.publish_outstanding();
 
         // Application policy runs only after consumption. Local obsolescence
@@ -1730,6 +1741,12 @@ impl PeerRoutine {
         else {
             return Ok(());
         };
+        // Refund the timeout charge only now the body is going somewhere. The credit
+        // exists for a body that was late but still useful; a late body for a height
+        // another peer already covered exits above and earns nothing.
+        if was_detached {
+            self.window.credit_late_delivery();
+        }
         self.trace
             .record_block_body_received(hash, BlockBodySource::Zakura);
         metrics::counter!("sync.block.body.received").increment(1);

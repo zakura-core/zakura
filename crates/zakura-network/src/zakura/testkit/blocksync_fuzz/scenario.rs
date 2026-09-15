@@ -116,10 +116,14 @@ pub(crate) struct ServeProfile {
     /// Probability in `[0, 1]` that a request is silently dropped (no response),
     /// forcing the node's request timeout / re-request path.
     pub(crate) drop_probability: f64,
+    /// Probability in `[0, 1]` that a request is answered with `RangeUnavailable`
+    /// instead of bodies: a legal short response that charges the requester's
+    /// reliability estimate without any protocol fault.
+    pub(crate) unavailable_probability: f64,
     /// Inclusive height window this peer refuses to serve (answers `RangeUnavailable`),
     /// modelling a peer that is missing a range.
     pub(crate) withhold: Option<(block::Height, block::Height)>,
-    /// Serve the blocks of a response in reverse order, exercising the reorder buffer.
+    /// Serve a response's blocks in reverse order; each mismatch spends a part and is discarded.
     pub(crate) reorder: bool,
     /// Optional mid-run degradation (wedge or slow-down) applied once the peer has been
     /// connected for [`Degrade::at`].
@@ -135,6 +139,7 @@ impl ServeProfile {
             bandwidth_bytes_per_sec: None,
             idle_gap: None,
             drop_probability: 0.0,
+            unavailable_probability: 0.0,
             withhold: None,
             reorder: false,
             degrade: None,

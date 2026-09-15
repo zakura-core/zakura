@@ -400,10 +400,18 @@ impl BlockSyncState {
 /// Carved out of `PeerBlockState` so the window math stays unit-testable
 /// while the per-peer download state moves into the spawned
 /// [`PeerRoutine`](super::peer_routine) (per-peer routines). The routine embeds one of these.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(super) struct DownloadWindow {
     pub(super) max_inflight_requests: u32,
+    /// Storage order can change when a range ends. Insert, consume and remove
+    /// through the window methods so both response indexes stay synchronized.
     pub(super) outstanding: Vec<OutstandingBlockRange>,
+    /// Bumped whenever a range is added or removed. Consuming a part or receiving a
+    /// body does not change the set, so publishing can skip rebuilding the
+    /// registry's sorted copy on the frames that only move credit.
+    pub(super) outstanding_revision: u64,
+    next_response_hashes: crate::zakura::regulation::ResponseIndex<[u8; 32]>,
+    response_starts: crate::zakura::regulation::ResponseIndex<block::Height>,
     /// Per-peer BBR-lite estimators + cwnd — the sole congestion controller. Under
     /// [`CwndUnit::Bytes`] the cwnd is itself a byte budget sourced from header size
     /// hints (no fixed per-request byte weight), so there is no `nominal_request_bytes`.
@@ -438,6 +446,9 @@ impl DownloadWindow {
         Self {
             max_inflight_requests: config.advertised_max_inflight_requests(),
             outstanding: Vec::new(),
+            outstanding_revision: 0,
+            next_response_hashes: crate::zakura::regulation::ResponseIndex::new(),
+            response_starts: crate::zakura::regulation::ResponseIndex::new(),
             bbr: BbrState::new(config),
             cwnd_unit: config.bbr_cwnd_unit,
             startup_request_cap: usize::try_from(config.initial_inflight_requests)
@@ -512,7 +523,13 @@ impl DownloadWindow {
     /// per-block worst case when nothing is outstanding. Used only for diagnostics and
     /// the floor-bypass byte bonus, never for admission.
     fn representative_body_bytes(&self) -> u64 {
-        let outstanding = self.outstanding.len() as u64;
+        let outstanding = u64::try_from(
+            self.outstanding
+                .iter()
+                .filter(|range| range.local_work_active)
+                .count(),
+        )
+        .expect("bounded request count fits u64");
         if outstanding == 0 {
             return block::MAX_BLOCK_BYTES;
         }
@@ -821,7 +838,7 @@ impl DownloadWindow {
     /// End a locally retired obligation before discarding its write status. If
     /// transport has not started, it must skip the frame and refund this probe.
     pub(super) fn retire_locally(&mut self, index: usize) -> OutstandingBlockRange {
-        let outstanding = self.outstanding.remove(index);
+        let outstanding = self.remove_outstanding(index);
         outstanding.write_status.expire_unwritten();
         if outstanding.write_status.was_skipped() && outstanding.charged_for_liveness {
             self.requests_without_block_progress =
@@ -862,18 +879,15 @@ impl DownloadWindow {
             .min(EFFECTIVE_BS_OUTBOUND_INFLIGHT_PER_PEER)
     }
 
-    pub(super) fn outstanding_index_for_height(&self, height: block::Height) -> Option<usize> {
-        self.outstanding
-            .iter()
-            .position(|outstanding| outstanding.request.contains(height))
-    }
-
     pub(super) fn outstanding_index_for_start(&self, start_height: block::Height) -> Option<usize> {
-        self.outstanding
-            .iter()
-            .position(|outstanding| outstanding.request.start_height == start_height)
+        match self.response_starts.find(start_height) {
+            crate::zakura::regulation::ResponseMatch::Unique(index) => Some(index),
+            _ => None,
+        }
     }
 }
+
+mod outstanding;
 
 /// Thin per-peer handle the reactor keeps to serve inbound
 /// `GetBlocks` (the session clone + serving meters), advertise our `Status`, count
@@ -901,9 +915,12 @@ impl PeerBlockState {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(super) struct OutstandingBlockRange {
     pub(super) request: BlockRangeRequest,
+    pub(super) response: crate::zakura::regulation::ResponseCredit,
+    /// Local work may end while the peer still owns response credit.
+    pub(super) local_work_active: bool,
     pub(super) write_status: RequestWriteStatus,
     /// Whether this attempt still contributes to the no-progress probe streak.
     pub(super) charged_for_liveness: bool,
@@ -923,6 +940,9 @@ pub(super) struct DeliverySnapshot {
 impl OutstandingBlockRange {
     /// Size estimates still reserved for unreceived heights.
     pub(super) fn reserved_bytes(&self) -> u64 {
+        if !self.local_work_active {
+            return 0;
+        }
         self.request
             .expected_blocks
             .iter()
@@ -930,10 +950,6 @@ impl OutstandingBlockRange {
             .fold(0u64, |acc, expected| {
                 acc.saturating_add(expected.estimated_bytes)
             })
-    }
-
-    pub(super) fn estimated_bytes_for_height(&self, height: block::Height) -> Option<u64> {
-        self.request.estimated_bytes_for_height(height)
     }
 
     pub(super) fn has_received(&self, height: block::Height) -> bool {
@@ -950,25 +966,6 @@ impl OutstandingBlockRange {
 
     pub(super) fn record_body_bytes(&mut self, bytes: u64) {
         self.delivered_bytes = self.delivered_bytes.saturating_add(bytes);
-    }
-
-    /// Mark every requested height at or below `tip` as received and return the
-    /// sum of the per-height size estimates those newly-received heights still
-    /// held, so the caller releases exactly the reservation those heights held.
-    pub(super) fn mark_received_through(&mut self, tip: block::Height) -> u64 {
-        self.request
-            .expected_blocks
-            .iter()
-            .filter(|expected| {
-                expected.height <= tip
-                    && self
-                        .request
-                        .offset_for_height(expected.height)
-                        .is_some_and(|offset| self.received.insert_offset(offset))
-            })
-            .fold(0u64, |acc, expected| {
-                acc.saturating_add(expected.estimated_bytes)
-            })
     }
 
     pub(super) fn is_complete(&self) -> bool {

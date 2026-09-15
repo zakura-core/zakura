@@ -1,6 +1,6 @@
 use super::super::trace::{
-    block_sync_message_label, elapsed_us, height as trace_height, peer as trace_peer,
-    saturating_usize, BlockTraceEvent, BlockTraceFields, BoolOrU64,
+    block_sync_message_label, elapsed_us, hash as trace_hash, height as trace_height,
+    peer as trace_peer, saturating_usize, BlockTraceEvent, BlockTraceFields, BoolOrU64,
 };
 use super::*;
 use crate::zakura::trace::block_sync_trace as bs_trace;
@@ -29,6 +29,31 @@ impl PeerRoutine {
             if let Some(last_block_at) = self.window.last_block_at {
                 row.last_block_age_ms = Some(elapsed_ms_u64(last_block_at.elapsed()));
             }
+        });
+    }
+
+    /// Trace the protocol-invalid message that is tearing this connection down.
+    pub(super) fn trace_protocol_reject(&self, error: &str) {
+        self.emit(bs_trace::BLOCK_PEER_PROTOCOL_REJECT, |row| {
+            row.peer = Some(trace_peer(&self.peer));
+            row.error = Some(error.to_string());
+            row.outstanding = Some(saturating_usize(self.window.outstanding.len()));
+        });
+    }
+
+    /// Trace a body discarded for not matching the next expected hash.
+    pub(super) fn trace_body_discarded(
+        &self,
+        height: block::Height,
+        requested: block::Hash,
+        delivered: block::Hash,
+    ) {
+        self.emit(bs_trace::BLOCK_BODY_DISCARDED, |row| {
+            row.peer = Some(trace_peer(&self.peer));
+            row.height = Some(trace_height(height));
+            row.requested_hash = Some(trace_hash(requested));
+            row.delivered_hash = Some(trace_hash(delivered));
+            row.outstanding = Some(saturating_usize(self.window.outstanding.len()));
         });
     }
 

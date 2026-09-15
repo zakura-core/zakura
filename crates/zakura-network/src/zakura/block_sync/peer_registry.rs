@@ -52,6 +52,8 @@ pub(super) struct Entry {
     /// independent of `work.in_flight`, so it structurally closes the
     /// reject-rollback window.
     pub(super) outstanding: BTreeMap<block::Height, OutstandingMeta>,
+    /// Sorted original response ranges, including locally detached and terminal-pending work.
+    response_ranges: Vec<(block::Height, block::Height)>,
     /// Routine-published slot and BBR diagnostics. The reactor summarizes this for
     /// the periodic `BLOCK_SYNC_STATE` row, and peer routines read it for cross-peer
     /// floor-bias decisions. Updated whenever the routine issues/finishes/times out
@@ -85,6 +87,7 @@ impl Entry {
             max_inflight_requests: config.advertised_max_inflight_requests(),
             max_response_bytes: config.advertised_max_response_bytes(),
             outstanding: BTreeMap::new(),
+            response_ranges: Vec::new(),
             slots: SlotDiagnostics::default(),
             floor_watchdog_avoid: BTreeMap::new(),
             generation,
@@ -576,6 +579,7 @@ impl PeerRegistry {
             .and_modify(|entry| {
                 entry.direction = direction;
                 entry.outstanding.clear();
+                entry.response_ranges.clear();
                 entry.floor_watchdog_avoid.clear();
                 entry.generation = generation;
                 entry.conn_id = Some(conn_id);
@@ -686,11 +690,20 @@ impl PeerRegistry {
         peer: &ZakuraPeerId,
         generation: u64,
         slots: SlotDiagnostics,
+        // `None` leaves the published ranges untouched, for the frames that move
+        // credit without changing the set. Rebuilding sorts the whole list while
+        // this lock is held, which every other block-sync routine needs.
+        response_ranges: Option<impl IntoIterator<Item = (block::Height, block::Height)>>,
     ) {
         let mut peers = self.lock();
         if let Some(entry) = peers.get_mut(peer) {
             if entry.generation == generation {
                 entry.slots = slots;
+                if let Some(ranges) = response_ranges {
+                    entry.response_ranges.clear();
+                    entry.response_ranges.extend(ranges);
+                    entry.response_ranges.sort_unstable();
+                }
             }
         }
     }
@@ -733,18 +746,8 @@ impl PeerRegistry {
         })
     }
 
-    /// Whether any connected peer has an outstanding request covering `height`
-    /// (regardless of hash). Used by the routine's terminator-dedup fallthrough
-    /// (`ignore_unmatched_active_terminator_response`): a `BlocksDone` for a range
-    /// another peer is actively requesting is dropped quietly, not scored.
-    pub(super) fn has_outstanding_height(&self, height: block::Height) -> bool {
-        let peers = self.lock();
-        peers
-            .values()
-            .any(|entry| entry.outstanding.contains_key(&height))
-    }
-
     /// Whether this exact peer still owns an outstanding claim for `height`.
+    #[cfg(test)]
     pub(super) fn peer_has_outstanding_height(
         &self,
         peer: &ZakuraPeerId,
@@ -1003,10 +1006,17 @@ impl PeerRegistry {
 
 impl Entry {
     fn can_serve_with_room(&self, height: block::Height) -> bool {
+        let earlier_ranges = self
+            .response_ranges
+            .partition_point(|(start, _)| *start <= height);
+        let overlaps_response = earlier_ranges
+            .checked_sub(1)
+            .is_some_and(|index| height <= self.response_ranges[index].1);
         self.received_status
             && self.servable_low <= height
             && height <= self.servable_high
             && self.slots.available_slots > 0
+            && !overlaps_response
     }
 }
 
@@ -1081,6 +1091,7 @@ mod floor_bias_tests {
                 bbr_rtprop_ms,
                 ..SlotDiagnostics::default()
             },
+            Some([]),
         );
     }
 
@@ -1334,6 +1345,56 @@ mod floor_bias_tests {
             &b,
             Some(50),
             true
+        ));
+    }
+
+    #[test]
+    fn retained_response_ranges_do_not_block_another_supplier() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let reg = PeerRegistry::new();
+        let (slow, fast) = (peer(1), peer(2));
+        register_with_rtprop(&reg, &config, &slow, 0, 1000, 3, Some(120));
+        register_with_rtprop(&reg, &config, &fast, 0, 1000, 3, Some(40));
+        let generation = reg.lock()[&fast].generation;
+        let slots = SlotDiagnostics {
+            available_slots: 3,
+            bbr_rtprop_ms: Some(40),
+            ..SlotDiagnostics::default()
+        };
+        reg.publish_slots(
+            &fast,
+            generation,
+            slots,
+            Some([
+                (block::Height(104), block::Height(106)),
+                (block::Height(100), block::Height(101)),
+            ]),
+        );
+        reg.clear_outstanding(&fast, generation);
+        // A retired generation cannot erase the replacement's response exclusions.
+        reg.publish_slots(&fast, generation.saturating_sub(1), slots, Some([]));
+        for height in [100, 101, 104, 106] {
+            assert!(!reg.floor_has_preferred_unsaturated_server(
+                block::Height(height),
+                &slow,
+                Some(120),
+                false,
+            ));
+        }
+        for height in [99, 102, 107] {
+            assert!(reg.floor_has_preferred_unsaturated_server(
+                block::Height(height),
+                &slow,
+                Some(120),
+                false,
+            ));
+        }
+        reg.publish_slots(&fast, generation, slots, Some([]));
+        assert!(reg.floor_has_preferred_unsaturated_server(
+            block::Height(100),
+            &slow,
+            Some(120),
+            false,
         ));
     }
 

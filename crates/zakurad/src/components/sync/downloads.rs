@@ -32,7 +32,7 @@ use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state as zs;
 
 use crate::components::{
-    auth_download_height::tip_child_mismatch,
+    auth_download_height::parent_height_mismatch,
     sync::{
         legacy_trace::{
             LegacyBlockOutcome, LegacyDiagnosticSnapshot, LegacySyncTrace, LegacyTaskState,
@@ -125,18 +125,10 @@ pub enum BlockDownloadVerifyError {
         hash: block::Hash,
     },
 
-    /// A downloaded block claims our best tip as its parent, but its coinbase height is not
-    /// one above the tip height.
-    ///
-    /// V5+ coinbase `scriptSig`s are not covered by the mined transaction ID, the transaction
-    /// merkle root, or the block hash, so a peer can rewrite the claimed height of an otherwise
-    /// canonical body without changing the requested hash. A tip child's real height is known
-    /// from our own committed tip, so a mismatch is definitively a poisoned body.
-    #[error(
-        "downloaded tip child claimed height {height:?} instead of {expected_height:?}: {hash:?}"
-    )]
-    TipChildHeightMismatch {
-        height: block::Height,
+    /// The supplied body claims a height inconsistent with its committed parent.
+    #[error("downloaded block claimed height {height:?} instead of {expected_height:?}: {hash:?}")]
+    ParentHeightMismatch {
+        height: Option<block::Height>,
         expected_height: block::Height,
         hash: block::Hash,
         advertiser_addr: Option<PeerSocketAddr>,
@@ -219,7 +211,7 @@ impl BlockDownloadVerifyError {
             Self::AboveLookaheadHeightLimit {
                 advertiser_addr, ..
             }
-            | Self::TipChildHeightMismatch {
+            | Self::ParentHeightMismatch {
                 advertiser_addr, ..
             }
             | Self::InvalidHeight {
@@ -272,7 +264,7 @@ impl From<tokio::time::error::Elapsed> for BlockDownloadVerifyError {
 /// Represents a [`Stream`] of download and verification tasks during chain sync.
 #[pin_project]
 #[derive(Debug)]
-pub struct Downloads<ZN, ZV, ZSTip>
+pub struct Downloads<ZN, ZV, ZSTip, ZS>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Sync + 'static,
     ZN::Future: Send,
@@ -283,6 +275,8 @@ where
         + 'static,
     ZV::Future: Send,
     ZSTip: ChainTip + Clone + Send + 'static,
+    ZS: Service<zs::Request, Response = zs::Response, Error = BoxError> + Clone + Send + 'static,
+    ZS::Future: Send,
 {
     // Services
     //
@@ -292,6 +286,7 @@ where
 
     /// A service that verifies downloaded blocks.
     verifier: ZV,
+    state: ZS,
 
     /// Allows efficient access to the best tip of the blockchain.
     latest_chain_tip: ZSTip,
@@ -342,7 +337,7 @@ fn take_task_state(
         .remove(&hash)
 }
 
-impl<ZN, ZV, ZSTip> Stream for Downloads<ZN, ZV, ZSTip>
+impl<ZN, ZV, ZSTip, ZS> Stream for Downloads<ZN, ZV, ZSTip, ZS>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Sync + 'static,
     ZN::Future: Send,
@@ -353,6 +348,8 @@ where
         + 'static,
     ZV::Future: Send,
     ZSTip: ChainTip + Clone + Send + 'static,
+    ZS: Service<zs::Request, Response = zs::Response, Error = BoxError> + Clone + Send + 'static,
+    ZS::Future: Send,
 {
     type Item = Result<(Height, block::Hash), BlockDownloadVerifyError>;
 
@@ -395,7 +392,7 @@ where
     }
 }
 
-impl<ZN, ZV, ZSTip> Downloads<ZN, ZV, ZSTip>
+impl<ZN, ZV, ZSTip, ZS> Downloads<ZN, ZV, ZSTip, ZS>
 where
     ZN: Service<zn::Request, Response = zn::Response, Error = BoxError> + Send + Sync + 'static,
     ZN::Future: Send,
@@ -406,6 +403,8 @@ where
         + 'static,
     ZV::Future: Send,
     ZSTip: ChainTip + Clone + Send + 'static,
+    ZS: Service<zs::Request, Response = zs::Response, Error = BoxError> + Clone + Send + 'static,
+    ZS::Future: Send,
 {
     /// Initialize a new download stream with the provided `network` and
     /// `verifier` services.
@@ -417,9 +416,11 @@ where
     /// The [`Downloads`] stream is agnostic to the network policy, so retry and
     /// timeout limits should be applied to the `network` service passed into
     /// this constructor.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         network: ZN,
         verifier: ZV,
+        state: ZS,
         latest_chain_tip: ZSTip,
         past_lookahead_limit_sender: watch::Sender<bool>,
         lookahead_limit: usize,
@@ -432,6 +433,7 @@ where
         Self {
             network,
             verifier,
+            state,
             latest_chain_tip,
             lookahead_limit,
             max_checkpoint_height,
@@ -558,6 +560,7 @@ where
         let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
 
         let mut verifier = self.verifier.clone();
+        let state = self.state.clone();
         let latest_chain_tip = self.latest_chain_tip.clone();
 
         let lookahead_limit = self.lookahead_limit;
@@ -592,6 +595,7 @@ where
                     None,
                 );
 
+                let (rsp, supplier_feedback) = rsp.split_block_feedback();
                 let (block, advertiser_addr) = if let zn::Response::Blocks(blocks) = rsp {
                     // A cooperating peer returns exactly one available block for a
                     // single-hash request. A response with a different count, or a
@@ -688,42 +692,24 @@ where
                     })
                     .unwrap_or(block::Height(0));
 
-                let block_height = if let Some(block_height) = block.coinbase_height() {
-                    block_height
-                } else {
-                    debug!(
-                        ?hash,
-                        "synced block with no height: dropped downloaded block"
-                    );
-                    metrics::counter!("sync.no.height.dropped.block.count").increment(1);
-
-                    return Err(BlockDownloadVerifyError::InvalidHeight { hash, advertiser_addr });
-                };
-
-                // Security: authenticate the claimed coinbase height against our own tip before
-                // any height-based policy runs below. Otherwise `min_accepted_height` would
-                // discard a height-rewritten body as a benign old block: unattributed,
-                // unscored, and not requeued. See `crate::components::auth_download_height`.
-                if let Some(expected_height) = tip_child_mismatch(
+                let claimed_height = block.coinbase_height();
+                if let Some(expected_height) = parent_height_mismatch(
+                    state,
                     block.header.previous_block_hash,
-                    block_height,
+                    claimed_height,
                     best_tip,
-                ) {
-                    debug!(
-                        ?hash,
-                        ?block_height,
-                        ?expected_height,
-                        "tip child claimed the wrong coinbase height: rejected poisoned block"
-                    );
-                    metrics::counter!("sync.tip.child.height.mismatch.count").increment(1);
-
-                    return Err(BlockDownloadVerifyError::TipChildHeightMismatch {
-                        height: block_height,
+                ).await {
+                    if let Some(feedback) = &supplier_feedback { feedback.reject(); }
+                    return Err(BlockDownloadVerifyError::ParentHeightMismatch {
+                        height: claimed_height,
                         expected_height,
                         hash,
                         advertiser_addr,
                     });
                 }
+                let block_height = claimed_height.ok_or(
+                    BlockDownloadVerifyError::InvalidHeight { hash, advertiser_addr: None }
+                )?;
 
                 trace.block_downloaded(
                     hash,

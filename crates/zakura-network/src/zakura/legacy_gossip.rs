@@ -511,7 +511,7 @@ impl LegacyResponseCodec {
         // shared across every frame of this response and aborts encoding early.
         let mut budget = ResponseEncodeBudget::default();
         match response {
-            Response::Blocks(blocks) => {
+            Response::Blocks(blocks) | Response::BlocksWithFeedback { blocks, .. } => {
                 let mut missing = Vec::new();
                 for block in blocks {
                     match block {
@@ -2021,7 +2021,11 @@ fn record_block_response_source(
     source: BlockBodySource,
     requested_hashes: Option<&HashSet<block::Hash>>,
 ) -> Response {
-    if let (Response::Blocks(blocks), Some(requested_hashes)) = (&response, requested_hashes) {
+    if let (
+        Response::Blocks(blocks) | Response::BlocksWithFeedback { blocks, .. },
+        Some(requested_hashes),
+    ) = (&response, requested_hashes)
+    {
         for block in blocks {
             match block {
                 InventoryResponse::Available((block, _))
@@ -2045,6 +2049,7 @@ pub struct ZakuraRequestClient {
     trace: ZakuraTrace,
     request_interval: Duration,
     next_request_at: Arc<Mutex<Instant>>,
+    block_suppliers: crate::block_feedback::BlockSuppliers,
 }
 
 impl ZakuraRequestClient {
@@ -2078,6 +2083,7 @@ impl ZakuraRequestClient {
             trace,
             request_interval: Duration::from_nanos(interval_nanos),
             next_request_at: Arc::new(Mutex::new(Instant::now())),
+            block_suppliers: Default::default(),
         }
     }
 
@@ -2109,7 +2115,15 @@ impl ZakuraRequestClient {
             _ => None,
         };
 
-        let handles = self.ready_handles().await?;
+        let mut handles = self.ready_handles().await?;
+        if let LegacyRequestFrame::BlocksByHash(hashes) = &frame {
+            let suppliers = &self.block_suppliers;
+            handles.retain(|handle| {
+                !hashes.iter().any(|hash| {
+                    suppliers.rejected(*hash, &PeerSource::Zakura(handle.peer_id().clone()))
+                })
+            });
+        }
         let Some(primary) = select_handle(&handles, preferred.as_ref()) else {
             return Err("no ready Zakura peer for legacy inventory request".into());
         };
@@ -2284,6 +2298,13 @@ impl ZakuraRequestClient {
                 &response,
             )
         });
+        if let Some(hashes) = requested_block_hashes.filter(|hashes| hashes.len() == 1) {
+            let hash = *hashes.iter().next().expect("one requested hash");
+            let feedback = self
+                .block_suppliers
+                .feedback(hash, PeerSource::Zakura(handle.peer_id().clone()));
+            response = feedback.attach(response);
+        }
         Ok(response)
     }
 }
@@ -2323,7 +2344,7 @@ fn select_fallback_handle(
 
 fn all_inventory_missing(response: &Response) -> bool {
     match response {
-        Response::Blocks(blocks) => {
+        Response::Blocks(blocks) | Response::BlocksWithFeedback { blocks, .. } => {
             blocks.is_empty() || blocks.iter().all(|block| block.is_missing())
         }
         Response::Transactions(transactions) => {
@@ -3893,12 +3914,52 @@ mod tests {
             .await?;
 
         match response {
-            Response::Blocks(blocks) => {
+            Response::Blocks(blocks) | Response::BlocksWithFeedback { blocks, .. } => {
                 assert_eq!(blocks, vec![InventoryResponse::Missing(hash)]);
             }
             response => panic!("unexpected response: {response:?}"),
         }
 
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejected_supplier_is_excluded_from_v2_retry() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+        let node_a = block_inventory_node(168, block.clone()).await?;
+        let node_b = block_inventory_node(169, block.clone()).await?;
+        let victim = ZakuraTestNode::builder(170).spawn().await?;
+        victim.connect_native(&node_a, TEST_NET_TIMEOUT).await?;
+        victim.connect_native(&node_b, TEST_NET_TIMEOUT).await?;
+        let source = PeerSource::Zakura(node_peer_id(&node_a).await?);
+        let adapter = LegacyRequestAdapter::new(victim.supervisor());
+        let request = Request::BlocksByHash(HashSet::from([block.hash()]));
+        let first = adapter
+            .request_from_source(request.clone(), Some(source.clone()))
+            .await?;
+        let (_, feedback) = first.split_block_feedback();
+        feedback.expect("download identifies its supplier").reject();
+        // Even an explicitly preferred source cannot bypass the exclusion.
+        let second = adapter
+            .request_from_source(request.clone(), Some(source.clone()))
+            .await?;
+        let (body, feedback) = second.split_block_feedback();
+        assert!(matches!(body, Response::Blocks(blocks)
+            if blocks.iter().any(|item| matches!(item, InventoryResponse::Available((received, _))
+                if received.hash() == block.hash()))));
+        feedback
+            .expect("replacement identifies its supplier")
+            .reject();
+        assert!(adapter
+            .request_from_source(request, Some(source))
+            .await
+            .is_err());
+        victim.shutdown().await;
         node_a.shutdown().await;
         node_b.shutdown().await;
         Ok(())
@@ -3929,7 +3990,8 @@ mod tests {
             )
             .await?;
 
-        let Response::Blocks(blocks) = response else {
+        let (Response::Blocks(blocks) | Response::BlocksWithFeedback { blocks, .. }) = response
+        else {
             panic!("unexpected response: {response:?}");
         };
         assert!(matches!(
@@ -4033,7 +4095,9 @@ mod tests {
                 None,
             )
             .await?;
-        let Response::Blocks(blocks) = block_response else {
+        let (Response::Blocks(blocks) | Response::BlocksWithFeedback { blocks, .. }) =
+            block_response
+        else {
             panic!("unexpected block response: {block_response:?}");
         };
         for response in blocks {
@@ -4138,7 +4202,8 @@ mod tests {
                 None,
             )
             .await?;
-        let Response::Blocks(blocks) = blocks else {
+        let (Response::Blocks(blocks) | Response::BlocksWithFeedback { blocks, .. }) = blocks
+        else {
             panic!("unexpected block response: {blocks:?}");
         };
         for response in blocks {
@@ -4243,7 +4308,7 @@ mod tests {
 
         release_tx.send(true)?;
         match tokio::time::timeout(Duration::from_secs(1), request_rx).await??? {
-            Response::Blocks(blocks) => {
+            Response::Blocks(blocks) | Response::BlocksWithFeedback { blocks, .. } => {
                 assert_eq!(blocks, vec![InventoryResponse::Missing(block_hash(11))]);
             }
             response => panic!("unexpected request response: {response:?}"),
@@ -5228,7 +5293,8 @@ mod tests {
 
         let response =
             LegacyResponseCodec::decode_response(7, LegacyRequestKind::Blocks, frames, None)?;
-        let Response::Blocks(blocks) = response else {
+        let (Response::Blocks(blocks) | Response::BlocksWithFeedback { blocks, .. }) = response
+        else {
             panic!("unexpected response: {response:?}");
         };
         assert!(matches!(
@@ -5290,7 +5356,8 @@ mod tests {
         // The smaller chunking must still round-trip back to the original block.
         let response =
             LegacyResponseCodec::decode_response(7, LegacyRequestKind::Blocks, frames, None)?;
-        let Response::Blocks(blocks) = response else {
+        let (Response::Blocks(blocks) | Response::BlocksWithFeedback { blocks, .. }) = response
+        else {
             panic!("unexpected response: {response:?}");
         };
         assert!(matches!(
@@ -5347,7 +5414,7 @@ mod tests {
         )?;
         assert!(matches!(
             response,
-            Response::Blocks(blocks)
+            Response::Blocks(blocks) | Response::BlocksWithFeedback { blocks, .. }
                 if matches!(
                     blocks.as_slice(),
                     [InventoryResponse::Available((received, None))]
@@ -6027,7 +6094,7 @@ mod tests {
             .await?;
         assert!(matches!(
             response,
-            Response::Blocks(ref blocks)
+            Response::Blocks(ref blocks) | Response::BlocksWithFeedback { ref blocks, .. }
                 if matches!(blocks.as_slice(), [InventoryResponse::Available(_)])
         ));
         assert_eq!(
@@ -6067,7 +6134,7 @@ mod tests {
             .await?;
         assert!(matches!(
             response,
-            Response::Blocks(ref blocks)
+            Response::Blocks(ref blocks) | Response::BlocksWithFeedback { ref blocks, .. }
                 if matches!(blocks.as_slice(), [InventoryResponse::Available(_)])
         ));
         assert_eq!(

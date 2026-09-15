@@ -1,34 +1,53 @@
-//! Authenticates a downloaded block's claimed coinbase height when it builds on our chain tip.
+//! Authenticates downloaded coinbase heights against committed parents.
 //!
 //! # Security
 //!
-//! A V5+ coinbase height is authorizing data and is not committed by the block hash. Download and
+//! A V5+ coinbase height is authorizing data and can change without changing the block hash. Download and
 //! gossip paths inspect it before full validation, so a peer could rewrite it to influence their
-//! height policies. A block whose parent is our best tip has one authenticated height: `tip + 1`.
+//! height policies. A committed parent determines its child height.
 //! This module centralizes that check for both paths.
 
+use tower::{Service, ServiceExt};
 use zakura_chain::block::{self, Height};
+use zakura_state as zs;
 
-/// Returns the expected height when a child of `best_tip` claims a different coinbase height.
-///
-/// Returns `None` without a tip, for a different parent, or when the claimed height matches.
-/// A mismatch identifies an invalid body and should be attributed to its supplying peer.
-pub(crate) fn tip_child_mismatch(
-    previous_block_hash: block::Hash,
-    block_height: Height,
+/// Checks a claimed height against a committed parent on any stored chain.
+/// Local lookup failures and unavailable parents do not prove supplier misconduct.
+pub(crate) async fn parent_height_mismatch<S>(
+    state: S,
+    parent_hash: block::Hash,
+    claimed: Option<Height>,
     best_tip: Option<(Height, block::Hash)>,
-) -> Option<Height> {
-    let (tip_height, tip_hash) = best_tip?;
-
-    if previous_block_hash != tip_hash {
+) -> Option<Height>
+where
+    S: Service<zs::Request, Response = zs::Response, Error = crate::BoxError>
+        + Send
+        + Clone
+        + 'static,
+    S::Future: Send,
+{
+    if parent_hash == block::Hash([0; 32]) {
         return None;
     }
-
-    // Committed heights are at most `Height::MAX`, so this cannot saturate. Saturating arithmetic
-    // keeps the comparison fail-closed if that invariant changes.
-    let expected_height = Height(tip_height.0.saturating_add(1));
-
-    (block_height != expected_height).then_some(expected_height)
+    let parent_height = match best_tip.filter(|(_, hash)| *hash == parent_hash) {
+        Some((height, _)) => height,
+        None => {
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                state.oneshot(zs::Request::AnyChainBlock(parent_hash.into())),
+            )
+            .await;
+            match response {
+                Ok(Ok(zs::Response::Block(Some(parent)))) if parent.hash() == parent_hash => {
+                    parent.coinbase_height()?
+                }
+                Ok(Ok(zs::Response::Block(_))) | Ok(Err(_)) | Err(_) => return None,
+                Ok(Ok(_)) => unreachable!("AnyChainBlock returns a block response"),
+            }
+        }
+    };
+    let expected = (parent_height + 1)?;
+    (claimed != Some(expected)).then_some(expected)
 }
 
 /// Clones `canonical` and rewrites its V5+ coinbase height without changing its block hash.
@@ -67,47 +86,65 @@ pub(crate) fn poison_coinbase_height(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use zakura_chain::{block::Block, serialization::ZcashDeserializeInto};
 
-    const TIP_HASH: block::Hash = block::Hash([0xAA; 32]);
-    const OTHER_HASH: block::Hash = block::Hash([0xBB; 32]);
-
-    #[test]
-    fn tip_child_with_the_expected_height_is_accepted() {
-        assert_eq!(
-            tip_child_mismatch(TIP_HASH, Height(101), Some((Height(100), TIP_HASH))),
+    #[tokio::test]
+    async fn committed_parent_authenticates_low_high_and_missing_heights() {
+        let parent: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        let parent_hash = parent.hash();
+        let expected = (parent.coinbase_height().unwrap() + 1).unwrap();
+        for claimed in [
             None,
-        );
+            Some(Height(1)),
+            Some(Height(4_000_000)),
+            Some(expected),
+        ] {
+            let parent = parent.clone();
+            let state = tower::service_fn(move |request| {
+                assert!(
+                    matches!(request, zs::Request::AnyChainBlock(hash) if hash == parent_hash.into())
+                );
+                let parent = parent.clone();
+                async move { Ok(zs::Response::Block(Some(parent))) }
+            });
+            assert_eq!(
+                parent_height_mismatch(state, parent_hash, claimed, None).await,
+                (claimed != Some(expected)).then_some(expected)
+            );
+        }
     }
 
-    #[test]
-    fn tip_child_with_a_rewritten_low_height_is_a_mismatch() {
+    #[tokio::test(start_paused = true)]
+    async fn unavailable_parent_and_local_failures_are_neutral() {
+        let hash = block::Hash([42; 32]);
+        let missing = tower::service_fn(|_| async { Ok(zs::Response::Block(None)) });
         assert_eq!(
-            tip_child_mismatch(TIP_HASH, Height(1), Some((Height(100), TIP_HASH))),
-            Some(Height(101)),
-            "a height rewritten far behind the tip must be reported, \
-             not left to the behind-tip policy"
+            parent_height_mismatch(missing, hash, None, None).await,
+            None
         );
-    }
-
-    #[test]
-    fn tip_child_with_a_rewritten_high_height_is_a_mismatch() {
+        let failed = tower::service_fn(|_| async { Err("local state failure".into()) });
+        assert_eq!(parent_height_mismatch(failed, hash, None, None).await, None);
+        let pending = tower::service_fn(|_| std::future::pending());
         assert_eq!(
-            tip_child_mismatch(TIP_HASH, Height(500_000), Some((Height(100), TIP_HASH))),
-            Some(Height(101)),
+            parent_height_mismatch(pending, hash, None, None).await,
+            None
         );
     }
 
-    #[test]
-    fn a_block_that_is_not_a_tip_child_is_not_checked() {
+    #[tokio::test]
+    async fn tip_fast_path_checks_missing_height_without_state_access() {
+        let hash = block::Hash([42; 32]);
+        let state = tower::service_fn(|_| async {
+            panic!("tip needs no lookup");
+            #[allow(unreachable_code)]
+            Ok(zs::Response::Block(None))
+        });
         assert_eq!(
-            tip_child_mismatch(OTHER_HASH, Height(1), Some((Height(100), TIP_HASH))),
-            None,
-            "without a known parent the height can't be authenticated from the tip alone",
+            parent_height_mismatch(state, hash, None, Some((Height(100), hash))).await,
+            Some(Height(101))
         );
-    }
-
-    #[test]
-    fn no_tip_means_no_check() {
-        assert_eq!(tip_child_mismatch(TIP_HASH, Height(1), None), None);
     }
 }

@@ -4453,7 +4453,7 @@ async fn v5_with_duplicate_orchard_action() {
 }
 
 /// Checks that ZIP 2003 accepts V4 transactions below NU7 and rejects them
-/// from NU7 when the experimental rules are enabled.
+/// from NU7 when the `nu7` feature is enabled.
 #[test]
 fn v4_deprecation_boundary() {
     let _init_guard = zakura_test::init();
@@ -4475,7 +4475,7 @@ fn v4_deprecation_boundary() {
         "a V4 transaction must be valid below the NU7 activation height",
     );
 
-    let expected = if cfg!(feature = "nu7-experimental") {
+    let expected = if cfg!(feature = "nu7") {
         Err(TransactionError::UnsupportedByNetworkUpgrade(
             transaction.version(),
             NetworkUpgrade::Nu7,
@@ -4486,7 +4486,7 @@ fn v4_deprecation_boundary() {
     assert_eq!(
         verify_v4_at(&network, &transaction, nu7),
         expected,
-        "V4 deprecation must match the experimental build at NU7",
+        "V4 deprecation must match the `nu7` feature at NU7",
     );
     assert_eq!(
         verify_v4_at(
@@ -4495,7 +4495,7 @@ fn v4_deprecation_boundary() {
             nu7.next().expect("NU7 is below the maximum height"),
         ),
         expected,
-        "V4 deprecation must match the experimental build after NU7",
+        "V4 deprecation must match the `nu7` feature after NU7",
     );
 
     let no_nu7 = configured_network_with_nu7(None);

@@ -1018,7 +1018,7 @@ where
         //
         // Use NU7's exact activation height: a later configured upgrade must
         // not substitute its height when this network omits NU7.
-        if cfg!(feature = "nu7-experimental")
+        if cfg!(feature = "nu7")
             && NetworkUpgrade::Nu7
                 .activation_height(network)
                 .is_some_and(|nu7_height| height >= nu7_height)

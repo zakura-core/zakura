@@ -349,24 +349,31 @@ impl ValueBalance<NonNegative> {
         Ok(chain_value_pool)
     }
 
+    /// Returns `IssuedSupply` from [protocol specification §4.17][4.17]: the total value
+    /// across every chain value pool.
+    ///
+    /// [4.17]: https://zips.z.cash/protocol/protocol.pdf#chainvaluepoolbalances
+    pub fn issued_supply(&self) -> Amount<NonNegative> {
+        (self.transparent
+            + self.sprout
+            + self.sapling
+            + self.orchard
+            + self.ironwood
+            + self.deferred)
+            .expect("consensus rules bound the issued supply by MAX_MONEY")
+    }
+
     /// Returns the [ZIP 234] money reserve: `MAX_MONEY - IssuedSupply`.
     ///
-    /// The issued supply is the total value across every chain value pool, so the money
-    /// reserve is the value that has never been issued or is otherwise outside the chain
-    /// value pools.
+    /// The money reserve is the value that has never been issued or is otherwise outside
+    /// the chain value pools.
     ///
     /// [ZIP 234]: https://zips.z.cash/zip-0234
     pub fn money_reserve(&self) -> Amount<NonNegative> {
         let max_money =
             Amount::<NonNegative>::try_from(MAX_MONEY).expect("MAX_MONEY is a valid amount");
 
-        (max_money
-            - self.transparent
-            - self.sprout
-            - self.sapling
-            - self.orchard
-            - self.ironwood
-            - self.deferred)
+        (max_money - self.issued_supply())
             .expect("consensus rules bound the issued supply by MAX_MONEY")
     }
 

@@ -639,8 +639,8 @@ fn zip234_start_height_follows_nu7_and_the_crossing_rule() {
 /// Checks the closed-form cumulative halving subsidy against a per-height sum across
 /// halvings and the NU7 spacing change.
 #[test]
-fn cumulative_halving_subsidies_match_per_height_sum() {
-    use crate::parameters::subsidy::cumulative_halving_subsidies_for_tests;
+fn expected_issued_supply_matches_per_height_sum() {
+    use crate::parameters::subsidy::expected_issued_supply;
 
     let _init_guard = zakura_test::init();
 
@@ -666,7 +666,7 @@ fn cumulative_halving_subsidies_match_per_height_sum() {
         "the range must cross halvings on both sides of NU7",
     );
 
-    // `cumulative_halving_subsidies` walks halving and spacing boundaries rather than
+    // `expected_issued_supply` walks halving and spacing boundaries rather than
     // every height, so check it against the sum it is standing in for.
     let mut brute_force = Amount::<NonNegative>::zero();
     for height in 1..=last_height.0 {
@@ -675,8 +675,7 @@ fn cumulative_halving_subsidies_match_per_height_sum() {
         .expect("sum is in range");
 
         assert_eq!(
-            cumulative_halving_subsidies_for_tests(Height(height), &network)
-                .expect("valid cumulative subsidy"),
+            expected_issued_supply(Height(height), &network).expect("valid cumulative subsidy"),
             brute_force,
             "cumulative subsidies must match the per-height sum at height {height}",
         );
@@ -687,7 +686,7 @@ fn cumulative_halving_subsidies_match_per_height_sum() {
 #[test]
 fn zip234_issuance() {
     use crate::{
-        parameters::{subsidy::cumulative_halving_subsidies_for_tests, ZIP218_ENABLED},
+        parameters::{subsidy::expected_issued_supply, ZIP218_ENABLED},
         value_balance::ValueBalance,
     };
 
@@ -732,11 +731,9 @@ fn zip234_issuance() {
     let halving_subsidy = halving_block_subsidy(start, &network).expect("valid subsidy");
 
     // A chain on schedule has nothing to reissue.
-    let scheduled = cumulative_halving_subsidies_for_tests(
-        start.previous().expect("start is above genesis"),
-        &network,
-    )
-    .expect("valid cumulative subsidy");
+    let scheduled =
+        expected_issued_supply(start.previous().expect("start is above genesis"), &network)
+            .expect("valid cumulative subsidy");
     let max_money = Amount::<NonNegative>::try_from(MAX_MONEY).expect("valid amount");
     let on_schedule = (max_money - scheduled).expect("valid amount");
 

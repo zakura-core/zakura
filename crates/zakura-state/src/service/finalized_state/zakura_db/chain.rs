@@ -28,6 +28,7 @@ use zakura_chain::{
 
 use crate::{
     request::FinalizedBlock,
+    service::check,
     service::finalized_state::{
         disk_db::DiskWriteBatch,
         disk_format::{
@@ -310,6 +311,8 @@ impl DiskWriteBatch {
                 block_value_pool_change: Box::new(block_value_pool_change),
                 height: Some(finalized.height),
             })?;
+
+        check::issuance_deficit_is_non_negative(&db.network(), finalized.height, &new_value_pool)?;
 
         // Update value pool metrics for observability (ZIP-209 compliance monitoring)
         value_pool_metrics(&new_value_pool);

@@ -557,8 +557,7 @@ pub(crate) fn zip234_crossing_height(network: &Network, halving: u32) -> Option<
         .map_or(first_candidate, |change| change.height)
         .max(network.slow_start_interval().0);
     let mut height = first_candidate.min(identical_below);
-    let mut supply =
-        amount_to_u128(cumulative_halving_subsidies(Height(height - 1), network).ok()?);
+    let mut supply = amount_to_u128(expected_issued_supply(Height(height - 1), network).ok()?);
 
     // The subsidy is constant within each run of heights, so a run holds the crossing
     // height if the money reserve falls far enough before the run ends.
@@ -759,26 +758,28 @@ fn reissuance_bonus(
     let max_money = Amount::<NonNegative>::try_from(MAX_MONEY)?;
     let parent = height.previous().unwrap_or(Height(0));
 
-    let scheduled_supply = cumulative_halving_subsidies(parent, net)?;
+    let scheduled_supply = expected_issued_supply(parent, net)?;
     let issued_supply = (max_money - money_reserve)?;
 
-    // zips#1354 rejects a block that makes the issuance deficit negative. The money
-    // reserve comes from the parent, so this check rejects the first block built on such
-    // a chain. The coinbase balance rule caps each block's issuance at its subsidy, so no
-    // valid block can make the deficit negative.
+    // Contextual validation in the state rejects any block at a ZIP 234 height that makes
+    // the deficit negative, as zips#1354 requires, so a parent at such a height always has
+    // a non-negative deficit. This check covers the other parents: the block just below
+    // the start height, where ZIP 234 is not yet active, and any money reserve that a
+    // caller takes from somewhere other than a committed block.
     let deficit =
         (scheduled_supply - issued_supply).map_err(|_| SubsidyError::NegativeIssuanceDeficit)?;
 
     reissuance_amount(deficit)
 }
 
-/// Returns the total block subsidy the halving schedule issues for blocks `1..=height`.
+/// Returns `ExpectedIssuedSupply(height)` from zips#1354: the total block subsidy the
+/// halving schedule issues for blocks `0..=height`. The genesis block's subsidy is zero.
 ///
 /// The subsidy is linear in the height through the slow start, and piecewise constant
 /// afterwards, changing only where a halving or a target spacing era begins. Summing over
 /// those pieces is exact, and takes a bounded number of steps no matter how tall the chain
 /// is.
-fn cumulative_halving_subsidies(
+pub fn expected_issued_supply(
     height: Height,
     net: &Network,
 ) -> Result<Amount<NonNegative>, SubsidyError> {
@@ -844,15 +845,6 @@ fn cumulative_halving_subsidies(
     let total = i64::try_from(total.min(max_money)).map_err(|_| SubsidyError::Overflow)?;
 
     Ok(Amount::try_from(total)?)
-}
-
-/// Test-only accessor for [`cumulative_halving_subsidies`].
-#[cfg(any(test, feature = "proptest-impl"))]
-pub fn cumulative_halving_subsidies_for_tests(
-    height: Height,
-    net: &Network,
-) -> Result<Amount<NonNegative>, SubsidyError> {
-    cumulative_halving_subsidies(height, net)
 }
 
 /// Returns the lowest height above `height` at which the halving block subsidy changes,

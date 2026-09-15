@@ -3,11 +3,16 @@
 use std::{borrow::Borrow, sync::Arc};
 
 use zakura_chain::{
+    amount::NonNegative,
     block::{
         self, merkle::AuthDataRoot, Block, ChainHistoryBlockTxAuthCommitmentHash, CommitmentError,
     },
     history_tree::HistoryTree,
-    parameters::{Network, NetworkUpgrade},
+    parameters::{
+        subsidy::{expected_issued_supply, is_zip234_active},
+        Network, NetworkUpgrade,
+    },
+    value_balance::ValueBalance,
     work::difficulty::CompactDifficulty,
 };
 
@@ -41,6 +46,43 @@ pub use utxo::transparent_coinbase_spend;
 mod tests;
 
 pub(crate) use difficulty::AdjustedDifficulty;
+
+/// Checks that the block at `height` does not make the ZIP 234 issuance deficit negative.
+///
+/// `value_pools` are the chain value pools after the block.
+///
+/// # Consensus
+///
+/// > [NU7 onward] If IssuanceDeficit(height) would become negative in the block chain
+/// > created as a result of accepting a block at height, then all nodes MUST reject the
+/// > block as invalid.
+///
+/// zips#1354 applies this rule from NU7 because it starts reissuance at NU7. Zakura starts
+/// reissuance at the later ZIP 234 start height, and applies the rule from that height.
+#[allow(clippy::unwrap_in_result)]
+pub(crate) fn issuance_deficit_is_non_negative(
+    network: &Network,
+    height: block::Height,
+    value_pools: &ValueBalance<NonNegative>,
+) -> Result<(), ValidateContextError> {
+    if !is_zip234_active(network, height) {
+        return Ok(());
+    }
+
+    let expected_issued_supply = expected_issued_supply(height, network)
+        .expect("the halving schedule is a valid amount at every height");
+    let issued_supply = value_pools.issued_supply();
+
+    if issued_supply > expected_issued_supply {
+        return Err(ValidateContextError::NegativeIssuanceDeficit {
+            height,
+            expected_issued_supply,
+            issued_supply,
+        });
+    }
+
+    Ok(())
+}
 
 /// Check that the semantically verified block is contextually valid for `network`,
 /// based on the `finalized_tip_height` and `relevant_chain`.

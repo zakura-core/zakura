@@ -7,13 +7,15 @@ use color_eyre::Report;
 
 use super::Network;
 use crate::{
-    amount::{Amount, NonNegative},
+    amount::{Amount, NonNegative, MAX_MONEY},
     block::{Height, HeightDiff},
     parameters::{
         subsidy::{
             block_subsidy, constants::POST_BLOSSOM_HALVING_INTERVAL, funding_stream_address_period,
-            halving, halving_divisor, height_for_halving, ParameterSubsidy,
+            halving, halving_block_subsidy, halving_divisor, height_for_halving, ParameterSubsidy,
+            SubsidyError,
         },
+        testnet::{self, ConfiguredActivationHeights},
         NetworkUpgrade,
     },
 };
@@ -192,25 +194,25 @@ fn block_subsidy_for_network(network: &Network) -> Result<(), Report> {
     // https://z.cash/support/faq/#what-is-slow-start-mining
     assert_eq!(
         Amount::<NonNegative>::try_from(1_250_000_000)?,
-        block_subsidy((network.slow_start_interval() + 1).unwrap(), network)?
+        block_subsidy((network.slow_start_interval() + 1).unwrap(), network, None)?
     );
     assert_eq!(
         Amount::<NonNegative>::try_from(1_250_000_000)?,
-        block_subsidy((blossom_height - 1).unwrap(), network)?
+        block_subsidy((blossom_height - 1).unwrap(), network, None)?
     );
 
     // After Blossom the block subsidy is reduced to 6.25 ZEC without halving
     // https://z.cash/upgrade/blossom/
     assert_eq!(
         Amount::<NonNegative>::try_from(625_000_000)?,
-        block_subsidy(blossom_height, network)?
+        block_subsidy(blossom_height, network, None)?
     );
 
     // After the 1st halving, the block subsidy is reduced to 3.125 ZEC
     // https://z.cash/upgrade/canopy/
     assert_eq!(
         Amount::<NonNegative>::try_from(312_500_000)?,
-        block_subsidy(first_halving_height, network)?
+        block_subsidy(first_halving_height, network, None)?
     );
 
     // After the 2nd halving, the block subsidy is reduced to 1.5625 ZEC
@@ -219,7 +221,8 @@ fn block_subsidy_for_network(network: &Network) -> Result<(), Report> {
         Amount::<NonNegative>::try_from(156_250_000)?,
         block_subsidy(
             (first_halving_height + POST_BLOSSOM_HALVING_INTERVAL).unwrap(),
-            network
+            network,
+            None
         )?
     );
 
@@ -229,7 +232,8 @@ fn block_subsidy_for_network(network: &Network) -> Result<(), Report> {
         Amount::<NonNegative>::try_from(4_882_812)?,
         block_subsidy(
             (first_halving_height + (POST_BLOSSOM_HALVING_INTERVAL * 6)).unwrap(),
-            network
+            network,
+            None
         )?
     );
 
@@ -239,7 +243,8 @@ fn block_subsidy_for_network(network: &Network) -> Result<(), Report> {
         Amount::<NonNegative>::try_from(1)?,
         block_subsidy(
             (first_halving_height + (POST_BLOSSOM_HALVING_INTERVAL * 28)).unwrap(),
-            network
+            network,
+            None
         )?
     );
 
@@ -249,7 +254,8 @@ fn block_subsidy_for_network(network: &Network) -> Result<(), Report> {
         Amount::<NonNegative>::try_from(0)?,
         block_subsidy(
             (first_halving_height + (POST_BLOSSOM_HALVING_INTERVAL * 29)).unwrap(),
-            network
+            network,
+            None
         )?
     );
 
@@ -257,7 +263,8 @@ fn block_subsidy_for_network(network: &Network) -> Result<(), Report> {
         Amount::<NonNegative>::try_from(0)?,
         block_subsidy(
             (first_halving_height + (POST_BLOSSOM_HALVING_INTERVAL * 39)).unwrap(),
-            network
+            network,
+            None
         )?
     );
 
@@ -265,7 +272,8 @@ fn block_subsidy_for_network(network: &Network) -> Result<(), Report> {
         Amount::<NonNegative>::try_from(0)?,
         block_subsidy(
             (first_halving_height + (POST_BLOSSOM_HALVING_INTERVAL * 49)).unwrap(),
-            network
+            network,
+            None
         )?
     );
 
@@ -273,7 +281,8 @@ fn block_subsidy_for_network(network: &Network) -> Result<(), Report> {
         Amount::<NonNegative>::try_from(0)?,
         block_subsidy(
             (first_halving_height + (POST_BLOSSOM_HALVING_INTERVAL * 59)).unwrap(),
-            network
+            network,
+            None
         )?
     );
 
@@ -282,7 +291,8 @@ fn block_subsidy_for_network(network: &Network) -> Result<(), Report> {
         Amount::<NonNegative>::try_from(0)?,
         block_subsidy(
             (first_halving_height + (POST_BLOSSOM_HALVING_INTERVAL * 62)).unwrap(),
-            network
+            network,
+            None
         )?
     );
 
@@ -291,7 +301,8 @@ fn block_subsidy_for_network(network: &Network) -> Result<(), Report> {
         Amount::<NonNegative>::try_from(0)?,
         block_subsidy(
             (first_halving_height + (POST_BLOSSOM_HALVING_INTERVAL * 63)).unwrap(),
-            network
+            network,
+            None
         )?
     );
 
@@ -299,23 +310,24 @@ fn block_subsidy_for_network(network: &Network) -> Result<(), Report> {
         Amount::<NonNegative>::try_from(0)?,
         block_subsidy(
             (first_halving_height + (POST_BLOSSOM_HALVING_INTERVAL * 64)).unwrap(),
-            network
+            network,
+            None
         )?
     );
 
     assert_eq!(
         Amount::<NonNegative>::try_from(0)?,
-        block_subsidy(Height(Height::MAX_AS_U32 / 4), network)?
+        block_subsidy(Height(Height::MAX_AS_U32 / 4), network, None)?
     );
 
     assert_eq!(
         Amount::<NonNegative>::try_from(0)?,
-        block_subsidy(Height(Height::MAX_AS_U32 / 2), network)?
+        block_subsidy(Height(Height::MAX_AS_U32 / 2), network, None)?
     );
 
     assert_eq!(
         Amount::<NonNegative>::try_from(0)?,
-        block_subsidy(Height::MAX, network)?
+        block_subsidy(Height::MAX, network, None)?
     );
 
     Ok(())
@@ -499,7 +511,7 @@ fn post_nu7_spacing_halving_and_subsidy() -> Result<(), Report> {
     //                   = floor(1_250_000_000 / (2 * 3 * 8)) = 26_041_666 zatoshi
     assert_eq!(
         Amount::<NonNegative>::try_from(26_041_666)?,
-        block_subsidy(nu7_height, &network)?,
+        halving_block_subsidy(nu7_height, &network)?,
     );
 
     // The third halving boundary lands exactly at NU7 here, so the block before
@@ -507,7 +519,7 @@ fn post_nu7_spacing_halving_and_subsidy() -> Result<(), Report> {
     assert_eq!(2, halving((nu7_height - 1).unwrap(), &network));
     assert_eq!(
         Amount::<NonNegative>::try_from(156_250_000)?,
-        block_subsidy((nu7_height - 1).unwrap(), &network)?,
+        halving_block_subsidy((nu7_height - 1).unwrap(), &network)?,
     );
 
     // The halving counter does not reset at NU7. The next boundary arrives after
@@ -530,7 +542,7 @@ fn post_nu7_spacing_halving_and_subsidy() -> Result<(), Report> {
     assert_eq!(16, halving_divisor(next_halving, &network).unwrap());
     assert_eq!(
         Amount::<NonNegative>::try_from(13_020_833)?,
-        block_subsidy(next_halving, &network)?,
+        halving_block_subsidy(next_halving, &network)?,
     );
 
     Ok(())
@@ -574,4 +586,267 @@ fn averaging_window_changes_at_nu7_activation_height() -> Result<(), Report> {
     );
 
     Ok(())
+}
+
+/// Checks the ZIP 234 crossing rule on the 75-second schedule.
+#[test]
+fn zip234_crossing_height() {
+    use crate::parameters::subsidy::{zip234_crossing_height, ZIP234_START_HALVING};
+
+    let _init_guard = zakura_test::init();
+
+    assert_eq!(
+        zip234_crossing_height(&Network::Mainnet, ZIP234_START_HALVING),
+        Some(Height(5_342_746)),
+    );
+    assert_eq!(
+        zip234_crossing_height(&Network::new_default_testnet(), ZIP234_START_HALVING),
+        Some(Height(5_412_346)),
+    );
+
+    // ZIP 234's own rule, after the second halving, gives its planned Mainnet start in
+    // February 2027.
+    assert_eq!(
+        zip234_crossing_height(&Network::Mainnet, 2),
+        Some(Height(3_662_746)),
+    );
+
+    // Regtest's short halving interval issues too little for the reserve to fall below
+    // the crossing threshold.
+    assert_eq!(
+        zip234_crossing_height(
+            &Network::new_regtest(Default::default()),
+            ZIP234_START_HALVING
+        ),
+        None,
+    );
+}
+
+/// Returns the default Testnet parameters with NU7 at `nu7`.
+fn testnet_with_nu7(nu7: Option<u32>) -> testnet::ParametersBuilder {
+    let mut activation_heights: ConfiguredActivationHeights = Network::new_default_testnet()
+        .parameters()
+        .expect("Testnet has parameters")
+        .activation_heights()
+        .into();
+    activation_heights.nu7 = nu7;
+
+    testnet::Parameters::build()
+        .with_activation_heights(activation_heights)
+        .expect("activation heights are valid")
+}
+
+/// Checks where ZIP 234 reissuance starts relative to NU7 and the crossing height.
+#[test]
+fn zip234_start_height_follows_nu7_and_the_crossing_rule() {
+    use crate::parameters::subsidy::zip234_start_height;
+
+    let _init_guard = zakura_test::init();
+
+    const TESTNET_CROSSING: u32 = 5_412_346;
+
+    // A network without NU7 never starts reissuance.
+    assert_eq!(zip234_start_height(&Network::Mainnet), None);
+    assert_eq!(zip234_start_height(&Network::new_default_testnet()), None);
+    let no_nu7 = testnet_with_nu7(None)
+        .to_network()
+        .expect("configured testnet is valid");
+    assert_eq!(zip234_start_height(&no_nu7), None);
+
+    // NU7 before the crossing height maps the crossing height through the halving clock.
+    // Each 75-second block after NU7 is three 25-second blocks.
+    for nu7 in [4_200_000, 4_500_000, 5_000_000, TESTNET_CROSSING - 1] {
+        let network = testnet_with_nu7(Some(nu7))
+            .to_network()
+            .expect("configured testnet is valid");
+        let expected = nu7 + 3 * (TESTNET_CROSSING - nu7);
+
+        assert_eq!(
+            zip234_start_height(&network),
+            Some(Height(expected)),
+            "NU7 at {nu7}",
+        );
+    }
+
+    // NU7 at or after the crossing height starts reissuance at NU7.
+    for nu7 in [TESTNET_CROSSING, 6_000_000] {
+        let network = testnet_with_nu7(Some(nu7))
+            .to_network()
+            .expect("configured testnet is valid");
+
+        assert_eq!(
+            zip234_start_height(&network),
+            Some(Height(nu7)),
+            "NU7 at {nu7}",
+        );
+    }
+
+    // A configured start height replaces the crossing height, but not NU7.
+    let configured = |nu7, start| {
+        testnet_with_nu7(Some(nu7))
+            .with_zip234_start_height(Height(start))
+            .to_network()
+            .expect("configured testnet is valid")
+    };
+    assert_eq!(
+        zip234_start_height(&configured(4_200_000, 4_200_010)),
+        Some(Height(4_200_010)),
+    );
+    assert_eq!(
+        zip234_start_height(&configured(4_200_000, 1)),
+        Some(Height(4_200_000)),
+    );
+
+    let regtest = |zip234_start_height| {
+        Network::new_regtest(testnet::RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu7: Some(10),
+                ..Default::default()
+            },
+            zip234_start_height,
+            ..Default::default()
+        })
+    };
+    assert_eq!(zip234_start_height(&regtest(None)), None);
+    assert_eq!(
+        zip234_start_height(&regtest(Some(Height(20)))),
+        Some(Height(20)),
+    );
+}
+
+/// Checks the closed-form cumulative halving subsidy against a per-height sum across
+/// halvings and the NU7 spacing change.
+#[test]
+fn expected_issued_supply_matches_per_height_sum() {
+    use crate::parameters::subsidy::expected_issued_supply;
+
+    let _init_guard = zakura_test::init();
+
+    let nu7 = Height(5_000);
+    let network = testnet::Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            blossom: Some(1),
+            canopy: Some(2),
+            nu7: Some(nu7.0),
+            ..Default::default()
+        })
+        .expect("activation heights are valid")
+        .with_slow_start_interval(Height(100))
+        .with_halving_interval(1_000)
+        .expect("halving interval is valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid");
+    let last_height = Height(25_000);
+
+    assert!(
+        halving(nu7, &network) > 1 && halving(last_height, &network) > halving(nu7, &network) + 1,
+        "the range must cross halvings on both sides of NU7",
+    );
+
+    // `expected_issued_supply` walks halving and spacing boundaries rather than
+    // every height, so check it against the sum it is standing in for.
+    let mut brute_force = Amount::<NonNegative>::zero();
+    for height in 1..=last_height.0 {
+        brute_force = (brute_force
+            + halving_block_subsidy(Height(height), &network).expect("valid subsidy"))
+        .expect("sum is in range");
+
+        assert_eq!(
+            expected_issued_supply(Height(height), &network).expect("valid cumulative subsidy"),
+            brute_force,
+            "cumulative subsidies must match the per-height sum at height {height}",
+        );
+    }
+}
+
+/// Checks the ZIP 234 reissuance bonus.
+#[test]
+fn zip234_issuance() {
+    use crate::{parameters::subsidy::expected_issued_supply, value_balance::ValueBalance};
+
+    let _init_guard = zakura_test::init();
+
+    let start = Height(1_000_000);
+    let network = testnet::Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            blossom: Some(1),
+            canopy: Some(2),
+            nu7: Some(start.0),
+            ..Default::default()
+        })
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .with_zip234_start_height(start)
+        .to_network()
+        .expect("configured testnet is valid");
+
+    if !cfg!(feature = "nu7") {
+        // Without ZIP 234, the subsidy stays on the halving schedule.
+        let reserve = Amount::<NonNegative>::try_from(1_000_000_000_000i64).expect("valid amount");
+        assert_eq!(
+            block_subsidy(start, &network, Some(reserve)).expect("valid subsidy"),
+            block_subsidy(start, &network, None).expect("valid subsidy"),
+        );
+        return;
+    }
+
+    // ZIP 234 needs the money reserve at its start height.
+    assert_eq!(
+        block_subsidy(start, &network, None),
+        Err(SubsidyError::MissingMoneyReserve),
+    );
+    assert!(block_subsidy(
+        start.previous().expect("start is above genesis"),
+        &network,
+        None
+    )
+    .is_ok());
+
+    let halving_subsidy = halving_block_subsidy(start, &network).expect("valid subsidy");
+
+    // A chain on schedule has nothing to reissue.
+    let scheduled =
+        expected_issued_supply(start.previous().expect("start is above genesis"), &network)
+            .expect("valid cumulative subsidy");
+    let max_money = Amount::<NonNegative>::try_from(MAX_MONEY).expect("valid amount");
+    let on_schedule = (max_money - scheduled).expect("valid amount");
+
+    assert_eq!(
+        block_subsidy(start, &network, Some(on_schedule)).expect("valid subsidy"),
+        halving_subsidy,
+    );
+
+    // A deficit of 10^12 zatoshi reissues `ceil(10^12 * 4126 / 10^10)` zatoshi, at 25-second
+    // blocks as at 75-second blocks.
+    let behind = (on_schedule
+        + Amount::<NonNegative>::try_from(1_000_000_000_000i64).expect("valid amount"))
+    .expect("valid amount");
+    assert_eq!(
+        block_subsidy(start, &network, Some(behind)).expect("valid subsidy"),
+        (halving_subsidy + Amount::try_from(412_600).expect("valid amount")).expect("valid amount"),
+    );
+
+    // A deficit of one zatoshi rounds up to a one-zatoshi bonus.
+    let one_behind = (on_schedule + Amount::<NonNegative>::try_from(1).expect("valid amount"))
+        .expect("valid amount");
+    assert_eq!(
+        block_subsidy(start, &network, Some(one_behind)).expect("valid subsidy"),
+        (halving_subsidy + Amount::try_from(1).expect("valid amount")).expect("valid amount"),
+    );
+
+    // A chain ahead of its schedule has a negative deficit, which zips#1354 rejects.
+    let ahead = (on_schedule - Amount::<NonNegative>::try_from(1).expect("valid amount"))
+        .expect("valid amount");
+    assert_eq!(
+        block_subsidy(start, &network, Some(ahead)),
+        Err(SubsidyError::NegativeIssuanceDeficit),
+    );
+
+    // The money reserve is what has never been issued plus everything removed from
+    // circulation.
+    assert_eq!(
+        ValueBalance::<NonNegative>::zero().money_reserve(),
+        Amount::<NonNegative>::try_from(MAX_MONEY).expect("valid amount"),
+    );
 }

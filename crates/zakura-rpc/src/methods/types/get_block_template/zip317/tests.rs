@@ -70,7 +70,7 @@ fn reserves_serialized_block_and_pool_tag_overhead() {
     let miner_params =
         MinerParams::from(Address::from(TransparentAddress::PublicKeyHash([0x7e; 20])));
     let fake_coinbase =
-        TransactionTemplate::new_coinbase(&network, height, &miner_params, Amount::zero())
+        TransactionTemplate::new_coinbase(&network, height, &miner_params, Amount::zero(), None)
             .expect("test coinbase template is valid");
     assert!(
         max_coinbase_bytes(&fake_coinbase) > fake_coinbase.data.as_ref().len(),
@@ -92,9 +92,11 @@ fn reserves_serialized_block_and_pool_tag_overhead() {
             &network,
             height,
             &miner_params,
+            None,
             vec![transaction],
             TransactionDependencies::default(),
         )
+        .expect("test coinbase template is valid")
     };
 
     assert_eq!(
@@ -128,9 +130,11 @@ fn excludes_tx_with_unselected_dependencies() {
             &network,
             Height(1_000_000),
             &MinerParams::from(Address::from(TransparentAddress::PublicKeyHash([0x7e; 20]))),
+            None,
             vec![unmined_tx],
             mempool_tx_deps,
-        ),
+        )
+        .expect("test coinbase template is valid"),
         vec![],
         "should not select any transactions when dependencies are unavailable"
     );
@@ -167,9 +171,11 @@ fn includes_tx_with_selected_dependencies() {
         &network,
         Height(1_000_000),
         &MinerParams::from(Address::from(TransparentAddress::PublicKeyHash([0x7e; 20]))),
+        None,
         unmined_txs.clone(),
         mempool_tx_deps.clone(),
-    );
+    )
+    .expect("test coinbase template is valid");
 
     assert_eq!(
         selected_txs.len(),
@@ -345,9 +351,18 @@ mod zip218_template_limits {
     fn template_limits(network: &Network, height: Height) -> BlockTemplateLimits {
         let miner_params =
             MinerParams::from(Address::from(TransparentAddress::PublicKeyHash([0x7e; 20])));
-        let fake_coinbase_tx =
-            TransactionTemplate::new_coinbase(network, height, &miner_params, Amount::zero())
-                .expect("valid coinbase transaction template");
+        let fake_coinbase_tx = TransactionTemplate::new_coinbase(
+            network,
+            height,
+            &miner_params,
+            Amount::zero(),
+            Some(
+                zakura_chain::amount::MAX_MONEY
+                    .try_into()
+                    .expect("valid money reserve"),
+            ),
+        )
+        .expect("valid coinbase transaction template");
 
         BlockTemplateLimits::initial(network, height, &fake_coinbase_tx)
     }

@@ -1,6 +1,6 @@
 [package]
 name = "zakura-state"
-version = "8.1.0"
+version = "9.0.0"
 authors.workspace = true
 description = "State contextual verification and storage code for the Zakura node. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -16,6 +16,12 @@ keywords.workspace = true
 categories = ["asynchronous", "caching", "cryptography::cryptocurrencies"]
 
 [features]
+
+# NU7 consensus rules. Off by default until NU7 has activation heights.
+nu7 = [
+    "zakura-chain/nu7",
+    "zakura-header-chain/nu7",
+]
 
 # Production features that activate extra dependencies, or extra features in dependencies
 
@@ -74,7 +80,7 @@ tracing = { workspace = true }
 sapling-crypto = { workspace = true }
 
 zakura-assets = { workspace = true }
-zakura-node-services = { path = "../zakura-node-services", version = "3.2.4" }
+zakura-node-services = { path = "../zakura-node-services", version = "3.2.5" }
 zakura-chain = { path = "../zakura-chain", version = "8.0.0", features = ["async-error"] }
 zakura-header-chain = { path = "../zakura-header-chain", version = "2.1.1" }
 

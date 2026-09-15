@@ -501,7 +501,11 @@ fn rollback_keeps_blocks_for_restore() -> Result<()> {
 
 /// A V1 coinbase transaction at `height` paying `value` to `address`. The miner data pads the
 /// coinbase script past `MIN_COINBASE_SCRIPT_LEN` so it round-trips through the database.
-fn coinbase_tx(height: Height, value: Amount<NonNegative>, address: &Address) -> Arc<Transaction> {
+pub(super) fn coinbase_tx(
+    height: Height,
+    value: Amount<NonNegative>,
+    address: &Address,
+) -> Arc<Transaction> {
     Arc::new(Transaction::V1 {
         inputs: vec![Input::Coinbase {
             height,
@@ -529,7 +533,7 @@ fn spend_tx(outpoint: OutPoint, value: Amount<NonNegative>, address: &Address) -
 /// Builds a child of `parent` containing `transactions` (whose coinbase encodes the new height).
 /// The checkpoint commit doesn't validate the pre-Sapling commitment or merkle root, so the
 /// parent's header is reused with only the parent hash updated.
-fn child_block(parent: &Block, transactions: Vec<Arc<Transaction>>) -> Arc<Block> {
+pub(super) fn child_block(parent: &Block, transactions: Vec<Arc<Transaction>>) -> Arc<Block> {
     let header = block::Header {
         previous_block_hash: parent.hash(),
         ..*parent.header
@@ -626,7 +630,7 @@ fn ironwood_v6_tx(expiry_height: Height) -> (Arc<Transaction>, ironwood::Nullifi
     )
 }
 
-fn child_block_with_history_commitment(
+pub(super) fn child_block_with_history_commitment(
     parent: &Block,
     transactions: Vec<Arc<Transaction>>,
     network: &Network,
@@ -726,6 +730,96 @@ fn rollback_reverses_intra_block_self_spend() {
             .map(|(balance, _)| balance),
         Some(value),
         "address balance is restored to its height-1 value",
+    );
+}
+
+/// Rolling back blocks at and after the ZIP 234 start height recomputes their subsidies from
+/// each parent's chain value pools.
+#[cfg(feature = "nu7")]
+#[test]
+fn rollback_crosses_the_zip234_start_height() {
+    use zakura_chain::parameters::{subsidy::is_zip234_active, testnet::RegtestParameters};
+
+    let _init_guard = zakura_test::init();
+
+    let start = Height(3);
+    let network = Network::new_regtest(RegtestParameters {
+        // Regtest activates Heartwood at height 1, where the block commitment is reserved.
+        // NU7 activates after it.
+        activation_heights: ConfiguredActivationHeights {
+            nu7: Some(2),
+            ..Default::default()
+        },
+        zip234_start_height: Some(start),
+        ..Default::default()
+    });
+    let address = Address::from_script_hash(NetworkKind::Regtest, [0x42; 20]);
+    let dust = Amount::<NonNegative>::try_from(1).expect("1 fits in Amount<NonNegative>");
+
+    let target = start.previous().expect("the start is above genesis");
+    assert!(!is_zip234_active(&network, target));
+    assert!(is_zip234_active(&network, start));
+
+    let synced_dir = TempDir::new().expect("temp dir");
+    let fresh_dir = TempDir::new().expect("temp dir");
+    let synced_config = config_at(synced_dir.path());
+    let fresh_config = config_at(fresh_dir.path());
+    let target_index = usize::try_from(target.0).expect("test height fits in usize");
+
+    // Each block commits to the history tree after its parent, so build the chain while
+    // syncing it.
+    let mut chain = vec![SemanticallyVerifiedBlock::from(
+        zakura_chain::block::genesis::regtest_genesis_block(),
+    )];
+    sync_to(&synced_config, &network, &chain);
+    for height in 1..=5 {
+        let parent = chain
+            .last()
+            .expect("the chain has a genesis block")
+            .block
+            .clone();
+        let transactions = vec![coinbase_tx(Height(height), dust, &address)];
+        let block = if height == 1 {
+            // The Heartwood activation block has the reserved all-zero commitment.
+            child_block(&parent, transactions)
+        } else {
+            let history_tree = open_unchecked_db(&synced_config, &network).history_tree();
+            child_block_with_history_commitment(&parent, transactions, &network, &history_tree)
+        };
+        let block = SemanticallyVerifiedBlock::from(block);
+
+        let mut state = reopen(&synced_config, &network);
+        state
+            .commit_finalized_direct(
+                CheckpointVerifiedBlock::from(block.block.clone()).into(),
+                None,
+                None,
+                "rollback test",
+            )
+            .expect("committing a generated block succeeds");
+        chain.push(block);
+    }
+    sync_to(&fresh_config, &network, &chain[..=target_index]);
+
+    rollback_finalized_state(
+        synced_config.clone(),
+        &network,
+        RollbackFinalizedStateOptions {
+            target_height: target,
+            keep_rolled_back_blocks: true,
+            max_checkpoint_height: Some(Height(0)),
+        },
+    )
+    .expect("rollback across the ZIP 234 start height succeeds");
+
+    let rolled = reopen(&synced_config, &network);
+    let fresh = reopen(&fresh_config, &network);
+    assert_equivalent(
+        &rolled,
+        &fresh,
+        &network,
+        &chain[..=target_index],
+        &chain[target_index + 1..],
     );
 }
 

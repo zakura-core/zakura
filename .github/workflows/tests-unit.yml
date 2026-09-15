@@ -347,7 +347,7 @@ jobs:
       id-token: write
       statuses: write
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
@@ -358,8 +358,10 @@ jobs:
       - uses: ./.github/actions/setup-zakura-build
       - name: Test NU7 builds
         run: |
+          cargo test --locked --features zakura-chain/nu7 \
+            -p zakura-chain -p zakura-header-chain --lib
           cargo test --locked --features nu7 \
-            -p zakura-consensus -p zakura-state --lib
+            -p zakura-consensus -p zakura-rpc -p zakura-state --lib
           cargo check --locked -p zakura --features nu7
 
   network-dependent:

@@ -184,7 +184,8 @@ impl DiskFormatUpgrade for Upgrade {
                 // ZIP 234 derives the block subsidy from the money reserve after the parent
                 // block, which is the running value pool.
                 let block_subsidy =
-                    block_subsidy(height, &network, Some(value_pool.money_reserve())).map_err(
+                    block_subsidy(height, &network, Some(value_pool.issuance_deficit_amount()))
+                        .map_err(
                         |error| {
                             super::FormatChangeError::InvalidPostcondition(format!(
                                 "invalid block subsidy at height {height:?}: {error}"
@@ -213,6 +214,7 @@ impl DiskFormatUpgrade for Upgrade {
                 .add_chain_value_pool_change(
                     block
                         .chain_value_pool_change(
+                            &network,
                             &utxos,
                             deferred_pool_balance_change.map(DeferredPoolBalanceChange::new),
                         )

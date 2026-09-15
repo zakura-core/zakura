@@ -705,13 +705,13 @@ fn deferred_pool_balance_change(
 
     // ZIP 234 derives the block subsidy from the money reserve after the parent block.
     // Every block being rolled back is finalized, so its parent's pools are in the db.
-    let money_reserve = height
+    let issuance_deficit = height
         .previous()
         .ok()
         .and_then(|parent| db.block_info(parent.into()))
-        .map(|parent_info| parent_info.value_pools().money_reserve());
+        .map(|parent_info| parent_info.value_pools().issuance_deficit_amount());
 
-    let block_subsidy = block_subsidy(height, network, money_reserve)?;
+    let block_subsidy = block_subsidy(height, network, issuance_deficit)?;
     let deferred_amount = funding_stream_values(height, network, block_subsidy)?
         .remove(&FundingStreamReceiver::Deferred)
         .unwrap_or_default()

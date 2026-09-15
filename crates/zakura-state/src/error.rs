@@ -779,14 +779,14 @@ pub enum ValidateContextError {
     },
 
     #[error(
-        "block makes the ZIP 234 issuance deficit negative: issued supply {issued_supply:?} \
-         exceeds expected issued supply {expected_issued_supply:?} at {height:?}"
+        "block makes the ZIP 234 issuance deficit negative: deficit {deficit_before:?} \
+         changes by {deficit_change:?} at {height:?}"
     )]
     #[non_exhaustive]
     NegativeIssuanceDeficit {
         height: block::Height,
-        expected_issued_supply: amount::Amount<NonNegative>,
-        issued_supply: amount::Amount<NonNegative>,
+        deficit_before: amount::Amount<NonNegative>,
+        deficit_change: amount::Amount<NegativeAllowed>,
     },
 
     #[error("error updating a note commitment tree: {0}")]
@@ -1347,8 +1347,9 @@ mod tests {
             },
             ValidateContextError::NegativeIssuanceDeficit {
                 height,
-                expected_issued_supply: amount::Amount::zero(),
-                issued_supply: amount::Amount::try_from(1).expect("one zatoshi is a valid amount"),
+                deficit_before: amount::Amount::zero(),
+                deficit_change: amount::Amount::try_from(-1)
+                    .expect("minus one zatoshi is a valid amount"),
             },
             ValidateContextError::InvalidBlockCommitment(
                 CommitmentError::InvalidChainHistoryActivationReserved { actual: [1; 32] },

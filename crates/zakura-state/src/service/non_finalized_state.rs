@@ -725,7 +725,7 @@ impl NonFinalizedState {
         let transaction_count = prepared.block.transactions.len();
         let spent_utxo_count = spent_utxos.len();
         let contextual =
-            ContextuallyVerifiedBlock::with_block_and_spent_utxos(prepared, spent_utxos).map_err(
+            ContextuallyVerifiedBlock::with_block_and_spent_utxos(&self.network, prepared, spent_utxos).map_err(
                 |value_balance_error| ValidateContextError::CalculateBlockChainValueChange {
                     value_balance_error,
                     height,

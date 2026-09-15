@@ -441,7 +441,7 @@ where
             // ZIP 234 derives the block subsidy from the money reserve after the parent
             // block, so a block at or above the start height needs its parent's chain
             // value pools. Wait for the parent commit if its verification is still running.
-            let money_reserve =
+            let issuance_deficit =
                 if zakura_chain::parameters::subsidy::is_zip234_active(&network, height) {
                     let parent_hash = block.header.previous_block_hash;
 
@@ -459,13 +459,17 @@ where
                     let parent_info = parent_info
                         .expect("AwaitBlockInfo only returns after the parent block commits");
 
-                    Some(parent_info.value_pools().money_reserve())
+                    Some(parent_info.value_pools().issuance_deficit_amount())
                 } else {
                     None
                 };
 
             let expected_block_subsidy =
-                zakura_chain::parameters::subsidy::block_subsidy(height, &network, money_reserve)?;
+                zakura_chain::parameters::subsidy::block_subsidy(
+                    height,
+                    &network,
+                    issuance_deficit,
+                )?;
 
             // See [ZIP-1015](https://zips.z.cash/zip-1015).
             let deferred_pool_balance_change =

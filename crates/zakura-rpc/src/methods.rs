@@ -3130,7 +3130,7 @@ where
             &self.network,
             height,
             miner_params,
-            Some(chain_info.value_pools.money_reserve()),
+            Some(chain_info.value_pools.issuance_deficit_amount()),
             mempool_txs,
             mempool_tx_deps,
         )
@@ -3528,7 +3528,7 @@ where
 
         // ZIP 234 derives the block subsidy from the money reserve after the parent
         // block, so look the parent's chain value pools up when the rules apply.
-        let money_reserve = if is_zip234_active(&net, height) {
+        let issuance_deficit = if is_zip234_active(&net, height) {
             let parent = height.previous().map_misc_error()?;
 
             let zakura_state::ReadResponse::BlockInfo(parent_info) = call_service(
@@ -3544,13 +3544,13 @@ where
                 parent_info
                     .ok_or_misc_error("parent block is not in any chain")?
                     .value_pools()
-                    .money_reserve(),
+                    .issuance_deficit_amount(),
             )
         } else {
             None
         };
 
-        let subsidy = block_subsidy(height, &net, money_reserve).map_misc_error()?;
+        let subsidy = block_subsidy(height, &net, issuance_deficit).map_misc_error()?;
 
         let (lockbox_streams, mut funding_streams): (Vec<_>, Vec<_>) =
             funding_stream_values(height, &net, subsidy)

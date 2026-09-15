@@ -25,6 +25,7 @@ use zakura_chain::{
     history_tree::HistoryTree,
     ironwood, orchard,
     parallel::tree::NoteCommitmentTrees,
+    parameters::Network,
     sapling,
     serialization::SerializationError,
     sprout,
@@ -653,6 +654,7 @@ impl ContextuallyVerifiedBlock {
     ///
     /// This function panics if `spent_outputs` omits a transparent input's UTXO.
     pub fn with_block_and_spent_utxos(
+        network: &Network,
         semantically_verified: SemanticallyVerifiedBlock,
         spent_outputs: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
     ) -> Result<Self, ValueBalanceError> {
@@ -667,6 +669,7 @@ impl ContextuallyVerifiedBlock {
         } = semantically_verified;
 
         let chain_value_pool_change = block.chain_value_pool_change_from_ordered_utxos(
+            network,
             &spent_outputs,
             deferred_pool_balance_change,
         )?;
@@ -849,6 +852,7 @@ mod tests {
                 .expect("the genesis block deserializes"),
         );
         let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+            &Network::Mainnet,
             SemanticallyVerifiedBlock::from(block),
             HashMap::new(),
         )
@@ -865,6 +869,7 @@ mod tests {
         assert_eq!(&semantic.new_outputs, contextual.new_outputs.as_ref());
 
         let unique = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+            &Network::Mainnet,
             SemanticallyVerifiedBlock::from(contextual.block.clone()),
             HashMap::new(),
         )

@@ -2557,17 +2557,18 @@ impl UpdateWith<(ValueBalance<NegativeAllowed>, Height, usize)> for Chain {
         &mut self,
         (block_value_pool_change, height, size): &(ValueBalance<NegativeAllowed>, Height, usize),
     ) -> Result<(), ValidateContextError> {
+        check::issuance_deficit_is_non_negative(
+            &self.network,
+            *height,
+            &self.chain_value_pools,
+            block_value_pool_change,
+        )?;
+
         match self
             .chain_value_pools
             .add_chain_value_pool_change(*block_value_pool_change)
         {
             Ok(chain_value_pools) => {
-                check::issuance_deficit_is_non_negative(
-                    &self.network,
-                    *height,
-                    &chain_value_pools,
-                )?;
-
                 self.chain_value_pools = chain_value_pools;
                 self.block_info_by_height
                     .insert(*height, BlockInfo::new(chain_value_pools, *size as u32));

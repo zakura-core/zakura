@@ -127,6 +127,8 @@ fn chain_pool_total_limit_includes_every_pool() {
         orchard: share,
         deferred: share,
         ironwood: share,
+        // The issuance deficit holds value that is in no pool, so `total` excludes it.
+        issuance_deficit: Amount::zero(),
     };
     assert_eq!(at_cap.total(), Ok(Amount::try_from(MAX_MONEY).unwrap()));
     assert_eq!(

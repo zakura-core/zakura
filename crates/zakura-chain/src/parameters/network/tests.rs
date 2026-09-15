@@ -785,7 +785,7 @@ fn expected_issued_supply_matches_per_height_sum() {
 #[test]
 fn zip234_issuance() {
     use crate::{
-        parameters::{subsidy::expected_issued_supply, ZIP218_ENABLED},
+        parameters::ZIP218_ENABLED,
         value_balance::ValueBalance,
     };
 
@@ -807,18 +807,18 @@ fn zip234_issuance() {
 
     if !ZIP218_ENABLED {
         // Without ZIP 234, the subsidy stays on the halving schedule.
-        let reserve = Amount::<NonNegative>::try_from(1_000_000_000_000i64).expect("valid amount");
+        let deficit = Amount::<NonNegative>::try_from(1_000_000_000_000i64).expect("valid amount");
         assert_eq!(
-            block_subsidy(start, &network, Some(reserve)).expect("valid subsidy"),
+            block_subsidy(start, &network, Some(deficit)).expect("valid subsidy"),
             block_subsidy(start, &network, None).expect("valid subsidy"),
         );
         return;
     }
 
-    // ZIP 234 needs the money reserve at its start height.
+    // ZIP 234 needs the issuance deficit at its start height.
     assert_eq!(
         block_subsidy(start, &network, None),
-        Err(SubsidyError::MissingMoneyReserve),
+        Err(SubsidyError::MissingIssuanceDeficit),
     );
     assert!(block_subsidy(
         start.previous().expect("start is above genesis"),
@@ -830,42 +830,29 @@ fn zip234_issuance() {
     let halving_subsidy = halving_block_subsidy(start, &network).expect("valid subsidy");
 
     // A chain on schedule has nothing to reissue.
-    let scheduled =
-        expected_issued_supply(start.previous().expect("start is above genesis"), &network)
-            .expect("valid cumulative subsidy");
-    let max_money = Amount::<NonNegative>::try_from(MAX_MONEY).expect("valid amount");
-    let on_schedule = (max_money - scheduled).expect("valid amount");
-
     assert_eq!(
-        block_subsidy(start, &network, Some(on_schedule)).expect("valid subsidy"),
+        block_subsidy(start, &network, Some(Amount::zero())).expect("valid subsidy"),
         halving_subsidy,
     );
 
     // A deficit of 10^12 zatoshi reissues `ceil(10^12 * 4126 / 10^10)` zatoshi, at 25-second
     // blocks as at 75-second blocks.
-    let behind = (on_schedule
-        + Amount::<NonNegative>::try_from(1_000_000_000_000i64).expect("valid amount"))
-    .expect("valid amount");
+    let behind = Amount::<NonNegative>::try_from(1_000_000_000_000i64).expect("valid amount");
     assert_eq!(
         block_subsidy(start, &network, Some(behind)).expect("valid subsidy"),
         (halving_subsidy + Amount::try_from(412_600).expect("valid amount")).expect("valid amount"),
     );
 
     // A deficit of one zatoshi rounds up to a one-zatoshi bonus.
-    let one_behind = (on_schedule + Amount::<NonNegative>::try_from(1).expect("valid amount"))
-        .expect("valid amount");
+    let one_behind = Amount::<NonNegative>::try_from(1).expect("valid amount");
     assert_eq!(
         block_subsidy(start, &network, Some(one_behind)).expect("valid subsidy"),
         (halving_subsidy + Amount::try_from(1).expect("valid amount")).expect("valid amount"),
     );
 
-    // A chain ahead of its schedule has a negative deficit, which zips#1354 rejects.
-    let ahead = (on_schedule - Amount::<NonNegative>::try_from(1).expect("valid amount"))
-        .expect("valid amount");
-    assert_eq!(
-        block_subsidy(start, &network, Some(ahead)),
-        Err(SubsidyError::NegativeIssuanceDeficit),
-    );
+    // A chain ahead of its schedule has a negative deficit, which the amount type cannot
+    // represent. `Chain::push` and the finalized commit path reject such a block before it
+    // reaches this function; see `issuance_deficit_is_non_negative`.
 
     // The money reserve is what has never been issued plus everything removed from
     // circulation.

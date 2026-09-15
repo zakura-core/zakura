@@ -290,6 +290,7 @@ impl DiskWriteBatch {
         let block_value_pool_change = finalized
             .block
             .chain_value_pool_change(
+                &db.network(),
                 &utxos_spent_by_block,
                 finalized.deferred_pool_balance_change,
             )
@@ -303,6 +304,13 @@ impl DiskWriteBatch {
                 }
             })?;
 
+        check::issuance_deficit_is_non_negative(
+            &db.network(),
+            finalized.height,
+            &value_pool,
+            &block_value_pool_change,
+        )?;
+
         let new_value_pool = value_pool
             .add_chain_value_pool_change(block_value_pool_change)
             .map_err(|value_balance_error| ValidateContextError::AddValuePool {
@@ -312,7 +320,6 @@ impl DiskWriteBatch {
                 height: Some(finalized.height),
             })?;
 
-        check::issuance_deficit_is_non_negative(&db.network(), finalized.height, &new_value_pool)?;
 
         // Update value pool metrics for observability (ZIP-209 compliance monitoring)
         value_pool_metrics(&new_value_pool);

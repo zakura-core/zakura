@@ -378,8 +378,8 @@ pub enum SubsidyError {
     #[error("miner fees are invalid")]
     InvalidMinerFees,
 
-    #[error("ZIP 234 block subsidy needs the money reserve after the parent block")]
-    MissingMoneyReserve,
+    #[error("ZIP 234 block subsidy needs the issuance deficit after the parent block")]
+    MissingIssuanceDeficit,
 
     #[error(
         "issued supply exceeds the scheduled supply, so the ZIP 234 issuance deficit is negative"
@@ -748,37 +748,22 @@ fn reissuance_amount(amount: Amount<NonNegative>) -> Result<Amount<NonNegative>,
     Ok(Amount::try_from(subsidy)?)
 }
 
-/// Returns the [ZIP 234] reissuance bonus for a block at `height`, given the money
-/// reserve after its parent.
+/// Returns the [ZIP 234] reissuance bonus for a block, given the `IssuanceDeficit` after
+/// its parent.
 ///
 /// The halving schedule keeps issuing new ZEC. The bonus reissues value removed from
 /// circulation.
 ///
 /// The deficit is what the halving schedule has issued so far minus what is actually in
 /// the chain value pools. The only way the chain falls behind its own schedule is value
-/// leaving circulation, so the deficit is exactly what is left to reissue.
+/// leaving circulation, so the deficit is exactly what is left to reissue. The state
+/// carries it forward block by block in
+/// [`ValueBalance::issuance_deficit`](crate::value_balance::ValueBalance), so this
+/// function does not re-derive it from the schedule.
 ///
 /// [ZIP 234]: https://zips.z.cash/zip-0234
-fn reissuance_bonus(
-    height: Height,
-    net: &Network,
-    money_reserve: Amount<NonNegative>,
-) -> Result<Amount<NonNegative>, SubsidyError> {
-    let max_money = Amount::<NonNegative>::try_from(MAX_MONEY)?;
-    let parent = height.previous().unwrap_or(Height(0));
-
-    let scheduled_supply = expected_issued_supply(parent, net)?;
-    let issued_supply = (max_money - money_reserve)?;
-
-    // Contextual validation in the state rejects any block at a ZIP 234 height that makes
-    // the deficit negative, as zips#1354 requires, so a parent at such a height always has
-    // a non-negative deficit. This check covers the other parents: the block just below
-    // the start height, where ZIP 234 is not yet active, and any money reserve that a
-    // caller takes from somewhere other than a committed block.
-    let deficit =
-        (scheduled_supply - issued_supply).map_err(|_| SubsidyError::NegativeIssuanceDeficit)?;
-
-    reissuance_amount(deficit)
+fn reissuance_bonus(issuance_deficit: Amount<NonNegative>) -> Result<Amount<NonNegative>, SubsidyError> {
+    reissuance_amount(issuance_deficit)
 }
 
 /// Returns `ExpectedIssuedSupply(height)` from zips#1354: the total block subsidy the
@@ -896,15 +881,15 @@ fn next_subsidy_boundary(height: Height, net: &Network) -> Option<Height> {
 pub fn block_subsidy(
     height: Height,
     net: &Network,
-    money_reserve: Option<Amount<NonNegative>>,
+    issuance_deficit: Option<Amount<NonNegative>>,
 ) -> Result<Amount<NonNegative>, SubsidyError> {
     if is_zip234_active(net, height) {
-        // The caller reads the money reserve from the parent block, so every caller that
-        // can reach a ZIP 234 height must supply it.
-        let money_reserve = money_reserve.ok_or(SubsidyError::MissingMoneyReserve)?;
+        // The caller reads the issuance deficit from the parent block, so every caller
+        // that can reach a ZIP 234 height must supply it.
+        let issuance_deficit = issuance_deficit.ok_or(SubsidyError::MissingIssuanceDeficit)?;
 
         let halving_subsidy = halving_block_subsidy(height, net)?;
-        let bonus = reissuance_bonus(height, net, money_reserve)?;
+        let bonus = reissuance_bonus(issuance_deficit)?;
 
         return Ok((halving_subsidy + bonus)?);
     }

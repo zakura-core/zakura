@@ -5,13 +5,13 @@ use std::{collections::HashMap, fmt, ops::Neg, sync::Arc};
 use halo2::pasta::pallas;
 
 use crate::{
-    amount::{DeferredPoolBalanceChange, NegativeAllowed},
+    amount::{Amount, DeferredPoolBalanceChange, NegativeAllowed},
     block::merkle::{auth_digest_or_placeholder, AuthDataRoot},
     fmt::DisplayToDebug,
     ironwood,
     memory::{inline_size_bytes, vec_capacity_bytes, AttributedMemorySize},
     orchard,
-    parameters::{Network, NetworkUpgrade},
+    parameters::{subsidy::halving_block_subsidy, Network, NetworkUpgrade},
     sapling,
     serialization::TrustedPreallocate,
     sprout,
@@ -287,12 +287,15 @@ impl Block {
     /// Note that the chain value pool has the opposite sign to the transaction value pool.
     pub fn chain_value_pool_change(
         &self,
+        network: &Network,
         utxos: &HashMap<transparent::OutPoint, transparent::Utxo>,
         deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
     ) -> Result<ValueBalance<NegativeAllowed>, ValueBalanceError> {
-        self.chain_value_pool_change_from_utxos(deferred_pool_balance_change, |transaction| {
-            transaction.value_balance(utxos)
-        })
+        self.chain_value_pool_change_from_utxos(
+            network,
+            deferred_pool_balance_change,
+            |transaction| transaction.value_balance(utxos),
+        )
     }
 
     /// Returns the overall chain value pool change using borrowed ordered UTXOs.
@@ -307,16 +310,20 @@ impl Block {
     /// This method panics if `utxos` omits a transparent input's UTXO.
     pub fn chain_value_pool_change_from_ordered_utxos(
         &self,
+        network: &Network,
         utxos: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
         deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
     ) -> Result<ValueBalance<NegativeAllowed>, ValueBalanceError> {
-        self.chain_value_pool_change_from_utxos(deferred_pool_balance_change, |transaction| {
-            transaction.value_balance_from_ordered_utxos(utxos)
-        })
+        self.chain_value_pool_change_from_utxos(
+            network,
+            deferred_pool_balance_change,
+            |transaction| transaction.value_balance_from_ordered_utxos(utxos),
+        )
     }
 
     fn chain_value_pool_change_from_utxos<F>(
         &self,
+        network: &Network,
         deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
         mut transaction_value_balance: F,
     ) -> Result<ValueBalance<NegativeAllowed>, ValueBalanceError>
@@ -333,11 +340,49 @@ impl Block {
                 acc + transaction_value_balance(tx)?
             })?;
 
-        Ok(*tx_pool_sum.neg().set_deferred_amount(
+        let mut change = *tx_pool_sum.neg().set_deferred_amount(
             deferred_pool_balance_change
                 .map(DeferredPoolBalanceChange::value)
                 .unwrap_or_default(),
-        ))
+        );
+
+        change.set_issuance_deficit_amount(self.issuance_deficit_change(network, &change)?);
+
+        Ok(change)
+    }
+
+    /// Returns this block's contribution to `IssuanceDeficit` from [zips#1354].
+    ///
+    /// The deficit is `ExpectedIssuedSupply(height) - IssuedSupply(height)`, so each block
+    /// moves it by the subsidy the halving schedule owed for that block, less the value the
+    /// block actually added to the chain value pools:
+    ///
+    /// `delta = ScheduledBlockSubsidy(height) - change.total()`
+    ///
+    /// A miner who claims less than the schedule allows raises the deficit by the shortfall.
+    /// A ZIP 234 reissuance claims more than the schedule, which lowers it again. Summing
+    /// this delta from genesis reproduces the specification's sum exactly, which
+    /// `issuance_deficit_matches_the_schedule` checks at every height.
+    ///
+    /// [zips#1354]: https://github.com/zcash/zips/pull/1354
+    fn issuance_deficit_change(
+        &self,
+        network: &Network,
+        change: &ValueBalance<NegativeAllowed>,
+    ) -> Result<Amount<NegativeAllowed>, ValueBalanceError> {
+        let height = self
+            .coinbase_height()
+            .ok_or(ValueBalanceError::MissingCoinbaseHeight)?;
+
+        // A block whose height has no halving subsidy issues nothing, so it owes nothing.
+        let scheduled = halving_block_subsidy(height, network)
+            .unwrap_or_else(|_| Amount::zero())
+            .constrain::<NegativeAllowed>()
+            .map_err(ValueBalanceError::IssuanceDeficit)?;
+
+        let issued = change.total().map_err(ValueBalanceError::IssuanceDeficit)?;
+
+        (scheduled - issued).map_err(ValueBalanceError::IssuanceDeficit)
     }
 
     /// Compute the root of the authorizing data Merkle tree,

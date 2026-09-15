@@ -113,7 +113,7 @@ pub fn select_mempool_transactions(
     net: &Network,
     height: Height,
     miner_params: &MinerParams,
-    money_reserve: Option<Amount<amount::NonNegative>>,
+    issuance_deficit: Option<Amount<amount::NonNegative>>,
     mempool_txs: Vec<VerifiedUnminedTx>,
     mempool_tx_deps: TransactionDependencies,
 ) -> Result<Vec<SelectedMempoolTx>, TransactionError> {
@@ -124,7 +124,7 @@ pub fn select_mempool_transactions(
         height,
         miner_params,
         Amount::zero(),
-        money_reserve,
+        issuance_deficit,
     )?;
 
     let tx_dependencies = mempool_tx_deps.dependencies();

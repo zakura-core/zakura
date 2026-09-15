@@ -3,13 +3,13 @@
 use std::{borrow::Borrow, sync::Arc};
 
 use zakura_chain::{
-    amount::NonNegative,
+    amount::{NegativeAllowed, NonNegative},
     block::{
         self, merkle::AuthDataRoot, Block, ChainHistoryBlockTxAuthCommitmentHash, CommitmentError,
     },
     history_tree::HistoryTree,
     parameters::{
-        subsidy::{expected_issued_supply, is_zip234_active},
+        subsidy::is_zip234_active,
         Network, NetworkUpgrade,
     },
     value_balance::ValueBalance,
@@ -49,7 +49,8 @@ pub(crate) use difficulty::AdjustedDifficulty;
 
 /// Checks that the block at `height` does not make the ZIP 234 issuance deficit negative.
 ///
-/// `value_pools` are the chain value pools after the block.
+/// `value_pools` are the chain value pools before the block, and `block_value_pool_change`
+/// is the block's change to them.
 ///
 /// # Consensus
 ///
@@ -59,25 +60,38 @@ pub(crate) use difficulty::AdjustedDifficulty;
 ///
 /// zips#1354 applies this rule from NU7 because it starts reissuance at NU7. Zakura starts
 /// reissuance at the later ZIP 234 start height, and applies the rule from that height.
+///
+/// This runs before the pools are added, because the deficit leg is constrained
+/// non-negative: adding a block that overdraws it would otherwise fail with a generic
+/// value-balance error instead of naming the rule it broke.
 #[allow(clippy::unwrap_in_result)]
 pub(crate) fn issuance_deficit_is_non_negative(
     network: &Network,
     height: block::Height,
     value_pools: &ValueBalance<NonNegative>,
+    block_value_pool_change: &ValueBalance<NegativeAllowed>,
 ) -> Result<(), ValidateContextError> {
     if !is_zip234_active(network, height) {
         return Ok(());
     }
 
-    let expected_issued_supply = expected_issued_supply(height, network)
-        .expect("the halving schedule is a valid amount at every height");
-    let issued_supply = value_pools.issued_supply();
+    let deficit_before = value_pools
+        .issuance_deficit_amount()
+        .constrain::<NegativeAllowed>()
+        .expect("a non-negative amount is always a valid signed amount");
 
-    if issued_supply > expected_issued_supply {
+    let deficit_after = (deficit_before + block_value_pool_change.issuance_deficit_amount())
+        .map_err(|_| ValidateContextError::NegativeIssuanceDeficit {
+            height,
+            deficit_before: value_pools.issuance_deficit_amount(),
+            deficit_change: block_value_pool_change.issuance_deficit_amount(),
+        })?;
+
+    if deficit_after.zatoshis() < 0 {
         return Err(ValidateContextError::NegativeIssuanceDeficit {
             height,
-            expected_issued_supply,
-            issued_supply,
+            deficit_before: value_pools.issuance_deficit_amount(),
+            deficit_change: block_value_pool_change.issuance_deficit_amount(),
         });
     }
 

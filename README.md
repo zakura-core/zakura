@@ -31,7 +31,8 @@ Zakura is forked from [Zebra](https://github.com/ZcashFoundation/zebra). This fi
 
 ## Getting Started
 
-There are several ways to install the node software: an interactive installer that downloads the binary, Docker, or building from source or crates.io.
+There are several ways to install the node software: an interactive installer
+that downloads the binary, Docker, or building from source or crates.io.
 
 ### Installer
 

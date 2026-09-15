@@ -121,10 +121,14 @@ fn startup_reclaims_auxiliary_reserve_without_due_deferrals() {
         }
         .expect("startup reclaims the reserve before publication");
         assert!(report.repairs.is_empty());
-        assert_eq!(runtime.store.load_aux_deliveries().unwrap().len(), 1);
+        // The two-slot reserve needs two rows. The deepest obsolete holders go first.
+        assert_eq!(runtime.store.load_aux_deliveries().unwrap().len(), 3);
         assert_eq!(runtime.publisher().snapshot(), report.current);
         assert_eq!(report.current.frontiers, before.frontiers);
-        for node in obsolete.iter().skip(1) {
+        for node in &obsolete[1..3] {
+            assert!(runtime.store.header_node(node.hash).unwrap().is_some());
+        }
+        for node in &obsolete[3..] {
             assert!(runtime.store.header_node(node.hash).unwrap().is_none());
         }
         let reader = runtime.reader();
@@ -146,7 +150,7 @@ fn startup_reclaims_auxiliary_reserve_without_due_deferrals() {
             .expect("reserve cleanup survives a second database reopen");
         assert!(second_report.repairs.is_empty());
         assert_eq!(second_report.current, report.current);
-        assert_eq!(runtime.store.load_aux_deliveries().unwrap().len(), 1);
+        assert_eq!(runtime.store.load_aux_deliveries().unwrap().len(), 3);
     }
 }
 

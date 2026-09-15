@@ -1596,17 +1596,28 @@ fn fork_selection_reclaims_displaced_auxiliary_rows_before_using_the_reserve() {
     )
     .expect("startup settlement reclaims an older saturated selection");
     recovered.commit(&recovered_plan);
-    assert_eq!(recovered.aux.len(), 1);
+    // The two-slot reserve needs two rows. The deepest displaced holders go first.
+    assert_eq!(recovered.aux.len(), 3);
+    assert!(old_path[3..]
+        .iter()
+        .all(|frontier| recovered.graph.header_node(frontier.hash).is_none()));
+    assert!(old_path[1..3]
+        .iter()
+        .all(|frontier| recovered.graph.header_node(frontier.hash).is_some()));
     let plan = apply_transition(&store, request.clone(), &context(&config, &clock, None))
         .expect("a header-only fork change reclaims unprotected displaced rows");
     assert_eq!(plan.change_set.metadata.frontiers.header_best.hash, new_tip);
-    assert!(old_path
+    assert!(old_path[3..]
         .iter()
-        .skip(1)
         .all(|frontier| plan.change_set.delete_nodes.contains(&frontier.hash)));
-    assert!(!plan.change_set.delete_nodes.contains(&anchor.hash));
+    assert!(
+        old_path[..3]
+            .iter()
+            .all(|frontier| !plan.change_set.delete_nodes.contains(&frontier.hash)),
+        "retention keeps the displaced prefix once the reserve is available"
+    );
     store.commit(&plan);
-    assert_eq!(store.aux.len(), 1, "the finalized anchor remains retained");
+    assert_eq!(store.aux.len(), 3);
     request.expected_version = store.metadata.state_version;
     let TransitionEvent::InsertHeaders(insert) = &mut request.event else {
         unreachable!()
@@ -1644,7 +1655,11 @@ fn fork_selection_reclaims_displaced_auxiliary_rows_before_using_the_reserve() {
     let plan = apply_transition(&store, request, &context(&config, &clock, None))
         .expect("both new commit prerequisites fit after fork selection");
     store.commit(&plan);
-    assert_eq!(store.aux.len(), 3);
+    assert_eq!(
+        store.aux.len(),
+        5,
+        "commit-window input fills the reserved slots"
+    );
 }
 
 #[test]

@@ -436,3 +436,150 @@ fn exact_v1_node_boundary_refuses_to_evict_the_selected_path() {
     assert!(plan.resource_stalled);
     assert!(store.header_node(selected.hash).is_some());
 }
+
+fn record_input(store: &mut MemHeaderStore, header: Frontier, marker: u8) {
+    store
+        .record_auxiliary_evidence_delivery(
+            header.hash,
+            crate::EvidenceId::from_digest([marker; 32]),
+        )
+        .expect("the fixture header is retained");
+}
+
+fn selected_chain(store: &mut MemHeaderStore, parent: block::Hash, seeds: &[u8]) -> Frontier {
+    seeds
+        .iter()
+        .fold(None, |tip: Option<Frontier>, seed| {
+            Some(insert_header(
+                store,
+                tip.map_or(parent, |tip| tip.hash),
+                *seed,
+                [],
+            ))
+        })
+        .expect("the selected chain is nonempty")
+}
+
+#[test]
+fn auxiliary_pressure_evicts_only_subtrees_that_hold_input() {
+    let mut store = retention_graph();
+    let anchor = store.finalized_frontier();
+    let selected = selected_chain(&mut store, anchor.hash, &[10, 11, 12]);
+    record_input(&mut store, selected, 0x61);
+    let low_side = [
+        insert_header(&mut store, anchor.hash, 1, []),
+        insert_header(&mut store, anchor.hash, 2, []),
+    ];
+    let permanent = insert_header(
+        &mut store,
+        anchor.hash,
+        3,
+        [EligibilityReason::CheckpointConflict {
+            height: block::Height(1),
+            expected: block::Hash([9; 32]),
+        }],
+    );
+    // The displaced branch outranks the empty side branches, so leaf-order eviction would
+    // remove them before reaching its input.
+    let displaced_parent = insert_header(&mut store, anchor.hash, 4, []);
+    let displaced = insert_header(&mut store, displaced_parent.hash, 5, []);
+    record_input(&mut store, displaced, 0x62);
+
+    let plan = enforce_retention(
+        &mut store,
+        selected,
+        anchor,
+        [],
+        limits(10, 100),
+        Some(AuxiliaryRetentionBudget {
+            retained: 2,
+            maximum: 1,
+        }),
+    )
+    .expect("retention reclaims unprotected input");
+
+    assert!(!plan.admission_refused);
+    assert_eq!(plan.work.evicted_auxiliary_deliveries, 1);
+    assert_eq!(plan.work.evicted_nodes, 1);
+    assert!(store.header_node(displaced.hash).is_none());
+    assert!(store.header_node(displaced_parent.hash).is_some());
+    assert!(store.header_node(permanent.hash).is_some());
+    assert!(low_side
+        .iter()
+        .all(|side| store.header_node(side.hash).is_some()));
+    assert!(store.header_node(selected.hash).is_some());
+}
+
+#[test]
+fn auxiliary_pressure_reclaims_input_on_a_shared_fork_header() {
+    let mut store = retention_graph();
+    let anchor = store.finalized_frontier();
+    let selected = selected_chain(&mut store, anchor.hash, &[10, 11, 12]);
+    let parent = insert_header(&mut store, anchor.hash, 1, []);
+    let fork = insert_header(&mut store, parent.hash, 2, []);
+    record_input(&mut store, fork, 0x63);
+    let children = [
+        insert_header(&mut store, fork.hash, 3, []),
+        insert_header(&mut store, fork.hash, 4, []),
+    ];
+
+    let plan = enforce_retention(
+        &mut store,
+        selected,
+        anchor,
+        [],
+        limits(10, 100),
+        Some(AuxiliaryRetentionBudget {
+            retained: 1,
+            maximum: 0,
+        }),
+    )
+    .expect("retention reclaims input above two empty leaves");
+
+    assert_eq!(plan.work.evicted_auxiliary_deliveries, 1);
+    assert_eq!(plan.work.evicted_nodes, 3);
+    assert!(store.header_node(fork.hash).is_none());
+    assert!(children
+        .iter()
+        .all(|child| store.header_node(child.hash).is_none()));
+    assert!(store.header_node(parent.hash).is_some());
+}
+
+#[test]
+fn auxiliary_pressure_evicts_permanently_ineligible_input_first() {
+    let mut store = retention_graph();
+    let anchor = store.finalized_frontier();
+    let selected = selected_chain(&mut store, anchor.hash, &[10, 11, 12]);
+    let eligible = insert_header(&mut store, anchor.hash, 1, []);
+    record_input(&mut store, eligible, 0x64);
+    // The ineligible branch has more work, so work order alone would evict the eligible input.
+    let permanent = insert_header(
+        &mut store,
+        anchor.hash,
+        2,
+        [EligibilityReason::CheckpointConflict {
+            height: block::Height(1),
+            expected: block::Hash([9; 32]),
+        }],
+    );
+    record_input(&mut store, permanent, 0x65);
+    let permanent_child = insert_header(&mut store, permanent.hash, 3, []);
+
+    let plan = enforce_retention(
+        &mut store,
+        selected,
+        anchor,
+        [],
+        limits(10, 100),
+        Some(AuxiliaryRetentionBudget {
+            retained: 2,
+            maximum: 1,
+        }),
+    )
+    .expect("retention reclaims ineligible input");
+
+    assert_eq!(plan.work.evicted_auxiliary_deliveries, 1);
+    assert!(store.header_node(permanent.hash).is_none());
+    assert!(store.header_node(permanent_child.hash).is_none());
+    assert!(store.header_node(eligible.hash).is_some());
+}

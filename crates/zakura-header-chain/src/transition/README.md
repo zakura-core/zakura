@@ -159,8 +159,9 @@ Keep these three resource-limit outcomes separate:
 ## Recovery audit
 
 Every integrated transition reserves auxiliary capacity for the finalized header and its two
-selected successors. Retention reclaims unprotected branches when a fork change would consume
-the new window's reserve. The planner and independent verifier check the post-retention bound.
+selected successors. When a fork change would consume the new window's reserve, retention
+evicts unprotected headers that hold input, with their descendants. It evicts no other header.
+The planner and independent verifier check the post-retention bound.
 The planner refuses admission when protected evidence prevents reserve recovery.
 A store that already lacks the reserve can commit transitions that keep or reduce the deficit,
 but not ones that increase it.

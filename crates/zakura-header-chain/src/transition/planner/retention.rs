@@ -1,6 +1,9 @@
 //! Deterministic pure retention and resource-eviction planning.
 
-use std::collections::{BTreeSet, HashSet};
+use std::{
+    cmp::Reverse,
+    collections::{BTreeSet, HashMap, HashSet},
+};
 
 use zakura_chain::block;
 
@@ -98,12 +101,14 @@ pub(super) fn enforce_retention<G: HeaderGraphEdit>(
     let mut candidates = RetentionCandidates::build(store)?;
     plan.work.candidate_nodes_scanned = candidates.header_nodes_scanned;
     plan.work.graph_workspaces = plan.work.graph_workspaces.saturating_add(1);
-    let permanently_evicted = evict_permanently_ineligible(
-        store,
-        &protected_header_hashes,
-        &mut candidates,
-        &mut plan.work,
-    )?;
+    // Auxiliary pressure evicts only the subtrees that hold input, below.
+    let permanently_evicted = (over_tip_limit || over_node_limit)
+        && evict_permanently_ineligible(
+            store,
+            &protected_header_hashes,
+            &mut candidates,
+            &mut plan.work,
+        )?;
     if store.view_eligible_header_tip_count() <= limits.max_candidate_tips.get()
         && store.view_header_node_count().saturating_sub(1) <= limits.max_non_finalized_nodes.get()
         && !auxiliary_budget.is_some_and(|budget| budget.exceeded(plan.work))
@@ -156,25 +161,92 @@ pub(super) fn enforce_retention<G: HeaderGraphEdit>(
         }
     }
 
-    while auxiliary_budget.is_some_and(|budget| budget.exceeded(plan.work)) {
-        let Some(score) = candidates.header_leaves.pop_first() else {
-            // The planner's final auxiliary check refuses admission when protected
-            // evidence prevents reserve recovery. Retention never removes that evidence.
-            break;
-        };
-        if protected_header_hashes.contains(&score.tip_hash) {
-            continue;
-        }
-        if store.view_header_node(score.tip_hash).is_some() {
-            evict_tip_branch(
-                store,
-                score.tip_hash,
-                &protected_header_hashes,
-                &mut plan.work,
-            )?;
-        }
+    if let Some(budget) = auxiliary_budget {
+        // The planner's final auxiliary check refuses a transition when protected evidence
+        // prevents reserve recovery. Retention never removes that evidence.
+        evict_auxiliary_holders(store, &protected_header_hashes, budget, &mut plan.work)?;
     }
     Ok(plan)
+}
+
+/// Evict the fewest unprotected headers that restore the auxiliary budget.
+///
+/// Removing a header's input requires removing that header and its descendants. Retention
+/// evicts that subtree for each unprotected input holder in turn: permanently ineligible holders
+/// first, then the holder whose best descendant tip has the least work. The deepest holder goes
+/// first on a shared tip, so an ancestor survives when its descendants' input suffices. Branches
+/// without input stay retained.
+fn evict_auxiliary_holders<G: HeaderGraphEdit>(
+    store: &mut G,
+    protected_header_hashes: &HashSet<block::Hash>,
+    budget: AuxiliaryRetentionBudget,
+    retention_work: &mut RetentionWork,
+) -> Result<(), GraphError> {
+    if !budget.exceeded(*retention_work) {
+        return Ok(());
+    }
+    retention_work.graph_workspaces = retention_work.graph_workspaces.saturating_add(1);
+    let postorder = subtree_postorder(store, store.view_finalized_frontier().hash);
+    retention_work.candidate_nodes_scanned = retention_work
+        .candidate_nodes_scanned
+        .saturating_add(postorder.len());
+    let mut best_tips: HashMap<block::Hash, crate::ChainScore> =
+        HashMap::with_capacity(postorder.len());
+    let mut holders = BTreeSet::new();
+    for hash in postorder {
+        let best_child_tip = store
+            .view_header_children(hash)
+            .iter()
+            .filter_map(|child| best_tips.get(child).copied())
+            .max();
+        let best_tip = match best_child_tip {
+            Some(score) => score,
+            None => store.view_header_chain_score(hash)?,
+        };
+        best_tips.insert(hash, best_tip);
+        let node = store
+            .view_header_node(hash)
+            .ok_or(GraphError::UnknownHeaderNode(hash))?;
+        // Protection covers every ancestor of a protected header, so an unprotected
+        // holder's subtree contains no protected header.
+        if node.aux_delivery_ids.is_empty() || protected_header_hashes.contains(&hash) {
+            continue;
+        }
+        let permanently_ineligible = node.eligibility.has_permanent_reason()
+            || matches!(
+                node.body_validation_state,
+                BodyValidationState::ConsensusInvalid { .. }
+            );
+        holders.insert((
+            !permanently_ineligible,
+            best_tip,
+            Reverse(node.height),
+            hash.0,
+        ));
+    }
+
+    for (_, _, _, raw_hash) in holders {
+        if !budget.exceeded(*retention_work) {
+            break;
+        }
+        let holder = block::Hash(raw_hash);
+        // An earlier holder's subtree may already contain this one.
+        if store.view_header_node(holder).is_none() {
+            continue;
+        }
+        retention_work.graph_workspaces = retention_work.graph_workspaces.saturating_add(1);
+        for hash in subtree_postorder(store, holder) {
+            retention_work.evicted_auxiliary_deliveries =
+                retention_work.evicted_auxiliary_deliveries.saturating_add(
+                    store
+                        .view_header_node(hash)
+                        .map_or(0, |node| node.aux_delivery_ids.len()),
+                );
+            store.edit_remove_header_leaf(hash)?;
+            retention_work.evicted_nodes = retention_work.evicted_nodes.saturating_add(1);
+        }
+    }
+    Ok(())
 }
 
 fn resource_stalled_plan(mut plan: RetentionPlan) -> RetentionPlan {

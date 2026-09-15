@@ -43,7 +43,7 @@ pub(crate) mod unauthenticated_commitment_roots;
 #[cfg(not(feature = "indexer"))]
 pub(crate) mod drop_tx_locs_by_spends;
 
-#[cfg(feature = "indexer")]
+#[cfg(any(test, feature = "indexer"))]
 pub(crate) mod track_tx_locs_by_spends;
 
 /// Defines one ordered state database format upgrade.

@@ -746,7 +746,7 @@ evidence. A rooted repair path only establishes eventual delivery under its
 honesty, credit, retention, and service assumptions. Implementations MUST keep
 the bounded repair and fallback behavior above; fallback does not remove a
 physical upload bottleneck. The design tracks the remaining
-[bootstrap work](../design/dogwood.md#open-problems-and-todos).
+[bootstrap work](../design/dogwood.md#open-work).
 
 ## 7. Redundancy and route control
 
@@ -1329,7 +1329,7 @@ not a production recommendation or evidence of conformance. A value marked `TBD`
 MUST be fixed when required by an implementation's selected profile or local
 policy before that implementation claims conformance. Optional future extensions
 do not block baseline conformance. Reports MUST record all overrides. The
-[design rationale](../design/dogwood.md#param-tuning) does not override this
+[design rationale](../design/dogwood.md#parameter-tuning) does not override this
 registry or the requirements in earlier sections.
 
 #### Workload and local policy

@@ -914,7 +914,7 @@ relation reaches the source, so a parent can eventually serve a child's deficit
 after reconstructing. The checker has no clocks, failed parents, credit
 exhaustion, retention expiry, or repair-byte cap. This is a conditional liveness
 check, not a bounded-latency guarantee or a proof for sparse part subscriptions.
-The [design TODOs](dogwood.md#open-problems-and-todos) track those missing cases
+The [design TODOs](dogwood.md#open-work) track those missing cases
 and the proposed seeding-grant semantics.
 
 ## On-arrival Reed–Solomon

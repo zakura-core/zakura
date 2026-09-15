@@ -53,7 +53,7 @@ should preserve delivery while those subscriptions adapt.
 
 ## Tradeoffs
 
-### Comparing and Contrasting Protocols w/ Dogwood
+### Protocol comparison
 
 Each node limits its forwarding peers as the network grows. Like
 [Gossipsub](https://github.com/libp2p/specs/blob/master/pubsub/gossipsub/gossipsub-v1.0.md#gossipsub-the-gossiping-mesh-router),
@@ -275,7 +275,7 @@ Sending the whole codeword to every direct peer can multiply proposer upload.
 Sending disjoint subsets can strand peers that cannot exchange those subsets. We
 need both an authorized seeding policy and a delivery path after seeding.
 
-### Let the proposer choose a bounded subset
+### Seed offers
 
 The candidate is a negotiated `SeedOffer` selection within `SubscribeParts`. The
 receiver permits any subset of the selected parts up to its existing part and
@@ -300,7 +300,7 @@ local hint improved static startup in the connected-relay experiment, but does
 not prove downstream reachability. Missing eligible credit must appear as
 degraded seeding, not unsolicited sends or hidden normal-path repair.
 
-### What can be optimal locally
+### Seed scheduling
 
 For equal-size parts, fixed known peer rates, sufficient any-index seed credit,
 and a shared proposer upload limit, we can minimize the time to seed a chosen
@@ -323,7 +323,7 @@ assignment takes 632.8 ms to seed every assigned part because it waits for the
 slowest peer. Neither number includes downstream delivery. The source can spend
 more time or bytes to establish a usable path for every receiver.
 
-### A delivery condition and its limits
+### Seeding reachability
 
 Assume honest peers, an arbitrary body with no prior body information, one valid
 codeword, retained data, adequate credit, fair eventual service, and
@@ -347,7 +347,7 @@ connected after removing the proposer and have enough upload to carry their
 subscriptions. Each part also needs a subscription path from its seed to its
 receivers; physical connectivity alone does not provide that path.
 
-### Large-body stripe candidate
+### Coding stripes
 
 The whole-body codeword remains the current profile. A separate large-body
 candidate uses equal-shape coding stripes. Nodes retain the incoming suppliers
@@ -379,7 +379,7 @@ body rate in its steady cases. Temporary upload changes still cause misses.
 Restoring startup suppliers after a miss does not consistently restore timely
 delivery. The candidate therefore does not complete the adaptive controller.
 
-### Small blocks and portions
+### Small-block parity and scheduling
 
 More parity for small blocks is worth testing because its absolute proposer cost
 can be small while a repair round trip remains expensive. The actual ratio
@@ -398,119 +398,40 @@ Merkle commitments, or wire messages requires a separate profile design.
 
 ## Redundancy and recovery
 
-One supplier per part is a useful traffic baseline. Duplicate subscriptions
-remain a design option for failure coverage and latency. Parity covers missing
-parts without requiring a duplicate of each part, but the proposer must first
-upload the parity it seeds.
+Parity lets a receiver reconstruct a block despite missing parts. With 32 data
+parts and eight parity parts, it needs any 32 of the 40 parts. To survive one
+supplier's failure without repair, its subscriptions must leave 32 distinct
+parts available from other suppliers.
 
-For body size `B`, parity/data ratio `r`, and proposer upload rate `U`, seeding
-each encoded part once takes at least `8*B*(1+r)/U` seconds when `U` is in bits
-per second. This assumes the proposer seeds the entire codeword. Direct
-duplicate sends, headers, and framing increase that cost. Relays can forward
-parts during seeding, but pipelining does not remove the proposer upload work.
+Assigning more parts to a fast peer can improve delivery, but requires coverage
+elsewhere if that peer fails. Receivers can request additional parity or
+duplicate parts, or accept repair latency. Parity consumes proposer upload;
+duplicates forwarded by relays consume relay upload. The
+[coverage rules](../specs/dogwood.md#distinct-part-coverage) define how receivers
+account for supplier failures, including correlated failures.
 
-Duplicate subscriptions can instead place redundancy on relays after they
-receive the part. That can save proposer upload compared with more parity.
-Duplicates requested directly from the proposer still cost proposer upload. We
-must measure proposer bytes, proposer encode/root time, receiver bytes, relay
-upload, and completion latency together. The local
-[parity comparison](dogwood-experiments.md#parity-versus-duplicate-subscriptions)
-isolates receiver allocation and calculates the proposer seeding lower bound; it
-does not yet model that seeding path.
-
-For a block with 32 data parts and eight parity parts, any eight parts can be
-unavailable. But if one peer supplies more than eight parts exclusively, losing
-that peer can prevent reconstruction. The default coverage target therefore
-keeps at least 32 distinct parts available after losing any one supplier.
-
-A fast connection can carry most of the block, provided other peers cover enough
-distinct parts. This costs duplicate traffic. The receiver can reduce that cost
-only by accepting recovery latency when the fast peer fails. Distinct peers also
-need not represent independent physical paths.
-
-Committed parity and subscribed redundancy are separate choices. Encoding more
-parity provides no additional failure coverage unless the receiver requests
-enough distinct parts. The draft's 25% parity schedule is not a measured
-optimum.
-
-With exactly one supplier per subscribed part, let `m` be the number of distinct
-subscribed parts and `a_max` the largest supplier assignment. Surviving that
-supplier's loss without repair requires `m - a_max >= k`. If its share is
-`f = a_max / m`, the required subscribed parity/data ratio is at least
-`f / (1 - f)`, before integer rounding and any additional safety margin.
-
-| Largest supplier share | Minimum parity/data | Encoded rate at 50,000 TPS |
-| --- | --- | --- |
-| 20% | 25% | 1.024 Gbps |
-| 25% | 33⅓% | 1.092 Gbps |
-| ⅓ | 50% | 1.229 Gbps |
-| 50% | 100% | 1.638 Gbps |
-
-These rates exclude proof and transport overhead. With equal assignments to `d`
-suppliers, the exact test is `m - ceil(m/d) >= k`. Thus `k=32, m=40` works with
-five suppliers carrying eight parts each, but not with four carrying ten each.
-Wider bandwidth variation can make equal assignment waste the fast peers'
-capacity. Concentrating half the parts on a fast peer instead requires 100%
-parity to survive its loss without duplicate subscriptions or repair. Any ratio
-other than the draft's 25% requires an agreed coding profile.
-
-For multiple failed peers or a correlated failure group, apply the same test to
-their combined exclusive assignment. For late parts, budget the observed tail of
-the missing-part count, not just its average. A receiver must choose between
-more parity, less concentration, and accepting bounded repair latency.
-Congestion control cannot remove this coverage constraint. These bounds apply to
-one subscription per part; they do not establish that more parity is better than
-duplicate subscriptions.
-
-Coverage describes assignments, not guaranteed availability. A subscription
-cycle may have no source for its parts. When progress stalls, the receiver uses
-`FullBlock` announcements to find peers that can serve missing parts through
-bounded block-specific subscriptions. Existing full-block download provides
-final recovery.
-
-Repair costs a request delay and extra upload, so normal routes must meet the
-latency target without frequent repair. Repair retains finite grants, a bounded
-proposer seed budget, and fixed deadlines. The receiver reports degraded service
-when it cannot recover within those limits. Unfamiliar entry points may still
-pay discovery or repair latency while nodes learn routes.
+When delivery stalls, a receiver requests missing parts from peers advertising
+`FullBlock`. Repair adds a request delay and extra traffic, so normal delivery
+should rarely need it. Grants and deadlines bound repair work. Existing
+full-block download provides final recovery when coded propagation fails.
 
 ## Encoding and verification
 
-The codec uses the systematic Reed–Solomon construction from
+Dogwood uses systematic Reed–Solomon coding, as described in
 [RFC 5510, section 8](https://www.rfc-editor.org/rfc/rfc5510.html#section-8).
-The decoder processes each verified part as an equation as it arrives. It can
-also reduce existing equations with each new pivot to shorten the final decode
-step. The reference benchmarks support testing this eager schedule without
-switching to RLNC. Re-encoding and root verification still remain. Forwarding
-never waits for decoding.
+The receiver verifies each part's Merkle proof before forwarding it and can
+start decoding while other parts arrive. Forwarding never waits for decoding.
+The spec gives an [on-arrival decoding example](../specs/dogwood.md#on-arrival-decoding-example).
 
-For example, take four data parts and one parity part. An eager decoder can
-consume the following sequence while the network continues delivering:
+A part's Merkle proof establishes membership in the committed codeword. After
+reconstruction, the receiver checks padding and re-encodes the body to verify
+the committed root. It then submits the block for consensus validation.
 
-| Verified arrival | Rank afterward | Action |
-| --- | --- | --- |
-| Parity part 4 | 1 | Normalize and retain its equation. |
-| Data part 1 | 2 | Eliminate its pivot from the retained equation. |
-| Part 4 again | 2 | Ignore the duplicate index. |
-| Data part 3 | 3 | Eliminate its pivot from retained equations. |
-| Data part 0 | 4 | Recover missing data part 2. |
+Changing the body requires new parity and a new Merkle tree. Changing only the
+header preserves both. After mining, the proposer signs the final block hash
+and coding metadata.
 
-Each pivot operation transforms the payload alongside its coefficient row. The
-receiver then re-encodes all five parts and checks the committed root. The
-[worked example](../specs/dogwood.md#on-arrival-decoding-example) shows the
-field equations. The local runnable example uses the same eager kernel as the
-benchmarks and checks recovery with nonzero high bytes.
-
-A body change requires new parity and a new Merkle tree. A header-only change
-does not. After mining, the proposer signs the final block hash and coding
-metadata.
-
-A Merkle proof establishes membership in the signed root, not correct encoding.
-After reconstruction, the receiver checks padding and re-encodes the body to
-verify the root. It combines the body with the admitted header and submits the
-block for consensus validation.
-
-## Param Tuning
+## Parameter tuning
 
 The [spec parameter registry](../specs/dogwood.md#parameter-registry) owns the
 definitions, starting values, and change rules. These values make experiments
@@ -543,7 +464,7 @@ samples across material workload changes. Wire parameters require negotiation
 before use. Existing grants retain their original authority during a policy
 change.
 
-## Open problems and TODOs
+## Open work
 
 The
 [bounded-recovery follow-up](dogwood-experiments.md#bounded-recovery-follow-up)

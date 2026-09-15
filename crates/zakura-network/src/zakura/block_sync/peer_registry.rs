@@ -882,8 +882,14 @@ impl PeerRegistry {
         self_rtprop_ms: Option<u64>,
         allow_equal_score: bool,
     ) -> bool {
-        let self_score = self_rtprop_ms.unwrap_or(u64::MAX);
         let peers = self.lock();
+        // Rank registered peers from the same published snapshot. Mixing a fresh
+        // local expiry with other peers' cached scores can make every peer defer.
+        let self_score = peers
+            .get(self_peer)
+            .map(|entry| entry.slots.bbr_rtprop_ms)
+            .unwrap_or(self_rtprop_ms)
+            .unwrap_or(u64::MAX);
         peers.iter().any(|(peer, entry)| {
             if peer == self_peer || !entry.can_serve_with_room(height) {
                 return false;
@@ -1358,6 +1364,37 @@ mod floor_bias_tests {
             Some(50),
             false
         ));
+    }
+
+    #[test]
+    fn floor_ranking_uses_one_snapshot_after_local_rtt_expires() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let reg = PeerRegistry::new();
+        let (fast, slow) = (peer(1), peer(2));
+        register_with_rtprop(&reg, &config, &fast, 0, 1000, 3, Some(75));
+        register_with_rtprop(&reg, &config, &slow, 0, 1000, 3, Some(145));
+
+        // Both local filters have expired, but neither cached score has refreshed.
+        // The fastest published carrier must still take work without a heartbeat.
+        assert!(!reg.floor_has_preferred_unsaturated_server(
+            block::Height(100),
+            &fast,
+            None,
+            false
+        ));
+        assert!(reg.floor_has_preferred_unsaturated_server(block::Height(100), &slow, None, false));
+
+        // Refreshing either cached score must leave an eligible normal carrier.
+        for expired_peer in [&fast, &slow] {
+            reg.lock()
+                .get_mut(expired_peer)
+                .expect("both test peers were registered")
+                .slots
+                .bbr_rtprop_ms = None;
+            assert!([&fast, &slow].into_iter().any(|peer| {
+                !reg.floor_has_preferred_unsaturated_server(block::Height(100), peer, None, false)
+            }));
+        }
     }
 
     #[test]

@@ -433,6 +433,11 @@ pub fn time_is_valid_at(
 /// >   `Σ orchard_actions + Σ (sapling_spends + sapling_outputs) + 2 * Σ joinsplits`.
 ///
 /// <https://zips.z.cash/zip-0218#shielded-pool-action-limits>
+///
+/// ZIP 218 names only Orchard actions. Zakura also counts Ironwood actions
+/// against the Orchard limit and in the global shielded budget, because NU6.3
+/// (ZIP 258) moves new Orchard-protocol value to the Ironwood pool. See
+/// [`ShieldedActionCounts::orchard_and_ironwood_actions`].
 pub fn shielded_action_limits_are_valid<'a>(
     transactions: impl IntoIterator<Item = &'a Arc<Transaction>>,
     height: Height,
@@ -450,9 +455,9 @@ pub fn shielded_action_limits_are_valid<'a>(
             ShieldedActionCounts::saturating_add,
         );
 
-    if totals.orchard_actions > ORCHARD_BLOCK_ACTION_LIMIT {
+    if totals.orchard_and_ironwood_actions > ORCHARD_BLOCK_ACTION_LIMIT {
         return Err(TransactionError::OrchardActionsExceedBlockLimit {
-            actions: totals.orchard_actions,
+            actions: totals.orchard_and_ironwood_actions,
             limit: ORCHARD_BLOCK_ACTION_LIMIT,
         });
     }

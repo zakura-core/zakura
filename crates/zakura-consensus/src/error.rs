@@ -272,7 +272,9 @@ pub enum TransactionError {
     #[error("wrong tx format: tx version is ≥ 5, but `nConsensusBranchId` is missing")]
     MissingConsensusBranchId,
 
-    #[error("Orchard action count {actions} exceeds the per-block limit of {limit}")]
+    #[error(
+        "Orchard and Ironwood action count {actions} exceeds the per-block Orchard limit of {limit}"
+    )]
     OrchardActionsExceedBlockLimit { actions: u32, limit: u32 },
 
     #[error("Sapling spends + outputs count {ios} exceeds the per-block limit of {limit}")]
@@ -283,7 +285,7 @@ pub enum TransactionError {
 
     #[error(
         "shielded cost {cost} \
-         (Orchard actions + Sapling spends + Sapling outputs + 2 * Sprout JoinSplits) \
+         (Orchard and Ironwood actions + Sapling spends + Sapling outputs + 2 * Sprout JoinSplits) \
          exceeds the per-block global shielded budget of {limit}"
     )]
     ShieldedCostExceedsBlockBudget { cost: u32, limit: u32 },

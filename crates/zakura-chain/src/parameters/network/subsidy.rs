@@ -420,8 +420,14 @@ pub fn halving(height: Height, network: &Network) -> u32 {
     // fractions with the common denominator factored out, so it stays in integer
     // arithmetic no matter how many spacing eras a network has. ZIP 218 adds a
     // third era at NU7.
+    //
+    // The spec's first term is `BlossomActivationHeight - SlowStartShift`
+    // pre-Blossom blocks, which is negative when Blossom activates below
+    // `SlowStartShift`. So the sum starts at `-SlowStartShift` pre-Blossom blocks
+    // instead of clamping each era at `SlowStartShift`.
     let pre_blossom_spacing_seconds = NetworkUpgrade::Genesis.target_spacing().num_seconds();
-    let mut total_block_seconds: HeightDiff = 0;
+    let mut total_block_seconds: HeightDiff =
+        -HeightDiff::from(slow_start_shift.0) * pre_blossom_spacing_seconds;
 
     let mut eras = NetworkUpgrade::target_spacings(network)
         .filter(|(era_start, _)| *era_start <= height)
@@ -432,14 +438,17 @@ pub fn halving(height: Height, network: &Network) -> u32 {
             .peek()
             .map(|(next_start, _)| *next_start)
             .unwrap_or(height);
-        let era_blocks = (era_end - era_start.max(slow_start_shift)).max(0);
-        total_block_seconds += era_blocks * era_spacing.num_seconds();
+        total_block_seconds += (era_end - era_start) * era_spacing.num_seconds();
     }
 
     let pre_blossom_denominator =
         network.pre_blossom_halving_interval() * pre_blossom_spacing_seconds;
 
+    // The sum is negative just above `SlowStartShift` when Blossom activates
+    // below it. The spec's floor then gives a negative index, which has no
+    // meaning, so this returns zero there.
     (total_block_seconds / pre_blossom_denominator)
+        .max(0)
         .try_into()
         .expect("halving index is non-negative and fits in u32")
 }

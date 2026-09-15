@@ -27,6 +27,7 @@ use tracing::Instrument;
 use zakura_chain::{
     block::{self, Height, HeightDiff},
     chain_tip::ChainTip,
+    parameters::Network,
 };
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state as zs;
@@ -37,7 +38,7 @@ use crate::components::{
         legacy_trace::{
             LegacyBlockOutcome, LegacyDiagnosticSnapshot, LegacySyncTrace, LegacyTaskState,
         },
-        BLOCK_DOWNLOAD_TIMEOUT, FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT,
+        lookahead_limit_multiplier, BLOCK_DOWNLOAD_TIMEOUT, FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT,
         FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT_LIMIT,
     },
 };
@@ -301,6 +302,9 @@ where
     /// The configured lookahead limit, after applying the minimum limit.
     lookahead_limit: usize,
 
+    /// The configured network, which sets the target spacing for the lookahead limit.
+    chain_network: Network,
+
     /// The largest block height for the checkpoint verifier, based on the current config.
     max_checkpoint_height: Height,
 
@@ -411,18 +415,21 @@ where
     /// `verifier` services.
     ///
     /// Uses the `latest_chain_tip` and `lookahead_limit` to drop blocks
-    /// that are too far ahead of the current state tip.
+    /// that are too far ahead of the current state tip. The `chain_network`
+    /// target spacing at the tip scales the `lookahead_limit`.
     /// Uses `max_checkpoint_height` to work around a known block timeout (#5125).
     ///
     /// The [`Downloads`] stream is agnostic to the network policy, so retry and
     /// timeout limits should be applied to the `network` service passed into
     /// this constructor.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         network: ZN,
         verifier: ZV,
         latest_chain_tip: ZSTip,
         past_lookahead_limit_sender: watch::Sender<bool>,
         lookahead_limit: usize,
+        chain_network: Network,
         max_checkpoint_height: Height,
         trace: LegacySyncTrace,
     ) -> Self {
@@ -434,6 +441,7 @@ where
             verifier,
             latest_chain_tip,
             lookahead_limit,
+            chain_network,
             max_checkpoint_height,
             past_lookahead_limit_sender: Arc::new(std::sync::Mutex::new(
                 past_lookahead_limit_sender,
@@ -561,6 +569,7 @@ where
         let latest_chain_tip = self.latest_chain_tip.clone();
 
         let lookahead_limit = self.lookahead_limit;
+        let chain_network = self.chain_network.clone();
         let max_checkpoint_height = self.max_checkpoint_height;
 
         let past_lookahead_limit_sender = self.past_lookahead_limit_sender.clone();
@@ -650,6 +659,10 @@ where
                 // existing lookahead and behind-tip policies to hash availability: a chain tip
                 // reporting a height but not yet a hash would fall into the no-tip regime.
                 let best_tip = latest_chain_tip.best_tip_height_and_hash();
+
+                // The target spacing at the tip scales the lookahead limit.
+                let lookahead_limit = lookahead_limit
+                    * tip_height.map_or(1, |tip_height| lookahead_limit_multiplier(&chain_network, tip_height));
 
                 let (lookahead_drop_height, lookahead_pause_height, lookahead_reset_height) = if let Some(tip_height) = tip_height {
                     // Scale the height limit with the lookahead limit,

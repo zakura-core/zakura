@@ -2,34 +2,34 @@
 
 The September 8–9, 2026 experiments test subscription allocation, proposer
 seeding, connected relay graphs, bounded fallback, and TCP delivery feedback.
-They do not establish production congestion control or sustained 50,000 TPS.
-The [design](dogwood.md) explains the tradeoffs; the
+They do not establish production congestion control or sustained 50,000 TPS. The
+[design](dogwood.md) explains the tradeoffs; the
 [spec](../specs/dogwood.md#parameter-registry) owns parameter definitions.
 
 The experiment source and raw results remain on the local branch
-`local/dogwood-experiments-20260908`. PR #901 contains documentation only.
-The local worktree is `zakura.dogwood-experiments`, alongside the docs worktree.
-Its `docs/experiments/dogwood` directory retains the September 5 experiments
-and adds the scripts and result directories named below.
+`local/dogwood-experiments-20260908`. PR #901 contains documentation only. The
+local worktree is `zakura.dogwood-experiments`, alongside the docs worktree. Its
+`docs/experiments/dogwood` directory retains the September 5 experiments and
+adds the scripts and result directories named below.
 
 ## Submission timestamps, nonce echoes, and shared credit
 
 `tcp_timing_credit.py` tests sender submission timestamps with nonce-echo
 calibration over four real TCP connections. It runs in a disposable network
-namespace with a shared 100 Mbps loopback queue. The two matrices configure
-5 ms or 25 ms delay, producing minimum echo RTTs near 10 ms or 50 ms.
-Supplier application pacing offers 80/40/20/10 Mbps. Each run releases 160
-synthetic bodies at 32 ms intervals, with four required 64 KiB parts and five
-available parts. This offers 65.536 Mbps of body data before redundancy.
+namespace with a shared 100 Mbps loopback queue. The two matrices configure 5 ms
+or 25 ms delay, producing minimum echo RTTs near 10 ms or 50 ms. Supplier
+application pacing offers 80/40/20/10 Mbps. Each run releases 160 synthetic
+bodies at 32 ms intervals, with four required 64 KiB parts and five available
+parts. This offers 65.536 Mbps of body data before redundancy.
 
 Two alternating proposer scopes maintain separate standing part masks and
-receiver-measured route histories. The supplier delays upstream availability
-by 2 ms for its nearby proposer and 35 ms for the other proposer. These are
-synthetic entry-point delays, not geographic network measurements. Every
-300 ms, the receiver can change future masks using delivery rate and local
-per-proposer arrival history. Existing bodies retain their assignments.
-Occasional extra part subscriptions probe idle suppliers. Both proposers share
-each connection's payload credit, calibration state, and delivery-rate estimate.
+receiver-measured route histories. The supplier delays upstream availability by
+2 ms for its nearby proposer and 35 ms for the other proposer. These are
+synthetic entry-point delays, not geographic network measurements. Every 300 ms,
+the receiver can change future masks using delivery rate and local per-proposer
+arrival history. Existing bodies retain their assignments. Occasional extra part
+subscriptions probe idle suppliers. Both proposers share each connection's
+payload credit, calibration state, and delivery-rate estimate.
 
 The receiver sends an unpredictable 64-bit nonce every 100 ms. The supplier
 echoes the nonce with its submission timestamp on the same TCP connection as
@@ -52,33 +52,33 @@ The experiment compares three policies:
 
 Every sample needs at least four parts. Bytes divided by the larger of sender
 and receiver spans bounds the sample by observed receiver delivery. A recent
-maximum supplies the rate estimate. A fixed future timestamp offset cancels
-in sender-span differences. Compression of sender spacing cannot push this
-sample above the receiver rate, although compressed receiver arrivals remain
-a source of estimation error when sender timing is dishonest.
+maximum supplies the rate estimate. A fixed future timestamp offset cancels in
+sender-span differences. Compression of sender spacing cannot push this sample
+above the receiver rate, although compressed receiver arrivals remain a source
+of estimation error when sender timing is dishonest.
 
 The candidate targets twice the estimated bandwidth-delay product. It limits
 credit to 128 KiB–2 MiB per peer and starts at 256 KiB. It raises the limit by
 at most 64 KiB per update, only after delivering at least half the current
 credit while demand reached 75% of that credit. Rising local RTT or estimated
 transit delay lowers the target. Payload arrival replenishes spent credit
-immediately; the receiver does not revoke outstanding grants when lowering
-the limit. These rules form an experimental controller, not BBR conformance.
+immediately; the receiver does not revoke outstanding grants when lowering the
+limit. These rules form an experimental controller, not BBR conformance.
 
 The attack matrix changes peer zero's part timestamps by 8 or 100 ms, compresses
 timestamp spacing, or forges both echo and part timestamps. A separate pair
-compares an honest 10 Mbps supplier with the same supplier delaying each echo
-by 80 ms. Honest scenarios include upstream stalls and an 80-to-5 Mbps upload
-drop from two to four seconds. The controller cannot use configured rates or
-the scenario label. Each run reports all released bodies, completion within
-800 ms and 1,200 ms, peak credit, route changes, and timestamp rejection counts.
+compares an honest 10 Mbps supplier with the same supplier delaying each echo by
+80 ms. Honest scenarios include upstream stalls and an 80-to-5 Mbps upload drop
+from two to four seconds. The controller cannot use configured rates or the
+scenario label. Each run reports all released bodies, completion within 800 ms
+and 1,200 ms, peak credit, route changes, and timestamp rejection counts.
 
 The final archive contains 81 low-RTT runs, 63 longer-RTT runs, and nine actual
-network-drop runs. The network-drop case changes the shared qdisc from 100 to
-50 Mbps at two seconds and restores 100 Mbps at four seconds. This differs
-from the supplier-pacing drop, which occurs before submission. Each table cell
-below gives **completion within 800 ms / completion within 1,200 ms**, out of
-480 released bodies across three repetitions.
+network-drop runs. The network-drop case changes the shared qdisc from 100 to 50
+Mbps at two seconds and restores 100 Mbps at four seconds. This differs from the
+supplier-pacing drop, which occurs before submission. Each table cell below
+gives **completion within 800 ms / completion within 1,200 ms**, out of 480
+released bodies across three repetitions.
 
 | Configured queue delay | Scenario | Receiver RTT | Unchecked timestamps | Echo-checked timestamps |
 | --- | --- | --- | --- | --- |
@@ -90,8 +90,8 @@ below gives **completion within 800 ms / completion within 1,200 ms**, out of
 | 25 ms | Supplier pacing drop | 319 / 371 | 306 / 349 | 309 / 345 |
 | 25 ms | Actual network drop | 297 / 359 | 271 / 335 | 276 / 345 |
 
-Sender timing helps the longer-RTT upstream-gap case in these repetitions.
-It does not consistently improve delivery when capacity drops. The 50 Mbps
+Sender timing helps the longer-RTT upstream-gap case in these repetitions. It
+does not consistently improve delivery when capacity drops. The 50 Mbps
 network-drop interval cannot sustain the 65.536 Mbps body load even without
 redundancy. All policies lose timely completions. In the longer-RTT baseline,
 mean run p95 is 292.4 ms with receiver-only sampling and 339.1 ms with checked
@@ -99,15 +99,15 @@ timestamps. The three repetitions and observed variation do not establish a
 general performance advantage for either estimator.
 
 The low-RTT runs mostly hold credit at its 128 KiB minimum after startup. The
-longer-RTT baseline exercises growth: peak peer-zero authorization reaches
-896 KiB under receiver-only and checked timestamp policies. During the actual
+longer-RTT baseline exercises growth: peak peer-zero authorization reaches 896
+KiB under receiver-only and checked timestamp policies. During the actual
 network drop, the first checked run reduces peer-zero's configured credit from
 about 808 KiB before the drop to 158 KiB during it, then grows again after
 capacity returns. Local echo RTT and delivered load contribute to that response;
 the experiment does not attribute it solely to sender timestamps.
 
-Echo calibration rejects impossible claims but accepts some forged timing.
-The following counts cover peer-zero part timestamps under the checked policy:
+Echo calibration rejects impossible claims but accepts some forged timing. The
+following counts cover peer-zero part timestamps under the checked policy:
 
 | Remote timestamp behavior | Rejected / received, 5 ms queue delay | Rejected / received, 25 ms queue delay |
 | --- | --- | --- |
@@ -123,12 +123,12 @@ timing metadata. No other supplier's timestamps fail validation in these runs.
 
 Delayed echoes expose a separate weakness in application RTT. At 25 ms queue
 delay, adding 80 ms of echo processing delay raises the slow supplier's minimum
-RTT from about 50 to 130 ms. Its peak authorized credit rises from 256 to
-320 KiB under all three policies. Under checked timestamps, mean configured
-credit rises from about 142 to 311 KiB over the recorded control updates.
-The nonce proves that the reply follows the challenge; it does not prove
-prompt processing or physical propagation delay. Calibration therefore cannot
-guarantee that an attacker receives no excess credit.
+RTT from about 50 to 130 ms. Its peak authorized credit rises from 256 to 320
+KiB under all three policies. Under checked timestamps, mean configured credit
+rises from about 142 to 311 KiB over the recorded control updates. The nonce
+proves that the reply follows the challenge; it does not prove prompt processing
+or physical propagation delay. Calibration therefore cannot guarantee that an
+attacker receives no excess credit.
 
 All 153 runs finish without harness errors or uncredited payloads. No peer
 exceeds the 2 MiB authorization cap or the 256-part supplier queue cap. The
@@ -136,14 +136,15 @@ local suite passes 91 tests, including nonce replay rejection, asymmetric-delay
 offset bounds, receiver-bounded rate samples, forged offset acceptance, and
 credit growth limits. Raw results, source snapshots, hashes, image IDs, and
 commands remain in `2026-09-11-timing-credit-final`,
-`2026-09-11-timing-credit-long-rtt`, and `2026-09-11-timing-credit-network-drop`.
-`summarize_timing_credit.py` validates accounting and produces comparison tables.
+`2026-09-11-timing-credit-long-rtt`, and
+`2026-09-11-timing-credit-network-drop`. `summarize_timing_credit.py` validates
+accounting and produces comparison tables.
 
-These runs use synthetic payload hashes, not Dogwood proofs or coding work.
-They do not implement the specification's immutable grant protocol, preserve
-failure coverage during route changes, or bound all pending assignments by the
-payload credit limit. The report records pending assignment bytes separately.
-The results support further testing of submission timing for upstream-limited
+These runs use synthetic payload hashes, not Dogwood proofs or coding work. They
+do not implement the specification's immutable grant protocol, preserve failure
+coverage during route changes, or bound all pending assignments by the payload
+credit limit. The report records pending assignment bytes separately. The
+results support further testing of submission timing for upstream-limited
 delivery. They do not justify treating echo calibration as timestamp
 authentication or selecting this controller for production.
 
@@ -159,15 +160,15 @@ Every 250 ms, the candidate checks up to 16 recent paired observations per
 receiver, mask bit, and supplier pair. Observations expire after one second.
 Four observations, an 80% win fraction, and a 20% median advantage permit a
 route change. The change takes effect after 20 ms and applies to future bodies.
-The candidate removes the losing supplier and adds the winner if needed.
-This can reduce two suppliers to one. Already released bodies retain their
+The candidate removes the losing supplier and adds the winner if needed. This
+can reduce two suppliers to one. Already released bodies retain their
 assignments and consume the same shared queues during the transition.
 
 The probe policy adds one temporary mask subscription per receiver every eight
 bodies. It prefers peers with no standing assignments, then considers other
-unassigned peer/mask pairs. Probe transfers share upload, ingress, and CPU queues
-with ordinary traffic. Each probe requests two or three 64 KiB parts in this
-fixed-size workload, at most about 1.2% of body bytes over eight releases.
+unassigned peer/mask pairs. Probe transfers share upload, ingress, and CPU
+queues with ordinary traffic. Each probe requests two or three 64 KiB parts in
+this fixed-size workload, at most about 1.2% of body bytes over eight releases.
 The experiment records probe authorization separately from actual transmitted
 bytes. It counts control bytes but models control delivery as a fixed delay.
 
@@ -177,10 +178,11 @@ cancellation delay. It does not supply a measured rate or a congestion failure.
 Upstream availability and receiver CPU delay can affect the comparison.
 
 The capacity follow-up holds source upload at 1,250 Mbps and receiver ingress at
-2,500 Mbps. It offers 819.2 Mbps of body data across 16 relays. Each run releases
-320 bodies of 2 MiB with 25% parity. Three seeds per policy produce 15,360
-receiver/body targets for each row. All traffic, including repair and probes,
-consumes the shared data queues. CPU costs remain the earlier model assumptions.
+2,500 Mbps. It offers 819.2 Mbps of body data across 16 relays. Each run
+releases 320 bodies of 2 MiB with 25% parity. Three seeds per policy produce
+15,360 receiver/body targets for each row. All traffic, including repair and
+probes, consumes the shared data queues. CPU costs remain the earlier model
+assumptions.
 
 | Relay upload | Policy | Complete within 400 ms | Mean run p95, completed bodies | Wire/body ratio |
 | --- | --- | --- | --- | --- |
@@ -193,14 +195,14 @@ consumes the shared data queues. CPU costs remain the earlier model assumptions.
 
 At 1,250 Mbps, static routes also leave 620 targets unfinished after 1,200 ms.
 Both adaptive policies complete all targets. At 1,750 Mbps, adaptation with
-probes reduces traffic by 18.3% while preserving normal completion. The wire/body
-ratio includes source and relay upload divided by released receiver/body bytes;
-it does not normalize by successful delivery. Failed static deliveries therefore
-make the 1,250 Mbps traffic comparison less useful than the completion result.
-The probes reach peers with no standing assignments 751 times at 1,250 Mbps
-and 715 times at 1,750 Mbps across the three seeds. These trials demonstrate
-that inactive peers receive opportunities; they do not show a steady-load
-advantage over adaptation without probes.
+probes reduces traffic by 18.3% while preserving normal completion. The
+wire/body ratio includes source and relay upload divided by released
+receiver/body bytes; it does not normalize by successful delivery. Failed static
+deliveries therefore make the 1,250 Mbps traffic comparison less useful than the
+completion result. The probes reach peers with no standing assignments 751 times
+at 1,250 Mbps and 715 times at 1,750 Mbps across the three seeds. These trials
+demonstrate that inactive peers receive opportunities; they do not show a
+steady-load advantage over adaptation without probes.
 
 The 54-run feedback matrix also tests 2,500 Mbps relay upload at full and half
 body load. The upload-drop scenario reduces four relays to one eighth of their
@@ -216,13 +218,13 @@ steady or heterogeneous upload. Each combination runs three seeds.
 | 409.6 Mbps | Adaptive, no probes | 97.03% | 15,360 / 15,360 |
 | 409.6 Mbps | Adaptive, probes | 96.93% | 15,360 / 15,360 |
 
-Probes improve the full-load normal-completion fraction slightly, but leave
-more targets unfinished at 1,200 ms than adaptation without probes. Half-load
-results show no consistent probe advantage. During the full-load drop, the
-probe policy makes four supplier additions across three seeds; most route
-changes still remove duplicate assignments. All policies complete every target
-normally in steady and heterogeneous service. At full steady load, adaptation
-with probes reduces the wire/body ratio from 2.360 to 1.790, about 24.2%.
+Probes improve the full-load normal-completion fraction slightly, but leave more
+targets unfinished at 1,200 ms than adaptation without probes. Half-load results
+show no consistent probe advantage. During the full-load drop, the probe policy
+makes four supplier additions across three seeds; most route changes still
+remove duplicate assignments. All policies complete every target normally in
+steady and heterogeneous service. At full steady load, adaptation with probes
+reduces the wire/body ratio from 2.360 to 1.790, about 24.2%.
 
 Together, the 72 runs support testing feedback-driven pruning further. They
 demonstrate occasional probes of inactive peers, but do not establish a robust
@@ -233,8 +235,8 @@ produces the comparison tables. The local suite passes 82 tests, including
 delayed route activation, unchanged assignments for existing bodies, stale
 evidence rejection, idle-peer probing, and static-baseline equivalence.
 
-This candidate does not implement the complete specification controller. It
-does not preserve single-supplier-loss coverage after pruning, fund probes from
+This candidate does not implement the complete specification controller. It does
+not preserve single-supplier-loss coverage after pruning, fund probes from
 validated completions, limit aggregate migrations per epoch, or adapt connection
 credit. A serialization model supplies contention and queue limits; it does not
 run TCP, Reed–Solomon, or consensus validation. FullBlock repair remains a
@@ -250,12 +252,13 @@ transaction, and 25% parity. It excludes the transaction-vector prefix, coding
 rounding, proofs, transport, and CPU. This calculation is not an experiment.
 
 The exact W1 field bound permits 52,428 data parts, or 3,435,921,408 body bytes.
-At the planning rate, that holds about 33.55392 seconds of transaction bytes.
-A 75-second example exceeds the field bound. Sending its codeword within five
+At the planning rate, that holds about 33.55392 seconds of transaction bytes. A
+75-second example exceeds the field bound. Sending its codeword within five
 seconds requires at least 15.36 Gbps of source upload. The 1.344 Gbps average
 capacity example needs at least 57.14 seconds for that transfer. Stripes cannot
 remove this serialization time. We must select the block interval and body size
-before testing the [latency target](dogwood.md#performance-targets) under the resulting burst load.
+before testing the [latency target](dogwood.md#performance-targets) under the
+resulting burst load.
 
 ## Reference codec scaling
 
@@ -283,9 +286,9 @@ cadence; source and receiver work belong to separate roles.
 
 Source means combine both arrival orders. Receiver time includes membership
 proofs, elimination, and re-encoding/root verification. It excludes consensus
-validation. The table excludes generator construction, which averages about
-1.2 seconds for the 64 MiB codeword and less than 0.1 ms for 2 MiB stripes.
-A new shape can require that construction even when prior shapes were cached.
+validation. The table excludes generator construction, which averages about 1.2
+seconds for the 64 MiB codeword and less than 0.1 ms for 2 MiB stripes. A new
+shape can require that construction even when prior shapes were cached.
 
 The 2 MiB cases fit the body cadence in this serial reference. Larger cases
 exceed it under parity-first reception. This supports 2 MiB as the next stripe
@@ -297,9 +300,9 @@ work. Its RSS values do not size production assembly memory.
 
 `stripe_scaling.cpp`, `run_stripe_scaling.py`, and `summarize_stripe_scaling.py`
 produce `results/2026-09-09-stripe-scaling`. The archive records source hashes,
-compiler/host details, raw process output, and summaries. The measured work
-also bounds interpretation of the earlier concurrent simulation: its fixed
-8 ms reconstruction cost and 0.02 ms proof cost are assumptions, not these
+compiler/host details, raw process output, and summaries. The measured work also
+bounds interpretation of the earlier concurrent simulation: its fixed 8 ms
+reconstruction cost and 0.02 ms proof cost are assumptions, not these
 measurements. The large-body profile still needs an outer commitment, bounded
 pipeline and retention, and an experiment at the selected block burst.
 
@@ -307,9 +310,9 @@ pipeline and retention, and an experiment at the selected block burst.
 
 The W1 follow-up fixes candidate payload bytes, tagged SHA-256 commitments,
 balanced 16-bit selection, and the metadata signature transcript. It preserves
-the whole-body codec. The profile separates seed permission from ordinary
-demand and gives each class its own inheritance action. Default scope cannot
-inherit. Both classes retain shared connection budgets and send-once records.
+the whole-body codec. The profile separates seed permission from ordinary demand
+and gives each class its own inheritance action. Default scope cannot inherit.
+Both classes retain shared connection budgets and send-once records.
 
 `wire_profile.py` emits six frame fixtures and checks their round trips. Tests
 cover all five message families, all selection classes, frame and field bounds,
@@ -337,8 +340,8 @@ bounds remain open. No result establishes sustained 50,000 TPS.
 
 ## Concurrent bodies and key binding
 
-The concurrent follow-up ran **128 streams of 120 synthetic 2 MiB bodies**.
-The 20.48 ms release interval supplies 819.2 Mbps of body bytes. It is a load
+The concurrent follow-up ran **128 streams of 120 synthetic 2 MiB bodies**. The
+20.48 ms release interval supplies 819.2 Mbps of body bytes. It is a load
 generator, not a selected consensus block interval. Each stream starts with
 routes and seed placement learned from one separate reference body.
 
@@ -373,8 +376,8 @@ codeword per body. These short traces do not establish long-run queue stability
 or end-to-end 50,000 TPS.
 
 Capacity planning must account for the largest relay, not only the network
-average. A relay serving three body copies at this workload needs about
-2.46 Gbps before additional overhead or utilization headroom. The retained-path
+average. A relay serving three body copies at this workload needs about 2.46
+Gbps before additional overhead or utilization headroom. The retained-path
 candidate lowers that cost in the steady cases, but does not protect a deadline
 when service changes.
 
@@ -399,11 +402,11 @@ completion is 95.9% and 95.5%, respectively. Fallback neither hides the missed
 normal deadline nor guarantees recovery within its caps. Do not select this
 restoration rule as a complete congestion controller.
 
-The source and CPU slowdowns also cause misses. Some disturbances reduce a
-node below the workload's required service rate. A routing policy cannot repair
-that capacity deficit. The model enforces upload queue and repair caps, but
-ingress and CPU queues are service-delay models without transport backpressure
-or production memory admission. Retained paths remain a candidate under fixed
+The source and CPU slowdowns also cause misses. Some disturbances reduce a node
+below the workload's required service rate. A routing policy cannot repair that
+capacity deficit. The model enforces upload queue and repair caps, but ingress
+and CPU queues are service-delay models without transport backpressure or
+production memory admission. Retained paths remain a candidate under fixed
 mapping and seed placement, not a deployed stripe profile.
 
 ### Coinbase key commitment probe
@@ -416,15 +419,15 @@ data in [ZIP 244](https://zips.z.cash/zip-0244).
 
 The candidate script is `OP_RETURN`, a direct 40-byte push, `DOGWOOD`, byte
 `01`, and a 32-byte key. The proof must establish coinbase position zero against
-the admitted header. A txid proof cannot authenticate a key carried only in
-the V5 input script. The probe rejects duplicate matching outputs, nonzero
+the admitted header. A txid proof cannot authenticate a key carried only in the
+V5 input script. The probe rejects duplicate matching outputs, nonzero
 commitment value, wrong position, stale roots, truncation, and noncanonical
 counts. Its example coinbase is 119 bytes. It does not check proof of work,
 metadata signatures, rewards, shielded coinbases, or post-Tachyon transaction
 formats. The chain adapter remains an implementation gate.
 
-The current local suite passes **60 tests**. Results and source snapshots are
-in `2026-09-09-concurrent-push`, `2026-09-09-concurrent-upload-change`, and
+The current local suite passes **60 tests**. Results and source snapshots are in
+`2026-09-09-concurrent-push`, `2026-09-09-concurrent-upload-change`, and
 `2026-09-09-coinbase-binding` under the local experiment results directory.
 
 ## Connected-network and transport follow-up
@@ -449,10 +452,10 @@ Source upload is 1 Gbps. Relay upload and ingress are 1.6/2 Gbps, either equal
 or divided by 1/2/4/8 across peers. The model serializes upload, ingress, and
 verification queues. Proof verification costs 0.02 ms per part; reconstruction
 costs 8 ms. These CPU values are assumptions. Metadata is preinstalled, parts
-pay 5 ms propagation, and control messages pay 20 ms. Fallback starts at
-400 ms, requests at most `2k` extra copies per receiver, and ends at 1,200 ms.
-Only completion advertisements authorize pull attempts. Failed peers remain
-silent; a separate case sends false completion advertisements.
+pay 5 ms propagation, and control messages pay 20 ms. Fallback starts at 400 ms,
+requests at most `2k` extra copies per receiver, and ends at 1,200 ms. Only
+completion advertisements authorize pull attempts. Failed peers remain silent; a
+separate case sends false completion advertisements.
 
 The following healthy, equal-rate cases use degree eight and four source
 neighbors. Values average eight distinct route seeds. The 16-relay cases also
@@ -479,9 +482,9 @@ one-supplier-loss coverage check do not preserve global delivery when several
 nodes prune routes. `seed_offer_routes.py` adds 192 sequences. Its source sends
 each seed only to an eligible neighbor with outgoing demand for that mask bit.
 Every static two-supplier configuration then completes normally in the tested
-six route seeds. Coverage-preserving pruning still causes fallback in three
-of eight configuration groups. Physical connectivity, local coverage, and
-past wins therefore do not establish a safe pruning rule.
+six route seeds. Coverage-preserving pruning still causes fallback in three of
+eight configuration groups. Physical connectivity, local coverage, and past wins
+therefore do not establish a safe pruning rule.
 
 `witness_pruning.py` tests a separate stripe candidate. Each node retains every
 incoming supplier that delivered a distinct part before its reconstruction of
@@ -500,21 +503,21 @@ directly. Changing the mapping, seed placement, codeword shape, or availability
 invalidates the reference argument. The earlier witness directory varied the
 mapping and does not support that argument.
 
-These simulations omit transport backpressure and real coding work. Direct
-pull responses have separate byte counters; later forwarding of repaired parts
-still counts as relay forwarding. Normal success always requires completion
-before the fallback timer. The models do not implement every grant and
-controller rule.
+These simulations omit transport backpressure and real coding work. Direct pull
+responses have separate byte counters; later forwarding of repaired parts still
+counts as relay forwarding. Normal success always requires completion before the
+fallback timer. The models do not implement every grant and controller rule.
 
 ### Real TCP feedback
 
 `run_tcp_feedback.py` ran 45 isolated TCP experiments: five scenarios, three
 allocation policies, and three repetitions. Four suppliers use application
-pacing at 80/40/20/10 Mbps. They share a 100 Mbps loopback qdisc with 5 ms delay.
-Each run releases 120 bodies at 25 ms intervals, with four required 64 KiB parts
-and five available parts. The capacity-drop case reduces the fastest supplier
-to 5 Mbps after 1.5 seconds. The application-limited case inserts 40 ms stalls.
-The loss and ECN cases configure 0.2% netem loss; ECN marks eligible packets.
+pacing at 80/40/20/10 Mbps. They share a 100 Mbps loopback qdisc with 5 ms
+delay. Each run releases 120 bodies at 25 ms intervals, with four required 64
+KiB parts and five available parts. The capacity-drop case reduces the fastest
+supplier to 5 Mbps after 1.5 seconds. The application-limited case inserts 40 ms
+stalls. The loss and ECN cases configure 0.2% netem loss; ECN marks eligible
+packets.
 
 The allocator compares equal assignment, receiver arrival-rate feedback, and
 feedback using the larger of sender and receiver spans. It assigns exact parts
@@ -533,19 +536,19 @@ Baseline mean per-run p95 completion falls from 1,011.8 ms with equal assignment
 to 82.3 ms with receiver-rate feedback. That p95 includes completed bodies only;
 the table includes every released body. Sender spans provide no consistent
 advantage and perform worse during application stalls. Keep sender timestamps
-out of the baseline wire profile. Continue testing receiver-local feedback.
-TCP counters confirm ECN marks, but retransmission counts are small. These
-short loopback runs do not establish WAN loss behavior, full controller
-stability, or throughput at the post-Tachyon target.
+out of the baseline wire profile. Continue testing receiver-local feedback. TCP
+counters confirm ECN marks, but retransmission counts are small. These short
+loopback runs do not establish WAN loss behavior, full controller stability, or
+throughput at the post-Tachyon target.
 
 ### Grants and remaining decisions
 
 `grant_model.py` exhausts 380 states and 1,270 transitions for a finite
 two-index grant model. It checks queueing, cancellation, crossed `FullBlock`,
 retirement, and send-once accounting. Separate tests cover exploration credit,
-loaded cohorts, failure precedence, migration overlap, and final coverage.
-That checkpoint passed 45 tests. This is bounded state exploration, not a proof
-of the full protocol or multi-connection controller.
+loaded cohorts, failure precedence, migration overlap, and final coverage. That
+checkpoint passed 45 tests. This is bounded state exploration, not a proof of
+the full protocol or multi-connection controller.
 
 Retain two-supplier startup coverage where budgets allow it. Do not select
 majority-based pruning as a demonstrated path to one-copy throughput. Keep
@@ -564,42 +567,42 @@ adoption. These experiments do not complete that profile.
 The local result directories are `2026-09-09-connected-push`,
 `2026-09-09-route-pruning-final`, `2026-09-09-seed-offer-routes`,
 `2026-09-09-witness-pruning-final`, `2026-09-09-tcp-feedback-run`, and
-`2026-09-09-grants` under `docs/experiments/dogwood/results`.
-They retain source snapshots and provenance. The local README records commands.
+`2026-09-09-grants` under `docs/experiments/dogwood/results`. They retain source
+snapshots and provenance. The local README records commands.
 
 ## Bounded-recovery follow-up
 
 The follow-up ran **2,448 deterministic single-block simulations** and eight
 reference codec configurations. The simulations replace the earlier timeless,
 all-index relay closure with sparse per-index subscriptions and serialized
-upload. They advance the bootstrap and small-block TODOs; transport feedback
-and controller convergence remain untested here.
+upload. They advance the bootstrap and small-block TODOs; transport feedback and
+controller convergence remain untested here.
 
 ### Method
 
-The recovery sweep covers one receiver and three eight-receiver topologies:
-a star, two branches with bridge peers, and a mesh with alternate paths.
-The proposer seeds each encoded index once, spread evenly across its neighbors.
-Each relay index selects one random non-source neighbor. Seeds 0–11 select
-those subscriptions. The proposer has 1 Gbps upload; relays have either
-200 Mbps each or repeated 800/400/200/100 Mbps upload rates.
-These rates constrain aggregate node upload, not independently measured links.
-The one-copy comparison does not implement the draft's startup coverage policy.
+The recovery sweep covers one receiver and three eight-receiver topologies: a
+star, two branches with bridge peers, and a mesh with alternate paths. The
+proposer seeds each encoded index once, spread evenly across its neighbors. Each
+relay index selects one random non-source neighbor. Seeds 0–11 select those
+subscriptions. The proposer has 1 Gbps upload; relays have either 200 Mbps each
+or repeated 800/400/200/100 Mbps upload rates. These rates constrain aggregate
+node upload, not independently measured links. The one-copy comparison does not
+implement the draft's startup coverage policy.
 
 We compare no repair, header-parent repair, and repair that tries alternatives
 after the first attempt. A failed peer remains silent from the start; metadata
-and the parent tree are preinstalled. Repairs start at 100/300/600 ms and pay
-20 ms control delay. Each receiver can add at most `2k` requests. Source credit
-allows either `n` parts or `n + nodes*k` parts, including initial seeds.
-The experiment ends at 1,200 ms and counts unfinished receivers as failures.
+and the parent tree are preinstalled. Repairs start at 100/300/600 ms and pay 20
+ms control delay. Each receiver can add at most `2k` requests. Source credit
+allows either `n` parts or `n + nodes*k` parts, including initial seeds. The
+experiment ends at 1,200 ms and counts unfinished receivers as failures.
 
-The model forwards a complete part after upload plus 5 ms propagation.
-It assumes unlimited ingress, instant verification and regeneration, and one
-valid block. It charges 384 bytes per part for proof/framing, includes sends
-to failed peers, and allows a 20 ms cancellation tail after reconstruction.
-It does not simulate full-block fallback, transport loss, competing blocks,
-negotiated grants, or adaptive routes. Completion establishes reconstruction
-in this model, not verified end-to-end production delivery.
+The model forwards a complete part after upload plus 5 ms propagation. It
+assumes unlimited ingress, instant verification and regeneration, and one valid
+block. It charges 384 bytes per part for proof/framing, includes sends to failed
+peers, and allows a 20 ms cancellation tail after reconstruction. It does not
+simulate full-block fallback, transport loss, competing blocks, negotiated
+grants, or adaptive routes. Completion establishes reconstruction in this model,
+not verified end-to-end production delivery.
 
 ### Recovery result
 
@@ -618,12 +621,12 @@ Source MiB includes seeds, repair, and cancellation tails.
 | Mesh, failed parent | Reserve / alternatives | 12/12 | 355.8 | 5.501 |
 | Bridge cut, failed bridge | Reserve / alternatives | 0/12 | — | 3.269 |
 
-The star requires eight body copies across eight separate source cuts.
-Its 16.094 MiB result matches that payload lower bound plus framing.
-The healthy mesh can trade repair delay for lower source upload.
-Alternatives recover the connected mesh after parent failure. They cannot
-recover the three honest receivers disconnected by the failed bridge.
-These cases do not support an unconditional one-codeword bootstrap guarantee.
+The star requires eight body copies across eight separate source cuts. Its
+16.094 MiB result matches that payload lower bound plus framing. The healthy
+mesh can trade repair delay for lower source upload. Alternatives recover the
+connected mesh after parent failure. They cannot recover the three honest
+receivers disconnected by the failed bridge. These cases do not support an
+unconditional one-codeword bootstrap guarantee.
 
 ### Small blocks, parity, and portions
 
@@ -631,8 +634,8 @@ The mesh sweep varies `k=1/2/4/8/32`, 16/64 KiB parts, 25%/100% parity,
 one/two/four-part service portions, and systematic-first/parity-first seeding.
 All 1,440 runs finish with the repair reserve. At `k=1`, parity rounding makes
 both ratios identical. The table uses 64 KiB parts, one-part portions, and
-systematic-first seeding.
-Times include repair; byte totals cover the whole network's source or relays.
+systematic-first seeding. Times include repair; byte totals cover the whole
+network's source or relays.
 
 | Body | Parity | Completion ms | Source MiB | Relay MiB |
 | --- | --- | --- | --- | --- |
@@ -642,21 +645,21 @@ Times include repair; byte totals cover the whole network's source or relays.
 | 512 KiB | 100% | 71.3 | 1.058 | 6.470 |
 
 More parity can reduce total source bytes by avoiding repair copies, while
-increasing relay bytes. Smaller parts also change that tradeoff: at 512 KiB
-and 100% parity, 16 KiB parts finish in 56.9 ms with 7.024 MiB relay upload.
-A threshold stated only as `k<=8` changes its body-size meaning when `S` changes.
+increasing relay bytes. Smaller parts also change that tradeoff: at 512 KiB and
+100% parity, 16 KiB parts finish in 56.9 ms with 7.024 MiB relay upload. A
+threshold stated only as `k<=8` changes its body-size meaning when `S` changes.
 
 Across the equally weighted sweep, mean completion is 93.3/93.7/94.1 ms for
 one/two/four-part portions with systematic-first seeding. Parity-first gives
-92.3/92.5/93.0 ms. These small differences do not select a larger portion or
-an ordering rule. Portions change local service fairness here; they add no
-wire aggregation or measured CPU savings.
+92.3/92.5/93.0 ms. These small differences do not select a larger portion or an
+ordering rule. Portions change local service fairness here; they add no wire
+aggregation or measured CPU savings.
 
 The codec run uses the existing 64 KiB reference kernel, one warm-up, and three
-retained repetitions per configuration on an unreserved host. At 512 KiB,
-the sum of median encoding and root times rises from 0.71 ms at 25% parity to
-1.77 ms at 100%. At 2 MiB it rises from 6.38 to 21.70 ms. These CPU measurements
-are separate from the network simulation; we have not tested their queueing
+retained repetitions per configuration on an unreserved host. At 512 KiB, the
+sum of median encoding and root times rises from 0.71 ms at 25% parity to 1.77
+ms at 100%. At 2 MiB it rises from 6.38 to 21.70 ms. These CPU measurements are
+separate from the network simulation; we have not tested their queueing
 interaction. They argue against extrapolating the small-block result to all
 block sizes.
 
@@ -677,22 +680,24 @@ block sizes.
   caps, and the target block interval still require profile decisions.
 
 Run `python3 bounded_overlay.py results/my-bounded-overlay` and
-`python3 summarize_bounded.py results/my-bounded-overlay` in the local experiment
-directory. Final raw runs, summaries, source snapshots, and environment records
-are in `results/2026-09-08-bounded-overlay-final`; codec CSVs and exact commands
-are in `results/2026-09-08-small-codec`. All 25 Python tests pass, including
-analytic serialization and source-cut checks, replay, credit, and deadline tests.
+`python3 summarize_bounded.py results/my-bounded-overlay` in the local
+experiment directory. Final raw runs, summaries, source snapshots, and
+environment records are in `results/2026-09-08-bounded-overlay-final`; codec
+CSVs and exact commands are in `results/2026-09-08-small-codec`. All 25 Python
+tests pass, including analytic serialization and source-cut checks, replay,
+credit, and deadline tests.
 
 ## Congestion baseline
 
 The model releases 400 synthetic 2 MiB bodies at 20.48 ms intervals, equivalent
 to 50,000 transactions/s at 2 KiB each. Each body has 32 data parts and eight
 parity parts. Four suppliers offer 800/400/200/100 Mbps of usable upload; the
-receiver has 1,600 Mbps ingress. These are scenario inputs, not peer measurements.
-Balanced suppliers each offer 375 Mbps. The 1 Gbps case changes only ingress.
-The capacity-drop case reduces the 800 Mbps supplier to 50 Mbps halfway through
-the run, leaving only 750 Mbps aggregate upload. The source-delay case adds
-150 ms to upstream part availability without changing link capacity.
+receiver has 1,600 Mbps ingress. These are scenario inputs, not peer
+measurements. Balanced suppliers each offer 375 Mbps. The 1 Gbps case changes
+only ingress. The capacity-drop case reduces the 800 Mbps supplier to 50 Mbps
+halfway through the run, leaving only 750 Mbps aggregate upload. The
+source-delay case adds 150 ms to upstream part availability without changing
+link capacity.
 
 The half-load case uses 40.96 ms releases. The larger-body case uses 100 bodies
 of 8 MiB at 81.92 ms intervals to preserve the offered byte rate. Every case
@@ -707,30 +712,30 @@ uses at least four delivered parts to estimate bytes divided by the larger of
 sender and receiver time spans. It excludes the first part's bytes and weights
 the new sample by 0.5. Different sender clocks have constant offsets, which
 cancel in span differences. The experiment assumes honest timestamps at the
-start of idealized link service. Application transport-submission timestamps
-may provide a weaker signal.
+start of idealized link service. Application transport-submission timestamps may
+provide a weaker signal.
 
 The candidate assigns each new distinct part to the smallest estimated
 completion time: outstanding assigned bytes plus the new part, divided by the
-estimated delivery rate. All blocks share that outstanding-byte count. Its
-exact block assignments incur the modeled control delay. The informed policy
-uses the same allocator with current supplier capacities, including the drop.
-It knows information unavailable to the receiver; it is a comparison, not a
-proven optimum. Neither allocator implements the complete spec controller.
+estimated delivery rate. All blocks share that outstanding-byte count. Its exact
+block assignments incur the modeled control delay. The informed policy uses the
+same allocator with current supplier capacities, including the drop. It knows
+information unavailable to the receiver; it is a comparison, not a proven
+optimum. Neither allocator implements the complete spec controller.
 
-Each link serializes parts and serves block queues in round-robin order.
-The model bounds queues at 256 parts and models receiver ingress separately.
-It charges a 384-byte proof/framing allowance per part, including the candidate's
-eight-byte timestamp. It models 20 ms control delay and cancellation tails.
-At 400 ms, repair requests can add at most `2k` copies. At 1,200 ms, an unfinished
+Each link serializes parts and serves block queues in round-robin order. The
+model bounds queues at 256 parts and models receiver ingress separately. It
+charges a 384-byte proof/framing allowance per part, including the candidate's
+eight-byte timestamp. It models 20 ms control delay and cancellation tails. At
+400 ms, repair requests can add at most `2k` copies. At 1,200 ms, an unfinished
 block counts as fallback, not reconstruction. Queue drops discard modeled work;
 the model does not simulate reliable-transport retransmissions.
 
 The first comparison requests one copy of each encoded index outside challenges
 and repair. It disables extra failure-coverage routes for every policy. Four
-suppliers cannot satisfy the single-supplier-loss target with 25% parity and
-no duplicates. This comparison isolates allocation and is not a conformant
-coverage configuration. The parity comparison below restores that requirement.
+suppliers cannot satisfy the single-supplier-loss target with 25% parity and no
+duplicates. This comparison isolates allocation and is not a conformant coverage
+configuration. The parity comparison below restores that requirement.
 
 ### Results
 
@@ -782,16 +787,16 @@ relative to all offered bodies. It excludes separately recorded control bytes.
 The candidate improves allocation on unequal links in these traces. Equal
 allocation already performs well on balanced links. The candidate also spends
 more bytes by delivering more parity before cancellation. The 1 Gbps receiver
-case accumulates queues and drops work even when reconstruction succeeds.
-The capacity-drop case exceeds available service and produces substantial
-fallback under every policy. A low completed-only latency cannot hide those
-failures. These results do not select production parameters.
+case accumulates queues and drops work even when reconstruction succeeds. The
+capacity-drop case exceeds available service and produces substantial fallback
+under every policy. A low completed-only latency cannot hide those failures.
+These results do not select production parameters.
 
 ### Do sender timestamps explain the improvement?
 
 A paired follow-up keeps the candidate allocator and all 42 case/seed inputs
-fixed, but estimates rate from receiver arrival spans alone. It retains the
-same per-part framing allowance to isolate the measurement change.
+fixed, but estimates rate from receiver arrival spans alone. It retains the same
+per-part framing allowance to isolate the measurement change.
 
 | Scenario | Sender-span candidate p95 ms | Receiver-only p95 ms |
 | --- | ---: | ---: |
@@ -803,22 +808,23 @@ same per-part framing allowance to isolate the measurement change.
 | Half load | 52.9 | 53.1 |
 | Larger bodies | 85.4 | 85.2 |
 
-Receiver-only fallback under the capacity drop is 21.4%, compared with 21.1%
-for the sender-span candidate. Every other receiver-only case has zero fallback.
+Receiver-only fallback under the capacity drop is 21.4%, compared with 21.1% for
+the sender-span candidate. Every other receiver-only case has zero fallback.
 This test does not establish a timestamp benefit. The allocation rule explains
 most of the observed improvement over equal assignment in this model. The
 separate receive-compression test confirms that a sender span can guard against
-an inflated sample, but the network traces do not establish its deployment value.
+an inflated sample, but the network traces do not establish its deployment
+value.
 
 ## Parity versus duplicate subscriptions
 
-This comparison uses the same heterogeneous supplier rates and body workload.
-It runs six seeds for each parity ratio and allocator. Every allocation must
-retain at least `k` distinct parts after removing any one supplier's assignments.
-The allocator adds duplicate routes where parity and assignment diversity do
-not satisfy that test. Both policies use the same failure model and repair
-deadline. The test does not model an actual supplier failure or independent
-physical paths; it checks assignment coverage before measuring normal delivery.
+This comparison uses the same heterogeneous supplier rates and body workload. It
+runs six seeds for each parity ratio and allocator. Every allocation must retain
+at least `k` distinct parts after removing any one supplier's assignments. The
+allocator adds duplicate routes where parity and assignment diversity do not
+satisfy that test. Both policies use the same failure model and repair deadline.
+The test does not model an actual supplier failure or independent physical
+paths; it checks assignment coverage before measuring normal delivery.
 
 Proposer seed time below is an analytic lower bound for uploading the entire
 encoded codeword once over a 1 Gbps link. It excludes encoding, proofs, framing,
@@ -838,23 +844,23 @@ their times must not be added as if this experiment measured a complete path.
 | 100% | delivery_rate | 33.6 | 71.5 | 0.0 | 1.828 | 0.103 |
 
 Duplicate/body counts delivered duplicate payload relative to offered body
-bytes. More parity raises the proposer seeding lower bound. Fewer duplicates
-can reduce receiver traffic, but concentration on fast suppliers can require
+bytes. More parity raises the proposer seeding lower bound. Fewer duplicates can
+reduce receiver traffic, but concentration on fast suppliers can require
 duplicates even with substantial parity. Cancellation also means delivered
-wire/body can be below the full codeword ratio. No row establishes a network-wide
-optimum. The next comparison must include a proposer with limited upload,
-relay forwarding during seeding, direct proposer subscriptions, and concurrent
-receivers. Relays can regenerate parity after reconstruction, but relying on
-that path changes when parity becomes available.
+wire/body can be below the full codeword ratio. No row establishes a
+network-wide optimum. The next comparison must include a proposer with limited
+upload, relay forwarding during seeding, direct proposer subscriptions, and
+concurrent receivers. Relays can regenerate parity after reconstruction, but
+relying on that path changes when parity becomes available.
 
 ## Proposer seeding checks
 
-`seeding.py` separates first-hop scheduling from downstream reachability.
-It uses a 2 MiB body, 40 encoded parts, the same 384-byte framing allowance,
-and a 1 Gbps proposer upload limit. All parts are ready at time zero. Peer
-rates are fixed independent capacities and every peer grants any-index credit
-for up to 40 parts. No ordinary demand, competing blocks, propagation delay,
-CPU work, or transport startup consumes the modeled capacity.
+`seeding.py` separates first-hop scheduling from downstream reachability. It
+uses a 2 MiB body, 40 encoded parts, the same 384-byte framing allowance, and a
+1 Gbps proposer upload limit. All parts are ready at time zero. Peer rates are
+fixed independent capacities and every peer grants any-index credit for up to 40
+parts. No ordinary demand, competing blocks, propagation delay, CPU work, or
+transport startup consumes the modeled capacity.
 
 | Peers' usable Mbps | Optimal part counts | Optimal seed ms | Equal-assignment seed ms |
 | --- | --- | ---: | ---: |
@@ -862,25 +868,25 @@ CPU work, or transport startup consumes the modeled capacity.
 | 250/250/250/250 | 10/10/10/10 | 21.1 | 21.1 |
 | 800/400/200/100/20/5 | 22/11/5/2/0/0 | 21.1 | 632.8 |
 
-For `N` parts of `w` bytes, proposer byte rate `U`, peer byte rates `c[p]`,
-and credits `g[p]`, choose the `N` earliest slots `j*w/c[p]` with
-`1<=j<=g[p]`. The resulting counts minimize `max_p(a[p]*w/c[p])`: any earlier
-completion threshold contains fewer than `N` eligible service slots. The
-shared-upload lower bound is `N*w/U`. Pacing each connection at
-`a[p]*w/max(N*w/U, max_p(a[p]*w/c[p]))` meets both rate constraints, so the
-larger bound is attainable in this model. The checker verifies that construction
-and compares the result with exhaustive count allocations in 240 small cases,
-including credit caps. It also rejects insufficient total credit.
+For `N` parts of `w` bytes, proposer byte rate `U`, peer byte rates `c[p]`, and
+credits `g[p]`, choose the `N` earliest slots `j*w/c[p]` with `1<=j<=g[p]`. The
+resulting counts minimize `max_p(a[p]*w/c[p])`: any earlier completion threshold
+contains fewer than `N` eligible service slots. The shared-upload lower bound is
+`N*w/U`. Pacing each connection at `a[p]*w/max(N*w/U, max_p(a[p]*w/c[p]))` meets
+both rate constraints, so the larger bound is attainable in this model. The
+checker verifies that construction and compares the result with exhaustive count
+allocations in 240 small cases, including credit caps. It also rejects
+insufficient total credit.
 
 This objective seeds every chosen part once; it is not the earliest time a
 receiver can reconstruct from `k` parts. It does not justify trusting advertised
 capacity or omitting the only path to a downstream group.
 
-For reachability, the checker enumerates all connected labeled undirected
-graphs with two through five nodes and uses node zero as proposer. The proposer
-seeds five distinct parts disjointly among its direct peers for `k=4`.
-Every non-proposer edge subscribes to every index. A receiver forwards verified
-parts and regenerates the codeword after collecting four distinct indices.
+For reachability, the checker enumerates all connected labeled undirected graphs
+with two through five nodes and uses node zero as proposer. The proposer seeds
+five distinct parts disjointly among its direct peers for `k=4`. Every
+non-proposer edge subscribes to every index. A receiver forwards verified parts
+and regenerates the codeword after collecting four distinct indices.
 
 | Nodes | Connected graphs checked | Incomplete without repair | Complete with header-tree repair |
 | --- | ---: | ---: | ---: |
@@ -890,18 +896,18 @@ parts and regenerates the codeword after collecting four distinct indices.
 | 5 | 728 | 158 | 728 |
 
 For all 771 graphs, the result matches the component condition: remove the
-proposer, then each remaining component reconstructs exactly when it receives
-at least `k` distinct seeds. With fewer than `k`, forwarding cannot create
-enough independent information for an arbitrary body. With at least `k`,
-all-index forwarding eventually brings those seeds to every node in the
-component. This argument assumes honest forwarding, adequate credit, retained
-data, no prior body information, and fair service.
+proposer, then each remaining component reconstructs exactly when it receives at
+least `k` distinct seeds. With fewer than `k`, forwarding cannot create enough
+independent information for an arbitrary body. With at least `k`, all-index
+forwarding eventually brings those seeds to every node in the component. This
+argument assumes honest forwarding, adequate credit, retained data, no prior
+body information, and fair service.
 
 A separate counterexample uses a star with four leaves, `k=4`, and 100% parity.
 Each leaf gets one distinct data part and one distinct parity part. None can
 decode. Repair supplies two more parts per leaf, raising proposer upload from
-eight parts to sixteen. That equals the cut lower bound of four bodies' worth
-of independent information. Some parity at every peer is therefore insufficient.
+eight parts to sixteen. That equals the cut lower bound of four bodies' worth of
+independent information. Some parity at every peer is therefore insufficient.
 
 The header-tree repair closure succeeds in all enumerated graphs. Its parent
 relation reaches the source, so a parent can eventually serve a child's deficit
@@ -921,9 +927,9 @@ root. Its data includes nonzero high bytes. The decoder verifies membership
 before each insertion and ignores duplicate indices.
 
 A fresh 2 MiB, 25%-parity, parity-first codec run used one warm-up and three
-retained repetitions. At a 1 ms synthetic arrival gap, median remaining work
-was 24.8 ms for batch decoding, 19.3 ms for forward-only incremental decoding,
-and 8.0 ms for eager incremental decoding. The eager run moved about 5.9 ms of
+retained repetitions. At a 1 ms synthetic arrival gap, median remaining work was
+24.8 ms for batch decoding, 19.3 ms for forward-only incremental decoding, and
+8.0 ms for eager incremental decoding. The eager run moved about 5.9 ms of
 elimination before the last required arrival. Re-encoding and root checking
 still cost about 7.8 ms in the eager run.
 
@@ -955,11 +961,12 @@ build/codec 32 0.25 rs parity_first 1 200 4
 The final result directories are `results/2026-09-08-congestion-final`,
 `results/2026-09-08-parity-final`, `results/2026-09-08-timestamps`, and
 `results/2026-09-08-seeding-final`. The timestamp comparison reads the saved
-final congestion cases as its paired reference. The codec CSV and example output are in
-`results/2026-09-08-congestion`. Result directories include source snapshots
-or hashes. The tests passed 19 Python cases and 121 small Reed–Solomon subsets
-under both incremental schedules. Tests check constant clock offsets, receive
-compression, idle samples, exact-assignment control delay, and failure coverage.
+final congestion cases as its paired reference. The codec CSV and example output
+are in `results/2026-09-08-congestion`. Result directories include source
+snapshots or hashes. The tests passed 19 Python cases and 121 small Reed–Solomon
+subsets under both incremental schedules. Tests check constant clock offsets,
+receive compression, idle samples, exact-assignment control delay, and failure
+coverage.
 
 The earlier September 5 experiments tested arrival ambiguity, coding schedules,
 and sparse subscription reachability. They found closed subscription cycles

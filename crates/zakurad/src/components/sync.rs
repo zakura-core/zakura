@@ -2542,8 +2542,7 @@ where
     /// a full verification wave times out on UTXO lookups without a successful verification.
     /// A duplicate with a pending commit uses the same per-hash retry budget.
     /// If the UTXO lookup timed out because the block's parent is neither committed nor in flight,
-    /// the block cannot verify in this round. The syncer drops that block without a restart, so a
-    /// peer cannot force restarts with blocks whose parent never arrives.
+    /// the block cannot verify in this round. The syncer drops that block without a restart.
     ///
     /// A [`NotFoundKind::Registry`] miss means the peer set found that *every* ready peer is marked
     /// missing the block, so it can't be served right now. Rather than blocking the loop on an inline
@@ -2584,9 +2583,21 @@ where
             self.registry_miss_retry.remove(hash);
         }
 
-        if let Some((hash, parent)) = response.as_ref().err().and_then(Self::unavailable_parent) {
-            if !self.downloads.contains(&parent) && !self.registry_miss_retry.contains_key(&parent)
-            {
+        let unavailable_parent = response.as_ref().err().and_then(Self::unavailable_parent);
+        if let Some((hash, parent)) = unavailable_parent {
+            // The parent may have committed after the verifier's state read.
+            let parent_can_arrive = self.downloads.contains(&parent)
+                || self.registry_miss_retry.contains_key(&parent)
+                || matches!(
+                    // Boxing lets rustc prove this future is `Send` for spawned callers.
+                    futures::FutureExt::boxed(
+                        self.state.clone().oneshot(zs::Request::KnownBlock(parent))
+                    )
+                    .await
+                    .map_err(|e| eyre!(e))?,
+                    zs::Response::KnownBlock(Some(_))
+                );
+            if !parent_can_arrive {
                 debug!(
                     ?hash,
                     ?parent,

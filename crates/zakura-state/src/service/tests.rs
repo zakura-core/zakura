@@ -2427,3 +2427,158 @@ async fn check_parent_inputs(
         );
     }
 }
+
+/// The parent input check must not prove an input missing from a chain that leaves a gap above
+/// the finalized tip or does not continue it. It must stay exact when a published chain overlaps
+/// the database.
+#[tokio::test]
+async fn parent_input_check_requires_a_chain_that_continues_the_finalized_tip() {
+    use crate::service::{non_finalized_state::NonFinalizedState, read};
+
+    let _init_guard = zakura_test::init();
+    let blocks: Vec<Arc<Block>> = [
+        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_2_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_3_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_4_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_5_BYTES.as_slice(),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(height, bytes)| {
+        let mut block: Block = bytes.zcash_deserialize_into().expect("vector");
+        if height >= 2 {
+            block.transactions = vec![Arc::new(transaction_v4_from_coinbase(
+                &block.transactions[0],
+            ))];
+        }
+        Arc::new(block)
+    })
+    .collect();
+    let coinbase = |i: usize| transparent::OutPoint {
+        hash: blocks[i].transactions[0].hash(),
+        index: 0,
+    };
+
+    // State A: database holds 0..=1, the non-finalized state holds 2..=5.
+    let mut config = Config::ephemeral();
+    config.vct_fast_sync = false;
+    let (mut state_a, _, _, _) =
+        StateService::new(config.clone(), &Network::Mainnet, Height::MAX, 0)
+            .await
+            .expect("state opens");
+    for block in &blocks[..2] {
+        state_a
+            .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block.clone()))
+            .await
+            .expect("writer responds")
+            .expect("checkpoint commits");
+    }
+    for block in &blocks[2..] {
+        state_a
+            .queue_and_commit_to_non_finalized_state(block.clone().prepare(), None)
+            .await
+            .expect("writer responds")
+            .expect("non-finalized block commits");
+    }
+    let db_a = state_a.read_service.db.clone();
+    let nfs_a = state_a.read_service.latest_non_finalized_state();
+    let tip_a = db_a.tip().expect("tip");
+    assert_eq!(tip_a.0, Height(1));
+
+    // Sanity: the aligned view proves coinbase(2) present at block 5.
+    assert_eq!(
+        read::parent_inputs(&nfs_a, &db_a, tip_a, blocks[5].hash(), &[coinbase(2)]),
+        ParentInputs::Inconclusive
+    );
+
+    // Gap: drop block 2 from the chain, so neither the chain nor the database has it.
+    let mut gapped = (**nfs_a.best_chain().expect("best chain")).clone();
+    let _ = gapped.pop_root();
+    let mut nfs_gap = NonFinalizedState::new(&Network::Mainnet);
+    nfs_gap.insert_test_chain(Arc::new(gapped));
+    assert_eq!(
+        read::parent_inputs(&nfs_gap, &db_a, tip_a, blocks[5].hash(), &[coinbase(2)]),
+        ParentInputs::Inconclusive,
+        "a chain with a gap above the finalized tip must not prove a missing input"
+    );
+    // The same with a fork parent below the chain tip.
+    assert_eq!(
+        read::parent_inputs(&nfs_gap, &db_a, tip_a, blocks[4].hash(), &[coinbase(2)]),
+        ParentInputs::Inconclusive,
+    );
+
+    // Misaligned: the chain's root does not continue the claimed finalized tip hash.
+    assert_eq!(
+        read::parent_inputs(
+            &nfs_a,
+            &db_a,
+            (Height(1), block::Hash([7; 32])),
+            blocks[5].hash(),
+            &[transparent::OutPoint {
+                hash: transaction::Hash([9; 32]),
+                index: 0
+            }],
+        ),
+        ParentInputs::Inconclusive,
+    );
+
+    // State B: database holds 0..=2, so state A's published chain (root 2) overlaps it.
+    let (mut state_b, _, _, _) = StateService::new(config, &Network::Mainnet, Height::MAX, 0)
+        .await
+        .expect("state opens");
+    for block in &blocks[..3] {
+        state_b
+            .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block.clone()))
+            .await
+            .expect("writer responds")
+            .expect("checkpoint commits");
+    }
+    let db_b = state_b.read_service.db.clone();
+    let tip_b = db_b.tip().expect("tip");
+    assert_eq!(tip_b, (Height(2), blocks[2].hash()));
+    for (parent, outpoints, expected) in [
+        (
+            blocks[5].hash(),
+            vec![coinbase(1), coinbase(2), coinbase(5)],
+            ParentInputs::Inconclusive,
+        ),
+        (
+            blocks[4].hash(),
+            vec![coinbase(2), coinbase(4)],
+            ParentInputs::Inconclusive,
+        ),
+        (
+            blocks[4].hash(),
+            vec![coinbase(5)],
+            ParentInputs::Missing(coinbase(5)),
+        ),
+        (
+            blocks[3].hash(),
+            vec![coinbase(4)],
+            ParentInputs::Missing(coinbase(4)),
+        ),
+        (
+            blocks[2].hash(),
+            vec![coinbase(3)],
+            ParentInputs::Missing(coinbase(3)),
+        ),
+        (
+            blocks[2].hash(),
+            vec![coinbase(2)],
+            ParentInputs::Inconclusive,
+        ),
+        (
+            blocks[1].hash(),
+            vec![coinbase(1)],
+            ParentInputs::ParentUnavailable,
+        ),
+    ] {
+        assert_eq!(
+            read::parent_inputs(&nfs_a, &db_b, tip_b, parent, &outpoints),
+            expected,
+            "overlap parent {parent:?}"
+        );
+    }
+}

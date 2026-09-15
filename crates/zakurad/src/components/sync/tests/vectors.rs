@@ -2551,10 +2551,10 @@ fn parent_unavailable(hash: block::Hash, parent: block::Hash) -> BlockDownloadVe
     }
 }
 
-/// A peer cannot force restarts with a block whose parent never arrives.
+/// A block whose parent is neither committed nor in flight is dropped without a restart.
 #[tokio::test]
 async fn unavailable_parent_drops_block_without_restart() {
-    let (mut chain_sync, _, _, mut peers, _, _) = setup_chain_sync();
+    let (mut chain_sync, _, _, mut peers, mut state, _) = setup_chain_sync();
     let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
     chain_sync.misbehavior_sender = sender;
     let hash = block::Hash([0xCC; 32]);
@@ -2565,10 +2565,17 @@ async fn unavailable_parent_drops_block_without_restart() {
         false
     ));
     for _ in 0..=sync::BLOCK_VERIFY_TIMEOUT_RETRY_LIMIT {
-        chain_sync
-            .handle_block_response_with_missing_retry(Err(parent_unavailable(hash, parent)))
-            .await
-            .expect("an unavailable parent does not restart sync");
+        let (response, _) = tokio::join!(
+            chain_sync
+                .handle_block_response_with_missing_retry(Err(parent_unavailable(hash, parent))),
+            async {
+                state
+                    .expect_request(zs::Request::KnownBlock(parent))
+                    .await
+                    .respond(zs::Response::KnownBlock(None));
+            },
+        );
+        response.expect("an unavailable parent does not restart sync");
     }
     assert!(receiver.try_recv().is_err(), "the supplier is not scored");
     assert!(chain_sync.verify_timeout_retry_counts.is_empty());
@@ -2576,24 +2583,64 @@ async fn unavailable_parent_drops_block_without_restart() {
     peers.expect_no_requests().await;
 }
 
-/// A block whose parent is still in flight keeps the bounded UTXO timeout retry.
+/// A block whose parent is in flight, awaiting a registry retry, or committed after the
+/// verifier's state read keeps the bounded UTXO timeout retry.
 #[tokio::test]
-async fn unavailable_parent_retries_while_parent_is_in_flight() -> Result<(), crate::BoxError> {
-    let (mut chain_sync, _, _verifier, mut peers, _state, _tip) = setup_chain_sync();
-    let hash = block::Hash([0xCC; 32]);
-    let parent = block::Hash([0xAA; 32]);
-    chain_sync.downloads.download_and_verify(parent).await?;
-    let _parent_download = peers
-        .expect_request(zn::Request::BlocksByHash(iter::once(parent).collect()))
-        .await;
-    chain_sync
-        .handle_block_response_with_missing_retry(Err(parent_unavailable(hash, parent)))
-        .await?;
-    assert_eq!(chain_sync.verify_timeout_retry_counts.get(&hash), Some(&1));
-    assert_eq!(chain_sync.utxo_race_drops, 1);
-    let _retry = peers
-        .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
-        .await;
+async fn unavailable_parent_retries_while_parent_can_arrive() -> Result<(), crate::BoxError> {
+    #[derive(Clone, Copy, Debug)]
+    enum Parent {
+        Downloading,
+        RegistryRetry,
+        Committed,
+    }
+    for parent_state in [
+        Parent::Downloading,
+        Parent::RegistryRetry,
+        Parent::Committed,
+    ] {
+        let (mut chain_sync, _, _verifier, mut peers, mut state, _tip) = setup_chain_sync();
+        let hash = block::Hash([0xCC; 32]);
+        let parent = block::Hash([0xAA; 32]);
+        let mut _parent_download = None;
+        match parent_state {
+            Parent::Downloading => {
+                chain_sync.downloads.download_and_verify(parent).await?;
+                _parent_download = Some(
+                    peers
+                        .expect_request(zn::Request::BlocksByHash(iter::once(parent).collect()))
+                        .await,
+                );
+            }
+            Parent::RegistryRetry => {
+                chain_sync
+                    .registry_miss_retry
+                    .insert(parent, tokio::time::Instant::now());
+            }
+            Parent::Committed => {}
+        }
+        let (response, _) = tokio::join!(
+            chain_sync
+                .handle_block_response_with_missing_retry(Err(parent_unavailable(hash, parent))),
+            async {
+                if matches!(parent_state, Parent::Committed) {
+                    state
+                        .expect_request(zs::Request::KnownBlock(parent))
+                        .await
+                        .respond(zs::Response::KnownBlock(Some(zs::KnownBlock::BestChain)));
+                }
+            },
+        );
+        response?;
+        assert_eq!(
+            chain_sync.verify_timeout_retry_counts.get(&hash),
+            Some(&1),
+            "{parent_state:?}"
+        );
+        assert_eq!(chain_sync.utxo_race_drops, 1, "{parent_state:?}");
+        let _retry = peers
+            .expect_request(zn::Request::BlocksByHash(iter::once(hash).collect()))
+            .await;
+    }
     Ok(())
 }
 

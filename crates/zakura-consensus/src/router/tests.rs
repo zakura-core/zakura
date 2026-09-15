@@ -558,7 +558,8 @@ async fn forged_lookahead_height_is_rejected_before_checkpoint_routing() {
             error.misbehavior_score() > 0,
             "the forged body must penalize its supplier: {error:?}"
         );
-        // Only a body that matches its header commitments can be consensus-invalid.
+        // A body that fails its transaction Merkle root is a payload mismatch.
+        // A legacy peer can rewrite only the coinbase height, which v2 binds to the block hash.
         let expected_class = if rewrite_expiry {
             BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::TransactionMerkleRoot)
         } else {
@@ -570,98 +571,112 @@ async fn forged_lookahead_height_is_rejected_before_checkpoint_routing() {
     }
 }
 
-/// A rewritten V5 coinbase expiry breaks the transaction Merkle root.
-/// The router must report the payload mismatch, because v2 block sync records a
+/// A rewritten V5 coinbase expiry or consensus branch ID breaks the transaction Merkle root.
+/// The verifiers must report the payload mismatch, because v2 block sync records a
 /// consensus-invalid body as permanent evidence against the requested hash.
 #[tokio::test]
 async fn forged_expiry_with_authentic_height_is_a_payload_mismatch() {
     use tower::service_fn;
+    use zakura_chain::parameters::NetworkUpgrade;
     use zakura_header_chain::{BodyCommitmentKind, BodyVerificationClass};
 
     let _init_guard = zakura_test::init();
-    let mut block: Block = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
-        .zcash_deserialize_into()
-        .unwrap();
-    let hash = block.hash();
-    let height = block.coinbase_height().unwrap();
-    assert_eq!(block.transactions[0].version(), 5);
-    *Arc::make_mut(&mut block.transactions[0]).expiry_height_mut() = Height(height.0 - 1);
-    assert_eq!(block.hash(), hash, "the canonical header hash is unchanged");
-    assert_eq!(
-        block.coinbase_height(),
-        Some(height),
-        "the coinbase height is authentic"
-    );
-    let block = Arc::new(block);
-    let payload_mismatch =
-        BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::TransactionMerkleRoot);
-
-    let genesis: Block = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
-        .zcash_deserialize_into()
-        .unwrap();
-    let unknown_block_state = service_fn(|request: zs::Request| match request {
-        zs::Request::KnownBlock(_) => {
-            std::future::ready(Ok::<_, BoxError>(zs::Response::KnownBlock(None)))
+    for rewrite_branch_id in [false, true] {
+        let mut block: Block = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        let hash = block.hash();
+        let height = block.coinbase_height().unwrap();
+        assert_eq!(block.transactions[0].version(), 5);
+        let coinbase = Arc::make_mut(&mut block.transactions[0]);
+        if rewrite_branch_id {
+            coinbase
+                .update_network_upgrade(NetworkUpgrade::Nu6)
+                .expect("V5 transactions have a consensus branch ID");
+        } else {
+            *coinbase.expiry_height_mut() = Height(height.0 - 1);
         }
-        request => panic!("unexpected state request: {request:?}"),
-    });
-    let transaction = service_fn(
-        |_| -> std::future::Ready<Result<transaction::Response, BoxError>> {
-            panic!("no transaction is verified")
-        },
-    );
+        assert_eq!(block.hash(), hash, "the canonical header hash is unchanged");
+        assert_eq!(
+            block.coinbase_height(),
+            Some(height),
+            "the coinbase height is authentic"
+        );
+        let block = Arc::new(block);
+        let payload_mismatch =
+            BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::TransactionMerkleRoot);
 
-    // Reference 1: the checkpoint verifier, still in progress, rejects the body on its Merkle root.
-    let in_progress_checkpoint = || {
-        CheckpointVerifier::from_list(
-            [
-                (Height(0), genesis.hash()),
-                (Height(1_687_110), block::Hash([0xCA; 32])),
-            ],
-            &Network::Mainnet,
-            None,
-            unknown_block_state,
-        )
-        .unwrap()
-    };
-    let checkpoint_error = in_progress_checkpoint()
-        .oneshot(block.clone())
-        .await
-        .unwrap_err();
-    assert_eq!(
-        checkpoint_error.body_verification_class(),
-        payload_mismatch,
-        "{checkpoint_error:?}"
-    );
+        let genesis: Block = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        let unknown_block_state = service_fn(|request: zs::Request| match request {
+            zs::Request::KnownBlock(_) => {
+                std::future::ready(Ok::<_, BoxError>(zs::Response::KnownBlock(None)))
+            }
+            request => panic!("unexpected state request: {request:?}"),
+        });
+        let transaction = service_fn(
+            |_| -> std::future::Ready<Result<transaction::Response, BoxError>> {
+                panic!("no transaction is verified")
+            },
+        );
 
-    // Reference 2: the semantic verifier rejects the body on its Merkle root.
-    let semantic_error =
-        SemanticBlockVerifier::new(&Network::Mainnet, unknown_block_state, transaction)
-            .oneshot(Request::Commit(block.clone()))
-            .await
-            .unwrap_err();
-    assert_eq!(
-        semantic_error.body_verification_class(),
-        payload_mismatch,
-        "{semantic_error:?}"
-    );
-
-    // The router must not turn the same commitment mismatch into durable invalidity evidence.
-    for max_checkpoint_height in [Height(1_687_105), Height(1_687_110)] {
-        let router = BlockVerifierRouter {
-            checkpoint: in_progress_checkpoint(),
-            max_checkpoint_height,
-            block: SemanticBlockVerifier::new(&Network::Mainnet, unknown_block_state, transaction),
+        // Reference 1: the checkpoint verifier, still in progress, rejects the body on its Merkle root.
+        let in_progress_checkpoint = || {
+            CheckpointVerifier::from_list(
+                [
+                    (Height(0), genesis.hash()),
+                    (Height(1_687_110), block::Hash([0xCA; 32])),
+                ],
+                &Network::Mainnet,
+                None,
+                unknown_block_state,
+            )
+            .unwrap()
         };
-        let error = router
-            .oneshot(Request::Commit(block.clone()))
+        let checkpoint_error = in_progress_checkpoint()
+            .oneshot(block.clone())
             .await
             .unwrap_err();
         assert_eq!(
-            error.body_verification_class(),
+            checkpoint_error.body_verification_class(),
             payload_mismatch,
-            "max checkpoint {max_checkpoint_height:?}: {error:?}"
+            "{checkpoint_error:?}"
         );
+
+        // Reference 2: the semantic verifier rejects the body on its Merkle root.
+        let semantic_error =
+            SemanticBlockVerifier::new(&Network::Mainnet, unknown_block_state, transaction)
+                .oneshot(Request::Commit(block.clone()))
+                .await
+                .unwrap_err();
+        assert_eq!(
+            semantic_error.body_verification_class(),
+            payload_mismatch,
+            "{semantic_error:?}"
+        );
+
+        // The router must not turn the same commitment mismatch into durable invalidity evidence.
+        for max_checkpoint_height in [Height(1_687_105), Height(1_687_110)] {
+            let router = BlockVerifierRouter {
+                checkpoint: in_progress_checkpoint(),
+                max_checkpoint_height,
+                block: SemanticBlockVerifier::new(
+                    &Network::Mainnet,
+                    unknown_block_state,
+                    transaction,
+                ),
+            };
+            let error = router
+                .oneshot(Request::Commit(block.clone()))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.body_verification_class(),
+                payload_mismatch,
+                "max checkpoint {max_checkpoint_height:?}: {error:?}"
+            );
+        }
     }
 }
 

@@ -1793,10 +1793,14 @@ async fn pending_commit_wait_reports_the_duplicate_after_its_limit() {
         panic!("a pending duplicate cannot reach transaction verification")
     });
     let start = tokio::time::Instant::now();
-    let error = SemanticBlockVerifier::new(&Network::Mainnet, state, transaction)
-        .oneshot(Request::Commit(Arc::new(block)))
-        .await
-        .unwrap_err();
+    let error = tokio::time::timeout(
+        super::PENDING_COMMIT_WAIT_LIMIT * 2,
+        SemanticBlockVerifier::new(&Network::Mainnet, state, transaction)
+            .oneshot(Request::Commit(Arc::new(block))),
+    )
+    .await
+    .expect("the pending commit wait has a limit")
+    .unwrap_err();
     assert!(start.elapsed() >= super::PENDING_COMMIT_WAIT_LIMIT);
     assert!(start.elapsed() < super::PENDING_COMMIT_WAIT_LIMIT * 2);
     assert_eq!(

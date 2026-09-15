@@ -5,11 +5,23 @@
 //! unless the response has already ended. The same lock orders replacement,
 //! request publication, and the writer's first-byte claim.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU8, Ordering},
+    Arc, Mutex, MutexGuard,
+};
 
 use tokio_util::sync::CancellationToken;
 
+use super::response_memory::{
+    shared_allocation_bytes, ConnectionResponseMemory, ResponseMemoryPermit,
+};
 use crate::zakura::CloseCause;
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ResponseAdmissionError {
+    Retired,
+    MemoryFull,
+}
 
 /// The response permissions owned by one receiver. Retiring this scope prevents
 /// its writers from publishing or starting requests. A started response must end
@@ -22,7 +34,13 @@ struct Scope {
     state: Mutex<ScopeState>,
     connection_cancel: CancellationToken,
     close_cause: CloseCause,
+    memory: ConnectionResponseMemory,
+    _setup: ResponseMemoryPermit,
 }
+
+// Covers the shared scope and platform locks initialized during construction.
+// Cold allocation tests check the real peak against this allowance.
+const SCOPE_SETUP_BYTES: u64 = 512;
 
 #[derive(Debug, Default)]
 struct ScopeState {
@@ -30,20 +48,27 @@ struct ScopeState {
     started: usize,
 }
 
-#[derive(Debug, PartialEq)]
-enum Phase {
-    Prepared,
-    Queued,
-    Started,
-    Finished,
-    Abandoned,
+impl Scope {
+    fn lock(&self) -> MutexGuard<'_, ScopeState> {
+        self.state
+            .lock()
+            .expect("response scope mutex is never poisoned")
+    }
 }
+
+const PREPARED: u8 = 0;
+const QUEUED: u8 = 1;
+const STARTED: u8 = 2;
+const FINISHED: u8 = 3;
+const ABANDONED: u8 = 4;
 
 #[derive(Debug)]
 struct Authorization {
     scope: ResponseScope,
-    // Always lock the scope before this phase, including terminal and Drop paths.
-    phase: Mutex<Phase>,
+    // The scope lock serializes every access. Inline atomic storage avoids a
+    // second mutex that can allocate when first locked on some platforms.
+    phase: AtomicU8,
+    _memory: ResponseMemoryPermit,
 }
 
 /// Keep the response alive until its validated ending. There is one owner.
@@ -58,28 +83,65 @@ pub(crate) struct ResponseAuthorization(Arc<Authorization>);
 pub(crate) struct ResponseWritePermission(Arc<Authorization>);
 
 impl ResponseScope {
-    pub(crate) fn new(connection_cancel: CancellationToken, close_cause: CloseCause) -> Self {
-        Self(Arc::new(Scope {
-            state: Mutex::new(ScopeState::default()),
-            connection_cancel,
-            close_cause,
-        }))
+    /// Reserve setup memory before replacing any existing receiver.
+    pub(crate) fn try_with_memory(
+        connection_cancel: &CancellationToken,
+        close_cause: &CloseCause,
+        memory: ConnectionResponseMemory,
+    ) -> Result<Self, ResponseAdmissionError> {
+        let setup = memory
+            .try_reserve(SCOPE_SETUP_BYTES)
+            .ok_or(ResponseAdmissionError::MemoryFull)?;
+        let retired = connection_cancel.is_cancelled();
+        let scope = Scope {
+            state: Mutex::new(ScopeState {
+                retired,
+                started: 0,
+            }),
+            connection_cancel: connection_cancel.clone(),
+            close_cause: close_cause.clone(),
+            memory,
+            _setup: setup,
+        };
+        // Some targets allocate a mutex on its first lock. Initialize it while
+        // setup is funded, before another thread can race that initialization.
+        drop(scope.lock());
+        Ok(Self(Arc::new(scope)))
     }
 
     /// Prepare before taking local work or allocating message-specific expectations.
-    pub(crate) fn authorize(&self) -> Option<ResponseAuthorization> {
-        let state = self
-            .0
-            .state
-            .lock()
-            .expect("response scope mutex is never poisoned");
+    pub(crate) fn authorize(&self) -> Result<ResponseAuthorization, ResponseAdmissionError> {
+        let state = self.0.lock();
         if state.retired || self.0.connection_cancel.is_cancelled() {
-            return None;
+            return Err(ResponseAdmissionError::Retired);
         }
-        Some(ResponseAuthorization(Arc::new(Authorization {
+        let memory = self
+            .0
+            .memory
+            .try_reserve(shared_allocation_bytes::<Authorization>())
+            .ok_or(ResponseAdmissionError::MemoryFull)?;
+        Ok(ResponseAuthorization(Arc::new(Authorization {
             scope: self.clone(),
-            phase: Mutex::new(Phase::Prepared),
+            phase: AtomicU8::new(PREPARED),
+            _memory: memory,
         })))
+    }
+
+    pub(crate) fn memory(&self) -> ConnectionResponseMemory {
+        self.0.memory.clone()
+    }
+
+    /// Wait for enough metadata space to retry one authorization. The future
+    /// owns its connection handle so callers can keep processing other events.
+    pub(crate) fn wait_for_capacity(
+        &self,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let memory = self.memory();
+        async move {
+            memory
+                .wait_for_capacity(shared_allocation_bytes::<Authorization>())
+                .await;
+        }
     }
 
     /// Fence old publishers and writers before removing or replacing their session.
@@ -119,15 +181,10 @@ impl ResponseAuthorization {
             .state
             .lock()
             .expect("response scope mutex is never poisoned");
-        let mut phase = self
-            .0
-            .phase
-            .lock()
-            .expect("response phase mutex is never poisoned");
-        if *phase == Phase::Started {
+        if self.0.phase.load(Ordering::Relaxed) == STARTED {
             state.started -= 1;
         }
-        *phase = Phase::Finished;
+        self.0.phase.store(FINISHED, Ordering::Relaxed);
     }
 }
 
@@ -142,18 +199,13 @@ impl ResponseWritePermission {
             .state
             .lock()
             .expect("response scope mutex is never poisoned");
-        let mut phase = self
-            .0
-            .phase
-            .lock()
-            .expect("response phase mutex is never poisoned");
         if state.retired
             || self.0.scope.0.connection_cancel.is_cancelled()
-            || *phase != Phase::Prepared
+            || self.0.phase.load(Ordering::Relaxed) != PREPARED
         {
             return false;
         }
-        *phase = Phase::Queued;
+        self.0.phase.store(QUEUED, Ordering::Relaxed);
         publish();
         true
     }
@@ -168,14 +220,9 @@ impl ResponseWritePermission {
             .state
             .lock()
             .expect("response scope mutex is never poisoned");
-        let mut phase = self
-            .0
-            .phase
-            .lock()
-            .expect("response phase mutex is never poisoned");
         if state.retired
             || self.0.scope.0.connection_cancel.is_cancelled()
-            || *phase != Phase::Queued
+            || self.0.phase.load(Ordering::Relaxed) != QUEUED
             || !claim()
         {
             return false;
@@ -184,7 +231,7 @@ impl ResponseWritePermission {
             .started
             .checked_add(1)
             .expect("each started exchange owns a distinct allocation");
-        *phase = Phase::Started;
+        self.0.phase.store(STARTED, Ordering::Relaxed);
         true
     }
 }
@@ -198,17 +245,12 @@ impl Drop for ResponseAuthorization {
             .state
             .lock()
             .expect("response scope mutex is never poisoned");
-        let mut phase = self
-            .0
-            .phase
-            .lock()
-            .expect("response phase mutex is never poisoned");
-        if *phase == Phase::Started {
+        if self.0.phase.load(Ordering::Relaxed) == STARTED {
             // Close before releasing the last record of unfinished authorization.
             self.0.scope.close_unfinished();
             state.started -= 1;
         }
-        *phase = Phase::Abandoned;
+        self.0.phase.store(ABANDONED, Ordering::Relaxed);
     }
 }
 

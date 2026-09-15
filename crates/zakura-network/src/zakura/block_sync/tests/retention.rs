@@ -134,6 +134,7 @@ impl RetentionHarness {
                 ]),
                 cancel,
                 CloseCause::new(),
+                crate::zakura::regulation::ResponseMemory::default().connection(),
             ));
         let advertised = wait_for_outbound_status(&mut outbound).await;
         inbound

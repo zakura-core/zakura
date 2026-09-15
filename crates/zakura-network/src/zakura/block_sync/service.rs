@@ -13,7 +13,7 @@ use tokio::sync::Notify;
 use zakura_chain::serialization::ZcashDecoder;
 
 mod sessions;
-use crate::zakura::regulation::{ResponseAuthorization, ResponseScope};
+use crate::zakura::regulation::{ResponseAdmissionError, ResponseAuthorization, ResponseScope};
 pub(super) use sessions::CurrentSessions;
 use sessions::SessionCapacity;
 
@@ -76,6 +76,7 @@ impl BlockSyncPeerSession {
         requests: FramedSend,
         connection_cancel: CancellationToken,
         close_cause: crate::zakura::CloseCause,
+        response_scope: ResponseScope,
     ) -> Self {
         Self {
             peer_id: session.peer_id().clone(),
@@ -85,7 +86,7 @@ impl BlockSyncPeerSession {
             requests,
             remote_status: watch::channel(false).0,
             cancel_token: session.cancel_token(),
-            response_scope: ResponseScope::new(connection_cancel.clone(), close_cause.clone()),
+            response_scope,
             connection_cancel,
             close_cause,
             reactor_ready: Arc::new(Notify::new()),
@@ -156,8 +157,16 @@ impl BlockSyncPeerSession {
         self.cancel_token.cancel();
     }
 
-    pub(super) fn authorize_response(&self) -> Option<ResponseAuthorization> {
+    pub(super) fn authorize_response(
+        &self,
+    ) -> Result<ResponseAuthorization, ResponseAdmissionError> {
         self.response_scope.authorize()
+    }
+
+    pub(super) fn wait_for_response_capacity(
+        &self,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        self.response_scope.wait_for_capacity()
     }
 
     #[cfg(test)]
@@ -699,6 +708,16 @@ impl Service for BlockSyncService {
                 }
             }
 
+            // Prepare before retiring the old receiver or publishing admission.
+            let Ok(response_scope) = ResponseScope::try_with_memory(
+                &connection_cancel_token,
+                &close_cause,
+                peer.response_memory(),
+            ) else {
+                service_cancel_token.cancel();
+                return;
+            };
+
             // Admission is atomic with the park state: a park recorded by the
             // predecessor routine after the entry-point `peer_is_parked` check
             // is honored here instead of being silently bypassed.
@@ -754,6 +773,7 @@ impl Service for BlockSyncService {
                 request_sender,
                 connection_cancel_token.clone(),
                 close_cause.clone(),
+                response_scope,
             );
             let old_record = active_peers.insert(
                 peer_id.clone(),

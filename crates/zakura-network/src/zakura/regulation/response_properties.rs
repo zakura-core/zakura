@@ -10,3 +10,5 @@ use proptest::prelude::*;
 mod discovery;
 mod lifecycle;
 mod subscription;
+
+mod memory;

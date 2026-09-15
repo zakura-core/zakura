@@ -1,6 +1,23 @@
 use super::super::tests::mainnet_decoder;
 use super::*;
+use crate::zakura::regulation::ConnectionResponseMemory;
 
+impl BlockSyncPeerSession {
+    /// Set the pool before a routine publishes its first request.
+    pub(in crate::zakura::block_sync) fn with_response_memory_for_test(
+        mut self,
+        memory: ConnectionResponseMemory,
+    ) -> Self {
+        self.response_scope = ResponseScope::with_memory(
+            self.connection_cancel.clone(),
+            self.close_cause.clone(),
+            memory,
+        );
+        self
+    }
+}
+
+mod replacement_budget;
 mod session_fencing;
 
 #[test]

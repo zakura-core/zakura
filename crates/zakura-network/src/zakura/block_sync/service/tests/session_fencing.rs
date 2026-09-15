@@ -119,7 +119,7 @@ async fn replacement_fences_old_publication_and_queued_first_write() {
         let (_new_input, mut new_output) = add_fence_peer(&service, &peer, 1, connection.clone());
         let new = service.current_sessions_for_test().snapshot()[&peer].clone();
         assert_ne!(old.session_id(), new.session_id());
-        assert!(old.authorize_response().is_none());
+        assert!(old.authorize_response().is_err());
         if queued {
             let mut wrote = false;
             time::timeout(DEADLINE, old_output.recv())
@@ -259,7 +259,7 @@ async fn finished_exchange_and_new_connection_allow_replacement() {
         assert_ne!(old.session_id(), new.session_id());
         assert_eq!(old_connection.is_cancelled(), !finished);
         assert!(!next_connection.is_cancelled());
-        assert!(new.authorize_response().is_some());
+        assert!(new.authorize_response().is_ok());
         service.remove_peer(&peer, next_id);
     }
 }
@@ -285,7 +285,7 @@ async fn removing_a_session_fences_writers_before_erasing_its_record() {
             }
             assert!(service.current_sessions_for_test().snapshot().is_empty());
             assert!(!request.write.try_start());
-            assert!(session.authorize_response().is_none());
+            assert!(session.authorize_response().is_err());
             assert_eq!(connection.is_cancelled(), started);
         }
     }
@@ -386,7 +386,7 @@ async fn parked_admission_leaves_the_incumbent_session_untouched() {
     );
     // `authorize_response` also covers the incumbent's connection staying open.
     assert!(
-        incumbent.authorize_response().is_some(),
+        incumbent.authorize_response().is_ok(),
         "a parked admission must not retire the incumbent"
     );
     let active = service.inner.sessions.active.lock().unwrap();

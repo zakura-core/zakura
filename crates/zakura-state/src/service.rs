@@ -17,6 +17,7 @@
 use std::{
     collections::{hash_map, BTreeMap, HashMap},
     future::Future,
+    num::NonZeroU32,
     ops::Bound,
     path::PathBuf,
     pin::Pin,
@@ -2248,18 +2249,35 @@ where
             .saturating_sub(start.0)
             .saturating_add(1),
     );
-    let size_hints: HashMap<_, _> = read::block_size_hints(chain.clone(), db, start, count)
-        .into_iter()
-        .collect();
     let selected_hashes: HashMap<_, _> = match selected_projection.as_deref() {
         Some(selected_projection) => selected_projection
             .iter()
             .copied()
             .filter(|frontier| {
-                frontier.height >= start && frontier.height <= best_header_tip.height
+                frontier.height >= start
+                    && frontier.height.0 < start.0.saturating_add(count)
+                    && frontier.height <= best_header_tip.height
             })
             .map(|frontier| (frontier.height, frontier.hash))
             .collect(),
+        None => HashMap::new(),
+    };
+    // Advisory sizes from retained header deliveries, keyed by the selected header hash so a
+    // fork at the same height can never borrow another block's size.
+    let advertised_sizes: HashMap<block::Height, NonZeroU32> = match header_chain {
+        Some(reader) => {
+            let window: Vec<(block::Height, block::Hash)> = selected_hashes
+                .iter()
+                .map(|(height, hash)| (*height, *hash))
+                .collect();
+            let hashes: Vec<block::Hash> = window.iter().map(|(_, hash)| *hash).collect();
+            let hints = reader.body_size_hints_by_hash(&hashes)?;
+            window
+                .into_iter()
+                .zip(hints)
+                .filter_map(|((height, _), hint)| hint.map(|size| (height, size)))
+                .collect()
+        }
         None => HashMap::new(),
     };
 
@@ -2279,7 +2297,10 @@ where
         if db.contains_body_at_height(height) && body_hash == Some(hash) {
             continue;
         }
-        metadata.push((height, hash, size_hints.get(&height).copied().flatten()));
+        let size = read::block_info(chain.clone(), db, hash.into())
+            .map(|info| info.size())
+            .or_else(|| advertised_sizes.get(&height).map(|size| size.get()));
+        metadata.push((height, hash, size));
     }
 
     Ok(crate::BlockSyncBodyMetadata {
@@ -3035,6 +3056,25 @@ impl Service<ReadRequest> for ReadStateService {
                 };
 
                 Ok(ReadResponse::BlockRoots(roots))
+            }
+
+            ReadRequest::BlockSizesByHash { hashes } => {
+                // The cap equals the largest header page (MAX_HS_RANGE in zakura-network), so a full page always fits.
+                let cap = usize::try_from(MAX_HEADER_SYNC_HEIGHT_RANGE)
+                    .expect("u32 fits usize on supported targets");
+                if hashes.len() > cap {
+                    Err("BlockSizesByHash exceeds MAX_HEADER_SYNC_HEIGHT_RANGE hashes".into())
+                } else {
+                    let chain = state.latest_best_chain();
+                    let sizes = hashes
+                        .into_iter()
+                        .map(|hash| {
+                            read::block_info(chain.clone(), &state.db, hash.into())
+                                .map(|info| info.size())
+                        })
+                        .collect();
+                    Ok(ReadResponse::BlockSizesByHash(sizes))
+                }
             }
 
             ReadRequest::BestHeaderTip => {

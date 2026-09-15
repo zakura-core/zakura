@@ -51,6 +51,15 @@ pub struct EngineSnapshot {
     pub alarms: AlarmSet,
 }
 
+/// One committed batch of advisory corrections. It grants no verification authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BodySizeHintBatch {
+    /// Monotonic process-local correction revision.
+    pub revision: u64,
+    /// Header height, hash, and current scheduling size, bounded by header admission.
+    pub updates: std::sync::Arc<[(block::Height, block::Hash, super::BodySizeHint)]>,
+}
+
 /// One atomic committed snapshot and its body-work compatibility epoch.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommittedHeaderChainView {
@@ -58,6 +67,12 @@ pub struct CommittedHeaderChainView {
     pub snapshot: EngineSnapshot,
     /// Process-local selected-lineage epoch.
     pub body_work_epoch: BodyWorkEpoch,
+    /// Process-local correction revision. Consumers refresh queued estimates when it changes.
+    /// It survives coalesced publications and grants no body-work authority.
+    pub body_size_hint_revision: u64,
+    /// Recent correction batches. A subscriber that misses this bounded history
+    /// refreshes its queued window from state.
+    pub body_size_hint_batches: Option<std::sync::Arc<[BodySizeHintBatch]>>,
 }
 
 impl CommittedHeaderChainView {
@@ -66,6 +81,8 @@ impl CommittedHeaderChainView {
         Self {
             snapshot,
             body_work_epoch,
+            body_size_hint_revision: 0,
+            body_size_hint_batches: None,
         }
     }
 }

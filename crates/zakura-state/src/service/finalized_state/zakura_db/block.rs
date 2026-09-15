@@ -60,34 +60,10 @@ pub(in crate::service::finalized_state) const ZAKURA_HEADER_HEIGHT_BY_HASH: &str
     "zakura_header_height_by_hash";
 pub(in crate::service::finalized_state) const ZAKURA_HEADER_BY_HEIGHT: &str =
     "zakura_header_by_height";
+/// Legacy column family kept registered for on-disk format compatibility.
+/// Its writer was removed with the fork-aware header engine; body-size hints now come from
+/// hash-keyed auxiliary deliveries and committed `BlockInfo`. Nothing reads or writes it.
 pub const ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT: &str = "zakura_header_body_size_by_height";
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-struct AdvertisedBodySize(u32);
-
-impl AdvertisedBodySize {
-    fn get(self) -> u32 {
-        self.0
-    }
-}
-
-impl IntoDisk for AdvertisedBodySize {
-    type Bytes = [u8; 4];
-
-    fn as_bytes(&self) -> Self::Bytes {
-        self.0.to_be_bytes()
-    }
-}
-
-impl FromDisk for AdvertisedBodySize {
-    fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
-        let bytes = bytes
-            .as_ref()
-            .try_into()
-            .expect("advertised body sizes are stored as u32");
-        Self(u32::from_be_bytes(bytes))
-    }
-}
 
 impl IntoDisk for BlockCommitmentRoots {
     type Bytes = Vec<u8>;
@@ -161,22 +137,6 @@ impl ZakuraDb {
         let first_tx = TransactionLocation::min_for_height(height);
 
         self.db.zs_contains(&tx_by_loc, &first_tx)
-    }
-
-    /// Returns the advisory body-size hint for a header-only height, if known.
-    ///
-    /// `None` means the peer supplied the `0` unknown sentinel or no hint has been
-    /// stored. This value is not consensus data.
-    #[allow(clippy::unwrap_in_result)]
-    pub fn advertised_body_size(&self, height: block::Height) -> Option<u32> {
-        let body_size_by_height = self
-            .db
-            .cf_handle(ZAKURA_HEADER_BODY_SIZE_BY_HEIGHT)
-            .unwrap();
-
-        self.db
-            .zs_get(&body_size_by_height, &height)
-            .map(AdvertisedBodySize::get)
     }
 
     /// Returns finalized commitment roots for a contiguous height range.

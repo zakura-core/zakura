@@ -283,6 +283,10 @@ pub(super) struct PeerRoutine {
     /// Next request identity in this peer-session generation. Exhaustion fails
     /// closed instead of reusing an owner.
     next_request_id: Option<NonZeroU64>,
+    /// Revision of the outstanding set that the registry currently holds. Starts
+    /// unset so the first publish always writes. Atomic only because publishing
+    /// takes `&self`; it is never shared across tasks.
+    published_outstanding_revision: std::sync::atomic::AtomicU64,
     budget: super::state::ByteBudget,
     work: Arc<WorkQueue>,
     registry: Arc<PeerRegistry>,
@@ -374,6 +378,7 @@ impl PeerRoutine {
             fill_stop_trace_at: BTreeMap::new(),
             generation,
             next_request_id: NonZeroU64::new(1),
+            published_outstanding_revision: std::sync::atomic::AtomicU64::new(u64::MAX),
             budget,
             work,
             registry,
@@ -1672,6 +1677,12 @@ impl PeerRoutine {
     fn gc_obsolete_outstanding(&mut self) {
         for index in (0..self.window.outstanding.len()).rev() {
             let outstanding = &self.window.outstanding[index];
+            // `detach_local_work` returns immediately for a range that is already
+            // detached, so scanning one costs a work-queue lock per unreceived height
+            // to reach a no-op. Retained wire authorization must not sit on this path.
+            if !outstanding.local_work_active {
+                continue;
+            }
             let owner = outstanding.request.owner;
             let still_owned = unreceived_heights(outstanding)
                 .any(|height| self.work.owner_for_height(height) == Some(owner));
@@ -1750,12 +1761,20 @@ impl PeerRoutine {
         );
         metrics::counter!("sync.block.body.discarded", "reason" => "hash_mismatch").increment(1);
         self.trace_body_discarded(height, requested, delivered);
-        // The peer answered, so give the exchange the same bounded grace a live
-        // request gets. Accepted-body accounting stays put: a peer that only ever
-        // answers from another fork must not read as a proven supplier, which
-        // would lift both its unproven-peer request cap and its stall count.
-        self.window
-            .extend_liveness_deadline(Instant::now(), self.config.effective_liveness_timeout());
+        // The peer answered, so give the exchange a bounded grace. Accepted-body
+        // accounting stays put: a peer that only ever answers from another fork must
+        // not read as a proven supplier, which would lift both its unproven-peer
+        // request cap and its stall count.
+        //
+        // The grace is one request timeout, not a full liveness interval, and a range
+        // whose local work is already detached buys none at all. A full interval per
+        // discarded part would let a peer spend credit banked before it was sealed to
+        // renew the deadline for hours, which is the eviction a zero congestion window
+        // deliberately hands to this timer.
+        if self.window.outstanding[index].local_work_active {
+            self.window
+                .extend_liveness_deadline(Instant::now(), self.config.request_timeout);
+        }
         self.note_retry_avoid([height]);
         self.publish_outstanding();
         Ok(())
@@ -1819,9 +1838,6 @@ impl PeerRoutine {
                 delivery_snapshot,
             );
         }
-        if was_detached {
-            self.window.credit_late_delivery();
-        }
         self.publish_outstanding();
 
         // Application policy runs only after consumption. Local obsolescence
@@ -1863,6 +1879,12 @@ impl PeerRoutine {
         else {
             return Ok(());
         };
+        // Refund the timeout charge only now the body is going somewhere. The credit
+        // exists for a body that was late but still useful; a late body for a height
+        // another peer already covered exits above and earns nothing.
+        if was_detached {
+            self.window.credit_late_delivery();
+        }
         self.trace
             .record_block_body_received(hash, BlockBodySource::Zakura);
         metrics::counter!("sync.block.body.received").increment(1);
@@ -2114,7 +2136,22 @@ impl PeerRoutine {
             "each height belongs to one current request owner"
         );
         // Publish the window diagnostics for the reactor's periodic trace row and
-        // for other routines' cross-peer floor-bias decisions.
+        // for other routines' cross-peer floor-bias decisions. The diagnostics change
+        // on every frame; the range set only changes when a range is added or removed,
+        // and rebuilding it sorts the whole list under the shared registry lock.
+        let revision = self.window.outstanding_revision;
+        let published = self
+            .published_outstanding_revision
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let ranges = (published != revision).then(|| {
+            self.published_outstanding_revision
+                .store(revision, std::sync::atomic::Ordering::Relaxed);
+            self.window
+                .outstanding
+                .iter()
+                .map(|range| (range.request.start_height, range.request.end_height()))
+                .collect::<Vec<_>>()
+        });
         let hard_capacity = hard_outbound_capacity(self.window.max_inflight_requests);
         self.registry.publish_response_snapshot(
             &self.peer,
@@ -2130,10 +2167,7 @@ impl PeerRoutine {
                 // floor-preference comparison.
                 bbr_rtprop_ms: self.window.bbr_rtprop_ms(Instant::now()),
             },
-            self.window
-                .outstanding
-                .iter()
-                .map(|range| (range.request.start_height, range.request.end_height())),
+            ranges,
         );
     }
 

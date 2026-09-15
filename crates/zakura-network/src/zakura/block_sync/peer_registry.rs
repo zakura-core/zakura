@@ -688,7 +688,10 @@ impl PeerRegistry {
         generation: u64,
         outstanding: &mut ResponseVec<(block::Height, OutstandingMeta)>,
         slots: SlotDiagnostics,
-        response_ranges: impl IntoIterator<Item = (block::Height, block::Height)>,
+        // `None` leaves the published ranges untouched, for the frames that move
+        // credit without changing the set. Rebuilding sorts the whole list while
+        // this lock is held, which every other block-sync routine needs.
+        response_ranges: Option<impl IntoIterator<Item = (block::Height, block::Height)>>,
     ) {
         let mut peers = self.lock();
         if let Some(entry) = peers
@@ -696,11 +699,13 @@ impl PeerRegistry {
             .filter(|entry| entry.generation == generation)
         {
             std::mem::swap(&mut entry.outstanding, outstanding);
-            entry.response_ranges.clear();
-            for range in response_ranges {
-                entry.response_ranges.push(range);
+            if let Some(ranges) = response_ranges {
+                entry.response_ranges.clear();
+                for range in ranges {
+                    entry.response_ranges.push(range);
+                }
+                entry.response_ranges.sort_unstable();
             }
-            entry.response_ranges.sort_unstable();
             entry.slots = slots;
         }
         outstanding.clear();

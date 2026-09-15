@@ -74,6 +74,7 @@ impl DownloadWindow {
             self.next_response_hashes.insert(hash.0, index);
         }
         self.outstanding.push(range);
+        self.outstanding_revision = self.outstanding_revision.wrapping_add(1);
     }
 
     pub(in crate::zakura::block_sync) fn response_for_hash(
@@ -106,6 +107,7 @@ impl DownloadWindow {
         index: usize,
     ) -> OutstandingBlockRange {
         let range = self.outstanding.swap_remove(index);
+        self.outstanding_revision = self.outstanding_revision.wrapping_add(1);
         self.response_starts
             .remove(range.request.start_height, index);
         if let Some(hash) = range.next_response_hash() {
@@ -129,6 +131,7 @@ impl DownloadWindow {
     #[cfg(test)]
     pub(in crate::zakura::block_sync) fn clear_outstanding(&mut self) {
         self.outstanding.clear();
+        self.outstanding_revision = self.outstanding_revision.wrapping_add(1);
         self.next_response_hashes.clear();
         self.response_starts.clear();
     }

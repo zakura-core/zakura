@@ -25,11 +25,11 @@ exclude = ["*.proto"]
 
 [features]
 
-# Experimental candidate NU7 consensus rules, dormant until NU7 activates.
-nu7-experimental = [
-    "zakura-chain/nu7-experimental",
-    "zakura-consensus/nu7-experimental",
-    "zakura-state/nu7-experimental",
+# NU7 consensus rules. Off by default until NU7 has activation heights.
+nu7 = [
+    "zakura-chain/nu7",
+    "zakura-consensus/nu7",
+    "zakura-state/nu7",
 ]
 
 # Production features that activate extra dependencies, or extra features in

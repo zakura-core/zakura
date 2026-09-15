@@ -1601,8 +1601,8 @@ fn state_commit_context_errors_keep_misbehavior_scores() {
 
 /// Tests for the ZIP 218 per-block shielded action limits.
 ///
-/// The limits only apply once the `nu7-experimental` feature is compiled in and
-/// NU7 is active, so the rejection cases only exist in an experimental NU7 build.
+/// The limits only apply once the `nu7` feature is compiled in and NU7 is
+/// active, so the rejection cases only exist in an NU7 build.
 mod zip218_shielded_action_limits {
     use zakura_chain::{
         block::{Block, Height},
@@ -1616,17 +1616,17 @@ mod zip218_shielded_action_limits {
 
     use crate::block::check;
 
-    #[cfg(feature = "nu7-experimental")]
+    #[cfg(feature = "nu7")]
     use std::sync::Arc;
 
-    #[cfg(feature = "nu7-experimental")]
+    #[cfg(feature = "nu7")]
     use proptest::{
         arbitrary::any,
         strategy::{Strategy, ValueTree},
         test_runner::TestRunner,
     };
 
-    #[cfg(feature = "nu7-experimental")]
+    #[cfg(feature = "nu7")]
     use zakura_chain::{
         parameters::{
             GLOBAL_SHIELDED_BUDGET, SAPLING_BLOCK_IO_LIMIT, SPROUT_BLOCK_JOINSPLIT_LIMIT,
@@ -1637,7 +1637,7 @@ mod zip218_shielded_action_limits {
         },
     };
 
-    #[cfg(feature = "nu7-experimental")]
+    #[cfg(feature = "nu7")]
     use crate::error::TransactionError;
 
     /// Every historical block satisfies the limits, because NU7 is not active on
@@ -1675,7 +1675,7 @@ mod zip218_shielded_action_limits {
     }
 
     #[test]
-    #[cfg(feature = "nu7-experimental")]
+    #[cfg(feature = "nu7")]
     fn limits_activate_at_the_nu7_height() {
         let network = nu7_activation_testnet(2);
         let over_limit_tx =
@@ -1701,10 +1701,10 @@ mod zip218_shielded_action_limits {
         );
     }
 
-    /// Without the `nu7-experimental` feature, the limits stay inactive even at an NU7
+    /// Without the `nu7` feature, the limits stay inactive even at an NU7
     /// height.
     #[test]
-    #[cfg(not(feature = "nu7-experimental"))]
+    #[cfg(not(feature = "nu7"))]
     fn limits_are_inactive_without_the_feature() {
         let over_limit_tx =
             fake_v5_with_orchard_actions(limit_plus_one(ORCHARD_BLOCK_ACTION_LIMIT));
@@ -1714,11 +1714,11 @@ mod zip218_shielded_action_limits {
             Height(1),
             &nu7_active_testnet(),
         )
-        .expect("the limits are inactive without the experimental NU7 feature");
+        .expect("the limits are inactive without the NU7 feature");
     }
 
     #[test]
-    #[cfg(feature = "nu7-experimental")]
+    #[cfg(feature = "nu7")]
     fn counts_at_the_per_pool_limits_are_accepted() {
         let cases: [(&str, Arc<Transaction>); 3] = [
             (
@@ -1744,7 +1744,7 @@ mod zip218_shielded_action_limits {
     }
 
     #[test]
-    #[cfg(feature = "nu7-experimental")]
+    #[cfg(feature = "nu7")]
     fn a_cost_at_the_global_budget_is_accepted() {
         // One JoinSplit costs 2, so the rest of the budget can hold that many
         // fewer Orchard actions.
@@ -1767,7 +1767,7 @@ mod zip218_shielded_action_limits {
     }
 
     #[test]
-    #[cfg(feature = "nu7-experimental")]
+    #[cfg(feature = "nu7")]
     fn sapling_ios_above_the_limit_are_rejected() {
         let err = check::shielded_action_limits_are_valid(
             [fake_v5_with_sapling_outputs(limit_plus_one(
@@ -1789,7 +1789,7 @@ mod zip218_shielded_action_limits {
     }
 
     #[test]
-    #[cfg(feature = "nu7-experimental")]
+    #[cfg(feature = "nu7")]
     fn sprout_joinsplits_above_the_limit_are_rejected() {
         let err = check::shielded_action_limits_are_valid(
             [fake_v4_with_sprout_joinsplits(limit_plus_one(
@@ -1813,7 +1813,7 @@ mod zip218_shielded_action_limits {
     /// A block can satisfy every per-pool limit and still exceed the global
     /// budget.
     #[test]
-    #[cfg(feature = "nu7-experimental")]
+    #[cfg(feature = "nu7")]
     fn a_cost_above_the_global_budget_is_rejected() {
         let err = check::shielded_action_limits_are_valid(
             [
@@ -1852,7 +1852,7 @@ mod zip218_shielded_action_limits {
             .expect("configured testnet is valid")
     }
 
-    #[cfg(feature = "nu7-experimental")]
+    #[cfg(feature = "nu7")]
     fn limit_as_usize(limit: u32) -> usize {
         usize::try_from(limit).expect("a shielded action limit fits in usize")
     }
@@ -1862,7 +1862,7 @@ mod zip218_shielded_action_limits {
     }
 
     /// Returns a V4 transaction containing `count` Sprout JoinSplits.
-    #[cfg(feature = "nu7-experimental")]
+    #[cfg(feature = "nu7")]
     fn fake_v4_with_sprout_joinsplits(count: usize) -> Arc<Transaction> {
         let mut runner = TestRunner::default();
         let mut joinsplit_data = any::<JoinSplitData<Groth16Proof>>()

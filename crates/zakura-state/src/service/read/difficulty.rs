@@ -426,6 +426,7 @@ mod tests {
 
         let is_standard = |offset: u32| {
             let mut result = GetBlockTemplateChainInfo {
+                value_pools: ValueBalance::zero(),
                 tip_hash: block::Hash([0; 32]),
                 tip_height,
                 chain_history_root: None,

@@ -690,15 +690,20 @@ impl PeerRegistry {
         peer: &ZakuraPeerId,
         generation: u64,
         slots: SlotDiagnostics,
-        response_ranges: impl IntoIterator<Item = (block::Height, block::Height)>,
+        // `None` leaves the published ranges untouched, for the frames that move
+        // credit without changing the set. Rebuilding sorts the whole list while
+        // this lock is held, which every other block-sync routine needs.
+        response_ranges: Option<impl IntoIterator<Item = (block::Height, block::Height)>>,
     ) {
         let mut peers = self.lock();
         if let Some(entry) = peers.get_mut(peer) {
             if entry.generation == generation {
                 entry.slots = slots;
-                entry.response_ranges.clear();
-                entry.response_ranges.extend(response_ranges);
-                entry.response_ranges.sort_unstable();
+                if let Some(ranges) = response_ranges {
+                    entry.response_ranges.clear();
+                    entry.response_ranges.extend(ranges);
+                    entry.response_ranges.sort_unstable();
+                }
             }
         }
     }
@@ -1086,7 +1091,7 @@ mod floor_bias_tests {
                 bbr_rtprop_ms,
                 ..SlotDiagnostics::default()
             },
-            [],
+            Some([]),
         );
     }
 
@@ -1360,14 +1365,14 @@ mod floor_bias_tests {
             &fast,
             generation,
             slots,
-            [
+            Some([
                 (block::Height(104), block::Height(106)),
                 (block::Height(100), block::Height(101)),
-            ],
+            ]),
         );
         reg.clear_outstanding(&fast, generation);
         // A retired generation cannot erase the replacement's response exclusions.
-        reg.publish_slots(&fast, generation.saturating_sub(1), slots, []);
+        reg.publish_slots(&fast, generation.saturating_sub(1), slots, Some([]));
         for height in [100, 101, 104, 106] {
             assert!(!reg.floor_has_preferred_unsaturated_server(
                 block::Height(height),
@@ -1384,7 +1389,7 @@ mod floor_bias_tests {
                 false,
             ));
         }
-        reg.publish_slots(&fast, generation, slots, []);
+        reg.publish_slots(&fast, generation, slots, Some([]));
         assert!(reg.floor_has_preferred_unsaturated_server(
             block::Height(100),
             &slow,

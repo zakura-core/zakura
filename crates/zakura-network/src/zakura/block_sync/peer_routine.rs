@@ -274,6 +274,10 @@ pub(super) struct PeerRoutine {
     /// Next request identity in this peer-session generation. Exhaustion fails
     /// closed instead of reusing an owner.
     next_request_id: Option<NonZeroU64>,
+    /// Revision of the outstanding set that the registry currently holds. Starts
+    /// unset so the first publish always writes. Atomic only because publishing
+    /// takes `&self`; it is never shared across tasks.
+    published_outstanding_revision: std::sync::atomic::AtomicU64,
     budget: super::state::ByteBudget,
     work: Arc<WorkQueue>,
     registry: Arc<PeerRegistry>,
@@ -363,6 +367,7 @@ impl PeerRoutine {
             fill_stop_trace_at: BTreeMap::new(),
             generation,
             next_request_id: NonZeroU64::new(1),
+            published_outstanding_revision: std::sync::atomic::AtomicU64::new(u64::MAX),
             budget,
             work,
             registry,
@@ -1994,7 +1999,22 @@ impl PeerRoutine {
                 .set_outstanding(&self.peer, self.generation, map);
         }
         // Publish the window diagnostics for the reactor's periodic trace row and
-        // for other routines' cross-peer floor-bias decisions.
+        // for other routines' cross-peer floor-bias decisions. The diagnostics change
+        // on every frame; the range set only changes when a range is added or removed,
+        // and rebuilding it sorts the whole list under the shared registry lock.
+        let revision = self.window.outstanding_revision;
+        let published = self
+            .published_outstanding_revision
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let ranges = (published != revision).then(|| {
+            self.published_outstanding_revision
+                .store(revision, std::sync::atomic::Ordering::Relaxed);
+            self.window
+                .outstanding
+                .iter()
+                .map(|range| (range.request.start_height, range.request.end_height()))
+                .collect::<Vec<_>>()
+        });
         let hard_capacity = hard_outbound_capacity(self.window.max_inflight_requests);
         self.registry.publish_slots(
             &self.peer,
@@ -2009,10 +2029,7 @@ impl PeerRoutine {
                 // floor-preference comparison.
                 bbr_rtprop_ms: self.window.bbr_rtprop_ms(Instant::now()),
             },
-            self.window
-                .outstanding
-                .iter()
-                .map(|range| (range.request.start_height, range.request.end_height())),
+            ranges,
         );
     }
 

@@ -406,6 +406,10 @@ pub(super) struct DownloadWindow {
     /// Storage order can change when a range ends. Insert, consume and remove
     /// through the window methods so both response indexes stay synchronized.
     pub(super) outstanding: Vec<OutstandingBlockRange>,
+    /// Bumped whenever a range is added or removed. Consuming a part or receiving a
+    /// body does not change the set, so publishing can skip rebuilding the
+    /// registry's sorted copy on the frames that only move credit.
+    pub(super) outstanding_revision: u64,
     next_response_hashes: crate::zakura::regulation::ResponseIndex<[u8; 32]>,
     response_starts: crate::zakura::regulation::ResponseIndex<block::Height>,
     /// Per-peer BBR-lite estimators + cwnd — the sole congestion controller. Under
@@ -442,6 +446,7 @@ impl DownloadWindow {
         Self {
             max_inflight_requests: config.advertised_max_inflight_requests(),
             outstanding: Vec::new(),
+            outstanding_revision: 0,
             next_response_hashes: crate::zakura::regulation::ResponseIndex::new(),
             response_starts: crate::zakura::regulation::ResponseIndex::new(),
             bbr: BbrState::new(config),

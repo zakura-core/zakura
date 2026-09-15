@@ -260,11 +260,9 @@ pub const POST_BLOSSOM_POW_TARGET_SPACING: u32 = 75;
 /// feature enabled follows today's consensus on any network without an NU7
 /// activation height.
 ///
-/// Enabled by the `nu7-experimental` feature.
+/// Enabled by the `nu7-experimental` feature, which also compiles in ZIP 234's
+/// halving-preserving reissuance, so this constant gates ZIP 234 too.
 pub const ZIP218_ENABLED: bool = cfg!(feature = "nu7-experimental");
-
-/// Whether ZIP 234's halving-preserving issuance is compiled into this build.
-pub const ZIP234_ENABLED: bool = cfg!(feature = "nu7-experimental");
 
 /// The target block spacing after NU7 activation, in seconds.
 ///

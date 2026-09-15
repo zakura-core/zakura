@@ -98,8 +98,8 @@ pub enum Response {
     /// Response to [`Request::Block`] with the specified block.
     Block(Option<Arc<Block>>),
 
-    /// Response to [`Request::BlockInfo`] or [`Request::AwaitBlockInfo`] with the specified
-    /// block's chain value pools.
+    /// Response to [`Request::AwaitBlockInfo`] with the specified block's chain value
+    /// pools.
     BlockInfo(Option<BlockInfo>),
 
     /// The response to a `BlockHeader` request.
@@ -692,7 +692,6 @@ impl TryFrom<ReadResponse> for Response {
             ReadResponse::BlockHash(hash) => Ok(Response::BlockHash(hash)),
 
             ReadResponse::Block(block) => Ok(Response::Block(block)),
-            ReadResponse::BlockInfo(block_info) => Ok(Response::BlockInfo(block_info)),
             ReadResponse::BlockAndSize(_) => {
                 Err("there is no corresponding Response for this ReadResponse")
             }
@@ -732,6 +731,7 @@ impl TryFrom<ReadResponse> for Response {
             | ReadResponse::PruningInfo { .. }
             | ReadResponse::BlockRoots(_)
             | ReadResponse::TipPoolValues { .. }
+            | ReadResponse::BlockInfo(_)
             | ReadResponse::TransactionIdsForBlock(_)
             | ReadResponse::AnyChainTransactionIdsForBlock(_)
             | ReadResponse::SaplingTree(_)

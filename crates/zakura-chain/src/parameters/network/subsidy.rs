@@ -19,7 +19,7 @@ use std::{collections::HashMap, sync::OnceLock};
 use crate::{
     amount::{self, Amount, NonNegative, MAX_MONEY},
     block::{Height, HeightDiff},
-    parameters::{Network, NetworkUpgrade, ZIP234_ENABLED},
+    parameters::{Network, NetworkUpgrade, ZIP218_ENABLED},
     transparent,
 };
 
@@ -723,7 +723,7 @@ impl<'a> Pre218Schedule<'a> {
 /// subsidy actually follows ZIP 234, and so whether a caller has to fetch the money
 /// reserve.
 pub fn is_zip234_active(network: &Network, height: Height) -> bool {
-    ZIP234_ENABLED && zip234_start_height(network).is_some_and(|start| height >= start)
+    ZIP218_ENABLED && zip234_start_height(network).is_some_and(|start| height >= start)
 }
 
 /// Applies the [ZIP 234] reissuance fraction to `amount`, rounding up.

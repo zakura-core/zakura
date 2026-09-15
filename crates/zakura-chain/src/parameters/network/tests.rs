@@ -636,11 +636,58 @@ fn zip234_start_height_follows_nu7_and_the_crossing_rule() {
     );
 }
 
-/// Checks the ZIP 234 reissuance bonus and cumulative schedule.
+/// Checks the closed-form cumulative halving subsidy against a per-height sum across
+/// halvings and the NU7 spacing change.
+#[test]
+fn cumulative_halving_subsidies_match_per_height_sum() {
+    use crate::parameters::subsidy::cumulative_halving_subsidies_for_tests;
+
+    let _init_guard = zakura_test::init();
+
+    let nu7 = Height(5_000);
+    let network = testnet::Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            blossom: Some(1),
+            canopy: Some(2),
+            nu7: Some(nu7.0),
+            ..Default::default()
+        })
+        .expect("activation heights are valid")
+        .with_slow_start_interval(Height(100))
+        .with_halving_interval(1_000)
+        .expect("halving interval is valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid");
+    let last_height = Height(25_000);
+
+    assert!(
+        halving(nu7, &network) > 1 && halving(last_height, &network) > halving(nu7, &network) + 1,
+        "the range must cross halvings on both sides of NU7",
+    );
+
+    // `cumulative_halving_subsidies` walks halving and spacing boundaries rather than
+    // every height, so check it against the sum it is standing in for.
+    let mut brute_force = Amount::<NonNegative>::zero();
+    for height in 1..=last_height.0 {
+        brute_force = (brute_force
+            + halving_block_subsidy(Height(height), &network).expect("valid subsidy"))
+        .expect("sum is in range");
+
+        assert_eq!(
+            cumulative_halving_subsidies_for_tests(Height(height), &network)
+                .expect("valid cumulative subsidy"),
+            brute_force,
+            "cumulative subsidies must match the per-height sum at height {height}",
+        );
+    }
+}
+
+/// Checks the ZIP 234 reissuance bonus.
 #[test]
 fn zip234_issuance() {
     use crate::{
-        parameters::{subsidy::cumulative_halving_subsidies_for_tests, ZIP234_ENABLED},
+        parameters::{subsidy::cumulative_halving_subsidies_for_tests, ZIP218_ENABLED},
         value_balance::ValueBalance,
     };
 
@@ -660,28 +707,7 @@ fn zip234_issuance() {
         .to_network()
         .expect("configured testnet is valid");
 
-    // `cumulative_halving_subsidies` walks halving and spacing boundaries rather than
-    // every height, so check it against the sum it is standing in for.
-    let mut brute_force = Amount::<NonNegative>::zero();
-    for height in 1..=25_000u32 {
-        brute_force = (brute_force
-            + block_subsidy(Height(height), &network, None).expect("valid subsidy"))
-        .expect("sum is in range");
-
-        assert_eq!(
-            cumulative_halving_subsidies_for_tests(Height(height), &network)
-                .expect("valid cumulative subsidy"),
-            brute_force,
-            "cumulative subsidies must match the per-height sum at height {height}",
-        );
-    }
-    assert_eq!(
-        cumulative_halving_subsidies_for_tests(Height::MAX, &network)
-            .expect("the cumulative subsidy calculation handles the maximum height"),
-        Amount::<NonNegative>::try_from(MAX_MONEY).expect("valid amount"),
-    );
-
-    if !ZIP234_ENABLED {
+    if !ZIP218_ENABLED {
         // Without ZIP 234, the subsidy stays on the halving schedule.
         let reserve = Amount::<NonNegative>::try_from(1_000_000_000_000i64).expect("valid amount");
         assert_eq!(

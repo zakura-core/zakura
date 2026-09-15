@@ -1850,6 +1850,7 @@ impl HeaderSyncReactor {
                                     Some("auxiliary_capacity"),
                                 );
                             }
+                            self.request_vct_repair_context();
                         } else {
                             self.retry_vct_repair(
                                 repair_owner,
@@ -1876,6 +1877,7 @@ impl HeaderSyncReactor {
                         if let Some(task) = self.vct_repair.get(repair_owner) {
                             self.emit_vct_repair_state(task, "wait", Some("resource_state_change"));
                         }
+                        self.request_vct_repair_context();
                     }
                     metrics::counter!("sync.header.vct.repair.resource_stalled.total").increment(1);
                 }
@@ -2048,7 +2050,9 @@ impl HeaderSyncReactor {
     /// Replay the newest committed state version against one just-blocked repair.
     ///
     /// A refusal can name a version the reactor already observed. Replay that version
-    /// immediately so the repair does not wait for a snapshot that already arrived.
+    /// immediately so the repair does not wait for a snapshot that already arrived. The caller
+    /// then requests context: the capacity deadline replaces the idle maintenance wake, so no
+    /// timer would dispatch the recheck.
     fn replay_committed_state_version(&mut self, owner: zakura_header_chain::BodyWorkOwner) {
         let Some(state_version) = self
             .committed_snapshot

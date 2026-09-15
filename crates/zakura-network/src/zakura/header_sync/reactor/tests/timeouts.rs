@@ -1434,6 +1434,67 @@ fn vct_resource_refusal_waits_for_a_newer_committed_state() {
 }
 
 #[test]
+fn superseded_resource_refusal_rechecks_context_without_a_timer() {
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let snapshot = committed_snapshot(anchor);
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let (_handle, mut actions, mut reactor) =
+        build_header_sync_reactor(startup).expect("the superseded refusal fixture builds");
+    let peer = peer();
+    let (source, owner, _) = seed_vct_active_request(
+        &mut reactor,
+        &snapshot,
+        peer.clone(),
+        7,
+        HeaderTargetPhase::Applying,
+    );
+    // The reactor observed a newer commit while the refused admission was in flight.
+    let mut advanced = snapshot.clone();
+    advanced.state_version = advanced
+        .state_version
+        .checked_next()
+        .expect("the committed state version advances");
+    reactor.committed_snapshot = Some(advanced);
+    std::iter::from_fn(|| actions.try_recv().ok()).for_each(drop);
+
+    reactor.handle_header_target_admission_ready(
+        peer,
+        source,
+        owner,
+        HeaderTargetAdmissionResult::ResourceStalled(zakura_header_chain::CommittedStallReceipt {
+            state_version: snapshot.state_version,
+            alarm_changed: true,
+            attempted_branch: Some(owner.header_authority().branch),
+        }),
+    );
+
+    // The capacity deadline suppresses the idle maintenance wake, so the handler itself must
+    // dispatch the recheck.
+    let task = reactor
+        .vct_repair
+        .current()
+        .expect("the committed refusal keeps the repair requirement");
+    assert!(
+        matches!(task.state(), RepairPolicyState::QueryingContext { .. }),
+        "{task:?}"
+    );
+    assert!(task.capacity_wait().is_some());
+    let actions: Vec<_> = std::iter::from_fn(|| actions.try_recv().ok()).collect();
+    assert!(
+        actions.iter().any(|action| matches!(
+            action,
+            HeaderPortOperation::QueryVctRepairContext {
+                owner: query_owner,
+                ..
+            } if *query_owner == owner.body_owner().expect("the repair owner is a body owner")
+        )),
+        "{actions:?}"
+    );
+}
+
+#[test]
 fn vct_auxiliary_capacity_refusal_resumes_only_after_state_changes() {
     let mut startup = startup(CancellationToken::new());
     let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);

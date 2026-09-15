@@ -51,6 +51,7 @@ Do not replace their ownership assertions with application-handler completion.
 | Local streams | Count locally opened and retiring streams until their protocol state is freed. |
 | Endpoint state | Bound identity mappings and idle actors across sequential new identities as well as simultaneous connections. |
 | Node total | Fund all live allocation owners from one node-wide transport budget, including pending control state, receive batching and allocator overhead. |
+| Service inbound queues | Bound queued frame bytes, not only frame count. Each service queue admits its configured depth of complete payloads, sized by the per-message payload limit, before the receiving routine agrees the frame type or decodes it ([#993](https://github.com/zakura-core/zakura/issues/993)). |
 
 The extracted patch addresses parts of this inventory. It does not complete the
 endpoint or node-wide bound. Its numeric limits and buffer-copying policy remain

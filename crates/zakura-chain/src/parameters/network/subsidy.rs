@@ -293,6 +293,10 @@ pub fn funding_stream_address_period<N: ParameterSubsidy>(
 
     let height_after_first_halving = height - network.height_for_first_halving();
 
+    // `div_euclid` matches the specification's floor because the interval is
+    // positive. The regression test uses a height one block before the
+    // address-period anchor: its numerator is -1, so `/` would truncate it
+    // to 0 rather than floor it to -1.
     (height_after_first_halving + network.post_blossom_halving_interval())
         .div_euclid(network.funding_stream_address_change_interval())
 }

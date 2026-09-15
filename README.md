@@ -20,7 +20,8 @@
 
 [**Zakura**](https://github.com/zakura-core/zakura/) is a consensus-compatible Zcash full node written in Rust, built for scale. Supporting payments at global scale requires on the order of 50k TPS, which translates to consensus processing at least 100 MB/s of block data. Today's chain peaks at 28 KB/s. With cryptographic optimizations to the Zcash protocol underway in [Project Tachyon](https://tachyon.z.cash/) and at [Valargroup](https://valargroup.dev), Zakura is the node implementation built to close that gap.
 
-Zakura is forked from [Zebra](https://github.com/ZcashFoundation/zebra). This first release brings major improvements over existing Zcash node software:
+Zakura is forked from [Zebra](https://github.com/ZcashFoundation/zebra).
+This first release brings major improvements over existing Zcash node software:
 
 - Performance: Blockchain sync is nearly 5× faster than Zebra. Block execution is notably faster than Zebra, especially on worst-case sandblast attacks.
 - Pruning and snapshots: Native block pruning with configurable retention lets you operate a full node with substantially less disk space. We also publish snapshots (~11 GB pruned) that let you bootstrap a node 680× faster than syncing over the standard P2P network. See the [snapshots page](https://zakura.com/snapshots/).

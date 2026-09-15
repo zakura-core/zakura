@@ -501,6 +501,15 @@ async fn any_chain_block_test() -> Result<()> {
 
     // Test: AnyChainBlock should find blocks by hash (same as Block)
     for block in &blocks {
+        let height = read_state
+            .clone()
+            .oneshot(ReadRequest::AnyChainHeight(block.hash()))
+            .await
+            .expect("height lookup succeeds");
+        assert_eq!(
+            height,
+            ReadResponse::AnyChainHeight(block.coinbase_height())
+        );
         let request = ReadRequest::AnyChainBlock(block.hash().into());
         let response = read_state
             .clone()
@@ -534,8 +543,41 @@ async fn any_chain_block_test() -> Result<()> {
         );
     }
 
+    // Pruning removes bodies but retains the committed height index.
+    let mut batch = DiskWriteBatch::new();
+    batch.prepare_prune_batch(&read_state.db, Height(1), Height(2));
+    read_state
+        .db
+        .write_batch(batch)
+        .expect("test pruning succeeds");
+    let pruned_hash = blocks[1].hash();
+    assert_eq!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::AnyChainBlock(pruned_hash.into()))
+            .await
+            .unwrap(),
+        ReadResponse::Block(None)
+    );
+    assert_eq!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::AnyChainHeight(pruned_hash))
+            .await
+            .unwrap(),
+        ReadResponse::AnyChainHeight(Some(Height(1)))
+    );
+
     // Test: Non-existent block should return None
     let fake_hash = zakura_chain::block::Hash([0xff; 32]);
+    assert_eq!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::AnyChainHeight(fake_hash))
+            .await
+            .expect("height lookup succeeds"),
+        ReadResponse::AnyChainHeight(None),
+    );
     let request = ReadRequest::AnyChainBlock(fake_hash.into());
     let response = read_state
         .clone()
@@ -607,6 +649,20 @@ async fn any_chain_block_finds_side_chain_blocks() -> Result<()> {
         2,
         "Should have 2 competing chains"
     );
+
+    let (_state, mut height_state, _tip, _tip_change) = init_test_services(&network).await;
+    let (_sender, receiver) = tokio::sync::watch::channel(non_finalized_state.clone());
+    height_state.non_finalized_state_receiver = crate::WatchReceiver::new(receiver);
+    for block in [&best_chain_block, &side_chain_block] {
+        assert_eq!(
+            height_state
+                .clone()
+                .oneshot(ReadRequest::AnyChainHeight(block.hash()))
+                .await
+                .unwrap(),
+            ReadResponse::AnyChainHeight(block.coinbase_height())
+        );
+    }
 
     // Now test with the read interface
     // We'll use the low-level block lookup functions directly

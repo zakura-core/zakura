@@ -34,15 +34,13 @@ where
         None => {
             let response = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                state.oneshot(zs::Request::AnyChainBlock(parent_hash.into())),
+                state.oneshot(zs::Request::AnyChainHeight(parent_hash)),
             )
             .await;
             match response {
-                Ok(Ok(zs::Response::Block(Some(parent)))) if parent.hash() == parent_hash => {
-                    parent.coinbase_height()?
-                }
-                Ok(Ok(zs::Response::Block(_))) | Ok(Err(_)) | Err(_) => return None,
-                Ok(Ok(_)) => unreachable!("AnyChainBlock returns a block response"),
+                Ok(Ok(zs::Response::AnyChainHeight(Some(height)))) => height,
+                Ok(Ok(zs::Response::AnyChainHeight(None))) | Ok(Err(_)) | Err(_) => return None,
+                Ok(Ok(_)) => unreachable!("AnyChainHeight returns a height response"),
             }
         }
     };
@@ -105,10 +103,10 @@ mod tests {
             let parent = parent.clone();
             let state = tower::service_fn(move |request| {
                 assert!(
-                    matches!(request, zs::Request::AnyChainBlock(hash) if hash == parent_hash.into())
+                    matches!(request, zs::Request::AnyChainHeight(hash) if hash == parent_hash)
                 );
                 let parent = parent.clone();
-                async move { Ok(zs::Response::Block(Some(parent))) }
+                async move { Ok(zs::Response::AnyChainHeight(parent.coinbase_height())) }
             });
             assert_eq!(
                 parent_height_mismatch(state, parent_hash, claimed, None).await,
@@ -120,7 +118,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn unavailable_parent_and_local_failures_are_neutral() {
         let hash = block::Hash([42; 32]);
-        let missing = tower::service_fn(|_| async { Ok(zs::Response::Block(None)) });
+        let missing = tower::service_fn(|_| async { Ok(zs::Response::AnyChainHeight(None)) });
         assert_eq!(
             parent_height_mismatch(missing, hash, None, None).await,
             None
@@ -140,7 +138,7 @@ mod tests {
         let state = tower::service_fn(|_| async {
             panic!("tip needs no lookup");
             #[allow(unreachable_code)]
-            Ok(zs::Response::Block(None))
+            Ok(zs::Response::AnyChainHeight(None))
         });
         assert_eq!(
             parent_height_mismatch(state, hash, None, Some((Height(100), hash))).await,

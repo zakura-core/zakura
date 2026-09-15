@@ -66,8 +66,8 @@ impl Service<zs::Request> for MockParentState {
         self.0.poll_ready(cx)
     }
     fn call(&mut self, request: zs::Request) -> Self::Future {
-        if matches!(request, zs::Request::AnyChainBlock(_)) {
-            return async { Ok(zs::Response::Block(None)) }.boxed();
+        if matches!(request, zs::Request::AnyChainHeight(_)) {
+            return async { Ok(zs::Response::AnyChainHeight(None)) }.boxed();
         }
         self.0.call(request).boxed()
     }
@@ -3924,8 +3924,8 @@ async fn tip_height_without_a_tip_hash_keeps_the_behind_tip_policy() {
 fn unknown_parent_state() -> tower::util::BoxCloneService<zs::Request, zs::Response, crate::BoxError>
 {
     tower::util::BoxCloneService::new(tower::service_fn(|request| async move {
-        assert!(matches!(request, zs::Request::AnyChainBlock(_)));
-        Ok(zs::Response::Block(None))
+        assert!(matches!(request, zs::Request::AnyChainHeight(_)));
+        Ok(zs::Response::AnyChainHeight(None))
     }))
 }
 

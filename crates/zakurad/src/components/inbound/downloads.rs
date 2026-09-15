@@ -1052,6 +1052,7 @@ mod tests {
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
                     zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                    zs::Request::AnyChainHeight(_) => Ok(zs::Response::AnyChainHeight(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
@@ -1160,6 +1161,7 @@ mod tests {
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
                     zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                    zs::Request::AnyChainHeight(_) => Ok(zs::Response::AnyChainHeight(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
@@ -1234,6 +1236,7 @@ mod tests {
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
                     zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                    zs::Request::AnyChainHeight(_) => Ok(zs::Response::AnyChainHeight(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
@@ -1335,6 +1338,7 @@ mod tests {
             BoxCloneService::new(service_fn(|request| async move {
                 match request {
                     zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                    zs::Request::AnyChainHeight(_) => Ok(zs::Response::AnyChainHeight(None)),
                     request => Err(format!("unexpected state request: {request:?}").into()),
                 }
             })),
@@ -1415,10 +1419,11 @@ mod tests {
                 let parent = parent.clone();
                 async move {
                     match request {
-                        zs::Request::AnyChainBlock(key) if key == parent.hash().into() => {
-                            Ok(zs::Response::Block(Some(parent)))
+                        zs::Request::AnyChainHeight(key) if key == parent.hash() => {
+                            Ok(zs::Response::AnyChainHeight(parent.coinbase_height()))
                         }
                         zs::Request::AnyChainBlock(_) => Ok(zs::Response::Block(None)),
+                        zs::Request::AnyChainHeight(_) => Ok(zs::Response::AnyChainHeight(None)),
                         _ => panic!("unexpected state request"),
                     }
                 }

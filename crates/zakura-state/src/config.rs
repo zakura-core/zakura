@@ -166,6 +166,12 @@ pub struct Config {
     /// deleted.
     pub delete_old_database: bool,
 
+    /// Whether a supported major upgrade may move the previous database into the new directory.
+    ///
+    /// Defaults to `false`, preserving the previous database for switching back to an older build.
+    /// Enabling this saves a resync, but switching back can require a backup restore or a resync.
+    pub reuse_previous_database: bool,
+
     /// Selects whether Zebra keeps all historical block data, or stores only the
     /// data required to validate future blocks.
     ///
@@ -238,9 +244,9 @@ impl Config {
         }
     }
 
-    /// Returns the path for the non-finalized state backup directory, based on the network.
-    /// Non-finalized state backup files are encoded in the network protocol format and remain
-    /// valid across db format upgrades.
+    /// Returns the backup directory for the database major format and network.
+    /// Each major database format keeps separate backups because older builds may not decode
+    /// blocks written by a newer build.
     pub fn non_finalized_state_backup_dir(&self, network: &Network) -> Option<PathBuf> {
         if self.ephemeral || !self.should_backup_non_finalized_state {
             // Ephemeral databases are intended to be irrecoverable across restarts and don't
@@ -249,7 +255,15 @@ impl Config {
         }
 
         let net_dir = network.lowercase_name();
-        Some(self.cache_dir.join("non_finalized_state").join(net_dir))
+        Some(
+            self.cache_dir
+                .join("non_finalized_state")
+                .join(format!(
+                    "v{}",
+                    state_database_format_version_in_code().major
+                ))
+                .join(net_dir),
+        )
     }
 
     /// Returns the path for the database format minor/patch version file,
@@ -466,6 +480,7 @@ impl Default for Config {
             vct_fast_sync: true,
             historical_frontier_artifact: None,
             delete_old_database: true,
+            reuse_previous_database: false,
             storage_mode: StorageMode::default(),
             debug_stop_at_height: None,
             debug_validity_check_interval: None,
@@ -477,6 +492,67 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn database_switch_defaults_preserve_the_previous_database() {
+        let config: Config = toml::from_str("").expect("empty configuration uses defaults");
+        assert!(!config.reuse_previous_database);
+        let configured: Config = toml::from_str("reuse_previous_database = true")
+            .expect("database reuse is an explicit configuration option");
+        assert!(configured.reuse_previous_database);
+    }
+
+    #[test]
+    fn cleanup_preserves_the_previous_database_even_without_a_reusable_upgrade() {
+        let cache = tempfile::tempdir().expect("temporary cache exists");
+        let config = Config {
+            cache_dir: cache.path().to_owned(),
+            ..Config::default()
+        };
+        let old_path = config.db_path(STATE_DATABASE_KIND, 1, &Network::Mainnet);
+        fs::create_dir_all(&old_path).expect("fixture directory exists");
+        let marker = old_path.join("keep");
+        fs::write(&marker, b"previous database").expect("fixture file is written");
+        let entry = fs::read_dir(config.cache_dir.join(STATE_DATABASE_KIND))
+            .expect("state directory exists")
+            .next()
+            .expect("old version exists")
+            .expect("old version entry is readable");
+        assert_eq!(check_and_delete_database(&config, 2, &[], &entry), None);
+        assert_eq!(
+            fs::read(&marker).expect("previous database survives cleanup"),
+            b"previous database"
+        );
+    }
+
+    #[test]
+    fn backups_use_the_database_major_format_and_network() {
+        let config = Config {
+            should_backup_non_finalized_state: true,
+            ..Config::default()
+        };
+        let path = config
+            .non_finalized_state_backup_dir(&Network::Mainnet)
+            .expect("persistent backup is enabled");
+        assert_eq!(
+            path,
+            config
+                .cache_dir
+                .join("non_finalized_state")
+                .join(format!(
+                    "v{}",
+                    state_database_format_version_in_code().major
+                ))
+                .join("mainnet")
+        );
+        assert_ne!(
+            path,
+            config.cache_dir.join("non_finalized_state").join("mainnet")
+        );
+        assert!(Config::ephemeral()
+            .non_finalized_state_backup_dir(&Network::Mainnet)
+            .is_none());
+    }
 
     #[test]
     fn storage_mode_deserializes_from_documented_toml() {
@@ -735,6 +811,11 @@ fn check_and_delete_database(
     let dir_major_version = parse_major_version(&dir_name)?;
 
     if dir_major_version >= major_version {
+        return None;
+    }
+
+    // Keep the previous build's database available for switching back.
+    if major_version.checked_sub(1) == Some(dir_major_version) {
         return None;
     }
 

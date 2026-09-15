@@ -178,28 +178,40 @@ impl ZakuraDb {
         // `ReadOnlyCacheDirUnreadable` error here instead of panicking on the version-file read.
         let version_path =
             config.version_file_path(&db_kind, format_version_in_code.major, network);
-        let read_disk_version = || {
-            database_format_version_on_disk(config, &db_kind, format_version_in_code.major, network)
-                .map_err(|source| StateInitError::DatabaseFormatVersion {
-                    path: version_path.clone(),
-                    source,
-                })
-        };
-        let disk_version = if read_only {
+        if read_only {
             DiskDb::check_cache_dir_readable(&config.cache_dir)?;
+        }
+        let disk_version = database_format_version_on_disk(
+            config,
+            &db_kind,
+            format_version_in_code.major,
+            network,
+        )
+        .map_err(|source| StateInitError::DatabaseFormatVersion {
+            path: version_path,
+            source,
+        })?;
+        if let Some(version) = &disk_version {
+            if version.major > format_version_in_code.major {
+                return Err(StateInitError::UnsupportedDatabaseFormat {
+                    path: config.db_path(&db_kind, format_version_in_code.major, network),
+                    disk_version: version.clone(),
+                    running_version: format_version_in_code.clone(),
+                });
+            }
+        }
 
-            read_disk_version()?
+        let disk_version = if read_only {
+            disk_version
         } else {
-            match DiskDb::try_reusing_previous_db_after_major_upgrade(
+            DiskDb::try_reusing_previous_db_after_major_upgrade(
                 &restorable_db_versions(),
                 format_version_in_code,
                 config,
                 &db_kind,
                 network,
-            ) {
-                Some(version) => Some(version),
-                None => read_disk_version()?,
-            }
+            )
+            .or(disk_version)
         };
         let disk_version_before_open = disk_version.clone();
 
@@ -621,6 +633,46 @@ mod tests {
 
         db.update_format_version_on_disk(&disk_version)
             .expect("fixture version write succeeds");
+    }
+
+    #[test]
+    fn newer_major_format_is_rejected_without_changing_the_database() {
+        let _init_guard = zakura_test::init();
+        let (_cache, config) = persistent_config();
+        let network = Network::Mainnet;
+        let running_version = state_database_format_version_in_code();
+        let disk_version = Version::new(running_version.major + 1, 0, 0);
+        seed_db(&config, &network, disk_version.clone(), false);
+        let version_path =
+            config.version_file_path(STATE_DATABASE_KIND, running_version.major, &network);
+        let original_version = std::fs::read(&version_path).expect("fixture version exists");
+
+        for read_only in [false, true] {
+            let error =
+                open(&config, &network, read_only).expect_err("newer major format is incompatible");
+            assert!(
+                matches!(error, StateInitError::UnsupportedDatabaseFormat { disk_version: actual, .. } if actual == disk_version)
+            );
+            assert_eq!(
+                std::fs::read(&version_path).expect("version remains readable"),
+                original_version
+            );
+        }
+    }
+
+    #[test]
+    fn newer_minor_format_remains_openable_in_both_modes() {
+        let _init_guard = zakura_test::init();
+        let network = Network::Mainnet;
+        let running_version = state_database_format_version_in_code();
+        let disk_version = Version::new(running_version.major, running_version.minor + 1, 0);
+        for read_only in [false, true] {
+            let (_cache, config) = persistent_config();
+            seed_db(&config, &network, disk_version.clone(), false);
+            let db = open(&config, &network, read_only)
+                .expect("minor format updates remain backwards compatible");
+            drop(db);
+        }
     }
 
     /// A Mainnet database written by the original VCT fast path is missing historical Sprout

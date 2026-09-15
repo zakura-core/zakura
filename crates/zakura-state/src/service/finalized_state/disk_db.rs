@@ -1474,6 +1474,26 @@ impl DiskDb {
 
             let new_path = config.db_path(db_kind, major_db_ver, network);
 
+            if !config.reuse_previous_database {
+                if !new_path.exists() {
+                    warn!(?old_path, ?new_path,
+                        "preserving the previous database and syncing a separate database for this major format; \
+                         state.reuse_previous_database=true permits moving the previous database, but switching back \
+                         can require a backup restore or a resync");
+                }
+                return None;
+            }
+
+            // A directory name cannot establish compatibility if someone moved a newer database.
+            match database_format_version_on_disk(config, db_kind, old_major_db_ver, network) {
+                Ok(Some(version)) if version.major == old_major_db_ver => {}
+                other => {
+                    warn!(?old_path, version = ?other,
+                        "skipping database reuse because its recorded major format does not match its directory");
+                    return None;
+                }
+            }
+
             let old_path = match fs::canonicalize(&old_path) {
                 Ok(canonicalized_old_path) => canonicalized_old_path,
                 Err(e) => {
@@ -1509,6 +1529,8 @@ impl DiskDb {
             let new_db_exists = DB::list_cf(&opts, &new_path).is_ok_and(|cf| !cf.is_empty());
 
             if old_db_exists && !new_db_exists {
+                warn!(?old_path, ?new_path,
+                    "moving the previous database for a major upgrade; switching back can require a backup restore or a resync");
                 // Create the parent directory for the new db. This is because we can't directly
                 // rename e.g. `state/v25/mainnet/` to `state/v26/mainnet/` with `fs::rename()` if
                 // `state/v26/` does not exist.

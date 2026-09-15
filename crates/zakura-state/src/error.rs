@@ -172,6 +172,21 @@ pub enum StateInitError {
         source: BoxError,
     },
 
+    /// The selected database requires a newer major format than this build supports.
+    #[error(
+        "database at {path:?} uses format {disk_version}, but this build supports {running_version}. \
+         Use a build that supports this database format, or restore a compatible database. \
+         Do not rename database directories or edit the version file to bypass this check"
+    )]
+    UnsupportedDatabaseFormat {
+        /// Database directory whose format is incompatible.
+        path: PathBuf,
+        /// Format recorded by the database writer.
+        disk_version: semver::Version,
+        /// Format supported by this build.
+        running_version: semver::Version,
+    },
+
     /// RocksDB could not open the requested primary or secondary database.
     #[error(
         "cannot open state database at {path:?}. Hint: check whether another process holds the database lock and whether cache_dir is readable and writable"

@@ -2544,6 +2544,11 @@ impl ZakuraService for LegacyGossipSink {
         legacy_gossip_streams()
     }
 
+    fn allowed_frame_flags(&self, _stream: Stream) -> u16 {
+        // Gossip, request and response codecs all reject nonzero flags.
+        0
+    }
+
     fn session_policy(&self) -> SessionPolicy {
         SessionPolicy {
             opening: SessionOpening::InitiatorOnly,

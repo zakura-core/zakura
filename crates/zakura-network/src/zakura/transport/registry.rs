@@ -217,6 +217,11 @@ impl ServiceRegistry {
         self.service_for_kind(stream.kind)?.message_types(stream)
     }
 
+    pub(crate) fn allowed_frame_flags(&self, stream: Stream) -> u16 {
+        self.service_for_kind(stream.kind)
+            .map_or(u16::MAX, |service| service.allowed_frame_flags(stream))
+    }
+
     /// Lookup the declared stream for `kind`.
     pub fn stream_for_kind(&self, kind: u16) -> Option<Stream> {
         let service = self.service_for_kind(kind)?;

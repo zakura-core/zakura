@@ -26,6 +26,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use tokio::sync::Notify;
 use zakura_chain::block;
 
 use super::{
@@ -191,6 +192,7 @@ pub(super) struct OutstandingClaim {
 #[derive(Debug)]
 pub(super) struct PeerRegistry {
     peers: StdMutex<HashMap<ZakuraPeerId, Entry>>,
+    floor_ranking_changed: Notify,
     session_parks: StdMutex<HashMap<ZakuraPeerId, SessionPark>>,
     body_retry_avoid: StdMutex<HashMap<(zakura_header_chain::SourceId, BodyRetryKey), Instant>>,
     body_retry_all: StdMutex<HashMap<BodyRetryKey, Instant>>,
@@ -208,6 +210,7 @@ impl PeerRegistry {
     pub(super) fn new() -> Self {
         Self {
             peers: StdMutex::new(HashMap::new()),
+            floor_ranking_changed: Notify::new(),
             session_parks: StdMutex::new(HashMap::new()),
             body_retry_avoid: StdMutex::new(HashMap::new()),
             body_retry_all: StdMutex::new(HashMap::new()),
@@ -661,12 +664,30 @@ impl PeerRegistry {
         generation: u64,
         slots: SlotDiagnostics,
     ) {
-        let mut peers = self.lock();
-        if let Some(entry) = peers.get_mut(peer) {
-            if entry.generation == generation {
-                entry.slots = slots;
+        let ranking_changed = {
+            let mut peers = self.lock();
+            let Some(entry) = peers.get_mut(peer) else {
+                return;
+            };
+            if entry.generation != generation {
+                return;
             }
+            let ranking_changed = entry.slots.bbr_rtprop_ms != slots.bbr_rtprop_ms
+                || (entry.slots.available_slots > 0) != (slots.available_slots > 0);
+            entry.slots = slots;
+            ranking_changed
+        };
+        if ranking_changed {
+            // A previous deferrer may now be the preferred carrier. Updating the
+            // table alone leaves its routine asleep until an unrelated wake.
+            self.floor_ranking_changed.notify_waiters();
         }
+    }
+
+    /// Register before checking floor preference so an update cannot be missed
+    /// between deferring to another peer and waiting for work.
+    pub(super) fn subscribe_floor_ranking(&self) -> &Notify {
+        &self.floor_ranking_changed
     }
 
     /// Aggregate the routines' slot diagnostics for the periodic trace row.
@@ -1394,6 +1415,57 @@ mod floor_bias_tests {
             assert!([&fast, &slow].into_iter().any(|peer| {
                 !reg.floor_has_preferred_unsaturated_server(block::Height(100), peer, None, false)
             }));
+        }
+    }
+
+    #[tokio::test]
+    async fn floor_ranking_notifies_only_when_preference_can_change() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let reg = PeerRegistry::new();
+        let provider = peer(1);
+        register_with_rtprop(&reg, &config, &provider, 0, 1000, 3, Some(75));
+        let generation = reg.lock().get(&provider).unwrap().generation;
+        let slots = SlotDiagnostics {
+            available_slots: 2,
+            outstanding_requests: 1,
+            bbr_rtprop_ms: Some(75),
+            ..SlotDiagnostics::default()
+        };
+        let unchanged = reg.subscribe_floor_ranking().notified();
+        tokio::pin!(unchanged);
+        unchanged.as_mut().enable();
+
+        reg.publish_slots(&provider, generation, slots);
+        let expired = SlotDiagnostics {
+            bbr_rtprop_ms: None,
+            ..slots
+        };
+        reg.publish_slots(&provider, generation + 1, expired);
+        reg.publish_slots(&peer(2), generation, expired);
+        assert!(
+            futures::poll!(unchanged.as_mut()).is_pending(),
+            "diagnostics, unchanged eligibility, and rejected publications must not wake routines"
+        );
+
+        for (score, available_slots) in [(None, 2), (None, 0), (None, 1), (Some(145), 1)] {
+            // Register before checking, then publish before the first await.
+            // Every waiting routine must retain that wake.
+            let first = reg.subscribe_floor_ranking().notified();
+            let second = reg.subscribe_floor_ranking().notified();
+            tokio::pin!(first, second);
+            first.as_mut().enable();
+            second.as_mut().enable();
+            reg.publish_slots(
+                &provider,
+                generation,
+                SlotDiagnostics {
+                    bbr_rtprop_ms: score,
+                    available_slots,
+                    ..slots
+                },
+            );
+            assert!(futures::poll!(first.as_mut()).is_ready());
+            assert!(futures::poll!(second.as_mut()).is_ready());
         }
     }
 

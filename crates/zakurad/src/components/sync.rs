@@ -32,6 +32,9 @@ use tower::{
 use zakura_chain::{
     block::{self, Height, HeightDiff},
     chain_tip::ChainTip,
+    parameters::{
+        Network, NetworkUpgrade, NU7_POW_TARGET_SPACING_RATIO, POST_NU7_POW_TARGET_SPACING,
+    },
 };
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state as zs;
@@ -176,6 +179,21 @@ pub const DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT: usize = 32;
 ///
 /// If the concurrency limit is 0, Zebra can't download or verify any blocks.
 pub const MIN_CONCURRENCY_LIMIT: usize = 1;
+
+/// Returns the multiplier for the syncer's block-count lookahead limits at `height`.
+///
+/// ZIP 218 scales block-count download limits by `NU7PoWTargetSpacingRatio` where the target
+/// spacing is 25 seconds, so the limits cover the same time as at 75 second spacing. The
+/// multiplier is 1 at every other spacing.
+fn lookahead_limit_multiplier(network: &Network, height: Height) -> usize {
+    let target_spacing = NetworkUpgrade::target_spacing_for_height(network, height);
+
+    if target_spacing.num_seconds() == i64::from(POST_NU7_POW_TARGET_SPACING) {
+        usize::try_from(NU7_POW_TARGET_SPACING_RATIO).expect("the spacing ratio fits in usize")
+    } else {
+        1
+    }
+}
 
 /// The expected maximum number of hashes in an ObtainTips or ExtendTips response.
 ///
@@ -858,6 +876,9 @@ where
     /// The genesis hash for the configured network
     genesis_hash: block::Hash,
 
+    /// The configured network, which sets the target spacing for the lookahead limits.
+    network: Network,
+
     /// The largest block height for the checkpoint verifier, based on the current config.
     max_checkpoint_height: Height,
 
@@ -1052,12 +1073,14 @@ where
                 checkpoint_verify_concurrency_limit,
                 full_verify_concurrency_limit,
             ),
+            config.network.network.clone(),
             max_checkpoint_height,
             trace.clone(),
         ));
 
         let new_syncer = Self {
             genesis_hash: config.network.network.genesis_hash(),
+            network: config.network.network.clone(),
             max_checkpoint_height,
             checkpoint_verify_concurrency_limit,
             full_verify_concurrency_limit,
@@ -2409,6 +2432,8 @@ where
 
     /// The configured lookahead limit, based on the currently verified height,
     /// and the number of hashes we haven't queued yet.
+    ///
+    /// The configured limits scale with [`lookahead_limit_multiplier`] at the verified height.
     fn lookahead_limit(&self, new_hashes: usize) -> usize {
         let max_checkpoint_height: usize = self
             .max_checkpoint_height
@@ -2417,24 +2442,20 @@ where
             .expect("fits in usize");
 
         // When the state is empty, we want to verify using checkpoints
-        let verified_height: usize = self
-            .latest_chain_tip
-            .best_tip_height()
-            .unwrap_or(Height(0))
-            .0
-            .try_into()
-            .expect("fits in usize");
+        let verified_height = self.latest_chain_tip.best_tip_height().unwrap_or(Height(0));
+        let multiplier = lookahead_limit_multiplier(&self.network, verified_height);
+        let verified_height: usize = verified_height.0.try_into().expect("fits in usize");
 
         if verified_height >= max_checkpoint_height {
-            self.full_verify_concurrency_limit
+            self.full_verify_concurrency_limit * multiplier
         } else if (verified_height + new_hashes) >= max_checkpoint_height {
             // If we're just about to start full verification, allow enough for the remaining checkpoint,
             // and also enough for a separate full verification lookahead.
             let checkpoint_hashes = verified_height + new_hashes - max_checkpoint_height;
 
-            self.full_verify_concurrency_limit + checkpoint_hashes
+            self.full_verify_concurrency_limit * multiplier + checkpoint_hashes
         } else {
-            self.checkpoint_verify_concurrency_limit
+            self.checkpoint_verify_concurrency_limit * multiplier
         }
     }
 

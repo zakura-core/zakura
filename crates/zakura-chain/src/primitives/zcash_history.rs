@@ -183,7 +183,9 @@ impl<V: Version> Tree<V> {
     ///
     /// # Panics
     ///
-    /// Will panic if `peaks` is empty.
+    /// Will panic if `peaks` is empty, or if `network_upgrade` has no consensus branch ID.
+    /// [`NonEmptyHistoryTree`](crate::history_tree::NonEmptyHistoryTree) returns an error
+    /// for an upgrade without a branch ID before it builds a tree.
     #[allow(clippy::unwrap_in_result)]
     pub fn new_from_cache(
         network: &Network,
@@ -194,7 +196,7 @@ impl<V: Version> Tree<V> {
     ) -> Result<Self, io::Error> {
         let branch_id = network_upgrade
             .branch_id()
-            .expect("unexpected pre-Overwinter MMR history tree");
+            .expect("history trees only exist for network upgrades with a branch ID");
         let mut peaks_vec = Vec::new();
         for (idx, entry) in peaks {
             let inner_entry = zcash_history::Entry::from_bytes(branch_id.into(), entry.inner)?;
@@ -390,7 +392,7 @@ impl Version for zcash_history::V1 {
         let network_upgrade = NetworkUpgrade::current(network, height);
         let branch_id = network_upgrade
             .branch_id()
-            .expect("must have branch ID for chain history network upgrades");
+            .expect("history trees only exist for network upgrades with a branch ID");
         let block_hash = header.hash().0;
         let time: u32 = header
             .time

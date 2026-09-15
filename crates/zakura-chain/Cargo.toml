@@ -20,12 +20,8 @@ default = []
 
 # Production features that activate extra functionality
 
-# NU7 consensus rules. Off by default until NU7 has activation heights.
-#
-# The rules include ZIP 218's shorter target spacing, wider difficulty averaging
-# window, subsidy reduced by the spacing ratio, and per-block shielded action
-# limits, and ZIP 234's halving-preserving reissuance. They change consensus
-# only on a network that configures an NU7 activation height.
+# ZIP 234 reissuance. Off by default until NU7 has activation heights.
+# ZIP 218 uses height-based activation in every build.
 nu7 = []
 
 # Consensus-critical conversion from JSON to Zcash types

@@ -50,6 +50,10 @@ impl From<PeerSocketAddr> for PeerSource {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(any(test, feature = "proptest-impl"), derive(Arbitrary))]
 pub enum Request {
+    /// Disconnect a legacy peer without changing its misbehavior score or ban status.
+    /// The peer set handles this request locally and returns [`super::Response::Nil`].
+    DisconnectPeer(PeerSocketAddr),
+
     /// Requests additional peers from the server.
     ///
     /// # Response
@@ -266,6 +270,7 @@ pub enum Request {
 impl fmt::Display for Request {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str(&match self {
+            Request::DisconnectPeer(_) => "DisconnectPeer".to_string(),
             Request::Peers => "Peers".to_string(),
             Request::Ping(_) => "Ping".to_string(),
 
@@ -307,6 +312,7 @@ impl Request {
     /// Returns the Zebra internal request type as a string.
     pub fn command(&self) -> &'static str {
         match self {
+            Request::DisconnectPeer(_) => "DisconnectPeer",
             Request::Peers => "Peers",
             Request::Ping(_) => "Ping",
 

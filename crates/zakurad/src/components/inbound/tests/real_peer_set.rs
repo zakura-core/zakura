@@ -1030,8 +1030,8 @@ async fn setup(
         .service(BoxService::new(mock_tx_verifier.clone()));
 
     // Mempool
-    let (misbehavior_tx, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
     let mempool_config = MempoolConfig::default();
+    let (misbehavior_sender, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
     let (mut mempool_service, transaction_subscriber) = Mempool::new(
         &mempool_config,
         false,
@@ -1042,7 +1042,7 @@ async fn setup(
         sync_status.clone(),
         latest_chain_tip.clone(),
         chain_tip_change.clone(),
-        misbehavior_tx,
+        misbehavior_sender.clone(),
     );
 
     // Enable the mempool
@@ -1055,7 +1055,6 @@ async fn setup(
         .service(mempool_service);
 
     // Initialize the inbound service
-    let (misbehavior_sender, _misbehavior_rx) = tokio::sync::mpsc::channel(1);
     let setup_data = InboundSetupData {
         address_book,
         block_download_peer_set: peer_set.clone(),

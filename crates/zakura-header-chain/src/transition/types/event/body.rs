@@ -126,8 +126,7 @@ pub enum BodyVerificationClass {
     Duplicate,
     /// Delivered body data disagrees with a commitment in its admitted header.
     PayloadMismatch(BodyCommitmentKind),
-    /// Header commitments bind every field needed to prove a deterministic rule failure.
-    /// A transaction-ID rule does not require matching unrelated authorization bytes.
+    /// All applicable commitments matched before one deterministic consensus rule failed.
     ConsensusInvalid(BodyRuleId),
     /// Verification could not reach a durable consensus conclusion.
     Retryable(TransientBodyFailureKind),

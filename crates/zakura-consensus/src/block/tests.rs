@@ -1629,11 +1629,13 @@ mod zip218_shielded_action_limits {
     #[cfg(feature = "nu7")]
     use zakura_chain::{
         parameters::{
-            GLOBAL_SHIELDED_BUDGET, SAPLING_BLOCK_IO_LIMIT, SPROUT_BLOCK_JOINSPLIT_LIMIT,
+            NetworkUpgrade, GLOBAL_SHIELDED_BUDGET, SAPLING_BLOCK_IO_LIMIT,
+            SPROUT_BLOCK_JOINSPLIT_LIMIT,
         },
         primitives::Groth16Proof,
         transaction::{
-            arbitrary::fake_v5_with_sapling_outputs, JoinSplitData, LockTime, Transaction,
+            arbitrary::{fake_v5_with_sapling_outputs, fake_v6_with_orchard_and_ironwood_actions},
+            JoinSplitData, LockTime, Transaction,
         },
     };
 
@@ -1833,6 +1835,99 @@ mod zip218_shielded_action_limits {
                 limit: GLOBAL_SHIELDED_BUDGET,
             }
         );
+    }
+
+    /// Ironwood actions count against the Orchard limit, alone or mixed with
+    /// Orchard actions, in one transaction or across transactions.
+    #[test]
+    #[cfg(feature = "nu7")]
+    fn ironwood_actions_above_the_orchard_limit_are_rejected() {
+        let over_limit = limit_plus_one(ORCHARD_BLOCK_ACTION_LIMIT);
+        let orchard_half = over_limit / 2;
+        let ironwood_half = over_limit - orchard_half;
+
+        let cases: [(&str, Vec<Arc<Transaction>>); 3] = [
+            ("Ironwood actions alone", vec![ironwood_tx(0, over_limit)]),
+            (
+                "Orchard and Ironwood actions in one transaction",
+                vec![ironwood_tx(orchard_half, ironwood_half)],
+            ),
+            (
+                "Orchard and Ironwood actions in separate transactions",
+                vec![
+                    fake_v5_with_orchard_actions(orchard_half),
+                    ironwood_tx(0, ironwood_half),
+                ],
+            ),
+        ];
+
+        for (case, transactions) in cases {
+            let err = check::shielded_action_limits_are_valid(
+                transactions.iter(),
+                Height(1),
+                &nu7_active_testnet(),
+            )
+            .expect_err("Ironwood actions above the Orchard limit must fail");
+
+            assert_eq!(
+                err,
+                TransactionError::OrchardActionsExceedBlockLimit {
+                    actions: ORCHARD_BLOCK_ACTION_LIMIT + 1,
+                    limit: ORCHARD_BLOCK_ACTION_LIMIT,
+                },
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "nu7")]
+    fn ironwood_actions_at_the_orchard_limit_are_accepted() {
+        let limit = limit_as_usize(ORCHARD_BLOCK_ACTION_LIMIT);
+        let orchard_half = limit / 2;
+
+        for tx in [
+            ironwood_tx(0, limit),
+            ironwood_tx(orchard_half, limit - orchard_half),
+        ] {
+            check::shielded_action_limits_are_valid([tx].iter(), Height(1), &nu7_active_testnet())
+                .expect("Orchard and Ironwood actions exactly at the Orchard limit must pass");
+        }
+    }
+
+    /// Ironwood actions add to the global budget like Orchard actions.
+    #[test]
+    #[cfg(feature = "nu7")]
+    fn ironwood_actions_count_in_the_global_budget() {
+        let err = check::shielded_action_limits_are_valid(
+            [
+                ironwood_tx(0, limit_as_usize(ORCHARD_BLOCK_ACTION_LIMIT)),
+                fake_v5_with_sapling_outputs(1),
+            ]
+            .iter(),
+            Height(1),
+            &nu7_active_testnet(),
+        )
+        .expect_err("Ironwood actions plus a Sapling output above the global budget must fail");
+
+        assert_eq!(
+            err,
+            TransactionError::ShieldedCostExceedsBlockBudget {
+                cost: GLOBAL_SHIELDED_BUDGET + 1,
+                limit: GLOBAL_SHIELDED_BUDGET,
+            }
+        );
+    }
+
+    /// Returns a V6 transaction with `orchard_actions` Orchard actions and
+    /// `ironwood_actions` Ironwood actions.
+    #[cfg(feature = "nu7")]
+    fn ironwood_tx(orchard_actions: usize, ironwood_actions: usize) -> Arc<Transaction> {
+        fake_v6_with_orchard_and_ironwood_actions(
+            NetworkUpgrade::Nu7,
+            orchard_actions,
+            ironwood_actions,
+        )
     }
 
     fn nu7_active_testnet() -> Network {

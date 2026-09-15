@@ -4,7 +4,11 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use zakura_chain::{block, parameters::NetworkKind, work::difficulty::U256};
+use zakura_chain::{
+    block,
+    parameters::{NetworkKind, POST_NU7_POW_AVERAGING_WINDOW},
+    work::difficulty::U256,
+};
 use zakura_header_chain::{
     AlarmSet, BodyValidationState, ChainScore, ChangeSet, DiskMigrationAuthentication,
     EngineConfig, EngineMetadata, EngineMode, EvidenceId, FinalityAncestryHeader, FinalityEpoch,
@@ -38,6 +42,17 @@ use crate::service::finalized_state::{
     HEADER_CONSENSUS_INVALID_BODY_TOMBSTONE, HEADER_ENGINE_META, HEADER_FINALITY_HISTORY,
     HEADER_FINALITY_WITNESS, HEADER_VALIDATION_CONTEXT,
 };
+
+/// The widest validation context any build retains below the finalized anchor:
+/// ZIP 218's averaging window plus the median-time span, less the anchor.
+///
+/// A build reads up to this many rows, so it can remove the rows that a build
+/// with a wider averaging window retained.
+const WIDEST_PREDECESSOR_CONTEXT_SPAN: usize =
+    POST_NU7_POW_AVERAGING_WINDOW + zakura_header_chain::POW_MEDIAN_BLOCK_SPAN - 1;
+
+const _: () =
+    assert!(zakura_header_chain::POW_PREDECESSOR_CONTEXT_SPAN <= WIDEST_PREDECESSOR_CONTEXT_SPAN);
 
 impl HeaderChainStore {
     /// Atomically migrate every released legacy header-chain format to v4.
@@ -254,12 +269,17 @@ impl HeaderChainStore {
         Ok(true)
     }
 
-    /// Add validation context that an older build did not retain.
+    /// Resize the retained validation context to this build's span.
     ///
-    /// The authenticated full-state header index supplies the additional rows.
-    /// This step runs before the startup audit because that audit requires the
-    /// complete context for the current build.
-    pub(in crate::service) fn backfill_validation_context(
+    /// A build with a narrower averaging window did not retain the older rows
+    /// this build needs, so the authenticated full-state header index supplies
+    /// them. A build with a wider averaging window, such as an NU7 build,
+    /// retained older rows that this build does not use, so this step removes
+    /// them. This step runs before the startup audit because that audit requires
+    /// exactly the context for the current build.
+    ///
+    /// Returns the number of rows added or removed.
+    pub(in crate::service) fn resize_validation_context(
         &self,
         source: &ZakuraDb,
     ) -> Result<usize, HeaderChainInitializationError> {
@@ -270,7 +290,7 @@ impl HeaderChainStore {
         let metadata = self
             .metadata_row()?
             .ok_or(HeaderChainStoreError::Incoherent(
-                "validation-context backfill requires initialized metadata",
+                "validation-context resize requires initialized metadata",
             ))?;
         if metadata.mode != EngineMode::Integrated {
             return Ok(0);
@@ -286,9 +306,7 @@ impl HeaderChainStore {
         self.audit_snapshot()
             .map_err(HeaderChainStoreError::Store)?
             .visit_validation_context_records(
-                zakura_header_chain::RowLimit::new(
-                    zakura_header_chain::POW_PREDECESSOR_CONTEXT_SPAN,
-                ),
+                zakura_header_chain::RowLimit::new(WIDEST_PREDECESSOR_CONTEXT_SPAN),
                 &mut |record| {
                     retained.push(record);
                     Ok(())
@@ -297,14 +315,16 @@ impl HeaderChainStore {
             .map_err(HeaderChainStoreError::Store)?;
         retained.sort_unstable_by_key(|record| record.height);
 
-        if retained.len() >= expected.len() {
+        if retained.len() == expected.len() {
             return Ok(0);
         }
 
-        let expected_suffix = &expected[expected.len() - retained.len()..];
-        if !retained
+        // Every build retains the newest rows below the anchor, so the shorter
+        // context must match the end of the longer one.
+        let shared = retained.len().min(expected.len());
+        if !retained[retained.len() - shared..]
             .iter()
-            .zip(expected_suffix)
+            .zip(&expected[expected.len() - shared..])
             .all(|(retained, expected)| {
                 retained.height == expected.height && retained.header == expected.header
             })
@@ -315,19 +335,32 @@ impl HeaderChainStore {
             .into());
         }
 
-        let missing = expected.len() - retained.len();
         let mut batch = DiskWriteBatch::new();
-        for context in expected.into_iter().take(missing) {
-            self.put_value(
-                &mut batch,
-                HEADER_VALIDATION_CONTEXT,
-                context.header.hash().0,
-                &context,
-            )?;
-        }
+        let changed = if retained.len() < expected.len() {
+            let missing = expected.len() - retained.len();
+            for context in expected.into_iter().take(missing) {
+                self.put_value(
+                    &mut batch,
+                    HEADER_VALIDATION_CONTEXT,
+                    context.header.hash().0,
+                    &context,
+                )?;
+            }
+            missing
+        } else {
+            let extra = retained.len() - expected.len();
+            for record in retained.iter().take(extra) {
+                self.delete_raw(
+                    &mut batch,
+                    HEADER_VALIDATION_CONTEXT,
+                    record.header.hash().0,
+                )?;
+            }
+            extra
+        };
         self.db.write(batch)?;
 
-        Ok(missing)
+        Ok(changed)
     }
 
     fn stage_v1_aux_deliveries(

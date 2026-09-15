@@ -35,7 +35,8 @@ There are several ways to install the node software: an interactive installer th
 
 ### Installer
 
-The simplest way to install Zakura on a new machine is using the interactive installer:
+The simplest way to install Zakura on a new machine is using the interactive
+installer:
 
 ```console
 curl -fsSL https://zakura.com/install.sh | bash

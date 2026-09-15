@@ -1,65 +1,29 @@
 //! Body commitment evidence used before permanently rejecting a header.
+//!
+//! A deterministic body failure condemns a header only when the header commits
+//! to every byte the failed rule read. Pre-NU5 transaction IDs hash the whole
+//! transaction, so a matching Merkle root binds the body. NU5 IDs exclude
+//! authorization data, which the header binds separately through the ZIP 244
+//! authorization-data commitment. A failure on a body that is not fully bound
+//! is a payload mismatch: another supplier may still deliver the committed body,
+//! and a header whose bodies never bind is handled like an unavailable body.
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use tower::{Service, ServiceExt};
 use zakura_chain::{
     block::{Block, CommitmentError},
     parameters::{Network, NetworkUpgrade},
-    transaction,
 };
 use zakura_state as zs;
 
-use super::{check, VerifyBlockError};
+use super::VerifyBlockError;
 use crate::{BlockError, BoxError};
 
 /// Bound the parent-history read needed to attribute a failed delivery.
 const COMMITMENT_CHECK_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// A transaction list whose IDs match the header. Padding is removed only for
-/// validation. A reconstructed body must never be committed or cached.
-pub(super) struct TransactionList {
-    pub block: Arc<Block>,
-    pub hashes: Arc<[transaction::Hash]>,
-    pub padded: bool,
-}
-
-impl TransactionList {
-    pub fn check(network: &Network, block: Arc<Block>) -> Result<Self, VerifyBlockError> {
-        let hashes: Arc<[_]> = block.transactions.iter().map(|tx| tx.hash()).collect();
-        let padded = match check::merkle_root_validity_with_attribution(network, &block, &hashes) {
-            Ok(()) => false,
-            Err(error) if is_padding_error(&error) => true,
-            Err(error) => return Err(error),
-        };
-        if !padded {
-            return Ok(Self {
-                block,
-                hashes,
-                padded,
-            });
-        }
-
-        let mut seen = HashSet::with_capacity(hashes.len());
-        let block = Arc::new(Block {
-            header: block.header.clone(),
-            transactions: block
-                .transactions
-                .iter()
-                .zip(hashes.iter())
-                .filter(|(_, hash)| seen.insert(**hash))
-                .map(|(tx, _)| tx.clone())
-                .collect(),
-        });
-        let hashes = block.transactions.iter().map(|tx| tx.hash()).collect();
-        Ok(Self {
-            block,
-            hashes,
-            padded,
-        })
-    }
-}
-
+/// Whether `error` is a duplicate that Merkle padding could have introduced.
 pub(crate) fn is_padding_error(error: &VerifyBlockError) -> bool {
     matches!(
         error,
@@ -69,7 +33,8 @@ pub(crate) fn is_padding_error(error: &VerifyBlockError) -> bool {
     )
 }
 
-/// Reject duplicate counts fixed by NU5's zero-padded authorization tree.
+/// Reject a padded transaction list when the NU5 authorization commitment
+/// proves that the header itself commits to the duplicates.
 pub(crate) async fn check_auth_bound_duplicates<S>(
     state: S,
     network: &Network,
@@ -87,7 +52,7 @@ where
 
 /// Returns whether NU5 authorization bytes match in the exact parent history.
 /// Missing history is retryable. Pre-NU5 IDs already bind authorization bytes,
-/// so those blocks return false and callers do not require a separate check.
+/// so those blocks return false and callers must not read that as a mismatch.
 pub(super) async fn auth_commitment_matches<S>(
     state: S,
     network: &Network,
@@ -143,8 +108,10 @@ where
     }
 }
 
-/// A semantic error may condemn NU5 authorization bytes only after they match
-/// the header. Successful commits already check this in contextual validation.
+/// Turn a deterministic failure on an NU5 body into a payload mismatch unless
+/// the header's authorization commitment binds the delivered bytes. Rules whose
+/// inputs the transaction ID fixes are deliberately not carved out: see the
+/// module docs.
 pub(super) async fn attribute_failure<S>(
     state: S,
     network: &Network,
@@ -156,28 +123,15 @@ where
     S::Future: Send + 'static,
 {
     use zakura_header_chain::BodyVerificationClass;
-    if !matches!(
+    let deterministic = matches!(
         error.body_verification_class(),
         BodyVerificationClass::ConsensusInvalid(_)
-    ) || block
+    );
+    let binds_auth_data_separately = block
         .coinbase_height()
-        .is_none_or(|height| NetworkUpgrade::current(network, height) < NetworkUpgrade::Nu5)
-    {
+        .is_some_and(|height| NetworkUpgrade::current(network, height) >= NetworkUpgrade::Nu5);
+    if !deterministic || !binds_auth_data_separately {
         return error;
-    }
-    // Recover any committed-field failure even if another transaction's
-    // authorization check finished first. Successful bodies pay no extra pass.
-    let height = block
-        .coinbase_height()
-        .expect("verified block has a height");
-    for tx in &block.transactions {
-        if let Err(error) =
-            crate::transaction::check::txid_rules(tx, height, network).and_then(|()| {
-                crate::transaction::check::lock_time_has_passed(tx, height, block.header.time)
-            })
-        {
-            return error.into();
-        }
     }
     match auth_commitment_matches(state, network, block).await {
         Ok(true) => error,

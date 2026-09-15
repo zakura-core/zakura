@@ -1465,9 +1465,11 @@ fn assert_body_verification_class(
 }
 
 #[tokio::test]
-async fn nu5_duplicate_attribution_checks_auth_and_unique_candidate() {
+async fn nu5_duplicate_attribution_requires_the_auth_commitment() {
     use zakura_chain::block::{ChainHistoryBlockTxAuthCommitmentHash, CommitmentError};
-    use zakura_header_chain::{BodyCommitmentKind, BodyRuleId, BodyVerificationClass};
+    use zakura_header_chain::{
+        BodyCommitmentKind, BodyRuleId, BodyVerificationClass, TransientBodyFailureKind,
+    };
 
     #[derive(Clone, Copy)]
     enum CommittedAuth {
@@ -1484,31 +1486,13 @@ async fn nu5_duplicate_attribution_checks_auth_and_unique_candidate() {
         .find(|block| block.transactions.len() > 1 && block.transactions.len() % 2 == 1)
         .expect("a NU5 fixture has an odd transaction count above one");
 
-    for (committed_auth, context_available, invalid_candidate) in [
-        (CommittedAuth::Unique, true, false),
-        (CommittedAuth::Duplicates, true, false),
-        (CommittedAuth::Duplicates, false, false),
-        (CommittedAuth::Unique, true, true),
-        (CommittedAuth::Neither, true, false),
-        (CommittedAuth::Neither, true, true),
-        (CommittedAuth::Unique, false, true),
+    for (committed_auth, context_available) in [
+        (CommittedAuth::Unique, true),
+        (CommittedAuth::Duplicates, true),
+        (CommittedAuth::Duplicates, false),
+        (CommittedAuth::Neither, true),
+        (CommittedAuth::Unique, false),
     ] {
-        let mut canonical = canonical.clone();
-        let height = canonical.coinbase_height().unwrap();
-        if invalid_candidate {
-            let last = Arc::make_mut(canonical.transactions.last_mut().unwrap());
-            match last {
-                Transaction::V3 { expiry_height, .. }
-                | Transaction::V4 { expiry_height, .. }
-                | Transaction::V5 { expiry_height, .. }
-                | Transaction::V6 { expiry_height, .. } => {
-                    *expiry_height = Height(height.0 - 1);
-                }
-                _ => panic!("the NU5 fixture has an expiring transaction"),
-            }
-            Arc::make_mut(&mut canonical.header).merkle_root =
-                canonical.transactions.iter().collect();
-        }
         let mut delivered = canonical.clone();
         delivered
             .transactions
@@ -1524,14 +1508,9 @@ async fn nu5_duplicate_attribution_checks_auth_and_unique_candidate() {
             ChainHistoryBlockTxAuthCommitmentHash::from_commitments(&history_root, &auth_root)
                 .into();
         Arc::make_mut(&mut delivered.header).commitment_bytes = commitment.into();
-        let unique_count = canonical.transactions.len();
         let state = service_fn(move |request| async move {
             match request {
                 zs::Request::KnownBlock(_) => Ok(zs::Response::KnownBlock(None)),
-                zs::Request::CheckBlockValidity(candidate) => {
-                    assert_eq!(candidate.block.transactions.len(), unique_count);
-                    Ok(zs::Response::ValidBlock)
-                }
                 zs::Request::CheckBlockCommitment(commitment) => {
                     if !context_available {
                         return Ok(zs::Response::BlockCommitmentValidity(
@@ -1556,47 +1535,28 @@ async fn nu5_duplicate_attribution_checks_auth_and_unique_candidate() {
                         )) as BoxError)
                     }
                 }
-                _ => panic!("duplicate bodies must not be committed: {request:?}"),
+                _ => panic!("padded bodies must not be validated or committed: {request:?}"),
             }
         });
-        // Supply sufficient fees once, so this test isolates attribution from
-        // transaction input lookup and fee calculation.
-        let fee_transaction = canonical.transactions[1].hash();
-        let transactions = service_fn(move |request: tx::Request| async move {
-            assert!(
-                !matches!(committed_auth, CommittedAuth::Neither),
-                "unbound authorization data cannot prove a candidate invalid"
-            );
-            if !request.transaction().is_coinbase() {
-                tx::check::non_coinbase_expiry_height(&height, &request.transaction())?;
-            }
-            let pays_fees = request.transaction().hash() == fee_transaction;
-            let mut response = accept_block_transaction(request);
-            if let tx::Response::Block { miner_fee, .. } = &mut response {
-                if pays_fees {
-                    *miner_fee = Some(Amount::try_from(MAX_MONEY / 2).unwrap());
-                }
-            }
-            Ok::<_, BoxError>(response)
-        });
+        // The header commitments settle a padded delivery on their own: no
+        // transaction is ever handed to the transaction verifier.
+        let transactions = service_fn(
+            |request: tx::Request| -> std::future::Ready<Result<tx::Response, BoxError>> {
+                panic!("padded bodies are not verified transaction by transaction: {request:?}")
+            },
+        );
         let error = SemanticBlockVerifier::new(&network, state, transactions)
             .oneshot(Request::CheckProposal(Arc::new(delivered)))
             .await
-            .expect_err("both duplicate bodies are rejected");
+            .expect_err("every padded delivery is rejected");
         assert_body_verification_class(
             error,
-            if invalid_candidate {
-                BodyVerificationClass::ConsensusInvalid(BodyRuleId::new("transaction.expired"))
-            } else if !context_available {
-                BodyVerificationClass::Retryable(
-                    zakura_header_chain::TransientBodyFailureKind::MissingContext,
-                )
+            if !context_available {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::MissingContext)
             } else if matches!(committed_auth, CommittedAuth::Duplicates) {
                 BodyVerificationClass::ConsensusInvalid(BodyRuleId::new(
                     "block.duplicate_transaction",
                 ))
-            } else if matches!(committed_auth, CommittedAuth::Neither) {
-                BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::AuthDataRoot)
             } else {
                 BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::TransactionMerkleRoot)
             },
@@ -1770,64 +1730,6 @@ async fn ordinary_auth_failures_require_matching_commitments_and_allow_a_correct
             );
         }
     }
-}
-
-#[tokio::test]
-async fn duplicate_padding_cannot_hide_a_transaction_without_inputs() {
-    use zakura_header_chain::{BodyRuleId, BodyVerificationClass};
-
-    let _init_guard = zakura_test::init();
-    let network = Network::Mainnet;
-    let mut block =
-        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_1687106_BYTES[..]).unwrap();
-    let invalid = Arc::new(Transaction::V5 {
-        network_upgrade: NetworkUpgrade::Nu5,
-        lock_time: LockTime::unlocked(),
-        expiry_height: block.coinbase_height().unwrap(),
-        inputs: vec![],
-        outputs: vec![transparent::Output {
-            value: Amount::zero(),
-            lock_script: transparent::Script::new(&[0]),
-        }],
-        sapling_shielded_data: None,
-        orchard_shielded_data: None,
-    });
-    block.transactions = vec![
-        block.transactions[0].clone(),
-        block.transactions[1].clone(),
-        invalid,
-    ];
-    Arc::make_mut(&mut block.header).merkle_root = block.transactions.iter().collect();
-    let header_hash = block.hash();
-    block
-        .transactions
-        .push(block.transactions.last().unwrap().clone());
-    let block = Block::zcash_deserialize(&block.zcash_serialize_to_vec().unwrap()[..]).unwrap();
-    assert_eq!(block.hash(), header_hash);
-    let hashes: Vec<_> = block
-        .transactions
-        .iter()
-        .map(|transaction| transaction.hash())
-        .collect();
-    let expected =
-        BodyVerificationClass::ConsensusInvalid(BodyRuleId::new("transaction.no_inputs"));
-
-    // The commitment selects a unique list. Shared transaction checks can reject
-    // that list without parent state or authorization data.
-    assert!(commitment::is_padding_error(
-        &check::merkle_root_validity_with_attribution(&network, &block, &hashes).unwrap_err()
-    ));
-    let state = service_fn(|request| async move {
-        assert!(matches!(request, zs::Request::KnownBlock(_)));
-        Ok::<_, BoxError>(zs::Response::KnownBlock(None))
-    });
-    let transactions =
-        service_fn(|request| async move { Ok::<_, BoxError>(accept_block_transaction(request)) });
-    let error = SemanticBlockVerifier::new(&network, state, transactions)
-        .oneshot(Request::CheckProposal(Arc::new(block)))
-        .await
-        .unwrap_err();
-    assert_eq!(error.body_verification_class(), expected);
 }
 
 #[test]

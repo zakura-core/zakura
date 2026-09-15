@@ -282,9 +282,6 @@ fn map_commit_error(source: BoxError, hash: block::Hash) -> VerifyBlockError {
 /// [§7.6]: <https://zips.z.cash/protocol/protocol.pdf#blockheader>
 pub const MAX_BLOCK_SIGOPS: u32 = 20_000;
 
-/// Limit how long a bad delivery can wait on validation of its reconstructed body.
-const PADDED_BODY_VALIDATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-
 impl<S, V> SemanticBlockVerifier<S, V>
 where
     S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
@@ -443,20 +440,26 @@ where
                     .record(solved_header_start.elapsed().as_secs_f64());
             }
 
-            let delivered = block;
-            let commitment::TransactionList {
-                block,
-                hashes: transaction_hashes,
-                padded,
-            } = commitment::TransactionList::check(&network, delivered.clone())?;
+            // Precomputing this avoids duplicating transaction hash computations.
+            let transaction_hashes: Arc<[_]> =
+                block.transactions.iter().map(|t| t.hash()).collect();
 
-            if padded {
-                // The normal transaction verifier runs these same committed-field
-                // checks. Padding must not hide them behind mismatched auth data.
-                for transaction in &block.transactions {
-                    tx::check::txid_rules(transaction, height, &network)?;
-                    tx::check::lock_time_has_passed(transaction, height, block.header.time)?;
+            // Check that the header binds the transaction list before any
+            // transaction rule can condemn it.
+            if let Err(error) =
+                check::merkle_root_validity_with_attribution(&network, &block, &transaction_hashes)
+            {
+                if commitment::is_padding_error(&error) {
+                    // Only the NU5 authorization commitment can prove that the
+                    // header itself commits to the duplicates.
+                    commitment::check_auth_bound_duplicates(
+                        state_service.clone(),
+                        &network,
+                        block.clone(),
+                    )
+                    .await?;
                 }
+                return Err(error);
             }
 
             // Since errors cause an early exit, try to do the
@@ -474,22 +477,6 @@ where
             // See [ZIP-1015](https://zips.z.cash/zip-1015).
             let deferred_pool_balance_change =
                 check::subsidy_is_valid(&block, &network, expected_block_subsidy)?;
-
-            if padded {
-                commitment::check_auth_bound_duplicates(state_service.clone(), &network, delivered)
-                    .await?;
-                if zakura_chain::parameters::NetworkUpgrade::current(&network, height)
-                    >= zakura_chain::parameters::NetworkUpgrade::Nu5
-                    && !commitment::auth_commitment_matches(
-                        state_service.clone(),
-                        &network,
-                        block.clone(),
-                    )
-                    .await?
-                {
-                    return Err(VerifyBlockError::AuthDataMismatch);
-                }
-            }
 
             let attribution_state = state_service.clone();
             let attribution_block = block.clone();
@@ -601,20 +588,6 @@ where
                     auth_data_root: None,
                 };
 
-                if padded {
-                    // Exercise normal contextual validation on a private snapshot of
-                    // the actual parent, without publishing the reconstructed body.
-                    let response = state_service
-                        .oneshot(zs::Request::CheckBlockValidity(prepared_block))
-                        .await
-                        .map_err(|source| map_commit_error(source, hash))?;
-                    assert!(
-                        matches!(response, zs::Response::ValidBlock),
-                        "state responds to CheckBlockValidity"
-                    );
-                    return Err(BlockError::DuplicateTransaction.into());
-                }
-
                 // Return early for proposal requests.
                 if request.is_proposal() {
                     let cache_copy = request.should_cache().then(|| prepared_block.clone());
@@ -652,21 +625,10 @@ where
 
                 commit_prepared_block(state_service, prepared_block, request.admission()).await
             };
-            let result = if padded {
-                // Missing inputs in a reconstructed candidate must not strand the
-                // delivered body while its supplier waits for a verdict.
-                tokio::time::timeout(PADDED_BODY_VALIDATION_TIMEOUT, validation)
-                    .await
-                    .map_err(|error| VerifyBlockError::StateService {
-                        source: Box::new(error),
-                        hash,
-                    })?
-            } else {
-                validation.await
-            };
-            match result {
-                // Padding candidates already proved their authorization commitment.
-                Err(error) if !padded => Err(commitment::attribute_failure(
+            match validation.await {
+                // A deterministic failure condemns the header only if the header
+                // commits to every byte the failed rule read: see `attribute_failure`.
+                Err(error) => Err(commitment::attribute_failure(
                     attribution_state,
                     &network,
                     attribution_block,

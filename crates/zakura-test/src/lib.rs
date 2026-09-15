@@ -16,11 +16,14 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 #[allow(missing_docs)]
 pub mod command;
 
+pub mod allocations;
+pub mod execution;
 pub mod log_capture;
 pub mod mock_service;
 pub mod net;
 pub mod network_addr;
 pub mod prelude;
+pub mod resources;
 pub mod service_extensions;
 pub mod transcript;
 pub mod vectors;

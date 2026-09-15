@@ -1,6 +1,6 @@
 [package]
 name = "zakura-test"
-version = "2.1.0"
+version = "2.2.0"
 authors.workspace = true
 description = "Test harnesses and test vectors for the Zakura node. Internal crate, published to support cargo install zakura"
 license.workspace = true
@@ -42,6 +42,9 @@ tracing = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 rand = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -914,6 +914,16 @@ impl WorkQueue {
         low: block::Height,
         high: block::Height,
     ) -> Option<block::Height> {
+        self.first_pending_work_in_range(low, high)
+            .map(|(height, _)| height)
+    }
+
+    /// Snapshot the first pending body's height and authority under one lock.
+    pub(super) fn first_pending_work_in_range(
+        &self,
+        low: block::Height,
+        high: block::Height,
+    ) -> Option<(block::Height, WorkItem)> {
         if low > high {
             return None;
         }
@@ -921,7 +931,7 @@ impl WorkQueue {
             .pending
             .range(low..=high)
             .next()
-            .map(|(height, _)| *height)
+            .map(|(height, item)| (*height, *item))
     }
 
     pub(super) fn max_in_flight(&self) -> Option<block::Height> {

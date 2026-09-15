@@ -28,6 +28,45 @@ use zcash_script::{
 
 use crate::error::TransactionError;
 
+/// Check context-free rules whose inputs are committed by the transaction ID.
+/// Authorization bytes, proof sizes, and spent-output lookups belong to later
+/// validation. Block attribution can use these rules even when authorization
+/// data is missing or does not match the header.
+pub(crate) fn txid_rules(
+    tx: &Transaction,
+    height: Height,
+    network: &Network,
+) -> Result<(), TransactionError> {
+    has_inputs_and_outputs(tx)?;
+    has_enough_orchard_flags(tx)?;
+    has_enough_ironwood_flags(tx)?;
+    orchard_cross_address_disabled(tx)?;
+    consensus_branch_id(tx, height, network)?;
+    sapling_point_encodings_are_valid(tx)?;
+
+    if network.is_orchard_temporarily_disabled(height) && tx.orchard_shielded_data().is_some() {
+        return Err(TransactionError::Other(
+            "transaction has Orchard actions (temporarily disabled)".into(),
+        ));
+    }
+
+    if tx.is_coinbase() {
+        coinbase_tx_no_prevout_joinsplit_spend(tx)?;
+        coinbase_has_no_orchard_shielded_data(tx, height, network)?;
+        coinbase_expiry_height(&height, tx, network)?;
+    } else {
+        if !tx.is_valid_non_coinbase() {
+            return Err(TransactionError::NonCoinbaseHasCoinbaseInput);
+        }
+        non_coinbase_expiry_height(&height, tx)?;
+    }
+
+    joinsplit_has_vpub_zero(tx)?;
+    disabled_add_to_sprout_pool(tx, height, network)?;
+    disabled_add_to_orchard_pool(tx, height, network)?;
+    spend_conflicts(tx)
+}
+
 /// Checks if the transaction's lock time allows this transaction to be included in a block.
 ///
 /// Arguments:

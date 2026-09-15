@@ -2106,6 +2106,8 @@ impl Service<Request> for StateService {
             | Request::FindBlockHashes { .. }
             | Request::FindBlockHeaders { .. }
             | Request::CheckBestChainTipNullifiersAndAnchors(_)
+            | Request::CheckBlockCommitment(_)
+            | Request::CheckBlockValidity(_)
             | Request::CheckPreparedMinedRelayEligibility(_)
             | Request::CheckBlockProposalValidity(_) => {
                 // Redirect the request to the concurrent ReadStateService
@@ -3339,6 +3341,21 @@ impl Service<ReadRequest> for ReadStateService {
                 Ok(ReadResponse::ValidBestChainTipNullifiersAndAnchors)
             }
 
+            ReadRequest::CheckBlockCommitment(commitment) => {
+                let validity = check_block_commitment_for_state(
+                    &state.network,
+                    &state.latest_non_finalized_state(),
+                    &state.db,
+                    commitment,
+                )?;
+                Ok(ReadResponse::BlockCommitmentValidity(validity))
+            }
+
+            ReadRequest::CheckBlockValidity(block) => {
+                validate_block_for_state(&state.db, state.latest_non_finalized_state(), block)?;
+                Ok(ReadResponse::ValidBlock)
+            }
+
             ReadRequest::CheckPreparedMinedRelayEligibility(commitment) => {
                 let latest_non_finalized_state = state.latest_non_finalized_state();
                 let eligibility = check_prepared_mined_relay_eligibility_for_state(
@@ -3420,7 +3437,7 @@ impl Service<ReadRequest> for ReadStateService {
                     "attempting to validate and commit block proposal \
                          onto a cloned non-finalized state"
                 );
-                let mut latest_non_finalized_state = state.latest_non_finalized_state();
+                let latest_non_finalized_state = state.latest_non_finalized_state();
 
                 // The previous block of a valid proposal must be on the best chain tip.
                 let Some((_best_tip_height, best_tip_hash)) =
@@ -3438,16 +3455,9 @@ impl Service<ReadRequest> for ReadStateService {
                         .into());
                 }
 
-                // This clone of the non-finalized state is dropped when this closure returns.
-                // The non-finalized state that's used in the rest of the state (including finalizing
-                // blocks into the db) is not mutated here.
-                //
-                // TODO: Convert `CommitSemanticallyVerifiedError` to a new `ValidateProposalError`?
-                latest_non_finalized_state.disable_metrics();
-
-                write::validate_and_commit_non_finalized(
+                validate_block_for_state(
                     &state.db,
-                    &mut latest_non_finalized_state,
+                    latest_non_finalized_state,
                     semantically_verified,
                 )?;
 
@@ -3521,12 +3531,29 @@ impl Service<ReadRequest> for ReadStateService {
     }
 }
 
-fn check_prepared_mined_relay_eligibility_for_state(
+/// Validate against the actual parent on a private snapshot. Mining proposals add
+/// their best-tip restriction at the caller, while downloaded candidates can fork.
+fn validate_block_for_state(
+    db: &ZakuraDb,
+    mut non_finalized_state: NonFinalizedState,
+    block: SemanticallyVerifiedBlock,
+) -> Result<(), ValidateContextError> {
+    // The write path has already committed genesis before contextual validation.
+    // Read-only callers can arrive before that context exists.
+    if db.finalized_tip_height().is_none() {
+        return Err(ValidateContextError::NotReadyToBeCommitted);
+    }
+    non_finalized_state.disable_metrics();
+    write::validate_and_commit_non_finalized(db, &mut non_finalized_state, block)
+}
+
+/// Check only the body commitment, without mining policy or recent-work checks.
+fn check_block_commitment_for_state(
     network: &Network,
     non_finalized_state: &NonFinalizedState,
     db: &ZakuraDb,
     commitment: BlockCommitmentData,
-) -> Result<PreparedMinedRelayEligibility, BoxError> {
+) -> Result<crate::BlockCommitmentValidity, BoxError> {
     let parent_hash = commitment.block.header.previous_block_hash;
     let parent_chain =
         non_finalized_state.find_chain(|chain| chain.contains_block_hash(parent_hash));
@@ -3542,7 +3569,7 @@ fn check_prepared_mined_relay_eligibility_for_state(
         {
             Arc::new(zakura_chain::history_tree::HistoryTree::default())
         }
-        None => return Ok(PreparedMinedRelayEligibility::Unavailable),
+        None => return Ok(crate::BlockCommitmentValidity::Unavailable),
     };
     check::block_commitment_is_valid_for_chain_history(
         commitment.block.clone(),
@@ -3550,6 +3577,22 @@ fn check_prepared_mined_relay_eligibility_for_state(
         &history_tree,
         commitment.auth_data_root,
     )?;
+
+    Ok(crate::BlockCommitmentValidity::Valid)
+}
+
+fn check_prepared_mined_relay_eligibility_for_state(
+    network: &Network,
+    non_finalized_state: &NonFinalizedState,
+    db: &ZakuraDb,
+    commitment: BlockCommitmentData,
+) -> Result<PreparedMinedRelayEligibility, BoxError> {
+    let parent_hash = commitment.block.header.previous_block_hash;
+    if check_block_commitment_for_state(network, non_finalized_state, db, commitment.clone())?
+        == crate::BlockCommitmentValidity::Unavailable
+    {
+        return Ok(PreparedMinedRelayEligibility::Unavailable);
+    }
 
     // Take only the blocks `block_is_valid_for_recent_chain_data` reads. The
     // iterator walks to genesis, so collecting it would load every ancestor

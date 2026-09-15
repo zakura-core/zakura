@@ -32,6 +32,8 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| `COMMITMENT_CHECK_TIMEOUT` | `crates/zakura-consensus/src/block/commitment.rs` | new → `20 s` | [#999](https://github.com/zakura-core/zakura/pull/999) | Bound parent-history reads used to attribute invalid body deliveries. |
+| `PADDED_BODY_VALIDATION_TIMEOUT` | `crates/zakura-consensus/src/block.rs` | new → `120 s` | [#999](https://github.com/zakura-core/zakura/pull/999) | Bound validation of a reconstructed duplicate-padding candidate before retrying delivery. |
 | `status_unavailable_seconds` | `deploy/continuous-sync/continuous-sync.py` and `deploy/continuous-sync/nodes.toml` | new → `600 s` | [#846](https://github.com/zakura-core/zakura/pull/846) | Stop a canary after ten continuous minutes without exact sync evidence while allowing individual metrics errors and timeouts to recover. |
 | `network.zakura.nat_traversal` | `crates/zakura-network/src/zakura/handler.rs` | always disabled → configurable, default `false`; `true` allows up to 32 remote candidate addresses with the pinned Iroh defaults | [#968](https://github.com/zakura-core/zakura/pull/968) | Let operators opt in to QUIC candidate exchange and probes while preserving the default behavior. |
 | `DEFAULT_ZAKURA_STREAM_RECEIVE_WINDOW` | `crates/zakura-network/src/zakura/handler.rs` | `32 MiB` → `16 MiB` | [#943](https://github.com/zakura-core/zakura/pull/943) | Leave connection receive credit for another service while one stream's application reads are paused. |

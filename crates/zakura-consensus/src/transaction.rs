@@ -454,12 +454,7 @@ where
         async move {
             tracing::trace!(?tx_id, ?req, "got tx verify request");
 
-            // Do quick checks first
-            check::has_inputs_and_outputs(&tx)?;
-            check::has_enough_orchard_flags(&tx)?;
-            check::has_enough_ironwood_flags(&tx)?;
-            check::orchard_cross_address_disabled(&tx)?;
-            match check::consensus_branch_id(&tx, req.height(), &network) {
+            match check::txid_rules(&tx, req.height(), &network) {
                 Err(TransactionError::WrongConsensusBranchId)
                     if req.is_mempool()
                         && is_nu6_3_branch_id_misbehavior_grace_period(&tx, req.height(), &network) =>
@@ -469,64 +464,12 @@ where
                 Err(error) => return Err(error),
                 Ok(()) => {}
             }
-            check::sapling_point_encodings_are_valid(&tx)?;
-
-            // Soft fork: temporarily require transactions to not contain Orchard actions.
-            //
-            // This soft fork was added while NU 6.1 was the active epoch on the Zcash
-            // chain, but we apply it uniformly even if NU 6.1 is not active in case it is
-            // ported to other chains with a different sequence of NUs.
-            //
-            // This will be treated as "Rules that apply generally before the next NU"
-            // when we add the NU that re-enables Orchard actions.
-            if network.is_orchard_temporarily_disabled(req.height()) && tx.orchard_shielded_data().is_some() {
-                return Err(TransactionError::Other("transaction has Orchard actions (temporarily disabled)".into()));
-            }
-
-            // Require every Orchard or Ironwood proof to have the canonical length for
-            // its number of actions.
-            // A proof that is present but not canonically sized can be padded with
-            // arbitrary trailing data without affecting its validity, allowing excess
-            // bandwidth and storage costs to be imposed while paying only fees sized to a
-            // canonical proof.
-            //
-            // Transaction parsing enforces the same rule. Repeat it here for
-            // defense-in-depth and transactions constructed in memory.
-            check::shielded_proof_size_is_canonical(&tx)?;
-
-            // Validate the coinbase input consensus rules
             if req.is_mempool() && tx.is_coinbase() {
                 return Err(TransactionError::CoinbaseInMempool);
             }
-
-            if tx.is_coinbase() {
-                check::coinbase_tx_no_prevout_joinsplit_spend(&tx)?;
-                check::coinbase_has_no_orchard_shielded_data(&tx, req.height(), &network)?;
-            } else if !tx.is_valid_non_coinbase() {
-                return Err(TransactionError::NonCoinbaseHasCoinbaseInput);
-            }
-
-            // Validate `nExpiryHeight` consensus rules
-            if tx.is_coinbase() {
-                check::coinbase_expiry_height(&req.height(), &tx, &network)?;
-            } else {
-                check::non_coinbase_expiry_height(&req.height(), &tx)?;
-            }
-
-            // Consensus rule:
-            //
-            // > Either v_{pub}^{old} or v_{pub}^{new} MUST be zero.
-            //
-            // https://zips.z.cash/protocol/protocol.pdf#joinsplitdesc
-            check::joinsplit_has_vpub_zero(&tx)?;
-
-            // [Canopy onward]: `vpub_old` MUST be zero.
-            // https://zips.z.cash/protocol/protocol.pdf#joinsplitdesc
-            check::disabled_add_to_sprout_pool(&tx, req.height(), &network)?;
-            // [NU6.3 onward]: `vbalanceOrchard` MUST be non-negative.
-            check::disabled_add_to_orchard_pool(&tx, req.height(), &network)?;
-
-            check::spend_conflicts(&tx)?;
+            // Proof size depends on authorization bytes, so it cannot establish
+            // header invalidity until the block authorization commitment matches.
+            check::shielded_proof_size_is_canonical(&tx)?;
 
             tracing::trace!(?tx_id, "passed quick checks");
 

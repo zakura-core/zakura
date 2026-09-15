@@ -92,9 +92,19 @@ fn prepared_relay_test_state() -> (
     super::non_finalized_state::NonFinalizedState,
     Arc<Block>,
 ) {
+    prepared_relay_test_state_for_network(Network::Mainnet)
+}
+
+fn prepared_relay_test_state_for_network(
+    network: Network,
+) -> (
+    Network,
+    super::finalized_state::FinalizedState,
+    super::non_finalized_state::NonFinalizedState,
+    Arc<Block>,
+) {
     use crate::tests::FakeChainHelper;
 
-    let network = Network::Mainnet;
     let heartwood_height = NetworkUpgrade::Heartwood
         .activation_height(&network)
         .expect("Heartwood activates")
@@ -261,6 +271,188 @@ fn prepared_relay_preflight_uses_commit_first_for_a_side_chain() {
         eligibility,
         crate::PreparedMinedRelayEligibility::CommitFirst
     );
+}
+
+#[test]
+fn body_commitment_check_is_independent_of_mining_work_waivers() {
+    use crate::tests::FakeChainHelper;
+
+    let _init_guard = zakura_test::init();
+    let network = zakura_chain::parameters::testnet::Parameters::build()
+        .with_disable_pow(true)
+        .to_network()
+        .expect("the configured test network is valid");
+    let (network, finalized, non_finalized, side) = prepared_relay_test_state_for_network(network);
+    let parent_chain = non_finalized.find_chain(|chain| chain.contains_block_hash(side.hash()));
+    let history_tree =
+        super::read::tree::history_tree(parent_chain, &finalized.db, side.hash().into())
+            .expect("side parent has a history tree");
+    let commitment = history_tree.hash().expect("the history root exists").into();
+    let child = side.make_fake_child().set_block_commitment(commitment);
+    let eligibility = super::check_block_commitment_for_state(
+        &network,
+        &non_finalized,
+        &finalized.db,
+        crate::BlockCommitmentData {
+            block: child,
+            auth_data_root: None,
+        },
+    )
+    .expect("the commitment and parent context match");
+    assert_eq!(eligibility, crate::BlockCommitmentValidity::Valid);
+}
+
+#[test]
+fn body_commitment_check_requires_the_exact_parent_history() {
+    use crate::tests::FakeChainHelper;
+
+    let _init_guard = zakura_test::init();
+    let (network, finalized, non_finalized, side) = prepared_relay_test_state();
+    let parent_chain = non_finalized.find_chain(|chain| chain.contains_block_hash(side.hash()));
+    let history = super::read::tree::history_tree(parent_chain, &finalized.db, side.hash().into())
+        .expect("the side parent has history");
+    let child = side
+        .make_fake_child()
+        .set_block_commitment(history.hash().unwrap().into());
+    let check = |block| {
+        super::check_block_commitment_for_state(
+            &network,
+            &non_finalized,
+            &finalized.db,
+            crate::BlockCommitmentData {
+                block,
+                auth_data_root: None,
+            },
+        )
+    };
+    assert_eq!(
+        check(child.clone()).unwrap(),
+        crate::BlockCommitmentValidity::Valid
+    );
+
+    let best_history = non_finalized
+        .best_chain()
+        .unwrap()
+        .history_block_commitment_tree()
+        .hash()
+        .unwrap();
+    let wrong_history = child.clone().set_block_commitment(best_history.into());
+    assert!(matches!(
+        check(wrong_history)
+            .unwrap_err()
+            .downcast_ref::<ValidateContextError>(),
+        Some(ValidateContextError::InvalidBlockCommitment(_))
+    ));
+
+    let mut missing_parent = child;
+    Arc::make_mut(&mut Arc::make_mut(&mut missing_parent).header).previous_block_hash =
+        block::Hash([0x99; 32]);
+    assert_eq!(
+        check(missing_parent).unwrap(),
+        crate::BlockCommitmentValidity::Unavailable
+    );
+}
+
+#[test]
+fn block_validation_checks_side_parents_without_writing_state() {
+    use crate::tests::FakeChainHelper;
+
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let mut finalized = FinalizedState::new(&Config::ephemeral(), &network).unwrap();
+    let genesis = Arc::new(
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..]).unwrap(),
+    );
+    assert!(matches!(
+        super::validate_block_for_state(
+            &finalized.db,
+            super::NonFinalizedState::new(&network),
+            genesis.make_fake_child().prepare(),
+        ),
+        Err(ValidateContextError::NotReadyToBeCommitted)
+    ));
+    finalized
+        .commit_finalized_direct(genesis.into(), None, None, "test")
+        .unwrap();
+    let mut non_finalized = super::NonFinalizedState::new(&network);
+    let mut first =
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES[..]).unwrap();
+    // Non-finalized state requires v4 or later transaction representations.
+    first.transactions = vec![Arc::new(transaction_v4_from_coinbase(
+        &first.transactions[0],
+    ))];
+    let first = Arc::new(first);
+    non_finalized
+        .commit_new_chain(first.clone().prepare(), &finalized)
+        .unwrap();
+    let best = first.make_fake_child().set_work(100);
+    let side = first.make_fake_child().set_work(50);
+    non_finalized
+        .commit_block(best.prepare(), &finalized)
+        .unwrap();
+    non_finalized
+        .commit_block(side.clone().prepare(), &finalized)
+        .unwrap();
+    let best_before = non_finalized.best_tip_block().unwrap().hash;
+    assert_ne!(best_before, side.hash());
+    let candidate = side.make_fake_child();
+    let candidate_hash = candidate.hash();
+
+    super::validate_block_for_state(
+        &finalized.db,
+        non_finalized.clone(),
+        candidate.clone().prepare(),
+    )
+    .expect("a candidate extending the side parent passes real contextual validation");
+    assert_eq!(non_finalized.best_tip_block().unwrap().hash, best_before);
+    assert!(non_finalized
+        .find_chain(|chain| chain.contains_block_hash(candidate_hash))
+        .is_none());
+    assert_eq!(finalized.db.finalized_tip_height(), Some(Height(0)));
+
+    let mut missing_parent = candidate.clone();
+    Arc::make_mut(&mut Arc::make_mut(&mut missing_parent).header).previous_block_hash =
+        block::Hash([0x99; 32]);
+    assert!(matches!(
+        super::validate_block_for_state(
+            &finalized.db,
+            non_finalized.clone(),
+            missing_parent.prepare()
+        ),
+        Err(ValidateContextError::NotReadyToBeCommitted)
+    ));
+
+    let mut invalid = candidate;
+    let mut spend = transaction_v4_from_coinbase(&first.transactions[0]);
+    let transaction::Transaction::V4 { inputs, .. } = &mut spend else {
+        unreachable!("the helper builds a v4 transaction");
+    };
+    *inputs = vec![transparent::Input::PrevOut {
+        outpoint: transparent::OutPoint {
+            hash: first.transactions[0].hash(),
+            index: 0,
+        },
+        unlock_script: transparent::Script::new(&[]),
+        sequence: u32::MAX,
+    }];
+    Arc::make_mut(&mut invalid)
+        .transactions
+        .push(Arc::new(spend));
+    let error =
+        super::validate_block_for_state(&finalized.db, non_finalized.clone(), invalid.prepare())
+            .expect_err("the same side-parent path enforces contextual rules");
+    assert!(
+        matches!(
+            error,
+            ValidateContextError::UnshieldedTransparentCoinbaseSpend { .. }
+        ),
+        "{error:?}"
+    );
+    assert!(matches!(
+        error.body_verification_class(),
+        zakura_header_chain::BodyVerificationClass::ConsensusInvalid(_)
+    ));
+    assert_eq!(non_finalized.best_tip_block().unwrap().hash, best_before);
 }
 
 #[test]

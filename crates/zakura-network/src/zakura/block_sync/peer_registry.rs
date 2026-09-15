@@ -861,7 +861,7 @@ impl PeerRegistry {
     }
 
     /// Whether some peer other than `self_peer` is a preferred floor server for
-    /// `height`: servable for it, holding a free normal (non-bypass) slot, and a
+    /// `height`: servable for it, allowed to retry its body, holding a free normal slot, and a
     /// better floor server by RTprop. "Better" is strictly lower RTprop, or — when
     /// `allow_equal_score` — equal-or-lower.
     ///
@@ -881,11 +881,12 @@ impl PeerRegistry {
         self_peer: &ZakuraPeerId,
         self_rtprop_ms: Option<u64>,
         allow_equal_score: bool,
+        can_retry_body: impl Fn(&ZakuraPeerId) -> bool,
     ) -> bool {
         let self_score = self_rtprop_ms.unwrap_or(u64::MAX);
         let peers = self.lock();
         peers.iter().any(|(peer, entry)| {
-            if peer == self_peer || !entry.can_serve_with_room(height) {
+            if peer == self_peer || !entry.can_serve_with_room(height) || !can_retry_body(peer) {
                 return false;
             }
             let other_score = entry.slots.bbr_rtprop_ms.unwrap_or(u64::MAX);
@@ -1302,13 +1303,20 @@ mod floor_bias_tests {
         register_with_rtprop(&reg, &config, &b, 0, 1000, 3, Some(50));
         // In the bypass region (include_equal) A defers — B can take the floor through
         // its normal capacity, so A keeps its scarce bypass slot…
-        assert!(reg.floor_has_preferred_unsaturated_server(block::Height(100), &a, Some(50), true));
+        assert!(reg.floor_has_preferred_unsaturated_server(
+            block::Height(100),
+            &a,
+            Some(50),
+            true,
+            |_| true
+        ));
         // …but B itself has no other unsaturated server (A is saturated), so B bypasses.
         assert!(!reg.floor_has_preferred_unsaturated_server(
             block::Height(100),
             &b,
             Some(50),
-            true
+            true,
+            |_| true
         ));
     }
 
@@ -1325,14 +1333,55 @@ mod floor_bias_tests {
             block::Height(100),
             &slow,
             Some(120),
-            false
+            false,
+            |_| true
         ));
         // …and the fastest carrier never defers, so the floor always lands somewhere.
         assert!(!reg.floor_has_preferred_unsaturated_server(
             block::Height(100),
             &fast,
             Some(40),
-            false
+            false,
+            |_| true
+        ));
+    }
+
+    #[test]
+    fn a_deferred_fast_supplier_does_not_block_an_honest_floor_server() {
+        let config = super::super::ZakuraBlockSyncConfig::default();
+        let reg = PeerRegistry::new();
+        let (slow, fast) = (peer(1), peer(2));
+        register_with_rtprop(&reg, &config, &slow, 0, 1000, 3, Some(120));
+        register_with_rtprop(&reg, &config, &fast, 0, 1000, 3, Some(40));
+        let scope = super::super::test_work_scope();
+        let hash = block::Hash([8; 32]);
+        let now = Instant::now();
+        reg.defer_body_retry(
+            [zakura_header_chain::SourceId::from_digest(fast.digest())],
+            scope,
+            hash,
+            now + Duration::from_secs(30),
+        );
+
+        for (requested, preferred) in [(hash, false), (block::Hash([9; 32]), true)] {
+            assert_eq!(
+                reg.floor_has_preferred_unsaturated_server(
+                    block::Height(100),
+                    &slow,
+                    Some(120),
+                    false,
+                    |peer| !reg.is_body_retry_avoided(peer, scope, requested, now),
+                ),
+                preferred
+            );
+        }
+        reg.clear_body_retry(scope, hash);
+        assert!(reg.floor_has_preferred_unsaturated_server(
+            block::Height(100),
+            &slow,
+            Some(120),
+            false,
+            |peer| !reg.is_body_retry_avoided(peer, scope, hash, now),
         ));
     }
 
@@ -1350,13 +1399,15 @@ mod floor_bias_tests {
             block::Height(100),
             &a,
             Some(50),
-            false
+            false,
+            |_| true
         ));
         assert!(!reg.floor_has_preferred_unsaturated_server(
             block::Height(100),
             &b,
             Some(50),
-            false
+            false,
+            |_| true
         ));
     }
 
@@ -1371,7 +1422,8 @@ mod floor_bias_tests {
             block::Height(100),
             &fast,
             Some(40),
-            true
+            true,
+            |_| true
         ));
     }
 
@@ -1382,7 +1434,13 @@ mod floor_bias_tests {
         let (a, b) = (peer(1), peer(2));
         register(&reg, &config, &a, 0, 1000, 0);
         register(&reg, &config, &b, 0, 1000, 0);
-        assert!(!reg.floor_has_preferred_unsaturated_server(block::Height(100), &a, None, true));
+        assert!(!reg.floor_has_preferred_unsaturated_server(
+            block::Height(100),
+            &a,
+            None,
+            true,
+            |_| true
+        ));
     }
 
     #[test]
@@ -1394,7 +1452,13 @@ mod floor_bias_tests {
         // B has a free slot but only serves heights 500..=1000 — it cannot take a floor
         // request at height 100, so A must still bypass.
         register(&reg, &config, &b, 500, 1000, 3);
-        assert!(!reg.floor_has_preferred_unsaturated_server(block::Height(100), &a, None, true));
+        assert!(!reg.floor_has_preferred_unsaturated_server(
+            block::Height(100),
+            &a,
+            None,
+            true,
+            |_| true
+        ));
     }
 
     #[test]

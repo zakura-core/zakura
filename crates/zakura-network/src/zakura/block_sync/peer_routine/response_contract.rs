@@ -39,6 +39,64 @@ struct Fixture {
 }
 
 #[tokio::test]
+async fn the_current_response_follows_request_order_not_vector_order() {
+    // Ending a range swap-removes it, so the vector is not in request order, and two
+    // requests issued in one clock tick would tie on a timestamp. Order comes from
+    // the monotonic request id instead.
+    let mut fixture = Fixture::with_initial_status(
+        1,
+        3,
+        0x47,
+        Some(BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(3),
+            max_blocks_per_response: 1,
+            max_inflight_requests: 8,
+            ..ZakuraBlockSyncConfig::default().initial_status()
+        }),
+    );
+    fixture.routine.try_fill().await;
+    assert_eq!(
+        fixture.routine.window.outstanding.len(),
+        3,
+        "a one-block response cap issues one request per height"
+    );
+    let second = fixture.routine.window.outstanding[1]
+        .request
+        .owner
+        .request_id;
+
+    // Ending the first range moves the last one into its slot, so the newest range
+    // now sits ahead of the one that should answer next.
+    fixture.routine.window.remove_outstanding(0);
+    assert!(
+        fixture.routine.window.outstanding[0]
+            .request
+            .owner
+            .request_id
+            > second,
+        "the swap left a newer range in front"
+    );
+
+    // Both were issued in the same clock tick, which a timestamp cannot separate:
+    // `min_by_key` would then return whichever the swap left first.
+    let tie = fixture.routine.window.outstanding[0].queued_at;
+    for range in &mut fixture.routine.window.outstanding {
+        range.queued_at = tie;
+    }
+
+    let index = fixture.routine.current_response_index().unwrap();
+    assert_eq!(
+        fixture.routine.window.outstanding[index]
+            .request
+            .owner
+            .request_id,
+        second,
+        "the earliest issued response still owns the body",
+    );
+}
+
+#[tokio::test]
 async fn work_refused_only_by_a_retained_range_gets_no_retry_deadline() {
     // A retained range clears on its ending or on connection close, and both wake
     // the routine on their own. Scheduling a timer instead spins: the fill loop

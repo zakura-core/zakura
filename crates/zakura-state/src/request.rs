@@ -1377,6 +1377,13 @@ pub enum Request {
     /// with the current best chain tip.
     Tip,
 
+    /// Reconciles durable checkpoint completion with queued semantic writes, including when
+    /// no further requests would drive the buffered state service.
+    ///
+    /// Returns [`Response::CheckpointHandoffChecked`] after checking the existing durable-state
+    /// handoff conditions. Repeated requests are safe. This does not wait for semantic commits.
+    CheckCheckpointHandoff,
+
     /// Computes a block locator object based on the current best chain.
     ///
     /// Returns [`Response::BlockLocator`] with hashes starting
@@ -1579,6 +1586,7 @@ impl Request {
             Request::AwaitUtxo(_) => "await_utxo",
             Request::Depth(_) => "depth",
             Request::Tip => "tip",
+            Request::CheckCheckpointHandoff => "check_checkpoint_handoff",
             Request::BlockLocator => "block_locator",
             Request::Transaction(_) => "transaction",
             Request::UnspentBestChainUtxo { .. } => "unspent_best_chain_utxo",
@@ -2237,6 +2245,7 @@ impl TryFrom<Request> for ReadRequest {
             | Request::CommitSemanticallyVerifiedBlock(_)
             | Request::CommitSemanticallyVerifiedBlockWithAdmission { .. }
             | Request::CommitCheckpointVerifiedBlock(_)
+            | Request::CheckCheckpointHandoff
             | Request::InvalidateBlock(_)
             | Request::ReconsiderBlock(_) => Err("ReadService does not write blocks"),
 

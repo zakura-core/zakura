@@ -1193,7 +1193,7 @@ impl<'de> Deserialize<'de> for Config {
                 build_configured_testnet::<D>(*params, &initial_testnet_peers)?
             }
             (DNetwork::ConfiguredRegtest { params, .. }, _) => {
-                Network::new_regtest(build_regtest_params(*params))
+                build_configured_regtest::<D>(*params)?
             }
             (DNetwork::DefaultForKind(NetworkKind::Mainnet), _) => Network::Mainnet,
             (DNetwork::DefaultForKind(NetworkKind::Testnet), Some(params)) => {
@@ -1203,7 +1203,7 @@ impl<'de> Deserialize<'de> for Config {
                 Network::new_default_testnet()
             }
             (DNetwork::DefaultForKind(NetworkKind::Regtest), Some(params)) => {
-                Network::new_regtest(build_regtest_params(params))
+                build_configured_regtest::<D>(params)?
             }
             (DNetwork::DefaultForKind(NetworkKind::Regtest), None) => {
                 Network::new_regtest(Default::default())
@@ -1475,7 +1475,11 @@ where
     }
 }
 
-fn build_regtest_params(params: DTestnetParameters) -> RegtestParameters {
+/// Builds Regtest parameters while reporting invalid settings as configuration errors.
+fn build_configured_regtest<'de, D>(params: DTestnetParameters) -> Result<Network, D::Error>
+where
+    D: Deserializer<'de>,
+{
     let DTestnetParameters {
         activation_heights,
         pre_nu6_funding_streams,
@@ -1498,12 +1502,16 @@ fn build_regtest_params(params: DTestnetParameters) -> RegtestParameters {
         funding_streams_vec.insert(0, funding_streams);
     }
 
-    RegtestParameters {
+    let params = RegtestParameters {
         activation_heights: activation_heights.unwrap_or_default(),
         funding_streams: Some(funding_streams_vec),
         lockbox_disbursements,
         checkpoints: Some(checkpoints),
         max_block_time_start_height: max_block_time_start_height.map(zakura_chain::block::Height),
         extend_funding_stream_addresses_as_required,
-    }
+    };
+
+    testnet::Parameters::new_regtest(params)
+        .map(Network::new_configured_testnet)
+        .map_err(de::Error::custom)
 }

@@ -51,6 +51,10 @@ pub(super) struct WorkItem {
     pub(super) hash: block::Hash,
     /// The block's size estimate. Used for request budget reservation and the advisory receive-path `SizeMismatch` report.
     pub(super) estimated_bytes: u64,
+    /// Largest payload seen locally. Peer hints cannot shrink a retry below it.
+    observed_bytes: u64,
+    /// A pressure refusal waits for verified progress before it can be retried.
+    retry_after_tip: Option<block::Height>,
     /// Request reservation; received bodies use `Released`.
     pub(super) budget: BlockBudgetLedger,
 }
@@ -189,6 +193,8 @@ impl WorkQueue {
                         provisional: false,
                         hash,
                         estimated_bytes,
+                        observed_bytes: 0,
+                        retry_after_tip: None,
                         budget: BlockBudgetLedger::Released,
                     },
                 );
@@ -232,6 +238,9 @@ impl WorkQueue {
         let mut next_expected: Option<block::Height> = None;
         let mut scope = None;
         for (height, item) in inner.pending.range(low..=high) {
+            if item.retry_after_tip.is_some_and(|tip| inner.floor <= tip) {
+                break;
+            }
             if scope.is_some_and(|scope| scope != item.scope) {
                 break;
             }
@@ -328,6 +337,9 @@ impl WorkQueue {
         let mut next_expected: Option<block::Height> = None;
         let mut scope = None;
         for (height, item) in inner.pending.range(low..=high) {
+            if item.retry_after_tip.is_some_and(|tip| inner.floor <= tip) {
+                break;
+            }
             if scope.is_some_and(|scope| scope != item.scope) {
                 break;
             }
@@ -658,6 +670,39 @@ impl WorkQueue {
         };
         drop(claim);
         outcome
+    }
+
+    /// Return an exact received attempt without releasing its request credit twice.
+    /// Waiting for verified progress prevents repeated downloads under memory pressure.
+    pub(super) fn defer_received_for_owner(
+        &self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        height: block::Height,
+        hash: block::Hash,
+        bytes: u64,
+        verified_tip: block::Height,
+    ) -> bool {
+        let mut inner = self.lock();
+        let Some(item) = inner.in_flight.get(&height) else {
+            return false;
+        };
+        if height <= inner.floor
+            || item.owner != Some(owner)
+            || item.hash != hash
+            || item.budget != BlockBudgetLedger::Released
+        {
+            return false;
+        }
+        let mut item = inner
+            .in_flight
+            .remove(&height)
+            .expect("the received owner was checked under the same lock");
+        item.observed_bytes = item.observed_bytes.max(bytes);
+        item.estimated_bytes = item.estimated_bytes.max(item.observed_bytes);
+        item.retry_after_tip = Some(verified_tip);
+        item.owner = None;
+        inner.pending.insert(height, item);
+        true
     }
 
     /// Settle requested heights and any queued request they retire. The caller

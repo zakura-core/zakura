@@ -93,7 +93,7 @@ defers and the floor still moves.
 
 ## Look-ahead rules: `admit()` and the commit window
 
-All admission decisions go through one pure function, `admission::admit(config,
+Request admission decisions go through one pure function, `admission::admit(config,
 snapshot, start_height, servable_high, response_byte_cap)`. It is the single authority
 for the commit-window exemption, the resident-memory gate, and request sizing — the
 fill loop feeds its grant verbatim to the work queue and may not substitute its own
@@ -172,8 +172,22 @@ Two gates, checked together in `lookahead_over_budget`:
 This is separate from the **in-flight request budget** (`max_inflight_block_bytes`,
 default 6 GiB, tracked by `ByteBudget`): that bounds outstanding request
 reservations — charged at issuance, released at receipt (or timeout/watchdog/
-reset/floor GC) — while the look-ahead gate is the single authority over bytes
-_retained_ by the pipeline.
+reset/floor GC) — while the request look-ahead gate paces incoming work.
+
+The sequencer also checks actual serialized bytes before retaining **every** new body,
+including matched replies and late winners. Above the verified checkpoint window,
+reorder plus applying bytes plus the incoming body must fit the same look-ahead limit
+and block-count cap. This check uses the sequencer's current counters, so suppliers
+cannot concurrently spend a stale snapshot or accumulate bodies using understated
+hints. Transfers between reorder and applying retain their charge. Removal releases
+it. The bounded decoded submission window accounts for detached verifier work.
+
+At pressure, the body is released and its exact attempt returns to pending with the
+measured size as a minimum for retry. It waits for verified progress to avoid repeated
+downloads while full. The checkpoint window remains exempt so commit can advance.
+Request reservations and queued copies do not consume this final backlog allowance
+twice. Input, transport, and decoded submission windows remain separate bounded
+pools. The configured look-ahead limit is not a hard cap on total process RSS.
 
 ### Config clamps
 

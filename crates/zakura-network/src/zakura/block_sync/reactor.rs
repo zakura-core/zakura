@@ -222,7 +222,8 @@ pub fn spawn_block_sync_reactor(
         ACTION_SEND_TIMEOUT,
         startup.trace.clone(),
     )
-    .with_initial_state_version(initial_state_version);
+    .with_initial_state_version(initial_state_version)
+    .with_retained_body_limit(startup.config.effective_max_reorder_lookahead_bytes());
     tokio::spawn(sequencer_task.run());
 
     // the shared per-peer fact table read by the producer / candidate / trace

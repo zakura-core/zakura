@@ -2746,13 +2746,13 @@ impl HeaderSyncReactor {
             )
             .unwrap_or(usize::MAX),
         );
-        let max_header_count = target
+        let negotiated_header_count = target
             .status
             .max_headers_per_response
             .min(self.serving_limits.max_headers_per_response())
             .min(byte_limited_count)
             .min(MAX_HS_RANGE);
-        let max_header_count = max_header_count.min(Self::request_header_prefix_remaining(
+        let max_header_count = negotiated_header_count.min(Self::request_header_prefix_remaining(
             &local,
             self.peer_work_queue.claimed_header_count(),
             target.status.selected_tip_height,
@@ -2804,7 +2804,7 @@ impl HeaderSyncReactor {
                     common_ancestor: None,
                     entries: Vec::new(),
                     phase: HeaderTargetPhase::Receiving,
-                    max_header_count,
+                    max_header_count: negotiated_header_count,
                     tree_aux_schema,
                 });
                 debug_assert!(

@@ -4892,17 +4892,24 @@ fn sequencer_applying_counters_match_scan_across_transitions() {
 
 #[tokio::test]
 async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() {
-    const BLOCK_COUNT: u32 = 403;
+    assert_checkpoint_completions_refill_window(401).await;
+}
+
+#[tokio::test]
+async fn sequencer_stale_checkpoint_completions_refill_overlapping_ranges() {
+    assert_checkpoint_completions_refill_window(801).await;
+}
+
+async fn assert_checkpoint_completions_refill_window(submission_limit: usize) {
+    let block_count = u32::try_from(submission_limit + 2).expect("test window fits u32");
     const CHANNEL_TIMEOUT: Duration = Duration::from_secs(2);
     const MISSING_SUBMISSION_TIMEOUT: Duration = Duration::from_millis(100);
 
-    let submission_limit = MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;
     let submission_limit_u64 =
         u64::try_from(submission_limit).expect("the checkpoint submission limit fits in u64");
-    let body_channel_capacity = usize::try_from(BLOCK_COUNT).expect("403 test bodies fit in usize");
-    assert_eq!(submission_limit, 401);
+    let body_channel_capacity = usize::try_from(block_count).expect("test body count fits usize");
 
-    let blocks = fake_sequential_blocks(BLOCK_COUNT);
+    let blocks = fake_sequential_blocks(block_count);
     let frontiers = BlockSyncFrontiers {
         finalized_height: block::Height(0),
         verified_block_tip: block::Height(0),
@@ -4936,7 +4943,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
 
     for (index, block) in blocks.iter().enumerate() {
         let height =
-            block::Height(u32::try_from(index + 1).expect("403 test block indices fit in u32"));
+            block::Height(u32::try_from(index + 1).expect("test block indices fit in u32"));
         body_tx
             .send(SequencedBody::new_queued(
                 test_work_owner(),
@@ -4961,7 +4968,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     time::timeout(CHANNEL_TIMEOUT, async {
         loop {
             let view = *view_rx.borrow_and_update();
-            if view.applying_len == u64::from(BLOCK_COUNT)
+            if view.applying_len == u64::from(block_count)
                 && view.in_flight_submission_count == submission_limit_u64
                 && view.unsubmitted_applying_count == 2
             {
@@ -4993,7 +5000,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
         assert_eq!(
             block.coinbase_height(),
             Some(block::Height(
-                u32::try_from(index + 1).expect("401 submission indices fit in u32")
+                u32::try_from(index + 1).expect("test submission indices fit in u32")
             )),
             "initial submissions must be ordered through the full checkpoint window",
         );
@@ -5017,15 +5024,18 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
         })
         .expect("height 1 completion queues");
 
-    let block_402 = match time::timeout(CHANNEL_TIMEOUT, actions_rx.recv())
+    let first_replacement = match time::timeout(CHANNEL_TIMEOUT, actions_rx.recv())
         .await
-        .expect("height 402 submission arrives")
+        .expect("first replacement submission arrives")
         .expect("sequencer action channel remains live")
     {
         BlockSyncAction::SubmitBlock { block, .. } => block,
-        action => panic!("unexpected action before height 402 submission: {action:?}"),
+        action => panic!("unexpected action before first replacement submission: {action:?}"),
     };
-    assert_eq!(block_402.coinbase_height(), Some(block::Height(402)));
+    assert_eq!(
+        first_replacement.coinbase_height(),
+        Some(block::Height(block_count - 1))
+    );
 
     for (height, (token, block)) in [
         (block::Height(2), &initial_submissions[1]),
@@ -5049,14 +5059,14 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
             .expect("stale checkpoint completion queues");
     }
 
-    let submit_403 = time::timeout(MISSING_SUBMISSION_TIMEOUT, async {
+    let second_replacement = time::timeout(MISSING_SUBMISSION_TIMEOUT, async {
         loop {
             let action = actions_rx
                 .recv()
                 .await
                 .expect("sequencer action channel remains live");
             if let BlockSyncAction::SubmitBlock { block, .. } = action {
-                assert_eq!(block.coinbase_height(), Some(block::Height(403)));
+                assert_eq!(block.coinbase_height(), Some(block::Height(block_count)));
                 break;
             }
         }
@@ -5064,8 +5074,8 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     .await;
     let diagnostic = *view_rx.borrow();
     assert!(
-        submit_403.is_ok(),
-        "height 403 must refill the checkpoint submission window; \
+        second_replacement.is_ok(),
+        "second replacement must refill the checkpoint submission window; \
          in_flight_submission_count = {}, unsubmitted_applying_count = {}",
         diagnostic.in_flight_submission_count,
         diagnostic.unsubmitted_applying_count,
@@ -5074,7 +5084,9 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     time::timeout(CHANNEL_TIMEOUT, async {
         loop {
             let view = *view_rx.borrow_and_update();
-            if view.in_flight_submission_count == 400 && view.unsubmitted_applying_count == 0 {
+            if view.in_flight_submission_count == submission_limit_u64 - 1
+                && view.unsubmitted_applying_count == 0
+            {
                 break;
             }
             view_rx
@@ -15976,4 +15988,326 @@ async fn missed_hint_history_refreshes_the_existing_queued_window() {
         .iter()
         .all(|(_, item)| item.estimated_bytes == 3_146));
     task.abort();
+}
+
+#[test]
+fn observed_size_estimates_preserve_reservations_and_memory_exposure() {
+    let queue = work_queue_with(0, (1..=100).map(|h| needed(h, BlockSizeEstimate::Unknown)));
+    let owner = test_work_scope().bind(7, std::num::NonZeroU64::new(1).unwrap());
+    let cold = queue.take_for_request(
+        block::Height(1),
+        block::Height(2),
+        2,
+        u64::MAX,
+        7,
+        owner.request_id,
+    );
+    assert_eq!(cold[0].1.estimated_bytes, block::MAX_BLOCK_BYTES);
+    queue.mark_reserved_for_owner(owner, [block::Height(1), block::Height(2)]);
+    let other = test_work_scope().bind(8, owner.request_id);
+    assert_eq!(
+        queue.receive_body_for_owner(other, block::Height(1), 1024),
+        None
+    );
+    assert_eq!(
+        queue.receive_body_for_owner(owner, block::Height(1), 1024),
+        Some(block::MAX_BLOCK_BYTES)
+    );
+    let estimate = queue
+        .pending_item(block::Height(3))
+        .unwrap()
+        .estimated_bytes;
+    assert_eq!(estimate, (7 * block::MAX_BLOCK_BYTES + 1024) / 8);
+    assert_eq!(
+        queue.receive_body_for_owner(owner, block::Height(1), 1),
+        None
+    );
+    assert_eq!(
+        queue
+            .pending_item(block::Height(3))
+            .unwrap()
+            .estimated_bytes,
+        estimate
+    );
+    assert_eq!(
+        queue
+            .in_flight_item(block::Height(2))
+            .unwrap()
+            .estimated_bytes,
+        block::MAX_BLOCK_BYTES
+    );
+    assert_eq!(queue.reserved_bytes(), block::MAX_BLOCK_BYTES);
+    queue.release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(2)]);
+    assert_eq!(queue.reserved_bytes(), 0);
+    let warm = queue.take_for_request(
+        block::Height(2),
+        block::Height(2),
+        1,
+        u64::MAX,
+        7,
+        owner.request_id,
+    );
+    assert_eq!(warm[0].1.estimated_bytes, estimate);
+    queue.mark_reserved_for_owner(owner, [block::Height(2)]);
+    assert_eq!(
+        queue.reserved_above(block::Height(0)),
+        (block::MAX_BLOCK_BYTES, 1)
+    );
+    assert_eq!(
+        queue.receive_body_for_owner(owner, block::Height(2), 1024),
+        Some(estimate)
+    );
+    assert_eq!(queue.reserved_bytes(), 0);
+    queue.reset_above(block::Height(0));
+    queue.extend(test_work_scope(), [needed(1, BlockSizeEstimate::Unknown)]);
+    assert_eq!(
+        queue
+            .pending_item(block::Height(1))
+            .unwrap()
+            .estimated_bytes,
+        block::MAX_BLOCK_BYTES
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn observed_size_estimates_wake_adapt_and_expire_without_changing_hints() {
+    let queue = work_queue_with(0, (1..=201).map(|h| needed(h, BlockSizeEstimate::Unknown)));
+    let scope = test_work_scope();
+    queue.extend(
+        scope,
+        [
+            needed(202, BlockSizeEstimate::Advertised(4567)),
+            needed(203, BlockSizeEstimate::Confirmed(9876)),
+        ],
+    );
+    for h in 1..=100 {
+        let owner = scope.bind(7, std::num::NonZeroU64::new(u64::from(h)).unwrap());
+        queue.take_for_request(
+            block::Height(h),
+            block::Height(h),
+            1,
+            u64::MAX,
+            7,
+            owner.request_id,
+        );
+        queue.mark_reserved_for_owner(owner, [block::Height(h)]);
+        let wake = queue.subscribe_available().notified();
+        tokio::pin!(wake);
+        wake.as_mut().enable();
+        queue
+            .receive_body_for_owner(owner, block::Height(h), 1024)
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(1), wake)
+            .await
+            .unwrap();
+    }
+    assert!(
+        queue
+            .pending_item(block::Height(101))
+            .unwrap()
+            .estimated_bytes
+            <= 1030
+    );
+    assert_eq!(
+        queue
+            .pending_item(block::Height(202))
+            .unwrap()
+            .estimated_bytes,
+        4567
+    );
+    assert_eq!(
+        queue
+            .pending_item(block::Height(203))
+            .unwrap()
+            .estimated_bytes,
+        9876
+    );
+    tokio::time::advance(Duration::from_secs(60)).await;
+    assert_eq!(
+        queue
+            .pending_item(block::Height(101))
+            .unwrap()
+            .estimated_bytes,
+        block::MAX_BLOCK_BYTES
+    );
+    for h in 101..=200 {
+        let owner = scope.bind(7, std::num::NonZeroU64::new(u64::from(h)).unwrap());
+        queue.take_for_request(
+            block::Height(h),
+            block::Height(h),
+            1,
+            u64::MAX,
+            7,
+            owner.request_id,
+        );
+        queue.mark_reserved_for_owner(owner, [block::Height(h)]);
+        queue
+            .receive_body_for_owner(owner, block::Height(h), block::MAX_BLOCK_BYTES)
+            .unwrap();
+    }
+    assert!(
+        queue
+            .pending_item(block::Height(201))
+            .unwrap()
+            .estimated_bytes
+            >= block::MAX_BLOCK_BYTES - 10
+    );
+    tokio::time::advance(Duration::from_secs(60)).await;
+    assert_eq!(
+        queue
+            .pending_item(block::Height(201))
+            .unwrap()
+            .estimated_bytes,
+        block::MAX_BLOCK_BYTES
+    );
+    assert_eq!(queue.reserved_bytes(), 0);
+}
+
+#[test]
+fn hint_refresh_cannot_relabel_an_issued_unknown_reservation() {
+    let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Unknown)]);
+    let owner = test_work_scope().bind(7, std::num::NonZeroU64::new(1).unwrap());
+    queue.take_for_request(
+        block::Height(1),
+        block::Height(1),
+        1,
+        u64::MAX,
+        7,
+        owner.request_id,
+    );
+    queue.mark_reserved_for_owner(owner, [block::Height(1)]);
+    queue.refresh_size_estimates(
+        test_work_scope(),
+        [needed(1, BlockSizeEstimate::Advertised(1024))],
+    );
+    let issued = queue.in_flight_item(block::Height(1)).unwrap();
+    assert!(!issued.reservation_has_size_hint);
+    assert_eq!(issued.estimated_bytes, block::MAX_BLOCK_BYTES);
+    assert_eq!(
+        queue.reserved_above(block::Height(0)),
+        (block::MAX_BLOCK_BYTES, 1)
+    );
+    queue.release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(1)]);
+    let retry = queue.take_for_request(
+        block::Height(1),
+        block::Height(1),
+        1,
+        u64::MAX,
+        7,
+        owner.request_id,
+    );
+    assert!(retry[0].1.reservation_has_size_hint);
+    assert_eq!(retry[0].1.estimated_bytes, 1024);
+}
+
+#[test]
+fn abrupt_large_body_regime_preserves_memory_exposure_and_issued_charges() {
+    let queue = work_queue_with(0, (1..=201).map(|h| needed(h, BlockSizeEstimate::Unknown)));
+    let scope = test_work_scope();
+    for h in 1..=100 {
+        let owner = scope.bind(7, std::num::NonZeroU64::new(u64::from(h)).unwrap());
+        queue.take_for_request(
+            block::Height(h),
+            block::Height(h),
+            1,
+            u64::MAX,
+            7,
+            owner.request_id,
+        );
+        queue.mark_reserved_for_owner(owner, [block::Height(h)]);
+        queue
+            .receive_body_for_owner(owner, block::Height(h), 1024)
+            .unwrap();
+    }
+
+    let owner = scope.bind(8, std::num::NonZeroU64::new(101).unwrap());
+    let issued = queue.take_for_request(
+        block::Height(101),
+        block::Height(200),
+        100,
+        u64::MAX,
+        8,
+        owner.request_id,
+    );
+    assert_eq!(issued.len(), 100);
+    let charge = issued[0].1.estimated_bytes;
+    assert!(charge <= 1030);
+    queue.mark_reserved_for_owner(owner, (101..=200).map(block::Height));
+    assert_eq!(queue.reserved_bytes(), 100 * charge);
+    assert_eq!(
+        queue.reserved_above(block::Height(100)),
+        (100 * block::MAX_BLOCK_BYTES, 100)
+    );
+
+    // The supplier switches size regimes while every request has a small fixed charge.
+    for h in 101..=200 {
+        assert_eq!(
+            queue.receive_body_for_owner(owner, block::Height(h), block::MAX_BLOCK_BYTES),
+            Some(charge)
+        );
+        let remaining = u64::from(200 - h);
+        assert_eq!(queue.reserved_bytes(), remaining * charge);
+        assert_eq!(
+            queue.reserved_above(block::Height(100)),
+            (remaining * block::MAX_BLOCK_BYTES, remaining)
+        );
+    }
+    assert!(
+        queue
+            .pending_item(block::Height(201))
+            .unwrap()
+            .estimated_bytes
+            >= block::MAX_BLOCK_BYTES - 10
+    );
+}
+
+#[test]
+fn overlapping_submission_window_retains_detached_memory_until_completion() {
+    for limit in [401, 801] {
+        let blocks = fake_sequential_blocks(u32::try_from(limit + 1).unwrap());
+        let mut seq = test_sequencer(0, limit);
+        for block in &blocks {
+            seq.accept_body(
+                block.coinbase_height().unwrap(),
+                block.hash(),
+                block.clone(),
+                2000,
+                peer(0),
+            );
+        }
+        seq.drain_ready_into_applying();
+        let submitted: Vec<_> = seq
+            .submittable_heights()
+            .into_iter()
+            .map(|height| seq.prepare_submit(height).unwrap())
+            .collect();
+        assert_eq!(submitted.len(), limit);
+        assert_eq!(seq.unsubmitted_applying_count(), 1);
+        seq.reset_to(block::Height(399), false);
+        assert_eq!(seq.in_flight_submission_count(), limit);
+        assert_eq!(
+            seq.in_flight_submission_bytes(),
+            u64::try_from(limit).unwrap() * 2000
+        );
+        assert!(seq.submittable_heights().is_empty());
+        for item in submitted {
+            assert!(seq.finish_submission(
+                item.owner,
+                item.source,
+                item.token,
+                item.height,
+                item.hash
+            ));
+            assert!(!seq.finish_submission(
+                item.owner,
+                item.source,
+                item.token,
+                item.height,
+                item.hash
+            ));
+        }
+        assert_eq!(seq.in_flight_submission_count(), 0);
+        assert_eq!(seq.in_flight_submission_bytes(), 0);
+        assert_eq!(seq.in_flight_submission_count_scanned(), 0);
+    }
 }

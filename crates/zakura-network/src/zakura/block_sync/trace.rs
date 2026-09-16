@@ -44,6 +44,12 @@ pub(super) struct BlockTraceFields {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub reserved_memory_exposure_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resident_pipeline_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lookahead_limit_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub estimate_source: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_owner: Option<String>,

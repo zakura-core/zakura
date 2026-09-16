@@ -1248,12 +1248,16 @@ impl PeerRoutine {
                 break FillStop::SendError;
             }
             metrics::counter!("sync.block.request.sent").increment(1);
-            let estimate_kind = if reserved_bytes
+            let estimate_kind = if items.iter().all(|(_, item)| item.reservation_has_size_hint) {
+                "hinted"
+            } else if items.iter().any(|(_, item)| item.reservation_has_size_hint) {
+                "mixed"
+            } else if reserved_bytes
                 >= u64::from(request_count).saturating_mul(block::MAX_BLOCK_BYTES)
             {
                 "worst_case"
             } else {
-                "hinted"
+                "observed"
             };
             metrics::counter!("sync.block.request.size_estimate", "kind" => estimate_kind)
                 .increment(1);
@@ -1728,7 +1732,13 @@ impl PeerRoutine {
                 }
             },
         };
-        if serialized_bytes > tolerated_bytes(estimated_bytes, self.config.size_deviation_tolerance)
+        let has_size_hint = self
+            .work
+            .in_flight_item(height)
+            .is_some_and(|item| item.reservation_has_size_hint);
+        if has_size_hint
+            && serialized_bytes
+                > tolerated_bytes(estimated_bytes, self.config.size_deviation_tolerance)
         {
             // The body matched the requested hash, so the hint was wrong, not the body.
             // Discarding it would let one bad advertised size stall this height on every
@@ -1742,9 +1752,9 @@ impl PeerRoutine {
         self.record_received(serialized_bytes);
         // End the request reservation at receipt, but release its bytes only
         // after the body is visible to the resident-memory accounting.
-        let Some(reserved_estimate) = self
-            .work
-            .release_active_reserved_height_for_owner(outstanding_owner, height)
+        let Some(reserved_estimate) =
+            self.work
+                .receive_body_for_owner(outstanding_owner, height, serialized_bytes)
         else {
             tracing::debug!(
                 peer = ?self.peer,
@@ -2516,6 +2526,63 @@ mod tests {
             ZakuraTrace::noop(),
         );
         (routine, out_recv, routine_to_reactor_rx)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn observed_estimates_open_request_capacity_without_parameter_changes() {
+        let mut counts = Vec::new();
+        for train in [false, true] {
+            let (mut routine, _outbound, _events) = status_test_routine();
+            routine
+                .window
+                .note_block_progress(Instant::now(), Duration::from_secs(30));
+            routine.handle_status(BlockSyncStatus {
+                servable_low: block::Height(1),
+                servable_high: block::Height(64),
+                ..BlockSyncStatus::default()
+            });
+            let scope = super::super::test_work_scope();
+            routine.work.extend(
+                scope,
+                (1..=64).chain(1000..1100).map(|h| {
+                    (
+                        block::Height(h),
+                        block::Hash([1; 32]),
+                        BlockSizeEstimate::Unknown,
+                    )
+                }),
+            );
+            if train {
+                for h in 1000..1100 {
+                    let request = std::num::NonZeroU64::new(u64::from(h)).unwrap();
+                    let owner = scope.bind(99, request);
+                    routine.work.take_for_request(
+                        block::Height(h),
+                        block::Height(h),
+                        1,
+                        u64::MAX,
+                        99,
+                        request,
+                    );
+                    routine
+                        .work
+                        .mark_reserved_for_owner(owner, [block::Height(h)]);
+                    routine
+                        .work
+                        .receive_body_for_owner(owner, block::Height(h), 10_000)
+                        .unwrap();
+                }
+            }
+            let before = tokio::time::Instant::now();
+            routine.try_fill().await;
+            assert_eq!(tokio::time::Instant::now(), before);
+            counts.push(routine.window.outstanding.len());
+        }
+        assert_eq!(counts[0], 2);
+        assert!(
+            counts[1] > counts[0],
+            "observed sizes must open byte credits: {counts:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]

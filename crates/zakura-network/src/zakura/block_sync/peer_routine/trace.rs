@@ -135,6 +135,13 @@ impl PeerRoutine {
             self.insert_bbr_fields(row);
             if let Some(item) = self.work.in_flight_item(start_height) {
                 row.estimate_source = Some(match item.size_hint {
+                    _ if !item.reservation_has_size_hint => {
+                        if item.estimated_bytes < block::MAX_BLOCK_BYTES {
+                            "observed"
+                        } else {
+                            "unknown_worst_case"
+                        }
+                    }
                     crate::zakura::block_sync::request::BlockSizeEstimate::Confirmed(_) => {
                         "confirmed"
                     }
@@ -142,11 +149,7 @@ impl PeerRoutine {
                         "advertised"
                     }
                     crate::zakura::block_sync::request::BlockSizeEstimate::Unknown => {
-                        if item.estimated_bytes < block::MAX_BLOCK_BYTES {
-                            "observed"
-                        } else {
-                            "unknown_cold"
-                        }
+                        "unknown_worst_case"
                     }
                 });
                 row.request_owner = item.owner.map(|owner| format!("{owner:?}"));

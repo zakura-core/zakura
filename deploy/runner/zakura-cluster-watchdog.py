@@ -757,6 +757,7 @@ def node_alert_text(fleet: Fleet, row: dict[str, Any], condition: str, age: floa
     height = coerce_height(row.get("height"))
     detail = slack_plain_text(row.get("detail") or "no detail", MAX_NODE_DETAIL_CHARS)
     height_text = str(height) if height is not None else "-"
+
     lines = [
         f":rotating_light: *Zakura {fleet_name}* - `{name}` {condition} "
         f"for {format_duration(age)}",

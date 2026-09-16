@@ -854,12 +854,22 @@ impl SequencerTask {
         persisted_availability: Option<zakura_header_chain::BodyUnavailableSummary>,
     ) {
         let hash = header.hash;
-        let Some(failure) = outcome.retryable_mut() else {
-            self.body_retries
-                .remove(owner.header_generation, owner.branch, hash);
-            self.registry.clear_body_retry(owner.authority(), hash);
-            return;
-        };
+        match outcome.verification() {
+            zakura_header_chain::BodyVerificationOutcome::PayloadMismatch(mismatch) => {
+                if mismatch.source != source {
+                    return;
+                }
+                // A bad payload still needs another delivery. Keep the failed
+                // supplier in the retry episode before making the height available.
+            }
+            zakura_header_chain::BodyVerificationOutcome::Retryable(_) => {}
+            _ => {
+                self.body_retries
+                    .remove(owner.header_generation, owner.branch, hash);
+                self.registry.clear_body_retry(owner.authority(), hash);
+                return;
+            }
+        }
         eligible_sources.insert(source);
         if self
             .body_retries
@@ -909,11 +919,13 @@ impl SequencerTask {
             | crate::zakura::header_sync::RetryUpdate::ProbeAt(retry_at) => retry_at,
             crate::zakura::header_sync::RetryUpdate::Alarmed { probe_at } => probe_at,
         };
-        failure.availability = episode.summary();
-        if let Some(persisted) = persisted_availability.filter(|summary| summary.alarmed) {
-            if persisted.suppliers > failure.availability.suppliers {
-                failure.availability.suppliers = persisted.suppliers;
-                failure.availability.supplier_set_digest = persisted.supplier_set_digest;
+        if let Some(failure) = outcome.retryable_mut() {
+            failure.availability = episode.summary();
+            if let Some(persisted) = persisted_availability.filter(|summary| summary.alarmed) {
+                if persisted.suppliers > failure.availability.suppliers {
+                    failure.availability.suppliers = persisted.suppliers;
+                    failure.availability.supplier_set_digest = persisted.supplier_set_digest;
+                }
             }
         }
         self.registry.defer_body_retry(
@@ -2045,6 +2057,12 @@ mod tests {
                     source: attributed_source,
                 };
                 let mut outcome = BlockApplyOutcome::payload_mismatch(mismatch);
+                let supplier = ZakuraPeerId::new(vec![1; 32]).unwrap();
+                let alternate = ZakuraPeerId::new(vec![2; 32]).unwrap();
+                let eligible_sources = BTreeSet::from([
+                    source,
+                    zakura_header_chain::SourceId::from_digest(alternate.digest()),
+                ]);
 
                 assert_eq!(
                     task.handle_apply_finished(
@@ -2054,7 +2072,7 @@ mod tests {
                         height,
                         hash,
                         &mut outcome,
-                        BTreeSet::new(),
+                        eligible_sources,
                         None,
                         Some((owner, zakura_header_chain::StateVersion::default())),
                     )
@@ -2064,6 +2082,25 @@ mod tests {
                 );
                 assert!(!task.sequencer.applying_contains(height));
                 assert_eq!(task.sequencer.in_flight_submission_count(), 0);
+                assert_eq!(
+                    task.registry.is_body_retry_avoided(
+                        &supplier,
+                        owner.authority(),
+                        hash,
+                        Instant::now(),
+                    ),
+                    attribution_matches,
+                    "only the proven supplier must be deferred before the body is refetched",
+                );
+                assert!(
+                    !task.registry.is_body_retry_avoided(
+                        &alternate,
+                        owner.authority(),
+                        hash,
+                        Instant::now(),
+                    ),
+                    "an alternate supplier must remain eligible",
+                );
 
                 if attribution_matches {
                     assert!(matches!(

@@ -908,22 +908,27 @@ impl PeerRoutine {
             // (geometry included — an exempt grant is clamped at the window top, so
             // no above-window height can ride an exempt request past the gate).
             let snapshot = self.admission_snapshot(&view);
-            // This asks the shared peer registry:
-            // "Is there another pper that should take the floor instead of this peer?"
-            // This is helpful for rescuing the floor with a peer who has better latency score and
-            // is not saturated.
+            let floor_work = self
+                .work
+                .first_pending_work_in_range(servable_low, servable_high.min(floor_high));
+            // A faster peer must also be eligible to retry this exact body.
+            // Otherwise its preference would keep honest suppliers from taking it.
             let floor_arm_allowed = !self.registry.floor_has_preferred_unsaturated_server(
-                view.download_floor,
+                floor_work.map_or(view.download_floor, |(height, _)| height),
                 &self.peer,
                 self.window.bbr_rtprop_ms(now),
                 in_bypass,
+                |peer| {
+                    floor_work.is_none_or(|(_, item)| {
+                        !self
+                            .registry
+                            .is_body_retry_avoided(peer, item.scope, item.hash, now)
+                    })
+                },
             );
             let mut items = Vec::new();
             if floor_arm_allowed && servable_low <= floor_high {
-                if let Some(floor_start) = self
-                    .work
-                    .first_pending_in_range(servable_low, servable_high.min(floor_high))
-                {
+                if let Some((floor_start, _)) = floor_work {
                     // Prioritize the lowest missing block so commit can keep moving, even if
                     // that means freeing look-ahead budget. `admit` is the single authority
                     // for the commit-window exemption, the resident-memory gate, and take

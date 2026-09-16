@@ -34,6 +34,7 @@ use zakura_state as zs;
 use crate::{error::*, primitives, transaction as tx, BoxError};
 
 pub mod check;
+pub(super) mod commitment;
 mod prepared;
 pub mod request;
 pub mod subsidy;
@@ -67,6 +68,14 @@ pub enum VerifyBlockError {
         #[from]
         source: BlockError,
     },
+
+    /// The supplied authorization bytes do not match the header in its parent context.
+    #[error("block authorization data does not match the header commitment")]
+    AuthDataMismatch,
+
+    /// Duplicate transactions bound by the header's transaction or authorization commitment.
+    #[error("block commitments require duplicate transactions")]
+    NonMalleableDuplicateTransaction,
 
     #[error(transparent)]
     Equihash {
@@ -159,7 +168,11 @@ impl VerifyBlockError {
                 BlockError::AlreadyInChain(..) => BodyVerificationClass::Duplicate,
                 BlockError::Transaction(error) => error.body_verification_class(),
                 BlockError::NoTransactions => consensus("block.no_transactions"),
-                BlockError::DuplicateTransaction => consensus("block.duplicate_transaction"),
+                // A bare duplicate error can be a padding alias. The Merkle
+                // verifier reports proven intrinsic duplicates separately.
+                BlockError::DuplicateTransaction => BodyVerificationClass::PayloadMismatch(
+                    BodyCommitmentKind::TransactionMerkleRoot,
+                ),
                 BlockError::WrongTransactionConsensusBranchId => {
                     consensus("block.wrong_transaction_consensus_branch_id")
                 }
@@ -177,6 +190,10 @@ impl VerifyBlockError {
                     BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
                 }
             },
+            Self::AuthDataMismatch => {
+                BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::AuthDataRoot)
+            }
+            Self::NonMalleableDuplicateTransaction => consensus("block.duplicate_transaction"),
             Self::Equihash { .. } | Self::PowPolicy(_) | Self::Time(_) => {
                 BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
             }
@@ -213,6 +230,7 @@ impl VerifyBlockError {
         match self {
             Block { source } => source.misbehavior_score(),
             Equihash { .. } | Subsidy(_) => 100,
+            AuthDataMismatch | NonMalleableDuplicateTransaction => 100,
             Transaction(err) => err.mempool_misbehavior_score(),
             Commit(err) => err.misbehavior_score(),
             _other => 0,
@@ -236,6 +254,11 @@ fn map_commit_error(source: BoxError, hash: block::Hash) -> VerifyBlockError {
         return VerifyBlockError::Commit(commit_err.clone());
     }
 
+    if let Some(error) = source.downcast_ref::<zs::ValidateContextError>() {
+        return VerifyBlockError::Commit(zs::CommitBlockError::ValidateContextError(Box::new(
+            error.clone(),
+        )));
+    }
     VerifyBlockError::StateService { source, hash }
 }
 
@@ -386,7 +409,7 @@ where
                         tx::check::lock_time_has_passed(transaction, height, block.header.time)
                             .map_err(VerifyBlockError::Transaction)?;
                     }
-                    check::merkle_root_validity(
+                    check::merkle_root_validity_with_attribution(
                         &network,
                         &block,
                         &cached_prepared_block.transaction_hashes,
@@ -418,14 +441,27 @@ where
                     .record(solved_header_start.elapsed().as_secs_f64());
             }
 
-            // Next, check the Merkle root validity, to ensure that
-            // the header binds to the transactions in the blocks.
-
             // Precomputing this avoids duplicating transaction hash computations.
             let transaction_hashes: Arc<[_]> =
                 block.transactions.iter().map(|t| t.hash()).collect();
 
-            check::merkle_root_validity(&network, &block, &transaction_hashes)?;
+            // Check that the header binds the transaction list before any
+            // transaction rule can condemn it.
+            if let Err(error) =
+                check::merkle_root_validity_with_attribution(&network, &block, &transaction_hashes)
+            {
+                if commitment::is_padding_error(&error) {
+                    // Only the NU5 authorization commitment can prove that the
+                    // header itself commits to the duplicates.
+                    commitment::check_auth_bound_duplicates(
+                        state_service.clone(),
+                        &network,
+                        block.clone(),
+                    )
+                    .await?;
+                }
+                return Err(error);
+            }
 
             // Since errors cause an early exit, try to do the
             // quick checks first.
@@ -443,150 +479,165 @@ where
             let deferred_pool_balance_change =
                 check::subsidy_is_valid(&block, &network, expected_block_subsidy)?;
 
-            // Now do the slower checks
+            let attribution_state = state_service.clone();
+            let attribution_block = block.clone();
+            let validation = async {
+                // Decryption converts the whole transaction, including authorization
+                // data, so conversion failures also need commitment attribution.
+                tx::check::coinbase_outputs_are_decryptable(&coinbase_tx, &network, height)?;
 
-            // Check compatibility with ZIP-212 shielded Sapling and Orchard coinbase output decryption
-            tx::check::coinbase_outputs_are_decryptable(&coinbase_tx, &network, height)?;
+                // Send transactions to the transaction verifier to be checked
+                let mut async_checks = FuturesUnordered::new();
 
-            // Send transactions to the transaction verifier to be checked
-            let mut async_checks = FuturesUnordered::new();
+                let known_utxos = Arc::new(transparent::new_ordered_outputs(
+                    &block,
+                    &transaction_hashes,
+                ));
 
-            let known_utxos = Arc::new(transparent::new_ordered_outputs(
-                &block,
-                &transaction_hashes,
-            ));
-
-            let known_outpoint_hashes: Arc<HashSet<transaction::Hash>> =
-                Arc::new(known_utxos.keys().map(|outpoint| outpoint.hash).collect());
-            // Keep this guard after `known_outpoint_hashes` so its `Drop` removes the
-            // pointer-keyed registration before the `Arc` address can be reused.
-            let _block_batch_flush = primitives::register_block_verifier_batch_flush(
-                &known_outpoint_hashes,
-                block.transactions.len(),
-            );
-
-            for (&transaction_hash, transaction) in
-                transaction_hashes.iter().zip(block.transactions.iter())
-            {
-                let rsp = transaction_verifier
-                    .ready()
-                    .await
-                    .expect("transaction verifier is always ready")
-                    .call(tx::Request::Block {
-                        transaction_hash,
-                        transaction: transaction.clone(),
-                        known_outpoint_hashes: known_outpoint_hashes.clone(),
-                        known_utxos: known_utxos.clone(),
-                        height,
-                        time: block.header.time,
-                    });
-                async_checks.push(rsp);
-            }
-            tracing::trace!(len = async_checks.len(), "built async tx checks");
-
-            // Get the transaction results back from the transaction verifier.
-
-            // Sum up some block totals from the transaction responses.
-            let mut sigops = 0;
-            let mut block_miner_fees = Ok(Amount::zero());
-
-            use futures::StreamExt;
-            while let Some(result) = async_checks.next().await {
-                tracing::trace!(?result, remaining = async_checks.len());
-                let response = result
-                    .map_err(Into::into)
-                    .map_err(VerifyBlockError::Transaction)?;
-
-                assert!(
-                    matches!(response, tx::Response::Block { .. }),
-                    "unexpected response from transaction verifier: {response:?}"
+                let known_outpoint_hashes: Arc<HashSet<transaction::Hash>> =
+                    Arc::new(known_utxos.keys().map(|outpoint| outpoint.hash).collect());
+                // Keep this guard after `known_outpoint_hashes` so its `Drop` removes the
+                // pointer-keyed registration before the `Arc` address can be reused.
+                let _block_batch_flush = primitives::register_block_verifier_batch_flush(
+                    &known_outpoint_hashes,
+                    block.transactions.len(),
                 );
 
-                sigops += response.sigops();
-
-                // Coinbase transactions consume the miner fee,
-                // so they don't add any value to the block's total miner fee.
-                if let Some(miner_fee) = response.miner_fee() {
-                    block_miner_fees += miner_fee;
-                }
-            }
-
-            // Check the summed block totals
-
-            if sigops > MAX_BLOCK_SIGOPS {
-                Err(BlockError::TooManyTransparentSignatureOperations {
-                    height,
-                    hash,
-                    sigops,
-                })?;
-            }
-
-            let block_miner_fees =
-                block_miner_fees.map_err(|amount_error| BlockError::SummingMinerFees {
-                    height,
-                    hash,
-                    source: amount_error,
-                })?;
-
-            check::miner_fees_are_valid(
-                &coinbase_tx,
-                height,
-                block_miner_fees,
-                expected_block_subsidy,
-                deferred_pool_balance_change,
-                &network,
-            )?;
-
-            // Finally, submit the block for contextual verification.
-            let new_outputs = Arc::into_inner(known_utxos)
-                .expect("all verification tasks using known_utxos are complete");
-
-            let prepared_block = zs::SemanticallyVerifiedBlock {
-                block,
-                hash,
-                height,
-                new_outputs,
-                transaction_hashes,
-                deferred_pool_balance_change: Some(deferred_pool_balance_change),
-                auth_data_root: None,
-            };
-
-            // Return early for proposal requests.
-            if request.is_proposal() {
-                let cache_copy = request.should_cache().then(|| prepared_block.clone());
-                let response = match state_service
-                    .ready()
-                    .await
-                    .map_err(VerifyBlockError::ValidateProposal)?
-                    .call(zs::Request::CheckBlockProposalValidity(prepared_block))
-                    .await
-                    .map_err(VerifyBlockError::ValidateProposal)?
+                for (&transaction_hash, transaction) in
+                    transaction_hashes.iter().zip(block.transactions.iter())
                 {
-                    zs::Response::ValidBlockProposal => Ok(hash),
-                    _ => unreachable!("wrong response for CheckBlockProposalValidity"),
-                };
-                if let (Ok(_), Some(cache_copy)) = (&response, cache_copy) {
-                    let candidate = cache_copy.block.clone();
-                    prepared_candidates.insert(
-                        &candidate,
-                        request.work_id(),
-                        request
-                            .prepared_candidate_source()
-                            .expect("cached preparation has a candidate source"),
-                        cache_copy,
-                        &network,
-                    );
-                    metrics::histogram!("mining.preparation.duration_seconds").record(
-                        preparation_start
-                            .expect("cached preparation records its start time")
-                            .elapsed()
-                            .as_secs_f64(),
-                    );
+                    let rsp = transaction_verifier
+                        .ready()
+                        .await
+                        .expect("transaction verifier is always ready")
+                        .call(tx::Request::Block {
+                            transaction_hash,
+                            transaction: transaction.clone(),
+                            known_outpoint_hashes: known_outpoint_hashes.clone(),
+                            known_utxos: known_utxos.clone(),
+                            height,
+                            time: block.header.time,
+                        });
+                    async_checks.push(rsp);
                 }
-                return response;
-            }
+                tracing::trace!(len = async_checks.len(), "built async tx checks");
 
-            commit_prepared_block(state_service, prepared_block, request.admission()).await
+                // Get the transaction results back from the transaction verifier.
+
+                // Sum up some block totals from the transaction responses.
+                let mut sigops = 0;
+                let mut block_miner_fees = Ok(Amount::zero());
+
+                use futures::StreamExt;
+                while let Some(result) = async_checks.next().await {
+                    tracing::trace!(?result, remaining = async_checks.len());
+                    let response = result
+                        .map_err(Into::into)
+                        .map_err(VerifyBlockError::Transaction)?;
+
+                    assert!(
+                        matches!(response, tx::Response::Block { .. }),
+                        "unexpected response from transaction verifier: {response:?}"
+                    );
+
+                    sigops += response.sigops();
+
+                    // Coinbase transactions consume the miner fee,
+                    // so they don't add any value to the block's total miner fee.
+                    if let Some(miner_fee) = response.miner_fee() {
+                        block_miner_fees += miner_fee;
+                    }
+                }
+
+                // Check the summed block totals
+
+                if sigops > MAX_BLOCK_SIGOPS {
+                    Err(BlockError::TooManyTransparentSignatureOperations {
+                        height,
+                        hash,
+                        sigops,
+                    })?;
+                }
+
+                let block_miner_fees =
+                    block_miner_fees.map_err(|amount_error| BlockError::SummingMinerFees {
+                        height,
+                        hash,
+                        source: amount_error,
+                    })?;
+
+                check::miner_fees_are_valid(
+                    &coinbase_tx,
+                    height,
+                    block_miner_fees,
+                    expected_block_subsidy,
+                    deferred_pool_balance_change,
+                    &network,
+                )?;
+
+                // Finally, submit the block for contextual verification.
+                let new_outputs = Arc::into_inner(known_utxos)
+                    .expect("all verification tasks using known_utxos are complete");
+
+                let prepared_block = zs::SemanticallyVerifiedBlock {
+                    block,
+                    hash,
+                    height,
+                    new_outputs,
+                    transaction_hashes,
+                    deferred_pool_balance_change: Some(deferred_pool_balance_change),
+                    auth_data_root: None,
+                };
+
+                // Return early for proposal requests.
+                if request.is_proposal() {
+                    let cache_copy = request.should_cache().then(|| prepared_block.clone());
+                    let response = match state_service
+                        .ready()
+                        .await
+                        .map_err(VerifyBlockError::ValidateProposal)?
+                        .call(zs::Request::CheckBlockProposalValidity(prepared_block))
+                        .await
+                        .map_err(VerifyBlockError::ValidateProposal)?
+                    {
+                        zs::Response::ValidBlockProposal => Ok(hash),
+                        _ => unreachable!("wrong response for CheckBlockProposalValidity"),
+                    };
+                    if let (Ok(_), Some(cache_copy)) = (&response, cache_copy) {
+                        let candidate = cache_copy.block.clone();
+                        prepared_candidates.insert(
+                            &candidate,
+                            request.work_id(),
+                            request
+                                .prepared_candidate_source()
+                                .expect("cached preparation has a candidate source"),
+                            cache_copy,
+                            &network,
+                        );
+                        metrics::histogram!("mining.preparation.duration_seconds").record(
+                            preparation_start
+                                .expect("cached preparation records its start time")
+                                .elapsed()
+                                .as_secs_f64(),
+                        );
+                    }
+                    return response;
+                }
+
+                commit_prepared_block(state_service, prepared_block, request.admission()).await
+            };
+            match validation.await {
+                // A deterministic failure condemns the header only if the header
+                // commits to every byte the failed rule read: see `attribute_failure`.
+                Err(error) => Err(commitment::attribute_failure(
+                    attribution_state,
+                    &network,
+                    attribution_block,
+                    error,
+                )
+                .await),
+                result => result,
+            }
         }
         .instrument(span)
         .boxed()

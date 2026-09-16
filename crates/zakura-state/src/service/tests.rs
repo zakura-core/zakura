@@ -92,9 +92,19 @@ fn prepared_relay_test_state() -> (
     super::non_finalized_state::NonFinalizedState,
     Arc<Block>,
 ) {
+    prepared_relay_test_state_for_network(Network::Mainnet)
+}
+
+fn prepared_relay_test_state_for_network(
+    network: Network,
+) -> (
+    Network,
+    super::finalized_state::FinalizedState,
+    super::non_finalized_state::NonFinalizedState,
+    Arc<Block>,
+) {
     use crate::tests::FakeChainHelper;
 
-    let network = Network::Mainnet;
     let heartwood_height = NetworkUpgrade::Heartwood
         .activation_height(&network)
         .expect("Heartwood activates")
@@ -260,6 +270,86 @@ fn prepared_relay_preflight_uses_commit_first_for_a_side_chain() {
     assert_eq!(
         eligibility,
         crate::PreparedMinedRelayEligibility::CommitFirst
+    );
+}
+
+#[test]
+fn body_commitment_check_is_independent_of_mining_work_waivers() {
+    use crate::tests::FakeChainHelper;
+
+    let _init_guard = zakura_test::init();
+    let network = zakura_chain::parameters::testnet::Parameters::build()
+        .with_disable_pow(true)
+        .to_network()
+        .expect("the configured test network is valid");
+    let (network, finalized, non_finalized, side) = prepared_relay_test_state_for_network(network);
+    let parent_chain = non_finalized.find_chain(|chain| chain.contains_block_hash(side.hash()));
+    let history_tree =
+        super::read::tree::history_tree(parent_chain, &finalized.db, side.hash().into())
+            .expect("side parent has a history tree");
+    let commitment = history_tree.hash().expect("the history root exists").into();
+    let child = side.make_fake_child().set_block_commitment(commitment);
+    let eligibility = super::check_block_commitment_for_state(
+        &network,
+        &non_finalized,
+        &finalized.db,
+        crate::BlockCommitmentData {
+            block: child,
+            auth_data_root: None,
+        },
+    )
+    .expect("the commitment and parent context match");
+    assert_eq!(eligibility, crate::BlockCommitmentValidity::Valid);
+}
+
+#[test]
+fn body_commitment_check_requires_the_exact_parent_history() {
+    use crate::tests::FakeChainHelper;
+
+    let _init_guard = zakura_test::init();
+    let (network, finalized, non_finalized, side) = prepared_relay_test_state();
+    let parent_chain = non_finalized.find_chain(|chain| chain.contains_block_hash(side.hash()));
+    let history = super::read::tree::history_tree(parent_chain, &finalized.db, side.hash().into())
+        .expect("the side parent has history");
+    let child = side
+        .make_fake_child()
+        .set_block_commitment(history.hash().unwrap().into());
+    let check = |block| {
+        super::check_block_commitment_for_state(
+            &network,
+            &non_finalized,
+            &finalized.db,
+            crate::BlockCommitmentData {
+                block,
+                auth_data_root: None,
+            },
+        )
+    };
+    assert_eq!(
+        check(child.clone()).unwrap(),
+        crate::BlockCommitmentValidity::Valid
+    );
+
+    let best_history = non_finalized
+        .best_chain()
+        .unwrap()
+        .history_block_commitment_tree()
+        .hash()
+        .unwrap();
+    let wrong_history = child.clone().set_block_commitment(best_history.into());
+    assert!(matches!(
+        check(wrong_history)
+            .unwrap_err()
+            .downcast_ref::<ValidateContextError>(),
+        Some(ValidateContextError::InvalidBlockCommitment(_))
+    ));
+
+    let mut missing_parent = child;
+    Arc::make_mut(&mut Arc::make_mut(&mut missing_parent).header).previous_block_hash =
+        block::Hash([0x99; 32]);
+    assert_eq!(
+        check(missing_parent).unwrap(),
+        crate::BlockCommitmentValidity::Unavailable
     );
 }
 

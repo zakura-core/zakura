@@ -396,10 +396,10 @@ pub struct SemanticallyVerifiedBlock {
     pub auth_data_root: Option<AuthDataRoot>,
 }
 
-/// Data required to check a prepared mined block before optimistic relay.
+/// Data required to check a block's commitment and parent context.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockCommitmentData {
-    /// The block whose header commits to the prepared body and parent history.
+    /// The block whose body and parent history will be checked against its header.
     pub block: Arc<Block>,
     /// The precomputed authorizing-data commitment root, when available.
     pub auth_data_root: Option<AuthDataRoot>,
@@ -1507,6 +1507,12 @@ pub enum Request {
     /// Returns [`Response::ValidBestChainTipNullifiersAndAnchors`]
     CheckBestChainTipNullifiersAndAnchors(UnminedTx),
 
+    /// Checks the chain-history and NU5 authorization commitment against the exact parent.
+    /// Returns [`Response::BlockCommitmentValidity`]. Missing parent history is unavailable.
+    /// Does not check the transaction Merkle root or pre-Heartwood Sapling root,
+    /// validate transactions, require the best tip, or authorize relay.
+    CheckBlockCommitment(BlockCommitmentData),
+
     /// Checks the expected work, body commitment, parent history, and selected tip.
     CheckPreparedMinedRelayEligibility(BlockCommitmentData),
 
@@ -1599,6 +1605,7 @@ impl Request {
             Request::InvalidateBlock(_) => "invalidate_block",
             Request::ReconsiderBlock(_) => "reconsider_block",
             Request::CheckBlockProposalValidity(_) => "check_block_proposal_validity",
+            Request::CheckBlockCommitment(_) => "check_block_commitment",
         }
     }
 
@@ -2038,6 +2045,12 @@ pub enum ReadRequest {
     /// Returns [`ReadResponse::ValidBestChainTipNullifiersAndAnchors`].
     CheckBestChainTipNullifiersAndAnchors(UnminedTx),
 
+    /// Checks the chain-history and NU5 authorization commitment against the exact parent.
+    /// Returns [`ReadResponse::BlockCommitmentValidity`]. Missing parent history is unavailable.
+    /// Does not check the transaction Merkle root or pre-Heartwood Sapling root,
+    /// validate transactions, require the best tip, or authorize relay.
+    CheckBlockCommitment(BlockCommitmentData),
+
     /// Checks the expected work, body commitment, parent history, and selected tip.
     CheckPreparedMinedRelayEligibility(BlockCommitmentData),
 
@@ -2173,6 +2186,7 @@ impl ReadRequest {
             ReadRequest::ChainInfo => "chain_info",
             ReadRequest::SolutionRate { .. } => "solution_rate",
             ReadRequest::CheckBlockProposalValidity(_) => "check_block_proposal_validity",
+            ReadRequest::CheckBlockCommitment(_) => "check_block_commitment",
             ReadRequest::TipBlockSize => "tip_block_size",
             ReadRequest::ChainTips => "chain_tips",
             ReadRequest::NonFinalizedBlocksListener { .. } => "non_finalized_blocks_listener",
@@ -2225,6 +2239,7 @@ impl TryFrom<Request> for ReadRequest {
             Request::CheckBestChainTipNullifiersAndAnchors(tx) => {
                 Ok(ReadRequest::CheckBestChainTipNullifiersAndAnchors(tx))
             }
+            Request::CheckBlockCommitment(block) => Ok(ReadRequest::CheckBlockCommitment(block)),
             Request::CheckPreparedMinedRelayEligibility(block) => {
                 Ok(ReadRequest::CheckPreparedMinedRelayEligibility(block))
             }

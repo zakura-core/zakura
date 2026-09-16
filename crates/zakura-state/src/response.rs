@@ -35,6 +35,15 @@ use crate::{
 #[cfg(test)]
 mod tests;
 
+/// Result of checking the chain-history and authorization commitment at the exact parent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockCommitmentValidity {
+    /// The commitment matched or predates activation. This does not imply consensus validity.
+    Valid,
+    /// The exact parent history is not available yet.
+    Unavailable,
+}
+
 /// State's decision for a prepared mined block's optimistic relay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PreparedMinedRelayEligibility {
@@ -124,6 +133,9 @@ pub enum Response {
     ///
     /// Does not check transparent UTXO inputs
     ValidBestChainTipNullifiersAndAnchors,
+
+    /// Response to [`Request::CheckBlockCommitment`].
+    BlockCommitmentValidity(BlockCommitmentValidity),
 
     /// Response to [`Request::CheckPreparedMinedRelayEligibility`].
     PreparedMinedRelayEligibility(PreparedMinedRelayEligibility),
@@ -594,6 +606,9 @@ pub enum ReadResponse {
     /// Does not check transparent UTXO inputs
     ValidBestChainTipNullifiersAndAnchors,
 
+    /// Response to [`ReadRequest::CheckBlockCommitment`].
+    BlockCommitmentValidity(BlockCommitmentValidity),
+
     /// Response to [`ReadRequest::CheckPreparedMinedRelayEligibility`].
     PreparedMinedRelayEligibility(PreparedMinedRelayEligibility),
 
@@ -755,6 +770,7 @@ impl TryFrom<ReadResponse> for Response {
             }
 
             ReadResponse::ValidBlockProposal => Ok(Response::ValidBlockProposal),
+            ReadResponse::BlockCommitmentValidity(validity) => Ok(Response::BlockCommitmentValidity(validity)),
 
             ReadResponse::SolutionRate(_)
             | ReadResponse::TipBlockSize(_)

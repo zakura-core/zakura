@@ -83,12 +83,10 @@ async fn port_capacity_release_preserves_busy_order_and_pending_status() {
         }
         reactor.handle_port_completion(completion);
         if !release_before_reply {
-            assert!(HeaderSyncReactor::wait_for_capacity(&reactor.peer_state)
-                .now_or_never()
-                .is_none());
+            assert!(reactor.capacity_waiters.next().now_or_never().is_none());
             signal.release();
         }
-        HeaderSyncReactor::wait_for_capacity(&reactor.peer_state).await;
+        reactor.capacity_waiters.next().await;
         time::advance(std::time::Duration::from_secs(1)).await;
         reactor.refresh_statuses();
         // Busy still fills the queue, so the failed status publication must remain pending.
@@ -132,7 +130,7 @@ async fn replaced_session_discards_capacity_notification() {
         send,
         CancellationToken::new(),
     ));
-    reactor.peer_state.get_mut(&peer).unwrap().capacity_signal = Some(signal.clone());
+    reactor.watch_capacity(&peer, signal.clone());
     reactor
         .peer_state
         .get_mut(&peer)
@@ -322,4 +320,60 @@ async fn reactor_wakes_on_capacity_release_without_an_input_event() {
     assert_eq!(codec.decode_frame(refreshed, None).unwrap(), initial);
     shutdown.cancel();
     task.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropped_capacity_busy_closes_the_session_without_an_unchoke() {
+    let signal = port::ServingCapacitySignal::default();
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let (_tx, rx) = watch::channel(Some(committed_snapshot(anchor)));
+    startup.committed_snapshots = Some(rx);
+    startup.header_chain_port = Arc::new(CapacityPort(signal.clone()));
+    startup.port_dispatch = PortDispatch::Direct;
+    let (_handle, _actions, mut reactor) = build_header_sync_reactor(startup).unwrap();
+    let peer = peer();
+    let (send, mut outbound) = framed_channel(1);
+    let cancel = CancellationToken::new();
+    reactor.handle_peer_connected(PeerSession::from_parts_with_session_id(
+        peer.clone(),
+        7,
+        send,
+        cancel.clone(),
+    ));
+    // The initial Status fills the queue before the Busy response.
+    reactor.handle_get_headers(peer.clone(), 7, request(1, anchor.hash, anchor.hash));
+    let completion = reactor.pending_port_operations.next().await.unwrap();
+    reactor.handle_port_completion(completion);
+    assert!(cancel.is_cancelled());
+    signal.release();
+    outbound.try_recv().unwrap();
+    time::advance(std::time::Duration::from_secs(1)).await;
+    reactor.refresh_statuses();
+    assert!(outbound.try_recv().is_err());
+    assert!(reactor.capacity_waiters.is_empty());
+    assert!(reactor.peer_state[&peer].capacity_signal.is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn capacity_wait_registration_survives_unrelated_polls_and_cancels_with_session() {
+    let (_handle, _actions, mut reactor) =
+        build_header_sync_reactor(startup(CancellationToken::new())).unwrap();
+    let peer = peer();
+    let (send, _outbound) = framed_channel(8);
+    reactor.handle_peer_connected(PeerSession::from_parts_with_session_id(
+        peer.clone(),
+        7,
+        send,
+        CancellationToken::new(),
+    ));
+    let signal = port::ServingCapacitySignal::default();
+    for _ in 0..100 {
+        reactor.watch_capacity(&peer, signal.clone());
+        assert!(reactor.capacity_waiters.next().now_or_never().is_none());
+        assert_eq!(reactor.capacity_waiters.len(), 1);
+    }
+    reactor.handle_peer_disconnected(&peer, 7, "test disconnect");
+    assert!(reactor.capacity_waiters.next().await.is_some());
+    assert!(reactor.capacity_waiters.is_empty());
 }

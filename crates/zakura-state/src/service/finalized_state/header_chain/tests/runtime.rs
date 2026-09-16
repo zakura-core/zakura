@@ -2681,3 +2681,45 @@ fn reservation_commit_keeps_the_waiter_until_exact_release_or_expiry() {
         assert!(signal.is_released());
     }
 }
+
+#[tokio::test]
+async fn abandoned_blocking_acquisition_releases_its_lease_and_notifies_waiters() {
+    let (runtime, _db, _, path) = reconciled_store_with_finalized_prefix(7);
+    let reader = runtime.reader();
+    let source = SourceId::from_digest([0xe5; 32]);
+    let target = path[5].hash;
+    let scope = HeaderWorkAuthority::for_target(&runtime.publisher().snapshot(), target);
+    let outcome = reader
+        .acquire_retained_path(source, 7, target, &[path[2].hash], scope)
+        .unwrap();
+    assert!(matches!(outcome, RetainedPathLeaseOutcome::Acquired(_)));
+    let RetainedPathLeaseOutcome::CapacityBusy(signal) = reader
+        .acquire_retained_path(source, 7, target, &[path[2].hash], scope)
+        .unwrap()
+    else {
+        panic!("the first acquisition owns the peer slot");
+    };
+    let (resume, blocked) = std::sync::mpsc::channel();
+    let task_reader = reader.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        blocked.recv().unwrap();
+        PendingRetainedPathAcquisition::new(task_reader, outcome)
+    });
+    drop(task);
+    assert!(!signal.is_released());
+    resume.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), signal.released())
+        .await
+        .unwrap();
+    let outcome = reader
+        .acquire_retained_path(source, 7, target, &[path[2].hash], scope)
+        .unwrap();
+    let pending = PendingRetainedPathAcquisition::new(reader.clone(), outcome);
+    let RetainedPathLeaseOutcome::Acquired(lease) = pending.into_outcome() else {
+        panic!("abandonment must return the peer slot");
+    };
+    // Receiving the result transfers ownership to the caller.
+    assert!(reader
+        .release_retained_path(source, 7, lease.lease_id, scope)
+        .unwrap());
+}

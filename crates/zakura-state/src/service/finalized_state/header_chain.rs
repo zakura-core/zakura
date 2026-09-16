@@ -944,6 +944,45 @@ struct CanonicalHeaderPathAdvance {
     now: Instant,
 }
 
+/// Owns a blocking acquisition until the state-service caller receives its result.
+pub(crate) struct PendingRetainedPathAcquisition {
+    reader: HeaderChainReader,
+    outcome: Option<RetainedPathLeaseOutcome>,
+}
+
+impl PendingRetainedPathAcquisition {
+    pub(crate) fn new(reader: HeaderChainReader, outcome: RetainedPathLeaseOutcome) -> Self {
+        Self {
+            reader,
+            outcome: Some(outcome),
+        }
+    }
+
+    pub(crate) fn into_outcome(mut self) -> RetainedPathLeaseOutcome {
+        self.outcome
+            .take()
+            .expect("pending acquisition owns its outcome")
+    }
+}
+
+impl Drop for PendingRetainedPathAcquisition {
+    fn drop(&mut self) {
+        if let Some(RetainedPathLeaseOutcome::Acquired(lease)) = self.outcome.take() {
+            if let Err(error) = self.reader.release_retained_path(
+                lease.peer,
+                lease.session_id,
+                lease.lease_id,
+                lease.scope,
+            ) {
+                tracing::error!(
+                    ?error,
+                    "failed to release an abandoned header path acquisition"
+                );
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct RetainedPathReservation {
     leases: Arc<Mutex<RetainedPathLeaseRegistry>>,

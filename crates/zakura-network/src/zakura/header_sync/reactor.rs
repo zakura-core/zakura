@@ -14,6 +14,7 @@ use tokio::{
     task::JoinHandle,
     time::{self, Instant},
 };
+use tokio_util::sync::CancellationToken;
 use zakura_chain::block;
 
 use super::{
@@ -164,6 +165,7 @@ fn build_header_sync_reactor(
         lifecycle: lifecycle_rx,
         actions: actions_tx,
         pending_port_operations: FuturesUnordered::new(),
+        capacity_waiters: FuturesUnordered::new(),
         pending_locator_queries: HashSet::new(),
         retained_paths: HashMap::new(),
         tip: tip_tx,
@@ -202,6 +204,7 @@ struct PeerState {
     last_status: Option<Status>,
     waiting_for_serving_slot: bool,
     capacity_signal: Option<zakura_node_services::header_chain::ServingCapacitySignal>,
+    capacity_wait_cancel: Option<CancellationToken>,
     /// Consecutive requests this session answered with nothing usable.
     unproductive_requests: u32,
 }
@@ -258,6 +261,7 @@ struct HeaderSyncReactor {
     #[cfg_attr(not(any(test, feature = "zakura-testkit")), allow(dead_code))]
     actions: mpsc::Sender<HeaderPortOperation>,
     pending_port_operations: FuturesUnordered<PendingPortOperation>,
+    capacity_waiters: FuturesUnordered<Pin<Box<dyn Future<Output = ()> + Send>>>,
     /// Peers with one direct continuation-locator read currently in flight.
     pending_locator_queries: HashSet<ZakuraPeerId>,
     #[cfg_attr(any(test, feature = "zakura-testkit"), allow(dead_code))]
@@ -766,7 +770,7 @@ impl HeaderSyncReactor {
                         self.handle_port_completion(completion);
                     }
                 }
-                _ = Self::wait_for_capacity(&self.peer_state) => {},
+                _ = self.capacity_waiters.next(), if !self.capacity_waiters.is_empty() => {},
                 _ = time::sleep_until(maintenance) => self.refresh_statuses(),
                 event = self.lifecycle.recv() => match event {
                     Some(event) => self.handle_event(event),
@@ -976,9 +980,13 @@ impl HeaderSyncReactor {
                 last_status: None,
                 waiting_for_serving_slot: false,
                 capacity_signal: None,
+                capacity_wait_cancel: None,
                 unproductive_requests: 0,
             },
         ) {
+            if let Some(cancel) = previous.capacity_wait_cancel {
+                cancel.cancel();
+            }
             previous.session.cancel_token().cancel();
             if let Some((owner, source)) = replaced_repair.and_then(|(owner, source, phase)| {
                 if phase == HeaderTargetPhase::Receiving {
@@ -1052,7 +1060,11 @@ impl HeaderSyncReactor {
         if !owns_local_repair_operation {
             self.retire_peer_work(peer, HeaderRequestTerminal::Disconnected);
         }
-        self.peer_state.remove(peer);
+        if let Some(state) = self.peer_state.remove(peer) {
+            if let Some(cancel) = state.capacity_wait_cancel {
+                cancel.cancel();
+            }
+        }
         self.vct_supplier_order.retain(|queued| queued != peer);
         if let Some((owner, source, HeaderTargetPhase::Receiving)) = abandoned_repair {
             self.retry_vct_repair(
@@ -1232,15 +1244,11 @@ impl HeaderSyncReactor {
         }
 
         if self.served_paths.contains_key(&peer) {
-            if let Some(state) = self.peer_state.get_mut(&peer) {
-                state.waiting_for_serving_slot = true;
+            if self.send_capacity_busy(&peer, request.request_id, request.target_tip_hash) {
+                if let Some(state) = self.peer_state.get_mut(&peer) {
+                    state.waiting_for_serving_slot = true;
+                }
             }
-            self.send_headers_outcome(
-                &peer,
-                request.request_id,
-                request.target_tip_hash,
-                HeadersOutcomeCode::Busy,
-            );
             return;
         }
 
@@ -2435,17 +2443,9 @@ impl HeaderSyncReactor {
         let lease = match result {
             HeaderPathLeaseResult::CapacityBusy(signal) => {
                 self.served_path_deadlines.remove(&peer);
-                if let Some(state) = self.peer_state.get_mut(&peer) {
-                    if state.session.session_id() == session_id {
-                        state.capacity_signal = Some(signal);
-                    }
+                if self.send_capacity_busy(&peer, request.request_id, request.target_tip_hash) {
+                    self.watch_capacity(&peer, signal);
                 }
-                self.send_headers_outcome(
-                    &peer,
-                    request.request_id,
-                    request.target_tip_hash,
-                    HeadersOutcomeCode::Busy,
-                );
                 return;
             }
             HeaderPathLeaseResult::Outcome(outcome) => {
@@ -3518,34 +3518,37 @@ impl HeaderSyncReactor {
         }
     }
 
-    async fn wait_for_capacity(peers: &HashMap<ZakuraPeerId, PeerState>) {
-        let waiting = {
-            let mut signals = peers
-                .values()
-                .filter(|state| state.status_publisher.is_some())
-                .filter_map(|state| state.capacity_signal.as_ref())
-                .peekable();
-            if signals.peek().is_none() {
-                None
-            } else {
-                Some(
-                    signals
-                        .map(|signal| signal.released())
-                        .collect::<FuturesUnordered<_>>(),
-                )
-            }
+    fn watch_capacity(
+        &mut self,
+        peer: &ZakuraPeerId,
+        signal: zakura_node_services::header_chain::ServingCapacitySignal,
+    ) {
+        let Some(state) = self.peer_state.get_mut(peer) else {
+            return;
         };
-        match waiting {
-            Some(mut waiting) => {
-                waiting.next().await;
-            }
-            None => std::future::pending::<()>().await,
+        if state.capacity_signal.as_ref() == Some(&signal) {
+            return;
         }
+        let cancel = CancellationToken::new();
+        if let Some(previous) = state.capacity_wait_cancel.replace(cancel.clone()) {
+            previous.cancel();
+        }
+        state.capacity_signal = Some(signal.clone());
+        self.capacity_waiters.push(Box::pin(async move {
+            tokio::select! {
+                _ = cancel.cancelled() => {},
+                _ = signal.released() => {},
+            }
+        }));
     }
 
     fn schedule_capacity_notifications(&mut self) {
         let now = Instant::now();
         for (peer, state) in &mut self.peer_state {
+            if state.session.cancel_token().is_cancelled() {
+                continue;
+            }
+
             let Some(publisher) = state.status_publisher.as_mut() else {
                 continue;
             };
@@ -3560,6 +3563,9 @@ impl HeaderSyncReactor {
             }
             if state_available {
                 state.capacity_signal = None;
+                if let Some(cancel) = state.capacity_wait_cancel.take() {
+                    cancel.cancel();
+                }
             }
             if slot_available || state_available {
                 // The Busy send precedes this publication on the ordered outbound queue.
@@ -3832,15 +3838,31 @@ impl HeaderSyncReactor {
             .min(MAX_HS_RANGE)
     }
 
+    fn send_capacity_busy(
+        &self,
+        peer: &ZakuraPeerId,
+        request_id: u64,
+        target: block::Hash,
+    ) -> bool {
+        let sent = self.send_headers_outcome(peer, request_id, target, HeadersOutcomeCode::Busy);
+        if !sent {
+            if let Some(state) = self.peer_state.get(peer) {
+                // Close the stream when its queue cannot retain the terminal response.
+                state.session.cancel_token().cancel();
+            }
+        }
+        sent
+    }
+
     fn send_headers_outcome(
         &self,
         peer: &ZakuraPeerId,
         request_id: u64,
         target_tip_hash: block::Hash,
         outcome: HeadersOutcomeCode,
-    ) {
+    ) -> bool {
         let Some(state) = self.peer_state.get(peer) else {
-            return;
+            return false;
         };
         if let Err(error) = state.session.try_send_headers_outcome(
             &self.codec,
@@ -3857,6 +3879,7 @@ impl HeaderSyncReactor {
                 &error,
                 Some(request_id),
             );
+            false
         } else {
             let session_id = state.session.session_id();
             let direction = state.session.direction();
@@ -3878,6 +3901,7 @@ impl HeaderSyncReactor {
                     headers_outcome_label(outcome).into(),
                 );
             });
+            true
         }
     }
 

@@ -2522,7 +2522,7 @@ async fn supplier_capacity_release_retries_the_waiting_downloader_before_refresh
         .handle_wire_response(peer.clone(), 7, first.owner.header_authority(), busy);
     assert!(downloader.reactor.peer_work_queue.active(&peer).is_none());
     signal.release();
-    HeaderSyncReactor::wait_for_capacity(&supplier.peer_state).await;
+    supplier.capacity_waiters.next().await;
     time::advance(std::time::Duration::from_secs(1)).await;
     supplier.refresh_statuses();
     let status = supplier

@@ -2750,6 +2750,45 @@ impl Service<ReadRequest> for ReadStateService {
             .boxed();
         };
 
+        if let ReadRequest::AcquireRetainedHeaderPath {
+            peer,
+            session_id,
+            target_tip_hash,
+            scope,
+            locator_hashes,
+        } = req
+        {
+            let reader = state.header_chain_reader_receiver.borrow().clone();
+            let Some(reader) = reader else {
+                return async {
+                    Ok(ReadResponse::RetainedHeaderPathLease(
+                        crate::RetainedPathLeaseOutcome::TargetNotRetained,
+                    ))
+                }
+                .boxed();
+            };
+            let acquisition = timed_span.spawn_blocking(move || {
+                let outcome = reader.acquire_retained_path(
+                    peer,
+                    session_id,
+                    target_tip_hash,
+                    &locator_hashes,
+                    scope,
+                )?;
+                Ok(
+                    finalized_state::header_chain::PendingRetainedPathAcquisition::new(
+                        reader, outcome,
+                    ),
+                )
+            });
+            return async move {
+                Ok(ReadResponse::RetainedHeaderPathLease(
+                    acquisition.await?.into_outcome(),
+                ))
+            }
+            .boxed();
+        }
+
         let request_handler = move || match req {
             // Used by the `getblockchaininfo` RPC.
             ReadRequest::UsageInfo => Ok(ReadResponse::UsageInfo(state.db.cached_size())),
@@ -2959,27 +2998,8 @@ impl Service<ReadRequest> for ReadStateService {
                 Ok(ReadResponse::VctRepairContext(context))
             }
 
-            ReadRequest::AcquireRetainedHeaderPath {
-                peer,
-                session_id,
-                target_tip_hash,
-                scope,
-                locator_hashes,
-            } => {
-                let Some(reader) = state.header_chain_reader_receiver.borrow().clone() else {
-                    return Ok(ReadResponse::RetainedHeaderPathLease(
-                        crate::RetainedPathLeaseOutcome::TargetNotRetained,
-                    ));
-                };
-                Ok(ReadResponse::RetainedHeaderPathLease(
-                    reader.acquire_retained_path(
-                        peer,
-                        session_id,
-                        target_tip_hash,
-                        &locator_hashes,
-                        scope,
-                    )?,
-                ))
+            ReadRequest::AcquireRetainedHeaderPath { .. } => {
+                unreachable!("path acquisition returns through its cancellation guard");
             }
 
             ReadRequest::ReadRetainedHeaderPath {

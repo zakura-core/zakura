@@ -50,6 +50,23 @@ pub struct GossipedTipChildHeightMismatch {
     pub hash: block::Hash,
 }
 
+/// A downloaded block claims a height far behind the tip, but a parent header
+/// lookup proves the claimed height is inconsistent with the parent's height.
+/// The body has been poisoned (ZIP-244 scriptSig rewrite) and the peer must
+/// be scored and the hash re-requested.
+///
+/// This is a distinct type rather than a string error so [`super::Inbound`] can score the
+/// supplying peer for it, matching the `GossipedTipChildHeightMismatch` handler.
+#[derive(Copy, Clone, Debug, thiserror::Error)]
+#[error(
+    "gossiped behind-tip block claimed height {height:?} but parent height is {parent_height:?}: {hash:?}"
+)]
+pub struct GossipedBehindTipHeightMismatch {
+    pub height: block::Height,
+    pub parent_height: block::Height,
+    pub hash: block::Hash,
+}
+
 /// Source key used for inbound block download ordering.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum AdvertiserSource {
@@ -596,6 +613,7 @@ where
         let network = self.network.clone();
         let verifier = self.verifier.clone();
         let state = self.state.clone();
+        let state_for_parent_lookup = self.state.clone();
         let latest_chain_tip = self.latest_chain_tip.clone();
         let full_verify_concurrency_limit = self.full_verify_concurrency_limit;
 
@@ -766,18 +784,56 @@ where
 
                 Err("gossiped block height too far ahead").map_err(|e| (e.into(), None))?;
             } else if block_height < min_accepted_height {
-                debug!(
-                    ?hash,
-                    ?block_height,
-                    ?tip_height,
-                    ?min_accepted_height,
-                    behind_tip_limit = ?zs::MAX_BLOCK_REORG_HEIGHT,
-                    "gossiped block height behind the finalized tip: dropped downloaded block",
-                );
-                metrics::counter!("gossip.min.height.limit.dropped.block.count").increment(1);
+                // Security: before discarding this block as genuinely old, check whether
+                // the claimed height is consistent with the parent header's height. If the
+                // parent is known and its height + 1 != block_height, the body has been
+                // poisoned (ZIP-244 scriptSig rewrite) and the peer must be scored.
+                let parent_header = state_for_parent_lookup
+                    .oneshot(zs::Request::BlockHeader(
+                        block.header.previous_block_hash.into(),
+                    ))
+                    .await;
 
-                Err("gossiped block height behind the finalized tip")
-                    .map_err(|e| (e.into(), None))?;
+                let is_forged = matches!(
+                    parent_header,
+                    Ok(zs::Response::BlockHeader { ref height, .. })
+                        if height.0 + 1 != block_height.0
+                );
+
+                if is_forged {
+                    let parent_height =
+                        if let Ok(zs::Response::BlockHeader { ref height, .. }) = parent_header {
+                            *height
+                        } else {
+                            block::Height(0)
+                        };
+
+                    debug!(
+                        ?hash, ?block_height, ?parent_height,
+                        "gossiped behind-tip block has a forged height: dropped and scored"
+                    );
+                    metrics::counter!("gossip.behind.tip.height.mismatch.count").increment(1);
+
+                    Err((
+                        BoxError::from(GossipedBehindTipHeightMismatch {
+                            height: block_height,
+                            parent_height,
+                            hash,
+                        }),
+                        advertiser_addr,
+                    ))?;
+                } else {
+                    // Genuinely old block (or unknown parent) — drop without scoring.
+                    debug!(
+                        ?hash, ?block_height, ?tip_height, ?min_accepted_height,
+                        behind_tip_limit = ?zs::MAX_BLOCK_REORG_HEIGHT,
+                        "gossiped block height behind the finalized tip: dropped downloaded block",
+                    );
+                    metrics::counter!("gossip.min.height.limit.dropped.block.count").increment(1);
+
+                    Err("gossiped block height behind the finalized tip")
+                        .map_err(|e| (e.into(), advertiser_addr))?;
+                }
             }
 
             let _source_guard = match source_lock {

@@ -17,7 +17,9 @@ reuse and no database exists at the destination. It moves the database into the 
 directory and applies the registered upgrades. It does not retain a fallback copy.
 
 Zakura checks the source's recorded major format before moving it. If the source format does
-not match its directory, Zakura skips reuse and logs a warning. The existing cleanup and
+not match its directory, Zakura skips reuse and logs a warning. Zakura still accepts legacy
+minor-only version files and infers the major format from the directory when no version file
+exists. The existing cleanup and
 non-finalized backup policies still apply.
 
 ## Unsupported older builds

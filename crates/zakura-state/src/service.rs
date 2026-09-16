@@ -2168,20 +2168,25 @@ fn missing_block_body_metadata<C>(
 where
     C: AsRef<Chain> + Clone,
 {
-    let (chain, verified_block_tip, selected_projection) = match header_chain {
+    let (chain, verified_block_tip, selected_projection, authority) = match header_chain {
         Some(reader) => {
-            let ((chain, verified_block_tip), selected_projection) = reader
+            let ((chain, verified_block_tip), selected_projection, authority) = reader
                 .with_selected_projection(|| {
                     let chain = latest_chain();
                     let verified_block_tip = read::tip(chain.clone(), db);
                     (chain, verified_block_tip)
                 })?;
-            (chain, verified_block_tip, Some(selected_projection))
+            (
+                chain,
+                verified_block_tip,
+                Some(selected_projection),
+                Some(authority),
+            )
         }
         None => {
             let chain = latest_chain();
             let verified_block_tip = read::tip(chain.clone(), db);
-            (chain, verified_block_tip, None)
+            (chain, verified_block_tip, None, None)
         }
     };
     let best_header_tip = match &selected_projection {
@@ -2237,6 +2242,7 @@ where
 
     if start > best_header_tip.height {
         return Ok(crate::BlockSyncBodyMetadata {
+            authority,
             anchor,
             blocks: Vec::new(),
         });
@@ -2304,6 +2310,7 @@ where
     }
 
     Ok(crate::BlockSyncBodyMetadata {
+        authority,
         anchor,
         blocks: metadata,
     })

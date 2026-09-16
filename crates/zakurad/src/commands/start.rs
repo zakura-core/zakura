@@ -2889,6 +2889,61 @@ mod zakura_header_sync_driver_tests {
     }
 
     #[tokio::test]
+    async fn block_sync_metadata_chunks_allow_compatible_progress_but_reject_resets() {
+        for reset in [false, true] {
+            let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let read_state = service_fn(move |request| {
+                let index = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    let zakura_state::ReadRequest::MissingBlockBodyMetadata { from, .. } = request
+                    else {
+                        panic!("metadata query");
+                    };
+                    let mut authority = test_block_work_owner().authority();
+                    authority.verified_generation = zakura_header_chain::VerifiedGeneration::new(
+                        u64::try_from(index + 1).unwrap(),
+                    );
+                    if reset && index > 0 {
+                        authority.body_work_epoch = zakura_header_chain::BodyWorkEpoch::new(1);
+                    }
+                    Ok::<_, zakura_state::BoxError>(
+                        zakura_state::ReadResponse::MissingBlockBodyMetadata(
+                            zakura_state::BlockSyncBodyMetadata {
+                                authority: Some(authority),
+                                anchor: zakura_header_chain::Frontier::new(
+                                    block::Height(u32::try_from(index + 1).unwrap()),
+                                    block::Hash([1; 32]),
+                                ),
+                                blocks: vec![(from, block::Hash([2; 32]), None)],
+                            },
+                        ),
+                    )
+                }
+            });
+            let result = query_block_sync_needed_blocks(
+                read_state,
+                block::Height(10),
+                zakura_state::constants::MAX_HEADER_SYNC_HEIGHT_RANGE + 1,
+            )
+            .await;
+            if reset {
+                assert!(
+                    result.is_err(),
+                    "one query cannot mix selected-chain epochs"
+                );
+            } else {
+                let (authority, anchor, blocks) = result.unwrap();
+                assert_eq!(anchor.height, block::Height(2));
+                assert_eq!(blocks.len(), 2);
+                assert_eq!(
+                    authority.unwrap().verified_generation,
+                    zakura_header_chain::VerifiedGeneration::new(2)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn block_sync_needed_blocks_chunks_state_range_reads() {
         let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
         let hash = block.hash();
@@ -2914,6 +2969,7 @@ mod zakura_header_sync_driver_tests {
                             Ok::<_, zakura_state::BoxError>(
                                 zakura_state::ReadResponse::MissingBlockBodyMetadata(
                                     zakura_state::BlockSyncBodyMetadata {
+                                        authority: None,
                                         anchor: zakura_header_chain::Frontier::new(
                                             block::Height(0),
                                             block::Hash([0; 32]),
@@ -2930,9 +2986,10 @@ mod zakura_header_sync_driver_tests {
         };
         let count = zakura_state::constants::MAX_HEADER_SYNC_HEIGHT_RANGE + 2;
 
-        let (_anchor, needed) = query_block_sync_needed_blocks(read_state, block::Height(1), count)
-            .await
-            .expect("mock read state succeeds");
+        let (_authority, _anchor, needed) =
+            query_block_sync_needed_blocks(read_state, block::Height(1), count)
+                .await
+                .expect("mock read state succeeds");
 
         assert_eq!(
             needed.len(),
@@ -3493,6 +3550,7 @@ mod zakura_header_sync_driver_tests {
                         assert_eq!(limit, 2);
                         Ok(zakura_state::ReadResponse::MissingBlockBodyMetadata(
                             zakura_state::BlockSyncBodyMetadata {
+                                authority: None,
                                 anchor: zakura_header_chain::Frontier::new(
                                     block::Height(0),
                                     block::Hash([0; 32]),
@@ -3749,6 +3807,7 @@ mod zakura_header_sync_driver_tests {
                         assert_eq!(limit, 3);
                         Ok(zakura_state::ReadResponse::MissingBlockBodyMetadata(
                             zakura_state::BlockSyncBodyMetadata {
+                                authority: None,
                                 anchor: zakura_header_chain::Frontier::new(
                                     block::Height(0),
                                     block::Hash([0; 32]),
@@ -5060,6 +5119,7 @@ mod zakura_header_sync_driver_tests {
                         Ok::<_, zakura_state::BoxError>(
                             zakura_state::ReadResponse::MissingBlockBodyMetadata(
                                 zakura_state::BlockSyncBodyMetadata {
+                                    authority: None,
                                     anchor: zakura_header_chain::Frontier::new(
                                         block::Height(0),
                                         block::Hash([0; 32]),

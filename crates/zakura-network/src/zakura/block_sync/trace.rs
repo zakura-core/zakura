@@ -492,6 +492,14 @@ enum BlockEventDetail {
         hash: String,
     },
     NeededBlocks {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        query_id: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_authority: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        read_authority: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        body_anchor_height: Option<u64>,
         range_count: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         range_start: Option<u64>,
@@ -559,12 +567,26 @@ impl BlockEventReceived {
                 verified_block_tip: height(frontiers.verified_block_tip),
                 hash: hash(frontiers.verified_block_hash),
             },
-            BlockSyncEvent::ScopedNeededBlocks { blocks, .. } => BlockEventDetail::NeededBlocks {
+            BlockSyncEvent::ScopedNeededBlocks {
+                query_id,
+                scope,
+                read_authority,
+                body_anchor,
+                blocks,
+            } => BlockEventDetail::NeededBlocks {
+                query_id: Some(query_id.get()),
+                request_authority: Some(format!("{scope:?}")),
+                read_authority: read_authority.map(|authority| format!("{authority:?}")),
+                body_anchor_height: Some(height(body_anchor.height)),
                 range_count: saturating_usize(blocks.len()),
                 range_start: blocks.first().map(|block| height(block.height)),
             },
             #[cfg(test)]
             BlockSyncEvent::NeededBlocks(blocks) => BlockEventDetail::NeededBlocks {
+                query_id: None,
+                request_authority: None,
+                read_authority: None,
+                body_anchor_height: None,
                 range_count: saturating_usize(blocks.len()),
                 range_start: blocks.first().map(|block| height(block.height)),
             },
@@ -626,6 +648,8 @@ pub(super) struct BlockActionDispatched {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum BlockActionDetail {
     QueryNeededBlocks {
+        query_id: u64,
+        request_authority: String,
         range_start: u64,
         range_count: u64,
         best_header_tip: u64,
@@ -655,11 +679,15 @@ impl BlockActionDispatched {
     pub(super) fn new(action: &BlockSyncAction) -> Self {
         let detail = match action {
             BlockSyncAction::QueryNeededBlocks {
+                query_id,
+                scope,
                 from,
                 limit,
                 best_header_tip,
                 ..
             } => BlockActionDetail::QueryNeededBlocks {
+                query_id: query_id.get(),
+                request_authority: format!("{scope:?}"),
                 range_start: height(*from),
                 range_count: u64::from(*limit),
                 best_header_tip: height(*best_header_tip),
@@ -914,6 +942,10 @@ mod tests {
             ),
             (
                 BlockEventDetail::NeededBlocks {
+                    query_id: None,
+                    request_authority: None,
+                    read_authority: None,
+                    body_anchor_height: None,
                     range_count: 2,
                     range_start: None,
                 },
@@ -964,11 +996,13 @@ mod tests {
         let cases = [
             (
                 BlockActionDetail::QueryNeededBlocks {
+                    query_id: 7,
+                    request_authority: "a".into(),
                     range_start: 1,
                     range_count: 2,
                     best_header_tip: 3,
                 },
-                json!({"kind": "query_needed_blocks", "range_start": 1, "range_count": 2, "best_header_tip": 3}),
+                json!({"kind": "query_needed_blocks", "query_id": 7, "request_authority": "a", "range_start": 1, "range_count": 2, "best_header_tip": 3}),
             ),
             (
                 BlockActionDetail::QueryBlocksByHeightRange {

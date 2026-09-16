@@ -148,8 +148,9 @@ impl ByteBudget {
 
     /// Audit the shared counter against an externally-derived expected value.
     ///
-    /// Handoff ordering can transiently leave the budget above the source
-    /// ledger; only a shortfall proves a double release or lost charge.
+    /// The caller must prevent ledger settlement until this read completes.
+    /// Handoff ordering can leave the budget above the ledger temporarily.
+    /// A shortfall against a stable ledger indicates an accounting error.
     pub(crate) fn audit(&self, expected: u64, _context: &'static str) -> bool {
         let actual = self.reserved();
         let ok = actual >= expected;

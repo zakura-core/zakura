@@ -16056,6 +16056,43 @@ async fn missed_hint_history_refreshes_the_existing_queued_window() {
 }
 
 #[test]
+fn budget_audit_does_not_compare_a_settled_budget_with_a_stale_ledger() {
+    let queue = work_queue_with(0, (1..=2).map(|h| needed(h, BlockSizeEstimate::Unknown)));
+    let owner = test_work_scope().bind(7, std::num::NonZeroU64::new(1).unwrap());
+    let mut budget = ByteBudget::new(2 * block::MAX_BLOCK_BYTES);
+    queue.take_for_request(
+        block::Height(1),
+        block::Height(2),
+        2,
+        u64::MAX,
+        7,
+        owner.request_id,
+    );
+    assert!(budget.try_reserve(2 * block::MAX_BLOCK_BYTES));
+    queue.mark_reserved_for_owner(owner, [block::Height(1), block::Height(2)]);
+    assert!(queue.audit_budget(&budget));
+
+    // Reproduce settlement between the old audit's two independent reads.
+    let stale_expected = queue.reserved_bytes();
+    let released = queue
+        .receive_body_for_owner(owner, block::Height(1), 1024)
+        .unwrap();
+    assert!(
+        queue.audit_budget(&budget),
+        "a pending budget release is conservative"
+    );
+    budget.release(released);
+    assert!(!budget.audit(stale_expected, "stale test snapshot"));
+    assert!(queue.audit_budget(&budget));
+
+    budget.release(block::MAX_BLOCK_BYTES);
+    assert!(
+        !queue.audit_budget(&budget),
+        "an actual lost charge must still fail the audit"
+    );
+}
+
+#[test]
 fn observed_size_estimates_preserve_reservations_and_memory_exposure() {
     let queue = work_queue_with(0, (1..=100).map(|h| needed(h, BlockSizeEstimate::Unknown)));
     let owner = test_work_scope().bind(7, std::num::NonZeroU64::new(1).unwrap());

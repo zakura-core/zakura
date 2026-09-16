@@ -187,6 +187,7 @@ fn finalized_state_rejects_a_block_that_makes_the_deficit_negative() {
 
     let network = zip234_network();
     let (mut state, parent) = state_below_start(&network);
+    let pools_before = state.db.finalized_value_pool();
 
     let over = start_block(&state, &network, &parent, 1);
     let error =
@@ -200,6 +201,9 @@ fn finalized_state_rejects_a_block_that_makes_the_deficit_negative() {
         START.previous().ok(),
         "the rejected block is not committed",
     );
+
+    assert_eq!(state.db.finalized_value_pool(), pools_before);
+    assert!(state.db.block_info(START.into()).is_none());
 
     let on_schedule = start_block(&state, &network, &parent, 0);
     commit(&mut state, &on_schedule).expect("a zero deficit is valid");

@@ -16,9 +16,10 @@ Zakura automatically reuses the preceding database when the registered major upg
 reuse and no database exists at the destination. It moves the database into the new format
 directory and applies the registered upgrades. It does not retain a fallback copy.
 
-Zakura checks the source's recorded major format before moving it. If the source format does
-not match its directory, Zakura skips reuse and logs a warning. Zakura still accepts legacy
-minor-only version files and infers the major format from the directory when no version file
+Zakura checks the source's recorded major format before moving it. It preserves an interrupted
+upgrade when every intervening major upgrade supports reuse. Otherwise, it skips reuse and
+logs a warning. Zakura still accepts legacy minor-only version files and infers the major
+format from the directory when no version file
 exists. The existing cleanup and
 non-finalized backup policies still apply.
 

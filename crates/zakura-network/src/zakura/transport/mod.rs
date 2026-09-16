@@ -20,10 +20,9 @@ pub use frame::{Frame, StreamPrelude, ZakuraTrace};
 #[allow(unused_imports)]
 pub(crate) use guard::{Admit, ByteBudget, PeerMeters, SessionGuard};
 pub use io::{framed_channel, FramedRecv, FramedSend};
-#[allow(unused_imports)] // guarded producers are activated by the next chunks
 pub(crate) use io::{
     worker_framed_channel, FrameGuard, FrameWriteClaim, FramedWorkerRecv, GuardedReserveError,
-    OrderedStreamFailure, OrderedStreamFailureCause, QueuedFrame,
+    OrderedStreamFailure, OrderedStreamFailureCause,
 };
 pub(crate) use pipe::{
     handle_pipe_exit, spawn_supervised_peer_task, spawn_supervised_pipe, CloseCause, Edge, Flow,

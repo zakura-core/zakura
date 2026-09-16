@@ -325,7 +325,7 @@ jobs:
   zakura-e2e-success:
     name: zakura e2e success
     runs-on: ubuntu-latest
-    if: always()
+    if: ${{ !cancelled() }}
     needs:
       - changes
       - zakura-regtest-e2e-pr-gate

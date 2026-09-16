@@ -139,9 +139,9 @@ members with one capability in `streams()`. Use the `Session*` policy, demand,
 and resource APIs. The transport supplies all declared members together.
 
 Move role-specific queue limits and write deadlines into the service hooks.
-For the block-sync activation following #943, the service must declare the
-one-slot request queue, the request write policy, and the 32-second data write
-deadline. The transport no longer assigns those policies by role name.
+The block-sync activation in #945 declares the one-slot request queue,
+`UntilCancelled` request writes, and the 32-second data-write deadline through
+these hooks. The transport no longer assigns those policies by role name.
 
-Production block sync in #943 remains a single-stream protocol. This change does
-not activate the later block-sync layout.
+Production block sync in #943 remains a single-stream protocol. #945 activates
+the two-stream layout after the combined transport qualification.

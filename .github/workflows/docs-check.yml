@@ -138,7 +138,7 @@ jobs:
   docs-check-success:
     name: docs check success
     runs-on: ubuntu-latest
-    if: always()
+    if: ${{ !cancelled() }}
     needs:
       - link-check
       - spell-check

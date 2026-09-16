@@ -484,7 +484,7 @@ jobs:
   test-success:
     name: test success
     runs-on: ubuntu-latest
-    if: always()
+    if: ${{ !cancelled() }}
     needs:
       - changes
       - build-tests

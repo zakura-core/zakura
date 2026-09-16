@@ -21,10 +21,11 @@ pub struct BlockSyncBlockMeta {
 /// The routine forwards only shared concerns to the reactor through [`RoutineToReactor`].
 #[derive(Clone, Debug)]
 pub enum BlockSyncEvent {
-    /// A peer became available for stream-6 block sync.
+    /// Direct session injection for reactor unit tests.
+    #[cfg(test)]
     PeerConnected(BlockSyncPeerSession),
-    /// A peer disconnected.
-    /// The routine drops all work owned by that peer.
+    /// Direct disconnection injection for reactor unit tests.
+    #[cfg(test)]
     PeerDisconnected(ZakuraPeerId),
     /// An authenticated local operator requested a fresh retry of one persistent alarm.
     RetryBodyAvailability {
@@ -77,28 +78,6 @@ pub enum BlockSyncEvent {
         hash: block::Hash,
         /// Typed, evidence-bearing verifier outcome.
         outcome: BlockApplyOutcome,
-    },
-    /// Node wiring finished or abandoned a `Block` response to an inbound `GetBlocks`.
-    BlockRangeResponseFinished {
-        /// Peer whose served-response slot can be released.
-        peer: ZakuraPeerId,
-        /// First requested height.
-        start_height: block::Height,
-        /// Requested block count.
-        requested_count: u32,
-        /// Number of blocks read from state and sent in the response.
-        returned_count: u32,
-    },
-    /// State returned committed bodies requested by a peer and the reactor should send them.
-    BlockRangeResponseReady {
-        /// Peer whose inbound request is being served.
-        peer: ZakuraPeerId,
-        /// First requested height.
-        start_height: block::Height,
-        /// Requested block count.
-        requested_count: u32,
-        /// Bounded committed blocks returned by state.
-        blocks: Vec<(block::Height, Arc<block::Block>, usize)>,
     },
 }
 
@@ -269,15 +248,6 @@ pub enum BlockSyncAction {
         /// Atomic durable coordinates that own this state query and its result.
         scope: zakura_header_chain::BodyWorkAuthority,
     },
-    /// Ask node wiring to read committed bodies for an inbound `GetBlocks`.
-    QueryBlocksByHeightRange {
-        /// Peer that requested the range.
-        peer: ZakuraPeerId,
-        /// First height.
-        start: block::Height,
-        /// Maximum count.
-        count: u32,
-    },
     /// Parent-first body ready for B3's verifier/commit driver.
     SubmitBlock {
         /// Exact network request that owns this verifier submission.
@@ -331,7 +301,6 @@ impl BlockSyncAction {
     pub(super) fn metric_label(&self) -> &'static str {
         match self {
             Self::QueryNeededBlocks { .. } => "query_needed_blocks",
-            Self::QueryBlocksByHeightRange { .. } => "query_blocks_by_height_range",
             Self::SubmitBlock { .. } => "submit_block",
             Self::RecordBodyUnavailable { .. } => "record_body_unavailable",
             Self::RecordBodyInvalid { .. } => "record_body_invalid",
@@ -349,10 +318,6 @@ pub enum BlockSyncMisbehavior {
     MalformedMessage,
     /// A peer sent blocks that were not requested.
     UnsolicitedBlock,
-    /// A peer requested more blocks than this node advertised it can serve.
-    GetBlocksTooLong,
-    /// A peer exceeded this node's inbound `GetBlocks` serving budget.
-    GetBlocksSpam,
     /// A peer supplied a body whose payload does not match its requested header.
     BodyPayloadMismatch(zakura_header_chain::BodyPayloadMismatch),
     /// A commitment-matching body deterministically failed consensus.
@@ -376,10 +341,9 @@ pub enum BlockSyncMisbehavior {
 /// Each per-peer pipe-routine ([`PeerRoutine`](super::peer_routine)) decodes its
 /// own frames and runs the download logic locally; it forwards only the concerns
 /// that need reactor-global state (serving, status advertisement, the producer,
-/// misbehavior aggregation) over this channel. The sender is `try_send`/bounded
-/// so a busy reactor never backpressures a routine's decode loop into stalling
-/// its transport (the only blocking routine send is the Sequencer `AcceptBody`).
-#[derive(Clone, Debug)]
+/// misbehavior aggregation) over this channel. Serving waits for channel capacity
+/// independently of stream reads; control notifications use bounded `try_send`.
+#[derive(Debug)]
 pub(super) enum RoutineToReactor {
     /// A routine received a `Status` and updated its own servable/caps + the
     /// registry. The reactor advertises our `Status` reply and republishes the
@@ -390,16 +354,6 @@ pub(super) enum RoutineToReactor {
         peer: ZakuraPeerId,
         /// Whether the rate meter allows sending a `Status` reply now.
         send_reply: bool,
-    },
-    /// A peer requested OUR committed blocks (serving). The reactor runs the
-    /// state query + driver path and sends via the peer's session clone.
-    ServeGetBlocks {
-        /// Peer that requested the range.
-        peer: ZakuraPeerId,
-        /// First requested height.
-        start_height: block::Height,
-        /// Requested block count.
-        count: u32,
     },
     /// A routine drained its pending work; the producer should re-query (it
     /// self-gates on low-water, so the ping is idempotent/cheap).

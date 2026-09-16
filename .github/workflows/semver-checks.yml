@@ -396,7 +396,7 @@ jobs:
 
   semver-checks:
     name: semver-checks
-    if: always()
+    if: ${{ !cancelled() }}
     needs: [select-packages, check-package, public-api-diff, warm-baselines]
     runs-on: ubuntu-latest
     timeout-minutes: 5

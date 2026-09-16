@@ -2,10 +2,13 @@ use super::{config::*, error::*, *};
 
 /// Zakura stream kind reserved for native block sync.
 pub const ZAKURA_STREAM_BLOCK_SYNC: u16 = 6;
-/// Capability bit for the native block-sync service.
-pub const ZAKURA_CAP_BLOCK_SYNC: u64 = 1 << 3;
-/// Version of the native block-sync stream.
-pub const ZAKURA_BLOCK_SYNC_STREAM_VERSION: u16 = 2;
+/// Request-only stream paired with the block-sync data stream.
+pub const ZAKURA_STREAM_BLOCK_REQUESTS: u16 = 7;
+/// Capability for both roles of the paired native block-sync service.
+/// Bit 3 remains reserved for the incompatible single-stream layout.
+pub const ZAKURA_CAP_BLOCK_SYNC: u64 = 1 << 6;
+/// Version of the native block-sync data stream; request streams use version 1.
+pub const ZAKURA_BLOCK_SYNC_STREAM_VERSION: u16 = 3;
 
 /// Peer status advertisement.
 pub const MSG_BS_STATUS: u8 = 1;
@@ -18,7 +21,7 @@ pub const MSG_BS_BLOCKS_DONE: u8 = 4;
 /// Report that a requested range is not servable.
 pub const MSG_BS_RANGE_UNAVAILABLE: u8 = 5;
 
-/// Maximum block bodies ever requested or reported by stream 6.
+/// Maximum block bodies in a native block-sync request or response.
 pub const MAX_BS_BLOCKS_PER_REQUEST: u32 = 128;
 /// Maximum encoded stream-6 message bytes.
 ///
@@ -33,7 +36,7 @@ pub(super) const BLOCK_SYNC_MESSAGE_TYPE_BYTES: usize = 1;
 const _: () = assert!(MAX_BS_MESSAGE_BYTES < 4 * 1024 * 1024);
 const _: () = assert!(MAX_BS_MESSAGE_BYTES > block::MAX_BLOCK_BYTES as usize);
 
-/// Native stream-6 block-sync message.
+/// Native block-sync message, sent on its declared stream role.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BlockSyncMessage {
     /// Servable range and serving capacity advertisement.
@@ -64,7 +67,7 @@ pub enum BlockSyncMessage {
 }
 
 impl BlockSyncMessage {
-    /// Returns this message's stream-6 discriminator.
+    /// Returns this message's block-sync discriminator.
     pub fn message_type(&self) -> u8 {
         match self {
             Self::Status(_) => MSG_BS_STATUS,
@@ -84,8 +87,12 @@ impl BlockSyncMessage {
             Self::GetBlocks {
                 start_height,
                 count,
+            } => {
+                validate_get_blocks_range(*start_height, *count)?;
+                write_height(&mut bytes, *start_height)?;
+                bytes.write_u32::<LittleEndian>(*count)?;
             }
-            | Self::RangeUnavailable {
+            Self::RangeUnavailable {
                 start_height,
                 count,
             } => {
@@ -122,7 +129,7 @@ impl BlockSyncMessage {
             MSG_BS_GET_BLOCKS => {
                 let start_height = read_height(&mut reader)?;
                 let count = reader.read_u32::<LittleEndian>()?;
-                validate_block_count(count)?;
+                validate_get_blocks_range(start_height, count)?;
                 Self::GetBlocks {
                     start_height,
                     count,
@@ -225,6 +232,23 @@ impl BlockSyncMessage {
                 .unwrap_or(u64::MAX)
         })
     }
+}
+
+/// Every requested height must fit, even if serving later selects a shorter prefix.
+fn validate_get_blocks_range(
+    start_height: block::Height,
+    count: u32,
+) -> Result<(), BlockSyncWireError> {
+    validate_block_count(count)?;
+    // Count is nonzero after validation; the range includes its starting height.
+    let end_height = start_height
+        .0
+        .checked_add(count - 1)
+        .ok_or(BlockSyncWireError::NumericOverflow("GetBlocks range end"))?;
+    if end_height > block::Height::MAX.0 {
+        return Err(BlockSyncWireError::HeightOutOfRange(end_height));
+    }
+    Ok(())
 }
 
 pub(super) fn validate_block_count(count: u32) -> Result<(), BlockSyncWireError> {

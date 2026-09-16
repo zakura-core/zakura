@@ -591,6 +591,8 @@ struct HeaderSyncBackgroundTasks {
 /// Durable state facts required before attaching the production header-sync driver.
 #[derive(Clone, Debug)]
 pub struct ZakuraHeaderSyncDriverStartup {
+    /// Owned block range reads supplied by the node for sequential block serving.
+    pub block_range_source: Arc<dyn super::BlockRangeSource>,
     /// Durable state frontiers loaded at node startup.
     pub frontiers: FullStateFrontiers,
     /// Durable best header tip loaded from state.
@@ -3734,6 +3736,7 @@ async fn spawn_zakura_endpoint_inner(
                 driver_startup.retained_block_height.clone(),
                 config.network.genesis_hash(),
             ));
+            let handle = handle.with_range_source(driver_startup.block_range_source.clone());
             (Some(handle), Some(actions), Some(task))
         } else {
             (None, None, None)
@@ -5436,6 +5439,7 @@ fn stream_kind_label(stream_kind: u16) -> &'static str {
         DISCOVERY_STREAM_KIND => "discovery",
         HEADER_SYNC_STREAM_KIND => "header_sync",
         ZAKURA_STREAM_BLOCK_SYNC => "block_sync",
+        crate::zakura::ZAKURA_STREAM_BLOCK_REQUESTS => "block_requests",
         _ => "unknown",
     }
 }
@@ -5688,7 +5692,10 @@ impl ZakuraHandlerError {
 #[cfg(test)]
 mod tests {
     pub(super) mod connection;
+    mod paired_block_sync;
     mod quic_progress;
+    mod serving_progress;
+
     use super::*;
     use crate::{
         protocol::internal::{InventoryResponse, Response},
@@ -9512,7 +9519,8 @@ mod tests {
             );
         }
 
-        for kind in [7u16, 255, u16::MAX] {
+        assert_eq!(stream_kind_label(7), "block_requests");
+        for kind in [255u16, u16::MAX] {
             assert_eq!(stream_kind_label(kind), "unknown");
         }
     }

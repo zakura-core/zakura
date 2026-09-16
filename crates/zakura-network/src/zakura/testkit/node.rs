@@ -227,6 +227,7 @@ pub struct ZakuraTestNodeBuilder {
     header_sync_request_timeout: Option<Duration>,
     supported_capabilities: Option<u64>,
     block_sync_config: ZakuraBlockSyncConfig,
+    block_range_source: Option<Arc<dyn crate::zakura::BlockRangeSource>>,
 }
 
 #[derive(Clone, Debug)]
@@ -282,12 +283,19 @@ impl ZakuraTestNodeBuilder {
             header_sync_request_timeout: None,
             supported_capabilities: None,
             block_sync_config: ZakuraBlockSyncConfig::default(),
+            block_range_source: None,
         }
     }
 
     /// Advertise these direct addresses in this node's discovery self-record.
     pub fn discovery_direct_addrs(mut self, direct_addrs: Vec<SocketAddr>) -> Self {
         self.discovery_direct_addrs = direct_addrs;
+        self
+    }
+
+    /// Supply owned storage reads for the node's native block-serving task.
+    pub fn block_range_source(mut self, source: Arc<dyn crate::zakura::BlockRangeSource>) -> Self {
+        self.block_range_source = Some(source);
         self
     }
 
@@ -534,6 +542,10 @@ impl ZakuraTestNodeBuilder {
             startup.shutdown = shutdown;
             startup.trace = ZakuraTrace::new(self.tracer.clone(), seed_label(self.seed));
             let (block_handle, actions, task) = spawn_block_sync_reactor(startup);
+            let block_handle = match self.block_range_source {
+                Some(source) => block_handle.with_range_source(source),
+                None => block_handle,
+            };
             header_sync_tasks.push(task);
             block_sync_actions = Some(actions);
             block_sync_handle = Some(block_handle.clone());
@@ -570,7 +582,8 @@ impl ZakuraTestNodeBuilder {
             self.limits.clone(),
             registry,
             ZakuraTrace::new(self.tracer.clone(), seed_label(self.seed)),
-        );
+        )
+        .with_endpoint(endpoint.clone());
         if let Some(supported_capabilities) = self.supported_capabilities {
             handler = handler.with_supported_capabilities(supported_capabilities);
         }

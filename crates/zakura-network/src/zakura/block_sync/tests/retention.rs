@@ -1,9 +1,50 @@
 use super::*;
+use crate::zakura::{transport::ServiceStream, CloseCause, ZAKURA_BLOCK_SYNC_STREAM_VERSION};
+use std::sync::Mutex;
+
+#[derive(Debug)]
+struct RetainedSource {
+    blocks: Vec<Arc<block::Block>>,
+    reads: Mutex<Vec<(block::Height, u32)>>,
+}
+
+impl BlockRangeSource for RetainedSource {
+    fn read_range(
+        &self,
+        request: BlockRangeRead,
+    ) -> futures::future::BoxFuture<'static, Result<BlockRangeReadResult, crate::BoxError>> {
+        let (start, count, max_bytes, lease) = request.into_parts();
+        assert!(lease.try_start());
+        self.reads.lock().unwrap().push((start, count));
+        let mut bytes = 0usize;
+        let blocks = self
+            .blocks
+            .iter()
+            .enumerate()
+            .skip(usize::try_from(start.0).unwrap())
+            .take(usize::try_from(count).unwrap())
+            .map(|(height, body)| {
+                let size = usize::try_from(block_size(body)).unwrap();
+                (
+                    block::Height(u32::try_from(height).unwrap()),
+                    body.clone(),
+                    size,
+                )
+            })
+            .take_while(|(_, _, size)| {
+                bytes += size;
+                bytes <= usize::try_from(max_bytes).unwrap()
+            })
+            .collect();
+        Box::pin(async move { Ok(BlockRangeReadResult::new(blocks, lease)) })
+    }
+}
 
 struct RetentionHarness {
     retained: Option<watch::Sender<block::Height>>,
     handle: BlockSyncHandle,
-    actions: mpsc::Receiver<BlockSyncAction>,
+    _actions: mpsc::Receiver<BlockSyncAction>,
+    source: Arc<RetainedSource>,
     service: BlockSyncService,
     task: JoinHandle<()>,
 }
@@ -17,6 +58,7 @@ impl RetentionHarness {
         let blocks = mainnet_blocks_1_to_3();
         let config = ZakuraBlockSyncConfig {
             status_refresh_interval,
+            max_blocks_per_response: 2,
             ..ZakuraBlockSyncConfig::default()
         };
         let mut startup = BlockSyncStartup::inert(config.clone());
@@ -31,28 +73,68 @@ impl RetentionHarness {
             receiver,
             zakura_chain::parameters::Network::Mainnet.genesis_hash(),
         ));
-        let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+        let source = Arc::new(RetainedSource {
+            blocks: std::iter::once(mainnet_block(
+                &zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES,
+            ))
+            .chain(blocks)
+            .collect(),
+            reads: Mutex::new(Vec::new()),
+        });
+        let handle = handle.with_range_source(source.clone());
+        let service = BlockSyncService::new_with_handle(config, handle.clone());
         Self {
             retained: Some(retained),
             handle,
-            actions,
+            _actions: actions,
+            source,
             service,
             task,
         }
     }
 
-    async fn connect(&self, id: u8) -> (ZakuraPeerId, FramedSend, FramedRecv, BlockSyncStatus) {
+    async fn connect(
+        &self,
+        id: u8,
+    ) -> (
+        ZakuraPeerId,
+        FramedSend,
+        FramedRecv,
+        BlockSyncStatus,
+        FramedSend,
+    ) {
         let peer = peer(id);
         let (inbound, receiver) = framed_channel(16);
         let (sender, mut outbound) = framed_channel(16);
-        self.service.add_peer(Peer::new_with_direction(
-            peer.clone(),
-            None,
-            ZAKURA_CAP_BLOCK_SYNC,
-            ServicePeerDirection::Outbound,
-            HashMap::from([(ZAKURA_STREAM_BLOCK_SYNC, (receiver, sender))]),
-            CancellationToken::new(),
-        ));
+        let (requests, request_receiver) = framed_channel(16);
+        let cancel = CancellationToken::new();
+        let session_cancel = cancel.child_token();
+        self.service
+            .add_peer(crate::zakura::Peer::new_with_service_streams(
+                0,
+                peer.clone(),
+                None,
+                ZAKURA_CAP_BLOCK_SYNC,
+                ServicePeerDirection::Outbound,
+                HashMap::from([
+                    (
+                        ZAKURA_STREAM_BLOCK_SYNC,
+                        ServiceStream::new(
+                            0,
+                            ZAKURA_BLOCK_SYNC_STREAM_VERSION,
+                            receiver,
+                            sender.clone(),
+                            session_cancel.clone(),
+                        ),
+                    ),
+                    (
+                        ZAKURA_STREAM_BLOCK_REQUESTS,
+                        ServiceStream::new(0, 1, request_receiver, sender, session_cancel),
+                    ),
+                ]),
+                cancel,
+                CloseCause::new(),
+            ));
         let advertised = wait_for_outbound_status(&mut outbound).await;
         inbound
             .send(
@@ -69,16 +151,14 @@ impl RetentionHarness {
             )
             .await
             .expect("status queues");
-        (peer, inbound, outbound, advertised)
+        (peer, requests, outbound, advertised, inbound)
     }
 
-    fn assert_no_storage_query(&mut self) {
-        while let Ok(action) = self.actions.try_recv() {
-            assert!(
-                !matches!(action, BlockSyncAction::QueryBlocksByHeightRange { .. }),
-                "a pruned range must not query storage"
-            );
-        }
+    fn assert_no_storage_read(&self) {
+        assert!(
+            self.source.reads.lock().unwrap().is_empty(),
+            "a pruned range must not query storage"
+        );
     }
 }
 
@@ -100,6 +180,46 @@ async fn request(inbound: &FramedSend, start: u32) {
         )
         .await
         .expect("request queues");
+}
+
+async fn next_serving_response(outbound: &mut FramedRecv) -> BlockSyncMessage {
+    time::timeout(Duration::from_secs(5), async {
+        loop {
+            let message = next_outbound_message(outbound).await;
+            if !matches!(message, BlockSyncMessage::Status(_)) {
+                return message;
+            }
+        }
+    })
+    .await
+    .expect("the serving response arrives")
+}
+
+async fn wait_for_outbound_range_unavailable(outbound: &mut FramedRecv) -> (block::Height, u32) {
+    match next_serving_response(outbound).await {
+        BlockSyncMessage::RangeUnavailable {
+            start_height,
+            count,
+        } => (start_height, count),
+        message => panic!("expected RangeUnavailable, got {message:?}"),
+    }
+}
+
+async fn wait_for_outbound_block(outbound: &mut FramedRecv) -> Arc<block::Block> {
+    match next_serving_response(outbound).await {
+        BlockSyncMessage::Block(body) => body,
+        message => panic!("expected a block, got {message:?}"),
+    }
+}
+
+async fn wait_for_outbound_blocks_done(outbound: &mut FramedRecv) -> (block::Height, u32) {
+    match next_serving_response(outbound).await {
+        BlockSyncMessage::BlocksDone {
+            start_height,
+            returned,
+        } => (start_height, returned),
+        message => panic!("expected BlocksDone, got {message:?}"),
+    }
 }
 
 async fn status_with_low(outbound: &mut FramedRecv, low: u32) -> BlockSyncStatus {
@@ -129,7 +249,7 @@ async fn retention_initial_status_preserves_archive_and_pruned_ranges() {
         ),
     ] {
         let harness = RetentionHarness::new(retained);
-        let (_, _inbound, _outbound, advertised) = harness.connect(0xe1).await;
+        let (_, _inbound, _outbound, advertised, _data_inbound_0xe1) = harness.connect(0xe1).await;
         assert_eq!(advertised.servable_low, block::Height(low));
         assert_eq!(advertised.servable_high, block::Height(high));
         assert_eq!(advertised.tip_hash, hash);
@@ -151,7 +271,7 @@ async fn retention_retries_initial_status_after_connecting_with_a_full_queue() {
         )
         .expect("the outbound queue fills before connecting");
     let mut peers = harness.handle.subscribe_peer_snapshot();
-    harness.service.add_peer(Peer::new_with_direction(
+    harness.service.add_peer(Peer::create_with_direction(
         peer(0xed),
         None,
         ZAKURA_CAP_BLOCK_SYNC,
@@ -181,45 +301,44 @@ async fn retention_retries_initial_status_after_connecting_with_a_full_queue() {
 #[tokio::test]
 async fn retention_rejects_pruned_reads_and_still_serves_retained_blocks() {
     let blocks = mainnet_blocks_1_to_3();
-    let mut harness = RetentionHarness::new(2);
-    let (peer, inbound, mut outbound, _) = harness.connect(0xe2).await;
+    let harness = RetentionHarness::new(2);
+    let (_, inbound, mut outbound, _, _data_inbound) = harness.connect(0xe2).await;
     request(&inbound, 1).await;
     assert_eq!(
         wait_for_outbound_range_unavailable(&mut outbound).await,
         (block::Height(1), 1)
     );
-    harness.assert_no_storage_query();
+    harness.assert_no_storage_read();
 
     let genesis = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES);
     for (height, body) in [(2, blocks[1].clone()), (0, genesis)] {
-        request(&inbound, height).await;
-        match next_action(&mut harness.actions).await {
-            BlockSyncAction::QueryBlocksByHeightRange { start, count, .. } => {
-                assert_eq!((start, count), (block::Height(height), 1));
-            }
-            other => panic!("expected a retained storage query, got {other:?}"),
-        }
-        harness
-            .handle
-            .send(BlockSyncEvent::BlockRangeResponseReady {
-                peer: peer.clone(),
+        send_inbound(
+            &inbound,
+            BlockSyncMessage::GetBlocks {
                 start_height: block::Height(height),
-                requested_count: 1,
-                blocks: vec![(
-                    block::Height(height),
-                    body.clone(),
-                    usize::try_from(block_size(&body)).expect("fixture size fits usize"),
-                )],
-            })
-            .await
-            .expect("storage result queues");
+                count: 2,
+            },
+        )
+        .await;
         assert_eq!(
             wait_for_outbound_block(&mut outbound).await.hash(),
             body.hash()
         );
+        let returned = if height == 0 { 1 } else { 2 };
+        if returned == 2 {
+            assert_eq!(
+                wait_for_outbound_block(&mut outbound).await.hash(),
+                blocks[2].hash()
+            );
+        }
         assert_eq!(
             wait_for_outbound_blocks_done(&mut outbound).await,
-            (block::Height(height), 1)
+            (block::Height(height), returned)
+        );
+        assert_eq!(
+            std::mem::take(&mut *harness.source.reads.lock().unwrap()),
+            vec![(block::Height(height), returned)],
+            "storage reads stop before the pruned gap after genesis",
         );
     }
 }
@@ -227,7 +346,7 @@ async fn retention_rejects_pruned_reads_and_still_serves_retained_blocks() {
 #[tokio::test]
 async fn retention_refreshes_without_tip_growth_and_survives_publisher_shutdown() {
     let mut harness = RetentionHarness::new(2);
-    let (_, inbound, mut outbound, _) = harness.connect(0xe3).await;
+    let (_, inbound, mut outbound, _, _data_inbound_0xe3) = harness.connect(0xe3).await;
     harness
         .retained
         .as_ref()
@@ -242,10 +361,11 @@ async fn retention_refreshes_without_tip_growth_and_survives_publisher_shutdown(
         wait_for_outbound_range_unavailable(&mut outbound).await,
         (block::Height(2), 1)
     );
-    harness.assert_no_storage_query();
+    harness.assert_no_storage_read();
 
     drop(harness.retained.take());
-    let (_, _inbound, _outbound, advertised_after_close) = harness.connect(0xe4).await;
+    let (_, _inbound, _outbound, advertised_after_close, _data_inbound_0xe4) =
+        harness.connect(0xe4).await;
     assert_eq!(advertised_after_close, advertised);
 }
 
@@ -253,7 +373,7 @@ async fn retention_refreshes_without_tip_growth_and_survives_publisher_shutdown(
 async fn retention_refreshes_at_meter_deadline_between_periodic_ticks() {
     let interval = Duration::from_secs(1);
     let harness = RetentionHarness::with_refresh_interval(1, interval);
-    let (_, _inbound, mut outbound, _) = harness.connect(0xea).await;
+    let (_, _inbound, mut outbound, _, _data_inbound_0xea) = harness.connect(0xea).await;
     wait_for_outbound_status(&mut outbound).await;
 
     // Offset the first change from reactor startup. Its meter reopens halfway
@@ -282,7 +402,7 @@ async fn retention_retries_latest_status_only_for_peer_with_full_outbound_queue(
     let harness = RetentionHarness::new(1);
     let (inbound, receiver) = framed_channel(16);
     let (sender, mut outbound) = framed_channel(1);
-    harness.service.add_peer(Peer::new_with_direction(
+    harness.service.add_peer(Peer::create_with_direction(
         peer(0xe8),
         None,
         ZAKURA_CAP_BLOCK_SYNC,
@@ -294,7 +414,8 @@ async fn retention_retries_latest_status_only_for_peer_with_full_outbound_queue(
     send_inbound(&inbound, BlockSyncMessage::Status(status())).await;
     wait_for_outbound_status(&mut outbound).await;
 
-    let (_, _healthy_inbound, mut healthy_outbound, _) = harness.connect(0xe9).await;
+    let (_, _healthy_inbound, mut healthy_outbound, _, _data_inbound_0xe9) =
+        harness.connect(0xe9).await;
     wait_for_outbound_status(&mut healthy_outbound).await;
 
     sender
@@ -338,7 +459,7 @@ async fn retention_corrects_a_debounced_tip_and_retries_the_latest_range_after_q
     let harness = RetentionHarness::with_refresh_interval(1, Duration::from_secs(30));
     let (inbound, receiver) = framed_channel(16);
     let (sender, mut outbound) = framed_channel(1);
-    harness.service.add_peer(Peer::new_with_direction(
+    harness.service.add_peer(Peer::create_with_direction(
         peer(0xeb),
         None,
         ZAKURA_CAP_BLOCK_SYNC,
@@ -349,7 +470,8 @@ async fn retention_corrects_a_debounced_tip_and_retries_the_latest_range_after_q
     let initial = wait_for_outbound_status(&mut outbound).await;
     send_inbound(&inbound, BlockSyncMessage::Status(status())).await;
     wait_for_outbound_status(&mut outbound).await;
-    let (_, _healthy_inbound, mut healthy_outbound, _) = harness.connect(0xec).await;
+    let (_, _healthy_inbound, mut healthy_outbound, _, _data_inbound_0xec) =
+        harness.connect(0xec).await;
     wait_for_outbound_status(&mut healthy_outbound).await;
 
     harness
@@ -404,8 +526,8 @@ async fn retention_corrects_a_debounced_tip_and_retries_the_latest_range_after_q
 
 #[tokio::test]
 async fn retention_above_tip_serves_only_genesis_until_retained_tip_arrives() {
-    let mut harness = RetentionHarness::new(4);
-    let (_, inbound, mut outbound, advertised) = harness.connect(0xe5).await;
+    let harness = RetentionHarness::new(4);
+    let (_, inbound, mut outbound, advertised, _data_inbound_0xe5) = harness.connect(0xe5).await;
     assert_eq!(
         (advertised.servable_low, advertised.servable_high),
         (block::Height(0), block::Height(0))
@@ -415,15 +537,22 @@ async fn retention_above_tip_serves_only_genesis_until_retained_tip_arrives() {
         wait_for_outbound_range_unavailable(&mut outbound).await,
         (block::Height(1), 1)
     );
-    harness.assert_no_storage_query();
+    harness.assert_no_storage_read();
 
     request(&inbound, 0).await;
-    match next_action(&mut harness.actions).await {
-        BlockSyncAction::QueryBlocksByHeightRange { start, count, .. } => {
-            assert_eq!((start, count), (block::Height(0), 1));
-        }
-        other => panic!("expected a genesis query, got {other:?}"),
-    }
+    let genesis = mainnet_block(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES);
+    assert_eq!(
+        wait_for_outbound_block(&mut outbound).await.hash(),
+        genesis.hash()
+    );
+    assert_eq!(
+        wait_for_outbound_blocks_done(&mut outbound).await,
+        (block::Height(0), 1)
+    );
+    assert_eq!(
+        *harness.source.reads.lock().unwrap(),
+        vec![(block::Height(0), 1)]
+    );
     harness
         .handle
         .send(BlockSyncEvent::ChainTipGrow(BlockSyncFrontiers {
@@ -455,7 +584,7 @@ async fn retention_advertisement_keeps_pruned_heights_out_of_download_requests()
         config.clone(),
     );
     let (handle, mut actions, task) = spawn_block_sync_reactor(startup);
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone());
     let (_, _inbound, mut outbound) = connect_peer_with_status_message(
         &service,
         &mut actions,
@@ -491,7 +620,7 @@ async fn retention_deferred_status_applies_after_peer_goes_quiet() {
     let config = ZakuraBlockSyncConfig::default();
     let (handle, mut actions, task) =
         spawn_block_sync_reactor(BlockSyncStartup::inert(config.clone()));
-    let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+    let service = BlockSyncService::new_with_handle(config, handle.clone());
     let mut advertised = BlockSyncStatus {
         servable_low: block::Height(1),
         servable_high: block::Height(3),

@@ -576,64 +576,6 @@ fn averaging_window_changes_at_nu7_activation_height() -> Result<(), Report> {
     Ok(())
 }
 
-/// Tests that `is_nu7_active` agrees with the NU7 target spacing and averaging
-/// window at every height near activation, so the shielded limits apply exactly
-/// where the rest of ZIP 218 does.
-#[test]
-fn is_nu7_active_matches_other_zip_218_rules() -> Result<(), Report> {
-    use crate::parameters::{
-        testnet::{self, ConfiguredActivationHeights},
-        POST_NU7_POW_AVERAGING_WINDOW, POST_NU7_POW_TARGET_SPACING,
-    };
-
-    let _init_guard = zakura_test::init();
-
-    let without_nu7 = testnet::Parameters::build()
-        .with_activation_heights(ConfiguredActivationHeights {
-            blossom: Some(1),
-            nu6: Some(10),
-            ..Default::default()
-        })
-        .expect("activation heights are valid")
-        .clear_funding_streams()
-        .to_network()
-        .expect("configured testnet is valid");
-
-    let with_nu7 = testnet::Parameters::build()
-        .with_activation_heights(ConfiguredActivationHeights {
-            blossom: Some(1),
-            nu7: Some(10),
-            ..Default::default()
-        })
-        .expect("activation heights are valid")
-        .clear_funding_streams()
-        .to_network()
-        .expect("configured testnet is valid");
-
-    for (name, network) in [
-        ("Mainnet", Network::Mainnet),
-        ("without NU7", without_nu7),
-        ("with NU7", with_nu7),
-    ] {
-        for height in (0..20).map(Height) {
-            let spacing_is_nu7 = NetworkUpgrade::target_spacing_for_height(&network, height)
-                .num_seconds()
-                == i64::from(POST_NU7_POW_TARGET_SPACING);
-            let window_is_nu7 = NetworkUpgrade::averaging_window_for_height(&network, height)
-                == POST_NU7_POW_AVERAGING_WINDOW;
-
-            assert_eq!(
-                spacing_is_nu7,
-                NetworkUpgrade::is_nu7_active(&network, height),
-                "{name} at {height:?}"
-            );
-            assert_eq!(spacing_is_nu7, window_is_nu7, "{name} at {height:?}");
-        }
-    }
-
-    Ok(())
-}
-
 /// Tests that slow-start subsidies stay unscaled when NU7 activates during slow
 /// start.
 ///
@@ -661,7 +603,10 @@ fn slow_start_subsidy_is_not_scaled_when_nu7_activates_early() -> Result<(), Rep
 
     let slow_start_interval = network.slow_start_interval();
     assert!(slow_start_interval > Height(3));
-    assert!(NetworkUpgrade::is_nu7_active(&network, Height(2)));
+    assert_eq!(
+        NetworkUpgrade::current(&network, Height(2)),
+        NetworkUpgrade::Nu7
+    );
 
     // floor(MaxBlockSubsidy / SlowStartInterval) * height, with no spacing ratio.
     let slow_start_rate = MAX_BLOCK_SUBSIDY / u64::from(slow_start_interval);

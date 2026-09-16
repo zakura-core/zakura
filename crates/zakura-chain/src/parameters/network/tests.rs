@@ -8,15 +8,44 @@ use color_eyre::Report;
 use super::Network;
 use crate::{
     amount::{Amount, NonNegative},
-    block::Height,
+    block::{Height, HeightDiff},
     parameters::{
         subsidy::{
-            block_subsidy, constants::POST_BLOSSOM_HALVING_INTERVAL, halving, halving_divisor,
-            height_for_halving, ParameterSubsidy as _,
+            block_subsidy, constants::POST_BLOSSOM_HALVING_INTERVAL, funding_stream_address_period,
+            halving, halving_divisor, height_for_halving, ParameterSubsidy,
         },
         NetworkUpgrade,
     },
 };
+
+#[test]
+fn funding_stream_period_uses_floor_division_for_negative_periods() {
+    struct TestParameters;
+
+    impl ParameterSubsidy for TestParameters {
+        fn height_for_first_halving(&self) -> Height {
+            Height(100)
+        }
+
+        fn post_blossom_halving_interval(&self) -> HeightDiff {
+            50
+        }
+
+        fn pre_blossom_halving_interval(&self) -> HeightDiff {
+            25
+        }
+
+        fn funding_stream_address_change_interval(&self) -> HeightDiff {
+            10
+        }
+    }
+
+    let parameters = TestParameters;
+
+    assert_eq!(0, funding_stream_address_period(Height(50), &parameters));
+    assert_eq!(-1, funding_stream_address_period(Height(49), &parameters));
+    assert_eq!(-2, funding_stream_address_period(Height(39), &parameters));
+}
 
 #[test]
 fn halving_test() -> Result<(), Report> {

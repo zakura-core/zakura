@@ -51,6 +51,12 @@ pub(super) struct WorkItem {
     pub(super) hash: block::Hash,
     /// The block's size estimate. Used for request budget reservation and the advisory receive-path `SizeMismatch` report.
     pub(super) estimated_bytes: u64,
+    /// Largest payload seen locally. Peer hints cannot shrink a retry below it.
+    observed_bytes: u64,
+    /// Refreshed hint for a future retry while an issued reservation stays fixed.
+    retry_estimated_bytes: Option<u64>,
+    /// A pressure refusal waits for verified progress before it can be retried.
+    retry_after_tip: Option<block::Height>,
     /// Request reservation; received bodies use `Released`.
     pub(super) budget: BlockBudgetLedger,
 }
@@ -174,13 +180,22 @@ impl WorkQueue {
             let mut inner = self.lock();
             inner.current_authority = Some(scope);
             for (height, hash, size) in items {
-                if height <= inner.floor
-                    || inner.pending.contains_key(&height)
-                    || inner.in_flight.contains_key(&height)
-                {
+                if height <= inner.floor {
                     continue;
                 }
                 let estimated_bytes = inner.estimate_bytes(size);
+                if let Some(item) = inner.pending.get_mut(&height) {
+                    if item.hash == hash
+                        && item.scope == scope
+                        && !matches!(size, BlockSizeEstimate::Unknown)
+                    {
+                        item.estimated_bytes = estimated_bytes.max(item.observed_bytes);
+                    }
+                    continue;
+                }
+                if inner.in_flight.contains_key(&height) {
+                    continue;
+                }
                 inner.pending.insert(
                     height,
                     WorkItem {
@@ -189,6 +204,9 @@ impl WorkQueue {
                         provisional: false,
                         hash,
                         estimated_bytes,
+                        observed_bytes: 0,
+                        retry_estimated_bytes: None,
+                        retry_after_tip: None,
                         budget: BlockBudgetLedger::Released,
                     },
                 );
@@ -199,6 +217,60 @@ impl WorkQueue {
             self.available.notify_waiters();
         }
         inserted
+    }
+
+    /// Refresh scheduling metadata without rewriting an issued reservation.
+    pub(super) fn refresh_size_estimates(
+        &self,
+        scope: zakura_header_chain::BodyWorkAuthority,
+        items: impl IntoIterator<Item = (block::Height, block::Hash, BlockSizeEstimate)>,
+    ) {
+        let mut inner = self.lock();
+        let mut changed = false;
+        for (height, hash, size) in items {
+            if matches!(size, BlockSizeEstimate::Unknown) {
+                continue;
+            }
+            let estimated = inner.estimate_bytes(size);
+            if let Some(item) = inner.pending.get_mut(&height) {
+                if item.scope == scope && item.hash == hash {
+                    let estimated = estimated.max(item.observed_bytes);
+                    changed |= item.estimated_bytes != estimated;
+                    item.estimated_bytes = estimated;
+                }
+            } else if let Some(item) = inner.in_flight.get_mut(&height) {
+                if item.scope.body_work_epoch == scope.body_work_epoch && item.hash == hash {
+                    item.retry_estimated_bytes = Some(estimated.max(item.observed_bytes));
+                }
+            }
+        }
+        drop(inner);
+        if changed {
+            self.available.notify_waiters();
+        }
+    }
+
+    /// Bound a correction refresh to work already queued locally.
+    pub(super) fn queued_bounds(&self) -> Option<(block::Height, block::Height)> {
+        let inner = self.lock();
+        Some((
+            [
+                inner.pending.first_key_value(),
+                inner.in_flight.first_key_value(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|(height, _)| *height)
+            .min()?,
+            [
+                inner.pending.last_key_value(),
+                inner.in_flight.last_key_value(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|(height, _)| *height)
+            .max()?,
+        ))
     }
 
     /// Reauthorize queued work while in-flight requests retain their registered owners.
@@ -232,6 +304,9 @@ impl WorkQueue {
         let mut next_expected: Option<block::Height> = None;
         let mut scope = None;
         for (height, item) in inner.pending.range(low..=high) {
+            if item.retry_after_tip.is_some_and(|tip| inner.floor <= tip) {
+                break;
+            }
             if scope.is_some_and(|scope| scope != item.scope) {
                 break;
             }
@@ -328,6 +403,9 @@ impl WorkQueue {
         let mut next_expected: Option<block::Height> = None;
         let mut scope = None;
         for (height, item) in inner.pending.range(low..=high) {
+            if item.retry_after_tip.is_some_and(|tip| inner.floor <= tip) {
+                break;
+            }
             if scope.is_some_and(|scope| scope != item.scope) {
                 break;
             }
@@ -381,6 +459,9 @@ impl WorkQueue {
             for height in heights {
                 if let Some(mut item) = inner.in_flight.remove(&height) {
                     item.owner = None;
+                    if let Some(estimate) = item.retry_estimated_bytes.take() {
+                        item.estimated_bytes = estimate.max(item.observed_bytes);
+                    }
                     inner.pending.insert(height, item);
                     moved = true;
                 }
@@ -409,6 +490,9 @@ impl WorkQueue {
             }
             if let Some(mut item) = inner.in_flight.remove(height) {
                 item.owner = None;
+                if let Some(estimate) = item.retry_estimated_bytes.take() {
+                    item.estimated_bytes = estimate.max(item.observed_bytes);
+                }
                 item.provisional = false;
                 inner.pending.insert(*height, item);
             }
@@ -605,6 +689,9 @@ impl WorkQueue {
                 if let Some(mut item) = inner.in_flight.remove(&height) {
                     released = released.saturating_add(item.budget.release_reserved());
                     item.owner = None;
+                    if let Some(estimate) = item.retry_estimated_bytes.take() {
+                        item.estimated_bytes = estimate.max(item.observed_bytes);
+                    }
                     inner.pending.insert(height, item);
                     moved = true;
                 }
@@ -658,6 +745,43 @@ impl WorkQueue {
         };
         drop(claim);
         outcome
+    }
+
+    /// Return an exact received attempt without releasing its request credit twice.
+    /// Waiting for verified progress prevents repeated downloads under memory pressure.
+    pub(super) fn defer_received_for_owner(
+        &self,
+        owner: zakura_header_chain::BodyWorkOwner,
+        height: block::Height,
+        hash: block::Hash,
+        bytes: u64,
+        verified_tip: block::Height,
+    ) -> bool {
+        let mut inner = self.lock();
+        let Some(item) = inner.in_flight.get(&height) else {
+            return false;
+        };
+        if height <= inner.floor
+            || item.owner != Some(owner)
+            || item.hash != hash
+            || item.budget != BlockBudgetLedger::Released
+        {
+            return false;
+        }
+        let mut item = inner
+            .in_flight
+            .remove(&height)
+            .expect("the received owner was checked under the same lock");
+        item.observed_bytes = item.observed_bytes.max(bytes);
+        item.estimated_bytes = item
+            .retry_estimated_bytes
+            .take()
+            .unwrap_or(item.estimated_bytes)
+            .max(item.observed_bytes);
+        item.retry_after_tip = Some(verified_tip);
+        item.owner = None;
+        inner.pending.insert(height, item);
+        true
     }
 
     /// Settle requested heights and any queued request they retire. The caller
@@ -735,6 +859,9 @@ impl WorkQueue {
                 .released_bytes
                 .saturating_add(item.budget.release_reserved());
             item.owner = None;
+            if let Some(estimate) = item.retry_estimated_bytes.take() {
+                item.estimated_bytes = estimate.max(item.observed_bytes);
+            }
             outcome.returned_count = outcome.returned_count.saturating_add(1);
             inner.pending.insert(height, item);
         }

@@ -171,13 +171,14 @@ impl WorkQueue {
     /// Add scoped `(height, hash, size)` items to `pending`.
     /// Insert a height above `floor` only when no pending or in-flight item owns it.
     /// Return the number of inserted heights.
-    /// Wake waiters after inserting any height.
+    /// Wake waiters after inserting a height or changing a pending size estimate.
     pub(super) fn extend(
         &self,
         scope: zakura_header_chain::BodyWorkAuthority,
         items: impl IntoIterator<Item = (block::Height, block::Hash, BlockSizeEstimate)>,
     ) -> usize {
         let mut inserted = 0usize;
+        let mut estimate_changed = false;
         {
             let mut inner = self.lock();
             inner.current_authority = Some(scope);
@@ -191,7 +192,9 @@ impl WorkQueue {
                         && item.scope == scope
                         && !matches!(size, BlockSizeEstimate::Unknown)
                     {
-                        item.estimated_bytes = estimated_bytes.max(item.observed_bytes);
+                        let estimated_bytes = estimated_bytes.max(item.observed_bytes);
+                        estimate_changed |= item.estimated_bytes != estimated_bytes;
+                        item.estimated_bytes = estimated_bytes;
                     }
                     continue;
                 }
@@ -215,7 +218,7 @@ impl WorkQueue {
                 inserted += 1;
             }
         }
-        if inserted > 0 {
+        if inserted > 0 || estimate_changed {
             self.available.notify_waiters();
         }
         inserted

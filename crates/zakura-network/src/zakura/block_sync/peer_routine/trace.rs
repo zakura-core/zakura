@@ -13,6 +13,7 @@ impl PeerRoutine {
 
     pub(super) fn trace_wake(&self, reason: &'static str) {
         self.emit("block_peer_wake", |row| {
+            row.peer = Some(trace_peer(&self.peer));
             row.outstanding = Some(saturating_usize(self.window.outstanding.len()));
             row.reason = Some(reason);
         });

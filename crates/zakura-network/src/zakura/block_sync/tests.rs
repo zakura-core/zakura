@@ -15665,6 +15665,40 @@ async fn serving_only_coordinator_demand_keeps_block_session_available_during_fa
     reactor_task.abort();
 }
 
+#[tokio::test]
+async fn extending_existing_work_wakes_only_for_changed_size_estimates() {
+    let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Unknown)]);
+    let available = queue.subscribe_available().notified();
+    tokio::pin!(available);
+    assert!(futures::poll!(&mut available).is_pending());
+    assert_eq!(
+        queue.extend(
+            test_work_scope(),
+            [needed(1, BlockSizeEstimate::Advertised(1024))]
+        ),
+        0
+    );
+    assert!(futures::poll!(&mut available).is_ready());
+    assert_eq!(
+        queue
+            .pending_item(block::Height(1))
+            .unwrap()
+            .estimated_bytes,
+        1024
+    );
+
+    let unchanged = queue.subscribe_available().notified();
+    tokio::pin!(unchanged);
+    assert!(futures::poll!(&mut unchanged).is_pending());
+    for estimate in [
+        BlockSizeEstimate::Advertised(1024),
+        BlockSizeEstimate::Unknown,
+    ] {
+        assert_eq!(queue.extend(test_work_scope(), [needed(1, estimate)]), 0);
+        assert!(futures::poll!(&mut unchanged).is_pending());
+    }
+}
+
 #[test]
 fn hint_refresh_updates_pending_and_retry_sizes_without_recharging_requests() {
     let queue = work_queue_with(

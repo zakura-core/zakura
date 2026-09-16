@@ -29,23 +29,10 @@ pub struct ValueBalance<C> {
     orchard: Amount<C>,
     deferred: Amount<C>,
     ironwood: Amount<C>,
-    /// `IssuanceDeficit` from [zips#1354]: the value the halving schedule has issued on
-    /// paper, less the value actually in the chain value pools.
-    ///
-    /// This is not a pool of spendable value. It is the running total that funds ZIP 234
-    /// reissuance, carried here so that the state accumulates and rolls it back with every
-    /// other pool instead of re-deriving it from the schedule on each block. It is
-    /// therefore excluded from [`Self::issued_supply`] and from
-    /// [`Self::remaining_transaction_value`]; including it would double-count value that is
-    /// by definition in no pool.
-    ///
-    /// The deficit is signed whatever `C` is. zips#1354 rejects a block that makes it
-    /// negative, but only from the reissuance start height, so a chain below that height
-    /// must be able to hold a negative value. `issuance_deficit_is_non_negative` enforces
-    /// the rule where the specification places it, rather than the type doing it
-    /// everywhere.
-    ///
-    /// [zips#1354]: https://github.com/zcash/zips/pull/1354
+    /// Scheduled issuance minus issued value since NU7, with no historical seed.
+    /// This accounting counter funds reissuance but holds no spendable value.
+    /// Monetary totals exclude it. The signed type preserves pre-reissuance states;
+    /// contextual validation rejects negative balances from the reissuance start.
     issuance_deficit: Amount<NegativeAllowed>,
 }
 
@@ -586,6 +573,9 @@ pub enum ValueBalanceError {
     /// issuance deficit amount error {0}
     IssuanceDeficit(amount::Error),
 
+    /// scheduled issuance calculation failed: {0}
+    ScheduledIssuance(crate::parameters::subsidy::SubsidyError),
+
     /// the block has no coinbase height, so its issuance deficit change is undefined
     MissingCoinbaseHeight,
 
@@ -606,6 +596,7 @@ impl fmt::Display for ValueBalanceError {
             Deferred(e) => format!("deferred amount err: {e}"),
             Ironwood(e) => format!("ironwood amount err: {e}"),
             IssuanceDeficit(e) => format!("issuance deficit amount err: {e}"),
+            ScheduledIssuance(e) => format!("scheduled issuance calculation failed: {e}"),
             MissingCoinbaseHeight => {
                 "block has no coinbase height, so its issuance deficit change is undefined"
                     .to_string()

@@ -761,12 +761,8 @@ fn reissuance_amount(amount: Amount<NonNegative>) -> Result<Amount<NonNegative>,
 /// The halving schedule keeps issuing new ZEC. The bonus reissues value removed from
 /// circulation.
 ///
-/// The deficit is what the halving schedule has issued so far minus what is actually in
-/// the chain value pools. The only way the chain falls behind its own schedule is value
-/// leaving circulation, so the deficit is exactly what is left to reissue. The state
-/// carries it forward block by block in
-/// [`ValueBalance::issuance_deficit`](crate::value_balance::ValueBalance), so this
-/// function does not re-derive it from the schedule.
+/// The state supplies the eligible deficit after the parent block. It excludes the
+/// pre-NU7 historical seed pending policy guidance; see `Block::issuance_deficit_change`.
 ///
 /// [ZIP 234]: https://zips.z.cash/zip-0234
 fn reissuance_bonus(
@@ -786,6 +782,17 @@ pub fn expected_issued_supply(
     height: Height,
     net: &Network,
 ) -> Result<Amount<NonNegative>, SubsidyError> {
+    let total = scheduled_issuance_zatoshis(height, net)?;
+    let max_money = u128::try_from(MAX_MONEY).map_err(|_| SubsidyError::Overflow)?;
+    Ok(Amount::try_from(
+        i64::try_from(total.min(max_money)).map_err(|_| SubsidyError::Overflow)?,
+    )?)
+}
+
+/// Return cumulative scheduled zatoshi without the Amount limit.
+/// Migrations subtract the pre-NU7 baseline before constraining the eligible balance.
+/// Custom schedules can exceed MAX_MONEY, so clamping either operand would lose value.
+pub fn scheduled_issuance_zatoshis(height: Height, net: &Network) -> Result<u128, SubsidyError> {
     let slow_start_shift = u128::from(net.slow_start_shift().0);
     let slow_start_interval = u128::from(net.slow_start_interval().0);
     let height = u128::from(height.0);
@@ -840,14 +847,7 @@ pub fn expected_issued_supply(
         block = run_end + 1;
     }
 
-    // The Mainnet and Testnet schedules issue less than `MAX_MONEY` in total, so this clamp
-    // never applies there. A configured testnet that activates Blossom before its slow start
-    // ends pays the slow start at the pre-Blossom rate, so its schedule can exceed
-    // `MAX_MONEY`, which the amount type cannot represent.
-    let max_money = u128::try_from(MAX_MONEY).map_err(|_| SubsidyError::Overflow)?;
-    let total = i64::try_from(total.min(max_money)).map_err(|_| SubsidyError::Overflow)?;
-
-    Ok(Amount::try_from(total)?)
+    Ok(total)
 }
 
 /// Returns the lowest height above `height` at which the halving block subsidy changes,

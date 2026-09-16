@@ -351,20 +351,11 @@ impl Block {
         Ok(change)
     }
 
-    /// Returns this block's contribution to `IssuanceDeficit` from [zips#1354].
+    /// Returns scheduled issuance minus issued value, starting at NU7 with no seed.
     ///
-    /// The deficit is `ExpectedIssuedSupply(height) - IssuedSupply(height)`, so each block
-    /// moves it by the subsidy the halving schedule owed for that block, less the value the
-    /// block actually added to the chain value pools:
-    ///
-    /// `delta = ScheduledBlockSubsidy(height) - change.total()`
-    ///
-    /// A miner who claims less than the schedule allows raises the deficit by the shortfall.
-    /// A ZIP 234 reissuance claims more than the schedule, which lowers it again. Summing
-    /// this delta from genesis reproduces the specification's sum exactly, which
-    /// `issuance_deficit_matches_the_schedule` checks at every height.
-    ///
-    /// [zips#1354]: https://github.com/zcash/zips/pull/1354
+    /// Should historical unclaimed subsidy and fees seed this balance? We need guidance before including those funds. Update the baseline
+    /// in `zakura-state/src/service/finalized_state/disk_format/upgrade/issuance_deficit_pool.rs`
+    /// together with this rule and its accounting tests.
     fn issuance_deficit_change(
         &self,
         network: &Network,
@@ -374,19 +365,19 @@ impl Block {
             .coinbase_height()
             .ok_or(ValueBalanceError::MissingCoinbaseHeight)?;
 
-        // `ExpectedIssuedSupply` sums the schedule from genesis but counts the genesis
-        // block's subsidy as zero, so genesis must owe nothing here too. On a network with
-        // no slow start, `halving_block_subsidy(Height(0))` is a full subsidy, and counting
-        // it would leave the stored deficit one subsidy above the specification's value for
-        // the whole life of the chain.
-        //
-        // A block whose height has no halving subsidy also issues nothing, so it owes
-        // nothing.
+        if !NetworkUpgrade::Nu7
+            .activation_height(network)
+            .is_some_and(|start| height >= start)
+        {
+            return Ok(Amount::zero());
+        }
+
+        // Genesis contributes no issuance, including on networks without slow start.
         let scheduled = if height == Height(0) {
             Amount::zero()
         } else {
             halving_block_subsidy(height, network)
-                .unwrap_or_else(|_| Amount::zero())
+                .map_err(ValueBalanceError::ScheduledIssuance)?
                 .constrain::<NegativeAllowed>()
                 .map_err(ValueBalanceError::IssuanceDeficit)?
         };
@@ -445,5 +436,54 @@ pub const MAX_BLOCK_LOCATOR_LENGTH: u64 = 101;
 impl TrustedPreallocate for Hash {
     fn max_allocation() -> u64 {
         MAX_BLOCK_LOCATOR_LENGTH
+    }
+}
+
+#[cfg(test)]
+mod issuance_deficit_properties {
+    use super::*;
+    use crate::{
+        parameters::testnet::{ConfiguredActivationHeights, RegtestParameters},
+        transparent::Input,
+    };
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(std::env::var("NSM_ARITHMETIC_CASES").ok().and_then(|value| value.parse().ok()).unwrap_or(1024)))]
+
+        #[test]
+        fn deficit_ignores_transfers_and_tracks_removed_value(
+            height in 1u32..20,
+            removed in 0i64..1_000_000_000,
+            transfer in 0i64..1_000_000_000,
+            pool in 0usize..5,
+        ) {
+            let network = Network::new_regtest(RegtestParameters {
+                activation_heights: ConfiguredActivationHeights { nu7: Some(3), ..Default::default() },
+                ..Default::default()
+            });
+            let mut block = (*genesis::regtest_genesis_block()).clone();
+            let transaction = Arc::make_mut(&mut block.transactions[0]);
+            let Input::Coinbase { height: coinbase_height, .. } = &mut transaction.inputs_mut()[0] else {
+                panic!("genesis has a coinbase input");
+            };
+            *coinbase_height = Height(height);
+            let amount = Amount::<NegativeAllowed>::try_from(transfer).unwrap();
+            let destination = match pool {
+                0 => ValueBalance::from_sprout_amount(amount),
+                1 => ValueBalance::from_sapling_amount(amount),
+                2 => ValueBalance::from_orchard_amount(amount),
+                3 => ValueBalance::from_ironwood_amount(amount),
+                _ => { let mut pools = ValueBalance::zero(); pools.set_deferred_amount(amount); pools },
+            };
+            let change = (destination + ValueBalance::from_transparent_amount(Amount::try_from(-transfer - removed).unwrap())).unwrap();
+            let actual = block.issuance_deficit_change(&network, &change).unwrap();
+            let expected = if height < 3 { 0 } else {
+                i64::from(halving_block_subsidy(Height(height), &network).unwrap()) + removed
+            };
+            prop_assert_eq!(i64::from(actual), expected);
+            let reverse = -change;
+            prop_assert_eq!((change + reverse).unwrap(), ValueBalance::<NegativeAllowed>::zero());
+        }
     }
 }

@@ -58,9 +58,7 @@ pub(crate) use difficulty::AdjustedDifficulty;
 /// zips#1354 applies this rule from NU7 because it starts reissuance at NU7. Zakura starts
 /// reissuance at the later ZIP 234 start height, and applies the rule from that height.
 ///
-/// This runs before the pools are added, because the deficit leg is constrained
-/// non-negative: adding a block that overdraws it would otherwise fail with a generic
-/// value-balance error instead of naming the rule it broke.
+/// Check before adding pools so an overdraw reports this consensus rule.
 #[allow(clippy::unwrap_in_result)]
 pub(crate) fn issuance_deficit_is_non_negative(
     network: &Network,

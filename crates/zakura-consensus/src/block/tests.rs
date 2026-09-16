@@ -1980,7 +1980,7 @@ const ZIP234_TEST_BONUS: i64 = 166;
 /// halving schedule.
 ///
 /// The deficit is stored in its own value pool leg, and the transparent pool is set so that
-/// the two agree with `ExpectedIssuedSupply - IssuedSupply`, as they do on a real chain.
+/// the test can isolate subsidy validation from the historical-baseline policy.
 #[cfg(feature = "nu7")]
 fn zip234_parent_pools(
     network: &Network,
@@ -2057,6 +2057,20 @@ async fn zip234_block_verification_checks_the_reissuance_bonus() {
             .expect("the coinbase claims the ZIP 234 subsidy"),
         block.hash(),
     );
+
+    // A one-zatoshi overclaim must fail the semantic subsidy check.
+    assert!(matches!(
+        verify(
+            ZIP234_TEST_DEFICIT,
+            (with_bonus + Amount::try_from(1).unwrap()).unwrap()
+        )
+        .await,
+        Err(VerifyBlockError::Block {
+            source: BlockError::Transaction(TransactionError::Subsidy(
+                SubsidyError::InvalidMinerFees
+            )),
+        }),
+    ));
 
     // A coinbase without the bonus does not balance.
     assert!(matches!(

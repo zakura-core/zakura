@@ -1118,7 +1118,7 @@ fn vct_format_changes_include_root_auth_metadata_updates() {
     assert_eq!(upgrades[3].version(), Version::new(28, 1, 3));
     assert_eq!(upgrades[4].version(), Version::new(28, 1, 4));
     assert_eq!(upgrades[5].version(), Version::new(28, 1, 5));
-    assert_eq!(upgrades[6].version(), Version::new(28, 2, 0));
+    assert_eq!(upgrades[6].version(), Version::new(29, 0, 0));
     assert!(
         !upgrades[3].needs_migration(),
         "the header-chain column families are created on open without rebasing authenticated roots"

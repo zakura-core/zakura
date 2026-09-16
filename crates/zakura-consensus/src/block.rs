@@ -343,14 +343,14 @@ where
             // > The block data MUST be validated and checked against the server's usual
             // > acceptance rules (excluding the check for a valid proof-of-work).
             // <https://en.bitcoin.it/wiki/BIP_0023#Block_Proposal>
-            let pow_policy = zakura_header_chain::PowPolicy::for_network(&network)?;
-            if request.is_proposal() || pow_policy.is_authenticated_custom_waiver() {
+            if request.is_proposal() {
+                zakura_header_chain::PowPolicy::for_network(&network)?;
+                block.header.solution.validate_shape(&network)?;
                 check::difficulty_threshold_is_valid(&block.header, &network, &height, &hash)?;
             } else {
                 // Do the difficulty checks first, to raise the threshold for
                 // attacks that use any other fields.
-                check::difficulty_is_valid(&block.header, &network, &height, &hash)?;
-                check::equihash_solution_is_valid(&block.header, &network)?;
+                check::proof_of_work_is_valid(&block.header, &network, &height, &hash)?;
             }
 
             if request.is_mined_commit() {

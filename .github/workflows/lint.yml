@@ -14,6 +14,8 @@ on:
       - deny.toml
       - rust-toolchain.toml
       - .github/workflows/lint.yml
+      - .github/workflows/codex-approval-adapter.yml
+      - .github/review-policy/**
       - .github/workflows/cross-platform.yml
       - docs/specs/fork-aware-header-chain-engine.md
       - qa/supply-chain/**
@@ -38,6 +40,8 @@ on:
       - deny.toml
       - rust-toolchain.toml
       - .github/workflows/lint.yml
+      - .github/workflows/codex-approval-adapter.yml
+      - .github/review-policy/**
       - .github/workflows/cross-platform.yml
       - docs/specs/fork-aware-header-chain-engine.md
       - qa/supply-chain/**
@@ -191,6 +195,10 @@ jobs:
         # droplets, where a shell bug costs a full provisioning cycle to find.
         run: shellcheck scripts/*.sh scripts/lib/*.sh .github/workflows/scripts/*.sh
       # Stdlib-only, so there is nothing to install.
+      - name: Codex approval policy tests
+        if: ${{ !cancelled() }}
+        run: python3 .github/review-policy/test_adapter.py
+
       - name: Mempool load harness tests
         if: ${{ !cancelled() }}
         run: python3 .github/workflows/scripts/test_mempool_load.py

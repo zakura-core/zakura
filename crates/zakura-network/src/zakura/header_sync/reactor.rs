@@ -66,6 +66,9 @@ fn snapshot_refresh_trace_due(last: Option<Instant>, now: Instant) -> bool {
 /// The refills also preserve enough work for a partial checkpoint range.
 const INTEGRATED_HEADER_BODY_WINDOW_V1: u32 = MAX_HS_RANGE;
 const INTEGRATED_HEADER_REFILL_LOW_WATER_V1: u32 = INTEGRATED_HEADER_BODY_WINDOW_V1 / 2;
+/// Complete a refill without chasing headroom freed by concurrent body commits.
+const INTEGRATED_HEADER_REFILL_BATCH_V1: u32 =
+    INTEGRATED_HEADER_BODY_WINDOW_V1 - INTEGRATED_HEADER_REFILL_LOW_WATER_V1;
 
 /// Spawn the canonical header-sync reactor.
 pub fn spawn_header_sync_reactor(
@@ -2839,8 +2842,8 @@ impl HeaderSyncReactor {
         u32::try_from(remaining).unwrap_or(u32::MAX)
     }
 
-    /// Prepare enough selected-chain headers for a checkpoint and its VCT successor
-    /// when the admitted body pipeline has less than that much work remaining.
+    /// Prepare a selected-chain refill once its batch is ready, or release a smaller
+    /// checkpoint prefix before the admitted body pipeline runs out of work.
     fn should_prepare_checkpoint_prefix(
         snapshot: &zakura_header_chain::EngineSnapshot,
         active: &ActiveHeaderRequest,
@@ -2853,12 +2856,15 @@ impl HeaderSyncReactor {
             .height
             .0
             .saturating_sub(snapshot.frontiers.verified_best.height.0);
+        let refill_batch = usize::try_from(INTEGRATED_HEADER_REFILL_BATCH_V1)
+            .expect("the bounded refill count fits usize on supported targets");
         snapshot.mode == zakura_header_chain::EngineMode::Integrated
             && matches!(active.purpose, HeaderTargetPurpose::Normal)
             && active.common_ancestor == Some(snapshot.frontiers.header_best)
             && active.entries.len() > checkpoint_gap
-            && usize::try_from(body_lag).expect("u32 body lag fits usize on supported targets")
-                <= checkpoint_gap
+            && (active.entries.len() >= refill_batch
+                || usize::try_from(body_lag).expect("u32 body lag fits usize on supported targets")
+                    <= checkpoint_gap)
     }
 
     /// Return requester headroom after both the durable DAG limit and the integrated body window.

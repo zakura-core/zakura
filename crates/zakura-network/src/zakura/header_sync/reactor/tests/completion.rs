@@ -126,6 +126,128 @@ fn early_checkpoint_prefix_preserves_minimum_work_and_exact_branch_scope() {
 }
 
 #[test]
+fn refill_batch_finishes_even_as_body_commits_free_more_headroom() {
+    let (reactor, _actions, mut snapshot, peer, _source, _owner) = peer_violation_fixture();
+    let mut active = reactor.peer_work_queue.active(&peer).unwrap().clone();
+    let entry = active.entries[0].clone();
+    snapshot.frontiers.header_best.height = block::Height(2_000);
+    active.common_ancestor = Some(snapshot.frontiers.header_best);
+    for page in 1..=8 {
+        let count = page * 250;
+        active.entries = vec![entry.clone(); count];
+        snapshot.frontiers.verified_best.height = block::Height(
+            u32::try_from(page * 40).expect("the fixture body progress fits a height"),
+        );
+        assert!(
+            HeaderSyncReactor::request_header_prefix_remaining(
+                &snapshot,
+                count,
+                block::Height(20_000),
+            ) > 0,
+            "body progress keeps reopening headroom after each page"
+        );
+        assert_eq!(
+            HeaderSyncReactor::should_prepare_checkpoint_prefix(&snapshot, &active),
+            page == 8,
+            "a complete refill must not chase newly freed capacity"
+        );
+    }
+    active.common_ancestor = Some(snapshot.frontiers.finalized);
+    assert!(!HeaderSyncReactor::should_prepare_checkpoint_prefix(
+        &snapshot, &active
+    ));
+    active.common_ancestor = Some(snapshot.frontiers.header_best);
+    snapshot.mode = zakura_header_chain::EngineMode::HeadersOnly;
+    assert!(!HeaderSyncReactor::should_prepare_checkpoint_prefix(
+        &snapshot, &active
+    ));
+    snapshot.mode = zakura_header_chain::EngineMode::Integrated;
+    active.purpose = HeaderTargetPurpose::SelectedAuxiliaryRepair {
+        selected_target: snapshot.frontiers.header_best,
+        repair_generation: 0,
+    };
+    assert!(!HeaderSyncReactor::should_prepare_checkpoint_prefix(
+        &snapshot, &active
+    ));
+}
+
+#[test]
+fn refill_batch_prepares_its_owned_prefix_before_the_body_pipeline_drains() {
+    let (mut reactor, mut actions, mut snapshot, peer, _source, owner) = peer_violation_fixture();
+    snapshot.frontiers.header_best.height = block::Height(2_000);
+    snapshot.frontiers.verified_best.height = block::Height(400);
+    reactor.committed_snapshot = Some(snapshot.clone());
+    let active = reactor.peer_work_queue.active_mut(&peer).unwrap();
+    active.phase = HeaderTargetPhase::Receiving;
+    active.common_ancestor = Some(snapshot.frontiers.header_best);
+    active.target.status.selected_tip_height = block::Height(20_000);
+    active.max_header_count = 250;
+    let mut parent = snapshot.frontiers.header_best.hash;
+    let mut entries = Vec::new();
+    for index in 0..2_000 {
+        let mut header = *regtest_genesis_block().header;
+        header.previous_block_hash = parent;
+        header.time += chrono::Duration::seconds(index + 1);
+        parent = header.hash();
+        entries.push(HeaderEntry {
+            header: Arc::new(header),
+            body_size: 0,
+            tree_aux: None,
+        });
+    }
+    let response_entries = entries.split_off(1_750);
+    active.entries = entries;
+    let staged_tip = active.staged_tip().unwrap();
+    reactor
+        .peer_work_queue
+        .set_capacity_for_test(&peer, 1_750, 250);
+    reactor.handle_headers(
+        peer.clone(),
+        owner.session_id(),
+        owner.header_authority(),
+        Headers {
+            request_id: owner.request_id().get(),
+            target_tip_hash: owner.header_authority().branch.target_tip_hash,
+            common_ancestor_height: staged_tip.height,
+            common_ancestor_hash: staged_tip.hash,
+            complete: false,
+            tree_aux_schema: AuxSchema::None,
+            entries: response_entries,
+        },
+    );
+    let HeaderPortOperation::PrepareHeaderTarget {
+        entries,
+        owner: prefix_owner,
+        target,
+        completion,
+        ..
+    } = actions
+        .try_recv()
+        .expect("a complete refill starts preparation")
+    else {
+        panic!("a complete refill must use normal header preparation");
+    };
+    assert_eq!(entries.len(), 2_000);
+    assert_eq!(target.height, block::Height(4_000));
+    assert_eq!(
+        prefix_owner.header_authority().branch.target_tip_hash,
+        target.hash
+    );
+    assert_eq!(
+        completion,
+        zakura_header_chain::TargetCompletion::TargetPrefix {
+            common_ancestor: snapshot.frontiers.header_best,
+        }
+    );
+    assert_eq!(reactor.peer_work_queue.chunk_budget_usage(), (0, 2_000));
+    assert_eq!(
+        reactor.peer_work_queue.active(&peer).unwrap().phase,
+        HeaderTargetPhase::Preparing
+    );
+    assert!(actions.try_recv().is_err());
+}
+
+#[test]
 fn requester_prepares_checkpoint_sized_extension_before_the_chunk_budget_fills() {
     let (mut reactor, mut actions, snapshot, peer, _source, owner) = peer_violation_fixture();
     let active = reactor.peer_work_queue.active_mut(&peer).unwrap();

@@ -171,6 +171,7 @@ impl JsonlEventEmitter {
         let event = build();
         let row = JsonlEventEnvelope {
             ts: elapsed_micros(self.started.elapsed()),
+            process_ts: process_elapsed_micros(),
             node: &self.node,
             process_trace_id: process_trace_id(),
             event: &event,
@@ -196,6 +197,7 @@ impl JsonlEventEmitter {
             "ts".to_string(),
             Value::from(elapsed_micros(self.started.elapsed())),
         );
+        row.insert("process_ts".to_string(), process_elapsed_micros().into());
         row.insert("node".to_string(), Value::String(self.node.to_string()));
         row.insert(
             "process_trace_id".to_string(),
@@ -222,10 +224,17 @@ impl Default for JsonlEventEmitter {
 #[derive(Serialize)]
 struct JsonlEventEnvelope<'a, E> {
     ts: u64,
+    process_ts: u64,
     node: &'a str,
     process_trace_id: &'static str,
     #[serde(flatten)]
     event: &'a E,
+}
+
+/// Shared monotonic timestamp for correlation across emitters in this process.
+fn process_elapsed_micros() -> u64 {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    elapsed_micros(START.get_or_init(std::time::Instant::now).elapsed())
 }
 
 fn elapsed_micros(elapsed: Duration) -> u64 {
@@ -476,8 +485,14 @@ impl JsonlTracer {
             .try_reserve_owned()
             .map(|permit| JsonlTracePermit { permit })
             .map_err(|error| match error {
-                TrySendError::Full(_) => JsonlTraceReserveError::Full,
-                TrySendError::Closed(_) => JsonlTraceReserveError::Closed,
+                TrySendError::Full(_) => {
+                    metrics::counter!("jsonl.events.dropped", "reason" => "full").increment(1);
+                    JsonlTraceReserveError::Full
+                }
+                TrySendError::Closed(_) => {
+                    metrics::counter!("jsonl.events.dropped", "reason" => "closed").increment(1);
+                    JsonlTraceReserveError::Closed
+                }
             })
     }
 
@@ -488,8 +503,14 @@ impl JsonlTracer {
         };
 
         runtime.tx.try_send(event).map_err(|error| match error {
-            TrySendError::Full(event) => JsonlTraceSendError::Full(event),
-            TrySendError::Closed(event) => JsonlTraceSendError::Closed(event),
+            TrySendError::Full(event) => {
+                metrics::counter!("jsonl.events.dropped", "reason" => "full").increment(1);
+                JsonlTraceSendError::Full(event)
+            }
+            TrySendError::Closed(event) => {
+                metrics::counter!("jsonl.events.dropped", "reason" => "closed").increment(1);
+                JsonlTraceSendError::Closed(event)
+            }
         })
     }
 }
@@ -863,6 +884,7 @@ mod tests {
         assert_eq!(row["value"], 7);
         assert_eq!(row["optional"], Value::Null);
         assert!(row["ts"].is_u64());
+        assert!(row["process_ts"].is_u64());
     }
 
     #[test]
@@ -880,6 +902,7 @@ mod tests {
         assert_eq!(row["process_trace_id"], process_trace_id());
         assert_eq!(row["event"], "raw_event");
         assert!(row["ts"].is_u64());
+        assert!(row["process_ts"].is_u64());
     }
 
     #[test]

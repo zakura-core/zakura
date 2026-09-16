@@ -1199,6 +1199,16 @@ impl SequencerTask {
         // core (and starves progress under CI load) on a real clock and fully wedges
         // a `start_paused` test clock, which auto-advances only once every task
         // parks. Keep the stored rates fresh, but notify only on a schedulable change.
+        self.trace.emit_event(|| {
+            super::trace::BlockTraceEvent::build("block_apply_occupancy", |row| {
+                row.verified_block_tip = Some(u64::from(next.verified_tip.0));
+                row.body_download_floor = Some(u64::from(next.download_floor.0));
+                row.in_flight_submission_count = Some(next.in_flight_submission_count);
+                row.unsubmitted_applying_count = Some(next.unsubmitted_applying_count);
+                row.reorder_len = Some(next.reorder_len);
+                row.pending_work = Some(super::trace::saturating_usize(self.work.pending_len()));
+            })
+        });
         publish_sequencer_view(&self.view_tx, next);
     }
 

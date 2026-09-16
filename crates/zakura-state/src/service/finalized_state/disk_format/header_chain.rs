@@ -528,7 +528,10 @@ mod tests {
                 "missing opened column family {expected}"
             );
         }
-        assert_eq!(db.format_version_in_code().minor, 2);
+        assert_eq!(
+            db.format_version_in_code(),
+            state_database_format_version_in_code()
+        );
 
         drop(db);
         let reopened = ZakuraDb::new(

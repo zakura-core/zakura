@@ -3686,20 +3686,14 @@ pub async fn init_with_header_chain_body_evidence(
     ),
     StateInitError,
 > {
-    let (state, read_state, latest_chain_tip, chain_tip_change) = init(
+    init_with_database_writer_metadata(
         config,
         network,
         max_checkpoint_height,
         checkpoint_verify_concurrency_limit,
+        DatabaseWriterMetadata::default_zakura(),
     )
-    .await?;
-    Ok((
-        state,
-        read_state,
-        latest_chain_tip,
-        chain_tip_change,
-        crate::HeaderChainBodyEvidenceAuthority::new(),
-    ))
+    .await
 }
 
 /// Initialize a state service from the provided [`Config`] and explicit node

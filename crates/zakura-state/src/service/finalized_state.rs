@@ -353,12 +353,14 @@ impl FinalizedState {
         network: &Network,
         database_writer_metadata: DatabaseWriterMetadata,
     ) -> Result<Self, StateInitError> {
-        Self::new_with_debug_and_database_writer_metadata(
+        Self::new_with_debug_and_database_writer_metadata_and_storage_validation(
             config,
             network,
             database_writer_metadata,
             false,
             false,
+            true,
+            true,
         )
     }
 
@@ -385,28 +387,10 @@ impl FinalizedState {
         debug_skip_format_upgrades: bool,
         read_only: bool,
     ) -> Result<Self, StateInitError> {
-        Self::new_with_debug_and_database_writer_metadata(
-            config,
-            network,
-            DatabaseWriterMetadata::default_zakura(),
-            debug_skip_format_upgrades,
-            read_only,
-        )
-    }
-
-    /// Returns an on-disk database instance with explicit node software metadata.
-    #[allow(clippy::unwrap_in_result)]
-    pub(crate) fn new_with_debug_and_database_writer_metadata(
-        config: &Config,
-        network: &Network,
-        database_writer_metadata: DatabaseWriterMetadata,
-        debug_skip_format_upgrades: bool,
-        read_only: bool,
-    ) -> Result<Self, StateInitError> {
         Self::new_with_debug_and_database_writer_metadata_and_storage_validation(
             config,
             network,
-            database_writer_metadata,
+            DatabaseWriterMetadata::default_zakura(),
             debug_skip_format_upgrades,
             read_only,
             true,

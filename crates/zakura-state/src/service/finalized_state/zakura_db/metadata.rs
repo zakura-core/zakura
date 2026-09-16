@@ -2,7 +2,7 @@
 
 use crate::service::finalized_state::{
     disk_db::{DiskWriteBatch, WriteDisk},
-    FromDisk, IntoDisk, NODE_SOFTWARE_METADATA,
+    IntoDisk, NODE_SOFTWARE_METADATA,
 };
 
 use super::ZakuraDb;
@@ -15,27 +15,20 @@ const LAST_WRITER_LAST_KNOWN_TAG_KEY: MetadataKey = MetadataKey("last_writer.las
 struct MetadataKey(&'static str);
 
 impl IntoDisk for MetadataKey {
-    type Bytes = Vec<u8>;
+    type Bytes = &'static [u8];
 
     fn as_bytes(&self) -> Self::Bytes {
-        self.0.as_bytes().to_vec()
+        self.0.as_bytes()
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct MetadataValue(String);
+struct MetadataValue<'a>(&'a str);
 
-impl IntoDisk for MetadataValue {
-    type Bytes = Vec<u8>;
+impl<'a> IntoDisk for MetadataValue<'a> {
+    type Bytes = &'a [u8];
 
     fn as_bytes(&self) -> Self::Bytes {
-        self.0.as_bytes().to_vec()
-    }
-}
-
-impl FromDisk for MetadataValue {
-    fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
-        Self(String::from_utf8_lossy(bytes.as_ref()).into_owned())
+        self.0.as_bytes()
     }
 }
 
@@ -99,17 +92,17 @@ impl ZakuraDb {
         batch.zs_insert(
             &metadata_cf,
             LAST_WRITER_SOFTWARE_KEY,
-            MetadataValue(metadata.software.clone()),
+            MetadataValue(&metadata.software),
         );
         batch.zs_insert(
             &metadata_cf,
             LAST_WRITER_VERSION_KEY,
-            MetadataValue(metadata.version.clone()),
+            MetadataValue(&metadata.version),
         );
         batch.zs_insert(
             &metadata_cf,
             LAST_WRITER_LAST_KNOWN_TAG_KEY,
-            MetadataValue(metadata.last_known_tag.clone()),
+            MetadataValue(&metadata.last_known_tag),
         );
 
         self.db.write(batch).map_err(Into::into)
@@ -125,7 +118,7 @@ impl ZakuraDb {
         let read = |key: MetadataKey| {
             self.db
                 .raw_get_cf(&metadata_cf, key.0.as_bytes())
-                .map(|value| value.map(MetadataValue::from_bytes))
+                .map(|value| value.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
         };
         let Some(software) = read(LAST_WRITER_SOFTWARE_KEY)? else {
             return Ok(None);
@@ -137,9 +130,9 @@ impl ZakuraDb {
             return Ok(None);
         };
         Ok(Some(DatabaseWriterMetadata::new(
-            software.0,
-            version.0,
-            last_known_tag.0,
+            software,
+            version,
+            last_known_tag,
         )))
     }
 }
@@ -338,7 +331,19 @@ mod tests {
         }
 
         {
-            let db = open_with_metadata(&config, true, &metadata);
+            let db = ZakuraDb::new_with_database_writer_metadata(
+                &config,
+                STATE_DATABASE_KIND,
+                &old_version,
+                &Network::Mainnet,
+                true,
+                STATE_COLUMN_FAMILIES_IN_CODE
+                    .iter()
+                    .map(ToString::to_string),
+                true,
+                Some(&metadata),
+            )
+            .expect("read-only access preserves the old database before its upgrade");
             assert_eq!(
                 db.database_writer_metadata()
                     .expect("metadata read succeeds"),

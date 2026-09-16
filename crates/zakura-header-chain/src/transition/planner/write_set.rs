@@ -157,22 +157,27 @@ pub(super) fn derive_plan(
         verified_best: verified_tip,
     };
     metadata.header_best_score = graph.view_header_chain_score(selected_tip.hash)?;
-    metadata.oldest_retained_height = if delete_nodes.is_empty() {
-        put_nodes
-            .iter()
-            .map(|node| node.height)
-            .min()
-            .map_or(snapshot_before_commit.oldest_retained_height, |height| {
-                height.min(snapshot_before_commit.oldest_retained_height)
-            })
-    } else {
-        graph
-            .view_header_nodes()
-            .into_iter()
-            .map(|node| node.height)
-            .min()
-            .unwrap_or(graph.view_finalized_frontier().height)
-    };
+    metadata.oldest_retained_height =
+        if effect.is_checkpoint_finality() && finality_append.is_some() {
+            // Finality removes ancestors and sibling subtrees. The new anchor is
+            // retained, and every remaining header descends from it.
+            graph.view_finalized_frontier().height
+        } else if delete_nodes.is_empty() {
+            put_nodes
+                .iter()
+                .map(|node| node.height)
+                .min()
+                .map_or(snapshot_before_commit.oldest_retained_height, |height| {
+                    height.min(snapshot_before_commit.oldest_retained_height)
+                })
+        } else {
+            graph
+                .view_header_nodes()
+                .into_iter()
+                .map(|node| node.height)
+                .min()
+                .unwrap_or(graph.view_finalized_frontier().height)
+        };
     let inserted = put_nodes
         .iter()
         .filter(|node| base_graph.header_node(node.hash).is_none())

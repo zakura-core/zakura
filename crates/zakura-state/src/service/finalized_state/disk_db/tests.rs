@@ -14,10 +14,10 @@ use crate::{
 };
 
 #[test]
-fn major_database_reuse_requires_opt_in_and_preserves_data() {
+fn automatic_major_database_reuse_validates_source_and_preserves_data() {
     let _init_guard = zakura_test::init();
     let cache = tempfile::tempdir().expect("temporary directory exists");
-    let mut config = Config {
+    let config = Config {
         cache_dir: cache.path().to_owned(),
         ..Config::default()
     };
@@ -42,20 +42,6 @@ fn major_database_reuse_requires_opt_in_and_preserves_data() {
         crate::write_database_format_version_to_disk(&config, "state", 1, &old_version, &network)
             .expect("fixture version is written");
     }
-    assert_eq!(
-        DiskDb::try_reusing_previous_db_after_major_upgrade(
-            &[2],
-            &new_version,
-            &config,
-            "state",
-            &network
-        ),
-        None
-    );
-    assert!(old_path.exists());
-    assert!(!new_path.exists());
-
-    config.reuse_previous_database = true;
     crate::write_database_format_version_to_disk(
         &config,
         "state",

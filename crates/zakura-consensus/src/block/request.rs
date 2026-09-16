@@ -19,6 +19,13 @@ pub enum PreparedCandidateSource {
 pub enum Request {
     /// Performs semantic validation, then asks the state to perform contextual validation and commit the block
     Commit(Arc<Block>),
+    /// Commits native sync work unless its owner cancels before write admission.
+    CommitCancellable {
+        /// The downloaded block.
+        block: Arc<Block>,
+        /// The fence shared with the commit owner.
+        cancellation: zakura_state::CommitCancellation,
+    },
     /// Reuses prepared mining work when possible, then commits the solved block.
     CommitMined {
         /// The solved block.
@@ -47,7 +54,7 @@ impl Request {
     /// Returns inner block
     pub fn block(&self) -> Arc<Block> {
         Arc::clone(match self {
-            Request::Commit(block) => block,
+            Request::Commit(block) | Request::CommitCancellable { block, .. } => block,
             Request::CommitMined { block, .. } => block,
             Request::CheckProposal(block) => block,
             Request::Prepare { block, .. } => block,
@@ -57,7 +64,9 @@ impl Request {
     /// Returns `true` if the request is a proposal
     pub fn is_proposal(&self) -> bool {
         match self {
-            Request::Commit(_) | Request::CommitMined { .. } => false,
+            Request::Commit(_)
+            | Request::CommitCancellable { .. }
+            | Request::CommitMined { .. } => false,
             Request::CheckProposal(_) | Request::Prepare { .. } => true,
         }
     }
@@ -81,7 +90,9 @@ impl Request {
             Request::CommitMined { work_id, .. } | Request::Prepare { work_id, .. } => {
                 work_id.as_deref()
             }
-            Request::Commit(_) | Request::CheckProposal(_) => None,
+            Request::Commit(_) | Request::CommitCancellable { .. } | Request::CheckProposal(_) => {
+                None
+            }
         }
     }
 
@@ -89,6 +100,14 @@ impl Request {
     pub fn admission(&self) -> Option<BlockAdmission> {
         match self {
             Request::CommitMined { admission, .. } => Some(admission.clone()),
+            _ => None,
+        }
+    }
+
+    /// Returns the native commit fence.
+    pub fn cancellation(&self) -> Option<zakura_state::CommitCancellation> {
+        match self {
+            Self::CommitCancellable { cancellation, .. } => Some(cancellation.clone()),
             _ => None,
         }
     }

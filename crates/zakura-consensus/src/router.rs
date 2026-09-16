@@ -339,8 +339,9 @@ where
 
     fn call(&mut self, request: Request) -> Self::Future {
         let block = request.block();
+        let cancellation = request.cancellation();
 
-        match block.coinbase_height() {
+        let verification = match block.coinbase_height() {
             // There's currently no known use case for block proposals below the checkpoint height,
             // so it's okay to immediately return an error here.
             Some(height) if height <= self.max_checkpoint_height && request.is_proposal() => {
@@ -353,13 +354,27 @@ where
                 .boxed()
             }
 
-            Some(height) if height <= self.max_checkpoint_height => {
-                self.checkpoint.call(block).map_err(Into::into).boxed()
-            }
+            Some(height) if height <= self.max_checkpoint_height => self
+                .checkpoint
+                .call_cancellable(block, cancellation.clone())
+                .map_err(Into::into)
+                .boxed(),
             // This also covers blocks with no height, which the block verifier
             // will reject immediately.
             _ => self.block.call(request).map_err(Into::into).boxed(),
+        };
+        async move {
+            tokio::select! {
+                result = verification => result,
+                _ = async {
+                    match cancellation {
+                        Some(cancellation) => cancellation.cancelled().await,
+                        None => std::future::pending().await,
+                    }
+                } => Err(VerifyBlockError::Commit(zs::CommitBlockError::Cancelled).into()),
+            }
         }
+        .boxed()
     }
 }
 

@@ -62,8 +62,11 @@ fn mined_orphans_finish_without_entering_the_sync_queue() {
 
     for _ in 0..2 {
         let admission = BlockAdmission::pending();
-        let response = state_service
-            .queue_and_commit_to_non_finalized_state(block.clone(), Some(admission.clone()));
+        let response = state_service.queue_and_commit_to_non_finalized_state(
+            block.clone(),
+            Some(admission.clone()),
+            None,
+        );
         assert!(!runtime.block_on(admission.wait()));
         assert!(response
             .blocking_recv()
@@ -75,7 +78,8 @@ fn mined_orphans_finish_without_entering_the_sync_queue() {
             .is_none());
     }
 
-    let mut response = state_service.queue_and_commit_to_non_finalized_state(block.clone(), None);
+    let mut response =
+        state_service.queue_and_commit_to_non_finalized_state(block.clone(), None, None);
     assert!(matches!(
         response.try_recv(),
         Err(tokio::sync::oneshot::error::TryRecvError::Empty)
@@ -431,6 +435,7 @@ async fn a_full_orphan_queue_still_admits_a_block_whose_parent_is_available() ->
         grandchild.clone(),
         grandchild_tx,
         None,
+        None,
     ));
 
     // Fill the rest of the queue with blocks whose parents this state will never have.
@@ -446,6 +451,7 @@ async fn a_full_orphan_queue_still_admits_a_block_whose_parent_is_available() ->
             Arc::new(orphan_block).prepare(),
             orphan_tx,
             None,
+            None,
         ));
         orphan_count += 1;
     }
@@ -456,8 +462,11 @@ async fn a_full_orphan_queue_still_admits_a_block_whose_parent_is_available() ->
 
     // The queue is full, but `child` extends the finalized tip, so it must still be admitted.
     let admission = BlockAdmission::pending();
-    let _response = state_service
-        .queue_and_commit_to_non_finalized_state(child.clone(), Some(admission.clone()));
+    let _response = state_service.queue_and_commit_to_non_finalized_state(
+        child.clone(),
+        Some(admission.clone()),
+        None,
+    );
 
     assert!(
         state_service
@@ -496,7 +505,7 @@ async fn descendant_arriving_after_a_local_parent_failure_completes_immediately(
     state.remember_failed_ancestor(ancestor, ancestor, NonFinalizedWriteFailureKind::Retryable);
 
     let response = state
-        .queue_and_commit_to_non_finalized_state(block.clone(), None)
+        .queue_and_commit_to_non_finalized_state(block.clone(), None, None)
         .await
         .expect("the state keeps the response channel open")
         .expect_err("the failed parent prevents this request from waiting");
@@ -1657,7 +1666,7 @@ proptest! {
             expected_non_finalized_value_pool += *block_value_pool;
 
             let result_receiver =
-                state_service.queue_and_commit_to_non_finalized_state(block.clone(), None);
+                state_service.queue_and_commit_to_non_finalized_state(block.clone(), None, None);
             let result = result_receiver.blocking_recv();
 
             prop_assert!(result.is_ok(), "unexpected failed non-finalized block commit: {:?}", result);
@@ -1751,7 +1760,7 @@ proptest! {
             let expected_action = TipAction::grow_with(expected_block.clone().into());
 
             let result_receiver =
-                state_service.queue_and_commit_to_non_finalized_state(block, None);
+                state_service.queue_and_commit_to_non_finalized_state(block, None, None);
             let result = result_receiver.blocking_recv();
 
             prop_assert!(result.is_ok(), "unexpected failed non-finalized block commit: {:?}", result);
@@ -2144,6 +2153,7 @@ async fn unpublished_writer_transitions_block_optimistic_relay_and_bound_bodies(
             Arc::new(block).prepare(),
             tx,
             Some(admission.clone()),
+            None,
         ));
         state.send_ready_non_finalized_queued(parent);
         (admission, rx)
@@ -2216,6 +2226,192 @@ async fn unpublished_writer_transitions_block_optimistic_relay_and_bound_bodies(
     );
 }
 
+/// Reproduces the dependency wait that can prevent a fallback drain.
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_parent_commit_requires_owner_cancellation() {
+    let _init_guard = zakura_test::init();
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_419201_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let parent = block.header.previous_block_hash;
+    let (mut state, _, _, _) =
+        StateService::new(Config::ephemeral(), &Network::Mainnet, Height::MAX, 0)
+            .await
+            .unwrap();
+    let cancellation = crate::CommitCancellation::default();
+    let mut response = state.queue_and_commit_to_non_finalized_state(
+        block.clone().into(),
+        None,
+        Some(cancellation.clone()),
+    );
+    assert!(state
+        .non_finalized_state_queued_blocks
+        .has_queued_children(parent));
+    assert!(timeout(Duration::from_millis(20), &mut response)
+        .await
+        .is_err());
+    assert!(cancellation.cancel());
+    state.non_finalized_state_queued_blocks.prune_cancelled();
+    let error = timeout(Duration::from_secs(1), response)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.inner(), &crate::CommitBlockError::Cancelled);
+    assert!(!state
+        .non_finalized_state_queued_blocks
+        .has_queued_children(parent));
+
+    // A later epoch can submit the same body without inheriting the cancelled fence.
+    let replacement = crate::CommitCancellation::default();
+    let mut response = state.queue_and_commit_to_non_finalized_state(
+        block.into(),
+        None,
+        Some(replacement.clone()),
+    );
+    assert!(timeout(Duration::from_millis(20), &mut response)
+        .await
+        .is_err());
+    assert!(cancellation.cancel());
+    assert!(!replacement.is_cancelled());
+    assert!(replacement.cancel());
+    state.non_finalized_state_queued_blocks.prune_cancelled();
+    assert_eq!(
+        response.await.unwrap().unwrap_err().inner(),
+        &crate::CommitBlockError::Cancelled
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_parent_wait_never_enters_the_write_channel() {
+    let _init_guard = zakura_test::init();
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let parent = block.header.previous_block_hash;
+    let (mut state, _, _, _) =
+        StateService::new(Config::ephemeral(), &Network::Mainnet, Height::MAX, 0)
+            .await
+            .unwrap();
+    let cancellation = crate::CommitCancellation::default();
+    let response = state.queue_and_commit_to_non_finalized_state(
+        block.clone().into(),
+        None,
+        Some(cancellation.clone()),
+    );
+    assert!(cancellation.cancel());
+    let (sender, mut writes) = tokio::sync::mpsc::unbounded_channel();
+    state.block_write_sender.non_finalized = Some(sender);
+    state.send_ready_non_finalized_queued(parent);
+    assert!(writes.try_recv().is_err());
+    assert_eq!(
+        response.await.unwrap().unwrap_err().inner(),
+        &crate::CommitBlockError::Cancelled
+    );
+
+    let replacement = crate::CommitCancellation::default();
+    let response = state.queue_and_commit_to_non_finalized_state(
+        block.into(),
+        None,
+        Some(replacement.clone()),
+    );
+    state.send_ready_non_finalized_queued(parent);
+    assert!(!replacement.cancel());
+    let write = writes.try_recv().unwrap();
+    let super::write::NonFinalizedWriteMessage::Commit {
+        queued: (block, sender, _, _),
+        ..
+    } = write
+    else {
+        panic!("the queue admits a block commit");
+    };
+    sender.send(Ok(block.hash)).unwrap();
+    assert_eq!(response.await.unwrap().unwrap(), block.hash);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn duplicate_parent_wait_uses_the_replacement_fence() {
+    let _init_guard = zakura_test::init();
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let parent = block.header.previous_block_hash;
+    let (mut state, _, _, _) =
+        StateService::new(Config::ephemeral(), &Network::Mainnet, Height::MAX, 0)
+            .await
+            .unwrap();
+    let old = crate::CommitCancellation::default();
+    let old_response = state.queue_and_commit_to_non_finalized_state(
+        block.clone().into(),
+        None,
+        Some(old.clone()),
+    );
+    let replacement = crate::CommitCancellation::default();
+    let response = state.queue_and_commit_to_non_finalized_state(
+        block.into(),
+        None,
+        Some(replacement.clone()),
+    );
+    assert!(old_response
+        .await
+        .unwrap()
+        .unwrap_err()
+        .inner()
+        .is_duplicate_request());
+    assert!(old.cancel());
+    state.non_finalized_state_queued_blocks.prune_cancelled();
+    assert!(state
+        .non_finalized_state_queued_blocks
+        .has_queued_children(parent));
+    assert!(replacement.cancel());
+    state.non_finalized_state_queued_blocks.prune_cancelled();
+    assert_eq!(
+        response.await.unwrap().unwrap_err().inner(),
+        &crate::CommitBlockError::Cancelled
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_duplicate_preserves_the_pending_state_request() {
+    let _guard = zakura_test::init();
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let (mut state, _, _, _) =
+        StateService::new(Config::ephemeral(), &Network::Mainnet, Height::MAX, 0)
+            .await
+            .unwrap();
+    let mut pending =
+        state.queue_and_commit_to_non_finalized_state(block.clone().into(), None, None);
+    let cancellation = crate::CommitCancellation::default();
+    assert!(cancellation.cancel());
+    let duplicate = state.queue_and_commit_to_non_finalized_state(
+        block.clone().into(),
+        None,
+        Some(cancellation),
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(1), duplicate)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err()
+            .inner(),
+        &crate::CommitBlockError::Cancelled
+    );
+    assert!(matches!(
+        pending.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    let queued = state
+        .non_finalized_state_queued_blocks
+        .dequeue_children(block.header.previous_block_hash);
+    assert_eq!(queued.len(), 1);
+    let (block, sender, _, _) = queued.into_iter().next().unwrap();
+    sender.send(Ok(block.hash)).unwrap();
+    assert_eq!(pending.await.unwrap().unwrap(), block.hash);
+}
+
 /// A missing parent can retain a semantic commit for the lifetime of the state service.
 #[tokio::test(flavor = "multi_thread")]
 async fn missing_parent_commit_waits_until_state_shutdown() {
@@ -2228,7 +2424,7 @@ async fn missing_parent_commit_waits_until_state_shutdown() {
         StateService::new(Config::ephemeral(), &Network::Mainnet, Height::MAX, 0)
             .await
             .unwrap();
-    let mut response = state.queue_and_commit_to_non_finalized_state(block.into(), None);
+    let mut response = state.queue_and_commit_to_non_finalized_state(block.into(), None, None);
     assert!(state
         .non_finalized_state_queued_blocks
         .has_queued_children(parent));

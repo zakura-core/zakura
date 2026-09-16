@@ -921,7 +921,7 @@ impl StateService {
         queued: QueuedSemanticallyVerified,
         error: impl Into<CommitSemanticallyVerifiedError>,
     ) {
-        let (finalized, rsp_tx, admission) = queued;
+        let (finalized, rsp_tx, admission, _) = queued;
 
         if let Some(admission) = admission {
             admission.reject();
@@ -1011,16 +1011,29 @@ impl StateService {
         &mut self,
         semantically_verified: SemanticallyVerifiedBlock,
         admission: Option<BlockAdmission>,
+        cancellation: Option<crate::CommitCancellation>,
     ) -> oneshot::Receiver<Result<block::Hash, CommitSemanticallyVerifiedError>> {
+        if cancellation
+            .as_ref()
+            .is_some_and(crate::CommitCancellation::is_cancelled)
+        {
+            let (sender, receiver) = oneshot::channel();
+            let _ = sender.send(Err(CommitBlockError::Cancelled.into()));
+            return receiver;
+        }
         tracing::debug!(block = %semantically_verified.block, "queueing block for contextual verification");
         let parent_hash = semantically_verified.block.header.previous_block_hash;
         let hash = semantically_verified.hash;
+        if let Some(cancellation) = &cancellation {
+            cancellation.waiting_for_parent();
+        }
 
         // Drop hashes of any blocks the write task has rejected before checking
         // the SentHashes membership below. Without this, a rejected same-hash
         // block would lock out a later honest re-delivery of a block at the
         // same hash as a false "duplicate".
         self.drain_non_finalized_rejected_hashes();
+        self.non_finalized_state_queued_blocks.prune_cancelled();
 
         if let Some((ancestor, kind)) = self
             .non_finalized_failed_ancestors
@@ -1091,9 +1104,9 @@ impl StateService {
         {
             tracing::debug!("replacing older queued request with new request");
             let (rsp_tx, rsp_rx) = oneshot::channel();
-            let (_, old_rsp_tx, old_admission) = self.non_finalized_state_queued_blocks.replace(
+            let (_, old_rsp_tx, old_admission, _) = self.non_finalized_state_queued_blocks.replace(
                 semantically_verified.hash,
-                (semantically_verified, rsp_tx, admission),
+                (semantically_verified, rsp_tx, admission, cancellation),
             );
             if let Some(old_admission) = old_admission {
                 old_admission.reject();
@@ -1125,6 +1138,7 @@ impl StateService {
                 semantically_verified,
                 rsp_tx,
                 admission,
+                cancellation,
             ));
             rsp_rx
         };
@@ -1226,7 +1240,18 @@ impl StateService {
                         );
                         continue;
                     };
-                    let (SemanticallyVerifiedBlock { hash, .. }, _, _) = &queued_child;
+                    if let Some(cancellation) = &queued_child.3 {
+                        if !crate::CommitCancellation::try_start_batch(std::slice::from_ref(
+                            cancellation,
+                        )) {
+                            Self::send_semantically_verified_block_error(
+                                queued_child,
+                                CommitBlockError::Cancelled,
+                            );
+                            continue;
+                        }
+                    }
+                    let (SemanticallyVerifiedBlock { hash, .. }, _, _, _) = &queued_child;
                     let hash = *hash;
 
                     self.non_finalized_block_write_sent_hashes
@@ -1815,7 +1840,11 @@ impl Service<Request> for StateService {
 
                 let rsp_rx = tokio::task::block_in_place(move || {
                     span.in_scope(|| {
-                        self.queue_and_commit_to_non_finalized_state(semantically_verified, None)
+                        self.queue_and_commit_to_non_finalized_state(
+                            semantically_verified,
+                            None,
+                            None,
+                        )
                     })
                 });
 
@@ -1842,6 +1871,33 @@ impl Service<Request> for StateService {
                 .boxed()
             }
 
+            Request::CommitSemanticallyVerifiedBlockCancellable {
+                block,
+                cancellation,
+            } => {
+                self.assert_block_can_be_validated(&block);
+                if !cancellation.is_cancelled() {
+                    self.pending_utxos.check_against_ordered(&block.new_outputs);
+                }
+                let rsp_rx = tokio::task::block_in_place(|| {
+                    self.queue_and_commit_to_non_finalized_state(
+                        block,
+                        None,
+                        Some(cancellation.clone()),
+                    )
+                });
+                async move {
+                    tokio::select! {
+                        result = rsp_rx => result
+                            .map_err(|_| CommitBlockError::WriteTaskExited.into())
+                            .and_then(|result| result)
+                            .map(Response::Committed)
+                            .map_err(BoxError::from),
+                        _ = cancellation.cancelled() => Err(BoxError::from(CommitSemanticallyVerifiedError::from(CommitBlockError::Cancelled))),
+                    }
+                }.boxed()
+            }
+
             Request::CommitSemanticallyVerifiedBlockWithAdmission {
                 block,
                 admission,
@@ -1860,7 +1916,7 @@ impl Service<Request> for StateService {
                 let queue_send_start = Instant::now();
                 let rsp_rx = tokio::task::block_in_place(move || {
                     span.in_scope(|| {
-                        self.queue_and_commit_to_non_finalized_state(block, Some(admission))
+                        self.queue_and_commit_to_non_finalized_state(block, Some(admission), None)
                     })
                 });
                 metrics::histogram!("state.semantic_commit.queue_and_commit.duration_seconds")

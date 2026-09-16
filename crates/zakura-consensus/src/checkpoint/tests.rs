@@ -1390,3 +1390,81 @@ fn state_checkpoint_commit_context_errors_are_unscored() {
 
     assert_eq!(err.misbehavior_score(), 0);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_partial_checkpoint_range_can_be_resubmitted() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+    let blocks: Vec<_> = zakura_test::vectors::MAINNET_BLOCKS
+        .range(0..=2)
+        .map(|(_, bytes)| Arc::<Block>::zcash_deserialize(&bytes[..]).unwrap())
+        .collect();
+    let checkpoints = BTreeMap::from([
+        (block::Height(0), blocks[0].hash()),
+        (block::Height(2), blocks[2].hash()),
+    ]);
+    let state = zakura_state::init_test(&Mainnet).await;
+    let mut verifier = CheckpointVerifier::from_list(checkpoints, &Mainnet, None, state)
+        .map_err(|error| eyre!(error))?;
+    timeout(Duration::from_secs(10), verifier.call(blocks[0].clone())).await??;
+    let cancellation = zs::CommitCancellation::default();
+    let mut pending = verifier.call_cancellable(blocks[1].clone(), Some(cancellation.clone()));
+    assert!(timeout(Duration::from_millis(20), &mut pending)
+        .await
+        .is_err());
+    assert!(cancellation.cancel());
+    assert!(matches!(
+        timeout(Duration::from_secs(1), pending).await?,
+        Err(VerifyCheckpointError::Cancelled)
+    ));
+    assert_eq!(
+        verifier.previous_checkpoint_height(),
+        PreviousCheckpoint(block::Height(0))
+    );
+    let first = verifier.call(blocks[1].clone());
+    let second = verifier.call(blocks[2].clone());
+    assert_eq!(
+        timeout(Duration::from_secs(10), first).await??,
+        blocks[1].hash()
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(10), second).await??,
+        blocks[2].hash()
+    );
+    assert_eq!(verifier.previous_checkpoint_height(), FinalCheckpoint);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_duplicate_preserves_the_pending_checkpoint_request() -> Result<(), Report> {
+    let _guard = zakura_test::init();
+    let blocks: Vec<_> = zakura_test::vectors::MAINNET_BLOCKS
+        .range(0..=2)
+        .map(|(_, bytes)| Arc::<Block>::zcash_deserialize(&bytes[..]).unwrap())
+        .collect();
+    let checkpoints = BTreeMap::from([
+        (block::Height(0), blocks[0].hash()),
+        (block::Height(2), blocks[2].hash()),
+    ]);
+    let state = zakura_state::init_test(&Mainnet).await;
+    let mut verifier = CheckpointVerifier::from_list(checkpoints, &Mainnet, None, state)
+        .map_err(|error| eyre!(error))?;
+    timeout(Duration::from_secs(10), verifier.call(blocks[0].clone())).await??;
+    let pending = verifier.call(blocks[1].clone());
+    let cancellation = zs::CommitCancellation::default();
+    assert!(cancellation.cancel());
+    let duplicate = verifier.call_cancellable(blocks[1].clone(), Some(cancellation));
+    assert!(matches!(
+        timeout(Duration::from_secs(1), duplicate).await?,
+        Err(VerifyCheckpointError::Cancelled)
+    ));
+    let last = verifier.call(blocks[2].clone());
+    assert_eq!(
+        timeout(Duration::from_secs(10), pending).await??,
+        blocks[1].hash()
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(10), last).await??,
+        blocks[2].hash()
+    );
+    Ok(())
+}

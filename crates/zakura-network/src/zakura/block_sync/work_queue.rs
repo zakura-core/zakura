@@ -1076,15 +1076,14 @@ impl WorkQueue {
 
     /// Sum of reserved request-estimate bytes across `pending` + `in_flight`.
     ///
-    /// O(1): returns the incrementally-maintained counter (see
-    /// [`WorkQueueInner::reserved_bytes`]). This is on the sequencer's hot path via
-    /// `publish_view`, so it must not scan the maps. `reserved_bytes_scanned` is
-    /// the O(n) ground-truth recomputation used by the audit / tests to catch drift.
+    /// Tests compare this maintained counter with `reserved_bytes_scanned`.
+    #[cfg(test)]
     pub(super) fn reserved_bytes(&self) -> u64 {
         self.lock().reserved_bytes
     }
 
     /// Keep settlement from invalidating the ledger snapshot before the budget read.
+    /// The sequencer calls this on each publication, so the audit must not scan work.
     pub(super) fn audit_budget(&self, budget: &super::super::transport::ByteBudget) -> bool {
         let inner = self.lock();
         budget.audit(inner.reserved_bytes, "block-sync work queue")

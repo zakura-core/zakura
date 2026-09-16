@@ -188,7 +188,7 @@ impl ZakuraDb {
             network,
         )
         .map_err(|source| StateInitError::DatabaseFormatVersion {
-            path: version_path,
+            path: version_path.clone(),
             source,
         })?;
         if let Some(version) = &disk_version {
@@ -213,7 +213,6 @@ impl ZakuraDb {
             )
             .or(disk_version)
         };
-        let disk_version_before_open = disk_version.clone();
 
         // Log any format changes before opening the database, in case opening fails.
         let format_change = DbFormatChange::open_database(format_version_in_code, disk_version);
@@ -241,12 +240,35 @@ impl ZakuraDb {
         // file can only be changed while we hold the RocksDB database lock.
         let disk_db = DiskDb::new(
             config,
-            db_kind,
+            &db_kind,
             format_version_in_code,
             network,
             column_families_in_code,
             read_only,
         )?;
+
+        // Another process can move or upgrade the database after the initial probe.
+        // Re-read its marker while this writer holds the RocksDB lock.
+        let disk_version_before_open = if version_path.exists() {
+            database_format_version_on_disk(config, &db_kind, format_version_in_code.major, network)
+                .map_err(|source| StateInitError::DatabaseFormatVersion {
+                    path: version_path,
+                    source,
+                })?
+        } else {
+            format_change.initial_disk_version()
+        };
+        if let Some(version) = &disk_version_before_open {
+            if version.major > format_version_in_code.major {
+                return Err(StateInitError::UnsupportedDatabaseFormat {
+                    path: disk_db.path().to_owned(),
+                    disk_version: version.clone(),
+                    running_version: format_version_in_code.clone(),
+                });
+            }
+        }
+        let format_change =
+            DbFormatChange::open_database(format_version_in_code, disk_version_before_open.clone());
 
         let mut db = ZakuraDb {
             config: Arc::new(config.clone()),
@@ -633,6 +655,52 @@ mod tests {
 
         db.update_format_version_on_disk(&disk_version)
             .expect("fixture version write succeeds");
+    }
+
+    #[test]
+    fn concurrent_major_reuse_keeps_one_startup_running() {
+        let _init_guard = zakura_test::init();
+        let network = Network::Mainnet;
+        let running = state_database_format_version_in_code();
+        for _ in 0..8 {
+            let (_cache, config) = persistent_config();
+            let previous = Version::new(running.major - 1, 0, 0);
+            let db = DiskDb::new(
+                &config,
+                STATE_DATABASE_KIND,
+                &previous,
+                &network,
+                STATE_COLUMN_FAMILIES_IN_CODE
+                    .iter()
+                    .map(ToString::to_string),
+                false,
+            )
+            .unwrap();
+            crate::write_database_format_version_to_disk(
+                &config,
+                STATE_DATABASE_KIND,
+                previous.major,
+                &previous,
+                &network,
+            )
+            .unwrap();
+            drop(db);
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                let start = || {
+                    barrier.wait();
+                    open(&config, &network, false)
+                };
+                let first = scope.spawn(start);
+                let second = scope.spawn(start);
+                let first = first.join().expect("first startup must not panic");
+                let second = second.join().expect("second startup must not panic");
+                assert!(
+                    first.is_ok() || second.is_ok(),
+                    "one startup must acquire the database"
+                );
+            });
+        }
     }
 
     #[test]

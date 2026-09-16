@@ -1307,8 +1307,11 @@ where
                     };
                     let parent_info = parent_info
                         .expect("AwaitBlockInfo only returns after the parent block commits");
-                    let issuance_deficit =
-                        Some(parent_info.value_pools().issuance_deficit_amount());
+                    let issuance_deficit = parent_info
+                        .value_pools()
+                        .issuance_deficit_amount()
+                        .constrain()
+                        .ok();
                     let deferred_pool_balance_change = deferred_pool_balance_change(
                         req_block.block.height,
                         &network,

@@ -3130,7 +3130,11 @@ where
             &self.network,
             height,
             miner_params,
-            Some(chain_info.value_pools.issuance_deficit_amount()),
+            chain_info
+                .value_pools
+                .issuance_deficit_amount()
+                .constrain()
+                .ok(),
             mempool_txs,
             mempool_tx_deps,
         )
@@ -3526,7 +3530,7 @@ where
             None => best_chain_tip_height(&self.latest_chain_tip)?,
         };
 
-        // ZIP 234 derives the block subsidy from the money reserve after the parent
+        // ZIP 234 derives the block subsidy from the issuance deficit after the parent
         // block, so look the parent's chain value pools up when the rules apply.
         let issuance_deficit = if is_zip234_active(&net, height) {
             let parent = height.previous().map_misc_error()?;
@@ -3540,12 +3544,12 @@ where
                 unreachable!("unmatched response to a BlockInfo request");
             };
 
-            Some(
-                parent_info
-                    .ok_or_misc_error("parent block is not in any chain")?
-                    .value_pools()
-                    .issuance_deficit_amount(),
-            )
+            parent_info
+                .ok_or_misc_error("parent block is not in any chain")?
+                .value_pools()
+                .issuance_deficit_amount()
+                .constrain()
+                .ok()
         } else {
             None
         };

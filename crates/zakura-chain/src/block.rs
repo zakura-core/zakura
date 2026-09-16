@@ -374,11 +374,22 @@ impl Block {
             .coinbase_height()
             .ok_or(ValueBalanceError::MissingCoinbaseHeight)?;
 
-        // A block whose height has no halving subsidy issues nothing, so it owes nothing.
-        let scheduled = halving_block_subsidy(height, network)
-            .unwrap_or_else(|_| Amount::zero())
-            .constrain::<NegativeAllowed>()
-            .map_err(ValueBalanceError::IssuanceDeficit)?;
+        // `ExpectedIssuedSupply` sums the schedule from genesis but counts the genesis
+        // block's subsidy as zero, so genesis must owe nothing here too. On a network with
+        // no slow start, `halving_block_subsidy(Height(0))` is a full subsidy, and counting
+        // it would leave the stored deficit one subsidy above the specification's value for
+        // the whole life of the chain.
+        //
+        // A block whose height has no halving subsidy also issues nothing, so it owes
+        // nothing.
+        let scheduled = if height == Height(0) {
+            Amount::zero()
+        } else {
+            halving_block_subsidy(height, network)
+                .unwrap_or_else(|_| Amount::zero())
+                .constrain::<NegativeAllowed>()
+                .map_err(ValueBalanceError::IssuanceDeficit)?
+        };
 
         let issued = change.total().map_err(ValueBalanceError::IssuanceDeficit)?;
 

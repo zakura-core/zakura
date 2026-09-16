@@ -709,7 +709,13 @@ fn deferred_pool_balance_change(
         .previous()
         .ok()
         .and_then(|parent| db.block_info(parent.into()))
-        .map(|parent_info| parent_info.value_pools().issuance_deficit_amount());
+        .and_then(|parent_info| {
+            parent_info
+                .value_pools()
+                .issuance_deficit_amount()
+                .constrain()
+                .ok()
+        });
 
     let block_subsidy = block_subsidy(height, network, issuance_deficit)?;
     let deferred_amount = funding_stream_values(height, network, block_subsidy)?

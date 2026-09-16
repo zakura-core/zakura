@@ -3252,9 +3252,12 @@ async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
             })
             .sum();
 
-        ValueBalance::from_transparent_amount(
+        let mut pools = ValueBalance::from_transparent_amount(
             Amount::try_from(scheduled_supply - deficit).expect("valid issued supply"),
-        )
+        );
+        pools.set_issuance_deficit_amount(Amount::try_from(deficit).expect("valid deficit"));
+
+        pools
     };
 
     let miner_address = ZcashAddress::from_transparent_p2pkh(NetworkType::Regtest, [0x7e; 20]);

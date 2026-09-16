@@ -41,7 +41,8 @@ proptest! {
                         | ValueBalanceError::Sapling(_)
                         | ValueBalanceError::Orchard(_)
                         | ValueBalanceError::Deferred(_)
-                        | ValueBalanceError::Ironwood(_))
+                        | ValueBalanceError::Ironwood(_)
+                        | ValueBalanceError::IssuanceDeficit(_))
                 )
             ),
         }
@@ -81,7 +82,8 @@ proptest! {
                         | ValueBalanceError::Sapling(_)
                         | ValueBalanceError::Orchard(_)
                         | ValueBalanceError::Deferred(_)
-                        | ValueBalanceError::Ironwood(_))
+                        | ValueBalanceError::Ironwood(_)
+                        | ValueBalanceError::IssuanceDeficit(_))
                 )),
         }
     }
@@ -123,7 +125,8 @@ proptest! {
                         | ValueBalanceError::Sapling(_)
                         | ValueBalanceError::Orchard(_)
                         | ValueBalanceError::Deferred(_)
-                        | ValueBalanceError::Ironwood(_))
+                        | ValueBalanceError::Ironwood(_)
+                        | ValueBalanceError::IssuanceDeficit(_))
                  ))
         }
     }

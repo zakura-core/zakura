@@ -452,7 +452,11 @@ impl BlockTemplateResponse {
                 height,
                 miner_params,
                 txs_fee,
-                Some(chain_info.value_pools.issuance_deficit_amount()),
+                chain_info
+                    .value_pools
+                    .issuance_deficit_amount()
+                    .constrain()
+                    .ok(),
             )?,
         };
 

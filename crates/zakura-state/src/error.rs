@@ -785,7 +785,7 @@ pub enum ValidateContextError {
     #[non_exhaustive]
     NegativeIssuanceDeficit {
         height: block::Height,
-        deficit_before: amount::Amount<NonNegative>,
+        deficit_before: amount::Amount<NegativeAllowed>,
         deficit_change: amount::Amount<NegativeAllowed>,
     },
 

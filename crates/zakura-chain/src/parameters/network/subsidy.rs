@@ -762,7 +762,9 @@ fn reissuance_amount(amount: Amount<NonNegative>) -> Result<Amount<NonNegative>,
 /// function does not re-derive it from the schedule.
 ///
 /// [ZIP 234]: https://zips.z.cash/zip-0234
-fn reissuance_bonus(issuance_deficit: Amount<NonNegative>) -> Result<Amount<NonNegative>, SubsidyError> {
+fn reissuance_bonus(
+    issuance_deficit: Amount<NonNegative>,
+) -> Result<Amount<NonNegative>, SubsidyError> {
     reissuance_amount(issuance_deficit)
 }
 

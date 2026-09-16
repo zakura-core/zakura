@@ -39,8 +39,14 @@ pub struct ValueBalance<C> {
     /// [`Self::remaining_transaction_value`]; including it would double-count value that is
     /// by definition in no pool.
     ///
+    /// The deficit is signed whatever `C` is. zips#1354 rejects a block that makes it
+    /// negative, but only from the reissuance start height, so a chain below that height
+    /// must be able to hold a negative value. `issuance_deficit_is_non_negative` enforces
+    /// the rule where the specification places it, rather than the type doing it
+    /// everywhere.
+    ///
     /// [zips#1354]: https://github.com/zcash/zips/pull/1354
-    issuance_deficit: Amount<C>,
+    issuance_deficit: Amount<NegativeAllowed>,
 }
 
 impl<C> ValueBalance<C>
@@ -162,12 +168,15 @@ where
     }
 
     /// Returns the [`ValueBalance::issuance_deficit`] amount.
-    pub fn issuance_deficit_amount(&self) -> Amount<C> {
+    pub fn issuance_deficit_amount(&self) -> Amount<NegativeAllowed> {
         self.issuance_deficit
     }
 
     /// Sets the [`ValueBalance::issuance_deficit`] amount without affecting other amounts.
-    pub fn set_issuance_deficit_amount(&mut self, issuance_deficit: Amount<C>) -> &Self {
+    pub fn set_issuance_deficit_amount(
+        &mut self,
+        issuance_deficit: Amount<NegativeAllowed>,
+    ) -> &Self {
         self.issuance_deficit = issuance_deficit;
         self
     }
@@ -182,7 +191,7 @@ where
             orchard: zero,
             deferred: zero,
             ironwood: zero,
-            issuance_deficit: zero,
+            issuance_deficit: Amount::zero(),
         }
     }
 
@@ -222,10 +231,9 @@ where
             orchard: self.orchard.constrain().map_err(Orchard)?,
             deferred: self.deferred.constrain().map_err(Deferred)?,
             ironwood: self.ironwood.constrain().map_err(Ironwood)?,
-            issuance_deficit: self
-                .issuance_deficit
-                .constrain()
-                .map_err(IssuanceDeficit)?,
+            // The deficit is signed in every `ValueBalance`, so it survives the conversion
+            // unchanged.
+            issuance_deficit: self.issuance_deficit,
         })
     }
 }

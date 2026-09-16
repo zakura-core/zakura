@@ -438,7 +438,7 @@ where
 
             check::shielded_action_limits_are_valid(&block.transactions, height, &network)?;
 
-            // ZIP 234 derives the block subsidy from the money reserve after the parent
+            // ZIP 234 derives the block subsidy from the issuance deficit after the parent
             // block, so a block at or above the start height needs its parent's chain
             // value pools. Wait for the parent commit if its verification is still running.
             let issuance_deficit =
@@ -459,17 +459,23 @@ where
                     let parent_info = parent_info
                         .expect("AwaitBlockInfo only returns after the parent block commits");
 
-                    Some(parent_info.value_pools().issuance_deficit_amount())
+                    // The deficit is signed, but `issuance_deficit_is_non_negative` rejects
+                    // any committed block at a ZIP 234 height that leaves it negative, so a
+                    // committed parent at this height always constrains.
+                    parent_info
+                        .value_pools()
+                        .issuance_deficit_amount()
+                        .constrain()
+                        .ok()
                 } else {
                     None
                 };
 
-            let expected_block_subsidy =
-                zakura_chain::parameters::subsidy::block_subsidy(
-                    height,
-                    &network,
-                    issuance_deficit,
-                )?;
+            let expected_block_subsidy = zakura_chain::parameters::subsidy::block_subsidy(
+                height,
+                &network,
+                issuance_deficit,
+            )?;
 
             // See [ZIP-1015](https://zips.z.cash/zip-1015).
             let deferred_pool_balance_change =

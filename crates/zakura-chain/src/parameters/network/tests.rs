@@ -784,10 +784,7 @@ fn expected_issued_supply_matches_per_height_sum() {
 /// Checks the ZIP 234 reissuance bonus.
 #[test]
 fn zip234_issuance() {
-    use crate::{
-        parameters::ZIP218_ENABLED,
-        value_balance::ValueBalance,
-    };
+    use crate::{parameters::ZIP218_ENABLED, value_balance::ValueBalance};
 
     let _init_guard = zakura_test::init();
 

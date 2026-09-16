@@ -2017,6 +2017,9 @@ const ZIP234_TEST_BONUS: i64 = 166;
 
 /// Returns the chain value pools after `parent` on `network`, `deficit` zatoshi behind the
 /// halving schedule.
+///
+/// The deficit is stored in its own value pool leg, and the transparent pool is set so that
+/// the two agree with `ExpectedIssuedSupply - IssuedSupply`, as they do on a real chain.
 #[cfg(feature = "nu7")]
 fn zip234_parent_pools(
     network: &Network,
@@ -2032,9 +2035,12 @@ fn zip234_parent_pools(
         })
         .sum();
 
-    zakura_chain::value_balance::ValueBalance::from_transparent_amount(
+    let mut pools = zakura_chain::value_balance::ValueBalance::from_transparent_amount(
         Amount::try_from(scheduled_supply - deficit).expect("the issued supply is valid"),
-    )
+    );
+    pools.set_issuance_deficit_amount(Amount::try_from(deficit).expect("valid deficit"));
+
+    pools
 }
 
 /// Semantic verification checks the coinbase against the ZIP 234 subsidy, which depends on
@@ -2101,11 +2107,13 @@ async fn zip234_block_verification_checks_the_reissuance_bonus() {
         }),
     ));
 
-    // A parent that issued more than the schedule makes the deficit negative.
+    // A parent that issued more than the schedule has a negative deficit. The state rejects
+    // such a parent at a ZIP 234 height, so semantic verification only has to refuse to
+    // compute a subsidy from it.
     assert!(matches!(
         verify(-1, halving_subsidy).await,
         Err(VerifyBlockError::Subsidy(
-            SubsidyError::NegativeIssuanceDeficit
+            SubsidyError::MissingIssuanceDeficit
         )),
     ));
 }

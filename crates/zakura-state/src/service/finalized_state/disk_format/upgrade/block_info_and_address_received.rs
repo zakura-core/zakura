@@ -183,15 +183,16 @@ impl DiskFormatUpgrade for Upgrade {
             let deferred_pool_balance_change = if height > network.slow_start_interval() {
                 // ZIP 234 derives the block subsidy from the money reserve after the parent
                 // block, which is the running value pool.
-                let block_subsidy =
-                    block_subsidy(height, &network, Some(value_pool.issuance_deficit_amount()))
-                        .map_err(
-                        |error| {
-                            super::FormatChangeError::InvalidPostcondition(format!(
-                                "invalid block subsidy at height {height:?}: {error}"
-                            ))
-                        },
-                    )?;
+                let block_subsidy = block_subsidy(
+                    height,
+                    &network,
+                    value_pool.issuance_deficit_amount().constrain().ok(),
+                )
+                .map_err(|error| {
+                    super::FormatChangeError::InvalidPostcondition(format!(
+                        "invalid block subsidy at height {height:?}: {error}"
+                    ))
+                })?;
 
                 // See [ZIP-1015](https://zips.z.cash/zip-1015).
                 let deferred_pool_balance_change =

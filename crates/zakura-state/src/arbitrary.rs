@@ -89,7 +89,7 @@ impl ContextuallyVerifiedBlock {
             block,
             zero_spent_utxos,
         )
-            .expect("all UTXOs are provided with zero values")
+        .expect("all UTXOs are provided with zero values")
     }
 
     /// Create a [`ContextuallyVerifiedBlock`] from a [`Block`] or [`SemanticallyVerifiedBlock`],

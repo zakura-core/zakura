@@ -180,3 +180,61 @@ fn finalized_state_rejects_a_block_that_makes_the_deficit_negative() {
     commit(&mut state, &on_schedule).expect("a zero deficit is valid");
     assert_eq!(state.db.finalized_tip_height(), Some(START));
 }
+
+/// The stored issuance deficit equals the specification's definition at every height.
+///
+/// zips#1354 defines `IssuanceDeficit(height)` as
+/// `ExpectedIssuedSupply(height) - IssuedSupply(height)`. Zakura carries the value forward
+/// block by block in [`ValueBalance::issuance_deficit`] instead of re-deriving it. This is
+/// the acceptance test for that refactor: the two must agree everywhere, on a chain whose
+/// blocks under-claim their subsidy (raising the deficit) and on the reissuance block that
+/// draws it back down.
+///
+/// [`ValueBalance::issuance_deficit`]: zakura_chain::value_balance::ValueBalance
+#[test]
+fn issuance_deficit_matches_the_schedule() {
+    let _init_guard = zakura_test::init();
+
+    let network = zip234_network();
+    let (mut state, parent) = state_below_start(&network);
+
+    // `state_below_start` mines dust coinbases, so every block so far under-claimed its
+    // subsidy and the deficit has been accumulating.
+    for height in 0..START.0 {
+        let height = Height(height);
+        let block_info = state
+            .db
+            .block_info(height.into())
+            .expect("every committed block has block info");
+
+        let expected = expected_issued_supply(height, &network)
+            .expect("the halving schedule is a valid amount at every height");
+        let issued = block_info.value_pools().issued_supply();
+        let derived = (expected - issued).expect("the chain is never ahead of its schedule");
+
+        assert_eq!(
+            block_info.value_pools().issuance_deficit_amount(),
+            derived,
+            "the stored deficit must equal ExpectedIssuedSupply - IssuedSupply at {height:?}",
+        );
+    }
+
+    let deficit_below_start = state.db.finalized_value_pool().issuance_deficit_amount();
+    assert!(
+        deficit_below_start > Amount::<NonNegative>::zero(),
+        "under-claiming coinbases must leave a deficit to reissue, got {deficit_below_start:?}",
+    );
+
+    // The block at START claims its reissuance bonus, which draws the deficit back down by
+    // exactly the bonus.
+    let on_schedule = start_block(&state, &network, &parent, 0);
+    commit(&mut state, &on_schedule).expect("a zero deficit is valid");
+
+    let expected = expected_issued_supply(START, &network).expect("valid expected issued supply");
+    let pools = state.db.finalized_value_pool();
+    assert_eq!(
+        pools.issuance_deficit_amount(),
+        (expected - pools.issued_supply()).expect("the chain is never ahead of its schedule"),
+        "the identity must still hold after a block that claims the reissuance bonus",
+    );
+}

@@ -8,10 +8,7 @@ use zakura_chain::{
         self, merkle::AuthDataRoot, Block, ChainHistoryBlockTxAuthCommitmentHash, CommitmentError,
     },
     history_tree::HistoryTree,
-    parameters::{
-        subsidy::is_zip234_active,
-        Network, NetworkUpgrade,
-    },
+    parameters::{subsidy::is_zip234_active, Network, NetworkUpgrade},
     value_balance::ValueBalance,
     work::difficulty::CompactDifficulty,
 };
@@ -75,23 +72,22 @@ pub(crate) fn issuance_deficit_is_non_negative(
         return Ok(());
     }
 
-    let deficit_before = value_pools
-        .issuance_deficit_amount()
-        .constrain::<NegativeAllowed>()
-        .expect("a non-negative amount is always a valid signed amount");
+    let deficit_before = value_pools.issuance_deficit_amount();
+    let deficit_change = block_value_pool_change.issuance_deficit_amount();
 
-    let deficit_after = (deficit_before + block_value_pool_change.issuance_deficit_amount())
-        .map_err(|_| ValidateContextError::NegativeIssuanceDeficit {
+    let deficit_after = (deficit_before + deficit_change).map_err(|_| {
+        ValidateContextError::NegativeIssuanceDeficit {
             height,
-            deficit_before: value_pools.issuance_deficit_amount(),
-            deficit_change: block_value_pool_change.issuance_deficit_amount(),
-        })?;
+            deficit_before,
+            deficit_change,
+        }
+    })?;
 
     if deficit_after.zatoshis() < 0 {
         return Err(ValidateContextError::NegativeIssuanceDeficit {
             height,
-            deficit_before: value_pools.issuance_deficit_amount(),
-            deficit_change: block_value_pool_change.issuance_deficit_amount(),
+            deficit_before,
+            deficit_change,
         });
     }
 

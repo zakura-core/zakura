@@ -724,16 +724,20 @@ impl NonFinalizedState {
         let block_hash = prepared.hash;
         let transaction_count = prepared.block.transactions.len();
         let spent_utxo_count = spent_utxos.len();
-        let contextual =
-            ContextuallyVerifiedBlock::with_block_and_spent_utxos(&self.network, prepared, spent_utxos).map_err(
-                |value_balance_error| ValidateContextError::CalculateBlockChainValueChange {
-                    value_balance_error,
-                    height,
-                    block_hash,
-                    transaction_count,
-                    spent_utxo_count,
-                },
-            );
+        let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+            &self.network,
+            prepared,
+            spent_utxos,
+        )
+        .map_err(|value_balance_error| {
+            ValidateContextError::CalculateBlockChainValueChange {
+                value_balance_error,
+                height,
+                block_hash,
+                transaction_count,
+                spent_utxo_count,
+            }
+        });
         contextual_metrics.record_duration(
             "state.contextual.block_construction.duration_seconds",
             "state.contextual.mined.block_construction.duration_seconds",

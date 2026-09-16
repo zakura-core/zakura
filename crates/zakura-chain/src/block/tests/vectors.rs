@@ -110,7 +110,9 @@ fn chain_value_pool_change_propagates_transaction_value_balance_errors() {
     };
 
     assert!(
-        block.chain_value_pool_change(&Network::Mainnet, &utxos, None).is_err(),
+        block
+            .chain_value_pool_change(&Network::Mainnet, &utxos, None)
+            .is_err(),
         "block-level aggregation should propagate transaction value-balance errors"
     );
 }

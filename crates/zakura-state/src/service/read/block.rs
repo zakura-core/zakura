@@ -356,12 +356,29 @@ where
     any_block_info(chain.iter(), db, hash_or_height)
 }
 
+/// Returns the [`BlockInfo`] for `hash_or_height` in `non_finalized_state` or `db`.
+///
+/// A hash resolves on any non-finalized chain, because a block verifier looks up its
+/// parent, which can be on a side chain. A height resolves only on the best chain, because
+/// a taller side chain can contain heights the best chain doesn't have yet.
+pub fn block_info_by_hash_or_best_chain_height(
+    non_finalized_state: &NonFinalizedState,
+    db: &ZakuraDb,
+    hash_or_height: HashOrHeight,
+) -> Option<BlockInfo> {
+    match hash_or_height {
+        HashOrHeight::Hash(_) => {
+            any_block_info(non_finalized_state.chain_iter(), db, hash_or_height)
+        }
+        HashOrHeight::Height(_) => block_info(non_finalized_state.best_chain(), db, hash_or_height),
+    }
+}
+
 /// Returns the [`BlockInfo`] of the block with [`block::Hash`] or [`Height`], if it
 /// exists in any of the non-finalized `chains` or in the finalized `db`.
 ///
-/// A block verifier looks up its parent, which can be on a chain other than the best one,
-/// so this searches every non-finalized chain. Heights still resolve on the best chain
-/// first, because `chains` yields it first.
+/// Heights resolve on the first chain in `chains` that has them, so use
+/// [`block_info_by_hash_or_best_chain_height`] to look up heights in the best chain.
 pub fn any_block_info<'a, C: AsRef<Chain> + 'a>(
     mut chains: impl Iterator<Item = &'a C>,
     db: &ZakuraDb,

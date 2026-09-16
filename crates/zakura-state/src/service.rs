@@ -2815,13 +2815,13 @@ impl Service<ReadRequest> for ReadStateService {
             }
 
             // Used by getblock
-            ReadRequest::BlockInfo(hash_or_height) => {
-                Ok(ReadResponse::BlockInfo(read::any_block_info(
-                    state.latest_non_finalized_state().chain_iter(),
+            ReadRequest::BlockInfo(hash_or_height) => Ok(ReadResponse::BlockInfo(
+                read::block_info_by_hash_or_best_chain_height(
+                    &state.latest_non_finalized_state(),
                     &state.db,
                     hash_or_height,
-                )))
-            }
+                ),
+            )),
 
             // Used by the StateService.
             ReadRequest::Depth(hash) => Ok(ReadResponse::Depth(read::depth(

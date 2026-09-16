@@ -113,10 +113,12 @@ fn estimated_height_after_release(network: &Network, days: u32) -> Height {
         let target_spacing = target_spacing.num_seconds();
         let remaining_blocks = remaining_seconds / target_spacing;
 
-        // The number of blocks from `height` to the start of the next target spacing.
+        // The number of blocks after `height` that still use this target spacing.
+        // The block at the next spacing's start height already uses the next
+        // spacing, so it is not counted here.
         let blocks_until_next_spacing = target_spacings
             .get(index + 1)
-            .map(|(next_height, _)| (i64::from(next_height.0) - height).max(0));
+            .map(|(next_height, _)| (i64::from(next_height.0) - height - 1).max(0));
 
         match blocks_until_next_spacing {
             Some(blocks) if blocks < remaining_blocks => {
@@ -221,12 +223,22 @@ mod tests {
             Height(ESTIMATED_RELEASE_HEIGHT + EOS_PANIC_AFTER * PRE_NU7_BLOCKS_PER_DAY),
         );
 
-        // NU7 activates 7 days into the support window.
+        // NU7 activates 7 days into the support window. Blocks up to `nu7 - 1`
+        // take 75 seconds, which leaves 75 seconds of the seventh day for 3
+        // blocks at 25 seconds, starting with the NU7 activation block.
         let nu7 = ESTIMATED_RELEASE_HEIGHT + 7 * PRE_NU7_BLOCKS_PER_DAY;
         let network = regtest_with_nu7(nu7);
         assert_eq!(
             estimated_height_after_release(&network, EOS_PANIC_AFTER),
-            Height(nu7 + (EOS_PANIC_AFTER - 7) * POST_NU7_BLOCKS_PER_DAY),
+            Height(nu7 - 1 + 3 + (EOS_PANIC_AFTER - 7) * POST_NU7_BLOCKS_PER_DAY),
+        );
+
+        // NU7 activates at the first block after the release, so every block in
+        // the window takes 25 seconds.
+        let network = regtest_with_nu7(ESTIMATED_RELEASE_HEIGHT + 1);
+        assert_eq!(
+            estimated_height_after_release(&network, EOS_PANIC_AFTER),
+            Height(ESTIMATED_RELEASE_HEIGHT + EOS_PANIC_AFTER * POST_NU7_BLOCKS_PER_DAY),
         );
 
         // NU7 activates before the release.

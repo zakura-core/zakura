@@ -585,16 +585,15 @@ impl NetworkUpgrade {
         NetworkUpgrade::current(network, height).averaging_window()
     }
 
-    /// Returns `true` if NU7 is configured on `network` and active at `height`.
+    /// Returns `true` if NU7's consensus rules apply at `height` on `network`.
     ///
-    /// NU7 has no default Mainnet or Testnet activation height, so this also
-    /// checks that `network` configures one before treating it as active.
+    /// This is `IsNU7Activated(height)` from ZIP 218. Like
+    /// [`NetworkUpgrade::target_spacing_for_height`], it treats every upgrade
+    /// after NU7 as NU7-active, including upgrades that share or replace NU7's
+    /// activation height. Networks that configure neither NU7 nor a later
+    /// upgrade never activate it.
     pub fn is_nu7_active(network: &Network, height: block::Height) -> bool {
-        network
-            .activation_list()
-            .values()
-            .any(|upgrade| *upgrade == NetworkUpgrade::Nu7)
-            && NetworkUpgrade::current(network, height) >= NetworkUpgrade::Nu7
+        NetworkUpgrade::current(network, height) >= NetworkUpgrade::Nu7
     }
 
     /// Returns the averaging window timespan for `network` and `height`.

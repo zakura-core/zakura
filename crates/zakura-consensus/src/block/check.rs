@@ -413,9 +413,8 @@ pub fn time_is_valid_at(
 /// exceed a per-block limit can never be mined, so the mempool rejects it on
 /// submission.
 ///
-/// The limits apply only once ZIP 218 is compiled in and NU7 is active, so this
-/// is a no-op in a default build and on any network without an NU7 activation
-/// height.
+/// The limits apply only once NU7 is active, so this is a no-op on any network
+/// without an NU7 activation height.
 ///
 /// # Consensus
 ///
@@ -443,7 +442,7 @@ pub fn shielded_action_limits_are_valid<'a>(
     height: Height,
     network: &Network,
 ) -> Result<(), TransactionError> {
-    if !NetworkUpgrade::is_zip218_active(network, height) {
+    if !NetworkUpgrade::is_nu7_active(network, height) {
         return Ok(());
     }
 

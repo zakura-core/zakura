@@ -46,8 +46,8 @@ use crate::service::finalized_state::{
 /// The widest validation context any build retains below the finalized anchor:
 /// ZIP 218's averaging window plus the median-time span, less the anchor.
 ///
-/// A build reads up to this many rows, so it can remove the rows that a build
-/// with a wider averaging window retained.
+/// Startup reads up to this many rows while normalizing validation contexts
+/// written before the maximum increased.
 const WIDEST_PREDECESSOR_CONTEXT_SPAN: usize =
     POST_NU7_POW_AVERAGING_WINDOW + zakura_header_chain::POW_MEDIAN_BLOCK_SPAN - 1;
 
@@ -269,14 +269,11 @@ impl HeaderChainStore {
         Ok(true)
     }
 
-    /// Resize the retained validation context to this build's span.
+    /// Resize the retained validation context to the consensus maximum.
     ///
-    /// A build with a narrower averaging window did not retain the older rows
-    /// this build needs, so the authenticated full-state header index supplies
-    /// them. A build with a wider averaging window, such as an NU7 build,
-    /// retained older rows that this build does not use, so this step removes
-    /// them. This step runs before the startup audit because that audit requires
-    /// exactly the context for the current build.
+    /// Older builds retained fewer rows, so the authenticated full-state header
+    /// index supplies the missing rows. This step runs before the startup audit
+    /// because that audit requires the complete context.
     ///
     /// Returns the number of rows added or removed.
     pub(in crate::service) fn resize_validation_context(
@@ -933,8 +930,8 @@ fn linked_validation_context(
 ) -> Result<Vec<HeaderValidationContextDisk>, HeaderChainInitializationError> {
     let mut contexts = Vec::new();
     let mut height = anchor.height;
-    // The recovery audit requires exactly the retained predecessor span below
-    // the anchor, which widens with the difficulty averaging window.
+    // The recovery audit requires exactly the maximum predecessor span below
+    // the anchor, even when the active difficulty window is narrower.
     for _ in 0..zakura_header_chain::POW_PREDECESSOR_CONTEXT_SPAN {
         let Ok(previous) = height.previous() else {
             break;

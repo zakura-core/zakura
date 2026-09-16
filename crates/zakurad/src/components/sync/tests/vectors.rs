@@ -20,7 +20,7 @@ use tower::{timeout::Timeout, Service};
 use zakura_chain::{
     block::{self, Block, Height},
     chain_tip::mock::{MockChainTip, MockChainTipSender},
-    parameters::{testnet::ConfiguredActivationHeights, Network, ZIP218_ENABLED},
+    parameters::{testnet::ConfiguredActivationHeights, Network},
     serialization::ZcashDeserializeInto,
 };
 use zakura_consensus::{
@@ -3935,7 +3935,7 @@ async fn lookahead_limit_scales_with_target_spacing() {
         }
         .into(),
     );
-    let multiplier = if ZIP218_ENABLED { 3 } else { 1 };
+    let multiplier = 3;
 
     let sync_config = ZakuradConfig::default().sync;
     let checkpoint_limit = sync_config.checkpoint_verify_concurrency_limit;

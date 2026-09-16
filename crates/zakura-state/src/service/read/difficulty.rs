@@ -412,8 +412,7 @@ fn adjust_difficulty_and_time_for_testnet(
 mod tests {
     use super::*;
     use zakura_chain::{
-        parameters::{testnet::ConfiguredActivationHeights, ZIP218_ENABLED},
-        serialization::ZcashDeserializeInto,
+        parameters::testnet::ConfiguredActivationHeights, serialization::ZcashDeserializeInto,
         work::difficulty::ParameterDifficulty,
     };
 
@@ -470,11 +469,7 @@ mod tests {
         // The minimum difficulty gap is 6 target spacings, and the template keeps the standard
         // difficulty for the first 4 of them.
         let pre_nu7_offset = 4 * 75;
-        let post_nu7_offset = if ZIP218_ENABLED {
-            4 * 25
-        } else {
-            pre_nu7_offset
-        };
+        let post_nu7_offset = 4 * 25;
 
         let testnet = Network::new_default_testnet();
         assert_eq!(

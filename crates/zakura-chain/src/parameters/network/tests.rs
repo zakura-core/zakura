@@ -8,17 +8,46 @@ use color_eyre::Report;
 use super::Network;
 use crate::{
     amount::{Amount, NonNegative, MAX_MONEY},
-    block::Height,
+    block::{Height, HeightDiff},
     parameters::{
         subsidy::{
-            block_subsidy, constants::POST_BLOSSOM_HALVING_INTERVAL, halving,
-            halving_block_subsidy, halving_divisor, height_for_halving, ParameterSubsidy as _,
+            block_subsidy, constants::POST_BLOSSOM_HALVING_INTERVAL, funding_stream_address_period,
+            halving, halving_block_subsidy, halving_divisor, height_for_halving, ParameterSubsidy,
             SubsidyError,
         },
         testnet::{self, ConfiguredActivationHeights},
         NetworkUpgrade,
     },
 };
+
+#[test]
+fn funding_stream_period_uses_floor_division_for_negative_periods() {
+    struct TestParameters;
+
+    impl ParameterSubsidy for TestParameters {
+        fn height_for_first_halving(&self) -> Height {
+            Height(100)
+        }
+
+        fn post_blossom_halving_interval(&self) -> HeightDiff {
+            50
+        }
+
+        fn pre_blossom_halving_interval(&self) -> HeightDiff {
+            25
+        }
+
+        fn funding_stream_address_change_interval(&self) -> HeightDiff {
+            10
+        }
+    }
+
+    let parameters = TestParameters;
+
+    assert_eq!(0, funding_stream_address_period(Height(50), &parameters));
+    assert_eq!(-1, funding_stream_address_period(Height(49), &parameters));
+    assert_eq!(-2, funding_stream_address_period(Height(39), &parameters));
+}
 
 #[test]
 fn halving_test() -> Result<(), Report> {
@@ -334,14 +363,12 @@ fn check_height_for_num_halvings() {
 /// Tests `halving` against ZIP 218's `Halving` formula on a configured Testnet
 /// whose Blossom height is below `SlowStartShift`, with and without NU7.
 ///
-/// On such a network the formula's pre-Blossom term is negative. A build
-/// without the `nu7` feature treats NU7 as inactive, so it follows the
-/// formula's Blossom case at every height.
+/// On such a network the formula's pre-Blossom term is negative.
 #[test]
 fn halving_matches_zip_218_when_blossom_is_below_the_slow_start_shift() {
     use crate::parameters::{
         testnet::{self, ConfiguredActivationHeights},
-        NU7_POW_TARGET_SPACING_RATIO, ZIP218_ENABLED,
+        NU7_POW_TARGET_SPACING_RATIO,
     };
 
     let _init_guard = zakura_test::init();
@@ -368,7 +395,7 @@ fn halving_matches_zip_218_when_blossom_is_below_the_slow_start_shift() {
         let pre_blossom_interval = i128::from(network.pre_blossom_halving_interval());
         let post_blossom_interval = i128::from(network.post_blossom_halving_interval());
         let post_nu7_interval = post_blossom_interval * i128::from(NU7_POW_TARGET_SPACING_RATIO);
-        let nu7_activation = configured_nu7.filter(|_| ZIP218_ENABLED).map(i128::from);
+        let nu7_activation = configured_nu7.map(i128::from);
 
         // `Halving(height)` from ZIP 218, as an exact fraction over the product
         // of the three halving intervals. A negative index has no meaning, so
@@ -433,7 +460,6 @@ fn halving_matches_zip_218_when_blossom_is_below_the_slow_start_shift() {
 /// Tests the ZIP 218 target spacing, halving, and block subsidy across the NU7
 /// activation boundary on a configured Testnet.
 #[test]
-#[cfg(feature = "nu7")]
 fn post_nu7_spacing_halving_and_subsidy() -> Result<(), Report> {
     use crate::parameters::{
         testnet::{self, ConfiguredActivationHeights},
@@ -522,58 +548,13 @@ fn post_nu7_spacing_halving_and_subsidy() -> Result<(), Report> {
     Ok(())
 }
 
-/// Tests funding stream periods before the first period anchor on a configured Testnet.
+/// Tests that the averaging window widens at NU7 and that every build retains
+/// enough context for the wider window.
 #[test]
-#[cfg(feature = "nu7")]
-fn funding_stream_period_before_anchor_uses_floor_division() -> Result<(), Report> {
-    use crate::parameters::{
-        subsidy::funding_stream_address_period,
-        testnet::{self, ConfiguredActivationHeights},
-    };
-
-    let _init_guard = zakura_test::init();
-
-    let network = testnet::Parameters::build()
-        .with_activation_heights(ConfiguredActivationHeights {
-            blossom: Some(4),
-            canopy: Some(6),
-            nu7: Some(11),
-            ..Default::default()
-        })
-        .expect("activation heights are valid")
-        .clear_funding_streams()
-        .to_network()
-        .expect("configured testnet is valid");
-
-    let first_period_height = (network.height_for_first_halving()
-        - network.post_blossom_halving_interval())
-    .expect("the first period starts above genesis");
-
-    assert_eq!(
-        0,
-        funding_stream_address_period(first_period_height, &network)
-    );
-    assert_eq!(
-        -1,
-        funding_stream_address_period(
-            first_period_height
-                .previous()
-                .expect("the height before the first period exists"),
-            &network,
-        )
-    );
-
-    Ok(())
-}
-
-/// Tests that the ZIP 218 difficulty averaging window widens at the NU7
-/// activation height.
-#[test]
-#[cfg(feature = "nu7")]
 fn averaging_window_changes_at_nu7_activation_height() -> Result<(), Report> {
     use crate::parameters::{
         testnet::{self, ConfiguredActivationHeights},
-        POST_NU7_POW_AVERAGING_WINDOW, PRE_NU7_POW_AVERAGING_WINDOW,
+        MAX_POW_AVERAGING_WINDOW, POST_NU7_POW_AVERAGING_WINDOW, PRE_NU7_POW_AVERAGING_WINDOW,
     };
 
     let _init_guard = zakura_test::init();
@@ -588,6 +569,8 @@ fn averaging_window_changes_at_nu7_activation_height() -> Result<(), Report> {
         .clear_funding_streams()
         .to_network()
         .expect("configured testnet is valid");
+
+    assert_eq!(POST_NU7_POW_AVERAGING_WINDOW, MAX_POW_AVERAGING_WINDOW);
 
     assert_eq!(
         PRE_NU7_POW_AVERAGING_WINDOW,
@@ -656,7 +639,7 @@ fn testnet_with_nu7(nu7: Option<u32>) -> testnet::ParametersBuilder {
 /// Checks where ZIP 234 reissuance starts relative to NU7 and the crossing height.
 #[test]
 fn zip234_start_height_follows_nu7_and_the_crossing_rule() {
-    use crate::parameters::{subsidy::zip234_start_height, ZIP218_ENABLED};
+    use crate::parameters::subsidy::zip234_start_height;
 
     let _init_guard = zakura_test::init();
 
@@ -676,11 +659,7 @@ fn zip234_start_height_follows_nu7_and_the_crossing_rule() {
         let network = testnet_with_nu7(Some(nu7))
             .to_network()
             .expect("configured testnet is valid");
-        let expected = if ZIP218_ENABLED {
-            nu7 + 3 * (TESTNET_CROSSING - nu7)
-        } else {
-            TESTNET_CROSSING
-        };
+        let expected = nu7 + 3 * (TESTNET_CROSSING - nu7);
 
         assert_eq!(
             zip234_start_height(&network),
@@ -784,7 +763,7 @@ fn expected_issued_supply_matches_per_height_sum() {
 /// Checks the ZIP 234 reissuance bonus.
 #[test]
 fn zip234_issuance() {
-    use crate::{parameters::ZIP218_ENABLED, value_balance::ValueBalance};
+    use crate::value_balance::ValueBalance;
 
     let _init_guard = zakura_test::init();
 
@@ -802,7 +781,7 @@ fn zip234_issuance() {
         .to_network()
         .expect("configured testnet is valid");
 
-    if !ZIP218_ENABLED {
+    if !cfg!(feature = "nu7") {
         // Without ZIP 234, the subsidy stays on the halving schedule.
         let deficit = Amount::<NonNegative>::try_from(1_000_000_000_000i64).expect("valid amount");
         assert_eq!(

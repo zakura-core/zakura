@@ -16110,6 +16110,14 @@ async fn observed_size_estimates_wake_adapt_and_expire_without_changing_hints() 
             .estimated_bytes,
         9876
     );
+    tokio::time::advance(Duration::from_secs(60)).await;
+    assert_eq!(
+        queue
+            .pending_item(block::Height(101))
+            .unwrap()
+            .estimated_bytes,
+        block::MAX_BLOCK_BYTES
+    );
     for h in 101..=200 {
         let owner = scope.bind(7, std::num::NonZeroU64::new(u64::from(h)).unwrap());
         queue.take_for_request(

@@ -2524,6 +2524,63 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn observed_estimates_open_request_capacity_without_parameter_changes() {
+        let mut counts = Vec::new();
+        for train in [false, true] {
+            let (mut routine, _outbound, _events) = status_test_routine();
+            routine
+                .window
+                .note_block_progress(Instant::now(), Duration::from_secs(30));
+            routine.handle_status(BlockSyncStatus {
+                servable_low: block::Height(1),
+                servable_high: block::Height(64),
+                ..BlockSyncStatus::default()
+            });
+            let scope = super::super::test_work_scope();
+            routine.work.extend(
+                scope,
+                (1..=64).chain(1000..1100).map(|h| {
+                    (
+                        block::Height(h),
+                        block::Hash([1; 32]),
+                        BlockSizeEstimate::Unknown,
+                    )
+                }),
+            );
+            if train {
+                for h in 1000..1100 {
+                    let request = std::num::NonZeroU64::new(u64::from(h)).unwrap();
+                    let owner = scope.bind(99, request);
+                    routine.work.take_for_request(
+                        block::Height(h),
+                        block::Height(h),
+                        1,
+                        u64::MAX,
+                        99,
+                        request,
+                    );
+                    routine
+                        .work
+                        .mark_reserved_for_owner(owner, [block::Height(h)]);
+                    routine
+                        .work
+                        .receive_body_for_owner(owner, block::Height(h), 10_000)
+                        .unwrap();
+                }
+            }
+            let before = tokio::time::Instant::now();
+            routine.try_fill().await;
+            assert_eq!(tokio::time::Instant::now(), before);
+            counts.push(routine.window.outstanding.len());
+        }
+        assert_eq!(counts[0], 2);
+        assert!(
+            counts[1] > counts[0],
+            "observed sizes must open byte credits: {counts:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn bounded_fill_waits_for_transport_and_resumes_without_time() {
         let (mut routine, _old_outbound, _reactor_events) = status_test_routine();
         let (sender, mut outbound) = framed_channel(32);

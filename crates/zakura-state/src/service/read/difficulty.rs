@@ -5,7 +5,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 
 use zakura_chain::{
-    block::{self, Block, Hash, Height},
+    block::{self, Hash, Height},
     history_tree::HistoryTree,
     parameters::{Network, NetworkUpgrade},
     serialization::{DateTime32, Duration32},
@@ -14,7 +14,6 @@ use zakura_chain::{
 
 use crate::{
     service::{
-        any_ancestor_blocks,
         block_iter::any_chain_ancestor_iter,
         check::{
             difficulty::{
@@ -23,10 +22,7 @@ use crate::{
             AdjustedDifficulty,
         },
         finalized_state::ZakuraDb,
-        read::{
-            self, find::calculate_median_time_past, tree::history_tree,
-            FINALIZED_STATE_QUERY_RETRIES,
-        },
+        read::{self, tree::history_tree, FINALIZED_STATE_QUERY_RETRIES},
         NonFinalizedState,
     },
     BoxError, GetBlockTemplateChainInfo,
@@ -163,7 +159,7 @@ pub fn solution_rate(
 /// Do a consistency check by checking the finalized tip before and after all other database
 /// queries.
 ///
-/// Returns the best chain tip, recent blocks in reverse height order from the tip,
+/// Returns the best chain tip, recent block headers in reverse height order from the tip,
 /// and the tip history tree.
 /// Returns an error if the tip obtained before and after is not the same.
 ///
@@ -173,17 +169,26 @@ pub fn solution_rate(
 fn best_relevant_chain_and_history_tree(
     non_finalized_state: &NonFinalizedState,
     db: &ZakuraDb,
-) -> Result<(Height, block::Hash, Vec<Arc<Block>>, Arc<HistoryTree>), BoxError> {
+) -> Result<
+    (
+        Height,
+        block::Hash,
+        Vec<Arc<block::Header>>,
+        Arc<HistoryTree>,
+    ),
+    BoxError,
+> {
     let state_tip_before_queries = read::best_tip(non_finalized_state, db).ok_or_else(|| {
         BoxError::from("Zakura's state is empty, wait until it syncs to the chain tip")
     })?;
 
-    let best_relevant_chain =
-        any_ancestor_blocks(non_finalized_state, db, state_tip_before_queries.1);
-    let best_relevant_chain: Vec<_> = best_relevant_chain
-        .into_iter()
-        .take(POW_ADJUSTMENT_BLOCK_SPAN)
-        .collect();
+    let best_relevant_chain: Vec<_> = any_chain_ancestor_iter::<block::Header>(
+        non_finalized_state,
+        db,
+        state_tip_before_queries.1,
+    )
+    .take(POW_ADJUSTMENT_BLOCK_SPAN)
+    .collect();
 
     if best_relevant_chain.is_empty() {
         return Err("missing genesis block, wait until it is committed".into());
@@ -214,11 +219,11 @@ fn best_relevant_chain_and_history_tree(
 /// Returns the [`GetBlockTemplateChainInfo`] for the supplied `relevant_chain`, tip, `network`,
 /// and `history_tree`.
 ///
-/// The `relevant_chain` has recent blocks in reverse height order from the tip.
+/// The `relevant_chain` has recent block headers in reverse height order from the tip.
 ///
 /// See [`get_block_template_chain_info()`] for details.
 fn difficulty_time_and_history_tree(
-    relevant_chain: Vec<Arc<Block>>,
+    relevant_chain: Vec<Arc<block::Header>>,
     tip_height: Height,
     tip_hash: block::Hash,
     network: &Network,
@@ -229,7 +234,7 @@ fn difficulty_time_and_history_tree(
     }
     let relevant_data: Vec<(CompactDifficulty, DateTime<Utc>)> = relevant_chain
         .iter()
-        .map(|block| (block.header.difficulty_threshold, block.header.time))
+        .map(|header| (header.difficulty_threshold, header.time))
         .collect();
 
     let cur_time = DateTime32::now();
@@ -237,13 +242,13 @@ fn difficulty_time_and_history_tree(
     // > For each block other than the genesis block , nTime MUST be strictly greater than
     // > the median-time-past of that block.
     // https://zips.z.cash/protocol/protocol.pdf#blockheader
-    let median_time_past = calculate_median_time_past(
+    let median_time_past = DateTime32::try_from(AdjustedDifficulty::median_time(
         relevant_chain
             .iter()
             .take(POW_MEDIAN_BLOCK_SPAN)
-            .cloned()
+            .map(|header| header.time)
             .collect(),
-    );
+    ))?;
 
     let min_time = median_time_past
         .checked_add(Duration32::from_seconds(1))
@@ -473,7 +478,7 @@ mod tests {
 
     #[test]
     fn mining_template_rejects_incomplete_difficulty_context() {
-        let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        let block: Arc<block::Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
             .zcash_deserialize_into()
             .expect("the genesis vector is valid");
 
@@ -485,7 +490,7 @@ mod tests {
                 let required = usize::try_from((tip + 1).min(span)).unwrap();
                 for count in 0..=required {
                     let result = difficulty_time_and_history_tree(
-                        vec![block.clone(); count],
+                        vec![block.header.clone(); count],
                         Height(tip),
                         block.hash(),
                         &network,

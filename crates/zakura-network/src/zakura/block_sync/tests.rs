@@ -12021,7 +12021,7 @@ async fn reactor_scores_exact_supplier_for_commitment_matching_consensus_invalid
         .expect("apply-finished event queues");
 
     // the apply-rejection `Misbehavior` is emitted by the Sequencer task while
-    // the routines independently ping `RequeryNeeded`, so one or more
+    // the routines independently request a refill, so one or more
     // `QueryNeededBlocks` can race ahead of the misbehavior report. Skip queries
     // and wait for the misbehavior; if it never arrives the `next_action` timeout
     // fails the test (the peer was not scored).

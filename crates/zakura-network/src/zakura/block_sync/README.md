@@ -289,3 +289,44 @@ consumer misses the retained update history, it refreshes its existing queued wi
 in bounded state queries. Accurate first deliveries add no correction writes or
 refresh queries. Size-only changes leave verification observations, header generations,
 and body-work epochs intact.
+
+
+## Requester readiness
+
+Each peer worker registers work, byte-budget, and peer-eligibility notifications
+before attempting a fill. The worker then waits for those events, an inbound
+frame, a sequencer view change, transport capacity, or an explicit deadline.
+The diagnostic heartbeat records state without publishing eligibility or
+starting another fill.
+
+The worker awaits a guarded transport reservation when the queue fills. It keeps
+the reservation future across unrelated events. It passes the acquired permit to
+the next fill and rechecks admission before claiming work. Cancellation drops the
+permit. A fill issues at most 32 requests before returning to the event loop.
+An explicit continuation resumes a bounded fill without waiting for new work.
+
+Peer selection compares published scores from one registry snapshot. A preferred
+peer must have request capacity, transport capacity, and a matching servable
+range. Its probe limit and retry exclusions must also permit the request. Session
+replacement clears the old eligibility. Removal and eligibility changes notify
+waiting workers. The worker publishes score expiry at the model deadline.
+
+| Condition | Progress event |
+| --- | --- |
+| Empty queue | Work publication or return; status range or authority change |
+| Byte budget exhausted | Reservation release |
+| Resident admission gate closed | Sequencer view change or reservation release |
+| Request window full | Response, completion, cancellation, or timeout |
+| Transport queue full | Guarded reservation becomes ready or transport closes |
+| Preferred peer blocks this worker | Registry eligibility change |
+| Retry exclusion active | Exclusion expiry, removal, or authority change |
+| Probe limit reached | Body progress or liveness deadline |
+| Published model ages | Minimum-latency or bandwidth-freshness expiry |
+
+The work queue sends producer refill requests through a separate `Notify`.
+`notify_one` retains one request when the producer is busy and coalesces repeated
+requests. Serving and status messages cannot fill this notification path.
+
+The `preferred_peer` fill-stop reason distinguishes peer deferral from `no_work`.
+Wake traces identify transport capacity, registry changes, deadlines, and fill
+continuations. These changes preserve admission limits and configuration values.

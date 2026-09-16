@@ -511,10 +511,12 @@ impl DownloadWindow {
         (self.outstanding_reserved_bytes() / outstanding).max(1)
     }
 
-    /// Current RTprop estimate in ms (windowed min as of `now`), for tracing and
-    /// floor-server preference. Filtering by `now` reports `None` (worst floor server)
-    /// once a deteriorating peer's only fast samples age past the horizon, rather than a
-    /// stale-low RTprop.
+    /// Next model expiry that can change request eligibility.
+    pub(super) fn bbr_next_expiry(&self, now: Instant) -> Option<Instant> {
+        self.bbr.next_expiry(now)
+    }
+
+    /// Current RTprop estimate in ms, filtered against the sample horizon.
     pub(super) fn bbr_rtprop_ms(&self, now: Instant) -> Option<u64> {
         self.bbr.rtprop_ms(now)
     }

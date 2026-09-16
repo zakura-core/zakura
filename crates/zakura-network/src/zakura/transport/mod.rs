@@ -22,8 +22,8 @@ pub(crate) use guard::{Admit, ByteBudget, PeerMeters, SessionGuard};
 pub use io::{framed_channel, FramedRecv, FramedSend};
 #[allow(unused_imports)] // guarded producers are activated by the next chunks
 pub(crate) use io::{
-    worker_framed_channel, FrameGuard, FrameWriteClaim, FramedWorkerRecv, GuardedReserveError,
-    OrderedStreamFailure, OrderedStreamFailureCause, QueuedFrame,
+    worker_framed_channel, FrameGuard, FrameWriteClaim, FramedWorkerRecv, GuardedFrameSlot,
+    GuardedReserveError, OrderedStreamFailure, OrderedStreamFailureCause, QueuedFrame,
 };
 pub(crate) use pipe::{
     handle_pipe_exit, spawn_supervised_peer_task, spawn_supervised_pipe, CloseCause, Edge, Flow,

@@ -1199,6 +1199,7 @@ impl SequencerTask {
         // core (and starves progress under CI load) on a real clock and fully wedges
         // a `start_paused` test clock, which auto-advances only once every task
         // parks. Keep the stored rates fresh, but notify only on a schedulable change.
+        self.trace_apply_occupancy(&next);
         publish_sequencer_view(&self.view_tx, next);
     }
 

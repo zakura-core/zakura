@@ -1317,6 +1317,24 @@ impl HeaderSyncReactor {
             response.complete,
             response.tree_aux_schema,
         );
+        self.startup.trace.emit_with(HEADER_SYNC_TABLE, |row| {
+            row.insert("event".into(), "header_body_size_hints_received".into());
+            row.insert("peer".into(), trace_peer_label(&peer).into());
+            row.insert("session_id".into(), session_id.into());
+            row.insert("request_id".into(), response.request_id.into());
+            row.insert(
+                "common_ancestor_height".into(),
+                response.common_ancestor_height.0.into(),
+            );
+            row.insert(
+                "body_sizes".into(),
+                serde_json::json!(response
+                    .entries
+                    .iter()
+                    .map(|entry| entry.body_size)
+                    .collect::<Vec<_>>()),
+            );
+        });
         let returned_ancestor = zakura_header_chain::Frontier::new(
             response.common_ancestor_height,
             response.common_ancestor_hash,

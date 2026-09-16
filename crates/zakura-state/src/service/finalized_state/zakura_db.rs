@@ -598,7 +598,9 @@ mod tests {
 
     use crate::{
         constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
-        service::finalized_state::{DiskWriteBatch, STATE_COLUMN_FAMILIES_IN_CODE},
+        service::finalized_state::{
+            DiskWriteBatch, NODE_SOFTWARE_METADATA, STATE_COLUMN_FAMILIES_IN_CODE,
+        },
     };
 
     use super::*;
@@ -676,6 +678,12 @@ mod tests {
                 false,
             )
             .unwrap();
+            db.put_cf(
+                db.cf_handle(NODE_SOFTWARE_METADATA).unwrap(),
+                b"reuse-test",
+                b"preserved",
+            )
+            .unwrap();
             crate::write_database_format_version_to_disk(
                 &config,
                 STATE_DATABASE_KIND,
@@ -699,7 +707,29 @@ mod tests {
                     first.is_ok() || second.is_ok(),
                     "one startup must acquire the database"
                 );
+                let db = first.as_ref().or(second.as_ref()).unwrap();
+                assert_eq!(
+                    db.db
+                        .get_cf(
+                            db.db.cf_handle(NODE_SOFTWARE_METADATA).unwrap(),
+                            b"reuse-test"
+                        )
+                        .unwrap(),
+                    Some(b"preserved".to_vec()),
+                    "the successful startup must retain the source database contents"
+                );
             });
+            assert!(
+                !config
+                    .db_path(STATE_DATABASE_KIND, previous.major, &network)
+                    .exists(),
+                "concurrent reuse must not recreate the source directory"
+            );
+            assert_eq!(
+                crate::state_database_format_version_on_disk(&config, &network).unwrap(),
+                Some(running.clone()),
+                "the successful startup must finish the format upgrade"
+            );
         }
     }
 

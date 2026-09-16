@@ -34,6 +34,7 @@ use zakura_state as zs;
 use crate::{error::*, primitives, transaction as tx, BoxError};
 
 pub mod check;
+pub(super) mod commitment;
 mod prepared;
 pub mod request;
 pub mod subsidy;
@@ -59,6 +60,10 @@ pub struct SemanticBlockVerifier<S, V> {
 #[allow(missing_docs)]
 #[derive(Debug, Error)]
 pub enum VerifyBlockError {
+    /// Duplicate transactions bound by the header's transaction or authorization commitment.
+    #[error("block commitments require duplicate transactions")]
+    NonMalleableDuplicateTransaction,
+
     /// The actual parent is not yet committed or its context is unavailable.
     #[error("commitment context is unavailable for parent {0}")]
     MissingParentContext(block::Hash),
@@ -180,7 +185,9 @@ impl VerifyBlockError {
                 BlockError::AlreadyInChain(..) => BodyVerificationClass::Duplicate,
                 BlockError::Transaction(error) => error.body_verification_class(),
                 BlockError::NoTransactions => consensus("block.no_transactions"),
-                BlockError::DuplicateTransaction => consensus("block.duplicate_transaction"),
+                BlockError::DuplicateTransaction => BodyVerificationClass::PayloadMismatch(
+                    BodyCommitmentKind::TransactionMerkleRoot,
+                ),
                 BlockError::WrongTransactionConsensusBranchId => {
                     consensus("block.wrong_transaction_consensus_branch_id")
                 }
@@ -198,6 +205,7 @@ impl VerifyBlockError {
                     BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
                 }
             },
+            Self::NonMalleableDuplicateTransaction => consensus("block.duplicate_transaction"),
             Self::Equihash { .. } | Self::PowPolicy(_) | Self::Time(_) => {
                 BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
             }
@@ -233,7 +241,11 @@ impl VerifyBlockError {
         use VerifyBlockError::*;
         match self {
             Block { source } => source.misbehavior_score(),
-            Equihash { .. } | Subsidy(_) | BodyCommitment(_) | ParentHeightMismatch { .. } => 100,
+            Equihash { .. }
+            | Subsidy(_)
+            | BodyCommitment(_)
+            | ParentHeightMismatch { .. }
+            | NonMalleableDuplicateTransaction => 100,
             Transaction(err) => err.mempool_misbehavior_score(),
             Commit(err) => err.misbehavior_score(),
             _other => 0,
@@ -397,38 +409,23 @@ where
             // V4 transaction IDs bind their authorizing data. A V5+ body also needs
             // its ZIP-244 commitment before transaction verification.
             let context = if block.transactions.iter().any(|tx| tx.version() >= 5) {
-                let parent = block.header.previous_block_hash;
-                let context = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    state_service
-                        .clone()
-                        .oneshot(zs::Request::BlockParentContext(parent)),
-                )
-                .await
-                .map_err(|_| VerifyBlockError::MissingParentContext(parent))?
-                .map_err(|source| {
-                    tracing::debug!(?source, ?parent, "parent context lookup failed");
-                    VerifyBlockError::MissingParentContext(parent)
-                })?;
-                let context = match context {
-                    zs::Response::BlockParentContext(Some(context)) if context.parent == parent => {
-                        context
+                match commitment::parent_context(state_service.clone(), &block).await {
+                    Ok(context) => Some(context),
+                    Err(error @ VerifyBlockError::MissingParentContext(_)) => {
+                        // Padding is a bad delivery even while parent verification is pending.
+                        let hashes: Vec<_> =
+                            block.transactions.iter().map(|tx| tx.hash()).collect();
+                        if let Err(padding) =
+                            check::merkle_root_validity_with_attribution(&network, &block, &hashes)
+                        {
+                            if commitment::is_padding_error(&padding) {
+                                return Err(padding);
+                            }
+                        }
+                        return Err(error);
                     }
-                    zs::Response::BlockParentContext(_) => {
-                        return Err(VerifyBlockError::MissingParentContext(parent))
-                    }
-                    _ => unreachable!("BlockParentContext returns parent context"),
-                };
-                let expected =
-                    (context.height + 1).ok_or(VerifyBlockError::MissingParentContext(parent))?;
-                if block.coinbase_height() != Some(expected) {
-                    return Err(VerifyBlockError::ParentHeightMismatch {
-                        claimed: block.coinbase_height(),
-                        expected,
-                    });
+                    Err(error) => return Err(error),
                 }
-
-                Some(context)
             } else {
                 None
             };
@@ -446,7 +443,7 @@ where
                         tx::check::lock_time_has_passed(transaction, height, block.header.time)
                             .map_err(VerifyBlockError::Transaction)?;
                     }
-                    check::merkle_root_validity(
+                    check::merkle_root_validity_with_attribution(
                         &network,
                         &block,
                         &cached_prepared_block.transaction_hashes,
@@ -485,26 +482,23 @@ where
             let transaction_hashes: Arc<[_]> =
                 block.transactions.iter().map(|t| t.hash()).collect();
 
-            check::merkle_root_validity(&network, &block, &transaction_hashes)?;
+            if let Err(error) =
+                check::merkle_root_validity_with_attribution(&network, &block, &transaction_hashes)
+            {
+                if commitment::is_padding_error(&error) {
+                    commitment::check_auth_bound_duplicates(
+                        state_service.clone(),
+                        &network,
+                        block.clone(),
+                        context,
+                    )
+                    .await?;
+                }
+                return Err(error);
+            }
             // Authenticate authorizing data before dispatching scripts or proofs.
             let auth_data_root = if let Some(context) = context {
-                let commitment_block = block.clone();
-                let commitment_network = network.clone();
-                Some(
-                    tokio::task::spawn_blocking(move || {
-                        let root = commitment_block.auth_data_root();
-                        zs::check::block_commitment_is_valid_for_chain_history(
-                            commitment_block,
-                            &commitment_network,
-                            &context.history_tree,
-                            Some(root),
-                        )
-                        .map_err(VerifyBlockError::BodyCommitment)?;
-                        Ok::<_, VerifyBlockError>(root)
-                    })
-                    .await
-                    .expect("commitment calculation must not panic")?,
-                )
+                Some(commitment::check_auth_data(network.clone(), block.clone(), context).await?)
             } else {
                 None
             };

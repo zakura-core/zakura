@@ -115,9 +115,10 @@ impl ZakuraDb {
         let Some(metadata_cf) = self.db.cf_handle(NODE_SOFTWARE_METADATA) else {
             return Ok(None);
         };
+        let snapshot = self.db.rocksdb_snapshot();
         let read = |key: MetadataKey| {
-            self.db
-                .raw_get_cf(&metadata_cf, key.0.as_bytes())
+            snapshot
+                .get_cf(&metadata_cf, key.0.as_bytes())
                 .map(|value| value.map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
         };
         let Some(software) = read(LAST_WRITER_SOFTWARE_KEY)? else {

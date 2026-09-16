@@ -105,7 +105,7 @@ use zakura::{
 };
 
 use crate::{
-    application::{build_version, release_version, user_agent, LAST_WARN_ERROR_LOG_SENDER},
+    application::{build_version, last_known_release_tag, user_agent, LAST_WARN_ERROR_LOG_SENDER},
     components::{
         health,
         inbound::{self, InboundSetupData, MAX_INBOUND_RESPONSE_TIME},
@@ -450,7 +450,7 @@ impl StartCmd {
         let database_writer_metadata = DatabaseWriterMetadata::new(
             "Zakura",
             build_version().to_string(),
-            format!("v{}", release_version()),
+            last_known_release_tag(),
         );
 
         let (

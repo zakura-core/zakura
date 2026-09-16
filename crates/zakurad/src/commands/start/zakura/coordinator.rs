@@ -406,27 +406,35 @@ impl SyncCoordinator {
                     });
                 }
                 _ = tokio::time::sleep(diagnostic_interval) => {
-                let epoch = self.apply_phase().epoch().get();
-                let records = self
-                    .operations
-                    .lock()
-                    .expect("operation lock is not poisoned");
-                let oldest = records
-                    .values()
-                    .map(|record| record.started.elapsed())
-                    .max()
-                    .unwrap_or_default();
-                metrics::gauge!("sync.zakura.apply.oldest_seconds").set(oldest.as_secs_f64());
-                for (id, record) in records.iter() {
-                    let (hash, height, parent) = record
-                        .block
-                        .map(|(hash, height, parent)| (Some(hash), height, Some(parent)))
+                    let epoch = self.apply_phase().epoch().get();
+                    let records = self
+                        .operations
+                        .lock()
+                        .expect("operation lock is not poisoned");
+                    let oldest = records
+                        .values()
+                        .map(|record| record.started.elapsed())
+                        .max()
                         .unwrap_or_default();
-                    tracing::warn!(operation_id = id.0, ?hash, ?height, ?parent, stage = record.cancellation.stage(), lifecycle = ?record.state,
-                        age_seconds = record.started.elapsed().as_secs_f64(), apply_epoch = epoch,
-                        "native block apply delays fallback");
-                }
-                drop(records);
+                    metrics::gauge!("sync.zakura.apply.oldest_seconds").set(oldest.as_secs_f64());
+                    for (id, record) in records.iter() {
+                        let (hash, height, parent) = record
+                            .block
+                            .map(|(hash, height, parent)| (Some(hash), height, Some(parent)))
+                            .unwrap_or_default();
+                        tracing::warn!(
+                            operation_id = id.0,
+                            ?hash,
+                            ?height,
+                            ?parent,
+                            stage = record.cancellation.stage(),
+                            lifecycle = ?record.state,
+                            age_seconds = record.started.elapsed().as_secs_f64(),
+                            apply_epoch = epoch,
+                            "native block apply delays fallback"
+                        );
+                    }
+                    drop(records);
 
                     tracing::warn!(
                         in_flight,

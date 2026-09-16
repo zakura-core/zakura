@@ -2371,6 +2371,47 @@ async fn duplicate_parent_wait_uses_the_replacement_fence() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_duplicate_preserves_the_pending_state_request() {
+    let _guard = zakura_test::init();
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let (mut state, _, _, _) =
+        StateService::new(Config::ephemeral(), &Network::Mainnet, Height::MAX, 0)
+            .await
+            .unwrap();
+    let mut pending =
+        state.queue_and_commit_to_non_finalized_state(block.clone().into(), None, None);
+    let cancellation = crate::CommitCancellation::default();
+    assert!(cancellation.cancel());
+    let duplicate = state.queue_and_commit_to_non_finalized_state(
+        block.clone().into(),
+        None,
+        Some(cancellation),
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(1), duplicate)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err()
+            .inner(),
+        &crate::CommitBlockError::Cancelled
+    );
+    assert!(matches!(
+        pending.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    let queued = state
+        .non_finalized_state_queued_blocks
+        .dequeue_children(block.header.previous_block_hash);
+    assert_eq!(queued.len(), 1);
+    let (block, sender, _, _) = queued.into_iter().next().unwrap();
+    sender.send(Ok(block.hash)).unwrap();
+    assert_eq!(pending.await.unwrap().unwrap(), block.hash);
+}
+
 /// A missing parent can retain a semantic commit for the lifetime of the state service.
 #[tokio::test(flavor = "multi_thread")]
 async fn missing_parent_commit_waits_until_state_shutdown() {

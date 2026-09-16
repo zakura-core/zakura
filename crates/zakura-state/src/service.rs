@@ -1013,6 +1013,14 @@ impl StateService {
         admission: Option<BlockAdmission>,
         cancellation: Option<crate::CommitCancellation>,
     ) -> oneshot::Receiver<Result<block::Hash, CommitSemanticallyVerifiedError>> {
+        if cancellation
+            .as_ref()
+            .is_some_and(crate::CommitCancellation::is_cancelled)
+        {
+            let (sender, receiver) = oneshot::channel();
+            let _ = sender.send(Err(CommitBlockError::Cancelled.into()));
+            return receiver;
+        }
         tracing::debug!(block = %semantically_verified.block, "queueing block for contextual verification");
         let parent_hash = semantically_verified.block.header.previous_block_hash;
         let hash = semantically_verified.hash;

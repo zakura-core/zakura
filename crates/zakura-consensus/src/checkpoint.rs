@@ -1270,11 +1270,18 @@ where
     S::Future: Send + 'static,
 {
     /// Verifies a block with cancellation fenced at complete-range admission.
+    #[tracing::instrument(name = "checkpoint", skip(self, block, cancellation))]
     pub fn call_cancellable(
         &mut self,
         block: Arc<Block>,
         cancellation: Option<zs::CommitCancellation>,
     ) -> futures::future::BoxFuture<'static, Result<block::Hash, VerifyCheckpointError>> {
+        if cancellation
+            .as_ref()
+            .is_some_and(zs::CommitCancellation::is_cancelled)
+        {
+            return async { Err(VerifyCheckpointError::Cancelled) }.boxed();
+        }
         // Reset the verifier back to the state tip if requested
         // (e.g. due to an error when committing a block to the state)
         self.apply_pending_reset();

@@ -13,6 +13,7 @@ impl PeerRoutine {
 
     pub(super) fn trace_wake(&self, reason: &'static str) {
         self.emit("block_peer_wake", |row| {
+            row.peer = Some(trace_peer(&self.peer));
             row.outstanding = Some(saturating_usize(self.window.outstanding.len()));
             row.reason = Some(reason);
         });
@@ -224,11 +225,6 @@ impl PeerRoutine {
             self.insert_no_progress_fields(row);
             self.insert_bbr_fields(row);
         });
-        // Refresh the published slot diagnostics on the same cadence so the cross-peer
-        // floor-preference view cannot hold a stale-low RTprop for a quiet peer:
-        // `publish_outstanding` re-reads `bbr_rtprop_ms(now)`, filtering out samples aged
-        // past the horizon (→ `None` = worst floor server).
-        self.publish_outstanding();
     }
 
     pub(super) fn trace_body_sequencer_sent(

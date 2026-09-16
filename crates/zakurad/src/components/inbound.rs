@@ -204,6 +204,9 @@ async fn retained_block_height(mut state: State, hash: block::Hash) -> Option<bl
 }
 
 /// Returns a committed block from any active chain.
+///
+/// Peers ask for blocks by hash, including hashes on a chain this node does not consider best,
+/// so this query deliberately spans every active chain rather than the best one.
 async fn block_by_hash(
     mut state: State,
     hash: block::Hash,
@@ -379,25 +382,6 @@ impl Inbound {
         zcashd_compat_peer_ips: Vec<IpAddr>,
         setup: oneshot::Receiver<InboundSetupData>,
     ) -> Inbound {
-        Self::new_with_pending_blocks(
-            full_verify_concurrency_limit,
-            expose_peer_addresses,
-            zcashd_compat_pruning_retention,
-            zcashd_compat_peer_ips,
-            setup,
-            PendingBlockRegistry::default(),
-        )
-    }
-
-    /// Creates an inbound service with a pending-block registry shared with mining RPCs.
-    pub fn new_with_pending_blocks(
-        full_verify_concurrency_limit: usize,
-        expose_peer_addresses: bool,
-        zcashd_compat_pruning_retention: Option<u32>,
-        zcashd_compat_peer_ips: Vec<IpAddr>,
-        setup: oneshot::Receiver<InboundSetupData>,
-        pending_blocks: PendingBlockRegistry,
-    ) -> Inbound {
         Inbound {
             setup: Setup::Pending {
                 full_verify_concurrency_limit,
@@ -408,8 +392,14 @@ impl Inbound {
                 zcashd_compat_pruning_retention,
                 zcashd_compat_peer_ips,
             )),
-            pending_blocks,
+            pending_blocks: PendingBlockRegistry::default(),
         }
+    }
+
+    /// Shares one pending-block registry with the mining RPCs.
+    pub fn with_pending_blocks(mut self, pending_blocks: PendingBlockRegistry) -> Self {
+        self.pending_blocks = pending_blocks;
+        self
     }
 
     /// Remove `self.setup`, temporarily replacing it with an invalid state.

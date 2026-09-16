@@ -478,6 +478,10 @@ pub enum InvalidateError {
     #[error("failed to send invalidate block request to block write task")]
     SendInvalidateRequestFailed,
 
+    /// Every block write slot is held by an in-flight commit, reconsideration, or invalidation.
+    #[error("the block write task is at capacity, retry the invalidation")]
+    WriterFull,
+
     /// The invalidate request was dropped before processing.
     #[error("invalidate block request was unexpectedly dropped")]
     InvalidateRequestDropped,

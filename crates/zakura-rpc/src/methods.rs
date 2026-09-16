@@ -1020,6 +1020,253 @@ where
     gbt: GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>,
 }
 
+/// How long one mining template may take to pass proposal validation.
+///
+/// Foreground recovery stops waiting at this deadline, because a miner is waiting on it.
+/// Speculative preparation cannot stop the work it dispatched, so it reads the same deadline as
+/// the point past which a parent's templates cost more than they are worth.
+const TEMPLATE_PREPARATION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The outcome of validating one server mining template.
+enum Preparation {
+    /// The template passed proposal validation.
+    Prepared,
+    /// Validation condemned the template itself, so the server must withdraw it.
+    Rejected,
+    /// The chain moved off the template's parent before validation finished.
+    Stale,
+    /// Validation did not finish within [`TEMPLATE_PREPARATION_TIMEOUT`].
+    TimedOut,
+    /// Validation failed for a local reason that does not condemn the template.
+    Failed(zakura_consensus::BoxError),
+}
+
+/// Runs one template's proposal validation to completion.
+///
+/// This is the whole cost of preparing a template: building the proposal block, then semantically
+/// verifying every transaction in it. Nothing here is cancellable. A caller that stops waiting
+/// leaves this running, which is why callers must account for it rather than assume it stopped.
+async fn verify_server_template<BlockVerifierRouter>(
+    verifier: BlockVerifierRouter,
+    template: &BlockTemplateResponse,
+    network: &Network,
+) -> Preparation
+where
+    BlockVerifierRouter: BlockVerifierService,
+{
+    let Ok(block) = proposal_block_from_template(template, None, network) else {
+        tracing::warn!(work_id = %template.work_id(), "server mining template cannot form a proposal");
+        return Preparation::Rejected;
+    };
+
+    // Building the block is itself CPU work, so re-check for shutdown rather than start a
+    // verification whose answer nobody will use.
+    if zakura_chain::shutdown::is_shutting_down() {
+        return Preparation::Stale;
+    }
+
+    let parent = block.header.previous_block_hash;
+    let request = zakura_consensus::Request::Prepare {
+        block: Arc::new(block),
+        source: zakura_consensus::PreparedCandidateSource::ServerTemplate,
+    };
+
+    match verifier.oneshot(request).await {
+        Ok(_hash) => Preparation::Prepared,
+        Err(error) => {
+            let rejects_template = rejects_template(&error);
+            tracing::debug!(
+                ?error,
+                work_id = %template.work_id(),
+                ?parent,
+                rejects_template,
+                "mining candidate preparation failed"
+            );
+            if rejects_template {
+                Preparation::Rejected
+            } else {
+                Preparation::Failed(error)
+            }
+        }
+    }
+}
+
+/// Dispatches one speculative preparation onto a detached task.
+///
+/// The verification runs in its own task, so nothing the caller does stops it: dropping a tower
+/// future leaves the work its request already dispatched running. The join handle is therefore
+/// the only honest signal that the computation is over, and the caller must not start another
+/// preparation until it resolves.
+///
+/// Returns `None`, having dispatched nothing, when the chain has already left this template's
+/// parent. A template can go stale while it waits its turn, and preparing it then would hold the
+/// one speculative worker away from a template a miner could still use.
+fn start_speculative_preparation<BlockVerifierRouter, Tip>(
+    verifier: BlockVerifierRouter,
+    template: &BlockTemplateResponse,
+    latest_chain_tip: Tip,
+    network: &Network,
+) -> Option<tokio::task::JoinHandle<Preparation>>
+where
+    BlockVerifierRouter: BlockVerifierService,
+    Tip: ChainTip + Clone + Send + Sync + 'static,
+{
+    if latest_chain_tip.best_tip_hash() != Some(template.previous_block_hash) {
+        return None;
+    }
+
+    Some(tokio::spawn({
+        let template = template.clone();
+        let network = network.clone();
+        async move { verify_server_template(verifier, &template, &network).await }.in_current_span()
+    }))
+}
+
+/// Validates one template in the foreground, for a caller that needs the answer now.
+///
+/// Unlike speculative preparation this is ordinary validation: a miner is waiting on it, so it
+/// runs whatever the speculation breaker says.
+async fn prepare_server_template<BlockVerifierRouter, Tip>(
+    verifier: BlockVerifierRouter,
+    template: &BlockTemplateResponse,
+    latest_chain_tip: Tip,
+    network: &Network,
+) -> Preparation
+where
+    BlockVerifierRouter: BlockVerifierService,
+    Tip: ChainTip + Clone + Send + Sync + 'static,
+{
+    let parent = template.previous_block_hash;
+    let mut tip = latest_chain_tip;
+    let stale = async {
+        loop {
+            tip.mark_best_tip_seen();
+            if tip.best_tip_hash() != Some(parent) {
+                break;
+            }
+            if tip.best_tip_changed().await.is_err() {
+                break;
+            }
+        }
+    };
+
+    tokio::select! {
+        biased;
+        _ = stale => Preparation::Stale,
+        result = tokio::time::timeout(
+            TEMPLATE_PREPARATION_TIMEOUT,
+            verify_server_template(verifier, template, network),
+        ) => result.unwrap_or(Preparation::TimedOut),
+    }
+}
+
+/// Prepares one queued server template, and returns once its computation is over.
+///
+/// Returning is the signal that the speculative worker is free again, so this must not return
+/// while work it dispatched is still running. See [`RpcImpl::prepare_template_in_background`].
+async fn prepare_one_server_template<BlockVerifierRouter, Tip, SyncStatus>(
+    gbt: &GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>,
+    verifier: BlockVerifierRouter,
+    template: &BlockTemplateResponse,
+    latest_chain_tip: &Tip,
+    network: &Network,
+) where
+    BlockVerifierRouter: BlockVerifierService,
+    Tip: ChainTip + Clone + Send + Sync + 'static,
+    SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
+{
+    let parent = template.previous_block_hash;
+    let work_id = template.work_id().clone();
+
+    // Once a parent needs recovery, only foreground-validated fallback work may be published.
+    // Discard its queued speculative preparations.
+    if gbt.template_rejections.borrow().needs_fallback() {
+        return;
+    }
+    if !gbt.speculation_breaker.allows(parent) {
+        metrics::counter!("mining.template_preparation.declined").increment(1);
+        return;
+    }
+
+    let Some(computation) =
+        start_speculative_preparation(verifier, template, latest_chain_tip.clone(), network)
+    else {
+        // The chain left this template's parent while it waited its turn.
+        metrics::counter!("mining.template_preparation.stale_before_dispatch").increment(1);
+        return;
+    };
+
+    let started = tokio::time::Instant::now();
+    let outcome = computation.await;
+    let elapsed = started.elapsed();
+
+    // The deadline classifies the cost; it does not stop the work, so it is read once the
+    // computation is actually over. An answer that arrives late still counts: withdrawing an
+    // invalid template late is better than never withdrawing it.
+    if elapsed >= TEMPLATE_PREPARATION_TIMEOUT {
+        // This parent's templates cost more than the deadline allows. Stop speculating on it
+        // until the chain moves on, instead of paying that cost again for every template built
+        // on it.
+        gbt.speculation_breaker.trip(parent);
+        metrics::counter!("mining.template_preparation.timed_out").increment(1);
+        tracing::debug!(
+            ?elapsed,
+            %work_id,
+            ?parent,
+            "a server mining template overran its preparation deadline"
+        );
+    }
+
+    match outcome {
+        Ok(Preparation::Prepared) => {
+            gbt.template_rejections
+                .send_if_modified(|state| state.mark_prepared(parent, &work_id));
+        }
+        Ok(Preparation::Rejected) => {
+            gbt.template_rejections.send_if_modified(|state| {
+                // A reorg away from this parent and back leaves the rejection state naming
+                // another parent while this validation finishes. Re-point it when the chain is
+                // back here, so the rejection is recorded rather than silently dropped.
+                if state.parent != Some(parent) && latest_chain_tip.best_tip_hash() == Some(parent)
+                {
+                    state.set_parent(parent);
+                }
+                state.reject(parent, &work_id)
+            });
+            metrics::counter!("mining.template_preparation.rejected").increment(1);
+        }
+        // The background path has no inner deadline, so `TimedOut` cannot reach here: both
+        // remaining outcomes mean the node gave up before it had an answer.
+        Ok(Preparation::Stale | Preparation::TimedOut) => {
+            metrics::counter!("mining.template_preparation.cancelled").increment(1);
+        }
+        Ok(Preparation::Failed(error)) => {
+            tracing::debug!(
+                ?error,
+                %work_id,
+                ?parent,
+                "background mining candidate preparation failed"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(?error, "template preparation task did not finish");
+        }
+    }
+}
+
+/// Whether a preparation error condemns the template rather than the node's local state.
+fn rejects_template(error: &zakura_consensus::BoxError) -> bool {
+    error
+        .downcast_ref::<zakura_consensus::VerifyBlockError>()
+        .or_else(
+            || match error.downcast_ref::<zakura_consensus::RouterError>() {
+                Some(zakura_consensus::RouterError::Block { source }) => Some(source.as_ref()),
+                _ => None,
+            },
+        )
+        .is_some_and(zakura_consensus::VerifyBlockError::rejects_template)
+}
+
 /// A type alias for the last event logged by the server.
 pub type LoggedLastEvent = watch::Receiver<Option<(String, tracing::Level, chrono::DateTime<Utc>)>>;
 
@@ -1082,48 +1329,6 @@ where
         VersionString: ToString + Clone + Send + 'static,
         UserAgentString: ToString + Clone + Send + 'static,
     {
-        Self::new_with_pending_blocks(
-            network,
-            mining_config,
-            debug_force_finished_sync,
-            build_version,
-            user_agent,
-            mempool,
-            state,
-            read_state,
-            block_verifier_router,
-            sync_status,
-            latest_chain_tip,
-            address_book,
-            last_warn_error_log_rx,
-            mined_block_sender,
-            PendingBlockRegistry::default(),
-        )
-    }
-
-    /// Creates an RPC handler with a pending-block registry shared with peer serving.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_pending_blocks<VersionString, UserAgentString>(
-        network: Network,
-        mining_config: config::mining::Config,
-        debug_force_finished_sync: bool,
-        build_version: VersionString,
-        user_agent: UserAgentString,
-        mempool: Mempool,
-        state: State,
-        read_state: ReadState,
-        block_verifier_router: BlockVerifierRouter,
-        sync_status: SyncStatus,
-        latest_chain_tip: Tip,
-        address_book: AddressBook,
-        last_warn_error_log_rx: LoggedLastEvent,
-        mined_block_sender: Option<mpsc::UnboundedSender<MinedBlockEvent>>,
-        pending_blocks: PendingBlockRegistry,
-    ) -> (Self, JoinHandle<()>)
-    where
-        VersionString: ToString + Clone + Send + 'static,
-        UserAgentString: ToString + Clone + Send + 'static,
-    {
         let (runner, queue_sender) = Queue::start();
 
         let mut build_version = build_version.to_string();
@@ -1134,13 +1339,12 @@ where
             build_version.insert(0, 'v');
         }
 
-        let gbt = GetBlockTemplateHandler::new_with_pending_blocks(
+        let gbt = GetBlockTemplateHandler::new(
             &network,
             mining_config.clone(),
             block_verifier_router,
             sync_status,
             mined_block_sender,
-            pending_blocks,
         );
 
         let rpc_impl = RpcImpl {
@@ -1176,6 +1380,7 @@ where
     }
 
     /// Returns whether background validation rejected this server work ID.
+    #[cfg(test)]
     pub fn mining_template_rejected(&self, work_id: &str) -> bool {
         self.gbt.template_rejections.borrow().contains(work_id)
     }
@@ -1190,11 +1395,24 @@ where
         self.gbt.template_rejections.borrow().withdrawn(work_id)
     }
 
-    /// Waits for withdrawal, including a rejection that preceded subscription.
-    pub async fn wait_for_mining_template_rejection(&self, work_id: &str) {
+    /// Waits for withdrawal of `work_id`, including a rejection that preceded subscription.
+    ///
+    /// Never resolves without active work, so a caller can select on it unconditionally.
+    pub async fn wait_for_mining_template_withdrawal(&self, work_id: Option<&str>) {
+        let Some(work_id) = work_id else {
+            return std::future::pending().await;
+        };
         let mut rejections = self.gbt.template_rejections.subscribe();
+        let revision = rejections.borrow().revision;
         loop {
-            if rejections.borrow_and_update().withdrawn(work_id) {
+            let withdrawn = {
+                let state = rejections.borrow_and_update();
+                // A parent change can clear a rejection before this waiter observes it.
+                // Keep the revision so clearing the work sets cannot erase that notification.
+                state.withdrawn(work_id)
+                    || (state.revision != revision && !state.is_prepared(work_id))
+            };
+            if withdrawn {
                 return;
             }
             if rejections.changed().await.is_err() {
@@ -1203,88 +1421,208 @@ where
         }
     }
 
+    /// Points the rejection state at `tip_hash` and returns it, unless the chain moved on.
+    ///
+    /// Returns `None` when `latest_chain_tip` no longer agrees with the tip a template is being
+    /// built on, so the caller must fetch the chain state again.
+    ///
+    /// The tip is checked while the rejection state is locked, because `set_parent` clears every
+    /// rejection recorded for the parent it replaces. Holding the lock across the check stops two
+    /// concurrent requests interleaving their checks and writes, so a request that already lost
+    /// the tip cannot erase the withdrawals of the parent that replaced it. `rejections` is both
+    /// the snapshot the caller works from and the marker of what it has seen, taken together so a
+    /// rejection published in between cannot be acknowledged unread.
+    fn track_template_parent(
+        &self,
+        tip_hash: block::Hash,
+        rejections: &mut watch::Receiver<types::get_block_template::TemplateRejections>,
+    ) -> Option<types::get_block_template::TemplateRejections> {
+        let mut tip_is_current = true;
+        self.gbt.template_rejections.send_if_modified(|state| {
+            if self
+                .latest_chain_tip
+                .best_tip_hash()
+                .is_some_and(|tip| tip != tip_hash)
+            {
+                tip_is_current = false;
+                return false;
+            }
+
+            let changed = state.parent != Some(tip_hash);
+            state.set_parent(tip_hash);
+            changed
+        });
+
+        tip_is_current.then(|| rejections.borrow_and_update().clone())
+    }
+
+    /// Returns the template to publish, recovering an empty one when this parent needs a fallback.
     async fn finish_mining_template(
         &self,
-        mut template: BlockTemplateResponse,
+        template: BlockTemplateResponse,
         chain_info: &zakura_state::GetBlockTemplateChainInfo,
         miner_params: &types::get_block_template::MinerParams,
     ) -> Result<GetBlockTemplateResponse> {
-        let state = self.gbt.template_rejections.borrow().clone();
-        if state.parent != Some(chain_info.tip_hash) {
+        let mut state = self.gbt.template_rejections.borrow().clone();
+
+        // Transaction selection ran after the chain state was fetched, so re-check both the
+        // rejection state's parent and the chain tip itself: neither request retargets the other.
+        if state.parent != Some(chain_info.tip_hash)
+            || self
+                .latest_chain_tip
+                .best_tip_hash()
+                .is_some_and(|tip| tip != chain_info.tip_hash)
+        {
             return Err(ErrorObject::owned(
                 0,
                 "template parent changed; retry",
                 None::<()>,
             ));
         }
-        if state.needs_fallback() {
-            if state.saturated {
+
+        if !state.needs_fallback() {
+            self.prepare_template_in_background(&template);
+            // A rejection can land between the snapshot above and this point, which would leave
+            // this brand-new work withdrawn the moment it reaches the miner. Recover instead.
+            state = self.gbt.template_rejections.borrow().clone();
+            if !state.needs_fallback() {
+                return Ok(template.into());
+            }
+        }
+
+        if state.saturated {
+            return Err(ErrorObject::owned(
+                0,
+                "template rejection limit reached; wait for a new tip",
+                None::<()>,
+            ));
+        }
+
+        self.recover_template(template, chain_info, miner_params, &state)
+            .await
+    }
+
+    /// Validates an empty replacement template in the foreground and publishes it.
+    ///
+    /// A recovered template is the only work this parent may still hand out, so it is validated
+    /// before it is returned, and only published if the context it was validated against still
+    /// holds.
+    async fn recover_template(
+        &self,
+        template: BlockTemplateResponse,
+        chain_info: &zakura_state::GetBlockTemplateChainInfo,
+        miner_params: &types::get_block_template::MinerParams,
+        state: &types::get_block_template::TemplateRejections,
+    ) -> Result<GetBlockTemplateResponse> {
+        let mut long_poll_id = template.long_poll_id;
+        // A miner holding work from an earlier revision must not resubmit it.
+        let submit_old = if long_poll_id.revision != state.revision {
+            Some(false)
+        } else {
+            template.submit_old
+        };
+        long_poll_id.revision = state.revision;
+        let template = BlockTemplateResponse::new_internal(
+            &self.network,
+            None,
+            miner_params,
+            chain_info,
+            long_poll_id,
+            vec![],
+            submit_old,
+        );
+
+        match prepare_server_template(
+            self.gbt.block_verifier_router(),
+            &template,
+            self.latest_chain_tip.clone(),
+            &self.network,
+        )
+        .await
+        {
+            Preparation::Prepared => {}
+            Preparation::Rejected => {
                 return Err(ErrorObject::owned(
                     0,
-                    "template rejection limit reached; wait for a new tip",
+                    "empty template recovery was rejected; wait for a new tip",
                     None::<()>,
-                ));
+                ))
             }
-            let mut long_poll_id = template.long_poll_id;
-            let submit_old = if long_poll_id.revision != state.revision {
-                Some(false)
-            } else {
-                template.submit_old
-            };
-            long_poll_id.revision = state.revision;
-            template = BlockTemplateResponse::new_internal(
-                &self.network,
-                None,
-                miner_params,
-                chain_info,
-                long_poll_id,
-                vec![],
-                submit_old,
-            );
-            let block =
-                proposal_block_from_template(&template, None, &self.network).map_misc_error()?;
-            tokio::time::timeout(
-                Duration::from_secs(30),
-                self.gbt
-                    .block_verifier_router()
-                    .oneshot(zakura_consensus::Request::Prepare {
-                        block: Arc::new(block),
-                        work_id: Some(template.work_id().clone()),
-                        source: zakura_consensus::PreparedCandidateSource::ServerTemplate,
-                    }),
-            )
-            .await
-            .map_misc_error()?
-            .map_misc_error()?;
-            // A fallback must still belong to the context we just validated.
-            let current = self.gbt.template_rejections.borrow();
-            if current.parent != state.parent
-                || current.revision != state.revision
-                || current.contains(template.work_id())
-                || self
-                    .latest_chain_tip
-                    .best_tip_hash()
-                    .is_some_and(|tip| tip != chain_info.tip_hash)
-            {
+            Preparation::Stale => {
                 return Err(ErrorObject::owned(
                     0,
                     "template changed during recovery; retry",
                     None::<()>,
-                ));
+                ))
             }
-            drop(current);
-            self.gbt.template_rejections.send_if_modified(|state| {
-                state.mark_prepared(chain_info.tip_hash, template.work_id());
-                false
-            });
-        } else {
-            self.prepare_template_in_background(&template);
+            Preparation::TimedOut => {
+                return Err(ErrorObject::owned(
+                    0,
+                    "empty template recovery timed out; retry",
+                    None::<()>,
+                ))
+            }
+            Preparation::Failed(error) => {
+                return Err(ErrorObject::owned(0, error.to_string(), None::<()>))
+            }
         }
+
+        if self.recovery_context_changed(state, &template, chain_info.tip_hash) {
+            return Err(ErrorObject::owned(
+                0,
+                "template changed during recovery; retry",
+                None::<()>,
+            ));
+        }
+
+        self.gbt
+            .template_rejections
+            .send_if_modified(|state| state.mark_prepared(chain_info.tip_hash, template.work_id()));
+
         Ok(template.into())
     }
 
+    /// Whether anything a recovered template was validated against has moved on since.
+    fn recovery_context_changed(
+        &self,
+        state: &types::get_block_template::TemplateRejections,
+        template: &BlockTemplateResponse,
+        tip_hash: block::Hash,
+    ) -> bool {
+        let current = self.gbt.template_rejections.borrow();
+
+        // Another rejection landed on this parent, or withdrew this very work.
+        current.parent != state.parent
+            || current.revision != state.revision
+            || current.contains(template.work_id())
+            // The chain moved off the parent this template was built on.
+            || self
+                .latest_chain_tip
+                .best_tip_hash()
+                .is_some_and(|tip| tip != tip_hash)
+    }
+
+    /// Validates queued server templates in the background, newest first.
+    ///
+    /// # Compute bound
+    ///
+    /// Speculative preparation is work nobody asked for, so it must never be able to accumulate.
+    /// Two properties bound it, and both are load-bearing:
+    ///
+    /// - `TemplatePreparationQueue` admits one loop and holds one pending template. The loop's
+    ///   `PreparationWorker` releases that slot however the loop ends.
+    /// - [`prepare_one_server_template`] waits for each preparation's *computation* to finish,
+    ///   not merely for an answer the node can still use. A deadline or a tip change does not
+    ///   stop the verification that was dispatched, so taking the next template then would leave
+    ///   two verifications in flight. Repeating that is how a stream of tip changes turns
+    ///   speculation into unbounded work.
+    ///
+    /// Together they hold speculative preparation to one verification in flight at any moment.
+    /// A preparation that never returns therefore stops speculation entirely, which is the safe
+    /// direction: ordinary submission and foreground recovery do not go through here.
     fn prepare_template_in_background(&self, template: &BlockTemplateResponse) {
-        let Some(template) = self.gbt.queue_template_preparation(template.clone()) else {
+        let Some((template, mut worker)) = self.gbt.queue_template_preparation(template.clone())
+        else {
             metrics::counter!("mining.template_preparation.coalesced").increment(1);
             return;
         };
@@ -1296,87 +1634,22 @@ where
             async move {
                 let mut template = template;
                 loop {
-                    // Once a parent needs recovery, only foreground-validated fallback work
-                    // may be published. Discard its queued speculative preparations.
-                    if gbt.template_rejections.borrow().needs_fallback() {
-                        let Some(next) = gbt.next_template_preparation() else {
-                            break;
-                        };
-                        template = next;
-                        continue;
-                    }
-                    if let Ok(block) = proposal_block_from_template(&template, None, &network) {
-                        let parent = block.header.previous_block_hash;
-                        let request = zakura_consensus::Request::Prepare {
-                            block: Arc::new(block),
-                            work_id: Some(template.work_id().clone()),
-                            source: zakura_consensus::PreparedCandidateSource::ServerTemplate,
-                        };
-                        let mut tip = latest_chain_tip.clone();
-                        let stale = async {
-                            loop {
-                                tip.mark_best_tip_seen();
-                                if tip.best_tip_hash() != Some(parent) {
-                                    break;
-                                }
-                                if tip.best_tip_changed().await.is_err() {
-                                    break;
-                                }
-                            }
-                        };
-                        let result = tokio::select! {
-                            biased;
-                            _ = stale => {
-                                metrics::counter!("mining.template_preparation.cancelled").increment(1);
-                                None
-                            }
-                            result = tokio::time::timeout(Duration::from_secs(30), verifier.clone().oneshot(request)) => {
-                                match result {
-                                    Ok(result) => Some(result),
-                                    Err(_) => {
-                                        metrics::counter!("mining.template_preparation.timed_out").increment(1);
-                                        None
-                                    }
-                                }
-                            }
-                        };
-                        if let Some(Ok(_)) = &result {
-                            gbt.template_rejections.send_if_modified(|state| {
-                                state.mark_prepared(parent, template.work_id());
-                                false
-                            });
-                        }
-                        if let Some(Err(error)) = result {
-                            let rejects_template = error
-                                .downcast_ref::<zakura_consensus::VerifyBlockError>()
-                                .or_else(|| match error.downcast_ref::<zakura_consensus::RouterError>() {
-                                    Some(zakura_consensus::RouterError::Block { source }) => Some(source.as_ref()),
-                                    _ => None,
-                                })
-                                .is_some_and(zakura_consensus::VerifyBlockError::rejects_template);
-                            if rejects_template {
-                                gbt.template_rejections.send_if_modified(|state| {
-                                    state.reject(parent, template.work_id())
-                                });
-                                metrics::counter!("mining.template_preparation.rejected")
-                                    .increment(1);
-                            }
-                            tracing::debug!(
-                                ?error,
-                                work_id = %template.work_id(),
-                                ?parent,
-                                rejects_template,
-                                "background mining candidate preparation failed"
-                            );
-                        }
-                    } else {
-                        gbt.template_rejections.send_if_modified(|state| {
-                            state.reject(template.previous_block_hash, template.work_id())
-                        });
-                        tracing::warn!(work_id = %template.work_id(), "server mining template cannot form a proposal");
+                    // Recheck everything that may have changed while the previous template was
+                    // being prepared, before spending anything on this one.
+                    if zakura_chain::shutdown::is_shutting_down() {
+                        break;
                     }
 
-                    let Some(next) = gbt.next_template_preparation() else {
+                    prepare_one_server_template(
+                        &gbt,
+                        verifier.clone(),
+                        &template,
+                        &latest_chain_tip,
+                        &network,
+                    )
+                    .await;
+
+                    let Some(next) = worker.next() else {
                         break;
                     };
                     template = next;
@@ -1384,6 +1657,12 @@ where
             }
             .in_current_span(),
         );
+    }
+
+    /// Shares one pending-block registry with peer serving.
+    pub fn with_pending_blocks(mut self, pending_blocks: PendingBlockRegistry) -> Self {
+        self.gbt.set_pending_blocks(pending_blocks);
+        self
     }
 
     /// Sets the end-of-support height reported by `getdeprecationinfo`.
@@ -2808,16 +3087,12 @@ where
             .as_ref()
             .and_then(GetBlockTemplateParameters::block_proposal_data)
         {
-            let work_id = parameters
-                .as_ref()
-                .and_then(|parameters| parameters.work_id.clone());
             return validate_block_proposal(
                 self.gbt.block_verifier_router(),
                 block_proposal_bytes,
                 &self.network,
                 latest_chain_tip,
                 sync_status,
-                work_id,
             )
             .await;
         }
@@ -2868,18 +3143,13 @@ where
                 cur_time,
                 ..
             } = fetch_chain_info(read_state.clone()).await?;
-            if latest_chain_tip
-                .best_tip_hash()
-                .is_some_and(|tip| tip != tip_hash)
-            {
+            // Tracking this iteration's parent marks the rejection state it snapshots as seen:
+            // this iteration's own parent update is not a reason to wake long polling again.
+            let Some(rejection_state) =
+                self.track_template_parent(tip_hash, &mut template_rejections)
+            else {
                 continue;
-            }
-            self.gbt.template_rejections.send_if_modified(|state| {
-                let changed = state.parent != Some(tip_hash);
-                state.set_parent(tip_hash);
-                changed
-            });
-            let rejection_state = template_rejections.borrow_and_update().clone();
+            };
 
             // Fetch the mempool data for the block template:
             // - if the mempool transactions change, we might return from long polling.
@@ -3029,15 +3299,12 @@ where
 
                 precomputed_coinbase = wait_for_new_tip => {
                     let chain_info = fetch_chain_info(read_state.clone()).await?;
-                    if latest_chain_tip.best_tip_hash().is_some_and(|tip| tip != chain_info.tip_hash) {
+                    let Some(rejection_state) =
+                        self.track_template_parent(chain_info.tip_hash, &mut template_rejections)
+                    else {
                         continue;
-                    }
+                    };
 
-                    self.gbt.template_rejections.send_if_modified(|state| {
-                        let changed = state.parent != Some(chain_info.tip_hash);
-                        state.set_parent(chain_info.tip_hash);
-                        changed
-                    });
                     let mut server_long_poll_id = LongPollInput::new(
                         chain_info.tip_height,
                         chain_info.tip_hash,
@@ -3045,7 +3312,7 @@ where
                         vec![]
                     )
                     .generate_id();
-                    server_long_poll_id.revision = self.gbt.template_rejections.borrow().revision;
+                    server_long_poll_id.revision = rejection_state.revision;
 
                     let submit_old = client_long_poll_id
                         .as_ref()
@@ -3141,7 +3408,9 @@ where
     async fn submit_block(
         &self,
         HexData(block_bytes): HexData,
-        parameters: Option<SubmitBlockParameters>,
+        // The work ID is accepted for BIP 22 compatibility and identifies nothing: the verifier
+        // looks a prepared candidate up by its content.
+        _parameters: Option<SubmitBlockParameters>,
     ) -> Result<SubmitBlockResponse> {
         let mut block_verifier_router = self.gbt.block_verifier_router();
         let submitted_at = std::time::Instant::now();
@@ -3167,11 +3436,9 @@ where
             Err(response) => return Ok(response.into()),
         };
         let block = Arc::new(block);
-        let work_id = parameters.and_then(|parameters| parameters.work_id);
         let admission = zakura_state::BlockAdmission::pending();
         let request = zakura_consensus::Request::CommitMined {
             block: block.clone(),
-            work_id,
             admission: admission.clone(),
         };
         let pending_blocks = self.gbt.pending_blocks();
@@ -3191,6 +3458,8 @@ where
             let verification_result = tokio::select! {
                 biased;
 
+                // Observe a completed commit before advertising its pending body.
+                result = &mut verification => result,
                 admitted = admission.wait() => {
                     metrics::histogram!("mining.state_admission.duration_seconds")
                         .record(admission_start.elapsed().as_secs_f64());
@@ -3213,7 +3482,6 @@ where
                     }
                     verification.await
                 },
-                result = &mut verification => result,
             };
 
             if let Some(registration) = pending_registration {

@@ -312,6 +312,37 @@ mod tests {
     }
 
     #[test]
+    fn eligible_negative_balance_follows_reissuance_activation() {
+        use zakura_chain::parameters::testnet::{ConfiguredActivationHeights, RegtestParameters};
+        let network = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu7: Some(2),
+                ..Default::default()
+            },
+            zip234_start_height: Some(Height(3)),
+            ..Default::default()
+        });
+        let baseline =
+            i128::try_from(scheduled_issuance_zatoshis(Height(1), &network).unwrap()).unwrap();
+        for h in [2, 3] {
+            let scheduled =
+                i128::try_from(scheduled_issuance_zatoshis(Height(h), &network).unwrap()).unwrap();
+            let pools = ValueBalance::from_transparent_amount(
+                Amount::try_from(i64::try_from(scheduled - baseline + 1).unwrap()).unwrap(),
+            );
+            let result = eligible_deficit(&network, Height(h), pools, baseline);
+            if cfg!(feature = "nu7") && h == 3 {
+                assert!(matches!(
+                    result,
+                    Err(FormatChangeError::InvalidPostcondition(_))
+                ));
+            } else {
+                assert_eq!(i64::from(result.unwrap()), -1);
+            }
+        }
+    }
+
+    #[test]
     fn backfill_preserves_negative_deficit() {
         let network = Network::Mainnet;
         let height = Height(1);
@@ -455,6 +486,24 @@ mod database_tests {
         assert!(matches!(result, Err(FormatChangeError::Cancelled)));
         Upgrade.run(Some(Height(10_000)), &db, &rx).unwrap();
         assert_upgraded(&db, 10_001);
+    }
+
+    #[test]
+    fn cancellation_after_tip_write_prevents_validation_and_allows_retry() {
+        let db = legacy_db(4, 48);
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        backfill(Some(Height(3)), &db, &rx, |batch| {
+            db.write_batch(batch).unwrap();
+            tx.send(CancelFormatChange).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        assert!(matches!(
+            Upgrade.validate(&db, &rx),
+            Err(FormatChangeError::Cancelled)
+        ));
+        Upgrade.run(Some(Height(3)), &db, &rx).unwrap();
+        assert_upgraded(&db, 4);
     }
 
     #[test]

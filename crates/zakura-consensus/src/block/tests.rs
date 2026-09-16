@@ -2024,11 +2024,14 @@ async fn zip234_block_verification_checks_the_reissuance_bonus() {
         |parent_deficit: i64, coinbase_value: Amount<zakura_chain::amount::NonNegative>| {
             let network = network.clone();
             let parent_pools = zip234_parent_pools(&network, parent, parent_deficit);
+            let block = zip234_test_block(&network, start, coinbase_value);
+            let expected_parent = block.header.previous_block_hash;
 
             let state = service_fn(move |request: zs::Request| async move {
                 let response = match request {
                     zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
-                    zs::Request::AwaitBlockInfo(_) => {
+                    zs::Request::AwaitBlockInfo(requested_parent) => {
+                        assert_eq!(requested_parent, expected_parent);
                         zs::Response::BlockInfo(Some(BlockInfo::new(parent_pools, 0)))
                     }
                     zs::Request::CommitSemanticallyVerifiedBlock(block) => {
@@ -2044,7 +2047,6 @@ async fn zip234_block_verification_checks_the_reissuance_bonus() {
                 Ok::<_, BoxError>(accept_block_transaction(request))
             });
             let verifier = SemanticBlockVerifier::new(&network, state, transaction);
-            let block = zip234_test_block(&network, start, coinbase_value);
 
             verifier.oneshot(Request::Commit(Arc::new(block)))
         };

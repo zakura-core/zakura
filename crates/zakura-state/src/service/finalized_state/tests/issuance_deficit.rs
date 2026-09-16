@@ -276,10 +276,10 @@ fn claim_fixture_obeys_subsidy_limit() {
     let change = block
         .chain_value_pool_change(&network, &Default::default(), None)
         .unwrap();
-    assert!(
-        change.total().unwrap() <= allowed,
-        "the acceptance fixture claims more than the subsidy: {:?} > {allowed:?}",
-        change.total().unwrap()
+    assert_eq!(
+        change.total().unwrap(),
+        allowed,
+        "the acceptance fixture must claim the exact subsidy"
     );
 }
 
@@ -432,7 +432,7 @@ proptest::proptest! {
     fn non_finalized_forks_keep_independent_deficits(shortfall in 1i64..1_000_000) {
         let _guard = zakura_test::init();
         let network = zip234_network();
-        let (state, parent) = state_below_start(&network);
+        let (mut state, parent) = state_below_start(&network);
         let before = state.db.finalized_value_pool();
         let deficit = i64::from(before.issuance_deficit_amount());
         let bonus = i64::try_from((i128::from(deficit) * 4126 + 9_999_999_999) / 10_000_000_000).unwrap();
@@ -452,6 +452,35 @@ proptest::proptest! {
         proptest::prop_assert!(forks.commit_new_chain(SemanticallyVerifiedBlock::from(over), &state.db).is_err());
         proptest::prop_assert_eq!(forks.chain_count(), 2);
         proptest::prop_assert_eq!(state.db.finalized_value_pool(), before);
+        for (index, (parent, parent_deficit)) in [(&full, deficit - bonus), (&partial, deficit - bonus + shortfall)].into_iter().enumerate() {
+            let height = START.next().unwrap();
+            let bonus = i64::try_from((i128::from(parent_deficit) * 4126 + 9_999_999_999) / 10_000_000_000).unwrap();
+            let scheduled = i64::from(zakura_chain::parameters::subsidy::halving_block_subsidy(height, &network).unwrap());
+            let mut coinbase = (*parent.transactions[0]).clone();
+            let Transaction::V5 { inputs, outputs, expiry_height, .. } = &mut coinbase else { unreachable!() };
+            *expiry_height = height;
+            let Input::Coinbase { height: input_height, .. } = &mut inputs[0] else { unreachable!() };
+            *input_height = height;
+            outputs[0].value = Amount::try_from(scheduled + bonus).unwrap();
+            let history = forks.chain_iter().find_map(|chain| chain.history_tree(parent.hash().into())).unwrap();
+            let child = child_block_with_history_commitment(parent, vec![Arc::new(coinbase)], &network, &history);
+            forks.commit_block(SemanticallyVerifiedBlock::from(child.clone()), &state.db).unwrap();
+            let info = forks.chain_iter().find_map(|chain| chain.block_info(child.hash().into())).unwrap();
+            proptest::prop_assert_eq!(i64::from(info.value_pools().issuance_deficit_amount()), parent_deficit - bonus);
+            if index == 0 {
+                proptest::prop_assert_eq!(forks.best_chain().unwrap().non_finalized_tip_hash(), child.hash());
+            }
+        }
+        let best = forks.best_chain().unwrap();
+        let root_pools = *best.block_info(START.into()).unwrap().value_pools();
+        let tip_before = best.non_finalized_tip_with_value_balance();
+        state.commit_finalized_direct(forks.finalize(), None, None, "deficit property").unwrap();
+        proptest::prop_assert_eq!(state.db.finalized_value_pool(), root_pools);
+        proptest::prop_assert_eq!(forks.chain_count(), 1);
+        proptest::prop_assert_eq!(forks.best_chain().unwrap().non_finalized_tip_with_value_balance(), tip_before);
+        state.commit_finalized_direct(forks.finalize(), None, None, "deficit property").unwrap();
+        proptest::prop_assert_eq!(state.db.finalized_value_pool(), tip_before.2);
+
     }
 }
 

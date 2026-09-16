@@ -1253,3 +1253,116 @@ async fn explicit_outcomes_are_nonpunitive_and_reschedule_after_status_refresh()
     shutdown.cancel();
     task.await.expect("the reactor exits cleanly");
 }
+
+#[test]
+fn header_continuation_uses_credits_released_after_a_small_first_request() {
+    for advertised_limit in [1, 1_000] {
+        let shutdown = CancellationToken::new();
+        let mut startup = startup(shutdown);
+        let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+        let mut snapshot = committed_snapshot(anchor);
+        snapshot.frontiers.header_best.height = block::Height(1_999);
+        let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+        startup.committed_snapshots = Some(snapshots_rx);
+        let (_, mut actions, mut reactor) = build_header_sync_reactor(startup).unwrap();
+        let supplier = peer();
+        let (send, mut outbound) = framed_channel(8);
+        reactor.handle_peer_connected(PeerSession::from_parts(
+            supplier.clone(),
+            send,
+            CancellationToken::new(),
+        ));
+        outbound.try_recv().expect("the initial status was sent");
+
+        let other = ZakuraPeerId::new(vec![0x72; 32]).unwrap();
+        seed_applying_request(&mut reactor, &snapshot, other.clone(), 1);
+        reactor
+            .peer_work_queue
+            .set_capacity_for_test(&other, 2_000, 0);
+        let target = block::Hash([0x53; 32]);
+        reactor.handle_wire_message(
+            supplier.clone(),
+            0,
+            HeaderSyncMessage::Status(Status {
+                work_anchor_height: anchor.height,
+                work_anchor_hash: anchor.hash,
+                selected_tip_height: block::Height(10_000),
+                selected_tip_hash: target,
+                suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(2_u8),
+                oldest_retained_height: anchor.height,
+                max_headers_per_response: advertised_limit,
+                max_inflight_requests: 1,
+                max_message_bytes: 2_000_000,
+                tree_aux_schema_mask: 0,
+            }),
+        );
+        let HeaderPortOperation::QueryHeaderLocator { scope, .. } = actions.try_recv().unwrap()
+        else {
+            panic!("the advertised target requires a locator");
+        };
+        reactor.handle_header_locator_ready(
+            supplier.clone(),
+            0,
+            target,
+            scope,
+            Some(zakura_header_chain::HeaderLocator::for_continuation(
+                snapshot.frontiers.header_best,
+            )),
+        );
+        let HeaderSyncMessage::GetHeaders(first) = reactor
+            .codec
+            .decode_frame(outbound.try_recv().unwrap(), None)
+            .unwrap()
+        else {
+            panic!("the first wire request must be GetHeaders");
+        };
+        assert_eq!(
+            first.max_header_count, 1,
+            "the other request owns the remaining credits"
+        );
+        reactor.retire_peer_work(&other, HeaderRequestTerminal::LocalError);
+
+        let mut header = *regtest_genesis_block().header;
+        header.previous_block_hash = snapshot.frontiers.header_best.hash;
+        header.time += chrono::Duration::seconds(1);
+        let header = Arc::new(header);
+        reactor.handle_headers(
+            supplier.clone(),
+            0,
+            scope,
+            Headers {
+                request_id: first.request_id,
+                target_tip_hash: target,
+                common_ancestor_height: snapshot.frontiers.header_best.height,
+                common_ancestor_hash: snapshot.frontiers.header_best.hash,
+                complete: false,
+                tree_aux_schema: AuxSchema::None,
+                entries: vec![HeaderEntry {
+                    header: header.clone(),
+                    body_size: 0,
+                    tree_aux: None,
+                }],
+            },
+        );
+        let HeaderSyncMessage::GetHeaders(next) = reactor
+            .codec
+            .decode_frame(outbound.try_recv().unwrap(), None)
+            .unwrap()
+        else {
+            panic!("the partial response must trigger a continuation");
+        };
+        assert_eq!(
+            next.max_header_count,
+            advertised_limit.min(250),
+            "the negotiated peer and byte limits still bound the page"
+        );
+        if advertised_limit > 1 {
+            assert!(next.max_header_count > first.max_header_count);
+        }
+        assert_eq!(next.locator_hashes, vec![header.hash()]);
+        assert_eq!(
+            reactor.peer_work_queue.claimed_header_count(),
+            1 + usize::try_from(next.max_header_count).unwrap()
+        );
+    }
+}

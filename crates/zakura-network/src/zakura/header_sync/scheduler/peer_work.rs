@@ -293,7 +293,8 @@ pub struct ActiveHeaderRequest {
     pub entries: Vec<HeaderEntry>,
     /// Exact phase of complete-target processing.
     pub phase: HeaderTargetPhase,
-    /// Effective count bound preserved across continuation requests.
+    /// Negotiated page bound before temporary credit limits.
+    /// Each request reserves its count against current shared headroom.
     pub max_header_count: u32,
     /// Requested auxiliary schema preserved across continuation requests.
     pub tree_aux_schema: AuxSchema,

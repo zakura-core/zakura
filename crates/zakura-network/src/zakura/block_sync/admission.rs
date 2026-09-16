@@ -220,7 +220,7 @@ impl AdmissionSnapshot {
 /// charge remains. Both decoded pools are structurally bounded, so
 /// the deep backlog — the pool that actually scales with look-ahead depth — is
 /// charged at its true serialized cost instead of a flat decoded multiple.
-fn estimated_resident_pipeline_bytes(snapshot: &AdmissionSnapshot) -> u64 {
+pub(super) fn estimated_resident_pipeline_bytes(snapshot: &AdmissionSnapshot) -> u64 {
     let serialized = snapshot
         .retained()
         .wire_bytes()

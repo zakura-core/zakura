@@ -100,6 +100,15 @@ impl PeerRoutine {
             let floor_bonus = self.window.scaled_floor_bonus(base_floor_bonus);
             row.peer = Some(trace_peer(&self.peer));
             row.fill_stop_reason = Some(reason);
+            let view = *self.sequencer_view.borrow();
+            let snapshot = self.admission_snapshot(&view);
+            row.body_download_floor = Some(trace_height(view.download_floor));
+            row.verified_block_tip = Some(trace_height(view.verified_tip));
+            row.reserved_memory_exposure_bytes = Some(snapshot.reserved_above_floor_bytes);
+            row.resident_pipeline_bytes = Some(
+                super::super::admission::estimated_resident_pipeline_bytes(&snapshot),
+            );
+            row.lookahead_limit_bytes = Some(self.config.effective_max_reorder_lookahead_bytes());
             row.fill_sent = Some(0);
             row.normal_slots = Some(saturating_usize(self.window.available_slots_at(now)));
             row.floor_slots = Some(saturating_usize(

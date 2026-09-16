@@ -1728,9 +1728,10 @@ impl PeerRoutine {
                 }
             },
         };
-        let has_size_hint = self.work.in_flight_item(height).is_some_and(|item| {
-            !matches!(item.size_hint, super::request::BlockSizeEstimate::Unknown)
-        });
+        let has_size_hint = self
+            .work
+            .in_flight_item(height)
+            .is_some_and(|item| item.reservation_has_size_hint);
         if has_size_hint
             && serialized_bytes
                 > tolerated_bytes(estimated_bytes, self.config.size_deviation_tolerance)

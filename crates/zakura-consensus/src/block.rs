@@ -412,7 +412,13 @@ where
                             }
                         }
                     }
-                    return commit_prepared_block(state_service, prepared_block, admission).await;
+                    return commit_prepared_block(
+                        state_service,
+                        prepared_block,
+                        admission,
+                        request.cancellation(),
+                    )
+                    .await;
                 }
                 metrics::histogram!("mining.solved_header_check.duration_seconds")
                     .record(solved_header_start.elapsed().as_secs_f64());
@@ -586,7 +592,13 @@ where
                 return response;
             }
 
-            commit_prepared_block(state_service, prepared_block, request.admission()).await
+            commit_prepared_block(
+                state_service,
+                prepared_block,
+                request.admission(),
+                request.cancellation(),
+            )
+            .await
         }
         .instrument(span)
         .boxed()
@@ -626,6 +638,7 @@ async fn commit_prepared_block<S>(
     mut state_service: S,
     prepared_block: zs::SemanticallyVerifiedBlock,
     admission: Option<zs::BlockAdmission>,
+    cancellation: Option<zs::CommitCancellation>,
 ) -> Result<block::Hash, VerifyBlockError>
 where
     S: Service<zs::Request, Response = zs::Response, Error = BoxError> + Send + Clone + 'static,
@@ -650,7 +663,13 @@ where
             admission,
             requested_at: std::time::Instant::now(),
         },
-        None => zs::Request::CommitSemanticallyVerifiedBlock(prepared_block),
+        None => match cancellation {
+            Some(cancellation) => zs::Request::CommitSemanticallyVerifiedBlockCancellable {
+                block: prepared_block,
+                cancellation,
+            },
+            None => zs::Request::CommitSemanticallyVerifiedBlock(prepared_block),
+        },
     };
     let response = ready_state_service.call(request).await;
     if is_mined_commit {

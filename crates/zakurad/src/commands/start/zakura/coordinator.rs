@@ -59,7 +59,6 @@ pub(crate) enum BlockApplyOperationState {
     Accepted,
     TooLate,
     Cancelled,
-    TransferredToLegacy,
     Committed,
     Rejected,
     Failed,
@@ -69,6 +68,13 @@ pub(crate) enum BlockApplyOperationState {
 struct BlockApplyOperationRecord {
     state: BlockApplyOperationState,
     state_tx: watch::Sender<BlockApplyOperationState>,
+    cancellation: zakura_state::CommitCancellation,
+    started: tokio::time::Instant,
+    block: Option<(
+        zakura_chain::block::Hash,
+        Option<zakura_chain::block::Height>,
+        zakura_chain::block::Hash,
+    )>,
 }
 
 /// The driver owns this queued operation.
@@ -86,20 +92,18 @@ pub(crate) struct AcceptedBlockApplyOperation {
     coordinator: Arc<SyncCoordinator>,
     id: BlockApplyOperationId,
     permit: Option<BlockApplyPermit>,
+    cancellation: zakura_state::CommitCancellation,
     finished: bool,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum BlockApplyTerminal {
+    Cancelled,
     Committed,
     Rejected,
-    TransferredToLegacy,
 }
 
-/// Authorization for one legacy fallback round after native admission stops.
-///
-/// Full semantic commits drain before this lease activates. The block driver transfers incomplete
-/// checkpoint ranges to the shared checkpoint verifier so fallback can supply their missing bodies.
+/// Exclusive authorization for one fully drained legacy fallback round.
 #[derive(Debug)]
 pub(crate) struct LegacyFallbackLease {
     coordinator: Arc<SyncCoordinator>,
@@ -217,19 +221,6 @@ impl SyncCoordinator {
         }
     }
 
-    /// Wait until fallback starts draining native applies.
-    pub(crate) async fn wait_for_legacy_yield(&self) {
-        loop {
-            let changed = self.phase_changed.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
-            if self.is_yielded_to_legacy() {
-                return;
-            }
-            changed.await;
-        }
-    }
-
     /// Reserve one apply in the exact current native epoch.
     #[cfg(test)]
     pub(crate) fn begin_apply(self: &Arc<Self>) -> Option<BlockApplyPermit> {
@@ -276,15 +267,34 @@ impl SyncCoordinator {
                 BlockApplyOperationRecord {
                     state: BlockApplyOperationState::Queued,
                     state_tx,
+                    cancellation: Default::default(),
+                    started: tokio::time::Instant::now(),
+                    block: None,
                 },
             );
         drop(phase);
-        metrics::gauge!("sync.zakura.apply.operations").set(self.operation_count() as f64);
+        self.publish_operation_metrics();
         Some(BlockApplyOperation {
             coordinator: self.clone(),
             id,
             finished: false,
         })
+    }
+
+    pub(crate) fn publish_operation_metrics(&self) {
+        let operations = self
+            .operations
+            .lock()
+            .expect("operation lock is not poisoned");
+        metrics::gauge!("sync.zakura.apply.operations").set(operations.len() as f64);
+        metrics::gauge!("sync.zakura.apply.in_flight")
+            .set(self.in_flight.load(std::sync::atomic::Ordering::SeqCst) as f64);
+        let oldest = operations
+            .values()
+            .map(|record| record.started.elapsed())
+            .max()
+            .unwrap_or_default();
+        metrics::gauge!("sync.zakura.apply.oldest_seconds").set(oldest.as_secs_f64());
     }
 
     /// Request the same acknowledged operation quiescence used by fallback during shutdown.
@@ -300,6 +310,8 @@ impl SyncCoordinator {
         {
             self.drained.notify_waiters();
         }
+        metrics::gauge!("sync.zakura.apply.in_flight")
+            .set(self.in_flight.load(std::sync::atomic::Ordering::SeqCst) as f64);
     }
 
     /// Stop native admission, quiesce the exact epoch, then authorize one legacy round.
@@ -394,6 +406,28 @@ impl SyncCoordinator {
                     });
                 }
                 _ = tokio::time::sleep(diagnostic_interval) => {
+                let epoch = self.apply_phase().epoch().get();
+                let records = self
+                    .operations
+                    .lock()
+                    .expect("operation lock is not poisoned");
+                let oldest = records
+                    .values()
+                    .map(|record| record.started.elapsed())
+                    .max()
+                    .unwrap_or_default();
+                metrics::gauge!("sync.zakura.apply.oldest_seconds").set(oldest.as_secs_f64());
+                for (id, record) in records.iter() {
+                    let (hash, height, parent) = record
+                        .block
+                        .map(|(hash, height, parent)| (Some(hash), height, Some(parent)))
+                        .unwrap_or_default();
+                    tracing::warn!(operation_id = id.0, ?hash, ?height, ?parent, stage = record.cancellation.stage(), lifecycle = ?record.state,
+                        age_seconds = record.started.elapsed().as_secs_f64(), apply_epoch = epoch,
+                        "native block apply delays fallback");
+                }
+                drop(records);
+
                     tracing::warn!(
                         in_flight,
                         operations,
@@ -407,14 +441,37 @@ impl SyncCoordinator {
     }
 
     fn request_operation_cancellation(&self) {
+        let epoch = self.apply_phase().epoch().get();
         let mut operations = self
             .operations
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for record in operations.values_mut() {
+        for (id, record) in operations.iter_mut() {
+            if record.state == BlockApplyOperationState::Accepted {
+                let (hash, height, parent) = record
+                    .block
+                    .map(|(hash, height, parent)| (Some(hash), height, Some(parent)))
+                    .unwrap_or_default();
+                tracing::info!(
+                    operation_id = id.0,
+                    ?hash,
+                    ?height,
+                    ?parent,
+                    apply_epoch = epoch,
+                    age_seconds = record.started.elapsed().as_secs_f64(),
+                    stage = record.cancellation.stage(),
+                    "requesting native block apply cancellation"
+                );
+            }
             let next = match record.state {
                 BlockApplyOperationState::Queued => BlockApplyOperationState::CancelRequested,
-                BlockApplyOperationState::Accepted => BlockApplyOperationState::TooLate,
+                BlockApplyOperationState::Accepted => {
+                    if record.cancellation.cancel() {
+                        BlockApplyOperationState::CancelRequested
+                    } else {
+                        BlockApplyOperationState::TooLate
+                    }
+                }
                 state => state,
             };
             if next != record.state {
@@ -450,7 +507,7 @@ impl SyncCoordinator {
             drop(operations);
             drop(phase);
             self.drained.notify_waiters();
-            metrics::gauge!("sync.zakura.apply.operations").set(self.operation_count() as f64);
+            self.publish_operation_metrics();
             return None;
         }
         self.in_flight
@@ -463,12 +520,15 @@ impl SyncCoordinator {
         record
             .state_tx
             .send_replace(BlockApplyOperationState::Accepted);
+        let cancellation = record.cancellation.clone();
         drop(operations);
         drop(phase);
+        self.publish_operation_metrics();
         Some(AcceptedBlockApplyOperation {
             coordinator: self.clone(),
             id,
             permit: Some(BlockApplyPermit(self.clone())),
+            cancellation,
             finished: false,
         })
     }
@@ -492,7 +552,7 @@ impl SyncCoordinator {
         }
         drop(operations);
         self.drained.notify_waiters();
-        metrics::gauge!("sync.zakura.apply.operations").set(self.operation_count() as f64);
+        self.publish_operation_metrics();
     }
 
     fn finish_operation(&self, id: BlockApplyOperationId, terminal: BlockApplyTerminal) {
@@ -502,11 +562,9 @@ impl SyncCoordinator {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(record) = operations.get_mut(&id) {
             let state = match terminal {
+                BlockApplyTerminal::Cancelled => BlockApplyOperationState::Cancelled,
                 BlockApplyTerminal::Committed => BlockApplyOperationState::Committed,
                 BlockApplyTerminal::Rejected => BlockApplyOperationState::Rejected,
-                BlockApplyTerminal::TransferredToLegacy => {
-                    BlockApplyOperationState::TransferredToLegacy
-                }
             };
             record.state = state;
             record.state_tx.send_replace(state);
@@ -514,7 +572,7 @@ impl SyncCoordinator {
         }
         drop(operations);
         self.drained.notify_waiters();
-        metrics::gauge!("sync.zakura.apply.operations").set(self.operation_count() as f64);
+        self.publish_operation_metrics();
     }
 
     fn fail_operation(&self, id: BlockApplyOperationId) {
@@ -545,7 +603,7 @@ impl SyncCoordinator {
         }
         drop(operations);
         self.drained.notify_waiters();
-        metrics::gauge!("sync.zakura.apply.operations").set(self.operation_count() as f64);
+        self.publish_operation_metrics();
     }
 
     fn operation_count(&self) -> usize {
@@ -679,6 +737,22 @@ impl Drop for BlockApplyPermit {
 }
 
 impl BlockApplyOperation {
+    pub(crate) fn describe(&self, block: &zakura_chain::block::Block) {
+        if let Some(record) = self
+            .coordinator
+            .operations
+            .lock()
+            .expect("operation lock is not poisoned")
+            .get_mut(&self.id)
+        {
+            record.block = Some((
+                block.hash(),
+                block.coinbase_height(),
+                block.header.previous_block_hash,
+            ));
+        }
+    }
+
     pub(crate) const fn id(&self) -> BlockApplyOperationId {
         self.id
     }
@@ -716,6 +790,10 @@ impl Drop for BlockApplyOperation {
 }
 
 impl AcceptedBlockApplyOperation {
+    pub(crate) fn cancellation(&self) -> zakura_state::CommitCancellation {
+        self.cancellation.clone()
+    }
+
     pub(crate) const fn id(&self) -> BlockApplyOperationId {
         self.id
     }
@@ -945,6 +1023,9 @@ mod tests {
             .expect("the queued operation becomes accepted");
         state.changed().await.expect("acceptance is observable");
         assert_eq!(*state.borrow(), BlockApplyOperationState::Accepted);
+        assert!(zakura_state::CommitCancellation::try_start_batch(&[
+            accepted.cancellation()
+        ]));
         let fallback_coordinator = coordinator.clone();
         let fallback = tokio::spawn(async move {
             fallback_coordinator
@@ -981,6 +1062,9 @@ mod tests {
             .expect("the queued operation becomes accepted");
         state.changed().await.expect("acceptance is observable");
 
+        assert!(zakura_state::CommitCancellation::try_start_batch(&[
+            accepted.cancellation()
+        ]));
         let fallback_coordinator = coordinator.clone();
         let fallback = tokio::spawn(async move {
             fallback_coordinator
@@ -1100,5 +1184,147 @@ mod tests {
         assert_eq!(coordinator.operation_count(), 1);
         accepted.complete(BlockApplyTerminal::Rejected);
         assert_eq!(coordinator.operation_count(), 0);
+    }
+    #[tokio::test]
+    async fn fallback_cancels_dependency_wait_before_advancing_epoch() {
+        let coordinator = SyncCoordinator::new();
+        let accepted = coordinator.queue_apply().unwrap().accept().unwrap();
+        let old_fence = accepted.cancellation();
+        let worker_fence = old_fence.clone();
+        let worker = tokio::spawn(async move {
+            worker_fence.cancelled().await;
+            accepted.complete(BlockApplyTerminal::Rejected);
+        });
+        let lease = tokio::time::timeout(
+            Duration::from_secs(1),
+            coordinator.acquire_legacy_fallback(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        worker.await.unwrap();
+        assert_eq!(coordinator.operation_count(), 0);
+        assert!(matches!(
+            coordinator.apply_phase(),
+            ApplyPhase::LegacyFallback { .. }
+        ));
+        drop(lease);
+        let replacement = coordinator.queue_apply().unwrap().accept().unwrap();
+        assert!(!zakura_state::CommitCancellation::try_start_batch(&[
+            old_fence
+        ]));
+        assert!(zakura_state::CommitCancellation::try_start_batch(&[
+            replacement.cancellation()
+        ]));
+        replacement.complete(BlockApplyTerminal::Committed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fallback_deadline_fails_without_releasing_write_ownership() {
+        let coordinator = SyncCoordinator::new();
+        let accepted = coordinator.queue_apply().unwrap().accept().unwrap();
+        assert!(zakura_state::CommitCancellation::try_start_batch(&[
+            accepted.cancellation()
+        ]));
+        let result = coordinator
+            .acquire_legacy_fallback(Duration::from_secs(60))
+            .await;
+        assert!(matches!(
+            result,
+            Err(LegacyFallbackError::ApplyDrainTimedOut { operations: 1, .. })
+        ));
+        assert!(matches!(
+            coordinator.apply_phase(),
+            ApplyPhase::Failed { .. }
+        ));
+        assert_eq!(coordinator.operation_count(), 1);
+        assert!(coordinator.queue_apply().is_none());
+        accepted.complete(BlockApplyTerminal::Committed);
+        assert!(matches!(
+            coordinator.apply_phase(),
+            ApplyPhase::Failed { .. }
+        ));
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fallback_recovers_missing_parent_without_restarting_state() {
+        use tower::{Service, ServiceExt};
+        use zakura_chain::{
+            block::Block, parameters::Network, serialization::ZcashDeserializeInto,
+        };
+        let _guard = zakura_test::init();
+        let state = zakura_state::init_test(&Network::Mainnet).await;
+        let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        let coordinator = SyncCoordinator::new();
+        let operation = coordinator.queue_apply().unwrap();
+        operation.describe(&block);
+        let accepted = operation.accept().unwrap();
+        let cancellation = accepted.cancellation();
+        let mut worker_state = state.clone();
+        let worker_cancellation = cancellation.clone();
+        let worker = tokio::spawn(async move {
+            let result = worker_state
+                .ready()
+                .await
+                .unwrap()
+                .call(
+                    zakura_state::Request::CommitSemanticallyVerifiedBlockCancellable {
+                        block: block.into(),
+                        cancellation: worker_cancellation,
+                    },
+                )
+                .await;
+            let error = result
+                .unwrap_err()
+                .downcast::<zakura_state::CommitSemanticallyVerifiedError>()
+                .unwrap();
+            assert_eq!(error.inner(), &zakura_state::CommitBlockError::Cancelled);
+            accepted.complete(BlockApplyTerminal::Cancelled);
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while cancellation.stage() != "waiting_for_parent" {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let lease = tokio::time::timeout(
+            Duration::from_secs(1),
+            coordinator.acquire_legacy_fallback(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        worker.await.unwrap();
+        assert_eq!(coordinator.operation_count(), 0);
+        for (_, bytes) in zakura_test::vectors::MAINNET_BLOCKS.range(0..=1) {
+            let block: Arc<Block> = bytes.zcash_deserialize_into().unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                state
+                    .clone()
+                    .oneshot(zakura_state::Request::CommitCheckpointVerifiedBlock(
+                        block.into(),
+                    )),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+        let tip = state
+            .clone()
+            .oneshot(zakura_state::Request::Tip)
+            .await
+            .unwrap();
+        assert!(matches!(
+            tip,
+            zakura_state::Response::Tip(Some((zakura_chain::block::Height(1), _)))
+        ));
+        assert!(!zakura_state::CommitCancellation::try_start_batch(&[
+            cancellation
+        ]));
+        drop(lease);
+        assert!(coordinator.zakura_owns_applies());
     }
 }

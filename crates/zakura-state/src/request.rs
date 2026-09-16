@@ -1301,6 +1301,14 @@ pub enum Request {
     /// [0]: (crate::error::CommitSemanticallyVerifiedError)
     CommitSemanticallyVerifiedBlock(SemanticallyVerifiedBlock),
 
+    /// Commits a native sync block unless its owner cancels before write admission.
+    CommitSemanticallyVerifiedBlockCancellable {
+        /// The verified block.
+        block: SemanticallyVerifiedBlock,
+        /// The fence checked by the state before write admission.
+        cancellation: crate::CommitCancellation,
+    },
+
     /// Commits a mined block and reports when state admits it to the active write queue.
     CommitSemanticallyVerifiedBlockWithAdmission {
         /// The semantically verified mined block.
@@ -1572,6 +1580,9 @@ impl Request {
                 "retry_header_chain_body_availability"
             }
             Request::CommitSemanticallyVerifiedBlock(_) => "commit_semantically_verified_block",
+            Request::CommitSemanticallyVerifiedBlockCancellable { .. } => {
+                "commit_semantically_verified_block_cancellable"
+            }
             Request::CommitSemanticallyVerifiedBlockWithAdmission { .. } => {
                 "commit_semantically_verified_block_with_admission"
             }
@@ -2235,6 +2246,7 @@ impl TryFrom<Request> for ReadRequest {
             | Request::RestartHeaderChainBodyAvailability { .. }
             | Request::RetryHeaderChainBodyAvailability { .. }
             | Request::CommitSemanticallyVerifiedBlock(_)
+            | Request::CommitSemanticallyVerifiedBlockCancellable { .. }
             | Request::CommitSemanticallyVerifiedBlockWithAdmission { .. }
             | Request::CommitCheckpointVerifiedBlock(_)
             | Request::InvalidateBlock(_)

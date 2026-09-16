@@ -2399,6 +2399,17 @@ mod zakura_header_sync_driver_tests {
         }))
     }
 
+    fn admit_test_commit(
+        request: &zakura_consensus::Request,
+    ) -> Result<(), zakura_consensus::VerifyBlockError> {
+        if let Some(cancellation) = request.cancellation() {
+            if !zakura_state::CommitCancellation::try_start_batch(&[cancellation]) {
+                return Err(zakura_state::CommitBlockError::Cancelled.into());
+            }
+        }
+        Ok(())
+    }
+
     fn counting_verifier(
         commit_count: Arc<AtomicUsize>,
         release_first: Option<Arc<tokio::sync::Notify>>,
@@ -2407,8 +2418,10 @@ mod zakura_header_sync_driver_tests {
             let commit_count = commit_count.clone();
             let release_first = release_first.clone();
             async move {
+                admit_test_commit(&request)?;
                 match request {
-                    zakura_consensus::Request::Commit(block) => {
+                    zakura_consensus::Request::Commit(block)
+                    | zakura_consensus::Request::CommitCancellable { block, .. } => {
                         let height = block.coinbase_height().expect("test block has height");
                         commit_count.fetch_add(1, Ordering::SeqCst);
 
@@ -2443,8 +2456,10 @@ mod zakura_header_sync_driver_tests {
             let commit_count = commit_count.clone();
             let release_first = release_first.clone();
             async move {
+                admit_test_commit(&request)?;
                 match request {
-                    zakura_consensus::Request::Commit(block) => {
+                    zakura_consensus::Request::Commit(block)
+                    | zakura_consensus::Request::CommitCancellable { block, .. } => {
                         let height = block.coinbase_height().expect("test block has height");
                         commit_count.fetch_add(1, Ordering::SeqCst);
                         commit_tx
@@ -2477,8 +2492,10 @@ mod zakura_header_sync_driver_tests {
         let verifier = service_fn(move |request: zakura_consensus::Request| {
             let commit_tx = commit_tx.clone();
             async move {
+                admit_test_commit(&request)?;
                 match request {
-                    zakura_consensus::Request::Commit(block) => {
+                    zakura_consensus::Request::Commit(block)
+                    | zakura_consensus::Request::CommitCancellable { block, .. } => {
                         let hash = block.hash();
                         commit_tx
                             .send(hash)
@@ -2784,8 +2801,10 @@ mod zakura_header_sync_driver_tests {
         let owner = test_block_work_owner();
         let source = test_block_source();
         let unavailable = service_fn(|request: zakura_consensus::Request| async move {
+            admit_test_commit(&request)?;
             match request {
-                zakura_consensus::Request::Commit(_) => {
+                zakura_consensus::Request::Commit(_)
+                | zakura_consensus::Request::CommitCancellable { .. } => {
                     Err::<block::Hash, zakura_consensus::BoxError>(
                         "local verifier unavailable".into(),
                     )
@@ -2812,8 +2831,10 @@ mod zakura_header_sync_driver_tests {
         ));
 
         let invalid = service_fn(|request: zakura_consensus::Request| async move {
+            admit_test_commit(&request)?;
             match request {
-                zakura_consensus::Request::Commit(_) => {
+                zakura_consensus::Request::Commit(_)
+                | zakura_consensus::Request::CommitCancellable { .. } => {
                     Err::<block::Hash, zakura_consensus::VerifyBlockError>(
                         zakura_consensus::VerifyBlockError::Block {
                             source: zakura_consensus::BlockError::NoTransactions,
@@ -4646,8 +4667,10 @@ mod zakura_header_sync_driver_tests {
         // A verifier that never answers a commit, mimicking the checkpoint
         // verifier buffering a block until its range completes.
         let verifier = service_fn(|request: zakura_consensus::Request| async move {
+            admit_test_commit(&request)?;
             match request {
-                zakura_consensus::Request::Commit(_) => {
+                zakura_consensus::Request::Commit(_)
+                | zakura_consensus::Request::CommitCancellable { .. } => {
                     std::future::pending::<Result<block::Hash, zakura_consensus::BoxError>>().await
                 }
                 request => panic!("unexpected consensus request: {request:?}"),
@@ -4711,8 +4734,10 @@ mod zakura_header_sync_driver_tests {
         );
 
         let verifier = service_fn(|request: zakura_consensus::Request| async move {
+            admit_test_commit(&request)?;
             match request {
-                zakura_consensus::Request::Commit(block) => {
+                zakura_consensus::Request::Commit(block)
+                | zakura_consensus::Request::CommitCancellable { block, .. } => {
                     Ok::<_, zakura_consensus::BoxError>(block.hash())
                 }
                 request => panic!("unexpected consensus request: {request:?}"),
@@ -4746,6 +4771,7 @@ mod zakura_header_sync_driver_tests {
             BlockApplyClass::Checkpoint,
             zakura_network::zakura::ZakuraTrace::noop(),
             None,
+            None,
         )
         .await;
 
@@ -4772,8 +4798,10 @@ mod zakura_header_sync_driver_tests {
         let (block_sync, _reactor_actions, reactor_task) =
             zakura_network::zakura::spawn_block_sync_reactor(startup);
         let verifier = service_fn(|request: zakura_consensus::Request| async move {
+            admit_test_commit(&request)?;
             match request {
-                zakura_consensus::Request::Commit(block) => {
+                zakura_consensus::Request::Commit(block)
+                | zakura_consensus::Request::CommitCancellable { block, .. } => {
                     Ok::<_, zakura_consensus::BoxError>(block.hash())
                 }
                 request => panic!("unexpected consensus request: {request:?}"),
@@ -4804,6 +4832,7 @@ mod zakura_header_sync_driver_tests {
             block,
             BlockApplyClass::Full,
             trace,
+            None,
             None,
         )
         .await;
@@ -4852,8 +4881,10 @@ mod zakura_header_sync_driver_tests {
         let (block_sync, _reactor_actions, reactor_task) =
             zakura_network::zakura::spawn_block_sync_reactor(startup);
         let verifier = service_fn(|request: zakura_consensus::Request| async move {
+            admit_test_commit(&request)?;
             match request {
-                zakura_consensus::Request::Commit(_block) => {
+                zakura_consensus::Request::Commit(_block)
+                | zakura_consensus::Request::CommitCancellable { block: _block, .. } => {
                     future::pending::<Result<block::Hash, zakura_consensus::BoxError>>().await
                 }
                 request => panic!("unexpected consensus request: {request:?}"),
@@ -4884,6 +4915,7 @@ mod zakura_header_sync_driver_tests {
             block,
             BlockApplyClass::Full,
             trace,
+            None,
             None,
         ));
 
@@ -4922,8 +4954,10 @@ mod zakura_header_sync_driver_tests {
         let verifier = service_fn(move |request: zakura_consensus::Request| {
             let mut release_commit_rx = release_commit_rx.clone();
             async move {
+                admit_test_commit(&request)?;
                 match request {
-                    zakura_consensus::Request::Commit(block) => {
+                    zakura_consensus::Request::Commit(block)
+                    | zakura_consensus::Request::CommitCancellable { block, .. } => {
                         while !*release_commit_rx.borrow() {
                             release_commit_rx
                                 .changed()
@@ -4969,6 +5003,7 @@ mod zakura_header_sync_driver_tests {
                 block,
                 BlockApplyClass::Full,
                 zakura_network::zakura::ZakuraTrace::noop(),
+                None,
                 None,
             )
             .await
@@ -5027,8 +5062,10 @@ mod zakura_header_sync_driver_tests {
         let verifier = service_fn(move |request: zakura_consensus::Request| {
             let mut release_commit_rx = release_commit_rx.clone();
             async move {
+                admit_test_commit(&request)?;
                 match request {
-                    zakura_consensus::Request::Commit(block) => {
+                    zakura_consensus::Request::Commit(block)
+                    | zakura_consensus::Request::CommitCancellable { block, .. } => {
                         while !*release_commit_rx.borrow() {
                             release_commit_rx
                                 .changed()
@@ -5139,8 +5176,10 @@ mod zakura_header_sync_driver_tests {
             let verifier_count = verifier_count.clone();
             let mut release_commits_rx = release_commits_rx.clone();
             async move {
+                admit_test_commit(&request)?;
                 match request {
-                    zakura_consensus::Request::Commit(block) => {
+                    zakura_consensus::Request::Commit(block)
+                    | zakura_consensus::Request::CommitCancellable { block, .. } => {
                         verifier_count.fetch_add(1, Ordering::SeqCst);
                         while !*release_commits_rx.borrow() {
                             release_commits_rx
@@ -5231,8 +5270,10 @@ mod zakura_header_sync_driver_tests {
             let attempts = verifier_attempts.clone();
             let commit_tx = commit_tx.clone();
             async move {
+                admit_test_commit(&request)?;
                 match request {
-                    zakura_consensus::Request::Commit(block) => {
+                    zakura_consensus::Request::Commit(block)
+                    | zakura_consensus::Request::CommitCancellable { block, .. } => {
                         let hash = block.hash();
                         if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                             return Err(zakura_consensus::RouterError::Block {
@@ -5329,11 +5370,10 @@ mod zakura_header_sync_driver_tests {
     /// A checkpoint is placed at height 10 so an 11-block range covers a full checkpoint gap
     /// without 400 real blocks. The whole range is submitted except one mid-range body, which
     /// the verifier holds the entire range for (it commits nothing until the range is
-    /// contiguous to the next checkpoint). The fallback handoff must transfer the held requests
-    /// to the shared verifier. The legacy driver can then deliver the withheld body and commit the
-    /// range.
+    /// contiguous to the next checkpoint). Fallback cancels the held requests before acquiring
+    /// ownership. The legacy driver then resubmits the range, including the missing body.
     #[tokio::test]
-    async fn legacy_fallback_completes_transferred_checkpoint_range() {
+    async fn legacy_fallback_resubmits_cancelled_checkpoint_range() {
         const CHECKPOINT_HEIGHT: u32 = 10;
         const WITHHELD: u32 = 5;
 
@@ -5375,27 +5415,12 @@ mod zakura_header_sync_driver_tests {
 
         let submitted_count = Arc::new(AtomicUsize::new(0));
         let verifier_submitted_count = submitted_count.clone();
-        let checkpoint_verifier = service_fn(move |block| {
+        let checkpoint_verifier = service_fn(move |request: zakura_consensus::Request| {
             verifier_submitted_count.fetch_add(1, Ordering::SeqCst);
-            checkpoint_verifier.call(block)
+            checkpoint_verifier.call_cancellable(request.block(), request.cancellation())
         });
-
-        // Adapt the checkpoint verifier (`Service<Arc<Block>>`) to the driver's
-        // `Service<zakura_consensus::Request, Response = block::Hash>` bound.
-        let checkpoint_verifier =
-            tower::buffer::Buffer::new(BoxService::new(checkpoint_verifier), 16);
-        let legacy_verifier = checkpoint_verifier.clone();
-        let verifier = service_fn(move |request: zakura_consensus::Request| {
-            let checkpoint_verifier = checkpoint_verifier.clone();
-            async move {
-                match request {
-                    zakura_consensus::Request::Commit(block) => {
-                        checkpoint_verifier.oneshot(block).await
-                    }
-                    request => panic!("unexpected consensus request: {request:?}"),
-                }
-            }
-        });
+        let verifier = tower::buffer::Buffer::new(BoxService::new(checkpoint_verifier), 16);
+        let legacy_verifier = verifier.clone();
 
         let (action_tx, action_rx) = mpsc::channel(64);
         let startup = block_sync_startup_for_test();
@@ -5475,18 +5500,20 @@ mod zakura_header_sync_driver_tests {
             .await
             .expect("fallback must not wait for an incomplete checkpoint range")
             .expect("fallback acquisition task must finish")
-            .expect("fallback must acquire the transferred checkpoint range");
+            .expect("fallback must acquire ownership after cancellation");
 
-        // The legacy driver uses the same verifier. Its missing body completes the transferred
-        // checkpoint range.
-        let (_withheld_height, withheld_block) = chain
-            .iter()
-            .find(|(height, _)| height.0 == WITHHELD)
-            .expect("withheld block is part of the test chain");
-        legacy_verifier
-            .oneshot(withheld_block.clone())
-            .await
-            .expect("legacy verifier submission completes the checkpoint range");
+        // Legacy resubmits the cancelled range to the same verifier and state service.
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            futures::future::try_join_all(chain.iter().skip(1).map(|(_, block)| {
+                legacy_verifier
+                    .clone()
+                    .oneshot(zakura_consensus::Request::Commit(block.clone()))
+            })),
+        )
+        .await
+        .expect("the complete range resolves within the recovery bound")
+        .expect("legacy submissions commit the checkpoint range");
 
         // Recovery: the entire range commits, so the finalized tip reaches the checkpoint.
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -5556,8 +5583,10 @@ mod zakura_header_sync_driver_tests {
         let verifier = service_fn(move |request: zakura_consensus::Request| {
             let checkpoint_verifier = checkpoint_verifier.clone();
             async move {
+                admit_test_commit(&request)?;
                 match request {
-                    zakura_consensus::Request::Commit(block) => {
+                    zakura_consensus::Request::Commit(block)
+                    | zakura_consensus::Request::CommitCancellable { block, .. } => {
                         checkpoint_verifier.oneshot(block).await
                     }
                     request => panic!("unexpected consensus request: {request:?}"),

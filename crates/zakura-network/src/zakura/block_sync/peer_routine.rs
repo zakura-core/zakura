@@ -1728,7 +1728,12 @@ impl PeerRoutine {
                 }
             },
         };
-        if serialized_bytes > tolerated_bytes(estimated_bytes, self.config.size_deviation_tolerance)
+        let has_size_hint = self.work.in_flight_item(height).is_some_and(|item| {
+            !matches!(item.size_hint, super::request::BlockSizeEstimate::Unknown)
+        });
+        if has_size_hint
+            && serialized_bytes
+                > tolerated_bytes(estimated_bytes, self.config.size_deviation_tolerance)
         {
             // The body matched the requested hash, so the hint was wrong, not the body.
             // Discarding it would let one bad advertised size stall this height on every
@@ -1742,9 +1747,9 @@ impl PeerRoutine {
         self.record_received(serialized_bytes);
         // End the request reservation at receipt, but release its bytes only
         // after the body is visible to the resident-memory accounting.
-        let Some(reserved_estimate) = self
-            .work
-            .release_active_reserved_height_for_owner(outstanding_owner, height)
+        let Some(reserved_estimate) =
+            self.work
+                .receive_body_for_owner(outstanding_owner, height, serialized_bytes)
         else {
             tracing::debug!(
                 peer = ?self.peer,

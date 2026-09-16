@@ -15977,3 +15977,168 @@ async fn missed_hint_history_refreshes_the_existing_queued_window() {
         .all(|(_, item)| item.estimated_bytes == 3_146));
     task.abort();
 }
+
+#[test]
+fn observed_size_estimates_preserve_reservations_and_memory_exposure() {
+    let queue = work_queue_with(0, (1..=100).map(|h| needed(h, BlockSizeEstimate::Unknown)));
+    let owner = test_work_scope().bind(7, std::num::NonZeroU64::new(1).unwrap());
+    let cold = queue.take_for_request(
+        block::Height(1),
+        block::Height(2),
+        2,
+        u64::MAX,
+        7,
+        owner.request_id,
+    );
+    assert_eq!(cold[0].1.estimated_bytes, block::MAX_BLOCK_BYTES);
+    queue.mark_reserved_for_owner(owner, [block::Height(1), block::Height(2)]);
+    let other = test_work_scope().bind(8, owner.request_id);
+    assert_eq!(
+        queue.receive_body_for_owner(other, block::Height(1), 1024),
+        None
+    );
+    assert_eq!(
+        queue.receive_body_for_owner(owner, block::Height(1), 1024),
+        Some(block::MAX_BLOCK_BYTES)
+    );
+    let estimate = queue
+        .pending_item(block::Height(3))
+        .unwrap()
+        .estimated_bytes;
+    assert_eq!(estimate, (7 * block::MAX_BLOCK_BYTES + 1024) / 8);
+    assert_eq!(
+        queue.receive_body_for_owner(owner, block::Height(1), 1),
+        None
+    );
+    assert_eq!(
+        queue
+            .pending_item(block::Height(3))
+            .unwrap()
+            .estimated_bytes,
+        estimate
+    );
+    assert_eq!(
+        queue
+            .in_flight_item(block::Height(2))
+            .unwrap()
+            .estimated_bytes,
+        block::MAX_BLOCK_BYTES
+    );
+    assert_eq!(queue.reserved_bytes(), block::MAX_BLOCK_BYTES);
+    queue.release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(2)]);
+    assert_eq!(queue.reserved_bytes(), 0);
+    let warm = queue.take_for_request(
+        block::Height(2),
+        block::Height(2),
+        1,
+        u64::MAX,
+        7,
+        owner.request_id,
+    );
+    assert_eq!(warm[0].1.estimated_bytes, estimate);
+    queue.mark_reserved_for_owner(owner, [block::Height(2)]);
+    assert_eq!(
+        queue.reserved_above(block::Height(0)),
+        (block::MAX_BLOCK_BYTES, 1)
+    );
+    assert_eq!(
+        queue.receive_body_for_owner(owner, block::Height(2), 1024),
+        Some(estimate)
+    );
+    assert_eq!(queue.reserved_bytes(), 0);
+    queue.reset_above(block::Height(0));
+    queue.extend(test_work_scope(), [needed(1, BlockSizeEstimate::Unknown)]);
+    assert_eq!(
+        queue
+            .pending_item(block::Height(1))
+            .unwrap()
+            .estimated_bytes,
+        block::MAX_BLOCK_BYTES
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn observed_size_estimates_wake_adapt_and_expire_without_changing_hints() {
+    let queue = work_queue_with(0, (1..=201).map(|h| needed(h, BlockSizeEstimate::Unknown)));
+    let scope = test_work_scope();
+    queue.extend(
+        scope,
+        [
+            needed(202, BlockSizeEstimate::Advertised(4567)),
+            needed(203, BlockSizeEstimate::Confirmed(9876)),
+        ],
+    );
+    for h in 1..=100 {
+        let owner = scope.bind(7, std::num::NonZeroU64::new(u64::from(h)).unwrap());
+        queue.take_for_request(
+            block::Height(h),
+            block::Height(h),
+            1,
+            u64::MAX,
+            7,
+            owner.request_id,
+        );
+        queue.mark_reserved_for_owner(owner, [block::Height(h)]);
+        let wake = queue.subscribe_available().notified();
+        tokio::pin!(wake);
+        wake.as_mut().enable();
+        queue
+            .receive_body_for_owner(owner, block::Height(h), 1024)
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(1), wake)
+            .await
+            .unwrap();
+    }
+    assert!(
+        queue
+            .pending_item(block::Height(101))
+            .unwrap()
+            .estimated_bytes
+            <= 1030
+    );
+    assert_eq!(
+        queue
+            .pending_item(block::Height(202))
+            .unwrap()
+            .estimated_bytes,
+        4567
+    );
+    assert_eq!(
+        queue
+            .pending_item(block::Height(203))
+            .unwrap()
+            .estimated_bytes,
+        9876
+    );
+    for h in 101..=200 {
+        let owner = scope.bind(7, std::num::NonZeroU64::new(u64::from(h)).unwrap());
+        queue.take_for_request(
+            block::Height(h),
+            block::Height(h),
+            1,
+            u64::MAX,
+            7,
+            owner.request_id,
+        );
+        queue.mark_reserved_for_owner(owner, [block::Height(h)]);
+        queue
+            .receive_body_for_owner(owner, block::Height(h), block::MAX_BLOCK_BYTES)
+            .unwrap();
+    }
+    assert!(
+        queue
+            .pending_item(block::Height(201))
+            .unwrap()
+            .estimated_bytes
+            >= block::MAX_BLOCK_BYTES - 10
+    );
+    tokio::time::advance(Duration::from_secs(60)).await;
+    assert_eq!(
+        queue
+            .pending_item(block::Height(201))
+            .unwrap()
+            .estimated_bytes,
+        block::MAX_BLOCK_BYTES
+    );
+    assert_eq!(queue.reserved_bytes(), 0);
+}

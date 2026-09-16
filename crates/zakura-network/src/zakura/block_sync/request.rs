@@ -16,7 +16,7 @@ pub enum BlockSizeEstimate {
     Confirmed(u32),
     /// Untrusted advertised size hint from header sync.
     Advertised(u32),
-    /// No size hint is known; reserve the per-block worst case.
+    /// No size hint is known; use the shared observed-size scheduling estimate.
     Unknown,
 }
 

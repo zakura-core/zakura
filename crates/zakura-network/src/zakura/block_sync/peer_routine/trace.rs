@@ -132,7 +132,13 @@ impl PeerRoutine {
                     crate::zakura::block_sync::request::BlockSizeEstimate::Advertised(_) => {
                         "advertised"
                     }
-                    crate::zakura::block_sync::request::BlockSizeEstimate::Unknown => "unknown",
+                    crate::zakura::block_sync::request::BlockSizeEstimate::Unknown => {
+                        if item.estimated_bytes < block::MAX_BLOCK_BYTES {
+                            "observed"
+                        } else {
+                            "unknown_cold"
+                        }
+                    }
                 });
                 row.request_owner = item.owner.map(|owner| format!("{owner:?}"));
             }

@@ -249,6 +249,21 @@ pub enum StateInitError {
          Hint: discard the database and resync, or restore a snapshot taken with a current release"
     )]
     VctSproutHistoryUnrepairable,
+
+    /// The selected database requires a newer major format than this build supports.
+    #[error(
+        "database at {path:?} uses format {disk_version}, but this build supports {running_version}. \
+         Use a build that supports this database format, or restore a compatible database. \
+         Do not rename database directories or edit the version file to bypass this check"
+    )]
+    UnsupportedDatabaseFormat {
+        /// Database directory whose format is incompatible.
+        path: PathBuf,
+        /// Format recorded by the database writer.
+        disk_version: semver::Version,
+        /// Format supported by this build.
+        running_version: semver::Version,
+    },
 }
 
 /// An error describing why a block could not be queued to be committed to the state.

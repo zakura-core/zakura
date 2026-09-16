@@ -467,9 +467,9 @@ impl StateService {
                     database_writer_metadata,
                 )
                 .unwrap_or_else(|error| match error {
-                    // This database cannot be repaired, and the generic hint below would
-                    // send the operator looking at permissions and disk space instead.
-                    error @ StateInitError::VctSproutHistoryUnrepairable => {
+                    // These errors require the guidance they carry, rather than a disk-space hint.
+                    error @ (StateInitError::VctSproutHistoryUnrepairable
+                    | StateInitError::UnsupportedDatabaseFormat { .. }) => {
                         panic!("{error}")
                     }
                     error => panic!(

@@ -241,6 +241,7 @@ pub(super) fn hash_transition_payload(hasher: &mut Sha256, event: &TransitionEve
                 TransientBodyFailureKind::VerifierUnavailable => 3,
                 TransientBodyFailureKind::Timeout => 4,
                 TransientBodyFailureKind::ResourceExhausted => 5,
+                TransientBodyFailureKind::NoBindingBody => 6,
             }]);
             hash_availability(hasher, event.availability);
         }

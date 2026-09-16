@@ -760,7 +760,7 @@ impl SequencerTask {
                 .await;
             }
         }
-        self.record_body_retry(
+        let availability = self.record_body_retry(
             semantic_owner,
             source,
             zakura_header_chain::Frontier::new(height, hash),
@@ -768,14 +768,34 @@ impl SequencerTask {
             &mut eligible_sources,
             persisted_availability,
         );
-        if let zakura_header_chain::BodyVerificationOutcome::Retryable(failure) =
-            outcome.verification()
-        {
-            self.send_required_action(BlockSyncAction::RecordBodyUnavailable {
-                expected_version: semantic_state_version,
-                failure: *failure,
-            })
-            .await;
+        match outcome.verification() {
+            zakura_header_chain::BodyVerificationOutcome::Retryable(failure) => {
+                self.send_required_action(BlockSyncAction::RecordBodyUnavailable {
+                    expected_version: semantic_state_version,
+                    failure: *failure,
+                })
+                .await;
+            }
+            // A header whose deliveries never bind is bounded like a header whose
+            // body is withheld, so it publishes the same availability episode.
+            // The mismatch scores its supplier separately below.
+            zakura_header_chain::BodyVerificationOutcome::PayloadMismatch(mismatch) => {
+                let evidence = mismatch.evidence;
+                if let Some(availability) = availability {
+                    self.send_required_action(BlockSyncAction::RecordBodyUnavailable {
+                        expected_version: semantic_state_version,
+                        failure: zakura_header_chain::TransientBodyFailure {
+                            hash,
+                            evidence,
+                            kind: zakura_header_chain::TransientBodyFailureKind::NoBindingBody,
+                            availability,
+                        },
+                    })
+                    .await;
+                }
+            }
+            zakura_header_chain::BodyVerificationOutcome::Verified(_)
+            | zakura_header_chain::BodyVerificationOutcome::ConsensusInvalid(_) => {}
         }
         if matches!(result, BlockApplyResult::Duplicate) && self.sequencer.verified_tip() < height {
             // Keep a duplicate attached until the committed snapshot includes its height.
@@ -852,12 +872,12 @@ impl SequencerTask {
         outcome: &mut BlockApplyOutcome,
         eligible_sources: &mut BTreeSet<zakura_header_chain::SourceId>,
         persisted_availability: Option<zakura_header_chain::BodyUnavailableSummary>,
-    ) {
+    ) -> Option<zakura_header_chain::BodyUnavailableSummary> {
         let hash = header.hash;
         match outcome.verification() {
             zakura_header_chain::BodyVerificationOutcome::PayloadMismatch(mismatch) => {
                 if mismatch.source != source {
-                    return;
+                    return None;
                 }
                 // A bad payload still needs another delivery. Keep the failed
                 // supplier in the retry episode before making the height available.
@@ -867,7 +887,7 @@ impl SequencerTask {
                 self.body_retries
                     .remove(owner.header_generation, owner.branch, hash);
                 self.registry.clear_body_retry(owner.authority(), hash);
-                return;
+                return None;
             }
         }
         eligible_sources.insert(source);
@@ -898,10 +918,12 @@ impl SequencerTask {
                 });
             self.body_retries.insert(episode);
         }
-        let episode = self
+        let Some(episode) = self
             .body_retries
             .get_mut(owner.header_generation, owner.branch, hash)
-            .expect("the exact retry episode exists because it was inserted above");
+        else {
+            unreachable!("the exact retry episode exists because it was inserted above")
+        };
         episode.refresh_suppliers(eligible_sources.clone());
         let update = episode.record_failure(
             source,
@@ -919,14 +941,15 @@ impl SequencerTask {
             | crate::zakura::header_sync::RetryUpdate::ProbeAt(retry_at) => retry_at,
             crate::zakura::header_sync::RetryUpdate::Alarmed { probe_at } => probe_at,
         };
-        if let Some(failure) = outcome.retryable_mut() {
-            failure.availability = episode.summary();
-            if let Some(persisted) = persisted_availability.filter(|summary| summary.alarmed) {
-                if persisted.suppliers > failure.availability.suppliers {
-                    failure.availability.suppliers = persisted.suppliers;
-                    failure.availability.supplier_set_digest = persisted.supplier_set_digest;
-                }
+        let mut availability = episode.summary();
+        if let Some(persisted) = persisted_availability.filter(|summary| summary.alarmed) {
+            if persisted.suppliers > availability.suppliers {
+                availability.suppliers = persisted.suppliers;
+                availability.supplier_set_digest = persisted.supplier_set_digest;
             }
+        }
+        if let Some(failure) = outcome.retryable_mut() {
+            failure.availability = availability;
         }
         self.registry.defer_body_retry(
             deferred_sources,
@@ -934,6 +957,7 @@ impl SequencerTask {
             hash,
             retry_deadline_instant(retry_at),
         );
+        Some(availability)
     }
 
     /// Drain the contiguous reorder prefix into applying, then submit it.
@@ -2103,6 +2127,16 @@ mod tests {
                 );
 
                 if attribution_matches {
+                    // The episode that will refetch this body is published before
+                    // its supplier is scored. Body-unavailable evidence does not
+                    // affect selection, so neither action changes eligibility.
+                    assert!(matches!(
+                        actions_rx.recv().await,
+                        Some(BlockSyncAction::RecordBodyUnavailable { failure, .. })
+                            if failure.hash == hash
+                                && failure.kind
+                                    == zakura_header_chain::TransientBodyFailureKind::NoBindingBody
+                    ));
                     assert!(matches!(
                         actions_rx.recv().await,
                         Some(BlockSyncAction::Misbehavior {
@@ -2115,9 +2149,129 @@ mod tests {
                 }
                 assert!(
                     actions_rx.try_recv().is_err(),
-                    "payload mismatch can emit only exact-supplier scoring, never eligibility state"
+                    "payload mismatch emits only supplier scoring and its retry \
+                     episode, never eligibility state"
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    // IN-03: a header whose deliveries never bind is bounded like a withheld
+    // body, so its mismatch episode must publish body-unavailable evidence
+    // instead of probing silently forever.
+    async fn payload_mismatch_publishes_the_body_unavailable_episode() {
+        for persisted_alarm in [false, true] {
+            let frontiers = BlockSyncFrontiers {
+                finalized_height: block::Height(0),
+                verified_block_tip: block::Height(0),
+                verified_block_hash: block::Hash([0; 32]),
+            };
+            let input_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let input_decoded_bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let (_body_tx, body_rx) = mpsc::channel(1);
+            let (_control_tx, control_rx) = mpsc::unbounded_channel();
+            let (actions, mut actions_rx) = mpsc::channel(4);
+            let (view_tx, _view_rx) = watch::channel(initial_view(frontiers));
+            let mut task = SequencerTask::new(
+                Sequencer::new(block::Height(0), 1),
+                ByteBudget::new(123),
+                Arc::new(WorkQueue::new(block::Height(0))),
+                Arc::new(PeerRegistry::new()),
+                actions,
+                ThroughputMeter::new(Instant::now()),
+                frontiers,
+                Some(super::test_work_scope()),
+                crate::zakura::header_sync::SeededRetryJitter::new([0; 32]),
+                body_rx,
+                control_rx,
+                input_bytes.clone(),
+                input_decoded_bytes.clone(),
+                view_tx,
+                Duration::from_secs(1),
+                ZakuraTrace::noop(),
+            );
+
+            let mut body = queued_test_body(input_bytes, input_decoded_bytes);
+            body.leave_queue();
+            task.handle_accept_body(body);
+            task.submit_pending_blocks().await;
+            let BlockSyncAction::SubmitBlock {
+                owner,
+                source,
+                token,
+                block,
+            } = actions_rx.recv().await.expect("body is submitted")
+            else {
+                panic!("expected a body submission");
+            };
+            let height = block.coinbase_height().expect("test block has height");
+            let hash = block.hash();
+            let mismatch = zakura_header_chain::BodyPayloadMismatch {
+                evidence: zakura_header_chain::EvidenceId::from_digest([0xc1; 32]),
+                requested: hash,
+                delivered: block::Hash([0xc2; 32]),
+                kind: zakura_header_chain::BodyCommitmentKind::AuthDataRoot,
+                source,
+            };
+            let mut outcome = BlockApplyOutcome::payload_mismatch(mismatch);
+            let alternate = zakura_header_chain::SourceId::from_digest([2; 32]);
+            let eligible_sources = BTreeSet::from([source, alternate]);
+            // An alarmed episode is restored from persisted evidence, because the
+            // episode clock is the system clock inside `record_body_retry`.
+            let persisted = persisted_alarm.then(|| zakura_header_chain::BodyUnavailableSummary {
+                started_at: chrono::Utc::now() - chrono::Duration::minutes(30),
+                attempts: 12,
+                suppliers: 2,
+                supplier_set_digest:
+                    zakura_header_chain::BodyUnavailableSummary::supplier_set_digest(
+                        &eligible_sources,
+                    ),
+                alarmed: true,
+                next_probe_at: chrono::Utc::now() - chrono::Duration::minutes(1),
+            });
+
+            let _ = task
+                .handle_apply_finished(
+                    owner,
+                    source,
+                    token,
+                    height,
+                    hash,
+                    &mut outcome,
+                    eligible_sources,
+                    persisted,
+                    Some((owner, zakura_header_chain::StateVersion::default())),
+                )
+                .await;
+
+            let Some(BlockSyncAction::RecordBodyUnavailable { failure, .. }) =
+                actions_rx.recv().await
+            else {
+                panic!("a mismatch episode must publish its body-unavailable evidence");
+            };
+            assert_eq!(failure.hash, hash);
+            assert_eq!(
+                failure.kind,
+                zakura_header_chain::TransientBodyFailureKind::NoBindingBody,
+                "the episode records that no delivery bound to this header",
+            );
+            assert_eq!(
+                failure.availability.alarmed, persisted_alarm,
+                "a restored alarm must survive a mismatch delivery",
+            );
+            assert_eq!(failure.availability.suppliers, 2);
+            assert!(failure.availability.attempts >= 1);
+            assert!(
+                matches!(
+                    actions_rx.recv().await,
+                    Some(BlockSyncAction::Misbehavior {
+                        reason: BlockSyncMisbehavior::BodyPayloadMismatch(_),
+                        ..
+                    })
+                ),
+                "the delivery still scores only its supplier",
+            );
         }
     }
 

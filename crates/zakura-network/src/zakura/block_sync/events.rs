@@ -51,6 +51,8 @@ pub enum BlockSyncEvent {
     ChainTipReset(BlockSyncFrontiers),
     /// Driver returned body-missing metadata bound to the exact queried snapshot.
     ScopedNeededBlocks {
+        /// Authority captured atomically with the state query's selected projection.
+        read_authority: Option<zakura_header_chain::BodyWorkAuthority>,
         /// Reactor-local query identifier echoed by the driver.
         query_id: NonZeroU64,
         /// Durable generation and branch coordinates echoed from the query.

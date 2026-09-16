@@ -52,7 +52,7 @@ use crate::{
     request::TimedSpan,
     response::NonFinalizedBlocksListener,
     service::{
-        block_iter::any_ancestor_blocks,
+        block_iter::{any_ancestor_blocks, any_chain_ancestor_iter},
         chain_tip::{ChainTipBlock, ChainTipChange, ChainTipSender, LatestChainTip},
         check::difficulty::POW_ADJUSTMENT_BLOCK_SPAN,
         finalized_state::{
@@ -3588,31 +3588,33 @@ fn check_prepared_mined_relay_eligibility_for_state(
         commitment.auth_data_root,
     )?;
 
-    // Take only the blocks `block_is_valid_for_recent_chain_data` reads. The
+    // Take only the headers `block_is_valid_for_recent_chain_data` reads. The
     // iterator walks to genesis, so collecting it would load every ancestor
-    // block body into memory to check the most recent
-    // `POW_ADJUSTMENT_BLOCK_SPAN` of them.
-    let relevant_chain: Vec<_> = any_ancestor_blocks(non_finalized_state, db, parent_hash)
-        .take(POW_ADJUSTMENT_BLOCK_SPAN)
-        .collect();
-    if relevant_chain.is_empty() {
+    // header to check the most recent `POW_ADJUSTMENT_BLOCK_SPAN` of them.
+    let relevant_headers =
+        any_chain_ancestor_iter::<block::Header>(non_finalized_state, db, parent_hash);
+    let parent_height = relevant_headers.height;
+    let relevant_headers: Vec<_> = relevant_headers.take(POW_ADJUSTMENT_BLOCK_SPAN).collect();
+    let Some(parent_height) = parent_height.filter(|_| !relevant_headers.is_empty()) else {
         return Ok(PreparedMinedRelayEligibility::Unavailable);
-    }
+    };
     let candidate_height = commitment
         .block
         .coinbase_height()
         .ok_or(crate::ValidateContextError::NotReadyToBeCommitted)?;
     let finalized_tip_height = db.finalized_tip_height().or_else(|| {
-        relevant_chain
-            .last()
-            .and_then(|block| block.coinbase_height())
+        // The headers are contiguous and end at the lowest context height.
+        let lowest_offset = HeightDiff::try_from(relevant_headers.len() - 1)
+            .expect("the difficulty context length fits in HeightDiff");
+        parent_height - lowest_offset
     });
     check::block_is_valid_for_recent_chain_data(
         &commitment.block,
         candidate_height,
         network,
         finalized_tip_height,
-        relevant_chain,
+        Some(parent_height),
+        relevant_headers,
     )?;
 
     if network.disable_pow() {

@@ -272,24 +272,6 @@ pub enum TransactionError {
     #[error("wrong tx format: tx version is ≥ 5, but `nConsensusBranchId` is missing")]
     MissingConsensusBranchId,
 
-    #[error(
-        "Orchard and Ironwood action count {actions} exceeds the per-block Orchard limit of {limit}"
-    )]
-    OrchardActionsExceedBlockLimit { actions: u32, limit: u32 },
-
-    #[error("Sapling spends + outputs count {ios} exceeds the per-block limit of {limit}")]
-    SaplingIOsExceedBlockLimit { ios: u32, limit: u32 },
-
-    #[error("Sprout JoinSplit count {joinsplits} exceeds the per-block limit of {limit}")]
-    SproutJoinSplitsExceedBlockLimit { joinsplits: u32, limit: u32 },
-
-    #[error(
-        "shielded cost {cost} \
-         (Orchard and Ironwood actions + Sapling spends + Sapling outputs + 2 * Sprout JoinSplits) \
-         exceeds the per-block global shielded budget of {limit}"
-    )]
-    ShieldedCostExceedsBlockBudget { cost: u32, limit: u32 },
-
     #[error("input/output error")]
     Io(String),
 
@@ -503,18 +485,6 @@ impl TransactionError {
             }
             Self::WrongConsensusBranchId => consensus("transaction.wrong_consensus_branch_id"),
             Self::MissingConsensusBranchId => consensus("transaction.missing_consensus_branch_id"),
-            Self::OrchardActionsExceedBlockLimit { .. } => {
-                consensus("transaction.orchard_actions_exceed_block_limit")
-            }
-            Self::SaplingIOsExceedBlockLimit { .. } => {
-                consensus("transaction.sapling_ios_exceed_block_limit")
-            }
-            Self::SproutJoinSplitsExceedBlockLimit { .. } => {
-                consensus("transaction.sprout_joinsplits_exceed_block_limit")
-            }
-            Self::ShieldedCostExceedsBlockBudget { .. } => {
-                consensus("transaction.shielded_cost_exceeds_block_budget")
-            }
             Self::Io(_) | Self::TryFromSlice(_) | Self::Other(_) => {
                 BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
             }
@@ -577,14 +547,6 @@ impl TransactionError {
             | IronwoodProofSize
             | WrongConsensusBranchId
             | MissingConsensusBranchId
-            // ZIP 218 does not specify a mempool rejection. The transaction
-            // verifier rejects a transaction that exceeds a per-block limit on
-            // its own, because no block can include it. The peer that sent it
-            // gets the full score.
-            | OrchardActionsExceedBlockLimit { .. }
-            | SaplingIOsExceedBlockLimit { .. }
-            | SproutJoinSplitsExceedBlockLimit { .. }
-            | ShieldedCostExceedsBlockBudget { .. }
             | LockedUntilAfterBlockHeight(_)
             | LockedUntilAfterBlockTime(_) => 100,
 

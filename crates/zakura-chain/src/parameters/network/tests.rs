@@ -837,3 +837,45 @@ fn zip234_issuance() {
         Amount::<NonNegative>::try_from(MAX_MONEY).expect("valid amount"),
     );
 }
+
+/// Tests that slow-start subsidies stay unscaled when NU7 activates during slow
+/// start.
+///
+/// ZIP 218 adds its NU7 subsidy case after the existing slow-start cases, just as
+/// the Blossom case follows them, so slow start takes precedence.
+#[test]
+fn slow_start_subsidy_is_not_scaled_when_nu7_activates_early() -> Result<(), Report> {
+    use crate::parameters::{
+        subsidy::constants::MAX_BLOCK_SUBSIDY,
+        testnet::{self, ConfiguredActivationHeights},
+    };
+
+    let _init_guard = zakura_test::init();
+
+    let network = testnet::Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            blossom: Some(1),
+            nu7: Some(2),
+            ..Default::default()
+        })
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid");
+
+    let slow_start_interval = network.slow_start_interval();
+    assert!(slow_start_interval > Height(3));
+    assert_eq!(
+        NetworkUpgrade::current(&network, Height(2)),
+        NetworkUpgrade::Nu7
+    );
+
+    // floor(MaxBlockSubsidy / SlowStartInterval) * height, with no spacing ratio.
+    let slow_start_rate = MAX_BLOCK_SUBSIDY / u64::from(slow_start_interval);
+    assert_eq!(
+        Amount::<NonNegative>::try_from(slow_start_rate * 2)?,
+        block_subsidy(Height(2), &network, None)?,
+    );
+
+    Ok(())
+}

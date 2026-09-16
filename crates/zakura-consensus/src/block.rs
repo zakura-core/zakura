@@ -436,8 +436,6 @@ where
                 .map_err(VerifyBlockError::Time)?;
             let coinbase_tx = check::coinbase_is_first(&block)?;
 
-            check::shielded_action_limits_are_valid(&block.transactions, height, &network)?;
-
             // ZIP 234 derives the block subsidy from the issuance deficit after the parent
             // block, so a block at or above the start height needs its parent's chain
             // value pools. Wait for the parent commit if its verification is still running.

@@ -284,32 +284,6 @@ pub const PRE_NU7_POW_AVERAGING_WINDOW: usize = 17;
 /// spacing: `17 * (150 / 25) = 102` blocks.
 pub const POST_NU7_POW_AVERAGING_WINDOW: usize = 102;
 
-/// Per-block limit on the total number of Orchard actions, applied from NU7
-/// activation onwards.
-///
-/// `OrchardBlockActionLimit` in ZIP 218.
-pub const ORCHARD_BLOCK_ACTION_LIMIT: u32 = 330;
-
-/// Per-block limit on the total number of Sapling spends plus outputs, applied
-/// from NU7 activation onwards.
-///
-/// `SaplingBlockIOLimit` in ZIP 218.
-pub const SAPLING_BLOCK_IO_LIMIT: u32 = 300;
-
-/// Per-block limit on the total number of Sprout JoinSplits, applied from NU7
-/// activation onwards.
-///
-/// `SproutBlockJoinSplitLimit` in ZIP 218.
-pub const SPROUT_BLOCK_JOINSPLIT_LIMIT: u32 = 25;
-
-/// Per-block budget for the total shielded cost across all pools, applied from
-/// NU7 activation onwards.
-///
-/// `GlobalShieldedBudget` in ZIP 218. It bounds the worst-case shielded sync
-/// bandwidth per block whichever combination of pools a block uses. Sprout
-/// JoinSplits count twice because each produces two shielded outputs.
-pub const GLOBAL_SHIELDED_BUDGET: u32 = 330;
-
 /// The largest consensus averaging window, which bounds the number of relevant
 /// blocks a difficulty adjustment can read.
 ///
@@ -583,18 +557,6 @@ impl NetworkUpgrade {
     /// See [`NetworkUpgrade::averaging_window`] for details.
     pub fn averaging_window_for_height(network: &Network, height: block::Height) -> usize {
         NetworkUpgrade::current(network, height).averaging_window()
-    }
-
-    /// Returns `true` if NU7 is configured on `network` and active at `height`.
-    ///
-    /// NU7 has no default Mainnet or Testnet activation height, so this also
-    /// checks that `network` configures one before treating it as active.
-    pub fn is_nu7_active(network: &Network, height: block::Height) -> bool {
-        network
-            .activation_list()
-            .values()
-            .any(|upgrade| *upgrade == NetworkUpgrade::Nu7)
-            && NetworkUpgrade::current(network, height) >= NetworkUpgrade::Nu7
     }
 
     /// Returns the averaging window timespan for `network` and `height`.

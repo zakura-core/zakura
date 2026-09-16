@@ -67,6 +67,45 @@ pub const VERIFICATION_PIPELINE_SCALING_MULTIPLIER: usize = 2;
 /// Blocks higher than this will get dropped and return an error.
 pub const VERIFICATION_PIPELINE_DROP_LIMIT: HeightDiff = 50_000;
 
+/// Returns the downloader's drop, pause, and reset heights for `tip_height`.
+///
+/// `multiplier` scales `lookahead_limit` and [`VERIFICATION_PIPELINE_DROP_LIMIT`]
+/// together, so the syncer never requests blocks that the downloader would drop
+/// just because they arrived before earlier blocks were committed.
+pub(super) fn lookahead_heights(
+    tip_height: Option<block::Height>,
+    lookahead_limit: usize,
+    multiplier: usize,
+) -> (block::Height, block::Height, block::Height) {
+    let lookahead_limit = lookahead_limit * multiplier;
+    let drop_limit = VERIFICATION_PIPELINE_DROP_LIMIT
+        * HeightDiff::try_from(multiplier).expect("the lookahead multiplier fits in HeightDiff");
+
+    if let Some(tip_height) = tip_height {
+        // Scale the height limit with the lookahead limit,
+        // so users with low capacity or under DoS can reduce them both.
+        let lookahead_pause = HeightDiff::try_from(
+            lookahead_limit + lookahead_limit * VERIFICATION_PIPELINE_SCALING_MULTIPLIER,
+        )
+        .expect("fits in HeightDiff");
+
+        (
+            (tip_height + drop_limit).expect("tip is much lower than Height::MAX"),
+            (tip_height + lookahead_pause).expect("tip is much lower than Height::MAX"),
+            (tip_height + lookahead_pause / 2).expect("tip is much lower than Height::MAX"),
+        )
+    } else {
+        let genesis_drop = drop_limit.try_into().expect("fits in u32");
+        let genesis_lookahead = u32::try_from(lookahead_limit - 1).expect("fits in u32");
+
+        (
+            block::Height(genesis_drop),
+            block::Height(genesis_lookahead),
+            block::Height(genesis_lookahead / 2),
+        )
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 pub(super) struct AlwaysHedge;
 
@@ -661,30 +700,10 @@ where
                 let best_tip = latest_chain_tip.best_tip_height_and_hash();
 
                 // The target spacing at the tip scales the lookahead limit.
-                let lookahead_limit = lookahead_limit
-                    * tip_height.map_or(1, |tip_height| lookahead_limit_multiplier(&chain_network, tip_height));
-
-                let (lookahead_drop_height, lookahead_pause_height, lookahead_reset_height) = if let Some(tip_height) = tip_height {
-                    // Scale the height limit with the lookahead limit,
-                    // so users with low capacity or under DoS can reduce them both.
-                    let lookahead_pause = HeightDiff::try_from(
-                        lookahead_limit + lookahead_limit * VERIFICATION_PIPELINE_SCALING_MULTIPLIER,
-                    )
-                        .expect("fits in HeightDiff");
-
-
-                    ((tip_height + VERIFICATION_PIPELINE_DROP_LIMIT).expect("tip is much lower than Height::MAX"),
-                     (tip_height + lookahead_pause).expect("tip is much lower than Height::MAX"),
-                     (tip_height + lookahead_pause/2).expect("tip is much lower than Height::MAX"))
-                } else {
-                    let genesis_drop = VERIFICATION_PIPELINE_DROP_LIMIT.try_into().expect("fits in u32");
-                    let genesis_lookahead =
-                        u32::try_from(lookahead_limit - 1).expect("fits in u32");
-
-                    (block::Height(genesis_drop),
-                     block::Height(genesis_lookahead),
-                     block::Height(genesis_lookahead/2))
-                };
+                let multiplier =
+                    tip_height.map_or(1, |tip_height| lookahead_limit_multiplier(&chain_network, tip_height));
+                let (lookahead_drop_height, lookahead_pause_height, lookahead_reset_height) =
+                    lookahead_heights(tip_height, lookahead_limit, multiplier);
 
                 // Get the finalized tip height, assuming we're using the non-finalized state.
                 //

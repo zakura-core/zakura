@@ -38,7 +38,10 @@ use crate::{
         auth_download_height::poison_coinbase_height,
         sync::{
             self,
-            downloads::{BlockDownloadVerifyError, Downloads},
+            downloads::{
+                lookahead_heights, BlockDownloadVerifyError, Downloads,
+                VERIFICATION_PIPELINE_DROP_LIMIT,
+            },
             legacy_trace::LegacySyncTrace,
             SyncStatus,
         },
@@ -3972,4 +3975,39 @@ async fn lookahead_limit_scales_with_target_spacing() {
         lookahead_limit_at(&regtest, Height(0), Height(NU7)),
         full_limit * multiplier
     );
+}
+
+/// The downloader must not drop blocks inside the syncer's scaled request window.
+#[test]
+fn scaled_lookahead_stays_below_the_drop_height() {
+    let _init_guard = zakura_test::init();
+
+    // A large but valid configured concurrency limit.
+    const LOOKAHEAD_LIMIT: usize = 20_000;
+    let tip = Height(1_000_000);
+
+    let (drop_height, _, _) = lookahead_heights(Some(tip), LOOKAHEAD_LIMIT, 1);
+    assert_eq!(
+        drop_height,
+        (tip + VERIFICATION_PIPELINE_DROP_LIMIT).expect("the test height is valid"),
+        "the drop limit is unchanged at 75 second spacing",
+    );
+
+    for multiplier in [1, 3] {
+        let request_height = (tip
+            + block::HeightDiff::try_from(LOOKAHEAD_LIMIT * multiplier)
+                .expect("the test lookahead fits"))
+        .expect("the test height is valid");
+
+        let (drop_height, pause_height, reset_height) =
+            lookahead_heights(Some(tip), LOOKAHEAD_LIMIT, multiplier);
+        assert!(request_height <= drop_height, "multiplier {multiplier}");
+        assert!(reset_height <= pause_height, "multiplier {multiplier}");
+
+        let (genesis_drop, _, _) = lookahead_heights(None, LOOKAHEAD_LIMIT, multiplier);
+        assert!(
+            Height(u32::try_from(LOOKAHEAD_LIMIT * multiplier).expect("fits")) <= genesis_drop,
+            "multiplier {multiplier}"
+        );
+    }
 }

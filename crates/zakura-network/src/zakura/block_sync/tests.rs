@@ -16215,3 +16215,40 @@ async fn observed_size_estimates_wake_adapt_and_expire_without_changing_hints() 
     );
     assert_eq!(queue.reserved_bytes(), 0);
 }
+
+#[test]
+fn hint_refresh_cannot_relabel_an_issued_unknown_reservation() {
+    let queue = work_queue_with(0, [needed(1, BlockSizeEstimate::Unknown)]);
+    let owner = test_work_scope().bind(7, std::num::NonZeroU64::new(1).unwrap());
+    queue.take_for_request(
+        block::Height(1),
+        block::Height(1),
+        1,
+        u64::MAX,
+        7,
+        owner.request_id,
+    );
+    queue.mark_reserved_for_owner(owner, [block::Height(1)]);
+    queue.refresh_size_estimates(
+        test_work_scope(),
+        [needed(1, BlockSizeEstimate::Advertised(1024))],
+    );
+    let issued = queue.in_flight_item(block::Height(1)).unwrap();
+    assert!(!issued.reservation_has_size_hint);
+    assert_eq!(issued.estimated_bytes, block::MAX_BLOCK_BYTES);
+    assert_eq!(
+        queue.reserved_above(block::Height(0)),
+        (block::MAX_BLOCK_BYTES, 1)
+    );
+    queue.release_reserved_and_return_items_detailed_for_owner(owner, [block::Height(1)]);
+    let retry = queue.take_for_request(
+        block::Height(1),
+        block::Height(1),
+        1,
+        u64::MAX,
+        7,
+        owner.request_id,
+    );
+    assert!(retry[0].1.reservation_has_size_hint);
+    assert_eq!(retry[0].1.estimated_bytes, 1024);
+}

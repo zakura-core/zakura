@@ -53,6 +53,8 @@ pub(super) struct WorkItem {
     pub(super) estimated_bytes: u64,
     /// Latest supplier hint, independent of the issued reservation.
     pub(super) size_hint: BlockSizeEstimate,
+    /// Freeze hint provenance with the issued charge, even if a later hint arrives.
+    pub(super) reservation_has_size_hint: bool,
     /// Largest payload seen locally. Peer hints cannot shrink a retry below it.
     observed_bytes: u64,
     /// Refreshed hint for a future retry while an issued reservation stays fixed.
@@ -127,7 +129,8 @@ impl WorkQueueInner {
     }
 
     fn scheduling_item(&self, mut item: WorkItem) -> WorkItem {
-        if matches!(item.size_hint, BlockSizeEstimate::Unknown) {
+        item.reservation_has_size_hint = !matches!(item.size_hint, BlockSizeEstimate::Unknown);
+        if !item.reservation_has_size_hint {
             item.estimated_bytes = self.unknown_estimate().max(item.observed_bytes);
         }
         item
@@ -234,6 +237,7 @@ impl WorkQueue {
                         hash,
                         estimated_bytes,
                         size_hint: size,
+                        reservation_has_size_hint: !matches!(size, BlockSizeEstimate::Unknown),
                         observed_bytes: 0,
                         retry_estimated_bytes: None,
                         retry_after_tip: None,
@@ -1047,7 +1051,7 @@ impl WorkQueue {
                 if charge == 0 {
                     (bytes, count)
                 } else {
-                    let exposure = if matches!(item.size_hint, BlockSizeEstimate::Unknown) {
+                    let exposure = if !item.reservation_has_size_hint {
                         block::MAX_BLOCK_BYTES
                     } else {
                         charge

@@ -1084,6 +1084,12 @@ impl WorkQueue {
         self.lock().reserved_bytes
     }
 
+    /// Keep settlement from invalidating the ledger snapshot before the budget read.
+    pub(super) fn audit_budget(&self, budget: &super::super::transport::ByteBudget) -> bool {
+        let inner = self.lock();
+        budget.audit(inner.reserved_bytes, "block-sync work queue")
+    }
+
     /// Ground-truth O(pending + in_flight) recomputation of [`reserved_bytes`],
     /// used by tests to assert the maintained counter never drifts.
     #[cfg(test)]

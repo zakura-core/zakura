@@ -290,7 +290,6 @@ in bounded state queries. Accurate first deliveries add no correction writes or
 refresh queries. Size-only changes leave verification observations, header generations,
 and body-work epochs intact.
 
-
 ## Requester readiness
 
 Each peer worker registers work, byte-budget, and peer-eligibility notifications

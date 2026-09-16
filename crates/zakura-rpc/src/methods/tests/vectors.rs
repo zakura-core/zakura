@@ -3300,6 +3300,41 @@ async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
             }
         }
 
+        // A parent outside the best chain, such as a future height, is an error that says
+        // how far above the tip the subsidy is known.
+        let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        let (rpc, _) = RpcImpl::new(
+            network.clone(),
+            Default::default(),
+            Default::default(),
+            "0.0.1",
+            "RPC test",
+            MockService::build().for_unit_tests(),
+            MockService::build().for_unit_tests(),
+            Buffer::new(read_state.clone(), 1),
+            MockService::build().for_unit_tests(),
+            MockSyncStatus::default(),
+            NoChainTip,
+            MockAddressBookPeers::default(),
+            rx,
+            None,
+        );
+        let respond = async move {
+            read_state
+                .expect_request(ReadRequest::BlockInfo(tip.into()))
+                .await
+                .respond(ReadResponse::BlockInfo(None));
+        };
+        let (response, ()) = tokio::join!(rpc.get_block_subsidy(Some(height.0)), respond);
+        let error = response.expect_err("a missing parent is an error");
+        assert!(
+            error
+                .message()
+                .contains("at most one block above the best chain tip"),
+            "{error:?}"
+        );
+
         // `getblocktemplate` pays the subsidy after the chain tip to the miner.
         for (deficit, succeeds) in [(DEFICIT, true), (-1, false)] {
             let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();

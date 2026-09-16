@@ -853,6 +853,9 @@ pub trait Rpc {
     /// # Notes
     ///
     /// If `height` is not supplied, uses the tip height.
+    ///
+    /// From the ZIP 234 reissuance start height, the subsidy depends on the parent block's
+    /// chain value pools, so `height` must be at most one block above the best chain tip.
     #[method(name = "getblocksubsidy")]
     async fn get_block_subsidy(&self, height: Option<u32>) -> Result<GetBlockSubsidyResponse>;
 
@@ -3545,7 +3548,10 @@ where
             };
 
             parent_info
-                .ok_or_misc_error("parent block is not in any chain")?
+                .ok_or_misc_error(
+                    "the ZIP 234 subsidy needs the parent block, which is not in the best chain; \
+                     heights can be at most one block above the best chain tip",
+                )?
                 .value_pools()
                 .issuance_deficit_amount()
                 .constrain()

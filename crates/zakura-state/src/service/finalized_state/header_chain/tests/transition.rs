@@ -1402,7 +1402,8 @@ fn checkpoint_auxiliary_staging_does_not_clone_the_retained_engine() {
         "already admitted checkpoint headers must not rebuild predecessor leases per block"
     );
     assert!(
-        implementation.contains("transition_engine.graph().header_node(header.hash).is_some()"),
+        implementation
+            .contains("retained_checkpoint_headers(&transition_engine, &checkpoint_request.event)"),
         "the predecessor-lease fast path must be justified by the coherent retained graph"
     );
     let validated = implementation

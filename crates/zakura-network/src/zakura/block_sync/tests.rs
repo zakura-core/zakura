@@ -16266,6 +16266,67 @@ fn hint_refresh_cannot_relabel_an_issued_unknown_reservation() {
 }
 
 #[test]
+fn abrupt_large_body_regime_preserves_memory_exposure_and_issued_charges() {
+    let queue = work_queue_with(0, (1..=201).map(|h| needed(h, BlockSizeEstimate::Unknown)));
+    let scope = test_work_scope();
+    for h in 1..=100 {
+        let owner = scope.bind(7, std::num::NonZeroU64::new(u64::from(h)).unwrap());
+        queue.take_for_request(
+            block::Height(h),
+            block::Height(h),
+            1,
+            u64::MAX,
+            7,
+            owner.request_id,
+        );
+        queue.mark_reserved_for_owner(owner, [block::Height(h)]);
+        queue
+            .receive_body_for_owner(owner, block::Height(h), 1024)
+            .unwrap();
+    }
+
+    let owner = scope.bind(8, std::num::NonZeroU64::new(101).unwrap());
+    let issued = queue.take_for_request(
+        block::Height(101),
+        block::Height(200),
+        100,
+        u64::MAX,
+        8,
+        owner.request_id,
+    );
+    assert_eq!(issued.len(), 100);
+    let charge = issued[0].1.estimated_bytes;
+    assert!(charge <= 1030);
+    queue.mark_reserved_for_owner(owner, (101..=200).map(block::Height));
+    assert_eq!(queue.reserved_bytes(), 100 * charge);
+    assert_eq!(
+        queue.reserved_above(block::Height(100)),
+        (100 * block::MAX_BLOCK_BYTES, 100)
+    );
+
+    // The supplier switches size regimes while every request has a small fixed charge.
+    for h in 101..=200 {
+        assert_eq!(
+            queue.receive_body_for_owner(owner, block::Height(h), block::MAX_BLOCK_BYTES),
+            Some(charge)
+        );
+        let remaining = u64::from(200 - h);
+        assert_eq!(queue.reserved_bytes(), remaining * charge);
+        assert_eq!(
+            queue.reserved_above(block::Height(100)),
+            (remaining * block::MAX_BLOCK_BYTES, remaining)
+        );
+    }
+    assert!(
+        queue
+            .pending_item(block::Height(201))
+            .unwrap()
+            .estimated_bytes
+            >= block::MAX_BLOCK_BYTES - 10
+    );
+}
+
+#[test]
 fn overlapping_submission_window_retains_detached_memory_until_completion() {
     for limit in [401, 801] {
         let blocks = fake_sequential_blocks(u32::try_from(limit + 1).unwrap());

@@ -1447,7 +1447,8 @@ impl DiskDb {
     /// If the current db version belongs to `restorable_db_versions`, the function moves a previous
     /// db to a new path so it can be used again. It does so by merely trying to rename the path
     /// corresponding to the db version directly preceding the current version to the path that is
-    /// used by the current db. If successful, it also deletes the db version file.
+    /// used by the current db. If successful, it records the previous format version at the new
+    /// path so startup can apply the remaining upgrades.
     ///
     /// Returns the old disk version if one existed and the db directory was renamed, or None otherwise.
     // TODO: Update this function to rename older major db format version to the current version (#9565).

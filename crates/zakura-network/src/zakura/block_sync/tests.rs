@@ -4892,17 +4892,24 @@ fn sequencer_applying_counters_match_scan_across_transitions() {
 
 #[tokio::test]
 async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() {
-    const BLOCK_COUNT: u32 = 403;
+    assert_checkpoint_completions_refill_window(401).await;
+}
+
+#[tokio::test]
+async fn sequencer_stale_checkpoint_completions_refill_overlapping_ranges() {
+    assert_checkpoint_completions_refill_window(801).await;
+}
+
+async fn assert_checkpoint_completions_refill_window(submission_limit: usize) {
+    let block_count = u32::try_from(submission_limit + 2).expect("test window fits u32");
     const CHANNEL_TIMEOUT: Duration = Duration::from_secs(2);
     const MISSING_SUBMISSION_TIMEOUT: Duration = Duration::from_millis(100);
 
-    let submission_limit = MIN_BS_CHECKPOINT_SUBMITTED_BLOCK_APPLIES;
     let submission_limit_u64 =
         u64::try_from(submission_limit).expect("the checkpoint submission limit fits in u64");
-    let body_channel_capacity = usize::try_from(BLOCK_COUNT).expect("403 test bodies fit in usize");
-    assert_eq!(submission_limit, 401);
+    let body_channel_capacity = usize::try_from(block_count).expect("test body count fits usize");
 
-    let blocks = fake_sequential_blocks(BLOCK_COUNT);
+    let blocks = fake_sequential_blocks(block_count);
     let frontiers = BlockSyncFrontiers {
         finalized_height: block::Height(0),
         verified_block_tip: block::Height(0),
@@ -4936,7 +4943,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
 
     for (index, block) in blocks.iter().enumerate() {
         let height =
-            block::Height(u32::try_from(index + 1).expect("403 test block indices fit in u32"));
+            block::Height(u32::try_from(index + 1).expect("test block indices fit in u32"));
         body_tx
             .send(SequencedBody::new_queued(
                 test_work_owner(),
@@ -4961,7 +4968,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     time::timeout(CHANNEL_TIMEOUT, async {
         loop {
             let view = *view_rx.borrow_and_update();
-            if view.applying_len == u64::from(BLOCK_COUNT)
+            if view.applying_len == u64::from(block_count)
                 && view.in_flight_submission_count == submission_limit_u64
                 && view.unsubmitted_applying_count == 2
             {
@@ -4993,7 +5000,7 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
         assert_eq!(
             block.coinbase_height(),
             Some(block::Height(
-                u32::try_from(index + 1).expect("401 submission indices fit in u32")
+                u32::try_from(index + 1).expect("test submission indices fit in u32")
             )),
             "initial submissions must be ordered through the full checkpoint window",
         );
@@ -5017,15 +5024,18 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
         })
         .expect("height 1 completion queues");
 
-    let block_402 = match time::timeout(CHANNEL_TIMEOUT, actions_rx.recv())
+    let first_replacement = match time::timeout(CHANNEL_TIMEOUT, actions_rx.recv())
         .await
-        .expect("height 402 submission arrives")
+        .expect("first replacement submission arrives")
         .expect("sequencer action channel remains live")
     {
         BlockSyncAction::SubmitBlock { block, .. } => block,
-        action => panic!("unexpected action before height 402 submission: {action:?}"),
+        action => panic!("unexpected action before first replacement submission: {action:?}"),
     };
-    assert_eq!(block_402.coinbase_height(), Some(block::Height(402)));
+    assert_eq!(
+        first_replacement.coinbase_height(),
+        Some(block::Height(block_count - 1))
+    );
 
     for (height, (token, block)) in [
         (block::Height(2), &initial_submissions[1]),
@@ -5049,14 +5059,14 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
             .expect("stale checkpoint completion queues");
     }
 
-    let submit_403 = time::timeout(MISSING_SUBMISSION_TIMEOUT, async {
+    let second_replacement = time::timeout(MISSING_SUBMISSION_TIMEOUT, async {
         loop {
             let action = actions_rx
                 .recv()
                 .await
                 .expect("sequencer action channel remains live");
             if let BlockSyncAction::SubmitBlock { block, .. } = action {
-                assert_eq!(block.coinbase_height(), Some(block::Height(403)));
+                assert_eq!(block.coinbase_height(), Some(block::Height(block_count)));
                 break;
             }
         }
@@ -5064,8 +5074,8 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     .await;
     let diagnostic = *view_rx.borrow();
     assert!(
-        submit_403.is_ok(),
-        "height 403 must refill the checkpoint submission window; \
+        second_replacement.is_ok(),
+        "second replacement must refill the checkpoint submission window; \
          in_flight_submission_count = {}, unsubmitted_applying_count = {}",
         diagnostic.in_flight_submission_count,
         diagnostic.unsubmitted_applying_count,
@@ -5074,7 +5084,9 @@ async fn sequencer_stale_checkpoint_completions_refill_full_submission_window() 
     time::timeout(CHANNEL_TIMEOUT, async {
         loop {
             let view = *view_rx.borrow_and_update();
-            if view.in_flight_submission_count == 400 && view.unsubmitted_applying_count == 0 {
+            if view.in_flight_submission_count == submission_limit_u64 - 1
+                && view.unsubmitted_applying_count == 0
+            {
                 break;
             }
             view_rx
@@ -16186,4 +16198,55 @@ fn hint_refresh_cannot_relabel_an_issued_unknown_reservation() {
     );
     assert!(retry[0].1.reservation_has_size_hint);
     assert_eq!(retry[0].1.estimated_bytes, 1024);
+}
+
+#[test]
+fn overlapping_submission_window_retains_detached_memory_until_completion() {
+    for limit in [401, 801] {
+        let blocks = fake_sequential_blocks(u32::try_from(limit + 1).unwrap());
+        let mut seq = test_sequencer(0, limit);
+        for block in &blocks {
+            seq.accept_body(
+                block.coinbase_height().unwrap(),
+                block.hash(),
+                block.clone(),
+                2000,
+                peer(0),
+            );
+        }
+        seq.drain_ready_into_applying();
+        let submitted: Vec<_> = seq
+            .submittable_heights()
+            .into_iter()
+            .map(|height| seq.prepare_submit(height).unwrap())
+            .collect();
+        assert_eq!(submitted.len(), limit);
+        assert_eq!(seq.unsubmitted_applying_count(), 1);
+        seq.reset_to(block::Height(399), false);
+        assert_eq!(seq.in_flight_submission_count(), limit);
+        assert_eq!(
+            seq.in_flight_submission_bytes(),
+            u64::try_from(limit).unwrap() * 2000
+        );
+        assert!(seq.submittable_heights().is_empty());
+        for item in submitted {
+            assert!(seq.finish_submission(
+                item.owner,
+                item.source,
+                item.token,
+                item.height,
+                item.hash
+            ));
+            assert!(!seq.finish_submission(
+                item.owner,
+                item.source,
+                item.token,
+                item.height,
+                item.hash
+            ));
+        }
+        assert_eq!(seq.in_flight_submission_count(), 0);
+        assert_eq!(seq.in_flight_submission_bytes(), 0);
+        assert_eq!(seq.in_flight_submission_count_scanned(), 0);
+    }
 }

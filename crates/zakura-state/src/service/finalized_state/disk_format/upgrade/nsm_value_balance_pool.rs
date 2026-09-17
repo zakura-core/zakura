@@ -1,6 +1,6 @@
 //! Backfill the unseeded reissuance balance from NU7 onward.
 //!
-//! The balance equals the signed schedule deficit minus its value immediately before
+//! The balance equals the signed schedule balance minus its value immediately before
 //! NU7. Earlier records carry zero. Historical funds remain excluded pending guidance.
 
 use crossbeam_channel::{Receiver, TryRecvError};
@@ -21,7 +21,7 @@ use super::{CancelFormatChange, DiskFormatUpgrade, FormatChangeError};
 /// The number of block info records to rewrite per database batch.
 const BATCH_BLOCKS: u32 = 10_000;
 
-/// Implements [`DiskFormatUpgrade`] for the issuance deficit backfill.
+/// Implements [`DiskFormatUpgrade`] for the NSM value balance backfill.
 pub struct Upgrade;
 
 impl DiskFormatUpgrade for Upgrade {
@@ -30,7 +30,7 @@ impl DiskFormatUpgrade for Upgrade {
     }
 
     fn description(&self) -> &'static str {
-        "backfill the ZIP 234 issuance deficit into the chain value pools"
+        "backfill the ZIP 234 NSM value balance into the chain value pools"
     }
 
     #[allow(clippy::unwrap_in_result)]
@@ -65,13 +65,13 @@ impl DiskFormatUpgrade for Upgrade {
                 "tip pools disagree with BlockInfo at {tip_height:?}"
             )));
         }
-        let expected = eligible_deficit(&network, tip_height, tip_pools, baseline(db)?)?;
+        let expected = eligible_balance(&network, tip_height, tip_pools, baseline(db)?)?;
 
-        if tip_pools.issuance_deficit_amount() != expected {
+        if tip_pools.nsm_value_balance_amount() != expected {
             return Ok(Err(format!(
-                "tip issuance deficit {:?} does not match the halving schedule's {expected:?} \
+                "tip NSM value balance {:?} does not match the halving schedule's {expected:?} \
                  at {tip_height:?}",
-                tip_pools.issuance_deficit_amount(),
+                tip_pools.nsm_value_balance_amount(),
             )));
         }
 
@@ -87,7 +87,7 @@ fn backfill(
 ) -> Result<(), FormatChangeError> {
     let Some(tip_height) = initial_finalized_tip_height else {
         // An empty database has no blocks to backfill. A genesis sync under this version
-        // writes the deficit as it goes.
+        // writes the balance as it goes.
         return Ok(());
     };
 
@@ -102,10 +102,10 @@ fn backfill(
         let height = Height(height);
         let block_info = read_block_info(db, height)?;
 
-        let deficit = eligible_deficit(&network, height, *block_info.value_pools(), baseline)?;
+        let balance = eligible_balance(&network, height, *block_info.value_pools(), baseline)?;
 
         let mut value_pools = *block_info.value_pools();
-        value_pools.set_issuance_deficit_amount(deficit);
+        value_pools.set_nsm_value_balance_amount(balance);
         let _ = db
             .block_info_cf()
             .with_batch_for_writing(&mut batch)
@@ -124,9 +124,9 @@ fn backfill(
     // The tip value pool is stored separately from the per-block records, and it is what
     // the next block's subsidy reads.
     let tip_pools = read_tip_pools(db)?;
-    let deficit = eligible_deficit(&network, tip_height, tip_pools, baseline)?;
+    let balance = eligible_balance(&network, tip_height, tip_pools, baseline)?;
     let mut tip_pools = tip_pools;
-    tip_pools.set_issuance_deficit_amount(deficit);
+    tip_pools.set_nsm_value_balance_amount(balance);
     let _ = db
         .chain_value_pools_cf()
         .with_batch_for_writing(&mut batch)
@@ -137,8 +137,8 @@ fn backfill(
     Ok(())
 }
 
-/// Subtract signed operands so pre-reissuance deficits can remain negative.
-fn deficit_at(
+/// Subtract signed operands so pre-reNSM value balances can remain negative.
+fn balance_at(
     network: &zakura_chain::parameters::Network,
     height: Height,
     value_pools: ValueBalance<NonNegative>,
@@ -148,8 +148,8 @@ fn deficit_at(
     Ok(scheduled - i128::from(i64::from(value_pools.total()?)))
 }
 
-/// Exclude the entire pre-NU7 deficit until the historical-funds policy is confirmed.
-/// Keep this baseline consistent with `Block::issuance_deficit_change`.
+/// Exclude the entire pre-NU7 balance until the historical-funds policy is confirmed.
+/// Keep this baseline consistent with `Block::nsm_value_balance_change`.
 fn baseline(db: &ZakuraDb) -> Result<i128, FormatChangeError> {
     let network = db.network();
     let Some(start) = NetworkUpgrade::Nu7.activation_height(&network) else {
@@ -160,14 +160,14 @@ fn baseline(db: &ZakuraDb) -> Result<i128, FormatChangeError> {
     }
     let height = Height(start.0 - 1); // The zero-height case returned above.
     let info = read_block_info(db, height)?;
-    deficit_at(&network, height, *info.value_pools()).map_err(|error| {
+    balance_at(&network, height, *info.value_pools()).map_err(|error| {
         FormatChangeError::InvalidPostcondition(format!(
             "invalid NU7 baseline at {height:?}: {error}"
         ))
     })
 }
 
-fn eligible_deficit(
+fn eligible_balance(
     network: &zakura_chain::parameters::Network,
     height: Height,
     pools: ValueBalance<NonNegative>,
@@ -179,7 +179,7 @@ fn eligible_deficit(
     {
         return Ok(Amount::zero());
     }
-    let eligible = deficit_at(network, height, pools)
+    let eligible = balance_at(network, height, pools)
         .and_then(|raw| {
             let eligible = i64::try_from(raw - baseline)
                 .map_err(|_| zakura_chain::parameters::subsidy::SubsidyError::Overflow)?;
@@ -187,14 +187,14 @@ fn eligible_deficit(
         })
         .map_err(|error| {
             FormatChangeError::InvalidPostcondition(format!(
-                "invalid issuance deficit at {height:?}: {error}"
+                "invalid NSM value balance at {height:?}: {error}"
             ))
         })?;
     if zakura_chain::parameters::subsidy::is_zip234_active(network, height)
         && i64::from(eligible) < 0
     {
         return Err(FormatChangeError::InvalidPostcondition(format!(
-            "negative issuance deficit at active reissuance height {height:?}"
+            "negative NSM value balance at active reissuance height {height:?}"
         )));
     }
     Ok(eligible)
@@ -275,7 +275,7 @@ mod tests {
             let pools = ValueBalance::from_transparent_amount(Amount::try_from(issued).unwrap());
             let expected = i64::from(expected_issued_supply(Height(height), &network).unwrap()) - issued;
             prop_assert_eq!(
-                deficit_at(&network, Height(height), pools),
+                balance_at(&network, Height(height), pools),
                 Ok(i128::from(expected)),
             );
         }
@@ -307,7 +307,7 @@ mod tests {
             baseline > i128::from(MAX_MONEY),
             "the fixture must exceed the Amount limit"
         );
-        let eligible = eligible_deficit(&network, start, ValueBalance::zero(), baseline).unwrap();
+        let eligible = eligible_balance(&network, start, ValueBalance::zero(), baseline).unwrap();
         assert_eq!(eligible, halving_block_subsidy(start, &network).unwrap());
     }
 
@@ -330,7 +330,7 @@ mod tests {
             let pools = ValueBalance::from_transparent_amount(
                 Amount::try_from(i64::try_from(scheduled - baseline + 1).unwrap()).unwrap(),
             );
-            let result = eligible_deficit(&network, Height(h), pools, baseline);
+            let result = eligible_balance(&network, Height(h), pools, baseline);
             if cfg!(feature = "nu7") && h == 3 {
                 assert!(matches!(
                     result,
@@ -343,14 +343,14 @@ mod tests {
     }
 
     #[test]
-    fn backfill_preserves_negative_deficit() {
+    fn backfill_preserves_negative_balance() {
         let network = Network::Mainnet;
         let height = Height(1);
         let expected = expected_issued_supply(height, &network).unwrap();
         let pools = ValueBalance::from_transparent_amount(
             Amount::try_from(i64::from(expected) + 1).unwrap(),
         );
-        assert_eq!(deficit_at(&network, height, pools), Ok(-1));
+        assert_eq!(balance_at(&network, height, pools), Ok(-1));
     }
 }
 
@@ -434,7 +434,7 @@ mod database_tests {
                     - base
             };
             assert_eq!(
-                i64::from(info.value_pools().issuance_deficit_amount()),
+                i64::from(info.value_pools().nsm_value_balance_amount()),
                 expected
             );
         }
@@ -522,7 +522,7 @@ mod database_tests {
                 Err(FormatChangeError::InvalidPostcondition(_))
             ));
             assert_eq!(
-                db.finalized_value_pool().issuance_deficit_amount(),
+                db.finalized_value_pool().nsm_value_balance_amount(),
                 Amount::<NegativeAllowed>::zero()
             );
         }

@@ -703,19 +703,19 @@ fn deferred_pool_balance_change(
     // in slow start on configured networks, so rollback must reverse it at every height too.
     // ZIP 234 derives the block subsidy from the money reserve after the parent block.
     // Every block being rolled back is finalized, so its parent's pools are in the db.
-    let issuance_deficit = height
+    let nsm_value_balance = height
         .previous()
         .ok()
         .and_then(|parent| db.block_info(parent.into()))
         .and_then(|parent_info| {
             parent_info
                 .value_pools()
-                .issuance_deficit_amount()
+                .nsm_value_balance_amount()
                 .constrain()
                 .ok()
         });
 
-    let block_subsidy = block_subsidy(height, network, issuance_deficit)?;
+    let block_subsidy = block_subsidy(height, network, nsm_value_balance)?;
     let deferred_amount = funding_stream_values(height, network, block_subsidy)?
         .remove(&FundingStreamReceiver::Deferred)
         .unwrap_or_default()

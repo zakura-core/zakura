@@ -586,10 +586,10 @@ fn roundtrip_block_info_with_ironwood_value_pool() {
     assert_value_properties(block_info);
 }
 
-/// A `BlockInfo` written before the issuance deficit leg still decodes, with a zero
-/// deficit. The `issuance_deficit_pool` database upgrade replaces that placeholder.
+/// A `BlockInfo` written before the NSM value balance leg still decodes, with a zero
+/// balance. The `nsm_value_balance_pool` database upgrade replaces that placeholder.
 #[test]
-fn block_info_decodes_pre_issuance_deficit_value_pools() {
+fn block_info_decodes_pre_nsm_value_balance_value_pools() {
     let _init_guard = zakura_test::init();
 
     let ironwood_amount = Amount::<NonNegative>::try_from(7).expect("7 zatoshi is a valid amount");
@@ -602,7 +602,7 @@ fn block_info_decodes_pre_issuance_deficit_value_pools() {
 
     assert_eq!(block_info.value_pools().ironwood_amount(), ironwood_amount);
     assert_eq!(
-        block_info.value_pools().issuance_deficit_amount(),
+        block_info.value_pools().nsm_value_balance_amount(),
         Amount::<NegativeAllowed>::zero(),
     );
     assert_eq!(block_info.size(), 123);

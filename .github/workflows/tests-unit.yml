@@ -371,8 +371,8 @@ jobs:
           NSM_HISTORY_CASES: '1000'
         run: |
           cargo test --locked -p zakura-chain --features nu7 reissuance_matches_integer_oracle
-          cargo test --locked -p zakura-chain --features nu7 deficit_ignores_transfers
-          cargo test --locked -p zakura-state --features nu7 deficit_rollback_replay_and_fork_equivalence
+          cargo test --locked -p zakura-chain --features nu7 balance_ignores_transfers
+          cargo test --locked -p zakura-state --features nu7 balance_rollback_replay_and_fork_equivalence
 
   network-dependent:
     name: network-dependent acceptance tests

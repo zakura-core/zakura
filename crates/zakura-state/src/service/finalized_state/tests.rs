@@ -13,7 +13,7 @@ use zakura_chain::{
 use crate::{arbitrary::Prepare, service::check, SemanticallyVerifiedBlock};
 
 #[cfg(feature = "nu7")]
-mod issuance_deficit;
+mod nsm_value_balance;
 mod prop;
 mod rollback;
 mod transparent;

@@ -385,13 +385,13 @@ pub enum SubsidyError {
     #[error("miner fees are invalid")]
     InvalidMinerFees,
 
-    #[error("ZIP 234 block subsidy needs the issuance deficit after the parent block")]
-    MissingIssuanceDeficit,
+    #[error("ZIP 234 block subsidy needs the NSM value balance after the parent block")]
+    MissingNsmValueBalance,
 
     #[error(
-        "issued supply exceeds the scheduled supply, so the ZIP 234 issuance deficit is negative"
+        "issued supply exceeds the scheduled supply, so the ZIP 234 NSM value balance is negative"
     )]
-    NegativeIssuanceDeficit,
+    NegativeNsmValueBalance,
 
     #[error("addition of amounts overflowed")]
     Overflow,
@@ -478,7 +478,7 @@ pub const BLOCK_SUBSIDY_FRACTION_NUMERATOR: u128 = 4_126;
 /// At the 75-second post-Blossom target spacing, the fraction satisfies
 /// `(1 - BLOCK_SUBSIDY_FRACTION) ^ PostBlossomHalvingInterval` is approximately
 /// one half. zips#1354 applies the fraction once per block at every target spacing,
-/// so ZIP 218's 25-second blocks halve the deficit about every 1.33 years instead.
+/// so ZIP 218's 25-second blocks halve the balance about every 1.33 years instead.
 pub const BLOCK_SUBSIDY_FRACTION_DENOMINATOR: u128 = 10_000_000_000;
 
 /// The halving after which the [ZIP 234] start rule looks for its crossing height.
@@ -755,20 +755,20 @@ fn reissuance_amount(amount: Amount<NonNegative>) -> Result<Amount<NonNegative>,
     Ok(Amount::try_from(subsidy)?)
 }
 
-/// Returns the [ZIP 234] reissuance bonus for a block, given the `IssuanceDeficit` after
+/// Returns the [ZIP 234] reissuance bonus for a block, given the `NsmValueBalance` after
 /// its parent.
 ///
 /// The halving schedule keeps issuing new ZEC. The bonus reissues value removed from
 /// circulation.
 ///
-/// The state supplies the eligible deficit after the parent block. It excludes the
-/// pre-NU7 historical seed pending policy guidance; see `Block::issuance_deficit_change`.
+/// The state supplies the eligible balance after the parent block. It excludes the
+/// pre-NU7 historical seed pending policy guidance; see `Block::nsm_value_balance_change`.
 ///
 /// [ZIP 234]: https://zips.z.cash/zip-0234
 fn reissuance_bonus(
-    issuance_deficit: Amount<NonNegative>,
+    nsm_value_balance: Amount<NonNegative>,
 ) -> Result<Amount<NonNegative>, SubsidyError> {
-    reissuance_amount(issuance_deficit)
+    reissuance_amount(nsm_value_balance)
 }
 
 /// Returns `ExpectedIssuedSupply(height)` from zips#1354: the total block subsidy the
@@ -890,15 +890,15 @@ fn next_subsidy_boundary(height: Height, net: &Network) -> Option<Height> {
 pub fn block_subsidy(
     height: Height,
     net: &Network,
-    issuance_deficit: Option<Amount<NonNegative>>,
+    nsm_value_balance: Option<Amount<NonNegative>>,
 ) -> Result<Amount<NonNegative>, SubsidyError> {
     if is_zip234_active(net, height) {
-        // The caller reads the issuance deficit from the parent block, so every caller
+        // The caller reads the NSM value balance from the parent block, so every caller
         // that can reach a ZIP 234 height must supply it.
-        let issuance_deficit = issuance_deficit.ok_or(SubsidyError::MissingIssuanceDeficit)?;
+        let nsm_value_balance = nsm_value_balance.ok_or(SubsidyError::MissingNsmValueBalance)?;
 
         let halving_subsidy = halving_block_subsidy(height, net)?;
-        let bonus = reissuance_bonus(issuance_deficit)?;
+        let bonus = reissuance_bonus(nsm_value_balance)?;
 
         return Ok((halving_subsidy + bonus)?);
     }

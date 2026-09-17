@@ -187,7 +187,7 @@ impl DiskFormatUpgrade for Upgrade {
                 let block_subsidy = block_subsidy(
                     height,
                     &network,
-                    value_pool.issuance_deficit_amount().constrain().ok(),
+                    value_pool.nsm_value_balance_amount().constrain().ok(),
                 )
                 .map_err(|error| {
                     super::FormatChangeError::InvalidPostcondition(format!(

@@ -18,10 +18,10 @@ proptest! {
         let orchard = value_balance1.orchard + value_balance2.orchard;
         let deferred = value_balance1.deferred + value_balance2.deferred;
         let ironwood = value_balance1.ironwood + value_balance2.ironwood;
-        let issuance_deficit = value_balance1.issuance_deficit + value_balance2.issuance_deficit;
+        let nsm_value_balance = value_balance1.nsm_value_balance + value_balance2.nsm_value_balance;
 
-        match (transparent, sprout, sapling, orchard, deferred, ironwood, issuance_deficit) {
-            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood), Ok(issuance_deficit)) => prop_assert_eq!(
+        match (transparent, sprout, sapling, orchard, deferred, ironwood, nsm_value_balance) {
+            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood), Ok(nsm_value_balance)) => prop_assert_eq!(
                 value_balance1 + value_balance2,
                 Ok(ValueBalance {
                     transparent,
@@ -30,7 +30,7 @@ proptest! {
                     orchard,
                     deferred,
                     ironwood,
-                    issuance_deficit
+                    nsm_value_balance
                 })
             ),
             _ => prop_assert!(
@@ -42,7 +42,7 @@ proptest! {
                         | ValueBalanceError::Orchard(_)
                         | ValueBalanceError::Deferred(_)
                         | ValueBalanceError::Ironwood(_)
-                        | ValueBalanceError::IssuanceDeficit(_))
+                        | ValueBalanceError::NsmValueBalance(_))
                 )
             ),
         }
@@ -60,10 +60,10 @@ proptest! {
         let orchard = value_balance1.orchard - value_balance2.orchard;
         let deferred = value_balance1.deferred - value_balance2.deferred;
         let ironwood = value_balance1.ironwood - value_balance2.ironwood;
-        let issuance_deficit = value_balance1.issuance_deficit - value_balance2.issuance_deficit;
+        let nsm_value_balance = value_balance1.nsm_value_balance - value_balance2.nsm_value_balance;
 
-        match (transparent, sprout, sapling, orchard, deferred, ironwood, issuance_deficit) {
-            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood), Ok(issuance_deficit)) => prop_assert_eq!(
+        match (transparent, sprout, sapling, orchard, deferred, ironwood, nsm_value_balance) {
+            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood), Ok(nsm_value_balance)) => prop_assert_eq!(
                 value_balance1 - value_balance2,
                 Ok(ValueBalance {
                     transparent,
@@ -72,7 +72,7 @@ proptest! {
                     orchard,
                     deferred,
                     ironwood,
-                    issuance_deficit
+                    nsm_value_balance
                 })
             ),
             _ => prop_assert!(matches!(
@@ -83,7 +83,7 @@ proptest! {
                         | ValueBalanceError::Orchard(_)
                         | ValueBalanceError::Deferred(_)
                         | ValueBalanceError::Ironwood(_)
-                        | ValueBalanceError::IssuanceDeficit(_))
+                        | ValueBalanceError::NsmValueBalance(_))
                 )),
         }
     }
@@ -103,10 +103,10 @@ proptest! {
         let orchard = value_balance1.orchard + value_balance2.orchard;
         let deferred = value_balance1.deferred + value_balance2.deferred;
         let ironwood = value_balance1.ironwood + value_balance2.ironwood;
-        let issuance_deficit = value_balance1.issuance_deficit + value_balance2.issuance_deficit;
+        let nsm_value_balance = value_balance1.nsm_value_balance + value_balance2.nsm_value_balance;
 
-        match (transparent, sprout, sapling, orchard, deferred, ironwood, issuance_deficit) {
-            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood), Ok(issuance_deficit)) => prop_assert_eq!(
+        match (transparent, sprout, sapling, orchard, deferred, ironwood, nsm_value_balance) {
+            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood), Ok(nsm_value_balance)) => prop_assert_eq!(
                 collection.iter().sum::<Result<ValueBalance<NegativeAllowed>, ValueBalanceError>>(),
                 Ok(ValueBalance {
                     transparent,
@@ -115,7 +115,7 @@ proptest! {
                     orchard,
                     deferred,
                     ironwood,
-                    issuance_deficit
+                    nsm_value_balance
                 })
             ),
             _ => prop_assert!(matches!(
@@ -126,7 +126,7 @@ proptest! {
                         | ValueBalanceError::Orchard(_)
                         | ValueBalanceError::Deferred(_)
                         | ValueBalanceError::Ironwood(_)
-                        | ValueBalanceError::IssuanceDeficit(_))
+                        | ValueBalanceError::NsmValueBalance(_))
                  ))
         }
     }

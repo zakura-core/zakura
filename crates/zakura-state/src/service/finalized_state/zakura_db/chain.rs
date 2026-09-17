@@ -316,7 +316,7 @@ impl DiskWriteBatch {
                 }
             })?;
 
-        check::issuance_deficit_is_non_negative(
+        check::nsm_value_balance_is_non_negative(
             &db.network(),
             finalized.height,
             &value_pool,

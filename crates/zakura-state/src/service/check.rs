@@ -44,14 +44,14 @@ mod tests;
 
 pub(crate) use difficulty::AdjustedDifficulty;
 
-/// Checks that the block at `height` does not make the ZIP 234 issuance deficit negative.
+/// Checks that the block at `height` does not make the ZIP 234 NSM value balance negative.
 ///
 /// `value_pools` are the chain value pools before the block, and `block_value_pool_change`
 /// is the block's change to them.
 ///
 /// # Consensus
 ///
-/// > [NU7 onward] If IssuanceDeficit(height) would become negative in the block chain
+/// > [NU7 onward] If NsmValueBalance(height) would become negative in the block chain
 /// > created as a result of accepting a block at height, then all nodes MUST reject the
 /// > block as invalid.
 ///
@@ -60,7 +60,7 @@ pub(crate) use difficulty::AdjustedDifficulty;
 ///
 /// Check before adding pools so an overdraw reports this consensus rule.
 #[allow(clippy::unwrap_in_result)]
-pub(crate) fn issuance_deficit_is_non_negative(
+pub(crate) fn nsm_value_balance_is_non_negative(
     network: &Network,
     height: block::Height,
     value_pools: &ValueBalance<NonNegative>,
@@ -70,22 +70,22 @@ pub(crate) fn issuance_deficit_is_non_negative(
         return Ok(());
     }
 
-    let deficit_before = value_pools.issuance_deficit_amount();
-    let deficit_change = block_value_pool_change.issuance_deficit_amount();
+    let balance_before = value_pools.nsm_value_balance_amount();
+    let balance_change = block_value_pool_change.nsm_value_balance_amount();
 
-    let deficit_after = (deficit_before + deficit_change).map_err(|_| {
-        ValidateContextError::NegativeIssuanceDeficit {
+    let balance_after = (balance_before + balance_change).map_err(|_| {
+        ValidateContextError::NegativeNsmValueBalance {
             height,
-            deficit_before,
-            deficit_change,
+            balance_before,
+            balance_change,
         }
     })?;
 
-    if deficit_after.zatoshis() < 0 {
-        return Err(ValidateContextError::NegativeIssuanceDeficit {
+    if balance_after.zatoshis() < 0 {
+        return Err(ValidateContextError::NegativeNsmValueBalance {
             height,
-            deficit_before,
-            deficit_change,
+            balance_before,
+            balance_change,
         });
     }
 

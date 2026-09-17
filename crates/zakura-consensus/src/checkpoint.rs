@@ -119,12 +119,12 @@ pub const MAX_QUEUED_BLOCKS_PER_HEIGHT: usize = 4;
 fn deferred_pool_balance_change(
     height: block::Height,
     network: &Network,
-    issuance_deficit: Option<Amount<NonNegative>>,
+    nsm_value_balance: Option<Amount<NonNegative>>,
 ) -> Result<Option<DeferredPoolBalanceChange>, VerifyCheckpointError> {
     let expected_deferred_amount = funding_stream_values(
         height,
         network,
-        block_subsidy(height, network, issuance_deficit)?,
+        block_subsidy(height, network, nsm_value_balance)?,
     )?
     .remove(&FundingStreamReceiver::Deferred);
 
@@ -1307,15 +1307,15 @@ where
                     };
                     let parent_info = parent_info
                         .expect("AwaitBlockInfo only returns after the parent block commits");
-                    let issuance_deficit = parent_info
+                    let nsm_value_balance = parent_info
                         .value_pools()
-                        .issuance_deficit_amount()
+                        .nsm_value_balance_amount()
                         .constrain()
                         .ok();
                     let deferred_pool_balance_change = deferred_pool_balance_change(
                         req_block.block.height,
                         &network,
-                        issuance_deficit,
+                        nsm_value_balance,
                     )?;
                     req_block.block = req_block
                         .block

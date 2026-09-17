@@ -108,7 +108,7 @@ pub fn select_mempool_transactions(
     net: &Network,
     height: Height,
     miner_params: &MinerParams,
-    issuance_deficit: Option<Amount<amount::NonNegative>>,
+    nsm_value_balance: Option<Amount<amount::NonNegative>>,
     mempool_txs: Vec<VerifiedUnminedTx>,
     mempool_tx_deps: TransactionDependencies,
 ) -> Result<Vec<SelectedMempoolTx>, TransactionError> {
@@ -119,7 +119,7 @@ pub fn select_mempool_transactions(
         height,
         miner_params,
         Amount::zero(),
-        issuance_deficit,
+        nsm_value_balance,
     )?;
 
     let tx_dependencies = mempool_tx_deps.dependencies();

@@ -783,18 +783,18 @@ fn zip234_issuance() {
 
     if !cfg!(feature = "nu7") {
         // Without ZIP 234, the subsidy stays on the halving schedule.
-        let deficit = Amount::<NonNegative>::try_from(1_000_000_000_000i64).expect("valid amount");
+        let balance = Amount::<NonNegative>::try_from(1_000_000_000_000i64).expect("valid amount");
         assert_eq!(
-            block_subsidy(start, &network, Some(deficit)).expect("valid subsidy"),
+            block_subsidy(start, &network, Some(balance)).expect("valid subsidy"),
             block_subsidy(start, &network, None).expect("valid subsidy"),
         );
         return;
     }
 
-    // ZIP 234 needs the issuance deficit at its start height.
+    // ZIP 234 needs the NSM value balance at its start height.
     assert_eq!(
         block_subsidy(start, &network, None),
-        Err(SubsidyError::MissingIssuanceDeficit),
+        Err(SubsidyError::MissingNsmValueBalance),
     );
     assert!(block_subsidy(
         start.previous().expect("start is above genesis"),
@@ -811,7 +811,7 @@ fn zip234_issuance() {
         halving_subsidy,
     );
 
-    // A deficit of 10^12 zatoshi reissues `ceil(10^12 * 4126 / 10^10)` zatoshi, at 25-second
+    // A balance of 10^12 zatoshi reissues `ceil(10^12 * 4126 / 10^10)` zatoshi, at 25-second
     // blocks as at 75-second blocks.
     let behind = Amount::<NonNegative>::try_from(1_000_000_000_000i64).expect("valid amount");
     assert_eq!(
@@ -819,16 +819,16 @@ fn zip234_issuance() {
         (halving_subsidy + Amount::try_from(412_600).expect("valid amount")).expect("valid amount"),
     );
 
-    // A deficit of one zatoshi rounds up to a one-zatoshi bonus.
+    // A balance of one zatoshi rounds up to a one-zatoshi bonus.
     let one_behind = Amount::<NonNegative>::try_from(1).expect("valid amount");
     assert_eq!(
         block_subsidy(start, &network, Some(one_behind)).expect("valid subsidy"),
         (halving_subsidy + Amount::try_from(1).expect("valid amount")).expect("valid amount"),
     );
 
-    // A chain ahead of its schedule has a negative deficit, which the amount type cannot
+    // A chain ahead of its schedule has a negative balance, which the amount type cannot
     // represent. `Chain::push` and the finalized commit path reject such a block before it
-    // reaches this function; see `issuance_deficit_is_non_negative`.
+    // reaches this function; see `nsm_value_balance_is_non_negative`.
 
     // The money reserve is what has never been issued plus everything removed from
     // circulation.

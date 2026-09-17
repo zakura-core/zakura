@@ -1625,7 +1625,7 @@ fn state_commit_context_errors_keep_misbehavior_scores() {
     let router_error = crate::router::RouterError::from(err);
     assert_eq!(router_error.misbehavior_score(), 100);
 }
-/// A deficit that pays a nonzero ZIP 234 bonus.
+/// A balance that pays a nonzero ZIP 234 bonus.
 #[cfg(feature = "nu7")]
 const ZIP234_TEST_DEFICIT: i64 = 400_000_000;
 
@@ -1633,16 +1633,16 @@ const ZIP234_TEST_DEFICIT: i64 = 400_000_000;
 #[cfg(feature = "nu7")]
 const ZIP234_TEST_BONUS: i64 = 166;
 
-/// Returns the chain value pools after `parent` on `network`, `deficit` zatoshi behind the
+/// Returns the chain value pools after `parent` on `network`, `balance` zatoshi behind the
 /// halving schedule.
 ///
-/// The deficit is stored in its own value pool leg, and the transparent pool is set so that
+/// The balance is stored in its own value pool leg, and the transparent pool is set so that
 /// the test can isolate subsidy validation from the historical-baseline policy.
 #[cfg(feature = "nu7")]
 fn zip234_parent_pools(
     network: &Network,
     parent: Height,
-    deficit: i64,
+    balance: i64,
 ) -> zakura_chain::value_balance::ValueBalance<zakura_chain::amount::NonNegative> {
     let scheduled_supply: i64 = (1..=parent.0)
         .map(|height| {
@@ -1654,9 +1654,9 @@ fn zip234_parent_pools(
         .sum();
 
     let mut pools = zakura_chain::value_balance::ValueBalance::from_transparent_amount(
-        Amount::try_from(scheduled_supply - deficit).expect("the issued supply is valid"),
+        Amount::try_from(scheduled_supply - balance).expect("the issued supply is valid"),
     );
-    pools.set_issuance_deficit_amount(Amount::try_from(deficit).expect("valid deficit"));
+    pools.set_nsm_value_balance_amount(Amount::try_from(balance).expect("valid balance"));
 
     pools
 }
@@ -1678,9 +1678,9 @@ async fn zip234_block_verification_checks_the_reissuance_bonus() {
         .expect("valid subsidy");
 
     let verify =
-        |parent_deficit: i64, coinbase_value: Amount<zakura_chain::amount::NonNegative>| {
+        |parent_balance: i64, coinbase_value: Amount<zakura_chain::amount::NonNegative>| {
             let network = network.clone();
-            let parent_pools = zip234_parent_pools(&network, parent, parent_deficit);
+            let parent_pools = zip234_parent_pools(&network, parent, parent_balance);
             let block = zip234_test_block(&network, start, coinbase_value);
             let expected_parent = block.header.previous_block_hash;
 
@@ -1741,13 +1741,13 @@ async fn zip234_block_verification_checks_the_reissuance_bonus() {
         }),
     ));
 
-    // A parent that issued more than the schedule has a negative deficit. The state rejects
+    // A parent that issued more than the schedule has a negative balance. The state rejects
     // such a parent at a ZIP 234 height, so semantic verification only has to refuse to
     // compute a subsidy from it.
     assert!(matches!(
         verify(-1, halving_subsidy).await,
         Err(VerifyBlockError::Subsidy(
-            SubsidyError::MissingIssuanceDeficit
+            SubsidyError::MissingNsmValueBalance
         )),
     ));
 }

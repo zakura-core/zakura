@@ -436,10 +436,10 @@ where
                 .map_err(VerifyBlockError::Time)?;
             let coinbase_tx = check::coinbase_is_first(&block)?;
 
-            // ZIP 234 derives the block subsidy from the issuance deficit after the parent
+            // ZIP 234 derives the block subsidy from the NSM value balance after the parent
             // block, so a block at or above the start height needs its parent's chain
             // value pools. Wait for the parent commit if its verification is still running.
-            let issuance_deficit =
+            let nsm_value_balance =
                 if zakura_chain::parameters::subsidy::is_zip234_active(&network, height) {
                     let parent_hash = block.header.previous_block_hash;
 
@@ -457,12 +457,12 @@ where
                     let parent_info = parent_info
                         .expect("AwaitBlockInfo only returns after the parent block commits");
 
-                    // The deficit is signed, but `issuance_deficit_is_non_negative` rejects
+                    // The balance is signed, but `nsm_value_balance_is_non_negative` rejects
                     // any committed block at a ZIP 234 height that leaves it negative, so a
                     // committed parent at this height always constrains.
                     parent_info
                         .value_pools()
-                        .issuance_deficit_amount()
+                        .nsm_value_balance_amount()
                         .constrain()
                         .ok()
                 } else {
@@ -472,7 +472,7 @@ where
             let expected_block_subsidy = zakura_chain::parameters::subsidy::block_subsidy(
                 height,
                 &network,
-                issuance_deficit,
+                nsm_value_balance,
             )?;
 
             // See [ZIP-1015](https://zips.z.cash/zip-1015).

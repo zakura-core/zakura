@@ -779,14 +779,14 @@ pub enum ValidateContextError {
     },
 
     #[error(
-        "block makes the ZIP 234 issuance deficit negative: deficit {deficit_before:?} \
-         changes by {deficit_change:?} at {height:?}"
+        "block makes the ZIP 234 NSM value balance negative: balance {balance_before:?} \
+         changes by {balance_change:?} at {height:?}"
     )]
     #[non_exhaustive]
-    NegativeIssuanceDeficit {
+    NegativeNsmValueBalance {
         height: block::Height,
-        deficit_before: amount::Amount<NegativeAllowed>,
-        deficit_change: amount::Amount<NegativeAllowed>,
+        balance_before: amount::Amount<NegativeAllowed>,
+        balance_change: amount::Amount<NegativeAllowed>,
     },
 
     #[error("error updating a note commitment tree: {0}")]
@@ -963,7 +963,7 @@ impl ValidateContextError {
                 consensus("context.calculate_block_chain_value_change")
             }
             Self::AddValuePool { .. } => consensus("context.add_value_pool"),
-            Self::NegativeIssuanceDeficit { .. } => consensus("context.negative_issuance_deficit"),
+            Self::NegativeNsmValueBalance { .. } => consensus("context.negative_nsm_value_balance"),
             Self::UnknownSproutAnchor { .. } => consensus("context.unknown_sprout_anchor"),
             Self::UnknownSaplingAnchor { .. } => consensus("context.unknown_sapling_anchor"),
             Self::UnknownOrchardAnchor { .. } => consensus("context.unknown_orchard_anchor"),
@@ -992,7 +992,7 @@ impl ValidateContextError {
             | ValidateContextError::DuplicateIronwoodNullifier { .. }
             | ValidateContextError::NegativeRemainingTransactionValue { .. }
             | ValidateContextError::AddValuePool { .. }
-            | ValidateContextError::NegativeIssuanceDeficit { .. }
+            | ValidateContextError::NegativeNsmValueBalance { .. }
             | ValidateContextError::InvalidBlockCommitment(_)
             | ValidateContextError::UnknownSproutAnchor { .. }
             | ValidateContextError::UnknownSaplingAnchor { .. }
@@ -1345,10 +1345,10 @@ mod tests {
                 block_value_pool_change: Box::new(ValueBalance::<NegativeAllowed>::zero()),
                 height: Some(height),
             },
-            ValidateContextError::NegativeIssuanceDeficit {
+            ValidateContextError::NegativeNsmValueBalance {
                 height,
-                deficit_before: amount::Amount::zero(),
-                deficit_change: amount::Amount::try_from(-1)
+                balance_before: amount::Amount::zero(),
+                balance_change: amount::Amount::try_from(-1)
                     .expect("minus one zatoshi is a valid amount"),
             },
             ValidateContextError::InvalidBlockCommitment(

@@ -346,7 +346,7 @@ impl Block {
                 .unwrap_or_default(),
         );
 
-        change.set_issuance_deficit_amount(self.issuance_deficit_change(network, &change)?);
+        change.set_nsm_value_balance_amount(self.nsm_value_balance_change(network, &change)?);
 
         Ok(change)
     }
@@ -354,9 +354,9 @@ impl Block {
     /// Returns scheduled issuance minus issued value, starting at NU7 with no seed.
     ///
     /// Should historical unclaimed subsidy and fees seed this balance? We need guidance before including those funds. Update the baseline
-    /// in `zakura-state/src/service/finalized_state/disk_format/upgrade/issuance_deficit_pool.rs`
+    /// in `zakura-state/src/service/finalized_state/disk_format/upgrade/nsm_value_balance_pool.rs`
     /// together with this rule and its accounting tests.
-    fn issuance_deficit_change(
+    fn nsm_value_balance_change(
         &self,
         network: &Network,
         change: &ValueBalance<NegativeAllowed>,
@@ -379,12 +379,12 @@ impl Block {
             halving_block_subsidy(height, network)
                 .map_err(ValueBalanceError::ScheduledIssuance)?
                 .constrain::<NegativeAllowed>()
-                .map_err(ValueBalanceError::IssuanceDeficit)?
+                .map_err(ValueBalanceError::NsmValueBalance)?
         };
 
-        let issued = change.total().map_err(ValueBalanceError::IssuanceDeficit)?;
+        let issued = change.total().map_err(ValueBalanceError::NsmValueBalance)?;
 
-        (scheduled - issued).map_err(ValueBalanceError::IssuanceDeficit)
+        (scheduled - issued).map_err(ValueBalanceError::NsmValueBalance)
     }
 
     /// Compute the root of the authorizing data Merkle tree,
@@ -440,7 +440,7 @@ impl TrustedPreallocate for Hash {
 }
 
 #[cfg(test)]
-mod issuance_deficit_properties {
+mod nsm_value_balance_properties {
     use super::*;
     use crate::{
         parameters::testnet::{ConfiguredActivationHeights, RegtestParameters},
@@ -452,7 +452,7 @@ mod issuance_deficit_properties {
         #![proptest_config(ProptestConfig::with_cases(std::env::var("NSM_ARITHMETIC_CASES").ok().and_then(|value| value.parse().ok()).unwrap_or(1024)))]
 
         #[test]
-        fn deficit_ignores_transfers_and_tracks_removed_value(
+        fn balance_ignores_transfers_and_tracks_removed_value(
             height in 1u32..20,
             removed in 0i64..1_000_000_000,
             transfer in 0i64..1_000_000_000,
@@ -477,7 +477,7 @@ mod issuance_deficit_properties {
                 _ => { let mut pools = ValueBalance::zero(); pools.set_deferred_amount(amount); pools },
             };
             let change = (destination + ValueBalance::from_transparent_amount(Amount::try_from(-transfer - removed).unwrap())).unwrap();
-            let actual = block.issuance_deficit_change(&network, &change).unwrap();
+            let actual = block.nsm_value_balance_change(&network, &change).unwrap();
             let expected = if height < 3 { 0 } else {
                 i64::from(halving_block_subsidy(Height(height), &network).unwrap()) + removed
             };

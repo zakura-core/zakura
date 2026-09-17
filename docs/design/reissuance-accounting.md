@@ -9,9 +9,9 @@ The balance starts at zero immediately before NU7. It excludes all pre-NU7
 unclaimed subsidy and fees. We need guidance on whether those funds should seed
 reissuance. The PR deliberately does not seed them while that decision remains open.
 
-`Block::issuance_deficit_change` in `crates/zakura-chain/src/block.rs` selects
+`Block::nsm_value_balance_change` in `crates/zakura-chain/src/block.rs` selects
 this baseline. The migration in
-`crates/zakura-state/src/service/finalized_state/disk_format/upgrade/issuance_deficit_pool.rs`
+`crates/zakura-state/src/service/finalized_state/disk_format/upgrade/nsm_value_balance_pool.rs`
 subtracts the same excluded balance. Change both implementations and their tests
 if the policy changes.
 
@@ -24,7 +24,7 @@ genesis issuance, and `I(h)` the sum of the six monetary pools. The stored balan
 
 Runtime updates add scheduled block issuance minus the block's monetary pool
 change from NU7 onward. Transfers between monetary pools leave the balance
-unchanged. Reductions in issued value increase it. The deficit itself holds no
+unchanged. Reductions in issued value increase it. The balance itself holds no
 spendable value and does not contribute to monetary pool totals.
 
 At the reissuance start height, the bonus becomes
@@ -32,7 +32,7 @@ At the reissuance start height, the bonus becomes
 Contextual validation rejects negative balances from that start height.
 The stored type remains signed because the rejection rule does not apply earlier.
 
-This baseline differs from zips#1354's genesis-based deficit. The later rejection
+This baseline differs from zips#1354's genesis-based balance. The later rejection
 height also differs from the draft's NU7 rule. The fraction remains fixed per
 block across ZIP 218 spacing changes. Configured networks can override the
 reissuance start height. These choices require confirmation before activation.

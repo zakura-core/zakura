@@ -25,7 +25,7 @@ use zakura_chain::{
     orchard::{Action, AuthorizedAction, Flags},
     parameters::{
         testnet::{ConfiguredActivationHeights, Parameters},
-        Network, NetworkUpgrade, ORCHARD_BLOCK_ACTION_LIMIT,
+        Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET, ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
     },
     primitives::{ed25519, x25519, Groth16Proof},
     sapling,
@@ -4455,32 +4455,23 @@ async fn v5_with_duplicate_orchard_action() {
     }
 }
 
-/// The mempool rejects a transaction whose Orchard and Ironwood actions exceed
-/// the ZIP 218 Orchard limit, because no block can include it. The check runs
-/// before any state service query, and only at or after NU7 activation.
+/// The mempool rejects a transaction whose own shielded actions exceed a ZIP 218
+/// per-block limit or the global budget, because no block can include it. The
+/// check runs before any state service query, and only at or after NU7
+/// activation. Ironwood has its own per-pool limit, and shares the global budget
+/// with Orchard.
 #[tokio::test]
-async fn mempool_applies_the_orchard_limit_to_ironwood_actions() {
+async fn mempool_applies_the_zip218_limits_to_ironwood_actions() {
     let _init_guard = zakura_test::init();
 
-    let height = Height(1);
-    let network = Parameters::build()
-        .with_activation_heights(ConfiguredActivationHeights {
-            nu7: Some(height.0),
-            ..Default::default()
-        })
-        .expect("activation heights are valid")
-        .clear_funding_streams()
-        .to_network()
-        .expect("configured testnet is valid");
+    let network = nu7_activation_testnet(1);
+    // Past the upgrade-activation grace period, so the limits produce their own
+    // errors.
+    let height = Height(41);
 
-    let limit = usize::try_from(ORCHARD_BLOCK_ACTION_LIMIT).expect("the limit fits in usize");
+    let limit =
+        usize::try_from(ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT).expect("the limit fits in usize");
     let orchard_half = limit / 2;
-    let over_limit = || {
-        Some(TransactionError::OrchardActionsExceedBlockLimit {
-            actions: ORCHARD_BLOCK_ACTION_LIMIT + 1,
-            limit: ORCHARD_BLOCK_ACTION_LIMIT,
-        })
-    };
 
     // The fake proofs fail the proof size check, which the verifier runs after
     // the shielded limits. That error shows a transaction passed the limits.
@@ -4488,13 +4479,19 @@ async fn mempool_applies_the_orchard_limit_to_ironwood_actions() {
         (
             0,
             limit + 1,
-            over_limit(),
+            Some(TransactionError::IronwoodActionsExceedBlockLimit {
+                actions: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT + 1,
+                limit: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
+            }),
             TransactionError::IronwoodProofSize,
         ),
         (
             orchard_half,
             limit + 1 - orchard_half,
-            over_limit(),
+            Some(TransactionError::ShieldedCostExceedsBlockBudget {
+                cost: GLOBAL_SHIELDED_BUDGET + 1,
+                limit: GLOBAL_SHIELDED_BUDGET,
+            }),
             TransactionError::OrchardProofSize,
         ),
         (0, limit, None, TransactionError::IronwoodProofSize),
@@ -4529,6 +4526,115 @@ async fn mempool_applies_the_orchard_limit_to_ironwood_actions() {
             "{orchard_actions} Orchard and {ironwood_actions} Ironwood actions",
         );
     }
+}
+
+/// Just after NU7 activates, a peer one block behind this node still admits a
+/// transaction that the ZIP 218 limits reject, so relaying it must not count as
+/// misbehavior. After the grace period, the same transaction bans the peer.
+#[tokio::test]
+async fn mempool_forgives_the_shielded_limits_during_the_activation_grace_period() {
+    let _init_guard = zakura_test::init();
+
+    let activation_height = Height(100);
+    let network = nu7_activation_testnet(activation_height.0);
+
+    let limit =
+        usize::try_from(ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT).expect("the limit fits in usize");
+    let over_limit_error = TransactionError::IronwoodActionsExceedBlockLimit {
+        actions: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT + 1,
+        limit: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
+    };
+
+    let cases = [
+        (
+            activation_height,
+            over_limit_error
+                .clone()
+                .into_upgrade_activation_grace_period(),
+            0,
+        ),
+        (
+            Height(activation_height.0 + 39),
+            over_limit_error
+                .clone()
+                .into_upgrade_activation_grace_period(),
+            0,
+        ),
+        (
+            Height(activation_height.0 + 40),
+            over_limit_error.clone(),
+            100,
+        ),
+    ];
+
+    for (height, expected_error, expected_score) in cases {
+        let tx = fake_v6_with_orchard_and_ironwood_actions(NetworkUpgrade::Nu7, 0, limit + 1);
+
+        let response = Verifier::new_for_tests(
+            &network,
+            service_fn(|_| async { unreachable!("state service should not be called") }),
+        )
+        .oneshot(Request::Mempool {
+            transaction: Arc::unwrap_or_clone(tx).into(),
+            height,
+        })
+        .await;
+
+        assert_eq!(response, Err(expected_error.clone()), "at {height:?}");
+        assert_eq!(
+            expected_error.mempool_misbehavior_score(),
+            expected_score,
+            "at {height:?}",
+        );
+    }
+}
+
+/// The block verifier keeps rejecting an over-limit block during the grace
+/// period: the grace period only covers mempool relay.
+#[tokio::test]
+async fn blocks_are_not_forgiven_during_the_activation_grace_period() {
+    let _init_guard = zakura_test::init();
+
+    let activation_height = Height(100);
+    let network = nu7_activation_testnet(activation_height.0);
+    let limit =
+        usize::try_from(ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT).expect("the limit fits in usize");
+    let tx = fake_v6_with_orchard_and_ironwood_actions(NetworkUpgrade::Nu7, 0, limit + 1);
+
+    let response = Verifier::new_for_tests(
+        &network,
+        service_fn(|_| async { unreachable!("state service should not be called") }),
+    )
+    .oneshot(Request::Block {
+        transaction_hash: tx.hash(),
+        transaction: tx,
+        known_utxos: Arc::new(HashMap::new()),
+        known_outpoint_hashes: Arc::new(HashSet::new()),
+        height: activation_height,
+        time: DateTime::<Utc>::MAX_UTC,
+    })
+    .await;
+
+    assert_eq!(
+        response,
+        Err(TransactionError::IronwoodActionsExceedBlockLimit {
+            actions: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT + 1,
+            limit: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
+        })
+    );
+}
+
+/// Returns a configured Testnet that activates NU7 at `nu7_activation_height`.
+fn nu7_activation_testnet(nu7_activation_height: u32) -> Network {
+    Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            nu7: Some(nu7_activation_height),
+            ..Default::default()
+        })
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid")
 }
 
 /// Checks that ZIP 2003 accepts V4 transactions below NU7 and rejects them
@@ -4998,18 +5104,20 @@ fn public_nu6_3_consensus_branch_id_boundary() {
             check::consensus_branch_id(&tx, activation_height, &network),
             Err(TransactionError::WrongConsensusBranchId),
         );
-        assert!(super::is_nu6_3_branch_id_misbehavior_grace_period(
+        assert!(super::is_branch_id_activation_grace_period(
             &tx,
             (activation_height + 39).expect("NU6.3 grace period should fit in a height"),
             &network,
         ));
-        assert!(!super::is_nu6_3_branch_id_misbehavior_grace_period(
+        assert!(!super::is_branch_id_activation_grace_period(
             &tx,
             (activation_height + 40).expect("NU6.3 grace period should fit in a height"),
             &network,
         ));
         assert_eq!(
-            TransactionError::WrongConsensusBranchIdNu6_3GracePeriod.mempool_misbehavior_score(),
+            TransactionError::WrongConsensusBranchId
+                .into_upgrade_activation_grace_period()
+                .mempool_misbehavior_score(),
             0,
         );
 
@@ -5110,17 +5218,24 @@ async fn v5_consensus_branch_ids() {
             let (block_rsp, mempool_rsp) = futures::join!(block_req, mempool_req);
 
             assert_eq!(block_rsp, Err(TransactionError::WrongConsensusBranchId));
-            let mempool_expected_error =
-                if network_upgrade == NetworkUpgrade::Nu6_2 && next_nu == NetworkUpgrade::Nu6_3 {
-                    TransactionError::WrongConsensusBranchIdNu6_3GracePeriod
-                } else {
-                    TransactionError::WrongConsensusBranchId
-                };
+
+            // The mempool forgives the previous upgrade's branch ID for the
+            // first blocks after any activation height, because peers one block
+            // behind still admit it.
+            let follows_previous_upgrade = (height - 1)
+                .is_some_and(|h| NetworkUpgrade::current(&network, h) == network_upgrade);
+            let grace_period_error =
+                TransactionError::WrongConsensusBranchId.into_upgrade_activation_grace_period();
+            let mempool_expected_error = if follows_previous_upgrade {
+                grace_period_error.clone()
+            } else {
+                TransactionError::WrongConsensusBranchId
+            };
             assert_eq!(mempool_rsp, Err(mempool_expected_error));
 
-            if network_upgrade == NetworkUpgrade::Nu6_2 && next_nu == NetworkUpgrade::Nu6_3 {
+            if follows_previous_upgrade {
                 let grace_period_last_height =
-                    (height + 39).expect("NU6.3 grace period should fit in a height");
+                    (height + 39).expect("the grace period should fit in a height");
                 let grace_period_response = verifier
                     .clone()
                     .oneshot(Request::Mempool {
@@ -5129,13 +5244,10 @@ async fn v5_consensus_branch_ids() {
                     })
                     .map_err(|err| *err.downcast().expect("`TransactionError` type"))
                     .await;
-                assert_eq!(
-                    grace_period_response,
-                    Err(TransactionError::WrongConsensusBranchIdNu6_3GracePeriod),
-                );
+                assert_eq!(grace_period_response, Err(grace_period_error));
 
                 let grace_period_end_height =
-                    (height + 40).expect("NU6.3 grace period should fit in a height");
+                    (height + 40).expect("the grace period should fit in a height");
                 let grace_period_end_response = verifier
                     .clone()
                     .oneshot(Request::Mempool {

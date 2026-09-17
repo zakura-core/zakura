@@ -7436,7 +7436,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-chain"
-version = "8.0.0"
+version = "9.0.0"
 dependencies = [
  "bech32",
  "bitflags",
@@ -7505,7 +7505,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-consensus"
-version = "9.0.0"
+version = "10.0.0"
 dependencies = [
  "blake2b_simd",
  "chrono",

@@ -13,7 +13,10 @@ use zakura_chain::{
     local_genesis::{generate_local_testnet_with_funded_keys, LocalTestnetGenesisOptions},
     parameters::Network::*,
     serialization::ZcashDeserialize,
+    transaction::Transaction,
 };
+
+use crate::error::TransactionError;
 
 use super::*;
 
@@ -1389,4 +1392,124 @@ fn state_checkpoint_commit_context_errors_are_unscored() {
     let err = VerifyCheckpointError::CommitCheckpointVerified(source);
 
     assert_eq!(err.misbehavior_score(), 0);
+}
+
+/// A network can activate NU7 below its highest checkpoint, and the state
+/// commits checkpoint-verified blocks without semantic transaction checks. So
+/// the checkpoint verifier must apply the ZIP 218 shielded limits itself,
+/// otherwise a peer serving the configured checkpoint chain could sneak an
+/// over-limit block past them.
+#[tokio::test(flavor = "multi_thread")]
+async fn checkpoint_verification_applies_the_shielded_action_limits() -> Result<(), Report> {
+    use zakura_chain::{
+        amount::Amount,
+        parameters::ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
+        transaction::{arbitrary::fake_v6_with_orchard_and_ironwood_actions, LockTime},
+        transparent::{self, Script},
+    };
+
+    let _init_guard = zakura_test::init();
+
+    // The generated seed chain ends one block below the network's activation
+    // height, so NU7 is active at the height just above its last block.
+    let generated = generate_local_testnet_with_funded_keys(
+        vec!["alice".to_string()],
+        LocalTestnetGenesisOptions {
+            latest_network_upgrade: NetworkUpgrade::Nu7,
+            ..Default::default()
+        },
+    )
+    .map_err(|error| eyre!(error.to_string()))?;
+
+    let network = generated.network;
+    let last_seed_block = generated
+        .blocks
+        .last()
+        .expect("a generated local testnet has at least one block");
+    let height = last_seed_block
+        .coinbase_height()
+        .expect("a generated block has a coinbase height")
+        .next()
+        .expect("the seed chain ends below the maximum height");
+    assert!(
+        NetworkUpgrade::is_nu7_active(&network, height),
+        "NU7 must be active at the height under test",
+    );
+
+    // The difficulty threshold check is context-free and the generated network
+    // waives proof of work, so the last seed block's header is valid at this
+    // height once its Merkle root binds the new transactions.
+    let header = last_seed_block.header.clone();
+    let coinbase = Arc::new(Transaction::V5 {
+        inputs: vec![transparent::Input::Coinbase {
+            height,
+            data: Vec::new(),
+            sequence: 0,
+        }],
+        outputs: vec![transparent::Output {
+            value: Amount::zero(),
+            lock_script: Script::new(&[]),
+        }],
+        lock_time: LockTime::unlocked(),
+        expiry_height: block::Height(0),
+        sapling_shielded_data: None,
+        orchard_shielded_data: None,
+        network_upgrade: NetworkUpgrade::Nu7,
+    });
+
+    let mut checkpoints: BTreeMap<block::Height, block::Hash> =
+        generated.checkpoints.iter().copied().collect();
+    checkpoints.insert(height, block::Hash([1; 32]));
+
+    let state_service = zakura_state::init_test(&network).await;
+    let checkpoint_verifier =
+        CheckpointVerifier::from_list(checkpoints, &network, None, state_service)
+            .map_err(|error| eyre!(error))?;
+
+    let within_limits = block_with(header.clone(), vec![coinbase.clone()]);
+    checkpoint_verifier
+        .check_block(Arc::new(within_limits))
+        .expect("a block within the shielded action limits passes checkpoint verification");
+
+    let over_limit_actions =
+        usize::try_from(ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT + 1).expect("the limit fits in usize");
+    let over_limit = block_with(
+        header,
+        vec![
+            coinbase,
+            fake_v6_with_orchard_and_ironwood_actions(NetworkUpgrade::Nu7, 0, over_limit_actions),
+        ],
+    );
+
+    let error = checkpoint_verifier
+        .check_block(Arc::new(over_limit))
+        .expect_err("an over-limit block must fail checkpoint verification");
+
+    assert_eq!(
+        error.to_string(),
+        VerifyCheckpointError::VerifyBlock(VerifyBlockError::Transaction(
+            TransactionError::IronwoodActionsExceedBlockLimit {
+                actions: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT + 1,
+                limit: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
+            }
+        ))
+        .to_string(),
+    );
+
+    Ok(())
+}
+
+/// Returns a block with `transactions` and a header whose Merkle root binds
+/// them.
+fn block_with(header: Arc<block::Header>, transactions: Vec<Arc<Transaction>>) -> Block {
+    let mut header = *header;
+    header.merkle_root = transactions
+        .iter()
+        .map(|transaction| transaction.hash())
+        .collect();
+
+    Block {
+        header: Arc::new(header),
+        transactions,
+    }
 }

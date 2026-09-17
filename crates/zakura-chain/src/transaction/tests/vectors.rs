@@ -3264,10 +3264,10 @@ fn coinbase_v5_with_sapling_spends_deserializes_successfully() {
     );
 }
 
-/// Ironwood actions share the ZIP 218 Orchard limit, so the Orchard count
-/// includes them and the shielded cost counts each of them once.
+/// Orchard and Ironwood actions are counted per pool, and the shielded cost
+/// counts each action in either pool once.
 #[test]
-fn shielded_action_counts_include_ironwood_actions() {
+fn shielded_action_counts_separate_orchard_and_ironwood_actions() {
     let _init_guard = zakura_test::init();
 
     for (orchard_actions, ironwood_actions) in [(0, 3), (2, 0), (2, 3)] {
@@ -3277,17 +3277,17 @@ fn shielded_action_counts_include_ironwood_actions() {
             ironwood_actions,
         )
         .shielded_action_counts();
-        let expected = u32::try_from(orchard_actions + ironwood_actions)
-            .expect("a small action count fits in u32");
+        let count = |n: usize| u32::try_from(n).expect("a small action count fits in u32");
 
         assert_eq!(
             counts,
             ShieldedActionCounts {
-                orchard_and_ironwood_actions: expected,
+                orchard_actions: count(orchard_actions),
+                ironwood_actions: count(ironwood_actions),
                 sapling_ios: 0,
                 sprout_joinsplits: 0,
             }
         );
-        assert_eq!(counts.cost(), expected);
+        assert_eq!(counts.cost(), count(orchard_actions + ironwood_actions));
     }
 }

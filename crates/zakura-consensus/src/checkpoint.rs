@@ -692,6 +692,19 @@ where
             &block.transaction_hashes,
         )?;
 
+        // A network can configure an NU7 activation height below its highest
+        // checkpoint, and the state commits checkpoint-verified blocks without
+        // running semantic transaction checks. Counting the shielded actions
+        // here keeps the ZIP 218 limits from depending on which verifier a block
+        // happened to reach. The counts come from the block alone, so this check
+        // needs no chain context.
+        crate::block::check::shielded_action_limits_are_valid(
+            &block.block.transactions,
+            height,
+            &self.network,
+        )
+        .map_err(VerifyBlockError::from)?;
+
         Ok(block)
     }
 

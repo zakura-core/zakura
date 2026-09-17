@@ -166,7 +166,7 @@ fn transaction_misbehavior(
     if matches!(
         error,
         TransactionError::WrongConsensusBranchId
-            | TransactionError::WrongConsensusBranchIdNu6_3GracePeriod
+            | TransactionError::UpgradeActivationGracePeriod(_)
             | TransactionError::LockedUntilAfterBlockHeight(_)
             | TransactionError::LockedUntilAfterBlockTime(_)
     ) {

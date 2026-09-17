@@ -265,17 +265,19 @@ pub enum TransactionError {
     WrongConsensusBranchId,
 
     #[error(
-        "mempool transaction uses the NU6.2 consensus branch id during the NU6.3 grace period"
+        "mempool transaction is invalid only under consensus rules that activated at the current \
+         network upgrade, within the peer-misbehavior grace period after that activation: {0}"
     )]
-    WrongConsensusBranchIdNu6_3GracePeriod,
+    UpgradeActivationGracePeriod(String),
 
     #[error("wrong tx format: tx version is ≥ 5, but `nConsensusBranchId` is missing")]
     MissingConsensusBranchId,
 
-    #[error(
-        "Orchard and Ironwood action count {actions} exceeds the per-block Orchard limit of {limit}"
-    )]
+    #[error("Orchard action count {actions} exceeds the per-block limit of {limit}")]
     OrchardActionsExceedBlockLimit { actions: u32, limit: u32 },
+
+    #[error("Ironwood action count {actions} exceeds the per-block limit of {limit}")]
+    IronwoodActionsExceedBlockLimit { actions: u32, limit: u32 },
 
     #[error("Sapling spends + outputs count {ios} exceeds the per-block limit of {limit}")]
     SaplingIOsExceedBlockLimit { ios: u32, limit: u32 },
@@ -285,7 +287,8 @@ pub enum TransactionError {
 
     #[error(
         "shielded cost {cost} \
-         (Orchard and Ironwood actions + Sapling spends + Sapling outputs + 2 * Sprout JoinSplits) \
+         (Orchard actions + Ironwood actions + Sapling spends + Sapling outputs \
+         + 2 * Sprout JoinSplits) \
          exceeds the per-block global shielded budget of {limit}"
     )]
     ShieldedCostExceedsBlockBudget { cost: u32, limit: u32 },
@@ -498,13 +501,16 @@ impl TransactionError {
             | Self::NonStandardScriptSigSize { .. }
             | Self::NonStandardScriptSigNotPushOnly { .. }
             | Self::NonStandardInputs
-            | Self::WrongConsensusBranchIdNu6_3GracePeriod => {
+            | Self::UpgradeActivationGracePeriod(_) => {
                 BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
             }
             Self::WrongConsensusBranchId => consensus("transaction.wrong_consensus_branch_id"),
             Self::MissingConsensusBranchId => consensus("transaction.missing_consensus_branch_id"),
             Self::OrchardActionsExceedBlockLimit { .. } => {
                 consensus("transaction.orchard_actions_exceed_block_limit")
+            }
+            Self::IronwoodActionsExceedBlockLimit { .. } => {
+                consensus("transaction.ironwood_actions_exceed_block_limit")
             }
             Self::SaplingIOsExceedBlockLimit { .. } => {
                 consensus("transaction.sapling_ios_exceed_block_limit")
@@ -529,6 +535,18 @@ impl TransactionError {
                 consensus("transaction.unshielded_transparent_coinbase_spend")
             }
         }
+    }
+
+    /// Wraps `self` as a rejection that must not count as peer misbehavior,
+    /// because the rule that produced it activated at the current network
+    /// upgrade.
+    ///
+    /// Around an activation height, an honest peer verifies mempool
+    /// transactions against a slightly earlier height than this node, so it can
+    /// relay a transaction that the newly active rules reject. Banning that peer
+    /// would partition the network at every upgrade.
+    pub fn into_upgrade_activation_grace_period(self) -> Self {
+        Self::UpgradeActivationGracePeriod(self.to_string())
     }
 
     /// Returns a suggested misbehaviour score increment for a certain error when
@@ -582,15 +600,17 @@ impl TransactionError {
             // its own, because no block can include it. The peer that sent it
             // gets the full score.
             | OrchardActionsExceedBlockLimit { .. }
+            | IronwoodActionsExceedBlockLimit { .. }
             | SaplingIOsExceedBlockLimit { .. }
             | SproutJoinSplitsExceedBlockLimit { .. }
             | ShieldedCostExceedsBlockBudget { .. }
             | LockedUntilAfterBlockHeight(_)
             | LockedUntilAfterBlockTime(_) => 100,
 
-            // NU6.2 mempool transactions are invalid under NU6.3 rules, but
-            // honest peers can relay them briefly while their chain tips converge.
-            WrongConsensusBranchIdNu6_3GracePeriod => 0,
+            // A transaction that a rule rejects only because that rule just
+            // activated. Honest peers relay these briefly while their chain
+            // tips converge across the activation height.
+            UpgradeActivationGracePeriod(_) => 0,
 
             // TODO: Consider add peer penalty 1 if these are very old
             DuplicateTransparentSpend(_)

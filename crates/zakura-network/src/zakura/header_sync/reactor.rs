@@ -60,6 +60,11 @@ fn snapshot_refresh_trace_due(last: Option<Instant>, now: Instant) -> bool {
 }
 /// Bound admitted and reserved headers to one wire page ahead of verified bodies.
 const INTEGRATED_HEADER_BODY_WINDOW_V1: u32 = MAX_HS_RANGE;
+/// Refill and publish selected-chain headers in whole batches.
+///
+/// One batch spans a maximum checkpoint range plus the first header of its successor.
+const HEADER_REFILL_BATCH_V1: usize =
+    zakura_chain::parameters::checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP + 1;
 
 /// Spawn the canonical header-sync reactor.
 pub fn spawn_header_sync_reactor(
@@ -2826,24 +2831,28 @@ impl HeaderSyncReactor {
         u32::try_from(remaining).unwrap_or(u32::MAX)
     }
 
-    /// Publish a checkpoint-sized selected extension without chasing new body credits.
+    /// Publish a normal selected-chain extension once it holds a whole refill batch.
+    ///
+    /// The extension does not wait for the body backlog to drain or for new body credits.
     fn should_prepare_checkpoint_prefix(
         snapshot: &zakura_header_chain::EngineSnapshot,
         active: &ActiveHeaderRequest,
     ) -> bool {
-        let checkpoint_gap =
-            zakura_chain::parameters::checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP;
         snapshot.mode == zakura_header_chain::EngineMode::Integrated
             && matches!(active.purpose, HeaderTargetPurpose::Normal)
             && active.common_ancestor == Some(snapshot.frontiers.header_best)
-            && active.entries.len() > checkpoint_gap
+            && active.entries.len() >= HEADER_REFILL_BATCH_V1
     }
 
     /// Return requester headroom after both the durable DAG limit and the integrated body window.
     ///
-    /// Coalesce returned credits until a checkpoint and its successor fit.
-    /// The final partial target can use fewer credits to reach the tip.
-    /// Reservations and staged entries still consume the same bounded window.
+    /// A drained window stays closed until it regains a whole refill batch of room.
+    /// That bound applies to the window rather than to the grant.
+    /// Other claims can leave less than a batch free, and the smaller top-up still keeps
+    /// the body backlog supplied.
+    /// A target the window already reaches is never withheld, so a short final suffix
+    /// stays reachable.
+    /// Reservations and staged entries consume the same bounded window.
     fn request_header_prefix_remaining(
         snapshot: &zakura_header_chain::EngineSnapshot,
         claimed: usize,
@@ -2860,16 +2869,32 @@ impl HeaderSyncReactor {
         let target_remaining = target_tip_height
             .0
             .saturating_sub(snapshot.frontiers.header_best.height.0);
-        let refill_batch = u32::try_from(
-            zakura_chain::parameters::checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP,
-        )
-        .expect("the consensus checkpoint height gap fits a block height")
-        .saturating_add(1);
+        let refill_batch =
+            u32::try_from(HEADER_REFILL_BATCH_V1).expect("the refill batch fits a block height");
         if body_window < refill_batch && target_remaining > body_window {
             return 0;
         }
         let claimed = u32::try_from(claimed).unwrap_or(u32::MAX);
         durable.min(body_window.saturating_sub(claimed))
+    }
+
+    /// Report whether a new snapshot reopens refill for a target a peer already advertised.
+    ///
+    /// Verified-body progress returns window credits without changing header authority.
+    /// Only a closed-to-open transition schedules work, so an open window costs no locator query.
+    fn reopens_refill(
+        &self,
+        old: &zakura_header_chain::EngineSnapshot,
+        new: &zakura_header_chain::EngineSnapshot,
+    ) -> bool {
+        let claimed = self.peer_work_queue.claimed_header_count();
+        self.peer_state.values().any(|state| {
+            state.last_status.as_ref().is_some_and(|status| {
+                let target = status.selected_tip_height;
+                Self::request_header_prefix_remaining(old, claimed, target) == 0
+                    && Self::request_header_prefix_remaining(new, claimed, target) > 0
+            })
+        })
     }
 
     fn observe_latest_committed_snapshot(&mut self, snapshot: zakura_header_chain::EngineSnapshot) {
@@ -2881,17 +2906,11 @@ impl HeaderSyncReactor {
             old.header_generation != snapshot.header_generation
                 || old.frontiers.finalized != snapshot.frontiers.finalized
         });
-        let claimed = self.peer_work_queue.claimed_header_count();
         let refill_reopened = !header_authority_changed
-            && self.committed_snapshot.as_ref().is_some_and(|old| {
-                self.peer_state.values().any(|peer| {
-                    peer.last_status.as_ref().is_some_and(|status| {
-                        let target = status.selected_tip_height;
-                        Self::request_header_prefix_remaining(old, claimed, target) == 0
-                            && Self::request_header_prefix_remaining(&snapshot, claimed, target) > 0
-                    })
-                })
-            });
+            && self
+                .committed_snapshot
+                .as_ref()
+                .is_some_and(|old| self.reopens_refill(old, &snapshot));
         self.emit_snapshot_observed(self.committed_snapshot.as_ref(), &snapshot);
         self.retire_obsolete_work(&snapshot);
         let old_tip = self

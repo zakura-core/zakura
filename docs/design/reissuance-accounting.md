@@ -82,11 +82,13 @@ backup or repair the identified corruption before retrying startup.
 
 ## Validation and activation requirements
 
-The tests cover integer rounding, schedule sums, historical exclusion, transfers
-through every monetary pool, reductions in issued value, contextual rejection,
-independent non-finalized forks, finalized rollback, replay, alternate branches,
-restart, fresh replay equivalence, legacy records, migration batch boundaries,
-failed writes, cancellation, corruption, and startup retry.
+The tests cover integer rounding, schedule sums, the seed and its rollback,
+the fraction and halving interval per target spacing era, the half-life over one
+interval, termination from a small balance, transfers through every monetary
+pool, reductions in issued value, contextual rejection from NU7, independent
+non-finalized forks, finalized rollback, replay, alternate branches, restart,
+fresh replay equivalence, legacy records, migration batch boundaries, failed
+writes, cancellation, corruption, and startup retry.
 
 Checkpoint fixtures isolate accounting. Some intentionally underclaim coinbases
 and do not represent semantically valid post-NU6 blocks. The semantic subsidy

@@ -42,6 +42,8 @@ This change raises average utilization inside existing bounds; it does not enlar
 1. Reopen ordinary refill when the integrated window has room for one maximum checkpoint range plus its successor: currently 401 headers.
    With a 4,000-header window, the refill threshold becomes a lead of 3,599 rather than 2,000.
    Coalesce smaller credit returns to avoid one-header durable transitions during bulk sync.
+   The bound applies to the window rather than to the grant.
+   Outstanding claims can still leave less than a batch free, and the smaller top-up keeps the backlog supplied.
    Allow the existing final partial-target exception near the tip.
 2. Publish a normal selected-chain extension once it contains that checkpoint-sized batch.
    Do not wait for the body backlog to drain or chase credits freed during receipt.

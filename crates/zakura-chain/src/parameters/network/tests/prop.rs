@@ -42,7 +42,7 @@ proptest! {
         use crate::{
             amount::Amount,
             parameters::{
-                subsidy::{block_subsidy, halving_block_subsidy},
+                subsidy::{block_subsidy, block_subsidy_fraction_numerator, halving_block_subsidy},
                 testnet::{ConfiguredActivationHeights, RegtestParameters},
             },
         };
@@ -55,7 +55,8 @@ proptest! {
         let scheduled = i64::from(halving_block_subsidy(Height(height), &network).unwrap());
         let actual = i64::from(block_subsidy(Height(height), &network, Some(Amount::try_from(balance).unwrap())).unwrap());
         let bonus = if cfg!(feature = "nu7") && height >= 3 {
-            (i128::from(balance) * 4126 + 9_999_999_999) / 10_000_000_000
+            let numerator = i128::try_from(block_subsidy_fraction_numerator(Height(height), &network)).unwrap();
+            (i128::from(balance) * numerator + 9_999_999_999) / 10_000_000_000
         } else {
             0
         };

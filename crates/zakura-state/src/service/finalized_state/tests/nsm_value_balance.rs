@@ -137,6 +137,19 @@ fn start_block(
     )
 }
 
+/// The ZIP 234 bonus a block at `height` pays on a parent balance of `balance` zatoshi.
+///
+/// The reference arithmetic here rounds up independently of `reissuance_amount`, and reads
+/// the fraction from the network so the tests follow ZIP 218's spacing change.
+fn bonus_at(network: &Network, height: Height, balance: i128) -> i128 {
+    let numerator = i128::try_from(
+        zakura_chain::parameters::subsidy::block_subsidy_fraction_numerator(height, network),
+    )
+    .expect("the fraction numerator fits in i128");
+
+    (balance * numerator + 9_999_999_999) / 10_000_000_000
+}
+
 /// Commits `block` to the finalized state as a checkpoint-verified block.
 fn commit(state: &mut FinalizedState, block: &Arc<Block>) -> Result<(), CommitBlockError> {
     state
@@ -451,7 +464,7 @@ proptest::proptest! {
             let height = Height(START.0 + u32::try_from(index).unwrap());
             let before = expected - issued;
             let scheduled = i64::from(halving_block_subsidy(height, &network).unwrap());
-            let bonus = (i128::from(before) * 4126 + 9_999_999_999) / 10_000_000_000;
+            let bonus = bonus_at(&network, height, i128::from(before));
             let allowed = block_subsidy(height, &network, Some(Amount::try_from(before).unwrap())).unwrap();
             proptest::prop_assert_eq!(i128::from(i64::from(allowed)), i128::from(scheduled) + bonus);
             let claimed = i64::try_from(i128::from(i64::from(allowed)) * i128::from(claim_fraction) / 1_000_000).unwrap();
@@ -479,8 +492,7 @@ proptest::proptest! {
 fn permitted_start_block(state: &FinalizedState, network: &Network, parent: &Block) -> Arc<Block> {
     use zakura_chain::parameters::subsidy::halving_block_subsidy;
     let balance = i64::from(state.db.finalized_value_pool().nsm_value_balance_amount());
-    let bonus =
-        i64::try_from((i128::from(balance) * 4126 + 9_999_999_999) / 10_000_000_000).unwrap();
+    let bonus = i64::try_from(bonus_at(network, START, i128::from(balance))).unwrap();
     let allowed = i64::from(halving_block_subsidy(START, network).unwrap()) + bonus;
     let address = Address::from_script_hash(NetworkKind::Regtest, [0x42; 20]);
     child_block_with_history_commitment(
@@ -521,7 +533,7 @@ proptest::proptest! {
         for (index, fraction) in claims.iter().enumerate() {
             let height = Height(START.0 + u32::try_from(index).unwrap());
             let scheduled = i128::from(i64::from(halving_block_subsidy(height, &network).unwrap()));
-            let bonus = (balance * 4126 + 9_999_999_999) / 10_000_000_000;
+            let bonus = bonus_at(&network, height, balance);
             let claim = (scheduled + bonus) * i128::from(*fraction) / 1_000_000;
             let block = child_block_with_history_commitment(&parent,
                 vec![coinbase_tx(height, Amount::try_from(i64::try_from(claim).unwrap()).unwrap(), &address)],
@@ -556,7 +568,7 @@ proptest::proptest! {
         let mut state = FinalizedState::new(&config, &network).unwrap();
         let height = target_height.next().unwrap();
         let balance = i128::from(i64::from(snapshots[target].nsm_value_balance_amount()));
-        let bonus = (balance * 4126 + 9_999_999_999) / 10_000_000_000;
+        let bonus = bonus_at(&network, height, balance);
         let scheduled = i128::from(i64::from(halving_block_subsidy(height, &network).unwrap()));
         let fork = child_block_with_history_commitment(&blocks[target],
             vec![coinbase_tx(height, Amount::try_from(i64::try_from(scheduled + bonus).unwrap()).unwrap(), &Address::from_script_hash(NetworkKind::Regtest, [0x43; 20]))],
@@ -583,7 +595,7 @@ proptest::proptest! {
         let (mut state, parent) = state_below_start(&network);
         let before = state.db.finalized_value_pool();
         let balance = i64::from(before.nsm_value_balance_amount());
-        let bonus = i64::try_from((i128::from(balance) * 4126 + 9_999_999_999) / 10_000_000_000).unwrap();
+        let bonus = i64::try_from(bonus_at(&network, START, i128::from(balance))).unwrap();
         // These fixtures isolate contextual accounting from semantic subsidy validation.
         let full = start_block(&state, &network, &parent, bonus - balance);
         let partial = start_block(&state, &network, &parent, bonus - balance - shortfall);
@@ -602,7 +614,7 @@ proptest::proptest! {
         proptest::prop_assert_eq!(state.db.finalized_value_pool(), before);
         for (index, (parent, parent_balance)) in [(&full, balance - bonus), (&partial, balance - bonus + shortfall)].into_iter().enumerate() {
             let height = START.next().unwrap();
-            let bonus = i64::try_from((i128::from(parent_balance) * 4126 + 9_999_999_999) / 10_000_000_000).unwrap();
+            let bonus = i64::try_from(bonus_at(&network, height, i128::from(parent_balance))).unwrap();
             let scheduled = i64::from(zakura_chain::parameters::subsidy::halving_block_subsidy(height, &network).unwrap());
             let mut coinbase = (*parent.transactions[0]).clone();
             let Transaction::V5 { inputs, outputs, expiry_height, .. } = &mut coinbase else { unreachable!() };

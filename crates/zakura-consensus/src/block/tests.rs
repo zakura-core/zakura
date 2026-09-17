@@ -1629,9 +1629,17 @@ fn state_commit_context_errors_keep_misbehavior_scores() {
 #[cfg(feature = "nu7")]
 const ZIP234_TEST_DEFICIT: i64 = 400_000_000;
 
-/// `ceil(ZIP234_TEST_DEFICIT * 4126 / 10^10)`, rounded up from 165.04.
+/// `ceil(ZIP234_TEST_DEFICIT * BLOCK_SUBSIDY_FRACTION)` at `height` on `network`.
 #[cfg(feature = "nu7")]
-const ZIP234_TEST_BONUS: i64 = 166;
+fn zip234_test_bonus(network: &Network, height: Height) -> i64 {
+    let numerator = i128::try_from(
+        zakura_chain::parameters::subsidy::block_subsidy_fraction_numerator(height, network),
+    )
+    .expect("the fraction numerator fits in i128");
+    let bonus = (i128::from(ZIP234_TEST_DEFICIT) * numerator + 9_999_999_999) / 10_000_000_000;
+
+    i64::try_from(bonus).expect("the bonus fits in i64")
+}
 
 /// Returns the chain value pools after `parent` on `network`, `balance` zatoshi behind the
 /// halving schedule.
@@ -1674,8 +1682,9 @@ async fn zip234_block_verification_checks_the_reissuance_bonus() {
     let network = zip234_test_network(start);
     let parent = start.previous().expect("the start is above genesis");
     let halving_subsidy = halving_block_subsidy(start, &network).expect("valid halving subsidy");
-    let with_bonus = (halving_subsidy + Amount::try_from(ZIP234_TEST_BONUS).expect("valid bonus"))
-        .expect("valid subsidy");
+    let with_bonus = (halving_subsidy
+        + Amount::try_from(zip234_test_bonus(&network, start)).expect("valid bonus"))
+    .expect("valid subsidy");
 
     let verify =
         |parent_balance: i64, coinbase_value: Amount<zakura_chain::amount::NonNegative>| {

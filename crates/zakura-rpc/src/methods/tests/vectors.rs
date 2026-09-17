@@ -3231,10 +3231,19 @@ async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
         ..Default::default()
     });
 
-    // A balance of 400,000,000 zatoshi reissues `ceil(400,000,000 * 4126 / 10^10)`, rounded
-    // up from 165.04.
     const BALANCE: i64 = 400_000_000;
-    const BONUS: i64 = 166;
+
+    // `ceil(BALANCE * BLOCK_SUBSIDY_FRACTION)`, read from the network so the test follows
+    // ZIP 218's change to the halving interval.
+    let bonus = |height| {
+        let numerator = i128::try_from(
+            zakura_chain::parameters::subsidy::block_subsidy_fraction_numerator(height, &network),
+        )
+        .expect("the fraction numerator fits in i128");
+
+        i64::try_from((i128::from(BALANCE) * numerator + 9_999_999_999) / 10_000_000_000)
+            .expect("the bonus fits in i64")
+    };
 
     // Returns the chain value pools after `tip`, `balance` zatoshi behind the schedule.
     let tip_pools = |tip: Height, balance: i64| {
@@ -3257,7 +3266,7 @@ async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
     for height in [start, (start + 1).expect("valid height")] {
         let tip = height.previous().expect("the start is above genesis");
         let expected_subsidy = (halving_block_subsidy(height, &network).expect("valid subsidy")
-            + Amount::try_from(BONUS).expect("valid bonus"))
+            + Amount::try_from(bonus(height)).expect("valid bonus"))
         .expect("valid subsidy");
 
         // `getblocksubsidy` reads the parent's chain value pools.

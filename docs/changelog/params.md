@@ -32,6 +32,7 @@ Keep entries **newest-first**. Each row records:
 
 | Parameter | Location | Old → New | PR | Why |
 | --- | --- | --- | --- | --- |
+| Integrated header refill threshold | `crates/zakura-network/src/zakura/header_sync/reactor.rs` | header lead ≤ 2,000 → enough room for one checkpoint range plus its successor (currently lead ≤ 3,599 within the same 4,000-header window) | [#1034](https://github.com/zakura-core/zakura/pull/1034) | Replenish the body backlog earlier while coalescing small credit returns and preserving memory bounds. |
 | Unknown-size scheduling estimate | `crates/zakura-network/src/zakura/block_sync/work_queue.rs` | fixed 2 MB → 1/8-weight EWMA, bounded to 1,024 B–2 MB | [#1025](https://github.com/zakura-core/zakura/pull/1025) | Use accepted body sizes for congestion scheduling while retaining worst-case memory admission. |
 | Unknown-size observation lifetime | `crates/zakura-network/src/zakura/block_sync/work_queue.rs` | none → 60 s without an observation | [#1025](https://github.com/zakura-core/zakura/pull/1025) | Restore conservative startup after an idle interval; frontier resets also discard the estimate. |
 | `status_unavailable_seconds` | `deploy/continuous-sync/continuous-sync.py` and `deploy/continuous-sync/nodes.toml` | new → `600 s` | [#846](https://github.com/zakura-core/zakura/pull/846) | Stop a canary after ten continuous minutes without exact sync evidence while allowing individual metrics errors and timeouts to recover. |

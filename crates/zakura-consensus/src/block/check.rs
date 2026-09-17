@@ -437,6 +437,11 @@ pub fn time_is_valid_at(
 /// against the Orchard limit and in the global shielded budget, because NU6.3
 /// (ZIP 258) moves new Orchard-protocol value to the Ironwood pool. See
 /// [`ShieldedActionCounts::orchard_and_ironwood_actions`].
+///
+/// ZIP 218 sets `SproutBlockJoinSplitLimit` to 25. Zakura sets it to zero, so
+/// this check rejects any JoinSplit at or after NU7, because ZIP 2003 disallows
+/// the only transaction versions that can carry one. See
+/// [`SPROUT_BLOCK_JOINSPLIT_LIMIT`].
 pub fn shielded_action_limits_are_valid<'a>(
     transactions: impl IntoIterator<Item = &'a Arc<Transaction>>,
     height: Height,

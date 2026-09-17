@@ -271,8 +271,11 @@ pub const SAPLING_BLOCK_IO_LIMIT: u32 = 300;
 /// Per-block limit on the total number of Sprout JoinSplits, applied from NU7
 /// activation onwards.
 ///
-/// `SproutBlockJoinSplitLimit` in ZIP 218.
-pub const SPROUT_BLOCK_JOINSPLIT_LIMIT: u32 = 25;
+/// `SproutBlockJoinSplitLimit` in ZIP 218, which sets it to 25. Zakura sets it
+/// to zero, because ZIP 2003 disallows version 4 transactions from NU7
+/// activation, and only version 2, 3, and 4 transactions can contain
+/// JoinSplits. So no block at or after NU7 can contain a JoinSplit.
+pub const SPROUT_BLOCK_JOINSPLIT_LIMIT: u32 = 0;
 
 /// Per-block budget for the total shielded cost across all pools, applied from
 /// NU7 activation onwards.

@@ -1718,18 +1718,18 @@ mod zip218_shielded_action_limits {
 
     #[test]
     fn a_cost_at_the_global_budget_is_accepted() {
-        // One JoinSplit costs 2, so the rest of the budget can hold that many
-        // fewer Orchard actions.
+        // One Sapling output costs 1, so the rest of the budget can hold one
+        // fewer Orchard action.
         let orchard_actions = limit_as_usize(
             GLOBAL_SHIELDED_BUDGET
-                .checked_sub(2)
-                .expect("the global shielded budget covers at least one JoinSplit"),
+                .checked_sub(1)
+                .expect("the global shielded budget covers at least one Sapling output"),
         );
 
         check::shielded_action_limits_are_valid(
             [
                 fake_v5_with_orchard_actions(orchard_actions),
-                fake_v4_with_sprout_joinsplits(1),
+                fake_v5_with_sapling_outputs(1),
             ]
             .iter(),
             Height(1),
@@ -1759,6 +1759,8 @@ mod zip218_shielded_action_limits {
         );
     }
 
+    /// The Sprout limit is zero, so a block containing any JoinSplit is
+    /// rejected once NU7 is active.
     #[test]
     fn sprout_joinsplits_above_the_limit_are_rejected() {
         let err = check::shielded_action_limits_are_valid(
@@ -1920,22 +1922,22 @@ mod zip218_shielded_action_limits {
 
     /// Returns a V4 transaction containing `count` Sprout JoinSplits.
     fn fake_v4_with_sprout_joinsplits(count: usize) -> Arc<Transaction> {
-        let mut runner = TestRunner::default();
-        let mut joinsplit_data = any::<JoinSplitData<Groth16Proof>>()
-            .new_tree(&mut runner)
-            .expect("sprout JoinSplit data strategy is valid")
-            .current();
-        let rest_len = count
-            .checked_sub(1)
-            .expect("a Sprout JoinSplit test count is at least one");
-        joinsplit_data.rest = vec![joinsplit_data.first.clone(); rest_len];
+        let joinsplit_data = count.checked_sub(1).map(|rest_len| {
+            let mut runner = TestRunner::default();
+            let mut joinsplit_data = any::<JoinSplitData<Groth16Proof>>()
+                .new_tree(&mut runner)
+                .expect("sprout JoinSplit data strategy is valid")
+                .current();
+            joinsplit_data.rest = vec![joinsplit_data.first.clone(); rest_len];
+            joinsplit_data
+        });
 
         Arc::new(Transaction::V4 {
             inputs: Vec::new(),
             outputs: Vec::new(),
             lock_time: LockTime::unlocked(),
             expiry_height: Height(100),
-            joinsplit_data: Some(joinsplit_data),
+            joinsplit_data,
             sapling_shielded_data: None,
         })
     }

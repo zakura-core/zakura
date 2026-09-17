@@ -1786,7 +1786,7 @@ fn zip234_test_network(start: Height) -> Network {
             ..Default::default()
         })
         .expect("failed to set test activation heights")
-        .with_zip234_start_height(start)
+        .with_nsm_reissuance_height(start)
         .clear_funding_streams()
         .with_slow_start_interval(Height::MIN)
         .with_disable_pow(true)

@@ -342,7 +342,7 @@ mod tests {
                 nu7: Some(2),
                 ..Default::default()
             },
-            zip234_start_height: Some(Height(3)),
+            nsm_reissuance_height: Some(Height(3)),
             ..Default::default()
         });
         let baseline =
@@ -376,7 +376,7 @@ mod tests {
                 nu7: Some(4),
                 ..Default::default()
             },
-            zip234_start_height: Some(Height(20_000)),
+            nsm_reissuance_height: Some(Height(20_000)),
             initial_nsm_value_balance: Some(Amount::try_from(SEED).unwrap()),
             ..Default::default()
         });
@@ -452,7 +452,7 @@ mod database_tests {
                 nu7: Some(2),
                 ..Default::default()
             },
-            zip234_start_height: Some(Height(20_000)),
+            nsm_reissuance_height: Some(Height(20_000)),
             initial_nsm_value_balance: Some(Amount::try_from(seed).unwrap()),
             ..Default::default()
         });

@@ -287,7 +287,7 @@ async fn checkpoint_sync_crosses_zip234_activation() -> Result<(), Report> {
             nu7: Some(1),
             ..Default::default()
         })?
-        .with_zip234_start_height(block::Height(1))
+        .with_nsm_reissuance_height(block::Height(1))
         .clear_funding_streams()
         .with_slow_start_interval(block::Height::MIN)
         .with_disable_pow(true)

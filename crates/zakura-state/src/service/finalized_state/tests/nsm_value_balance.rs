@@ -55,7 +55,7 @@ fn zip234_network() -> Network {
             nu7: Some(2),
             ..Default::default()
         },
-        zip234_start_height: Some(START),
+        nsm_reissuance_height: Some(START),
         ..Default::default()
     })
 }
@@ -309,7 +309,7 @@ fn seeded_network() -> Network {
             nu7: Some(2),
             ..Default::default()
         },
-        zip234_start_height: Some(START),
+        nsm_reissuance_height: Some(START),
         initial_nsm_value_balance: Some(
             Amount::try_from(SEED).expect("the seed is a valid amount"),
         ),

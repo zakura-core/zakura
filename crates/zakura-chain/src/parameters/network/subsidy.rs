@@ -536,6 +536,10 @@ pub const ZIP234_START_HALVING: u32 = 3;
 ///
 /// # Consensus
 ///
+/// TODO: take this height from the deployment ZIP once it names one. zips#1363 calls it
+/// `NSMReissuanceHeight` and leaves it TBD, and zips#1354 has no separate height at all.
+/// Until then Zakura derives it, which is a known divergence from both drafts.
+///
 /// No ZIP defines this height. zips#1354 starts reissuance at NU7 activation. The
 /// 2026-09-14 coinholder poll (Q2) chose February 2031 instead, and Zakura derives that
 /// date from ZIP 234's own start definition, applied after the third halving instead of
@@ -561,12 +565,12 @@ pub const ZIP234_START_HALVING: u32 = 3;
 ///
 /// Reissuance is an NU7 rule, so it never starts below NU7 activation, and never starts
 /// on a network without NU7. Configured testnets and Regtest can replace the crossing
-/// height with [`ParametersBuilder::with_zip234_start_height`]. Mainnet and the default
+/// height with [`ParametersBuilder::with_nsm_reissuance_height`]. Mainnet and the default
 /// Testnet always use the crossing rule.
 ///
 /// [ZIP 234]: https://zips.z.cash/zip-0234
-/// [`ParametersBuilder::with_zip234_start_height`]: super::testnet::ParametersBuilder::with_zip234_start_height
-pub fn zip234_start_height(network: &Network) -> Option<Height> {
+/// [`ParametersBuilder::with_nsm_reissuance_height`]: super::testnet::ParametersBuilder::with_nsm_reissuance_height
+pub fn nsm_reissuance_height(network: &Network) -> Option<Height> {
     let nu7 = NetworkUpgrade::Nu7.activation_height(network)?;
 
     // The crossing calculation evaluates the halving clock hundreds of times, and block
@@ -574,12 +578,12 @@ pub fn zip234_start_height(network: &Network) -> Option<Height> {
     let start = match network {
         Network::Mainnet => {
             static MAINNET_START: OnceLock<Option<Height>> = OnceLock::new();
-            *MAINNET_START.get_or_init(|| zip234_crossing_start_height(network))
+            *MAINNET_START.get_or_init(|| nsm_reissuance_crossing_height(network))
         }
-        Network::Testnet(params) => params.configured_zip234_start_height().or_else(|| {
+        Network::Testnet(params) => params.configured_nsm_reissuance_height().or_else(|| {
             params
-                .zip234_crossing_start_height()
-                .get_or_init(|| zip234_crossing_start_height(network))
+                .nsm_reissuance_crossing_height()
+                .get_or_init(|| nsm_reissuance_crossing_height(network))
         }),
     }?;
 
@@ -589,10 +593,10 @@ pub fn zip234_start_height(network: &Network) -> Option<Height> {
 /// Returns the real chain height at the [ZIP 234] crossing height after
 /// [`ZIP234_START_HALVING`], ignoring NU7 activation.
 ///
-/// See [`zip234_start_height`] for the rule.
+/// See [`nsm_reissuance_height`] for the rule.
 ///
 /// [ZIP 234]: https://zips.z.cash/zip-0234
-fn zip234_crossing_start_height(network: &Network) -> Option<Height> {
+fn nsm_reissuance_crossing_height(network: &Network) -> Option<Height> {
     let crossing = zip234_crossing_height(network, ZIP234_START_HALVING)?;
 
     Some(Height(Pre218Schedule::new(network).real_height(crossing.0)))
@@ -602,7 +606,7 @@ fn zip234_crossing_start_height(network: &Network) -> Option<Height> {
 /// `ceil(BLOCK_SUBSIDY_FRACTION * (MAX_MONEY - ScheduledSupply(height - 1)))` is less than
 /// the block's halving subsidy, on `network`'s 75-second schedule.
 ///
-/// Returns `None` if no such height exists. See [`zip234_start_height`].
+/// Returns `None` if no such height exists. See [`nsm_reissuance_height`].
 pub(crate) fn zip234_crossing_height(network: &Network, halving: u32) -> Option<Height> {
     let schedule = Pre218Schedule::new(network);
     // The crossing runs on the 75-second schedule, so it uses that era's fraction.
@@ -778,12 +782,12 @@ impl<'a> Pre218Schedule<'a> {
 
 /// Returns whether ZIP 234 is compiled in and applies to `network` at `height`.
 ///
-/// [`zip234_start_height`] gives the ZIP's height whatever the build, so that the height
+/// [`nsm_reissuance_height`] gives the ZIP's height whatever the build, so that the height
 /// arithmetic is testable everywhere. This is the check that decides whether a block
 /// subsidy actually follows ZIP 234, and so whether a caller has to fetch the money
 /// reserve.
 pub fn is_zip234_active(network: &Network, height: Height) -> bool {
-    cfg!(feature = "nu7") && zip234_start_height(network).is_some_and(|start| height >= start)
+    cfg!(feature = "nu7") && nsm_reissuance_height(network).is_some_and(|start| height >= start)
 }
 
 /// Applies the [ZIP 234] reissuance fraction at `height` to `amount`, rounding up.

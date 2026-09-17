@@ -737,7 +737,7 @@ fn rollback_reverses_intra_block_self_spend() {
 /// each parent's chain value pools.
 #[cfg(feature = "nu7")]
 #[test]
-fn rollback_crosses_the_zip234_start_height() {
+fn rollback_crosses_the_nsm_reissuance_height() {
     use zakura_chain::parameters::{subsidy::is_zip234_active, testnet::RegtestParameters};
 
     let _init_guard = zakura_test::init();
@@ -750,7 +750,7 @@ fn rollback_crosses_the_zip234_start_height() {
             nu7: Some(2),
             ..Default::default()
         },
-        zip234_start_height: Some(start),
+        nsm_reissuance_height: Some(start),
         ..Default::default()
     });
     let address = Address::from_script_hash(NetworkKind::Regtest, [0x42; 20]);

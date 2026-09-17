@@ -642,20 +642,20 @@ fn testnet_with_nu7(nu7: Option<u32>) -> testnet::ParametersBuilder {
 
 /// Checks where ZIP 234 reissuance starts relative to NU7 and the crossing height.
 #[test]
-fn zip234_start_height_follows_nu7_and_the_crossing_rule() {
-    use crate::parameters::subsidy::zip234_start_height;
+fn nsm_reissuance_height_follows_nu7_and_the_crossing_rule() {
+    use crate::parameters::subsidy::nsm_reissuance_height;
 
     let _init_guard = zakura_test::init();
 
     const TESTNET_CROSSING: u32 = 5_412_346;
 
     // A network without NU7 never starts reissuance.
-    assert_eq!(zip234_start_height(&Network::Mainnet), None);
-    assert_eq!(zip234_start_height(&Network::new_default_testnet()), None);
+    assert_eq!(nsm_reissuance_height(&Network::Mainnet), None);
+    assert_eq!(nsm_reissuance_height(&Network::new_default_testnet()), None);
     let no_nu7 = testnet_with_nu7(None)
         .to_network()
         .expect("configured testnet is valid");
-    assert_eq!(zip234_start_height(&no_nu7), None);
+    assert_eq!(nsm_reissuance_height(&no_nu7), None);
 
     // NU7 before the crossing height maps the crossing height through the halving clock.
     // Each 75-second block after NU7 is three 25-second blocks.
@@ -666,7 +666,7 @@ fn zip234_start_height_follows_nu7_and_the_crossing_rule() {
         let expected = nu7 + 3 * (TESTNET_CROSSING - nu7);
 
         assert_eq!(
-            zip234_start_height(&network),
+            nsm_reissuance_height(&network),
             Some(Height(expected)),
             "NU7 at {nu7}",
         );
@@ -679,7 +679,7 @@ fn zip234_start_height_follows_nu7_and_the_crossing_rule() {
             .expect("configured testnet is valid");
 
         assert_eq!(
-            zip234_start_height(&network),
+            nsm_reissuance_height(&network),
             Some(Height(nu7)),
             "NU7 at {nu7}",
         );
@@ -688,32 +688,32 @@ fn zip234_start_height_follows_nu7_and_the_crossing_rule() {
     // A configured start height replaces the crossing height, but not NU7.
     let configured = |nu7, start| {
         testnet_with_nu7(Some(nu7))
-            .with_zip234_start_height(Height(start))
+            .with_nsm_reissuance_height(Height(start))
             .to_network()
             .expect("configured testnet is valid")
     };
     assert_eq!(
-        zip234_start_height(&configured(4_200_000, 4_200_010)),
+        nsm_reissuance_height(&configured(4_200_000, 4_200_010)),
         Some(Height(4_200_010)),
     );
     assert_eq!(
-        zip234_start_height(&configured(4_200_000, 1)),
+        nsm_reissuance_height(&configured(4_200_000, 1)),
         Some(Height(4_200_000)),
     );
 
-    let regtest = |zip234_start_height| {
+    let regtest = |nsm_reissuance_height| {
         Network::new_regtest(testnet::RegtestParameters {
             activation_heights: ConfiguredActivationHeights {
                 nu7: Some(10),
                 ..Default::default()
             },
-            zip234_start_height,
+            nsm_reissuance_height,
             ..Default::default()
         })
     };
-    assert_eq!(zip234_start_height(&regtest(None)), None);
+    assert_eq!(nsm_reissuance_height(&regtest(None)), None);
     assert_eq!(
-        zip234_start_height(&regtest(Some(Height(20)))),
+        nsm_reissuance_height(&regtest(Some(Height(20)))),
         Some(Height(20)),
     );
 }
@@ -872,7 +872,7 @@ fn reissuance_drains_a_small_balance() {
         })
         .expect("activation heights are valid")
         .clear_funding_streams()
-        .with_zip234_start_height(start)
+        .with_nsm_reissuance_height(start)
         .to_network()
         .expect("configured testnet is valid");
 
@@ -919,7 +919,7 @@ fn zip234_issuance() {
         })
         .expect("activation heights are valid")
         .clear_funding_streams()
-        .with_zip234_start_height(start)
+        .with_nsm_reissuance_height(start)
         .to_network()
         .expect("configured testnet is valid");
 

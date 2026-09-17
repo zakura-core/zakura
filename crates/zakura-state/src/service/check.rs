@@ -8,7 +8,7 @@ use zakura_chain::{
         self, merkle::AuthDataRoot, Block, ChainHistoryBlockTxAuthCommitmentHash, CommitmentError,
     },
     history_tree::HistoryTree,
-    parameters::{subsidy::is_zip234_active, Network, NetworkUpgrade},
+    parameters::{Network, NetworkUpgrade},
     value_balance::ValueBalance,
     work::difficulty::CompactDifficulty,
 };
@@ -55,8 +55,9 @@ pub(crate) use difficulty::AdjustedDifficulty;
 /// > created as a result of accepting a block at height, then all nodes MUST reject the
 /// > block as invalid.
 ///
-/// zips#1354 applies this rule from NU7 because it starts reissuance at NU7. Zakura starts
-/// reissuance at the later ZIP 234 start height, and applies the rule from that height.
+/// The rule holds from NU7, not from the later reissuance start height. Between the two
+/// no block claims a bonus, so nothing there can drive the balance negative, but matching
+/// the draft costs nothing and leaves one rule instead of two.
 ///
 /// Check before adding pools so an overdraw reports this consensus rule.
 #[allow(clippy::unwrap_in_result)]
@@ -66,7 +67,12 @@ pub(crate) fn nsm_value_balance_is_non_negative(
     value_pools: &ValueBalance<NonNegative>,
     block_value_pool_change: &ValueBalance<NegativeAllowed>,
 ) -> Result<(), ValidateContextError> {
-    if !is_zip234_active(network, height) {
+    let nu7_active = cfg!(feature = "nu7")
+        && NetworkUpgrade::Nu7
+            .activation_height(network)
+            .is_some_and(|nu7| height >= nu7);
+
+    if !nu7_active {
         return Ok(());
     }
 

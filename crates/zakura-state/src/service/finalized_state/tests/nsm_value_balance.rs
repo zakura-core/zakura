@@ -193,6 +193,82 @@ fn non_finalized_state_rejects_a_block_that_makes_the_balance_negative() {
         .expect("a zero balance is valid");
 }
 
+/// The rule applies from NU7, not from the later reissuance start height.
+#[test]
+fn nu7_rejects_a_negative_balance_below_the_reissuance_start() {
+    use zakura_chain::parameters::subsidy::halving_block_subsidy;
+
+    let _init_guard = zakura_test::init();
+
+    let network = zip234_network();
+    let nu7 = NetworkUpgrade::Nu7
+        .activation_height(&network)
+        .expect("the test network activates NU7");
+
+    assert!(
+        nu7 < START,
+        "the fixture must leave a gap between NU7 and the reissuance start",
+    );
+    assert!(
+        !is_zip234_active(&network, nu7),
+        "no block at NU7 claims a bonus on this network",
+    );
+
+    let address = Address::from_script_hash(NetworkKind::Regtest, [0x42; 20]);
+    let mut state = FinalizedState::new(&Config::ephemeral(), &network)
+        .expect("opening an ephemeral database should succeed");
+    let mut parent = zakura_chain::block::genesis::regtest_genesis_block();
+    commit(&mut state, &parent).expect("the genesis block commits");
+
+    for height in 1..nu7.0 {
+        // The Heartwood activation block has the reserved all-zero commitment.
+        let dust = Amount::<NonNegative>::try_from(1).expect("1 fits in Amount<NonNegative>");
+        let block = child_block(&parent, vec![coinbase_tx(Height(height), dust, &address)]);
+        commit(&mut state, &block).expect("a block below NU7 commits");
+        parent = block;
+    }
+
+    // One zatoshi above the schedule drives the balance below zero.
+    let scheduled = i64::from(halving_block_subsidy(nu7, &network).expect("valid subsidy"));
+    let over = child_block_with_history_commitment(
+        &parent,
+        vec![coinbase_tx(
+            nu7,
+            Amount::try_from(scheduled + 1).expect("valid coinbase value"),
+            &address,
+        )],
+        &network,
+        &state.db.history_tree(),
+    );
+
+    let error = commit(&mut state, &over)
+        .expect_err("a block that issues above the schedule is invalid from NU7");
+    let CommitBlockError::ValidateContextError(error) = error else {
+        panic!("unexpected commit error: {error:?}");
+    };
+
+    assert!(
+        matches!(
+            *error,
+            ValidateContextError::NegativeNsmValueBalance { height, .. } if height == nu7
+        ),
+        "{error:?}",
+    );
+
+    // The same block claiming exactly the schedule commits.
+    let on_schedule = child_block_with_history_commitment(
+        &parent,
+        vec![coinbase_tx(
+            nu7,
+            Amount::try_from(scheduled).expect("valid coinbase value"),
+            &address,
+        )],
+        &network,
+        &state.db.history_tree(),
+    );
+    commit(&mut state, &on_schedule).expect("a zero balance is valid");
+}
+
 /// The finalized state rejects a checkpoint-verified block that makes the balance negative.
 #[test]
 fn finalized_state_rejects_a_block_that_makes_the_balance_negative() {

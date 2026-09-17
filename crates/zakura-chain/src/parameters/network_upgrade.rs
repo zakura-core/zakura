@@ -67,6 +67,9 @@ pub enum NetworkUpgrade {
     /// The Zcash protocol after the NU7 upgrade.
     #[serde(rename = "NU7")]
     Nu7,
+    /// The Zcash protocol after the NuTachyon upgrade.
+    #[cfg(zcash_unstable = "nutachyon")]
+    NuTachyon,
 
     #[cfg(zcash_unstable = "zfuture")]
     ZFuture,
@@ -241,6 +244,8 @@ pub(crate) const CONSENSUS_BRANCH_IDS: &[(NetworkUpgrade, ConsensusBranchId)] = 
     // TODO: set below to (Nu7, ConsensusBranchId(0x77190ad8)), once the same value is set in librustzcash
     #[cfg(any(test, feature = "zakura-test"))]
     (Nu7, ConsensusBranchId(0xfffffffe)),
+    #[cfg(zcash_unstable = "nutachyon")]
+    (NuTachyon, ConsensusBranchId(0xfffffffc)),
     #[cfg(zcash_unstable = "zfuture")]
     (ZFuture, ConsensusBranchId(0xfffffffd)),
 ];
@@ -406,6 +411,9 @@ impl NetworkUpgrade {
                 POST_BLOSSOM_POW_TARGET_SPACING.into()
             }
 
+            #[cfg(zcash_unstable = "nutachyon")]
+            NuTachyon => POST_BLOSSOM_POW_TARGET_SPACING.into(),
+
             #[cfg(zcash_unstable = "zfuture")]
             ZFuture => POST_BLOSSOM_POW_TARGET_SPACING.into(),
         };
@@ -531,6 +539,8 @@ impl From<zcash_protocol::consensus::NetworkUpgrade> for NetworkUpgrade {
             zcash_protocol::consensus::NetworkUpgrade::Nu6_3 => Self::Nu6_3,
             #[cfg(zcash_unstable = "nu7")]
             zcash_protocol::consensus::NetworkUpgrade::Nu7 => Self::Nu7,
+            #[cfg(zcash_unstable = "nutachyon")]
+            zcash_protocol::consensus::NetworkUpgrade::NuTachyon => Self::NuTachyon,
             #[cfg(zcash_unstable = "zfuture")]
             zcash_protocol::consensus::NetworkUpgrade::ZFuture => Self::ZFuture,
         }

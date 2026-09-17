@@ -154,6 +154,39 @@ fn sapling_orchard_ironwood_anchors_refer_to_final_treestates(
         );
     }
 
+    #[cfg(zcash_unstable = "nutachyon")]
+    if let Some(tachyon_shielded_data) = transaction.tachyon_shielded_data() {
+        if let zcash_tachyon::TachyonBundle::Proven(bundle) = &tachyon_shielded_data.0 {
+            let anchor = zakura_chain::tachyon::Anchor::from(bundle.stamp.anchor);
+            let network = finalized_state.network();
+            let anchor_in_window = |anchor_height: Height| match height {
+                Some(height) => {
+                    zakura_chain::tachyon::within_scan_window(&network, anchor_height, height)
+                }
+                None => true,
+            };
+            let in_parent_chain = parent_chain.is_some_and(|chain| {
+                chain
+                    .tachyon_anchors
+                    .get(&anchor)
+                    .is_some_and(|heights| heights.iter().copied().any(anchor_in_window))
+            });
+
+            if !in_parent_chain
+                && !finalized_state
+                    .tachyon_anchor_height(&anchor)
+                    .is_some_and(anchor_in_window)
+            {
+                return Err(ValidateContextError::UnknownTachyonAnchor {
+                    anchor,
+                    height,
+                    tx_index_in_block,
+                    transaction_hash,
+                });
+            }
+        }
+    }
+
     Ok(())
 }
 

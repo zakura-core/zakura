@@ -331,6 +331,18 @@ fn mock_transparent_transaction(
             ironwood_shielded_data: None,
             network_upgrade,
         },
+        #[cfg(zcash_unstable = "nutachyon")]
+        7 => Transaction::V7 {
+            inputs,
+            outputs,
+            lock_time,
+            expiry_height,
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+            ironwood_shielded_data: None,
+            tachyon_shielded_data: None,
+            network_upgrade,
+        },
         invalid_version => unreachable!("invalid transaction version: {}", invalid_version),
     };
 
@@ -360,6 +372,8 @@ fn sanitize_transaction_version(
             Nu5 | Nu6 | Nu6_1 | Nu6_2 => (4, 5),
             Nu6_3 => (4, 6),
             Nu7 => (5, 5),
+            #[cfg(zcash_unstable = "nutachyon")]
+            NuTachyon => (5, 7),
 
             #[cfg(zcash_unstable = "zfuture")]
             NetworkUpgrade::ZFuture => (5, u8::MAX),
@@ -372,12 +386,14 @@ fn sanitize_transaction_version(
 }
 
 #[test]
-fn sanitize_transaction_version_handles_v6_at_nu6_3() {
+#[cfg(zcash_unstable = "nutachyon")]
+fn sanitize_transaction_version_handles_v6_and_v7_upgrades() {
     let network = zakura_chain::parameters::testnet::Parameters::build()
         .with_activation_heights(
             zakura_chain::parameters::testnet::ConfiguredActivationHeights {
                 nu6_3: Some(1),
                 nu7: Some(2),
+                nu_tachyon: Some(3),
                 ..Default::default()
             },
         )
@@ -401,6 +417,14 @@ fn sanitize_transaction_version_handles_v6_at_nu6_3() {
     assert_eq!(
         sanitize_transaction_version(&network, 6, block::Height(2)),
         (5, NetworkUpgrade::Nu7)
+    );
+    assert_eq!(
+        sanitize_transaction_version(&network, 6, block::Height(3)),
+        (6, NetworkUpgrade::NuTachyon)
+    );
+    assert_eq!(
+        sanitize_transaction_version(&network, 7, block::Height(3)),
+        (7, NetworkUpgrade::NuTachyon)
     );
 }
 

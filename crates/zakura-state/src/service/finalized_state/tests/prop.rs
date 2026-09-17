@@ -315,6 +315,8 @@ fn vct_generated_final_frontier_bytes_are_node_loader_compatible() -> Result<()>
             nu6_2: Some(47),
             nu6_3: Some(48),
             nu7: Some(50),
+            #[cfg(zcash_unstable = "nutachyon")]
+            nu_tachyon: None,
         })
         .expect("failed to set activation heights")
         .extend_funding_streams()
@@ -430,6 +432,8 @@ fn all_upgrades_and_wrong_commitments_with_fake_activation_heights() -> Result<(
             nu6_2: Some(47),
             nu6_3: Some(48),
             nu7: Some(50),
+            #[cfg(zcash_unstable = "nutachyon")]
+            nu_tachyon: None,
         })
         .expect("failed to set activation heights")
         .extend_funding_streams()
@@ -551,6 +555,8 @@ fn vct_fast_path_matches_legacy_and_rejects_wrong_roots() -> Result<()> {
             nu6_2: Some(47),
             nu6_3: Some(48),
             nu7: Some(50),
+            #[cfg(zcash_unstable = "nutachyon")]
+            nu_tachyon: None,
         })
         .expect("failed to set activation heights")
         .extend_funding_streams()
@@ -773,6 +779,8 @@ fn vct_frozen_frontier_hole_refuses_instead_of_recomputing() -> Result<()> {
             nu6_2: Some(47),
             nu6_3: Some(48),
             nu7: Some(50),
+            #[cfg(zcash_unstable = "nutachyon")]
+            nu_tachyon: None,
         })
         .expect("failed to set activation heights")
         .extend_funding_streams()
@@ -878,6 +886,8 @@ fn vct_retryable_root_miss_keeps_checkpoint_response_pending() -> Result<()> {
             nu6_2: Some(47),
             nu6_3: Some(48),
             nu7: Some(50),
+            #[cfg(zcash_unstable = "nutachyon")]
+            nu_tachyon: None,
         })
         .expect("failed to set activation heights")
         .extend_funding_streams()
@@ -979,6 +989,8 @@ fn vct_untrusted_source_defers_unverifiable_tip_root_until_successor() -> Result
             nu6_2: Some(47),
             nu6_3: Some(48),
             nu7: Some(50),
+            #[cfg(zcash_unstable = "nutachyon")]
+            nu_tachyon: None,
         })
         .expect("failed to set activation heights")
         .extend_funding_streams()
@@ -1224,6 +1236,8 @@ fn vct_untrusted_source_bad_root_replacement_commits_same_height() -> Result<()>
             nu6_2: Some(47),
             nu6_3: Some(48),
             nu7: Some(50),
+            #[cfg(zcash_unstable = "nutachyon")]
+            nu_tachyon: None,
         })
         .expect("failed to set activation heights")
         .extend_funding_streams()
@@ -1377,6 +1391,8 @@ fn vct_frozen_frontier_survives_reopen() -> Result<()> {
             nu6_2: Some(47),
             nu6_3: Some(48),
             nu7: Some(50),
+            #[cfg(zcash_unstable = "nutachyon")]
+            nu_tachyon: None,
         })
         .expect("failed to set activation heights")
         .extend_funding_streams()
@@ -1554,6 +1570,8 @@ fn vct_fast_sync_handoff_marks_database_and_resumes() -> Result<()> {
             nu6_2: Some(47),
             nu6_3: Some(48),
             nu7: Some(50),
+            #[cfg(zcash_unstable = "nutachyon")]
+            nu_tachyon: None,
         })
         .expect("failed to set activation heights")
         .extend_funding_streams()
@@ -2089,6 +2107,8 @@ fn vct_mode_switches_continue_from_safe_boundaries() -> Result<()> {
             nu6_2: Some(47),
             nu6_3: Some(48),
             nu7: Some(50),
+            #[cfg(zcash_unstable = "nutachyon")]
+            nu_tachyon: None,
         })
         .expect("failed to set activation heights")
         .extend_funding_streams()
@@ -2294,6 +2314,8 @@ fn vct_dedup_skips_redundant_check_and_guards_stale_cache() -> Result<()> {
             nu6_2: Some(47),
             nu6_3: Some(48),
             nu7: Some(50),
+            #[cfg(zcash_unstable = "nutachyon")]
+            nu_tachyon: None,
         })
         .expect("failed to set activation heights")
         .extend_funding_streams()
@@ -2566,6 +2588,8 @@ fn vct_clear_prevalidation_cache_disarms_skip_then_dedup_resumes() -> Result<()>
             nu6_2: Some(47),
             nu6_3: Some(48),
             nu7: Some(50),
+            #[cfg(zcash_unstable = "nutachyon")]
+            nu_tachyon: None,
         })
         .expect("failed to set activation heights")
         .extend_funding_streams()
@@ -2674,6 +2698,8 @@ fn vct_db_produced_payload_round_trips_to_byte_identical_state() -> Result<()> {
             nu6_2: Some(47),
             nu6_3: Some(48),
             nu7: Some(50),
+            #[cfg(zcash_unstable = "nutachyon")]
+            nu_tachyon: None,
         })
         .expect("failed to set activation heights")
         .extend_funding_streams()
@@ -3071,6 +3097,8 @@ fn vct_untrusted_fixture_drives_byte_identical_state() -> Result<()> {
             nu6_2: Some(47),
             nu6_3: Some(48),
             nu7: Some(50),
+            #[cfg(zcash_unstable = "nutachyon")]
+            nu_tachyon: None,
         })
         .expect("failed to set activation heights")
         .extend_funding_streams()
@@ -3245,6 +3273,8 @@ fn vct_read_service_serves_or_refuses_absent_band_treestates() -> Result<()> {
             nu6_2: Some(47),
             nu6_3: Some(48),
             nu7: Some(50),
+            #[cfg(zcash_unstable = "nutachyon")]
+            nu_tachyon: None,
         })
         .expect("failed to set activation heights")
         .extend_funding_streams()

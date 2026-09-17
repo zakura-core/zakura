@@ -111,8 +111,8 @@ fn format_upgrades(
     let min_version = move || min_version.clone().unwrap_or(Version::new(0, 0, 0));
 
     // Note: Disk format upgrades must be run in order of database version.
-    ([
-        Box::new(block_info_and_address_received::Upgrade),
+    vec![
+        Box::new(block_info_and_address_received::Upgrade) as Box<dyn DiskFormatUpgrade>,
         Box::new(no_migration::NoMigration::new(
             "add pruning metadata column family",
             Version::new(27, 1, 0),
@@ -144,9 +144,23 @@ fn format_upgrades(
         )),
         Box::new(drop_header_root_auth_frontier::Upgrade),
         Box::new(unauthenticated_commitment_roots::Upgrade),
-    ] as [Box<dyn DiskFormatUpgrade>; 10])
-        .into_iter()
-        .filter(move |upgrade| upgrade.version() > min_version())
+        Box::new(no_migration::NoMigration::new(
+            "add node software metadata column family",
+            Version::new(28, 2, 0),
+        )),
+        #[cfg(zcash_unstable = "nutachyon")]
+        Box::new(no_migration::NoMigration::new(
+            "widen history tree entries for NuTachyon",
+            Version::new(28, 2, 5),
+        )),
+        #[cfg(zcash_unstable = "nutachyon")]
+        Box::new(no_migration::NoMigration::new(
+            "add Tachyon state and widen chain value balance and history entries",
+            Version::new(29, 0, 0),
+        )),
+    ]
+    .into_iter()
+    .filter(move |upgrade| upgrade.version() > min_version())
 }
 
 /// Returns a list of all the major db format versions that can restored from the
@@ -1104,18 +1118,43 @@ fn fast_sync_metadata_cf_upgrade_is_no_migration() {
 }
 
 #[test]
-fn vct_format_changes_include_root_auth_metadata_updates() {
+fn node_software_metadata_cf_upgrade_is_no_migration() {
+    let upgrades: Vec<_> = format_upgrades(Some(Version::new(28, 1, 5))).collect();
+    let upgrade = upgrades
+        .iter()
+        .find(|upgrade| upgrade.version() == Version::new(28, 2, 0))
+        .expect("node software metadata upgrade should be present");
+
+    assert!(!upgrade.needs_migration());
+}
+
+#[test]
+fn vct_format_changes_include_root_auth_and_node_metadata_updates() {
     use crate::constants::state_database_format_version_in_code;
 
     let upgrades: Vec<_> = format_upgrades(Some(Version::new(27, 3, 0))).collect();
 
-    assert_eq!(upgrades.len(), 6);
+    assert_eq!(
+        upgrades.len(),
+        if cfg!(zcash_unstable = "nutachyon") {
+            9
+        } else {
+            7
+        }
+    );
     assert_eq!(upgrades[0].version(), Version::new(28, 0, 0));
     assert_eq!(upgrades[1].version(), Version::new(28, 0, 1));
     assert_eq!(upgrades[2].version(), Version::new(28, 0, 2));
     assert_eq!(upgrades[3].version(), Version::new(28, 1, 3));
     assert_eq!(upgrades[4].version(), Version::new(28, 1, 4));
     assert_eq!(upgrades[5].version(), Version::new(28, 1, 5));
+    assert_eq!(upgrades[6].version(), Version::new(28, 2, 0));
+    assert!(!upgrades[6].needs_migration());
+    #[cfg(zcash_unstable = "nutachyon")]
+    {
+        assert_eq!(upgrades[7].version(), Version::new(28, 2, 5));
+        assert_eq!(upgrades[8].version(), Version::new(29, 0, 0));
+    }
     assert!(
         !upgrades[3].needs_migration(),
         "the header-chain column families are created on open without rebasing authenticated roots"

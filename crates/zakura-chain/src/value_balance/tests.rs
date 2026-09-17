@@ -119,7 +119,10 @@ fn chain_pool_total_limit_includes_every_pool() {
     let _init_guard = zakura_test::init();
 
     // Every pool contributes to a total exactly at the cap.
+    #[cfg(not(zcash_unstable = "nutachyon"))]
     let share = Amount::<NonNegative>::try_from(MAX_MONEY / 6).unwrap();
+    #[cfg(zcash_unstable = "nutachyon")]
+    let share = Amount::<NonNegative>::try_from(MAX_MONEY / 7).unwrap();
     let at_cap = ValueBalance {
         transparent: share,
         sprout: share,
@@ -127,6 +130,8 @@ fn chain_pool_total_limit_includes_every_pool() {
         orchard: share,
         deferred: share,
         ironwood: share,
+        #[cfg(zcash_unstable = "nutachyon")]
+        tachyon: share,
     };
     assert_eq!(at_cap.total(), Ok(Amount::try_from(MAX_MONEY).unwrap()));
     assert_eq!(

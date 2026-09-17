@@ -908,3 +908,35 @@ pub fn consensus_branch_id(
 
     Ok(())
 }
+
+/// Checks that no Tachyon action's value commitment or verification key is the identity point.
+#[cfg(zcash_unstable = "nutachyon")]
+pub fn tachyon_actions_have_valid_digests(tx: &Transaction) -> Result<(), TransactionError> {
+    let Some(tachyon_shielded_data) = tx.tachyon_shielded_data() else {
+        return Ok(());
+    };
+
+    for action in tachyon_shielded_data.actions() {
+        action
+            .digest()
+            .map_err(|error| TransactionError::TachyonIdentityAction(error.to_string()))?;
+    }
+
+    Ok(())
+}
+
+/// Checks that a Tachyon transaction is autonome before it enters the mempool.
+#[cfg(zcash_unstable = "nutachyon")]
+pub fn tachyon_bundle_is_autonome(tx: &Transaction) -> Result<(), TransactionError> {
+    let Some(tachyon_shielded_data) = tx.tachyon_shielded_data() else {
+        return Ok(());
+    };
+
+    match &tachyon_shielded_data.0 {
+        zcash_tachyon::TachyonBundle::Proven(bundle) if bundle.is_autonome() => Ok(()),
+        zcash_tachyon::TachyonBundle::NoBundle => Ok(()),
+        zcash_tachyon::TachyonBundle::Proven(_) | zcash_tachyon::TachyonBundle::Adjunct(_) => {
+            Err(TransactionError::NonAutonomeTachyon)
+        }
+    }
+}

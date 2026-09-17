@@ -26,14 +26,17 @@ use crate::service::finalized_state::disk_format::{FromDisk, IntoDisk};
 /// An error decoding a persisted history-tree snapshot.
 #[derive(Debug, Error)]
 pub enum HistoryTreeDecodeError {
-    /// The snapshot does not use either supported serialization format.
+    /// The snapshot does not use any supported serialization format.
     #[error(
-        "history tree snapshot is neither the current nor legacy format: \
-         current format error: {current}; legacy format error: {legacy}"
+        "history tree snapshot is neither the current, Ironwood, nor legacy format: \
+         current format error: {current}; Ironwood format error: {ironwood}; \
+         legacy format error: {legacy}"
     )]
     InvalidEncoding {
         /// The current-width decoding error.
         current: bincode::Error,
+        /// The Ironwood-width decoding error.
+        ironwood: bincode::Error,
         /// The legacy-width decoding error.
         legacy: bincode::Error,
     },
@@ -55,7 +58,10 @@ pub enum HistoryTreeDecodeError {
 }
 
 impl IntoDisk for ValueBalance<NonNegative> {
+    #[cfg(not(zcash_unstable = "nutachyon"))]
     type Bytes = [u8; 48];
+    #[cfg(zcash_unstable = "nutachyon")]
+    type Bytes = [u8; 56];
 
     fn as_bytes(&self) -> Self::Bytes {
         self.to_bytes()
@@ -89,19 +95,26 @@ impl HistoryTreeParts {
         let bytes = bytes.as_ref();
         let options = bincode::DefaultOptions::new();
 
-        // Try the current entry width first. Databases written before NU6.3 widened
-        // `zcash_history::Entry` store narrower entries that fail to parse at the current width,
-        // so fall back to the legacy width and zero-pad each entry up to the current width.
+        // Try the current entry width first. Earlier databases store narrower entries, so fall
+        // back through the Ironwood and pre-Ironwood widths and zero-pad each entry to the current
+        // width.
         //
         // Legacy-width rows can fail the current-width decoder with errors other than
         // `UnexpectedEof`, because the wider entry can read into the next legacy entry and
         // interpret arbitrary entry bytes as bincode control bytes.
         match options.deserialize::<HistoryTreeParts>(bytes) {
             Ok(parts) => Ok(parts),
-            Err(current) => options
-                .deserialize::<LegacyHistoryTreeParts>(bytes)
-                .map(HistoryTreeParts::from)
-                .map_err(|legacy| HistoryTreeDecodeError::InvalidEncoding { current, legacy }),
+            Err(current) => match options.deserialize::<IronwoodHistoryTreeParts>(bytes) {
+                Ok(parts) => Ok(parts.into()),
+                Err(ironwood) => options
+                    .deserialize::<LegacyHistoryTreeParts>(bytes)
+                    .map(HistoryTreeParts::from)
+                    .map_err(|legacy| HistoryTreeDecodeError::InvalidEncoding {
+                        current,
+                        ironwood,
+                        legacy,
+                    }),
+            },
         }
     }
 
@@ -151,6 +164,46 @@ impl IntoDisk for HistoryTreeParts {
 /// The width of a history-tree [`zcash_history::Entry`] as serialized by database formats written
 /// before NU6.3 widened `zcash_history::NodeData`.
 const LEGACY_MAX_ENTRY_SIZE: usize = 253;
+
+/// The width of a history-tree [`zcash_history::Entry`] from NU6.3 until NuTachyon support
+/// reserved space for V4 node data.
+const IRONWOOD_MAX_ENTRY_SIZE: usize = 326;
+
+/// A mirror of [`HistoryTreeParts`] using the NU6.3 [`zcash_history::Entry`] width.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct IronwoodHistoryTreeParts {
+    network_kind: NetworkKind,
+    size: u32,
+    peaks: BTreeMap<u32, IronwoodEntry>,
+    current_height: Height,
+}
+
+/// A history-tree entry serialized at the NU6.3 [`IRONWOOD_MAX_ENTRY_SIZE`] width.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct IronwoodEntry {
+    #[serde(with = "BigArray")]
+    inner: [u8; IRONWOOD_MAX_ENTRY_SIZE],
+}
+
+impl From<IronwoodHistoryTreeParts> for HistoryTreeParts {
+    fn from(ironwood: IronwoodHistoryTreeParts) -> Self {
+        HistoryTreeParts {
+            network_kind: ironwood.network_kind,
+            size: ironwood.size,
+            peaks: ironwood
+                .peaks
+                .into_iter()
+                .map(|(index, entry)| {
+                    (
+                        index,
+                        zcash_history::Entry::from_raw_bytes_padded(&entry.inner),
+                    )
+                })
+                .collect(),
+            current_height: ironwood.current_height,
+        }
+    }
+}
 
 /// A mirror of [`HistoryTreeParts`] using the pre-NU6.3 [`zcash_history::Entry`] width.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -210,18 +263,34 @@ impl IntoDisk for BlockInfo {
 
 impl FromDisk for BlockInfo {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
-        // We have two different DB formats, one from NU6_1 (Lockbox) one for Ironwood and onwards.
+        // We have different DB formats for NU6.1, Ironwood, and NuTachyon onward.
         const NU6_1_VALUE_BALANCE_LEN: usize = 40;
         const IRONWOOD_VALUE_BALANCE_LEN: usize = 48;
+        #[cfg(zcash_unstable = "nutachyon")]
+        const TACHYON_VALUE_BALANCE_LEN: usize = 56;
         const BLOCK_SIZE_LEN: usize = 4;
         const NU6_1_BLOCK_INFO_LEN: usize = NU6_1_VALUE_BALANCE_LEN + BLOCK_SIZE_LEN;
         const IRONWOOD_BLOCK_INFO_LEN: usize = IRONWOOD_VALUE_BALANCE_LEN + BLOCK_SIZE_LEN;
+        #[cfg(zcash_unstable = "nutachyon")]
+        const TACHYON_BLOCK_INFO_LEN: usize = TACHYON_VALUE_BALANCE_LEN + BLOCK_SIZE_LEN;
 
         let bytes = bytes.as_ref();
 
         // We want to be forward-compatible, so this must work even if the
         // size of the buffer is larger than expected.
         match bytes.len() {
+            #[cfg(zcash_unstable = "nutachyon")]
+            TACHYON_BLOCK_INFO_LEN.. => {
+                let value_pools =
+                    ValueBalance::<NonNegative>::from_bytes(&bytes[..TACHYON_VALUE_BALANCE_LEN])
+                        .expect("must work for 56 bytes");
+                let size = u32::from_le_bytes(
+                    bytes[TACHYON_VALUE_BALANCE_LEN..TACHYON_VALUE_BALANCE_LEN + BLOCK_SIZE_LEN]
+                        .try_into()
+                        .expect("must be 4 bytes"),
+                );
+                BlockInfo::new(value_pools, size)
+            }
             IRONWOOD_BLOCK_INFO_LEN.. => {
                 let value_pools =
                     ValueBalance::<NonNegative>::from_bytes(&bytes[..IRONWOOD_VALUE_BALANCE_LEN])

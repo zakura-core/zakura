@@ -6,6 +6,7 @@ use crate::{amount::*, value_balance::*};
 
 proptest! {
     #[test]
+    #[cfg(zcash_unstable = "nutachyon")]
     fn value_blance_add(
         value_balance1 in any::<ValueBalance<NegativeAllowed>>(),
         value_balance2 in any::<ValueBalance<NegativeAllowed>>())
@@ -18,9 +19,10 @@ proptest! {
         let orchard = value_balance1.orchard + value_balance2.orchard;
         let deferred = value_balance1.deferred + value_balance2.deferred;
         let ironwood = value_balance1.ironwood + value_balance2.ironwood;
+        let tachyon = value_balance1.tachyon + value_balance2.tachyon;
 
-        match (transparent, sprout, sapling, orchard, deferred, ironwood) {
-            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood)) => prop_assert_eq!(
+        match (transparent, sprout, sapling, orchard, deferred, ironwood, tachyon) {
+            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood), Ok(tachyon)) => prop_assert_eq!(
                 value_balance1 + value_balance2,
                 Ok(ValueBalance {
                     transparent,
@@ -28,7 +30,8 @@ proptest! {
                     sapling,
                     orchard,
                     deferred,
-                    ironwood
+                    ironwood,
+                    tachyon
                 })
             ),
             _ => prop_assert!(
@@ -39,12 +42,14 @@ proptest! {
                         | ValueBalanceError::Sapling(_)
                         | ValueBalanceError::Orchard(_)
                         | ValueBalanceError::Deferred(_)
-                        | ValueBalanceError::Ironwood(_))
+                        | ValueBalanceError::Ironwood(_)
+                        | ValueBalanceError::Tachyon(_))
                 )
             ),
         }
     }
     #[test]
+    #[cfg(zcash_unstable = "nutachyon")]
     fn value_balance_sub(
         value_balance1 in any::<ValueBalance<NegativeAllowed>>(),
         value_balance2 in any::<ValueBalance<NegativeAllowed>>())
@@ -57,9 +62,10 @@ proptest! {
         let orchard = value_balance1.orchard - value_balance2.orchard;
         let deferred = value_balance1.deferred - value_balance2.deferred;
         let ironwood = value_balance1.ironwood - value_balance2.ironwood;
+        let tachyon = value_balance1.tachyon - value_balance2.tachyon;
 
-        match (transparent, sprout, sapling, orchard, deferred, ironwood) {
-            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood)) => prop_assert_eq!(
+        match (transparent, sprout, sapling, orchard, deferred, ironwood, tachyon) {
+            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood), Ok(tachyon)) => prop_assert_eq!(
                 value_balance1 - value_balance2,
                 Ok(ValueBalance {
                     transparent,
@@ -67,7 +73,8 @@ proptest! {
                     sapling,
                     orchard,
                     deferred,
-                    ironwood
+                    ironwood,
+                    tachyon
                 })
             ),
             _ => prop_assert!(matches!(
@@ -77,12 +84,14 @@ proptest! {
                         | ValueBalanceError::Sapling(_)
                         | ValueBalanceError::Orchard(_)
                         | ValueBalanceError::Deferred(_)
-                        | ValueBalanceError::Ironwood(_))
+                        | ValueBalanceError::Ironwood(_)
+                        | ValueBalanceError::Tachyon(_))
                 )),
         }
     }
 
     #[test]
+    #[cfg(zcash_unstable = "nutachyon")]
     fn value_balance_sum(
         value_balance1 in any::<ValueBalance<NegativeAllowed>>(),
         value_balance2 in any::<ValueBalance<NegativeAllowed>>(),
@@ -97,9 +106,10 @@ proptest! {
         let orchard = value_balance1.orchard + value_balance2.orchard;
         let deferred = value_balance1.deferred + value_balance2.deferred;
         let ironwood = value_balance1.ironwood + value_balance2.ironwood;
+        let tachyon = value_balance1.tachyon + value_balance2.tachyon;
 
-        match (transparent, sprout, sapling, orchard, deferred, ironwood) {
-            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood)) => prop_assert_eq!(
+        match (transparent, sprout, sapling, orchard, deferred, ironwood, tachyon) {
+            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood), Ok(tachyon)) => prop_assert_eq!(
                 collection.iter().sum::<Result<ValueBalance<NegativeAllowed>, ValueBalanceError>>(),
                 Ok(ValueBalance {
                     transparent,
@@ -107,7 +117,8 @@ proptest! {
                     sapling,
                     orchard,
                     deferred,
-                    ironwood
+                    ironwood,
+                    tachyon
                 })
             ),
             _ => prop_assert!(matches!(
@@ -117,7 +128,8 @@ proptest! {
                         | ValueBalanceError::Sapling(_)
                         | ValueBalanceError::Orchard(_)
                         | ValueBalanceError::Deferred(_)
-                        | ValueBalanceError::Ironwood(_))
+                        | ValueBalanceError::Ironwood(_)
+                        | ValueBalanceError::Tachyon(_))
                  ))
         }
     }
@@ -132,7 +144,8 @@ proptest! {
     }
 
     #[test]
-    fn value_balance_deserialization(bytes in any::<[u8; 48]>()) {
+    #[cfg(zcash_unstable = "nutachyon")]
+    fn value_balance_deserialization(bytes in any::<[u8; 56]>()) {
         let _init_guard = zakura_test::init();
 
         if let Ok(deserialized) = ValueBalance::<NonNegative>::from_bytes(&bytes) {
@@ -140,7 +153,7 @@ proptest! {
         }
     }
 
-    /// The legacy version of [`ValueBalance`] had 32 bytes compared to the current 48 bytes,
+    /// The legacy version of [`ValueBalance`] had 32 bytes compared to the current 56 bytes,
     /// but it's possible to correctly instantiate the current version of [`ValueBalance`] from
     /// the legacy format, so we test if Zebra can still deserialize the legacy format.
     #[test]
@@ -149,7 +162,7 @@ proptest! {
 
         if let Ok(deserialized) = ValueBalance::<NonNegative>::from_bytes(&bytes) {
             let deserialized = deserialized.to_bytes();
-            let mut extended_bytes = [0u8; 48];
+            let mut extended_bytes = [0u8; VALUE_BALANCE_BYTES];
             extended_bytes[..32].copy_from_slice(&bytes);
             prop_assert_eq!(extended_bytes, deserialized);
         }
@@ -165,8 +178,22 @@ proptest! {
 
         if let Ok(deserialized) = ValueBalance::<NonNegative>::from_bytes(&bytes) {
             let deserialized = deserialized.to_bytes();
-            let mut extended_bytes = [0u8; 48];
+            let mut extended_bytes = [0u8; VALUE_BALANCE_BYTES];
             extended_bytes[..40].copy_from_slice(&bytes);
+            prop_assert_eq!(extended_bytes, deserialized);
+        }
+    }
+
+    /// The pre-Tachyon value balance was a 48-byte prefix of the current format.
+    #[test]
+    #[cfg(zcash_unstable = "nutachyon")]
+    fn pre_tachyon_value_balance_deserialization(bytes in any::<[u8; 48]>()) {
+        let _init_guard = zakura_test::init();
+
+        if let Ok(deserialized) = ValueBalance::<NonNegative>::from_bytes(&bytes) {
+            let deserialized = deserialized.to_bytes();
+            let mut extended_bytes = [0u8; 56];
+            extended_bytes[..48].copy_from_slice(&bytes);
             prop_assert_eq!(extended_bytes, deserialized);
         }
     }

@@ -3,6 +3,8 @@
 pub mod constants;
 pub mod parameters;
 pub mod proposal;
+#[cfg(zcash_unstable = "nutachyon")]
+pub mod tachyon;
 pub mod zip317;
 
 #[cfg(test)]

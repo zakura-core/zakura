@@ -238,6 +238,11 @@ pub enum RollbackFinalizedStateError {
     #[error("failed to rebuild history tree")]
     HistoryTree(#[from] HistoryTreeError),
 
+    /// Rebuilding the Tachyon anchor failed.
+    #[error("failed to rebuild the Tachyon anchor")]
+    #[cfg(zcash_unstable = "nutachyon")]
+    TachyonAnchor(#[from] zcash_tachyon::AnchorError),
+
     /// Computing a block subsidy failed.
     #[error("failed to compute block subsidy")]
     Subsidy(#[from] SubsidyError),
@@ -606,14 +611,44 @@ fn rebuild_history_tree_from_upgrade_activation(
 
     let (block, sapling_root, orchard_root, ironwood_root) =
         history_rebuild_inputs_at_height(db, start_height)?;
-    let mut history_tree =
-        HistoryTree::from_block(network, block, &sapling_root, &orchard_root, &ironwood_root)?;
+    #[cfg(zcash_unstable = "nutachyon")]
+    let mut tachyon_anchor = zakura_chain::tachyon::Anchor::default();
+    #[cfg(zcash_unstable = "nutachyon")]
+    if let Some(pool_height) = zakura_chain::tachyon::pool_height(network, start_height) {
+        tachyon_anchor = tachyon_anchor
+            .advance_with_block(pool_height, &block)?
+            .post_block;
+    }
+    let mut history_tree = HistoryTree::from_block(
+        network,
+        block,
+        &sapling_root,
+        &orchard_root,
+        &ironwood_root,
+        #[cfg(zcash_unstable = "nutachyon")]
+        &tachyon_anchor,
+    )?;
 
     for height in ((start_height.0 + 1)..=target_height.0).map(Height) {
         let (block, sapling_root, orchard_root, ironwood_root) =
             history_rebuild_inputs_at_height(db, height)?;
 
-        history_tree.push(network, block, &sapling_root, &orchard_root, &ironwood_root)?;
+        #[cfg(zcash_unstable = "nutachyon")]
+        if let Some(pool_height) = zakura_chain::tachyon::pool_height(network, height) {
+            tachyon_anchor = tachyon_anchor
+                .advance_with_block(pool_height, &block)?
+                .post_block;
+        }
+
+        history_tree.push(
+            network,
+            block,
+            &sapling_root,
+            &orchard_root,
+            &ironwood_root,
+            #[cfg(zcash_unstable = "nutachyon")]
+            &tachyon_anchor,
+        )?;
     }
 
     Ok(history_tree)
@@ -679,12 +714,28 @@ fn rebuild_treestate_to_height(
             .ok_or(RollbackFinalizedStateError::MissingBlock { height })?;
 
         note_commitment_trees.update_trees_parallel(&block)?;
+        #[cfg(zcash_unstable = "nutachyon")]
+        if let Some(pool_height) = zakura_chain::tachyon::pool_height(network, height) {
+            let advance = note_commitment_trees
+                .tachyon_anchor
+                .advance_with_block(pool_height, &block)?;
+            note_commitment_trees.tachyon_anchor = advance.post_block;
+            note_commitment_trees.tachyon_epoch_anchor = advance.epoch_boundary;
+        }
         retained_sprout_roots.insert(note_commitment_trees.sprout.root());
 
         let sapling_root = note_commitment_trees.sapling.root();
         let orchard_root = note_commitment_trees.orchard.root();
         let ironwood_root = note_commitment_trees.ironwood.root();
-        history_tree.push(network, block, &sapling_root, &orchard_root, &ironwood_root)?;
+        history_tree.push(
+            network,
+            block,
+            &sapling_root,
+            &orchard_root,
+            &ironwood_root,
+            #[cfg(zcash_unstable = "nutachyon")]
+            &note_commitment_trees.tachyon_anchor,
+        )?;
     }
 
     Ok(RebuiltTreestate {

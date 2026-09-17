@@ -6,7 +6,7 @@ on:
   # that touch no test-relevant files. This keeps the `test success` required
   # check reporting on every PR instead of sitting in "Expected" forever.
   pull_request:
-    branches: [main, "feat/**", "release/**"]
+    branches: [main, "feat/**", "release/**", "c/nu-tachyon"]
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
   push:
@@ -26,6 +26,7 @@ on:
       - .github/actions/setup-zakura-build/**
       - .github/workflows/tests-unit.yml
       - scripts/check-crate-publish-graph.sh
+      - scripts/test-tachyon-db-upgrade.sh
       - scripts/lib/crates-index.sh
       - docs/specs/fork-aware-header-chain-engine.md
       - crates/zakura-header-chain/conformance.toml
@@ -174,7 +175,7 @@ jobs:
           # the build archive consumed by zakura-config, so `config` implies
           # `rust` even for paths outside the old workflow-level filter.
           if [[ "$config" == "true" ]] || \
-             grep -qE '(^crates/|\.rs$|(^|/)Cargo\.(toml|lock)$|^\.cargo/config\.toml$|^\.config/nextest\.toml$|^\.github/workflows/tests-unit\.yml$)' <<< "$changed"; then
+             grep -qE '(^crates/|\.rs$|(^|/)Cargo\.(toml|lock)$|^\.cargo/config\.toml$|^\.config/nextest\.toml$|^\.github/workflows/tests-unit\.yml$|^scripts/test-tachyon-db-upgrade\.sh$)' <<< "$changed"; then
             rust=true
           else
             rust=false
@@ -362,6 +363,35 @@ jobs:
             -p zakura-consensus --lib
           cargo check --locked -p zakura --features nu7
 
+  tachyon-upgrade:
+    name: Tachyon database upgrade
+    needs: changes
+    # Compiles its own binaries, because the shared nextest archive is built
+    # without this feature.
+    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      id-token: write
+      statuses: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
+        with:
+          toolchain: stable
+      - uses: ./.github/actions/setup-zakura-build
+      - name: Test ordinary and Tachyon database formats
+        run: |
+          scripts/test-tachyon-db-upgrade.sh
+          RUSTFLAGS='' cargo test --locked -p zakura-state --lib
+          RUSTFLAGS='--cfg zcash_unstable="nutachyon"' cargo test --locked -p zakura-state --lib
+          RUSTFLAGS='' cargo test --locked -p zakura-rpc --lib snapshot
+          RUSTFLAGS='--cfg zcash_unstable="nutachyon"' cargo test --locked -p zakura-rpc --lib snapshot
+          RUSTFLAGS='--cfg zcash_unstable="nutachyon"' cargo test --locked -p zakura-chain -p zakura-consensus --lib tachyon
+
   network-dependent:
     name: network-dependent acceptance tests
     needs: changes
@@ -491,6 +521,7 @@ jobs:
       - unit-tests
       - zakura-config
       - nu7
+      - tachyon-upgrade
       - network-dependent
       - pruned-storage
       - check-no-git-dependencies
@@ -508,7 +539,7 @@ jobs:
           # check-no-git-dependencies is A-release-label only, publish-graph
           # skips on PRs that do not touch Cargo manifests or this check.
           # Failed, non-skipped jobs still fail this aggregate status.
-          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, network-dependent, nu7, publish-graph
+          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, network-dependent, nu7, tachyon-upgrade, publish-graph
 
   report-nightly-result:
     name: report nightly release test result

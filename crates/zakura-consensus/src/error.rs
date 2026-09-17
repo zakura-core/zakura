@@ -290,6 +290,18 @@ pub enum TransactionError {
     #[error("Ironwood proof has a non-canonical size")]
     IronwoodProofSize,
 
+    #[error("Tachyon action value commitment and verification key must not be identity: {0}")]
+    #[cfg(zcash_unstable = "nutachyon")]
+    TachyonIdentityAction(String),
+
+    #[error("Tachyon action and binding signatures must verify: {0}")]
+    #[cfg(zcash_unstable = "nutachyon")]
+    TachyonSignatureInvalid(String),
+
+    #[error("the mempool only accepts autonome Tachyon transactions")]
+    #[cfg(zcash_unstable = "nutachyon")]
+    NonAutonomeTachyon,
+
     #[error("unexpected error")]
     Other(String),
 }
@@ -492,6 +504,14 @@ impl TransactionError {
             Self::Balance(_) => consensus("transaction.balance"),
             Self::OrchardProofSize => consensus("transaction.orchard_proof_size"),
             Self::IronwoodProofSize => consensus("transaction.ironwood_proof_size"),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Self::TachyonIdentityAction(_) => consensus("transaction.tachyon_identity_action"),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Self::TachyonSignatureInvalid(_) => consensus("transaction.tachyon_signature_invalid"),
+            #[cfg(zcash_unstable = "nutachyon")]
+            Self::NonAutonomeTachyon => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
+            }
             Self::ImmatureTransparentCoinbaseSpend { .. } => {
                 consensus("transaction.immature_transparent_coinbase_spend")
             }
@@ -549,6 +569,9 @@ impl TransactionError {
             | MissingConsensusBranchId
             | LockedUntilAfterBlockHeight(_)
             | LockedUntilAfterBlockTime(_) => 100,
+
+            #[cfg(zcash_unstable = "nutachyon")]
+            TachyonIdentityAction(_) | TachyonSignatureInvalid(_) => 100,
 
             // NU6.2 mempool transactions are invalid under NU6.3 rules, but
             // honest peers can relay them briefly while their chain tips converge.
@@ -717,6 +740,30 @@ pub enum BlockError {
         source: amount::Error,
     },
 
+    #[error("all Tachygrams in a block must be distinct")]
+    #[cfg(zcash_unstable = "nutachyon")]
+    DuplicateTachygram,
+
+    #[error("a Tachyon pointer stamp must refer to a proof-stamped transaction in the same block")]
+    #[cfg(zcash_unstable = "nutachyon")]
+    TachyonAggregateNotFound,
+
+    #[error("a Tachyon proof stamp's covered-actions digest does not match its aggregate")]
+    #[cfg(zcash_unstable = "nutachyon")]
+    TachyonCoverageMismatch,
+
+    #[error("action descriptors covered by a Tachyon proof stamp must be distinct")]
+    #[cfg(zcash_unstable = "nutachyon")]
+    TachyonDuplicateAction,
+
+    #[error("a Tachyon proof stamp must publish exactly two Tachygrams per covered action")]
+    #[cfg(zcash_unstable = "nutachyon")]
+    TachyonTachygramArityMismatch,
+
+    #[error("a Tachyon proof stamp must verify: {0}")]
+    #[cfg(zcash_unstable = "nutachyon")]
+    TachyonProofInvalid(String),
+
     #[error("unexpected error occurred: {0}")]
     Other(String),
 }
@@ -755,6 +802,13 @@ impl BlockError {
             | BadMerkleRoot { .. }
             | WrongTransactionConsensusBranchId
             | TooManyTransparentSignatureOperations { .. } => 100,
+            #[cfg(zcash_unstable = "nutachyon")]
+            DuplicateTachygram
+            | TachyonAggregateNotFound
+            | TachyonCoverageMismatch
+            | TachyonDuplicateAction
+            | TachyonTachygramArityMismatch
+            | TachyonProofInvalid(_) => 100,
             Transaction(err) => err.mempool_misbehavior_score(),
             _other => 0,
         }

@@ -35,7 +35,7 @@ use crate::{
     service::finalized_state::{
         disk_db::DiskDb,
         disk_format::{tests::KV, RawBytes},
-        FinalizedState, COMMITMENT_ROOTS_BY_HEIGHT, VCT_UPGRADE_METADATA,
+        FinalizedState, COMMITMENT_ROOTS_BY_HEIGHT, NODE_SOFTWARE_METADATA, VCT_UPGRADE_METADATA,
     },
     Config, ReadDisk,
 };
@@ -70,7 +70,7 @@ fn test_raw_rocksdb_column_families_with_network(network: Network) {
 
     // Assert that column family names are the same, regardless of the network.
     // Later, we check they are also the same regardless of the block height.
-    insta::assert_ron_snapshot!("column_family_names", cf_names);
+    insta::assert_ron_snapshot!(build_snapshot_name("column_family_names"), cf_names);
 
     // Assert that empty databases are the same, regardless of the network.
     let mut settings = insta::Settings::clone_current();
@@ -142,13 +142,33 @@ fn snapshot_raw_rocksdb_column_family_data(db: &DiskDb, original_cf_names: &[Str
             // The note commitment tree snapshots will change if the trees do not have cached roots.
             // But we expect them to always have cached roots,
             // because those roots are used to populate the anchor column families.
-            insta::assert_ron_snapshot!(format!("{cf_name}_raw_data"), cf_data);
+            let name = format!("{cf_name}_raw_data");
+            let name = if matches!(cf_name.as_str(), "block_info" | "tip_chain_value_pool") {
+                build_snapshot_name(&name)
+            } else {
+                name
+            };
+            insta::assert_ron_snapshot!(name, cf_data);
         }
     }
 
-    insta::assert_ron_snapshot!("empty_column_families", empty_column_families);
+    insta::assert_ron_snapshot!(
+        build_snapshot_name("empty_column_families"),
+        empty_column_families
+    );
 }
 
 fn skip_raw_data_snapshot(cf_name: &str) -> bool {
-    matches!(cf_name, COMMITMENT_ROOTS_BY_HEIGHT | VCT_UPGRADE_METADATA)
+    matches!(
+        cf_name,
+        COMMITMENT_ROOTS_BY_HEIGHT | NODE_SOFTWARE_METADATA | VCT_UPGRADE_METADATA
+    )
+}
+
+fn build_snapshot_name(name: &str) -> String {
+    if cfg!(zcash_unstable = "nutachyon") {
+        format!("{name}_tachyon")
+    } else {
+        name.to_owned()
+    }
 }

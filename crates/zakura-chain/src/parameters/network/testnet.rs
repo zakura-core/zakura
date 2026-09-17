@@ -194,6 +194,8 @@ impl From<&BTreeMap<Height, NetworkUpgrade>> for ConfiguredActivationHeights {
                 NetworkUpgrade::Nu6_2 => &mut configured_activation_heights.nu6_2,
                 NetworkUpgrade::Nu6_3 => &mut configured_activation_heights.nu6_3,
                 NetworkUpgrade::Nu7 => &mut configured_activation_heights.nu7,
+                #[cfg(zcash_unstable = "nutachyon")]
+                NetworkUpgrade::NuTachyon => &mut configured_activation_heights.nu_tachyon,
                 #[cfg(zcash_unstable = "zfuture")]
                 NetworkUpgrade::ZFuture => &mut configured_activation_heights.zfuture,
                 NetworkUpgrade::Genesis => continue,
@@ -516,6 +518,9 @@ pub struct ConfiguredActivationHeights {
     /// Activation height for `NU7` network upgrade.
     #[serde(rename = "NU7")]
     pub nu7: Option<u32>,
+    /// Activation height for `NuTachyon` network upgrade.
+    #[cfg(zcash_unstable = "nutachyon")]
+    pub nu_tachyon: Option<u32>,
     /// Activation height for `ZFuture` network upgrade.
     #[serde(rename = "ZFuture")]
     #[cfg(zcash_unstable = "zfuture")]
@@ -539,6 +544,8 @@ impl ConfiguredActivationHeights {
             nu6_2,
             nu6_3,
             nu7,
+            #[cfg(zcash_unstable = "nutachyon")]
+            nu_tachyon,
             #[cfg(zcash_unstable = "zfuture")]
             zfuture,
         } = self;
@@ -562,6 +569,8 @@ impl ConfiguredActivationHeights {
             nu6_2,
             nu6_3,
             nu7,
+            #[cfg(zcash_unstable = "nutachyon")]
+            nu_tachyon,
             #[cfg(zcash_unstable = "zfuture")]
             zfuture,
         }
@@ -759,6 +768,8 @@ impl ParametersBuilder {
             nu6_2,
             nu6_3,
             nu7,
+            #[cfg(zcash_unstable = "nutachyon")]
+            nu_tachyon,
             #[cfg(zcash_unstable = "zfuture")]
             zfuture,
         }: ConfiguredActivationHeights,
@@ -788,6 +799,10 @@ impl ParametersBuilder {
                 .chain(nu6_2.into_iter().map(|h| (h, Nu6_2)))
                 .chain(nu6_3.into_iter().map(|h| (h, Nu6_3)))
                 .chain(nu7.into_iter().map(|h| (h, Nu7)));
+
+            #[cfg(zcash_unstable = "nutachyon")]
+            let activation_heights =
+                activation_heights.chain(nu_tachyon.into_iter().map(|h| (h, NuTachyon)));
 
             #[cfg(zcash_unstable = "zfuture")]
             let activation_heights =

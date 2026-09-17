@@ -739,6 +739,8 @@ fn synthetic_block_at_height(
         | Transaction::V4 { inputs, .. }
         | Transaction::V5 { inputs, .. } => &mut inputs[0],
         Transaction::V6 { inputs, .. } => &mut inputs[0],
+        #[cfg(zcash_unstable = "nutachyon")]
+        Transaction::V7 { inputs, .. } => &mut inputs[0],
     };
     match input {
         transparent::Input::Coinbase {

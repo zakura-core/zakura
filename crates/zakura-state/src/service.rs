@@ -57,7 +57,7 @@ use crate::{
         check::difficulty::POW_ADJUSTMENT_BLOCK_SPAN,
         finalized_state::{
             header_chain::{HeaderChainStore, HeaderChainStoreError},
-            FinalizedState, ZakuraDb,
+            DatabaseWriterMetadata, FinalizedState, ZakuraDb,
         },
         non_finalized_state::{Chain, NonFinalizedState},
         pending_utxos::PendingUtxos,
@@ -435,6 +435,25 @@ impl StateService {
         max_checkpoint_height: block::Height,
         checkpoint_verify_concurrency_limit: usize,
     ) -> Result<(Self, ReadStateService, LatestChainTip, ChainTipChange), StateInitError> {
+        Self::new_with_database_writer_metadata(
+            config,
+            network,
+            max_checkpoint_height,
+            checkpoint_verify_concurrency_limit,
+            DatabaseWriterMetadata::default_zakura(),
+        )
+        .await
+    }
+
+    /// Creates a new state service, recording explicit writer metadata in the
+    /// writable finalized database.
+    pub async fn new_with_database_writer_metadata(
+        config: Config,
+        network: &Network,
+        max_checkpoint_height: block::Height,
+        checkpoint_verify_concurrency_limit: usize,
+        database_writer_metadata: DatabaseWriterMetadata,
+    ) -> Result<(Self, ReadStateService, LatestChainTip, ChainTipChange), StateInitError> {
         let (finalized_state, finalized_tip, historical_trees, timer) = {
             let config = config.clone();
             let network = network.clone();
@@ -442,20 +461,24 @@ impl StateService {
                 let timer = CodeTimer::start();
                 // `expect` would format the error with `Debug`, which drops the actionable
                 // guidance each `StateInitError` carries in its `Display` message.
-                let finalized_state = FinalizedState::new(&config, &network)
-                    .unwrap_or_else(|error| match error {
-                        // This database cannot be repaired, and the generic hint below would
-                        // send the operator looking at permissions and disk space instead.
-                        error @ StateInitError::VctSproutHistoryUnrepairable => {
-                            panic!("{error}")
-                        }
-                        error => panic!(
-                            "opening the read-write finalized state database failed: {error}; \
+                let finalized_state = FinalizedState::new_with_database_writer_metadata(
+                    &config,
+                    &network,
+                    database_writer_metadata,
+                )
+                .unwrap_or_else(|error| match error {
+                    // These errors require the guidance they carry, rather than a disk-space hint.
+                    error @ (StateInitError::VctSproutHistoryUnrepairable
+                    | StateInitError::UnsupportedDatabaseFormat { .. }) => {
+                        panic!("{error}")
+                    }
+                    error => panic!(
+                        "opening the read-write finalized state database failed: {error}; \
                              check that the state cache directory is writable and not locked by \
                              another Zakura instance, and that there is free disk space"
-                        ),
-                    })
-                    .with_checkpoint_raw_tx_retention(max_checkpoint_height, &config);
+                    ),
+                })
+                .with_checkpoint_raw_tx_retention(max_checkpoint_height, &config);
                 timer.finish_desc("opening finalized state database");
 
                 let timer = CodeTimer::start();
@@ -2781,6 +2804,103 @@ impl Service<ReadRequest> for ReadStateService {
                 })
             }
 
+            #[cfg(zcash_unstable = "nutachyon")]
+            ReadRequest::TachyonMiningData {
+                anchors,
+                tachygrams,
+                tip_hash,
+                candidate_height,
+            } => {
+                let best_chain = state.latest_best_chain();
+                if read::tip(best_chain.clone(), &state.db).is_none_or(
+                    |(current_tip_height, current_tip_hash)| {
+                        current_tip_hash != tip_hash
+                            || current_tip_height.0.checked_add(1) != Some(candidate_height.0)
+                    },
+                ) {
+                    return Ok(ReadResponse::TachyonMiningData(None));
+                }
+
+                let anchor_heights: HashMap<_, _> = anchors
+                    .into_iter()
+                    .filter_map(|anchor| {
+                        best_chain
+                            .as_ref()
+                            .and_then(|chain| chain.tachyon_anchors.get(&anchor))
+                            .and_then(|heights| heights.last().copied())
+                            .or_else(|| state.db.tachyon_anchor_height(&anchor))
+                            .map(|height| (anchor, height))
+                    })
+                    .collect();
+
+                let tip_anchor = best_chain.as_ref().map_or_else(
+                    || state.db.tachyon_anchor_for_tip(),
+                    |chain| chain.tachyon_anchor_for_tip(),
+                );
+
+                let mut epoch_ranges = HashMap::new();
+                for &height in anchor_heights.values() {
+                    let Some(epoch) = zakura_chain::tachyon::epoch(&state.network, height) else {
+                        continue;
+                    };
+
+                    epoch_ranges
+                        .entry(epoch)
+                        .and_modify(|(start, end): &mut (block::Height, block::Height)| {
+                            *start = (*start).min(height);
+                            *end = (*end).max(height);
+                        })
+                        .or_insert((height, height));
+                }
+
+                let mut blocks = BTreeMap::new();
+                for (start, end) in epoch_ranges.into_values() {
+                    if start == end {
+                        continue;
+                    }
+
+                    for height_value in (start.0 + 1)..=end.0 {
+                        let height = block::Height(height_value);
+                        if let Some(block) =
+                            read::block(best_chain.clone(), &state.db, height.into())
+                        {
+                            blocks.insert(height, block);
+                        }
+                    }
+                }
+
+                let revealed_tachygrams = tachygrams
+                    .into_iter()
+                    .filter(|tachygram| {
+                        let in_window = |revealed_height| {
+                            zakura_chain::tachyon::within_scan_window(
+                                &state.network,
+                                revealed_height,
+                                candidate_height,
+                            )
+                        };
+
+                        best_chain
+                            .as_ref()
+                            .and_then(|chain| chain.tachyon_tachygrams.get(tachygram))
+                            .is_some_and(|heights| heights.iter().copied().any(in_window))
+                            || state
+                                .db
+                                .tachyon_tachygram_revealed_height(tachygram)
+                                .is_some_and(in_window)
+                    })
+                    .collect();
+
+                Ok(ReadResponse::TachyonMiningData(Some(
+                    crate::response::TachyonMiningData {
+                        tip_anchor,
+                        anchor_heights,
+                        blocks,
+                        revealed_tachygrams,
+                    },
+                )))
+            }
+
             // Used by getblock
             ReadRequest::BlockInfo(hash_or_height) => Ok(ReadResponse::BlockInfo(
                 read::block_info(state.latest_best_chain(), &state.db, hash_or_height),
@@ -3663,16 +3783,52 @@ pub async fn init_with_header_chain_body_evidence(
     ),
     StateInitError,
 > {
-    let (state, read_state, latest_chain_tip, chain_tip_change) = init(
+    init_with_database_writer_metadata(
         config,
         network,
         max_checkpoint_height,
         checkpoint_verify_concurrency_limit,
+        DatabaseWriterMetadata::default_zakura(),
     )
-    .await?;
+    .await
+}
+
+/// Initialize a state service from the provided [`Config`] and explicit node
+/// software metadata. Returns the body-evidence authority used by the node.
+///
+/// # Errors
+///
+/// Returns a [`StateInitError`] if historical tree derivation is misconfigured or its
+/// frontier artifact cannot be loaded.
+pub async fn init_with_database_writer_metadata(
+    config: Config,
+    network: &Network,
+    max_checkpoint_height: block::Height,
+    checkpoint_verify_concurrency_limit: usize,
+    database_writer_metadata: DatabaseWriterMetadata,
+) -> Result<
+    (
+        BoxService<Request, Response, BoxError>,
+        ReadStateService,
+        LatestChainTip,
+        ChainTipChange,
+        crate::HeaderChainBodyEvidenceAuthority,
+    ),
+    StateInitError,
+> {
+    let (state_service, read_only_state_service, latest_chain_tip, chain_tip_change) =
+        StateService::new_with_database_writer_metadata(
+            config,
+            network,
+            max_checkpoint_height,
+            checkpoint_verify_concurrency_limit,
+            database_writer_metadata,
+        )
+        .await?;
+
     Ok((
-        state,
-        read_state,
+        BoxService::new(state_service),
+        read_only_state_service,
         latest_chain_tip,
         chain_tip_change,
         crate::HeaderChainBodyEvidenceAuthority::new(),

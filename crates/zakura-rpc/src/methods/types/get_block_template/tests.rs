@@ -205,6 +205,77 @@ fn local_genesis_activation_coinbase_includes_lockbox_marker() -> anyhow::Result
     Ok(())
 }
 
+/// A NuTachyon template must convert into a mineable proposal block.
+#[cfg(zcash_unstable = "nutachyon")]
+#[test]
+fn nu_tachyon_template_converts_to_proposal_block() -> anyhow::Result<()> {
+    use crate::methods::types::{
+        get_block_template::proposal::proposal_block_from_template, long_poll::LongPollInput,
+    };
+    use zakura_chain::{
+        block::ChainHistoryMmrRootHash,
+        serialization::{BytesInDisplayOrder, DateTime32},
+        work::difficulty::{CompactDifficulty, ExpandedDifficulty, U256},
+    };
+
+    let net = testnet::Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            canopy: Some(1),
+            nu5: Some(2),
+            nu6: Some(3),
+            nu6_1: Some(4),
+            nu6_2: Some(5),
+            nu6_3: Some(6),
+            nu_tachyon: Some(7),
+            ..Default::default()
+        })?
+        .clear_funding_streams()
+        .to_network()?;
+    let height = NetworkUpgrade::NuTachyon
+        .activation_height(&net)
+        .ok_or(anyhow!("NuTachyon activation height must be configured"))?;
+    let tip_height = height.previous()?;
+    let miner_params = MinerParams::from(
+        Address::decode(
+            &net,
+            default_miner_address(net.kind(), &MinerAddressType::Transparent),
+        )
+        .ok_or(anyhow!("hard-coded transparent address must be valid"))?,
+    );
+    let now = DateTime32::now();
+    let chain_info = zakura_state::GetBlockTemplateChainInfo {
+        tip_hash: net.genesis_hash(),
+        tip_height,
+        chain_history_root: Some(ChainHistoryMmrRootHash::default()),
+        expected_difficulty: CompactDifficulty::from(ExpandedDifficulty::from(U256::one())),
+        cur_time: now,
+        min_time: now,
+        max_time: now,
+    };
+    let long_poll_id = LongPollInput::new(tip_height, chain_info.tip_hash, now, []).generate_id();
+    let template = super::BlockTemplateResponse::new_internal(
+        &net,
+        None,
+        &miner_params,
+        &chain_info,
+        long_poll_id,
+        vec![],
+        None,
+    );
+
+    let block = proposal_block_from_template(&template, None, &net)?;
+
+    assert_eq!(
+        block.header.commitment_bytes.0,
+        template
+            .default_roots
+            .block_commitments_hash
+            .bytes_in_serialized_order(),
+    );
+
+    Ok(())
+}
+
 /// The Zakura marker is always prepended, and `extra_coinbase_data` can't exceed
 /// the limit.
 #[test]

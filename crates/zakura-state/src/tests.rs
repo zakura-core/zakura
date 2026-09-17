@@ -37,6 +37,8 @@ impl FakeChainHelper for Arc<Block> {
             Transaction::V4 { inputs, .. } => &mut inputs[0],
             Transaction::V5 { inputs, .. } => &mut inputs[0],
             Transaction::V6 { inputs, .. } => &mut inputs[0],
+            #[cfg(zcash_unstable = "nutachyon")]
+            Transaction::V7 { inputs, .. } => &mut inputs[0],
         };
 
         match input {

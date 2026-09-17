@@ -142,6 +142,10 @@ impl Commitment {
             (Nu5 | Nu6 | Nu6_1 | Nu6_2 | Nu6_3 | Nu7, _) => Ok(ChainHistoryBlockTxAuthCommitment(
                 ChainHistoryBlockTxAuthCommitmentHash(bytes),
             )),
+            #[cfg(zcash_unstable = "nutachyon")]
+            (NuTachyon, _) => Ok(ChainHistoryBlockTxAuthCommitment(
+                ChainHistoryBlockTxAuthCommitmentHash(bytes),
+            )),
 
             #[cfg(zcash_unstable = "zfuture")]
             (ZFuture, _) => Ok(ChainHistoryBlockTxAuthCommitment(

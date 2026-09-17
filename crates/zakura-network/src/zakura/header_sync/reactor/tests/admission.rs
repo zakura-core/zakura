@@ -770,3 +770,74 @@ async fn peer_admission_catches_up_snapshot_before_initial_status() {
 
     reactor.abort();
 }
+
+#[test]
+fn verified_progress_reopens_refill_without_a_status_refresh_or_reanchor() {
+    for (target_height, before_credit, open_credit) in [(20_000, 400, 401), (4_001, 0, 1)] {
+        let mut startup = startup(CancellationToken::new());
+        let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+        let mut initial = committed_snapshot(anchor);
+        initial.frontiers.header_best.height = block::Height(anchor.height.0 + MAX_HS_RANGE);
+        let (_snapshots_tx, snapshots_rx) = watch::channel(Some(initial.clone()));
+        startup.committed_snapshots = Some(snapshots_rx);
+        let (_handle, mut actions, mut reactor) = build_header_sync_reactor(startup).unwrap();
+        let peer = peer();
+        let (send, _outbound) = framed_channel(8);
+        reactor.handle_event(Event::PeerConnected(
+            PeerSession::from_parts_with_session_id(
+                peer.clone(),
+                7,
+                send,
+                CancellationToken::new(),
+            ),
+        ));
+        seed_applying_request(&mut reactor, &initial, peer.clone(), 7);
+        let mut advertised = reactor
+            .peer_work_queue
+            .active(&peer)
+            .unwrap()
+            .target
+            .status
+            .clone();
+        advertised.selected_tip_height = block::Height(anchor.height.0 + target_height);
+        reactor.peer_state.get_mut(&peer).unwrap().last_status = Some(advertised.clone());
+        reactor.clear_peer_work_for_test(&peer);
+        while actions.try_recv().is_ok() {}
+
+        let mut next = initial.clone();
+        next.frontiers.verified_best.height = block::Height(anchor.height.0 + before_credit);
+        next.state_version = next.state_version.checked_next().unwrap();
+        reactor.observe_latest_committed_snapshot(next.clone());
+        assert!(
+            actions.try_recv().is_err(),
+            "insufficient returned credits must not start a refill"
+        );
+
+        next.frontiers.verified_best.height = block::Height(anchor.height.0 + open_credit);
+        next.state_version = next.state_version.checked_next().unwrap();
+        reactor.observe_latest_committed_snapshot(next.clone());
+        let HeaderPortOperation::QueryHeaderLocator {
+            peer: scheduled_peer,
+            target_tip_hash,
+            ..
+        } = actions
+            .try_recv()
+            .expect("returned body credits immediately reconsider the cached target")
+        else {
+            panic!("refill must request its locator without waiting for peer status");
+        };
+        assert_eq!(scheduled_peer, peer);
+        assert_eq!(target_tip_hash, advertised.selected_tip_hash);
+        assert_eq!(next.header_generation, initial.header_generation);
+        assert_eq!(next.frontiers.finalized, initial.frontiers.finalized);
+        assert!(actions.try_recv().is_err());
+
+        next.frontiers.verified_best.height = block::Height(anchor.height.0 + open_credit + 1);
+        next.state_version = next.state_version.checked_next().unwrap();
+        reactor.observe_latest_committed_snapshot(next);
+        assert!(
+            actions.try_recv().is_err(),
+            "an open refill does not schedule a locator per commit"
+        );
+    }
+}

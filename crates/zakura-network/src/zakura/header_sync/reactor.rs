@@ -58,14 +58,8 @@ const SNAPSHOT_REFRESH_TRACE_INTERVAL: std::time::Duration = std::time::Duration
 fn snapshot_refresh_trace_due(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|last| now.saturating_duration_since(last) >= SNAPSHOT_REFRESH_TRACE_INTERVAL)
 }
-/// Keep one maximum wire page ahead of integrated full state, then refill at half-window low water.
-///
-/// Each integrated full-state advance reanchors the durable header DAG.
-/// The bound keeps initial-sync consensus transitions proportional to pipeline work.
-/// Half-window refills overlap proof validation and durable admission with body application.
-/// The refills also preserve enough work for a partial checkpoint range.
+/// Bound admitted and reserved headers to one wire page ahead of verified bodies.
 const INTEGRATED_HEADER_BODY_WINDOW_V1: u32 = MAX_HS_RANGE;
-const INTEGRATED_HEADER_REFILL_LOW_WATER_V1: u32 = INTEGRATED_HEADER_BODY_WINDOW_V1 / 2;
 
 /// Spawn the canonical header-sync reactor.
 pub fn spawn_header_sync_reactor(
@@ -2832,34 +2826,24 @@ impl HeaderSyncReactor {
         u32::try_from(remaining).unwrap_or(u32::MAX)
     }
 
-    /// Prepare enough selected-chain headers for a checkpoint and its VCT successor
-    /// when the admitted body pipeline has less than that much work remaining.
+    /// Publish a checkpoint-sized selected extension without chasing new body credits.
     fn should_prepare_checkpoint_prefix(
         snapshot: &zakura_header_chain::EngineSnapshot,
         active: &ActiveHeaderRequest,
     ) -> bool {
         let checkpoint_gap =
             zakura_chain::parameters::checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP;
-        let body_lag = snapshot
-            .frontiers
-            .header_best
-            .height
-            .0
-            .saturating_sub(snapshot.frontiers.verified_best.height.0);
         snapshot.mode == zakura_header_chain::EngineMode::Integrated
             && matches!(active.purpose, HeaderTargetPurpose::Normal)
             && active.common_ancestor == Some(snapshot.frontiers.header_best)
             && active.entries.len() > checkpoint_gap
-            && usize::try_from(body_lag).expect("u32 body lag fits usize on supported targets")
-                <= checkpoint_gap
     }
 
     /// Return requester headroom after both the durable DAG limit and the integrated body window.
     ///
-    /// A partial window remains closed until half of the admitted body lag remains.
-    /// The hysteresis avoids small header transitions and preserves work for body application.
-    /// The checkpoint bound lets a smaller protocol window admit a complete checkpoint range.
-    /// The final partial page lets a node reach a target with a suffix shorter than one page.
+    /// Coalesce returned credits until a checkpoint and its successor fit.
+    /// The final partial target can use fewer credits to reach the tip.
+    /// Reservations and staged entries still consume the same bounded window.
     fn request_header_prefix_remaining(
         snapshot: &zakura_header_chain::EngineSnapshot,
         claimed: usize,
@@ -2876,13 +2860,12 @@ impl HeaderSyncReactor {
         let target_remaining = target_tip_height
             .0
             .saturating_sub(snapshot.frontiers.header_best.height.0);
-        let checkpoint_low_water = u32::try_from(
+        let refill_batch = u32::try_from(
             zakura_chain::parameters::checkpoint::constants::MAX_CHECKPOINT_HEIGHT_GAP,
         )
         .expect("the consensus checkpoint height gap fits a block height")
         .saturating_add(1);
-        let refill_low_water = checkpoint_low_water.max(INTEGRATED_HEADER_REFILL_LOW_WATER_V1);
-        if body_lag > refill_low_water && target_remaining > body_window {
+        if body_window < refill_batch && target_remaining > body_window {
             return 0;
         }
         let claimed = u32::try_from(claimed).unwrap_or(u32::MAX);
@@ -2898,6 +2881,17 @@ impl HeaderSyncReactor {
             old.header_generation != snapshot.header_generation
                 || old.frontiers.finalized != snapshot.frontiers.finalized
         });
+        let claimed = self.peer_work_queue.claimed_header_count();
+        let refill_reopened = !header_authority_changed
+            && self.committed_snapshot.as_ref().is_some_and(|old| {
+                self.peer_state.values().any(|peer| {
+                    peer.last_status.as_ref().is_some_and(|status| {
+                        let target = status.selected_tip_height;
+                        Self::request_header_prefix_remaining(old, claimed, target) == 0
+                            && Self::request_header_prefix_remaining(&snapshot, claimed, target) > 0
+                    })
+                })
+            });
         self.emit_snapshot_observed(self.committed_snapshot.as_ref(), &snapshot);
         self.retire_obsolete_work(&snapshot);
         let old_tip = self
@@ -2932,7 +2926,7 @@ impl HeaderSyncReactor {
             self.publish_peer_state();
         }
         self.refresh_statuses();
-        if header_authority_changed {
+        if header_authority_changed || refill_reopened {
             self.reconsider_advertised_header_targets();
         }
     }

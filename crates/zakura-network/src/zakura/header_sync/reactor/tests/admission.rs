@@ -841,3 +841,115 @@ fn verified_progress_reopens_refill_without_a_status_refresh_or_reanchor() {
         );
     }
 }
+
+#[test]
+fn retiring_repair_reopens_refill_at_the_batch_boundary() {
+    assert_retiring_repair_reopens_refill(400);
+}
+
+#[test]
+fn retiring_repair_preserves_refill_above_the_batch_boundary() {
+    assert_retiring_repair_reopens_refill(401);
+}
+
+/// Exercise a real repair reservation without another peer status or header authority change.
+fn assert_retiring_repair_reopens_refill(initial_window: u32) {
+    let frontier = |height: u32| {
+        let mut hash = [0; 32];
+        hash[..4].copy_from_slice(&height.to_le_bytes());
+        zakura_header_chain::Frontier::new(block::Height(height), block::Hash(hash))
+    };
+    let mut startup = startup(CancellationToken::new());
+    let anchor = zakura_header_chain::Frontier::new(startup.anchor.0, startup.anchor.1);
+    let mut snapshot = committed_snapshot(anchor);
+    snapshot.frontiers.header_best = frontier(MAX_HS_RANGE);
+    snapshot.frontiers.verified_best = frontier(initial_window);
+    let (_snapshots_tx, snapshots_rx) = watch::channel(Some(snapshot.clone()));
+    startup.committed_snapshots = Some(snapshots_rx);
+    let (_handle, mut actions, mut reactor) = build_header_sync_reactor(startup).unwrap();
+    let peer = peer();
+    let (send, _outbound) = framed_channel(8);
+    reactor.handle_event(Event::PeerConnected(
+        PeerSession::from_parts_with_session_id(peer.clone(), 7, send, CancellationToken::new()),
+    ));
+    reactor.observe_vct_root_repair(zakura_header_chain::VctRootRepairStatus {
+        state: zakura_header_chain::VctRootRepairState::Unavailable {
+            height: block::Height(500),
+        },
+        generation: 7,
+    });
+    let HeaderPortOperation::QueryVctRepairContext { owner, .. } = actions.try_recv().unwrap()
+    else {
+        panic!("the repair must request its context");
+    };
+    let target = frontier(20_000);
+    reactor.handle_wire_message(
+        peer.clone(),
+        7,
+        HeaderSyncMessage::Status(Status {
+            work_anchor_height: anchor.height,
+            work_anchor_hash: anchor.hash,
+            selected_tip_height: target.height,
+            selected_tip_hash: target.hash,
+            suffix_cumulative_work: zakura_chain::work::difficulty::U256::from(20_000_u32),
+            oldest_retained_height: anchor.height,
+            max_headers_per_response: 401,
+            max_inflight_requests: 1,
+            max_message_bytes: 2_000_000,
+            tree_aux_schema_mask: AuxSchema::V1.mask_bit(),
+        }),
+    );
+    assert!(matches!(
+        actions.try_recv().unwrap(),
+        HeaderPortOperation::QueryHeaderLocator { .. }
+    ));
+    // The repair takes the peer slot while the ordinary locator query is outstanding.
+    let selected: Vec<_> = (500..901).map(frontier).collect();
+    let context = zakura_header_chain::VctRepairContext::from_durable_rows(
+        selected[0],
+        zakura_header_chain::HeaderLocator::for_continuation(frontier(499)),
+        snapshot.state_version,
+        Some(selected[1].hash),
+        true,
+        &[],
+    )
+    .unwrap()
+    .extend_empty_selected_range(&selected[1..], None)
+    .unwrap();
+    reactor.handle_vct_repair_context_ready(owner, VctRepairContextResult::Resolved(context));
+    assert!(matches!(
+        reactor.peer_work_queue.active(&peer).unwrap().purpose,
+        HeaderTargetPurpose::SelectedAuxiliaryRepair { .. }
+    ));
+    assert_eq!(reactor.peer_work_queue.reserved_header_count(&peer), 401);
+    assert_eq!(reactor.peer_work_queue.claimed_header_count(), 401);
+    assert!(actions.try_recv().is_err());
+
+    for (advance, expected_queries) in [(1, 1), (2, 0)] {
+        snapshot.frontiers.verified_best = frontier(initial_window + advance);
+        snapshot.verified_generation = snapshot.verified_generation.checked_next().unwrap();
+        snapshot.state_version = snapshot.state_version.checked_next().unwrap();
+        reactor.observe_latest_committed_snapshot(snapshot.clone());
+        assert_eq!(reactor.peer_work_queue.claimed_header_count(), 0);
+        let mut locator_queries = 0;
+        while let Ok(action) = actions.try_recv() {
+            match action {
+                HeaderPortOperation::QueryHeaderLocator {
+                    peer: scheduled_peer,
+                    target_tip_hash,
+                    ..
+                } => {
+                    assert_eq!(scheduled_peer, peer);
+                    assert_eq!(target_tip_hash, target.hash);
+                    locator_queries += 1;
+                }
+                HeaderPortOperation::QueryVctRepairContext { .. } => {}
+                other => panic!("unexpected action after verified progress: {other:?}"),
+            }
+        }
+        assert_eq!(
+            locator_queries, expected_queries,
+            "retiring the repair must wake refill once, without waiting for peer status"
+        );
+    }
+}

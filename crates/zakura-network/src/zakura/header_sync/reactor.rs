@@ -2881,18 +2881,20 @@ impl HeaderSyncReactor {
     /// Report whether a new snapshot reopens refill for a target a peer already advertised.
     ///
     /// Verified-body progress returns window credits without changing header authority.
+    /// Compare claims before and after retirement so released repairs also reopen refill.
     /// Only a closed-to-open transition schedules work, so an open window costs no locator query.
     fn reopens_refill(
         &self,
         old: &zakura_header_chain::EngineSnapshot,
         new: &zakura_header_chain::EngineSnapshot,
+        claimed_before: usize,
+        claimed_after: usize,
     ) -> bool {
-        let claimed = self.peer_work_queue.claimed_header_count();
         self.peer_state.values().any(|state| {
             state.last_status.as_ref().is_some_and(|status| {
                 let target = status.selected_tip_height;
-                Self::request_header_prefix_remaining(old, claimed, target) == 0
-                    && Self::request_header_prefix_remaining(new, claimed, target) > 0
+                Self::request_header_prefix_remaining(old, claimed_before, target) == 0
+                    && Self::request_header_prefix_remaining(new, claimed_after, target) > 0
             })
         })
     }
@@ -2906,13 +2908,14 @@ impl HeaderSyncReactor {
             old.header_generation != snapshot.header_generation
                 || old.frontiers.finalized != snapshot.frontiers.finalized
         });
-        let refill_reopened = !header_authority_changed
-            && self
-                .committed_snapshot
-                .as_ref()
-                .is_some_and(|old| self.reopens_refill(old, &snapshot));
         self.emit_snapshot_observed(self.committed_snapshot.as_ref(), &snapshot);
+        let claimed_before = self.peer_work_queue.claimed_header_count();
         self.retire_obsolete_work(&snapshot);
+        let claimed_after = self.peer_work_queue.claimed_header_count();
+        let refill_reopened = !header_authority_changed
+            && self.committed_snapshot.as_ref().is_some_and(|old| {
+                self.reopens_refill(old, &snapshot, claimed_before, claimed_after)
+            });
         let old_tip = self
             .committed_snapshot
             .as_ref()

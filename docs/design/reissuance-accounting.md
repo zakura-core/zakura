@@ -3,39 +3,60 @@
 This implementation keeps reissuance behind the disabled-by-default `nu7` feature.
 Production activation still requires policy guidance and a production NU7 branch ID.
 
-## Provisional historical-funds policy
+## The seed
 
-The balance starts at zero immediately before NU7. It excludes all pre-NU7
-unclaimed subsidy and fees. We need guidance on whether those funds should seed
-reissuance. The PR deliberately does not seed them while that decision remains open.
+The balance holds `INITIAL_NSM_VALUE_BALANCE` on the last block below NU7: the block
+subsidy and fees that earlier coinbase transactions never claimed. The 2026-09-15
+ZIP Editor call settled this, and zips#1354 defines the constant.
 
-`Block::nsm_value_balance_change` in `crates/zakura-chain/src/block.rs` selects
-this baseline. The migration in
+`Network::initial_nsm_value_balance` in
+`crates/zakura-chain/src/parameters/network/subsidy.rs` holds the value. Mainnet and
+Testnet carry the measured constants. Every other network carries zero, because a chain
+with no history before NU7 has nothing to seed, and
+`ParametersBuilder::with_initial_nsm_value_balance` overrides it.
+
+Let `N` denote NU7 activation, `S(h)` cumulative scheduled issuance with zero genesis
+issuance, `I(h)` the sum of the six monetary pools, and `C` the seed. The stored balance
+is:
+
+- `D(h) = 0` for `h < N - 1`, or when the network has no NU7 activation.
+- `D(N - 1) = C`.
+- `D(h) = C + (S(h) - S(N-1)) - (I(h) - I(N-1))` for `h >= N`.
+- For NU7 at genesis there is no seeded block, so `D(h) = S(h) - I(h)`.
+
+`Block::nsm_value_balance_change` in `crates/zakura-chain/src/block.rs` applies the rule
+as the chain grows, and the migration in
 `crates/zakura-state/src/service/finalized_state/disk_format/upgrade/nsm_value_balance_pool.rs`
-subtracts the same excluded balance. Change both implementations and their tests
-if the policy changes.
+applies it to an existing database. Change both together.
 
-Let `N` denote NU7 activation, `S(h)` cumulative scheduled issuance with zero
-genesis issuance, and `I(h)` the sum of the six monetary pools. The stored balance is:
+## Why the running total is the draft's recurrence
 
-- `D(h) = 0` for `h < N`, or when the network has no NU7 activation.
-- `D(h) = S(h) - I(h) - (S(N-1) - I(N-1))` for `h >= N`.
-- For NU7 at genesis, the excluded baseline is zero.
+zips#1354 defines the balance by what each block claims:
 
-Runtime updates add scheduled block issuance minus the block's monetary pool
-change from NU7 onward. Transfers between monetary pools leave the balance
-unchanged. Reductions in issued value increase it. The balance itself holds no
-spendable value and does not contribute to monetary pool totals.
+```
+NSMValueBalance(h) = NSMValueBalance(h - 1) - AdditionalBlockSubsidy(h) + removed(h)
+```
+
+NU7 deploys neither ZIP 233 nor ZIP 235, so `removed(h)` is zero throughout.
+
+A block carries no reference to its parent's balance, so the implementation derives the
+bonus from the block. From NU6, ZIP 236 makes the coinbase claim exactly
+`BlockSubsidy(h)` plus the transaction fees, and fees move between transactions inside
+the block, so the block's change across the six monetary pools is `BlockSubsidy(h)`.
+That is the halving subsidy plus the bonus, so the halving subsidy minus it is
+`-AdditionalBlockSubsidy(h)`. The two definitions therefore agree at every height.
+
+Transfers between monetary pools leave the balance unchanged. Reductions in issued value
+increase it. The balance itself holds no spendable value and does not contribute to
+monetary pool totals.
 
 At the reissuance start height, the bonus becomes
-`ceil(D(parent) * 4126 / 10^10)`. Each fork uses its own parent balance.
-Contextual validation rejects negative balances from that start height.
-The stored type remains signed because the rejection rule does not apply earlier.
+`ceil(D(parent) * BLOCK_SUBSIDY_FRACTION)`. Each fork uses its own parent balance.
+Contextual validation rejects negative balances from NU7 onward. The stored type remains
+signed because a chain can run ahead of its schedule before NU7.
 
-This baseline differs from zips#1354's genesis-based balance. The later rejection
-height also differs from the draft's NU7 rule. The fraction remains fixed per
-block across ZIP 218 spacing changes. Configured networks can override the
-reissuance start height. These choices require confirmation before activation.
+The reissuance start height still differs from both drafts, which take it from the
+deployment ZIP. Configured networks can override it.
 
 ## Migration and recovery
 
@@ -44,9 +65,11 @@ Older binaries do not select that path. Do not move the upgraded database back
 to v28: older decoders cannot read the expanded BlockInfo layout. Downgrade
 requires a pre-upgrade backup or a separate sync.
 
-The migration reads legacy pool records and subtracts the pre-NU7 baseline.
-It performs cumulative schedule arithmetic without clamping either operand to
-MAX_MONEY. It checks the eligible balance after subtraction.
+The migration reads legacy pool records and offsets them so the balance starts at the
+seed on the last block below NU7. The offset is zero when the constant matches the
+chain's own history, as the measured Mainnet and Testnet constants do. The migration
+performs cumulative schedule arithmetic without clamping either operand to MAX_MONEY. It
+checks the eligible balance after the offset.
 
 The migration writes batches of 10,000 BlockInfo records. It preserves monetary
 pools and block sizes. It updates the separately stored tip balance last.
@@ -73,7 +96,7 @@ not establish support for a ZIP 233 transaction format.
 
 Before production activation:
 
-- Resolve the historical seed, rejection height, and spacing policy.
+- Resolve the reissuance start height against the deployment ZIP.
 - Assign the production NU7 branch ID and activation heights.
 - Run real transaction verification across activation on a private network.
 - Mine bonus-paying blocks, create forks, restart nodes, migrate a database,

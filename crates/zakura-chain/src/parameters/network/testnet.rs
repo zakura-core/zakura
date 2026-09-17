@@ -1168,6 +1168,9 @@ pub struct RegtestParameters {
     /// The height at which ZIP 234 reissuance starts, see
     /// [`ParametersBuilder::with_zip234_start_height`].
     pub zip234_start_height: Option<Height>,
+    /// The NSM value balance immediately before NU7, see
+    /// [`ParametersBuilder::with_initial_nsm_value_balance`].
+    pub initial_nsm_value_balance: Option<Amount<NonNegative>>,
 }
 
 impl From<ConfiguredActivationHeights> for RegtestParameters {
@@ -1274,6 +1277,7 @@ impl Parameters {
             extend_funding_stream_addresses_as_required,
             max_block_time_start_height,
             zip234_start_height,
+            initial_nsm_value_balance,
         }: RegtestParameters,
     ) -> Result<Self, ParametersBuilderError> {
         let mut parameters = Self::build()
@@ -1305,6 +1309,10 @@ impl Parameters {
 
         if let Some(height) = zip234_start_height {
             parameters = parameters.with_zip234_start_height(height);
+        }
+
+        if let Some(balance) = initial_nsm_value_balance {
+            parameters = parameters.with_initial_nsm_value_balance(balance);
         }
 
         // Regtest does not run the `to_network()` checks, so run them here: block validation

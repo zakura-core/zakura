@@ -11,7 +11,10 @@ use crate::{
     ironwood,
     memory::{inline_size_bytes, vec_capacity_bytes, AttributedMemorySize},
     orchard,
-    parameters::{subsidy::halving_block_subsidy, Network, NetworkUpgrade},
+    parameters::{
+        subsidy::{halving_block_subsidy, ParameterSubsidy},
+        Network, NetworkUpgrade,
+    },
     sapling,
     serialization::TrustedPreallocate,
     sprout,
@@ -351,11 +354,29 @@ impl Block {
         Ok(change)
     }
 
-    /// Returns scheduled issuance minus issued value, starting at NU7 with no seed.
+    /// Returns this block's change to the NSM value balance, as zips#1354 defines it.
     ///
-    /// Should historical unclaimed subsidy and fees seed this balance? We need guidance before including those funds. Update the baseline
-    /// in `zakura-state/src/service/finalized_state/disk_format/upgrade/nsm_value_balance_pool.rs`
-    /// together with this rule and its accounting tests.
+    /// # Consensus
+    ///
+    /// zips#1354 seeds the balance immediately before NU7 and then draws it down by the
+    /// bonus each block claims:
+    ///
+    /// > NSMValueBalance(NU7ActivationHeight - 1) = INITIAL\_NSM\_VALUE\_BALANCE
+    /// >
+    /// > NSMValueBalance(height) = NSMValueBalance(height - 1)
+    /// >   - AdditionalBlockSubsidy(height) + removed(height)
+    ///
+    /// NU7 deploys neither ZIP 233 nor ZIP 235, so `removed(height)` is zero throughout.
+    ///
+    /// A block carries no reference to its parent's balance, so this derives
+    /// `AdditionalBlockSubsidy(height)` from the block instead. From NU6, ZIP 236 makes the
+    /// coinbase claim exactly `BlockSubsidy(height)` plus the transaction fees, and fees
+    /// move between transactions inside the block, so the block's change across the six
+    /// monetary pools is `BlockSubsidy(height)`. That is the halving subsidy plus the
+    /// bonus, so the halving subsidy minus it is `-AdditionalBlockSubsidy(height)`.
+    ///
+    /// `zakura-state/src/service/check.rs::nsm_value_balance_is_non_negative` rejects a
+    /// block that would drive the running total below zero.
     fn nsm_value_balance_change(
         &self,
         network: &Network,
@@ -365,10 +386,21 @@ impl Block {
             .coinbase_height()
             .ok_or(ValueBalanceError::MissingCoinbaseHeight)?;
 
-        if !NetworkUpgrade::Nu7
-            .activation_height(network)
-            .is_some_and(|start| height >= start)
-        {
+        let Some(nu7) = NetworkUpgrade::Nu7.activation_height(network) else {
+            return Ok(Amount::zero());
+        };
+
+        // The seed lands on the last block below NU7, so the balance already holds it when
+        // the first NU7 block claims its bonus. NU7 at genesis has no such block, and a
+        // chain with no history before NU7 has nothing to seed.
+        if nu7.0.checked_sub(1) == Some(height.0) {
+            return network
+                .initial_nsm_value_balance()
+                .constrain::<NegativeAllowed>()
+                .map_err(ValueBalanceError::NsmValueBalance);
+        }
+
+        if height < nu7 {
             return Ok(Amount::zero());
         }
 

@@ -1212,7 +1212,7 @@ impl<'de> Deserialize<'de> for Config {
                 build_configured_testnet::<D>(*params, &initial_testnet_peers)?
             }
             (DNetwork::ConfiguredRegtest { params, .. }, _) => {
-                Network::new_regtest(build_regtest_params(*params))
+                Network::new_regtest(build_regtest_params::<D>(*params)?)
             }
             (DNetwork::DefaultForKind(NetworkKind::Mainnet), _) => Network::Mainnet,
             (DNetwork::DefaultForKind(NetworkKind::Testnet), Some(params)) => {
@@ -1222,7 +1222,7 @@ impl<'de> Deserialize<'de> for Config {
                 Network::new_default_testnet()
             }
             (DNetwork::DefaultForKind(NetworkKind::Regtest), Some(params)) => {
-                Network::new_regtest(build_regtest_params(params))
+                Network::new_regtest(build_regtest_params::<D>(params)?)
             }
             (DNetwork::DefaultForKind(NetworkKind::Regtest), None) => {
                 Network::new_regtest(Default::default())
@@ -1509,7 +1509,9 @@ where
     }
 }
 
-fn build_regtest_params(params: DTestnetParameters) -> RegtestParameters {
+fn build_regtest_params<'de, D: Deserializer<'de>>(
+    params: DTestnetParameters,
+) -> Result<RegtestParameters, D::Error> {
     let DTestnetParameters {
         activation_heights,
         pre_nu6_funding_streams,
@@ -1520,6 +1522,7 @@ fn build_regtest_params(params: DTestnetParameters) -> RegtestParameters {
         extend_funding_stream_addresses_as_required,
         max_block_time_start_height,
         zip234_start_height,
+        initial_nsm_value_balance,
         ..
     } = params;
 
@@ -1533,7 +1536,15 @@ fn build_regtest_params(params: DTestnetParameters) -> RegtestParameters {
         funding_streams_vec.insert(0, funding_streams);
     }
 
-    RegtestParameters {
+    let initial_nsm_value_balance = initial_nsm_value_balance
+        .map(|balance| {
+            i64::try_from(balance)
+                .map_err(de::Error::custom)
+                .and_then(|balance| Amount::try_from(balance).map_err(de::Error::custom))
+        })
+        .transpose()?;
+
+    Ok(RegtestParameters {
         activation_heights: activation_heights.unwrap_or_default(),
         funding_streams: Some(funding_streams_vec),
         lockbox_disbursements,
@@ -1541,5 +1552,6 @@ fn build_regtest_params(params: DTestnetParameters) -> RegtestParameters {
         max_block_time_start_height: max_block_time_start_height.map(zakura_chain::block::Height),
         extend_funding_stream_addresses_as_required,
         zip234_start_height: zip234_start_height.map(zakura_chain::block::Height),
-    }
+        initial_nsm_value_balance,
+    })
 }

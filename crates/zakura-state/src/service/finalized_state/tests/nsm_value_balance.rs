@@ -210,6 +210,150 @@ fn finalized_state_rejects_a_block_that_makes_the_balance_negative() {
     assert_eq!(state.db.finalized_tip_height(), Some(START));
 }
 
+/// A seed large enough to stand out against the test network's dust coinbases.
+const SEED: i64 = 1_234_567;
+
+/// Returns [`zip234_network`] with a nonzero `INITIAL_NSM_VALUE_BALANCE`.
+fn seeded_network() -> Network {
+    Network::new_regtest(RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            nu7: Some(2),
+            ..Default::default()
+        },
+        zip234_start_height: Some(START),
+        initial_nsm_value_balance: Some(
+            Amount::try_from(SEED).expect("the seed is a valid amount"),
+        ),
+        ..Default::default()
+    })
+}
+
+/// Returns NU7 activation and the block below it on `network`.
+fn seed_height(network: &Network) -> (Height, Height) {
+    let nu7 = NetworkUpgrade::Nu7
+        .activation_height(network)
+        .expect("the test network activates NU7");
+
+    (nu7, nu7.previous().expect("NU7 activates above genesis"))
+}
+
+/// The seed lands on the last block below NU7, and no earlier block carries it.
+#[test]
+fn the_seed_lands_on_the_last_block_below_nu7() {
+    let _init_guard = zakura_test::init();
+
+    let network = seeded_network();
+    let (nu7, seed_height) = seed_height(&network);
+    let (state, _parent) = state_below_start(&network);
+
+    for height in 0..seed_height.0 {
+        let info = state
+            .db
+            .block_info(Height(height).into())
+            .expect("every committed block has block info");
+
+        assert_eq!(
+            i64::from(info.value_pools().nsm_value_balance_amount()),
+            0,
+            "the balance must stay empty below the seed height, at {height}",
+        );
+    }
+
+    let seeded = state
+        .db
+        .block_info(seed_height.into())
+        .expect("the seeded block has block info");
+
+    assert_eq!(
+        i64::from(seeded.value_pools().nsm_value_balance_amount()),
+        SEED,
+        "the last block below NU7 must carry the whole seed",
+    );
+
+    // The dust coinbase at NU7 leaves its own subsidy unclaimed, which the balance keeps
+    // on top of the seed.
+    let activation = state
+        .db
+        .block_info(nu7.into())
+        .expect("the NU7 activation block has block info");
+
+    assert!(
+        i64::from(activation.value_pools().nsm_value_balance_amount()) > SEED,
+        "an under-claiming NU7 block must add to the seed, got {:?}",
+        activation.value_pools().nsm_value_balance_amount(),
+    );
+}
+
+/// Rolling back below the seed height clears the seed, and replay restores it.
+#[test]
+fn rollback_across_the_seed_height_restores_it_on_replay() {
+    use crate::{rollback_finalized_state, RollbackFinalizedStateOptions};
+
+    let _init_guard = zakura_test::init();
+
+    let network = seeded_network();
+    let (_nu7, seed_height) = seed_height(&network);
+    let dir = tempfile::tempdir().expect("a temporary directory is available");
+    let config = Config {
+        cache_dir: dir.path().to_owned(),
+        ephemeral: false,
+        ..Config::default()
+    };
+
+    let (state, _parent) = state_below_start_with_config(&network, &config);
+    let tip = state
+        .db
+        .finalized_tip_height()
+        .expect("the fixture commits blocks");
+    let committed: Vec<_> = (0..=tip.0)
+        .map(|height| {
+            state
+                .db
+                .block(Height(height).into())
+                .expect("every committed block is readable")
+        })
+        .collect();
+    let before = state.db.finalized_value_pool();
+    drop(state);
+
+    let target = seed_height
+        .previous()
+        .expect("the seed height is above genesis");
+
+    rollback_finalized_state(
+        config.clone(),
+        &network,
+        RollbackFinalizedStateOptions {
+            target_height: target,
+            keep_rolled_back_blocks: false,
+            max_checkpoint_height: Some(Height(0)),
+        },
+    )
+    .expect("rolling back below the seed height succeeds");
+
+    let mut state =
+        FinalizedState::new(&config, &network).expect("reopening the database succeeds");
+
+    assert_eq!(
+        i64::from(state.db.finalized_value_pool().nsm_value_balance_amount()),
+        0,
+        "rolling back below the seed height must undo the seed",
+    );
+
+    for block in committed
+        .iter()
+        .skip(usize::try_from(target.0).expect("the target height fits in a usize") + 1)
+    {
+        commit(&mut state, block).expect("replaying a rolled back block commits");
+    }
+
+    assert_eq!(
+        state.db.finalized_value_pool(),
+        before,
+        "replay must restore the seed and every later change",
+    );
+}
+
 /// Check the unseeded balance before NU7 and after a permitted bonus claim.
 #[test]
 fn nsm_value_balance_matches_the_schedule() {

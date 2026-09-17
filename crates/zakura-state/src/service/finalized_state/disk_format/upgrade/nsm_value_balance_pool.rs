@@ -1,7 +1,8 @@
-//! Backfill the unseeded reissuance balance from NU7 onward.
+//! Backfill the NSM value balance from the last block below NU7 onward.
 //!
-//! The balance equals the signed schedule balance minus its value immediately before
-//! NU7. Earlier records carry zero. Historical funds remain excluded pending guidance.
+//! The balance holds `INITIAL_NSM_VALUE_BALANCE` on the last block below NU7, and from
+//! NU7 it falls by each block's additional block subsidy. Earlier records carry zero.
+//! `Block::nsm_value_balance_change` applies the same rule as the chain grows.
 
 use crossbeam_channel::{Receiver, TryRecvError};
 use semver::Version;
@@ -10,7 +11,10 @@ use zakura_chain::{
     amount::{Amount, NegativeAllowed, NonNegative},
     block::Height,
     block_info::BlockInfo,
-    parameters::{subsidy::scheduled_issuance_zatoshis, NetworkUpgrade},
+    parameters::{
+        subsidy::{scheduled_issuance_zatoshis, ParameterSubsidy},
+        NetworkUpgrade,
+    },
     value_balance::ValueBalance,
 };
 
@@ -137,7 +141,8 @@ fn backfill(
     Ok(())
 }
 
-/// Subtract signed operands so pre-reNSM value balances can remain negative.
+/// Returns the schedule's cumulative subsidy at `height` minus the value the chain holds,
+/// as a signed value: below the reissuance start a chain can run ahead of its schedule.
 fn balance_at(
     network: &zakura_chain::parameters::Network,
     height: Height,
@@ -148,23 +153,39 @@ fn balance_at(
     Ok(scheduled - i128::from(i64::from(value_pools.total()?)))
 }
 
-/// Exclude the entire pre-NU7 balance until the historical-funds policy is confirmed.
-/// Keep this baseline consistent with `Block::nsm_value_balance_change`.
+/// Returns the offset that makes the backfilled balance start at
+/// `INITIAL_NSM_VALUE_BALANCE` on the last block below NU7.
+///
+/// `balance_at` measures the whole gap between the schedule and the chain, back to
+/// genesis. Subtracting this offset leaves the seed there, and leaves each later block
+/// the seed minus the bonuses claimed since, which is what
+/// `Block::nsm_value_balance_change` accumulates.
+///
+/// The offset is zero when the constant matches the chain's own history, as the measured
+/// Mainnet and Testnet constants do.
 fn baseline(db: &ZakuraDb) -> Result<i128, FormatChangeError> {
     let network = db.network();
     let Some(start) = NetworkUpgrade::Nu7.activation_height(&network) else {
         return Ok(0);
     };
-    if db.finalized_tip_height().is_none_or(|tip| tip < start) || start == Height(0) {
+    let Some(seed_height) = start.0.checked_sub(1).map(Height) else {
+        // NU7 at genesis leaves no block to seed, so the balance starts at zero.
+        return Ok(0);
+    };
+    if db
+        .finalized_tip_height()
+        .is_none_or(|tip| tip < seed_height)
+    {
         return Ok(0);
     }
-    let height = Height(start.0 - 1); // The zero-height case returned above.
-    let info = read_block_info(db, height)?;
-    balance_at(&network, height, *info.value_pools()).map_err(|error| {
+    let info = read_block_info(db, seed_height)?;
+    let historical = balance_at(&network, seed_height, *info.value_pools()).map_err(|error| {
         FormatChangeError::InvalidPostcondition(format!(
-            "invalid NU7 baseline at {height:?}: {error}"
+            "invalid NU7 baseline at {seed_height:?}: {error}"
         ))
-    })
+    })?;
+
+    Ok(historical - i128::from(i64::from(network.initial_nsm_value_balance())))
 }
 
 fn eligible_balance(
@@ -173,10 +194,12 @@ fn eligible_balance(
     pools: ValueBalance<NonNegative>,
     baseline: i128,
 ) -> Result<Amount<NegativeAllowed>, FormatChangeError> {
-    if !NetworkUpgrade::Nu7
+    // The seed lands on the last block below NU7, so records below that carry zero.
+    let seeded = NetworkUpgrade::Nu7
         .activation_height(network)
-        .is_some_and(|start| height >= start)
-    {
+        .is_some_and(|start| height.0 >= start.0.saturating_sub(1));
+
+    if !seeded {
         return Ok(Amount::zero());
     }
     let eligible = balance_at(network, height, pools)
@@ -343,6 +366,52 @@ mod tests {
     }
 
     #[test]
+    fn backfill_seeds_the_last_block_below_nu7() {
+        use zakura_chain::parameters::testnet::{ConfiguredActivationHeights, RegtestParameters};
+
+        const SEED: i64 = 1_234_567;
+
+        let network = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu7: Some(4),
+                ..Default::default()
+            },
+            zip234_start_height: Some(Height(20_000)),
+            initial_nsm_value_balance: Some(Amount::try_from(SEED).unwrap()),
+            ..Default::default()
+        });
+
+        // A chain that claimed none of its subsidy, so the whole schedule is unclaimed.
+        let pools = ValueBalance::zero();
+        let seed_height = Height(3);
+        let baseline = balance_at(&network, seed_height, pools).unwrap() - i128::from(SEED);
+
+        assert_eq!(
+            i64::from(eligible_balance(&network, seed_height, pools, baseline).unwrap()),
+            SEED,
+            "the block below NU7 must hold exactly the seed",
+        );
+        assert_eq!(
+            i64::from(eligible_balance(&network, Height(2), pools, baseline).unwrap()),
+            0,
+            "earlier blocks must hold nothing",
+        );
+
+        let scheduled_since = i128::try_from(
+            scheduled_issuance_zatoshis(Height(4), &network).unwrap()
+                - scheduled_issuance_zatoshis(seed_height, &network).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            i128::from(i64::from(
+                eligible_balance(&network, Height(4), pools, baseline).unwrap()
+            )),
+            i128::from(SEED) + scheduled_since,
+            "NU7 must keep the seed and add what its own block left unclaimed",
+        );
+    }
+
+    #[test]
     fn backfill_preserves_negative_balance() {
         let network = Network::Mainnet;
         let height = Height(1);
@@ -374,12 +443,17 @@ mod database_tests {
     };
 
     fn legacy_db(rows: u32, pool_len: usize) -> ZakuraDb {
+        legacy_db_with_seed(rows, pool_len, 0)
+    }
+
+    fn legacy_db_with_seed(rows: u32, pool_len: usize, seed: i64) -> ZakuraDb {
         let network = Network::new_regtest(RegtestParameters {
             activation_heights: ConfiguredActivationHeights {
                 nu7: Some(2),
                 ..Default::default()
             },
             zip234_start_height: Some(Height(20_000)),
+            initial_nsm_value_balance: Some(Amount::try_from(seed).unwrap()),
             ..Default::default()
         });
         let db = ZakuraDb::new(
@@ -440,6 +514,43 @@ mod database_tests {
         }
         let (_tx, rx) = crossbeam_channel::bounded(1);
         assert!(Upgrade.validate(db, &rx).unwrap().is_ok());
+    }
+
+    #[test]
+    fn migration_seeds_the_last_block_below_nu7() {
+        const SEED: i64 = 1_234_567;
+        const ROWS: u32 = 6;
+
+        let db = legacy_db_with_seed(ROWS, 48, SEED);
+        let (_tx, rx) = crossbeam_channel::bounded(1);
+        Upgrade.run(Some(Height(ROWS - 1)), &db, &rx).unwrap();
+
+        let stored = |height: u32| {
+            i64::from(
+                read_block_info(&db, Height(height))
+                    .unwrap()
+                    .value_pools()
+                    .nsm_value_balance_amount(),
+            )
+        };
+
+        assert_eq!(stored(0), 0, "genesis is below the seed height");
+        assert_eq!(stored(1), SEED, "the block below NU7 holds the seed");
+
+        // The fixture issues one zatoshi per block, so each block from NU7 adds its whole
+        // scheduled subsidy less that zatoshi.
+        let seeded_supply = i64::from(expected_issued_supply(Height(1), &db.network()).unwrap());
+        for height in 2..ROWS {
+            let scheduled =
+                i64::from(expected_issued_supply(Height(height), &db.network()).unwrap());
+            assert_eq!(
+                stored(height),
+                SEED + scheduled - seeded_supply - (i64::from(height) - 1),
+                "at height {height}",
+            );
+        }
+
+        assert!(Upgrade.validate(&db, &rx).unwrap().is_ok());
     }
 
     #[test]

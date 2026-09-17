@@ -40,6 +40,10 @@ fn funding_stream_period_uses_floor_division_for_negative_periods() {
         fn funding_stream_address_change_interval(&self) -> HeightDiff {
             10
         }
+
+        fn initial_nsm_value_balance(&self) -> Amount<NonNegative> {
+            Amount::zero()
+        }
     }
 
     let parameters = TestParameters;

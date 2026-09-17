@@ -31,6 +31,16 @@ pub(crate) const NU6_1_LOCKBOX_DISBURSEMENTS: [(&str, Amount<NonNegative>); 10] 
 pub(crate) const EXPECTED_NU6_1_LOCKBOX_DISBURSEMENTS_TOTAL: Amount<NonNegative> =
     Amount::new_from_zec(78_750);
 
+/// `INITIAL_NSM_VALUE_BALANCE` on Mainnet: block subsidy and fees the coinbase
+/// transactions below NU6 never claimed, which seeds the NSM value balance at NU7.
+///
+/// Measured at the last pre-NU6 height, 2,726,399: the halving schedule issued
+/// 15,750,000 ZEC there, and the chain value pools held 15,749,631.41554480 ZEC.
+///
+/// zips#1354 leaves this constant as a TODO and estimates 350.8 ZEC. The estimate is
+/// about 17.8 ZEC low.
+pub(crate) const INITIAL_NSM_VALUE_BALANCE: Amount<NonNegative> = Amount::new(36_858_445_520);
+
 /// The post-NU6 funding stream height range on Mainnet
 pub(crate) const POST_NU6_FUNDING_STREAM_START_RANGE: std::ops::Range<Height> =
     Height(POST_NU6_FUNDING_STREAM_START_HEIGHT)

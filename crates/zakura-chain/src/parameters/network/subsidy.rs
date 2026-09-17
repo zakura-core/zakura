@@ -24,9 +24,9 @@ use crate::{
 };
 
 use constants::{
-    regtest, testnet, BLOSSOM_POW_TARGET_SPACING_RATIO, FUNDING_STREAM_RECEIVER_DENOMINATOR,
-    FUNDING_STREAM_SPECIFICATION, LOCKBOX_SPECIFICATION, MAX_BLOCK_SUBSIDY,
-    POST_BLOSSOM_HALVING_INTERVAL, PRE_BLOSSOM_HALVING_INTERVAL,
+    mainnet, regtest, testnet, BLOSSOM_POW_TARGET_SPACING_RATIO,
+    FUNDING_STREAM_RECEIVER_DENOMINATOR, FUNDING_STREAM_SPECIFICATION, LOCKBOX_SPECIFICATION,
+    MAX_BLOCK_SUBSIDY, POST_BLOSSOM_HALVING_INTERVAL, PRE_BLOSSOM_HALVING_INTERVAL,
 };
 
 /// The funding stream receiver categories.
@@ -232,6 +232,10 @@ pub trait ParameterSubsidy {
     ///
     /// [7.10]: https://zips.z.cash/protocol/protocol.pdf#zip214fundingstreams
     fn funding_stream_address_change_interval(&self) -> HeightDiff;
+
+    /// Returns zips#1354's `INITIAL_NSM_VALUE_BALANCE`: the value the NSM value balance
+    /// holds immediately before NU7 activates.
+    fn initial_nsm_value_balance(&self) -> Amount<NonNegative>;
 }
 
 /// Network methods related to Block Subsidy and Funding Streams
@@ -272,6 +276,13 @@ impl ParameterSubsidy for Network {
 
     fn funding_stream_address_change_interval(&self) -> HeightDiff {
         self.post_blossom_halving_interval() / 48
+    }
+
+    fn initial_nsm_value_balance(&self) -> Amount<NonNegative> {
+        match self {
+            Network::Mainnet => mainnet::INITIAL_NSM_VALUE_BALANCE,
+            Network::Testnet(params) => params.initial_nsm_value_balance(),
+        }
     }
 }
 

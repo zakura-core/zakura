@@ -19,6 +19,7 @@ use tokio::fs;
 
 use tracing::Span;
 use zakura_chain::{
+    amount::Amount,
     common::atomic_write,
     parameters::{
         testnet::{
@@ -983,6 +984,11 @@ struct DTestnetParameters {
     /// If unset, the ZIP 234 crossing rule sets it. Reissuance never starts below NU7
     /// activation.
     zip234_start_height: Option<u32>,
+    /// The NSM value balance in zatoshi immediately before NU7 activates.
+    ///
+    /// If unset, the balance starts at zero, which is right for a chain with no
+    /// pre-NU7 history of its own.
+    initial_nsm_value_balance: Option<u64>,
 }
 
 /// Network configuration used during deserialization.
@@ -1103,6 +1109,11 @@ impl From<Arc<testnet::Parameters>> for DTestnetParameters {
             zip234_start_height: params
                 .configured_zip234_start_height()
                 .map(|height| height.0),
+            initial_nsm_value_balance: match i64::from(params.initial_nsm_value_balance()) {
+                0 => None,
+                // The amount type keeps this non-negative, so the cast cannot wrap.
+                balance => Some(balance as u64),
+            },
         }
     }
 }
@@ -1373,6 +1384,7 @@ where
         extend_funding_stream_addresses_as_required,
         temporary_orchard_disabling_soft_fork_height,
         zip234_start_height,
+        initial_nsm_value_balance,
     } = params;
 
     let mut params_builder = testnet::Parameters::build();
@@ -1469,6 +1481,14 @@ where
     if let Some(height) = zip234_start_height {
         params_builder =
             params_builder.with_zip234_start_height(height.try_into().map_err(de::Error::custom)?);
+    }
+
+    if let Some(balance) = initial_nsm_value_balance {
+        let balance = i64::try_from(balance)
+            .map_err(de::Error::custom)
+            .and_then(|balance| Amount::try_from(balance).map_err(de::Error::custom))?;
+
+        params_builder = params_builder.with_initial_nsm_value_balance(balance);
     }
 
     // Return an error if the initial testnet peers includes any of the default initial Mainnet or Testnet

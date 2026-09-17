@@ -638,6 +638,9 @@ pub struct ParametersBuilder {
     temporary_orchard_disabling_soft_fork_height: Option<Height>,
     /// The configured ZIP 234 start height, see [`Parameters::configured_zip234_start_height`].
     zip234_start_height: Option<Height>,
+    /// The NSM value balance immediately before NU7, see
+    /// [`Parameters::initial_nsm_value_balance`].
+    initial_nsm_value_balance: Amount<NonNegative>,
 }
 
 impl Default for ParametersBuilder {
@@ -679,6 +682,10 @@ impl Default for ParametersBuilder {
                 super::TESTNET_TEMPORARY_ORCHARD_DISABLING_SOFT_FORK_HEIGHT,
             ),
             zip234_start_height: None,
+            // A seed measures one chain's own history, so it is meaningless on a network
+            // built from these defaults. The default Testnet sets its own in
+            // `Parameters::default`.
+            initial_nsm_value_balance: Amount::zero(),
         }
     }
 }
@@ -1008,6 +1015,16 @@ impl ParametersBuilder {
         self
     }
 
+    /// Sets zips#1354's `INITIAL_NSM_VALUE_BALANCE`, the value the NSM value balance holds
+    /// immediately before NU7 activates.
+    ///
+    /// The seed is a measurement of one chain's own history, so it defaults to zero on
+    /// every network but Mainnet and the default Testnet.
+    pub fn with_initial_nsm_value_balance(mut self, balance: Amount<NonNegative>) -> Self {
+        self.initial_nsm_value_balance = balance;
+        self
+    }
+
     /// Converts the builder to a [`Parameters`] struct
     fn finish(self) -> Parameters {
         // The builder defaults to public Testnet consensus parameters, so an unset
@@ -1034,6 +1051,7 @@ impl ParametersBuilder {
             checkpoints,
             temporary_orchard_disabling_soft_fork_height,
             zip234_start_height,
+            initial_nsm_value_balance,
         } = self;
         Parameters {
             network_name,
@@ -1054,6 +1072,7 @@ impl ParametersBuilder {
             temporary_orchard_disabling_soft_fork_height,
             configured_zip234_start_height: zip234_start_height,
             zip234_crossing_start_height: DerivedHeight::default(),
+            initial_nsm_value_balance,
         }
     }
 
@@ -1110,6 +1129,8 @@ impl ParametersBuilder {
             checkpoints: _,
             temporary_orchard_disabling_soft_fork_height: _,
             zip234_start_height,
+            // The seed is a per-chain measurement, so it does not decide compatibility.
+            initial_nsm_value_balance: _,
         } = Self::default();
 
         self.activation_heights == activation_heights
@@ -1198,6 +1219,8 @@ pub struct Parameters {
     configured_zip234_start_height: Option<Height>,
     /// The ZIP 234 start height that the crossing rule derives from the other fields.
     zip234_crossing_start_height: DerivedHeight,
+    /// The NSM value balance immediately before NU7 activates.
+    initial_nsm_value_balance: Amount<NonNegative>,
 }
 
 /// A height derived from the other [`Parameters`] fields and computed on first use.
@@ -1227,6 +1250,7 @@ impl Default for Parameters {
         Self {
             network_name: "Testnet".to_string(),
             max_block_time_start_height: TESTNET_MAX_TIME_START_HEIGHT,
+            initial_nsm_value_balance: testnet::INITIAL_NSM_VALUE_BALANCE,
             ..Self::build().finish()
         }
     }
@@ -1332,6 +1356,10 @@ impl Parameters {
             // The ZIP 234 start height is configurable on Regtest
             configured_zip234_start_height: _,
             zip234_crossing_start_height: _,
+            // Regtest chains start empty, so the seed is always zero. It stays out of the
+            // identity check for the same reason the halving interval stays in: it is
+            // derived from the defaults above, not chosen.
+            initial_nsm_value_balance: _,
         } = Self::new_regtest(Default::default()).expect("default regtest parameters are valid");
 
         self.network_name == network_name
@@ -1453,6 +1481,13 @@ impl Parameters {
     }
 
     /// Returns the cached start height that the ZIP 234 crossing rule derives.
+    /// Returns zips#1354's `INITIAL_NSM_VALUE_BALANCE` for this network.
+    ///
+    /// See [`ParametersBuilder::with_initial_nsm_value_balance`].
+    pub fn initial_nsm_value_balance(&self) -> Amount<NonNegative> {
+        self.initial_nsm_value_balance
+    }
+
     pub(crate) fn zip234_crossing_start_height(&self) -> &DerivedHeight {
         &self.zip234_crossing_start_height
     }

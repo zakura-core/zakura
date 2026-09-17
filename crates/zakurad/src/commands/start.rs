@@ -429,12 +429,13 @@ impl StartCmd {
                 .set(f64::from(max_checkpoint_height.0));
             for metric in [
                 "sync.block.payload.received.bytes",
-                "sync.block.payload.committed.bytes",
                 "state.vct.fast.block.count",
                 "state.vct.legacy.block.count",
             ] {
                 metrics::counter!(metric).increment(0);
             }
+            #[cfg(feature = "sync-metrics")]
+            metrics::counter!("sync.block.payload.committed.bytes").increment(0);
         }
 
         info!("opening database, this may take a few minutes");

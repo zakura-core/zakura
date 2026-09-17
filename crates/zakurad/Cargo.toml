@@ -83,9 +83,9 @@ default = ["default-release-binaries"]
 
 # Production features that activate extra dependencies, or extra features in dependencies
 
-# Experimental candidate NU7 consensus rules, dormant until NU7 activates.
-nu7-experimental = [
-    "zakura-consensus/nu7-experimental",
+# NU7 consensus rules. Off by default until NU7 has activation heights.
+nu7 = [
+    "zakura-consensus/nu7",
 ]
 
 # Indexer support
@@ -93,6 +93,9 @@ indexer = ["zakura-state/indexer", "zakura-rpc/indexer"]
 
 # Per-block commit-phase timing histograms (zakura.state.write.*), for perf profiling
 commit-metrics = ["zakura-state/commit-metrics"]
+
+# Accurate committed payload counters for continuous-sync reports.
+sync-metrics = ["zakura-network/sync-metrics"]
 
 # Experimental internal miner support
 internal-miner = [
@@ -173,8 +176,8 @@ tokio-console = ["console-subscriber"]
 comparison-interpreter = ["zakura-script/comparison-interpreter"]
 
 [dependencies]
-zakura-chain = { path = "../zakura-chain", version = "7.0.0" }
-zakura-consensus = { path = "../zakura-consensus", version = "8.0.0" }
+zakura-chain = { path = "../zakura-chain", version = "8.0.0" }
+zakura-consensus = { path = "../zakura-consensus", version = "9.0.0" }
 zakura-header-chain = { path = "../zakura-header-chain", version = "2.1.0" }
 zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.2.0" }
 zakura-network = { path = "../zakura-network", version = "8.0.0" }
@@ -310,8 +313,8 @@ tonic-prost = { workspace = true }
 proptest = { workspace = true }
 proptest-derive = { workspace = true }
 
-zakura-chain = { path = "../zakura-chain", version = "7.0.0", features = ["proptest-impl"] }
-zakura-consensus = { path = "../zakura-consensus", version = "8.0.0", features = ["proptest-impl"] }
+zakura-chain = { path = "../zakura-chain", version = "8.0.0", features = ["proptest-impl"] }
+zakura-consensus = { path = "../zakura-consensus", version = "9.0.0", features = ["proptest-impl"] }
 zakura-header-chain = { path = "../zakura-header-chain", version = "2.1.0", features = ["test-support"] }
 zakura-network = { path = "../zakura-network", version = "8.0.0", features = ["proptest-impl", "zakura-testkit"] }
 zakura-state = { path = "../zakura-state", version = "9.0.0", features = ["proptest-impl"] }

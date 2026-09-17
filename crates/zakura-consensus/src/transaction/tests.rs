@@ -25,7 +25,7 @@ use zakura_chain::{
     orchard::{Action, AuthorizedAction, Flags},
     parameters::{
         testnet::{ConfiguredActivationHeights, Parameters},
-        Network, NetworkUpgrade,
+        Network, NetworkUpgrade, ORCHARD_BLOCK_ACTION_LIMIT,
     },
     primitives::{ed25519, x25519, Groth16Proof},
     sapling,
@@ -35,8 +35,8 @@ use zakura_chain::{
     sprout,
     transaction::{
         arbitrary::{
-            insert_fake_orchard_shielded_data, test_transactions, transactions_from_blocks,
-            v5_transactions,
+            fake_v6_with_orchard_and_ironwood_actions, insert_fake_orchard_shielded_data,
+            test_transactions, transactions_from_blocks, v5_transactions,
         },
         zip317, Hash, HashType, JoinSplitData, LockTime, Transaction,
     },
@@ -46,7 +46,7 @@ use zakura_chain::{ironwood, orchard};
 
 use zakura_node_services::mempool;
 use zakura_state::ValidateContextError;
-use zakura_test::mock_service::MockService;
+use zakura_test::mock_service::{MockService, PanicAssertion};
 
 use crate::{error::TransactionError, primitives, transaction::POLL_MEMPOOL_DELAY, BoxError};
 
@@ -4450,6 +4450,182 @@ async fn v5_with_duplicate_orchard_action() {
             ))
         );
     }
+}
+
+/// The mempool rejects a transaction whose Orchard and Ironwood actions exceed
+/// the ZIP 218 Orchard limit, because no block can include it. The check runs
+/// before any state service query, and only at or after NU7 activation.
+#[tokio::test]
+async fn mempool_applies_the_orchard_limit_to_ironwood_actions() {
+    let _init_guard = zakura_test::init();
+
+    let height = Height(1);
+    let network = Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            nu7: Some(height.0),
+            ..Default::default()
+        })
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid");
+
+    let limit = usize::try_from(ORCHARD_BLOCK_ACTION_LIMIT).expect("the limit fits in usize");
+    let orchard_half = limit / 2;
+    let over_limit = || {
+        Some(TransactionError::OrchardActionsExceedBlockLimit {
+            actions: ORCHARD_BLOCK_ACTION_LIMIT + 1,
+            limit: ORCHARD_BLOCK_ACTION_LIMIT,
+        })
+    };
+
+    // The fake proofs fail the proof size check, which the verifier runs after
+    // the shielded limits. That error shows a transaction passed the limits.
+    let cases = [
+        (
+            0,
+            limit + 1,
+            over_limit(),
+            TransactionError::IronwoodProofSize,
+        ),
+        (
+            orchard_half,
+            limit + 1 - orchard_half,
+            over_limit(),
+            TransactionError::OrchardProofSize,
+        ),
+        (0, limit, None, TransactionError::IronwoodProofSize),
+        (
+            orchard_half,
+            limit - orchard_half,
+            None,
+            TransactionError::OrchardProofSize,
+        ),
+    ];
+
+    for (orchard_actions, ironwood_actions, limit_error, proof_size_error) in cases {
+        let tx = fake_v6_with_orchard_and_ironwood_actions(
+            NetworkUpgrade::Nu7,
+            orchard_actions,
+            ironwood_actions,
+        );
+
+        let response = Verifier::new_for_tests(
+            &network,
+            service_fn(|_| async { unreachable!("state service should not be called") }),
+        )
+        .oneshot(Request::Mempool {
+            transaction: Arc::unwrap_or_clone(tx).into(),
+            height,
+        })
+        .await;
+
+        assert_eq!(
+            response,
+            Err(limit_error.unwrap_or(proof_size_error)),
+            "{orchard_actions} Orchard and {ironwood_actions} Ironwood actions",
+        );
+    }
+}
+
+/// Checks that ZIP 2003 accepts V4 transactions below NU7 and rejects them
+/// from NU7 when the `nu7` feature is enabled.
+#[test]
+fn v4_deprecation_boundary() {
+    let _init_guard = zakura_test::init();
+
+    let nu7 = Height(2_000_000);
+    let transaction = test_transactions(&Network::Mainnet)
+        .map(|(_, transaction)| transaction)
+        .find(|transaction| matches!(**transaction, Transaction::V4 { .. }))
+        .expect("the test vectors contain a V4 transaction");
+    let network = configured_network_with_nu7(Some(nu7));
+
+    assert!(
+        verify_v4_at(
+            &network,
+            &transaction,
+            nu7.previous().expect("NU7 is above the minimum height"),
+        )
+        .is_ok(),
+        "a V4 transaction must be valid below the NU7 activation height",
+    );
+
+    let expected = if cfg!(feature = "nu7") {
+        Err(TransactionError::UnsupportedByNetworkUpgrade(
+            transaction.version(),
+            NetworkUpgrade::Nu7,
+        ))
+    } else {
+        Ok(())
+    };
+    assert_eq!(
+        verify_v4_at(&network, &transaction, nu7),
+        expected,
+        "V4 deprecation must match the `nu7` feature at NU7",
+    );
+    assert_eq!(
+        verify_v4_at(
+            &network,
+            &transaction,
+            nu7.next().expect("NU7 is below the maximum height"),
+        ),
+        expected,
+        "V4 deprecation must match the `nu7` feature after NU7",
+    );
+
+    let no_nu7 = configured_network_with_nu7(None);
+    assert!(
+        verify_v4_at(&no_nu7, &transaction, Height::MAX).is_ok(),
+        "a network without an exact NU7 activation must keep accepting V4",
+    );
+}
+
+/// Returns a configured network whose latest upgrade is NU6.3 unless `nu7`
+/// supplies an exact NU7 activation height.
+fn configured_network_with_nu7(nu7: Option<Height>) -> Network {
+    Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            before_overwinter: Some(1),
+            overwinter: Some(2),
+            sapling: Some(3),
+            blossom: Some(4),
+            heartwood: Some(5),
+            canopy: Some(6),
+            nu5: Some(7),
+            nu6: Some(8),
+            nu6_1: Some(9),
+            nu6_2: Some(10),
+            nu6_3: Some(11),
+            nu7: nu7.map(|height| height.0),
+            #[cfg(zcash_unstable = "zfuture")]
+            zfuture: None,
+        })
+        .expect("activation heights are ordered")
+        .clear_funding_streams()
+        .to_network()
+        .expect("the configured network parameters are valid")
+}
+
+/// A [`Verifier`] with concrete service types for calling its associated
+/// network-upgrade check in tests.
+type TestVerifier = Verifier<
+    MockService<zakura_state::Request, zakura_state::Response, PanicAssertion>,
+    MockService<mempool::Request, mempool::Response, PanicAssertion>,
+>;
+
+/// Runs the V4 network-upgrade check at `height` on `network`.
+fn verify_v4_at(
+    network: &Network,
+    transaction: &Transaction,
+    height: Height,
+) -> Result<(), TransactionError> {
+    TestVerifier::verify_v4_transaction_network_upgrade(
+        transaction,
+        network,
+        height,
+        NetworkUpgrade::current(network, height),
+    )
 }
 
 /// Checks the activation boundary of the temporary Orchard-disabling soft fork:

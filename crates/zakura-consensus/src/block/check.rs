@@ -513,11 +513,8 @@ pub fn merkle_root_validity(
     block: &Block,
     transaction_hashes: &[transaction::Hash],
 ) -> Result<(), BlockError> {
-    // TODO: deduplicate zakura-chain and zakura-consensus errors (#2908)
-    block
-        .check_transaction_network_upgrade_consistency(network)
-        .map_err(|_| BlockError::WrongTransactionConsensusBranchId)?;
-
+    // Check the header commitments first. The network upgrade check trusts the coinbase height,
+    // which a peer can rewrite without changing a V5 block's hash.
     let merkle_root = transaction_hashes.iter().cloned().collect();
 
     if block.header.merkle_root != merkle_root {
@@ -548,6 +545,11 @@ pub fn merkle_root_validity(
     if transaction_hashes.len() != transaction_hashes.iter().collect::<HashSet<_>>().len() {
         return Err(BlockError::DuplicateTransaction);
     }
+
+    // TODO: deduplicate zakura-chain and zakura-consensus errors (#2908)
+    block
+        .check_transaction_network_upgrade_consistency(network)
+        .map_err(|_| BlockError::WrongTransactionConsensusBranchId)?;
 
     Ok(())
 }

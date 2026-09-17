@@ -96,16 +96,34 @@ impl<'a> ProjectedTransitionState<'a> {
     pub(super) fn record_aux_delivery(
         &mut self,
         delivery: crate::AuxDelivery,
-    ) -> Result<(), TransitionFailure> {
+    ) -> Result<usize, TransitionFailure> {
         self.graph
             .edit_record_auxiliary_evidence_delivery(delivery.header_hash, delivery.delivery_id)?;
-        self.aux_changes.push(AuxDelta::Put(Box::new(delivery)));
-        Ok(())
+        Ok(self.update_aux_delivery(delivery))
     }
 
-    /// Stage an updated auxiliary delivery row.
-    pub(super) fn update_aux_delivery(&mut self, delivery: crate::AuxDelivery) {
+    /// Stage an updated auxiliary delivery row and return its batch-local index.
+    pub(super) fn update_aux_delivery(&mut self, delivery: crate::AuxDelivery) -> usize {
+        let index = self.aux_changes.len();
         self.aux_changes.push(AuxDelta::Put(Box::new(delivery)));
+        index
+    }
+
+    /// Read a staged row while header admission coalesces semantic duplicates.
+    pub(super) fn staged_aux_delivery(&self, index: usize) -> crate::AuxDelivery {
+        let AuxDelta::Put(delivery) = &self.aux_changes[index] else {
+            unreachable!("admission indices refer to staged delivery puts");
+        };
+        **delivery
+    }
+
+    /// Replace a staged correction without adding a second write for its evidence ID.
+    pub(super) fn replace_staged_aux_delivery(
+        &mut self,
+        index: usize,
+        delivery: crate::AuxDelivery,
+    ) {
+        self.aux_changes[index] = AuxDelta::Put(Box::new(delivery));
     }
 
     /// Add an operator invalidation and dirty verified selection when it changes state.

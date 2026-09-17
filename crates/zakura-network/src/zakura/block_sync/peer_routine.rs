@@ -1188,6 +1188,15 @@ impl PeerRoutine {
                 break FillStop::SendError;
             }
             metrics::counter!("sync.block.request.sent").increment(1);
+            let estimate_kind = if reserved_bytes
+                >= u64::from(request_count).saturating_mul(block::MAX_BLOCK_BYTES)
+            {
+                "worst_case"
+            } else {
+                "hinted"
+            };
+            metrics::counter!("sync.block.request.size_estimate", "kind" => estimate_kind)
+                .increment(1);
             if in_bypass {
                 // A floor request borrowed a bypass slot while the cwnd was saturated.
                 metrics::counter!("sync.block.request.floor_bypass").increment(1);
@@ -1656,10 +1665,12 @@ impl PeerRoutine {
         };
         if serialized_bytes > tolerated_bytes(estimated_bytes, self.config.size_deviation_tolerance)
         {
+            // The body matched the requested hash, so the hint was wrong, not the body.
+            // Discarding it would let one bad advertised size stall this height on every
+            // honest delivery; report and keep going.
+            metrics::counter!("sync.block.body.size_hint_mismatch").increment(1);
             self.report_misbehavior(BlockSyncMisbehavior::SizeMismatch)
                 .await;
-            self.finish_outstanding_at(index, Disposition::RetryOriginal);
-            return;
         }
 
         metrics::counter!("sync.block.body.received").increment(1);
@@ -3920,6 +3931,130 @@ mod tests {
         assert_eq!(work.in_flight_contains(block::Height(1)), received);
         assert_eq!(sequencer_recv.try_recv().is_ok(), received);
         assert!(sequencer_recv.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn oversized_body_against_an_advertised_hint_is_reported_but_still_sequenced() {
+        use zakura_chain::serialization::ZcashDeserializeInto;
+
+        use crate::zakura::transport::OrderedStreamFailureCause;
+        use crate::zakura::ServicePeerDirection;
+
+        let body: Arc<block::Block> = Arc::new(
+            zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+                .zcash_deserialize_into()
+                .unwrap(),
+        );
+        let config = ZakuraBlockSyncConfig::default();
+        let budget = ByteBudget::new(1_000_000);
+        let work = Arc::new(WorkQueue::new(block::Height(0)));
+        work.set_estimate_floor_for_tests(1);
+        // 500 B advertised at the default 200 % tolerance means anything over 1 000 B
+        // mismatches; the block header alone is 1 487 B.
+        work.extend(
+            super::super::test_work_scope(),
+            [(
+                block::Height(1),
+                body.hash(),
+                BlockSizeEstimate::Advertised(500),
+            )],
+        );
+        let peer = ZakuraPeerId::new(vec![23; 32]).unwrap();
+        let registry = Arc::new(PeerRegistry::new());
+        let now = Instant::now();
+        let generation = registry
+            .admit_session(&peer, ServicePeerDirection::Outbound, &config, 0, now)
+            .generation();
+        let cancel = CancellationToken::new();
+        let (out_send, mut out_recv) = crate::zakura::transport::worker_framed_channel(4);
+        let (in_send, in_recv) = framed_channel(4);
+        let cause = OrderedStreamFailureCause::default();
+        let session = BlockSyncPeerSession::for_test(peer.clone(), out_send, cancel.clone());
+        let (sequencer_input, mut sequencer_recv) = mpsc::channel(4);
+        let (reactor_input, mut reactor_recv) = mpsc::channel(4);
+        let (_view_tx, view_rx) = watch::channel(initial_view(BlockSyncFrontiers {
+            finalized_height: block::Height(0),
+            verified_block_tip: block::Height(0),
+            verified_block_hash: block::Hash([0; 32]),
+        }));
+        let mut routine = PeerRoutine::new(
+            peer.clone(),
+            0,
+            session,
+            in_recv.with_failure_cause(cause),
+            config.clone(),
+            true,
+            generation,
+            budget.clone(),
+            work.clone(),
+            registry.clone(),
+            Arc::new(Mutex::new(ThroughputMeter::new(now))),
+            sequencer_input,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            reactor_input,
+            view_rx,
+            cancel.clone(),
+            ZakuraTrace::noop(),
+        );
+        routine.handle_status(BlockSyncStatus {
+            servable_low: block::Height(1),
+            servable_high: block::Height(1),
+            max_blocks_per_response: 1,
+            ..BlockSyncStatus::default()
+        });
+        routine.try_fill().await;
+        assert_eq!(routine.window.outstanding.len(), 1);
+        timeout(Duration::from_secs(1), out_recv.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .write_with(|_| async { Ok::<_, std::convert::Infallible>(()) })
+            .await
+            .unwrap();
+        in_send
+            .send(
+                BlockSyncMessage::Block(body.clone())
+                    .encode_frame()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        in_send
+            .send(
+                BlockSyncMessage::BlocksDone {
+                    start_height: block::Height(1),
+                    returned: 1,
+                }
+                .encode_frame()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let mut running = Box::pin(routine.run());
+        let sequenced = tokio::select! {
+            sequenced = sequencer_recv.recv() => sequenced,
+            _ = &mut running => panic!("the routine must stay alive until the body is sequenced"),
+        };
+        assert!(
+            sequenced.is_some(),
+            "a hash-matched body is sequenced even though it exceeds its size hint"
+        );
+        let reported = std::iter::from_fn(|| reactor_recv.try_recv().ok()).any(|message| {
+            matches!(
+                message,
+                RoutineToReactor::Misbehavior {
+                    reason: super::BlockSyncMisbehavior::SizeMismatch,
+                    ..
+                }
+            )
+        });
+        assert!(reported, "the mismatch is still reported to the reactor");
+
+        cancel.cancel();
+        let result = timeout(Duration::from_secs(1), running).await.unwrap();
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::{
     cell::Cell,
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
-    num::NonZeroU64,
+    num::{NonZeroU32, NonZeroU64},
     panic::AssertUnwindSafe,
     pin::Pin,
 };
@@ -661,6 +661,7 @@ fn assemble_port_header_path_page(
 ) -> Option<HeaderPathPage> {
     if page.headers.len() != page.aux_deliveries.len()
         || page.headers.len() != page.finalized_tree_aux.len()
+        || page.headers.len() != page.finalized_body_sizes.len()
     {
         return None;
     }
@@ -682,25 +683,31 @@ fn assemble_port_header_path_page(
         .into_iter()
         .zip(page.aux_deliveries)
         .zip(page.finalized_tree_aux)
-        .map(|((header, deliveries), finalized_tree_aux)| {
-            let delivery_schema =
-                if tree_aux_schema == AuxSchema::V1 && finalized_tree_aux.is_none() {
-                    AuxSchema::V1
-                } else {
-                    AuxSchema::None
-                };
-            let delivery = selected_port_aux_delivery(&deliveries, delivery_schema);
-            HeaderEntry {
-                header,
-                body_size: delivery.map_or(0, |delivery| match delivery.body_size {
-                    zakura_header_chain::BodySizeHint::Unknown => 0,
-                    zakura_header_chain::BodySizeHint::Known(size) => size.get(),
-                }),
-                tree_aux: (tree_aux_schema == AuxSchema::V1)
-                    .then(|| finalized_tree_aux.or_else(|| delivery.and_then(|item| item.tree_aux)))
-                    .flatten(),
-            }
-        })
+        .zip(page.finalized_body_sizes)
+        .map(
+            |(((header, deliveries), finalized_tree_aux), finalized_body_size)| {
+                let delivery_schema =
+                    if tree_aux_schema == AuxSchema::V1 && finalized_tree_aux.is_none() {
+                        AuxSchema::V1
+                    } else {
+                        AuxSchema::None
+                    };
+                let delivery = selected_port_aux_delivery(&deliveries, delivery_schema);
+                HeaderEntry {
+                    header,
+                    body_size: finalized_body_size
+                        .or_else(|| {
+                            zakura_header_chain::AuxDelivery::advertised_body_size(&deliveries)
+                        })
+                        .map_or(0, NonZeroU32::get),
+                    tree_aux: (tree_aux_schema == AuxSchema::V1)
+                        .then(|| {
+                            finalized_tree_aux.or_else(|| delivery.and_then(|item| item.tree_aux))
+                        })
+                        .flatten(),
+                }
+            },
+        )
         .collect();
     Some(HeaderPathPage {
         lease_id,

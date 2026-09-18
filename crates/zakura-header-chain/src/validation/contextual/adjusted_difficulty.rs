@@ -4,14 +4,14 @@ use chrono::{DateTime, Duration, Utc};
 use thiserror::Error;
 use zakura_chain::{
     block::{self, Block},
-    parameters::{Network, NetworkUpgrade, POW_AVERAGING_WINDOW},
+    parameters::{Network, NetworkUpgrade},
     work::difficulty::{CompactDifficulty, ExpandedDifficulty, ParameterDifficulty as _, U256},
     BoundedVec,
 };
 
 use super::{
-    MAX_POW_ADJUSTMENT_BLOCK_SPAN, POW_ADJUSTMENT_BLOCK_SPAN, POW_DAMPING_FACTOR,
-    POW_MAX_ADJUST_DOWN_PERCENT, POW_MAX_ADJUST_UP_PERCENT, POW_MEDIAN_BLOCK_SPAN,
+    MAX_POW_ADJUSTMENT_BLOCK_SPAN, POW_DAMPING_FACTOR, POW_MAX_ADJUST_DOWN_PERCENT,
+    POW_MAX_ADJUST_UP_PERCENT, POW_MEDIAN_BLOCK_SPAN,
 };
 
 /// The difficulty context calculates a block's adjusted difficulty.
@@ -116,8 +116,11 @@ impl AdjustedDifficulty {
             .take(MAX_POW_ADJUSTMENT_BLOCK_SPAN + 1)
             .unzip::<_, _, Vec<_>, Vec<_>>();
 
-        let active_span = u32::try_from(POW_ADJUSTMENT_BLOCK_SPAN)
-            .map_err(|_| AdjustedDifficultyError::HeightOverflow)?;
+        let active_span = u32::try_from(
+            NetworkUpgrade::averaging_window_for_height(network, candidate_height)
+                + POW_MEDIAN_BLOCK_SPAN,
+        )
+        .map_err(|_| AdjustedDifficultyError::HeightOverflow)?;
         let maximum_span = u32::try_from(MAX_POW_ADJUSTMENT_BLOCK_SPAN)
             .map_err(|_| AdjustedDifficultyError::HeightOverflow)?;
         let active_required = usize::try_from(candidate_height.0.min(active_span))
@@ -182,6 +185,11 @@ impl AdjustedDifficulty {
         self.network.clone()
     }
 
+    /// Returns the averaging window selected by the candidate block's upgrade.
+    fn averaging_window(&self) -> usize {
+        NetworkUpgrade::averaging_window_for_height(&self.network, self.candidate_height)
+    }
+
     /// Calculate the expected `difficulty_threshold` from the candidate block's time and height,
     /// the network, and the
     /// `difficulty_threshold`s and `time`s from the previous
@@ -213,7 +221,7 @@ impl AdjustedDifficulty {
     /// The difficulty calculation implements `ThresholdBits` from the Zcash specification.
     /// `ThresholdBits` excludes the Testnet minimum difficulty adjustment.
     fn threshold_bits(&self) -> CompactDifficulty {
-        let averaging_window_height = u32::try_from(POW_AVERAGING_WINDOW)
+        let averaging_window_height = u32::try_from(self.averaging_window())
             .expect("averaging window is much smaller than u32::MAX");
 
         if self.candidate_height.0 <= averaging_window_height {
@@ -249,12 +257,14 @@ impl AdjustedDifficulty {
     /// Implements `MeanTarget` from the Zcash specification.
     fn mean_target_difficulty(&self) -> ExpandedDifficulty {
         // `threshold_bits` returns `PoWLimit` before it calls this function at early-chain heights.
-        // A valid relevant chain contains at least 17 blocks at later heights.
+        // A valid relevant chain contains at least one full averaging window at later heights.
+
+        let averaging_window = self.averaging_window();
 
         let averaging_window_thresholds =
-            &self.relevant_difficulty_thresholds.as_slice()[0..POW_AVERAGING_WINDOW];
+            &self.relevant_difficulty_thresholds.as_slice()[0..averaging_window];
 
-        let divisor: U256 = POW_AVERAGING_WINDOW.into();
+        let divisor: U256 = averaging_window.into();
         let mut quotient_total = U256::zero();
         let mut remainder_total = U256::zero();
         for compact in averaging_window_thresholds {
@@ -267,7 +277,7 @@ impl AdjustedDifficulty {
                 .expect("the sum of divided targets is at most U256::MAX");
             remainder_total = remainder_total
                 .checked_add(target % divisor)
-                .expect("17 remainders smaller than 17 fit in U256");
+                .expect("a window of remainders smaller than the window fits in U256");
         }
         ExpandedDifficulty::from(
             quotient_total
@@ -329,11 +339,12 @@ impl AdjustedDifficulty {
         let newer_median = self.median_time_past();
 
         // MedianTime(height : N) := median([ nTime(𝑖) for 𝑖 from max(0, height − PoWMedianBlockSpan) up to max(0, height − 1) ])
-        let older_median = if self.relevant_times.len() > POW_AVERAGING_WINDOW {
+        let averaging_window = self.averaging_window();
+        let older_median = if self.relevant_times.len() > averaging_window {
             let older_times: Vec<_> = self
                 .relevant_times
                 .iter()
-                .skip(POW_AVERAGING_WINDOW)
+                .skip(averaging_window)
                 .cloned()
                 .take(POW_MEDIAN_BLOCK_SPAN)
                 .collect();

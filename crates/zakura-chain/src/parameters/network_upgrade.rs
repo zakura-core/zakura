@@ -522,11 +522,25 @@ impl NetworkUpgrade {
         }
     }
 
+    /// Returns the difficulty averaging window at the selected network height.
+    ///
+    /// All currently configured upgrades use the same 17-block window.
+    pub fn averaging_window_for_height(network: &Network, height: block::Height) -> usize {
+        NetworkUpgrade::current(network, height).averaging_window()
+    }
+
+    /// Returns the difficulty averaging window for this upgrade.
+    ///
+    /// Every upgrade currently uses the same 17-block window.
+    pub fn averaging_window(&self) -> usize {
+        POW_AVERAGING_WINDOW
+    }
+
     /// Returns the averaging window timespan for the network upgrade.
     ///
     /// `AveragingWindowTimespan` from the Zcash specification.
     pub fn averaging_window_timespan(&self) -> Duration {
-        self.target_spacing() * POW_AVERAGING_WINDOW.try_into().expect("fits in i32")
+        self.target_spacing() * self.averaging_window().try_into().expect("fits in i32")
     }
 
     /// Returns `true` if NU7's consensus rules apply at `height` on `network`.

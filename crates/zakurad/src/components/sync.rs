@@ -2969,9 +2969,12 @@ where
                 false
             }
             BlockDownloadVerifyError::ParentHeightMismatch { .. } => {
-                // Only reached once the requeue budget is exhausted: the required hash still
-                // hasn't produced a usable body, so restart to get fresh tips and peers rather
-                // than leaving the newest block unresolved.
+                // `handle_block_response_with_missing_retry` handles every mismatch itself and
+                // returns success even once the requeue budget is exhausted, so that an
+                // exhausted budget keeps the round's other downloads. This arm is therefore
+                // only reached by a caller that bypasses the retry handler. The round's stall
+                // deadline is what recovers an exhausted hash: a swallowed completion is not
+                // verified progress, so the round restarts and obtains fresh tips and peers.
                 warn!(
                     error = ?e,
                     %peer,

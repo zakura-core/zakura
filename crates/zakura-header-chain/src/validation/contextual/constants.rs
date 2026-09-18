@@ -7,6 +7,7 @@ pub const POW_MEDIAN_BLOCK_SPAN: usize = 11;
 ///
 /// `PoWAveragingWindow + PoWMedianBlockSpan` in the Zcash specification based on
 /// > ActualTimespan(height : N) := MedianTime(height) − MedianTime(height − PoWAveragingWindow)
+///
 /// Retain the future ZIP 218 maximum even while the active averaging window is 17.
 /// The active difficulty calculation remains independent of this storage bound.
 pub const POW_ADJUSTMENT_BLOCK_SPAN: usize = 102 + POW_MEDIAN_BLOCK_SPAN;

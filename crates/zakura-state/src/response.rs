@@ -98,8 +98,8 @@ pub enum Response {
     /// Response to [`Request::Block`] with the specified block.
     Block(Option<Arc<Block>>),
 
-    /// Response to [`Request::AwaitBlockInfo`] with the specified block's chain value
-    /// pools.
+    /// Response to [`Request::AwaitBlockInfo`] and [`Request::BlockInfo`] with the
+    /// specified block's chain value pools.
     BlockInfo(Option<BlockInfo>),
 
     /// The response to a `BlockHeader` request.
@@ -727,11 +727,12 @@ impl TryFrom<ReadResponse> for Response {
                 Ok(Response::PreparedMinedRelayEligibility(eligibility))
             }
 
+            ReadResponse::BlockInfo(block_info) => Ok(Response::BlockInfo(block_info)),
+
             ReadResponse::UsageInfo(_)
             | ReadResponse::PruningInfo { .. }
             | ReadResponse::BlockRoots(_)
             | ReadResponse::TipPoolValues { .. }
-            | ReadResponse::BlockInfo(_)
             | ReadResponse::TransactionIdsForBlock(_)
             | ReadResponse::AnyChainTransactionIdsForBlock(_)
             | ReadResponse::SaplingTree(_)

@@ -708,3 +708,43 @@ fn scheduled_issuance_boundary_differences_match_block_subsidy() {
         }
     }
 }
+
+/// A halving interval of one overflows the halving divisor inside the default slow start.
+/// Cumulative issuance must stop there, like the per-block subsidy.
+#[test]
+fn scheduled_issuance_stops_at_a_halving_overflow_inside_slow_start() {
+    use crate::parameters::{
+        subsidy::{halving_block_subsidy, halving_divisor, scheduled_issuance_zatoshis},
+        testnet,
+    };
+    let network = testnet::Parameters::build()
+        .with_halving_interval(1)
+        .expect("the halving interval is valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("the configured testnet is valid");
+    let slow_start_end = network.slow_start_interval().0;
+    let cutoff = (1..slow_start_end)
+        .find(|h| halving_divisor(Height(*h), &network).is_none())
+        .expect("the halving divisor overflows inside slow start");
+
+    let mut direct = 0u128;
+    for h in 1..=slow_start_end + 2 {
+        let block = u128::try_from(i64::from(
+            halving_block_subsidy(Height(h), &network).expect("valid subsidy"),
+        ))
+        .expect("subsidies are non-negative");
+        direct += block;
+        if h.abs_diff(cutoff) <= 2 || h + 2 >= slow_start_end {
+            assert_eq!(
+                scheduled_issuance_zatoshis(Height(h), &network).expect("valid issuance"),
+                direct,
+                "height {h}, cutoff {cutoff}"
+            );
+        }
+    }
+    assert_eq!(
+        halving_block_subsidy(Height(cutoff), &network).expect("valid subsidy"),
+        Amount::<NonNegative>::zero()
+    );
+}

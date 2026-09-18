@@ -21,6 +21,13 @@ pub use zakura_chain::transparent::MIN_TRANSPARENT_COINBASE_MATURITY;
 /// `zakura-checkpoints`) can use it without depending on `zakura-state`.
 pub const MAX_BLOCK_REORG_HEIGHT: u32 = zakura_chain::parameters::constants::MAX_BLOCK_REORG_HEIGHT;
 
+/// The longest time a [`crate::Request::AwaitBlockInfo`] request waits for its block to commit.
+///
+/// A block's parent can still be verifying when the block needs the parent's metadata. The
+/// parent can also fail semantic verification and never reach the state. This limit bounds
+/// the wait in that case. Callers treat the timeout as retryable.
+pub const AWAIT_BLOCK_INFO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2 * 60);
+
 /// The directory name used to distinguish the state database from Zebra's other databases or flat files.
 pub const STATE_DATABASE_KIND: &str = "state";
 

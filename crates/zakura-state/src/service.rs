@@ -45,10 +45,14 @@ use zakura_chain::{
 
 use crate::{
     constants::{
-        MAX_BLOCK_REORG_HEIGHT, MAX_FIND_BLOCK_HASHES_RESULTS, MAX_FIND_BLOCK_HEADERS_RESULTS,
-        MAX_HEADER_SYNC_HEIGHT_RANGE, MAX_HISTORICAL_TREE_REPLAY_BLOCKS, MAX_LEGACY_CHAIN_BLOCKS,
+        AWAIT_BLOCK_INFO_TIMEOUT, MAX_BLOCK_REORG_HEIGHT, MAX_FIND_BLOCK_HASHES_RESULTS,
+        MAX_FIND_BLOCK_HEADERS_RESULTS, MAX_HEADER_SYNC_HEIGHT_RANGE,
+        MAX_HISTORICAL_TREE_REPLAY_BLOCKS, MAX_LEGACY_CHAIN_BLOCKS,
     },
-    error::{CommitBlockError, CommitCheckpointVerifiedError, InvalidateError, ReconsiderError},
+    error::{
+        AwaitBlockInfoError, CommitBlockError, CommitCheckpointVerifiedError, InvalidateError,
+        ReconsiderError,
+    },
     request::TimedSpan,
     response::NonFinalizedBlocksListener,
     service::{
@@ -225,8 +229,11 @@ pub(crate) struct StateService {
     non_finalized_rejected_receiver:
         tokio::sync::mpsc::UnboundedReceiver<write::NonFinalizedWriteFailure>,
 
-    /// Receives a notification after each successful block commit.
-    block_commit_receiver: tokio::sync::watch::Receiver<u64>,
+    /// Receives a notification after each block commit, rejection, or reconsideration.
+    block_commit_receiver: tokio::sync::watch::Receiver<write::BlockWriteNotice>,
+
+    /// The longest time an [`Request::AwaitBlockInfo`] request waits for its block.
+    await_block_info_timeout: Duration,
 
     // Pending UTXO Request Tracking
     //
@@ -611,6 +618,7 @@ impl StateService {
             invalid_block_write_reset_receiver,
             non_finalized_rejected_receiver,
             block_commit_receiver,
+            await_block_info_timeout: AWAIT_BLOCK_INFO_TIMEOUT,
             pending_utxos,
             last_prune: Instant::now(),
             read_service: read_service.clone(),
@@ -2013,26 +2021,41 @@ impl Service<Request> for StateService {
             Request::AwaitBlockInfo(hash) => {
                 let mut block_commit_receiver = self.block_commit_receiver.clone();
                 let read_service = self.read_service.clone();
+                let limit = self.await_block_info_timeout;
 
                 async move {
-                    loop {
-                        let response = read_service
-                            .clone()
-                            .oneshot(ReadRequest::BlockInfo(hash.into()))
-                            .await?;
-                        let ReadResponse::BlockInfo(block_info) = response else {
-                            unreachable!("wrong response to ReadRequest::BlockInfo");
-                        };
+                    let wait = async {
+                        loop {
+                            // Mark this notice as seen before the read, so a write that lands
+                            // after the read still wakes this request.
+                            block_commit_receiver.borrow_and_update();
 
-                        if block_info.is_some() {
-                            return Ok(Response::BlockInfo(block_info));
+                            let response = read_service
+                                .clone()
+                                .oneshot(ReadRequest::BlockInfo(hash.into()))
+                                .await?;
+                            let ReadResponse::BlockInfo(block_info) = response else {
+                                unreachable!("wrong response to ReadRequest::BlockInfo");
+                            };
+
+                            if block_info.is_some() {
+                                return Ok(Response::BlockInfo(block_info));
+                            }
+
+                            if block_commit_receiver.borrow().is_rejected(&hash) {
+                                return Err(AwaitBlockInfoError::Rejected { hash }.into());
+                            }
+
+                            block_commit_receiver
+                                .changed()
+                                .await
+                                .map_err(BoxError::from)?;
                         }
+                    };
 
-                        block_commit_receiver
-                            .changed()
-                            .await
-                            .map_err(BoxError::from)?;
-                    }
+                    tokio::time::timeout(limit, wait)
+                        .await
+                        .map_err(|_elapsed| AwaitBlockInfoError::TimedOut { hash, limit })?
                 }
                 .boxed()
             }

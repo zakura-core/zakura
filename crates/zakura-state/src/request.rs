@@ -1431,6 +1431,10 @@ pub enum Request {
     ///
     /// Returns [`Response::BlockInfo(Some(block_info))`](Response::BlockInfo) after the block
     /// commits. The response future remains pending while the block is unknown.
+    ///
+    /// Returns [`AwaitBlockInfoError`](crate::AwaitBlockInfoError) if the state rejects the
+    /// block or the block does not commit within
+    /// [`AWAIT_BLOCK_INFO_TIMEOUT`](crate::constants::AWAIT_BLOCK_INFO_TIMEOUT).
     AwaitBlockInfo(block::Hash),
 
     /// Looks up a block by hash in any current chain or by height in the current best chain.

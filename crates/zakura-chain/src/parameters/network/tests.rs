@@ -1022,3 +1022,130 @@ fn slow_start_subsidy_is_not_scaled_when_nu7_activates_early() -> Result<(), Rep
 
     Ok(())
 }
+
+#[test]
+fn scheduled_issuance_boundary_differences_match_block_subsidy() {
+    use crate::parameters::subsidy::{halving_block_subsidy, scheduled_issuance_zatoshis};
+    for network in [
+        Network::Mainnet,
+        Network::new_default_testnet(),
+        Network::new_regtest(Default::default()),
+    ] {
+        assert_eq!(scheduled_issuance_zatoshis(Height(0), &network).unwrap(), 0);
+        let mut boundaries = vec![
+            Height(1),
+            network.slow_start_shift(),
+            network.slow_start_interval(),
+            Height(Height::MAX_AS_U32),
+        ];
+        boundaries.extend(NetworkUpgrade::target_spacings(&network).map(|(height, _)| height));
+        boundaries.extend((0..35).filter_map(|n| height_for_halving(n, &network)));
+        for boundary in boundaries {
+            for h in [
+                boundary.0.saturating_sub(1),
+                boundary.0,
+                boundary.0.saturating_add(1),
+            ] {
+                if h == 0 || h > Height::MAX_AS_U32 {
+                    continue;
+                }
+                let previous = scheduled_issuance_zatoshis(Height(h - 1), &network).unwrap();
+                let current = scheduled_issuance_zatoshis(Height(h), &network).unwrap();
+                let block = u128::try_from(i64::from(
+                    halving_block_subsidy(Height(h), &network).unwrap(),
+                ))
+                .unwrap();
+                assert_eq!(current - previous, block, "network {network:?}, height {h}");
+                assert_eq!(
+                    block_subsidy(Height(h), &network, None).unwrap(),
+                    halving_block_subsidy(Height(h), &network).unwrap()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn reissuance_activation_and_rounding_boundary_matrix() {
+    use crate::parameters::subsidy::{
+        halving_block_subsidy, is_zip234_active, nsm_reissuance_height, SubsidyError,
+    };
+    for nu7 in [None, Some(2)] {
+        for configured_start in [1, 2, 3, 10] {
+            let network = Network::new_regtest(testnet::RegtestParameters {
+                activation_heights: ConfiguredActivationHeights {
+                    nu7,
+                    ..Default::default()
+                },
+                nsm_reissuance_height: Some(Height(configured_start)),
+                ..Default::default()
+            });
+            assert_eq!(
+                nsm_reissuance_height(&network),
+                nu7.map(|n| Height(n.max(configured_start)))
+            );
+            for height in 1..=11 {
+                let active =
+                    cfg!(feature = "nu7") && nu7.is_some_and(|n| height >= n.max(configured_start));
+                assert_eq!(is_zip234_active(&network, Height(height)), active);
+                let scheduled = halving_block_subsidy(Height(height), &network).unwrap();
+                if active {
+                    assert_eq!(
+                        block_subsidy(Height(height), &network, None),
+                        Err(SubsidyError::MissingNsmValueBalance)
+                    );
+                } else {
+                    assert_eq!(
+                        block_subsidy(Height(height), &network, None).unwrap(),
+                        scheduled
+                    );
+                }
+                let numerator = i128::try_from(
+                    crate::parameters::subsidy::block_subsidy_fraction_numerator(
+                        Height(height),
+                        &network,
+                    ),
+                )
+                .unwrap();
+                // The largest deficit that still rounds up to a one-zatoshi bonus.
+                let boundary = i64::try_from(10_000_000_000 / numerator).unwrap();
+                for deficit in [
+                    0i64,
+                    1,
+                    2,
+                    boundary,
+                    boundary + 1,
+                    4_999_999_999,
+                    5_000_000_000,
+                    5_000_000_001,
+                    crate::amount::MAX_MONEY,
+                ] {
+                    let expected_bonus = if active {
+                        (i128::from(deficit) * numerator + 9_999_999_999) / 10_000_000_000
+                    } else {
+                        0
+                    };
+                    let actual = block_subsidy(
+                        Height(height),
+                        &network,
+                        Some(Amount::try_from(deficit).unwrap()),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        i128::from(i64::from(actual)),
+                        i128::from(i64::from(scheduled)) + expected_bonus
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        testnet::Parameters::build()
+            .with_activation_heights(ConfiguredActivationHeights {
+                nu7: Some(0),
+                ..Default::default()
+            })
+            .is_err(),
+        "the network builder reserves genesis for the Genesis upgrade"
+    );
+}

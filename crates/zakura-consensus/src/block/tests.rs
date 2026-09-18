@@ -1717,6 +1717,40 @@ async fn zip234_block_verification_checks_the_reissuance_bonus() {
             verifier.oneshot(Request::Commit(Arc::new(block)))
         };
 
+    // Exercise zero, single-zatoshi rounding, a rounding boundary, and a larger deficit.
+    let numerator = i128::try_from(
+        zakura_chain::parameters::subsidy::block_subsidy_fraction_numerator(start, &network),
+    )
+    .expect("the fraction numerator fits in i128");
+    // The largest deficit that still rounds up to a one-zatoshi bonus.
+    let boundary = i64::try_from(10_000_000_000 / numerator).expect("the boundary fits in i64");
+    for deficit in [0i64, 1, 2, boundary, boundary + 1, ZIP234_TEST_DEFICIT] {
+        let bonus =
+            i64::try_from((i128::from(deficit) * numerator + 9_999_999_999) / 10_000_000_000)
+                .unwrap();
+        let allowed = (halving_subsidy + Amount::try_from(bonus).unwrap()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), verify(deficit, allowed))
+            .await
+            .expect("verification completes")
+            .expect("exact claim passes");
+        let excess = (allowed + Amount::try_from(1).unwrap()).unwrap();
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(10), verify(deficit, excess))
+                .await
+                .expect("verification completes");
+        assert!(
+            matches!(
+                result,
+                Err(VerifyBlockError::Block {
+                    source: BlockError::Transaction(TransactionError::Subsidy(
+                        SubsidyError::InvalidMinerFees
+                    ))
+                })
+            ),
+            "deficit {deficit}: {result:?}"
+        );
+    }
+
     // The coinbase claims the halving subsidy plus the reissuance bonus.
     let block = zip234_test_block(&network, start, with_bonus);
     assert_eq!(
@@ -1759,6 +1793,49 @@ async fn zip234_block_verification_checks_the_reissuance_bonus() {
             SubsidyError::MissingNsmValueBalance
         )),
     ));
+}
+
+/// A proposal whose parent has not committed is rejected immediately after the ZIP 234
+/// start, instead of waiting for a parent commit that may never arrive.
+#[cfg(feature = "nu7")]
+#[tokio::test]
+async fn zip234_proposal_with_uncommitted_parent_is_rejected_without_waiting() {
+    use zakura_chain::parameters::subsidy::halving_block_subsidy;
+
+    let _init_guard = zakura_test::init();
+
+    let start = Height(3);
+    let network = zip234_test_network(start);
+    let halving_subsidy = halving_block_subsidy(start, &network).expect("valid halving subsidy");
+    let block = zip234_test_block(&network, start, halving_subsidy);
+    let expected_parent = block.header.previous_block_hash;
+
+    let state = service_fn(move |request: zs::Request| async move {
+        let response = match request {
+            zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+            zs::Request::BlockInfo(requested_parent) => {
+                assert_eq!(requested_parent, expected_parent);
+                zs::Response::BlockInfo(None)
+            }
+            _ => panic!("a proposal must not wait for its parent: {request:?}"),
+        };
+        Ok::<_, BoxError>(response)
+    });
+    let transaction =
+        service_fn(|request| async move { Ok::<_, BoxError>(accept_block_transaction(request)) });
+    let verifier = SemanticBlockVerifier::new(&network, state, transaction);
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        verifier.oneshot(Request::CheckProposal(Arc::new(block))),
+    )
+    .await
+    .expect("proposal verification does not wait for the parent");
+
+    assert!(
+        matches!(result, Err(VerifyBlockError::ValidateProposal(_))),
+        "{result:?}"
+    );
 }
 
 /// A network with NU7 at height 1 and ZIP 234 reissuance from `start`.

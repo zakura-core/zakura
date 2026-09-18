@@ -8,13 +8,9 @@ use color_eyre::eyre::Result;
 
 use zakura_chain::{block::Height, chain_tip::mock::MockChainTip, parameters::Network};
 use zakurad::components::sync::end_of_support::{
-    self, EOS_PANIC_AFTER, EOS_WARN_AFTER, EOS_WARN_MESSAGE_HEADER, ESTIMATED_RELEASE_HEIGHT,
+    self, EOS_PANIC_AFTER, EOS_WARN_AFTER, EOS_WARN_MESSAGE_HEADER, ESTIMATED_BLOCKS_PER_DAY,
+    ESTIMATED_RELEASE_HEIGHT,
 };
-
-/// The number of Mainnet blocks per day.
-///
-/// Mainnet has no NU7 height, so it keeps the 75 second target spacing.
-const ESTIMATED_BLOCKS_PER_DAY: u32 = 24 * 60 * 60 / 75;
 
 /// Test that the `end_of_support` function is working as expected.
 #[test]

@@ -527,4 +527,43 @@ mod nsm_value_balance_properties {
             prop_assert_eq!((change + reverse).unwrap(), ValueBalance::<NegativeAllowed>::zero());
         }
     }
+    #[test]
+    fn issuance_accounting_activation_genesis_and_sign_boundaries() {
+        for activation in [None, Some(1), Some(3)] {
+            let network = Network::new_regtest(RegtestParameters {
+                activation_heights: ConfiguredActivationHeights {
+                    nu7: activation,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            for height in 0..5 {
+                let mut block = (*genesis::regtest_genesis_block()).clone();
+                let transaction = Arc::make_mut(&mut block.transactions[0]);
+                let Input::Coinbase { height: h, .. } = &mut transaction.inputs_mut()[0] else {
+                    unreachable!()
+                };
+                *h = Height(height);
+                let scheduled = if height == 0 {
+                    0
+                } else {
+                    i64::from(halving_block_subsidy(Height(height), &network).unwrap())
+                };
+                for issued in [-1, 0, 1, scheduled, scheduled + 1] {
+                    let change =
+                        ValueBalance::from_transparent_amount(Amount::try_from(issued).unwrap());
+                    let expected = if activation.is_some_and(|start| height >= start) {
+                        scheduled - issued
+                    } else {
+                        0
+                    };
+                    assert_eq!(
+                        i64::from(block.nsm_value_balance_change(&network, &change).unwrap()),
+                        expected,
+                        "activation {activation:?}, height {height}, issued {issued}"
+                    );
+                }
+            }
+        }
+    }
 }

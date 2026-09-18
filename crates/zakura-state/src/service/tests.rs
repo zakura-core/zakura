@@ -43,37 +43,53 @@ const LAST_BLOCK_HEIGHT: u32 = 10;
 #[tokio::test(flavor = "multi_thread")]
 async fn await_block_info_waits_for_checkpoint_commit() {
     let _init_guard = zakura_test::init();
-    let network = Network::Mainnet;
-    let state = init_test(&network).await;
+    let state = init_test(&Network::Mainnet).await;
     let block0: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
         .zcash_deserialize_into()
         .expect("genesis block deserializes");
     let block1: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
         .zcash_deserialize_into()
         .expect("block 1 deserializes");
-    let block1_hash = block1.hash();
+    let hash = block1.hash();
+    let limit = Duration::from_secs(10);
+    let mut wait = tokio::spawn(state.clone().oneshot(Request::AwaitBlockInfo(hash)));
+    let second_wait = tokio::spawn(state.clone().oneshot(Request::AwaitBlockInfo(hash)));
 
-    let wait = tokio::spawn(state.clone().oneshot(Request::AwaitBlockInfo(block1_hash)));
-    tokio::task::yield_now().await;
-    assert!(
-        !wait.is_finished(),
-        "unknown block info must remain pending"
-    );
-
-    for block in [block0, block1] {
-        let response = state
+    // A different block's commit must wake readers without answering this request.
+    timeout(
+        limit,
+        state
             .clone()
-            .oneshot(Request::CommitCheckpointVerifiedBlock(block.into()))
+            .oneshot(Request::CommitCheckpointVerifiedBlock(block0.into())),
+    )
+    .await
+    .expect("genesis commit completes")
+    .expect("genesis commits");
+    assert!(timeout(Duration::from_millis(50), &mut wait).await.is_err());
+
+    timeout(
+        limit,
+        state
+            .clone()
+            .oneshot(Request::CommitCheckpointVerifiedBlock(block1.into())),
+    )
+    .await
+    .expect("parent commit completes")
+    .expect("parent commits");
+    for waiter in [wait, second_wait] {
+        let response = timeout(limit, waiter)
             .await
-            .expect("checkpoint block commits");
-        assert!(matches!(response, Response::Committed(_)));
+            .expect("reader observes commit")
+            .expect("reader task completes")
+            .expect("lookup succeeds");
+        assert!(matches!(response, Response::BlockInfo(Some(_))));
     }
 
-    let response = timeout(Duration::from_secs(5), wait)
+    // A reader registered after the notification must also see the committed block.
+    let response = timeout(limit, state.oneshot(Request::AwaitBlockInfo(hash)))
         .await
-        .expect("block info wait should finish")
-        .expect("block info task should not panic")
-        .expect("block info lookup should succeed");
+        .expect("known parent returns immediately")
+        .expect("lookup succeeds");
     assert!(matches!(response, Response::BlockInfo(Some(_))));
 }
 

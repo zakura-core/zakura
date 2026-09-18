@@ -27,7 +27,8 @@ pub struct HeaderContextFact {
 pub struct ValidationLease {
     /// Exact known parent.
     pub(crate) parent: Frontier,
-    /// Up to 113 facts in reverse height order, beginning with `parent`.
+    /// Up to [`crate::MAX_POW_ADJUSTMENT_BLOCK_SPAN`] facts in reverse height
+    /// order, beginning with `parent`.
     pub(crate) predecessors: Vec<HeaderContextFact>,
     /// Exact network policy used by the issuing engine.
     pub(crate) network: zakura_chain::parameters::Network,

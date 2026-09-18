@@ -1096,7 +1096,7 @@ where
         loop {
             if self.try_to_sync(None).await.is_err() {
                 self.downloads.cancel_all();
-                self.discovery = Default::default();
+                self.discovery.abandon();
             }
 
             self.update_metrics();
@@ -1306,7 +1306,7 @@ where
         };
         if self.try_to_sync(None).await.is_err() {
             self.downloads.cancel_all();
-            self.discovery = Default::default();
+            self.discovery.abandon();
         }
         self.update_metrics();
         drop(lease);
@@ -1539,15 +1539,23 @@ where
                         .clone()
                         .oneshot(zs::Request::KnownBlock(hash))
                         .await;
-                    if matches!(
-                        response,
-                        Ok(zs::Response::KnownBlock(Some(
-                            zs::KnownBlock::Finalized
-                                | zs::KnownBlock::BestChain
-                                | zs::KnownBlock::SideChain
-                        )))
+                    let Ok(zs::Response::KnownBlock(Some(known))) = response else {
+                        continue;
+                    };
+                    if !matches!(
+                        known,
+                        zs::KnownBlock::Finalized
+                            | zs::KnownBlock::BestChain
+                            | zs::KnownBlock::SideChain
                     ) {
-                        self.discovery.committed(hash);
+                        continue;
+                    }
+                    // A side-chain commit resolves the advertised hash, so it still credits the
+                    // peer. It does not advance the best chain, so it must not postpone the
+                    // verified-progress deadline: an attacker who can mine a low-work fork would
+                    // otherwise hold an unproductive round open indefinitely.
+                    self.discovery.committed(hash);
+                    if matches!(known, zs::KnownBlock::Finalized | zs::KnownBlock::BestChain) {
                         self.last_verified_progress = tokio::time::Instant::now();
                     }
                 }

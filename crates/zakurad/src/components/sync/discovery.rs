@@ -85,6 +85,20 @@ impl Discovery {
         Some(record)
     }
 
+    /// Resolves every retained response when the round discards its evidence.
+    ///
+    /// Dropping the records completes them as neutral, which neither scores the peer nor
+    /// rotates it out, so an aborted round would let the same peers refill the next one
+    /// with hashes that never commit.
+    pub(super) fn abandon(&mut self) {
+        for (_, (_, feedback)) in std::mem::take(&mut self.responses).into_values() {
+            feedback.expired();
+        }
+        self.by_hash.clear();
+        self.reconcile_at = None;
+        self.reconcile_cursor = 0;
+    }
+
     pub(super) fn expire(&mut self) {
         let expired: Vec<_> = self
             .responses

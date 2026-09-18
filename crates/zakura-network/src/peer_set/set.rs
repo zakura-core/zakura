@@ -129,6 +129,7 @@ use crate::{
     constants::MIN_PEER_SET_LOG_INTERVAL,
     peer::{LoadTrackedClient, MinimumPeerVersion},
     peer_set::{
+        discovery_feedback::PendingDiscovery,
         legacy_peer_trace::{LegacyPeerTrace, PeerTraceContext},
         stall_tracker::FindResponseStallTracker,
         unready_service::{Error as UnreadyError, UnreadyService},
@@ -1041,11 +1042,11 @@ where
                     .chain_tip()
                     .is_at_or_near_network_tip(&self.network);
 
-            let feedback = if track_stalls {
+            let feedback = PendingDiscovery::new(if track_stalls {
                 self.find_response_stalls.start(p2c_key)
             } else {
                 None
-            };
+            });
             let fut = svc.call(req);
             self.push_unready(p2c_key, svc);
 
@@ -1053,7 +1054,7 @@ where
                 let trace = self.legacy_peer_trace.clone();
                 return async move {
                     let mut result = fut.await;
-                    if let Some(feedback) = feedback {
+                    if let Some(feedback) = feedback.responded() {
                         match &mut result {
                             Ok(Response::BlockHashes {
                                 hashes,

@@ -1,6 +1,7 @@
 //! Unit tests for [`FindResponseStallTracker`].
 
 use super::*;
+use crate::peer_set::discovery_feedback::PendingDiscovery;
 
 fn test_addr(last_octet: u8) -> PeerSocketAddr {
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -174,4 +175,53 @@ async fn deadlines_wake_an_idle_owner() {
     tokio::task::yield_now().await;
     assert!(flag.0.load(Ordering::SeqCst));
     assert!(tracker.eligible(&addr));
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelled_request_rotates_the_silent_peer_out() {
+    let mut tracker = FindResponseStallTracker::new();
+    let addr = test_addr(1);
+    tracker.connection(addr, 1);
+    tracker.record_stall(addr);
+
+    // The syncer cancels a discovery request after six seconds, well before the connection
+    // reports a receive timeout. Dropping the guard stands in for that cancellation.
+    let guard = PendingDiscovery::new(tracker.start(addr));
+    drop(guard);
+
+    assert!(
+        drain(&mut tracker).is_empty(),
+        "cancellation is not a strike"
+    );
+    assert!(
+        !tracker.eligible(&addr),
+        "a peer that answered nothing must leave the discovery rotation"
+    );
+    assert_eq!(
+        tracker.counts[&addr], 1,
+        "cancellation neither adds nor clears a misconduct strike"
+    );
+
+    tokio::time::advance(REPROBE_DELAY).await;
+    assert!(
+        tracker.eligible(&addr),
+        "the peer is reprobed after the delay"
+    );
+}
+
+#[tokio::test]
+async fn a_response_disarms_the_cancellation_guard() {
+    let mut tracker = FindResponseStallTracker::new();
+    let addr = test_addr(1);
+    tracker.connection(addr, 1);
+
+    let guard = PendingDiscovery::new(tracker.start(addr));
+    let feedback = guard.responded().expect("the request was tracked");
+    feedback.verified();
+
+    assert!(drain(&mut tracker).is_empty());
+    assert!(
+        tracker.eligible(&addr),
+        "a peer that answered and committed stays in the rotation"
+    );
 }

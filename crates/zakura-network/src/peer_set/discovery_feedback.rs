@@ -73,3 +73,33 @@ impl DiscoveryFeedback {
         self.0.completion.wake.wake();
     }
 }
+
+/// Holds discovery evidence for one in-flight request and resolves it on cancellation.
+///
+/// A dropped [`DiscoveryFeedback`] completes as `NEUTRAL`, which records nothing. The syncer
+/// cancels a discovery request after six seconds, long before the connection classifies a
+/// silent peer as a receive timeout, so a peer that accepts `getblocks` and then stays quiet —
+/// or answers with an unrelated message the handler never completes on — would stay eligible
+/// and repeat that indefinitely. Cancellation instead expires the evidence, which rotates the
+/// peer out for the reprobe delay without charging it a misconduct strike.
+#[derive(Debug)]
+pub(super) struct PendingDiscovery(Option<DiscoveryFeedback>);
+
+impl PendingDiscovery {
+    pub(super) fn new(feedback: Option<DiscoveryFeedback>) -> Self {
+        Self(feedback)
+    }
+
+    /// Disarms the guard once the request produced a result, so the caller classifies it.
+    pub(super) fn responded(mut self) -> Option<DiscoveryFeedback> {
+        self.0.take()
+    }
+}
+
+impl Drop for PendingDiscovery {
+    fn drop(&mut self) {
+        if let Some(feedback) = self.0.take() {
+            feedback.expired();
+        }
+    }
+}

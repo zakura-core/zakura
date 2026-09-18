@@ -113,7 +113,7 @@ use futures::{
 };
 use itertools::Itertools;
 use tokio::{
-    sync::{broadcast, mpsc as tokio_mpsc, watch},
+    sync::{broadcast, watch},
     task::JoinHandle,
 };
 use tower::{
@@ -129,6 +129,7 @@ use crate::{
     constants::MIN_PEER_SET_LOG_INTERVAL,
     peer::{LoadTrackedClient, MinimumPeerVersion},
     peer_set::{
+        discovery_feedback::PendingDiscovery,
         legacy_peer_trace::{LegacyPeerTrace, PeerTraceContext},
         stall_tracker::FindResponseStallTracker,
         unready_service::{Error as UnreadyError, UnreadyService},
@@ -161,26 +162,6 @@ pub struct CancelClientWork;
 
 type ResponseFuture = Pin<Box<dyn Future<Output = Result<Response, BoxError>> + Send + 'static>>;
 
-/// Classification of a `FindBlocks`/`FindHeaders` response, sent from a
-/// response-wrapping future to [`PeerSet::poll_ready`] via an mpsc channel so
-/// the stall tracker can be updated and the peer disconnected if needed.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum StallOutcome {
-    Stall,
-    Clear,
-}
-
-fn classify_find_response<E>(result: &Result<Response, E>) -> Option<StallOutcome> {
-    match result {
-        Ok(Response::BlockHashes(hashes)) if hashes.is_empty() => Some(StallOutcome::Stall),
-        Ok(Response::BlockHashes(_)) => Some(StallOutcome::Clear),
-        Ok(Response::BlockHeaders(headers)) if headers.is_empty() => Some(StallOutcome::Stall),
-        Ok(Response::BlockHeaders(_)) => Some(StallOutcome::Clear),
-        Ok(_) => None,
-        Err(_) => Some(StallOutcome::Stall),
-    }
-}
-
 /// A [`tower::Service`] that abstractly represents "the rest of the network".
 ///
 /// # Security
@@ -209,18 +190,8 @@ where
     /// A shared list of banned IP addresses.
     bans: BannedIps,
 
-    /// Tracks peers returning empty `FindBlocks`/`FindHeaders` responses.
-    /// Mutated only from [`Self::poll_ready`] via [`Self::stall_event_rx`].
+    /// Bounded, connection-scoped block discovery feedback.
     find_response_stalls: FindResponseStallTracker,
-
-    /// Receives stall/clear events from tracked routing futures in
-    /// [`Self::route_p2c`]. The channel keeps the tracker single-owner (no
-    /// `Mutex`) and confines mutation to `poll_ready`, where the peer set can
-    /// call [`Self::remove`] directly.
-    stall_event_rx: tokio_mpsc::UnboundedReceiver<(PeerSocketAddr, StallOutcome)>,
-
-    /// Producer clones handed to each tracked request's response wrapper.
-    stall_event_tx: tokio_mpsc::UnboundedSender<(PeerSocketAddr, StallOutcome)>,
 
     // Peer Tracking: Ready Peers
     //
@@ -372,7 +343,6 @@ where
         minimum_peer_version: MinimumPeerVersion<C>,
         max_conns_per_ip: Option<usize>,
     ) -> Self {
-        let (stall_event_tx, stall_event_rx) = tokio_mpsc::unbounded_channel();
         Self {
             // New peers
             discover,
@@ -382,8 +352,6 @@ where
 
             // Stall tracking
             find_response_stalls: FindResponseStallTracker::new(),
-            stall_event_rx,
-            stall_event_tx,
 
             // Ready peers
             ready_services: HashMap::new(),
@@ -825,19 +793,18 @@ where
     /// TCP connection is closed when its service is dropped; address book and
     /// ban list are untouched, so the peer is free to reconnect.
     fn drain_stall_events(&mut self, cx: &mut Context<'_>) {
-        while let Poll::Ready(Some((addr, outcome))) = self.stall_event_rx.poll_recv(cx) {
-            match outcome {
-                StallOutcome::Stall => {
-                    if self.find_response_stalls.record_stall(addr) {
-                        info!(
-                            peer = %addr.addr_label(self.expose_peer_addresses),
-                            "dropping stalled peer: exceeded FindBlocks/FindHeaders stall threshold",
-                        );
-                        self.remove(&addr);
-                    }
-                }
-                StallOutcome::Clear => self.find_response_stalls.clear(addr),
-            }
+        self.find_response_stalls.retain(|addr| {
+            self.ready_services.contains_key(addr) || self.cancel_handles.contains_key(addr)
+        });
+        if self
+            .minimum_peer_version
+            .chain_tip()
+            .is_at_or_near_network_tip(&self.network)
+        {
+            self.find_response_stalls.pause();
+        }
+        for addr in self.find_response_stalls.drain(cx) {
+            self.remove(&addr);
         }
     }
 
@@ -884,6 +851,7 @@ where
     /// If the service is for a connection to an outdated peer, the request is cancelled and the
     /// service is dropped.
     fn push_unready(&mut self, key: D::Key, svc: D::Service) {
+        self.find_response_stalls.connection(key, svc.trace_id());
         let peer_version = svc.remote_version();
         let (tx, rx) = oneshot::channel();
 
@@ -1024,7 +992,25 @@ where
 
     /// Routes a request using P2C load-balancing.
     fn route_p2c(&mut self, req: Request) -> <Self as tower::Service<Request>>::Future {
-        if let Some(p2c_key) = self.select_ready_p2c_peer() {
+        let selected = if matches!(&req, Request::FindBlocks { .. }) {
+            let mut eligible: HashSet<_> = self
+                .ready_services
+                .keys()
+                .filter(|addr| self.find_response_stalls.eligible(addr))
+                .copied()
+                .collect();
+            if let Some(oldest) = eligible
+                .iter()
+                .map(|addr| self.find_response_stalls.last_selected(addr))
+                .min()
+            {
+                eligible.retain(|addr| self.find_response_stalls.last_selected(addr) == oldest);
+            }
+            self.select_p2c_peer_from_list(&eligible)
+        } else {
+            self.select_ready_p2c_peer()
+        };
+        if let Some(p2c_key) = selected {
             tracing::trace!(
                 peer = %p2c_key.addr_label(self.expose_peer_addresses),
                 "routing based on p2c"
@@ -1034,6 +1020,9 @@ where
                 .take_ready_service(&p2c_key)
                 .expect("selected peer must be ready");
 
+            if matches!(&req, Request::FindBlocks { .. }) {
+                self.find_response_stalls.selected(p2c_key);
+            }
             let find_blocks_trace = match &req {
                 Request::FindBlocks { known_blocks, stop } => Some((
                     self.legacy_peer_trace.next_request_id(),
@@ -1045,6 +1034,11 @@ where
                 _ => None,
             };
 
+            // Headers never commit a block, so a header probe can never credit a peer with
+            // verified progress. An empty response while this node is behind the tip is still
+            // proven no-progress: without recording it, the legacy watchdog's header probes
+            // can be answered emptily forever and it never reaches the threshold that
+            // activates legacy fallback.
             let is_find_request = matches!(
                 &req,
                 Request::FindBlocks { .. } | Request::FindHeaders { .. }
@@ -1056,17 +1050,36 @@ where
                     .chain_tip()
                     .is_at_or_near_network_tip(&self.network);
 
+            let feedback = PendingDiscovery::new(if track_stalls {
+                self.find_response_stalls.start(p2c_key)
+            } else {
+                None
+            });
             let fut = svc.call(req);
             self.push_unready(p2c_key, svc);
 
             if track_stalls || find_blocks_trace.is_some() {
-                let stall_tx = self.stall_event_tx.clone();
                 let trace = self.legacy_peer_trace.clone();
                 return async move {
-                    let result = fut.await;
-                    if track_stalls {
-                        if let Some(outcome) = classify_find_response(&result) {
-                            let _ = stall_tx.send((p2c_key, outcome));
+                    let mut result = fut.await;
+                    if let Some(feedback) = feedback.responded() {
+                        match &mut result {
+                            Ok(Response::BlockHashes {
+                                hashes,
+                                feedback: slot,
+                            }) => {
+                                if hashes.is_empty() {
+                                    feedback.no_progress();
+                                }
+                                *slot = Some(feedback);
+                            }
+                            Ok(Response::BlockHeaders(headers)) if headers.is_empty() => {
+                                feedback.no_progress()
+                            }
+                            Err(error) if error.is_remote_response_failure() => {
+                                feedback.no_progress()
+                            }
+                            _ => {}
                         }
                     }
                     if let Some((request_id, peer, locator_tip, stop, started)) = find_blocks_trace

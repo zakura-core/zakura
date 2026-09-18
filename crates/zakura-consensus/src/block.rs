@@ -439,23 +439,35 @@ where
             // ZIP 234 derives the block subsidy from the NSM value balance after the parent
             // block, so a block at or above the start height needs its parent's chain
             // value pools. Wait for the parent commit if its verification is still running.
+            //
+            // Proposals skip proof of work and can name any parent, so they never wait:
+            // a proposal whose parent has not committed is rejected immediately.
             let nsm_value_balance =
                 if zakura_chain::parameters::subsidy::is_zip234_active(&network, height) {
                     let parent_hash = block.header.previous_block_hash;
+                    let parent_request = if request.is_proposal() {
+                        zs::Request::BlockInfo(parent_hash)
+                    } else {
+                        zs::Request::AwaitBlockInfo(parent_hash)
+                    };
 
                     let zs::Response::BlockInfo(parent_info) = state_service
                         .ready()
                         .await
                         .map_err(|source| VerifyBlockError::Depth { source, hash })?
-                        .call(zs::Request::AwaitBlockInfo(parent_hash))
+                        .call(parent_request)
                         .await
                         .map_err(|source| VerifyBlockError::Depth { source, hash })?
                     else {
-                        unreachable!("wrong response to Request::AwaitBlockInfo");
+                        unreachable!("wrong response to a block info request");
                     };
 
-                    let parent_info = parent_info
-                        .expect("AwaitBlockInfo only returns after the parent block commits");
+                    let Some(parent_info) = parent_info else {
+                        // AwaitBlockInfo only returns after the parent block commits.
+                        return Err(VerifyBlockError::ValidateProposal(
+                            format!("proposal parent {parent_hash} has not committed").into(),
+                        ));
+                    };
 
                     // The balance is signed, but `nsm_value_balance_is_non_negative` rejects
                     // any committed block at a ZIP 234 height that leaves it negative, so a

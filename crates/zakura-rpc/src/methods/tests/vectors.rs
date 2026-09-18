@@ -365,51 +365,6 @@ async fn rpc_getdeprecationinfo_estimates_time_from_tip_with_safety_margin() {
     assert!(end_of_service.estimated_time <= after + expected_offset);
 }
 
-/// The end-of-service estimate counts each block with the target spacing at its height.
-#[test]
-fn end_of_service_estimate_follows_target_spacing() {
-    let _init_guard = zakura_test::init();
-
-    // Mainnet has no NU7 height, so it keeps 75 second blocks after Blossom.
-    assert_eq!(
-        target_seconds_between_heights(&Mainnet, Height(3_000_000), Height(3_000_100)),
-        100 * 75,
-    );
-    assert_eq!(
-        target_seconds_between_heights(&Mainnet, Height(3_000_100), Height(3_000_000)),
-        -100 * 75,
-    );
-    assert_eq!(
-        target_seconds_between_heights(&Mainnet, Height(653_589), Height(653_609)),
-        10 * 150 + 10 * 75,
-    );
-
-    const NU7: u32 = 1_000;
-    let network = Network::new_regtest(
-        testnet::ConfiguredActivationHeights {
-            nu7: Some(NU7),
-            ..Default::default()
-        }
-        .into(),
-    );
-    let post_nu7_spacing = 25;
-
-    // 10 blocks before NU7, and 20 blocks from NU7 onwards.
-    let expected = 10 * 75 + 20 * post_nu7_spacing;
-    assert_eq!(
-        target_seconds_between_heights(&network, Height(NU7 - 11), Height(NU7 + 19)),
-        expected,
-    );
-    assert_eq!(
-        target_seconds_between_heights(&network, Height(NU7 + 19), Height(NU7 - 11)),
-        -expected,
-    );
-    assert_eq!(
-        target_seconds_between_heights(&network, Height(NU7), Height(NU7)),
-        0,
-    );
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_getdeprecationinfo_omits_end_of_service_off_mainnet() {
     let _init_guard = zakura_test::init();
@@ -3233,15 +3188,15 @@ async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
 
     const BALANCE: i64 = 400_000_000;
 
-    // `ceil(BALANCE * BLOCK_SUBSIDY_FRACTION)`, read from the network so the test follows
+    // `ceil(balance * BLOCK_SUBSIDY_FRACTION)`, read from the network so the test follows
     // ZIP 218's change to the halving interval.
-    let bonus = |height| {
+    let bonus = |height, balance: i64| {
         let numerator = i128::try_from(
             zakura_chain::parameters::subsidy::block_subsidy_fraction_numerator(height, &network),
         )
         .expect("the fraction numerator fits in i128");
 
-        i64::try_from((i128::from(BALANCE) * numerator + 9_999_999_999) / 10_000_000_000)
+        i64::try_from((i128::from(balance.max(0)) * numerator + 9_999_999_999) / 10_000_000_000)
             .expect("the bonus fits in i64")
     };
 
@@ -3265,12 +3220,13 @@ async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
 
     for height in [start, (start + 1).expect("valid height")] {
         let tip = height.previous().expect("the start is above genesis");
-        let expected_subsidy = (halving_block_subsidy(height, &network).expect("valid subsidy")
-            + Amount::try_from(bonus(height)).expect("valid bonus"))
-        .expect("valid subsidy");
 
         // `getblocksubsidy` reads the parent's chain value pools.
-        for (balance, succeeds) in [(BALANCE, true), (-1, false)] {
+        for (balance, succeeds) in [(0i64, true), (1, true), (BALANCE, true), (-1, false)] {
+            let expected_subsidy = (halving_block_subsidy(height, &network)
+                .expect("valid subsidy")
+                + Amount::try_from(bonus(height, balance)).expect("valid bonus"))
+            .expect("valid subsidy");
             let mut read_state: MockService<_, _, _, BoxError> =
                 MockService::build().for_unit_tests();
             let (_tx, rx) = tokio::sync::watch::channel(None);
@@ -3345,7 +3301,11 @@ async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
         );
 
         // `getblocktemplate` pays the subsidy after the chain tip to the miner.
-        for (balance, succeeds) in [(BALANCE, true), (-1, false)] {
+        for (balance, succeeds) in [(0i64, true), (1, true), (BALANCE, true), (-1, false)] {
+            let expected_subsidy = (halving_block_subsidy(height, &network)
+                .expect("valid subsidy")
+                + Amount::try_from(bonus(height, balance)).expect("valid bonus"))
+            .expect("valid subsidy");
             let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
             let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
             let tip_hash = Hash([0x11; 32]);

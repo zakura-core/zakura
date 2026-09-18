@@ -505,3 +505,52 @@ pub(crate) fn initial_contextual_validity(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod nsm_value_balance_boundary_tests {
+    use super::*;
+    use zakura_chain::{
+        amount::{Amount, MAX_MONEY},
+        parameters::testnet::{ConfiguredActivationHeights, RegtestParameters},
+    };
+
+    #[test]
+    fn rejection_matrix_covers_activation_sign_and_arithmetic_limits() {
+        let network = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu7: Some(2),
+                ..Default::default()
+            },
+            nsm_reissuance_height: Some(block::Height(3)),
+            ..Default::default()
+        });
+        for height in [1, 2, 3, 4] {
+            for before in [-MAX_MONEY, -1, 0, 1, MAX_MONEY] {
+                for delta in [-MAX_MONEY, -1, 0, 1, MAX_MONEY] {
+                    let mut pools = ValueBalance::<NonNegative>::zero();
+                    pools.set_nsm_value_balance_amount(Amount::try_from(before).unwrap());
+                    let mut change = ValueBalance::<NegativeAllowed>::zero();
+                    change.set_nsm_value_balance_amount(Amount::try_from(delta).unwrap());
+                    let result = nsm_value_balance_is_non_negative(
+                        &network,
+                        block::Height(height),
+                        &pools,
+                        &change,
+                    );
+                    let sum = i128::from(before) + i128::from(delta);
+                    // Rejection starts at NU7, before the reissuance height.
+                    let reject = cfg!(feature = "nu7")
+                        && height >= 2
+                        && !(0..=i128::from(MAX_MONEY)).contains(&sum);
+                    assert_eq!(
+                        result.is_err(),
+                        reject,
+                        "height {height}, before {before}, delta {delta}"
+                    );
+                    assert_eq!(i64::from(pools.nsm_value_balance_amount()), before);
+                    assert_eq!(i64::from(change.nsm_value_balance_amount()), delta);
+                }
+            }
+        }
+    }
+}

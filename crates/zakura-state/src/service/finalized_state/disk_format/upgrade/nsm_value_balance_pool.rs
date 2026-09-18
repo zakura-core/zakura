@@ -638,4 +638,80 @@ mod database_tests {
             );
         }
     }
+    #[test]
+    fn migration_rejects_missing_anchor_rows_and_tip() {
+        for missing in [0, 1, 2, 3, 4] {
+            let db = legacy_db(4, 48);
+            let mut batch = DiskWriteBatch::new();
+            if missing == 4 {
+                let _ = db
+                    .raw_chain_value_pools_cf()
+                    .with_batch_for_writing(&mut batch)
+                    .zs_delete(&());
+            } else {
+                let _ = db
+                    .raw_block_info_cf()
+                    .with_batch_for_writing(&mut batch)
+                    .zs_delete(&Height(missing));
+            }
+            db.write_batch(batch).unwrap();
+            let (_tx, rx) = crossbeam_channel::bounded(1);
+            assert!(
+                matches!(
+                    Upgrade.run(Some(Height(3)), &db, &rx),
+                    Err(FormatChangeError::InvalidPostcondition(_))
+                ),
+                "missing {missing}"
+            );
+        }
+    }
+
+    #[test]
+    fn migration_cancelled_before_first_write_preserves_legacy_records() {
+        let db = legacy_db(4, 48);
+        let original = db.raw_block_info_cf().zs_get(&Height(2)).unwrap().0;
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.send(CancelFormatChange).unwrap();
+        let mut writes = 0;
+        let result = backfill(Some(Height(3)), &db, &rx, |_| {
+            writes += 1;
+            Ok(())
+        });
+        assert!(matches!(result, Err(FormatChangeError::Cancelled)));
+        assert_eq!(writes, 0);
+        assert_eq!(
+            db.raw_block_info_cf().zs_get(&Height(2)).unwrap().0,
+            original
+        );
+        Upgrade.run(Some(Height(3)), &db, &rx).unwrap();
+        assert_upgraded(&db, 4);
+    }
+
+    #[test]
+    fn migration_validates_tip_agreement_and_rejects_invalid_pool_totals() {
+        for invalid_total in [false, true] {
+            let db = legacy_db(4, 48);
+            let (_tx, rx) = crossbeam_channel::bounded(1);
+            Upgrade.run(Some(Height(3)), &db, &rx).unwrap();
+            let mut bytes = db.raw_chain_value_pools_cf().zs_get(&()).unwrap().0;
+            if invalid_total {
+                bytes[..8].copy_from_slice(&zakura_chain::amount::MAX_MONEY.to_le_bytes());
+                bytes[8..16].copy_from_slice(&1i64.to_le_bytes());
+            } else {
+                bytes[..8].copy_from_slice(&4i64.to_le_bytes());
+            }
+            let mut batch = DiskWriteBatch::new();
+            let _ = db
+                .raw_chain_value_pools_cf()
+                .with_batch_for_writing(&mut batch)
+                .zs_insert(&(), &RawBytes(bytes));
+            db.write_batch(batch).unwrap();
+            let result = Upgrade.validate(&db, &rx);
+            if invalid_total {
+                assert!(result.is_err());
+            } else {
+                assert!(result.unwrap().is_err());
+            }
+        }
+    }
 }

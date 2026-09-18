@@ -366,14 +366,23 @@ impl Block {
     /// > NSMValueBalance(height) = NSMValueBalance(height - 1)
     /// >   - AdditionalBlockSubsidy(height) + removed(height)
     ///
-    /// NU7 deploys neither ZIP 233 nor ZIP 235, so `removed(height)` is zero throughout.
+    /// Fee recycling is deferred to a separate change. The NU7 deployment draft proposes
+    /// contributing `floor(6 * TransactionFees(height) / 10)` to this balance without new
+    /// transaction fields. This implementation still requires the coinbase to claim all
+    /// fees, so `removed(height)` is zero for semantically valid blocks under the current
+    /// rules. This is an implementation limit, not a claim about the final NU7 scope.
     ///
     /// A block carries no reference to its parent's balance, so this derives
-    /// `AdditionalBlockSubsidy(height)` from the block instead. From NU6, ZIP 236 makes the
-    /// coinbase claim exactly `BlockSubsidy(height)` plus the transaction fees, and fees
-    /// move between transactions inside the block, so the block's change across the six
-    /// monetary pools is `BlockSubsidy(height)`. That is the halving subsidy plus the
-    /// bonus, so the halving subsidy minus it is `-AdditionalBlockSubsidy(height)`.
+    /// `AdditionalBlockSubsidy(height)` from the block instead. Under the currently
+    /// implemented ZIP 236 rule, the coinbase claims exactly `BlockSubsidy(height)` plus
+    /// all transaction fees from NU6 onward. Fees move between transactions inside the
+    /// block, so the block's change across the six monetary pools is `BlockSubsidy(height)`.
+    /// This equals the halving subsidy plus the bonus, so subtracting it from the
+    /// halving subsidy gives `-AdditionalBlockSubsidy(height)`.
+    ///
+    /// Once coinbase validation and block templates withhold the fee contribution,
+    /// the monetary pool change will be `BlockSubsidy(height) - removed(height)`, so this
+    /// calculation will already include the contribution. It must not be added twice.
     ///
     /// `zakura-state/src/service/check.rs::nsm_value_balance_is_non_negative` rejects a
     /// block that would drive the running total below zero.

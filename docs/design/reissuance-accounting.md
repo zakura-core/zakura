@@ -29,7 +29,26 @@ as the chain grows, and the migration in
 `crates/zakura-state/src/service/finalized_state/disk_format/upgrade/nsm_value_balance_pool.rs`
 applies it to an existing database. Change both together.
 
-## Why the running total is the draft's recurrence
+## Fee recycling scope
+
+Fee recycling is deferred to a separate change. The NU7 deployment draft's
+[NSM reserve rules] propose contributing `floor(6 * TransactionFees(h) / 10)` from
+aggregate block fees without adding transaction fields. This implementation retains
+the full fee claim in coinbase validation and block templates. Deferring that work does
+not exclude fee recycling from the intended NU7 scope.
+
+For example, with 1,000 zatoshi in fees, the current implementation requires the
+coinbase to claim all 1,000. The draft would leave 400 for the miner and contribute
+600 to NSM. Omitting ZIP 233's transaction fields does not rule out that contribution.
+
+The follow-up must update coinbase validation, block templates, and activation tests
+together. Once coinbases withhold the contribution, the existing calculation below
+will include it through the reduction in issued value. Adding it again would count
+the same fees twice.
+
+[NSM reserve rules]: https://github.com/zcash/zips/blob/32f447759aba83acfb20aab0757b68147643de22/zips/draft-valargroup-deploy-nu7.md#L120-L149
+
+## Running total
 
 zips#1354 defines the balance by what each block claims:
 
@@ -37,14 +56,20 @@ zips#1354 defines the balance by what each block claims:
 NSMValueBalance(h) = NSMValueBalance(h - 1) - AdditionalBlockSubsidy(h) + removed(h)
 ```
 
-NU7 deploys neither ZIP 233 nor ZIP 235, so `removed(h)` is zero throughout.
+Under the currently implemented full fee claim rule, `removed(h)` is zero for
+semantically valid blocks from NU7 onward. This describes the current implementation,
+not the complete NU7 deployment proposal.
 
 A block carries no reference to its parent's balance, so the implementation derives the
-bonus from the block. From NU6, ZIP 236 makes the coinbase claim exactly
-`BlockSubsidy(h)` plus the transaction fees, and fees move between transactions inside
-the block, so the block's change across the six monetary pools is `BlockSubsidy(h)`.
+bonus from the block. Under the currently implemented ZIP 236 rule, the coinbase claims
+exactly `BlockSubsidy(h)` plus all transaction fees from NU6 onward. Fees move between
+transactions inside the block, so the block's change across the six monetary pools is
+`BlockSubsidy(h)`.
 That is the halving subsidy plus the bonus, so the halving subsidy minus it is
-`-AdditionalBlockSubsidy(h)`. The two definitions therefore agree at every height.
+`-AdditionalBlockSubsidy(h)`. The two definitions therefore agree from NU7 onward
+under the current fee rules. With fee recycling, the monetary pool change would instead
+be `BlockSubsidy(h) - removed(h)`, yielding
+`-AdditionalBlockSubsidy(h) + removed(h)` from the same calculation.
 
 Transfers between monetary pools leave the balance unchanged. Reductions in issued value
 increase it. The balance itself holds no spendable value and does not contribute to
@@ -98,6 +123,7 @@ not establish support for a ZIP 233 transaction format.
 
 Before production activation:
 
+- Implement and validate the deployment draft's fee recycling rules in the follow-up.
 - Resolve the reissuance start height against the deployment ZIP.
 - Assign the production NU7 branch ID and activation heights.
 - Run real transaction verification across activation on a private network.

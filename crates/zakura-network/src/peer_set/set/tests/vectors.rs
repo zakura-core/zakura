@@ -874,6 +874,11 @@ fn peer_set_route_inv_advertised_registry() {
 }
 
 fn peer_set_route_inv_advertised_registry_order(advertised_first: bool) {
+    peer_set_route_inv_supplier_policy(advertised_first, false);
+    peer_set_route_inv_supplier_policy(advertised_first, true);
+}
+
+fn peer_set_route_inv_supplier_policy(advertised_first: bool, rejected: bool) {
     let test_hash = block::Hash([0; 32]);
     let test_inv = InventoryHash::Block(test_hash);
 
@@ -921,6 +926,12 @@ fn peer_set_route_inv_advertised_registry_order(advertised_first: bool) {
             .max_conns_per_ip(max(2, DEFAULT_MAX_CONNS_PER_IP))
             .build();
 
+        if rejected {
+            peer_set
+                .block_suppliers
+                .feedback(test_hash, test_peer.into())
+                .reject();
+        }
         // Advertise some inventory
         peer_set_guard
             .inventory_sender()
@@ -943,7 +954,7 @@ fn peer_set_route_inv_advertised_registry_order(advertised_first: bool) {
         let _fut = peer_ready.call(sent_request.clone());
 
         // Check that the client that advertised the inventory received the request
-        let advertised_handle = if advertised_first {
+        let advertised_handle = if advertised_first != rejected {
             &mut handles[0]
         } else {
             &mut handles[1]
@@ -958,7 +969,7 @@ fn peer_set_route_inv_advertised_registry_order(advertised_first: bool) {
             panic!("inv request not routed to advertised peer");
         }
 
-        let other_handle = if advertised_first {
+        let other_handle = if advertised_first != rejected {
             &mut handles[1]
         } else {
             &mut handles[0]

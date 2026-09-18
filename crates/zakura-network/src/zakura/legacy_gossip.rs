@@ -511,7 +511,7 @@ impl LegacyResponseCodec {
         // shared across every frame of this response and aborts encoding early.
         let mut budget = ResponseEncodeBudget::default();
         match response {
-            Response::Blocks(blocks) => {
+            Response::Blocks(blocks) | Response::BlocksWithFeedback { blocks, .. } => {
                 let mut missing = Vec::new();
                 for block in blocks {
                     match block {
@@ -620,6 +620,10 @@ impl LegacyResponseCodec {
         let mut saw_pong = false;
         let mut saw_nil = false;
         let mut reassembler = ResponseReassembler::new(request_id);
+        // Requested hashes may be answered once each. Membership alone lets a peer repeat one
+        // requested block until the response vector no longer matches the request, which the
+        // consumer reports as a generic failure that excludes nobody.
+        let mut answered: HashSet<block::Hash> = HashSet::new();
 
         for frame in frames {
             if frame.flags != 0 {
@@ -642,7 +646,7 @@ impl LegacyResponseCodec {
                         // and kind, not by hash).
                         if let Some(requested) = requested_block_hashes {
                             let hash = block.hash();
-                            if !requested.contains(&hash) {
+                            if !requested.contains(&hash) || !answered.insert(hash) {
                                 return Err(LegacyGossipError::UnsolicitedBlock(hash));
                             }
                         }
@@ -670,7 +674,7 @@ impl LegacyResponseCodec {
                     for hash in decode_hashes_response(request_id, frame.payload)? {
                         // A peer may only report blocks we requested as missing.
                         if let Some(requested) = requested_block_hashes {
-                            if !requested.contains(&hash) {
+                            if !requested.contains(&hash) || !answered.insert(hash) {
                                 return Err(LegacyGossipError::UnsolicitedBlock(hash));
                             }
                         }
@@ -2021,7 +2025,11 @@ fn record_block_response_source(
     source: BlockBodySource,
     requested_hashes: Option<&HashSet<block::Hash>>,
 ) -> Response {
-    if let (Response::Blocks(blocks), Some(requested_hashes)) = (&response, requested_hashes) {
+    if let (
+        Response::Blocks(blocks) | Response::BlocksWithFeedback { blocks, .. },
+        Some(requested_hashes),
+    ) = (&response, requested_hashes)
+    {
         for block in blocks {
             match block {
                 InventoryResponse::Available((block, _))
@@ -2045,6 +2053,7 @@ pub struct ZakuraRequestClient {
     trace: ZakuraTrace,
     request_interval: Duration,
     next_request_at: Arc<Mutex<Instant>>,
+    block_suppliers: crate::block_feedback::BlockSuppliers,
 }
 
 impl ZakuraRequestClient {
@@ -2078,6 +2087,7 @@ impl ZakuraRequestClient {
             trace,
             request_interval: Duration::from_nanos(interval_nanos),
             next_request_at: Arc::new(Mutex::new(Instant::now())),
+            block_suppliers: Default::default(),
         }
     }
 
@@ -2109,7 +2119,15 @@ impl ZakuraRequestClient {
             _ => None,
         };
 
-        let handles = self.ready_handles().await?;
+        let mut handles = self.ready_handles().await?;
+        if let LegacyRequestFrame::BlocksByHash(hashes) = &frame {
+            let suppliers = &self.block_suppliers;
+            handles.retain(|handle| {
+                !hashes.iter().any(|hash| {
+                    suppliers.rejected(*hash, &PeerSource::Zakura(handle.peer_id().clone()))
+                })
+            });
+        }
         let Some(primary) = select_handle(&handles, preferred.as_ref()) else {
             return Err("no ready Zakura peer for legacy inventory request".into());
         };
@@ -2259,6 +2277,18 @@ impl ZakuraRequestClient {
         ) {
             Ok(response) => response,
             Err(error) => {
+                // The supplier proved it cannot serve this hash. A decode failure reaches the
+                // consumer as a generic download error, which retries the hash without
+                // excluding anyone, so the same peer would stay eligible on every attempt.
+                if let Some(hashes) = requested_block_hashes
+                    .as_ref()
+                    .filter(|hashes| hashes.len() == 1)
+                {
+                    let hash = *hashes.iter().next().expect("one requested hash");
+                    self.block_suppliers
+                        .feedback(hash, PeerSource::Zakura(handle.peer_id().clone()))
+                        .reject();
+                }
                 self.trace.emit_event(|| {
                     LegacyRequestError::new(
                         "outbound.decode_error",
@@ -2284,6 +2314,13 @@ impl ZakuraRequestClient {
                 &response,
             )
         });
+        if let Some(hashes) = requested_block_hashes.filter(|hashes| hashes.len() == 1) {
+            let hash = *hashes.iter().next().expect("one requested hash");
+            let feedback = self
+                .block_suppliers
+                .feedback(hash, PeerSource::Zakura(handle.peer_id().clone()));
+            response = feedback.attach(response);
+        }
         Ok(response)
     }
 }
@@ -2323,7 +2360,7 @@ fn select_fallback_handle(
 
 fn all_inventory_missing(response: &Response) -> bool {
     match response {
-        Response::Blocks(blocks) => {
+        Response::Blocks(blocks) | Response::BlocksWithFeedback { blocks, .. } => {
             blocks.is_empty() || blocks.iter().all(|block| block.is_missing())
         }
         Response::Transactions(transactions) => {
@@ -3893,12 +3930,52 @@ mod tests {
             .await?;
 
         match response {
-            Response::Blocks(blocks) => {
+            Response::Blocks(blocks) | Response::BlocksWithFeedback { blocks, .. } => {
                 assert_eq!(blocks, vec![InventoryResponse::Missing(hash)]);
             }
             response => panic!("unexpected response: {response:?}"),
         }
 
+        node_a.shutdown().await;
+        node_b.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejected_supplier_is_excluded_from_v2_retry() -> Result<(), BoxError> {
+        let _guard = zakura_test::init();
+        let block = Arc::new(Block::zcash_deserialize(
+            BLOCK_TESTNET_141042_BYTES.as_slice(),
+        )?);
+        let node_a = block_inventory_node(168, block.clone()).await?;
+        let node_b = block_inventory_node(169, block.clone()).await?;
+        let victim = ZakuraTestNode::builder(170).spawn().await?;
+        victim.connect_native(&node_a, TEST_NET_TIMEOUT).await?;
+        victim.connect_native(&node_b, TEST_NET_TIMEOUT).await?;
+        let source = PeerSource::Zakura(node_peer_id(&node_a).await?);
+        let adapter = LegacyRequestAdapter::new(victim.supervisor());
+        let request = Request::BlocksByHash(HashSet::from([block.hash()]));
+        let first = adapter
+            .request_from_source(request.clone(), Some(source.clone()))
+            .await?;
+        let (_, feedback) = first.split_block_feedback();
+        feedback.expect("download identifies its supplier").reject();
+        // Even an explicitly preferred source cannot bypass the exclusion.
+        let second = adapter
+            .request_from_source(request.clone(), Some(source.clone()))
+            .await?;
+        let (body, feedback) = second.split_block_feedback();
+        assert!(matches!(body, Response::Blocks(blocks)
+            if blocks.iter().any(|item| matches!(item, InventoryResponse::Available((received, _))
+                if received.hash() == block.hash()))));
+        feedback
+            .expect("replacement identifies its supplier")
+            .reject();
+        assert!(adapter
+            .request_from_source(request, Some(source))
+            .await
+            .is_err());
+        victim.shutdown().await;
         node_a.shutdown().await;
         node_b.shutdown().await;
         Ok(())
@@ -3929,7 +4006,8 @@ mod tests {
             )
             .await?;
 
-        let Response::Blocks(blocks) = response else {
+        let (Response::Blocks(blocks) | Response::BlocksWithFeedback { blocks, .. }) = response
+        else {
             panic!("unexpected response: {response:?}");
         };
         assert!(matches!(
@@ -4033,7 +4111,9 @@ mod tests {
                 None,
             )
             .await?;
-        let Response::Blocks(blocks) = block_response else {
+        let (Response::Blocks(blocks) | Response::BlocksWithFeedback { blocks, .. }) =
+            block_response
+        else {
             panic!("unexpected block response: {block_response:?}");
         };
         for response in blocks {
@@ -4138,7 +4218,8 @@ mod tests {
                 None,
             )
             .await?;
-        let Response::Blocks(blocks) = blocks else {
+        let (Response::Blocks(blocks) | Response::BlocksWithFeedback { blocks, .. }) = blocks
+        else {
             panic!("unexpected block response: {blocks:?}");
         };
         for response in blocks {
@@ -4243,7 +4324,7 @@ mod tests {
 
         release_tx.send(true)?;
         match tokio::time::timeout(Duration::from_secs(1), request_rx).await??? {
-            Response::Blocks(blocks) => {
+            Response::Blocks(blocks) | Response::BlocksWithFeedback { blocks, .. } => {
                 assert_eq!(blocks, vec![InventoryResponse::Missing(block_hash(11))]);
             }
             response => panic!("unexpected request response: {response:?}"),
@@ -5228,7 +5309,8 @@ mod tests {
 
         let response =
             LegacyResponseCodec::decode_response(7, LegacyRequestKind::Blocks, frames, None)?;
-        let Response::Blocks(blocks) = response else {
+        let (Response::Blocks(blocks) | Response::BlocksWithFeedback { blocks, .. }) = response
+        else {
             panic!("unexpected response: {response:?}");
         };
         assert!(matches!(
@@ -5237,6 +5319,56 @@ mod tests {
         ));
 
         Ok(())
+    }
+
+    /// A requested hash may be answered once.
+    ///
+    /// Membership in the requested set was the only check, so a peer could answer one requested
+    /// hash repeatedly. The consumer then saw a response that did not match its single-hash
+    /// request, reported it as a generic download failure, and retried without excluding the
+    /// supplier, so the peer could repeat the response indefinitely.
+    #[test]
+    fn response_codec_rejects_a_repeated_requested_hash() {
+        let request_id: u64 = 7;
+        let hash = block::Hash([9; 32]);
+        let requested: HashSet<block::Hash> = std::iter::once(hash).collect();
+
+        let missing_blocks = |repeats: usize| {
+            let mut payload = request_id.to_le_bytes().to_vec();
+            payload.extend_from_slice(&encoded_count(repeats));
+            for _ in 0..repeats {
+                payload.extend_from_slice(&hash.0);
+            }
+            Frame {
+                message_type: MSG_RESPONSE_MISSING_BLOCKS,
+                flags: 0,
+                payload,
+            }
+        };
+
+        LegacyResponseCodec::decode_response(
+            request_id,
+            LegacyRequestKind::Blocks,
+            vec![missing_blocks(1)],
+            Some(&requested),
+        )
+        .expect("one report per requested hash is a valid response");
+
+        for frames in [
+            vec![missing_blocks(2)],
+            vec![missing_blocks(1), missing_blocks(1)],
+        ] {
+            let result = LegacyResponseCodec::decode_response(
+                request_id,
+                LegacyRequestKind::Blocks,
+                frames,
+                Some(&requested),
+            );
+            assert!(
+                matches!(result, Err(LegacyGossipError::UnsolicitedBlock(repeated)) if repeated == hash),
+                "a repeated requested hash must be rejected, got {result:?}"
+            );
+        }
     }
 
     /// Regression test for `claude-outbound-write-ignores-message-cap` (legacy
@@ -5290,7 +5422,8 @@ mod tests {
         // The smaller chunking must still round-trip back to the original block.
         let response =
             LegacyResponseCodec::decode_response(7, LegacyRequestKind::Blocks, frames, None)?;
-        let Response::Blocks(blocks) = response else {
+        let (Response::Blocks(blocks) | Response::BlocksWithFeedback { blocks, .. }) = response
+        else {
             panic!("unexpected response: {response:?}");
         };
         assert!(matches!(
@@ -5347,7 +5480,7 @@ mod tests {
         )?;
         assert!(matches!(
             response,
-            Response::Blocks(blocks)
+            Response::Blocks(blocks) | Response::BlocksWithFeedback { blocks, .. }
                 if matches!(
                     blocks.as_slice(),
                     [InventoryResponse::Available((received, None))]
@@ -6027,7 +6160,7 @@ mod tests {
             .await?;
         assert!(matches!(
             response,
-            Response::Blocks(ref blocks)
+            Response::Blocks(ref blocks) | Response::BlocksWithFeedback { ref blocks, .. }
                 if matches!(blocks.as_slice(), [InventoryResponse::Available(_)])
         ));
         assert_eq!(
@@ -6067,7 +6200,7 @@ mod tests {
             .await?;
         assert!(matches!(
             response,
-            Response::Blocks(ref blocks)
+            Response::Blocks(ref blocks) | Response::BlocksWithFeedback { ref blocks, .. }
                 if matches!(blocks.as_slice(), [InventoryResponse::Available(_)])
         ));
         assert_eq!(

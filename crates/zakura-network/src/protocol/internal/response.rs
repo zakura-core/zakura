@@ -74,6 +74,15 @@ pub enum Response {
     // TODO: make this into a HashMap<block::Hash, InventoryResponse<Arc<Block>, ()>> - a unique list (#2244)
     Blocks(Vec<InventoryResponse<(Arc<Block>, Option<PeerSocketAddr>), block::Hash>>),
 
+    /// Downloaded blocks with local supplier rejection feedback. Never serialized.
+    #[cfg_attr(any(test, feature = "proptest-impl"), proptest(skip))]
+    BlocksWithFeedback {
+        /// Downloaded block bodies and missing hashes.
+        blocks: Vec<InventoryResponse<(Arc<Block>, Option<PeerSocketAddr>), block::Hash>>,
+        /// Local capability to exclude the supplying peer for this hash.
+        feedback: crate::BlockFeedback,
+    },
+
     /// A list of found unmined transactions, and missing unmined transaction IDs.
     ///
     /// Each list contains zero or more entries.
@@ -99,7 +108,9 @@ impl fmt::Display for Response {
             Response::TransactionIds(ids) => format!("TransactionIds {{ ids: {} }}", ids.len()),
 
             // Display heights for single-block responses (which Zebra requests and expects)
-            Response::Blocks(blocks) if blocks.len() == 1 => {
+            Response::Blocks(blocks) | Response::BlocksWithFeedback { blocks, .. }
+                if blocks.len() == 1 =>
+            {
                 match blocks.first().expect("len is 1") {
                     Available((block, _)) => format!(
                         "Block {{ height: {}, hash: {} }}",
@@ -113,7 +124,7 @@ impl fmt::Display for Response {
                     Missing(hash) => format!("Block {{ missing: {hash} }}"),
                 }
             }
-            Response::Blocks(blocks) => format!(
+            Response::Blocks(blocks) | Response::BlocksWithFeedback { blocks, .. } => format!(
                 "Blocks {{ blocks: {}, missing: {} }}",
                 blocks.iter().filter(|r| r.is_available()).count(),
                 blocks.iter().filter(|r| r.is_missing()).count()
@@ -129,6 +140,14 @@ impl fmt::Display for Response {
 }
 
 impl Response {
+    /// Separates local supplier feedback from the wire-compatible block response.
+    pub fn split_block_feedback(self) -> (Self, Option<crate::BlockFeedback>) {
+        match self {
+            Self::BlocksWithFeedback { blocks, feedback } => (Self::Blocks(blocks), Some(feedback)),
+            response => (response, None),
+        }
+    }
+
     /// Returns the Zebra internal response type as a string.
     pub fn command(&self) -> &'static str {
         match self {
@@ -142,14 +161,17 @@ impl Response {
             Response::BlockHeaders(_) => "BlockHeaders",
             Response::TransactionIds(_) => "TransactionIds",
 
-            Response::Blocks(_) => "Blocks",
+            Response::Blocks(_) | Response::BlocksWithFeedback { .. } => "Blocks",
             Response::Transactions(_) => "Transactions",
         }
     }
 
     /// Returns true if the response is a block or transaction inventory download.
     pub fn is_inventory_download(&self) -> bool {
-        matches!(self, Response::Blocks(_) | Response::Transactions(_))
+        matches!(
+            self,
+            Response::Blocks(_) | Response::BlocksWithFeedback { .. } | Response::Transactions(_)
+        )
     }
 
     /// Returns true if self is the [`Response::Nil`] variant.

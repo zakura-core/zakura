@@ -50,7 +50,7 @@ use cached_peer_addr_response::CachedPeerAddrResponse;
 #[cfg(test)]
 mod tests;
 
-use downloads::{Downloads as BlockDownloads, GossipedTipChildHeightMismatch};
+use downloads::{Downloads as BlockDownloads, GossipedParentHeightMismatch};
 
 /// The maximum response time for block-body requests that can wait for a mined-block commit.
 ///
@@ -529,7 +529,7 @@ impl Service<zn::Request> for Inbound {
                     // Scoring and re-requesting are kept together here rather than split across
                     // `block_misbehavior`, because the re-request needs `block_downloads` and
                     // the two decisions are the same decision.
-                    if let Some(mismatch) = err.downcast_ref::<GossipedTipChildHeightMismatch>() {
+                    if let Some(mismatch) = err.downcast_ref::<GossipedParentHeightMismatch>() {
                         if let Some(advertiser_addr) = advertiser_addr {
                             let _ = misbehavior_sender.try_send((
                                 advertiser_addr,

@@ -914,7 +914,7 @@ async fn mempool_transaction_expiration() -> Result<(), crate::BoxError> {
 /// that the block is re-requested instead of being left for the syncer.
 ///
 /// This pins the *consumer* side of the check. `Inbound::poll_ready` identifies the rejection by
-/// downcasting the boxed error to [`GossipedTipChildHeightMismatch`], so it depends on the inbound
+/// downcasting the boxed error to [`GossipedParentHeightMismatch`], so it depends on the inbound
 /// downloader passing that error through unwrapped. If it were ever wrapped in context — the way
 /// the syncer wraps its errors into `BlockDownloadVerifyError` — the downcast would silently stop
 /// matching, scoring would stop, and every other test would stay green.

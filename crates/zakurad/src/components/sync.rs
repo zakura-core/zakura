@@ -116,13 +116,16 @@ const MAX_TRANSIENT_BLOCK_PEER_REQUESTS_PER_SYNC_ROUND: usize =
 
 /// Controls how many times the syncer immediately requeues a required block after a peer supplies
 /// a body whose coinbase height contradicts our own tip
-/// ([`BlockDownloadVerifyError::TipChildHeightMismatch`]).
+/// ([`BlockDownloadVerifyError::ParentHeightMismatch`]).
 ///
 /// A poisoned body satisfies the network request without delivering a usable block, so the hash
 /// must be requeued rather than left for the next discovery round — otherwise a peer can keep the
 /// node, and any mining backend it feeds, off the newest block. Each rejected body also scores its
 /// supplier for a ban; this budget bounds the loop while that ban is still batched.
 const POISONED_BLOCK_RETRY_LIMIT: usize = MISSING_BLOCK_DOWNLOAD_RETRY_LIMIT;
+
+/// Bounds retained rejected-body budgets, including exhausted hashes, within a sync round.
+const MAX_POISONED_BLOCK_RETRY_HASHES: usize = 4096;
 
 /// Controls how many times the syncer retries a required block that the peer set reports as missing
 /// from *all* current peers (`NotFoundKind::Registry`) before giving up on the round.
@@ -890,8 +893,9 @@ where
 
     /// A service which downloads and verifies blocks, using the provided
     /// network and verifier services.
-    downloads:
-        Pin<Box<Downloads<Hedge<ConcurrencyLimit<Timeout<ZN>>, AlwaysHedge>, Timeout<ZV>, ZSTip>>>,
+    downloads: Pin<
+        Box<Downloads<Hedge<ConcurrencyLimit<Timeout<ZN>>, AlwaysHedge>, Timeout<ZV>, ZSTip, ZS>>,
+    >,
 
     /// The cached block chain state.
     state: ZS,
@@ -1059,6 +1063,7 @@ where
         let downloads = Box::pin(Downloads::new(
             block_network,
             verifier,
+            state.clone(),
             latest_chain_tip.clone(),
             past_lookahead_limit_sender,
             max(
@@ -2486,7 +2491,7 @@ where
             // is provably malformed, and the peer being scored is the one that
             // served that body — not a peer that merely supplied a hash. There is
             // no misattribution to avoid here.
-            Err(BlockDownloadVerifyError::TipChildHeightMismatch {
+            Err(BlockDownloadVerifyError::ParentHeightMismatch {
                 advertiser_addr: Some(advertiser_addr),
                 ..
             }) => {
@@ -2519,7 +2524,7 @@ where
     /// Handles a downloaded block response and requeues a required hash when retrying one block can
     /// preserve the rest of the round.
     ///
-    /// A [`BlockDownloadVerifyError::TipChildHeightMismatch`] means a peer returned a body under
+    /// A [`BlockDownloadVerifyError::ParentHeightMismatch`] means a peer returned a body under
     /// the correct block hash but with a rewritten coinbase height. That satisfies the network
     /// request without delivering a usable block, so the supplier is scored for a ban and the hash
     /// is requeued immediately, bounded by [`POISONED_BLOCK_RETRY_LIMIT`]. Without the requeue the
@@ -2655,7 +2660,7 @@ where
 
         if let Some((hash, advertiser_addr)) = response.as_ref().err().and_then(|error| match error
         {
-            BlockDownloadVerifyError::TipChildHeightMismatch {
+            BlockDownloadVerifyError::ParentHeightMismatch {
                 hash,
                 advertiser_addr,
                 ..
@@ -2668,25 +2673,28 @@ where
             } if Self::is_poisoned_body(error) => Some((*hash, *advertiser_addr)),
             _ => None,
         }) {
+            // Score every proven mismatch, including the response that exhausts the budget.
+            if let Some(advertiser_addr) = advertiser_addr {
+                let _ = self
+                    .misbehavior_sender
+                    .try_send((advertiser_addr, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE));
+            }
+            if !self.poisoned_block_retry_counts.contains_key(&hash)
+                && self.poisoned_block_retry_counts.len() >= MAX_POISONED_BLOCK_RETRY_HASHES
+            {
+                return Ok(());
+            }
             let retry_count = self.poisoned_block_retry_counts.entry(hash).or_default();
 
             if *retry_count < POISONED_BLOCK_RETRY_LIMIT {
                 *retry_count += 1;
 
-                // Ban the supplier before requeueing, so the replacement request is less likely
-                // to route back to it. The peer set batches misbehavior updates, so the ban may
-                // not have landed yet; the retry budget bounds the loop if it hasn't.
-                if let Some(advertiser_addr) = advertiser_addr {
-                    let _ = self
-                        .misbehavior_sender
-                        .try_send((advertiser_addr, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE));
-                }
-
                 info!(
                     ?hash,
                     retry_attempt = *retry_count,
                     retry_limit = POISONED_BLOCK_RETRY_LIMIT,
-                    "sync block body failed height or transaction commitment checks, retrying required block"
+                    "sync block body failed height or transaction commitment checks, \
+                     retrying required block"
                 );
                 metrics::counter!("sync.poisoned.block.requeued.count").increment(1);
 
@@ -2701,14 +2709,14 @@ where
                 return Ok(());
             }
 
-            self.poisoned_block_retry_counts.remove(&hash);
-
+            // Retain exhaustion until the round ends. A bad body does not invalidate its hash.
             warn!(
                 ?hash,
                 retry_limit = POISONED_BLOCK_RETRY_LIMIT,
-                "poisoned sync block retry budget exhausted, restarting sync"
+                "poisoned sync block retry budget exhausted, preserving other downloads"
             );
             metrics::counter!("sync.poisoned.block.retry.limit.count").increment(1);
+            return Ok(());
         }
 
         if let Some((hash, kind)) = response
@@ -3060,10 +3068,13 @@ where
                 );
                 false
             }
-            BlockDownloadVerifyError::TipChildHeightMismatch { .. } => {
-                // Only reached once the requeue budget is exhausted: the required hash still
-                // hasn't produced a usable body, so restart to get fresh tips and peers rather
-                // than leaving the newest block unresolved.
+            BlockDownloadVerifyError::ParentHeightMismatch { .. } => {
+                // `handle_block_response_with_missing_retry` handles every mismatch itself and
+                // returns success even once the requeue budget is exhausted, so that an
+                // exhausted budget keeps the round's other downloads. This arm is therefore
+                // only reached by a caller that bypasses the retry handler. The round's stall
+                // deadline is what recovers an exhausted hash: a swallowed completion is not
+                // verified progress, so the round restarts and obtains fresh tips and peers.
                 warn!(
                     error = ?e,
                     %peer,

@@ -1435,6 +1435,10 @@ pub enum Request {
     /// [`block::Height`] using `.into()`.
     AnyChainBlock(HashOrHeight),
 
+    /// Returns the committed height for this hash on any retained chain.
+    /// The lookup uses height indexes and does not require a retained block body.
+    AnyChainHeight(block::Hash),
+
     /// Looks up a block header by hash or height in the current best chain.
     ///
     /// Returns
@@ -1595,6 +1599,7 @@ impl Request {
             Request::CheckParentInputs { .. } => "check_parent_inputs",
             Request::Block(_) => "block",
             Request::AnyChainBlock(_) => "any_chain_block",
+            Request::AnyChainHeight(_) => "any_chain_height",
             Request::BlockHeader(_) => "block_header",
             Request::FindBlockHashes { .. } => "find_block_hashes",
             Request::FindBlockHeaders { .. } => "find_block_headers",
@@ -1689,6 +1694,10 @@ pub enum ReadRequest {
     /// Note: the [`HashOrHeight`] can be constructed from a [`block::Hash`] or
     /// [`block::Height`] using `.into()`.
     AnyChainBlock(HashOrHeight),
+
+    /// Returns the committed height for this hash on any retained chain.
+    /// The lookup uses height indexes and does not require a retained block body.
+    AnyChainHeight(block::Hash),
 
     //// Same as Block, but also returns serialized block size.
     ////
@@ -2148,6 +2157,7 @@ impl ReadRequest {
             ReadRequest::Depth(_) => "depth",
             ReadRequest::Block(_) => "block",
             ReadRequest::AnyChainBlock(_) => "any_chain_block",
+            ReadRequest::AnyChainHeight(_) => "any_chain_height",
             ReadRequest::BlockAndSize(_) => "block_and_size",
             ReadRequest::BlockHeader(_) => "block_header",
             ReadRequest::Transaction(_) => "transaction",
@@ -2227,6 +2237,7 @@ impl TryFrom<Request> for ReadRequest {
             Request::BestChainBlockHash(hash) => Ok(ReadRequest::BestChainBlockHash(hash)),
 
             Request::Block(hash_or_height) => Ok(ReadRequest::Block(hash_or_height)),
+            Request::AnyChainHeight(hash) => Ok(ReadRequest::AnyChainHeight(hash)),
             Request::AnyChainBlock(hash_or_height) => {
                 Ok(ReadRequest::AnyChainBlock(hash_or_height))
             }

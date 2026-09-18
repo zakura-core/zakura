@@ -38,7 +38,7 @@ const EXTRA_SPACINGS_TO_MINE_A_BLOCK: i32 = 2;
 /// testnet, for a block at `height`.
 ///
 /// The time scales with the target spacing at `height`, so it stays below the minimum difficulty
-/// gap after ZIP 218 shortens the spacing at NU7. Before NU7 it is 150 seconds.
+/// gap when a future upgrade shortens the spacing. At 75-second spacing it is 150 seconds.
 fn extra_time_to_mine_a_block(network: &Network, height: Height) -> Result<Duration32, BoxError> {
     let extra_time =
         NetworkUpgrade::target_spacing_for_height(network, height) * EXTRA_SPACINGS_TO_MINE_A_BLOCK;
@@ -308,9 +308,9 @@ fn adjust_difficulty_and_time_for_testnet(
     // > then the block is a minimum-difficulty block.
     //
     // The max time is always a minimum difficulty block, because the minimum difficulty
-    // gap is 7.5 minutes (2.5 minutes after ZIP 218 activates at NU7), but the maximum gap
-    // is 90 minutes. This means that testnet blocks have two valid time ranges with different
-    // difficulties, shown here before NU7:
+    // gap is 7.5 minutes at 75-second spacing, but the maximum gap is 90 minutes.
+    // This means that testnet blocks have two valid time ranges with different
+    // difficulties:
     // * 1s - 7m30s: standard difficulty
     // * 7m31s - 90m: minimum difficulty
     //

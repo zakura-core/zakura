@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use zakura_chain::{
     block::{self, Hash, Height},
     history_tree::HistoryTree,
-    parameters::{Network, NetworkUpgrade, POST_BLOSSOM_POW_TARGET_SPACING},
+    parameters::{Network, NetworkUpgrade},
     serialization::{DateTime32, Duration32},
     work::difficulty::{CompactDifficulty, PartialCumulativeWork, Work, U256},
 };
@@ -28,10 +28,23 @@ use crate::{
     BoxError, GetBlockTemplateChainInfo,
 };
 
-/// The amount of extra time we allow for a miner to mine a standard difficulty block on testnet.
+/// The number of target block spacings we allow for a miner to mine a standard difficulty block
+/// on testnet.
 ///
 /// This is a Zebra-specific standard rule.
-pub const EXTRA_TIME_TO_MINE_A_BLOCK: u32 = POST_BLOSSOM_POW_TARGET_SPACING * 2;
+const EXTRA_SPACINGS_TO_MINE_A_BLOCK: i32 = 2;
+
+/// Returns the amount of extra time we allow for a miner to mine a standard difficulty block on
+/// testnet, for a block at `height`.
+///
+/// The time scales with the target spacing at `height`, so it stays below the minimum difficulty
+/// gap when a future upgrade shortens the spacing. At 75-second spacing it is 150 seconds.
+fn extra_time_to_mine_a_block(network: &Network, height: Height) -> Result<Duration32, BoxError> {
+    let extra_time =
+        NetworkUpgrade::target_spacing_for_height(network, height) * EXTRA_SPACINGS_TO_MINE_A_BLOCK;
+
+    Ok(extra_time.try_into()?)
+}
 
 fn finalized_state_query_interrupted_error() -> BoxError {
     "Zakura is committing too many blocks to the state, \
@@ -295,8 +308,9 @@ fn adjust_difficulty_and_time_for_testnet(
     // > then the block is a minimum-difficulty block.
     //
     // The max time is always a minimum difficulty block, because the minimum difficulty
-    // gap is 7.5 minutes, but the maximum gap is 90 minutes. This means that testnet blocks
-    // have two valid time ranges with different difficulties:
+    // gap is 7.5 minutes at 75-second spacing, but the maximum gap is 90 minutes.
+    // This means that testnet blocks have two valid time ranges with different
+    // difficulties:
     // * 1s - 7m30s: standard difficulty
     // * 7m31s - 90m: minimum difficulty
     //
@@ -313,8 +327,12 @@ fn adjust_difficulty_and_time_for_testnet(
     let previous_block_time = relevant_data.first().expect("has at least one block").1;
     let previous_block_time: DateTime32 = previous_block_time.try_into()?;
 
+    // The consensus rule uses the spacing at the candidate block's height, which differs from the
+    // previous block's spacing at an upgrade that changes the spacing.
+    let candidate_height = (previous_block_height + 1).ok_or("candidate height is out of range")?;
+
     let Some(minimum_difficulty_spacing) =
-        NetworkUpgrade::minimum_difficulty_spacing_for_height(network, previous_block_height)
+        NetworkUpgrade::minimum_difficulty_spacing_for_height(network, candidate_height)
     else {
         // Returns early if the testnet minimum difficulty consensus rule is not active
         return Ok(());
@@ -341,7 +359,7 @@ fn adjust_difficulty_and_time_for_testnet(
     //    difficulty block, which makes mining easier;
     // - if cur_time gets clamped to max_time, this is almost always a minimum difficulty block.
     let local_std_difficulty_limit = std_difficulty_max_time
-        .checked_sub(Duration32::from_seconds(EXTRA_TIME_TO_MINE_A_BLOCK))
+        .checked_sub(extra_time_to_mine_a_block(network, candidate_height)?)
         .expect("a valid block time minus a small constant is in-range");
 
     if result.cur_time <= local_std_difficulty_limit {
@@ -379,7 +397,110 @@ fn adjust_difficulty_and_time_for_testnet(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zakura_chain::serialization::ZcashDeserializeInto;
+    use zakura_chain::{
+        parameters::testnet::ConfiguredActivationHeights, serialization::ZcashDeserializeInto,
+        work::difficulty::ParameterDifficulty,
+    };
+
+    /// Returns the highest offset from the tip time where the testnet template for the block after
+    /// `tip_height` keeps the standard difficulty.
+    fn last_standard_difficulty_offset(network: &Network, tip_height: Height) -> u32 {
+        let tip_time = DateTime32::from(1_700_000_000);
+        let difficulty = network.target_difficulty_limit().to_compact();
+        let relevant_data = vec![(difficulty, tip_time.to_chrono()); POW_ADJUSTMENT_BLOCK_SPAN];
+
+        let is_standard = |offset: u32| {
+            let mut result = GetBlockTemplateChainInfo {
+                tip_hash: block::Hash([0; 32]),
+                tip_height,
+                chain_history_root: None,
+                expected_difficulty: difficulty,
+                cur_time: tip_time.saturating_add(Duration32::from_seconds(offset)),
+                min_time: tip_time.saturating_add(Duration32::from_seconds(1)),
+                max_time: tip_time
+                    .saturating_add(Duration32::from_seconds(BLOCK_MAX_TIME_SINCE_MEDIAN)),
+            };
+            adjust_difficulty_and_time_for_testnet(
+                &mut result,
+                network,
+                tip_height,
+                relevant_data.clone(),
+            )
+            .expect("the template context is complete");
+
+            // Only the minimum difficulty branch raises the minimum time.
+            result.min_time == tip_time.saturating_add(Duration32::from_seconds(1))
+        };
+
+        let offset = (1..BLOCK_MAX_TIME_SINCE_MEDIAN)
+            .find(|&offset| !is_standard(offset))
+            .expect("the maximum time is a minimum difficulty time");
+        offset - 1
+    }
+
+    #[test]
+    fn testnet_template_standard_difficulty_window_follows_target_spacing() {
+        let _init_guard = zakura_test::init();
+
+        const NU7: u32 = 400_000;
+        let regtest = Network::new_regtest(
+            ConfiguredActivationHeights {
+                nu7: Some(NU7),
+                ..Default::default()
+            }
+            .into(),
+        );
+
+        // The minimum difficulty gap is 6 target spacings, and the template keeps the standard
+        // difficulty for the first 4 of them.
+        let pre_nu7_offset = 4 * 75;
+        let post_nu7_offset = 4 * 75;
+
+        let testnet = Network::new_default_testnet();
+        assert_eq!(
+            last_standard_difficulty_offset(&testnet, Height(3_000_000)),
+            pre_nu7_offset
+        );
+        assert_eq!(
+            last_standard_difficulty_offset(&regtest, Height(NU7 - 2)),
+            pre_nu7_offset
+        );
+
+        // Configuring NU7 does not yet change its 75-second spacing.
+        for tip in [NU7 - 1, NU7, NU7 + 1_000] {
+            assert_eq!(
+                last_standard_difficulty_offset(&regtest, Height(tip)),
+                post_nu7_offset,
+                "tip={tip}",
+            );
+        }
+    }
+
+    #[test]
+    fn testnet_template_uses_candidate_spacing_at_blossom() {
+        let _init_guard = zakura_test::init();
+        const BLOSSOM: u32 = 400_000;
+        let network = Network::new_regtest(
+            ConfiguredActivationHeights {
+                blossom: Some(BLOSSOM),
+                ..Default::default()
+            }
+            .into(),
+        );
+        assert_eq!(
+            last_standard_difficulty_offset(&network, Height(BLOSSOM - 2)),
+            600
+        );
+        // The parent is pre-Blossom but the candidate already uses 75 seconds.
+        assert_eq!(
+            last_standard_difficulty_offset(&network, Height(BLOSSOM - 1)),
+            300
+        );
+        assert_eq!(
+            last_standard_difficulty_offset(&network, Height(BLOSSOM)),
+            300
+        );
+    }
 
     #[test]
     fn mining_template_rejects_incomplete_difficulty_context() {
@@ -387,8 +508,10 @@ mod tests {
             .zcash_deserialize_into()
             .expect("the genesis vector is valid");
 
+        // The retained context is bounded independently of the active window.
+        let span = u32::try_from(POW_ADJUSTMENT_BLOCK_SPAN).unwrap();
+
         for network in [Network::Mainnet, Network::new_default_testnet()] {
-            let span = u32::try_from(POW_ADJUSTMENT_BLOCK_SPAN).unwrap();
             for tip in [0, 1, span - 2, span - 1, span, 3_474_810] {
                 let required = usize::try_from((tip + 1).min(span)).unwrap();
                 for count in 0..=required {

@@ -1034,7 +1034,15 @@ where
                 _ => None,
             };
 
-            let is_find_request = matches!(&req, Request::FindBlocks { .. });
+            // Headers never commit a block, so a header probe can never credit a peer with
+            // verified progress. An empty response while this node is behind the tip is still
+            // proven no-progress: without recording it, the legacy watchdog's header probes
+            // can be answered emptily forever and it never reaches the threshold that
+            // activates legacy fallback.
+            let is_find_request = matches!(
+                &req,
+                Request::FindBlocks { .. } | Request::FindHeaders { .. }
+            );
             let track_stalls = is_find_request
                 && !self.is_zcashd_compat_peer(&svc)
                 && !self
@@ -1064,6 +1072,9 @@ where
                                     feedback.no_progress();
                                 }
                                 *slot = Some(feedback);
+                            }
+                            Ok(Response::BlockHeaders(headers)) if headers.is_empty() => {
+                                feedback.no_progress()
                             }
                             Err(error) if error.is_remote_response_failure() => {
                                 feedback.no_progress()

@@ -496,7 +496,9 @@ fn previous_halving(height: Height, network: &Network) -> u32 {
     } else {
         let pre_blossom_height = blossom_height - slow_start_shift;
         let scaled_pre_blossom_height = pre_blossom_height
-            * HeightDiff::from(crate::parameters::BLOSSOM_POW_TARGET_SPACING_RATIO);
+            * HeightDiff::from(
+                crate::parameters::subsidy::constants::BLOSSOM_POW_TARGET_SPACING_RATIO,
+            );
 
         let post_blossom_height = height - blossom_height;
 

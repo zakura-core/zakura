@@ -2,6 +2,7 @@
 
 pub mod constants;
 pub mod parameters;
+pub(crate) mod precompute;
 pub mod proposal;
 pub mod zip317;
 
@@ -9,7 +10,7 @@ pub mod zip317;
 mod tests;
 
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fmt::{self},
     sync::{Arc, Mutex},
 };
@@ -381,7 +382,7 @@ impl BlockTemplateResponse {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_internal(
         net: &Network,
-        precomputed_coinbase: Option<TransactionTemplate<amount::NegativeOrZero>>,
+        coinbase_cache: &CoinbaseCache,
         miner_params: &MinerParams,
         chain_info: &GetBlockTemplateChainInfo,
         long_poll_id: LongPollId,
@@ -437,9 +438,14 @@ impl BlockTemplateResponse {
             .sum::<amount::Result<Amount<NonNegative>>>()
             .expect("mempool tx fees must be non-negative");
 
-        let coinbase_txn = precomputed_coinbase.unwrap_or_else(|| {
-            TransactionTemplate::new_coinbase(net, height, miner_params, txs_fee)
-                .expect("valid coinbase tx")
+        let coinbase_txn = coinbase_cache.get(height, txs_fee).unwrap_or_else(|| {
+            let coinbase_txn =
+                TransactionTemplate::new_coinbase(net, height, miner_params, txs_fee)
+                    .expect("valid coinbase tx");
+
+            coinbase_cache.store(height, txs_fee, coinbase_txn.clone());
+
+            coinbase_txn
         });
 
         let default_roots = DefaultRoots::from_coinbase(
@@ -619,6 +625,19 @@ impl MinerParams {
         self.memo.as_ref()
     }
 
+    /// Returns `true` if the coinbase transaction that pays these parameters has a shielded
+    /// output, which needs a proof that takes seconds to build.
+    ///
+    /// This mirrors the receiver that `TransactionTemplate::new_coinbase()` pays: a unified
+    /// address falls back to its transparent receiver when it has no shielded receiver.
+    pub(crate) fn has_shielded_component(&self) -> bool {
+        match &self.addr {
+            Address::Unified(addr) => addr.orchard().is_some() || addr.sapling().is_some(),
+            Address::Sapling(_) => true,
+            _ => false,
+        }
+    }
+
     /// Randomizes the memo.
     pub fn randomize_memo(&mut self) {
         let mut random = [0u8; 512];
@@ -661,6 +680,73 @@ impl From<zcash_address::ConversionError<&'static str>> for MinerParamsError {
     }
 }
 
+/// Caches recently built coinbase transactions for the next block, keyed on `(height, fee)`.
+///
+/// `getblocktemplate` clients commonly short-poll (re-request without long polling), and building
+/// the coinbase to a shielded address re-runs an expensive Sapling/Orchard proof. The coinbase only
+/// depends on `(height, fees)` for a given miner configuration, so repeated requests within the
+/// same block can reuse the cached transaction instead of re-proving it on every call.
+///
+/// Each `getblocktemplate` call needs two coinbase transactions at the same height: a zero-fee
+/// "fake" coinbase for ZIP-317 weight estimation, and the real coinbase with actual fees. Entries
+/// from previous heights are cleared on insert to bound memory.
+#[derive(Clone, Default)]
+pub(crate) struct CoinbaseCache(
+    Arc<
+        Mutex<
+            HashMap<
+                (block::Height, Amount<NonNegative>),
+                TransactionTemplate<amount::NegativeOrZero>,
+            >,
+        >,
+    >,
+);
+
+impl CoinbaseCache {
+    /// Returns the cached coinbase transaction if it was built for `height` and `fee`.
+    fn get(
+        &self,
+        height: block::Height,
+        fee: Amount<NonNegative>,
+    ) -> Option<TransactionTemplate<amount::NegativeOrZero>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&(height, fee))
+            .cloned()
+    }
+
+    /// Stores `coinbase` as the cached transaction for `height` and `fee`.
+    fn store(
+        &self,
+        height: block::Height,
+        fee: Amount<NonNegative>,
+        coinbase: TransactionTemplate<amount::NegativeOrZero>,
+    ) {
+        let mut map = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // Evict entries from previous heights so the map stays bounded.
+        map.retain(|&(h, _), _| h == height);
+        // Only 2 entries are ever useful (zero-fee fake + current real-fee coinbase), but mempool
+        // fee churn can accumulate stale entries within a block. Cap at 4 to stay well above the
+        // useful set while preventing unbounded growth. When evicting, preserve the zero-fee sizing
+        // coinbase — losing it recreates the churn this cache exists to prevent.
+        if !map.contains_key(&(height, fee)) && map.len() >= 4 {
+            let evict_key = map
+                .keys()
+                .copied()
+                .find(|&(_, f)| f != Amount::<NonNegative>::zero());
+            if let Some(key) = evict_key {
+                map.remove(&key);
+            }
+        }
+        map.insert((height, fee), coinbase);
+    }
+}
+
 /// Handler for the `getblocktemplate` RPC.
 #[derive(Clone)]
 pub struct GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>
@@ -670,6 +756,12 @@ where
 {
     /// Miner parameters, including the miner address, data, and memo.
     miner_params: Option<MinerParams>,
+
+    /// Shares coinbase transactions across template builds.
+    coinbase_cache: CoinbaseCache,
+
+    /// Shares templates built by the background updater.
+    template_cache: Option<precompute::TemplateCache>,
 
     /// The chain verifier, used for submitting blocks.
     block_verifier_router: BlockVerifierRouter,
@@ -714,6 +806,8 @@ where
         let optimistic_block_inventory = conf.optimistic_block_inventory;
         Self {
             miner_params: MinerParams::new(net, conf).ok(),
+            coinbase_cache: CoinbaseCache::default(),
+            template_cache: Some(precompute::TemplateCache::default()),
             block_verifier_router,
             sync_status,
             mined_block_sender: mined_block_sender
@@ -737,6 +831,16 @@ where
     /// Returns the miner parameters, including the address, data, and memo.
     pub fn miner_params(&self) -> Option<&MinerParams> {
         self.miner_params.as_ref()
+    }
+
+    /// Returns the shared coinbase cache.
+    pub(crate) fn coinbase_cache(&self) -> CoinbaseCache {
+        self.coinbase_cache.clone()
+    }
+
+    /// Returns the template cache for this handler's miner parameters.
+    pub(crate) fn template_cache(&self) -> Option<&precompute::TemplateCache> {
+        self.template_cache.as_ref()
     }
 
     /// Returns the sync status.
@@ -782,6 +886,9 @@ where
         if let Some(miner_params) = &mut self.miner_params {
             miner_params.randomize_data();
             miner_params.randomize_memo();
+            // This clone now builds different coinbases from the updater.
+            self.coinbase_cache = CoinbaseCache::default();
+            self.template_cache = None;
         }
     }
 }

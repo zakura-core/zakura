@@ -435,3 +435,24 @@ unwrap_in_result = "warn"
 
 # TODOs: fix this lint eventually
 result_large_err = "allow"
+
+# Temporary integration pin for the obsolete ZIP 233 cleanup. Replace with the
+# coordinated breaking common release before shipping. Keep the family on one revision.
+[patch.crates-io]
+zakura-bellman = { git = "https://github.com/zakura-core/common.git", rev = "e6149d2b1b2a9da15f1b1d94e9e356f8a99bf7f6" }
+zakura-bls12-381 = { git = "https://github.com/zakura-core/common.git", rev = "e6149d2b1b2a9da15f1b1d94e9e356f8a99bf7f6" }
+zakura-halo2-gadgets = { git = "https://github.com/zakura-core/common.git", rev = "e6149d2b1b2a9da15f1b1d94e9e356f8a99bf7f6" }
+zakura-halo2-legacy-pdqsort = { git = "https://github.com/zakura-core/common.git", rev = "e6149d2b1b2a9da15f1b1d94e9e356f8a99bf7f6" }
+zakura-halo2-poseidon = { git = "https://github.com/zakura-core/common.git", rev = "e6149d2b1b2a9da15f1b1d94e9e356f8a99bf7f6" }
+zakura-halo2-proofs = { git = "https://github.com/zakura-core/common.git", rev = "e6149d2b1b2a9da15f1b1d94e9e356f8a99bf7f6" }
+zakura-jubjub = { git = "https://github.com/zakura-core/common.git", rev = "e6149d2b1b2a9da15f1b1d94e9e356f8a99bf7f6" }
+zakura-keys = { git = "https://github.com/zakura-core/common.git", rev = "e6149d2b1b2a9da15f1b1d94e9e356f8a99bf7f6" }
+zakura-orchard = { git = "https://github.com/zakura-core/common.git", rev = "e6149d2b1b2a9da15f1b1d94e9e356f8a99bf7f6" }
+zakura-pairing = { git = "https://github.com/zakura-core/common.git", rev = "e6149d2b1b2a9da15f1b1d94e9e356f8a99bf7f6" }
+zakura-pasta-curves = { git = "https://github.com/zakura-core/common.git", rev = "e6149d2b1b2a9da15f1b1d94e9e356f8a99bf7f6" }
+zakura-primitives = { git = "https://github.com/zakura-core/common.git", rev = "e6149d2b1b2a9da15f1b1d94e9e356f8a99bf7f6" }
+zakura-proofs = { git = "https://github.com/zakura-core/common.git", rev = "e6149d2b1b2a9da15f1b1d94e9e356f8a99bf7f6" }
+zakura-reddsa = { git = "https://github.com/zakura-core/common.git", rev = "e6149d2b1b2a9da15f1b1d94e9e356f8a99bf7f6" }
+zakura-redjubjub = { git = "https://github.com/zakura-core/common.git", rev = "e6149d2b1b2a9da15f1b1d94e9e356f8a99bf7f6" }
+zakura-sapling-crypto = { git = "https://github.com/zakura-core/common.git", rev = "e6149d2b1b2a9da15f1b1d94e9e356f8a99bf7f6" }
+zakura-sinsemilla = { git = "https://github.com/zakura-core/common.git", rev = "e6149d2b1b2a9da15f1b1d94e9e356f8a99bf7f6" }

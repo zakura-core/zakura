@@ -279,24 +279,26 @@ impl ParameterSubsidy for Network {
 /// as described in [protocol specification §7.10][7.10]
 ///
 /// [7.10]: https://zips.z.cash/protocol/protocol.pdf#fundingstreams
-pub fn funding_stream_address_period<N: ParameterSubsidy>(height: Height, network: &N) -> u32 {
-    // Spec equation: `address_period = floor((height - (height_for_halving(1) - post_blossom_halving_interval))/funding_stream_address_change_interval)`,
+pub fn funding_stream_address_period<N: ParameterSubsidy>(
+    height: Height,
+    network: &N,
+) -> HeightDiff {
+    // Spec equation: `address_period = floor((height -
+    // (height_for_halving(1) - post_blossom_halving_interval)) /
+    // funding_stream_address_change_interval)`,
     // <https://zips.z.cash/protocol/protocol.pdf#fundingstreams>
     //
-    // Note that the brackets make it so the post blossom halving interval is added to the total.
-    //
-    // In Rust, "integer division rounds towards zero":
-    // <https://doc.rust-lang.org/stable/reference/expressions/operator-expr.html#arithmetic-and-logical-binary-operators>
-    // This is the same as `floor()`, because these numbers are all positive.
+    // Note that the brackets make it so the post-Blossom halving interval is
+    // added to the total.
 
     let height_after_first_halving = height - network.height_for_first_halving();
 
-    let address_period = (height_after_first_halving + network.post_blossom_halving_interval())
-        / network.funding_stream_address_change_interval();
-
-    address_period
-        .try_into()
-        .expect("all values are positive and smaller than the input height")
+    // `div_euclid` matches the specification's floor because the interval is
+    // positive. The regression test uses a height one block before the
+    // address-period anchor: its numerator is -1, so `/` would truncate it
+    // to 0 rather than floor it to -1.
+    (height_after_first_halving + network.post_blossom_halving_interval())
+        .div_euclid(network.funding_stream_address_change_interval())
 }
 
 /// The first block height of the halving at the provided halving index for a network.

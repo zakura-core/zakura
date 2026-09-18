@@ -1224,6 +1224,20 @@ where
 
         // Immediately reject all incoming blocks that arrive after we've finished.
         if let FinalCheckpoint = self.previous_checkpoint_height() {
+            // A peer can rewrite the coinbase input and expiry heights without changing the header hash.
+            // Reject the changed transaction IDs before returning the unscored Finished error.
+            let transaction_hashes = block
+                .transactions
+                .iter()
+                .map(|tx| tx.hash())
+                .collect::<Vec<_>>();
+            if let Err(error) = crate::block::check::merkle_root_validity(
+                &self.network,
+                &block,
+                &transaction_hashes,
+            ) {
+                return async { Err(error.into()) }.boxed();
+            }
             return async { Err(VerifyCheckpointError::Finished) }.boxed();
         }
 

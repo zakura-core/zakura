@@ -4741,6 +4741,142 @@ async fn rpc_getchaintips_empty_state() {
     read_state.expect_no_requests().await;
 }
 
+/// Answers the block template updater task's state and mempool requests for a switchable chain
+/// tip.
+///
+/// Each mock keeps one responder task for the whole test. Aborting a responder and spawning a new
+/// one loses every request sent between the two, because a new [`MockService`] clone only receives
+/// requests sent after it subscribes. The updater task then waits for that response forever.
+struct TemplateUpdaterResponders {
+    shared: Arc<std::sync::Mutex<TemplateUpdaterResponderState>>,
+    tasks: [tokio::task::JoinHandle<()>; 2],
+}
+
+struct TemplateUpdaterResponderState {
+    tip: (Height, Hash),
+    /// `Some` holds mempool requests unanswered until [`TemplateUpdaterResponders::resume_mempool`].
+    paused_mempool_requests: Option<
+        Vec<
+            zakura_test::mock_service::ResponseSender<
+                mempool::Request,
+                mempool::Response,
+                BoxError,
+            >,
+        >,
+    >,
+}
+
+impl TemplateUpdaterResponders {
+    /// Spawns responders that report `tip` until [`Self::set_tip`] changes it.
+    ///
+    /// `ReadRequest::Tip` and `ReadRequest::ChainInfo` always report the same tip, like the state
+    /// does: both read the same non-finalized state channel.
+    fn spawn(
+        net: &Network,
+        mut read_state: MockService<
+            ReadRequest,
+            ReadResponse,
+            zakura_test::mock_service::PanicAssertion,
+            BoxError,
+        >,
+        mut mempool: MockService<
+            mempool::Request,
+            mempool::Response,
+            zakura_test::mock_service::PanicAssertion,
+            BoxError,
+        >,
+        tip: (Height, Hash),
+    ) -> Self {
+        let shared = Arc::new(std::sync::Mutex::new(TemplateUpdaterResponderState {
+            tip,
+            paused_mempool_requests: None,
+        }));
+        let chain_history_root = fake_history_tree(net).hash();
+
+        let read_state_shared = shared.clone();
+        let read_state_responder = tokio::spawn(async move {
+            loop {
+                let request = read_state.expect_request_that(|_| true).await;
+                let (tip_height, tip_hash) = read_state_shared.lock().expect("unpoisoned").tip;
+                request.respond_with(move |req| match req {
+                    ReadRequest::ChainInfo => ReadResponse::ChainInfo(GetBlockTemplateChainInfo {
+                        expected_difficulty: CompactDifficulty::from(ExpandedDifficulty::from(
+                            U256::one(),
+                        )),
+                        tip_height,
+                        tip_hash,
+                        cur_time: DateTime32::from(1654008617),
+                        min_time: DateTime32::from(1654008606),
+                        max_time: DateTime32::from(1654008728),
+                        chain_history_root,
+                    }),
+                    ReadRequest::Tip => ReadResponse::Tip(Some((tip_height, tip_hash))),
+                    other => panic!("unexpected read state request: {other:?}"),
+                });
+            }
+        });
+
+        let mempool_shared = shared.clone();
+        let mempool_responder = tokio::spawn(async move {
+            loop {
+                let request = mempool
+                    .expect_request(mempool::Request::FullTransactions)
+                    .await;
+                let mut state = mempool_shared.lock().expect("unpoisoned");
+                let tip_hash = state.tip.1;
+                match state.paused_mempool_requests.as_mut() {
+                    Some(paused) => paused.push(request),
+                    None => request.respond(Self::mempool_response(tip_hash)),
+                }
+            }
+        });
+
+        Self {
+            shared,
+            tasks: [read_state_responder, mempool_responder],
+        }
+    }
+
+    fn mempool_response(last_seen_tip_hash: Hash) -> mempool::Response {
+        mempool::Response::FullTransactions {
+            transactions: vec![],
+            transaction_dependencies: Default::default(),
+            last_seen_tip_hash,
+        }
+    }
+
+    /// Makes the responders report `tip` for every request they have not answered yet.
+    fn set_tip(&self, tip: (Height, Hash)) {
+        self.shared.lock().expect("unpoisoned").tip = tip;
+    }
+
+    /// Holds mempool requests unanswered, so a caller that reads the mempool blocks.
+    fn pause_mempool(&self) {
+        self.shared
+            .lock()
+            .expect("unpoisoned")
+            .paused_mempool_requests
+            .get_or_insert_with(Vec::new);
+    }
+
+    /// Answers the held mempool requests and every later one for the current tip.
+    fn resume_mempool(&self) {
+        let mut state = self.shared.lock().expect("unpoisoned");
+        let tip_hash = state.tip.1;
+        for request in state.paused_mempool_requests.take().into_iter().flatten() {
+            request.respond(Self::mempool_response(tip_hash));
+        }
+    }
+}
+
+impl Drop for TemplateUpdaterResponders {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
 /// Checks that `getblocktemplate` answers from the template precomputed by the block template
 /// updater task after validating the state tip, without reading the mempool, and that it never
 /// answers with a template for a stale chain tip.
@@ -4804,56 +4940,12 @@ async fn getblocktemplate_precomputed() {
         None,
     );
 
-    // Answers the updater task's state and mempool requests for a chain tip, until the returned
-    // tasks are aborted. `ReadRequest::Tip` and `ReadRequest::ChainInfo` always report the same
-    // tip, like the state does: both read the same non-finalized state channel.
-    let spawn_responders = |tip_height: Height, tip_hash: Hash| {
-        let mut read_state = read_state.clone();
-        let mut mempool = mempool.clone();
-        let chain_history_root = fake_history_tree(&net).hash();
-
-        let read_state_responder = tokio::spawn(async move {
-            loop {
-                read_state
-                    .expect_request_that(|_| true)
-                    .await
-                    .respond_with(move |req| match req {
-                        ReadRequest::ChainInfo => {
-                            ReadResponse::ChainInfo(GetBlockTemplateChainInfo {
-                                expected_difficulty: CompactDifficulty::from(
-                                    ExpandedDifficulty::from(U256::one()),
-                                ),
-                                tip_height,
-                                tip_hash,
-                                cur_time: DateTime32::from(1654008617),
-                                min_time: DateTime32::from(1654008606),
-                                max_time: DateTime32::from(1654008728),
-                                chain_history_root,
-                            })
-                        }
-                        ReadRequest::Tip => ReadResponse::Tip(Some((tip_height, tip_hash))),
-                        other => panic!("unexpected read state request: {other:?}"),
-                    });
-            }
-        });
-
-        let mempool_responder = tokio::spawn(async move {
-            loop {
-                mempool
-                    .expect_request(mempool::Request::FullTransactions)
-                    .await
-                    .respond(mempool::Response::FullTransactions {
-                        transactions: vec![],
-                        transaction_dependencies: Default::default(),
-                        last_seen_tip_hash: tip_hash,
-                    });
-            }
-        });
-
-        (read_state_responder, mempool_responder)
-    };
-
-    let (read_state_responder, mempool_responder) = spawn_responders(tip_height, tip_hash);
+    let responders = TemplateUpdaterResponders::spawn(
+        &net,
+        read_state.clone(),
+        mempool.clone(),
+        (tip_height, tip_hash),
+    );
 
     let updater = rpc
         .spawn_block_template_updater()
@@ -4879,9 +4971,9 @@ async fn getblocktemplate_precomputed() {
     .expect("the updater task should precompute a template for the chain tip");
 
     // The RPC validates the tip against the state, then must answer from the precomputed template:
-    // the mempool never responds again, so selecting transactions for a fresh template would block
-    // forever.
-    mempool_responder.abort();
+    // the mempool holds requests unanswered, so selecting transactions for a fresh template would
+    // block until the timeout.
+    responders.pause_mempool();
 
     let template = tokio::time::timeout(Duration::from_secs(1), rpc.get_block_template(None))
         .await
@@ -4901,10 +4993,8 @@ async fn getblocktemplate_precomputed() {
     let next_tip_hash =
         Hash::from_hex("0000000000b6a5024aa412120b684a509ba8fd57e01de07bc2a84e4d3719a9f1").unwrap();
 
-    read_state_responder.abort();
-
-    let (read_state_responder, mempool_responder) =
-        spawn_responders(next_tip_height, next_tip_hash);
+    responders.set_tip((next_tip_height, next_tip_hash));
+    responders.resume_mempool();
 
     mock_tip_sender.send_best_tip_height(next_tip_height);
     mock_tip_sender.send_best_tip_hash(next_tip_hash);
@@ -4922,8 +5012,6 @@ async fn getblocktemplate_precomputed() {
     );
     assert_eq!(template.height, next_tip_height.0 + 1);
 
-    read_state_responder.abort();
-    mempool_responder.abort();
     updater.abort();
 }
 
@@ -5179,14 +5267,9 @@ async fn getblocktemplate_ignores_precomputed_template_when_tip_channel_lags_sta
 
     let net = Network::Mainnet;
 
-    let request_delay = Duration::from_secs(30);
-    let mempool: MockService<_, _, _, BoxError> = MockService::build()
-        .with_max_request_delay(request_delay)
-        .for_unit_tests();
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
-    let read_state: MockService<_, _, _, BoxError> = MockService::build()
-        .with_max_request_delay(request_delay)
-        .for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
 
     let mut mock_sync_status = MockSyncStatus::default();
     mock_sync_status.set_is_close_to_tip(true);
@@ -5227,7 +5310,7 @@ async fn getblocktemplate_ignores_precomputed_template_when_tip_channel_lags_sta
         "RPC test",
         Buffer::new(mempool.clone(), 1),
         state.clone(),
-        Buffer::new(read_state.clone(), 1),
+        read_state.clone(),
         MockService::build().for_unit_tests(),
         mock_sync_status,
         mock_tip,
@@ -5236,86 +5319,44 @@ async fn getblocktemplate_ignores_precomputed_template_when_tip_channel_lags_sta
         None,
     );
 
-    let spawn_responders = |tip_height: Height, tip_hash: Hash| {
-        let mut read_state = read_state.clone();
-        let mut mempool = mempool.clone();
-        let chain_history_root = fake_history_tree(&net).hash();
-
-        let read_state_responder = tokio::spawn(async move {
-            loop {
-                read_state
-                    .expect_request_that(|_| true)
-                    .await
-                    .respond_with(move |req| match req {
-                        ReadRequest::ChainInfo => {
-                            ReadResponse::ChainInfo(GetBlockTemplateChainInfo {
-                                expected_difficulty: CompactDifficulty::from(
-                                    ExpandedDifficulty::from(U256::one()),
-                                ),
-                                tip_height,
-                                tip_hash,
-                                cur_time: DateTime32::from(1654008617),
-                                min_time: DateTime32::from(1654008606),
-                                max_time: DateTime32::from(1654008728),
-                                chain_history_root,
-                            })
-                        }
-                        ReadRequest::Tip => ReadResponse::Tip(Some((tip_height, tip_hash))),
-                        other => panic!("unexpected read state request: {other:?}"),
-                    });
-            }
-        });
-
-        let mempool_responder = tokio::spawn(async move {
-            loop {
-                mempool
-                    .expect_request(mempool::Request::FullTransactions)
-                    .await
-                    .respond(mempool::Response::FullTransactions {
-                        transactions: vec![],
-                        transaction_dependencies: Default::default(),
-                        last_seen_tip_hash: tip_hash,
-                    });
-            }
-        });
-
-        (read_state_responder, mempool_responder)
-    };
-
     // Fill the cache with a template for the tip both the state and the channel agree on.
-    let (read_state_responder, mempool_responder) = spawn_responders(tip_height, tip_hash);
-
-    let updater = rpc
-        .spawn_block_template_updater()
-        .expect("mining is configured");
-
-    let template_cache = rpc
+    let cache = rpc
         .gbt
         .template_cache()
         .expect("the miner params were not overridden")
         .clone();
 
-    tokio::time::timeout(Duration::from_secs(30), async {
-        let mut templates = template_cache.subscribe();
-        while template_cache
-            .template_for_tip(tip_hash, &net, DateTime32::now())
-            .is_none()
-        {
-            templates.changed().await;
-        }
-    })
-    .await
-    .expect("the updater task should precompute a template for the chain tip");
+    cache.publish(template_extending(&net, tip_height, tip_hash));
+
+    let get_block_template = rpc.get_block_template(None);
+    tokio::pin!(get_block_template);
 
     // Commit a block in the state without advancing the chain tip channel.
-    read_state_responder.abort();
-    mempool_responder.abort();
-    let (read_state_responder, mempool_responder) =
-        spawn_responders(committed_height, committed_hash);
+    tokio::select! {
+        biased;
+        _ = &mut get_block_template => {
+            panic!("getblocktemplate must read the committed tip before serving a cached template")
+        }
+        request = read_state.expect_request(ReadRequest::Tip) => {
+            request.respond(ReadResponse::Tip(Some((committed_height, committed_hash))));
+        }
+    }
 
-    let template = tokio::time::timeout(Duration::from_secs(30), rpc.get_block_template(None))
-        .await
-        .expect("getblocktemplate should answer while the chain tip channel lags the state")
+    assert!(
+        futures::poll!(&mut get_block_template).is_pending(),
+        "getblocktemplate must wait for a template on the committed tip, not serve the cached \
+         template for the tip the chain tip channel still reports",
+    );
+
+    cache.publish(template_extending(&net, committed_height, committed_hash));
+
+    let (template, ()) = tokio::join!(get_block_template, async {
+        read_state
+            .expect_request(ReadRequest::Tip)
+            .await
+            .respond(ReadResponse::Tip(Some((committed_height, committed_hash))));
+    });
+    let template = template
         .expect("getblocktemplate should succeed")
         .try_into_template()
         .expect("getblocktemplate without parameters should return a template");
@@ -5326,10 +5367,6 @@ async fn getblocktemplate_ignores_precomputed_template_when_tip_channel_lags_sta
          tip channel still reports",
     );
     assert_eq!(template.height, committed_height.0 + 1);
-
-    read_state_responder.abort();
-    mempool_responder.abort();
-    updater.abort();
 }
 
 /// A template published during a cache wait must be checked against the new committed tip.

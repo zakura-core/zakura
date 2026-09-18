@@ -707,9 +707,15 @@ where
                         advertiser_addr,
                     });
                 }
-                let block_height = claimed_height.ok_or(
-                    BlockDownloadVerifyError::InvalidHeight { hash, advertiser_addr: None }
-                )?;
+                // A body with no coinbase height cannot be the block this header commits to.
+                // The block identifier comes from the header, so the response still satisfies
+                // the requested hash: only the supplier is implicated, and without excluding it
+                // the same peer stays eligible for this hash on every retry. The advertiser
+                // stays unattributed, because it did not choose the body.
+                let Some(block_height) = claimed_height else {
+                    if let Some(feedback) = &supplier_feedback { feedback.reject(); }
+                    return Err(BlockDownloadVerifyError::InvalidHeight { hash, advertiser_addr: None });
+                };
 
                 trace.block_downloaded(
                     hash,

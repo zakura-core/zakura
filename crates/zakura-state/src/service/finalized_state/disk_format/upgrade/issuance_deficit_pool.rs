@@ -532,11 +532,13 @@ mod database_tests {
             let db = legacy_db(4, 48);
             let mut batch = DiskWriteBatch::new();
             if missing == 4 {
-                let _ = db.raw_chain_value_pools_cf()
+                let _ = db
+                    .raw_chain_value_pools_cf()
                     .with_batch_for_writing(&mut batch)
                     .zs_delete(&());
             } else {
-                let _ = db.raw_block_info_cf()
+                let _ = db
+                    .raw_block_info_cf()
                     .with_batch_for_writing(&mut batch)
                     .zs_delete(&Height(missing));
             }
@@ -587,7 +589,8 @@ mod database_tests {
                 bytes[..8].copy_from_slice(&4i64.to_le_bytes());
             }
             let mut batch = DiskWriteBatch::new();
-            let _ = db.raw_chain_value_pools_cf()
+            let _ = db
+                .raw_chain_value_pools_cf()
                 .with_batch_for_writing(&mut batch)
                 .zs_insert(&(), &RawBytes(bytes));
             db.write_batch(batch).unwrap();

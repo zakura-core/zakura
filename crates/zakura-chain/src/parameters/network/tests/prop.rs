@@ -32,6 +32,39 @@ proptest! {
 }
 
 proptest! {
+    #![proptest_config(ProptestConfig::with_cases(std::env::var("NSM_ARITHMETIC_CASES").ok().and_then(|value| value.parse().ok()).unwrap_or(1024)))]
+
+    #[test]
+    fn reissuance_matches_integer_oracle(
+        deficit in prop_oneof![Just(0i64), Just(1i64), Just(crate::amount::MAX_MONEY), 0i64..=crate::amount::MAX_MONEY],
+        height in prop_oneof![Just(2u32), Just(3u32), Just(4u32), Just(u32::MAX), 3u32..10_000_000],
+    ) {
+        use crate::{
+            amount::Amount,
+            parameters::{
+                subsidy::{block_subsidy, halving_block_subsidy},
+                testnet::{ConfiguredActivationHeights, RegtestParameters},
+            },
+        };
+
+        let network = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights { nu7: Some(2), ..Default::default() },
+            zip234_start_height: Some(Height(3)),
+            ..Default::default()
+        });
+        let scheduled = i64::from(halving_block_subsidy(Height(height), &network).unwrap());
+        let actual = i64::from(block_subsidy(Height(height), &network, Some(Amount::try_from(deficit).unwrap())).unwrap());
+        let bonus = if cfg!(feature = "nu7") && height >= 3 {
+            (i128::from(deficit) * 4126 + 9_999_999_999) / 10_000_000_000
+        } else {
+            0
+        };
+        prop_assert_eq!(i128::from(actual), i128::from(scheduled) + bonus);
+        prop_assert!(bonus >= 0 && bonus <= i128::from(deficit));
+    }
+}
+
+proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
     #[test]

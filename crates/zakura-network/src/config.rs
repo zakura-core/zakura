@@ -978,6 +978,11 @@ struct DTestnetParameters {
     /// If unset, the default activation height for the network is used; the soft fork
     /// cannot be disabled via configuration.
     temporary_orchard_disabling_soft_fork_height: Option<u32>,
+    /// Height at which ZIP 234 reissuance starts.
+    ///
+    /// If unset, the ZIP 234 crossing rule sets it. Reissuance never starts below NU7
+    /// activation.
+    zip234_start_height: Option<u32>,
 }
 
 /// Network configuration used during deserialization.
@@ -1094,6 +1099,9 @@ impl From<Arc<testnet::Parameters>> for DTestnetParameters {
             extend_funding_stream_addresses_as_required: None,
             temporary_orchard_disabling_soft_fork_height: params
                 .temporary_orchard_disabling_soft_fork_height()
+                .map(|height| height.0),
+            zip234_start_height: params
+                .configured_zip234_start_height()
                 .map(|height| height.0),
         }
     }
@@ -1364,6 +1372,7 @@ where
         checkpoints,
         extend_funding_stream_addresses_as_required,
         temporary_orchard_disabling_soft_fork_height,
+        zip234_start_height,
     } = params;
 
     let mut params_builder = testnet::Parameters::build();
@@ -1457,6 +1466,11 @@ where
         );
     }
 
+    if let Some(height) = zip234_start_height {
+        params_builder =
+            params_builder.with_zip234_start_height(height.try_into().map_err(de::Error::custom)?);
+    }
+
     // Return an error if the initial testnet peers includes any of the default initial Mainnet or Testnet
     // peers and the configured network parameters are incompatible with the default public Testnet.
     if !params_builder.is_compatible_with_default_parameters()
@@ -1485,6 +1499,7 @@ fn build_regtest_params(params: DTestnetParameters) -> RegtestParameters {
         checkpoints,
         extend_funding_stream_addresses_as_required,
         max_block_time_start_height,
+        zip234_start_height,
         ..
     } = params;
 
@@ -1505,5 +1520,6 @@ fn build_regtest_params(params: DTestnetParameters) -> RegtestParameters {
         checkpoints: Some(checkpoints),
         max_block_time_start_height: max_block_time_start_height.map(zakura_chain::block::Height),
         extend_funding_stream_addresses_as_required,
+        zip234_start_height: zip234_start_height.map(zakura_chain::block::Height),
     }
 }

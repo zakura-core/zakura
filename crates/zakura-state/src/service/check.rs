@@ -3,11 +3,13 @@
 use std::{borrow::Borrow, sync::Arc};
 
 use zakura_chain::{
+    amount::{NegativeAllowed, NonNegative},
     block::{
         self, merkle::AuthDataRoot, Block, ChainHistoryBlockTxAuthCommitmentHash, CommitmentError,
     },
     history_tree::HistoryTree,
-    parameters::{Network, NetworkUpgrade},
+    parameters::{subsidy::is_zip234_active, Network, NetworkUpgrade},
+    value_balance::ValueBalance,
     work::difficulty::CompactDifficulty,
 };
 
@@ -41,6 +43,54 @@ pub use utxo::transparent_coinbase_spend;
 mod tests;
 
 pub(crate) use difficulty::AdjustedDifficulty;
+
+/// Checks that the block at `height` does not make the ZIP 234 issuance deficit negative.
+///
+/// `value_pools` are the chain value pools before the block, and `block_value_pool_change`
+/// is the block's change to them.
+///
+/// # Consensus
+///
+/// > [NU7 onward] If IssuanceDeficit(height) would become negative in the block chain
+/// > created as a result of accepting a block at height, then all nodes MUST reject the
+/// > block as invalid.
+///
+/// zips#1354 applies this rule from NU7 because it starts reissuance at NU7. Zakura starts
+/// reissuance at the later ZIP 234 start height, and applies the rule from that height.
+///
+/// Check before adding pools so an overdraw reports this consensus rule.
+#[allow(clippy::unwrap_in_result)]
+pub(crate) fn issuance_deficit_is_non_negative(
+    network: &Network,
+    height: block::Height,
+    value_pools: &ValueBalance<NonNegative>,
+    block_value_pool_change: &ValueBalance<NegativeAllowed>,
+) -> Result<(), ValidateContextError> {
+    if !is_zip234_active(network, height) {
+        return Ok(());
+    }
+
+    let deficit_before = value_pools.issuance_deficit_amount();
+    let deficit_change = block_value_pool_change.issuance_deficit_amount();
+
+    let deficit_after = (deficit_before + deficit_change).map_err(|_| {
+        ValidateContextError::NegativeIssuanceDeficit {
+            height,
+            deficit_before,
+            deficit_change,
+        }
+    })?;
+
+    if deficit_after.zatoshis() < 0 {
+        return Err(ValidateContextError::NegativeIssuanceDeficit {
+            height,
+            deficit_before,
+            deficit_change,
+        });
+    }
+
+    Ok(())
+}
 
 /// Check that the semantically verified block is contextually valid for `network`,
 /// based on the `finalized_tip_height` and `relevant_headers`.
@@ -448,4 +498,52 @@ pub(crate) fn initial_contextual_validity(
     check::nullifier::no_duplicates_in_finalized_chain(semantically_verified, finalized_state)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod issuance_deficit_boundary_tests {
+    use super::*;
+    use zakura_chain::{
+        amount::{Amount, MAX_MONEY},
+        parameters::testnet::{ConfiguredActivationHeights, RegtestParameters},
+    };
+
+    #[test]
+    fn rejection_matrix_covers_activation_sign_and_arithmetic_limits() {
+        let network = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu7: Some(2),
+                ..Default::default()
+            },
+            zip234_start_height: Some(block::Height(3)),
+            ..Default::default()
+        });
+        for height in [1, 2, 3, 4] {
+            for before in [-MAX_MONEY, -1, 0, 1, MAX_MONEY] {
+                for delta in [-MAX_MONEY, -1, 0, 1, MAX_MONEY] {
+                    let mut pools = ValueBalance::<NonNegative>::zero();
+                    pools.set_issuance_deficit_amount(Amount::try_from(before).unwrap());
+                    let mut change = ValueBalance::<NegativeAllowed>::zero();
+                    change.set_issuance_deficit_amount(Amount::try_from(delta).unwrap());
+                    let result = issuance_deficit_is_non_negative(
+                        &network,
+                        block::Height(height),
+                        &pools,
+                        &change,
+                    );
+                    let sum = i128::from(before) + i128::from(delta);
+                    let reject = cfg!(feature = "nu7")
+                        && height >= 3
+                        && !(0..=i128::from(MAX_MONEY)).contains(&sum);
+                    assert_eq!(
+                        result.is_err(),
+                        reject,
+                        "height {height}, before {before}, delta {delta}"
+                    );
+                    assert_eq!(i64::from(pools.issuance_deficit_amount()), before);
+                    assert_eq!(i64::from(change.issuance_deficit_amount()), delta);
+                }
+            }
+        }
+    }
 }

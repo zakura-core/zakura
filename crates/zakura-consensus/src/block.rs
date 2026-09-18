@@ -436,8 +436,44 @@ where
                 .map_err(VerifyBlockError::Time)?;
             let coinbase_tx = check::coinbase_is_first(&block)?;
 
-            let expected_block_subsidy =
-                zakura_chain::parameters::subsidy::block_subsidy(height, &network)?;
+            // ZIP 234 derives the block subsidy from the issuance deficit after the parent
+            // block, so a block at or above the start height needs its parent's chain
+            // value pools. Wait for the parent commit if its verification is still running.
+            let issuance_deficit =
+                if zakura_chain::parameters::subsidy::is_zip234_active(&network, height) {
+                    let parent_hash = block.header.previous_block_hash;
+
+                    let zs::Response::BlockInfo(parent_info) = state_service
+                        .ready()
+                        .await
+                        .map_err(|source| VerifyBlockError::Depth { source, hash })?
+                        .call(zs::Request::AwaitBlockInfo(parent_hash))
+                        .await
+                        .map_err(|source| VerifyBlockError::Depth { source, hash })?
+                    else {
+                        unreachable!("wrong response to Request::AwaitBlockInfo");
+                    };
+
+                    let parent_info = parent_info
+                        .expect("AwaitBlockInfo only returns after the parent block commits");
+
+                    // The deficit is signed, but `issuance_deficit_is_non_negative` rejects
+                    // any committed block at a ZIP 234 height that leaves it negative, so a
+                    // committed parent at this height always constrains.
+                    parent_info
+                        .value_pools()
+                        .issuance_deficit_amount()
+                        .constrain()
+                        .ok()
+                } else {
+                    None
+                };
+
+            let expected_block_subsidy = zakura_chain::parameters::subsidy::block_subsidy(
+                height,
+                &network,
+                issuance_deficit,
+            )?;
 
             // See [ZIP-1015](https://zips.z.cash/zip-1015).
             let deferred_pool_balance_change =

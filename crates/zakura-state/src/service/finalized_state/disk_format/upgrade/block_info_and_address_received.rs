@@ -182,7 +182,14 @@ impl DiskFormatUpgrade for Upgrade {
             // Get the deferred amount which is required to update the value pool. Block commits
             // apply it at every height, including heights in slow start on configured networks.
             let deferred_pool_balance_change = {
-                let block_subsidy = block_subsidy(height, &network).map_err(|error| {
+                // ZIP 234 derives the block subsidy from the money reserve after the parent
+                // block, which is the running value pool.
+                let block_subsidy = block_subsidy(
+                    height,
+                    &network,
+                    value_pool.issuance_deficit_amount().constrain().ok(),
+                )
+                .map_err(|error| {
                     super::FormatChangeError::InvalidPostcondition(format!(
                         "invalid block subsidy at height {height:?}: {error}"
                     ))

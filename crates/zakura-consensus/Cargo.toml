@@ -23,7 +23,11 @@ categories = ["asynchronous", "cryptography::cryptocurrencies"]
 default = []
 
 # NU7 consensus rules. Off by default until NU7 has activation heights.
-nu7 = []
+nu7 = [
+    "zakura-chain/nu7",
+    "zakura-state/nu7",
+    "zakura-header-chain/nu7",
+]
 
 # Production features that activate extra dependencies, or extra features in dependencies
 
@@ -70,9 +74,9 @@ zcash_primitives = { workspace = true }
 tower-fallback = { package = "zakura-tower-fallback", path = "../tower-fallback/", version = "1.2.0" }
 tower-batch-control = { package = "zakura-tower-batch-control", path = "../tower-batch-control/", version = "1.3.0" }
 
-zakura-script = { path = "../zakura-script", version = "3.2.3" }
+zakura-script = { path = "../zakura-script", version = "3.2.4" }
 zakura-state = { path = "../zakura-state", version = "9.0.0" }
-zakura-node-services = { path = "../zakura-node-services", version = "3.2.4" }
+zakura-node-services = { path = "../zakura-node-services", version = "3.2.5" }
 zakura-chain = { path = "../zakura-chain", version = "8.0.0" }
 zakura-header-chain = { path = "../zakura-header-chain", version = "2.1.1" }
 

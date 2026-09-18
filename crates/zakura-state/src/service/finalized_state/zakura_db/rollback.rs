@@ -473,7 +473,7 @@ fn prepare_rollback(
             .block(height.into())
             .ok_or(RollbackFinalizedStateError::MissingBlock { height })?;
         let semantically_verified = SemanticallyVerifiedBlock::from(block.clone())
-            .with_deferred_pool_balance_change(deferred_pool_balance_change(height, network)?);
+            .with_deferred_pool_balance_change(deferred_pool_balance_change(db, height, network)?);
 
         reverse_transparent_block(
             db,
@@ -695,11 +695,28 @@ fn rebuild_treestate_to_height(
 }
 
 fn deferred_pool_balance_change(
+    db: &ZakuraDb,
     height: Height,
     network: &Network,
 ) -> Result<Option<DeferredPoolBalanceChange>, RollbackFinalizedStateError> {
-    // Commits apply deferred funding during slow start on configured networks too.
-    let deferred_amount = funding_stream_values(height, network, block_subsidy(height, network)?)?
+    // Block commits apply the deferred funding stream at every height, including heights
+    // in slow start on configured networks, so rollback must reverse it at every height too.
+    // ZIP 234 derives the block subsidy from the money reserve after the parent block.
+    // Every block being rolled back is finalized, so its parent's pools are in the db.
+    let issuance_deficit = height
+        .previous()
+        .ok()
+        .and_then(|parent| db.block_info(parent.into()))
+        .and_then(|parent_info| {
+            parent_info
+                .value_pools()
+                .issuance_deficit_amount()
+                .constrain()
+                .ok()
+        });
+
+    let block_subsidy = block_subsidy(height, network, issuance_deficit)?;
+    let deferred_amount = funding_stream_values(height, network, block_subsidy)?
         .remove(&FundingStreamReceiver::Deferred)
         .unwrap_or_default()
         .checked_sub(network.lockbox_disbursement_total_amount(height))
@@ -1520,6 +1537,8 @@ mod deferred_pool_tests {
         },
     };
 
+    use crate::{config::Config, service::finalized_state::FinalizedState};
+
     /// Rollback reverses the deferred funding stream inside slow start, where block commits
     /// already apply it on configured networks.
     #[test]
@@ -1550,14 +1569,16 @@ mod deferred_pool_tests {
         let expected = funding_stream_values(
             height,
             &network,
-            block_subsidy(height, &network).expect("valid subsidy"),
+            block_subsidy(height, &network, None).expect("valid subsidy"),
         )
         .expect("valid funding streams")
         .remove(&FundingStreamReceiver::Deferred)
         .expect("the deferred stream is active");
         assert!(expected > Amount::<NonNegative>::zero());
 
-        let change = super::deferred_pool_balance_change(height, &network)
+        let state = FinalizedState::new(&Config::ephemeral(), &network)
+            .expect("an ephemeral database opens");
+        let change = super::deferred_pool_balance_change(&state.db, height, &network)
             .expect("the deferred change is valid")
             .expect("the deferred change is always computed");
 

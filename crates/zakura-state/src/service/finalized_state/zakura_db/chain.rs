@@ -28,6 +28,7 @@ use zakura_chain::{
 
 use crate::{
     request::FinalizedBlock,
+    service::check,
     service::finalized_state::{
         disk_db::DiskWriteBatch,
         disk_format::{
@@ -314,6 +315,13 @@ impl DiskWriteBatch {
                     spent_utxo_count: utxos_spent_by_block.len(),
                 }
             })?;
+
+        check::issuance_deficit_is_non_negative(
+            &db.network(),
+            finalized.height,
+            &value_pool,
+            &block_value_pool_change,
+        )?;
 
         let new_value_pool = value_pool
             .add_chain_value_pool_change(block_value_pool_change)

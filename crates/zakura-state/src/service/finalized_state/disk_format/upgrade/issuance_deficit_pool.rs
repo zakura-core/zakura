@@ -190,6 +190,13 @@ fn eligible_deficit(
                 "invalid issuance deficit at {height:?}: {error}"
             ))
         })?;
+    if zakura_chain::parameters::subsidy::is_zip234_active(network, height)
+        && i64::from(eligible) < 0
+    {
+        return Err(FormatChangeError::InvalidPostcondition(format!(
+            "negative issuance deficit at active reissuance height {height:?}"
+        )));
+    }
     Ok(eligible)
 }
 
@@ -302,6 +309,37 @@ mod tests {
         );
         let eligible = eligible_deficit(&network, start, ValueBalance::zero(), baseline).unwrap();
         assert_eq!(eligible, halving_block_subsidy(start, &network).unwrap());
+    }
+
+    #[test]
+    fn eligible_negative_balance_follows_reissuance_activation() {
+        use zakura_chain::parameters::testnet::{ConfiguredActivationHeights, RegtestParameters};
+        let network = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu7: Some(2),
+                ..Default::default()
+            },
+            zip234_start_height: Some(Height(3)),
+            ..Default::default()
+        });
+        let baseline =
+            i128::try_from(scheduled_issuance_zatoshis(Height(1), &network).unwrap()).unwrap();
+        for h in [2, 3] {
+            let scheduled =
+                i128::try_from(scheduled_issuance_zatoshis(Height(h), &network).unwrap()).unwrap();
+            let pools = ValueBalance::from_transparent_amount(
+                Amount::try_from(i64::try_from(scheduled - baseline + 1).unwrap()).unwrap(),
+            );
+            let result = eligible_deficit(&network, Height(h), pools, baseline);
+            if cfg!(feature = "nu7") && h == 3 {
+                assert!(matches!(
+                    result,
+                    Err(FormatChangeError::InvalidPostcondition(_))
+                ));
+            } else {
+                assert_eq!(i64::from(result.unwrap()), -1);
+            }
+        }
     }
 
     #[test]

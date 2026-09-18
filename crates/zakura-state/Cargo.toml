@@ -17,6 +17,12 @@ categories = ["asynchronous", "caching", "cryptography::cryptocurrencies"]
 
 [features]
 
+# NU7 consensus rules. Off by default until NU7 has activation heights.
+nu7 = [
+    "zakura-chain/nu7",
+    "zakura-header-chain/nu7",
+]
+
 # Production features that activate extra dependencies, or extra features in dependencies
 
 # Exposes narrow internal hooks used by benchmarks.
@@ -74,7 +80,7 @@ tracing = { workspace = true }
 sapling-crypto = { workspace = true }
 
 zakura-assets = { workspace = true }
-zakura-node-services = { path = "../zakura-node-services", version = "3.2.4" }
+zakura-node-services = { path = "../zakura-node-services", version = "3.2.5" }
 zakura-chain = { path = "../zakura-chain", version = "8.0.0", features = ["async-error"] }
 zakura-header-chain = { path = "../zakura-header-chain", version = "2.1.1" }
 

@@ -513,6 +513,10 @@ pub fn scheduled_issuance_zatoshis(height: Height, net: &Network) -> Result<u128
     let height = u32::try_from(height).map_err(|_| SubsidyError::Overflow)?;
 
     while block <= height {
+        // Once the halving divisor overflows, every later subsidy is zero.
+        if halving_divisor(Height(block), net).is_none() {
+            break;
+        }
         let subsidy = u128::try_from(i64::from(halving_block_subsidy(Height(block), net)?))
             .map_err(|_| SubsidyError::Overflow)?;
 

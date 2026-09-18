@@ -1491,6 +1491,8 @@ struct WriteBlockWorkerTask {
     chain_tip_sender: ChainTipSender,
     non_finalized_state_sender: watch::Sender<NonFinalizedState>,
     vct_root_repair_sender: watch::Sender<VctRootRepairStatus>,
+    /// Notifies contextual readers after each successful block commit.
+    block_commit_sender: watch::Sender<u64>,
     /// If `Some`, the non-finalized state is written to this backup directory
     /// synchronously before each channel update, instead of via the async backup task.
     backup_dir_path: Option<PathBuf>,
@@ -1743,6 +1745,7 @@ impl BlockWriteSender {
         tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
         tokio::sync::mpsc::UnboundedReceiver<NonFinalizedWriteFailure>,
         watch::Receiver<VctRootRepairStatus>,
+        watch::Receiver<u64>,
         Arc<OnceLock<BlockWriteTaskFailure>>,
         Option<Arc<std::thread::JoinHandle<BlockWriteTaskExit>>>,
     ) {
@@ -1779,6 +1782,7 @@ impl BlockWriteSender {
         tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
         tokio::sync::mpsc::UnboundedReceiver<NonFinalizedWriteFailure>,
         watch::Receiver<VctRootRepairStatus>,
+        watch::Receiver<u64>,
         Arc<OnceLock<BlockWriteTaskFailure>>,
         Option<Arc<std::thread::JoinHandle<BlockWriteTaskExit>>>,
     ) {
@@ -1794,6 +1798,7 @@ impl BlockWriteSender {
             tokio::sync::mpsc::unbounded_channel();
         let (vct_root_repair_sender, vct_root_repair_receiver) =
             watch::channel(VctRootRepairStatus::default());
+        let (block_commit_sender, block_commit_receiver) = watch::channel(0u64);
         let task_failure = Arc::new(OnceLock::new());
         let worker_task_failure = task_failure.clone();
 
@@ -1811,6 +1816,7 @@ impl BlockWriteSender {
                         chain_tip_sender,
                         non_finalized_state_sender,
                         vct_root_repair_sender,
+                        block_commit_sender,
                         backup_dir_path,
                         header_chain,
                         attach_header_chain_at_handoff,
@@ -1842,6 +1848,7 @@ impl BlockWriteSender {
             invalid_block_write_reset_receiver,
             non_finalized_rejected_receiver,
             vct_root_repair_receiver,
+            block_commit_receiver,
             task_failure,
             Some(Arc::new(task)),
         )
@@ -2155,6 +2162,7 @@ impl WriteBlockWorkerTask {
             chain_tip_sender,
             non_finalized_state_sender,
             vct_root_repair_sender,
+            block_commit_sender,
             backup_dir_path,
             header_chain,
             attach_header_chain_at_handoff,
@@ -2453,6 +2461,7 @@ impl WriteBlockWorkerTask {
                     let tip_block = ChainTipBlock::from(finalized);
                     prev_finalized_note_commitment_trees = Some(note_commitment_trees);
                     chain_tip_sender.set_finalized_tip(tip_block);
+                    block_commit_sender.send_modify(|count| *count = count.wrapping_add(1));
                 }
                 Err((ordered_block, error)) => {
                     let mut attributed_failure_repair = None;
@@ -2961,6 +2970,8 @@ impl WriteBlockWorkerTask {
                 non_finalized_state_sender,
                 backup_dir_path.as_deref(),
             );
+
+            block_commit_sender.send_modify(|count| *count = count.wrapping_add(1));
 
             // Update the caller with the result.
             let _ = rsp_tx.send(result.map(|()| child_hash).map_err(Into::into));

@@ -7,7 +7,7 @@
 use std::{env, sync::Arc, time::Duration};
 
 use tokio::{runtime::Runtime, time::timeout};
-use tower::{buffer::Buffer, util::BoxService};
+use tower::{buffer::Buffer, util::BoxService, ServiceExt};
 
 use zakura_chain::{
     block::{self, Block, CountedHeader, Height},
@@ -39,6 +39,59 @@ use crate::{
 };
 
 const LAST_BLOCK_HEIGHT: u32 = 10;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn await_block_info_waits_for_checkpoint_commit() {
+    let _init_guard = zakura_test::init();
+    let state = init_test(&Network::Mainnet).await;
+    let block0: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("genesis block deserializes");
+    let block1: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .expect("block 1 deserializes");
+    let hash = block1.hash();
+    let limit = Duration::from_secs(10);
+    let mut wait = tokio::spawn(state.clone().oneshot(Request::AwaitBlockInfo(hash)));
+    let second_wait = tokio::spawn(state.clone().oneshot(Request::AwaitBlockInfo(hash)));
+
+    // A different block's commit must wake readers without answering this request.
+    timeout(
+        limit,
+        state
+            .clone()
+            .oneshot(Request::CommitCheckpointVerifiedBlock(block0.into())),
+    )
+    .await
+    .expect("genesis commit completes")
+    .expect("genesis commits");
+    assert!(timeout(Duration::from_millis(50), &mut wait).await.is_err());
+
+    timeout(
+        limit,
+        state
+            .clone()
+            .oneshot(Request::CommitCheckpointVerifiedBlock(block1.into())),
+    )
+    .await
+    .expect("parent commit completes")
+    .expect("parent commits");
+    for waiter in [wait, second_wait] {
+        let response = timeout(limit, waiter)
+            .await
+            .expect("reader observes commit")
+            .expect("reader task completes")
+            .expect("lookup succeeds");
+        assert!(matches!(response, Response::BlockInfo(Some(_))));
+    }
+
+    // A reader registered after the notification must also see the committed block.
+    let response = timeout(limit, state.oneshot(Request::AwaitBlockInfo(hash)))
+        .await
+        .expect("known parent returns immediately")
+        .expect("lookup succeeds");
+    assert!(matches!(response, Response::BlockInfo(Some(_))));
+}
 
 #[test]
 fn mined_orphans_finish_without_entering_the_sync_queue() {

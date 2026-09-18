@@ -127,6 +127,9 @@ const POISONED_BLOCK_RETRY_LIMIT: usize = MISSING_BLOCK_DOWNLOAD_RETRY_LIMIT;
 /// Bounds retained rejected-body budgets, including exhausted hashes, within a sync round.
 const MAX_POISONED_BLOCK_RETRY_HASHES: usize = 4096;
 
+/// Distinct hashes that can wait for a missing parent's context at once.
+const MAX_PARENT_CONTEXT_WAIT_HASHES: usize = 4096;
+
 /// Controls how many times the syncer retries a required block that the peer set reports as missing
 /// from *all* current peers (`NotFoundKind::Registry`) before giving up on the round.
 ///
@@ -943,6 +946,8 @@ where
     /// and tip extension continue concurrently during the backoff. A map so that a second block missing while the first is still
     /// backing off isn't dropped: every registry-missed required block stays scheduled.
     registry_miss_retry: HashMap<block::Hash, tokio::time::Instant>,
+    /// Missing-parent retries retain hashes, not bodies or verifier permits.
+    parent_context_wait_started: HashMap<block::Hash, tokio::time::Instant>,
 
     /// Receiver that is `true` when the downloader is past the lookahead limit.
     /// This is based on the downloaded block height and the state tip height.
@@ -1094,6 +1099,7 @@ where
             poisoned_block_retry_counts: HashMap::new(),
             registry_miss_retry_counts: HashMap::new(),
             registry_miss_retry: HashMap::new(),
+            parent_context_wait_started: HashMap::new(),
             past_lookahead_limit_receiver,
             misbehavior_sender,
             trace,
@@ -1457,6 +1463,7 @@ where
         self.poisoned_block_retry_counts.clear();
         self.registry_miss_retry_counts.clear();
         self.registry_miss_retry.clear();
+        self.parent_context_wait_started.clear();
         let state_tip = self.latest_chain_tip.best_tip_height();
         self.trace.round_start(state_tip);
 
@@ -1551,6 +1558,7 @@ where
                 reserve.clear();
                 self.prospective_tips.clear();
                 self.registry_miss_retry.clear();
+                self.parent_context_wait_started.clear();
 
                 while let Some(response) = self.downloads.next().await {
                     if let Err(error) = response {
@@ -1626,7 +1634,10 @@ where
             // waiting on its registry-miss backoff, pause *new* speculative dispatch so in-flight
             // downloads drain and free up ready-peer slots. Otherwise lookahead work can keep every
             // peer busy and starve the critical retry. This is inert in healthy sync.
-            let head_of_line_starved = !self.registry_miss_retry.is_empty();
+            let head_of_line_starved = self
+                .registry_miss_retry
+                .keys()
+                .any(|hash| !self.parent_context_wait_started.contains_key(hash));
 
             if !past_lookahead && !head_of_line_starved && !reserve.is_empty() {
                 debug!(
@@ -1657,7 +1668,7 @@ where
             if reserve.is_empty()
                 && extend.is_none()
                 && self.prospective_tips.is_empty()
-                && self.registry_miss_retry.is_empty()
+                && self.only_parent_context_retries_pending()
                 && self.downloads.in_flight() > 0
             {
                 // Give the in-flight blocks a chance to finish on their own first, so a healthy
@@ -1734,7 +1745,7 @@ where
                 && reserve.is_empty()
                 && extend.is_none()
                 && self.prospective_tips.is_empty()
-                && self.registry_miss_retry.is_empty()
+                && self.only_parent_context_retries_pending()
             {
                 break;
             }
@@ -1758,12 +1769,31 @@ where
                         if registry_retry_at.is_some() =>
                     {
                         let now = tokio::time::Instant::now();
-                        let due: Vec<block::Hash> = self
+                        let mut due: Vec<block::Hash> = self
                             .registry_miss_retry
                             .iter()
                             .filter(|(_, deadline)| **deadline <= now)
                             .map(|(hash, _)| *hash)
                             .collect();
+
+                        // Retries are exempt from speculative lookahead gating so the
+                        // head-of-line block always gets another chance, but the wave itself
+                        // must respect the configured limit: thousands of retained
+                        // missing-context hashes can come due together.
+                        let wave_limit = lookahead_limit
+                            .saturating_sub(self.downloads.in_flight())
+                            .max(1);
+                        if due.len() > wave_limit {
+                            due.truncate(wave_limit);
+                            // Re-arm the rest instead of leaving a past deadline in the map,
+                            // which would spin this arm.
+                            let next = now + Duration::from_secs(1);
+                            for deadline in self.registry_miss_retry.values_mut() {
+                                if *deadline <= now {
+                                    *deadline = next;
+                                }
+                            }
+                        }
 
                         for hash in due {
                             self.registry_miss_retry.remove(&hash);
@@ -2556,6 +2586,18 @@ where
     /// speculative dispatch and re-dispatching the hash from its `select!` timer arm once the backoff
     /// elapses. Bounded by [`MISSING_BLOCK_REGISTRY_RETRY_LIMIT`]; only a block that stays missing
     /// for the whole budget (e.g. a bad tip) falls through to [`Self::handle_block_response`] and
+    /// Reports whether every pending retry is waiting for a parent's context.
+    ///
+    /// A registry miss means no current peer has the block, so the round must not discover
+    /// more work until it drains. A missing parent is the opposite: the round has to keep
+    /// extending tips, because a new tip is how the absent parent is found. Blocking the
+    /// refresh on those retries traps a child-only tip for the whole retention window.
+    fn only_parent_context_retries_pending(&self) -> bool {
+        self.registry_miss_retry
+            .keys()
+            .all(|hash| self.parent_context_wait_started.contains_key(hash))
+    }
+
     /// restarts the round to obtain fresh tips and peers.
     async fn handle_block_response_with_missing_retry(
         &mut self,
@@ -2586,6 +2628,39 @@ where
             self.poisoned_block_retry_counts.remove(hash);
             self.registry_miss_retry_counts.remove(hash);
             self.registry_miss_retry.remove(hash);
+            self.parent_context_wait_started.remove(hash);
+        }
+
+        if let Err(BlockDownloadVerifyError::Invalid { error, hash, .. }) = &response {
+            if matches!(error, zakura_consensus::RouterError::Block { source }
+                if matches!(source.as_ref(), zakura_consensus::VerifyBlockError::MissingParentContext(_)))
+            {
+                // An expired wait can never schedule another retry, so retaining it is dead
+                // weight. Without this, 4,096 expired entries fill the table and every later
+                // required hash is dropped here before it is recorded or scheduled.
+                self.parent_context_wait_started
+                    .retain(|_, started| started.elapsed() < BLOCK_VERIFY_TIMEOUT);
+                if self.parent_context_wait_started.len() >= MAX_PARENT_CONTEXT_WAIT_HASHES
+                    && !self.parent_context_wait_started.contains_key(hash)
+                {
+                    return Ok(());
+                }
+                let started = *self
+                    .parent_context_wait_started
+                    .entry(*hash)
+                    .or_insert_with(tokio::time::Instant::now);
+                if started.elapsed() < BLOCK_VERIFY_TIMEOUT {
+                    let delay = Duration::from_secs(1 + started.elapsed().as_secs() / 2)
+                        .min(Duration::from_secs(30));
+                    // Clamp to the retention deadline: a failure arriving just before the
+                    // boundary would otherwise schedule an attempt past it, and the retry
+                    // dispatch does not constrain the new download to the original window.
+                    let retry_at =
+                        (tokio::time::Instant::now() + delay).min(started + BLOCK_VERIFY_TIMEOUT);
+                    self.registry_miss_retry.insert(*hash, retry_at);
+                }
+                return Ok(());
+            }
         }
 
         let unavailable_parent = response.as_ref().err().and_then(Self::unavailable_parent);
@@ -2950,11 +3025,14 @@ where
 
     /// Identifies a body that disagrees with its transaction commitments.
     fn is_poisoned_body(error: &RouterError) -> bool {
-        use zakura_header_chain::{BodyCommitmentKind, BodyVerificationClass};
+        use zakura_header_chain::BodyVerificationClass;
 
+        // Every body-commitment mismatch, not only the transaction merkle root: the early
+        // commitment check proves an authorizing-data mismatch before proof verification, and
+        // an alternate body for the same header can repair it.
         matches!(
             error.body_verification_class(),
-            BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::TransactionMerkleRoot)
+            BodyVerificationClass::PayloadMismatch(_)
         ) || matches!(error, RouterError::Block { source }
                 if matches!(**source, VerifyBlockError::Transaction(TransactionError::CoinbaseExpiryBlockHeight { .. })))
     }

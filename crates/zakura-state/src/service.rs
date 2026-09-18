@@ -2093,6 +2093,7 @@ impl Service<Request> for StateService {
 
             // Runs concurrently using the ReadStateService
             Request::Tip
+            | Request::BlockParentContext(_)
             | Request::Depth(_)
             | Request::BestChainNextMedianTimePast
             | Request::BestChainBlockHash(_)
@@ -2760,6 +2761,48 @@ impl Service<ReadRequest> for ReadStateService {
                 pruned: state.db.prunes_historical_data(),
                 prune_height: state.db.prune_height(),
             }),
+
+            ReadRequest::BlockParentContext(parent) => {
+                let chains = state.latest_non_finalized_state();
+                for chain in chains.chain_iter() {
+                    if let (Some(height), Some(history_tree)) = (
+                        chain.height_by_hash(parent),
+                        chain.history_tree(parent.into()),
+                    ) {
+                        return Ok(ReadResponse::BlockParentContext(Some(
+                            crate::BlockParentContext {
+                                parent,
+                                height,
+                                history_tree,
+                            },
+                        )));
+                    }
+                }
+                // Read the finalized tip on both sides of the tree read. A concurrent
+                // commit makes this lookup unavailable, never evidence of a bad body.
+                let before = state.db.tip();
+                let context = match before {
+                    Some((height, hash)) if hash == parent => {
+                        let history_tree = state.db.try_history_tree()?;
+                        if state.db.tip() != before
+                            || history_tree
+                                .as_ref()
+                                .as_ref()
+                                .is_some_and(|tree| tree.current_height() != height)
+                        {
+                            None
+                        } else {
+                            Some(crate::BlockParentContext {
+                                parent,
+                                height,
+                                history_tree,
+                            })
+                        }
+                    }
+                    _ => None,
+                };
+                Ok(ReadResponse::BlockParentContext(context))
+            }
 
             // Used by the StateService.
             ReadRequest::Tip => Ok(ReadResponse::Tip(read::tip(

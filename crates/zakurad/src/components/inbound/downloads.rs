@@ -15,7 +15,7 @@ use futures::{
 };
 use pin_project::pin_project;
 use tokio::{
-    sync::{oneshot, Mutex},
+    sync::{oneshot, Mutex, Semaphore},
     task::JoinHandle,
 };
 use tower::{Service, ServiceExt};
@@ -42,6 +42,15 @@ pub struct GossipedParentHeightMismatch {
     pub height: Option<block::Height>,
     pub expected_height: block::Height,
     pub hash: block::Hash,
+}
+
+/// A verifier-proven body mismatch, retained with its requested hash for recovery.
+#[derive(Debug, thiserror::Error)]
+#[error("gossiped body does not match its header: {source}")]
+pub struct GossipedBodyMismatch {
+    pub hash: block::Hash,
+    #[source]
+    pub source: BoxError,
 }
 
 /// Source key used for inbound block download ordering.
@@ -265,6 +274,9 @@ where
 
     /// Re-request budgets for gossiped hashes whose body was rejected as poisoned.
     poisoned_retries: PoisonedRetryBudgets,
+
+    /// Reserve at least half the download queue for work that can supply missing parents.
+    missing_parent_slots: Arc<Semaphore>,
 }
 
 impl<ZN, ZV, ZS> Stream for Downloads<ZN, ZV, ZS>
@@ -369,6 +381,9 @@ where
             source_locks: HashMap::new(),
             source_counts: HashMap::new(),
             poisoned_retries: PoisonedRetryBudgets::default(),
+            missing_parent_slots: Arc::new(Semaphore::new(
+                (full_verify_concurrency_limit / 2).max(1),
+            )),
         }
     }
 
@@ -567,6 +582,7 @@ where
 
         let network = self.network.clone();
         let verifier = self.verifier.clone();
+        let missing_parent_slots = self.missing_parent_slots.clone();
         let state = self.state.clone();
         let latest_chain_tip = self.latest_chain_tip.clone();
         let full_verify_concurrency_limit = self.full_verify_concurrency_limit;
@@ -736,16 +752,65 @@ where
                     .map_err(|e| (e.into(), None))?;
             }
 
-            let _source_guard = match source_lock {
-                Some(source_lock) => Some(source_lock.lock_owned().await),
-                None => None,
+            let context_deadline = tokio::time::Instant::now()
+                + crate::components::sync::BLOCK_VERIFY_TIMEOUT;
+            let mut missing_parent_slot = None;
+            let verified = loop {
+                let result = {
+                    let _source_guard = match &source_lock {
+                        Some(source_lock) => Some(source_lock.clone().lock_owned().await),
+                        None => None,
+                    };
+                    verifier.clone().oneshot(zakura_consensus::Request::Commit(block.clone())).await
+                };
+                let missing_context = result.as_ref().err().is_some_and(|error| {
+                    matches!(error.downcast_ref::<zakura_consensus::RouterError>(),
+                        Some(zakura_consensus::RouterError::Block { source })
+                        if matches!(source.as_ref(), zakura_consensus::VerifyBlockError::MissingParentContext(_)))
+                });
+                if !missing_context || tokio::time::Instant::now() >= context_deadline {
+                    break result;
+                }
+                if missing_parent_slot.is_none() {
+                    let Ok(permit) = missing_parent_slots.clone().try_acquire_owned() else {
+                        // Sync recovery can rediscover this hash without retaining its body here.
+                        break result;
+                    };
+                    missing_parent_slot = Some(permit);
+                }
+                // Retain this bounded download slot and body. Release the source gate so
+                // the same supplier's parent can commit before we retry the child.
+                tokio::time::sleep_until(context_deadline.min(
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(1)
+                )).await;
+                if tokio::time::Instant::now() >= context_deadline {
+                    // Re-check before starting another attempt. Each verifier request carries
+                    // its own full timeout, so an attempt begun at the deadline would hold the
+                    // body, the queue slot, the source count and the permit far past it.
+                    break result;
+                }
             };
-
-            verifier
-                .oneshot(zakura_consensus::Request::Commit(block))
-                .await
+            verified
                 .map(|hash| (hash, block_height))
-                .map_err(|e| (e, advertiser_addr))
+                .map_err(|e| {
+                    let payload_mismatch = e
+                        .downcast_ref::<zakura_consensus::RouterError>()
+                        .is_some_and(|error| {
+                            matches!(
+                                error.body_verification_class(),
+                                zakura_header_chain::BodyVerificationClass::PayloadMismatch(_)
+                            )
+                        });
+                    let e = if payload_mismatch {
+                        if let Some(feedback) = &supplier_feedback {
+                            feedback.reject();
+                        }
+                        BoxError::from(GossipedBodyMismatch { hash, source: e })
+                    } else {
+                        e
+                    };
+                    (e, advertiser_addr)
+                })
         }
         .map_ok(|(hash, height)| {
             info!(?height, "downloaded and verified gossiped block");
@@ -1440,6 +1505,141 @@ mod tests {
             assert_eq!(mismatch.expected_height, block::Height(1_687_107));
             assert_eq!(supplier, Some(addr));
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missing_parent_retries_retained_gossip_body_without_holding_source_gate() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        let hash = block.hash();
+        let parent = block.header.previous_block_hash;
+        let supplier: PeerSocketAddr = "192.0.2.1:8233".parse().unwrap();
+        let (_sender, tip) = chain_tip_at(block::Height(1_687_106), parent);
+        let mut downloads = downloads_returning(block.clone(), supplier, tip);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let (called, mut received) = tokio::sync::mpsc::unbounded_channel();
+        downloads.verifier =
+            BoxCloneService::new(service_fn(move |request: zakura_consensus::Request| {
+                assert!(Arc::ptr_eq(&request.block(), &block));
+                let attempt = observed.fetch_add(1, Ordering::SeqCst);
+                called.send(()).unwrap();
+                async move {
+                    if attempt == 0 {
+                        Err(BoxError::from(zakura_consensus::RouterError::from(
+                            zakura_consensus::VerifyBlockError::MissingParentContext(parent),
+                        )))
+                    } else {
+                        Ok(hash)
+                    }
+                }
+            }));
+        assert_eq!(
+            downloads.download_and_verify(hash, Some(supplier.into())),
+            DownloadAction::AddedToQueue
+        );
+        let gate = downloads.source_locks.values().next().unwrap().clone();
+        received.recv().await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            gate.try_lock().is_ok(),
+            "the parent must be able to acquire the source gate"
+        );
+        assert_eq!(downloads.next().await.unwrap().unwrap(), hash);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(downloads.cancel_handles.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unavailable_gossip_parent_releases_slot_after_deadline() {
+        for saturated in [false, true] {
+            let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+                .zcash_deserialize_into()
+                .unwrap();
+            let hash = block.hash();
+            let parent = block.header.previous_block_hash;
+            let supplier: PeerSocketAddr = "192.0.2.1:8233".parse().unwrap();
+            let (_sender, tip) = chain_tip_at(block::Height(1_687_106), parent);
+            let mut downloads = downloads_returning(block, supplier, tip);
+            downloads.verifier = BoxCloneService::new(service_fn(move |_| async move {
+                Err(BoxError::from(zakura_consensus::RouterError::from(
+                    zakura_consensus::VerifyBlockError::MissingParentContext(parent),
+                )))
+            }));
+            let capacity = downloads.full_verify_concurrency_limit / 2;
+            assert_eq!(downloads.missing_parent_slots.available_permits(), capacity);
+            let _occupied = if saturated {
+                Some(
+                    downloads
+                        .missing_parent_slots
+                        .clone()
+                        .acquire_many_owned(u32::try_from(capacity).unwrap())
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let started = tokio::time::Instant::now();
+            downloads.download_and_verify(hash, Some(supplier.into()));
+            let (error, _) = downloads.next().await.unwrap().unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<zakura_consensus::RouterError>()
+                    .unwrap()
+                    .misbehavior_score(),
+                0
+            );
+            assert_eq!(
+                started.elapsed(),
+                if saturated {
+                    std::time::Duration::ZERO
+                } else {
+                    crate::components::sync::BLOCK_VERIFY_TIMEOUT
+                }
+            );
+            assert!(downloads.cancel_handles.is_empty());
+            assert!(downloads.source_locks.is_empty());
+            assert_eq!(
+                downloads.missing_parent_slots.available_permits(),
+                if saturated { 0 } else { capacity }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn gossiped_authorizing_mismatch_retains_hash_and_supplier() {
+        let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1687107_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        let hash = block.hash();
+        let supplier: PeerSocketAddr = "192.0.2.1:8233".parse().unwrap();
+        let (_sender, tip) =
+            chain_tip_at(block::Height(1_687_106), block.header.previous_block_hash);
+        let mut downloads = downloads_returning(block, supplier, tip);
+        downloads.verifier = BoxCloneService::new(service_fn(|_| async {
+            let error = zakura_consensus::VerifyBlockError::BodyCommitment(
+                zs::ValidateContextError::InvalidBlockCommitment(
+                    block::CommitmentError::InvalidChainHistoryBlockTxAuthCommitment {
+                        actual: [0; 32],
+                        expected: [1; 32],
+                    },
+                ),
+            );
+            Err(BoxError::from(zakura_consensus::RouterError::from(error)))
+        }));
+        assert_eq!(
+            downloads.download_and_verify(hash, None),
+            DownloadAction::AddedToQueue
+        );
+        let (error, addr) = downloads.next().await.unwrap().unwrap_err();
+        assert_eq!(addr, Some(supplier));
+        assert_eq!(
+            error.downcast_ref::<GossipedBodyMismatch>().unwrap().hash,
+            hash
+        );
     }
 
     /// A gossiped block that is not a tip child keeps the existing behind-tip policy, and stays

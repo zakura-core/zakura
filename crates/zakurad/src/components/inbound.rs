@@ -543,6 +543,15 @@ impl Service<zn::Request> for Inbound {
                         continue;
                     }
 
+                    if let Some(mismatch) = err.downcast_ref::<downloads::GossipedBodyMismatch>() {
+                        if let Some(addr) = advertiser_addr {
+                            let _ = misbehavior_sender
+                                .try_send((addr, zn::constants::MAX_PEER_MISBEHAVIOR_SCORE));
+                        }
+                        let _ = block_downloads.retry_poisoned(mismatch.hash);
+                        continue;
+                    }
+
                     if let Some(update) = block_misbehavior(err, advertiser_addr) {
                         let _ = misbehavior_sender.try_send(update);
                     }

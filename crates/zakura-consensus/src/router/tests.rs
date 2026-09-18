@@ -613,6 +613,11 @@ async fn forged_expiry_with_authentic_height_is_a_payload_mismatch() {
             zs::Request::KnownBlock(_) => {
                 std::future::ready(Ok::<_, BoxError>(zs::Response::KnownBlock(None)))
             }
+            // The parent is not committed here, so its context is unavailable. The body's
+            // Merkle root is still decided without it, which is what this test asserts.
+            zs::Request::BlockParentContext(_) => {
+                std::future::ready(Ok::<_, BoxError>(zs::Response::BlockParentContext(None)))
+            }
             request => panic!("unexpected state request: {request:?}"),
         });
         let transaction = service_fn(

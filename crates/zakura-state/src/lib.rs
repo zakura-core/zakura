@@ -66,8 +66,8 @@ pub use request::{
 pub use request::Spend;
 
 pub use response::{
-    AnyTx, BlockSyncBodyMetadata, GetBlockTemplateChainInfo, KnownBlock, MinedTx,
-    NonFinalizedBlocksListener, ParentInputs, PreparedMinedRelayEligibility, ReadResponse,
+    AnyTx, BlockParentContext, BlockSyncBodyMetadata, GetBlockTemplateChainInfo, KnownBlock,
+    MinedTx, NonFinalizedBlocksListener, ParentInputs, PreparedMinedRelayEligibility, ReadResponse,
     Response,
 };
 #[cfg(any(test, feature = "header-fuzz"))]

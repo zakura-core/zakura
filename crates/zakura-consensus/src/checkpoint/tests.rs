@@ -27,6 +27,46 @@ use super::*;
 /// high system load.
 const VERIFY_TIMEOUT_SECONDS: u64 = 10;
 
+#[tokio::test]
+async fn padding_with_uncommitted_parent_preserves_supplier_attribution() {
+    let _init_guard = zakura_test::init();
+    let canonical = zakura_test::vectors::MAINNET_BLOCKS
+        .range(1_687_104..)
+        .map(|(_, bytes)| Block::zcash_deserialize(&bytes[..]).unwrap())
+        .find(|block| block.transactions.len() > 1 && block.transactions.len() % 2 == 1)
+        .unwrap();
+    let mut delivered = canonical.clone();
+    delivered
+        .transactions
+        .push(delivered.transactions.last().unwrap().clone());
+    assert_eq!(canonical.hash(), delivered.hash());
+    let state = zakura_state::init_test(&Mainnet).await;
+    let mut verifier = CheckpointVerifier::new(&Mainnet, None, state);
+    let error = timeout(
+        Duration::from_secs(VERIFY_TIMEOUT_SECONDS),
+        verifier.call(Arc::new(delivered)),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(
+        error.body_verification_class(),
+        zakura_header_chain::BodyVerificationClass::PayloadMismatch(
+            zakura_header_chain::BodyCommitmentKind::TransactionMerkleRoot
+        )
+    );
+    assert_eq!(error.misbehavior_score(), 100);
+    let height = canonical.coinbase_height().unwrap();
+    let expected_count = canonical.transactions.len();
+    let pending = verifier.call(Arc::new(canonical));
+    assert_eq!(
+        verifier.queued[&height][0].block.block.transactions.len(),
+        expected_count,
+        "rejecting padding must leave the honest body eligible for the same header"
+    );
+    drop(pending);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn single_item_checkpoint_list_test() -> Result<(), Report> {
     single_item_checkpoint_list().await

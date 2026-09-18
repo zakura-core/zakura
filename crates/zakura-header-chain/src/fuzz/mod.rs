@@ -1547,6 +1547,7 @@ fn assert_body_evidence_matrix() -> [u8; 32] {
             TransientBodyFailureKind::VerifierUnavailable => 3,
             TransientBodyFailureKind::Timeout => 4,
             TransientBodyFailureKind::ResourceExhausted => 5,
+            TransientBodyFailureKind::NoBindingBody => 6,
         }]);
     }
 

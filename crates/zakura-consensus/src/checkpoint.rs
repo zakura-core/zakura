@@ -686,7 +686,7 @@ where
         // don't do precalculation until the block passes basic difficulty checks
         let block = CheckpointVerifiedBlock::new(block, Some(hash), deferred_pool_balance_change);
 
-        crate::block::check::merkle_root_validity(
+        crate::block::check::merkle_root_validity_with_attribution(
             &self.network,
             &block.block,
             &block.transaction_hashes,
@@ -1124,7 +1124,9 @@ impl VerifyCheckpointError {
             Self::BadMerkleRoot { .. } => {
                 BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::TransactionMerkleRoot)
             }
-            Self::DuplicateTransaction => consensus("checkpoint.duplicate_transaction"),
+            Self::DuplicateTransaction => {
+                BodyVerificationClass::PayloadMismatch(BodyCommitmentKind::TransactionMerkleRoot)
+            }
             Self::VerifyBlock(error) => error.body_verification_class(),
             Self::SubsidyError(_) => consensus("checkpoint.subsidy"),
             Self::AmountError(_) => consensus("checkpoint.amount"),
@@ -1241,8 +1243,22 @@ where
             return async { Err(VerifyCheckpointError::Finished) }.boxed();
         }
 
-        let mut req_block = match self.queue_block(block) {
+        let mut req_block = match self.queue_block(block.clone()) {
             Ok(req_block) => req_block,
+            Err(VerifyCheckpointError::VerifyBlock(error))
+                if crate::block::commitment::is_padding_error(&error) =>
+            {
+                let state = self.state_service.clone();
+                let network = self.network.clone();
+                return async move {
+                    crate::block::commitment::check_auth_bound_duplicates(
+                        state, &network, block, None,
+                    )
+                    .await?;
+                    Err(error.into())
+                }
+                .boxed();
+            }
             Err(e) => return async { Err(e) }.boxed(),
         };
 

@@ -604,6 +604,18 @@ impl BlockSyncReactor {
             ) {
                 continue;
             }
+            // Exclude before returning the work, not after. Returning the height notifies
+            // every routine, so on a multithreaded runtime the timed-out peer can wake,
+            // take the height and publish a replacement request in the gap; installing the
+            // exclusion afterwards does not revoke that new owner.
+            let excluded = servable_peers > 2;
+            if excluded {
+                self.registry.avoid_floor_height_until(
+                    &claim.peer,
+                    claim.height,
+                    now + self.startup.config.effective_floor_peer_avoid_cooldown(),
+                );
+            }
             let released = self
                 .state
                 .work_queue
@@ -613,14 +625,10 @@ impl BlockSyncReactor {
                 );
             self.state.budget.release(released.released_bytes);
             // Settlement arbitrates against writer startup. Skipped frames and
-            // already-settled work must not count against the peer.
-            if servable_peers > 2 && released.returned_count > 0 && !released.request_was_unwritten
-            {
-                self.registry.avoid_floor_height_until(
-                    &claim.peer,
-                    claim.height,
-                    now + self.startup.config.effective_floor_peer_avoid_cooldown(),
-                );
+            // already-settled work must not count against the peer, so withdraw the
+            // provisional exclusion once settlement says it was not this peer's fault.
+            if excluded && (released.returned_count == 0 || released.request_was_unwritten) {
+                self.registry.clear_floor_avoid(&claim.peer, claim.height);
             }
             self.trace_floor_watchdog_cancelled(&claim, released);
             metrics::counter!("sync.block.floor_watchdog.cancelled").increment(1);

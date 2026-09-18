@@ -405,6 +405,37 @@ pub fn time_is_valid_at(
     zakura_header_chain::validate_future_time(header, now, *height, *hash)
 }
 
+/// Check the transaction commitment and distinguish padding aliases from
+/// intrinsic duplicates before assigning permanent invalidity to a header.
+pub(crate) fn merkle_root_validity_with_attribution(
+    network: &Network,
+    block: &Block,
+    transaction_hashes: &[transaction::Hash],
+) -> Result<(), super::VerifyBlockError> {
+    let Err(error) = merkle_root_validity(network, block, transaction_hashes) else {
+        return Ok(());
+    };
+    if error == BlockError::DuplicateTransaction {
+        // The received list already matches the header's root. Removing
+        // duplicates in order recovers the unique list for a padding alias,
+        // including duplicated subtrees such as [A,B,C,D,E,F,E,F].
+        let mut seen = HashSet::with_capacity(transaction_hashes.len());
+        let unique_root = transaction_hashes
+            .iter()
+            .copied()
+            .filter(|hash| seen.insert(*hash))
+            .collect();
+        if block.header.merkle_root != unique_root {
+            return Err(super::VerifyBlockError::NonMalleableDuplicateTransaction);
+        }
+        // The upgrade ID is committed even when the transaction count is ambiguous.
+        block
+            .check_transaction_network_upgrade_consistency(network)
+            .map_err(|_| BlockError::WrongTransactionConsensusBranchId)?;
+    }
+    Err(error.into())
+}
+
 /// Returns `Ok(())` if the ZIP 218 per-block shielded limits hold for the sum of
 /// `transactions` on `network` at `height`.
 ///
@@ -546,6 +577,8 @@ pub fn merkle_root_validity(
         return Err(BlockError::DuplicateTransaction);
     }
 
+    // Only attribute a branch-ID failure to the header after checking that it
+    // commits to this transaction list.
     // TODO: deduplicate zakura-chain and zakura-consensus errors (#2908)
     block
         .check_transaction_network_upgrade_consistency(network)

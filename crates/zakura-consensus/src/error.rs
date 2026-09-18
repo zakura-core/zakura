@@ -790,6 +790,7 @@ impl BlockError {
             | TargetDifficultyLimit(_, _, _, _, _)
             | DifficultyFilter(_, _, _, _)
             | NoTransactions
+            | DuplicateTransaction
             | BadMerkleRoot { .. }
             | WrongTransactionConsensusBranchId
             | TooManyTransparentSignatureOperations { .. } => 100,

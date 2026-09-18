@@ -179,25 +179,27 @@ impl DiskFormatUpgrade for Upgrade {
                 } => (block, size, utxos, address_balance_changes),
             };
 
-            // Get the deferred amount which is required to update the value pool.
-            let deferred_pool_balance_change = if height > network.slow_start_interval() {
+            // Get the deferred amount which is required to update the value pool. Block commits
+            // apply it at every height, including heights in slow start on configured networks.
+            let deferred_pool_balance_change = {
+                let block_subsidy = block_subsidy(height, &network).map_err(|error| {
+                    super::FormatChangeError::InvalidPostcondition(format!(
+                        "invalid block subsidy at height {height:?}: {error}"
+                    ))
+                })?;
+
                 // See [ZIP-1015](https://zips.z.cash/zip-1015).
-                let deferred_pool_balance_change = funding_stream_values(
-                    height,
-                    &network,
-                    block_subsidy(height, &network).unwrap_or_default(),
-                )
-                .expect("should have valid funding stream values")
-                .remove(&FundingStreamReceiver::Deferred)
-                .unwrap_or_default()
-                .checked_sub(network.lockbox_disbursement_total_amount(height));
+                let deferred_pool_balance_change =
+                    funding_stream_values(height, &network, block_subsidy)
+                        .expect("should have valid funding stream values")
+                        .remove(&FundingStreamReceiver::Deferred)
+                        .unwrap_or_default()
+                        .checked_sub(network.lockbox_disbursement_total_amount(height));
 
                 Some(
                     deferred_pool_balance_change
                         .expect("deferred pool balance change should be valid Amount"),
                 )
-            } else {
-                None
             };
 
             // Add this block's value pool changes to the total value pool.

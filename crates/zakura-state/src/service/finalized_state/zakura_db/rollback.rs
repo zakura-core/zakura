@@ -698,10 +698,7 @@ fn deferred_pool_balance_change(
     height: Height,
     network: &Network,
 ) -> Result<Option<DeferredPoolBalanceChange>, RollbackFinalizedStateError> {
-    if height <= network.slow_start_interval() {
-        return Ok(None);
-    }
-
+    // Commits apply deferred funding during slow start on configured networks too.
     let deferred_amount = funding_stream_values(height, network, block_subsidy(height, network)?)?
         .remove(&FundingStreamReceiver::Deferred)
         .unwrap_or_default()
@@ -1505,6 +1502,70 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Height(4), Height(5), Height(6)],
             "a request at or above U is served from the index"
+        );
+    }
+}
+
+#[cfg(test)]
+mod deferred_pool_tests {
+    use zakura_chain::{
+        amount::{Amount, NonNegative},
+        block::Height,
+        parameters::{
+            subsidy::{block_subsidy, funding_stream_values, FundingStreamReceiver},
+            testnet::{
+                self, ConfiguredActivationHeights, ConfiguredFundingStreamRecipient,
+                ConfiguredFundingStreams,
+            },
+        },
+    };
+
+    /// Rollback reverses the deferred funding stream inside slow start, where block commits
+    /// already apply it on configured networks.
+    #[test]
+    fn deferred_pool_change_applies_during_slow_start() {
+        let _init_guard = zakura_test::init();
+
+        let network = testnet::Parameters::build()
+            .with_activation_heights(ConfiguredActivationHeights {
+                blossom: Some(1),
+                canopy: Some(2),
+                ..Default::default()
+            })
+            .expect("activation heights are valid")
+            .with_funding_streams(vec![ConfiguredFundingStreams {
+                height_range: Some(Height(2)..Height(100)),
+                recipients: Some(vec![ConfiguredFundingStreamRecipient {
+                    receiver: FundingStreamReceiver::Deferred,
+                    numerator: 12,
+                    addresses: None,
+                }]),
+            }])
+            .to_network()
+            .expect("configured testnet is valid");
+
+        let height = Height(10);
+        assert!(height <= network.slow_start_interval());
+
+        let expected = funding_stream_values(
+            height,
+            &network,
+            block_subsidy(height, &network).expect("valid subsidy"),
+        )
+        .expect("valid funding streams")
+        .remove(&FundingStreamReceiver::Deferred)
+        .expect("the deferred stream is active");
+        assert!(expected > Amount::<NonNegative>::zero());
+
+        let change = super::deferred_pool_balance_change(height, &network)
+            .expect("the deferred change is valid")
+            .expect("the deferred change is always computed");
+
+        assert_eq!(
+            change.value(),
+            expected
+                .constrain::<zakura_chain::amount::NegativeAllowed>()
+                .expect("valid amount")
         );
     }
 }

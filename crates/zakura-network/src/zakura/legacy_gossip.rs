@@ -620,6 +620,10 @@ impl LegacyResponseCodec {
         let mut saw_pong = false;
         let mut saw_nil = false;
         let mut reassembler = ResponseReassembler::new(request_id);
+        // Requested hashes may be answered once each. Membership alone lets a peer repeat one
+        // requested block until the response vector no longer matches the request, which the
+        // consumer reports as a generic failure that excludes nobody.
+        let mut answered: HashSet<block::Hash> = HashSet::new();
 
         for frame in frames {
             if frame.flags != 0 {
@@ -642,7 +646,7 @@ impl LegacyResponseCodec {
                         // and kind, not by hash).
                         if let Some(requested) = requested_block_hashes {
                             let hash = block.hash();
-                            if !requested.contains(&hash) {
+                            if !requested.contains(&hash) || !answered.insert(hash) {
                                 return Err(LegacyGossipError::UnsolicitedBlock(hash));
                             }
                         }
@@ -670,7 +674,7 @@ impl LegacyResponseCodec {
                     for hash in decode_hashes_response(request_id, frame.payload)? {
                         // A peer may only report blocks we requested as missing.
                         if let Some(requested) = requested_block_hashes {
-                            if !requested.contains(&hash) {
+                            if !requested.contains(&hash) || !answered.insert(hash) {
                                 return Err(LegacyGossipError::UnsolicitedBlock(hash));
                             }
                         }
@@ -2273,6 +2277,18 @@ impl ZakuraRequestClient {
         ) {
             Ok(response) => response,
             Err(error) => {
+                // The supplier proved it cannot serve this hash. A decode failure reaches the
+                // consumer as a generic download error, which retries the hash without
+                // excluding anyone, so the same peer would stay eligible on every attempt.
+                if let Some(hashes) = requested_block_hashes
+                    .as_ref()
+                    .filter(|hashes| hashes.len() == 1)
+                {
+                    let hash = *hashes.iter().next().expect("one requested hash");
+                    self.block_suppliers
+                        .feedback(hash, PeerSource::Zakura(handle.peer_id().clone()))
+                        .reject();
+                }
                 self.trace.emit_event(|| {
                     LegacyRequestError::new(
                         "outbound.decode_error",
@@ -5303,6 +5319,56 @@ mod tests {
         ));
 
         Ok(())
+    }
+
+    /// A requested hash may be answered once.
+    ///
+    /// Membership in the requested set was the only check, so a peer could answer one requested
+    /// hash repeatedly. The consumer then saw a response that did not match its single-hash
+    /// request, reported it as a generic download failure, and retried without excluding the
+    /// supplier, so the peer could repeat the response indefinitely.
+    #[test]
+    fn response_codec_rejects_a_repeated_requested_hash() {
+        let request_id: u64 = 7;
+        let hash = block::Hash([9; 32]);
+        let requested: HashSet<block::Hash> = std::iter::once(hash).collect();
+
+        let missing_blocks = |repeats: usize| {
+            let mut payload = request_id.to_le_bytes().to_vec();
+            payload.extend_from_slice(&encoded_count(repeats));
+            for _ in 0..repeats {
+                payload.extend_from_slice(&hash.0);
+            }
+            Frame {
+                message_type: MSG_RESPONSE_MISSING_BLOCKS,
+                flags: 0,
+                payload,
+            }
+        };
+
+        LegacyResponseCodec::decode_response(
+            request_id,
+            LegacyRequestKind::Blocks,
+            vec![missing_blocks(1)],
+            Some(&requested),
+        )
+        .expect("one report per requested hash is a valid response");
+
+        for frames in [
+            vec![missing_blocks(2)],
+            vec![missing_blocks(1), missing_blocks(1)],
+        ] {
+            let result = LegacyResponseCodec::decode_response(
+                request_id,
+                LegacyRequestKind::Blocks,
+                frames,
+                Some(&requested),
+            );
+            assert!(
+                matches!(result, Err(LegacyGossipError::UnsolicitedBlock(repeated)) if repeated == hash),
+                "a repeated requested hash must be rejected, got {result:?}"
+            );
+        }
     }
 
     /// Regression test for `claude-outbound-write-ignores-message-cap` (legacy

@@ -95,7 +95,7 @@ pub const MAX_PRUNE_HEIGHTS_PER_COMMIT: u32 = 100;
 ///
 /// Instead of using this constant directly, use [`constants::state_database_format_version_in_code()`]
 /// or [`config::database_format_version_on_disk()`] to get the full semantic format version.
-const DATABASE_FORMAT_VERSION: u64 = 28;
+const DATABASE_FORMAT_VERSION: u64 = 29;
 
 /// The database format minor version, incremented each time the on-disk database format has a
 /// significant data format change.
@@ -104,11 +104,11 @@ const DATABASE_FORMAT_VERSION: u64 = 28;
 /// - adding new column families,
 /// - changing the format of a column family in a compatible way, or
 /// - breaking changes with compatibility code in all supported Zebra versions.
-const DATABASE_FORMAT_MINOR_VERSION: u64 = 1;
+const DATABASE_FORMAT_MINOR_VERSION: u64 = 0;
 
 /// The database format patch version, incremented each time the on-disk database format has a
 /// significant format compatibility fix.
-const DATABASE_FORMAT_PATCH_VERSION: u64 = 5;
+const DATABASE_FORMAT_PATCH_VERSION: u64 = 0;
 
 /// Returns the full semantic version of the currently running state database format code.
 ///

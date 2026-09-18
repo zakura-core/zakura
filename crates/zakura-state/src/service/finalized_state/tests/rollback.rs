@@ -501,7 +501,11 @@ fn rollback_keeps_blocks_for_restore() -> Result<()> {
 
 /// A V1 coinbase transaction at `height` paying `value` to `address`. The miner data pads the
 /// coinbase script past `MIN_COINBASE_SCRIPT_LEN` so it round-trips through the database.
-fn coinbase_tx(height: Height, value: Amount<NonNegative>, address: &Address) -> Arc<Transaction> {
+pub(super) fn coinbase_tx(
+    height: Height,
+    value: Amount<NonNegative>,
+    address: &Address,
+) -> Arc<Transaction> {
     Arc::new(Transaction::V1 {
         inputs: vec![Input::Coinbase {
             height,
@@ -529,7 +533,7 @@ fn spend_tx(outpoint: OutPoint, value: Amount<NonNegative>, address: &Address) -
 /// Builds a child of `parent` containing `transactions` (whose coinbase encodes the new height).
 /// The checkpoint commit doesn't validate the pre-Sapling commitment or merkle root, so the
 /// parent's header is reused with only the parent hash updated.
-fn child_block(parent: &Block, transactions: Vec<Arc<Transaction>>) -> Arc<Block> {
+pub(super) fn child_block(parent: &Block, transactions: Vec<Arc<Transaction>>) -> Arc<Block> {
     let header = block::Header {
         previous_block_hash: parent.hash(),
         ..*parent.header
@@ -626,7 +630,7 @@ fn ironwood_v6_tx(expiry_height: Height) -> (Arc<Transaction>, ironwood::Nullifi
     )
 }
 
-fn child_block_with_history_commitment(
+pub(super) fn child_block_with_history_commitment(
     parent: &Block,
     transactions: Vec<Arc<Transaction>>,
     network: &Network,

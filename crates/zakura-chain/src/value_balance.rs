@@ -7,8 +7,10 @@ use core::fmt;
 #[cfg(any(test, feature = "proptest-impl"))]
 use std::{borrow::Borrow, collections::HashMap};
 
+use crate::amount::MAX_MONEY;
+
 #[cfg(any(test, feature = "proptest-impl"))]
-use crate::{amount::MAX_MONEY, transaction::Transaction, transparent};
+use crate::{transaction::Transaction, transparent};
 
 #[cfg(any(test, feature = "proptest-impl"))]
 mod arbitrary;
@@ -27,6 +29,10 @@ pub struct ValueBalance<C> {
     orchard: Amount<C>,
     deferred: Amount<C>,
     ironwood: Amount<C>,
+    /// Scheduled issuance minus issued value since NU7, with no historical seed.
+    /// This accounting counter funds reissuance but holds no spendable value.
+    /// Monetary totals exclude it. The signed type preserves negative accounting states.
+    issuance_deficit: Amount<NegativeAllowed>,
 }
 
 impl<C> ValueBalance<C>
@@ -147,6 +153,20 @@ where
         self
     }
 
+    /// Returns the [`ValueBalance::issuance_deficit`] amount.
+    pub fn issuance_deficit_amount(&self) -> Amount<NegativeAllowed> {
+        self.issuance_deficit
+    }
+
+    /// Sets the [`ValueBalance::issuance_deficit`] amount without affecting other amounts.
+    pub fn set_issuance_deficit_amount(
+        &mut self,
+        issuance_deficit: Amount<NegativeAllowed>,
+    ) -> &Self {
+        self.issuance_deficit = issuance_deficit;
+        self
+    }
+
     /// Creates a [`ValueBalance`] where all the pools are zero.
     pub fn zero() -> Self {
         let zero = Amount::zero();
@@ -157,6 +177,7 @@ where
             orchard: zero,
             deferred: zero,
             ironwood: zero,
+            issuance_deficit: Amount::zero(),
         }
     }
 
@@ -164,6 +185,9 @@ where
     ///
     /// Returns an error if the final sum does not satisfy the amount constraint `C`.
     /// Signed balances are summed before applying that constraint.
+    ///
+    /// [`ValueBalance::issuance_deficit`] is excluded: it holds value that is in no pool,
+    /// so adding it would overstate the monetary base this sum is used to bound.
     pub fn total(self) -> Result<Amount<C>, amount::Error> {
         let total: i128 = [
             self.transparent,
@@ -193,6 +217,9 @@ where
             orchard: self.orchard.constrain().map_err(Orchard)?,
             deferred: self.deferred.constrain().map_err(Deferred)?,
             ironwood: self.ironwood.constrain().map_err(Ironwood)?,
+            // The deficit is signed in every `ValueBalance`, so it survives the conversion
+            // unchanged.
+            issuance_deficit: self.issuance_deficit,
         })
     }
 }
@@ -347,6 +374,34 @@ impl ValueBalance<NonNegative> {
         Ok(chain_value_pool)
     }
 
+    /// Returns `IssuedSupply` from [protocol specification §4.17][4.17]: the total value
+    /// across every chain value pool.
+    ///
+    /// [4.17]: https://zips.z.cash/protocol/protocol.pdf#chainvaluepoolbalances
+    pub fn issued_supply(&self) -> Amount<NonNegative> {
+        (self.transparent
+            + self.sprout
+            + self.sapling
+            + self.orchard
+            + self.ironwood
+            + self.deferred)
+            .expect("consensus rules bound the issued supply by MAX_MONEY")
+    }
+
+    /// Returns the [ZIP 234] money reserve: `MAX_MONEY - IssuedSupply`.
+    ///
+    /// The money reserve is the value that has never been issued or is otherwise outside
+    /// the chain value pools.
+    ///
+    /// [ZIP 234]: https://zips.z.cash/zip-0234
+    pub fn money_reserve(&self) -> Amount<NonNegative> {
+        let max_money =
+            Amount::<NonNegative>::try_from(MAX_MONEY).expect("MAX_MONEY is a valid amount");
+
+        (max_money - self.issued_supply())
+            .expect("consensus rules bound the issued supply by MAX_MONEY")
+    }
+
     /// Create a fake value pool for testing purposes.
     ///
     /// The resulting [`ValueBalance`] has `MAX_MONEY / 8` on the transparent, Sprout, Sapling,
@@ -379,10 +434,10 @@ impl ValueBalance<NonNegative> {
 
     /// To byte array
     ///
-    /// The `ironwood` pool (NU6.3 onward) is appended after `deferred`, so that records written by
-    /// earlier Zebra versions (32 bytes without `deferred`, or 40 bytes with it) remain parsable by
-    /// [`Self::from_bytes`].
-    pub fn to_bytes(self) -> [u8; 48] {
+    /// Each leg is appended after the last, so that records written by earlier versions
+    /// (32 bytes without `deferred`, 40 bytes with it, 48 bytes with `ironwood`) remain
+    /// parsable by [`Self::from_bytes`]. `issuance_deficit` is the seventh leg, at 48..56.
+    pub fn to_bytes(self) -> [u8; 56] {
         match [
             self.transparent.to_bytes(),
             self.sprout.to_bytes(),
@@ -390,28 +445,33 @@ impl ValueBalance<NonNegative> {
             self.orchard.to_bytes(),
             self.deferred.to_bytes(),
             self.ironwood.to_bytes(),
+            self.issuance_deficit.to_bytes(),
         ]
         .concat()
         .try_into()
         {
             Ok(bytes) => bytes,
             _ => unreachable!(
-                "six [u8; 8] should always concat with no error into a single [u8; 48]"
+                "seven [u8; 8] should always concat with no error into a single [u8; 56]"
             ),
         }
     }
 
     /// From byte array
     ///
-    /// Accepts 32-byte (pre-`deferred`), 40-byte (pre-`ironwood`), and 48-byte records; missing
-    /// trailing pools default to zero.
+    /// Accepts 32-byte (pre-`deferred`), 40-byte (pre-`ironwood`), 48-byte
+    /// (pre-`issuance_deficit`) and 56-byte records; missing trailing pools default to zero.
+    ///
+    /// A zero `issuance_deficit` on a shorter record is a placeholder, not the real deficit.
+    /// The `issuance_deficit_pool` database upgrade recomputes it from the halving schedule
+    /// and the stored pools before any block reads it.
     #[allow(clippy::unwrap_in_result)]
     pub fn from_bytes(bytes: &[u8]) -> Result<ValueBalance<NonNegative>, ValueBalanceError> {
         let bytes_length = bytes.len();
 
         // Return an error early if bytes don't have the right length instead of panicking later.
         match bytes_length {
-            32 | 40 | 48 => {}
+            32 | 40 | 48 | 56 => {}
             _ => return Err(Unparsable),
         };
 
@@ -445,7 +505,7 @@ impl ValueBalance<NonNegative> {
 
         let deferred = match bytes_length {
             32 => Amount::zero(),
-            40 | 48 => Amount::from_bytes(
+            40 | 48 | 56 => Amount::from_bytes(
                 bytes[32..40]
                     .try_into()
                     .expect("deferred amount should be parsable"),
@@ -456,12 +516,23 @@ impl ValueBalance<NonNegative> {
 
         let ironwood = match bytes_length {
             32 | 40 => Amount::zero(),
-            48 => Amount::from_bytes(
+            48 | 56 => Amount::from_bytes(
                 bytes[40..48]
                     .try_into()
                     .expect("ironwood amount should be parsable"),
             )
             .map_err(Ironwood)?,
+            _ => return Err(Unparsable),
+        };
+
+        let issuance_deficit = match bytes_length {
+            32 | 40 | 48 => Amount::zero(),
+            56 => Amount::from_bytes(
+                bytes[48..56]
+                    .try_into()
+                    .expect("issuance deficit amount should be parsable"),
+            )
+            .map_err(IssuanceDeficit)?,
             _ => return Err(Unparsable),
         };
 
@@ -472,6 +543,7 @@ impl ValueBalance<NonNegative> {
             orchard,
             deferred,
             ironwood,
+            issuance_deficit,
         })
     }
 }
@@ -497,6 +569,15 @@ pub enum ValueBalanceError {
     /// ironwood amount error {0}
     Ironwood(amount::Error),
 
+    /// issuance deficit amount error {0}
+    IssuanceDeficit(amount::Error),
+
+    /// scheduled issuance calculation failed: {0}
+    ScheduledIssuance(crate::parameters::subsidy::SubsidyError),
+
+    /// the block has no coinbase height, so its issuance deficit change is undefined
+    MissingCoinbaseHeight,
+
     /// total amount error {0}
     Total(amount::Error),
 
@@ -513,6 +594,12 @@ impl fmt::Display for ValueBalanceError {
             Orchard(e) => format!("orchard amount err: {e}"),
             Deferred(e) => format!("deferred amount err: {e}"),
             Ironwood(e) => format!("ironwood amount err: {e}"),
+            IssuanceDeficit(e) => format!("issuance deficit amount err: {e}"),
+            ScheduledIssuance(e) => format!("scheduled issuance calculation failed: {e}"),
+            MissingCoinbaseHeight => {
+                "block has no coinbase height, so its issuance deficit change is undefined"
+                    .to_string()
+            }
             Total(e) => format!("total amount err: {e}"),
             Unparsable => "value balance is unparsable".to_string(),
         })
@@ -532,6 +619,8 @@ where
             orchard: (self.orchard + rhs.orchard).map_err(Orchard)?,
             deferred: (self.deferred + rhs.deferred).map_err(Deferred)?,
             ironwood: (self.ironwood + rhs.ironwood).map_err(Ironwood)?,
+            issuance_deficit: (self.issuance_deficit + rhs.issuance_deficit)
+                .map_err(IssuanceDeficit)?,
         })
     }
 }
@@ -582,6 +671,8 @@ where
             orchard: (self.orchard - rhs.orchard).map_err(Orchard)?,
             deferred: (self.deferred - rhs.deferred).map_err(Deferred)?,
             ironwood: (self.ironwood - rhs.ironwood).map_err(Ironwood)?,
+            issuance_deficit: (self.issuance_deficit - rhs.issuance_deficit)
+                .map_err(IssuanceDeficit)?,
         })
     }
 }
@@ -652,6 +743,7 @@ where
             orchard: self.orchard.neg(),
             deferred: self.deferred.neg(),
             ironwood: self.ironwood.neg(),
+            issuance_deficit: self.issuance_deficit.neg(),
         }
     }
 }

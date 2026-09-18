@@ -19,7 +19,7 @@ use crate::{
         finalized_state::{CheckpointVerifiedBlock, FinalizedState},
         non_finalized_state::NonFinalizedState,
     },
-    CommitBlockError, Config, SemanticallyVerifiedBlock,
+    CommitBlockError, Config, SemanticallyVerifiedBlock, ValidateContextError,
 };
 
 use super::rollback::{child_block, coinbase_tx};
@@ -289,7 +289,7 @@ proptest::proptest! {
     /// Exercise accounting transitions through real databases. Partial claims intentionally
     /// bypass semantic subsidy validation; this property tests the state accounting layer.
     #[test]
-    fn deficit_rollback_replay_and_fork_equivalence(
+    fn balance_rollback_replay_and_fork_equivalence(
         claims in proptest::collection::vec(0u32..=1_000_000, 2..12),
         target_offset in 0usize..12,
     ) {
@@ -532,9 +532,20 @@ fn signed_balance_agrees_across_both_commit_paths() {
             forks.commit_new_chain(SemanticallyVerifiedBlock::from(block.clone()), &state.db);
         let finalized_result = commit(&mut state, &block);
 
-        if excess > 0 {
-            assert!(fork_result.is_err(), "excess {excess}");
-            assert!(finalized_result.is_err(), "excess {excess}");
+        if cfg!(feature = "nu7") && excess > 0 {
+            assert!(
+                matches!(fork_result,
+                    Err(ValidateContextError::NegativeNsmValueBalance { height, .. }) if height == START
+                ),
+                "excess {excess}: {fork_result:?}"
+            );
+            assert!(
+                matches!(finalized_result,
+                    Err(CommitBlockError::ValidateContextError(ref error))
+                        if matches!(**error, ValidateContextError::NegativeNsmValueBalance { height, .. } if height == START)
+                ),
+                "excess {excess}: {finalized_result:?}"
+            );
             continue;
         }
 

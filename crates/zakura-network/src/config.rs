@@ -1491,6 +1491,15 @@ where
         params_builder = params_builder.with_initial_nsm_value_balance(balance);
     }
 
+    // An omitted seed and otherwise default parameters select public Testnet.
+    // An explicit zero seed must remain zero on the configured network.
+    if network_name.is_none()
+        && initial_nsm_value_balance.is_none()
+        && params_builder == testnet::Parameters::build()
+    {
+        return Ok(Network::new_default_testnet());
+    }
+
     // Return an error if the initial testnet peers includes any of the default initial Mainnet or Testnet
     // peers and the configured network parameters are incompatible with the default public Testnet.
     if !params_builder.is_compatible_with_default_parameters()
@@ -1501,12 +1510,7 @@ where
         ));
     };
 
-    // Return the default Testnet if no network name was configured and all parameters match the default Testnet
-    if network_name.is_none() && params_builder == testnet::Parameters::build() {
-        Ok(Network::new_default_testnet())
-    } else {
-        Ok(params_builder.to_network().map_err(de::Error::custom)?)
-    }
+    params_builder.to_network().map_err(de::Error::custom)
 }
 
 fn build_regtest_params<'de, D: Deserializer<'de>>(

@@ -1795,8 +1795,66 @@ async fn zip234_block_verification_checks_the_reissuance_bonus() {
     ));
 }
 
-/// A proposal whose parent has not committed is rejected immediately after the ZIP 234
-/// start, instead of waiting for a parent commit that may never arrive.
+/// A proposal uses its committed parent's balance and rejects an excessive bonus.
+#[cfg(feature = "nu7")]
+#[tokio::test]
+async fn zip234_proposal_with_committed_parent_checks_the_bonus_without_waiting() {
+    use zakura_chain::{block_info::BlockInfo, parameters::subsidy::halving_block_subsidy};
+
+    let _init_guard = zakura_test::init();
+    let start = Height(3);
+    let network = zip234_test_network(start);
+    let parent_pools =
+        zip234_parent_pools(&network, start.previous().unwrap(), ZIP234_TEST_DEFICIT);
+    let subsidy = (halving_block_subsidy(start, &network).unwrap()
+        + Amount::try_from(zip234_test_bonus(&network, start)).unwrap())
+    .unwrap();
+    for excess in [0, 1] {
+        let claim = (subsidy + Amount::try_from(excess).unwrap()).unwrap();
+        let block = zip234_test_block(&network, start, claim);
+        let hash = block.hash();
+        let expected_parent = block.header.previous_block_hash;
+        let state = service_fn(move |request: zs::Request| async move {
+            Ok::<_, BoxError>(match request {
+                zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+                zs::Request::BlockInfo(parent) => {
+                    assert_eq!(parent, expected_parent);
+                    zs::Response::BlockInfo(Some(BlockInfo::new(parent_pools, 0)))
+                }
+                zs::Request::CheckBlockProposalValidity(_) => zs::Response::ValidBlockProposal,
+                _ => panic!("a proposal must neither wait nor commit: {request:?}"),
+            })
+        });
+        let transaction =
+            service_fn(
+                |request| async move { Ok::<_, BoxError>(accept_block_transaction(request)) },
+            );
+        let verifier = SemanticBlockVerifier::new(&network, state, transaction);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            verifier.oneshot(Request::CheckProposal(Arc::new(block))),
+        )
+        .await
+        .expect("proposal verification completes");
+        if excess == 0 {
+            assert_eq!(result.unwrap(), hash);
+        } else {
+            assert!(
+                matches!(
+                    result,
+                    Err(VerifyBlockError::Block {
+                        source: BlockError::Transaction(TransactionError::Subsidy(
+                            SubsidyError::InvalidMinerFees
+                        ))
+                    })
+                ),
+                "{result:?}"
+            );
+        }
+    }
+}
+
+/// A proposal must reject an uncommitted parent without waiting for its commit.
 #[cfg(feature = "nu7")]
 #[tokio::test]
 async fn zip234_proposal_with_uncommitted_parent_is_rejected_without_waiting() {

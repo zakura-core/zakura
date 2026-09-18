@@ -1129,7 +1129,7 @@ impl ParametersBuilder {
             checkpoints: _,
             temporary_orchard_disabling_soft_fork_height: _,
             nsm_reissuance_height,
-            // The seed is a per-chain measurement, so it does not decide compatibility.
+            // Compare the configured seed with public Testnet's seed below.
             initial_nsm_value_balance: _,
         } = Self::default();
 
@@ -1147,6 +1147,7 @@ impl ParametersBuilder {
             && self.post_blossom_halving_interval == post_blossom_halving_interval
             && self.lockbox_disbursements == lockbox_disbursements
             && self.nsm_reissuance_height == nsm_reissuance_height
+            && self.initial_nsm_value_balance == testnet::INITIAL_NSM_VALUE_BALANCE
     }
 }
 
@@ -1488,7 +1489,6 @@ impl Parameters {
         self.configured_nsm_reissuance_height
     }
 
-    /// Returns the cached start height that the ZIP 234 crossing rule derives.
     /// Returns zips#1354's `INITIAL_NSM_VALUE_BALANCE` for this network.
     ///
     /// See [`ParametersBuilder::with_initial_nsm_value_balance`].
@@ -1496,6 +1496,7 @@ impl Parameters {
         self.initial_nsm_value_balance
     }
 
+    /// Returns the cached start height that the ZIP 234 crossing rule derives.
     pub(crate) fn nsm_reissuance_crossing_height(&self) -> &DerivedHeight {
         &self.nsm_reissuance_crossing_height
     }

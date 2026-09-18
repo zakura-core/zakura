@@ -4002,3 +4002,72 @@ async fn missing_parent_context_releases_body_and_schedules_unscored_retry() {
     assert!(sync.registry_miss_retry.contains_key(&hash));
     assert!(sync.parent_context_wait_started.contains_key(&hash));
 }
+
+/// Builds a distinct hash for bulk table-pressure tests.
+fn wait_table_hash(index: usize) -> block::Hash {
+    let mut bytes = [0u8; 32];
+    bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+    block::Hash(bytes)
+}
+
+#[tokio::test(start_paused = true)]
+async fn expired_parent_context_waits_do_not_starve_later_hashes() {
+    let (mut sync, _, _, _, _, _) = setup_chain_sync();
+
+    // A full table of waits that have all run out of retention window.
+    for index in 0..sync::MAX_PARENT_CONTEXT_WAIT_HASHES {
+        sync.parent_context_wait_started
+            .insert(wait_table_hash(index), tokio::time::Instant::now());
+    }
+    tokio::time::advance(sync::BLOCK_VERIFY_TIMEOUT + Duration::from_secs(1)).await;
+
+    let hash = block::Hash([7; 32]);
+    sync.handle_block_response_with_missing_retry(Err(BlockDownloadVerifyError::Invalid {
+        error: VerifyBlockError::MissingParentContext(block::Hash([6; 32])).into(),
+        height: Height(1_687_107),
+        hash,
+        advertiser_addr: None,
+    }))
+    .await
+    .unwrap();
+
+    assert!(
+        sync.parent_context_wait_started.contains_key(&hash),
+        "expired waits must not fill the table and drop a later required hash"
+    );
+    assert!(
+        sync.registry_miss_retry.contains_key(&hash),
+        "the new hash must still be scheduled for a retry"
+    );
+    assert_eq!(
+        sync.parent_context_wait_started.len(),
+        1,
+        "every expired wait is pruned, because none can schedule another retry"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn parent_context_backoff_never_outlives_the_retention_window() {
+    let (mut sync, _, _, _, _, _) = setup_chain_sync();
+    tokio::time::advance(sync::BLOCK_VERIFY_TIMEOUT).await;
+
+    // A wait one second short of its deadline, where the backoff has grown to its maximum.
+    let hash = block::Hash([9; 32]);
+    let started =
+        tokio::time::Instant::now() - (sync::BLOCK_VERIFY_TIMEOUT - Duration::from_secs(1));
+    sync.parent_context_wait_started.insert(hash, started);
+
+    sync.handle_block_response_with_missing_retry(Err(BlockDownloadVerifyError::Invalid {
+        error: VerifyBlockError::MissingParentContext(block::Hash([8; 32])).into(),
+        height: Height(1_687_107),
+        hash,
+        advertiser_addr: None,
+    }))
+    .await
+    .unwrap();
+
+    assert!(
+        sync.registry_miss_retry[&hash] <= started + sync::BLOCK_VERIFY_TIMEOUT,
+        "the thirty-second backoff must be clamped to the retention deadline"
+    );
+}

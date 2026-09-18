@@ -381,7 +381,9 @@ where
             source_locks: HashMap::new(),
             source_counts: HashMap::new(),
             poisoned_retries: PoisonedRetryBudgets::default(),
-            missing_parent_slots: Arc::new(Semaphore::new(full_verify_concurrency_limit / 2)),
+            missing_parent_slots: Arc::new(Semaphore::new(
+                (full_verify_concurrency_limit / 2).max(1),
+            )),
         }
     }
 
@@ -781,6 +783,12 @@ where
                 tokio::time::sleep_until(context_deadline.min(
                     tokio::time::Instant::now() + std::time::Duration::from_secs(1)
                 )).await;
+                if tokio::time::Instant::now() >= context_deadline {
+                    // Re-check before starting another attempt. Each verifier request carries
+                    // its own full timeout, so an attempt begun at the deadline would hold the
+                    // body, the queue slot, the source count and the permit far past it.
+                    break result;
+                }
             };
             verified
                 .map(|hash| (hash, block_height))

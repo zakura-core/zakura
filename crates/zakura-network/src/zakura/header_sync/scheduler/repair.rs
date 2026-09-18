@@ -7,6 +7,24 @@ use tokio::time::Instant;
 use zakura_chain::block;
 use zakura_header_chain::{BodyWorkOwner, EngineSnapshot, SourceId, VctRepairContext};
 
+/// Maximum uninterrupted wait for local auxiliary capacity.
+pub(in crate::zakura::header_sync) const VCT_CAPACITY_FATAL_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(30 * 60);
+
+/// Blockage history survives context queries until capacity resolves or the task retires.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(in crate::zakura::header_sync) struct CapacityWait {
+    pub target: zakura_header_chain::Frontier,
+    pub since: Instant,
+    pub fatal_sent: bool,
+}
+
+impl CapacityWait {
+    pub fn deadline(self) -> Instant {
+        self.since + VCT_CAPACITY_FATAL_AFTER
+    }
+}
+
 /// Structurally complete state of one auxiliary repair task.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::zakura::header_sync) enum RepairPolicyState {
@@ -76,7 +94,7 @@ pub(in crate::zakura::header_sync) struct RepairRequirement {
     /// Durable repair-signal generation that owns this task.
     pub repair_generation: u64,
     /// Current structurally complete state.
-    pub state: RepairPolicyState,
+    state: RepairPolicyState,
     /// Failed or abandoned on-wire attempts, saturated only for diagnostics.
     pub attempts: u64,
     /// Connected suppliers already tried in the current durable episode.
@@ -87,6 +105,7 @@ pub(in crate::zakura::header_sync) struct RepairRequirement {
     /// Suppliers waiting for a later status from their current session after Busy.
     /// Live peer admission limits bound this set.
     busy_sources: HashSet<SourceId>,
+    capacity_wait: Option<CapacityWait>,
 }
 
 impl RepairRequirement {
@@ -101,7 +120,12 @@ impl RepairRequirement {
             tried_sources: HashSet::new(),
             excluded_input_sources: HashSet::new(),
             busy_sources: HashSet::new(),
+            capacity_wait: None,
         }
+    }
+
+    pub fn state(&self) -> &RepairPolicyState {
+        &self.state
     }
 
     /// Record that one bounded state context read is outstanding.
@@ -118,7 +142,11 @@ impl RepairRequirement {
     }
 
     /// Attach a still-current exact selected request context.
-    pub fn resolve(&mut self, context: VctRepairContext) -> Result<(), RepairPolicyError> {
+    pub fn resolve(
+        &mut self,
+        context: VctRepairContext,
+        now: Instant,
+    ) -> Result<(), RepairPolicyError> {
         if !matches!(self.state, RepairPolicyState::QueryingContext { .. }) {
             return Err(RepairPolicyError::IllegalState);
         }
@@ -126,8 +154,14 @@ impl RepairRequirement {
             return Err(RepairPolicyError::TargetMismatch);
         }
         self.state = if context.admission_capacity_available {
+            self.capacity_wait = None;
             RepairPolicyState::Ready { context }
         } else {
+            self.capacity_wait.get_or_insert(CapacityWait {
+                target: context.target,
+                since: now,
+                fatal_sent: false,
+            });
             RepairPolicyState::StateBlocked {
                 state_version: context.state_version,
                 context,
@@ -273,11 +307,17 @@ impl RepairRequirement {
     pub fn wait_for_state_change(
         &mut self,
         state_version: zakura_header_chain::StateVersion,
+        now: Instant,
     ) -> Result<(), RepairPolicyError> {
         let RepairPolicyState::Assigned { context } = &self.state else {
             return Err(RepairPolicyError::IllegalState);
         };
         self.attempts = self.attempts.saturating_add(1);
+        self.capacity_wait = Some(CapacityWait {
+            target: context.target,
+            since: now,
+            fatal_sent: false,
+        });
         self.state = RepairPolicyState::StateBlocked {
             context: context.clone(),
             state_version,
@@ -317,12 +357,34 @@ impl RepairRequirement {
 
     /// Return the next task-owned maintenance deadline.
     pub fn next_deadline(&self) -> Option<Instant> {
-        match self.state {
+        let retry = match self.state {
             RepairPolicyState::QueryingContext { deadline, .. } => Some(deadline),
             RepairPolicyState::ContextBackoff { retry_at }
             | RepairPolicyState::LocalBackoff { retry_at, .. } => Some(retry_at),
             _ => None,
+        };
+        retry
+            .into_iter()
+            .chain(
+                self.capacity_wait
+                    .filter(|wait| !wait.fatal_sent)
+                    .map(CapacityWait::deadline),
+            )
+            .min()
+    }
+
+    pub fn capacity_wait(&self) -> Option<CapacityWait> {
+        self.capacity_wait
+    }
+
+    /// Claim an expired wait once, after the reactor has observed current writer signals.
+    pub fn take_capacity_expiry(&mut self, now: Instant) -> Option<CapacityWait> {
+        let wait = self.capacity_wait.as_mut()?;
+        if wait.fatal_sent || now < wait.deadline() {
+            return None;
         }
+        wait.fatal_sent = true;
+        Some(*wait)
     }
 }
 
@@ -420,6 +482,7 @@ impl RepairRequirementSlot {
 
 #[cfg(test)]
 mod tests {
+    mod capacity_sequences;
     use std::num::NonZeroU64;
 
     use zakura_chain::{block, work::difficulty::U256};
@@ -486,7 +549,7 @@ mod tests {
         let source = SourceId::from_digest([8; 32]);
         let context = context();
         mark_context_requested(&mut task);
-        task.resolve(context.clone())
+        task.resolve(context.clone(), Instant::now())
             .expect("the exact context can resolve");
         task.assign(task.owner, context.clone())
             .expect("ready work can go on wire");
@@ -516,7 +579,7 @@ mod tests {
         let excluded = SourceId::from_digest([9; 32]);
         let context = context();
         mark_context_requested(&mut task);
-        task.resolve(context.clone())
+        task.resolve(context.clone(), Instant::now())
             .expect("the selected context resolves");
         task.assign(task.owner, context.clone())
             .expect("the excluded supplier is assigned");
@@ -557,7 +620,7 @@ mod tests {
         let second = SourceId::from_digest([9; 32]);
         let context = context();
         mark_context_requested(&mut task);
-        task.resolve(context.clone())
+        task.resolve(context.clone(), Instant::now())
             .expect("the exact context resolves");
         task.assign(task.owner, context.clone())
             .expect("the first supplier goes on wire");
@@ -585,7 +648,7 @@ mod tests {
         let mut task = task(&snapshot());
         let context = context();
         mark_context_requested(&mut task);
-        task.resolve(context.clone())
+        task.resolve(context.clone(), Instant::now())
             .expect("the exact context resolves");
 
         for byte in 1_u8..=64 {
@@ -608,7 +671,7 @@ mod tests {
         let mut task = task(&snapshot());
         let context = context();
         mark_context_requested(&mut task);
-        task.resolve(context.clone())
+        task.resolve(context.clone(), Instant::now())
             .expect("the exact context resolves");
         let source = |index: usize| {
             let bytes = u64::try_from(index)
@@ -640,12 +703,12 @@ mod tests {
         let mut task = task(&snapshot());
         let context = context();
         mark_context_requested(&mut task);
-        task.resolve(context.clone())
+        task.resolve(context.clone(), Instant::now())
             .expect("the exact context resolves");
         task.assign(task.owner, context.clone())
             .expect("ready work can go on wire");
         let blocked_at = StateVersion::new(3);
-        task.wait_for_state_change(blocked_at)
+        task.wait_for_state_change(blocked_at, Instant::now())
             .expect("a committed resource refusal blocks the assigned repair");
 
         task.observe_state_change(blocked_at);
@@ -677,7 +740,7 @@ mod tests {
         )
         .expect("an empty durable input set is coherent");
         mark_context_requested(&mut task);
-        task.resolve(blocked.clone())
+        task.resolve(blocked.clone(), Instant::now())
             .expect("the exact context resolves into a state wait");
 
         assert_eq!(
@@ -689,7 +752,10 @@ mod tests {
         );
         assert_eq!(task.attempts, 0);
         assert!(task.tried_sources.is_empty());
-        assert!(task.next_deadline().is_none());
+        assert_eq!(
+            task.next_deadline(),
+            task.capacity_wait().map(CapacityWait::deadline)
+        );
     }
 
     #[test]
@@ -698,7 +764,7 @@ mod tests {
         let mut task = task(&snapshot);
         let context = context();
         mark_context_requested(&mut task);
-        task.resolve(context.clone())
+        task.resolve(context.clone(), Instant::now())
             .expect("the exact context resolves");
         let excluded_sources: Vec<_> = (1_u8..=3)
             .map(|byte| SourceId::from_digest([byte; 32]))
@@ -744,7 +810,7 @@ mod tests {
             let mut task = task(&snapshot());
             let context = context();
             mark_context_requested(&mut task);
-            task.resolve(context.clone())
+            task.resolve(context.clone(), Instant::now())
                 .expect("the exact context resolves");
             let failed_source = SourceId::from_digest([1; 32]);
             if assigned {

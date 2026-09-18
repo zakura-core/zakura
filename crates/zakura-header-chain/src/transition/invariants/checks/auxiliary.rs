@@ -39,11 +39,13 @@ pub(crate) fn verify_aux<G: HeaderGraphView>(
         })
         .collect();
     for (header_hash, delivery_id) in &deletes {
-        let exists = engine_before_commit
+        let existing = engine_before_commit
             .aux_deliveries(*header_hash)
             .iter()
-            .any(|delivery| delivery.delivery_id == *delivery_id);
-        if !exists {
+            .find(|delivery| delivery.delivery_id == *delivery_id);
+        if existing.is_none_or(|delivery| {
+            graph.view_header_node(*header_hash).is_some() && delivery.is_authenticated()
+        }) {
             return Err(InvariantViolation::Auxiliary(*header_hash));
         }
     }
@@ -70,6 +72,48 @@ pub(crate) fn verify_aux<G: HeaderGraphView>(
         );
     if projected_aux_count > plan.limits.max_aux_deliveries_total.get() {
         return Err(InvariantViolation::Limits);
+    }
+    let window_capacity = plan
+        .limits
+        .max_aux_deliveries_per_header
+        .get()
+        .saturating_mul(3);
+    if plan.change_set.metadata.mode == crate::EngineMode::Integrated
+        && projected_aux_count.saturating_add(window_capacity)
+            > plan.limits.max_aux_deliveries_total.get()
+    {
+        let frontiers = plan.change_set.metadata.frontiers;
+        let mut occupied = 0usize;
+        for offset in 0..3 {
+            let Some(height) = frontiers
+                .finalized
+                .height
+                .0
+                .checked_add(offset)
+                .map(zakura_chain::block::Height)
+            else {
+                break;
+            };
+            if height > frontiers.header_best.height {
+                break;
+            }
+            let frontier = graph
+                .view_header_ancestor(frontiers.header_best.hash, height)
+                .map_err(|_| InvariantViolation::Limits)?
+                .ok_or(InvariantViolation::Limits)?;
+            occupied = occupied.saturating_add(
+                graph
+                    .view_header_node(frontier.hash)
+                    .ok_or(InvariantViolation::Auxiliary(frontier.hash))?
+                    .aux_delivery_ids
+                    .len(),
+            );
+        }
+        if projected_aux_count.saturating_add(window_capacity.saturating_sub(occupied))
+            > engine_before_commit.auxiliary_reserve_ceiling(plan.limits)
+        {
+            return Err(InvariantViolation::Limits);
+        }
     }
     let mut nodes: Vec<&HeaderNode> = match mode {
         #[cfg(any(test, feature = "fuzz-impl"))]
@@ -180,6 +224,52 @@ mod tests {
             verify_aux(&fixture.engine, &graph, plan, VerificationMode::Production),
             verify_aux(&fixture.engine, &graph, plan, VerificationMode::Exhaustive),
         ]
+    }
+
+    #[test]
+    fn projected_commit_reserve_includes_missing_successors() {
+        let fixture = fixture(EngineMode::Integrated);
+        // A side branch holds input outside the selected window. The window's second
+        // successor has not arrived, so its slot stays reserved.
+        let mut side_header = *fixture
+            .engine
+            .graph()
+            .header_node(fixture.child.hash)
+            .unwrap()
+            .header;
+        side_header.nonce.0[0] = 2;
+        let mut overlay = GraphOverlay::new(fixture.engine.graph());
+        let side = match overlay
+            .insert(
+                std::sync::Arc::new(side_header),
+                crate::HeaderValidationState::Valid,
+                [],
+                crate::BodyValidationState::Unknown,
+            )
+            .unwrap()
+        {
+            crate::InsertResult::Inserted(frontier)
+            | crate::InsertResult::AlreadyPresent(frontier) => frontier,
+        };
+        let row = delivery(
+            &fixture.engine,
+            side.hash,
+            EvidenceId::from_digest([0x79; 32]),
+        );
+        overlay
+            .record_auxiliary_evidence_delivery(side.hash, row.delivery_id)
+            .unwrap();
+        let mut plan = candidate_with_delta(&fixture.engine, overlay.delta());
+        plan.change_set.aux_changes = vec![AuxDelta::Put(Box::new(row))];
+        plan.limits.max_aux_deliveries_per_header = NonZeroUsize::new(1).unwrap();
+        // The empty store exactly holds the reserve for the anchor, child, and missing successor.
+        plan.limits.max_aux_deliveries_total = NonZeroUsize::new(3).unwrap();
+        assert_eq!(
+            verify_in_both_modes(&fixture, &plan),
+            [Err(InvariantViolation::Limits); 2]
+        );
+        plan.limits.max_aux_deliveries_total = NonZeroUsize::new(4).unwrap();
+        assert_eq!(verify_in_both_modes(&fixture, &plan), [Ok(()); 2]);
     }
 
     #[test]

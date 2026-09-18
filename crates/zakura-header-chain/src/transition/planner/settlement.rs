@@ -235,9 +235,11 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
     }
 
     let retention = projected.enforce_retention(
+        engine,
         selected_tip,
         context.retention_references.iter().copied(),
         context.config.limits,
+        context.config.mode == EngineMode::Integrated,
     )?;
     if retention.admission_refused {
         return Ok(FinalityRetentionOutcome::ResourceStalled);
@@ -271,7 +273,12 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
     };
 
     let projected = projected.finish_after_retention(engine)?;
-    projected.validate_auxiliary_limits(engine, context.config.limits)?;
+    projected.validate_auxiliary_limits(
+        engine,
+        context.config.limits,
+        &selected,
+        context.config.mode == EngineMode::Integrated,
+    )?;
     Ok(FinalityRetentionOutcome::Settled(Box::new(
         SettledTransition {
             projected,

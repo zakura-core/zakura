@@ -120,6 +120,11 @@ pub struct HeaderSyncFatalEvent {
 
 impl fmt::Display for HeaderSyncFatalEvent {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.phase == "auxiliary_capacity" {
+            return write!(formatter,
+                "VCT repair cannot acquire auxiliary capacity: owner={:?}, generation={}, target={:?}, elapsed={:?}; protected data remains retained; restarting alone may not free capacity",
+                self.owner, self.repair_generation, self.target, self.elapsed);
+        }
         write!(
             formatter,
             "VCT local {} operation exceeded its hard deadline: owner={:?}, generation={}, branch={:?}, target={:?}, elapsed={:?}",

@@ -522,6 +522,13 @@ impl NetworkUpgrade {
         }
     }
 
+    /// Returns the difficulty averaging window at the selected network height.
+    ///
+    /// All currently configured upgrades use the same 17-block window.
+    pub fn averaging_window_for_height(_network: &Network, _height: block::Height) -> usize {
+        POW_AVERAGING_WINDOW
+    }
+
     /// Returns the averaging window timespan for the network upgrade.
     ///
     /// `AveragingWindowTimespan` from the Zcash specification.

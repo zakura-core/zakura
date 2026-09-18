@@ -3105,6 +3105,83 @@ async fn rpc_getnetworksolps_saturates_to_response_width() {
     );
 }
 
+/// A block count below 1 selects the averaging window at the requested height, capped at the tip.
+#[tokio::test(flavor = "multi_thread")]
+async fn rpc_getnetworksolps_uses_averaging_window_at_height() {
+    let _init_guard = zakura_test::init();
+
+    const NU7: u32 = 1_000;
+    let network = Network::new_regtest(
+        testnet::ConfiguredActivationHeights {
+            nu7: Some(NU7),
+            ..Default::default()
+        }
+        .into(),
+    );
+    let pre_nu7_window = 17;
+    let post_nu7_window = 17;
+
+    let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let mut read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
+    let (latest_chain_tip, latest_chain_tip_sender) = MockChainTip::new();
+
+    let (_tx, rx) = tokio::sync::watch::channel(None);
+    let (rpc, _rpc_tx_queue) = RpcImpl::new(
+        network,
+        Default::default(),
+        Default::default(),
+        "0.0.1",
+        "RPC test",
+        Buffer::new(mempool, 1),
+        Buffer::new(state, 1),
+        Buffer::new(read_state.clone(), 1),
+        MockService::build().for_unit_tests(),
+        MockSyncStatus::default(),
+        latest_chain_tip,
+        MockAddressBookPeers::default(),
+        rx,
+        None,
+    );
+
+    let nu7 = i32::try_from(NU7).expect("fits in i32");
+    let above_tip = nu7 + 100;
+    let cases = [
+        // (tip, height, expected window)
+        (NU7 - 5, None, pre_nu7_window),
+        (NU7 - 5, Some(above_tip), pre_nu7_window),
+        (NU7 + 10, None, post_nu7_window),
+        (NU7 + 10, Some(-1), post_nu7_window),
+        (NU7 + 10, Some(above_tip), post_nu7_window),
+        (NU7 + 10, Some(nu7 - 1), pre_nu7_window),
+        (NU7 + 10, Some(nu7), post_nu7_window),
+    ];
+
+    for (tip, height, expected_window) in cases {
+        latest_chain_tip_sender.send_best_tip_height(Height(tip));
+
+        let rpc = rpc.clone();
+        let request = tokio::spawn(async move { rpc.get_network_sol_ps(Some(0), height).await });
+
+        read_state
+            .expect_request(ReadRequest::SolutionRate {
+                num_blocks: expected_window,
+                height: height.and_then(|height| height.try_into_height().ok()),
+            })
+            .await
+            .respond(ReadResponse::SolutionRate(Some(U256::one())));
+
+        assert_eq!(
+            request
+                .await
+                .expect("the RPC task should not panic")
+                .expect("the RPC call should succeed"),
+            1,
+            "tip={tip}, height={height:?}",
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn getblocktemplate() {
     let _init_guard = zakura_test::init();

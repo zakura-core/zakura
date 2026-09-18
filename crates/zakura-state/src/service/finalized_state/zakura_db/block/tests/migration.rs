@@ -261,7 +261,7 @@ fn existing_narrow_validation_context_is_backfilled_before_startup() {
     let network = Network::Mainnet;
     let genesis = mainnet_block(0);
     let state = state_with_genesis_config(&network, genesis.clone(), Config::ephemeral());
-    let predecessor_span = zakura_header_chain::POW_PREDECESSOR_CONTEXT_SPAN;
+    let predecessor_span = zakura_header_chain::MAX_POW_PREDECESSOR_CONTEXT_SPAN;
     let chain_tip = u32::try_from(predecessor_span + 1)
         .expect("the validation context span fits in a block height");
     write_synthetic_finalized_headers(&state, &genesis, chain_tip);

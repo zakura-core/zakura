@@ -46,7 +46,8 @@ pub use validation::{
     validate_hash_filter, validate_link, AdjustedDifficulty, AdjustedDifficultyError,
     CompactTargetError, ContextualValidationError, HashFilterError, HeaderBatchInput,
     HeaderEncodingError, HeaderFailure, HeaderHeightError, HeaderLinkError, HeaderRule,
-    HeaderRules, PowPolicy, PowPolicyError, BLOCK_MAX_TIME_SINCE_MEDIAN, POW_ADJUSTMENT_BLOCK_SPAN,
+    HeaderRules, PowPolicy, PowPolicyError, BLOCK_MAX_TIME_SINCE_MEDIAN,
+    MAX_POW_ADJUSTMENT_BLOCK_SPAN, MAX_POW_PREDECESSOR_CONTEXT_SPAN, POW_ADJUSTMENT_BLOCK_SPAN,
     POW_MEDIAN_BLOCK_SPAN, POW_PREDECESSOR_CONTEXT_SPAN,
 };
 pub use work::{

@@ -509,3 +509,53 @@ fn previous_halving(height: Height, network: &Network) -> u32 {
         .try_into()
         .expect("already checked for negatives")
 }
+
+/// Reject intervals that would overflow the halving denominator or make it non-positive.
+#[test]
+fn halving_interval_must_be_positive_and_representable_in_seconds() {
+    use super::{error::ParametersBuilderError, testnet};
+
+    let spacing = NetworkUpgrade::Genesis.target_spacing().num_seconds();
+    let max_interval = HeightDiff::MAX / spacing;
+    for interval in [
+        HeightDiff::MIN,
+        -1,
+        0,
+        max_interval + 1,
+        122_978_293_824_730_345,
+        HeightDiff::MAX,
+    ] {
+        assert!(
+            matches!(
+                testnet::Parameters::build().with_halving_interval(interval),
+                Err(ParametersBuilderError::InvalidHalvingInterval)
+            ),
+            "invalid interval {interval} must be rejected"
+        );
+    }
+
+    for interval in [1, 100, max_interval] {
+        let network = testnet::Parameters::build()
+            .with_slow_start_interval(Height(0))
+            .with_halving_interval(interval)
+            .expect("positive interval fits in target seconds")
+            .with_activation_heights(testnet::ConfiguredActivationHeights {
+                blossom: Some(1),
+                canopy: Some(1),
+                ..Default::default()
+            })
+            .unwrap()
+            .clear_funding_streams()
+            .to_network()
+            .unwrap();
+        assert_eq!(network.pre_blossom_halving_interval(), interval);
+        assert_eq!(network.post_blossom_halving_interval(), interval * 2);
+        assert_eq!(
+            halving(Height(2), &network),
+            if interval == 1 { 1 } else { 0 }
+        );
+        if interval == max_interval {
+            assert_eq!(halving(Height::MAX, &network), 0);
+        }
+    }
+}

@@ -61,6 +61,10 @@ pub enum ParametersBuilderError {
     #[non_exhaustive]
     HalvingIntervalAfterFundingStreams,
 
+    #[error("halving interval must be positive and fit in i64 as both target seconds and post-Blossom blocks")]
+    #[non_exhaustive]
+    InvalidHalvingInterval,
+
     #[error("checkpoints file format must be valid")]
     #[non_exhaustive]
     InvalidCheckpointsFormat,

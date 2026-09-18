@@ -26,6 +26,7 @@ use zakura_chain::{
     parameters::{
         testnet::{ConfiguredActivationHeights, Parameters},
         Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET, ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
+        SPROUT_BLOCK_JOINSPLIT_LIMIT,
     },
     primitives::{ed25519, x25519, Groth16Proof},
     sapling,
@@ -4576,6 +4577,69 @@ async fn mempool_forgives_the_shielded_limits_during_the_activation_grace_period
         )
         .oneshot(Request::Mempool {
             transaction: Arc::unwrap_or_clone(tx).into(),
+            height,
+        })
+        .await;
+
+        assert_eq!(response, Err(expected_error.clone()), "at {height:?}");
+        assert_eq!(
+            expected_error.mempool_misbehavior_score(),
+            expected_score,
+            "at {height:?}",
+        );
+    }
+}
+
+/// The V12 finding F-280823 repro: a peer one block behind the NU7 activation
+/// height validly admits a V4 transaction carrying Sprout JoinSplits, because
+/// ZIP 218 is inactive in its context and V4 has no consensus branch ID to
+/// check. Relaying it must not ban that peer. The ZIP 218 check runs before the
+/// V4 version check, so the transaction still gets a ZIP 218 rejection.
+#[tokio::test]
+async fn mempool_forgives_sprout_joinsplits_at_the_nu7_boundary() {
+    let _init_guard = zakura_test::init();
+
+    let activation_height = Height(100);
+    let network = nu7_activation_testnet(activation_height.0);
+
+    // The Sprout JoinSplit limit is zero from NU7, so one JoinSplit exceeds it.
+    let (joinsplit_data, _signing_key) = mock_sprout_join_split_data();
+    let tx = Transaction::V4 {
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        lock_time: LockTime::unlocked(),
+        expiry_height: Height::MAX_EXPIRY_HEIGHT,
+        joinsplit_data: Some(joinsplit_data),
+        sapling_shielded_data: None,
+    };
+
+    let over_limit_error = TransactionError::SproutJoinSplitsExceedBlockLimit {
+        joinsplits: 1,
+        limit: SPROUT_BLOCK_JOINSPLIT_LIMIT,
+    };
+
+    let cases = [
+        (
+            activation_height,
+            over_limit_error
+                .clone()
+                .into_upgrade_activation_grace_period(),
+            0,
+        ),
+        (
+            Height(activation_height.0 + 40),
+            over_limit_error.clone(),
+            100,
+        ),
+    ];
+
+    for (height, expected_error, expected_score) in cases {
+        let response = Verifier::new_for_tests(
+            &network,
+            service_fn(|_| async { unreachable!("state service should not be called") }),
+        )
+        .oneshot(Request::Mempool {
+            transaction: tx.clone().into(),
             height,
         })
         .await;

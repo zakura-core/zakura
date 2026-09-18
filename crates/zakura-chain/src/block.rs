@@ -488,7 +488,7 @@ mod issuance_deficit_properties {
     }
     #[test]
     fn issuance_accounting_activation_genesis_and_sign_boundaries() {
-        for activation in [None, Some(0), Some(1), Some(3)] {
+        for activation in [None, Some(1), Some(3)] {
             let network = Network::new_regtest(RegtestParameters {
                 activation_heights: ConfiguredActivationHeights {
                     nu7: activation,

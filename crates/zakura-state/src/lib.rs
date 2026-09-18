@@ -67,7 +67,8 @@ pub use request::Spend;
 
 pub use response::{
     AnyTx, BlockSyncBodyMetadata, GetBlockTemplateChainInfo, KnownBlock, MinedTx,
-    NonFinalizedBlocksListener, PreparedMinedRelayEligibility, ReadResponse, Response,
+    NonFinalizedBlocksListener, ParentInputs, PreparedMinedRelayEligibility, ReadResponse,
+    Response,
 };
 #[cfg(any(test, feature = "header-fuzz"))]
 pub use service::finalized_state::{replay_recovery_rows_bytes, RecoveryRowsReplaySummary};
@@ -124,7 +125,7 @@ pub use service::read::{
 };
 pub use service::{
     finalized_state::{DiskWriteBatch, FallibleDiskValue, FromDisk, IntoDisk, WriteDisk, ZakuraDb},
-    ReadStateService, VctRootRepairState, VctRootRepairStatus,
+    OwnedBlockRange, ReadStateService, VctRootRepairState, VctRootRepairStatus,
 };
 
 // Allow use in external tests

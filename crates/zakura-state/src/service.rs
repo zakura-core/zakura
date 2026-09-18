@@ -67,11 +67,12 @@ use crate::{
     },
     BlockAdmission, BlockCommitmentData, BoxError, CheckpointVerifiedBlock,
     CommitSemanticallyVerifiedError, Config, HashOrHeight, HistoricalTreeUnavailable, KnownBlock,
-    PreparedMinedRelayEligibility, ReadRequest, ReadResponse, Request, Response,
+    ParentInputs, PreparedMinedRelayEligibility, ReadRequest, ReadResponse, Request, Response,
     SemanticallyVerifiedBlock, StateInitError, ValidateContextError,
 };
 
 pub mod block_iter;
+mod block_range;
 pub mod chain_tip;
 pub mod watch_receiver;
 
@@ -91,6 +92,7 @@ pub mod arbitrary;
 #[cfg(test)]
 mod tests;
 
+pub use block_range::OwnedBlockRange;
 pub use finalized_state::{OutputLocation, TransactionIndex, TransactionLocation};
 use write::NonFinalizedWriteMessage;
 pub use write::{VctRootRepairState, VctRootRepairStatus};
@@ -1623,6 +1625,17 @@ impl ReadStateService {
         artifact_checkpoint.is_some()
     }
 
+    /// Subscribe to the lowest height at and above which block bodies are retained.
+    ///
+    /// The initial value reflects persisted pruning. Later values follow successful
+    /// writes, before their callers publish the corresponding verified tip. Archive
+    /// state publishes zero. Genesis is always retained separately, and checkpoint
+    /// retention can put this floor above the current verified tip.
+    /// Read-only secondary databases refresh it when they catch up with the primary.
+    pub fn subscribe_retained_block_height(&self) -> tokio::sync::watch::Receiver<block::Height> {
+        self.db.subscribe_retained_block_height()
+    }
+
     /// Subscribe to VCT supplied-root repair needs discovered by the finalized writer.
     pub fn subscribe_vct_root_repairs(&self) -> tokio::sync::watch::Receiver<VctRootRepairStatus> {
         self.vct_root_repair_receiver.clone()
@@ -1661,9 +1674,10 @@ impl ReadStateService {
             .borrow_mapped(|non_finalized_state| non_finalized_state.best_chain().cloned())
     }
 
-    /// Test-only access to the inner database.
+    /// Returns the shared database handle.
+    ///
     /// Can be used to modify the database without doing any consensus checks.
-    #[cfg(any(test, feature = "proptest-impl"))]
+    #[cfg(any(test, feature = "indexer", feature = "proptest-impl"))]
     pub fn db(&self) -> &ZakuraDb {
         &self.db
     }
@@ -1935,16 +1949,15 @@ impl Service<Request> for StateService {
                 let read_service = self.read_service.clone();
 
                 async move {
-                    if sent_hash_response.is_some() {
-                        return Ok(Response::KnownBlock(sent_hash_response));
-                    };
-
+                    // The sent cache retains committed blocks until finalization.
+                    // Prefer committed state so retries can observe a completed write.
                     let response = read::non_finalized_state_contains_block_hash(
                         &read_service.latest_non_finalized_state(),
                         hash,
                     )
                     // TODO: Move this to a blocking task, perhaps by moving some of this logic to the ReadStateService.
-                    .or_else(|| read::finalized_state_contains_block_hash(&read_service.db, hash));
+                    .or_else(|| read::finalized_state_contains_block_hash(&read_service.db, hash))
+                    .or(sent_hash_response);
 
                     timer.finish_desc("Request::KnownBlock");
 
@@ -2005,6 +2018,7 @@ impl Service<Request> for StateService {
             | Request::BlockLocator
             | Request::Transaction(_)
             | Request::UnspentBestChainUtxo(_)
+            | Request::CheckParentInputs { .. }
             | Request::Block(_)
             | Request::AnyChainBlock(_)
             | Request::BlockHeader(_)
@@ -2790,6 +2804,27 @@ impl Service<ReadRequest> for ReadStateService {
             ReadRequest::SpendingTransactionId(spend) => Ok(ReadResponse::TransactionId(
                 read::spending_transaction_hash(state.latest_best_chain(), &state.db, spend),
             )),
+
+            ReadRequest::CheckParentInputs { parent, outpoints } => {
+                let Some(finalized_tip) = state.db.tip() else {
+                    return Ok(ReadResponse::ParentInputs(ParentInputs::Inconclusive));
+                };
+                let inputs = read::parent_inputs(
+                    &state.latest_non_finalized_state(),
+                    &state.db,
+                    finalized_tip,
+                    parent,
+                    &outpoints,
+                );
+                // Finalization can remove an output spent after `parent`,
+                // or move `parent` from a non-finalized chain into the database.
+                let inputs = if state.db.finalized_tip_height() == Some(finalized_tip.0) {
+                    inputs
+                } else {
+                    ParentInputs::Inconclusive
+                };
+                Ok(ReadResponse::ParentInputs(inputs))
+            }
 
             ReadRequest::UnspentBestChainUtxo(outpoint) => Ok(ReadResponse::UnspentBestChainUtxo(
                 read::unspent_utxo(state.latest_best_chain(), &state.db, outpoint),

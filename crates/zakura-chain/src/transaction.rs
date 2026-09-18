@@ -307,6 +307,50 @@ impl fmt::Display for Transaction {
     }
 }
 
+/// The shielded action counts of a transaction or block, used to enforce the
+/// per-block shielded limits from ZIP 218.
+///
+/// Each count saturates at [`u32::MAX`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ShieldedActionCounts {
+    /// The number of Orchard actions plus the number of Ironwood actions.
+    ///
+    /// ZIP 218 names only Orchard actions. Zakura also counts Ironwood actions,
+    /// because NU6.3 (ZIP 258) moves new Orchard-protocol value to the Ironwood
+    /// pool. Ironwood actions therefore share the Orchard limit and add to the
+    /// global shielded budget.
+    pub orchard_and_ironwood_actions: u32,
+    /// The number of Sapling spends plus outputs.
+    pub sapling_ios: u32,
+    /// The number of Sprout JoinSplits.
+    pub sprout_joinsplits: u32,
+}
+
+impl ShieldedActionCounts {
+    /// Returns the total shielded cost:
+    /// `orchard_and_ironwood_actions + sapling_ios + 2 * sprout_joinsplits`.
+    ///
+    /// Sprout JoinSplits count twice because each produces two shielded outputs.
+    pub fn cost(&self) -> u32 {
+        self.orchard_and_ironwood_actions
+            .saturating_add(self.sapling_ios)
+            .saturating_add(self.sprout_joinsplits.saturating_mul(2))
+    }
+
+    /// Returns the field-wise saturating sum of `self` and `other`.
+    pub fn saturating_add(self, other: Self) -> Self {
+        Self {
+            orchard_and_ironwood_actions: self
+                .orchard_and_ironwood_actions
+                .saturating_add(other.orchard_and_ironwood_actions),
+            sapling_ios: self.sapling_ios.saturating_add(other.sapling_ios),
+            sprout_joinsplits: self
+                .sprout_joinsplits
+                .saturating_add(other.sprout_joinsplits),
+        }
+    }
+}
+
 impl Transaction {
     // identifiers and hashes
 
@@ -1253,6 +1297,20 @@ impl Transaction {
         self.orchard_shielded_data()
             .into_iter()
             .flat_map(orchard::ShieldedData::actions)
+    }
+
+    /// Returns this transaction's [`ShieldedActionCounts`], used to enforce the
+    /// ZIP 218 per-block shielded limits.
+    pub fn shielded_action_counts(&self) -> ShieldedActionCounts {
+        let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+
+        ShieldedActionCounts {
+            orchard_and_ironwood_actions: count(self.orchard_actions().count())
+                .saturating_add(count(self.ironwood_actions().count())),
+            sapling_ios: count(self.sapling_spends_per_anchor().count())
+                .saturating_add(count(self.sapling_outputs().count())),
+            sprout_joinsplits: count(self.joinsplit_count()),
+        }
     }
 
     /// Access the [`orchard::Nullifier`]s in this transaction, if there are any,

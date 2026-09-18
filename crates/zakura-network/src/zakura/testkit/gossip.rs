@@ -20,7 +20,7 @@ use std::{collections::HashSet, sync::Arc};
 use iroh::{
     endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler, Router},
-    NodeAddr,
+    EndpointAddr,
 };
 use tokio::sync::Mutex;
 
@@ -144,7 +144,7 @@ impl GossipNode {
     }
 
     /// Current Iroh node address.
-    pub async fn node_addr(&self) -> NodeAddr {
+    pub async fn node_addr(&self) -> EndpointAddr {
         LocalEndpointFactory::node_addr(self.router.endpoint()).await
     }
 
@@ -157,7 +157,7 @@ impl GossipNode {
     pub async fn connect(&self, peer: &GossipNode) -> Result<(), BoxError> {
         let peer_addr = peer.node_addr().await;
         let endpoint = self.router.endpoint();
-        endpoint.add_node_addr(peer_addr.clone())?;
+
         let conn = endpoint.connect(peer_addr, GOSSIP_ALPN).await?;
         self.core.register_conn(conn.clone()).await;
         let core = self.core.clone();

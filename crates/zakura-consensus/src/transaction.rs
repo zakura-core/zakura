@@ -471,6 +471,16 @@ where
             }
             check::sapling_point_encodings_are_valid(&tx)?;
 
+            // A transaction whose own shielded counts exceed a per-block ZIP 218
+            // limit can never be mined, so reject it on submission. ZIP 218 does
+            // not specify this rejection. The error's mempool misbehavior score
+            // is 100.
+            crate::block::check::shielded_action_limits_are_valid(
+                std::iter::once(&tx),
+                req.height(),
+                &network,
+            )?;
+
             // Soft fork: temporarily require transactions to not contain Orchard actions.
             //
             // This soft fork was added while NU 6.1 was the active epoch on the Zcash
@@ -985,7 +995,7 @@ where
         let tx = request.transaction();
         let nu = request.upgrade(network);
 
-        Self::verify_v4_transaction_network_upgrade(&tx, nu)?;
+        Self::verify_v4_transaction_network_upgrade(&tx, network, request.height(), nu)?;
 
         let sapling_bundle = cached_ffi_transaction.sighasher().sapling_bundle();
 
@@ -1002,11 +1012,37 @@ where
         .and(Self::verify_sapling_bundle(sapling_bundle, &sighash, tx_id)))
     }
 
-    /// Verifies if a V4 `transaction` is supported by `network_upgrade`.
+    /// Verifies if a V4 `transaction` is supported by `network_upgrade` at
+    /// `height` on `network`.
     fn verify_v4_transaction_network_upgrade(
         transaction: &Transaction,
+        network: &Network,
+        height: block::Height,
         network_upgrade: NetworkUpgrade,
     ) -> Result<(), TransactionError> {
+        // # Consensus
+        //
+        // > [NU7 onward] The transaction version number MUST be 5 or 6.
+        //
+        // https://zips.z.cash/zip-2003
+        //
+        // The `nu7` feature gates this rule until NU7 has activation heights,
+        // so default builds accept V4 at NU7.
+        //
+        // `activation_height` falls back to the next upgrade's height when this
+        // network omits NU7. The only later upgrade is `ZFuture`, which exists
+        // only under `cfg(zcash_unstable = "zfuture")`.
+        if cfg!(feature = "nu7")
+            && NetworkUpgrade::Nu7
+                .activation_height(network)
+                .is_some_and(|nu7_height| height >= nu7_height)
+        {
+            return Err(TransactionError::UnsupportedByNetworkUpgrade(
+                transaction.version(),
+                network_upgrade,
+            ));
+        }
+
         match network_upgrade {
             // Supports V4 transactions
             //
@@ -1031,7 +1067,8 @@ where
             | NetworkUpgrade::Nu6
             | NetworkUpgrade::Nu6_1
             | NetworkUpgrade::Nu6_2
-            | NetworkUpgrade::Nu6_3 => Ok(()),
+            | NetworkUpgrade::Nu6_3
+            | NetworkUpgrade::Nu7 => Ok(()),
 
             #[cfg(zcash_unstable = "zfuture")]
             NetworkUpgrade::ZFuture => Ok(()),
@@ -1039,8 +1076,7 @@ where
             // Does not support V4 transactions
             NetworkUpgrade::Genesis
             | NetworkUpgrade::BeforeOverwinter
-            | NetworkUpgrade::Overwinter
-            | NetworkUpgrade::Nu7 => Err(TransactionError::UnsupportedByNetworkUpgrade(
+            | NetworkUpgrade::Overwinter => Err(TransactionError::UnsupportedByNetworkUpgrade(
                 transaction.version(),
                 network_upgrade,
             )),

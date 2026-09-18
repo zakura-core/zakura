@@ -8,13 +8,22 @@ use std::{
 use thiserror::Error;
 
 use super::{
-    Frame, OrderedSessionDemand, OrderedStreamPolicy, Peer, Service, SinkReject, Stream, StreamMode,
+    Frame, Peer, Service, SessionDemand, SessionPolicy, SinkReject, Stream, StreamMode,
+    StreamWritePolicy,
 };
 use crate::zakura::{ServicePeerDirection, ZakuraConnId, ZakuraPeerId};
 
 /// Errors returned while building a [`ServiceRegistry`].
 #[derive(Debug, Error)]
 pub enum RegistryError {
+    /// A service declared incompatible persistent session layouts.
+    #[error("service {service} declared an invalid service session for kind {kind}")]
+    InvalidSessionLayout {
+        /// Service declaring the session.
+        service: &'static str,
+        /// Stream with an inconsistent session declaration.
+        kind: u16,
+    },
     /// Two services declared the same stream kind.
     #[error(
         "duplicate Zakura stream kind {kind} declared by {first_service} and {second_service}"
@@ -60,6 +69,23 @@ pub enum RegistryError {
     },
 }
 
+/// A validated set of persistent streams admitted as one service session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SessionLayout {
+    pub(crate) streams: Arc<[Stream]>,
+}
+
+impl SessionLayout {
+    /// The lowest stream kind supplies the session identity and layout version.
+    pub(crate) fn primary(&self) -> Stream {
+        self.streams[0]
+    }
+
+    pub(crate) fn is_multi_stream(&self) -> bool {
+        self.streams.len() > 1
+    }
+}
+
 /// Registry of Zakura protocol services.
 #[derive(Clone, Debug, Default)]
 pub struct ServiceRegistry {
@@ -67,6 +93,7 @@ pub struct ServiceRegistry {
     by_kind: HashMap<u16, usize>,
     by_capability: HashMap<u64, Vec<usize>>,
     supported_capabilities: u64,
+    session_layouts: HashMap<(u16, u16), SessionLayout>,
 }
 
 impl ServiceRegistry {
@@ -75,6 +102,7 @@ impl ServiceRegistry {
         let mut by_kind: HashMap<u16, usize> = HashMap::new();
         let mut by_capability: HashMap<u64, Vec<usize>> = HashMap::new();
         let mut supported_capabilities = 0;
+        let mut session_layouts = HashMap::new();
 
         for (index, service) in services.iter().enumerate() {
             let mut service_capabilities = HashSet::new();
@@ -116,6 +144,37 @@ impl ServiceRegistry {
                 service_capabilities.insert(stream.capability);
             }
 
+            let mut layouts: HashMap<u64, Vec<Stream>> = HashMap::new();
+            for stream in service
+                .streams()
+                .iter()
+                .filter(|s| s.mode == StreamMode::Persistent)
+            {
+                layouts.entry(stream.capability).or_default().push(*stream);
+            }
+            let mut primary_kind = None;
+            for mut streams in layouts.into_values() {
+                streams.sort_unstable_by_key(|stream| stream.kind);
+                let primary = streams[0];
+                let invalid = primary_kind.is_some_and(|kind| kind != primary.kind)
+                    || streams
+                        .windows(2)
+                        .any(|roles| roles[0].kind == roles[1].kind);
+                if invalid {
+                    return Err(RegistryError::InvalidSessionLayout {
+                        service: service.name(),
+                        kind: primary.kind,
+                    });
+                }
+                primary_kind = Some(primary.kind);
+                let layout = SessionLayout {
+                    streams: streams.into(),
+                };
+                for stream in layout.streams.iter() {
+                    session_layouts.insert((stream.kind, stream.version), layout.clone());
+                }
+            }
+
             for capability in service_capabilities {
                 by_capability.entry(capability).or_default().push(index);
             }
@@ -126,6 +185,7 @@ impl ServiceRegistry {
             by_kind,
             by_capability,
             supported_capabilities,
+            session_layouts,
         })
     }
 
@@ -139,6 +199,22 @@ impl ServiceRegistry {
         self.by_kind
             .get(&kind)
             .map(|index| Arc::clone(&self.services[*index]))
+    }
+
+    /// Local message limits supplied by the service that owns this stream.
+    pub(crate) fn message_payload_limits(&self, stream: Stream) -> &'static [(u16, usize)] {
+        self.service_for_kind(stream.kind)
+            .map(|service| service.message_payload_limits(stream))
+            .unwrap_or(&[])
+    }
+
+    pub(crate) fn stream_queue_depths(&self, stream: Stream) -> Option<(usize, usize)> {
+        self.service_for_kind(stream.kind)?
+            .stream_queue_depths(stream)
+    }
+
+    pub(crate) fn message_types(&self, stream: Stream) -> Option<&'static [u16]> {
+        self.service_for_kind(stream.kind)?.message_types(stream)
     }
 
     /// Lookup the declared stream for `kind`.
@@ -215,28 +291,50 @@ impl ServiceRegistry {
         self.supported_capabilities
     }
 
-    /// Ordered streams negotiated with a peer, in registry service order.
-    pub fn ordered_streams_for_negotiated(&self, negotiated: u64) -> Vec<Stream> {
+    /// Return the complete persistent layout containing this exact stream.
+    pub(crate) fn session_layout(&self, stream: Stream) -> Option<SessionLayout> {
+        self.session_layouts
+            .get(&(stream.kind, stream.version))
+            .filter(|layout| layout.streams.contains(&stream))
+            .cloned()
+    }
+
+    pub(crate) fn stream_write_policy(&self, stream: Stream) -> StreamWritePolicy {
+        self.service_for_kind(stream.kind)
+            .expect("a registered stream has an owning service")
+            .stream_write_policy(stream)
+    }
+
+    fn selected_session_streams(&self, service: &dyn Service, negotiated: u64) -> Vec<Stream> {
+        service
+            .streams()
+            .iter()
+            .filter(|stream| {
+                stream.mode == StreamMode::Persistent && negotiated & stream.capability != 0
+            })
+            .filter_map(|stream| self.session_layout(*stream))
+            .max_by_key(|layout| layout.primary().version)
+            .map_or_else(Vec::new, |layout| layout.streams.to_vec())
+    }
+
+    /// Persistent streams negotiated with a peer, in registry service order.
+    pub fn persistent_streams_for_negotiated(&self, negotiated: u64) -> Vec<Stream> {
         let mut streams = Vec::new();
 
         for service in self.services_for_negotiated(negotiated) {
-            streams.extend(selected_streams(
-                service.streams(),
-                negotiated,
-                StreamMode::Ordered,
-            ));
+            streams.extend(self.selected_session_streams(service.as_ref(), negotiated));
         }
 
         streams
     }
 
-    /// Ordered streams that should be lazily escalated for this peer now.
+    /// Persistent streams that should be lazily escalated for this peer now.
     ///
     /// The connection loop applies its per-kind opening policy to each returned
     /// stream. This demand check narrows the negotiated capabilities to services
     /// that currently have local interest and room; the owning reactor still
     /// makes the final admission decision after the typed session arrives.
-    pub fn ordered_streams_for_escalation(
+    pub fn persistent_streams_for_escalation(
         &self,
         negotiated: u64,
         peer_id: &ZakuraPeerId,
@@ -249,18 +347,14 @@ impl ServiceRegistry {
                 continue;
             }
 
-            streams.extend(selected_streams(
-                service.streams(),
-                negotiated,
-                StreamMode::Ordered,
-            ));
+            streams.extend(self.selected_session_streams(service.as_ref(), negotiated));
         }
 
         streams
     }
 
     /// Return true when the service owning `kind` still wants this peer.
-    pub fn wants_ordered_stream(
+    pub fn wants_session(
         &self,
         kind: u16,
         negotiated: u64,
@@ -275,26 +369,41 @@ impl ServiceRegistry {
     }
 
     /// Return the owning service's static ordered-stream policy.
-    pub fn ordered_stream_policy(&self, kind: u16) -> OrderedStreamPolicy {
+    pub fn session_policy(&self, kind: u16) -> SessionPolicy {
         self.service_for_kind(kind)
-            .map(|service| service.ordered_stream_policy(kind))
+            .map(|service| service.session_policy())
             .unwrap_or_default()
     }
 
     /// Return the owning service's current demand for an absent ordered session.
-    pub fn ordered_session_demand(
+    pub fn session_demand(
         &self,
         kind: u16,
         conn_id: ZakuraConnId,
         negotiated: u64,
         peer_id: &ZakuraPeerId,
         direction: ServicePeerDirection,
-    ) -> OrderedSessionDemand {
+    ) -> SessionDemand {
         let Some(service) = self.service_for_kind(kind) else {
-            return OrderedSessionDemand::Retire;
+            return SessionDemand::Retire;
         };
 
-        service.ordered_session_demand(conn_id, peer_id, negotiated, direction)
+        service.session_demand(conn_id, peer_id, negotiated, direction)
+    }
+
+    /// Recheck demand after a complete session has reserved its service capacity.
+    pub(crate) fn reserved_session_demand(
+        &self,
+        kind: u16,
+        conn_id: ZakuraConnId,
+        negotiated: u64,
+        peer_id: &ZakuraPeerId,
+        direction: ServicePeerDirection,
+    ) -> SessionDemand {
+        let Some(service) = self.service_for_kind(kind) else {
+            return SessionDemand::Retire;
+        };
+        service.reserved_session_demand(conn_id, peer_id, negotiated, direction)
     }
 
     /// Request/response streams negotiated with a peer, in registry service order.
@@ -303,7 +412,7 @@ impl ServiceRegistry {
 
         for service in self.services_for_negotiated(negotiated) {
             streams.extend(selected_streams(
-                service.streams(),
+                service.as_ref(),
                 negotiated,
                 StreamMode::RequestResponse,
             ));
@@ -470,9 +579,10 @@ impl ServiceRegistry {
 /// Each capability bit declares one version alternative.
 /// Select the highest matching version before opening the prelude.
 /// The stream selection scopes decoding and preserves existing streams for older peers.
-fn selected_streams(streams: &[Stream], negotiated: u64, mode: StreamMode) -> Vec<Stream> {
+fn selected_streams(service: &dyn Service, negotiated: u64, mode: StreamMode) -> Vec<Stream> {
     let mut selected = Vec::<Stream>::new();
-    for stream in streams
+    for stream in service
+        .streams()
         .iter()
         .copied()
         .filter(|stream| stream.mode == mode && negotiated & stream.capability != 0)
@@ -601,7 +711,7 @@ mod tests {
             version: 1,
             frame_cap: 1024,
             capability,
-            mode: StreamMode::Ordered,
+            mode: StreamMode::Persistent,
         }
     }
 
@@ -627,13 +737,46 @@ mod tests {
         assert!(registry.is_supported_stream(5, 7));
         assert!(registry.is_supported_stream(5, 8));
         assert_eq!(
-            registry.ordered_streams_for_negotiated(0b0001),
+            registry.persistent_streams_for_negotiated(0b0001),
             vec![versioned_stream(5, 7, 0b0001)]
         );
         assert_eq!(
-            registry.ordered_streams_for_negotiated(0b0011),
+            registry.persistent_streams_for_negotiated(0b0011),
             vec![versioned_stream(5, 8, 0b0010)]
         );
+    }
+
+    #[test]
+    fn session_versions_are_selected_as_complete_layouts() {
+        let legacy = versioned_stream(6, 1, 1);
+        let older = [versioned_stream(6, 2, 2), versioned_stream(7, 4, 2)];
+        let newer = [
+            versioned_stream(6, 3, 4),
+            versioned_stream(7, 1, 4),
+            versioned_stream(8, 1, 4),
+        ];
+        let service = TestService::new(
+            "session",
+            [vec![legacy], older.to_vec(), newer.to_vec()].concat(),
+        );
+        let registry = ServiceRegistry::new(vec![service]).unwrap();
+        assert_eq!(registry.persistent_streams_for_negotiated(1), vec![legacy]);
+        assert_eq!(registry.persistent_streams_for_negotiated(3), older);
+        // Per-kind selection would incorrectly choose stream 7 version 4.
+        assert_eq!(registry.persistent_streams_for_negotiated(7), newer);
+    }
+
+    #[test]
+    fn session_layouts_require_one_version_per_kind_and_a_stable_primary_kind() {
+        for streams in [
+            vec![versioned_stream(6, 1, 1), versioned_stream(6, 2, 1)],
+            vec![versioned_stream(6, 1, 1), versioned_stream(7, 1, 2)],
+        ] {
+            assert!(matches!(
+                ServiceRegistry::new(vec![TestService::new("invalid", streams)]),
+                Err(RegistryError::InvalidSessionLayout { .. })
+            ));
+        }
     }
 
     #[test]
@@ -658,7 +801,10 @@ mod tests {
 
     #[test]
     fn registry_builds_kind_and_capability_lookups() {
-        let header = TestService::new("header", vec![stream(5, 0b0001), stream(6, 0b0010)]);
+        let header = TestService::new(
+            "header",
+            vec![stream(5, 0b0001), versioned_stream(5, 2, 0b0010)],
+        );
         let gossip = TestService::new("gossip", vec![stream(2, 0b0100)]);
 
         let registry = ServiceRegistry::new(vec![header.clone(), gossip.clone()])
@@ -739,7 +885,10 @@ mod tests {
 
     #[test]
     fn supported_capabilities_are_or_of_declared_streams() {
-        let header = TestService::new("header", vec![stream(5, 0b0001), stream(6, 0b0010)]);
+        let header = TestService::new(
+            "header",
+            vec![stream(5, 0b0001), versioned_stream(5, 2, 0b0010)],
+        );
         let gossip = TestService::new("gossip", vec![stream(2, 0b0100)]);
 
         let registry = ServiceRegistry::new(vec![header, gossip])
@@ -750,7 +899,10 @@ mod tests {
 
     #[test]
     fn services_for_negotiated_matches_any_bit_once_in_registration_order() {
-        let header = TestService::new("header", vec![stream(5, 0b0001), stream(6, 0b0010)]);
+        let header = TestService::new(
+            "header",
+            vec![stream(5, 0b0001), versioned_stream(5, 2, 0b0010)],
+        );
         let gossip = TestService::new("gossip", vec![stream(2, 0b0100)]);
         let discovery = TestService::new("discovery", vec![stream(4, 0b1000)]);
 
@@ -773,7 +925,7 @@ mod tests {
             "multi-capability",
             vec![
                 stream(5, 0b0001),
-                stream(6, 0b0010),
+                versioned_stream(5, 2, 0b0010),
                 request_response_one,
                 request_response_two,
             ],
@@ -783,12 +935,12 @@ mod tests {
         let peer = ZakuraPeerId::new(vec![8; 32]).expect("32-byte test peer id is valid");
 
         let ordered_kinds: Vec<_> = registry
-            .ordered_streams_for_negotiated(0b0001)
+            .persistent_streams_for_negotiated(0b0001)
             .iter()
             .map(|stream| stream.kind)
             .collect();
         let escalated_kinds: Vec<_> = registry
-            .ordered_streams_for_escalation(0b0001, &peer, ServicePeerDirection::Outbound)
+            .persistent_streams_for_escalation(0b0001, &peer, ServicePeerDirection::Outbound)
             .iter()
             .map(|stream| stream.kind)
             .collect();
@@ -911,7 +1063,7 @@ mod tests {
     }
 
     #[test]
-    fn ordered_streams_for_escalation_filters_services_without_demand() {
+    fn persistent_streams_for_escalation_filters_services_without_demand() {
         let header = TestService::new("header", vec![stream(5, 0b0001)]);
         let discovery = TestService::new("discovery", vec![stream(4, 0b0010)]);
         let registry = ServiceRegistry::new(vec![header.clone(), discovery.clone()])
@@ -920,8 +1072,11 @@ mod tests {
 
         header.set_wants(false);
 
-        let streams =
-            registry.ordered_streams_for_escalation(0b0011, &peer, ServicePeerDirection::Outbound);
+        let streams = registry.persistent_streams_for_escalation(
+            0b0011,
+            &peer,
+            ServicePeerDirection::Outbound,
+        );
         let stream_kinds: Vec<_> = streams.iter().map(|stream| stream.kind).collect();
 
         assert_eq!(stream_kinds, [4]);

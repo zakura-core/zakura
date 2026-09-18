@@ -2142,7 +2142,7 @@ async fn add_initial_peers_deadlock() {
 /// Open a local listener on `listen_addr` for `network`.
 /// Asserts that the local listener address works as expected.
 async fn local_listener_port_with(listen_addr: SocketAddr, network: Network) {
-    let config = Config {
+    let mut config = Config {
         listen_addr,
         network,
 
@@ -2153,6 +2153,7 @@ async fn local_listener_port_with(listen_addr: SocketAddr, network: Network) {
 
         ..Config::default()
     };
+    config.zakura.listen_addr = Some("127.0.0.1:0".parse().expect("valid test bind address"));
     let inbound_service =
         service_fn(|_| async { unreachable!("inbound service should never be called") });
 
@@ -2212,7 +2213,9 @@ where
     // (localhost should be enough).
     let unused_v4 = "0.0.0.0:0".parse().unwrap();
 
-    let default_config = default_config.into().unwrap_or_default();
+    let mut default_config = default_config.into().unwrap_or_default();
+    default_config.zakura.listen_addr =
+        Some("127.0.0.1:0".parse().expect("valid test bind address"));
 
     let config = Config {
         peerset_initial_target_size,

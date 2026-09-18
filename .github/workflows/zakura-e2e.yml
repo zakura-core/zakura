@@ -128,7 +128,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0 # zizmor: ignore[cache-poisoning] -- CI e2e job; uploads only diagnostic traces and builds a throwaway debug binary, nothing published/released
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v1.17.0 # zizmor: ignore[cache-poisoning] -- CI e2e job; uploads only diagnostic traces and builds a throwaway debug binary, nothing published/released
         with:
           toolchain: stable
           # The two regtest-e2e jobs share one debug `cargo test --no-run` build
@@ -200,7 +200,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0 # zizmor: ignore[cache-poisoning] -- CI integration job; uploads only diagnostic test traces
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v1.17.0 # zizmor: ignore[cache-poisoning] -- CI integration job; uploads only diagnostic test traces
         with:
           toolchain: stable
           # Same debug + default-release-binaries workspace build as the unit
@@ -208,7 +208,7 @@ jobs:
           cache-shared-key: zakura-drb-debug
           cache-on-failure: true
           cache-save-if: false
-      - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 #v2.86.8
+      - uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 #v2.87.9
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -244,13 +244,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0 # zizmor: ignore[cache-poisoning] -- CI fuzz-scenario job; uploads only diagnostic test traces
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v1.17.0 # zizmor: ignore[cache-poisoning] -- CI fuzz-scenario job; uploads only diagnostic test traces
         with:
           toolchain: stable
           cache-shared-key: zakura-drb-debug
           cache-on-failure: true
           cache-save-if: false
-      - uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 #v2.86.8
+      - uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 #v2.87.9
         with:
           tool: cargo-nextest
       - uses: ./.github/actions/setup-zakura-build
@@ -289,7 +289,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0 # zizmor: ignore[cache-poisoning] -- CI e2e job; uploads only diagnostic traces and builds a throwaway debug binary, nothing published/released
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v1.17.0 # zizmor: ignore[cache-poisoning] -- CI e2e job; uploads only diagnostic traces and builds a throwaway debug binary, nothing published/released
         with:
           toolchain: stable
           cache-shared-key: zakura-e2e-debug

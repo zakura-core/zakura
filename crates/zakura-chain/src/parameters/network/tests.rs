@@ -8,15 +8,44 @@ use color_eyre::Report;
 use super::Network;
 use crate::{
     amount::{Amount, NonNegative},
-    block::Height,
+    block::{Height, HeightDiff},
     parameters::{
         subsidy::{
-            block_subsidy, constants::POST_BLOSSOM_HALVING_INTERVAL, halving, halving_divisor,
-            height_for_halving, ParameterSubsidy as _,
+            block_subsidy, constants::POST_BLOSSOM_HALVING_INTERVAL, funding_stream_address_period,
+            halving, halving_divisor, height_for_halving, ParameterSubsidy,
         },
         NetworkUpgrade,
     },
 };
+
+#[test]
+fn funding_stream_period_uses_floor_division_for_negative_periods() {
+    struct TestParameters;
+
+    impl ParameterSubsidy for TestParameters {
+        fn height_for_first_halving(&self) -> Height {
+            Height(100)
+        }
+
+        fn post_blossom_halving_interval(&self) -> HeightDiff {
+            50
+        }
+
+        fn pre_blossom_halving_interval(&self) -> HeightDiff {
+            25
+        }
+
+        fn funding_stream_address_change_interval(&self) -> HeightDiff {
+            10
+        }
+    }
+
+    let parameters = TestParameters;
+
+    assert_eq!(0, funding_stream_address_period(Height(50), &parameters));
+    assert_eq!(-1, funding_stream_address_period(Height(49), &parameters));
+    assert_eq!(-2, funding_stream_address_period(Height(39), &parameters));
+}
 
 #[test]
 fn halving_test() -> Result<(), Report> {
@@ -317,4 +346,53 @@ fn check_height_for_num_halvings() {
             );
         }
     }
+}
+
+/// Tests that `is_nu7_active` is true exactly from the NU7 activation height, and
+/// never on networks without one.
+#[test]
+fn is_nu7_active_from_the_nu7_activation_height() -> Result<(), Report> {
+    use crate::parameters::testnet::{self, ConfiguredActivationHeights};
+
+    let _init_guard = zakura_test::init();
+
+    let without_nu7 = testnet::Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            blossom: Some(1),
+            nu6: Some(10),
+            ..Default::default()
+        })
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid");
+
+    let with_nu7 = testnet::Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            blossom: Some(1),
+            nu7: Some(10),
+            ..Default::default()
+        })
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid");
+
+    for (name, network) in [
+        ("Mainnet", Network::Mainnet),
+        ("without NU7", without_nu7),
+        ("with NU7", with_nu7),
+    ] {
+        let nu7_height = NetworkUpgrade::Nu7.activation_height(&network);
+
+        for height in (0..20).map(Height) {
+            assert_eq!(
+                nu7_height.is_some_and(|nu7_height| height >= nu7_height),
+                NetworkUpgrade::is_nu7_active(&network, height),
+                "{name} at {height:?}"
+            );
+        }
+    }
+
+    Ok(())
 }

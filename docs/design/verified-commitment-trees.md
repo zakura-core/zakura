@@ -562,7 +562,10 @@ So the committer **fails closed** rather than falling back to recompute (commit 
   region is exactly `tip < last_checkpoint_height` (the last checkpoint height itself carries the real frontier).
 
 Outside the frozen window (legacy), a missing root is
-simply the ordinary legacy recompute — bit-identical to today. Inside the frozen window, a
+simply the ordinary legacy recompute — bit-identical to today. The writer also uses
+this path when a root is present but its required successor metadata is unavailable.
+It still attempts fast commits when complete metadata becomes available later.
+Inside the frozen window, a
 missing root parks the current checkpoint block **in place** — **without resetting the block
 queue**. The writer continues to process header-chain control messages while it remains parked.
 An `ApplyHeaderChainInsert` completion retries the parked block immediately. The writer defers

@@ -1,0 +1,9 @@
+{
+  "Rules": [{
+    "ID": "sync-traces-seven-days",
+    "Status": "Enabled",
+    "Prefix": "sync-traces/",
+    "Expiration": {"Days": 7},
+    "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 1}
+  }]
+}

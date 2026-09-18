@@ -5,6 +5,8 @@
 //! The fixture commits a body prefix.
 //! The fixture admits the remaining headers with auxiliary deliveries.
 
+mod writer_fallback;
+
 use std::{num::NonZeroU64, sync::Arc};
 
 use proptest::prelude::*;

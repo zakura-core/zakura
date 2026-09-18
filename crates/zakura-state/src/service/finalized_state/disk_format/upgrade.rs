@@ -250,6 +250,9 @@ pub enum FormatChangeError {
     /// A migration or final format check found an invalid postcondition.
     #[error("database format migration postcondition failed: {0}")]
     InvalidPostcondition(String),
+    /// A migration cannot repair the existing records, so the state must be synced again.
+    #[error("delete the state database and sync again: {0}")]
+    ResyncRequired(String),
 }
 
 impl From<CancelFormatChange> for FormatChangeError {

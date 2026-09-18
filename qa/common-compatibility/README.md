@@ -1,8 +1,8 @@
 # Common compatibility
 
-This check exercises the pending common 2.0.0 cleanup before those crates are
-published. `dependencies.patch` pins the complete 17-crate family to
-`f150f4ef895475603a52ddecb850be9c00441c98` and includes the matching lockfile.
+This check exercises the pending common cleanup before it is published. `dependencies.patch` pins the complete 17-crate family to
+`a036226543f54dbc83c8d27713c7a24864b26301` and includes the matching lockfile. The snapshot retains workspace version
+1.2.0, but its git source distinguishes it from the published 1.2.0 crates.
 
 The Common compatibility workflow applies the patch only in its disposable
 checkout. Normal builds retain the published dependencies from the root
@@ -22,6 +22,6 @@ build cache with `CARGO_TARGET_DIR`. Do not apply the patch in a checkout used f
 packaging or release checks.
 
 Refresh the patch and its lockfile together when the candidate revision or base
-dependency graph changes. After a reviewed common 2.0.0 release exists, update the
+dependency graph changes. After a reviewed common 1.x release containing the cleanup exists, update the
 normal dependencies through the regular dependency and API compatibility checks
 and remove this temporary integration patch and job.

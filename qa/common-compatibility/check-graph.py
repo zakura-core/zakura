@@ -23,11 +23,11 @@ def check_graph(manifest, metadata):
         if len(packages) != 1:
             raise ValueError(f"expected one copy of {name}, found {len(packages)}")
         package = packages[0]
-        if package["source"] != source or package["version"] != "2.0.0":
-            raise ValueError(f"{name} must resolve to the pinned common 2.0.0 snapshot")
+        if package["source"] != source or package["version"] != "1.2.0":
+            raise ValueError(f"{name} must resolve to the pinned common 1.2.0 snapshot")
         if "zip-233" in package["features"]:
             raise ValueError(f"{name} still exposes the obsolete zip-233 feature")
-    print(f"Verified all 17 common crates at 2.0.0, revision {revision}")
+    print(f"Verified all 17 common crates at 1.2.0, revision {revision}")
 
 
 if __name__ == "__main__":

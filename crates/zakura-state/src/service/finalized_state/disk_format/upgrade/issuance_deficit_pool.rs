@@ -10,7 +10,13 @@ use zakura_chain::{
     amount::{Amount, NegativeAllowed, NonNegative},
     block::Height,
     block_info::BlockInfo,
-    parameters::{subsidy::scheduled_issuance_zatoshis, NetworkUpgrade},
+    parameters::{
+        subsidy::{
+            funding_stream_values, halving_block_subsidy, scheduled_issuance_zatoshis,
+            FundingStreamReceiver,
+        },
+        Network, NetworkUpgrade,
+    },
     value_balance::ValueBalance,
 };
 
@@ -92,6 +98,7 @@ fn backfill(
     };
 
     let network = db.network();
+    refuse_unrepairable_history(&network, tip_height)?;
     let baseline = baseline(db)?;
     let mut batch = DiskWriteBatch::new();
     let mut batched = 0;
@@ -134,6 +141,47 @@ fn backfill(
 
     write(batch)?;
 
+    Ok(())
+}
+
+/// Refuses databases whose committed value pools older migrations cannot repair.
+///
+/// Blocks at or above the ZIP 234 start derive their subsidy, and so their Deferred
+/// funding, from the parent's issuance deficit. Older versions committed those blocks
+/// without reissuance, so their Deferred balances differ from a fresh sync.
+///
+/// Before format 29, the version 27 replay omitted Deferred funding during slow start.
+/// A database that ran that replay can hold undercounted Deferred balances, and its
+/// version marker stops the corrected replay from running again. Block commits always
+/// applied the funding, so a fresh sync produces the correct balances.
+fn refuse_unrepairable_history(network: &Network, tip: Height) -> Result<(), FormatChangeError> {
+    if zakura_chain::parameters::subsidy::is_zip234_active(network, tip) {
+        return Err(FormatChangeError::ResyncRequired(format!(
+            "blocks at or above the ZIP 234 start {:?} were committed without reissuance",
+            zakura_chain::parameters::subsidy::zip234_start_height(network),
+        )));
+    }
+
+    let slow_start_end = network.slow_start_interval().min(tip);
+    for height in 1..=slow_start_end.0 {
+        let height = Height(height);
+        let invalid = |error: &dyn std::fmt::Display| {
+            FormatChangeError::InvalidPostcondition(format!(
+                "invalid funding streams at {height:?}: {error}"
+            ))
+        };
+        let subsidy = halving_block_subsidy(height, network).map_err(|error| invalid(&error))?;
+        let deferred = funding_stream_values(height, network, subsidy)
+            .map_err(|error| invalid(&error))?
+            .remove(&FundingStreamReceiver::Deferred)
+            .unwrap_or_default();
+        if !deferred.is_zero() {
+            return Err(FormatChangeError::ResyncRequired(format!(
+                "this network pays Deferred funding during slow start from {height:?}, \
+                 and older replays of those blocks did not record it"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -381,6 +429,10 @@ mod database_tests {
             },
             ..Default::default()
         });
+        legacy_db_on(network, rows, pool_len)
+    }
+
+    fn legacy_db_on(network: Network, rows: u32, pool_len: usize) -> ZakuraDb {
         let db = ZakuraDb::new(
             &Config::ephemeral(),
             STATE_DATABASE_KIND,
@@ -503,6 +555,50 @@ mod database_tests {
         ));
         Upgrade.run(Some(Height(3)), &db, &rx).unwrap();
         assert_upgraded(&db, 4);
+    }
+
+    /// Older replays omitted Deferred funding during slow start, so a database on a network
+    /// that pays it there must sync again.
+    #[test]
+    fn migration_requires_resync_after_slow_start_deferred_funding() {
+        use zakura_chain::parameters::testnet::{
+            self, ConfiguredFundingStreamRecipient, ConfiguredFundingStreams,
+        };
+        let network = testnet::Parameters::build()
+            .with_activation_heights(ConfiguredActivationHeights {
+                blossom: Some(1),
+                canopy: Some(2),
+                ..Default::default()
+            })
+            .unwrap()
+            .with_funding_streams(vec![ConfiguredFundingStreams {
+                height_range: Some(Height(2)..Height(100)),
+                recipients: Some(vec![ConfiguredFundingStreamRecipient {
+                    receiver: FundingStreamReceiver::Deferred,
+                    numerator: 12,
+                    addresses: None,
+                }]),
+            }])
+            .to_network()
+            .unwrap();
+        assert!(network.slow_start_interval() > Height(3));
+
+        // The tip is below the first Deferred payment, so the history is intact.
+        let db = legacy_db_on(network.clone(), 2, 48);
+        let (_tx, rx) = crossbeam_channel::bounded(1);
+        Upgrade.run(Some(Height(1)), &db, &rx).unwrap();
+
+        let db = legacy_db_on(network, 4, 48);
+        let before = db.raw_block_info_cf().zs_get(&Height(3)).unwrap();
+        assert!(matches!(
+            Upgrade.run(Some(Height(3)), &db, &rx),
+            Err(FormatChangeError::ResyncRequired(_))
+        ));
+        assert_eq!(
+            db.raw_block_info_cf().zs_get(&Height(3)).unwrap().0,
+            before.0,
+            "the refusal leaves the legacy records unchanged"
+        );
     }
 
     #[test]

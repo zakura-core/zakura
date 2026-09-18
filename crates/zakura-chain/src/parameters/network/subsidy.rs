@@ -489,20 +489,27 @@ pub fn scheduled_issuance_zatoshis(height: Height, net: &Network) -> Result<u128
     let mut total: u128 = 0;
 
     // The slow start issues `rate * h` below the shift and `rate * (h + 1)` from the shift
-    // up to the interval, so each phase is a triangular number rather than a rectangle.
+    // up to the interval, so each phase is a sum of consecutive integers.
     if slow_start_interval > 0 && slow_start_shift > 0 {
         let rate = u128::from(MAX_BLOCK_SUBSIDY) / slow_start_interval;
-        let triangle = |n: u128| n * (n + 1) / 2;
+        let sum_from_one_through = |n: u128| n * (n + 1) / 2;
 
-        // `rate * h` for h in 1..=min(height, shift - 1).
-        let first_phase_end = height.min(slow_start_shift - 1);
-        total += triangle(first_phase_end) * rate;
+        // A short halving interval can overflow the halving divisor inside the slow start.
+        // From that height on, every block subsidy is zero.
+        let last_paying = first_overflowed_halving_height(net, slow_start_interval - 1)
+            .map_or(slow_start_interval - 1, |cutoff| cutoff.saturating_sub(1));
+        let slow_start_end = height.min(last_paying);
 
-        // `rate * (h + 1)` for h in shift..=min(height, interval - 1), which is
-        // `rate * k` for k in shift + 1..=that end + 1.
-        if height >= slow_start_shift {
-            let second_phase_end = height.min(slow_start_interval - 1);
-            total += (triangle(second_phase_end + 1) - triangle(slow_start_shift)) * rate;
+        // `rate * h` for h in 1..=min(slow_start_end, shift - 1).
+        let first_phase_end = slow_start_end.min(slow_start_shift - 1);
+        total += sum_from_one_through(first_phase_end) * rate;
+
+        // `rate * (h + 1)` for h in shift..=slow_start_end, which is
+        // `rate * k` for k in shift + 1..=slow_start_end + 1.
+        if slow_start_end >= slow_start_shift {
+            total += (sum_from_one_through(slow_start_end + 1)
+                - sum_from_one_through(slow_start_shift))
+                * rate;
         }
     }
 
@@ -542,6 +549,26 @@ pub fn scheduled_issuance_zatoshis(height: Height, net: &Network) -> Result<u128
     }
 
     Ok(total)
+}
+
+/// Returns the lowest height at or below `last` whose halving divisor overflows, if any.
+fn first_overflowed_halving_height(net: &Network, last: u128) -> Option<u128> {
+    let last = u32::try_from(last).ok()?;
+    if halving_divisor(Height(last), net).is_some() {
+        return None;
+    }
+
+    // `halving` is non-decreasing, so binary search for the first overflow.
+    let (mut low, mut high) = (0, last);
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if halving_divisor(Height(mid), net).is_none() {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    Some(u128::from(low))
 }
 
 /// Returns the lowest height above `height` at which the halving block subsidy changes,

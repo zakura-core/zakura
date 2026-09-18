@@ -133,8 +133,9 @@ impl TransactionTemplate<NegativeOrZero> {
         height: Height,
         miner_params: &MinerParams,
         txs_fee: Amount<NonNegative>,
+        issuance_deficit: Option<Amount<NonNegative>>,
     ) -> Result<Self, TransactionError> {
-        let block_subsidy = block_subsidy(height, net, None)?;
+        let block_subsidy = block_subsidy(height, net, issuance_deficit)?;
         let miner_reward = miner_subsidy(height, net, block_subsidy)? + txs_fee;
         let miner_reward = Zatoshis::try_from(miner_reward?)?;
 

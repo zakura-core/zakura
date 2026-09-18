@@ -5,10 +5,12 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 
 use zakura_chain::{
+    amount::NonNegative,
     block::{self, Hash, Height},
     history_tree::HistoryTree,
-    parameters::{Network, NetworkUpgrade},
+    parameters::{subsidy::is_zip234_active, Network, NetworkUpgrade},
     serialization::{DateTime32, Duration32},
+    value_balance::ValueBalance,
     work::difficulty::{CompactDifficulty, PartialCumulativeWork, Work, U256},
 };
 
@@ -78,12 +80,27 @@ pub fn get_block_template_chain_info(
     let (best_tip_height, best_tip_hash, best_relevant_chain, best_tip_history_tree) =
         best_relevant_chain_and_history_tree_result?;
 
+    // A candidate block's ZIP 234 subsidy comes from the money reserve after its parent,
+    // which is this tip.
+    let tip_info = read::block_info(non_finalized_state.best_chain(), db, best_tip_hash.into());
+    let value_pools = match tip_info {
+        Some(block_info) => *block_info.value_pools(),
+        None if best_tip_height
+            .next()
+            .is_ok_and(|height| is_zip234_active(network, height)) =>
+        {
+            return Err("missing chain value pools for the ZIP 234 candidate block parent".into());
+        }
+        None => ValueBalance::zero(),
+    };
+
     difficulty_time_and_history_tree(
         best_relevant_chain,
         best_tip_height,
         best_tip_hash,
         network,
         best_tip_history_tree,
+        value_pools,
     )
 }
 
@@ -228,6 +245,7 @@ fn difficulty_time_and_history_tree(
     tip_hash: block::Hash,
     network: &Network,
     history_tree: Arc<HistoryTree>,
+    value_pools: ValueBalance<NonNegative>,
 ) -> Result<GetBlockTemplateChainInfo, BoxError> {
     if relevant_chain.is_empty() {
         return Err("mining template difficulty context is empty".into());
@@ -281,6 +299,7 @@ fn difficulty_time_and_history_tree(
         cur_time,
         min_time,
         max_time,
+        value_pools,
     };
 
     adjust_difficulty_and_time_for_testnet(&mut result, network, tip_height, relevant_data)?;
@@ -411,6 +430,7 @@ mod tests {
 
         let is_standard = |offset: u32| {
             let mut result = GetBlockTemplateChainInfo {
+                value_pools: ValueBalance::zero(),
                 tip_hash: block::Hash([0; 32]),
                 tip_height,
                 chain_history_root: None,
@@ -495,6 +515,7 @@ mod tests {
                         block.hash(),
                         &network,
                         Arc::new(HistoryTree::default()),
+                        ValueBalance::zero(),
                     );
                     assert_eq!(
                         result.is_ok(),

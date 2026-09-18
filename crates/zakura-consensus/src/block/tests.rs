@@ -1751,6 +1751,57 @@ async fn unavailable_parent_does_not_dispatch_transactions_or_score_supplier() {
     assert_eq!(error.misbehavior_score(), 0);
 }
 
+/// An intrinsic duplicate is decided without the parent, so a pending parent must not hide it.
+///
+/// While `BlockParentContext` is unavailable the verifier reports the body error instead of
+/// `MissingParentContext` only for errors this predicate accepts. A transaction list whose
+/// deduplication changes the committed root is permanently invalid whatever the parent turns
+/// out to be: reporting the pending-parent error would classify it retryable and leave its
+/// supplier unscored, so the same body could be redelivered for the whole retention window.
+/// Reaching that path needs a header with valid proof of work over the duplicated list, which
+/// is why this checks the classification rather than driving the whole verifier.
+#[test]
+fn intrinsic_duplicates_are_not_hidden_by_a_pending_parent() -> Result<(), Report> {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let original = Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_347499_BYTES[..])?;
+
+    // Padding aliases, then lists whose deduplication changes the root. Both are decided
+    // from the header's commitment and the delivered list alone.
+    for indices in [
+        &[0, 1, 2, 2][..],
+        &[0, 1, 2, 3, 4, 4, 4, 4][..],
+        &[0, 1, 0][..],
+        &[0, 1, 0, 0][..],
+        &[0, 1, 2, 3, 0, 1][..],
+    ] {
+        let mut block = original.clone();
+        block.transactions = indices
+            .iter()
+            .map(|index| original.transactions[*index].clone())
+            .collect();
+        let transaction_hashes: Vec<_> = block.transactions.iter().map(|tx| tx.hash()).collect();
+        Arc::make_mut(&mut block.header).merkle_root = transaction_hashes.iter().cloned().collect();
+
+        let error =
+            check::merkle_root_validity_with_attribution(&network, &block, &transaction_hashes)
+                .expect_err("a duplicated transaction list must be rejected");
+        assert!(
+            crate::block::commitment::is_context_independent_body_error(&error),
+            "{indices:?} is decided without the parent, so it must survive a pending parent: \
+             {error:?}"
+        );
+    }
+
+    assert!(
+        !crate::block::commitment::is_context_independent_body_error(
+            &VerifyBlockError::MissingParentContext(block::Hash([0; 32]))
+        ),
+        "a pending parent is not a body error"
+    );
+    Ok(())
+}
+
 #[tokio::test(start_paused = true)]
 async fn parent_lookup_failure_and_timeout_remain_retryable() {
     for pending in [false, true] {

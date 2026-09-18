@@ -412,14 +412,16 @@ where
                 match commitment::parent_context(state_service.clone(), &block).await {
                     Ok(context) => Some(context),
                     Err(error @ VerifyBlockError::MissingParentContext(_)) => {
-                        // Padding is a bad delivery even while parent verification is pending.
+                        // Padding is a bad delivery even while parent verification is pending,
+                        // and so is a transaction list the header's root commits to with an
+                        // intrinsic duplicate. Both are decided without the parent.
                         let hashes: Vec<_> =
                             block.transactions.iter().map(|tx| tx.hash()).collect();
-                        if let Err(padding) =
+                        if let Err(body_error) =
                             check::merkle_root_validity_with_attribution(&network, &block, &hashes)
                         {
-                            if commitment::is_padding_error(&padding) {
-                                return Err(padding);
+                            if commitment::is_context_independent_body_error(&body_error) {
+                                return Err(body_error);
                             }
                         }
                         return Err(error);

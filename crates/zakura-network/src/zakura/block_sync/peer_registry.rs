@@ -945,6 +945,14 @@ impl PeerRegistry {
         }
     }
 
+    /// Withdraw a provisional floor exclusion that settlement decided not to charge.
+    pub(super) fn clear_floor_avoid(&self, peer: &ZakuraPeerId, height: block::Height) {
+        let mut peers = self.lock();
+        if let Some(entry) = peers.get_mut(peer) {
+            entry.floor_watchdog_avoid.remove(&height);
+        }
+    }
+
     /// Whether the floor watchdog still hard-excludes this peer from `height`.
     pub(super) fn is_floor_height_avoided(
         &self,

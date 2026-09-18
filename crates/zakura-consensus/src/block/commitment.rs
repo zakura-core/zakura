@@ -22,6 +22,16 @@ pub(crate) fn is_padding_error(error: &VerifyBlockError) -> bool {
     )
 }
 
+/// Whether the merkle-root attribution proved the body invalid without the parent's context.
+///
+/// A padding alias and an intrinsic duplicate are both decided from the header's committed
+/// root and the delivered transaction list alone, so neither determination changes once the
+/// parent commits. Reporting the pending-parent error instead would make a permanently
+/// invalid body look retryable and leave its supplier unscored.
+pub(crate) fn is_context_independent_body_error(error: &VerifyBlockError) -> bool {
+    is_padding_error(error) || matches!(error, VerifyBlockError::NonMalleableDuplicateTransaction)
+}
+
 /// Read the exact committed parent and authenticate the body's claimed height.
 pub(super) async fn parent_context<S>(
     state: S,

@@ -518,8 +518,8 @@ fn startup_migration_failure_preserves_version_and_retry_matches_fresh_sync() {
     );
 }
 
-/// From NU7, both commit paths reject a block that overdraws the NSM value balance, and
-/// agree on the balance after a block that does not.
+/// Both commit paths track the same signed balance. With the NU7 feature enabled,
+/// they reject a block that overdraws it from NU7 activation onward.
 #[test]
 fn signed_balance_agrees_across_both_commit_paths() {
     let _guard = zakura_test::init();
@@ -532,7 +532,7 @@ fn signed_balance_agrees_across_both_commit_paths() {
             forks.commit_new_chain(SemanticallyVerifiedBlock::from(block.clone()), &state.db);
         let finalized_result = commit(&mut state, &block);
 
-        if excess > 0 {
+        if cfg!(feature = "nu7") && excess > 0 {
             assert!(fork_result.is_err(), "excess {excess}");
             assert!(finalized_result.is_err(), "excess {excess}");
             continue;

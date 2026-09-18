@@ -365,6 +365,7 @@ pub struct VerifiedUnminedTx {
     pub transaction: UnminedTx,
 
     /// The transaction fee for this unmined transaction.
+    /// This is the full fee before the block's aggregate NSM fee split.
     pub miner_fee: Amount<NonNegative>,
 
     /// The number of legacy transparent signature operations in this transaction.

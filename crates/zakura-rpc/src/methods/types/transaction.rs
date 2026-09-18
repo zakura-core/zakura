@@ -14,7 +14,7 @@ use zakura_chain::{
     block::{self, merkle::AUTH_DIGEST_PLACEHOLDER, Height},
     orchard,
     parameters::{
-        subsidy::{block_subsidy, funding_stream_values, miner_subsidy},
+        subsidy::{block_subsidy, funding_stream_values, miner_fee_share, miner_subsidy},
         Network, NetworkUpgrade,
     },
     primitives::ed25519,
@@ -74,8 +74,9 @@ where
     /// The fee for this transaction.
     ///
     /// Non-coinbase transactions must be `NonNegative`.
-    /// The Coinbase transaction `fee` is the negative sum of the fees of the transactions in
-    /// the block, so their fee must be `NegativeOrZero`.
+    /// A coinbase reports the negative fees it collects, excluding the block subsidy
+    /// and the NU7 NSM contribution. Its fee must be `NegativeOrZero`.
+    /// Non-coinbase entries report the full fee before the aggregate NSM split.
     #[getter(copy)]
     pub(crate) fee: Amount<FeeConstraint>,
 
@@ -128,6 +129,8 @@ impl From<VerifiedUnminedTx> for TransactionTemplate<NonNegative> {
 
 impl TransactionTemplate<NegativeOrZero> {
     /// Constructs a transaction template for a coinbase transaction.
+    ///
+    /// `txs_fee` is the sum of all non-coinbase fees before the NSM contribution.
     pub fn new_coinbase(
         net: &Network,
         height: Height,
@@ -136,7 +139,8 @@ impl TransactionTemplate<NegativeOrZero> {
         nsm_value_balance: Option<Amount<NonNegative>>,
     ) -> Result<Self, TransactionError> {
         let block_subsidy = block_subsidy(height, net, nsm_value_balance)?;
-        let miner_reward = miner_subsidy(height, net, block_subsidy)? + txs_fee;
+        let miner_fees = miner_fee_share(height, net, txs_fee);
+        let miner_reward = miner_subsidy(height, net, block_subsidy)? + miner_fees;
         let miner_reward = Zatoshis::try_from(miner_reward?)?;
 
         let mut builder = Builder::new(
@@ -301,7 +305,7 @@ impl TransactionTemplate<NegativeOrZero> {
             hash: tx.txid().as_ref().into(),
             auth_digest: tx.auth_commitment().as_ref().try_into()?,
             depends: Vec::new(),
-            fee: (-txs_fee).constrain()?,
+            fee: (-miner_fees).constrain()?,
             sigops: tx.sigops()?,
             required: true,
         })

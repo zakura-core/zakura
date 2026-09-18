@@ -13,6 +13,9 @@
 //! `Network` and `block::Height`.
 
 pub(crate) mod constants;
+mod fees;
+
+pub use fees::miner_fee_share;
 
 use std::{collections::HashMap, sync::OnceLock};
 

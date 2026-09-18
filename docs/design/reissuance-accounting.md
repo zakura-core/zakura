@@ -1,6 +1,7 @@
 # Reissuance accounting
 
-This implementation keeps reissuance behind the disabled-by-default `nu7` feature.
+This implementation keeps fee recycling and reissuance behind the disabled-by-default
+`nu7` feature.
 Production activation still requires policy guidance and a production NU7 branch ID.
 
 ## The seed
@@ -29,47 +30,43 @@ as the chain grows, and the migration in
 `crates/zakura-state/src/service/finalized_state/disk_format/upgrade/nsm_value_balance_pool.rs`
 applies it to an existing database. Change both together.
 
-## Fee recycling scope
+## Fee recycling
 
-Fee recycling is deferred to a separate change. The NU7 deployment draft's
-[NSM reserve rules] propose contributing `floor(6 * TransactionFees(h) / 10)` from
-aggregate block fees without adding transaction fields. This implementation retains
-the full fee claim in coinbase validation and block templates. Deferring that work does
-not exclude fee recycling from the intended NU7 scope.
+With the `nu7` feature enabled, the NU7 deployment draft's [NSM reserve rules]
+contribute `floor(6 * TransactionFees(h) / 10)` from aggregate block fees to NSM.
+Contributions start at NU7 activation, including the interval before reissuance starts.
+Before NU7, or without the feature, the miner receives all fees.
 
-For example, with 1,000 zatoshi in fees, the current implementation requires the
-coinbase to claim all 1,000. The draft would leave 400 for the miner and contribute
-600 to NSM. Omitting ZIP 233's transaction fields does not rule out that contribution.
+For example, with 1,000 zatoshi in fees, the miner receives 400 and NSM receives 600.
+The calculation rounds down the contribution once per block, so the remainder favors
+miners. Two transactions paying one zatoshi each contribute one zatoshi together.
+Rounding each transaction separately would incorrectly contribute zero.
 
-The follow-up must update coinbase validation, block templates, and activation tests
-together. Once coinbases withhold the contribution, the existing calculation below
-will include it through the reduction in issued value. Adding it again would count
-the same fees twice.
+`subsidy::miner_fee_share` in `zakura-chain` supplies the same calculation to coinbase
+validation and block templates. The coinbase must claim the subsidy plus the miner's
+share, subject to the existing funding stream and deferred pool rules. Claiming one
+zatoshi more or less than the permitted amount is rejected.
+
+In `getblocktemplate`, non-coinbase `fee` fields still report the full transaction fee.
+The coinbase `fee` is the negative amount of fees it collects, excluding the NSM
+contribution. For the 1,000-zatoshi example, it is `-400`. Miners that change the
+transaction list must recompute the split from the new aggregate fees.
 
 [NSM reserve rules]: https://github.com/zcash/zips/blob/32f447759aba83acfb20aab0757b68147643de22/zips/draft-valargroup-deploy-nu7.md#L120-L149
 
 ## Running total
 
-zips#1354 defines the balance by what each block claims:
+The balance follows this recurrence from NU7 onward:
 
-```
+```text
 NSMValueBalance(h) = NSMValueBalance(h - 1) - AdditionalBlockSubsidy(h) + removed(h)
 ```
 
-Under the currently implemented full fee claim rule, `removed(h)` is zero for
-semantically valid blocks from NU7 onward. This describes the current implementation,
-not the complete NU7 deployment proposal.
-
-A block carries no reference to its parent's balance, so the implementation derives the
-bonus from the block. Under the currently implemented ZIP 236 rule, the coinbase claims
-exactly `BlockSubsidy(h)` plus all transaction fees from NU6 onward. Fees move between
-transactions inside the block, so the block's change across the six monetary pools is
-`BlockSubsidy(h)`.
-That is the halving subsidy plus the bonus, so the halving subsidy minus it is
-`-AdditionalBlockSubsidy(h)`. The two definitions therefore agree from NU7 onward
-under the current fee rules. With fee recycling, the monetary pool change would instead
-be `BlockSubsidy(h) - removed(h)`, yielding
-`-AdditionalBlockSubsidy(h) + removed(h)` from the same calculation.
+Here, `removed(h)` is the fee contribution. The block's change across the six monetary
+pools is `BlockSubsidy(h) - removed(h)`. Subtracting that change from the halving
+subsidy yields `-AdditionalBlockSubsidy(h) + removed(h)`. The contribution is already
+included through reduced issuance and must not be credited a second time. The same
+accounting applies during replay and the format 29 backfill.
 
 Transfers between monetary pools leave the balance unchanged. Reductions in issued value
 increase it. The balance itself holds no spendable value and does not contribute to
@@ -107,7 +104,9 @@ backup or repair the identified corruption before retrying startup.
 
 ## Validation and activation requirements
 
-The tests cover integer rounding, schedule sums, the seed and its rollback,
+The tests cover aggregate fee rounding, fee activation before reissuance, coinbase
+claims and template fees, the resulting NSM contribution, schedule sums, the seed and
+its rollback,
 the fraction and halving interval per target spacing era, the half-life over one
 interval, termination from a small balance, transfers through every monetary
 pool, reductions in issued value, contextual rejection from NU7, independent
@@ -123,7 +122,6 @@ not establish support for a ZIP 233 transaction format.
 
 Before production activation:
 
-- Implement and validate the deployment draft's fee recycling rules in the follow-up.
 - Resolve the reissuance start height against the deployment ZIP.
 - Assign the production NU7 branch ID and activation heights.
 - Run real transaction verification across activation on a private network.

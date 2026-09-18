@@ -20,7 +20,7 @@ default = []
 
 # Production features that activate extra functionality
 
-# ZIP 234 reissuance. Off by default until NU7 has activation heights.
+# NSM fee recycling and ZIP 234 reissuance. Off by default until NU7 has activation heights.
 # ZIP 218 uses height-based activation in every build.
 nu7 = []
 

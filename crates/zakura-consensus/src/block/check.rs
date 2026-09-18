@@ -11,8 +11,8 @@ use zakura_chain::{
     block::{Block, Hash, Header, Height},
     parameters::{
         subsidy::{
-            founders_reward, founders_reward_address, funding_stream_values, FundingStreamReceiver,
-            ParameterSubsidy, SubsidyError,
+            founders_reward, founders_reward_address, funding_stream_values, miner_fee_share,
+            FundingStreamReceiver, ParameterSubsidy, SubsidyError,
         },
         Network, NetworkUpgrade,
     },
@@ -319,11 +319,14 @@ pub fn subsidy_is_valid(
 
 /// Returns `Ok(())` if the miner fees consensus rule is valid.
 ///
+/// `block_transaction_fees` is the aggregate fee before the NU7 NSM contribution.
+/// The coinbase must claim the remaining miner share from NU7 onward.
+///
 /// [7.1.2]: https://zips.z.cash/protocol/protocol.pdf#txnconsensus
 pub fn miner_fees_are_valid(
     coinbase_tx: &Transaction,
     height: Height,
-    block_miner_fees: Amount<NonNegative>,
+    block_transaction_fees: Amount<NonNegative>,
     expected_block_subsidy: Amount<NonNegative>,
     expected_deferred_pool_balance_change: DeferredPoolBalanceChange,
     network: &Network,
@@ -359,6 +362,9 @@ pub fn miner_fees_are_valid(
         + expected_deferred_pool_balance_change.value())
     .map_err(|_| SubsidyError::Overflow)?;
 
+    // NU7 modifies ZIP 236's full-claim rule by excluding the NSM fee contribution.
+    // Round once over the aggregate fees, independently of the reissuance start height.
+    let block_miner_fees = miner_fee_share(height, network, block_transaction_fees);
     let total_input_value =
         (expected_block_subsidy + block_miner_fees).map_err(|_| SubsidyError::Overflow)?;
 

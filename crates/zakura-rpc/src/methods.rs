@@ -68,7 +68,7 @@ use zakura_chain::{
             block_subsidy, founders_reward, funding_stream_values, miner_subsidy,
             FundingStreamReceiver,
         },
-        ConsensusBranchId, Network, NetworkUpgrade,
+        ConsensusBranchId, Network, NetworkUpgrade, POST_BLOSSOM_POW_TARGET_SPACING,
     },
     serialization::{BytesInDisplayOrder, ZcashDeserialize, ZcashDeserializeInto, ZcashSerialize},
     subtree::NoteCommitmentSubtreeIndex,
@@ -1476,14 +1476,12 @@ where
                     .latest_chain_tip
                     .best_tip_height()
                     .unwrap_or_else(|| self.network.checkpoint_list().max_height());
-                let remaining_seconds = target_seconds_between_heights(
-                    &self.network,
-                    tip_height,
-                    end_of_support_height,
-                );
+                let remaining_blocks = i64::from(end_of_support_height.0) - i64::from(tip_height.0);
                 let estimated_time = Utc::now()
                     .timestamp()
-                    .saturating_add(remaining_seconds)
+                    .saturating_add(
+                        remaining_blocks.saturating_mul(i64::from(POST_BLOSSOM_POW_TARGET_SPACING)),
+                    )
                     .saturating_sub(END_OF_SERVICE_ESTIMATE_SAFETY_MARGIN)
                     .max(0);
 
@@ -4012,38 +4010,6 @@ impl GetInfoResponse {
 /// Block times vary, so the halt can happen earlier than a spacing-based
 /// estimate. Reporting it a day early gives consumers time to act.
 const END_OF_SERVICE_ESTIMATE_SAFETY_MARGIN: i64 = 24 * 60 * 60;
-
-/// Returns the target time to mine the blocks above `from` up to `to` on `network`, in seconds.
-///
-/// Each block counts with the target spacing at its height, so ZIP 218's 25 second spacing after
-/// NU7 shortens the time. The result is negative when `to` is below `from`.
-fn target_seconds_between_heights(network: &Network, from: Height, to: Height) -> i64 {
-    let low = i64::from(from.0.min(to.0));
-    let high = i64::from(from.0.max(to.0));
-
-    let target_spacings: Vec<_> = NetworkUpgrade::target_spacings(network).collect();
-    let seconds: i64 = target_spacings
-        .iter()
-        .enumerate()
-        .map(|(index, (start_height, target_spacing))| {
-            // The heights in `low + 1..=high` that use this target spacing.
-            let first = i64::from(start_height.0).max(low + 1);
-            let last = target_spacings
-                .get(index + 1)
-                .map_or(high, |(next_height, _)| {
-                    (i64::from(next_height.0) - 1).min(high)
-                });
-
-            (last - first + 1).max(0) * target_spacing.num_seconds()
-        })
-        .sum();
-
-    if to < from {
-        -seconds
-    } else {
-        seconds
-    }
-}
 
 /// Response to a `getdeprecationinfo` RPC request.
 ///

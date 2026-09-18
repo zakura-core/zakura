@@ -85,54 +85,25 @@ const MEMPOOL_OUTPUT_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::
 /// response from the transaction verifier.
 const POLL_MEMPOOL_DELAY: std::time::Duration = Duration::from_millis(50);
 
-/// Number of blocks after a network upgrade activates during which a mempool
-/// transaction that only the upgrade's new rules reject does not count as peer
-/// misbehavior.
-const UPGRADE_ACTIVATION_MISBEHAVIOR_GRACE_BLOCKS: i64 = 40;
+/// Number of blocks after NU6.3 activation during which a NU6.2 branch ID
+/// does not count as peer misbehavior.
+const NU6_3_BRANCH_ID_MISBEHAVIOR_GRACE_BLOCKS: i64 = 40;
 
-/// Returns the last height before the current network upgrade activated, if
-/// `height` is within the peer-misbehavior grace period after that activation.
-///
-/// An honest peer whose tip is a block or two behind this node verifies mempool
-/// transactions against that earlier height. Just after an activation height,
-/// that height still runs the previous upgrade's rules, so the peer can relay a
-/// transaction this node rejects. The returned height is the one such a peer
-/// verifies against, which callers use to decide whether the rejection comes
-/// from a rule that the upgrade introduced.
-fn upgrade_activation_grace_period_height(
-    network: &Network,
-    height: block::Height,
-) -> Option<block::Height> {
-    let (_upgrade, activation_height) =
-        NetworkUpgrade::current_with_activation_height(network, height);
-
-    let grace_period_end = (activation_height + UPGRADE_ACTIVATION_MISBEHAVIOR_GRACE_BLOCKS)?;
-    if height >= grace_period_end {
-        return None;
-    }
-
-    activation_height - 1
-}
-
-/// Returns whether a mempool transaction's consensus branch ID is the one that
-/// was current just before the network upgrade activated, within the
-/// peer-misbehavior grace period after that activation.
-fn is_branch_id_activation_grace_period(
+/// Returns whether a mempool transaction with a NU6.2 branch ID is within the
+/// NU6.3 peer-misbehavior grace period.
+fn is_nu6_3_branch_id_misbehavior_grace_period(
     tx: &Transaction,
     height: block::Height,
     network: &Network,
 ) -> bool {
-    upgrade_activation_grace_period_height(network, height).is_some_and(|previous_height| {
-        tx.network_upgrade() == Some(NetworkUpgrade::current(network, previous_height))
-    })
-}
-
-/// Returns whether the ZIP 218 shielded limits first applied at the network
-/// upgrade that is current at `height`, and `height` is within the
-/// peer-misbehavior grace period after that activation.
-fn is_shielded_limits_activation_grace_period(height: block::Height, network: &Network) -> bool {
-    upgrade_activation_grace_period_height(network, height)
-        .is_some_and(|previous_height| !NetworkUpgrade::is_nu7_active(network, previous_height))
+    tx.network_upgrade() == Some(NetworkUpgrade::Nu6_2)
+        && NetworkUpgrade::current(network, height) == NetworkUpgrade::Nu6_3
+        && NetworkUpgrade::Nu6_3
+            .activation_height(network)
+            .and_then(|activation_height| {
+                activation_height + NU6_3_BRANCH_ID_MISBEHAVIOR_GRACE_BLOCKS
+            })
+            .is_some_and(|grace_period_end| height < grace_period_end)
 }
 
 /// Asynchronous transaction verification.
@@ -491,10 +462,9 @@ where
             match check::consensus_branch_id(&tx, req.height(), &network) {
                 Err(TransactionError::WrongConsensusBranchId)
                     if req.is_mempool()
-                        && is_branch_id_activation_grace_period(&tx, req.height(), &network) =>
+                        && is_nu6_3_branch_id_misbehavior_grace_period(&tx, req.height(), &network) =>
                 {
-                    return Err(TransactionError::WrongConsensusBranchId
-                        .into_upgrade_activation_grace_period());
+                    return Err(TransactionError::WrongConsensusBranchIdNu6_3GracePeriod);
                 }
                 Err(error) => return Err(error),
                 Ok(()) => {}
@@ -504,24 +474,12 @@ where
             // A transaction whose own shielded counts exceed a per-block ZIP 218
             // limit can never be mined, so reject it on submission. ZIP 218 does
             // not specify this rejection. The error's mempool misbehavior score
-            // is 100, except while the limits are newly active: a peer one block
-            // behind this node still admits such a transaction under the
-            // previous upgrade's rules.
-            if let Err(error) = crate::block::check::shielded_action_limits_are_valid(
+            // is 100.
+            crate::block::check::shielded_action_limits_are_valid(
                 std::iter::once(&tx),
                 req.height(),
                 &network,
-            ) {
-                return Err(
-                    if req.is_mempool()
-                        && is_shielded_limits_activation_grace_period(req.height(), &network)
-                    {
-                        error.into_upgrade_activation_grace_period()
-                    } else {
-                        error
-                    },
-                );
-            }
+            )?;
 
             // Soft fork: temporarily require transactions to not contain Orchard actions.
             //

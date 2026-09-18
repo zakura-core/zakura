@@ -27,7 +27,7 @@ pub struct HeaderContextFact {
 pub struct ValidationLease {
     /// Exact known parent.
     pub(crate) parent: Frontier,
-    /// Up to 28 facts in reverse height order, beginning with `parent`.
+    /// Up to 113 facts in reverse height order, beginning with `parent`.
     pub(crate) predecessors: Vec<HeaderContextFact>,
     /// Exact network policy used by the issuing engine.
     pub(crate) network: zakura_chain::parameters::Network,
@@ -98,7 +98,7 @@ impl ValidationLease {
         let required = usize::try_from(self.parent.height.0)
             .ok()
             .and_then(|height| height.checked_add(1))
-            .map(|height| height.min(crate::POW_ADJUSTMENT_BLOCK_SPAN));
+            .map(|height| height.min(crate::MAX_POW_ADJUSTMENT_BLOCK_SPAN));
         if self.network != *network
             || self.trust_anchor_digest != trust_anchor_digest
             || required != Some(self.predecessors.len())
@@ -360,7 +360,7 @@ mod tests {
         let required = usize::try_from(height)
             .expect("the fixture height fits in memory")
             .saturating_add(1)
-            .min(crate::POW_ADJUSTMENT_BLOCK_SPAN);
+            .min(crate::MAX_POW_ADJUSTMENT_BLOCK_SPAN);
         ValidationLease::new(
             parent,
             facts.into_iter().rev().take(required).collect(),
@@ -374,7 +374,7 @@ mod tests {
         let network = Network::new_regtest(RegtestParameters::default());
         // A lease retains every predecessor below the difficulty adjustment
         // span, and caps at the span above it.
-        let span = crate::POW_ADJUSTMENT_BLOCK_SPAN;
+        let span = crate::MAX_POW_ADJUSTMENT_BLOCK_SPAN;
         let span_height = u32::try_from(span).expect("the difficulty adjustment span fits in u32");
         for (height, expected_len) in [
             (0, 1),

@@ -449,7 +449,7 @@ fn atomic_finality_context_can_use_a_newly_staged_anchor_path() {
 
     // Stage one node past the retained predecessor span, so the context cap
     // binds whatever difficulty averaging window this build uses.
-    let predecessor_span = zakura_header_chain::POW_PREDECESSOR_CONTEXT_SPAN;
+    let predecessor_span = zakura_header_chain::MAX_POW_PREDECESSOR_CONTEXT_SPAN;
     let staged_len =
         u32::try_from(predecessor_span + 1).expect("the retained predecessor span fits in u32");
 

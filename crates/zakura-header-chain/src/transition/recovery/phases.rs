@@ -130,9 +130,9 @@ pub(super) fn load_pre_audit_store_rows<S: StoreAuditSnapshot>(
             early_violations.push(AuditViolation::BodyValidationEvidenceAuthority(node.hash));
         }
     }
-    let mut validation_contexts = Vec::with_capacity(crate::POW_PREDECESSOR_CONTEXT_SPAN);
+    let mut validation_contexts = Vec::with_capacity(crate::MAX_POW_PREDECESSOR_CONTEXT_SPAN);
     store.visit_validation_context_records(
-        RowLimit::new(crate::POW_PREDECESSOR_CONTEXT_SPAN),
+        RowLimit::new(crate::MAX_POW_PREDECESSOR_CONTEXT_SPAN),
         &mut |record| {
             validation_contexts.push(record);
             Ok(())

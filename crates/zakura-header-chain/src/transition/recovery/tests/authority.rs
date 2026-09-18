@@ -684,7 +684,7 @@ fn oversized_auxiliary_and_context_tables_fail_before_rows_are_loaded() {
             header: store.nodes[0].header.clone(),
             height: block::Height(0),
         };
-        crate::POW_PREDECESSOR_CONTEXT_SPAN + 1
+        crate::MAX_POW_PREDECESSOR_CONTEXT_SPAN + 1
     ];
     store.failed_read = Some(AuditRead::ValidationContexts);
 
@@ -692,7 +692,7 @@ fn oversized_auxiliary_and_context_tables_fail_before_rows_are_loaded() {
         audit_store(&store, &config),
         Err(RecoveryFailure::Store(StoreError::LimitExceeded {
             collection: crate::StoreCollection::ValidationContexts,
-            limit: crate::RowLimit::new(crate::POW_PREDECESSOR_CONTEXT_SPAN),
+            limit: crate::RowLimit::new(crate::MAX_POW_PREDECESSOR_CONTEXT_SPAN),
         }))
     );
 }

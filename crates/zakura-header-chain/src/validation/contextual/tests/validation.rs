@@ -49,7 +49,7 @@ fn validate_with_expected_target(
         context.iter().copied(),
     ) {
         Ok(adjustment) => adjustment,
-        Err(error) => panic!("the helper requires an exact height-dependent context: {error}"),
+        Err(error) => panic!("the helper requires a valid height-dependent context: {error}"),
     };
     let expected = adjustment.expected_difficulty_threshold();
     validate_contextual_difficulty_and_time(expected, adjustment)
@@ -172,6 +172,81 @@ fn difficulty_windows_upgrades_testnet_minimum_and_partitions_match() {
         testnet.target_difficulty_limit().to_compact(),
         "ZIP 205/208 minimum difficulty begins strictly above six target spacings"
     );
+}
+
+#[test]
+fn difficulty_context_accepts_retained_inactive_tail() {
+    let network = Network::Mainnet;
+    let candidate_height = block::Height(700_000);
+    let previous_height = (candidate_height - 1).expect("height is positive");
+    let candidate_time =
+        DateTime::from_timestamp(2_000_000_000, 0).expect("test timestamp is in range");
+    let spacing = NetworkUpgrade::target_spacing_for_height(&network, candidate_height);
+
+    let expected = AdjustedDifficulty::new_from_header_time(
+        candidate_time,
+        previous_height,
+        &network,
+        context(&network, candidate_time, spacing, POW_ADJUSTMENT_BLOCK_SPAN),
+    )
+    .expect("the active difficulty context is accepted")
+    .expected_difficulty_threshold();
+
+    for len in [
+        POW_ADJUSTMENT_BLOCK_SPAN + 1,
+        70,
+        MAX_POW_ADJUSTMENT_BLOCK_SPAN,
+    ] {
+        let actual = AdjustedDifficulty::new_from_header_time(
+            candidate_time,
+            previous_height,
+            &network,
+            context(&network, candidate_time, spacing, len),
+        )
+        .expect("retained inactive context is accepted")
+        .expected_difficulty_threshold();
+        assert_eq!(actual, expected, "inactive context changed the result");
+    }
+
+    assert!(matches!(
+        AdjustedDifficulty::new_from_header_time(
+            candidate_time,
+            previous_height,
+            &network,
+            context(
+                &network,
+                candidate_time,
+                spacing,
+                MAX_POW_ADJUSTMENT_BLOCK_SPAN + 1,
+            ),
+        ),
+        Err(AdjustedDifficultyError::ContextLength {
+            expected: MAX_POW_ADJUSTMENT_BLOCK_SPAN,
+            actual,
+        }) if actual == MAX_POW_ADJUSTMENT_BLOCK_SPAN + 1
+    ));
+
+    let early_height = block::Height(20);
+    let early_previous = (early_height - 1).expect("height is positive");
+    AdjustedDifficulty::new_from_header_time(
+        candidate_time,
+        early_previous,
+        &network,
+        context(&network, candidate_time, spacing, 20),
+    )
+    .expect("early context ending at genesis is accepted");
+    assert!(matches!(
+        AdjustedDifficulty::new_from_header_time(
+            candidate_time,
+            early_previous,
+            &network,
+            context(&network, candidate_time, spacing, 21),
+        ),
+        Err(AdjustedDifficultyError::ContextLength {
+            expected: 20,
+            actual: 21,
+        })
+    ));
 }
 
 #[test]

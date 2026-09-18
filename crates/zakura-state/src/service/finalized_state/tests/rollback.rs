@@ -1301,3 +1301,111 @@ fn rollback_prunes_ironwood_nullifiers_above_target() {
         "rollback prunes Ironwood nullifiers above the target"
     );
 }
+
+#[test]
+fn legacy_block_info_replay_preserves_slow_start_deferred_funding() {
+    use crate::service::finalized_state::disk_format::upgrade::{
+        block_info_and_address_received::Upgrade, DiskFormatUpgrade,
+    };
+    use zakura_chain::{
+        amount::DeferredPoolBalanceChange,
+        parameters::{
+            subsidy::{funding_stream_values, FundingStreamReceiver},
+            testnet::{ConfiguredFundingStreamRecipient, ConfiguredFundingStreams},
+        },
+    };
+    let _guard = zakura_test::init();
+    let network = TestnetParameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            blossom: Some(1),
+            canopy: Some(2),
+            ..Default::default()
+        })
+        .unwrap()
+        .with_funding_streams(vec![ConfiguredFundingStreams {
+            height_range: Some(Height(2)..Height(100)),
+            recipients: Some(vec![ConfiguredFundingStreamRecipient {
+                receiver: FundingStreamReceiver::Deferred,
+                numerator: 12,
+                addresses: None,
+            }]),
+        }])
+        .to_network()
+        .unwrap();
+    let mut state = FinalizedState::new(&Config::ephemeral(), &network).unwrap();
+    let mut parent: Arc<Block> = zakura_test::vectors::BLOCK_TESTNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    state
+        .commit_finalized_direct(
+            CheckpointVerifiedBlock::from(parent.clone()).into(),
+            None,
+            None,
+            "replay fixture",
+        )
+        .unwrap();
+    let address = Address::from_script_hash(NetworkKind::Testnet, [0x42; 20]);
+    let mut snapshots = Vec::new();
+    for h in 1..=3 {
+        let height = Height(h);
+        assert!(height < network.slow_start_shift());
+        let scheduled = Amount::<NonNegative>::try_from(
+            1_250_000_000u64 / u64::from(network.slow_start_interval()) * u64::from(h),
+        )
+        .unwrap();
+        let deferred = funding_stream_values(height, &network, scheduled)
+            .unwrap()
+            .remove(&FundingStreamReceiver::Deferred)
+            .unwrap_or_default();
+        let transactions = vec![coinbase_tx(height, Amount::try_from(1).unwrap(), &address)];
+        let mut block = if h <= 2 {
+            child_block(&parent, transactions)
+        } else {
+            child_block_with_history_commitment(
+                &parent,
+                transactions,
+                &network,
+                &state.db.history_tree(),
+            )
+        };
+        if h == 2 {
+            Arc::make_mut(&mut Arc::make_mut(&mut block).header).commitment_bytes = [0; 32].into();
+        }
+        state
+            .commit_finalized_direct(
+                CheckpointVerifiedBlock::new(
+                    block.clone(),
+                    None,
+                    Some(DeferredPoolBalanceChange::new(
+                        deferred.constrain().unwrap(),
+                    )),
+                )
+                .into(),
+                None,
+                None,
+                "replay fixture",
+            )
+            .unwrap();
+        snapshots.push(*state.db.block_info(height.into()).unwrap().value_pools());
+        parent = block;
+    }
+    assert!(snapshots[1].deferred_amount() > Amount::<NonNegative>::zero());
+    let mut batch = DiskWriteBatch::new();
+    for h in [2, 3] {
+        let _ = state
+            .db
+            .block_info_cf()
+            .with_batch_for_writing(&mut batch)
+            .zs_delete(&Height(h));
+    }
+    state.db.write_batch(batch).unwrap();
+    let (_tx, rx) = crossbeam_channel::bounded(1);
+    Upgrade.run(Some(Height(3)), &state.db, &rx).unwrap();
+    for (index, expected) in snapshots.into_iter().enumerate() {
+        let height = Height(u32::try_from(index + 1).unwrap());
+        assert_eq!(
+            *state.db.block_info(height.into()).unwrap().value_pools(),
+            expected
+        );
+    }
+}

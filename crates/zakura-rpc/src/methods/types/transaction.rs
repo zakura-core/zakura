@@ -225,7 +225,11 @@ impl CoinbasePlan {
 
     /// Returns exact sigops and a serialized-size upper bound that reserves the
     /// maximum coinbase input script.
-    fn resource_usage(&self, version: TxVersion) -> CoinbaseResourceUsage {
+    #[allow(clippy::unwrap_in_result)]
+    fn resource_usage(
+        &self,
+        version: TxVersion,
+    ) -> Result<CoinbaseResourceUsage, TransactionError> {
         const V4_FIXED_FIELDS_BYTES: usize = 16;
         const V5_AND_V6_FIXED_FIELDS_BYTES: usize = 20;
         const OUTPOINT_BYTES: usize = 36;
@@ -327,7 +331,11 @@ impl CoinbasePlan {
 
                 (V4_FIXED_FIELDS_BYTES, sapling + joinsplit_count)
             }
-            _ => unreachable!("block production only supports v4 or later transactions"),
+            _ => {
+                return Err(TransactionError::CoinbaseConstruction(format!(
+                    "Block production does not support the {version:?} transaction format"
+                )));
+            }
         };
 
         let sigops = transparent_outputs
@@ -350,11 +358,11 @@ impl CoinbasePlan {
             MinerRewardAddress::Transparent(_) => ShieldedActionCounts::default(),
         };
 
-        CoinbaseResourceUsage {
+        Ok(CoinbaseResourceUsage {
             max_serialized_size: fixed_fields_bytes + transparent_bytes + shielded_bytes,
             sigops,
             shielded_action_counts,
-        }
+        })
     }
 }
 
@@ -371,7 +379,7 @@ impl TransactionTemplate<NegativeOrZero> {
         let branch = BranchId::for_height(net, BlockHeight::from(height));
         let version = TxVersion::suggested_for_branch(branch);
 
-        Ok(plan.resource_usage(version))
+        plan.resource_usage(version)
     }
 
     /// Constructs a transaction template for a coinbase transaction.

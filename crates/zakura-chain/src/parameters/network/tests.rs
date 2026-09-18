@@ -617,3 +617,94 @@ fn slow_start_subsidy_is_not_scaled_when_nu7_activates_early() -> Result<(), Rep
 
     Ok(())
 }
+
+/// Checks the closed-form cumulative halving subsidy against a per-height sum across
+/// halvings and the NU7 spacing change.
+#[test]
+fn expected_issued_supply_matches_per_height_sum() {
+    use crate::parameters::{
+        subsidy::{expected_issued_supply, halving_block_subsidy},
+        testnet::{self, ConfiguredActivationHeights},
+    };
+
+    let _init_guard = zakura_test::init();
+
+    let nu7 = Height(5_000);
+    let network = testnet::Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            blossom: Some(1),
+            canopy: Some(2),
+            nu7: Some(nu7.0),
+            ..Default::default()
+        })
+        .expect("activation heights are valid")
+        .with_slow_start_interval(Height(100))
+        .with_halving_interval(1_000)
+        .expect("halving interval is valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid");
+    let last_height = Height(25_000);
+
+    assert!(
+        halving(nu7, &network) > 1 && halving(last_height, &network) > halving(nu7, &network) + 1,
+        "the range must cross halvings on both sides of NU7",
+    );
+
+    // `expected_issued_supply` walks halving and spacing boundaries rather than
+    // every height, so check it against the sum it is standing in for.
+    let mut brute_force = Amount::<NonNegative>::zero();
+    for height in 1..=last_height.0 {
+        brute_force = (brute_force
+            + halving_block_subsidy(Height(height), &network).expect("valid subsidy"))
+        .expect("sum is in range");
+
+        assert_eq!(
+            expected_issued_supply(Height(height), &network).expect("valid cumulative subsidy"),
+            brute_force,
+            "cumulative subsidies must match the per-height sum at height {height}",
+        );
+    }
+}
+
+#[test]
+fn scheduled_issuance_boundary_differences_match_block_subsidy() {
+    use crate::parameters::subsidy::{halving_block_subsidy, scheduled_issuance_zatoshis};
+    for network in [
+        Network::Mainnet,
+        Network::new_default_testnet(),
+        Network::new_regtest(Default::default()),
+    ] {
+        assert_eq!(scheduled_issuance_zatoshis(Height(0), &network).unwrap(), 0);
+        let mut boundaries = vec![
+            Height(1),
+            network.slow_start_shift(),
+            network.slow_start_interval(),
+            Height(Height::MAX_AS_U32),
+        ];
+        boundaries.extend(NetworkUpgrade::target_spacings(&network).map(|(height, _)| height));
+        boundaries.extend((0..35).filter_map(|n| height_for_halving(n, &network)));
+        for boundary in boundaries {
+            for h in [
+                boundary.0.saturating_sub(1),
+                boundary.0,
+                boundary.0.saturating_add(1),
+            ] {
+                if h == 0 || h > Height::MAX_AS_U32 {
+                    continue;
+                }
+                let previous = scheduled_issuance_zatoshis(Height(h - 1), &network).unwrap();
+                let current = scheduled_issuance_zatoshis(Height(h), &network).unwrap();
+                let block = u128::try_from(i64::from(
+                    halving_block_subsidy(Height(h), &network).unwrap(),
+                ))
+                .unwrap();
+                assert_eq!(current - previous, block, "network {network:?}, height {h}");
+                assert_eq!(
+                    block_subsidy(Height(h), &network).unwrap(),
+                    halving_block_subsidy(Height(h), &network).unwrap()
+                );
+            }
+        }
+    }
+}

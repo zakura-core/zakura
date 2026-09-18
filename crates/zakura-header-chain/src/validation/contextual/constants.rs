@@ -1,5 +1,3 @@
-use zakura_chain::parameters::POW_AVERAGING_WINDOW;
-
 /// The median block span for time median calculations.
 ///
 /// `PoWMedianBlockSpan` in the Zcash specification.
@@ -9,7 +7,10 @@ pub const POW_MEDIAN_BLOCK_SPAN: usize = 11;
 ///
 /// `PoWAveragingWindow + PoWMedianBlockSpan` in the Zcash specification based on
 /// > ActualTimespan(height : N) := MedianTime(height) − MedianTime(height − PoWAveragingWindow)
-pub const POW_ADJUSTMENT_BLOCK_SPAN: usize = POW_AVERAGING_WINDOW + POW_MEDIAN_BLOCK_SPAN;
+///
+/// Retain the future ZIP 218 maximum even while the active averaging window is 17.
+/// The active difficulty calculation remains independent of this storage bound.
+pub const POW_ADJUSTMENT_BLOCK_SPAN: usize = 102 + POW_MEDIAN_BLOCK_SPAN;
 
 /// Durable predecessors needed below a separately retained parent frontier.
 pub const POW_PREDECESSOR_CONTEXT_SPAN: usize = POW_ADJUSTMENT_BLOCK_SPAN - 1;

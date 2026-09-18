@@ -388,8 +388,9 @@ mod tests {
             .expect("the genesis vector is valid");
 
         for network in [Network::Mainnet, Network::new_default_testnet()] {
-            for tip in [0, 1, 26, 27, 28, 3_474_810] {
-                let required = usize::try_from((tip + 1).min(28)).unwrap();
+            let span = u32::try_from(POW_ADJUSTMENT_BLOCK_SPAN).unwrap();
+            for tip in [0, 1, span - 2, span - 1, span, 3_474_810] {
+                let required = usize::try_from((tip + 1).min(span)).unwrap();
                 for count in 0..=required {
                     let result = difficulty_time_and_history_tree(
                         vec![block.header.clone(); count],

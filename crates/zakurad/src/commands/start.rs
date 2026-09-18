@@ -745,7 +745,7 @@ impl StartCmd {
         });
 
         // Keep a block template ready for the `getblocktemplate` RPC, if this node is configured
-        // for mining, and something can actually ask for a template. Without the RPC server and
+        // for mining, and something can actually ask for a template. Without the RPC servers and
         // without the internal miner, nothing can call `getblocktemplate`, so precomputing
         // templates would build coinbase transactions that no one reads.
         #[cfg(feature = "internal-miner")]
@@ -753,14 +753,16 @@ impl StartCmd {
         #[cfg(not(feature = "internal-miner"))]
         let is_internal_miner_enabled = false;
 
-        let block_template_task_handle =
-            if config.rpc.listen_addr.is_some() || is_internal_miner_enabled {
-                rpc_impl
-                    .spawn_block_template_updater()
-                    .inspect(|_| info!("spawned block template updater task"))
-            } else {
-                None
-            };
+        let block_template_task_handle = if config.rpc.listen_addr.is_some()
+            || config.rpc.admin_listen_addr.is_some()
+            || is_internal_miner_enabled
+        {
+            rpc_impl
+                .spawn_block_template_updater()
+                .inspect(|_| info!("spawned block template updater task"))
+        } else {
+            None
+        };
 
         // Supervise the updater like every other ongoing task: if it exits or panics, the RPC
         // keeps serving the last template it published, and pays the new-tip timeout on every call

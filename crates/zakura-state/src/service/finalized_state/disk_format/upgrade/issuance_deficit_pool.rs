@@ -146,11 +146,22 @@ fn backfill(
 
 /// Refuses databases whose committed value pools older migrations cannot repair.
 ///
+/// Blocks at or above the ZIP 234 start derive their subsidy, and so their Deferred
+/// funding, from the parent's issuance deficit. Older versions committed those blocks
+/// without reissuance, so their Deferred balances differ from a fresh sync.
+///
 /// Before format 29, the version 27 replay omitted Deferred funding during slow start.
 /// A database that ran that replay can hold undercounted Deferred balances, and its
 /// version marker stops the corrected replay from running again. Block commits always
 /// applied the funding, so a fresh sync produces the correct balances.
 fn refuse_unrepairable_history(network: &Network, tip: Height) -> Result<(), FormatChangeError> {
+    if zakura_chain::parameters::subsidy::is_zip234_active(network, tip) {
+        return Err(FormatChangeError::ResyncRequired(format!(
+            "blocks at or above the ZIP 234 start {:?} were committed without reissuance",
+            zakura_chain::parameters::subsidy::zip234_start_height(network),
+        )));
+    }
+
     let slow_start_end = network.slow_start_interval().min(tip);
     for height in 1..=slow_start_end.0 {
         let height = Height(height);

@@ -477,6 +477,32 @@ mod tests {
     }
 
     #[test]
+    fn testnet_template_uses_candidate_spacing_at_blossom() {
+        let _init_guard = zakura_test::init();
+        const BLOSSOM: u32 = 400_000;
+        let network = Network::new_regtest(
+            ConfiguredActivationHeights {
+                blossom: Some(BLOSSOM),
+                ..Default::default()
+            }
+            .into(),
+        );
+        assert_eq!(
+            last_standard_difficulty_offset(&network, Height(BLOSSOM - 2)),
+            600
+        );
+        // The parent is pre-Blossom but the candidate already uses 75 seconds.
+        assert_eq!(
+            last_standard_difficulty_offset(&network, Height(BLOSSOM - 1)),
+            300
+        );
+        assert_eq!(
+            last_standard_difficulty_offset(&network, Height(BLOSSOM)),
+            300
+        );
+    }
+
+    #[test]
     fn mining_template_rejects_incomplete_difficulty_context() {
         let block: Arc<block::Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
             .zcash_deserialize_into()

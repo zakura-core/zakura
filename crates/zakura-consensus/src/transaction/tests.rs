@@ -25,7 +25,7 @@ use zakura_chain::{
     orchard::{Action, AuthorizedAction, Flags},
     parameters::{
         testnet::{ConfiguredActivationHeights, Parameters},
-        Network, NetworkUpgrade,
+        Network, NetworkUpgrade, ORCHARD_BLOCK_ACTION_LIMIT,
     },
     primitives::{ed25519, x25519, Groth16Proof},
     sapling,
@@ -35,8 +35,8 @@ use zakura_chain::{
     sprout,
     transaction::{
         arbitrary::{
-            insert_fake_orchard_shielded_data, test_transactions, transactions_from_blocks,
-            v5_transactions,
+            fake_v6_with_orchard_and_ironwood_actions, insert_fake_orchard_shielded_data,
+            test_transactions, transactions_from_blocks, v5_transactions,
         },
         zip317, Hash, HashType, JoinSplitData, LockTime, Transaction,
     },
@@ -4448,6 +4448,82 @@ async fn v5_with_duplicate_orchard_action() {
             Err(TransactionError::DuplicateOrchardNullifier(
                 duplicate_nullifier
             ))
+        );
+    }
+}
+
+/// The mempool rejects a transaction whose Orchard and Ironwood actions exceed
+/// the ZIP 218 Orchard limit, because no block can include it. The check runs
+/// before any state service query, and only at or after NU7 activation.
+#[tokio::test]
+async fn mempool_applies_the_orchard_limit_to_ironwood_actions() {
+    let _init_guard = zakura_test::init();
+
+    let height = Height(1);
+    let network = Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            nu7: Some(height.0),
+            ..Default::default()
+        })
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid");
+
+    let limit = usize::try_from(ORCHARD_BLOCK_ACTION_LIMIT).expect("the limit fits in usize");
+    let orchard_half = limit / 2;
+    let over_limit = || {
+        Some(TransactionError::OrchardActionsExceedBlockLimit {
+            actions: ORCHARD_BLOCK_ACTION_LIMIT + 1,
+            limit: ORCHARD_BLOCK_ACTION_LIMIT,
+        })
+    };
+
+    // The fake proofs fail the proof size check, which the verifier runs after
+    // the shielded limits. That error shows a transaction passed the limits.
+    let cases = [
+        (
+            0,
+            limit + 1,
+            over_limit(),
+            TransactionError::IronwoodProofSize,
+        ),
+        (
+            orchard_half,
+            limit + 1 - orchard_half,
+            over_limit(),
+            TransactionError::OrchardProofSize,
+        ),
+        (0, limit, None, TransactionError::IronwoodProofSize),
+        (
+            orchard_half,
+            limit - orchard_half,
+            None,
+            TransactionError::OrchardProofSize,
+        ),
+    ];
+
+    for (orchard_actions, ironwood_actions, limit_error, proof_size_error) in cases {
+        let tx = fake_v6_with_orchard_and_ironwood_actions(
+            NetworkUpgrade::Nu7,
+            orchard_actions,
+            ironwood_actions,
+        );
+
+        let response = Verifier::new_for_tests(
+            &network,
+            service_fn(|_| async { unreachable!("state service should not be called") }),
+        )
+        .oneshot(Request::Mempool {
+            transaction: Arc::unwrap_or_clone(tx).into(),
+            height,
+        })
+        .await;
+
+        assert_eq!(
+            response,
+            Err(limit_error.unwrap_or(proof_size_error)),
+            "{orchard_actions} Orchard and {ironwood_actions} Ironwood actions",
         );
     }
 }

@@ -313,6 +313,7 @@ fn existing_narrow_validation_context_is_backfilled_before_startup() {
         .startup(&config)
         .expect("startup accepts the backfilled validation context");
     assert!(startup.publication_allowed);
+    let store = HeaderChainStore::new(state.header_chain_disk_db());
     assert_eq!(store.resize_validation_context(&state).unwrap(), 0);
     assert!(store.startup(&config).unwrap().1.publication_allowed);
 }

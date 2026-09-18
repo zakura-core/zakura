@@ -819,10 +819,12 @@ where
                     .call(zakura_consensus::Request::Commit(block)).boxed();
 
                 // Add a shorter timeout to workaround a known bug (#5125)
-                let short_timeout_max = (max_checkpoint_height + FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT_LIMIT).expect("checkpoint block height is in valid range");
-                if block_height >= max_checkpoint_height && block_height <= short_timeout_max {
+                let short_timeout_max = (max_checkpoint_height + FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT_LIMIT).unwrap_or(Height::MAX);
+                // The final checkpoint can wait for its entire range; only fully verified blocks
+                // need the short timeout. Preserve the error type for the sync retry handler.
+                if block_height > max_checkpoint_height && block_height <= short_timeout_max {
                     rsp = timeout(FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT, rsp)
-                        .map_err(|timeout| format!("initial fully verified block timed out: retrying: {timeout:?}").into())
+                        .map_err(BoxError::from)
                         .map(|nested_result| nested_result.and_then(convert::identity)).boxed();
                 }
 
@@ -914,6 +916,11 @@ where
             .lock()
             .expect("thread panicked while holding the past_lookahead_limit_sender mutex guard")
             .send(false);
+    }
+
+    /// Returns true if `hash` has an in-flight download and verify task.
+    pub(super) fn contains(&self, hash: &block::Hash) -> bool {
+        self.cancel_handles.contains_key(hash)
     }
 
     /// Get the number of currently in-flight download and verify tasks.

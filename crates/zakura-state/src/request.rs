@@ -1405,6 +1405,16 @@ pub enum Request {
     /// Checks verified blocks in the finalized chain and the _best_ non-finalized chain.
     UnspentBestChainUtxo(transparent::OutPoint),
 
+    /// Checks a candidate block's external inputs against the UTXO set at `parent`.
+    /// Returns [`ParentInputs::Inconclusive`](crate::ParentInputs::Inconclusive) if the parent
+    /// context changes during the read. Callers must omit outputs created within the candidate block.
+    CheckParentInputs {
+        /// Parent whose UTXO set must contain the inputs.
+        parent: block::Hash,
+        /// External inputs from one bounded block.
+        outpoints: Arc<[transparent::OutPoint]>,
+    },
+
     /// Looks up a block by hash or height in the current best chain.
     ///
     /// Returns
@@ -1590,6 +1600,7 @@ impl Request {
             Request::BlockLocator => "block_locator",
             Request::Transaction(_) => "transaction",
             Request::UnspentBestChainUtxo { .. } => "unspent_best_chain_utxo",
+            Request::CheckParentInputs { .. } => "check_parent_inputs",
             Request::Block(_) => "block",
             Request::AnyChainBlock(_) => "any_chain_block",
             Request::AnyChainHeight(_) => "any_chain_height",
@@ -1762,6 +1773,16 @@ pub enum ReadRequest {
     ///
     /// Checks verified blocks in the finalized chain and the _best_ non-finalized chain.
     UnspentBestChainUtxo(transparent::OutPoint),
+
+    /// Checks a candidate block's external inputs against the UTXO set at `parent`.
+    /// Returns [`ParentInputs::Inconclusive`](crate::ParentInputs::Inconclusive) if the parent
+    /// context changes during the read. Callers must omit outputs created within the candidate block.
+    CheckParentInputs {
+        /// Parent whose UTXO set must contain the inputs.
+        parent: block::Hash,
+        /// External inputs from one bounded block.
+        outpoints: Arc<[transparent::OutPoint]>,
+    },
 
     /// Looks up a UTXO identified by the given [`OutPoint`](transparent::OutPoint),
     /// returning `None` immediately if it is unknown.
@@ -2152,6 +2173,7 @@ impl ReadRequest {
             ReadRequest::TransactionIdsForBlock(_) => "transaction_ids_for_block",
             ReadRequest::AnyChainTransactionIdsForBlock(_) => "any_chain_transaction_ids_for_block",
             ReadRequest::UnspentBestChainUtxo { .. } => "unspent_best_chain_utxo",
+            ReadRequest::CheckParentInputs { .. } => "check_parent_inputs",
             ReadRequest::AnyChainUtxo { .. } => "any_chain_utxo",
             ReadRequest::BlockLocator => "block_locator",
             ReadRequest::FindBlockHashes { .. } => "find_block_hashes",
@@ -2230,6 +2252,9 @@ impl TryFrom<Request> for ReadRequest {
             }
             Request::BlockHeader(hash_or_height) => Ok(ReadRequest::BlockHeader(hash_or_height)),
             Request::Transaction(tx_hash) => Ok(ReadRequest::Transaction(tx_hash)),
+            Request::CheckParentInputs { parent, outpoints } => {
+                Ok(ReadRequest::CheckParentInputs { parent, outpoints })
+            }
             Request::UnspentBestChainUtxo(outpoint) => {
                 Ok(ReadRequest::UnspentBestChainUtxo(outpoint))
             }

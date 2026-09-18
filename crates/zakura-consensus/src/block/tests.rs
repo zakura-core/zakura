@@ -163,6 +163,9 @@ fn prepared_test_verifier(
             ),
             zs::Request::BlockParentContext(parent) => activation_parent_context(parent),
             zs::Request::CheckBlockProposalValidity(_) => zs::Response::ValidBlockProposal,
+            zs::Request::CheckParentInputs { .. } => {
+                zs::Response::ParentInputs(zs::ParentInputs::Inconclusive)
+            }
             _ => panic!("prepared-path test received an unexpected state request: {request:?}"),
         };
         Ok::<_, BoxError>(response)
@@ -171,6 +174,125 @@ fn prepared_test_verifier(
         service_fn(|request| async move { Ok::<_, BoxError>(accept_block_transaction(request)) });
 
     SemanticBlockVerifier::new(network, state, transaction)
+}
+
+#[tokio::test(start_paused = true)]
+async fn missing_input_requires_committed_parent_evidence() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let _init_guard = zakura_test::init();
+    let block = Arc::new(
+        Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_347499_BYTES[..])
+            .expect("the test block deserializes"),
+    );
+    let outpoint = block
+        .transactions
+        .iter()
+        .flat_map(|tx| tx.inputs())
+        .find_map(transparent::Input::outpoint)
+        .expect("the test block spends an external output");
+    #[derive(Clone, Copy, Debug)]
+    enum ContextRead {
+        Missing,
+        ParentUnavailable,
+        Inconclusive,
+        Failed,
+        TimedOut,
+    }
+    #[derive(Debug)]
+    enum Expected {
+        Missing,
+        ParentUnavailable,
+        Timeout,
+    }
+    use ContextRead::*;
+    // The first read runs before the UTXO wait, and the second runs after the wait expires.
+    for (reads, expected) in [
+        (vec![Missing], Expected::Missing),
+        (vec![Inconclusive, Missing], Expected::Missing),
+        (vec![ParentUnavailable, Missing], Expected::Missing),
+        (
+            vec![ParentUnavailable, ParentUnavailable],
+            Expected::ParentUnavailable,
+        ),
+        (vec![Inconclusive, Inconclusive], Expected::Timeout),
+        (vec![Failed, Failed], Expected::Timeout),
+        (vec![TimedOut, TimedOut], Expected::Timeout),
+    ] {
+        let reads = Arc::new(reads);
+        let read_count = Arc::new(AtomicUsize::new(0));
+        let state = service_fn({
+            let reads = reads.clone();
+            let read_count = read_count.clone();
+            move |request: zs::Request| {
+                let reads = reads.clone();
+                let read_count = read_count.clone();
+                async move {
+                    Ok::<_, BoxError>(match request {
+                        zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+                        zs::Request::CheckParentInputs { parent, outpoints } => {
+                            assert!(outpoints.contains(&outpoint));
+                            assert_ne!(parent, block::Hash([0; 32]));
+                            let read = reads[read_count.fetch_add(1, Ordering::SeqCst)];
+                            zs::Response::ParentInputs(match read {
+                                Failed => {
+                                    return Err(std::io::Error::other("state unavailable").into())
+                                }
+                                TimedOut => return std::future::pending().await,
+                                Missing => zs::ParentInputs::Missing(outpoint),
+                                ParentUnavailable => zs::ParentInputs::ParentUnavailable,
+                                Inconclusive => zs::ParentInputs::Inconclusive,
+                            })
+                        }
+                        _ => panic!("unexpected state request: {request:?}"),
+                    })
+                }
+            }
+        });
+        let proven_before_wait = matches!(reads[0], Missing);
+        let transaction = service_fn(move |_: tx::Request| async move {
+            assert!(
+                !proven_before_wait,
+                "proven missing inputs must fail before transaction checks"
+            );
+            Err::<tx::Response, BoxError>(TransactionError::TransparentInputNotFound.into())
+        });
+        let error = SemanticBlockVerifier::new(&Network::Mainnet, state, transaction)
+            .oneshot(Request::Commit(block.clone()))
+            .await
+            .expect_err("the input cannot be resolved");
+        assert_eq!(read_count.load(Ordering::SeqCst), reads.len(), "{reads:?}");
+        match expected {
+            Expected::Missing => {
+                assert!(
+                    matches!(error, VerifyBlockError::MissingTransparentInput { .. }),
+                    "{reads:?}: {error:?}"
+                );
+                assert_eq!(error.misbehavior_score(), 100);
+            }
+            Expected::ParentUnavailable => {
+                assert!(
+                    matches!(error, VerifyBlockError::ParentUnavailable { .. }),
+                    "{reads:?}: {error:?}"
+                );
+                assert_eq!(error.misbehavior_score(), 0);
+                assert!(matches!(
+                    error.body_verification_class(),
+                    zakura_header_chain::BodyVerificationClass::Retryable(_)
+                ));
+            }
+            Expected::Timeout => {
+                assert!(
+                    matches!(
+                        error,
+                        VerifyBlockError::Transaction(TransactionError::TransparentInputNotFound)
+                    ),
+                    "{reads:?}: {error:?}"
+                );
+                assert_eq!(error.misbehavior_score(), 0);
+            }
+        }
+    }
 }
 
 fn accept_block_transaction(request: tx::Request) -> tx::Response {
@@ -483,6 +605,9 @@ async fn proposal_validation_succeeds_when_cache_insertion_conflicts() {
             ),
             zs::Request::BlockParentContext(parent) => activation_parent_context(parent),
             zs::Request::CheckBlockProposalValidity(_) => zs::Response::ValidBlockProposal,
+            zs::Request::CheckParentInputs { .. } => {
+                zs::Response::ParentInputs(zs::ParentInputs::Inconclusive)
+            }
             zs::Request::CommitSemanticallyVerifiedBlockWithAdmission { block, .. } => {
                 zs::Response::Committed(block.hash)
             }
@@ -1690,6 +1815,11 @@ async fn authorizing_data_mismatch_rejects_before_transaction_dispatch() {
                 zs::Request::BlockParentContext(hash) if hash == context.parent => {
                     Ok(zs::Response::BlockParentContext(Some(context)))
                 }
+                // The transparent-input probe is advisory and precedes the commitment
+                // rejection this test asserts.
+                zs::Request::CheckParentInputs { .. } => {
+                    Ok(zs::Response::ParentInputs(zs::ParentInputs::Inconclusive))
+                }
                 _ => panic!("a rejected body must not reach state commit"),
             }
         }
@@ -1751,23 +1881,23 @@ async fn unavailable_parent_does_not_dispatch_transactions_or_score_supplier() {
     assert_eq!(error.misbehavior_score(), 0);
 }
 
-/// An intrinsic duplicate is decided without the parent, so a pending parent must not hide it.
+/// Every merkle-root outcome is decided without the parent, so a pending parent must not hide one.
 ///
-/// While `BlockParentContext` is unavailable the verifier reports the body error instead of
-/// `MissingParentContext` only for errors this predicate accepts. A transaction list whose
-/// deduplication changes the committed root is permanently invalid whatever the parent turns
-/// out to be: reporting the pending-parent error would classify it retryable and leave its
-/// supplier unscored, so the same body could be redelivered for the whole retention window.
-/// Reaching that path needs a header with valid proof of work over the duplicated list, which
-/// is why this checks the classification rather than driving the whole verifier.
+/// While `BlockParentContext` is unavailable the verifier runs the merkle-root attribution
+/// before reporting the pending-parent error. A malleated body, a padding alias and an
+/// intrinsic duplicate are all decided from the header's commitment and the delivered
+/// transaction list, so none of them changes once the parent commits. Reporting
+/// `MissingParentContext` instead would classify a permanently invalid body retryable and
+/// leave a malleated body's supplier unscored. Reaching that path needs a header with valid
+/// proof of work over the delivered list, which is why this checks the attribution outcomes
+/// rather than driving the whole verifier.
 #[test]
-fn intrinsic_duplicates_are_not_hidden_by_a_pending_parent() -> Result<(), Report> {
+fn every_merkle_root_outcome_is_decided_without_the_parent() -> Result<(), Report> {
     let _init_guard = zakura_test::init();
     let network = Network::Mainnet;
     let original = Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_347499_BYTES[..])?;
 
-    // Padding aliases, then lists whose deduplication changes the root. Both are decided
-    // from the header's commitment and the delivered list alone.
+    // Padding aliases, then lists whose deduplication changes the committed root.
     for indices in [
         &[0, 1, 2, 2][..],
         &[0, 1, 2, 3, 4, 4, 4, 4][..],
@@ -1783,21 +1913,22 @@ fn intrinsic_duplicates_are_not_hidden_by_a_pending_parent() -> Result<(), Repor
         let transaction_hashes: Vec<_> = block.transactions.iter().map(|tx| tx.hash()).collect();
         Arc::make_mut(&mut block.header).merkle_root = transaction_hashes.iter().cloned().collect();
 
-        let error =
-            check::merkle_root_validity_with_attribution(&network, &block, &transaction_hashes)
-                .expect_err("a duplicated transaction list must be rejected");
-        assert!(
-            crate::block::commitment::is_context_independent_body_error(&error),
-            "{indices:?} is decided without the parent, so it must survive a pending parent: \
-             {error:?}"
-        );
+        check::merkle_root_validity_with_attribution(&network, &block, &transaction_hashes)
+            .expect_err("a duplicated transaction list must be rejected");
     }
 
+    // A body that does not match the header's committed root at all.
+    let mut block = original.clone();
+    block.transactions.truncate(1);
+    let transaction_hashes: Vec<_> = block.transactions.iter().map(|tx| tx.hash()).collect();
+    let error = check::merkle_root_validity_with_attribution(&network, &block, &transaction_hashes)
+        .expect_err("a body that does not match the committed root must be rejected");
     assert!(
-        !crate::block::commitment::is_context_independent_body_error(
-            &VerifyBlockError::MissingParentContext(block::Hash([0; 32]))
+        matches!(
+            error.body_verification_class(),
+            zakura_header_chain::BodyVerificationClass::PayloadMismatch(_)
         ),
-        "a pending parent is not a body error"
+        "a malleated body is its supplier's fault, not the header's: {error:?}"
     );
     Ok(())
 }
@@ -2028,6 +2159,60 @@ async fn nu5_padding_uses_early_commitment_context_without_dispatching_proofs() 
     }
 }
 
+/// A retry must observe the queued commit's outcome before reporting a duplicate.
+#[tokio::test(start_paused = true)]
+async fn pending_commit_retry_waits_for_state_outcome() {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    for committed in [true, false] {
+        let mut block: Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        // If the previous commit fails, revalidation must reach this malformed body.
+        block.transactions.clear();
+        let hash = block.hash();
+        let locations = Arc::new(Mutex::new(VecDeque::from([
+            Some(zs::KnownBlock::WriteChannel),
+            Some(zs::KnownBlock::WriteChannel),
+            committed.then_some(zs::KnownBlock::BestChain),
+        ])));
+        let state = service_fn({
+            let locations = locations.clone();
+            move |request| {
+                assert_eq!(request, zs::Request::KnownBlock(hash));
+                let location = locations
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("three state queries");
+                async move { Ok::<_, BoxError>(zs::Response::KnownBlock(location)) }
+            }
+        });
+        let transaction = service_fn(|_| -> std::future::Ready<Result<tx::Response, BoxError>> {
+            panic!("duplicate and missing-height blocks cannot reach transaction verification")
+        });
+        let verifier = SemanticBlockVerifier::new(&Network::Mainnet, state, transaction);
+        let start = tokio::time::Instant::now();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            verifier.oneshot(Request::Commit(Arc::new(block))),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(start.elapsed() >= std::time::Duration::from_secs(2));
+        assert!(locations.lock().unwrap().is_empty());
+        if committed {
+            assert_eq!(error.duplicate_location(), Some(&zs::KnownBlock::BestChain));
+        } else {
+            assert!(
+                matches!(error, VerifyBlockError::Block { source: BlockError::MissingHeight(h) } if h == hash)
+            );
+        }
+    }
+}
+
 #[test]
 fn merkle_root_attribution_distinguishes_padding_from_intrinsic_duplicates() -> Result<(), Report> {
     use zakura_header_chain::{BodyCommitmentKind, BodyRuleId, BodyVerificationClass};
@@ -2128,4 +2313,379 @@ fn a_malleated_body_is_attributed_to_its_supplier_not_the_header() -> Result<(),
     );
 
     Ok(())
+}
+
+/// A pending commit that never resolves must not hold a caller without its own timeout.
+#[tokio::test(start_paused = true)]
+async fn pending_commit_wait_reports_the_duplicate_after_its_limit() {
+    let block: Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let hash = block.hash();
+    let state = service_fn(move |request| {
+        assert_eq!(request, zs::Request::KnownBlock(hash));
+        async move { Ok::<_, BoxError>(zs::Response::KnownBlock(Some(zs::KnownBlock::WriteChannel))) }
+    });
+    let transaction = service_fn(|_| -> std::future::Ready<Result<tx::Response, BoxError>> {
+        panic!("a pending duplicate cannot reach transaction verification")
+    });
+    let start = tokio::time::Instant::now();
+    let error = tokio::time::timeout(
+        super::PENDING_COMMIT_WAIT_LIMIT * 2,
+        SemanticBlockVerifier::new(&Network::Mainnet, state, transaction)
+            .oneshot(Request::Commit(Arc::new(block))),
+    )
+    .await
+    .expect("the pending commit wait has a limit")
+    .unwrap_err();
+    assert!(start.elapsed() >= super::PENDING_COMMIT_WAIT_LIMIT);
+    assert!(start.elapsed() < super::PENDING_COMMIT_WAIT_LIMIT * 2);
+    assert_eq!(
+        error.duplicate_location(),
+        Some(&zs::KnownBlock::WriteChannel)
+    );
+}
+
+/// Tests for the ZIP 218 per-block shielded action limits.
+///
+/// The limits only apply once NU7 is active.
+mod zip218_shielded_action_limits {
+    use std::sync::Arc;
+
+    use proptest::{
+        arbitrary::any,
+        strategy::{Strategy, ValueTree},
+        test_runner::TestRunner,
+    };
+    use zakura_chain::{
+        block::{Block, Height},
+        parameters::{
+            testnet::{ConfiguredActivationHeights, Parameters},
+            Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET, ORCHARD_BLOCK_ACTION_LIMIT,
+            SAPLING_BLOCK_IO_LIMIT, SPROUT_BLOCK_JOINSPLIT_LIMIT,
+        },
+        primitives::Groth16Proof,
+        serialization::{ZcashDeserialize, ZcashDeserializeInto},
+        transaction::{
+            arbitrary::{
+                fake_v5_with_orchard_actions, fake_v5_with_sapling_outputs,
+                fake_v6_with_orchard_and_ironwood_actions,
+            },
+            JoinSplitData, LockTime, Transaction,
+        },
+    };
+
+    use crate::block::check;
+    use crate::error::TransactionError;
+
+    /// Every historical block satisfies the limits, because NU7 is not active on
+    /// Mainnet. A block with no shielded data also satisfies them once NU7 is
+    /// active.
+    #[test]
+    fn historical_blocks_satisfy_the_limits() {
+        let _init_guard = zakura_test::init();
+
+        for block in zakura_test::vectors::BLOCKS.iter() {
+            let block = block
+                .zcash_deserialize_into::<Block>()
+                .expect("block is structurally valid");
+
+            check::shielded_action_limits_are_valid(
+                &block.transactions,
+                block
+                    .coinbase_height()
+                    .expect("block has a coinbase height"),
+                &Network::Mainnet,
+            )
+            .expect("a historical Mainnet block satisfies the shielded action limits");
+        }
+
+        let genesis =
+            Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
+                .expect("mainnet genesis deserializes");
+
+        check::shielded_action_limits_are_valid(
+            &genesis.transactions,
+            Height(1),
+            &nu7_active_testnet(),
+        )
+        .expect("a block with no shielded data satisfies the post-NU7 limits");
+    }
+
+    #[test]
+    fn limits_activate_at_the_nu7_height() {
+        let network = nu7_activation_testnet(2);
+        let over_limit_tx =
+            fake_v5_with_orchard_actions(limit_plus_one(ORCHARD_BLOCK_ACTION_LIMIT));
+
+        check::shielded_action_limits_are_valid(
+            [over_limit_tx.clone()].iter(),
+            Height(1),
+            &network,
+        )
+        .expect("the limits are inactive below the NU7 activation height");
+
+        let err =
+            check::shielded_action_limits_are_valid([over_limit_tx].iter(), Height(2), &network)
+                .expect_err("the limits are enforced at the NU7 activation height");
+
+        assert_eq!(
+            err,
+            TransactionError::OrchardActionsExceedBlockLimit {
+                actions: ORCHARD_BLOCK_ACTION_LIMIT + 1,
+                limit: ORCHARD_BLOCK_ACTION_LIMIT,
+            }
+        );
+    }
+
+    #[test]
+    fn counts_at_the_per_pool_limits_are_accepted() {
+        let cases: [(&str, Arc<Transaction>); 3] = [
+            (
+                "Orchard actions",
+                fake_v5_with_orchard_actions(limit_as_usize(ORCHARD_BLOCK_ACTION_LIMIT)),
+            ),
+            (
+                "Sapling spends and outputs",
+                fake_v5_with_sapling_outputs(limit_as_usize(SAPLING_BLOCK_IO_LIMIT)),
+            ),
+            (
+                "Sprout JoinSplits",
+                fake_v4_with_sprout_joinsplits(limit_as_usize(SPROUT_BLOCK_JOINSPLIT_LIMIT)),
+            ),
+        ];
+
+        for (pool, tx) in cases {
+            check::shielded_action_limits_are_valid([tx].iter(), Height(1), &nu7_active_testnet())
+                .unwrap_or_else(|error| {
+                    panic!("{pool} exactly at the per-block limit must pass, got {error}")
+                });
+        }
+    }
+
+    #[test]
+    fn a_cost_at_the_global_budget_is_accepted() {
+        // One Sapling output costs 1, so the rest of the budget can hold one
+        // fewer Orchard action.
+        let orchard_actions = limit_as_usize(
+            GLOBAL_SHIELDED_BUDGET
+                .checked_sub(1)
+                .expect("the global shielded budget covers at least one Sapling output"),
+        );
+
+        check::shielded_action_limits_are_valid(
+            [
+                fake_v5_with_orchard_actions(orchard_actions),
+                fake_v5_with_sapling_outputs(1),
+            ]
+            .iter(),
+            Height(1),
+            &nu7_active_testnet(),
+        )
+        .expect("a combined shielded cost exactly at the global budget must pass");
+    }
+
+    #[test]
+    fn sapling_ios_above_the_limit_are_rejected() {
+        let err = check::shielded_action_limits_are_valid(
+            [fake_v5_with_sapling_outputs(limit_plus_one(
+                SAPLING_BLOCK_IO_LIMIT,
+            ))]
+            .iter(),
+            Height(1),
+            &nu7_active_testnet(),
+        )
+        .expect_err("Sapling spends and outputs above the per-block limit must fail");
+
+        assert_eq!(
+            err,
+            TransactionError::SaplingIOsExceedBlockLimit {
+                ios: SAPLING_BLOCK_IO_LIMIT + 1,
+                limit: SAPLING_BLOCK_IO_LIMIT,
+            }
+        );
+    }
+
+    /// The Sprout limit is zero, so a block containing any JoinSplit is
+    /// rejected once NU7 is active.
+    #[test]
+    fn sprout_joinsplits_above_the_limit_are_rejected() {
+        let err = check::shielded_action_limits_are_valid(
+            [fake_v4_with_sprout_joinsplits(limit_plus_one(
+                SPROUT_BLOCK_JOINSPLIT_LIMIT,
+            ))]
+            .iter(),
+            Height(1),
+            &nu7_active_testnet(),
+        )
+        .expect_err("Sprout JoinSplits above the per-block limit must fail");
+
+        assert_eq!(
+            err,
+            TransactionError::SproutJoinSplitsExceedBlockLimit {
+                joinsplits: SPROUT_BLOCK_JOINSPLIT_LIMIT + 1,
+                limit: SPROUT_BLOCK_JOINSPLIT_LIMIT,
+            }
+        );
+    }
+
+    /// A block can satisfy every per-pool limit and still exceed the global
+    /// budget.
+    #[test]
+    fn a_cost_above_the_global_budget_is_rejected() {
+        let err = check::shielded_action_limits_are_valid(
+            [
+                fake_v5_with_orchard_actions(limit_as_usize(ORCHARD_BLOCK_ACTION_LIMIT)),
+                fake_v5_with_sapling_outputs(1),
+            ]
+            .iter(),
+            Height(1),
+            &nu7_active_testnet(),
+        )
+        .expect_err("a combined shielded cost above the global budget must fail");
+
+        assert_eq!(
+            err,
+            TransactionError::ShieldedCostExceedsBlockBudget {
+                cost: GLOBAL_SHIELDED_BUDGET + 1,
+                limit: GLOBAL_SHIELDED_BUDGET,
+            }
+        );
+    }
+
+    /// Ironwood actions count against the Orchard limit, alone or mixed with
+    /// Orchard actions, in one transaction or across transactions.
+    #[test]
+    fn ironwood_actions_above_the_orchard_limit_are_rejected() {
+        let over_limit = limit_plus_one(ORCHARD_BLOCK_ACTION_LIMIT);
+        let orchard_half = over_limit / 2;
+        let ironwood_half = over_limit - orchard_half;
+
+        let cases: [(&str, Vec<Arc<Transaction>>); 3] = [
+            ("Ironwood actions alone", vec![ironwood_tx(0, over_limit)]),
+            (
+                "Orchard and Ironwood actions in one transaction",
+                vec![ironwood_tx(orchard_half, ironwood_half)],
+            ),
+            (
+                "Orchard and Ironwood actions in separate transactions",
+                vec![
+                    fake_v5_with_orchard_actions(orchard_half),
+                    ironwood_tx(0, ironwood_half),
+                ],
+            ),
+        ];
+
+        for (case, transactions) in cases {
+            let err = check::shielded_action_limits_are_valid(
+                transactions.iter(),
+                Height(1),
+                &nu7_active_testnet(),
+            )
+            .expect_err("Ironwood actions above the Orchard limit must fail");
+
+            assert_eq!(
+                err,
+                TransactionError::OrchardActionsExceedBlockLimit {
+                    actions: ORCHARD_BLOCK_ACTION_LIMIT + 1,
+                    limit: ORCHARD_BLOCK_ACTION_LIMIT,
+                },
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn ironwood_actions_at_the_orchard_limit_are_accepted() {
+        let limit = limit_as_usize(ORCHARD_BLOCK_ACTION_LIMIT);
+        let orchard_half = limit / 2;
+
+        for tx in [
+            ironwood_tx(0, limit),
+            ironwood_tx(orchard_half, limit - orchard_half),
+        ] {
+            check::shielded_action_limits_are_valid([tx].iter(), Height(1), &nu7_active_testnet())
+                .expect("Orchard and Ironwood actions exactly at the Orchard limit must pass");
+        }
+    }
+
+    /// Ironwood actions add to the global budget like Orchard actions.
+    #[test]
+    fn ironwood_actions_count_in_the_global_budget() {
+        let err = check::shielded_action_limits_are_valid(
+            [
+                ironwood_tx(0, limit_as_usize(ORCHARD_BLOCK_ACTION_LIMIT)),
+                fake_v5_with_sapling_outputs(1),
+            ]
+            .iter(),
+            Height(1),
+            &nu7_active_testnet(),
+        )
+        .expect_err("Ironwood actions plus a Sapling output above the global budget must fail");
+
+        assert_eq!(
+            err,
+            TransactionError::ShieldedCostExceedsBlockBudget {
+                cost: GLOBAL_SHIELDED_BUDGET + 1,
+                limit: GLOBAL_SHIELDED_BUDGET,
+            }
+        );
+    }
+
+    /// Returns a V6 transaction with `orchard_actions` Orchard actions and
+    /// `ironwood_actions` Ironwood actions.
+    fn ironwood_tx(orchard_actions: usize, ironwood_actions: usize) -> Arc<Transaction> {
+        fake_v6_with_orchard_and_ironwood_actions(
+            NetworkUpgrade::Nu7,
+            orchard_actions,
+            ironwood_actions,
+        )
+    }
+
+    fn nu7_active_testnet() -> Network {
+        nu7_activation_testnet(1)
+    }
+
+    fn nu7_activation_testnet(nu7_activation_height: u32) -> Network {
+        Parameters::build()
+            .with_slow_start_interval(Height(0))
+            .with_activation_heights(ConfiguredActivationHeights {
+                nu7: Some(nu7_activation_height),
+                ..Default::default()
+            })
+            .expect("activation heights are valid")
+            .clear_funding_streams()
+            .to_network()
+            .expect("configured testnet is valid")
+    }
+
+    fn limit_as_usize(limit: u32) -> usize {
+        usize::try_from(limit).expect("a shielded action limit fits in usize")
+    }
+
+    fn limit_plus_one(limit: u32) -> usize {
+        usize::try_from(limit + 1).expect("a shielded action limit fits in usize")
+    }
+
+    /// Returns a V4 transaction containing `count` Sprout JoinSplits.
+    fn fake_v4_with_sprout_joinsplits(count: usize) -> Arc<Transaction> {
+        let joinsplit_data = count.checked_sub(1).map(|rest_len| {
+            let mut runner = TestRunner::default();
+            let mut joinsplit_data = any::<JoinSplitData<Groth16Proof>>()
+                .new_tree(&mut runner)
+                .expect("sprout JoinSplit data strategy is valid")
+                .current();
+            joinsplit_data.rest = vec![joinsplit_data.first.clone(); rest_len];
+            joinsplit_data
+        });
+
+        Arc::new(Transaction::V4 {
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            lock_time: LockTime::unlocked(),
+            expiry_height: Height(100),
+            joinsplit_data,
+            sapling_shielded_data: None,
+        })
+    }
 }

@@ -67,7 +67,7 @@ use crate::{
     },
     BlockAdmission, BlockCommitmentData, BoxError, CheckpointVerifiedBlock,
     CommitSemanticallyVerifiedError, Config, HashOrHeight, HistoricalTreeUnavailable, KnownBlock,
-    PreparedMinedRelayEligibility, ReadRequest, ReadResponse, Request, Response,
+    ParentInputs, PreparedMinedRelayEligibility, ReadRequest, ReadResponse, Request, Response,
     SemanticallyVerifiedBlock, StateInitError, ValidateContextError,
 };
 
@@ -2018,16 +2018,15 @@ impl Service<Request> for StateService {
                 let read_service = self.read_service.clone();
 
                 async move {
-                    if sent_hash_response.is_some() {
-                        return Ok(Response::KnownBlock(sent_hash_response));
-                    };
-
+                    // The sent cache retains committed blocks until finalization.
+                    // Prefer committed state so retries can observe a completed write.
                     let response = read::non_finalized_state_contains_block_hash(
                         &read_service.latest_non_finalized_state(),
                         hash,
                     )
                     // TODO: Move this to a blocking task, perhaps by moving some of this logic to the ReadStateService.
-                    .or_else(|| read::finalized_state_contains_block_hash(&read_service.db, hash));
+                    .or_else(|| read::finalized_state_contains_block_hash(&read_service.db, hash))
+                    .or(sent_hash_response);
 
                     timer.finish_desc("Request::KnownBlock");
 
@@ -2101,6 +2100,7 @@ impl Service<Request> for StateService {
             | Request::BlockLocator
             | Request::Transaction(_)
             | Request::UnspentBestChainUtxo(_)
+            | Request::CheckParentInputs { .. }
             | Request::Block(_)
             | Request::AnyChainHeight(_)
             | Request::AnyChainBlock(_)
@@ -2937,6 +2937,27 @@ impl Service<ReadRequest> for ReadStateService {
             ReadRequest::SpendingTransactionId(spend) => Ok(ReadResponse::TransactionId(
                 read::spending_transaction_hash(state.latest_best_chain(), &state.db, spend),
             )),
+
+            ReadRequest::CheckParentInputs { parent, outpoints } => {
+                let Some(finalized_tip) = state.db.tip() else {
+                    return Ok(ReadResponse::ParentInputs(ParentInputs::Inconclusive));
+                };
+                let inputs = read::parent_inputs(
+                    &state.latest_non_finalized_state(),
+                    &state.db,
+                    finalized_tip,
+                    parent,
+                    &outpoints,
+                );
+                // Finalization can remove an output spent after `parent`,
+                // or move `parent` from a non-finalized chain into the database.
+                let inputs = if state.db.finalized_tip_height() == Some(finalized_tip.0) {
+                    inputs
+                } else {
+                    ParentInputs::Inconclusive
+                };
+                Ok(ReadResponse::ParentInputs(inputs))
+            }
 
             ReadRequest::UnspentBestChainUtxo(outpoint) => Ok(ReadResponse::UnspentBestChainUtxo(
                 read::unspent_utxo(state.latest_best_chain(), &state.db, outpoint),

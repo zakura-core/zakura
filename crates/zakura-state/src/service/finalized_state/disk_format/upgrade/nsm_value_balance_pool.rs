@@ -213,11 +213,14 @@ fn eligible_balance(
                 "invalid NSM value balance at {height:?}: {error}"
             ))
         })?;
-    if zakura_chain::parameters::subsidy::is_zip234_active(network, height)
+    if cfg!(feature = "nu7")
+        && NetworkUpgrade::Nu7
+            .activation_height(network)
+            .is_some_and(|start| height >= start)
         && i64::from(eligible) < 0
     {
         return Err(FormatChangeError::InvalidPostcondition(format!(
-            "negative NSM value balance at active reissuance height {height:?}"
+            "negative NSM value balance at NU7 height {height:?}"
         )));
     }
     Ok(eligible)
@@ -335,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn eligible_negative_balance_follows_reissuance_activation() {
+    fn eligible_negative_balance_is_rejected_from_nu7() {
         use zakura_chain::parameters::testnet::{ConfiguredActivationHeights, RegtestParameters};
         let network = Network::new_regtest(RegtestParameters {
             activation_heights: ConfiguredActivationHeights {
@@ -354,7 +357,7 @@ mod tests {
                 Amount::try_from(i64::try_from(scheduled - baseline + 1).unwrap()).unwrap(),
             );
             let result = eligible_balance(&network, Height(h), pools, baseline);
-            if cfg!(feature = "nu7") && h == 3 {
+            if cfg!(feature = "nu7") {
                 assert!(matches!(
                     result,
                     Err(FormatChangeError::InvalidPostcondition(_))
@@ -551,6 +554,56 @@ mod database_tests {
         }
 
         assert!(Upgrade.validate(&db, &rx).unwrap().is_ok());
+    }
+
+    #[test]
+    fn migration_rejects_overdraw_between_nu7_and_reissuance() {
+        // NU7 starts at 2; reissuance starts at 20,000. The tip must not hide an
+        // invalid intermediate row, even when its own balance remains positive.
+        for overdraw_height in [2, 3] {
+            let db = legacy_db(4, 48);
+            let baseline = baseline(&db).unwrap();
+            let scheduled = i128::try_from(
+                scheduled_issuance_zatoshis(Height(overdraw_height), &db.network()).unwrap(),
+            )
+            .unwrap();
+            let issued = i64::try_from(scheduled - baseline + 1).unwrap();
+            let mut bytes = vec![0; 48];
+            bytes[..8].copy_from_slice(&issued.to_le_bytes());
+            let mut batch = DiskWriteBatch::new();
+            if overdraw_height == 3 {
+                let _ = db
+                    .raw_chain_value_pools_cf()
+                    .with_batch_for_writing(&mut batch)
+                    .zs_insert(&(), &RawBytes(bytes.clone()));
+            }
+            bytes.extend_from_slice(&100u32.to_le_bytes());
+            let _ = db
+                .raw_block_info_cf()
+                .with_batch_for_writing(&mut batch)
+                .zs_insert(&Height(overdraw_height), &RawBytes(bytes));
+            db.write_batch(batch).unwrap();
+
+            let (_tx, rx) = crossbeam_channel::bounded(1);
+            let result = Upgrade.run(Some(Height(3)), &db, &rx);
+            if cfg!(feature = "nu7") {
+                assert!(matches!(
+                    result,
+                    Err(FormatChangeError::InvalidPostcondition(_))
+                ));
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    i64::from(
+                        read_block_info(&db, Height(overdraw_height))
+                            .unwrap()
+                            .value_pools()
+                            .nsm_value_balance_amount()
+                    ),
+                    -1,
+                );
+            }
+        }
     }
 
     #[test]

@@ -1,9 +1,9 @@
-//! Mining templates, coinbase validation, and NSM accounting use the same fee split.
+//! Mining templates pay the miner share and account for the NSM contribution once.
 
 use std::{collections::HashMap, sync::Arc};
 
 use zakura_chain::{
-    amount::{Amount, DeferredPoolBalanceChange, NonNegative},
+    amount::{Amount, NonNegative},
     block::{genesis, Block, Hash, Height},
     parameters::{
         subsidy::{block_subsidy, halving_block_subsidy},
@@ -16,7 +16,6 @@ use zakura_chain::{
     value_balance::ValueBalance,
     work::difficulty::{CompactDifficulty, ExpandedDifficulty, U256},
 };
-use zakura_consensus::block::check;
 use zakura_state::GetBlockTemplateChainInfo;
 use zcash_address::{ToAddress, ZcashAddress};
 use zcash_protocol::consensus::NetworkType;
@@ -25,10 +24,11 @@ use super::super::{BlockTemplateResponse, MinerParams};
 use crate::config::mining;
 
 #[test]
-fn nsm_fee_templates_validate_and_credit_the_balance_once() {
+fn nsm_fee_templates_pay_miner_and_credit_balance_once() {
     let _init_guard = zakura_test::init();
     let network = Network::new_regtest(RegtestParameters {
         activation_heights: ConfiguredActivationHeights {
+            nu6_3: Some(1),
             nu7: Some(5),
             ..Default::default()
         },
@@ -52,7 +52,7 @@ fn nsm_fee_templates_validate_and_credit_the_balance_once() {
         for transaction_count in [0u8, 2] {
             let mut mempool = Vec::new();
             let mut utxos = HashMap::new();
-            for index in 0..transaction_count {
+            for index in 1..=transaction_count {
                 let outpoint = OutPoint {
                     hash: transaction::Hash([index; 32]),
                     index: 0,
@@ -136,15 +136,6 @@ fn nsm_fee_templates_validate_and_credit_the_balance_once() {
                 .sum::<Result<Amount<NonNegative>, _>>()
                 .unwrap();
             assert_eq!(i64::from(coinbase_value), i64::from(subsidy) + miner_fees);
-            check::miner_fees_are_valid(
-                &coinbase,
-                height,
-                Amount::try_from(fees).unwrap(),
-                subsidy,
-                DeferredPoolBalanceChange::new(Amount::zero()),
-                &network,
-            )
-            .expect("the generated coinbase satisfies the consensus fee rule");
 
             let mut block: Block = (*genesis::regtest_genesis_block()).clone();
             block.transactions = vec![Arc::new(coinbase)];

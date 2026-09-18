@@ -6,7 +6,7 @@ use crate::{
     parameters::{Network, NetworkUpgrade},
 };
 
-/// Returns the fees the coinbase must claim, excluding the block subsidy.
+/// Returns the miner's share of aggregate block fees, excluding the block subsidy.
 ///
 /// With the `nu7` feature enabled, NU7 contributes `floor(6 * transaction_fees / 10)`
 /// to NSM and leaves the remainder to the miner. Before NU7, or without that feature,

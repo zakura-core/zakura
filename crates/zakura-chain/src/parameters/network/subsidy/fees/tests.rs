@@ -9,6 +9,7 @@ use crate::{
 fn network() -> Network {
     Network::new_regtest(RegtestParameters {
         activation_heights: ConfiguredActivationHeights {
+            nu6_3: Some(1),
             nu7: Some(5),
             ..Default::default()
         },
@@ -34,7 +35,7 @@ fn nsm_fee_share_rounds_aggregate_fees_at_activation() {
         (10, 4),
         (1_000, 400),
         (1_001, 401),
-        (MAX_MONEY, 840_000_000_000_000),
+        (MAX_MONEY, 840_000_000_000_000i64),
         (MAX_MONEY - 1, 840_000_000_000_000),
     ] {
         let fees = Amount::try_from(fees).unwrap();

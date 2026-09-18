@@ -8,6 +8,7 @@ fn nsm_fee_claims_at_activation_and_reissuance() {
 
     let network = Network::new_regtest(RegtestParameters {
         activation_heights: ConfiguredActivationHeights {
+            nu6_3: Some(1),
             nu7: Some(5),
             ..Default::default()
         },
@@ -45,7 +46,7 @@ fn nsm_fee_claims_at_activation_and_reissuance() {
                 assert_eq!(
                     result.is_ok(),
                     adjustment == 0,
-                    "height={height}, fees={fees}"
+                    "height={height:?}, fees={fees}"
                 );
             }
         }

@@ -152,8 +152,8 @@ proptest::proptest! {
     #![proptest_config(proptest::test_runner::Config::with_cases(32))]
 
     #[test]
-    fn max_money_aggregate_fees_reject_before_recycling(
-        first in 1_000i64..=zakura_chain::amount::MAX_MONEY,
+    fn max_money_aggregate_fees_enforce_bound_before_recycling(
+        first in 1_000i64..zakura_chain::amount::MAX_MONEY,
         excess in 1i64..=1_000,
     ) {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -166,10 +166,15 @@ proptest::proptest! {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let network = zip234_test_network(Height(4));
-            for height in [Height(1), Height(2), Height(4)] {
+            for (height, excess) in [Height(1), Height(2), Height(4)].into_iter()
+                .flat_map(|height| [-1, 0, 1, excess].map(|excess| (height, excess))) {
                 let subsidy = block_subsidy(height, &network,
                     Some(Amount::try_from(ZIP234_TEST_DEFICIT).unwrap())).unwrap();
-                let mut block = zip234_test_block(&network, height, subsidy);
+                let total_fees = MAX_MONEY + excess;
+                // Compute the miner share independently, including for rejected totals.
+                let miner_share = total_fees - total_fees * 3 / 5;
+                let coinbase_value = (subsidy + Amount::try_from(miner_share).unwrap()).unwrap();
+                let mut block = zip234_test_block(&network, height, coinbase_value);
                 for index in [1u8, 2] {
                     let mut tx = v5_coinbase_transaction(NetworkUpgrade::Nu7, height, &network);
                     *tx.inputs_mut() = vec![Input::PrevOut {
@@ -186,7 +191,10 @@ proptest::proptest! {
                         zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
                         zs::Request::CheckParentInputs { .. } => zs::Response::ParentInputs(zs::ParentInputs::Inconclusive),
                         zs::Request::AwaitBlockInfo(_) => zs::Response::BlockInfo(Some(BlockInfo::new(parent_pools, 0))),
-                        zs::Request::CommitSemanticallyVerifiedBlock(_) => panic!("overflowing fees must not reach state commit"),
+                        zs::Request::CommitSemanticallyVerifiedBlock(block) => {
+                            assert!(excess <= 0, "overflowing fees must not reach state commit");
+                            zs::Response::Committed(block.hash)
+                        },
                         _ => panic!("unexpected state request: {request:?}"),
                     })
                 });
@@ -207,9 +215,13 @@ proptest::proptest! {
                 let verifier = SemanticBlockVerifier::new(&network, state, transaction);
                 let result = tokio::time::timeout(std::time::Duration::from_secs(10),
                     verifier.oneshot(Request::Commit(Arc::new(block)))).await.unwrap();
-                assert!(matches!(result, Err(VerifyBlockError::Block {
-                    source: BlockError::SummingMinerFees { .. },
-                })), "height={height:?}, fees={fees:?}: {result:?}");
+                if excess > 0 {
+                    assert!(matches!(result, Err(VerifyBlockError::Block {
+                        source: BlockError::SummingMinerFees { .. },
+                    })), "height={height:?}, fees={fees:?}: {result:?}");
+                } else {
+                    assert!(result.is_ok(), "height={height:?}, fees={fees:?}: {result:?}");
+                }
             }
         });
     }

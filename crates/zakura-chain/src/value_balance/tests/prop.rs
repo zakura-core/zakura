@@ -245,6 +245,12 @@ proptest! {
             *slot = Amount::try_from(if index == source { -value } else if index == destination { value } else { 0 }).unwrap();
         }
         let updated = pools.add_chain_value_pool_change(change).unwrap();
+        for (index, amount) in [updated.transparent, updated.sprout, updated.sapling,
+            updated.orchard, updated.deferred, updated.ironwood].into_iter().enumerate() {
+            let expected = if index == source { MAX_MONEY - value }
+                else if index == destination { value } else { 0 };
+            prop_assert_eq!(i64::from(amount), expected);
+        }
         prop_assert_eq!(updated.total(), pools.total());
         prop_assert_eq!(updated.nsm_value_balance_amount(), pools.nsm_value_balance_amount());
         prop_assert_eq!(updated.add_chain_value_pool_change(-change), Ok(pools));

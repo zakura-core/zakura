@@ -532,9 +532,7 @@ mod issuance_deficit_boundary_tests {
                         &change,
                     );
                     let sum = i128::from(before) + i128::from(delta);
-                    let reject = cfg!(feature = "nu7")
-                        && height >= 3
-                        && !(0..=i128::from(MAX_MONEY)).contains(&sum);
+                    let reject = height >= 3 && !(0..=i128::from(MAX_MONEY)).contains(&sum);
                     assert_eq!(
                         result.is_err(),
                         reject,

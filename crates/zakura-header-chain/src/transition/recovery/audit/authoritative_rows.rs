@@ -89,7 +89,7 @@ pub(super) fn check_authoritative_rows<S: StoreAuditSnapshot>(
 
     let mut contexts = validation_contexts.to_vec();
     contexts.sort_unstable_by_key(|record| record.height);
-    let predecessor_span = u32::try_from(crate::POW_PREDECESSOR_CONTEXT_SPAN)
+    let predecessor_span = u32::try_from(crate::MAX_POW_PREDECESSOR_CONTEXT_SPAN)
         .map_err(|_| StoreError::Incoherent("validation context bound does not fit in u32"))?;
     let required_contexts = usize::try_from(
         metadata.frontiers.finalized.height.0.min(predecessor_span),

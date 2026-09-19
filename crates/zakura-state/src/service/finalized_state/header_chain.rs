@@ -5333,7 +5333,7 @@ impl HeaderChainStore {
             return Ok(None);
         }
 
-        let predecessor_span = u32::try_from(zakura_header_chain::POW_PREDECESSOR_CONTEXT_SPAN)
+        let predecessor_span = u32::try_from(zakura_header_chain::MAX_POW_PREDECESSOR_CONTEXT_SPAN)
             .map_err(|_| {
                 HeaderChainStoreError::Incoherent("validation context bound does not fit in u32")
             })?;
@@ -6026,7 +6026,7 @@ fn authenticated_context_headers(
     let parent_node = staged_parent
         .or(stored_parent.as_ref())
         .ok_or(StoreError::Incoherent("validation parent is not retained"))?;
-    let predecessor_span = u32::try_from(zakura_header_chain::POW_PREDECESSOR_CONTEXT_SPAN)
+    let predecessor_span = u32::try_from(zakura_header_chain::MAX_POW_PREDECESSOR_CONTEXT_SPAN)
         .map_err(|_| StoreError::Incoherent("validation context bound does not fit in u32"))?;
     let required = usize::try_from(parent_node.height.0.min(predecessor_span))
         .map_err(|_| StoreError::Incoherent("validation context bound does not fit in usize"))?;

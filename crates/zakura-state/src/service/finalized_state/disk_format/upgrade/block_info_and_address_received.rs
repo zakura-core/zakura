@@ -207,6 +207,7 @@ impl DiskFormatUpgrade for Upgrade {
                 .add_chain_value_pool_change(
                     block
                         .chain_value_pool_change(
+                            &network,
                             &utxos,
                             deferred_pool_balance_change.map(DeferredPoolBalanceChange::new),
                         )

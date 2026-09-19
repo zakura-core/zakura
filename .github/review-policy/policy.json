@@ -1,0 +1,27 @@
+{
+  "repository": "zakura-core/zakura",
+  "base_branch": "main",
+  "slack_channel": "C0BCQ7PP32A",
+  "changelog_fragment_root": "docs/changelog/unreleased/",
+  "eligible_roots": [
+    "deploy/",
+    ".github/workflows/",
+    ".github/scripts/"
+  ],
+  "human_only": [
+    ".github/workflows/codex-approval-adapter.yml",
+    ".github/workflows/create-release.yml",
+    ".github/workflows/prepare-release-pr.yml",
+    ".github/workflows/publish-crates.yml",
+    ".github/workflows/release-binaries.yml",
+    ".github/workflows/release-drafter.yml",
+    ".github/workflows/release-pr-readiness.yml",
+    ".github/workflows/update-release-state.yml",
+    ".github/scripts/fetch-release-state.py",
+    ".github/scripts/import-release-state.py",
+    ".github/scripts/validate-checkpoints.sh",
+    "deploy/release-state/"
+  ],
+  "codex_user_id": 199175422,
+  "codex_app_id": 1144995
+}

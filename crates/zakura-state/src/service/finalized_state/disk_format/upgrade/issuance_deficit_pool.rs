@@ -105,13 +105,23 @@ fn backfill(
         return Ok(());
     };
 
+    check_cancelled(cancel_receiver)?;
     let network = db.network();
     refuse_unrepairable_history(&network, tip_height)?;
+    let Some(start) = NetworkUpgrade::Nu7.activation_height(&network) else {
+        return Ok(());
+    };
+    if tip_height < start {
+        return Ok(());
+    }
+
+    // Legacy records already decode with the required zero pre-NU7 deficit.
+    // Only the baseline immediately before activation is needed from that history.
     let baseline = baseline(db)?;
     let mut batch = DiskWriteBatch::new();
     let mut batched = 0;
 
-    for height in 0..=tip_height.0 {
+    for height in start.0..=tip_height.0 {
         check_cancelled(cancel_receiver)?;
 
         let height = Height(height);
@@ -382,14 +392,17 @@ mod database_tests {
     };
 
     fn legacy_db(rows: u32, pool_len: usize) -> ZakuraDb {
-        let network = Network::new_regtest(RegtestParameters {
+        legacy_db_on(accounting_network(), rows, pool_len)
+    }
+
+    fn accounting_network() -> Network {
+        Network::new_regtest(RegtestParameters {
             activation_heights: ConfiguredActivationHeights {
                 nu7: Some(2),
                 ..Default::default()
             },
             ..Default::default()
-        });
-        legacy_db_on(network, rows, pool_len)
+        })
     }
 
     fn legacy_db_on(network: Network, rows: u32, pool_len: usize) -> ZakuraDb {
@@ -405,6 +418,9 @@ mod database_tests {
             false,
         )
         .unwrap();
+        if rows == 0 {
+            return db;
+        }
         let mut batch = DiskWriteBatch::new();
         for h in 0..rows {
             let mut bytes = vec![0; pool_len];
@@ -454,8 +470,95 @@ mod database_tests {
     }
 
     #[test]
+    fn empty_migration_does_not_write() {
+        let db = legacy_db(0, 48);
+        let (_tx, rx) = crossbeam_channel::bounded(1);
+        backfill(None, &db, &rx, |_| panic!("empty migration must not write")).unwrap();
+        assert!(Upgrade.validate(&db, &rx).unwrap().is_ok());
+    }
+
+    #[test]
+    fn migration_before_activation_leaves_legacy_data_unchanged() {
+        for network in [Network::Mainnet, accounting_network()] {
+            let db = legacy_db_on(network, 2, 48);
+            let tip = db.raw_block_info_cf().zs_get(&Height(1)).unwrap().0;
+            let pools = db.raw_chain_value_pools_cf().zs_get(&()).unwrap().0;
+            // A missing unrelated historical row proves neither run nor validation
+            // traverses the pre-activation history.
+            let mut batch = DiskWriteBatch::new();
+            let _ = db
+                .raw_block_info_cf()
+                .with_batch_for_writing(&mut batch)
+                .zs_delete(&Height(0));
+            db.write_batch(batch).unwrap();
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            backfill(Some(Height(1)), &db, &rx, |_| {
+                panic!("pre-NU7 migration must not write")
+            })
+            .unwrap();
+            assert!(Upgrade.validate(&db, &rx).unwrap().is_ok());
+            assert_eq!(db.raw_block_info_cf().zs_get(&Height(1)).unwrap().0, tip);
+            assert_eq!(db.raw_chain_value_pools_cf().zs_get(&()).unwrap().0, pools);
+            tx.send(CancelFormatChange).unwrap();
+            assert!(matches!(
+                Upgrade.run(Some(Height(1)), &db, &rx),
+                Err(FormatChangeError::Cancelled)
+            ));
+        }
+    }
+
+    #[test]
+    fn migration_preserves_pre_activation_bytes() {
+        for rows in [3, 4] {
+            for pool_len in [40, 48, 56] {
+                let db = legacy_db(rows, pool_len);
+                let before: Vec<_> = (0..2)
+                    .map(|h| db.raw_block_info_cf().zs_get(&Height(h)).unwrap().0)
+                    .collect();
+                let (_tx, rx) = crossbeam_channel::bounded(1);
+                Upgrade.run(Some(Height(rows - 1)), &db, &rx).unwrap();
+                assert_upgraded(&db, rows);
+                for (h, bytes) in before.iter().enumerate() {
+                    assert_eq!(
+                        &db.raw_block_info_cf()
+                            .zs_get(&Height(u32::try_from(h).unwrap()))
+                            .unwrap()
+                            .0,
+                        bytes
+                    );
+                }
+                for h in 2..rows {
+                    assert_eq!(
+                        db.raw_block_info_cf().zs_get(&Height(h)).unwrap().0.len(),
+                        60
+                    );
+                }
+                assert_eq!(
+                    db.raw_chain_value_pools_cf().zs_get(&()).unwrap().0.len(),
+                    56
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn migration_does_not_require_rows_before_baseline() {
+        let db = legacy_db(4, 48);
+        let mut batch = DiskWriteBatch::new();
+        let _ = db
+            .raw_block_info_cf()
+            .with_batch_for_writing(&mut batch)
+            .zs_delete(&Height(0));
+        db.write_batch(batch).unwrap();
+        let (_tx, rx) = crossbeam_channel::bounded(1);
+        Upgrade.run(Some(Height(3)), &db, &rx).unwrap();
+        assert!(Upgrade.validate(&db, &rx).unwrap().is_ok());
+    }
+
+    #[test]
     fn migration_batch_boundaries_retry_and_idempotence() {
-        for (rows, pool_len) in [(9_999, 40), (10_000, 48), (10_001, 48)] {
+        for (affected, pool_len) in [(9_999, 40), (10_000, 48), (10_001, 48)] {
+            let rows = affected + 2;
             for fail_write in [0, 1] {
                 let db = legacy_db(rows, pool_len);
                 let (_tx, rx) = crossbeam_channel::bounded(1);
@@ -471,11 +574,13 @@ mod database_tests {
                     db.write_batch(batch).unwrap();
                     Ok(())
                 });
-                if fail_write == 0 || rows >= 10_000 {
+                if fail_write == 0 || affected >= BATCH_BLOCKS {
                     assert!(matches!(
                         result,
                         Err(FormatChangeError::MigrationStorage(_))
                     ));
+                } else {
+                    result.unwrap();
                 }
                 Upgrade.run(Some(Height(rows - 1)), &db, &rx).unwrap();
                 assert_upgraded(&db, rows);
@@ -487,16 +592,16 @@ mod database_tests {
 
     #[test]
     fn migration_cancellation_between_batches_is_retryable() {
-        let db = legacy_db(10_001, 48);
+        let db = legacy_db(10_003, 48);
         let (tx, rx) = crossbeam_channel::bounded(1);
-        let result = backfill(Some(Height(10_000)), &db, &rx, |batch| {
+        let result = backfill(Some(Height(10_002)), &db, &rx, |batch| {
             db.write_batch(batch).unwrap();
             tx.send(CancelFormatChange).unwrap();
             Ok(())
         });
         assert!(matches!(result, Err(FormatChangeError::Cancelled)));
-        Upgrade.run(Some(Height(10_000)), &db, &rx).unwrap();
-        assert_upgraded(&db, 10_001);
+        Upgrade.run(Some(Height(10_002)), &db, &rx).unwrap();
+        assert_upgraded(&db, 10_003);
     }
 
     #[test]
@@ -584,7 +689,7 @@ mod database_tests {
     }
     #[test]
     fn migration_rejects_missing_anchor_rows_and_tip() {
-        for missing in [0, 1, 2, 3, 4] {
+        for missing in [1, 2, 3, 4] {
             let db = legacy_db(4, 48);
             let mut batch = DiskWriteBatch::new();
             if missing == 4 {

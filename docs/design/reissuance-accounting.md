@@ -12,8 +12,13 @@ Runtime accounting and migration use the same excluded pre-NU7 baseline.
 Changing that policy requires changing both paths and their tests together.
 
 Format 29 appends the counter to pool records and BlockInfo. The upgrade moves
-an existing v28 database to the v29 path and backfills every record. It preserves
-monetary pools and block sizes. It writes the separately stored tip pools last.
+an existing v28 database to the v29 path and backfills records from NU7 activation
+through the finalized tip, using the preceding block as the excluded baseline.
+Earlier records remain unchanged: legacy records decode with a zero deficit.
+If NU7 is unscheduled or the tip precedes activation, the migration performs no
+data writes, including to the separately stored tip pools. Otherwise it preserves
+monetary pools and block sizes and writes the separately stored tip pools last.
+Both paths validate the tip before advancing the format version.
 Failures and cancellation preserve the version marker so startup can retry.
 Older binaries cannot read the expanded records; downgrade requires a backup
 or a separate sync.

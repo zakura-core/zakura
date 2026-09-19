@@ -366,10 +366,10 @@ impl Block {
     /// > NSMValueBalance(height) = NSMValueBalance(height - 1)
     /// >   - AdditionalBlockSubsidy(height) + removed(height)
     ///
-    /// With the `nu7` feature enabled, the NU7 deployment draft's fee recycling rule
-    /// makes `removed(height) = floor(6 * TransactionFees(height) / 10)`. Coinbase
+    /// The NU7 deployment draft's fee recycling rule makes
+    /// `removed(height) = floor(6 * TransactionFees(height) / 10)`. Coinbase
     /// validation and block templates use `subsidy::miner_fee_share` to withhold that
-    /// contribution from the aggregate fees, starting at NU7 activation.
+    /// contribution from the aggregate fees, starting at NU7 activation in every build.
     ///
     /// The block's change across the six monetary pools is therefore
     /// `BlockSubsidy(height) - removed(height)`. Subtracting that from the halving

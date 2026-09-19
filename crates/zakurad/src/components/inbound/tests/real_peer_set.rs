@@ -1063,6 +1063,7 @@ async fn setup(
         mempool: mempool_service.clone(),
         state: state_service.clone(),
         latest_chain_tip,
+        network: network.clone(),
         misbehavior_sender,
     };
     let r = setup_tx.send(setup_data);

@@ -54,7 +54,7 @@ proptest! {
         });
         let scheduled = i64::from(halving_block_subsidy(Height(height), &network).unwrap());
         let actual = i64::from(block_subsidy(Height(height), &network, Some(Amount::try_from(balance).unwrap())).unwrap());
-        let bonus = if cfg!(feature = "nu7") && height >= 3 {
+        let bonus = if height >= 3 {
             let numerator = i128::try_from(block_subsidy_fraction_numerator(Height(height), &network)).unwrap();
             (i128::from(balance) * numerator + 9_999_999_999) / 10_000_000_000
         } else {

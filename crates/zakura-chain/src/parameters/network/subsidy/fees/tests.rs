@@ -40,7 +40,7 @@ fn nsm_fee_share_rounds_aggregate_fees_at_activation() {
     ] {
         let fees = Amount::try_from(fees).unwrap();
         for height in [Height(4), Height(5), Height(9), Height(10)] {
-            let expected = if cfg!(feature = "nu7") && height >= Height(5) {
+            let expected = if height >= Height(5) {
                 Amount::try_from(miner).unwrap()
             } else {
                 fees
@@ -58,7 +58,6 @@ fn nsm_fee_share_requires_a_configured_activation() {
     assert_eq!(miner_fee_share(Height::MAX, &network, fees), fees);
 }
 
-#[cfg(feature = "nu7")]
 #[test]
 fn nsm_fee_rounding_is_per_block() {
     let network = network();

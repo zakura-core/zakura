@@ -7,7 +7,7 @@
 use std::{env, sync::Arc, time::Duration};
 
 use tokio::{runtime::Runtime, time::timeout};
-use tower::{buffer::Buffer, util::BoxService, ServiceExt};
+use tower::{buffer::Buffer, util::BoxService, Service, ServiceExt};
 
 use zakura_chain::{
     block::{self, Block, CountedHeader, Height},
@@ -33,9 +33,9 @@ use crate::{
     },
     tests::setup::{partial_nu5_chain_strategy, transaction_v4_from_coinbase},
     BlockAdmission, BoxError, CheckpointVerifiedBlock, CommitBlockError, Config,
-    HistoricalTreeUnavailable, PruningConfig, Request, Response, SemanticallyVerifiedBlock,
-    StateInitError, StorageMode, ValidateContextError, CHAIN_TIP_UPDATE_WAIT_LIMIT,
-    MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
+    HistoricalTreeUnavailable, ParentInputs, PruningConfig, Request, Response,
+    SemanticallyVerifiedBlock, StateInitError, StorageMode, ValidateContextError,
+    CHAIN_TIP_UPDATE_WAIT_LIMIT, MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
 };
 
 const LAST_BLOCK_HEIGHT: u32 = 10;
@@ -154,6 +154,172 @@ async fn await_block_info_waits_for_checkpoint_commit() {
     let response = timeout(limit, state.oneshot(Request::AwaitBlockInfo(hash)))
         .await
         .expect("known parent returns immediately")
+        .expect("lookup succeeds");
+    assert!(matches!(response, Response::BlockInfo(Some(_))));
+}
+
+/// Returns Mainnet blocks 0..=2 with v4 coinbases, so block 2 can reach the non-finalized state.
+fn v4_coinbase_mainnet_chain() -> Vec<Arc<Block>> {
+    let mut chain: Vec<Arc<Block>> = Vec::new();
+    for (_height, block_bytes) in zakura_test::vectors::MAINNET_BLOCKS.range(0..=2) {
+        let mut block = block_bytes
+            .zcash_deserialize_into::<Block>()
+            .expect("the mainnet block vector decodes");
+        block.transactions = vec![Arc::new(transaction_v4_from_coinbase(
+            &block.transactions[0],
+        ))];
+        if let Some(parent) = chain.last() {
+            Arc::make_mut(&mut block.header).previous_block_hash = parent.hash();
+        }
+        chain.push(Arc::new(block));
+    }
+    chain
+}
+
+/// Returns a state with blocks 0 and 1 of `chain` finalized.
+async fn state_with_finalized_parent(chain: &[Arc<Block>]) -> StateService {
+    let (mut state, _, _, _) =
+        StateService::new(Config::ephemeral(), &Network::Mainnet, Height::MAX, 0)
+            .await
+            .expect("ephemeral state initialization succeeds");
+    for block in &chain[0..=1] {
+        let result = state
+            .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block.clone()))
+            .await;
+        assert!(matches!(result, Ok(Ok(_))), "checkpoint commit: {result:?}");
+    }
+    state
+}
+
+fn await_block_info_error(result: Result<Response, BoxError>) -> crate::AwaitBlockInfoError {
+    let error = result.expect_err("the wait fails");
+    error
+        .downcast_ref::<crate::AwaitBlockInfoError>()
+        .unwrap_or_else(|| panic!("unexpected error: {error:?}"))
+        .clone()
+}
+
+/// A block restored by `reconsiderblock` must wake readers waiting for it,
+/// even though no block commit follows.
+#[tokio::test(flavor = "multi_thread")]
+async fn await_block_info_wakes_after_reconsider() {
+    let _init_guard = zakura_test::init();
+    let limit = Duration::from_secs(10);
+    let chain = v4_coinbase_mainnet_chain();
+    let mut state = state_with_finalized_parent(&chain).await;
+
+    let child = chain[2].clone().prepare();
+    let hash = child.hash;
+    timeout(
+        limit,
+        state.queue_and_commit_to_non_finalized_state(child, None),
+    )
+    .await
+    .expect("non-finalized commit completes")
+    .expect("the response channel stays open")
+    .expect("the non-finalized block commits");
+
+    let state = Buffer::new(BoxService::new(state), 10);
+    timeout(limit, state.clone().oneshot(Request::InvalidateBlock(hash)))
+        .await
+        .expect("invalidation completes")
+        .expect("block is invalidated");
+
+    let mut wait = tokio::spawn(state.clone().oneshot(Request::AwaitBlockInfo(hash)));
+    assert!(
+        timeout(Duration::from_millis(100), &mut wait)
+            .await
+            .is_err(),
+        "an invalidated block has no block info"
+    );
+
+    timeout(limit, state.clone().oneshot(Request::ReconsiderBlock(hash)))
+        .await
+        .expect("reconsideration completes")
+        .expect("block is reconsidered");
+
+    let response = timeout(limit, wait)
+        .await
+        .expect("reader wakes without another block commit")
+        .expect("reader task completes")
+        .expect("lookup succeeds");
+    assert!(matches!(response, Response::BlockInfo(Some(_))));
+}
+
+/// A reader waiting for a block stops waiting when the state rejects that block.
+#[tokio::test(flavor = "multi_thread")]
+async fn await_block_info_fails_when_the_block_is_rejected() {
+    let _init_guard = zakura_test::init();
+    let limit = Duration::from_secs(10);
+    let chain = v4_coinbase_mainnet_chain();
+    let mut state = state_with_finalized_parent(&chain).await;
+
+    // A spend of an output this state does not have fails contextual validation.
+    let later: Block = zakura_test::vectors::BLOCK_MAINNET_419201_BYTES
+        .zcash_deserialize_into()
+        .expect("the later block vector decodes");
+    let spend = later
+        .transactions
+        .iter()
+        .find(|transaction| !transaction.is_coinbase() && !transaction.inputs().is_empty())
+        .expect("the later block has a transparent spend")
+        .clone();
+    let mut invalid = (*chain[2]).clone();
+    invalid.transactions.push(spend);
+    let invalid = Arc::new(invalid).prepare();
+    let hash = invalid.hash;
+
+    let wait = state.call(Request::AwaitBlockInfo(hash));
+    let commit = state.queue_and_commit_to_non_finalized_state(invalid, None);
+    timeout(limit, commit)
+        .await
+        .expect("non-finalized commit completes")
+        .expect("the response channel stays open")
+        .expect_err("the invalid block is rejected");
+
+    let error = await_block_info_error(timeout(limit, wait).await.expect("reader wakes"));
+    assert_eq!(error, crate::AwaitBlockInfoError::Rejected { hash });
+}
+
+/// A reader waiting for a block that never arrives stops at the wait limit.
+#[tokio::test(flavor = "multi_thread")]
+async fn await_block_info_times_out() {
+    let _init_guard = zakura_test::init();
+    let chain = v4_coinbase_mainnet_chain();
+    let mut state = state_with_finalized_parent(&chain).await;
+    let wait_limit = Duration::from_millis(200);
+    state.await_block_info_timeout = wait_limit;
+
+    let hash = chain[2].hash();
+    let error = await_block_info_error(
+        timeout(
+            Duration::from_secs(10),
+            state.call(Request::AwaitBlockInfo(hash)),
+        )
+        .await
+        .expect("the wait limit ends the request"),
+    );
+    assert_eq!(
+        error,
+        crate::AwaitBlockInfoError::TimedOut {
+            hash,
+            limit: wait_limit,
+        }
+    );
+
+    // A reader that starts after the block commits still succeeds.
+    let child = chain[2].clone().prepare();
+    timeout(
+        Duration::from_secs(10),
+        state.queue_and_commit_to_non_finalized_state(child, None),
+    )
+    .await
+    .expect("non-finalized commit completes")
+    .expect("the response channel stays open")
+    .expect("the non-finalized block commits");
+    let response = state
+        .call(Request::AwaitBlockInfo(hash))
+        .await
         .expect("lookup succeeds");
     assert!(matches!(response, Response::BlockInfo(Some(_))));
 }
@@ -2332,4 +2498,371 @@ async fn unpublished_writer_transitions_block_optimistic_relay_and_bound_bodies(
         state.non_finalized_write_slots.available_permits(),
         super::queued_blocks::MAX_QUEUED_BLOCKS
     );
+}
+
+/// The sent cache must not hide a completed commit from a same-hash retry.
+#[tokio::test]
+async fn known_block_prefers_committed_state_over_sent_cache() {
+    use crate::KnownBlock;
+    use tower::{Service, ServiceExt};
+
+    let _init_guard = zakura_test::init();
+    let mut config = Config::ephemeral();
+    config.enable_zakura_header_seed_from_committed_blocks = true;
+    config.vct_fast_sync = false;
+    let (mut state, _, _, _) = StateService::new(config, &Network::Mainnet, Height::MAX, 0)
+        .await
+        .unwrap();
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let hash = block.hash();
+    let checkpoint = CheckpointVerifiedBlock::from(block);
+    state
+        .non_finalized_block_write_sent_hashes
+        .add_finalized(&checkpoint);
+    assert_eq!(
+        state
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::KnownBlock(hash))
+            .await
+            .unwrap(),
+        Response::KnownBlock(Some(KnownBlock::WriteChannel))
+    );
+
+    timeout(
+        Duration::from_secs(5),
+        state.queue_and_commit_to_finalized_state(checkpoint),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    assert!(state.non_finalized_block_write_sent_hashes.contains(&hash));
+    assert_eq!(
+        state
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::KnownBlock(hash))
+            .await
+            .unwrap(),
+        Response::KnownBlock(Some(KnownBlock::Finalized))
+    );
+}
+
+#[tokio::test]
+async fn parent_input_check_uses_the_parent_utxo_set() {
+    let _init_guard = zakura_test::init();
+    let mut config = Config::ephemeral();
+    config.vct_fast_sync = false;
+    let (mut state, _, _, _) = StateService::new(config, &Network::Mainnet, Height::MAX, 0)
+        .await
+        .expect("the test state opens");
+    let blocks: Vec<Arc<Block>> = [
+        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_2_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_3_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_4_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_5_BYTES.as_slice(),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(height, bytes)| {
+        let mut block: Block = bytes
+            .zcash_deserialize_into()
+            .expect("the test block deserializes");
+        // Non-finalized blocks need v4+ transactions. The header hash stays the same.
+        if height >= 2 {
+            block.transactions = vec![Arc::new(transaction_v4_from_coinbase(
+                &block.transactions[0],
+            ))];
+        }
+        Arc::new(block)
+    })
+    .collect();
+    let coinbase = |i: usize| transparent::OutPoint {
+        hash: blocks[i].transactions[0].hash(),
+        index: 0,
+    };
+    let missing = transparent::OutPoint {
+        hash: transaction::Hash([255; 32]),
+        index: 0,
+    };
+
+    for block in &blocks[..2] {
+        state
+            .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block.clone()))
+            .await
+            .expect("the writer responds")
+            .expect("the checkpoint commits");
+    }
+    check_parent_inputs(
+        &mut state,
+        [
+            (
+                blocks[1].hash(),
+                vec![coinbase(1)],
+                ParentInputs::Inconclusive,
+            ),
+            (
+                blocks[1].hash(),
+                vec![coinbase(1), missing],
+                ParentInputs::Missing(missing),
+            ),
+            (
+                blocks[0].hash(),
+                vec![missing],
+                ParentInputs::ParentUnavailable,
+            ),
+            (
+                block::Hash([255; 32]),
+                vec![missing],
+                ParentInputs::ParentUnavailable,
+            ),
+        ],
+    )
+    .await;
+
+    for block in &blocks[2..] {
+        state
+            .queue_and_commit_to_non_finalized_state(block.clone().prepare(), None)
+            .await
+            .expect("the writer responds")
+            .expect("the non-finalized block commits");
+    }
+    assert_eq!(
+        state
+            .read_service
+            .latest_non_finalized_state()
+            .best_chain()
+            .map(|chain| chain.blocks.len()),
+        Some(4),
+        "blocks 2..=5 are non-finalized"
+    );
+    check_parent_inputs(
+        &mut state,
+        [
+            (
+                blocks[5].hash(),
+                vec![coinbase(1), coinbase(3), coinbase(5)],
+                ParentInputs::Inconclusive,
+            ),
+            (
+                blocks[5].hash(),
+                vec![coinbase(3), missing],
+                ParentInputs::Missing(missing),
+            ),
+            // A parent below the best tip uses a fork that excludes the outputs above it.
+            (
+                blocks[4].hash(),
+                vec![coinbase(3)],
+                ParentInputs::Inconclusive,
+            ),
+            (
+                blocks[4].hash(),
+                vec![coinbase(5)],
+                ParentInputs::Missing(coinbase(5)),
+            ),
+            // The finalized tip excludes non-finalized outputs.
+            (
+                blocks[1].hash(),
+                vec![coinbase(1)],
+                ParentInputs::Inconclusive,
+            ),
+            (
+                blocks[1].hash(),
+                vec![coinbase(2)],
+                ParentInputs::Missing(coinbase(2)),
+            ),
+            (
+                blocks[0].hash(),
+                vec![missing],
+                ParentInputs::ParentUnavailable,
+            ),
+        ],
+    )
+    .await;
+}
+
+async fn check_parent_inputs(
+    state: &mut StateService,
+    cases: impl IntoIterator<Item = (block::Hash, Vec<transparent::OutPoint>, ParentInputs)>,
+) {
+    use tower::{Service, ServiceExt};
+    for (parent, outpoints, expected) in cases {
+        let response = state
+            .ready()
+            .await
+            .expect("state is ready")
+            .call(Request::CheckParentInputs {
+                parent,
+                outpoints: outpoints.into(),
+            })
+            .await
+            .expect("the input read succeeds");
+        assert_eq!(
+            response,
+            Response::ParentInputs(expected),
+            "parent {parent:?}"
+        );
+    }
+}
+
+/// The parent input check must not prove an input missing from a chain that leaves a gap above
+/// the finalized tip or does not continue it. It must stay exact when a published chain overlaps
+/// the database.
+#[tokio::test]
+async fn parent_input_check_requires_a_chain_that_continues_the_finalized_tip() {
+    use crate::service::{non_finalized_state::NonFinalizedState, read};
+
+    let _init_guard = zakura_test::init();
+    let blocks: Vec<Arc<Block>> = [
+        zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_1_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_2_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_3_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_4_BYTES.as_slice(),
+        zakura_test::vectors::BLOCK_MAINNET_5_BYTES.as_slice(),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(height, bytes)| {
+        let mut block: Block = bytes.zcash_deserialize_into().expect("vector");
+        if height >= 2 {
+            block.transactions = vec![Arc::new(transaction_v4_from_coinbase(
+                &block.transactions[0],
+            ))];
+        }
+        Arc::new(block)
+    })
+    .collect();
+    let coinbase = |i: usize| transparent::OutPoint {
+        hash: blocks[i].transactions[0].hash(),
+        index: 0,
+    };
+
+    // State A: database holds 0..=1, the non-finalized state holds 2..=5.
+    let mut config = Config::ephemeral();
+    config.vct_fast_sync = false;
+    let (mut state_a, _, _, _) =
+        StateService::new(config.clone(), &Network::Mainnet, Height::MAX, 0)
+            .await
+            .expect("state opens");
+    for block in &blocks[..2] {
+        state_a
+            .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block.clone()))
+            .await
+            .expect("writer responds")
+            .expect("checkpoint commits");
+    }
+    for block in &blocks[2..] {
+        state_a
+            .queue_and_commit_to_non_finalized_state(block.clone().prepare(), None)
+            .await
+            .expect("writer responds")
+            .expect("non-finalized block commits");
+    }
+    let db_a = state_a.read_service.db.clone();
+    let nfs_a = state_a.read_service.latest_non_finalized_state();
+    let tip_a = db_a.tip().expect("tip");
+    assert_eq!(tip_a.0, Height(1));
+
+    // Sanity: the aligned view proves coinbase(2) present at block 5.
+    assert_eq!(
+        read::parent_inputs(&nfs_a, &db_a, tip_a, blocks[5].hash(), &[coinbase(2)]),
+        ParentInputs::Inconclusive
+    );
+
+    // Gap: drop block 2 from the chain, so neither the chain nor the database has it.
+    let mut gapped = (**nfs_a.best_chain().expect("best chain")).clone();
+    let _ = gapped.pop_root();
+    let mut nfs_gap = NonFinalizedState::new(&Network::Mainnet);
+    nfs_gap.insert_test_chain(Arc::new(gapped));
+    assert_eq!(
+        read::parent_inputs(&nfs_gap, &db_a, tip_a, blocks[5].hash(), &[coinbase(2)]),
+        ParentInputs::Inconclusive,
+        "a chain with a gap above the finalized tip must not prove a missing input"
+    );
+    // The same with a fork parent below the chain tip.
+    assert_eq!(
+        read::parent_inputs(&nfs_gap, &db_a, tip_a, blocks[4].hash(), &[coinbase(2)]),
+        ParentInputs::Inconclusive,
+    );
+
+    // Misaligned: the chain's root does not continue the claimed finalized tip hash.
+    assert_eq!(
+        read::parent_inputs(
+            &nfs_a,
+            &db_a,
+            (Height(1), block::Hash([7; 32])),
+            blocks[5].hash(),
+            &[transparent::OutPoint {
+                hash: transaction::Hash([9; 32]),
+                index: 0
+            }],
+        ),
+        ParentInputs::Inconclusive,
+    );
+
+    // State B: database holds 0..=2, so state A's published chain (root 2) overlaps it.
+    let (mut state_b, _, _, _) = StateService::new(config, &Network::Mainnet, Height::MAX, 0)
+        .await
+        .expect("state opens");
+    for block in &blocks[..3] {
+        state_b
+            .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block.clone()))
+            .await
+            .expect("writer responds")
+            .expect("checkpoint commits");
+    }
+    let db_b = state_b.read_service.db.clone();
+    let tip_b = db_b.tip().expect("tip");
+    assert_eq!(tip_b, (Height(2), blocks[2].hash()));
+    for (parent, outpoints, expected) in [
+        (
+            blocks[5].hash(),
+            vec![coinbase(1), coinbase(2), coinbase(5)],
+            ParentInputs::Inconclusive,
+        ),
+        (
+            blocks[4].hash(),
+            vec![coinbase(2), coinbase(4)],
+            ParentInputs::Inconclusive,
+        ),
+        (
+            blocks[4].hash(),
+            vec![coinbase(5)],
+            ParentInputs::Missing(coinbase(5)),
+        ),
+        (
+            blocks[3].hash(),
+            vec![coinbase(4)],
+            ParentInputs::Missing(coinbase(4)),
+        ),
+        (
+            blocks[2].hash(),
+            vec![coinbase(3)],
+            ParentInputs::Missing(coinbase(3)),
+        ),
+        (
+            blocks[2].hash(),
+            vec![coinbase(2)],
+            ParentInputs::Inconclusive,
+        ),
+        (
+            blocks[1].hash(),
+            vec![coinbase(1)],
+            ParentInputs::ParentUnavailable,
+        ),
+    ] {
+        assert_eq!(
+            read::parent_inputs(&nfs_a, &db_b, tip_b, parent, &outpoints),
+            expected,
+            "overlap parent {parent:?}"
+        );
+    }
 }

@@ -27,9 +27,9 @@ use crate::{
 };
 
 use constants::{
-    mainnet, regtest, testnet, BLOSSOM_POW_TARGET_SPACING_RATIO,
-    FUNDING_STREAM_RECEIVER_DENOMINATOR, FUNDING_STREAM_SPECIFICATION, LOCKBOX_SPECIFICATION,
-    MAX_BLOCK_SUBSIDY, POST_BLOSSOM_HALVING_INTERVAL, PRE_BLOSSOM_HALVING_INTERVAL,
+    mainnet, testnet, BLOSSOM_POW_TARGET_SPACING_RATIO, FUNDING_STREAM_RECEIVER_DENOMINATOR,
+    FUNDING_STREAM_SPECIFICATION, LOCKBOX_SPECIFICATION, MAX_BLOCK_SUBSIDY,
+    POST_BLOSSOM_HALVING_INTERVAL, PRE_BLOSSOM_HALVING_INTERVAL,
 };
 
 /// The funding stream receiver categories.
@@ -247,14 +247,15 @@ impl ParameterSubsidy for Network {
         // First halving on Mainnet is at Canopy
         // while in Testnet is at block constant height of `1_116_000`
         // <https://zips.z.cash/protocol/protocol.pdf#zip214fundingstreams>
+        //
+        // Regtest and configured testnets derive it, because their target
+        // spacings, including the 25 second spacing after NU7, set the height.
         match self {
             Network::Mainnet => NetworkUpgrade::Canopy
                 .activation_height(self)
                 .expect("canopy activation height should be available"),
             Network::Testnet(params) => {
-                if params.is_regtest() {
-                    regtest::FIRST_HALVING
-                } else if params.is_default_testnet() {
+                if params.is_default_testnet() {
                     testnet::FIRST_HALVING
                 } else {
                     height_for_halving(1, self).expect("first halving height should be available")
@@ -783,14 +784,12 @@ impl<'a> Pre218Schedule<'a> {
     }
 }
 
-/// Returns whether ZIP 234 is compiled in and applies to `network` at `height`.
+/// Returns whether ZIP 234 applies to `network` at `height`.
 ///
-/// [`nsm_reissuance_height`] gives the ZIP's height whatever the build, so that the height
-/// arithmetic is testable everywhere. This is the check that decides whether a block
-/// subsidy actually follows ZIP 234, and so whether a caller has to fetch the money
-/// reserve.
+/// This check decides whether a block subsidy follows ZIP 234, and so whether a caller
+/// has to fetch the money reserve.
 pub fn is_zip234_active(network: &Network, height: Height) -> bool {
-    cfg!(feature = "nu7") && nsm_reissuance_height(network).is_some_and(|start| height >= start)
+    nsm_reissuance_height(network).is_some_and(|start| height >= start)
 }
 
 /// Applies the [ZIP 234] reissuance fraction at `height` to `amount`, rounding up.
@@ -857,20 +856,27 @@ pub fn scheduled_issuance_zatoshis(height: Height, net: &Network) -> Result<u128
     let mut total: u128 = 0;
 
     // The slow start issues `rate * h` below the shift and `rate * (h + 1)` from the shift
-    // up to the interval, so each phase is a triangular number rather than a rectangle.
+    // up to the interval, so each phase is a sum of consecutive integers.
     if slow_start_interval > 0 && slow_start_shift > 0 {
         let rate = u128::from(MAX_BLOCK_SUBSIDY) / slow_start_interval;
-        let triangle = |n: u128| n * (n + 1) / 2;
+        let sum_from_one_through = |n: u128| n * (n + 1) / 2;
 
-        // `rate * h` for h in 1..=min(height, shift - 1).
-        let first_phase_end = height.min(slow_start_shift - 1);
-        total += triangle(first_phase_end) * rate;
+        // A short halving interval can overflow the halving divisor inside the slow start.
+        // From that height on, every block subsidy is zero.
+        let last_paying = first_overflowed_halving_height(net, slow_start_interval - 1)
+            .map_or(slow_start_interval - 1, |cutoff| cutoff.saturating_sub(1));
+        let slow_start_end = height.min(last_paying);
 
-        // `rate * (h + 1)` for h in shift..=min(height, interval - 1), which is
-        // `rate * k` for k in shift + 1..=that end + 1.
-        if height >= slow_start_shift {
-            let second_phase_end = height.min(slow_start_interval - 1);
-            total += (triangle(second_phase_end + 1) - triangle(slow_start_shift)) * rate;
+        // `rate * h` for h in 1..=min(slow_start_end, shift - 1).
+        let first_phase_end = slow_start_end.min(slow_start_shift - 1);
+        total += sum_from_one_through(first_phase_end) * rate;
+
+        // `rate * (h + 1)` for h in shift..=slow_start_end, which is
+        // `rate * k` for k in shift + 1..=slow_start_end + 1.
+        if slow_start_end >= slow_start_shift {
+            total += (sum_from_one_through(slow_start_end + 1)
+                - sum_from_one_through(slow_start_shift))
+                * rate;
         }
     }
 
@@ -910,6 +916,26 @@ pub fn scheduled_issuance_zatoshis(height: Height, net: &Network) -> Result<u128
     }
 
     Ok(total)
+}
+
+/// Returns the lowest height at or below `last` whose halving divisor overflows, if any.
+fn first_overflowed_halving_height(net: &Network, last: u128) -> Option<u128> {
+    let last = u32::try_from(last).ok()?;
+    if halving_divisor(Height(last), net).is_some() {
+        return None;
+    }
+
+    // `halving` is non-decreasing, so binary search for the first overflow.
+    let (mut low, mut high) = (0, last);
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if halving_divisor(Height(mid), net).is_none() {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    Some(u128::from(low))
 }
 
 /// Returns the lowest height above `height` at which the halving block subsidy changes,

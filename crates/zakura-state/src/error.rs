@@ -44,6 +44,26 @@ impl From<BoxError> for CloneError {
 /// A boxed [`std::error::Error`].
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
+/// A [`crate::Request::AwaitBlockInfo`] request stopped waiting before its block committed.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum AwaitBlockInfoError {
+    /// The state rejected the block, so it will not commit unless it is sent again.
+    #[error("block {hash} was rejected by the state")]
+    Rejected {
+        /// The requested block.
+        hash: block::Hash,
+    },
+
+    /// The block did not commit within the wait limit.
+    #[error("block {hash} did not commit within {limit:?}")]
+    TimedOut {
+        /// The requested block.
+        hash: block::Hash,
+        /// The wait limit.
+        limit: std::time::Duration,
+    },
+}
+
 /// The finalized database has blocks but no persisted Sprout tip frontier.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 #[error("missing Sprout note commitment tree at finalized tip {tip:?}")]

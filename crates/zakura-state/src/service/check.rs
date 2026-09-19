@@ -15,8 +15,9 @@ use zakura_chain::{
 
 use crate::{
     service::{
-        block_iter::any_chain_ancestor_iter, check::difficulty::POW_ADJUSTMENT_BLOCK_SPAN,
-        finalized_state::ZakuraDb, non_finalized_state::NonFinalizedState,
+        block_iter::any_chain_ancestor_iter,
+        check::difficulty::pow_adjustment_block_span_for_height, finalized_state::ZakuraDb,
+        non_finalized_state::NonFinalizedState,
     },
     BoxError, SemanticallyVerifiedBlock, ValidateContextError,
 };
@@ -67,10 +68,9 @@ pub(crate) fn nsm_value_balance_is_non_negative(
     value_pools: &ValueBalance<NonNegative>,
     block_value_pool_change: &ValueBalance<NegativeAllowed>,
 ) -> Result<(), ValidateContextError> {
-    let nu7_active = cfg!(feature = "nu7")
-        && NetworkUpgrade::Nu7
-            .activation_height(network)
-            .is_some_and(|nu7| height >= nu7);
+    let nu7_active = NetworkUpgrade::Nu7
+        .activation_height(network)
+        .is_some_and(|nu7| height >= nu7);
 
     if !nu7_active {
         return Ok(());
@@ -98,6 +98,25 @@ pub(crate) fn nsm_value_balance_is_non_negative(
     Ok(())
 }
 
+/// Returns the most recent difficulty-context entries that validating a block at
+/// `candidate_height` reads.
+///
+/// The candidate block's upgrade selects the averaging window, so ZIP 218 widens
+/// this context at NU7.
+pub(crate) fn difficulty_context<C: IntoIterator>(
+    network: &Network,
+    candidate_height: block::Height,
+    context: C,
+) -> Vec<C::Item> {
+    context
+        .into_iter()
+        .take(pow_adjustment_block_span_for_height(
+            network,
+            candidate_height,
+        ))
+        .collect()
+}
+
 /// Check that the semantically verified block is contextually valid for `network`,
 /// based on the `finalized_tip_height` and `relevant_headers`.
 ///
@@ -106,7 +125,7 @@ pub(crate) fn nsm_value_balance_is_non_negative(
 ///
 /// The relevant headers are the ancestors of `block`, starting with its parent at
 /// `parent_height`. Only headers are read, because the difficulty context spans
-/// up to `POW_ADJUSTMENT_BLOCK_SPAN` blocks and only needs their difficulty and time.
+/// up to `MAX_POW_ADJUSTMENT_BLOCK_SPAN` blocks and only needs their difficulty and time.
 #[tracing::instrument(skip(semantically_verified, finalized_tip_height, relevant_headers))]
 pub(crate) fn block_is_valid_for_recent_chain<C>(
     semantically_verified: &SemanticallyVerifiedBlock,
@@ -146,10 +165,7 @@ where
         .expect("finalized state must contain at least one block to do contextual validation");
     check::block_is_not_orphaned(finalized_tip_height, candidate_height)?;
 
-    let relevant_headers: Vec<_> = relevant_headers
-        .into_iter()
-        .take(POW_ADJUSTMENT_BLOCK_SPAN)
-        .collect();
+    let relevant_headers = difficulty_context(network, candidate_height, relevant_headers);
 
     let Some(parent_height) = parent_height.filter(|_| !relevant_headers.is_empty()) else {
         warn!(
@@ -169,7 +185,7 @@ where
     //
     // TODO: accept a NotReadyToBeCommitted error in those tests instead
     #[cfg(test)]
-    if relevant_headers.len() < POW_ADJUSTMENT_BLOCK_SPAN {
+    if relevant_headers.len() < pow_adjustment_block_span_for_height(network, candidate_height) {
         return Ok(());
     }
 
@@ -181,7 +197,7 @@ where
     // verified blocks, so there will be at least 1 million blocks in the state when it is
     // called. So this error should never happen on Mainnet or the default Testnet.
     //
-    // It's okay to use a relevant chain of fewer than `POW_ADJUSTMENT_BLOCK_SPAN` blocks, because
+    // It's okay to use a relevant chain shorter than the adjustment span, because
     // the MedianTime function uses height 0 if passed a negative height by the ActualTimespan function:
     // > ActualTimespan(height : N) := MedianTime(height) − MedianTime(height − PoWAveragingWindow)
     // > MedianTime(height : N) := median([[ nTime(𝑖) for 𝑖 from max(0, height − PoWMedianBlockSpan) up to height − 1 ]])
@@ -222,10 +238,10 @@ pub(crate) fn header_is_valid_for_recent_chain<C>(
 where
     C: IntoIterator<Item = (CompactDifficulty, chrono::DateTime<chrono::Utc>)>,
 {
-    let relevant_headers: Vec<_> = relevant_headers
-        .into_iter()
-        .take(POW_ADJUSTMENT_BLOCK_SPAN)
-        .collect();
+    let candidate_height = previous_block_height
+        .next()
+        .map_err(|_| ValidateContextError::NotReadyToBeCommitted)?;
+    let relevant_headers = difficulty_context(network, candidate_height, relevant_headers);
 
     let difficulty_adjustment = AdjustedDifficulty::new_from_header_time(
         candidate_header.time,
@@ -539,9 +555,7 @@ mod nsm_value_balance_boundary_tests {
                     );
                     let sum = i128::from(before) + i128::from(delta);
                     // Rejection starts at NU7, before the reissuance height.
-                    let reject = cfg!(feature = "nu7")
-                        && height >= 2
-                        && !(0..=i128::from(MAX_MONEY)).contains(&sum);
+                    let reject = height >= 2 && !(0..=i128::from(MAX_MONEY)).contains(&sum);
                     assert_eq!(
                         result.is_err(),
                         reject,

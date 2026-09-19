@@ -24,14 +24,6 @@ categories = [
 exclude = ["*.proto"]
 
 [features]
-
-# NU7 consensus rules. Off by default until NU7 has activation heights.
-nu7 = [
-    "zakura-chain/nu7",
-    "zakura-consensus/nu7",
-    "zakura-state/nu7",
-]
-
 # Production features that activate extra dependencies, or extra features in
 # dependencies
 
@@ -119,7 +111,7 @@ zcash_transparent = { workspace = true }
 zakura-chain = { path = "../zakura-chain", version = "8.0.0", features = [
     "json-conversion",
 ] }
-zakura-consensus = { path = "../zakura-consensus", version = "8.0.0" }
+zakura-consensus = { path = "../zakura-consensus", version = "9.0.0" }
 zakura-network = { path = "../zakura-network", version = "8.0.0" }
 zakura-node-services = { path = "../zakura-node-services", version = "3.2.5", features = [
     "rpc-client",
@@ -147,7 +139,7 @@ tokio = { workspace = true, features = ["full", "tracing", "test-util"] }
 zakura-chain = { path = "../zakura-chain", version = "8.0.0", features = [
     "proptest-impl",
 ] }
-zakura-consensus = { path = "../zakura-consensus", version = "8.0.0", features = [
+zakura-consensus = { path = "../zakura-consensus", version = "9.0.0", features = [
     "proptest-impl",
 ] }
 zakura-network = { path = "../zakura-network", version = "8.0.0", features = [

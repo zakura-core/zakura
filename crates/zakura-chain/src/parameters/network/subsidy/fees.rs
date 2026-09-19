@@ -8,9 +8,9 @@ use crate::{
 
 /// Returns the miner's share of aggregate block fees, excluding the block subsidy.
 ///
-/// With the `nu7` feature enabled, NU7 contributes `floor(6 * transaction_fees / 10)`
-/// to NSM and leaves the remainder to the miner. Before NU7, or without that feature,
-/// all fees go to the miner. Contributions start at NU7 even before reissuance begins.
+/// From NU7 activation, every build contributes `floor(6 * transaction_fees / 10)`
+/// to NSM and leaves the remainder to the miner. Before NU7, all fees go to the miner.
+/// Contributions start at NU7 even before reissuance begins.
 ///
 /// `transaction_fees` must be the sum of all non-coinbase fees in the block. Rounding
 /// each transaction separately would underfund NSM. The aggregate is rounded in the
@@ -22,7 +22,7 @@ pub fn miner_fee_share(
     network: &Network,
     transaction_fees: Amount<NonNegative>,
 ) -> Amount<NonNegative> {
-    if !cfg!(feature = "nu7") || NetworkUpgrade::current(network, height) < NetworkUpgrade::Nu7 {
+    if NetworkUpgrade::current(network, height) < NetworkUpgrade::Nu7 {
         return transaction_fees;
     }
 

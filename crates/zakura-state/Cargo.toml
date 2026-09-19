@@ -17,12 +17,6 @@ categories = ["asynchronous", "caching", "cryptography::cryptocurrencies"]
 
 [features]
 
-# NU7 consensus rules. Off by default until NU7 has activation heights.
-nu7 = [
-    "zakura-chain/nu7",
-    "zakura-header-chain/nu7",
-]
-
 # Production features that activate extra dependencies, or extra features in dependencies
 
 # Exposes narrow internal hooks used by benchmarks.

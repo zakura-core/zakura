@@ -19,7 +19,7 @@ fn nsm_fee_claims_at_activation_and_reissuance() {
         let subsidy =
             block_subsidy(height, &network, Some(Amount::try_from(1_000_000).unwrap())).unwrap();
         for (fees, miner_share) in [(0, 0), (1, 1), (2, 1), (1_000, 400), (1_001, 401)] {
-            let miner_share = if cfg!(feature = "nu7") && height >= Height(5) {
+            let miner_share = if height >= Height(5) {
                 miner_share
             } else {
                 fees
@@ -53,7 +53,6 @@ fn nsm_fee_claims_at_activation_and_reissuance() {
     }
 }
 
-#[cfg(feature = "nu7")]
 #[tokio::test]
 async fn nsm_fee_semantic_verification_rounds_the_block_total() {
     use zakura_chain::{
@@ -97,6 +96,9 @@ async fn nsm_fee_semantic_verification_rounds_the_block_total() {
             let state = service_fn(move |request: zs::Request| async move {
                 Ok::<_, BoxError>(match request {
                     zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+                    zs::Request::CheckParentInputs { .. } => {
+                        zs::Response::ParentInputs(zs::ParentInputs::Inconclusive)
+                    }
                     zs::Request::AwaitBlockInfo(_) => {
                         zs::Response::BlockInfo(Some(BlockInfo::new(parent_pools, 0)))
                     }

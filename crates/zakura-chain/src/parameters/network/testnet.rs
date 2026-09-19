@@ -925,7 +925,10 @@ impl ParametersBuilder {
         self
     }
 
-    /// Sets the pre and post Blosssom halving intervals to be used in the [`Parameters`] being built.
+    /// Sets the pre- and post-Blossom halving intervals in the [`Parameters`] being built.
+    ///
+    /// Returns an error if funding streams are already configured, or if the interval is not
+    /// positive or cannot be represented as a [`HeightDiff`] in pre-Blossom target seconds.
     pub fn with_halving_interval(
         mut self,
         pre_blossom_halving_interval: HeightDiff,
@@ -934,9 +937,16 @@ impl ParametersBuilder {
             return Err(ParametersBuilderError::HalvingIntervalAfterFundingStreams);
         }
 
+        pre_blossom_halving_interval
+            .checked_mul(NetworkUpgrade::Genesis.target_spacing().num_seconds())
+            .filter(|seconds| *seconds > 0)
+            .ok_or(ParametersBuilderError::InvalidHalvingInterval)?;
+        let post_blossom_halving_interval = pre_blossom_halving_interval
+            .checked_mul(HeightDiff::from(BLOSSOM_POW_TARGET_SPACING_RATIO))
+            .ok_or(ParametersBuilderError::InvalidHalvingInterval)?;
+
         self.pre_blossom_halving_interval = pre_blossom_halving_interval;
-        self.post_blossom_halving_interval =
-            self.pre_blossom_halving_interval * (BLOSSOM_POW_TARGET_SPACING_RATIO as HeightDiff);
+        self.post_blossom_halving_interval = post_blossom_halving_interval;
         Ok(self)
     }
 

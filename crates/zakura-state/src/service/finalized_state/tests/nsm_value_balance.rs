@@ -737,13 +737,13 @@ fn startup_migration_failure_preserves_version_and_retry_matches_fresh_sync() {
         ephemeral: false,
         ..Config::default()
     };
-    let (mut state, parent) = state_below_start_with_config(&network, &config);
-    let block = permitted_start_block(&state, &network, &parent);
-    commit(&mut state, &block).unwrap();
+    // The tip stays below the ZIP 234 start, because the migration refuses later tips.
+    let (state, _parent) = state_below_start_with_config(&network, &config);
+    let tip = START.previous().unwrap();
     let expected = state.db.finalized_value_pool();
     let baseline_bytes = state.db.raw_block_info_cf().zs_get(&Height(1)).unwrap();
     let mut batch = DiskWriteBatch::new();
-    for height in 0..=START.0 {
+    for height in 0..=tip.0 {
         let mut bytes = state
             .db
             .raw_block_info_cf()
@@ -817,7 +817,38 @@ fn startup_migration_failure_preserves_version_and_retry_matches_fresh_sync() {
         Some(state_database_format_version_in_code())
     );
     assert_eq!(
-        *upgraded.db.block_info(START.into()).unwrap().value_pools(),
+        *upgraded.db.block_info(tip.into()).unwrap().value_pools(),
         expected
     );
+}
+
+/// Older versions committed blocks at or above the ZIP 234 start without reissuance,
+/// so the migration requires a resync instead of keeping their Deferred balances.
+#[test]
+fn migration_requires_resync_after_the_reissuance_start() {
+    use crate::service::finalized_state::disk_format::upgrade::{
+        nsm_value_balance_pool::Upgrade, DiskFormatUpgrade, FormatChangeError,
+    };
+    let _guard = zakura_test::init();
+    let network = zip234_network();
+    let (mut state, parent) = state_below_start(&network);
+    let (_cancel, cancel_receiver) = crossbeam_channel::bounded(1);
+
+    // A tip below the start migrates.
+    Upgrade
+        .run(Some(parent_height(&parent)), &state.db, &cancel_receiver)
+        .unwrap();
+
+    let block = permitted_start_block(&state, &network, &parent);
+    commit(&mut state, &block).unwrap();
+    let pools = state.db.finalized_value_pool();
+    let result = Upgrade.run(Some(START), &state.db, &cancel_receiver);
+    assert!(matches!(result, Err(FormatChangeError::ResyncRequired(_))));
+    assert_eq!(state.db.finalized_value_pool(), pools);
+}
+
+fn parent_height(parent: &Block) -> Height {
+    parent
+        .coinbase_height()
+        .expect("the parent has a coinbase height")
 }

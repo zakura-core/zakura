@@ -117,7 +117,7 @@ fn nsm_fee_templates_pay_miner_and_credit_balance_once() {
                 .unwrap();
             let fees = if transaction_count == 0 { 0 } else { 20_002 };
             // Rounding two fees of 10,001 separately would contribute 12,000, not 12,001.
-            let contribution = if cfg!(feature = "nu7") && height >= Height(5) && fees > 0 {
+            let contribution = if height >= Height(5) && fees > 0 {
                 12_001
             } else {
                 0

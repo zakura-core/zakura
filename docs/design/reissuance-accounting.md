@@ -1,7 +1,7 @@
 # Reissuance accounting
 
-This implementation keeps fee recycling and reissuance behind the disabled-by-default
-`nu7` feature.
+Fee recycling activates at NU7 and reissuance at the ZIP 234 start height.
+Both activate by height alone in every build.
 Production activation still requires policy guidance and a production NU7 branch ID.
 
 ## The seed
@@ -32,10 +32,10 @@ applies it to an existing database. Change both together.
 
 ## Fee recycling
 
-With the `nu7` feature enabled, the NU7 deployment draft's [NSM reserve rules]
-contribute `floor(6 * TransactionFees(h) / 10)` from aggregate block fees to NSM.
-Contributions start at NU7 activation, including the interval before reissuance starts.
-Before NU7, or without the feature, the miner receives all fees.
+The NU7 deployment draft's [NSM reserve rules] contribute
+`floor(6 * TransactionFees(h) / 10)` from aggregate block fees to NSM.
+Contributions start at NU7 activation in every build, including the interval before
+reissuance starts. Before NU7, the miner receives all fees.
 
 For example, with 1,000 zatoshi in fees, the miner receives 400 and NSM receives 600.
 The calculation rounds down the contribution once per block, so the remainder favors
@@ -106,8 +106,7 @@ backup or repair the identified corruption before retrying startup.
 
 The tests cover aggregate fee rounding, fee activation before reissuance, coinbase
 claims and template fees, the resulting NSM contribution, schedule sums, the seed and
-its rollback,
-the fraction and halving interval per target spacing era, the half-life over one
+its rollback, the fraction and halving interval per target spacing era, the half-life over one
 interval, termination from a small balance, transfers through every monetary
 pool, reductions in issued value, contextual rejection from NU7, independent
 non-finalized forks, finalized rollback, replay, alternate branches, restart,

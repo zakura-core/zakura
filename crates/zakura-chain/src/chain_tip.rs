@@ -4,7 +4,11 @@ use std::{future, sync::Arc};
 
 use chrono::{DateTime, Utc};
 
-use crate::{block, parameters::Network, transaction, BoxError};
+use crate::{
+    block,
+    parameters::{Network, NetworkUpgrade, POST_BLOSSOM_POW_TARGET_SPACING},
+    transaction, BoxError,
+};
 
 mod network_chain_tip_height_estimator;
 
@@ -16,15 +20,28 @@ mod tests;
 pub use network_chain_tip_height_estimator::NetworkChainTipHeightEstimator;
 
 /// The maximum estimated distance to the network chain tip that is considered
-/// at or near tip.
+/// at or near tip, at the 75 second post-Blossom target spacing.
 ///
-/// Allows for normal block-time variance and propagation delay. Considering the
-/// 75 second target for the time between blocks on Mainnet, this equals
-/// approximately 20 minutes of time the node can stay without receiving a new
-/// block before being considered far from the tip. Because the comparison is
-/// inclusive, the node is considered far from the tip once the estimated
-/// distance exceeds 16 blocks.
+/// Allows for normal block-time variance and propagation delay. At 75 seconds
+/// per block, this equals approximately 20 minutes of time the node can stay
+/// without receiving a new block before being considered far from the tip.
+/// Because the comparison is inclusive, the node is considered far from the tip
+/// once the estimated distance exceeds 16 blocks.
+///
+/// [`at_or_near_tip_threshold`] scales this value for shorter target spacings.
 pub const AT_OR_NEAR_TIP_THRESHOLD: block::HeightDiff = 16;
+
+/// Returns the maximum estimated distance to the network chain tip that is
+/// considered at or near tip, when the network tip is at `height`.
+///
+/// Scales [`AT_OR_NEAR_TIP_THRESHOLD`] by the ratio of the post-Blossom target
+/// spacing to the target spacing at `height`, so the threshold stays about 20
+/// minutes. That is 16 blocks at 75 seconds, and 48 blocks at the 25 second
+/// spacing that ZIP 218 activates at NU7. Longer spacings keep 16 blocks.
+pub fn at_or_near_tip_threshold(network: &Network, height: block::Height) -> block::HeightDiff {
+    let spacing = NetworkUpgrade::target_spacing_for_height(network, height).num_seconds();
+    AT_OR_NEAR_TIP_THRESHOLD * (i64::from(POST_BLOSSOM_POW_TARGET_SPACING) / spacing).max(1)
+}
 
 /// An interface for querying the chain tip.
 ///
@@ -133,12 +150,15 @@ pub trait ChainTip {
     /// Returns `true` if the node is at or near the network chain tip.
     ///
     /// Returns `false` if the chain is empty or the node is more than
-    /// [`AT_OR_NEAR_TIP_THRESHOLD`] blocks behind the estimated network tip,
+    /// [`at_or_near_tip_threshold`] blocks behind the estimated network tip,
     /// meaning stall detection should remain active.
     fn is_at_or_near_network_tip(&self, network: &Network) -> bool {
         match self.estimate_distance_to_network_chain_tip(network) {
             None => false,
-            Some((distance, _height)) => distance <= AT_OR_NEAR_TIP_THRESHOLD,
+            Some((distance, height)) => {
+                let estimated_tip = (height + distance).unwrap_or(height);
+                distance <= at_or_near_tip_threshold(network, estimated_tip)
+            }
         }
     }
 }

@@ -83,11 +83,6 @@ default = ["default-release-binaries"]
 
 # Production features that activate extra dependencies, or extra features in dependencies
 
-# NU7 consensus rules. Off by default until NU7 has activation heights.
-nu7 = [
-    "zakura-consensus/nu7",
-]
-
 # Indexer support
 indexer = ["zakura-state/indexer", "zakura-rpc/indexer"]
 

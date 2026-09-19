@@ -4499,7 +4499,7 @@ async fn lookahead_limit_scales_with_target_spacing() {
     let checkpoint_limit = sync_config.checkpoint_verify_concurrency_limit;
     let full_limit = sync_config.full_verify_concurrency_limit;
 
-    // Mainnet has no NU7 height, so its limits stay unscaled.
+    // These heights are below the Mainnet NU7 height, so its limits stay unscaled.
     let mainnet_checkpoint = Height(3_000_000);
     assert_eq!(
         lookahead_limit_at(&Network::Mainnet, mainnet_checkpoint, Height(2_000_000)),

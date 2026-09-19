@@ -15,7 +15,7 @@ use zakura_chain::{
             funding_stream_values, halving_block_subsidy, scheduled_issuance_zatoshis,
             FundingStreamReceiver,
         },
-        Network, NetworkUpgrade,
+        NetworkUpgrade,
     },
     value_balance::ValueBalance,
 };
@@ -107,7 +107,7 @@ fn backfill(
 
     check_cancelled(cancel_receiver)?;
     let network = db.network();
-    refuse_unrepairable_history(&network, tip_height)?;
+    validate_deferred_history(db, tip_height, cancel_receiver)?;
     let Some(start) = NetworkUpgrade::Nu7.activation_height(&network) else {
         return Ok(());
     };
@@ -162,32 +162,82 @@ fn backfill(
     Ok(())
 }
 
-/// Refuses databases whose committed value pools older migrations cannot repair.
+/// Checks stored balances on networks exposed to the old Deferred replay bug.
 ///
-/// Before format 29, the version 27 replay omitted Deferred funding during slow start.
+/// The original version 27 replay omitted Deferred funding during slow start.
 /// A database that ran that replay can hold undercounted Deferred balances, and its
-/// version marker stops the corrected replay from running again. Block commits always
-/// applied the funding, so a fresh sync produces the correct balances.
-fn refuse_unrepairable_history(network: &Network, tip: Height) -> Result<(), FormatChangeError> {
-    let slow_start_end = network.slow_start_interval().min(tip);
-    for height in 1..=slow_start_end.0 {
-        let height = Height(height);
+/// version marker stops the corrected replay from running again. Normal commits and
+/// corrected replays produce healthy databases on the same networks, so configuration
+/// alone cannot justify a resync. Check the history and separate tip balance before
+/// writing anything, even if NU7 is not active: Deferred corruption also affects commits.
+fn validate_deferred_history(
+    db: &ZakuraDb,
+    tip: Height,
+    cancel_receiver: &Receiver<CancelFormatChange>,
+) -> Result<(), FormatChangeError> {
+    let network = db.network();
+    let deferred_funding = |height| {
         let invalid = |error: &dyn std::fmt::Display| {
             FormatChangeError::InvalidPostcondition(format!(
                 "invalid funding streams at {height:?}: {error}"
             ))
         };
-        let subsidy = halving_block_subsidy(height, network).map_err(|error| invalid(&error))?;
-        let deferred = funding_stream_values(height, network, subsidy)
-            .map_err(|error| invalid(&error))?
-            .remove(&FundingStreamReceiver::Deferred)
-            .unwrap_or_default();
-        if !deferred.is_zero() {
+        let subsidy = halving_block_subsidy(height, &network).map_err(|error| invalid(&error))?;
+        Ok::<_, FormatChangeError>(
+            funding_stream_values(height, &network, subsidy)
+                .map_err(|error| invalid(&error))?
+                .remove(&FundingStreamReceiver::Deferred)
+                .unwrap_or_default(),
+        )
+    };
+
+    // Networks without slow-start Deferred payments never encountered this replay bug.
+    let slow_start_end = network.slow_start_interval().min(tip);
+    let mut exposed = false;
+    for height in 1..=slow_start_end.0 {
+        check_cancelled(cancel_receiver)?;
+        if !deferred_funding(Height(height))?.is_zero() {
+            exposed = true;
+            break;
+        }
+    }
+    if !exposed {
+        return Ok(());
+    }
+
+    // Genesis does not contribute to the value pools. Check every later record, since
+    // an interrupted replay can leave a mixture of healthy and undercounted balances.
+    let mut expected = Amount::<NegativeAllowed>::zero();
+    for height in 1..=tip.0 {
+        check_cancelled(cancel_receiver)?;
+        let height = Height(height);
+        let change = deferred_funding(height)?
+            .constrain::<NegativeAllowed>()
+            .and_then(|funding| {
+                funding
+                    - network
+                        .lockbox_disbursement_total_amount(height)
+                        .constrain()?
+            });
+        expected = (expected + change).map_err(|error| {
+            FormatChangeError::InvalidPostcondition(format!(
+                "invalid cumulative Deferred balance at {height:?}: {error}"
+            ))
+        })?;
+        let stored = read_block_info(db, height)?.value_pools().deferred_amount();
+        if i64::from(stored) != i64::from(expected) {
             return Err(FormatChangeError::ResyncRequired(format!(
-                "this network pays Deferred funding during slow start from {height:?}, \
-                 and older replays of those blocks did not record it"
+                "stored Deferred balance {stored:?} at {height:?} does not match \
+                 the funding schedule's {expected:?}"
             )));
         }
+    }
+    let stored = read_tip_pools(db)?.deferred_amount();
+    if i64::from(stored) != i64::from(expected) {
+        return Err(FormatChangeError::ResyncRequired(format!(
+            "stored tip Deferred balance {stored:?} at {tip:?} does not match \
+             the funding schedule's {expected:?}"
+        )));
     }
     Ok(())
 }
@@ -406,8 +456,17 @@ mod database_tests {
     }
 
     fn legacy_db_on(network: Network, rows: u32, pool_len: usize) -> ZakuraDb {
+        legacy_db_with_config(network, rows, pool_len, &Config::ephemeral())
+    }
+
+    fn legacy_db_with_config(
+        network: Network,
+        rows: u32,
+        pool_len: usize,
+        config: &Config,
+    ) -> ZakuraDb {
         let db = ZakuraDb::new(
-            &Config::ephemeral(),
+            config,
             STATE_DATABASE_KIND,
             &state_database_format_version_in_code(),
             &network,
@@ -622,20 +681,25 @@ mod database_tests {
         assert_upgraded(&db, 4);
     }
 
-    /// Older replays omitted Deferred funding during slow start, so a database on a network
-    /// that pays it there must sync again.
-    #[test]
-    fn migration_requires_resync_after_slow_start_deferred_funding() {
+    fn slow_start_deferred_network(nu7: Option<u32>) -> Network {
         use zakura_chain::parameters::testnet::{
             self, ConfiguredFundingStreamRecipient, ConfiguredFundingStreams,
+            ConfiguredLockboxDisbursement,
         };
-        let network = testnet::Parameters::build()
+        testnet::Parameters::build()
+            .with_slow_start_interval(Height(8))
             .with_activation_heights(ConfiguredActivationHeights {
                 blossom: Some(1),
                 canopy: Some(2),
+                nu6_1: Some(3),
+                nu7,
                 ..Default::default()
             })
             .unwrap()
+            .with_lockbox_disbursements(vec![ConfiguredLockboxDisbursement {
+                address: "t26ovBdKAJLtrvBsE2QGF4nqBkEuptuPFZz".to_string(),
+                amount: Amount::try_from(1_000_000).unwrap(),
+            }])
             .with_funding_streams(vec![ConfiguredFundingStreams {
                 height_range: Some(Height(2)..Height(100)),
                 recipients: Some(vec![ConfiguredFundingStreamRecipient {
@@ -645,25 +709,156 @@ mod database_tests {
                 }]),
             }])
             .to_network()
-            .unwrap();
-        assert!(network.slow_start_interval() > Height(3));
+            .unwrap()
+    }
 
-        // The tip is below the first Deferred payment, so the history is intact.
-        let db = legacy_db_on(network.clone(), 2, 48);
+    /// Write the legacy balances produced by normal commits or a corrected replay.
+    fn healthy_deferred_db(network: Network, rows: u32, pool_len: usize) -> ZakuraDb {
+        let db = legacy_db_on(network, rows, pool_len);
+        populate_deferred_balances(&db, rows);
+        db
+    }
+
+    fn populate_deferred_balances(db: &ZakuraDb, rows: u32) {
+        let network = db.network();
+        let mut balance = Amount::<NonNegative>::zero();
+        let mut batch = DiskWriteBatch::new();
+        for h in 1..rows {
+            let height = Height(h);
+            let funding = funding_stream_values(
+                height,
+                &network,
+                halving_block_subsidy(height, &network).unwrap(),
+            )
+            .unwrap()
+            .remove(&FundingStreamReceiver::Deferred)
+            .unwrap_or_default();
+            balance =
+                (balance + funding - network.lockbox_disbursement_total_amount(height)).unwrap();
+            let mut bytes = db.raw_block_info_cf().zs_get(&height).unwrap();
+            bytes.0[32..40].copy_from_slice(&balance.to_bytes());
+            let _ = db
+                .raw_block_info_cf()
+                .with_batch_for_writing(&mut batch)
+                .zs_insert(&height, &bytes);
+        }
+        let mut bytes = db.raw_chain_value_pools_cf().zs_get(&()).unwrap();
+        bytes.0[32..40].copy_from_slice(&balance.to_bytes());
+        let _ = db
+            .raw_chain_value_pools_cf()
+            .with_batch_for_writing(&mut batch)
+            .zs_insert(&(), &bytes);
+        db.write_batch(batch).unwrap();
+    }
+
+    #[test]
+    fn migration_accepts_healthy_slow_start_deferred_history() {
+        for nu7 in [None, Some(20), Some(4)] {
+            for pool_len in [40, 48] {
+                // Cover the first payment, disbursement, NU7, and slow-start boundary.
+                for tip in [1, 2, 3, 4, 7, 8, 10] {
+                    let db =
+                        healthy_deferred_db(slow_start_deferred_network(nu7), tip + 1, pool_len);
+                    let before = db.raw_chain_value_pools_cf().zs_get(&()).unwrap();
+                    let (_tx, rx) = crossbeam_channel::bounded(1);
+                    let mut writes = 0;
+                    backfill(Some(Height(tip)), &db, &rx, |batch| {
+                        writes += 1;
+                        db.write_batch(batch).unwrap();
+                        Ok(())
+                    })
+                    .unwrap();
+                    assert!(Upgrade.validate(&db, &rx).unwrap().is_ok());
+                    let after = db.raw_chain_value_pools_cf().zs_get(&()).unwrap();
+                    assert_eq!(&after.0[..pool_len], &before.0);
+                    if nu7.is_none_or(|start| tip < start) {
+                        assert_eq!(writes, 0, "inactive NU7 requires no backfill writes");
+                        assert_eq!(after.0, before.0);
+                    }
+                    Upgrade.run(Some(Height(tip)), &db, &rx).unwrap();
+                    assert!(Upgrade.validate(&db, &rx).unwrap().is_ok());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn migration_rejects_actual_deferred_mismatches_before_writing() {
+        for nu7 in [None, Some(20), Some(4)] {
+            // A bad historical row must be detected even when the tip is healthy, and
+            // the separately stored tip must be checked even when all rows are healthy.
+            for bad_row in [Some(2), Some(7), Some(10), None] {
+                let db = healthy_deferred_db(slow_start_deferred_network(nu7), 11, 48);
+                let mut batch = DiskWriteBatch::new();
+                if let Some(h) = bad_row {
+                    let mut bytes = db.raw_block_info_cf().zs_get(&Height(h)).unwrap();
+                    bytes.0[32..40].fill(0);
+                    let _ = db
+                        .raw_block_info_cf()
+                        .with_batch_for_writing(&mut batch)
+                        .zs_insert(&Height(h), &bytes);
+                } else {
+                    let mut bytes = db.raw_chain_value_pools_cf().zs_get(&()).unwrap();
+                    bytes.0[32..40].fill(0);
+                    let _ = db
+                        .raw_chain_value_pools_cf()
+                        .with_batch_for_writing(&mut batch)
+                        .zs_insert(&(), &bytes);
+                }
+                db.write_batch(batch).unwrap();
+                let (_tx, rx) = crossbeam_channel::bounded(1);
+                let result = backfill(Some(Height(10)), &db, &rx, |_| {
+                    panic!("a corrupt Deferred history must be rejected before any writes")
+                });
+                assert!(matches!(result, Err(FormatChangeError::ResyncRequired(_))));
+            }
+        }
+    }
+
+    #[test]
+    fn healthy_deferred_history_advances_format_version() {
+        use super::super::DbFormatChange;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = Config {
+            cache_dir: tempdir.path().to_owned(),
+            ephemeral: false,
+            ..Config::default()
+        };
+        let db = legacy_db_with_config(slow_start_deferred_network(None), 11, 48, &config);
+        populate_deferred_balances(&db, 11);
+        let old_version = Version::new(28, 1, 5);
+        let running_version = state_database_format_version_in_code();
+        db.update_format_version_on_disk(&old_version).unwrap();
         let (_tx, rx) = crossbeam_channel::bounded(1);
-        Upgrade.run(Some(Height(1)), &db, &rx).unwrap();
-
-        let db = legacy_db_on(network, 4, 48);
-        let before = db.raw_block_info_cf().zs_get(&Height(3)).unwrap();
-        assert!(matches!(
-            Upgrade.run(Some(Height(3)), &db, &rx),
-            Err(FormatChangeError::ResyncRequired(_))
-        ));
+        DbFormatChange::open_database(&running_version, Some(old_version))
+            .apply_format_upgrade(&db, Some(Height(10)), &rx)
+            .unwrap();
         assert_eq!(
-            db.raw_block_info_cf().zs_get(&Height(3)).unwrap().0,
-            before.0,
-            "the refusal leaves the legacy records unchanged"
+            db.format_version_on_disk().unwrap(),
+            Some(running_version.clone())
         );
+        let network = db.network();
+        drop(db);
+        let db = ZakuraDb::new(
+            &config,
+            STATE_DATABASE_KIND,
+            &running_version,
+            &network,
+            // The fixture contains accounting rows, not a complete chain. Exercise
+            // format selection and this migration's validation directly below.
+            true,
+            STATE_COLUMN_FAMILIES_IN_CODE
+                .iter()
+                .map(ToString::to_string),
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            DbFormatChange::open_database(&running_version, db.format_version_on_disk().unwrap()),
+            DbFormatChange::CheckOpenCurrent { .. }
+        ));
+        assert!(Upgrade.validate(&db, &rx).unwrap().is_ok());
     }
 
     #[test]

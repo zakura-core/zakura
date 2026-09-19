@@ -611,11 +611,7 @@ fn migration_requires_resync_after_the_reissuance_start() {
     commit(&mut state, &block).unwrap();
     let pools = state.db.finalized_value_pool();
     let result = Upgrade.run(Some(START), &state.db, &cancel_receiver);
-    if cfg!(feature = "nu7") {
-        assert!(matches!(result, Err(FormatChangeError::ResyncRequired(_))));
-    } else {
-        result.unwrap();
-    }
+    assert!(matches!(result, Err(FormatChangeError::ResyncRequired(_))));
     assert_eq!(state.db.finalized_value_pool(), pools);
 }
 

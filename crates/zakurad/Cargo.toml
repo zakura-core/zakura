@@ -86,10 +86,6 @@ default = ["default-release-binaries"]
 # NU7 consensus rules. Off by default until NU7 has activation heights.
 nu7 = [
     "zakura-consensus/nu7",
-    "zakura-chain/nu7",
-    "zakura-state/nu7",
-    "zakura-rpc/nu7",
-    "zakura-header-chain/nu7",
 ]
 
 # Indexer support

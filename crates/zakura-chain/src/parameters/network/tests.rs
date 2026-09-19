@@ -781,16 +781,6 @@ fn zip234_issuance() {
         .to_network()
         .expect("configured testnet is valid");
 
-    if !cfg!(feature = "nu7") {
-        // Without ZIP 234, the subsidy stays on the halving schedule.
-        let deficit = Amount::<NonNegative>::try_from(1_000_000_000_000i64).expect("valid amount");
-        assert_eq!(
-            block_subsidy(start, &network, Some(deficit)).expect("valid subsidy"),
-            block_subsidy(start, &network, None).expect("valid subsidy"),
-        );
-        return;
-    }
-
     // ZIP 234 needs the issuance deficit at its start height.
     assert_eq!(
         block_subsidy(start, &network, None),
@@ -942,8 +932,7 @@ fn reissuance_activation_and_rounding_boundary_matrix() {
                 nu7.map(|n| Height(n.max(configured_start)))
             );
             for height in 1..=11 {
-                let active =
-                    cfg!(feature = "nu7") && nu7.is_some_and(|n| height >= n.max(configured_start));
+                let active = nu7.is_some_and(|n| height >= n.max(configured_start));
                 assert_eq!(is_zip234_active(&network, Height(height)), active);
                 let scheduled = halving_block_subsidy(Height(height), &network).unwrap();
                 if active {

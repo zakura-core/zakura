@@ -20,10 +20,6 @@ default = []
 
 # Production features that activate extra functionality
 
-# ZIP 234 reissuance. Off by default until NU7 has activation heights.
-# ZIP 218 uses height-based activation in every build.
-nu7 = []
-
 # Consensus-critical conversion from JSON to Zcash types
 json-conversion = [
     "serde_json",

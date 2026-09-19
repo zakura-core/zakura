@@ -379,7 +379,7 @@ mod tests {
                 Amount::try_from(i64::try_from(scheduled - baseline + 1).unwrap()).unwrap(),
             );
             let result = eligible_deficit(&network, Height(h), pools, baseline);
-            if cfg!(feature = "nu7") && h == 3 {
+            if h == 3 {
                 assert!(matches!(
                     result,
                     Err(FormatChangeError::InvalidPostcondition(_))

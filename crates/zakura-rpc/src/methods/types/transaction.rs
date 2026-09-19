@@ -375,8 +375,9 @@ impl TransactionTemplate<NegativeOrZero> {
         net: &Network,
         height: Height,
         miner_params: &MinerParams,
+        issuance_deficit: Option<Amount<NonNegative>>,
     ) -> Result<CoinbaseResourceUsage, TransactionError> {
-        let block_subsidy = block_subsidy(height, net, None)?;
+        let block_subsidy = block_subsidy(height, net, issuance_deficit)?;
         let plan = CoinbasePlan::new(net, height, miner_params, block_subsidy)?;
         let branch = BranchId::for_height(net, BlockHeight::from(height));
         let version = TxVersion::suggested_for_branch(branch);
@@ -390,8 +391,9 @@ impl TransactionTemplate<NegativeOrZero> {
         height: Height,
         miner_params: &MinerParams,
         txs_fee: Amount<NonNegative>,
+        nsm_value_balance: Option<Amount<NonNegative>>,
     ) -> Result<Self, TransactionError> {
-        let block_subsidy = block_subsidy(height, net, None)?;
+        let block_subsidy = block_subsidy(height, net, nsm_value_balance)?;
         let plan = CoinbasePlan::new(net, height, miner_params, block_subsidy)?;
         let miner_reward = miner_subsidy(height, net, block_subsidy)? + txs_fee;
         let miner_reward = Zatoshis::try_from(miner_reward?)?;

@@ -399,7 +399,7 @@ mod tests {
     fn progress_timing_follows_tip_target_spacing() {
         let _init_guard = zakura_test::init();
 
-        // This tip is below NU7 on Mainnet and Testnet, so their values stay unchanged.
+        // Mainnet and Testnet have no NU7 height, so their values stay unchanged.
         let tip = Height(3_500_000);
         assert_eq!(stall_interval_seconds(&Network::Mainnet, tip), 600);
         assert_eq!(

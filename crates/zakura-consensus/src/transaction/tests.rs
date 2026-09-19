@@ -2989,9 +2989,7 @@ async fn v5_transaction_with_last_valid_expiry_height() {
 /// is equal to the height of the block the transaction belongs to.
 #[tokio::test]
 async fn v5_coinbase_transaction_expiry_height() {
-    // The last check uses `Height::MAX`, which is NU7 on Mainnet and Testnet.
-    // Zakura cannot verify V5 transactions at NU7 until librustzcash has an NU7
-    // branch ID, so this network stops at NU6.3.
+    // Keep this expiry-height test independent of future NU7 activation heights.
     let network = configured_network_with_nu7(None);
     let state_service =
         service_fn(|_| async { unreachable!("State service should not be called") });
@@ -3216,7 +3214,7 @@ async fn v5_transaction_with_exceeding_expiry_height() {
 
     let transaction_hash = transaction.hash();
 
-    // `Height::MAX` is NU7 on Mainnet and Testnet, so this network stops at NU6.3.
+    // Keep this expiry-height test independent of future NU7 activation heights.
     let network = configured_network_with_nu7(None);
     let verification_result = Verifier::new_for_tests(&network, state)
         .oneshot(Request::Block {
@@ -4578,11 +4576,18 @@ fn v4_deprecation_boundary() {
         "a V4 transaction must be invalid after the NU7 activation height",
     );
 
-    let no_nu7 = configured_network_with_nu7(None);
-    assert!(
-        verify_v4_at(&no_nu7, &transaction, Height::MAX).is_ok(),
-        "a network without an exact NU7 activation must keep accepting V4",
-    );
+    for network in [
+        Network::Mainnet,
+        Network::new_default_testnet(),
+        configured_network_with_nu7(None),
+    ] {
+        assert_eq!(NetworkUpgrade::Nu7.activation_height(&network), None);
+        assert!(!NetworkUpgrade::is_nu7_active(&network, Height::MAX));
+        assert!(
+            verify_v4_at(&network, &transaction, Height::MAX).is_ok(),
+            "a network without an exact NU7 activation must keep accepting V4",
+        );
+    }
 }
 
 /// Returns a configured network whose latest upgrade is NU6.3 unless `nu7`

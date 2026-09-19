@@ -570,6 +570,154 @@ fn startup_migration_failure_preserves_version_and_retry_matches_fresh_sync() {
     );
 }
 
+#[test]
+fn legacy_migration_reopens_and_replays_across_activation() {
+    use crate::{
+        constants::state_database_format_version_in_code,
+        rollback_finalized_state,
+        service::finalized_state::{
+            disk_format::{FromDisk, IntoDisk, RawBytes},
+            DiskWriteBatch,
+        },
+        RollbackFinalizedStateOptions,
+    };
+
+    let _guard = zakura_test::init();
+    let network = accounting_network(false);
+    for migrate_before_activation in [false, true] {
+        for excess in [-1, 0] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = Config {
+                cache_dir: dir.path().to_owned(),
+                ephemeral: false,
+                ..Config::default()
+            };
+            let (mut state, parent) = state_below_start_with_config(&network, &config);
+            let block = start_block(&state, &network, &parent, excess);
+            commit(&mut state, &block).unwrap();
+            let expected = state.db.finalized_value_pool();
+            let before_activation = *state.db.block_info(Height(1).into()).unwrap().value_pools();
+
+            if migrate_before_activation {
+                drop(state);
+                rollback_finalized_state(
+                    config.clone(),
+                    &network,
+                    RollbackFinalizedStateOptions {
+                        target_height: Height(1),
+                        keep_rolled_back_blocks: false,
+                        max_checkpoint_height: Some(Height(0)),
+                    },
+                )
+                .unwrap();
+                state = FinalizedState::new(&config, &network).unwrap();
+            }
+
+            let tip = state.db.finalized_tip_height().unwrap();
+            let mut batch = DiskWriteBatch::new();
+            for height in 0..=tip.0 {
+                let mut bytes = state
+                    .db
+                    .raw_block_info_cf()
+                    .zs_get(&Height(height))
+                    .unwrap()
+                    .as_bytes();
+                bytes.drain(48..56);
+                let _ = state
+                    .db
+                    .raw_block_info_cf()
+                    .with_batch_for_writing(&mut batch)
+                    .zs_insert(&Height(height), &RawBytes::from_bytes(bytes));
+            }
+            let tip_bytes = state
+                .db
+                .raw_chain_value_pools_cf()
+                .zs_get(&())
+                .unwrap()
+                .as_bytes();
+            let _ = state
+                .db
+                .raw_chain_value_pools_cf()
+                .with_batch_for_writing(&mut batch)
+                .zs_insert(&(), &RawBytes::from_bytes(&tip_bytes[..48]));
+            state.db.write_batch(batch).unwrap();
+            let legacy_anchor = state
+                .db
+                .raw_block_info_cf()
+                .zs_get(&Height(1))
+                .unwrap()
+                .as_bytes();
+            state
+                .db
+                .update_format_version_on_disk(&semver::Version::new(28, 2, 0))
+                .unwrap();
+            drop(state);
+
+            let upgraded = FinalizedState::new(&config, &network).unwrap();
+            assert_eq!(
+                upgraded.db.format_version_on_disk().unwrap(),
+                Some(state_database_format_version_in_code())
+            );
+            assert_eq!(
+                upgraded
+                    .db
+                    .raw_block_info_cf()
+                    .zs_get(&Height(1))
+                    .unwrap()
+                    .as_bytes(),
+                legacy_anchor
+            );
+            if migrate_before_activation {
+                assert_eq!(
+                    upgraded
+                        .db
+                        .raw_chain_value_pools_cf()
+                        .zs_get(&())
+                        .unwrap()
+                        .as_bytes(),
+                    tip_bytes[..48]
+                );
+            } else {
+                assert_eq!(upgraded.db.finalized_value_pool(), expected);
+            }
+            drop(upgraded);
+
+            if !migrate_before_activation {
+                rollback_finalized_state(
+                    config.clone(),
+                    &network,
+                    RollbackFinalizedStateOptions {
+                        target_height: Height(1),
+                        keep_rolled_back_blocks: false,
+                        max_checkpoint_height: Some(Height(0)),
+                    },
+                )
+                .unwrap();
+            }
+            let mut replayed = FinalizedState::new(&config, &network).unwrap();
+            assert_eq!(replayed.db.finalized_value_pool(), before_activation);
+            assert_eq!(
+                replayed
+                    .db
+                    .finalized_value_pool()
+                    .nsm_value_balance_amount(),
+                Amount::<zakura_chain::amount::NegativeAllowed>::zero()
+            );
+            commit(&mut replayed, &parent).unwrap();
+            commit(&mut replayed, &block).unwrap();
+            assert_eq!(replayed.db.finalized_value_pool(), expected);
+            drop(replayed);
+            assert_eq!(
+                FinalizedState::new(&config, &network)
+                    .unwrap()
+                    .db
+                    .finalized_value_pool(),
+                expected
+            );
+        }
+    }
+}
+
 /// From NU7, both commit paths reject a block that overdraws the NSM value balance, and
 /// agree on the balance after a block that does not.
 #[test]

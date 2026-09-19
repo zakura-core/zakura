@@ -96,7 +96,12 @@ chain's own history, as the measured Mainnet and Testnet constants do. The migra
 performs cumulative schedule arithmetic without clamping either operand to MAX_MONEY. It
 checks the eligible balance after the offset.
 
-The migration writes batches of 10,000 BlockInfo records. It preserves monetary
+The migration skips records before NU7, except for the preceding block when it
+must receive a nonzero seed. Earlier legacy records already decode with a zero
+balance. If NU7 is unscheduled or the tip precedes the first affected block, the
+migration performs no data writes, including to the separately stored tip pools.
+
+The migration writes batches of 10,000 affected BlockInfo records. It preserves monetary
 pools and block sizes. It updates the separately stored tip balance last.
 Cancellation or a failed write leaves the version marker unchanged. Restarting
 the migration recomputes every balance, including already rewritten records.

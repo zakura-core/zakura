@@ -1423,7 +1423,7 @@ pub enum Request {
     /// [`block::Height`] using `.into()`.
     Block(HashOrHeight),
 
-    /// Looks up the [`BlockInfo`] for a block hash.
+    /// Looks up the [`BlockInfo`](zakura_chain::block_info::BlockInfo) for a block hash.
     ///
     /// This request waits until the block commits if needed.
     ///

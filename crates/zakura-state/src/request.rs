@@ -1423,6 +1423,20 @@ pub enum Request {
     /// [`block::Height`] using `.into()`.
     Block(HashOrHeight),
 
+    /// Looks up the [`BlockInfo`](zakura_chain::block_info::BlockInfo) for a block hash.
+    ///
+    /// This request waits until the block commits if needed.
+    ///
+    /// This request checks every non-finalized chain and the finalized state.
+    ///
+    /// Returns [`Response::BlockInfo(Some(block_info))`](Response::BlockInfo) after the block
+    /// commits. The response future remains pending while the block is unknown.
+    ///
+    /// Returns [`AwaitBlockInfoError`](crate::AwaitBlockInfoError) if the state rejects the
+    /// block or the block does not commit within
+    /// [`AWAIT_BLOCK_INFO_TIMEOUT`](crate::constants::AWAIT_BLOCK_INFO_TIMEOUT).
+    AwaitBlockInfo(block::Hash),
+
     /// Looks up a block by hash in any current chain or by height in the current best chain.
     ///
     /// Returns
@@ -1594,6 +1608,7 @@ impl Request {
             Request::UnspentBestChainUtxo { .. } => "unspent_best_chain_utxo",
             Request::CheckParentInputs { .. } => "check_parent_inputs",
             Request::Block(_) => "block",
+            Request::AwaitBlockInfo(_) => "await_block_info",
             Request::AnyChainBlock(_) => "any_chain_block",
             Request::BlockHeader(_) => "block_header",
             Request::FindBlockHashes { .. } => "find_block_hashes",
@@ -1652,9 +1667,10 @@ pub enum ReadRequest {
     /// with the pool values of the current best chain tip.
     TipPoolValues,
 
-    /// Looks up the block info after a block by hash or height in the current best chain.
+    /// Looks up the block info after a block by hash in any chain, or by height in the
+    /// current best chain.
     ///
-    /// * [`ReadResponse::BlockInfo(Some(pool_values))`](ReadResponse::BlockInfo) if the block is in the best chain;
+    /// * [`ReadResponse::BlockInfo(Some(pool_values))`](ReadResponse::BlockInfo) if the block is found;
     /// * [`ReadResponse::BlockInfo(None)`](ReadResponse::BlockInfo) otherwise.
     BlockInfo(HashOrHeight),
 
@@ -2268,6 +2284,8 @@ impl TryFrom<Request> for ReadRequest {
             Request::AwaitUtxo(_) => Err("ReadService does not track pending UTXOs. \
                      Manually convert the request to ReadRequest::AnyChainUtxo, \
                      and handle pending UTXOs"),
+
+            Request::AwaitBlockInfo(_) => Err("ReadService does not track pending block commits"),
 
             Request::KnownBlock(_) => Err("ReadService does not track queued blocks"),
 

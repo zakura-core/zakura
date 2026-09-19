@@ -550,6 +550,77 @@ async fn any_chain_block_test() -> Result<()> {
     Ok(())
 }
 
+/// Block info resolves hashes on side chains, but heights only on the best chain, even when a
+/// lower-work side chain is taller.
+#[tokio::test(flavor = "multi_thread")]
+async fn block_info_heights_resolve_on_the_best_chain() -> Result<()> {
+    use crate::{
+        arbitrary::Prepare,
+        service::{
+            finalized_state::FinalizedState, non_finalized_state::NonFinalizedState,
+            read::block_info_by_hash_or_best_chain_height,
+        },
+        tests::FakeChainHelper,
+    };
+    use zakura_chain::{amount::NonNegative, value_balance::ValueBalance};
+
+    let _init_guard = zakura_test::init();
+
+    let network = Mainnet;
+
+    // Use pre-Heartwood blocks to avoid history tree complications
+    let genesis: Arc<Block> = Arc::new(network.test_block(653599, 583999).unwrap());
+    let best_block = genesis.make_fake_child().set_work(100);
+    let side_block = genesis.make_fake_child().set_work(40);
+    let taller_side_block = side_block.make_fake_child().set_work(40);
+
+    let mut non_finalized_state = NonFinalizedState::new(&network);
+    let finalized_state = FinalizedState::new(&Config::ephemeral(), &network)
+        .expect("opening an ephemeral database should succeed");
+    finalized_state.set_finalized_value_pool(ValueBalance::<NonNegative>::fake_populated_pool());
+
+    non_finalized_state.commit_new_chain(genesis.prepare(), &finalized_state)?;
+    non_finalized_state.commit_block(best_block.clone().prepare(), &finalized_state)?;
+    non_finalized_state.commit_block(side_block.prepare(), &finalized_state)?;
+    non_finalized_state.commit_block(taller_side_block.clone().prepare(), &finalized_state)?;
+
+    assert_eq!(non_finalized_state.chain_count(), 2);
+    assert_eq!(
+        non_finalized_state
+            .best_tip()
+            .expect("the best chain has a tip")
+            .1,
+        best_block.hash()
+    );
+
+    let taller_height = taller_side_block
+        .coinbase_height()
+        .expect("fake blocks have a height");
+    assert!(block_info_by_hash_or_best_chain_height(
+        &non_finalized_state,
+        &finalized_state.db,
+        taller_side_block.hash().into(),
+    )
+    .is_some());
+    assert!(block_info_by_hash_or_best_chain_height(
+        &non_finalized_state,
+        &finalized_state.db,
+        taller_height.into(),
+    )
+    .is_none());
+    assert!(block_info_by_hash_or_best_chain_height(
+        &non_finalized_state,
+        &finalized_state.db,
+        best_block
+            .coinbase_height()
+            .expect("fake blocks have a height")
+            .into(),
+    )
+    .is_some());
+
+    Ok(())
+}
+
 /// Test that AnyChainBlock finds blocks in side chains, while Block does not.
 #[tokio::test(flavor = "multi_thread")]
 async fn any_chain_block_finds_side_chain_blocks() -> Result<()> {

@@ -7,7 +7,7 @@
 use std::{env, sync::Arc, time::Duration};
 
 use tokio::{runtime::Runtime, time::timeout};
-use tower::{buffer::Buffer, util::BoxService};
+use tower::{buffer::Buffer, util::BoxService, Service, ServiceExt};
 
 use zakura_chain::{
     block::{self, Block, CountedHeader, Height},
@@ -39,6 +39,225 @@ use crate::{
 };
 
 const LAST_BLOCK_HEIGHT: u32 = 10;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn await_block_info_waits_for_checkpoint_commit() {
+    let _init_guard = zakura_test::init();
+    let state = init_test(&Network::Mainnet).await;
+    let block0: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .expect("genesis block deserializes");
+    let block1: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .expect("block 1 deserializes");
+    let hash = block1.hash();
+    let limit = Duration::from_secs(10);
+    let mut wait = tokio::spawn(state.clone().oneshot(Request::AwaitBlockInfo(hash)));
+    let second_wait = tokio::spawn(state.clone().oneshot(Request::AwaitBlockInfo(hash)));
+
+    // A different block's commit must wake readers without answering this request.
+    timeout(
+        limit,
+        state
+            .clone()
+            .oneshot(Request::CommitCheckpointVerifiedBlock(block0.into())),
+    )
+    .await
+    .expect("genesis commit completes")
+    .expect("genesis commits");
+    assert!(timeout(Duration::from_millis(50), &mut wait).await.is_err());
+
+    timeout(
+        limit,
+        state
+            .clone()
+            .oneshot(Request::CommitCheckpointVerifiedBlock(block1.into())),
+    )
+    .await
+    .expect("parent commit completes")
+    .expect("parent commits");
+    for waiter in [wait, second_wait] {
+        let response = timeout(limit, waiter)
+            .await
+            .expect("reader observes commit")
+            .expect("reader task completes")
+            .expect("lookup succeeds");
+        assert!(matches!(response, Response::BlockInfo(Some(_))));
+    }
+
+    // A reader registered after the notification must also see the committed block.
+    let response = timeout(limit, state.oneshot(Request::AwaitBlockInfo(hash)))
+        .await
+        .expect("known parent returns immediately")
+        .expect("lookup succeeds");
+    assert!(matches!(response, Response::BlockInfo(Some(_))));
+}
+
+/// Returns Mainnet blocks 0..=2 with v4 coinbases, so block 2 can reach the non-finalized state.
+fn v4_coinbase_mainnet_chain() -> Vec<Arc<Block>> {
+    let mut chain: Vec<Arc<Block>> = Vec::new();
+    for (_height, block_bytes) in zakura_test::vectors::MAINNET_BLOCKS.range(0..=2) {
+        let mut block = block_bytes
+            .zcash_deserialize_into::<Block>()
+            .expect("the mainnet block vector decodes");
+        block.transactions = vec![Arc::new(transaction_v4_from_coinbase(
+            &block.transactions[0],
+        ))];
+        if let Some(parent) = chain.last() {
+            Arc::make_mut(&mut block.header).previous_block_hash = parent.hash();
+        }
+        chain.push(Arc::new(block));
+    }
+    chain
+}
+
+/// Returns a state with blocks 0 and 1 of `chain` finalized.
+async fn state_with_finalized_parent(chain: &[Arc<Block>]) -> StateService {
+    let (mut state, _, _, _) =
+        StateService::new(Config::ephemeral(), &Network::Mainnet, Height::MAX, 0)
+            .await
+            .expect("ephemeral state initialization succeeds");
+    for block in &chain[0..=1] {
+        let result = state
+            .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block.clone()))
+            .await;
+        assert!(matches!(result, Ok(Ok(_))), "checkpoint commit: {result:?}");
+    }
+    state
+}
+
+fn await_block_info_error(result: Result<Response, BoxError>) -> crate::AwaitBlockInfoError {
+    let error = result.expect_err("the wait fails");
+    error
+        .downcast_ref::<crate::AwaitBlockInfoError>()
+        .unwrap_or_else(|| panic!("unexpected error: {error:?}"))
+        .clone()
+}
+
+/// A block restored by `reconsiderblock` must wake readers waiting for it,
+/// even though no block commit follows.
+#[tokio::test(flavor = "multi_thread")]
+async fn await_block_info_wakes_after_reconsider() {
+    let _init_guard = zakura_test::init();
+    let limit = Duration::from_secs(10);
+    let chain = v4_coinbase_mainnet_chain();
+    let mut state = state_with_finalized_parent(&chain).await;
+
+    let child = chain[2].clone().prepare();
+    let hash = child.hash;
+    timeout(
+        limit,
+        state.queue_and_commit_to_non_finalized_state(child, None),
+    )
+    .await
+    .expect("non-finalized commit completes")
+    .expect("the response channel stays open")
+    .expect("the non-finalized block commits");
+
+    let state = Buffer::new(BoxService::new(state), 10);
+    timeout(limit, state.clone().oneshot(Request::InvalidateBlock(hash)))
+        .await
+        .expect("invalidation completes")
+        .expect("block is invalidated");
+
+    let mut wait = tokio::spawn(state.clone().oneshot(Request::AwaitBlockInfo(hash)));
+    assert!(
+        timeout(Duration::from_millis(100), &mut wait)
+            .await
+            .is_err(),
+        "an invalidated block has no block info"
+    );
+
+    timeout(limit, state.clone().oneshot(Request::ReconsiderBlock(hash)))
+        .await
+        .expect("reconsideration completes")
+        .expect("block is reconsidered");
+
+    let response = timeout(limit, wait)
+        .await
+        .expect("reader wakes without another block commit")
+        .expect("reader task completes")
+        .expect("lookup succeeds");
+    assert!(matches!(response, Response::BlockInfo(Some(_))));
+}
+
+/// A reader waiting for a block stops waiting when the state rejects that block.
+#[tokio::test(flavor = "multi_thread")]
+async fn await_block_info_fails_when_the_block_is_rejected() {
+    let _init_guard = zakura_test::init();
+    let limit = Duration::from_secs(10);
+    let chain = v4_coinbase_mainnet_chain();
+    let mut state = state_with_finalized_parent(&chain).await;
+
+    // A spend of an output this state does not have fails contextual validation.
+    let later: Block = zakura_test::vectors::BLOCK_MAINNET_419201_BYTES
+        .zcash_deserialize_into()
+        .expect("the later block vector decodes");
+    let spend = later
+        .transactions
+        .iter()
+        .find(|transaction| !transaction.is_coinbase() && !transaction.inputs().is_empty())
+        .expect("the later block has a transparent spend")
+        .clone();
+    let mut invalid = (*chain[2]).clone();
+    invalid.transactions.push(spend);
+    let invalid = Arc::new(invalid).prepare();
+    let hash = invalid.hash;
+
+    let wait = state.call(Request::AwaitBlockInfo(hash));
+    let commit = state.queue_and_commit_to_non_finalized_state(invalid, None);
+    timeout(limit, commit)
+        .await
+        .expect("non-finalized commit completes")
+        .expect("the response channel stays open")
+        .expect_err("the invalid block is rejected");
+
+    let error = await_block_info_error(timeout(limit, wait).await.expect("reader wakes"));
+    assert_eq!(error, crate::AwaitBlockInfoError::Rejected { hash });
+}
+
+/// A reader waiting for a block that never arrives stops at the wait limit.
+#[tokio::test(flavor = "multi_thread")]
+async fn await_block_info_times_out() {
+    let _init_guard = zakura_test::init();
+    let chain = v4_coinbase_mainnet_chain();
+    let mut state = state_with_finalized_parent(&chain).await;
+    let wait_limit = Duration::from_millis(200);
+    state.await_block_info_timeout = wait_limit;
+
+    let hash = chain[2].hash();
+    let error = await_block_info_error(
+        timeout(
+            Duration::from_secs(10),
+            state.call(Request::AwaitBlockInfo(hash)),
+        )
+        .await
+        .expect("the wait limit ends the request"),
+    );
+    assert_eq!(
+        error,
+        crate::AwaitBlockInfoError::TimedOut {
+            hash,
+            limit: wait_limit,
+        }
+    );
+
+    // A reader that starts after the block commits still succeeds.
+    let child = chain[2].clone().prepare();
+    timeout(
+        Duration::from_secs(10),
+        state.queue_and_commit_to_non_finalized_state(child, None),
+    )
+    .await
+    .expect("non-finalized commit completes")
+    .expect("the response channel stays open")
+    .expect("the non-finalized block commits");
+    let response = state
+        .call(Request::AwaitBlockInfo(hash))
+        .await
+        .expect("lookup succeeds");
+    assert!(matches!(response, Response::BlockInfo(Some(_))));
+}
 
 #[test]
 fn mined_orphans_finish_without_entering_the_sync_queue() {

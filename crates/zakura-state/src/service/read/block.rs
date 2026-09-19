@@ -417,14 +417,44 @@ pub fn block_info<C>(
 where
     C: AsRef<Chain>,
 {
+    any_block_info(chain.iter(), db, hash_or_height)
+}
+
+/// Returns the [`BlockInfo`] for `hash_or_height` in `non_finalized_state` or `db`.
+///
+/// A hash resolves on any non-finalized chain, because a block verifier looks up its
+/// parent, which can be on a side chain. A height resolves only on the best chain, because
+/// a taller side chain can contain heights the best chain doesn't have yet.
+pub fn block_info_by_hash_or_best_chain_height(
+    non_finalized_state: &NonFinalizedState,
+    db: &ZakuraDb,
+    hash_or_height: HashOrHeight,
+) -> Option<BlockInfo> {
+    match hash_or_height {
+        HashOrHeight::Hash(_) => {
+            any_block_info(non_finalized_state.chain_iter(), db, hash_or_height)
+        }
+        HashOrHeight::Height(_) => block_info(non_finalized_state.best_chain(), db, hash_or_height),
+    }
+}
+
+/// Returns the [`BlockInfo`] of the block with [`block::Hash`] or [`Height`], if it
+/// exists in any of the non-finalized `chains` or in the finalized `db`.
+///
+/// Heights resolve on the first chain in `chains` that has them, so use
+/// [`block_info_by_hash_or_best_chain_height`] to look up heights in the best chain.
+pub fn any_block_info<'a, C: AsRef<Chain> + 'a>(
+    mut chains: impl Iterator<Item = &'a C>,
+    db: &ZakuraDb,
+    hash_or_height: HashOrHeight,
+) -> Option<BlockInfo> {
     // # Correctness
     //
     // Since blocks are the same in the finalized and non-finalized state, we
-    // check the most efficient alternative first. (`chain` is always in memory,
+    // check the most efficient alternative first. (the chains are always in memory,
     // but `db` stores blocks on disk, with a memory cache.)
-    chain
-        .as_ref()
-        .and_then(|chain| chain.as_ref().block_info(hash_or_height))
+    chains
+        .find_map(|chain| chain.as_ref().block_info(hash_or_height))
         .or_else(|| db.block_info(hash_or_height))
 }
 

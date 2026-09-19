@@ -9,15 +9,16 @@ use zakura_chain::{
     amount::Amount,
     block::{Height, MAX_BLOCK_BYTES},
     parameters::Network,
-    serialization::ZcashSerialize,
+    serialization::{ZcashDeserializeInto, ZcashSerialize},
     transaction,
     transparent::{OutPoint, Output, Script},
 };
 use zakura_node_services::mempool::TransactionDependencies;
+use zcash_transparent::coinbase::MAX_COINBASE_SCRIPT_LEN;
 
 use crate::methods::types::{get_block_template::MinerParams, transaction::TransactionTemplate};
 
-use super::{block_template_overhead_bytes, max_coinbase_bytes, select_mempool_transactions};
+use super::{block_template_overhead_bytes, select_mempool_transactions};
 
 /// Replaces `transaction`'s inner transaction with one that has exactly
 /// `target_size` serialized bytes.
@@ -69,17 +70,36 @@ fn reserves_serialized_block_and_pool_tag_overhead() {
     let height = Height(1_000_000);
     let miner_params =
         MinerParams::from(Address::from(TransparentAddress::PublicKeyHash([0x7e; 20])));
-    let fake_coinbase =
+    let coinbase_resources =
+        TransactionTemplate::coinbase_resource_usage(&network, height, &miner_params)
+            .expect("test coinbase resource usage is valid");
+    let coinbase =
         TransactionTemplate::new_coinbase(&network, height, &miner_params, Amount::zero())
             .expect("test coinbase template is valid");
-    assert!(
-        max_coinbase_bytes(&fake_coinbase) > fake_coinbase.data.as_ref().len(),
-        "the test coinbase leaves room for a pool tag",
+    let transaction: transaction::Transaction = coinbase
+        .data
+        .as_ref()
+        .zcash_deserialize_into()
+        .expect("test coinbase transaction is valid");
+    let coinbase_script_len = transaction.inputs()[0]
+        .coinbase_script()
+        .expect("generated coinbase input has a canonical script")
+        .len();
+    assert_eq!(
+        coinbase_resources.max_serialized_size,
+        coinbase.data.as_ref().len() + MAX_COINBASE_SCRIPT_LEN - coinbase_script_len,
+        "the resource estimate reserves the exact coinbase size plus pool tag space",
     );
+    assert_eq!(coinbase_resources.sigops, coinbase.sigops);
+    assert_eq!(
+        coinbase_resources.shielded_action_counts,
+        transaction.shielded_action_counts(),
+    );
+
     let max_block_bytes = usize::try_from(MAX_BLOCK_BYTES).expect("fits in memory");
     let max_mempool_transaction_bytes = max_block_bytes
         - block_template_overhead_bytes(&network)
-        - max_coinbase_bytes(&fake_coinbase);
+        - coinbase_resources.max_serialized_size;
 
     let template_transactions = |transaction_size| {
         let transaction = network
@@ -225,7 +245,7 @@ mod zip218_template_limits {
 
     use super::{
         super::{BlockTemplateLimits, MinerParams},
-        Amount, Height, TransactionTemplate,
+        Height, TransactionTemplate,
     };
 
     /// A transaction that fills the Orchard limit leaves no room under the
@@ -345,11 +365,11 @@ mod zip218_template_limits {
     fn template_limits(network: &Network, height: Height) -> BlockTemplateLimits {
         let miner_params =
             MinerParams::from(Address::from(TransparentAddress::PublicKeyHash([0x7e; 20])));
-        let fake_coinbase_tx =
-            TransactionTemplate::new_coinbase(network, height, &miner_params, Amount::zero())
-                .expect("valid coinbase transaction template");
+        let coinbase_resources =
+            TransactionTemplate::coinbase_resource_usage(network, height, &miner_params)
+                .expect("valid coinbase resource usage");
 
-        BlockTemplateLimits::initial(network, height, &fake_coinbase_tx)
+        BlockTemplateLimits::initial(network, height, coinbase_resources)
     }
 
     fn nu7_template_limits() -> BlockTemplateLimits {

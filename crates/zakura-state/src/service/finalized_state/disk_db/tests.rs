@@ -138,3 +138,126 @@ fn zs_iter_opts_increments_key_by_one() {
         }
     }
 }
+
+mod major_upgrade_reuse {
+    use std::fs;
+
+    use semver::Version;
+    use zakura_chain::parameters::Network;
+
+    use crate::{
+        database_format_version_on_disk,
+        service::finalized_state::disk_db::{DiskDb, DB},
+        Config,
+    };
+
+    const KIND: &str = "state";
+    const RESTORABLE: &[u64] = &[27, 28, 29];
+
+    fn config(tempdir: &tempfile::TempDir) -> Config {
+        Config {
+            cache_dir: tempdir.path().to_owned(),
+            ephemeral: false,
+            ..Config::default()
+        }
+    }
+
+    /// Creates a database at `major`, with `version_file` as the raw version file contents.
+    fn create_db(config: &Config, major: u64, version_file: Option<&str>) {
+        let path = config.db_path(KIND, major, &Network::Mainnet);
+        fs::create_dir_all(&path).expect("the test database directory is created");
+        drop(DB::open(&DiskDb::options(), &path).expect("the test database opens"));
+        if let Some(contents) = version_file {
+            fs::write(
+                config.version_file_path(KIND, major, &Network::Mainnet),
+                contents,
+            )
+            .expect("the version file is written");
+        }
+    }
+
+    fn reuse(config: &Config, restorable: &[u64]) -> Option<Version> {
+        DiskDb::try_reusing_previous_db_after_major_upgrade(
+            restorable,
+            &Version::new(29, 0, 0),
+            config,
+            KIND,
+            &Network::Mainnet,
+        )
+    }
+
+    fn version_on_disk(config: &Config, major: u64) -> Option<Version> {
+        database_format_version_on_disk(config, KIND, major, &Network::Mainnet)
+            .expect("the version file is readable")
+    }
+
+    #[test]
+    fn keeps_the_older_major_of_an_interrupted_upgrade() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = config(&tempdir);
+        create_db(&config, 28, Some("27.3.0"));
+
+        assert_eq!(reuse(&config, RESTORABLE), Some(Version::new(27, 3, 0)));
+        assert_eq!(version_on_disk(&config, 29), Some(Version::new(27, 3, 0)));
+    }
+
+    #[test]
+    fn resolves_legacy_and_missing_version_files_to_the_old_major() {
+        for (version_file, expected) in [
+            (Some("1.5"), Version::new(28, 1, 5)),
+            (None, Version::new(28, 0, 0)),
+        ] {
+            let tempdir = tempfile::tempdir().unwrap();
+            let config = config(&tempdir);
+            create_db(&config, 28, version_file);
+
+            assert_eq!(reuse(&config, RESTORABLE), Some(expected.clone()));
+            // The version file moved with the directory, so a crash after the rename
+            // cannot make the next startup infer 29.0.0.
+            assert_eq!(version_on_disk(&config, 29), Some(expected));
+        }
+    }
+
+    #[test]
+    fn reuses_a_database_two_majors_back() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = config(&tempdir);
+        create_db(&config, 27, Some("27.3.0"));
+
+        assert_eq!(reuse(&config, RESTORABLE), Some(Version::new(27, 3, 0)));
+        assert!(!config.db_path(KIND, 27, &Network::Mainnet).exists());
+        assert_eq!(version_on_disk(&config, 29), Some(Version::new(27, 3, 0)));
+    }
+
+    #[test]
+    fn prefers_the_newest_older_database() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = config(&tempdir);
+        create_db(&config, 27, Some("27.3.0"));
+        create_db(&config, 28, Some("28.1.5"));
+
+        assert_eq!(reuse(&config, RESTORABLE), Some(Version::new(28, 1, 5)));
+        assert!(config.db_path(KIND, 27, &Network::Mainnet).exists());
+    }
+
+    #[test]
+    fn does_not_skip_a_major_without_a_reusable_upgrade() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = config(&tempdir);
+        create_db(&config, 27, Some("27.3.0"));
+
+        assert_eq!(reuse(&config, &[27, 29]), None);
+        assert!(config.db_path(KIND, 27, &Network::Mainnet).exists());
+    }
+
+    #[test]
+    fn does_not_replace_an_existing_current_database() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = config(&tempdir);
+        create_db(&config, 28, Some("28.1.5"));
+        create_db(&config, 29, Some("29.0.0"));
+
+        assert_eq!(reuse(&config, RESTORABLE), None);
+        assert!(config.db_path(KIND, 28, &Network::Mainnet).exists());
+    }
+}

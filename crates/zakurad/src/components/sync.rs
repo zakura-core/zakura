@@ -159,6 +159,11 @@ const REGISTRY_MISS_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 /// [`super::inbound::downloads::MAX_INBOUND_CONCURRENCY`] and #1880 for details.
 /// So we want to keep the lookahead limit reasonably small.
 ///
+/// The configured limits count blocks, so the syncer multiplies them by
+/// [`lookahead_limit_multiplier`] to keep the same time window at shorter target
+/// spacings. A future shorter target spacing increases the in-flight bound and
+/// its RAM bound by the same ratio.
+///
 /// Once these malicious blocks start failing validation, the syncer will cancel all
 /// the pending download and verify tasks, drop all the blocks, and start a new
 /// ObtainTips with a new set of peers.
@@ -189,7 +194,7 @@ pub const MIN_CONCURRENCY_LIMIT: usize = 1;
 ///
 /// Existing 150- and 75-second eras retain the configured limits. Shorter future
 /// target spacings increase the number of blocks in the same time window.
-fn lookahead_limit_multiplier(network: &Network, height: Height) -> usize {
+pub(crate) fn lookahead_limit_multiplier(network: &Network, height: Height) -> usize {
     let spacing = NetworkUpgrade::target_spacing_for_height(network, height).num_seconds();
     usize::try_from((i64::from(POST_BLOSSOM_POW_TARGET_SPACING) / spacing).max(1))
         .expect("the spacing ratio fits in usize")

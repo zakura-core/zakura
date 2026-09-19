@@ -1,4 +1,4 @@
-//! State histories for seeded NSM accounting before reissuance payouts.
+//! State histories for the signed issuance counter, with and without ZIP 234 reissuance.
 
 use std::sync::Arc;
 
@@ -6,7 +6,10 @@ use zakura_chain::{
     amount::{Amount, NonNegative},
     block::{Block, Height},
     parameters::{
-        subsidy::expected_issued_supply,
+        subsidy::{
+            block_subsidy_fraction_numerator, expected_issued_supply, is_zip234_active,
+            BLOCK_SUBSIDY_FRACTION_DENOMINATOR,
+        },
         testnet::{ConfiguredActivationHeights, RegtestParameters},
         Network, NetworkKind, NetworkUpgrade,
     },
@@ -48,8 +51,8 @@ pub(super) const START: Height = Height(3);
 
 /// Returns a Regtest network with NU7 at height 2 and accounting fixtures from [`START`].
 ///
-/// Reissuance payouts are wired separately from these accounting checks.
-pub(super) fn accounting_network() -> Network {
+/// If `reissuance` is true, ZIP 234 reissuance starts at [`START`].
+pub(super) fn accounting_network(reissuance: bool) -> Network {
     Network::new_regtest(RegtestParameters {
         // Regtest activates Heartwood at height 1, where the block commitment is reserved.
         // NU7 activates after it.
@@ -57,8 +60,24 @@ pub(super) fn accounting_network() -> Network {
             nu7: Some(2),
             ..Default::default()
         },
+        nsm_reissuance_height: reissuance.then_some(START),
         ..Default::default()
     })
+}
+
+/// Returns the ZIP 234 reissuance bonus for a block at `height` whose parent left
+/// `deficit`, or zero where reissuance is inactive.
+///
+/// This oracle restates `ceil(deficit * BLOCK_SUBSIDY_FRACTION)` independently of
+/// `block_subsidy`, and reads the fraction from the network so the tests follow ZIP 218's
+/// spacing change.
+fn reissuance_bonus(network: &Network, height: Height, deficit: i128) -> i128 {
+    if !is_zip234_active(network, height) {
+        return 0;
+    }
+    let numerator = i128::try_from(block_subsidy_fraction_numerator(height, network)).unwrap();
+    let denominator = i128::try_from(BLOCK_SUBSIDY_FRACTION_DENOMINATOR).unwrap();
+    (deficit * numerator + denominator - 1) / denominator
 }
 
 /// Returns a finalized state with Regtest blocks up to the parent of [`START`], and that
@@ -159,8 +178,8 @@ pub(super) fn commit(
 fn nsm_value_balance_matches_the_schedule() {
     let _init_guard = zakura_test::init();
 
-    {
-        nsm_value_balance_matches_the_schedule_on(&accounting_network());
+    for reissuance in [false, true] {
+        nsm_value_balance_matches_the_schedule_on(&accounting_network(reissuance));
     }
 }
 
@@ -221,10 +240,11 @@ fn claim_fixture_obeys_subsidy_limit() {
     use zakura_chain::parameters::subsidy::block_subsidy;
 
     let _init_guard = zakura_test::init();
-    {
-        let network = accounting_network();
+    for reissuance in [false, true] {
+        let network = accounting_network(reissuance);
         let (state, parent) = state_below_start(&network);
-        let allowed = block_subsidy(START, &network).unwrap();
+        let deficit = state.db.finalized_value_pool().nsm_value_balance_amount();
+        let allowed = block_subsidy(START, &network, Some(deficit.constrain().unwrap())).unwrap();
         let block = permitted_start_block(&state, &network, &parent);
         let change = block
             .chain_value_pool_change(&network, &Default::default(), None)
@@ -243,11 +263,12 @@ proptest::proptest! {
     #[test]
     fn checkpoint_claim_sequences_preserve_balance(
         claims in proptest::collection::vec(0u64..=1_000_000, 1..32),
+        reissuance in proptest::bool::ANY,
     ) {
         use zakura_chain::parameters::subsidy::{block_subsidy, halving_block_subsidy};
 
         let _init_guard = zakura_test::init();
-        let network = accounting_network();
+        let network = accounting_network(reissuance);
         let (mut state, mut parent) = state_below_start(&network);
         let address = Address::from_script_hash(NetworkKind::Regtest, [0x42; 20]);
         let mut issued = i64::from(state.db.finalized_value_pool().issued_supply());
@@ -255,9 +276,10 @@ proptest::proptest! {
 
         for (index, claim_fraction) in claims.into_iter().enumerate() {
             let height = Height(START.0 + u32::try_from(index).unwrap());
+            let before = expected - issued;
             let scheduled = i64::from(halving_block_subsidy(height, &network).unwrap());
-            let bonus = 0;
-            let allowed = block_subsidy(height, &network).unwrap();
+            let bonus = reissuance_bonus(&network, height, i128::from(before));
+            let allowed = block_subsidy(height, &network, Some(Amount::try_from(before).unwrap())).unwrap();
             proptest::prop_assert_eq!(i128::from(i64::from(allowed)), i128::from(scheduled) + bonus);
             let claimed = i64::try_from(i128::from(i64::from(allowed)) * i128::from(claim_fraction) / 1_000_000).unwrap();
             let block = child_block_with_history_commitment(
@@ -288,7 +310,8 @@ pub(super) fn permitted_start_block(
 ) -> Arc<Block> {
     use zakura_chain::parameters::subsidy::halving_block_subsidy;
 
-    let bonus = 0;
+    let deficit = i64::from(state.db.finalized_value_pool().nsm_value_balance_amount());
+    let bonus = i64::try_from(reissuance_bonus(network, START, i128::from(deficit))).unwrap();
     let allowed = i64::from(halving_block_subsidy(START, network).unwrap()) + bonus;
     let address = Address::from_script_hash(NetworkKind::Regtest, [0x42; 20]);
     child_block_with_history_commitment(
@@ -312,11 +335,12 @@ proptest::proptest! {
     fn balance_rollback_replay_and_fork_equivalence(
         claims in proptest::collection::vec(0u32..=1_000_000, 2..12),
         target_offset in 0usize..12,
+        reissuance in proptest::bool::ANY,
     ) {
         use zakura_chain::parameters::subsidy::halving_block_subsidy;
         use crate::{rollback_finalized_state, RollbackFinalizedStateOptions};
         let _guard = zakura_test::init();
-        let network = accounting_network();
+        let network = accounting_network(reissuance);
         let dir = tempfile::tempdir().unwrap();
         let config = Config { cache_dir: dir.path().to_owned(), ephemeral: false, ..Config::default() };
         let (mut state, mut parent) = state_below_start_with_config(&network, &config);
@@ -329,7 +353,7 @@ proptest::proptest! {
         for (index, fraction) in claims.iter().enumerate() {
             let height = Height(START.0 + u32::try_from(index).unwrap());
             let scheduled = i128::from(i64::from(halving_block_subsidy(height, &network).unwrap()));
-            let bonus = 0;
+            let bonus = reissuance_bonus(&network, height, deficit);
             let claim = (scheduled + bonus) * i128::from(*fraction) / 1_000_000;
             let block = child_block_with_history_commitment(&parent,
                 vec![coinbase_tx(height, Amount::try_from(i64::try_from(claim).unwrap()).unwrap(), &address)],
@@ -364,7 +388,7 @@ proptest::proptest! {
         let mut state = FinalizedState::new(&config, &network).unwrap();
         let height = target_height.next().unwrap();
         let deficit = i128::from(i64::from(snapshots[target].nsm_value_balance_amount()));
-        let bonus = 0;
+        let bonus = reissuance_bonus(&network, height, deficit);
         let scheduled = i128::from(i64::from(halving_block_subsidy(height, &network).unwrap()));
         let fork = child_block_with_history_commitment(&blocks[target],
             vec![coinbase_tx(height, Amount::try_from(i64::try_from(scheduled + bonus).unwrap()).unwrap(), &Address::from_script_hash(NetworkKind::Regtest, [0x43; 20]))],
@@ -387,13 +411,14 @@ proptest::proptest! {
     #[test]
     fn non_finalized_forks_keep_independent_balances(
         shortfall in 1i64..1_000_000,
+        reissuance in proptest::bool::ANY,
     ) {
         let _guard = zakura_test::init();
-        let network = accounting_network();
+        let network = accounting_network(reissuance);
         let (mut state, parent) = state_below_start(&network);
         let before = state.db.finalized_value_pool();
         let deficit = i64::from(before.nsm_value_balance_amount());
-        let bonus = 0;
+        let bonus = i64::try_from(reissuance_bonus(&network, START, i128::from(deficit))).unwrap();
         // These fixtures isolate contextual accounting from semantic subsidy validation.
         let full = start_block(&state, &network, &parent, bonus - deficit);
         let partial = start_block(&state, &network, &parent, bonus - deficit - shortfall);
@@ -413,7 +438,7 @@ proptest::proptest! {
         proptest::prop_assert_eq!(state.db.finalized_value_pool(), before);
         for (index, (parent, parent_deficit)) in [(&full, deficit - bonus), (&partial, deficit - bonus + shortfall)].into_iter().enumerate() {
             let height = START.next().unwrap();
-            let bonus = 0;
+            let bonus = i64::try_from(reissuance_bonus(&network, height, i128::from(parent_deficit))).unwrap();
             let scheduled = i64::from(zakura_chain::parameters::subsidy::halving_block_subsidy(height, &network).unwrap());
             let mut coinbase = (*parent.transactions[0]).clone();
             let Transaction::V5 { inputs, outputs, expiry_height, .. } = &mut coinbase else { unreachable!() };
@@ -453,7 +478,7 @@ fn startup_migration_failure_preserves_version_and_retry_matches_fresh_sync() {
         },
     };
     let _guard = zakura_test::init();
-    let network = accounting_network();
+    let network = accounting_network(false);
     let dir = tempfile::tempdir().unwrap();
     let config = Config {
         cache_dir: dir.path().to_owned(),
@@ -558,7 +583,7 @@ fn legacy_migration_reopens_and_replays_across_activation() {
     };
 
     let _guard = zakura_test::init();
-    let network = accounting_network();
+    let network = accounting_network(false);
     for migrate_before_activation in [false, true] {
         for excess in [-1, 0] {
             let dir = tempfile::tempdir().unwrap();
@@ -698,7 +723,7 @@ fn legacy_migration_reopens_and_replays_across_activation() {
 #[test]
 fn signed_balance_agrees_across_both_commit_paths() {
     let _guard = zakura_test::init();
-    let network = accounting_network();
+    let network = accounting_network(false);
     for excess in [-1, 0, 1, 1_000_000] {
         let (mut state, parent) = state_below_start(&network);
         let block = start_block(&state, &network, &parent, excess);
@@ -748,7 +773,7 @@ fn deficit_validation_accepts_block_info_rows_with_appended_fields() {
     };
 
     let _guard = zakura_test::init();
-    let network = accounting_network();
+    let network = accounting_network(false);
     let (mut state, parent) = state_below_start(&network);
     let block = permitted_start_block(&state, &network, &parent);
     commit(&mut state, &block).unwrap();

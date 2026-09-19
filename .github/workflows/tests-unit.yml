@@ -347,7 +347,7 @@ jobs:
       id-token: write
       statuses: write
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
@@ -361,6 +361,16 @@ jobs:
           cargo test --locked --features nu7 \
             -p zakura-consensus -p zakura-state --lib
           cargo check --locked -p zakura --features nu7
+
+      - name: Extended reissuance properties
+        if: github.event_name != 'pull_request'
+        env:
+          NSM_ARITHMETIC_CASES: '10000'
+          NSM_HISTORY_CASES: '1000'
+        run: |
+          cargo test --locked -p zakura-chain reissuance_matches_integer_oracle
+          cargo test --locked -p zakura-chain balance_ignores_transfers
+          cargo test --locked -p zakura-state balance_rollback_replay_and_fork_equivalence
 
   network-dependent:
     name: network-dependent acceptance tests

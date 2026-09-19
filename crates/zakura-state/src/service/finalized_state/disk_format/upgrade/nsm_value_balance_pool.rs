@@ -108,6 +108,7 @@ fn backfill(
 
     check_cancelled(cancel_receiver)?;
     let network = db.network();
+    refuse_reissuance_history(&network, tip_height)?;
     let Some(activation) = NetworkUpgrade::Nu7.activation_height(&network) else {
         return Ok(());
     };
@@ -178,6 +179,22 @@ fn backfill(
 
     write(batch)?;
 
+    Ok(())
+}
+
+/// Refuses histories committed with the old, parent-independent reward calculation.
+fn refuse_reissuance_history(
+    network: &zakura_chain::parameters::Network,
+    tip: Height,
+) -> Result<(), FormatChangeError> {
+    if let Some(start) = zakura_chain::parameters::subsidy::nsm_reissuance_height(network)
+        .filter(|start| tip >= *start)
+    {
+        return Err(FormatChangeError::ResyncRequired(format!(
+            "blocks at or above the ZIP 234 start height {} were committed without reissuance",
+            start.0,
+        )));
+    }
     Ok(())
 }
 
@@ -421,6 +438,7 @@ mod tests {
                 nu7: Some(2),
                 ..Default::default()
             },
+            nsm_reissuance_height: Some(Height(3)),
             ..Default::default()
         });
         let baseline =
@@ -450,6 +468,7 @@ mod tests {
                 nu7: Some(4),
                 ..Default::default()
             },
+            nsm_reissuance_height: Some(Height(20_000)),
             initial_nsm_value_balance: Some(Amount::try_from(SEED).unwrap()),
             ..Default::default()
         });
@@ -531,6 +550,7 @@ mod database_tests {
                 nu7: Some(2),
                 ..Default::default()
             },
+            nsm_reissuance_height: Some(Height(20_000)),
             initial_nsm_value_balance: Some(Amount::try_from(seed).unwrap()),
             ..Default::default()
         })

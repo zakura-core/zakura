@@ -537,6 +537,7 @@ mod nsm_value_balance_boundary_tests {
                 nu7: Some(2),
                 ..Default::default()
             },
+            nsm_reissuance_height: Some(block::Height(3)),
             ..Default::default()
         });
         for height in [1, 2, 3, 4] {

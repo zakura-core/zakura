@@ -1973,6 +1973,13 @@ pub enum ReadRequest {
     /// * [`ReadResponse::SaplingTree(None)`](crate::ReadResponse::SaplingTree) otherwise.
     SaplingTree(HashOrHeight),
 
+    /// Looks up the Sapling note commitment tree by block hash in any retained chain.
+    ///
+    /// Returns [`ReadResponse::SaplingTree`](crate::ReadResponse::SaplingTree).
+    /// Unlike [`SaplingTree`](Self::SaplingTree), this also finds blocks moved onto
+    /// a side chain by a concurrent reorg. Historical-tree recovery is unchanged.
+    AnyChainSaplingTree(block::Hash),
+
     /// Looks up an Orchard note commitment tree either by a hash or height.
     ///
     /// Returns
@@ -1982,6 +1989,13 @@ pub enum ReadRequest {
     /// * [`ReadResponse::OrchardTree(None)`](crate::ReadResponse::OrchardTree) otherwise.
     OrchardTree(HashOrHeight),
 
+    /// Looks up the Orchard note commitment tree by block hash in any retained chain.
+    ///
+    /// Returns [`ReadResponse::OrchardTree`](crate::ReadResponse::OrchardTree).
+    /// Unlike [`OrchardTree`](Self::OrchardTree), this also finds blocks moved onto
+    /// a side chain by a concurrent reorg. Historical-tree recovery is unchanged.
+    AnyChainOrchardTree(block::Hash),
+
     /// Looks up an Ironwood note commitment tree either by a hash or height.
     ///
     /// Returns
@@ -1990,6 +2004,13 @@ pub enum ReadRequest {
     ///   if the corresponding block contains an Ironwood note commitment tree.
     /// * [`ReadResponse::IronwoodTree(None)`](crate::ReadResponse::IronwoodTree) otherwise.
     IronwoodTree(HashOrHeight),
+
+    /// Looks up the Ironwood note commitment tree by block hash in any retained chain.
+    ///
+    /// Returns [`ReadResponse::IronwoodTree`](crate::ReadResponse::IronwoodTree).
+    /// Unlike [`IronwoodTree`](Self::IronwoodTree), this also finds blocks moved onto
+    /// a side chain by a concurrent reorg. Historical-tree recovery is unchanged.
+    AnyChainIronwoodTree(block::Hash),
 
     /// Returns a list of Sapling note commitment subtrees by their indexes, starting at
     /// `start_index`, and returning up to `limit` subtrees.
@@ -2190,8 +2211,11 @@ impl ReadRequest {
             #[cfg(feature = "indexer")]
             ReadRequest::RawBlocksByHeightRange { .. } => "raw_blocks_by_height_range",
             ReadRequest::SaplingTree { .. } => "sapling_tree",
+            ReadRequest::AnyChainSaplingTree { .. } => "any_chain_sapling_tree",
             ReadRequest::OrchardTree { .. } => "orchard_tree",
+            ReadRequest::AnyChainOrchardTree { .. } => "any_chain_orchard_tree",
             ReadRequest::IronwoodTree { .. } => "ironwood_tree",
+            ReadRequest::AnyChainIronwoodTree { .. } => "any_chain_ironwood_tree",
             ReadRequest::SaplingSubtrees { .. } => "sapling_subtrees",
             ReadRequest::OrchardSubtrees { .. } => "orchard_subtrees",
             ReadRequest::IronwoodSubtrees { .. } => "ironwood_subtrees",

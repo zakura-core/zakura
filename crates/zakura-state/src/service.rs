@@ -3184,12 +3184,20 @@ impl Service<ReadRequest> for ReadStateService {
                 Ok(ReadResponse::RawBlocks(blocks))
             }
 
-            ReadRequest::SaplingTree(hash_or_height) => {
-                let tree = match read::sapling_tree(
-                    state.latest_best_chain(),
-                    &state.db,
-                    hash_or_height,
-                ) {
+            request @ (ReadRequest::SaplingTree(_) | ReadRequest::AnyChainSaplingTree(_)) => {
+                let (chain, hash_or_height) = match request {
+                    ReadRequest::SaplingTree(hash_or_height) => {
+                        (state.latest_best_chain(), hash_or_height)
+                    }
+                    ReadRequest::AnyChainSaplingTree(hash) => (
+                        state.non_finalized_state_receiver.borrow_mapped(|state| {
+                            state.find_chain(|chain| chain.contains_block_hash(hash))
+                        }),
+                        hash.into(),
+                    ),
+                    _ => unreachable!("matched only Sapling tree requests"),
+                };
+                let tree = match read::sapling_tree(chain, &state.db, hash_or_height) {
                     Ok(tree) => tree,
                     Err(unavailable) => Some(
                         historical_frontiers(&state, hash_or_height, unavailable)?
@@ -3200,12 +3208,20 @@ impl Service<ReadRequest> for ReadStateService {
                 Ok(ReadResponse::SaplingTree(tree))
             }
 
-            ReadRequest::OrchardTree(hash_or_height) => {
-                let tree = match read::orchard_tree(
-                    state.latest_best_chain(),
-                    &state.db,
-                    hash_or_height,
-                ) {
+            request @ (ReadRequest::OrchardTree(_) | ReadRequest::AnyChainOrchardTree(_)) => {
+                let (chain, hash_or_height) = match request {
+                    ReadRequest::OrchardTree(hash_or_height) => {
+                        (state.latest_best_chain(), hash_or_height)
+                    }
+                    ReadRequest::AnyChainOrchardTree(hash) => (
+                        state.non_finalized_state_receiver.borrow_mapped(|state| {
+                            state.find_chain(|chain| chain.contains_block_hash(hash))
+                        }),
+                        hash.into(),
+                    ),
+                    _ => unreachable!("matched only Orchard tree requests"),
+                };
+                let tree = match read::orchard_tree(chain, &state.db, hash_or_height) {
                     Ok(tree) => tree,
                     Err(unavailable) => Some(
                         historical_frontiers(&state, hash_or_height, unavailable)?
@@ -3216,17 +3232,27 @@ impl Service<ReadRequest> for ReadStateService {
                 Ok(ReadResponse::OrchardTree(tree))
             }
 
-            ReadRequest::IronwoodTree(hash_or_height) => {
-                let tree =
-                    match read::ironwood_tree(state.latest_best_chain(), &state.db, hash_or_height)
-                    {
-                        Ok(tree) => tree,
-                        Err(unavailable) => Some(
-                            historical_frontiers(&state, hash_or_height, unavailable)?
-                                .ironwood
-                                .clone(),
-                        ),
-                    };
+            request @ (ReadRequest::IronwoodTree(_) | ReadRequest::AnyChainIronwoodTree(_)) => {
+                let (chain, hash_or_height) = match request {
+                    ReadRequest::IronwoodTree(hash_or_height) => {
+                        (state.latest_best_chain(), hash_or_height)
+                    }
+                    ReadRequest::AnyChainIronwoodTree(hash) => (
+                        state.non_finalized_state_receiver.borrow_mapped(|state| {
+                            state.find_chain(|chain| chain.contains_block_hash(hash))
+                        }),
+                        hash.into(),
+                    ),
+                    _ => unreachable!("matched only Ironwood tree requests"),
+                };
+                let tree = match read::ironwood_tree(chain, &state.db, hash_or_height) {
+                    Ok(tree) => tree,
+                    Err(unavailable) => Some(
+                        historical_frontiers(&state, hash_or_height, unavailable)?
+                            .ironwood
+                            .clone(),
+                    ),
+                };
                 Ok(ReadResponse::IronwoodTree(tree))
             }
 

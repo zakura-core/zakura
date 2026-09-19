@@ -96,6 +96,18 @@ async fn populated_read_state_responds_correctly() -> Result<()> {
                 ReadRequest::Block(block.coinbase_height().unwrap().into()),
                 Ok(ReadResponse::Block(Some(block.clone()))),
             ),
+            (
+                ReadRequest::AnyChainSaplingTree(block.hash()),
+                Ok(ReadResponse::SaplingTree(Some(Default::default()))),
+            ),
+            (
+                ReadRequest::AnyChainOrchardTree(block.hash()),
+                Ok(ReadResponse::OrchardTree(Some(Default::default()))),
+            ),
+            (
+                ReadRequest::AnyChainIronwoodTree(block.hash()),
+                Ok(ReadResponse::IronwoodTree(Some(Default::default()))),
+            ),
         ];
 
         let block_cases = Transcript::from(block_cases);
@@ -729,6 +741,65 @@ async fn any_chain_block_finds_side_chain_blocks() -> Result<()> {
         "block should find best chain block by hash"
     );
     assert_eq!(found.unwrap().hash(), best_hash);
+
+    // A reorg can move the block found by an RPC onto a retained side chain before
+    // its tree requests run. Exercise the service dispatch, including unknown hashes.
+    let (_state, mut read_state, _tip, _tip_change) = init_test_services(&network).await;
+    read_state.db = finalized_state.db.clone();
+    let (_sender, receiver) = tokio::sync::watch::channel(non_finalized_state);
+    read_state.non_finalized_state_receiver = crate::WatchReceiver::new(receiver);
+
+    for (hash, expected_present) in [
+        (best_hash, true),
+        (side_hash, true),
+        (zakura_chain::block::Hash([0xff; 32]), false),
+    ] {
+        let ReadResponse::SaplingTree(tree) = read_state
+            .clone()
+            .oneshot(ReadRequest::AnyChainSaplingTree(hash))
+            .await?
+        else {
+            panic!("a Sapling tree request must return a Sapling tree response");
+        };
+        assert_eq!(tree.is_some(), expected_present);
+        let ReadResponse::OrchardTree(tree) = read_state
+            .clone()
+            .oneshot(ReadRequest::AnyChainOrchardTree(hash))
+            .await?
+        else {
+            panic!("a Orchard tree request must return a Orchard tree response");
+        };
+        assert_eq!(tree.is_some(), expected_present);
+        let ReadResponse::IronwoodTree(tree) = read_state
+            .clone()
+            .oneshot(ReadRequest::AnyChainIronwoodTree(hash))
+            .await?
+        else {
+            panic!("a Ironwood tree request must return a Ironwood tree response");
+        };
+        assert_eq!(tree.is_some(), expected_present);
+    }
+    assert!(matches!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::SaplingTree(side_hash.into()))
+            .await?,
+        ReadResponse::SaplingTree(None)
+    ));
+    assert!(matches!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::OrchardTree(side_hash.into()))
+            .await?,
+        ReadResponse::OrchardTree(None)
+    ));
+    assert!(matches!(
+        read_state
+            .clone()
+            .oneshot(ReadRequest::IronwoodTree(side_hash.into()))
+            .await?,
+        ReadResponse::IronwoodTree(None)
+    ));
 
     Ok(())
 }

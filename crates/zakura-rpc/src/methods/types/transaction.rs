@@ -389,9 +389,9 @@ impl TransactionTemplate<NegativeOrZero> {
         height: Height,
         miner_params: &MinerParams,
         txs_fee: Amount<NonNegative>,
-        issuance_deficit: Option<Amount<NonNegative>>,
+        nsm_value_balance: Option<Amount<NonNegative>>,
     ) -> Result<Self, TransactionError> {
-        let block_subsidy = block_subsidy(height, net, issuance_deficit)?;
+        let block_subsidy = block_subsidy(height, net, nsm_value_balance)?;
         let plan = CoinbasePlan::new(net, height, miner_params, block_subsidy)?;
         let miner_reward = miner_subsidy(height, net, block_subsidy)? + txs_fee;
         let miner_reward = Zatoshis::try_from(miner_reward?)?;

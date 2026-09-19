@@ -52,7 +52,7 @@ pub(crate) use difficulty::AdjustedDifficulty;
 ///
 /// # Consensus
 ///
-/// > [NU7 onward] If IssuanceDeficit(height) would become negative in the block chain
+/// > [NU7 onward] If NsmValueBalance(height) would become negative in the block chain
 /// > created as a result of accepting a block at height, then all nodes MUST reject the
 /// > block as invalid.
 ///
@@ -61,7 +61,7 @@ pub(crate) use difficulty::AdjustedDifficulty;
 ///
 /// Check before adding pools so an overdraw reports this consensus rule.
 #[allow(clippy::unwrap_in_result)]
-pub(crate) fn issuance_deficit_is_non_negative(
+pub(crate) fn nsm_value_balance_is_non_negative(
     network: &Network,
     height: block::Height,
     value_pools: &ValueBalance<NonNegative>,
@@ -71,11 +71,11 @@ pub(crate) fn issuance_deficit_is_non_negative(
         return Ok(());
     }
 
-    let deficit_before = value_pools.issuance_deficit_amount();
-    let deficit_change = block_value_pool_change.issuance_deficit_amount();
+    let deficit_before = value_pools.nsm_value_balance_amount();
+    let deficit_change = block_value_pool_change.nsm_value_balance_amount();
 
     let deficit_after = (deficit_before + deficit_change).map_err(|_| {
-        ValidateContextError::NegativeIssuanceDeficit {
+        ValidateContextError::NegativeNsmValueBalance {
             height,
             deficit_before,
             deficit_change,
@@ -83,7 +83,7 @@ pub(crate) fn issuance_deficit_is_non_negative(
     })?;
 
     if deficit_after.zatoshis() < 0 {
-        return Err(ValidateContextError::NegativeIssuanceDeficit {
+        return Err(ValidateContextError::NegativeNsmValueBalance {
             height,
             deficit_before,
             deficit_change,
@@ -518,7 +518,7 @@ pub(crate) fn initial_contextual_validity(
 }
 
 #[cfg(test)]
-mod issuance_deficit_boundary_tests {
+mod nsm_value_balance_boundary_tests {
     use super::*;
     use zakura_chain::{
         amount::{Amount, MAX_MONEY},
@@ -532,17 +532,17 @@ mod issuance_deficit_boundary_tests {
                 nu7: Some(2),
                 ..Default::default()
             },
-            zip234_start_height: Some(block::Height(3)),
+            nsm_reissuance_height: Some(block::Height(3)),
             ..Default::default()
         });
         for height in [1, 2, 3, 4] {
             for before in [-MAX_MONEY, -1, 0, 1, MAX_MONEY] {
                 for delta in [-MAX_MONEY, -1, 0, 1, MAX_MONEY] {
                     let mut pools = ValueBalance::<NonNegative>::zero();
-                    pools.set_issuance_deficit_amount(Amount::try_from(before).unwrap());
+                    pools.set_nsm_value_balance_amount(Amount::try_from(before).unwrap());
                     let mut change = ValueBalance::<NegativeAllowed>::zero();
-                    change.set_issuance_deficit_amount(Amount::try_from(delta).unwrap());
-                    let result = issuance_deficit_is_non_negative(
+                    change.set_nsm_value_balance_amount(Amount::try_from(delta).unwrap());
+                    let result = nsm_value_balance_is_non_negative(
                         &network,
                         block::Height(height),
                         &pools,
@@ -555,8 +555,8 @@ mod issuance_deficit_boundary_tests {
                         reject,
                         "height {height}, before {before}, delta {delta}"
                     );
-                    assert_eq!(i64::from(pools.issuance_deficit_amount()), before);
-                    assert_eq!(i64::from(change.issuance_deficit_amount()), delta);
+                    assert_eq!(i64::from(pools.nsm_value_balance_amount()), before);
+                    assert_eq!(i64::from(change.nsm_value_balance_amount()), delta);
                 }
             }
         }

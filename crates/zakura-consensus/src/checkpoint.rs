@@ -33,7 +33,7 @@ use zakura_chain::{
     parameters::{
         checkpoint::list::CheckpointList,
         subsidy::{
-            block_subsidy, funding_stream_values, is_zip234_active, parent_issuance_deficit,
+            block_subsidy, funding_stream_values, is_zip234_active, parent_nsm_value_balance,
             FundingStreamReceiver, SubsidyError,
         },
         Network, NetworkUpgrade, GENESIS_PREVIOUS_BLOCK_HASH,
@@ -119,12 +119,12 @@ pub const MAX_QUEUED_BLOCKS_PER_HEIGHT: usize = 4;
 fn deferred_pool_balance_change(
     height: block::Height,
     network: &Network,
-    issuance_deficit: Option<Amount<NonNegative>>,
+    nsm_value_balance: Option<Amount<NonNegative>>,
 ) -> Result<Option<DeferredPoolBalanceChange>, VerifyCheckpointError> {
     let expected_deferred_amount = funding_stream_values(
         height,
         network,
-        block_subsidy(height, network, issuance_deficit)?,
+        block_subsidy(height, network, nsm_value_balance)?,
     )?
     .remove(&FundingStreamReceiver::Deferred);
 
@@ -1323,15 +1323,15 @@ where
                         .expect("AwaitBlockInfo only returns after the parent block commits");
                     // The verifier has already advanced its progress past this block, so
                     // report a failure here as a commit failure, which resets the verifier.
-                    let deferred_pool_balance_change = parent_issuance_deficit(
-                        parent_info.value_pools().issuance_deficit_amount(),
+                    let deferred_pool_balance_change = parent_nsm_value_balance(
+                        parent_info.value_pools().nsm_value_balance_amount(),
                     )
                     .map_err(VerifyCheckpointError::from)
-                    .and_then(|issuance_deficit| {
+                    .and_then(|nsm_value_balance| {
                         deferred_pool_balance_change(
                             req_block.block.height,
                             &network,
-                            Some(issuance_deficit),
+                            Some(nsm_value_balance),
                         )
                     })
                     .map_err(|error| {

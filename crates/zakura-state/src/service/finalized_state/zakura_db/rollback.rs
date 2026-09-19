@@ -15,7 +15,7 @@ use zakura_chain::{
     parallel::tree::{NoteCommitmentTreeError, NoteCommitmentTrees},
     parameters::{
         subsidy::{
-            block_subsidy, funding_stream_values, is_zip234_active, parent_issuance_deficit,
+            block_subsidy, funding_stream_values, is_zip234_active, parent_nsm_value_balance,
             FundingStreamReceiver, SubsidyError,
         },
         Network, NetworkUpgrade,
@@ -706,20 +706,20 @@ fn deferred_pool_balance_change(
     // in slow start on configured networks, so rollback must reverse it at every height too.
     // ZIP 234 derives the block subsidy from the money reserve after the parent block.
     // Every block being rolled back is finalized, so its parent's pools are in the db.
-    let issuance_deficit = if is_zip234_active(network, height) {
+    let nsm_value_balance = if is_zip234_active(network, height) {
         height
             .previous()
             .ok()
             .and_then(|parent| db.block_info(parent.into()))
             .map(|parent_info| {
-                parent_issuance_deficit(parent_info.value_pools().issuance_deficit_amount())
+                parent_nsm_value_balance(parent_info.value_pools().nsm_value_balance_amount())
             })
             .transpose()?
     } else {
         None
     };
 
-    let block_subsidy = block_subsidy(height, network, issuance_deficit)?;
+    let block_subsidy = block_subsidy(height, network, nsm_value_balance)?;
     let deferred_amount = funding_stream_values(height, network, block_subsidy)?
         .remove(&FundingStreamReceiver::Deferred)
         .unwrap_or_default()

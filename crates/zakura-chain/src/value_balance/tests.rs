@@ -128,7 +128,7 @@ fn chain_pool_total_limit_includes_every_pool() {
         deferred: share,
         ironwood: share,
         // The issuance deficit holds value that is in no pool, so `total` excludes it.
-        issuance_deficit: Amount::zero(),
+        nsm_value_balance: Amount::zero(),
     };
     assert_eq!(at_cap.total(), Ok(Amount::try_from(MAX_MONEY).unwrap()));
     assert_eq!(
@@ -191,7 +191,7 @@ fn signed_deficit_roundtrips_without_changing_monetary_totals() {
     for deficit in [-MAX_MONEY, -1, 0, 1, MAX_MONEY] {
         let mut pools =
             ValueBalance::from_transparent_amount(Amount::<NonNegative>::try_from(7).unwrap());
-        pools.set_issuance_deficit_amount(Amount::try_from(deficit).unwrap());
+        pools.set_nsm_value_balance_amount(Amount::try_from(deficit).unwrap());
         assert_eq!(i64::from(pools.total().unwrap()), 7);
         assert_eq!(i64::from(pools.issued_supply()), 7);
         assert_eq!(i64::from(pools.money_reserve()), MAX_MONEY - 7);

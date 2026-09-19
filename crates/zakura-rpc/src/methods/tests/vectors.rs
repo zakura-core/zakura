@@ -3219,7 +3219,7 @@ async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
             nu7: Some(1),
             ..Default::default()
         },
-        zip234_start_height: Some(start),
+        nsm_reissuance_height: Some(start),
         ..Default::default()
     });
 
@@ -3239,7 +3239,7 @@ async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
         let mut pools = ValueBalance::from_transparent_amount(
             Amount::try_from(scheduled_supply - deficit).expect("valid issued supply"),
         );
-        pools.set_issuance_deficit_amount(Amount::try_from(deficit).expect("valid deficit"));
+        pools.set_nsm_value_balance_amount(Amount::try_from(deficit).expect("valid deficit"));
 
         pools
     };

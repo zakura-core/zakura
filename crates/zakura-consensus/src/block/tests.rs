@@ -1790,7 +1790,7 @@ fn zip234_parent_pools(
     let mut pools = zakura_chain::value_balance::ValueBalance::from_transparent_amount(
         Amount::try_from(scheduled_supply - deficit).expect("the issued supply is valid"),
     );
-    pools.set_issuance_deficit_amount(Amount::try_from(deficit).expect("valid deficit"));
+    pools.set_nsm_value_balance_amount(Amount::try_from(deficit).expect("valid deficit"));
 
     pools
 }
@@ -1906,7 +1906,7 @@ async fn zip234_block_verification_checks_the_reissuance_bonus() {
     assert!(matches!(
         verify(-1, halving_subsidy).await,
         Err(VerifyBlockError::Subsidy(
-            SubsidyError::NegativeIssuanceDeficit
+            SubsidyError::NegativeNsmValueBalance
         )),
     ));
 }
@@ -1977,7 +1977,7 @@ fn zip234_test_network(start: Height) -> Network {
             ..Default::default()
         })
         .expect("failed to set test activation heights")
-        .with_zip234_start_height(start)
+        .with_nsm_reissuance_height(start)
         .clear_funding_streams()
         .with_slow_start_interval(Height::MIN)
         .with_disable_pow(true)

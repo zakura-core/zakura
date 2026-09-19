@@ -500,7 +500,7 @@ where
             //
             // Proposals skip proof of work and can name any parent, so they never wait:
             // a proposal whose parent has not committed is rejected immediately.
-            let issuance_deficit =
+            let nsm_value_balance =
                 if zakura_chain::parameters::subsidy::is_zip234_active(&network, height) {
                     let parent_hash = block.header.previous_block_hash;
                     let parent_request = if request.is_proposal() {
@@ -527,10 +527,10 @@ where
                         ));
                     };
 
-                    // `issuance_deficit_is_non_negative` exempts heights below the start,
+                    // `nsm_value_balance_is_non_negative` exempts heights below the start,
                     // so the parent of the first active block can have a negative deficit.
-                    Some(zakura_chain::parameters::subsidy::parent_issuance_deficit(
-                        parent_info.value_pools().issuance_deficit_amount(),
+                    Some(zakura_chain::parameters::subsidy::parent_nsm_value_balance(
+                        parent_info.value_pools().nsm_value_balance_amount(),
                     )?)
                 } else {
                     None
@@ -539,7 +539,7 @@ where
             let expected_block_subsidy = zakura_chain::parameters::subsidy::block_subsidy(
                 height,
                 &network,
-                issuance_deficit,
+                nsm_value_balance,
             )?;
 
             // See [ZIP-1015](https://zips.z.cash/zip-1015).

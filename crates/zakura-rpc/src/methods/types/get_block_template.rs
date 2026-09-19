@@ -454,7 +454,7 @@ impl BlockTemplateResponse {
                 txs_fee,
                 chain_info
                     .value_pools
-                    .issuance_deficit_amount()
+                    .nsm_value_balance_amount()
                     .constrain()
                     .ok(),
             )?,

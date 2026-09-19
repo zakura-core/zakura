@@ -32,7 +32,7 @@ pub struct ValueBalance<C> {
     /// Scheduled issuance minus issued value since NU7, with no historical seed.
     /// This accounting counter funds reissuance but holds no spendable value.
     /// Monetary totals exclude it. The signed type preserves negative accounting states.
-    issuance_deficit: Amount<NegativeAllowed>,
+    nsm_value_balance: Amount<NegativeAllowed>,
 }
 
 impl<C> ValueBalance<C>
@@ -153,17 +153,17 @@ where
         self
     }
 
-    /// Returns the [`ValueBalance::issuance_deficit`] amount.
-    pub fn issuance_deficit_amount(&self) -> Amount<NegativeAllowed> {
-        self.issuance_deficit
+    /// Returns the [`ValueBalance::nsm_value_balance`] amount.
+    pub fn nsm_value_balance_amount(&self) -> Amount<NegativeAllowed> {
+        self.nsm_value_balance
     }
 
-    /// Sets the [`ValueBalance::issuance_deficit`] amount without affecting other amounts.
-    pub fn set_issuance_deficit_amount(
+    /// Sets the [`ValueBalance::nsm_value_balance`] amount without affecting other amounts.
+    pub fn set_nsm_value_balance_amount(
         &mut self,
-        issuance_deficit: Amount<NegativeAllowed>,
+        nsm_value_balance: Amount<NegativeAllowed>,
     ) -> &Self {
-        self.issuance_deficit = issuance_deficit;
+        self.nsm_value_balance = nsm_value_balance;
         self
     }
 
@@ -177,7 +177,7 @@ where
             orchard: zero,
             deferred: zero,
             ironwood: zero,
-            issuance_deficit: Amount::zero(),
+            nsm_value_balance: Amount::zero(),
         }
     }
 
@@ -186,7 +186,7 @@ where
     /// Returns an error if the final sum does not satisfy the amount constraint `C`.
     /// Signed balances are summed before applying that constraint.
     ///
-    /// [`ValueBalance::issuance_deficit`] is excluded: it holds value that is in no pool,
+    /// [`ValueBalance::nsm_value_balance`] is excluded: it holds value that is in no pool,
     /// so adding it would overstate the monetary base this sum is used to bound.
     pub fn total(self) -> Result<Amount<C>, amount::Error> {
         let total: i128 = [
@@ -219,7 +219,7 @@ where
             ironwood: self.ironwood.constrain().map_err(Ironwood)?,
             // The deficit is signed in every `ValueBalance`, so it survives the conversion
             // unchanged.
-            issuance_deficit: self.issuance_deficit,
+            nsm_value_balance: self.nsm_value_balance,
         })
     }
 }
@@ -436,7 +436,7 @@ impl ValueBalance<NonNegative> {
     ///
     /// Each leg is appended after the last, so that records written by earlier versions
     /// (32 bytes without `deferred`, 40 bytes with it, 48 bytes with `ironwood`) remain
-    /// parsable by [`Self::from_bytes`]. `issuance_deficit` is the seventh leg, at 48..56.
+    /// parsable by [`Self::from_bytes`]. `nsm_value_balance` is the seventh leg, at 48..56.
     pub fn to_bytes(self) -> [u8; 56] {
         match [
             self.transparent.to_bytes(),
@@ -445,7 +445,7 @@ impl ValueBalance<NonNegative> {
             self.orchard.to_bytes(),
             self.deferred.to_bytes(),
             self.ironwood.to_bytes(),
-            self.issuance_deficit.to_bytes(),
+            self.nsm_value_balance.to_bytes(),
         ]
         .concat()
         .try_into()
@@ -460,10 +460,10 @@ impl ValueBalance<NonNegative> {
     /// From byte array
     ///
     /// Accepts 32-byte (pre-`deferred`), 40-byte (pre-`ironwood`), 48-byte
-    /// (pre-`issuance_deficit`) and 56-byte records; missing trailing pools default to zero.
+    /// (pre-`nsm_value_balance`) and 56-byte records; missing trailing pools default to zero.
     ///
-    /// A zero `issuance_deficit` on a shorter record is a placeholder, not the real deficit.
-    /// The `issuance_deficit_pool` database upgrade recomputes it from the halving schedule
+    /// A zero `nsm_value_balance` on a shorter record is a placeholder, not the real deficit.
+    /// The `nsm_value_balance_pool` database upgrade recomputes it from the halving schedule
     /// and the stored pools before any block reads it.
     #[allow(clippy::unwrap_in_result)]
     pub fn from_bytes(bytes: &[u8]) -> Result<ValueBalance<NonNegative>, ValueBalanceError> {
@@ -525,14 +525,14 @@ impl ValueBalance<NonNegative> {
             _ => return Err(Unparsable),
         };
 
-        let issuance_deficit = match bytes_length {
+        let nsm_value_balance = match bytes_length {
             32 | 40 | 48 => Amount::zero(),
             56 => Amount::from_bytes(
                 bytes[48..56]
                     .try_into()
                     .expect("issuance deficit amount should be parsable"),
             )
-            .map_err(IssuanceDeficit)?,
+            .map_err(NsmValueBalance)?,
             _ => return Err(Unparsable),
         };
 
@@ -543,7 +543,7 @@ impl ValueBalance<NonNegative> {
             orchard,
             deferred,
             ironwood,
-            issuance_deficit,
+            nsm_value_balance,
         })
     }
 }
@@ -570,7 +570,7 @@ pub enum ValueBalanceError {
     Ironwood(amount::Error),
 
     /// issuance deficit amount error {0}
-    IssuanceDeficit(amount::Error),
+    NsmValueBalance(amount::Error),
 
     /// scheduled issuance calculation failed: {0}
     ScheduledIssuance(crate::parameters::subsidy::SubsidyError),
@@ -594,7 +594,7 @@ impl fmt::Display for ValueBalanceError {
             Orchard(e) => format!("orchard amount err: {e}"),
             Deferred(e) => format!("deferred amount err: {e}"),
             Ironwood(e) => format!("ironwood amount err: {e}"),
-            IssuanceDeficit(e) => format!("issuance deficit amount err: {e}"),
+            NsmValueBalance(e) => format!("issuance deficit amount err: {e}"),
             ScheduledIssuance(e) => format!("scheduled issuance calculation failed: {e}"),
             MissingCoinbaseHeight => {
                 "block has no coinbase height, so its issuance deficit change is undefined"
@@ -619,8 +619,8 @@ where
             orchard: (self.orchard + rhs.orchard).map_err(Orchard)?,
             deferred: (self.deferred + rhs.deferred).map_err(Deferred)?,
             ironwood: (self.ironwood + rhs.ironwood).map_err(Ironwood)?,
-            issuance_deficit: (self.issuance_deficit + rhs.issuance_deficit)
-                .map_err(IssuanceDeficit)?,
+            nsm_value_balance: (self.nsm_value_balance + rhs.nsm_value_balance)
+                .map_err(NsmValueBalance)?,
         })
     }
 }
@@ -671,8 +671,8 @@ where
             orchard: (self.orchard - rhs.orchard).map_err(Orchard)?,
             deferred: (self.deferred - rhs.deferred).map_err(Deferred)?,
             ironwood: (self.ironwood - rhs.ironwood).map_err(Ironwood)?,
-            issuance_deficit: (self.issuance_deficit - rhs.issuance_deficit)
-                .map_err(IssuanceDeficit)?,
+            nsm_value_balance: (self.nsm_value_balance - rhs.nsm_value_balance)
+                .map_err(NsmValueBalance)?,
         })
     }
 }
@@ -743,7 +743,7 @@ where
             orchard: self.orchard.neg(),
             deferred: self.deferred.neg(),
             ironwood: self.ironwood.neg(),
-            issuance_deficit: self.issuance_deficit.neg(),
+            nsm_value_balance: self.nsm_value_balance.neg(),
         }
     }
 }

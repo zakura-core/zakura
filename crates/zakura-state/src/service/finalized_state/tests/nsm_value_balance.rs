@@ -18,7 +18,7 @@ use super::issuance_accounting::{
 fn is_negative_deficit_at_start(error: &ValidateContextError) -> bool {
     matches!(
         error,
-        ValidateContextError::NegativeIssuanceDeficit { height, .. } if *height == START
+        ValidateContextError::NegativeNsmValueBalance { height, .. } if *height == START
     )
 }
 
@@ -79,7 +79,7 @@ fn finalized_state_rejects_a_block_that_makes_the_deficit_negative() {
 #[test]
 fn migration_requires_resync_after_the_reissuance_start() {
     use crate::service::finalized_state::disk_format::upgrade::{
-        issuance_deficit_pool::Upgrade, DiskFormatUpgrade, FormatChangeError,
+        nsm_value_balance_pool::Upgrade, DiskFormatUpgrade, FormatChangeError,
     };
     let _guard = zakura_test::init();
     let network = accounting_network(true);

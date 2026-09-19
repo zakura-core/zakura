@@ -387,12 +387,12 @@ pub enum SubsidyError {
     InvalidMinerFees,
 
     #[error("ZIP 234 block subsidy needs the issuance deficit after the parent block")]
-    MissingIssuanceDeficit,
+    MissingNsmValueBalance,
 
     #[error(
         "issued supply exceeds the scheduled supply, so the ZIP 234 issuance deficit is negative"
     )]
-    NegativeIssuanceDeficit,
+    NegativeNsmValueBalance,
 
     #[error("addition of amounts overflowed")]
     Overflow,
@@ -520,12 +520,12 @@ pub const ZIP234_START_HALVING: u32 = 3;
 ///
 /// Reissuance is an NU7 rule, so it never starts below NU7 activation, and never starts
 /// on a network without NU7. Configured testnets and Regtest can replace the crossing
-/// height with [`ParametersBuilder::with_zip234_start_height`]. Mainnet and the default
+/// height with [`ParametersBuilder::with_nsm_reissuance_height`]. Mainnet and the default
 /// Testnet always use the crossing rule.
 ///
 /// [ZIP 234]: https://zips.z.cash/zip-0234
-/// [`ParametersBuilder::with_zip234_start_height`]: super::testnet::ParametersBuilder::with_zip234_start_height
-pub fn zip234_start_height(network: &Network) -> Option<Height> {
+/// [`ParametersBuilder::with_nsm_reissuance_height`]: super::testnet::ParametersBuilder::with_nsm_reissuance_height
+pub fn nsm_reissuance_height(network: &Network) -> Option<Height> {
     let nu7 = NetworkUpgrade::Nu7.activation_height(network)?;
 
     // The crossing calculation evaluates the halving clock hundreds of times, and block
@@ -533,12 +533,12 @@ pub fn zip234_start_height(network: &Network) -> Option<Height> {
     let start = match network {
         Network::Mainnet => {
             static MAINNET_START: OnceLock<Option<Height>> = OnceLock::new();
-            *MAINNET_START.get_or_init(|| zip234_crossing_start_height(network))
+            *MAINNET_START.get_or_init(|| nsm_reissuance_crossing_height(network))
         }
-        Network::Testnet(params) => params.configured_zip234_start_height().or_else(|| {
+        Network::Testnet(params) => params.configured_nsm_reissuance_height().or_else(|| {
             params
-                .zip234_crossing_start_height()
-                .get_or_init(|| zip234_crossing_start_height(network))
+                .nsm_reissuance_crossing_height()
+                .get_or_init(|| nsm_reissuance_crossing_height(network))
         }),
     }?;
 
@@ -548,10 +548,10 @@ pub fn zip234_start_height(network: &Network) -> Option<Height> {
 /// Returns the real chain height at the [ZIP 234] crossing height after
 /// [`ZIP234_START_HALVING`], ignoring NU7 activation.
 ///
-/// See [`zip234_start_height`] for the rule.
+/// See [`nsm_reissuance_height`] for the rule.
 ///
 /// [ZIP 234]: https://zips.z.cash/zip-0234
-fn zip234_crossing_start_height(network: &Network) -> Option<Height> {
+fn nsm_reissuance_crossing_height(network: &Network) -> Option<Height> {
     let crossing = zip234_crossing_height(network, ZIP234_START_HALVING)?;
 
     Some(Height(Pre218Schedule::new(network).real_height(crossing.0)))
@@ -561,7 +561,7 @@ fn zip234_crossing_start_height(network: &Network) -> Option<Height> {
 /// `ceil(BLOCK_SUBSIDY_FRACTION * (MAX_MONEY - ScheduledSupply(height - 1)))` is less than
 /// the block's halving subsidy, on `network`'s 75-second schedule.
 ///
-/// Returns `None` if no such height exists. See [`zip234_start_height`].
+/// Returns `None` if no such height exists. See [`nsm_reissuance_height`].
 pub(crate) fn zip234_crossing_height(network: &Network, halving: u32) -> Option<Height> {
     let schedule = Pre218Schedule::new(network);
     let max_money = u128::try_from(MAX_MONEY).ok()?;
@@ -737,19 +737,19 @@ impl<'a> Pre218Schedule<'a> {
 /// This check decides whether a block subsidy follows ZIP 234, and so whether a caller
 /// has to fetch the money reserve.
 pub fn is_zip234_active(network: &Network, height: Height) -> bool {
-    zip234_start_height(network).is_some_and(|start| height >= start)
+    nsm_reissuance_height(network).is_some_and(|start| height >= start)
 }
 
 /// Returns the issuance deficit after a block's parent, in the form [`block_subsidy`] takes.
 ///
-/// The state stores a signed deficit. Returns [`SubsidyError::NegativeIssuanceDeficit`] if
+/// The state stores a signed deficit. Returns [`SubsidyError::NegativeNsmValueBalance`] if
 /// the parent's chain issued more than the halving schedule.
-pub fn parent_issuance_deficit(
-    issuance_deficit: Amount<NegativeAllowed>,
+pub fn parent_nsm_value_balance(
+    nsm_value_balance: Amount<NegativeAllowed>,
 ) -> Result<Amount<NonNegative>, SubsidyError> {
-    issuance_deficit
+    nsm_value_balance
         .constrain()
-        .map_err(|_| SubsidyError::NegativeIssuanceDeficit)
+        .map_err(|_| SubsidyError::NegativeNsmValueBalance)
 }
 
 /// Applies the [ZIP 234] reissuance fraction to `amount`, rounding up.
@@ -766,20 +766,20 @@ fn reissuance_amount(amount: Amount<NonNegative>) -> Result<Amount<NonNegative>,
     Ok(Amount::try_from(subsidy)?)
 }
 
-/// Returns the [ZIP 234] reissuance bonus for a block, given the `IssuanceDeficit` after
+/// Returns the [ZIP 234] reissuance bonus for a block, given the `NsmValueBalance` after
 /// its parent.
 ///
 /// The halving schedule keeps issuing new ZEC. The bonus reissues value removed from
 /// circulation.
 ///
 /// The state supplies the eligible deficit after the parent block. It excludes the
-/// pre-NU7 historical seed pending policy guidance; see `Block::issuance_deficit_change`.
+/// pre-NU7 historical seed pending policy guidance; see `Block::nsm_value_balance_change`.
 ///
 /// [ZIP 234]: https://zips.z.cash/zip-0234
 fn reissuance_bonus(
-    issuance_deficit: Amount<NonNegative>,
+    nsm_value_balance: Amount<NonNegative>,
 ) -> Result<Amount<NonNegative>, SubsidyError> {
-    reissuance_amount(issuance_deficit)
+    reissuance_amount(nsm_value_balance)
 }
 
 /// Returns `ExpectedIssuedSupply(height)` from zips#1354: the total block subsidy the
@@ -932,15 +932,15 @@ fn next_subsidy_boundary(height: Height, net: &Network) -> Option<Height> {
 pub fn block_subsidy(
     height: Height,
     net: &Network,
-    issuance_deficit: Option<Amount<NonNegative>>,
+    nsm_value_balance: Option<Amount<NonNegative>>,
 ) -> Result<Amount<NonNegative>, SubsidyError> {
     if is_zip234_active(net, height) {
         // The caller reads the issuance deficit from the parent block, so every caller
         // that can reach a ZIP 234 height must supply it.
-        let issuance_deficit = issuance_deficit.ok_or(SubsidyError::MissingIssuanceDeficit)?;
+        let nsm_value_balance = nsm_value_balance.ok_or(SubsidyError::MissingNsmValueBalance)?;
 
         let halving_subsidy = halving_block_subsidy(height, net)?;
-        let bonus = reissuance_bonus(issuance_deficit)?;
+        let bonus = reissuance_bonus(nsm_value_balance)?;
 
         return Ok((halving_subsidy + bonus)?);
     }

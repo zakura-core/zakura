@@ -81,11 +81,11 @@ impl DiskFormatUpgrade for Upgrade {
         }
         let expected = eligible_deficit(&network, tip_height, tip_pools, baseline(db)?)?;
 
-        if tip_pools.issuance_deficit_amount() != expected {
+        if tip_pools.nsm_value_balance_amount() != expected {
             return Ok(Err(format!(
                 "tip issuance deficit {:?} does not match the halving schedule's {expected:?} \
                  at {tip_height:?}",
-                tip_pools.issuance_deficit_amount(),
+                tip_pools.nsm_value_balance_amount(),
             )));
         }
 
@@ -120,7 +120,7 @@ fn backfill(
         let deficit = eligible_deficit(&network, height, *block_info.value_pools(), baseline)?;
 
         let mut value_pools = *block_info.value_pools();
-        value_pools.set_issuance_deficit_amount(deficit);
+        value_pools.set_nsm_value_balance_amount(deficit);
         let _ = db
             .block_info_cf()
             .with_batch_for_writing(&mut batch)
@@ -141,7 +141,7 @@ fn backfill(
     let tip_pools = read_tip_pools(db)?;
     let deficit = eligible_deficit(&network, tip_height, tip_pools, baseline)?;
     let mut tip_pools = tip_pools;
-    tip_pools.set_issuance_deficit_amount(deficit);
+    tip_pools.set_nsm_value_balance_amount(deficit);
     let _ = db
         .chain_value_pools_cf()
         .with_batch_for_writing(&mut batch)
@@ -163,7 +163,7 @@ fn backfill(
 /// version marker stops the corrected replay from running again. Block commits always
 /// applied the funding, so a fresh sync produces the correct balances.
 fn refuse_unrepairable_history(network: &Network, tip: Height) -> Result<(), FormatChangeError> {
-    if let Some(start) = zakura_chain::parameters::subsidy::zip234_start_height(network)
+    if let Some(start) = zakura_chain::parameters::subsidy::nsm_reissuance_height(network)
         .filter(|start| tip >= *start)
     {
         return Err(FormatChangeError::ResyncRequired(format!(
@@ -207,7 +207,7 @@ fn deficit_at(
 }
 
 /// Exclude the entire pre-NU7 deficit until the historical-funds policy is confirmed.
-/// Keep this baseline consistent with `Block::issuance_deficit_change`.
+/// Keep this baseline consistent with `Block::nsm_value_balance_change`.
 fn baseline(db: &ZakuraDb) -> Result<i128, FormatChangeError> {
     let network = db.network();
     let Some(start) = NetworkUpgrade::Nu7.activation_height(&network) else {
@@ -378,7 +378,7 @@ mod tests {
                 nu7: Some(2),
                 ..Default::default()
             },
-            zip234_start_height: Some(Height(3)),
+            nsm_reissuance_height: Some(Height(3)),
             ..Default::default()
         });
         let baseline =
@@ -496,7 +496,7 @@ mod database_tests {
                     - base
             };
             assert_eq!(
-                i64::from(info.value_pools().issuance_deficit_amount()),
+                i64::from(info.value_pools().nsm_value_balance_amount()),
                 expected
             );
         }
@@ -628,7 +628,7 @@ mod database_tests {
                 Err(FormatChangeError::InvalidPostcondition(_))
             ));
             assert_eq!(
-                db.finalized_value_pool().issuance_deficit_amount(),
+                db.finalized_value_pool().nsm_value_balance_amount(),
                 Amount::<NegativeAllowed>::zero()
             );
         }

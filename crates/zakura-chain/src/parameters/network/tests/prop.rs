@@ -49,7 +49,7 @@ proptest! {
 
         let network = Network::new_regtest(RegtestParameters {
             activation_heights: ConfiguredActivationHeights { nu7: Some(2), ..Default::default() },
-            zip234_start_height: Some(Height(3)),
+            nsm_reissuance_height: Some(Height(3)),
             ..Default::default()
         });
         let scheduled = i64::from(halving_block_subsidy(Height(height), &network).unwrap());

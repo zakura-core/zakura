@@ -284,7 +284,7 @@ fn zip234_crossing_fixture() -> Result<(Network, Arc<Block>, Arc<Block>), Report
             nu7: Some(1),
             ..Default::default()
         })?
-        .with_zip234_start_height(block::Height(1))
+        .with_nsm_reissuance_height(block::Height(1))
         .clear_funding_streams()
         .with_slow_start_interval(block::Height::MIN)
         .with_disable_pow(true)
@@ -375,7 +375,7 @@ async fn checkpoint_negative_parent_deficit_resets_the_verifier() -> Result<(), 
     let hash0 = block0.hash();
 
     let mut parent_pools = ValueBalance::zero();
-    parent_pools.set_issuance_deficit_amount(Amount::try_from(-1)?);
+    parent_pools.set_nsm_value_balance_amount(Amount::try_from(-1)?);
 
     let tip_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let state_tip_requests = tip_requests.clone();
@@ -427,7 +427,7 @@ async fn checkpoint_negative_parent_deficit_resets_the_verifier() -> Result<(), 
         matches!(
             source.downcast_ref::<VerifyCheckpointError>(),
             Some(VerifyCheckpointError::SubsidyError(
-                SubsidyError::NegativeIssuanceDeficit
+                SubsidyError::NegativeNsmValueBalance
             ))
         ),
         "{error:?}"

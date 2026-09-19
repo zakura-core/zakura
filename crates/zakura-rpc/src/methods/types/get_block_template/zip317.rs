@@ -84,12 +84,12 @@ pub fn select_mempool_transactions(
     net: &Network,
     height: Height,
     miner_params: &MinerParams,
-    issuance_deficit: Option<Amount<amount::NonNegative>>,
+    nsm_value_balance: Option<Amount<amount::NonNegative>>,
     mempool_txs: Vec<VerifiedUnminedTx>,
     mempool_tx_deps: TransactionDependencies,
 ) -> Result<Vec<SelectedMempoolTx>, TransactionError> {
     let coinbase_resources =
-        TransactionTemplate::coinbase_resource_usage(net, height, miner_params, issuance_deficit)?;
+        TransactionTemplate::coinbase_resource_usage(net, height, miner_params, nsm_value_balance)?;
 
     let tx_dependencies = mempool_tx_deps.dependencies();
     let (independent_mempool_txs, mut dependent_mempool_txs): (HashMap<_, _>, HashMap<_, _>) =

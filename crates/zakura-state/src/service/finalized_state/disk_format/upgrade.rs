@@ -36,8 +36,8 @@ pub(crate) mod block_info_and_address_received;
 pub(crate) mod cache_genesis_roots;
 pub(crate) mod drop_header_root_auth_frontier;
 pub(crate) mod fix_tree_key_type;
-pub(crate) mod issuance_deficit_pool;
 pub(crate) mod no_migration;
+pub(crate) mod nsm_value_balance_pool;
 pub(crate) mod prune_trees;
 pub(crate) mod unauthenticated_commitment_roots;
 
@@ -145,7 +145,7 @@ fn format_upgrades(
         )),
         Box::new(drop_header_root_auth_frontier::Upgrade),
         Box::new(unauthenticated_commitment_roots::Upgrade),
-        Box::new(issuance_deficit_pool::Upgrade),
+        Box::new(nsm_value_balance_pool::Upgrade),
     ] as [Box<dyn DiskFormatUpgrade>; 11])
         .into_iter()
         .filter(move |upgrade| upgrade.version() > min_version())

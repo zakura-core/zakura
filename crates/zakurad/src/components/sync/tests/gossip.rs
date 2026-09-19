@@ -15,7 +15,7 @@ use zakura_chain::{
     serialization::ZcashDeserializeInto,
 };
 use zakura_network::{Request, Response};
-use zakura_rpc::{MinedBlockEvent, PendingBlockSignal, SubmitBlockChannel};
+use zakura_rpc::{MinedBlockEvent, SubmitBlockChannel};
 use zakura_state::{Config as StateConfig, CHAIN_TIP_UPDATE_WAIT_LIMIT};
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
@@ -144,6 +144,7 @@ async fn mined_block_marks_tip_after_successful_broadcast() {
         .send(MinedBlockEvent::Committed {
             hash: block_two.hash(),
             height: block_two.coinbase_height().unwrap(),
+            early_advertised: false,
         })
         .expect("mined block notification should be accepted");
 
@@ -189,7 +190,11 @@ async fn mined_block_mark_survives_pending_submit_queue() {
 
     // First mined notification — start AdvertiseBlockToAll but hold the response open.
     submitblock_sender
-        .send(MinedBlockEvent::Committed { hash, height })
+        .send(MinedBlockEvent::Committed {
+            hash,
+            height,
+            early_advertised: false,
+        })
         .expect("mined block notification should be accepted");
 
     let first_broadcast = peer_set
@@ -199,7 +204,11 @@ async fn mined_block_mark_survives_pending_submit_queue() {
     // Queue a second notification while the first broadcast is still in flight so the
     // submit-block channel is nonempty when the first mark arrives.
     submitblock_sender
-        .send(MinedBlockEvent::Committed { hash, height })
+        .send(MinedBlockEvent::Committed {
+            hash,
+            height,
+            early_advertised: false,
+        })
         .expect("second mined block notification should be accepted");
 
     first_broadcast.respond(Response::Nil);
@@ -248,6 +257,7 @@ async fn mined_block_broadcast_timeout_uses_committed_tip_fallback() {
         .send(MinedBlockEvent::Committed {
             hash: block_two.hash(),
             height: block_two.coinbase_height().unwrap(),
+            early_advertised: false,
         })
         .expect("mined block notification should be accepted");
 
@@ -263,74 +273,6 @@ async fn mined_block_broadcast_timeout_uses_committed_tip_fallback() {
     tokio::time::sleep(PEER_GOSSIP_DELAY).await;
     peer_set
         .expect_request(Request::AdvertiseBlock(block_two.hash(), None))
-        .await
-        .respond(Response::Nil);
-}
-
-/// An early broadcast advertises a hash whose body the node cannot serve yet, so it must not
-/// suppress the committed-tip fallback.
-///
-/// A peer can follow the early inventory, exhaust `PENDING_BLOCK_WAIT` waiting for the body, and
-/// give up. If the later committed broadcast then fails, the committed-tip gossip is the only
-/// thing left that prompts that peer to ask again.
-#[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn early_broadcast_does_not_suppress_the_committed_tip_fallback() {
-    let GossipTestSetup {
-        mut peer_set,
-        submitblock_sender,
-        mut state_service,
-        gossip_task_handle: _gossip_task_handle,
-    } = setup_gossip_test().await;
-
-    let block_two: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
-        .zcash_deserialize_into()
-        .unwrap();
-    let hash = block_two.hash();
-    let height = block_two.coinbase_height().unwrap();
-
-    // The early broadcast succeeds, which is what would mark the tip as already gossiped.
-    submitblock_sender
-        .send(MinedBlockEvent::Early {
-            hash,
-            height,
-            submitted_at: tokio::time::Instant::now().into_std(),
-            pending: PendingBlockSignal::valid_for_tests(),
-        })
-        .expect("the early mined block notification is accepted");
-
-    peer_set
-        .expect_request(Request::AdvertiseBlockToAll(hash))
-        .await
-        .respond(Response::Nil);
-
-    // Let the spawned early broadcast finish before the block commits.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    state_service
-        .ready()
-        .await
-        .unwrap()
-        .call(zakura_state::Request::CommitCheckpointVerifiedBlock(
-            block_two.clone().into(),
-        ))
-        .await
-        .unwrap();
-
-    submitblock_sender
-        .send(MinedBlockEvent::Committed { hash, height })
-        .expect("the committed mined block notification is accepted");
-
-    // Hold the committed broadcast open past the gossip timeout so it fails without marking.
-    let slow_broadcast = peer_set
-        .expect_request(Request::AdvertiseBlockToAll(hash))
-        .await;
-    tokio::time::sleep(TIPS_RESPONSE_TIMEOUT + Duration::from_secs(1)).await;
-    drop(slow_broadcast);
-
-    // Nothing has advertised a body this node can serve, so the fallback must still run.
-    tokio::time::sleep(PEER_GOSSIP_DELAY).await;
-    peer_set
-        .expect_request(Request::AdvertiseBlock(hash, None))
         .await
         .respond(Response::Nil);
 }

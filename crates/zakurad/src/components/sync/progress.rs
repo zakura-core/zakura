@@ -425,7 +425,7 @@ mod tests {
         assert_eq!(stall_interval_seconds(&regtest, pre_nu7), 600);
         assert_eq!(min_minutes_after_checkpoint_update(&regtest, pre_nu7), 13);
 
-        assert_eq!(stall_interval_seconds(&regtest, post_nu7), 600);
-        assert_eq!(min_minutes_after_checkpoint_update(&regtest, post_nu7), 13);
+        assert_eq!(stall_interval_seconds(&regtest, post_nu7), 200);
+        assert_eq!(min_minutes_after_checkpoint_update(&regtest, post_nu7), 5);
     }
 }

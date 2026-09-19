@@ -3226,12 +3226,9 @@ impl HeaderChainRuntime {
                 let projected = if deleted.contains(&expected.hash) {
                     None
                 } else if let Some(node) = put_nodes.get(&expected.hash) {
-                    Some((*node).clone())
+                    Some(*node)
                 } else {
-                    transition_engine
-                        .graph()
-                        .header_node(expected.hash)
-                        .cloned()
+                    transition_engine.graph().header_node(expected.hash)
                 };
                 let matches = projected.is_some_and(|node| {
                     node.height == expected.height

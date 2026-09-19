@@ -396,3 +396,166 @@ fn is_nu7_active_from_the_nu7_activation_height() -> Result<(), Report> {
 
     Ok(())
 }
+
+/// Compare the generalized schedule with the previous two-era consensus formula.
+#[test]
+fn spacing_schedule_preserves_existing_halving_and_subsidy() {
+    use crate::parameters::{subsidy::constants::MAX_BLOCK_SUBSIDY, testnet};
+    let _init_guard = zakura_test::init();
+    let mut networks: Vec<_> = Network::iter().collect();
+    for blossom in [4, 1_000] {
+        networks.push(
+            testnet::Parameters::build()
+                .with_slow_start_interval(Height(20))
+                .with_halving_interval(100)
+                .unwrap()
+                .with_activation_heights(testnet::ConfiguredActivationHeights {
+                    blossom: Some(blossom),
+                    canopy: Some(blossom + 2),
+                    ..Default::default()
+                })
+                .unwrap()
+                .clear_funding_streams()
+                .to_network()
+                .unwrap(),
+        );
+    }
+    for network in networks {
+        let blossom = NetworkUpgrade::Blossom.activation_height(&network).unwrap();
+        let shift = network.slow_start_shift();
+        let mut heights = vec![
+            Height(0),
+            shift,
+            (shift + 1).unwrap(),
+            blossom.previous().unwrap(),
+            blossom,
+            blossom.next().unwrap(),
+            Height::MAX,
+        ];
+        for index in 1..=8 {
+            let height = height_for_halving(index, &network).unwrap();
+            heights.extend([height.previous().unwrap(), height, height.next().unwrap()]);
+            assert_eq!(halving(height, &network), index);
+            assert_eq!(halving(height.previous().unwrap(), &network), index - 1);
+        }
+        for height in heights {
+            let old_halving = previous_halving(height, &network);
+            assert_eq!(
+                halving(height, &network),
+                old_halving,
+                "{network:?} at {height:?}"
+            );
+            if height >= network.slow_start_interval() {
+                let ratio = if height < blossom { 1 } else { 2 };
+                let expected = 1u64
+                    .checked_shl(old_halving)
+                    .map_or(0, |divisor| MAX_BLOCK_SUBSIDY / ratio / divisor);
+                assert_eq!(
+                    block_subsidy(height, &network).unwrap(),
+                    Amount::<NonNegative>::try_from(expected).unwrap()
+                );
+            }
+        }
+    }
+}
+
+/// The inverse must not add the slow-start shift twice for a pre-Blossom halving.
+#[test]
+fn pre_blossom_halving_inverse_counts_slow_start_once() {
+    use crate::parameters::testnet;
+    let _init_guard = zakura_test::init();
+    let network = testnet::Parameters::build()
+        .with_slow_start_interval(Height(20))
+        .with_halving_interval(100)
+        .unwrap()
+        .with_activation_heights(testnet::ConfiguredActivationHeights {
+            blossom: Some(1_000),
+            canopy: Some(1_002),
+            ..Default::default()
+        })
+        .unwrap()
+        .clear_funding_streams()
+        .to_network()
+        .unwrap();
+    assert_eq!(height_for_halving(1, &network), Some(Height(110)));
+    assert_eq!(halving(Height(109), &network), 0);
+    assert_eq!(halving(Height(110), &network), 1);
+}
+
+fn previous_halving(height: Height, network: &Network) -> u32 {
+    let slow_start_shift = network.slow_start_shift();
+    let blossom_height = NetworkUpgrade::Blossom
+        .activation_height(network)
+        .expect("blossom activation height should be available");
+
+    let halving_index = if height < slow_start_shift {
+        0
+    } else if height < blossom_height {
+        let pre_blossom_height = height - slow_start_shift;
+        pre_blossom_height / network.pre_blossom_halving_interval()
+    } else {
+        let pre_blossom_height = blossom_height - slow_start_shift;
+        let scaled_pre_blossom_height = pre_blossom_height
+            * HeightDiff::from(
+                crate::parameters::subsidy::constants::BLOSSOM_POW_TARGET_SPACING_RATIO,
+            );
+
+        let post_blossom_height = height - blossom_height;
+
+        (scaled_pre_blossom_height + post_blossom_height) / network.post_blossom_halving_interval()
+    };
+
+    halving_index
+        .try_into()
+        .expect("already checked for negatives")
+}
+
+/// Reject intervals that would overflow the halving denominator or make it non-positive.
+#[test]
+fn halving_interval_must_be_positive_and_representable_in_seconds() {
+    use super::{error::ParametersBuilderError, testnet};
+
+    let spacing = NetworkUpgrade::Genesis.target_spacing().num_seconds();
+    let max_interval = HeightDiff::MAX / spacing;
+    for interval in [
+        HeightDiff::MIN,
+        -1,
+        0,
+        max_interval + 1,
+        122_978_293_824_730_345,
+        HeightDiff::MAX,
+    ] {
+        assert!(
+            matches!(
+                testnet::Parameters::build().with_halving_interval(interval),
+                Err(ParametersBuilderError::InvalidHalvingInterval)
+            ),
+            "invalid interval {interval} must be rejected"
+        );
+    }
+
+    for interval in [1, 100, max_interval] {
+        let network = testnet::Parameters::build()
+            .with_slow_start_interval(Height(0))
+            .with_halving_interval(interval)
+            .expect("positive interval fits in target seconds")
+            .with_activation_heights(testnet::ConfiguredActivationHeights {
+                blossom: Some(1),
+                canopy: Some(1),
+                ..Default::default()
+            })
+            .unwrap()
+            .clear_funding_streams()
+            .to_network()
+            .unwrap();
+        assert_eq!(network.pre_blossom_halving_interval(), interval);
+        assert_eq!(network.post_blossom_halving_interval(), interval * 2);
+        assert_eq!(
+            halving(Height(2), &network),
+            if interval == 1 { 1 } else { 0 }
+        );
+        if interval == max_interval {
+            assert_eq!(halving(Height::MAX, &network), 0);
+        }
+    }
+}

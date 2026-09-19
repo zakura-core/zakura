@@ -24,9 +24,9 @@ use crate::{
 };
 
 use constants::{
-    mainnet, regtest, testnet, BLOSSOM_POW_TARGET_SPACING_RATIO,
-    FUNDING_STREAM_RECEIVER_DENOMINATOR, FUNDING_STREAM_SPECIFICATION, LOCKBOX_SPECIFICATION,
-    MAX_BLOCK_SUBSIDY, POST_BLOSSOM_HALVING_INTERVAL, PRE_BLOSSOM_HALVING_INTERVAL,
+    mainnet, testnet, BLOSSOM_POW_TARGET_SPACING_RATIO, FUNDING_STREAM_RECEIVER_DENOMINATOR,
+    FUNDING_STREAM_SPECIFICATION, LOCKBOX_SPECIFICATION, MAX_BLOCK_SUBSIDY,
+    POST_BLOSSOM_HALVING_INTERVAL, PRE_BLOSSOM_HALVING_INTERVAL,
 };
 
 /// The funding stream receiver categories.
@@ -244,14 +244,15 @@ impl ParameterSubsidy for Network {
         // First halving on Mainnet is at Canopy
         // while in Testnet is at block constant height of `1_116_000`
         // <https://zips.z.cash/protocol/protocol.pdf#zip214fundingstreams>
+        //
+        // Regtest and configured testnets derive it, because their target
+        // spacings, including the 25 second spacing after NU7, set the height.
         match self {
             Network::Mainnet => NetworkUpgrade::Canopy
                 .activation_height(self)
                 .expect("canopy activation height should be available"),
             Network::Testnet(params) => {
-                if params.is_regtest() {
-                    regtest::FIRST_HALVING
-                } else if params.is_default_testnet() {
+                if params.is_default_testnet() {
                     testnet::FIRST_HALVING
                 } else {
                     height_for_halving(1, self).expect("first halving height should be available")

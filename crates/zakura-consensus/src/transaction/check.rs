@@ -523,15 +523,7 @@ pub fn coinbase_expiry_height(
         //
         // <https://zips.z.cash/protocol/protocol.pdf#txnconsensus>
         if *block_height >= nu5_activation_height {
-            if expiry_height != Some(*block_height) {
-                return Err(TransactionError::CoinbaseExpiryBlockHeight {
-                    expiry_height,
-                    block_height: *block_height,
-                    transaction_hash: coinbase.hash(),
-                });
-            } else {
-                return Ok(());
-            }
+            return coinbase_height_matches_expiry(block_height, coinbase);
         }
     }
 
@@ -542,6 +534,23 @@ pub fn coinbase_expiry_height(
     //
     // <https://zips.z.cash/protocol/protocol.pdf#txnconsensus>
     validate_expiry_height_max(expiry_height, true, block_height, coinbase)
+}
+
+/// Checks the height rule for NU5+ coinbase transactions.
+/// Their transaction IDs commit to the expiry height but exclude the coinbase input height.
+pub(crate) fn coinbase_height_matches_expiry(
+    block_height: &Height,
+    coinbase: &Transaction,
+) -> Result<(), TransactionError> {
+    let expiry_height = coinbase.expiry_height();
+    if expiry_height != Some(*block_height) {
+        return Err(TransactionError::CoinbaseExpiryBlockHeight {
+            expiry_height,
+            block_height: *block_height,
+            transaction_hash: coinbase.hash(),
+        });
+    }
+    Ok(())
 }
 
 /// Returns `Ok(())` if the expiry height for a non coinbase transaction is

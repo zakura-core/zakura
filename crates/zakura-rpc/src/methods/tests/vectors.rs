@@ -365,6 +365,44 @@ async fn rpc_getdeprecationinfo_estimates_time_from_tip_with_safety_margin() {
     assert!(end_of_service.estimated_time <= after + expected_offset);
 }
 
+/// The end-of-service estimate counts each block with the target spacing at its
+/// height.
+#[test]
+fn end_of_service_estimate_follows_target_spacing() {
+    let _init_guard = zakura_test::init();
+    let pre_blossom_spacing = NetworkUpgrade::Genesis.target_spacing().num_seconds();
+    let post_blossom_spacing = NetworkUpgrade::Blossom.target_spacing().num_seconds();
+
+    assert_eq!(
+        target_seconds_between_heights(&Mainnet, Height(653_589), Height(653_609)),
+        10 * pre_blossom_spacing + 10 * post_blossom_spacing,
+    );
+
+    const BLOSSOM: u32 = 1_000;
+    let network = Network::new_regtest(
+        testnet::ConfiguredActivationHeights {
+            blossom: Some(BLOSSOM),
+            ..Default::default()
+        }
+        .into(),
+    );
+
+    // 10 blocks before Blossom, and 20 blocks from Blossom onwards.
+    let expected = 10 * pre_blossom_spacing + 20 * post_blossom_spacing;
+    assert_eq!(
+        target_seconds_between_heights(&network, Height(BLOSSOM - 11), Height(BLOSSOM + 19),),
+        expected,
+    );
+    assert_eq!(
+        target_seconds_between_heights(&network, Height(BLOSSOM + 19), Height(BLOSSOM - 11),),
+        -expected,
+    );
+    assert_eq!(
+        target_seconds_between_heights(&network, Height(BLOSSOM), Height(BLOSSOM)),
+        0,
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn rpc_getdeprecationinfo_omits_end_of_service_off_mainnet() {
     let _init_guard = zakura_test::init();

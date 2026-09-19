@@ -12,9 +12,70 @@ use std::{
     ops::RangeBounds,
 };
 
+#[cfg(all(test, not(feature = "indexer")))]
+use std::{
+    path::{Path, PathBuf},
+    sync::{LazyLock, Mutex},
+};
+
 use crate::service::finalized_state::{DiskWriteBatch, FromDisk, IntoDisk, ReadDisk, WriteDisk};
 
 use super::DiskDb;
+
+#[cfg(all(test, not(feature = "indexer")))]
+static TYPED_BATCH_WRITE_ERRORS: LazyLock<Mutex<HashMap<(PathBuf, String), rocksdb::Error>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(all(test, not(feature = "indexer")))]
+pub(crate) struct TypedBatchWriteErrorGuard {
+    database_path: PathBuf,
+    column_family_name: String,
+}
+
+#[cfg(all(test, not(feature = "indexer")))]
+impl Drop for TypedBatchWriteErrorGuard {
+    fn drop(&mut self) {
+        TYPED_BATCH_WRITE_ERRORS
+            .lock()
+            .expect("typed batch write error mutex is not poisoned")
+            .remove(&(self.database_path.clone(), self.column_family_name.clone()));
+    }
+}
+
+#[cfg(all(test, not(feature = "indexer")))]
+pub(crate) fn register_typed_batch_write_error(
+    database_path: impl Into<PathBuf>,
+    column_family_name: impl Into<String>,
+    error: rocksdb::Error,
+) -> TypedBatchWriteErrorGuard {
+    let database_path = database_path.into();
+    let column_family_name = column_family_name.into();
+    let replaced = TYPED_BATCH_WRITE_ERRORS
+        .lock()
+        .expect("typed batch write error mutex is not poisoned")
+        .insert((database_path.clone(), column_family_name.clone()), error);
+    assert!(
+        replaced.is_none(),
+        "database column family already has a typed batch write error"
+    );
+
+    TypedBatchWriteErrorGuard {
+        database_path,
+        column_family_name,
+    }
+}
+
+#[cfg(all(test, not(feature = "indexer")))]
+fn typed_batch_write_error(
+    database_path: &Path,
+    column_family_name: &str,
+) -> Option<rocksdb::Error> {
+    TYPED_BATCH_WRITE_ERRORS
+        .lock()
+        .expect("typed batch write error mutex is not poisoned")
+        .get(&(database_path.to_owned(), column_family_name.to_owned()))
+        .cloned()
+}
 
 /// A type-safe read-only column family reference.
 ///
@@ -319,6 +380,11 @@ where
     /// Writes this batch to this column family in the database,
     /// taking ownership and consuming it.
     pub fn write_batch(self) -> Result<(), rocksdb::Error> {
+        #[cfg(all(test, not(feature = "indexer")))]
+        if let Some(error) = typed_batch_write_error(self.inner.db.path(), &self.inner._cf_name) {
+            return Err(error);
+        }
+
         self.inner.db.write(self.batch)
     }
 }

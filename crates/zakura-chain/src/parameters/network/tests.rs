@@ -24,6 +24,10 @@ fn funding_stream_period_uses_floor_division_for_negative_periods() {
     struct TestParameters;
 
     impl ParameterSubsidy for TestParameters {
+        fn initial_nsm_value_balance(&self) -> Amount<NonNegative> {
+            Amount::zero()
+        }
+
         fn height_for_first_halving(&self) -> Height {
             Height(100)
         }
@@ -856,6 +860,58 @@ fn scheduled_issuance_boundary_differences_match_block_subsidy() {
                 );
             }
         }
+    }
+}
+
+/// Checks the initial NSM balances against value pools measured by `getblock` at
+/// the last pre-NU6 block on each public network.
+#[test]
+fn initial_nsm_value_balances_match_pre_nu6_chain_value_pools() {
+    use crate::parameters::subsidy::scheduled_issuance_zatoshis;
+
+    let cases = [
+        (
+            Network::Mainnet,
+            Height(2_726_399),
+            "https://mainnet.zcashexplorer.app/blocks/2726399",
+            [
+                1_402_654_579_762_796u128, // transparent
+                2_605_536_175_709,         // Sprout
+                101_161_389_852_194,       // Sapling
+                68_541_635_763_781,        // Orchard
+                0,                         // Deferred
+                0,                         // Ironwood
+            ],
+        ),
+        (
+            Network::new_default_testnet(),
+            Height(2_975_999),
+            "https://testnet.zcashexplorer.app/blocks/2975999",
+            [
+                1_433_024_042_538_559u128, // transparent
+                42_832_983_037_484,        // Sprout
+                123_413_239_739_335,       // Sapling
+                3_798_966_269_665,         // Orchard
+                0,                         // Deferred
+                0,                         // Ironwood
+            ],
+        ),
+    ];
+
+    for (network, height, explorer, value_pools) in cases {
+        let scheduled = scheduled_issuance_zatoshis(height, &network)
+            .expect("the public network issuance schedule is valid");
+        let issued = value_pools.into_iter().sum::<u128>();
+        let measured_seed = scheduled
+            .checked_sub(issued)
+            .expect("scheduled issuance is at least the issued supply");
+        let configured_seed = u128::try_from(i64::from(network.initial_nsm_value_balance()))
+            .expect("the initial NSM value balance is non-negative");
+
+        assert_eq!(
+            measured_seed, configured_seed,
+            "{network:?} value pools at {height:?}, see {explorer}",
+        );
     }
 }
 

@@ -19,6 +19,7 @@ use tokio::fs;
 
 use tracing::Span;
 use zakura_chain::{
+    amount::Amount,
     common::atomic_write,
     parameters::{
         testnet::{
@@ -978,6 +979,11 @@ struct DTestnetParameters {
     /// If unset, the default activation height for the network is used; the soft fork
     /// cannot be disabled via configuration.
     temporary_orchard_disabling_soft_fork_height: Option<u32>,
+    /// The NSM value balance in zatoshi immediately before NU7 activates.
+    ///
+    /// If unset, the balance starts at zero, which is right for a chain with no
+    /// pre-NU7 history of its own.
+    initial_nsm_value_balance: Option<u64>,
 }
 
 /// Network configuration used during deserialization.
@@ -1095,6 +1101,11 @@ impl From<Arc<testnet::Parameters>> for DTestnetParameters {
             temporary_orchard_disabling_soft_fork_height: params
                 .temporary_orchard_disabling_soft_fork_height()
                 .map(|height| height.0),
+            initial_nsm_value_balance: match i64::from(params.initial_nsm_value_balance()) {
+                0 => None,
+                // The amount type keeps this non-negative, so the cast cannot wrap.
+                balance => Some(balance as u64),
+            },
         }
     }
 }
@@ -1193,7 +1204,7 @@ impl<'de> Deserialize<'de> for Config {
                 build_configured_testnet::<D>(*params, &initial_testnet_peers)?
             }
             (DNetwork::ConfiguredRegtest { params, .. }, _) => {
-                Network::new_regtest(build_regtest_params(*params))
+                Network::new_regtest(build_regtest_params::<D>(*params)?)
             }
             (DNetwork::DefaultForKind(NetworkKind::Mainnet), _) => Network::Mainnet,
             (DNetwork::DefaultForKind(NetworkKind::Testnet), Some(params)) => {
@@ -1203,7 +1214,7 @@ impl<'de> Deserialize<'de> for Config {
                 Network::new_default_testnet()
             }
             (DNetwork::DefaultForKind(NetworkKind::Regtest), Some(params)) => {
-                Network::new_regtest(build_regtest_params(params))
+                Network::new_regtest(build_regtest_params::<D>(params)?)
             }
             (DNetwork::DefaultForKind(NetworkKind::Regtest), None) => {
                 Network::new_regtest(Default::default())
@@ -1364,6 +1375,7 @@ where
         checkpoints,
         extend_funding_stream_addresses_as_required,
         temporary_orchard_disabling_soft_fork_height,
+        initial_nsm_value_balance,
     } = params;
 
     let mut params_builder = testnet::Parameters::build();
@@ -1457,6 +1469,23 @@ where
         );
     }
 
+    if let Some(balance) = initial_nsm_value_balance {
+        let balance = i64::try_from(balance)
+            .map_err(de::Error::custom)
+            .and_then(|balance| Amount::try_from(balance).map_err(de::Error::custom))?;
+
+        params_builder = params_builder.with_initial_nsm_value_balance(balance);
+    }
+
+    // An omitted seed and otherwise default parameters select public Testnet.
+    // An explicit zero seed must remain zero on the configured network.
+    if network_name.is_none()
+        && initial_nsm_value_balance.is_none()
+        && params_builder == testnet::Parameters::build()
+    {
+        return Ok(Network::new_default_testnet());
+    }
+
     // Return an error if the initial testnet peers includes any of the default initial Mainnet or Testnet
     // peers and the configured network parameters are incompatible with the default public Testnet.
     if !params_builder.is_compatible_with_default_parameters()
@@ -1467,15 +1496,12 @@ where
         ));
     };
 
-    // Return the default Testnet if no network name was configured and all parameters match the default Testnet
-    if network_name.is_none() && params_builder == testnet::Parameters::build() {
-        Ok(Network::new_default_testnet())
-    } else {
-        Ok(params_builder.to_network().map_err(de::Error::custom)?)
-    }
+    params_builder.to_network().map_err(de::Error::custom)
 }
 
-fn build_regtest_params(params: DTestnetParameters) -> RegtestParameters {
+fn build_regtest_params<'de, D: Deserializer<'de>>(
+    params: DTestnetParameters,
+) -> Result<RegtestParameters, D::Error> {
     let DTestnetParameters {
         activation_heights,
         pre_nu6_funding_streams,
@@ -1485,6 +1511,7 @@ fn build_regtest_params(params: DTestnetParameters) -> RegtestParameters {
         checkpoints,
         extend_funding_stream_addresses_as_required,
         max_block_time_start_height,
+        initial_nsm_value_balance,
         ..
     } = params;
 
@@ -1498,12 +1525,21 @@ fn build_regtest_params(params: DTestnetParameters) -> RegtestParameters {
         funding_streams_vec.insert(0, funding_streams);
     }
 
-    RegtestParameters {
+    let initial_nsm_value_balance = initial_nsm_value_balance
+        .map(|balance| {
+            i64::try_from(balance)
+                .map_err(de::Error::custom)
+                .and_then(|balance| Amount::try_from(balance).map_err(de::Error::custom))
+        })
+        .transpose()?;
+
+    Ok(RegtestParameters {
         activation_heights: activation_heights.unwrap_or_default(),
         funding_streams: Some(funding_streams_vec),
         lockbox_disbursements,
         checkpoints: Some(checkpoints),
         max_block_time_start_height: max_block_time_start_height.map(zakura_chain::block::Height),
         extend_funding_stream_addresses_as_required,
-    }
+        initial_nsm_value_balance,
+    })
 }

@@ -11,7 +11,10 @@ use crate::{
     ironwood,
     memory::{inline_size_bytes, vec_capacity_bytes, AttributedMemorySize},
     orchard,
-    parameters::{subsidy::halving_block_subsidy, Network, NetworkUpgrade},
+    parameters::{
+        subsidy::{halving_block_subsidy, ParameterSubsidy},
+        Network, NetworkUpgrade,
+    },
     sapling,
     serialization::TrustedPreallocate,
     sprout,
@@ -346,17 +349,44 @@ impl Block {
                 .unwrap_or_default(),
         );
 
-        change.set_issuance_deficit_amount(self.issuance_deficit_change(network, &change)?);
+        change.set_nsm_value_balance_amount(self.nsm_value_balance_change(network, &change)?);
 
         Ok(change)
     }
 
-    /// Returns scheduled issuance minus issued value, starting at NU7 with no seed.
+    /// Returns this block's change to the NSM value balance, as zips#1354 defines it.
     ///
-    /// Should historical unclaimed subsidy and fees seed this balance? We need guidance before including those funds. Update the baseline
-    /// in `zakura-state/src/service/finalized_state/disk_format/upgrade/issuance_deficit_pool.rs`
-    /// together with this rule and its accounting tests.
-    fn issuance_deficit_change(
+    /// # Consensus
+    ///
+    /// zips#1354 seeds the balance immediately before NU7 and then draws it down by the
+    /// bonus each block claims:
+    ///
+    /// > NSMValueBalance(NU7ActivationHeight - 1) = INITIAL\_NSM\_VALUE\_BALANCE
+    /// >
+    /// > NSMValueBalance(height) = NSMValueBalance(height - 1)
+    /// >   - AdditionalBlockSubsidy(height) + removed(height)
+    ///
+    /// Fee recycling is deferred to a separate change. The NU7 deployment draft proposes
+    /// contributing `floor(6 * TransactionFees(height) / 10)` to this balance without new
+    /// transaction fields. This implementation still requires the coinbase to claim all
+    /// fees, so `removed(height)` is zero for semantically valid blocks under the current
+    /// rules. This is an implementation limit, not a claim about the final NU7 scope.
+    ///
+    /// A block carries no reference to its parent's balance, so this derives
+    /// `AdditionalBlockSubsidy(height)` from the block instead. Under the currently
+    /// implemented ZIP 236 rule, the coinbase claims exactly `BlockSubsidy(height)` plus
+    /// all transaction fees from NU6 onward. Fees move between transactions inside the
+    /// block, so the block's change across the six monetary pools is `BlockSubsidy(height)`.
+    /// This equals the halving subsidy plus the bonus, so subtracting it from the
+    /// halving subsidy gives `-AdditionalBlockSubsidy(height)`.
+    ///
+    /// Once coinbase validation and block templates withhold the fee contribution,
+    /// the monetary pool change will be `BlockSubsidy(height) - removed(height)`, so this
+    /// calculation will already include the contribution. It must not be added twice.
+    ///
+    /// `zakura-state/src/service/check.rs::nsm_value_balance_is_non_negative` rejects a
+    /// block that would drive the running total below zero.
+    fn nsm_value_balance_change(
         &self,
         network: &Network,
         change: &ValueBalance<NegativeAllowed>,
@@ -365,10 +395,21 @@ impl Block {
             .coinbase_height()
             .ok_or(ValueBalanceError::MissingCoinbaseHeight)?;
 
-        if !NetworkUpgrade::Nu7
-            .activation_height(network)
-            .is_some_and(|start| height >= start)
-        {
+        let Some(nu7) = NetworkUpgrade::Nu7.activation_height(network) else {
+            return Ok(Amount::zero());
+        };
+
+        // The seed lands on the last block below NU7, so the balance already holds it when
+        // the first NU7 block claims its bonus. NU7 at genesis has no such block, and a
+        // chain with no history before NU7 has nothing to seed.
+        if nu7.0.checked_sub(1) == Some(height.0) {
+            return network
+                .initial_nsm_value_balance()
+                .constrain::<NegativeAllowed>()
+                .map_err(ValueBalanceError::NsmValueBalance);
+        }
+
+        if height < nu7 {
             return Ok(Amount::zero());
         }
 
@@ -379,12 +420,12 @@ impl Block {
             halving_block_subsidy(height, network)
                 .map_err(ValueBalanceError::ScheduledIssuance)?
                 .constrain::<NegativeAllowed>()
-                .map_err(ValueBalanceError::IssuanceDeficit)?
+                .map_err(ValueBalanceError::NsmValueBalance)?
         };
 
-        let issued = change.total().map_err(ValueBalanceError::IssuanceDeficit)?;
+        let issued = change.total().map_err(ValueBalanceError::NsmValueBalance)?;
 
-        (scheduled - issued).map_err(ValueBalanceError::IssuanceDeficit)
+        (scheduled - issued).map_err(ValueBalanceError::NsmValueBalance)
     }
 
     /// Compute the root of the authorizing data Merkle tree,
@@ -440,7 +481,7 @@ impl TrustedPreallocate for Hash {
 }
 
 #[cfg(test)]
-mod issuance_deficit_properties {
+mod nsm_value_balance_properties {
     use super::*;
     use crate::{
         parameters::testnet::{ConfiguredActivationHeights, RegtestParameters},
@@ -452,7 +493,7 @@ mod issuance_deficit_properties {
         #![proptest_config(ProptestConfig::with_cases(std::env::var("NSM_ARITHMETIC_CASES").ok().and_then(|value| value.parse().ok()).unwrap_or(1024)))]
 
         #[test]
-        fn deficit_ignores_transfers_and_tracks_removed_value(
+        fn balance_ignores_transfers_and_tracks_removed_value(
             height in 1u32..20,
             removed in 0i64..1_000_000_000,
             transfer in 0i64..1_000_000_000,
@@ -477,7 +518,7 @@ mod issuance_deficit_properties {
                 _ => { let mut pools = ValueBalance::zero(); pools.set_deferred_amount(amount); pools },
             };
             let change = (destination + ValueBalance::from_transparent_amount(Amount::try_from(-transfer - removed).unwrap())).unwrap();
-            let actual = block.issuance_deficit_change(&network, &change).unwrap();
+            let actual = block.nsm_value_balance_change(&network, &change).unwrap();
             let expected = if height < 3 { 0 } else {
                 i64::from(halving_block_subsidy(Height(height), &network).unwrap()) + removed
             };
@@ -517,7 +558,7 @@ mod issuance_deficit_properties {
                         0
                     };
                     assert_eq!(
-                        i64::from(block.issuance_deficit_change(&network, &change).unwrap()),
+                        i64::from(block.nsm_value_balance_change(&network, &change).unwrap()),
                         expected,
                         "activation {activation:?}, height {height}, issued {issued}"
                     );

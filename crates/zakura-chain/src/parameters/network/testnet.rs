@@ -636,6 +636,9 @@ pub struct ParametersBuilder {
     checkpoints: Arc<CheckpointList>,
     /// Height at which the soft-fork to temporarily disable Orchard in transactions activates
     temporary_orchard_disabling_soft_fork_height: Option<Height>,
+    /// The NSM value balance immediately before NU7, see
+    /// [`Parameters::initial_nsm_value_balance`].
+    initial_nsm_value_balance: Amount<NonNegative>,
 }
 
 impl Default for ParametersBuilder {
@@ -676,6 +679,10 @@ impl Default for ParametersBuilder {
             temporary_orchard_disabling_soft_fork_height: Some(
                 super::TESTNET_TEMPORARY_ORCHARD_DISABLING_SOFT_FORK_HEIGHT,
             ),
+            // A seed measures one chain's own history, so it is meaningless on a network
+            // built from these defaults. The default Testnet sets its own in
+            // `Parameters::default`.
+            initial_nsm_value_balance: Amount::zero(),
         }
     }
 }
@@ -1006,6 +1013,16 @@ impl ParametersBuilder {
         self
     }
 
+    /// Sets zips#1354's `INITIAL_NSM_VALUE_BALANCE`, the value the NSM value balance holds
+    /// immediately before NU7 activates.
+    ///
+    /// The seed is a measurement of one chain's own history, so it defaults to zero on
+    /// every network but Mainnet and the default Testnet.
+    pub fn with_initial_nsm_value_balance(mut self, balance: Amount<NonNegative>) -> Self {
+        self.initial_nsm_value_balance = balance;
+        self
+    }
+
     /// Converts the builder to a [`Parameters`] struct
     fn finish(self) -> Parameters {
         // The builder defaults to public Testnet consensus parameters, so an unset
@@ -1031,6 +1048,7 @@ impl ParametersBuilder {
             lockbox_disbursements,
             checkpoints,
             temporary_orchard_disabling_soft_fork_height,
+            initial_nsm_value_balance,
         } = self;
         Parameters {
             network_name,
@@ -1049,6 +1067,7 @@ impl ParametersBuilder {
             lockbox_disbursements,
             checkpoints,
             temporary_orchard_disabling_soft_fork_height,
+            initial_nsm_value_balance,
         }
     }
 
@@ -1104,6 +1123,8 @@ impl ParametersBuilder {
             lockbox_disbursements,
             checkpoints: _,
             temporary_orchard_disabling_soft_fork_height: _,
+            // Compare the configured seed with public Testnet's seed below.
+            initial_nsm_value_balance: _,
         } = Self::default();
 
         self.activation_heights == activation_heights
@@ -1119,6 +1140,7 @@ impl ParametersBuilder {
             && self.pre_blossom_halving_interval == pre_blossom_halving_interval
             && self.post_blossom_halving_interval == post_blossom_halving_interval
             && self.lockbox_disbursements == lockbox_disbursements
+            && self.initial_nsm_value_balance == testnet::INITIAL_NSM_VALUE_BALANCE
     }
 }
 
@@ -1137,6 +1159,9 @@ pub struct RegtestParameters {
     pub max_block_time_start_height: Option<Height>,
     /// Whether funding stream addresses should be repeated to fill all required funding stream periods.
     pub extend_funding_stream_addresses_as_required: Option<bool>,
+    /// The NSM value balance immediately before NU7, see
+    /// [`ParametersBuilder::with_initial_nsm_value_balance`].
+    pub initial_nsm_value_balance: Option<Amount<NonNegative>>,
 }
 
 impl From<ConfiguredActivationHeights> for RegtestParameters {
@@ -1184,6 +1209,8 @@ pub struct Parameters {
     checkpoints: Arc<CheckpointList>,
     /// Height at which the soft-fork to temporarily disable Orchard in transactions activates
     temporary_orchard_disabling_soft_fork_height: Option<Height>,
+    /// The NSM value balance immediately before NU7 activates.
+    initial_nsm_value_balance: Amount<NonNegative>,
 }
 
 impl Default for Parameters {
@@ -1192,6 +1219,7 @@ impl Default for Parameters {
         Self {
             network_name: "Testnet".to_string(),
             max_block_time_start_height: TESTNET_MAX_TIME_START_HEIGHT,
+            initial_nsm_value_balance: testnet::INITIAL_NSM_VALUE_BALANCE,
             ..Self::build().finish()
         }
     }
@@ -1214,6 +1242,7 @@ impl Parameters {
             checkpoints,
             extend_funding_stream_addresses_as_required,
             max_block_time_start_height,
+            initial_nsm_value_balance,
         }: RegtestParameters,
     ) -> Result<Self, ParametersBuilderError> {
         let mut parameters = Self::build()
@@ -1241,6 +1270,10 @@ impl Parameters {
 
         if Some(true) == extend_funding_stream_addresses_as_required {
             parameters = parameters.extend_funding_streams();
+        }
+
+        if let Some(balance) = initial_nsm_value_balance {
+            parameters = parameters.with_initial_nsm_value_balance(balance);
         }
 
         // Regtest does not run the `to_network()` checks, so run them here: block validation
@@ -1289,6 +1322,10 @@ impl Parameters {
             lockbox_disbursements: _,
             checkpoints: _,
             temporary_orchard_disabling_soft_fork_height: _,
+            // Regtest chains start empty, so the seed is always zero. It stays out of the
+            // identity check for the same reason the halving interval stays in: it is
+            // derived from the defaults above, not chosen.
+            initial_nsm_value_balance: _,
         } = Self::new_regtest(Default::default()).expect("default regtest parameters are valid");
 
         self.network_name == network_name
@@ -1400,6 +1437,13 @@ impl Parameters {
     /// transactions activates.
     pub fn temporary_orchard_disabling_soft_fork_height(&self) -> Option<Height> {
         self.temporary_orchard_disabling_soft_fork_height
+    }
+
+    /// Returns zips#1354's `INITIAL_NSM_VALUE_BALANCE` for this network.
+    ///
+    /// See [`ParametersBuilder::with_initial_nsm_value_balance`].
+    pub fn initial_nsm_value_balance(&self) -> Amount<NonNegative> {
+        self.initial_nsm_value_balance
     }
 }
 

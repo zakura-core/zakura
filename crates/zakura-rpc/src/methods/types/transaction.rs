@@ -345,12 +345,14 @@ impl CoinbasePlan {
             .try_into()
             .expect("coinbase transparent output count fits in u32");
         let shielded_action_counts = match self.miner_reward_address {
-            MinerRewardAddress::Orchard(_) | MinerRewardAddress::Ironwood(_) => {
-                ShieldedActionCounts {
-                    orchard_and_ironwood_actions: 1,
-                    ..Default::default()
-                }
-            }
+            MinerRewardAddress::Orchard(_) => ShieldedActionCounts {
+                orchard_actions: 1,
+                ..Default::default()
+            },
+            MinerRewardAddress::Ironwood(_) => ShieldedActionCounts {
+                ironwood_actions: 1,
+                ..Default::default()
+            },
             MinerRewardAddress::Sapling(_) => ShieldedActionCounts {
                 sapling_ios: 1,
                 ..Default::default()

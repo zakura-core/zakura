@@ -31,8 +31,7 @@ pub struct ValueBalance<C> {
     ironwood: Amount<C>,
     /// Historical unclaimed issuance plus scheduled issuance minus issued value since NU7.
     /// This accounting counter funds reissuance but holds no spendable value.
-    /// Monetary totals exclude it. The signed type preserves pre-reissuance states;
-    /// contextual validation rejects negative balances from the reissuance start.
+    /// Monetary totals exclude it. Contextual validation rejects negative balances from NU7.
     nsm_value_balance: Amount<NegativeAllowed>,
 }
 

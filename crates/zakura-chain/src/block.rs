@@ -285,6 +285,9 @@ impl Block {
     /// UTXOs, which are ignored.
     ///
     /// Note that the chain value pool has the opposite sign to the transaction value pool.
+    ///
+    /// The NSM seed is excluded. After adding these changes, state calls
+    /// [`ValueBalance::seed_nsm_value_balance`].
     pub fn chain_value_pool_change(
         &self,
         network: &Network,
@@ -304,6 +307,8 @@ impl Block {
     /// input in this block. This includes UTXOs created by earlier transactions
     /// in the same block. The map can also contain unrelated UTXOs, which this
     /// method ignores.
+    ///
+    /// The NSM seed is excluded, as in [`Self::chain_value_pool_change`].
     ///
     /// # Panics
     ///

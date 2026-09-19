@@ -729,6 +729,15 @@ impl CheckpointVerifiedBlock {
         self.0.auth_data_root = Some(self.0.block.auth_data_root());
         self
     }
+
+    /// Returns this checkpoint block with its deferred pool balance change.
+    pub fn with_deferred_pool_balance_change(
+        mut self,
+        deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
+    ) -> Self {
+        self.0.deferred_pool_balance_change = deferred_pool_balance_change;
+        self
+    }
 }
 
 impl SemanticallyVerifiedBlock {

@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, HashSet},
     fmt,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use crate::{
@@ -636,6 +636,8 @@ pub struct ParametersBuilder {
     checkpoints: Arc<CheckpointList>,
     /// Height at which the soft-fork to temporarily disable Orchard in transactions activates
     temporary_orchard_disabling_soft_fork_height: Option<Height>,
+    /// The configured ZIP 234 start height, see [`Parameters::configured_zip234_start_height`].
+    zip234_start_height: Option<Height>,
 }
 
 impl Default for ParametersBuilder {
@@ -676,6 +678,7 @@ impl Default for ParametersBuilder {
             temporary_orchard_disabling_soft_fork_height: Some(
                 super::TESTNET_TEMPORARY_ORCHARD_DISABLING_SOFT_FORK_HEIGHT,
             ),
+            zip234_start_height: None,
         }
     }
 }
@@ -1006,6 +1009,15 @@ impl ParametersBuilder {
         self
     }
 
+    /// Sets the height at which ZIP 234 reissuance starts, replacing the crossing rule in
+    /// [`subsidy::zip234_start_height`](super::subsidy::zip234_start_height).
+    ///
+    /// Reissuance still waits for NU7, so a height below NU7 activation starts it at NU7.
+    pub fn with_zip234_start_height(mut self, height: Height) -> Self {
+        self.zip234_start_height = Some(height);
+        self
+    }
+
     /// Converts the builder to a [`Parameters`] struct
     fn finish(self) -> Parameters {
         // The builder defaults to public Testnet consensus parameters, so an unset
@@ -1031,6 +1043,7 @@ impl ParametersBuilder {
             lockbox_disbursements,
             checkpoints,
             temporary_orchard_disabling_soft_fork_height,
+            zip234_start_height,
         } = self;
         Parameters {
             network_name,
@@ -1049,6 +1062,8 @@ impl ParametersBuilder {
             lockbox_disbursements,
             checkpoints,
             temporary_orchard_disabling_soft_fork_height,
+            configured_zip234_start_height: zip234_start_height,
+            zip234_crossing_start_height: DerivedHeight::default(),
         }
     }
 
@@ -1104,6 +1119,7 @@ impl ParametersBuilder {
             lockbox_disbursements,
             checkpoints: _,
             temporary_orchard_disabling_soft_fork_height: _,
+            zip234_start_height,
         } = Self::default();
 
         self.activation_heights == activation_heights
@@ -1119,6 +1135,7 @@ impl ParametersBuilder {
             && self.pre_blossom_halving_interval == pre_blossom_halving_interval
             && self.post_blossom_halving_interval == post_blossom_halving_interval
             && self.lockbox_disbursements == lockbox_disbursements
+            && self.zip234_start_height == zip234_start_height
     }
 }
 
@@ -1137,6 +1154,9 @@ pub struct RegtestParameters {
     pub max_block_time_start_height: Option<Height>,
     /// Whether funding stream addresses should be repeated to fill all required funding stream periods.
     pub extend_funding_stream_addresses_as_required: Option<bool>,
+    /// The height at which ZIP 234 reissuance starts, see
+    /// [`ParametersBuilder::with_zip234_start_height`].
+    pub zip234_start_height: Option<Height>,
 }
 
 impl From<ConfiguredActivationHeights> for RegtestParameters {
@@ -1184,7 +1204,32 @@ pub struct Parameters {
     checkpoints: Arc<CheckpointList>,
     /// Height at which the soft-fork to temporarily disable Orchard in transactions activates
     temporary_orchard_disabling_soft_fork_height: Option<Height>,
+    /// The configured ZIP 234 start height, if any.
+    configured_zip234_start_height: Option<Height>,
+    /// The ZIP 234 start height that the crossing rule derives from the other fields.
+    zip234_crossing_start_height: DerivedHeight,
 }
+
+/// A height derived from the other [`Parameters`] fields and computed on first use.
+///
+/// Equality ignores it, because equal parameters derive equal heights.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DerivedHeight(OnceLock<Option<Height>>);
+
+impl DerivedHeight {
+    /// Returns the height, computing it with `derive` on first use.
+    pub(crate) fn get_or_init(&self, derive: impl FnOnce() -> Option<Height>) -> Option<Height> {
+        *self.0.get_or_init(derive)
+    }
+}
+
+impl PartialEq for DerivedHeight {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for DerivedHeight {}
 
 impl Default for Parameters {
     /// Returns an instance of the default public testnet [`Parameters`].
@@ -1214,6 +1259,7 @@ impl Parameters {
             checkpoints,
             extend_funding_stream_addresses_as_required,
             max_block_time_start_height,
+            zip234_start_height,
         }: RegtestParameters,
     ) -> Result<Self, ParametersBuilderError> {
         let mut parameters = Self::build()
@@ -1241,6 +1287,10 @@ impl Parameters {
 
         if Some(true) == extend_funding_stream_addresses_as_required {
             parameters = parameters.extend_funding_streams();
+        }
+
+        if let Some(height) = zip234_start_height {
+            parameters = parameters.with_zip234_start_height(height);
         }
 
         // Regtest does not run the `to_network()` checks, so run them here: block validation
@@ -1289,6 +1339,9 @@ impl Parameters {
             lockbox_disbursements: _,
             checkpoints: _,
             temporary_orchard_disabling_soft_fork_height: _,
+            // The ZIP 234 start height is configurable on Regtest
+            configured_zip234_start_height: _,
+            zip234_crossing_start_height: _,
         } = Self::new_regtest(Default::default()).expect("default regtest parameters are valid");
 
         self.network_name == network_name
@@ -1400,6 +1453,18 @@ impl Parameters {
     /// transactions activates.
     pub fn temporary_orchard_disabling_soft_fork_height(&self) -> Option<Height> {
         self.temporary_orchard_disabling_soft_fork_height
+    }
+
+    /// Returns the configured height at which ZIP 234 reissuance starts, or `None` if the
+    /// crossing rule in [`subsidy::zip234_start_height`](super::subsidy::zip234_start_height)
+    /// applies.
+    pub fn configured_zip234_start_height(&self) -> Option<Height> {
+        self.configured_zip234_start_height
+    }
+
+    /// Returns the cached start height that the ZIP 234 crossing rule derives.
+    pub(crate) fn zip234_crossing_start_height(&self) -> &DerivedHeight {
+        &self.zip234_crossing_start_height
     }
 }
 

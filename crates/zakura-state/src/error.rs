@@ -798,6 +798,17 @@ pub enum ValidateContextError {
         height: Option<block::Height>,
     },
 
+    #[error(
+        "block makes the ZIP 234 issuance deficit negative: deficit {deficit_before:?} \
+         changes by {deficit_change:?} at {height:?}"
+    )]
+    #[non_exhaustive]
+    NegativeIssuanceDeficit {
+        height: block::Height,
+        deficit_before: amount::Amount<NegativeAllowed>,
+        deficit_change: amount::Amount<NegativeAllowed>,
+    },
+
     #[error("error updating a note commitment tree: {0}")]
     NoteCommitmentTreeError(#[from] zakura_chain::parallel::tree::NoteCommitmentTreeError),
 
@@ -972,6 +983,7 @@ impl ValidateContextError {
                 consensus("context.calculate_block_chain_value_change")
             }
             Self::AddValuePool { .. } => consensus("context.add_value_pool"),
+            Self::NegativeIssuanceDeficit { .. } => consensus("context.negative_issuance_deficit"),
             Self::UnknownSproutAnchor { .. } => consensus("context.unknown_sprout_anchor"),
             Self::UnknownSaplingAnchor { .. } => consensus("context.unknown_sapling_anchor"),
             Self::UnknownOrchardAnchor { .. } => consensus("context.unknown_orchard_anchor"),
@@ -1000,6 +1012,7 @@ impl ValidateContextError {
             | ValidateContextError::DuplicateIronwoodNullifier { .. }
             | ValidateContextError::NegativeRemainingTransactionValue { .. }
             | ValidateContextError::AddValuePool { .. }
+            | ValidateContextError::NegativeIssuanceDeficit { .. }
             | ValidateContextError::InvalidBlockCommitment(_)
             | ValidateContextError::UnknownSproutAnchor { .. }
             | ValidateContextError::UnknownSaplingAnchor { .. }
@@ -1351,6 +1364,12 @@ mod tests {
                 chain_value_pools: Box::new(ValueBalance::<NonNegative>::zero()),
                 block_value_pool_change: Box::new(ValueBalance::<NegativeAllowed>::zero()),
                 height: Some(height),
+            },
+            ValidateContextError::NegativeIssuanceDeficit {
+                height,
+                deficit_before: amount::Amount::zero(),
+                deficit_change: amount::Amount::try_from(-1)
+                    .expect("minus one zatoshi is a valid amount"),
             },
             ValidateContextError::InvalidBlockCommitment(
                 CommitmentError::InvalidChainHistoryActivationReserved { actual: [1; 32] },

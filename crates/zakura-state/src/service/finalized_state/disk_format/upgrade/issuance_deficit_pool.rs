@@ -154,11 +154,24 @@ fn backfill(
 
 /// Refuses databases whose committed value pools older migrations cannot repair.
 ///
+/// Blocks at or above the ZIP 234 start derive their subsidy, and so their Deferred
+/// funding, from the parent's issuance deficit. Older versions committed those blocks
+/// without reissuance, so their Deferred balances differ from a fresh sync.
+///
 /// Before format 29, the version 27 replay omitted Deferred funding during slow start.
 /// A database that ran that replay can hold undercounted Deferred balances, and its
 /// version marker stops the corrected replay from running again. Block commits always
 /// applied the funding, so a fresh sync produces the correct balances.
 fn refuse_unrepairable_history(network: &Network, tip: Height) -> Result<(), FormatChangeError> {
+    if let Some(start) = zakura_chain::parameters::subsidy::zip234_start_height(network)
+        .filter(|start| tip >= *start)
+    {
+        return Err(FormatChangeError::ResyncRequired(format!(
+            "blocks at or above the ZIP 234 start height {} were committed without reissuance",
+            start.0,
+        )));
+    }
+
     let slow_start_end = network.slow_start_interval().min(tip);
     for height in 1..=slow_start_end.0 {
         let height = Height(height);
@@ -235,6 +248,13 @@ fn eligible_deficit(
                 "invalid issuance deficit at {height:?}: {error}"
             ))
         })?;
+    if zakura_chain::parameters::subsidy::is_zip234_active(network, height)
+        && i64::from(eligible) < 0
+    {
+        return Err(FormatChangeError::InvalidPostcondition(format!(
+            "negative issuance deficit at active reissuance height {height:?}"
+        )));
+    }
     Ok(eligible)
 }
 
@@ -348,6 +368,37 @@ mod tests {
         );
         let eligible = eligible_deficit(&network, start, ValueBalance::zero(), baseline).unwrap();
         assert_eq!(eligible, halving_block_subsidy(start, &network).unwrap());
+    }
+
+    #[test]
+    fn eligible_negative_balance_follows_reissuance_activation() {
+        use zakura_chain::parameters::testnet::{ConfiguredActivationHeights, RegtestParameters};
+        let network = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu7: Some(2),
+                ..Default::default()
+            },
+            zip234_start_height: Some(Height(3)),
+            ..Default::default()
+        });
+        let baseline =
+            i128::try_from(scheduled_issuance_zatoshis(Height(1), &network).unwrap()).unwrap();
+        for h in [2, 3] {
+            let scheduled =
+                i128::try_from(scheduled_issuance_zatoshis(Height(h), &network).unwrap()).unwrap();
+            let pools = ValueBalance::from_transparent_amount(
+                Amount::try_from(i64::try_from(scheduled - baseline + 1).unwrap()).unwrap(),
+            );
+            let result = eligible_deficit(&network, Height(h), pools, baseline);
+            if h == 3 {
+                assert!(matches!(
+                    result,
+                    Err(FormatChangeError::InvalidPostcondition(_))
+                ));
+            } else {
+                assert_eq!(i64::from(result.unwrap()), -1);
+            }
+        }
     }
 
     #[test]

@@ -13,6 +13,7 @@ use zakura_chain::{
 use crate::{arbitrary::Prepare, service::check, SemanticallyVerifiedBlock};
 
 mod issuance_accounting;
+mod issuance_deficit;
 mod prop;
 mod rollback;
 mod transparent;

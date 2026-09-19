@@ -754,7 +754,7 @@ pub trait Rpc {
     /// `height`.
     ///
     /// If `num_blocks` is not supplied, uses 120 blocks. If it is 0 or -1, uses the difficulty
-    /// averaging window at `height`.
+    /// averaging window at `height`, which ZIP 218 widens at NU7.
     /// If `height` is not supplied or is -1, uses the tip height.
     ///
     /// zcashd reference: [`getnetworksolps`](https://zcash.github.io/rpc/getnetworksolps.html)

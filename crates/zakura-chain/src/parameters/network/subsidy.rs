@@ -24,7 +24,7 @@ use crate::{
 };
 
 use constants::{
-    regtest, testnet, BLOSSOM_POW_TARGET_SPACING_RATIO, FUNDING_STREAM_RECEIVER_DENOMINATOR,
+    testnet, BLOSSOM_POW_TARGET_SPACING_RATIO, FUNDING_STREAM_RECEIVER_DENOMINATOR,
     FUNDING_STREAM_SPECIFICATION, LOCKBOX_SPECIFICATION, MAX_BLOCK_SUBSIDY,
     POST_BLOSSOM_HALVING_INTERVAL, PRE_BLOSSOM_HALVING_INTERVAL,
 };
@@ -240,14 +240,15 @@ impl ParameterSubsidy for Network {
         // First halving on Mainnet is at Canopy
         // while in Testnet is at block constant height of `1_116_000`
         // <https://zips.z.cash/protocol/protocol.pdf#zip214fundingstreams>
+        //
+        // Regtest and configured testnets derive it, because their target
+        // spacings, including the 25 second spacing after NU7, set the height.
         match self {
             Network::Mainnet => NetworkUpgrade::Canopy
                 .activation_height(self)
                 .expect("canopy activation height should be available"),
             Network::Testnet(params) => {
-                if params.is_regtest() {
-                    regtest::FIRST_HALVING
-                } else if params.is_default_testnet() {
+                if params.is_default_testnet() {
                     testnet::FIRST_HALVING
                 } else {
                     height_for_halving(1, self).expect("first halving height should be available")
@@ -425,7 +426,8 @@ pub fn halving(height: Height, network: &Network) -> u32 {
     // running total of block seconds, which the pre-Blossom halving interval
     // measured in seconds then divides. This is the spec's segmented sum of
     // fractions with the common denominator factored out, so it stays in integer
-    // arithmetic no matter how many spacing eras a network has. Future upgrades can add eras without changing this calculation.
+    // arithmetic no matter how many spacing eras a network has. ZIP 218 adds a
+    // third era at NU7.
     //
     // The spec's first term is `BlossomActivationHeight - SlowStartShift`
     // pre-Blossom blocks, which is negative when Blossom activates below
@@ -483,7 +485,7 @@ pub fn block_subsidy(height: Height, net: &Network) -> Result<Amount<NonNegative
         // Each spacing era scales the per-block subsidy by
         // `current_spacing / pre_blossom_spacing`, which keeps issuance per unit of
         // wall-clock time constant across spacing changes. Blossom divides the
-        // subsidy by 2. The casts are
+        // subsidy by 2, and ZIP 218 divides it by a further 3 at NU7. The casts are
         // safe because target spacings are small positive constants.
         let current_spacing_seconds =
             NetworkUpgrade::target_spacing_for_height(net, height).num_seconds() as u64;

@@ -3119,7 +3119,7 @@ async fn rpc_getnetworksolps_uses_averaging_window_at_height() {
         .into(),
     );
     let pre_nu7_window = 17;
-    let post_nu7_window = 17;
+    let post_nu7_window = 102;
 
     let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
     let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();

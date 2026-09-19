@@ -9,8 +9,8 @@ use zakura_chain::{
 };
 use zakura_header_chain::{
     prepare_headers, CheckpointSet, EngineConfig, EngineMode, Frontier, HeaderBatchInput,
-    HeaderRules, RowLimit, StoreAuditRead, StoreAuditSnapshot, SystemClock, TrustedAnchor,
-    MAX_NON_FINALIZED_NODES_V1,
+    HeaderChainDiskVersion, HeaderRules, RowLimit, StoreAuditRead, StoreAuditSnapshot, SystemClock,
+    TrustedAnchor, MAX_NON_FINALIZED_NODES_V1,
 };
 
 use super::{
@@ -23,7 +23,10 @@ use super::{
 use crate::{
     service::finalized_state::{
         disk_db::{DiskWriteBatch, WriteDisk},
-        disk_format::RawBytes,
+        disk_format::{
+            header_chain_values::{decode_v4_engine_metadata, HeaderChainValueError},
+            RawBytes,
+        },
         header_chain::{
             migration::{initialize_header_chain_reconciled, HeaderChainInitializationError},
             HeaderChainStore,
@@ -33,7 +36,7 @@ use crate::{
     Config,
 };
 
-use crate::service::finalized_state::HEADER_VALIDATION_CONTEXT;
+use crate::service::finalized_state::{HEADER_ENGINE_META, HEADER_VALIDATION_CONTEXT};
 
 /// Writes a synthetic finalized header chain from `genesis` to `chain_tip`, and
 /// returns its headers indexed by height.
@@ -298,10 +301,47 @@ fn existing_narrow_validation_context_is_backfilled_before_startup() {
     {
         downgrade.zs_delete(&context_cf, context.header.hash());
     }
+    // That build also recorded header-chain disk format 4.
+    let metadata_cf = state
+        .db
+        .cf_handle(HEADER_ENGINE_META)
+        .expect("the header-chain metadata column exists");
+    let mut metadata = state
+        .db
+        .raw_get_cf(&metadata_cf, b"")
+        .expect("the metadata row reads")
+        .expect("the initialized store has metadata");
+    metadata[..4].copy_from_slice(&4_u32.to_be_bytes());
+    downgrade.zs_insert(
+        &metadata_cf,
+        RawBytes::new_raw_bytes(Vec::new()),
+        RawBytes::new_raw_bytes(metadata),
+    );
     state
         .db
         .write(downgrade)
         .expect("the pre-ZIP 218 context fixture writes");
+
+    assert!(store
+        .migrate_to_current(&config)
+        .expect("version four migrates to the current format"));
+    let metadata = state
+        .db
+        .raw_get_cf(&metadata_cf, b"")
+        .expect("the metadata row reads")
+        .expect("the migrated store has metadata");
+    assert_eq!(
+        metadata[..4],
+        HeaderChainDiskVersion::CURRENT.0.to_be_bytes()
+    );
+    // The previous release accepts only format 4, so it reports the newer format
+    // instead of reading a validation context wider than its row limit.
+    assert_eq!(
+        decode_v4_engine_metadata(&metadata),
+        Err(HeaderChainValueError::UnsupportedDiskFormat(
+            HeaderChainDiskVersion::CURRENT.0
+        ))
+    );
 
     assert_eq!(
         store

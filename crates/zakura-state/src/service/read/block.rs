@@ -26,7 +26,7 @@ use zakura_chain::{
 
 use crate::{
     constants::MAX_HEADER_SYNC_HEIGHT_RANGE,
-    response::{AnyTx, MinedTx},
+    response::{AnyTx, MinedTx, ParentInputs},
     service::{
         finalized_state::ZakuraDb,
         non_finalized_state::{Chain, NonFinalizedState},
@@ -296,6 +296,70 @@ where
         Some(chain) if chain.as_ref().spent_utxos.contains_key(&outpoint) => None,
         chain => utxo(chain, db, outpoint),
     }
+}
+
+/// Checks `outpoints` against the UTXO set at `parent`.
+///
+/// Returns [`ParentInputs::Missing`] only if `parent` is the finalized tip, or if `parent` is in a
+/// non-finalized chain that continues the finalized tip. Finalization can remove an output that a
+/// block after `parent` spends, so callers must discard the result if the finalized tip changes
+/// during this read.
+pub fn parent_inputs(
+    non_finalized_state: &NonFinalizedState,
+    db: &ZakuraDb,
+    (finalized_height, finalized_hash): (Height, block::Hash),
+    parent: block::Hash,
+    outpoints: &[transparent::OutPoint],
+) -> ParentInputs {
+    let first_missing = |chain: Option<&Arc<Chain>>| {
+        outpoints
+            .iter()
+            .copied()
+            .find(|outpoint| unspent_utxo(chain, db, *outpoint).is_none())
+            .map_or(ParentInputs::Inconclusive, ParentInputs::Missing)
+    };
+
+    // The database holds exactly the finalized tip's UTXO set.
+    if parent == finalized_hash {
+        return first_missing(None);
+    }
+    // No chain can accept a child of a block below the finalized tip.
+    if db.height(parent).is_some() {
+        return ParentInputs::ParentUnavailable;
+    }
+
+    // A fork at `parent` reverts the outputs created and spent above it.
+    let Some(chain) = non_finalized_state
+        .find_chain(|chain| chain.non_finalized_tip_hash() == parent)
+        .or_else(|| {
+            non_finalized_state
+                .chain_iter()
+                .find_map(|chain| chain.fork(parent))
+                .map(Arc::new)
+        })
+    else {
+        return ParentInputs::ParentUnavailable;
+    };
+
+    // The database supplies the outputs below the chain, so the chain must continue the
+    // finalized tip without a gap.
+    let root_height = chain.non_finalized_root_height();
+    let continues_finalized_tip = if finalized_height.next().ok() == Some(root_height) {
+        chain
+            .blocks
+            .values()
+            .next()
+            .map(|root| root.block.header.previous_block_hash)
+            == Some(finalized_hash)
+    } else {
+        root_height <= finalized_height
+            && chain.hash_by_height(finalized_height) == Some(finalized_hash)
+    };
+    if !continues_finalized_tip {
+        return ParentInputs::Inconclusive;
+    }
+
+    first_missing(Some(&chain))
 }
 
 /// Returns the [`Hash`](transaction::Hash) of the transaction that spent an output at

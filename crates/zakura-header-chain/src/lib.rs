@@ -41,7 +41,8 @@ pub use identity::{
 pub(crate) use transition::semantic_payload_fingerprint;
 pub use transition::*;
 pub use validation::{
-    infer_height, prepare_headers, validate_commitment_structure, validate_compact_target,
+    infer_height, pow_adjustment_block_span_for_height, prepare_headers,
+    validate_commitment_structure, validate_compact_target,
     validate_contextual_difficulty_and_time, validate_encoding_version_hash, validate_future_time,
     validate_hash_filter, validate_link, AdjustedDifficulty, AdjustedDifficultyError,
     CompactTargetError, ContextualValidationError, HashFilterError, HeaderBatchInput,

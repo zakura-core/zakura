@@ -16,10 +16,8 @@ use crate::{
     service::{
         block_iter::any_chain_ancestor_iter,
         check::{
-            difficulty::{
-                BLOCK_MAX_TIME_SINCE_MEDIAN, POW_ADJUSTMENT_BLOCK_SPAN, POW_MEDIAN_BLOCK_SPAN,
-            },
-            AdjustedDifficulty,
+            difficulty::{BLOCK_MAX_TIME_SINCE_MEDIAN, POW_MEDIAN_BLOCK_SPAN},
+            difficulty_context, AdjustedDifficulty,
         },
         finalized_state::ZakuraDb,
         read::{self, tree::history_tree, FINALIZED_STATE_QUERY_RETRIES},
@@ -61,7 +59,7 @@ pub fn get_block_template_chain_info(
     network: &Network,
 ) -> Result<GetBlockTemplateChainInfo, BoxError> {
     let mut best_relevant_chain_and_history_tree_result =
-        best_relevant_chain_and_history_tree(non_finalized_state, db);
+        best_relevant_chain_and_history_tree(non_finalized_state, db, network);
 
     // Retry the finalized state query if it was interrupted by a finalizing block.
     //
@@ -72,7 +70,7 @@ pub fn get_block_template_chain_info(
         }
 
         best_relevant_chain_and_history_tree_result =
-            best_relevant_chain_and_history_tree(non_finalized_state, db);
+            best_relevant_chain_and_history_tree(non_finalized_state, db, network);
     }
 
     let (best_tip_height, best_tip_hash, best_relevant_chain, best_tip_history_tree) =
@@ -169,6 +167,7 @@ pub fn solution_rate(
 fn best_relevant_chain_and_history_tree(
     non_finalized_state: &NonFinalizedState,
     db: &ZakuraDb,
+    network: &Network,
 ) -> Result<
     (
         Height,
@@ -182,13 +181,20 @@ fn best_relevant_chain_and_history_tree(
         BoxError::from("Zakura's state is empty, wait until it syncs to the chain tip")
     })?;
 
-    let best_relevant_chain: Vec<_> = any_chain_ancestor_iter::<block::Header>(
-        non_finalized_state,
-        db,
-        state_tip_before_queries.1,
-    )
-    .take(POW_ADJUSTMENT_BLOCK_SPAN)
-    .collect();
+    // The template's candidate block, one above the tip, selects the averaging window.
+    let candidate_height = state_tip_before_queries
+        .0
+        .next()
+        .map_err(|_| BoxError::from("the best chain tip is at the maximum height"))?;
+    let best_relevant_chain = difficulty_context(
+        network,
+        candidate_height,
+        any_chain_ancestor_iter::<block::Header>(
+            non_finalized_state,
+            db,
+            state_tip_before_queries.1,
+        ),
+    );
 
     if best_relevant_chain.is_empty() {
         return Err("missing genesis block, wait until it is committed".into());
@@ -397,6 +403,9 @@ fn adjust_difficulty_and_time_for_testnet(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::service::check::difficulty::{
+        pow_adjustment_block_span_for_height, POW_ADJUSTMENT_BLOCK_SPAN,
+    };
     use zakura_chain::{
         parameters::testnet::ConfiguredActivationHeights, serialization::ZcashDeserializeInto,
         work::difficulty::ParameterDifficulty,
@@ -407,7 +416,13 @@ mod tests {
     fn last_standard_difficulty_offset(network: &Network, tip_height: Height) -> u32 {
         let tip_time = DateTime32::from(1_700_000_000);
         let difficulty = network.target_difficulty_limit().to_compact();
-        let relevant_data = vec![(difficulty, tip_time.to_chrono()); POW_ADJUSTMENT_BLOCK_SPAN];
+        let span = pow_adjustment_block_span_for_height(
+            network,
+            tip_height
+                .next()
+                .expect("the test tip is below the maximum height"),
+        );
+        let relevant_data = vec![(difficulty, tip_time.to_chrono()); span];
 
         let is_standard = |offset: u32| {
             let mut result = GetBlockTemplateChainInfo {

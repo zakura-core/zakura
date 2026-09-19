@@ -54,7 +54,6 @@ use crate::{
     service::{
         block_iter::{any_ancestor_blocks, any_chain_ancestor_iter},
         chain_tip::{ChainTipBlock, ChainTipChange, ChainTipSender, LatestChainTip},
-        check::difficulty::POW_ADJUSTMENT_BLOCK_SPAN,
         finalized_state::{
             header_chain::{HeaderChainStore, HeaderChainStoreError},
             FinalizedState, ZakuraDb,
@@ -3574,11 +3573,16 @@ fn check_prepared_mined_relay_eligibility_for_state(
 
     // Take only the headers `block_is_valid_for_recent_chain_data` reads. The
     // iterator walks to genesis, so collecting it would load every ancestor
-    // header to check the most recent `POW_ADJUSTMENT_BLOCK_SPAN` of them.
+    // header to check the most recent difficulty-adjustment span of them. The
+    // candidate block's upgrade selects that span.
     let relevant_headers =
         any_chain_ancestor_iter::<block::Header>(non_finalized_state, db, parent_hash);
     let parent_height = relevant_headers.height;
-    let relevant_headers: Vec<_> = relevant_headers.take(POW_ADJUSTMENT_BLOCK_SPAN).collect();
+    let Some(context_height) = parent_height.and_then(|parent_height| parent_height.next().ok())
+    else {
+        return Ok(PreparedMinedRelayEligibility::Unavailable);
+    };
+    let relevant_headers = check::difficulty_context(network, context_height, relevant_headers);
     let Some(parent_height) = parent_height.filter(|_| !relevant_headers.is_empty()) else {
         return Ok(PreparedMinedRelayEligibility::Unavailable);
     };

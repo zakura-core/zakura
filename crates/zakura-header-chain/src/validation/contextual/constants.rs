@@ -1,4 +1,7 @@
-use zakura_chain::parameters::{MAX_POW_AVERAGING_WINDOW, POW_AVERAGING_WINDOW};
+use zakura_chain::{
+    block,
+    parameters::{Network, NetworkUpgrade, MAX_POW_AVERAGING_WINDOW, POW_AVERAGING_WINDOW},
+};
 
 /// The median block span for time median calculations.
 ///
@@ -24,6 +27,19 @@ pub const MAX_POW_ADJUSTMENT_BLOCK_SPAN: usize = MAX_POW_AVERAGING_WINDOW + POW_
 
 /// Maximum retained predecessors below a separately retained parent frontier.
 pub const MAX_POW_PREDECESSOR_CONTEXT_SPAN: usize = MAX_POW_ADJUSTMENT_BLOCK_SPAN - 1;
+
+/// Returns the difficulty-adjustment block span that validating a block at
+/// `candidate_height` reads.
+///
+/// The candidate block's upgrade selects the averaging window, so ZIP 218 widens
+/// this span from [`POW_ADJUSTMENT_BLOCK_SPAN`] to [`MAX_POW_ADJUSTMENT_BLOCK_SPAN`]
+/// at NU7.
+pub fn pow_adjustment_block_span_for_height(
+    network: &Network,
+    candidate_height: block::Height,
+) -> usize {
+    NetworkUpgrade::averaging_window_for_height(network, candidate_height) + POW_MEDIAN_BLOCK_SPAN
+}
 
 /// The damping factor for median timespan variance.
 ///

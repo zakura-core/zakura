@@ -16,7 +16,7 @@ use rand::{
 use zakura_chain::{
     block::{Height, MAX_BLOCK_BYTES},
     parameters::{
-        Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET, ORCHARD_BLOCK_ACTION_LIMIT,
+        Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET, ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
         SAPLING_BLOCK_IO_LIMIT, SPROUT_BLOCK_JOINSPLIT_LIMIT,
     },
     serialization::{CompactSizeMessage, TrustedPreallocate, ZcashSerialize},
@@ -304,7 +304,8 @@ struct BlockTemplateLimits {
     remaining_bytes: usize,
     remaining_sigops: u32,
     remaining_unpaid_actions: u32,
-    remaining_orchard_and_ironwood_actions: u32,
+    remaining_orchard_actions: u32,
+    remaining_ironwood_actions: u32,
     remaining_sapling_ios: u32,
     remaining_sprout_joinsplits: u32,
     remaining_shielded_cost: u32,
@@ -331,7 +332,8 @@ impl BlockTemplateLimits {
                 .checked_sub(coinbase.sigops)
                 .expect("coinbase sigops fit within the block limit"),
             remaining_unpaid_actions: BLOCK_UNPAID_ACTION_LIMIT,
-            remaining_orchard_and_ironwood_actions: shielded_limits.orchard_and_ironwood_actions,
+            remaining_orchard_actions: shielded_limits.orchard_actions,
+            remaining_ironwood_actions: shielded_limits.ironwood_actions,
             remaining_sapling_ios: shielded_limits.sapling_ios,
             remaining_sprout_joinsplits: shielded_limits.sprout_joinsplits,
             remaining_shielded_cost: shielded_limits.cost,
@@ -346,7 +348,8 @@ impl BlockTemplateLimits {
     ) -> RemainingShieldedLimits {
         if !NetworkUpgrade::is_nu7_active(network, height) {
             return RemainingShieldedLimits {
-                orchard_and_ironwood_actions: u32::MAX,
+                orchard_actions: u32::MAX,
+                ironwood_actions: u32::MAX,
                 sapling_ios: u32::MAX,
                 sprout_joinsplits: u32::MAX,
                 cost: u32::MAX,
@@ -354,9 +357,12 @@ impl BlockTemplateLimits {
         }
 
         RemainingShieldedLimits {
-            orchard_and_ironwood_actions: ORCHARD_BLOCK_ACTION_LIMIT
-                .checked_sub(coinbase.orchard_and_ironwood_actions)
+            orchard_actions: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT
+                .checked_sub(coinbase.orchard_actions)
                 .expect("a generated coinbase satisfies the Orchard action limit"),
+            ironwood_actions: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT
+                .checked_sub(coinbase.ironwood_actions)
+                .expect("a generated coinbase satisfies the Ironwood action limit"),
             sapling_ios: SAPLING_BLOCK_IO_LIMIT
                 .checked_sub(coinbase.sapling_ios)
                 .expect("a generated coinbase satisfies the Sapling I/O limit"),
@@ -394,7 +400,8 @@ impl BlockTemplateLimits {
         if tx.transaction.size() > self.remaining_bytes
             || tx_block_sigops > self.remaining_sigops
             || tx.unpaid_actions > self.remaining_unpaid_actions
-            || counts.orchard_and_ironwood_actions > self.remaining_orchard_and_ironwood_actions
+            || counts.orchard_actions > self.remaining_orchard_actions
+            || counts.ironwood_actions > self.remaining_ironwood_actions
             || counts.sapling_ios > self.remaining_sapling_ios
             || counts.sprout_joinsplits > self.remaining_sprout_joinsplits
             || cost > self.remaining_shielded_cost
@@ -405,7 +412,8 @@ impl BlockTemplateLimits {
         self.remaining_bytes -= tx.transaction.size();
         self.remaining_sigops -= tx_block_sigops;
         self.remaining_unpaid_actions -= tx.unpaid_actions;
-        self.remaining_orchard_and_ironwood_actions -= counts.orchard_and_ironwood_actions;
+        self.remaining_orchard_actions -= counts.orchard_actions;
+        self.remaining_ironwood_actions -= counts.ironwood_actions;
         self.remaining_sapling_ios -= counts.sapling_ios;
         self.remaining_sprout_joinsplits -= counts.sprout_joinsplits;
         self.remaining_shielded_cost -= cost;
@@ -416,7 +424,8 @@ impl BlockTemplateLimits {
 
 /// ZIP 218 capacity remaining after the generated coinbase transaction.
 struct RemainingShieldedLimits {
-    orchard_and_ironwood_actions: u32,
+    orchard_actions: u32,
+    ironwood_actions: u32,
     sapling_ios: u32,
     sprout_joinsplits: u32,
     cost: u32,

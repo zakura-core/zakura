@@ -2156,6 +2156,7 @@ impl Service<Request> for StateService {
             | Request::UnspentBestChainUtxo(_)
             | Request::CheckParentInputs { .. }
             | Request::Block(_)
+            | Request::BlockInfo(_)
             | Request::AnyChainBlock(_)
             | Request::BlockHeader(_)
             | Request::FindBlockHashes { .. }

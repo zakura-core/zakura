@@ -736,7 +736,7 @@ fn rollback_reverses_intra_block_self_spend() {
 /// Rolling back blocks at and after the ZIP 234 start height recomputes their subsidies from
 /// each parent's chain value pools.
 #[test]
-fn rollback_crosses_the_zip234_start_height() {
+fn rollback_crosses_the_nsm_reissuance_height() {
     use zakura_chain::parameters::{subsidy::is_zip234_active, testnet::RegtestParameters};
 
     let _init_guard = zakura_test::init();
@@ -749,7 +749,7 @@ fn rollback_crosses_the_zip234_start_height() {
             nu7: Some(2),
             ..Default::default()
         },
-        zip234_start_height: Some(start),
+        nsm_reissuance_height: Some(start),
         ..Default::default()
     });
     let address = Address::from_script_hash(NetworkKind::Regtest, [0x42; 20]);
@@ -965,6 +965,13 @@ fn modern_rollback_network() -> Network {
             nu7: Some(12),
         })
         .expect("configured activation heights are valid")
+        // These chains are generated for their commitments, not their coinbases, so blocks
+        // from NU7 claim arbitrary amounts. Seed the NSM value balance so an over-claim
+        // cannot drive it below zero, which `nsm_value_balance_is_non_negative` rejects
+        // from NU7. Half of MAX_MONEY leaves room on both sides of the balance.
+        .with_initial_nsm_value_balance(
+            Amount::try_from(zakura_chain::amount::MAX_MONEY / 2).expect("a valid amount"),
+        )
         .extend_funding_streams()
         .to_network()
         .expect("configured network is valid")

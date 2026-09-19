@@ -36,31 +36,32 @@ proptest! {
 
     #[test]
     fn reissuance_matches_integer_oracle(
-        deficit in prop_oneof![Just(0i64), Just(1i64), Just(crate::amount::MAX_MONEY), 0i64..=crate::amount::MAX_MONEY],
+        balance in prop_oneof![Just(0i64), Just(1i64), Just(crate::amount::MAX_MONEY), 0i64..=crate::amount::MAX_MONEY],
         height in prop_oneof![Just(2u32), Just(3u32), Just(4u32), Just(u32::MAX), 3u32..10_000_000],
     ) {
         use crate::{
             amount::Amount,
             parameters::{
-                subsidy::{block_subsidy, halving_block_subsidy},
+                subsidy::{block_subsidy, block_subsidy_fraction_numerator, halving_block_subsidy},
                 testnet::{ConfiguredActivationHeights, RegtestParameters},
             },
         };
 
         let network = Network::new_regtest(RegtestParameters {
             activation_heights: ConfiguredActivationHeights { nu7: Some(2), ..Default::default() },
-            zip234_start_height: Some(Height(3)),
+            nsm_reissuance_height: Some(Height(3)),
             ..Default::default()
         });
         let scheduled = i64::from(halving_block_subsidy(Height(height), &network).unwrap());
-        let actual = i64::from(block_subsidy(Height(height), &network, Some(Amount::try_from(deficit).unwrap())).unwrap());
+        let actual = i64::from(block_subsidy(Height(height), &network, Some(Amount::try_from(balance).unwrap())).unwrap());
         let bonus = if height >= 3 {
-            super::reissuance_bonus_oracle(deficit)
+            let numerator = i128::try_from(block_subsidy_fraction_numerator(Height(height), &network)).unwrap();
+            super::reissuance_bonus_oracle(balance, numerator)
         } else {
             0
         };
         prop_assert_eq!(i128::from(actual), i128::from(scheduled) + bonus);
-        prop_assert!(bonus >= 0 && bonus <= i128::from(deficit));
+        prop_assert!(bonus >= 0 && bonus <= i128::from(balance));
     }
 }
 

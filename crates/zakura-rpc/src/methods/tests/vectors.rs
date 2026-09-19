@@ -3200,7 +3200,7 @@ async fn getblocktemplate() {
 }
 
 /// `getblocksubsidy` and `getblocktemplate` include the ZIP 234 reissuance bonus at and
-/// after the start height, and return an error when the deficit is negative.
+/// after the start height, and return an error when the balance is negative.
 #[tokio::test(flavor = "multi_thread")]
 async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
     use zakura_chain::{
@@ -3219,17 +3219,26 @@ async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
             nu7: Some(1),
             ..Default::default()
         },
-        zip234_start_height: Some(start),
+        nsm_reissuance_height: Some(start),
         ..Default::default()
     });
 
-    // A deficit of 400,000,000 zatoshi reissues `ceil(400,000,000 * 4126 / 10^10)`, rounded
-    // up from 165.04.
-    const DEFICIT: i64 = 400_000_000;
-    const BONUS: i64 = 166;
+    const BALANCE: i64 = 400_000_000;
 
-    // Returns the chain value pools after `tip`, `deficit` zatoshi behind the schedule.
-    let tip_pools = |tip: Height, deficit: i64| {
+    // `ceil(balance * BLOCK_SUBSIDY_FRACTION)`, read from the network so the test follows
+    // ZIP 218's change to the halving interval.
+    let bonus = |height, balance: i64| {
+        let numerator = i128::try_from(
+            zakura_chain::parameters::subsidy::block_subsidy_fraction_numerator(height, &network),
+        )
+        .expect("the fraction numerator fits in i128");
+
+        i64::try_from((i128::from(balance.max(0)) * numerator + 9_999_999_999) / 10_000_000_000)
+            .expect("the bonus fits in i64")
+    };
+
+    // Returns the chain value pools after `tip`, `balance` zatoshi behind the schedule.
+    let tip_pools = |tip: Height, balance: i64| {
         let scheduled_supply: i64 = (1..=tip.0)
             .map(|height| {
                 i64::from(halving_block_subsidy(Height(height), &network).expect("valid subsidy"))
@@ -3237,9 +3246,9 @@ async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
             .sum();
 
         let mut pools = ValueBalance::from_transparent_amount(
-            Amount::try_from(scheduled_supply - deficit).expect("valid issued supply"),
+            Amount::try_from(scheduled_supply - balance).expect("valid issued supply"),
         );
-        pools.set_issuance_deficit_amount(Amount::try_from(deficit).expect("valid deficit"));
+        pools.set_nsm_value_balance_amount(Amount::try_from(balance).expect("valid balance"));
 
         pools
     };
@@ -3250,16 +3259,11 @@ async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
         let tip = height.previous().expect("the start is above genesis");
 
         // `getblocksubsidy` reads the parent's chain value pools.
-        for (deficit, succeeds) in [(0i64, true), (1, true), (DEFICIT, true), (-1, false)] {
-            let bonus =
-                i64::try_from((i128::from(deficit.max(0)) * 4126 + 9_999_999_999) / 10_000_000_000)
-                    .unwrap();
-            if deficit == DEFICIT {
-                assert_eq!(bonus, BONUS);
-            }
-            let expected_subsidy = (halving_block_subsidy(height, &network).unwrap()
-                + Amount::try_from(bonus).unwrap())
-            .unwrap();
+        for (balance, succeeds) in [(0i64, true), (1, true), (BALANCE, true), (-1, false)] {
+            let expected_subsidy = (halving_block_subsidy(height, &network)
+                .expect("valid subsidy")
+                + Amount::try_from(bonus(height, balance)).expect("valid bonus"))
+            .expect("valid subsidy");
             let mut read_state: MockService<_, _, _, BoxError> =
                 MockService::build().for_unit_tests();
             let (_tx, rx) = tokio::sync::watch::channel(None);
@@ -3280,7 +3284,7 @@ async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
                 None,
             );
 
-            let pools = tip_pools(tip, deficit);
+            let pools = tip_pools(tip, balance);
             let respond = async move {
                 read_state
                     .expect_request(ReadRequest::BlockInfo(tip.into()))
@@ -3294,7 +3298,7 @@ async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
                 assert_eq!(response.total_block_subsidy(), Zec::from(expected_subsidy));
                 assert_eq!(response.miner(), Zec::from(expected_subsidy));
             } else {
-                response.expect_err("a negative deficit is an error");
+                response.expect_err("a negative balance is an error");
             }
         }
 
@@ -3334,16 +3338,11 @@ async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
         );
 
         // `getblocktemplate` pays the subsidy after the chain tip to the miner.
-        for (deficit, succeeds) in [(0i64, true), (1, true), (DEFICIT, true), (-1, false)] {
-            let bonus =
-                i64::try_from((i128::from(deficit.max(0)) * 4126 + 9_999_999_999) / 10_000_000_000)
-                    .unwrap();
-            if deficit == DEFICIT {
-                assert_eq!(bonus, BONUS);
-            }
-            let expected_subsidy = (halving_block_subsidy(height, &network).unwrap()
-                + Amount::try_from(bonus).unwrap())
-            .unwrap();
+        for (balance, succeeds) in [(0i64, true), (1, true), (BALANCE, true), (-1, false)] {
+            let expected_subsidy = (halving_block_subsidy(height, &network)
+                .expect("valid subsidy")
+                + Amount::try_from(bonus(height, balance)).expect("valid bonus"))
+            .expect("valid subsidy");
             let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
             let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
             let tip_hash = Hash([0x11; 32]);
@@ -3376,7 +3375,7 @@ async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
             );
 
             let chain_info = GetBlockTemplateChainInfo {
-                value_pools: tip_pools(tip, deficit),
+                value_pools: tip_pools(tip, balance),
                 expected_difficulty: CompactDifficulty::from(ExpandedDifficulty::from(U256::one())),
                 tip_height: tip,
                 tip_hash,
@@ -3415,7 +3414,7 @@ async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
             );
 
             if !succeeds {
-                response.expect_err("a negative deficit is an error");
+                response.expect_err("a negative balance is an error");
                 continue;
             }
 

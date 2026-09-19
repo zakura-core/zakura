@@ -11,7 +11,7 @@ use zakura_chain::{
     block::{Block, Height},
     block_info::BlockInfo,
     parameters::subsidy::{
-        block_subsidy, funding_stream_values, is_zip234_active, parent_issuance_deficit,
+        block_subsidy, funding_stream_values, is_zip234_active, parent_nsm_value_balance,
         FundingStreamReceiver,
     },
     transparent::{self, OutPoint, Utxo},
@@ -188,9 +188,11 @@ impl DiskFormatUpgrade for Upgrade {
                 // ZIP 234 derives the block subsidy from the money reserve after the parent
                 // block, which is the running value pool.
                 let block_subsidy = is_zip234_active(&network, height)
-                    .then(|| parent_issuance_deficit(value_pool.issuance_deficit_amount()))
+                    .then(|| parent_nsm_value_balance(value_pool.nsm_value_balance_amount()))
                     .transpose()
-                    .and_then(|issuance_deficit| block_subsidy(height, &network, issuance_deficit))
+                    .and_then(|nsm_value_balance| {
+                        block_subsidy(height, &network, nsm_value_balance)
+                    })
                     .map_err(|error| {
                         super::FormatChangeError::InvalidPostcondition(format!(
                             "invalid block subsidy at height {height:?}: {error}"

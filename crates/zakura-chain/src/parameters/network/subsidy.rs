@@ -19,12 +19,12 @@ use std::{collections::HashMap, sync::OnceLock};
 use crate::{
     amount::{self, Amount, NegativeAllowed, NonNegative, MAX_MONEY},
     block::{Height, HeightDiff},
-    parameters::{Network, NetworkUpgrade},
+    parameters::{network_upgrade::POST_BLOSSOM_POW_TARGET_SPACING, Network, NetworkUpgrade},
     transparent,
 };
 
 use constants::{
-    testnet, BLOSSOM_POW_TARGET_SPACING_RATIO, FUNDING_STREAM_RECEIVER_DENOMINATOR,
+    mainnet, testnet, BLOSSOM_POW_TARGET_SPACING_RATIO, FUNDING_STREAM_RECEIVER_DENOMINATOR,
     FUNDING_STREAM_SPECIFICATION, LOCKBOX_SPECIFICATION, MAX_BLOCK_SUBSIDY,
     POST_BLOSSOM_HALVING_INTERVAL, PRE_BLOSSOM_HALVING_INTERVAL,
 };
@@ -232,6 +232,10 @@ pub trait ParameterSubsidy {
     ///
     /// [7.10]: https://zips.z.cash/protocol/protocol.pdf#zip214fundingstreams
     fn funding_stream_address_change_interval(&self) -> HeightDiff;
+
+    /// Returns zips#1354's `INITIAL_NSM_VALUE_BALANCE`: the value the NSM value balance
+    /// holds immediately before NU7 activates.
+    fn initial_nsm_value_balance(&self) -> Amount<NonNegative>;
 }
 
 /// Network methods related to Block Subsidy and Funding Streams
@@ -273,6 +277,13 @@ impl ParameterSubsidy for Network {
 
     fn funding_stream_address_change_interval(&self) -> HeightDiff {
         self.post_blossom_halving_interval() / 48
+    }
+
+    fn initial_nsm_value_balance(&self) -> Amount<NonNegative> {
+        match self {
+            Network::Mainnet => mainnet::INITIAL_NSM_VALUE_BALANCE,
+            Network::Testnet(params) => params.initial_nsm_value_balance(),
+        }
     }
 }
 
@@ -386,13 +397,13 @@ pub enum SubsidyError {
     #[error("miner fees are invalid")]
     InvalidMinerFees,
 
-    #[error("ZIP 234 block subsidy needs the issuance deficit after the parent block")]
-    MissingIssuanceDeficit,
+    #[error("ZIP 234 block subsidy needs the NSM value balance after the parent block")]
+    MissingNsmValueBalance,
 
     #[error(
-        "issued supply exceeds the scheduled supply, so the ZIP 234 issuance deficit is negative"
+        "issued supply exceeds the scheduled supply, so the ZIP 234 NSM value balance is negative"
     )]
-    NegativeIssuanceDeficit,
+    NegativeNsmValueBalance,
 
     #[error("addition of amounts overflowed")]
     Overflow,
@@ -469,18 +480,49 @@ pub fn halving(height: Height, network: &Network) -> u32 {
         .expect("halving index is non-negative and fits in u32")
 }
 
-/// The numerator of [ZIP 234]'s `BLOCK_SUBSIDY_FRACTION`.
+/// `ln(2)` scaled by [`BLOCK_SUBSIDY_FRACTION_DENOMINATOR`], from [ZIP 234].
 ///
 /// [ZIP 234]: https://zips.z.cash/zip-0234
-pub const BLOCK_SUBSIDY_FRACTION_NUMERATOR: u128 = 4_126;
+pub const LN2_SCALED: u128 = 6_931_680_000;
 
-/// The denominator of [`BLOCK_SUBSIDY_FRACTION_NUMERATOR`].
+/// The denominator of [ZIP 234]'s `BLOCK_SUBSIDY_FRACTION`.
 ///
-/// At the 75-second post-Blossom target spacing, the fraction satisfies
-/// `(1 - BLOCK_SUBSIDY_FRACTION) ^ PostBlossomHalvingInterval` is approximately
-/// one half. zips#1354 applies the fraction once per block at every target spacing,
-/// so ZIP 218's 25-second blocks halve the deficit about every 1.33 years instead.
+/// [ZIP 234]: https://zips.z.cash/zip-0234
 pub const BLOCK_SUBSIDY_FRACTION_DENOMINATOR: u128 = 10_000_000_000;
+
+/// Returns `HalvingInterval(height)`: the number of blocks in a halving period at `height`.
+///
+/// Each target spacing era keeps the halving period at about four years of wall-clock
+/// time, so the interval scales by the inverse of the spacing. On Mainnet that gives
+/// 840,000 blocks before Blossom at 150 seconds, 1,680,000 after it at 75 seconds, and
+/// 5,040,000 from NU7 at ZIP 218's 25 seconds.
+pub fn halving_interval(height: Height, network: &Network) -> HeightDiff {
+    let post_blossom_spacing = HeightDiff::from(POST_BLOSSOM_POW_TARGET_SPACING);
+    let spacing = NetworkUpgrade::target_spacing_for_height(network, height).num_seconds();
+
+    network.post_blossom_halving_interval() * post_blossom_spacing / spacing
+}
+
+/// Returns the numerator of [ZIP 234]'s `BLOCK_SUBSIDY_FRACTION` at `height`.
+///
+/// # Consensus
+///
+/// > BLOCK_SUBSIDY_FRACTION(height) = floor(LN2_SCALED / HalvingInterval(height))
+/// >                                  / BLOCK_SUBSIDY_FRACTION_DENOMINATOR
+///
+/// The fraction removes `ln(2) / HalvingInterval` of the balance per block, so the
+/// balance halves once per halving period whatever the target spacing. A fixed numerator
+/// would pay out three times as fast under ZIP 218's 25-second blocks.
+///
+/// On Mainnet this is 4126 after Blossom and 1375 from NU7.
+///
+/// [ZIP 234]: https://zips.z.cash/zip-0234
+pub fn block_subsidy_fraction_numerator(height: Height, network: &Network) -> u128 {
+    let interval = u128::try_from(halving_interval(height, network).max(1))
+        .expect("a positive halving interval fits in u128");
+
+    LN2_SCALED / interval
+}
 
 /// The halving after which the [ZIP 234] start rule looks for its crossing height.
 ///
@@ -494,6 +536,10 @@ pub const ZIP234_START_HALVING: u32 = 3;
 /// never starts.
 ///
 /// # Consensus
+///
+/// TODO: take this height from the deployment ZIP once it names one. zips#1363 calls it
+/// `NSMReissuanceHeight` and leaves it TBD, and zips#1354 has no separate height at all.
+/// Until then Zakura derives it, which is a known divergence from both drafts.
 ///
 /// No ZIP defines this height. zips#1354 starts reissuance at NU7 activation. The
 /// 2026-09-14 coinholder poll (Q2) chose February 2031 instead, and Zakura derives that
@@ -520,12 +566,12 @@ pub const ZIP234_START_HALVING: u32 = 3;
 ///
 /// Reissuance is an NU7 rule, so it never starts below NU7 activation, and never starts
 /// on a network without NU7. Configured testnets and Regtest can replace the crossing
-/// height with [`ParametersBuilder::with_zip234_start_height`]. Mainnet and the default
+/// height with [`ParametersBuilder::with_nsm_reissuance_height`]. Mainnet and the default
 /// Testnet always use the crossing rule.
 ///
 /// [ZIP 234]: https://zips.z.cash/zip-0234
-/// [`ParametersBuilder::with_zip234_start_height`]: super::testnet::ParametersBuilder::with_zip234_start_height
-pub fn zip234_start_height(network: &Network) -> Option<Height> {
+/// [`ParametersBuilder::with_nsm_reissuance_height`]: super::testnet::ParametersBuilder::with_nsm_reissuance_height
+pub fn nsm_reissuance_height(network: &Network) -> Option<Height> {
     let nu7 = NetworkUpgrade::Nu7.activation_height(network)?;
 
     // The crossing calculation evaluates the halving clock hundreds of times, and block
@@ -533,12 +579,12 @@ pub fn zip234_start_height(network: &Network) -> Option<Height> {
     let start = match network {
         Network::Mainnet => {
             static MAINNET_START: OnceLock<Option<Height>> = OnceLock::new();
-            *MAINNET_START.get_or_init(|| zip234_crossing_start_height(network))
+            *MAINNET_START.get_or_init(|| nsm_reissuance_crossing_height(network))
         }
-        Network::Testnet(params) => params.configured_zip234_start_height().or_else(|| {
+        Network::Testnet(params) => params.configured_nsm_reissuance_height().or_else(|| {
             params
-                .zip234_crossing_start_height()
-                .get_or_init(|| zip234_crossing_start_height(network))
+                .nsm_reissuance_crossing_height()
+                .get_or_init(|| nsm_reissuance_crossing_height(network))
         }),
     }?;
 
@@ -548,10 +594,10 @@ pub fn zip234_start_height(network: &Network) -> Option<Height> {
 /// Returns the real chain height at the [ZIP 234] crossing height after
 /// [`ZIP234_START_HALVING`], ignoring NU7 activation.
 ///
-/// See [`zip234_start_height`] for the rule.
+/// See [`nsm_reissuance_height`] for the rule.
 ///
 /// [ZIP 234]: https://zips.z.cash/zip-0234
-fn zip234_crossing_start_height(network: &Network) -> Option<Height> {
+fn nsm_reissuance_crossing_height(network: &Network) -> Option<Height> {
     let crossing = zip234_crossing_height(network, ZIP234_START_HALVING)?;
 
     Some(Height(Pre218Schedule::new(network).real_height(crossing.0)))
@@ -561,9 +607,12 @@ fn zip234_crossing_start_height(network: &Network) -> Option<Height> {
 /// `ceil(BLOCK_SUBSIDY_FRACTION * (MAX_MONEY - ScheduledSupply(height - 1)))` is less than
 /// the block's halving subsidy, on `network`'s 75-second schedule.
 ///
-/// Returns `None` if no such height exists. See [`zip234_start_height`].
+/// Returns `None` if no such height exists. See [`nsm_reissuance_height`].
 pub(crate) fn zip234_crossing_height(network: &Network, halving: u32) -> Option<Height> {
     let schedule = Pre218Schedule::new(network);
+    // The crossing runs on the 75-second schedule, so it uses that era's fraction.
+    let post_blossom_numerator =
+        LN2_SCALED / u128::try_from(network.post_blossom_halving_interval().max(1)).ok()?;
     let max_money = u128::try_from(MAX_MONEY).ok()?;
     let first_candidate = schedule.halving_height(halving)?.checked_add(1)?;
 
@@ -591,8 +640,8 @@ pub(crate) fn zip234_crossing_height(network: &Network, halving: u32) -> Option<
             }
 
             // `ceil(fraction * reserve) < subsidy` holds when `reserve <= max_reserve`.
-            let max_reserve = (subsidy - 1) * BLOCK_SUBSIDY_FRACTION_DENOMINATOR
-                / BLOCK_SUBSIDY_FRACTION_NUMERATOR;
+            let max_reserve =
+                (subsidy - 1) * BLOCK_SUBSIDY_FRACTION_DENOMINATOR / post_blossom_numerator;
             let reserve =
                 max_money.saturating_sub(supply + u128::from(candidate - height) * subsidy);
             let crossing =
@@ -737,27 +786,31 @@ impl<'a> Pre218Schedule<'a> {
 /// This check decides whether a block subsidy follows ZIP 234, and so whether a caller
 /// has to fetch the money reserve.
 pub fn is_zip234_active(network: &Network, height: Height) -> bool {
-    zip234_start_height(network).is_some_and(|start| height >= start)
+    nsm_reissuance_height(network).is_some_and(|start| height >= start)
 }
 
-/// Returns the issuance deficit after a block's parent, in the form [`block_subsidy`] takes.
+/// Returns the NSM value balance after a block's parent, in the form [`block_subsidy`] takes.
 ///
-/// The state stores a signed deficit. Returns [`SubsidyError::NegativeIssuanceDeficit`] if
+/// The state stores a signed balance. Returns [`SubsidyError::NegativeNsmValueBalance`] if
 /// the parent's chain issued more than the halving schedule.
-pub fn parent_issuance_deficit(
-    issuance_deficit: Amount<NegativeAllowed>,
+pub fn parent_nsm_value_balance(
+    nsm_value_balance: Amount<NegativeAllowed>,
 ) -> Result<Amount<NonNegative>, SubsidyError> {
-    issuance_deficit
+    nsm_value_balance
         .constrain()
-        .map_err(|_| SubsidyError::NegativeIssuanceDeficit)
+        .map_err(|_| SubsidyError::NegativeNsmValueBalance)
 }
 
-/// Applies the [ZIP 234] reissuance fraction to `amount`, rounding up.
+/// Applies the [ZIP 234] reissuance fraction at `height` to `amount`, rounding up.
 ///
 /// [ZIP 234]: https://zips.z.cash/zip-0234
-fn reissuance_amount(amount: Amount<NonNegative>) -> Result<Amount<NonNegative>, SubsidyError> {
+fn reissuance_amount(
+    amount: Amount<NonNegative>,
+    height: Height,
+    network: &Network,
+) -> Result<Amount<NonNegative>, SubsidyError> {
     let subsidy = amount_to_u128(amount)
-        .checked_mul(BLOCK_SUBSIDY_FRACTION_NUMERATOR)
+        .checked_mul(block_subsidy_fraction_numerator(height, network))
         .ok_or(SubsidyError::Overflow)?
         .div_ceil(BLOCK_SUBSIDY_FRACTION_DENOMINATOR);
 
@@ -766,20 +819,22 @@ fn reissuance_amount(amount: Amount<NonNegative>) -> Result<Amount<NonNegative>,
     Ok(Amount::try_from(subsidy)?)
 }
 
-/// Returns the [ZIP 234] reissuance bonus for a block, given the `IssuanceDeficit` after
+/// Returns the [ZIP 234] reissuance bonus for a block, given the `NsmValueBalance` after
 /// its parent.
 ///
 /// The halving schedule keeps issuing new ZEC. The bonus reissues value removed from
 /// circulation.
 ///
-/// The state supplies the eligible deficit after the parent block. It excludes the
-/// pre-NU7 historical seed pending policy guidance; see `Block::issuance_deficit_change`.
+/// The state supplies the balance after the parent block; see
+/// `Block::nsm_value_balance_change`.
 ///
 /// [ZIP 234]: https://zips.z.cash/zip-0234
 fn reissuance_bonus(
-    issuance_deficit: Amount<NonNegative>,
+    nsm_value_balance: Amount<NonNegative>,
+    height: Height,
+    network: &Network,
 ) -> Result<Amount<NonNegative>, SubsidyError> {
-    reissuance_amount(issuance_deficit)
+    reissuance_amount(nsm_value_balance, height, network)
 }
 
 /// Returns `ExpectedIssuedSupply(height)` from zips#1354: the total block subsidy the
@@ -932,15 +987,15 @@ fn next_subsidy_boundary(height: Height, net: &Network) -> Option<Height> {
 pub fn block_subsidy(
     height: Height,
     net: &Network,
-    issuance_deficit: Option<Amount<NonNegative>>,
+    nsm_value_balance: Option<Amount<NonNegative>>,
 ) -> Result<Amount<NonNegative>, SubsidyError> {
     if is_zip234_active(net, height) {
-        // The caller reads the issuance deficit from the parent block, so every caller
+        // The caller reads the NSM value balance from the parent block, so every caller
         // that can reach a ZIP 234 height must supply it.
-        let issuance_deficit = issuance_deficit.ok_or(SubsidyError::MissingIssuanceDeficit)?;
+        let nsm_value_balance = nsm_value_balance.ok_or(SubsidyError::MissingNsmValueBalance)?;
 
         let halving_subsidy = halving_block_subsidy(height, net)?;
-        let bonus = reissuance_bonus(issuance_deficit)?;
+        let bonus = reissuance_bonus(nsm_value_balance, height, net)?;
 
         return Ok((halving_subsidy + bonus)?);
     }

@@ -1750,33 +1750,39 @@ fn state_commit_context_errors_keep_misbehavior_scores() {
     let router_error = crate::router::RouterError::from(err);
     assert_eq!(router_error.misbehavior_score(), 100);
 }
-/// A deficit that pays a nonzero ZIP 234 bonus.
+/// A balance that pays a nonzero ZIP 234 bonus.
 const ZIP234_TEST_DEFICIT: i64 = 400_000_000;
 
-/// `ceil(ZIP234_TEST_DEFICIT * 4126 / 10^10)`, rounded up from 165.04.
-const ZIP234_TEST_BONUS: i64 = 166;
-
-/// Restates ZIP 234's `ceil(deficit * BLOCK_SUBSIDY_FRACTION)` independently of
-/// `block_subsidy`.
-fn zip234_bonus(deficit: i64) -> i64 {
+/// Restates ZIP 234's `ceil(balance * BLOCK_SUBSIDY_FRACTION)` at `height` on `network`
+/// independently of `block_subsidy`.
+fn zip234_bonus(network: &Network, height: Height, balance: i64) -> i64 {
     use zakura_chain::parameters::subsidy::{
-        BLOCK_SUBSIDY_FRACTION_DENOMINATOR, BLOCK_SUBSIDY_FRACTION_NUMERATOR,
+        block_subsidy_fraction_numerator, BLOCK_SUBSIDY_FRACTION_DENOMINATOR,
     };
 
-    let numerator = i128::try_from(BLOCK_SUBSIDY_FRACTION_NUMERATOR).unwrap();
-    let denominator = i128::try_from(BLOCK_SUBSIDY_FRACTION_DENOMINATOR).unwrap();
-    i64::try_from((i128::from(deficit) * numerator + denominator - 1) / denominator).unwrap()
+    let numerator = i128::try_from(block_subsidy_fraction_numerator(height, network))
+        .expect("the fraction numerator fits in i128");
+    let denominator = i128::try_from(BLOCK_SUBSIDY_FRACTION_DENOMINATOR)
+        .expect("the fraction denominator fits in i128");
+    let bonus = (i128::from(balance) * numerator + denominator - 1) / denominator;
+
+    i64::try_from(bonus).expect("the bonus fits in i64")
 }
 
-/// Returns the chain value pools after `parent` on `network`, `deficit` zatoshi behind the
+/// `ceil(ZIP234_TEST_DEFICIT * BLOCK_SUBSIDY_FRACTION)` at `height` on `network`.
+fn zip234_test_bonus(network: &Network, height: Height) -> i64 {
+    zip234_bonus(network, height, ZIP234_TEST_DEFICIT)
+}
+
+/// Returns the chain value pools after `parent` on `network`, `balance` zatoshi behind the
 /// halving schedule.
 ///
-/// The deficit is stored in its own value pool leg, and the transparent pool is set so that
+/// The balance is stored in its own value pool leg, and the transparent pool is set so that
 /// the test can isolate subsidy validation from the historical-baseline policy.
 fn zip234_parent_pools(
     network: &Network,
     parent: Height,
-    deficit: i64,
+    balance: i64,
 ) -> zakura_chain::value_balance::ValueBalance<zakura_chain::amount::NonNegative> {
     let scheduled_supply: i64 = (1..=parent.0)
         .map(|height| {
@@ -1788,9 +1794,9 @@ fn zip234_parent_pools(
         .sum();
 
     let mut pools = zakura_chain::value_balance::ValueBalance::from_transparent_amount(
-        Amount::try_from(scheduled_supply - deficit).expect("the issued supply is valid"),
+        Amount::try_from(scheduled_supply - balance).expect("the issued supply is valid"),
     );
-    pools.set_issuance_deficit_amount(Amount::try_from(deficit).expect("valid deficit"));
+    pools.set_nsm_value_balance_amount(Amount::try_from(balance).expect("valid balance"));
 
     pools
 }
@@ -1807,13 +1813,14 @@ async fn zip234_block_verification_checks_the_reissuance_bonus() {
     let network = zip234_test_network(start);
     let parent = start.previous().expect("the start is above genesis");
     let halving_subsidy = halving_block_subsidy(start, &network).expect("valid halving subsidy");
-    let with_bonus = (halving_subsidy + Amount::try_from(ZIP234_TEST_BONUS).expect("valid bonus"))
-        .expect("valid subsidy");
+    let with_bonus = (halving_subsidy
+        + Amount::try_from(zip234_test_bonus(&network, start)).expect("valid bonus"))
+    .expect("valid subsidy");
 
     let verify =
-        |parent_deficit: i64, coinbase_value: Amount<zakura_chain::amount::NonNegative>| {
+        |parent_balance: i64, coinbase_value: Amount<zakura_chain::amount::NonNegative>| {
             let network = network.clone();
-            let parent_pools = zip234_parent_pools(&network, parent, parent_deficit);
+            let parent_pools = zip234_parent_pools(&network, parent, parent_balance);
             let block = zip234_test_block(&network, start, coinbase_value);
             let expected_parent = block.header.previous_block_hash;
 
@@ -1842,8 +1849,14 @@ async fn zip234_block_verification_checks_the_reissuance_bonus() {
         };
 
     // Exercise zero, single-zatoshi rounding, a rounding boundary, and a larger deficit.
-    for deficit in [0i64, 1, 2, 2_423_654, 2_423_655, ZIP234_TEST_DEFICIT] {
-        let bonus = zip234_bonus(deficit);
+    let numerator = i128::try_from(
+        zakura_chain::parameters::subsidy::block_subsidy_fraction_numerator(start, &network),
+    )
+    .expect("the fraction numerator fits in i128");
+    // The largest deficit that still rounds up to a one-zatoshi bonus.
+    let boundary = i64::try_from(10_000_000_000 / numerator).expect("the boundary fits in i64");
+    for deficit in [0i64, 1, 2, boundary, boundary + 1, ZIP234_TEST_DEFICIT] {
+        let bonus = zip234_bonus(&network, start, deficit);
         let allowed = (halving_subsidy + Amount::try_from(bonus).unwrap()).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(10), verify(deficit, allowed))
             .await
@@ -1900,19 +1913,75 @@ async fn zip234_block_verification_checks_the_reissuance_bonus() {
         }),
     ));
 
-    // A parent that issued more than the schedule has a negative deficit. The state rejects
-    // such a parent only at ZIP 234 heights, so the parent of the first active block can
-    // still have one.
+    // A parent that issued more than the schedule has a negative balance, which
+    // semantic verification reports instead of computing a subsidy from it.
     assert!(matches!(
         verify(-1, halving_subsidy).await,
         Err(VerifyBlockError::Subsidy(
-            SubsidyError::NegativeIssuanceDeficit
+            SubsidyError::NegativeNsmValueBalance
         )),
     ));
 }
 
-/// A proposal whose parent has not committed is rejected immediately after the ZIP 234
-/// start, instead of waiting for a parent commit that may never arrive.
+/// A proposal uses its committed parent's balance and rejects an excessive bonus.
+#[tokio::test]
+async fn zip234_proposal_with_committed_parent_checks_the_bonus_without_waiting() {
+    use zakura_chain::{block_info::BlockInfo, parameters::subsidy::halving_block_subsidy};
+
+    let _init_guard = zakura_test::init();
+    let start = Height(3);
+    let network = zip234_test_network(start);
+    let parent_pools =
+        zip234_parent_pools(&network, start.previous().unwrap(), ZIP234_TEST_DEFICIT);
+    let subsidy = (halving_block_subsidy(start, &network).unwrap()
+        + Amount::try_from(zip234_test_bonus(&network, start)).unwrap())
+    .unwrap();
+    for excess in [0, 1] {
+        let claim = (subsidy + Amount::try_from(excess).unwrap()).unwrap();
+        let block = zip234_test_block(&network, start, claim);
+        let hash = block.hash();
+        let expected_parent = block.header.previous_block_hash;
+        let state = service_fn(move |request: zs::Request| async move {
+            Ok::<_, BoxError>(match request {
+                zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+                zs::Request::BlockInfo(parent) => {
+                    assert_eq!(parent, expected_parent);
+                    zs::Response::BlockInfo(Some(BlockInfo::new(parent_pools, 0)))
+                }
+                zs::Request::CheckBlockProposalValidity(_) => zs::Response::ValidBlockProposal,
+                _ => panic!("a proposal must neither wait nor commit: {request:?}"),
+            })
+        });
+        let transaction =
+            service_fn(
+                |request| async move { Ok::<_, BoxError>(accept_block_transaction(request)) },
+            );
+        let verifier = SemanticBlockVerifier::new(&network, state, transaction);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            verifier.oneshot(Request::CheckProposal(Arc::new(block))),
+        )
+        .await
+        .expect("proposal verification completes");
+        if excess == 0 {
+            assert_eq!(result.unwrap(), hash);
+        } else {
+            assert!(
+                matches!(
+                    result,
+                    Err(VerifyBlockError::Block {
+                        source: BlockError::Transaction(TransactionError::Subsidy(
+                            SubsidyError::InvalidMinerFees
+                        ))
+                    })
+                ),
+                "{result:?}"
+            );
+        }
+    }
+}
+
+/// A proposal must reject an uncommitted parent without waiting for its commit.
 #[tokio::test]
 async fn zip234_proposal_with_uncommitted_parent_is_rejected_without_waiting() {
     use zakura_chain::parameters::subsidy::halving_block_subsidy;
@@ -1977,7 +2046,7 @@ fn zip234_test_network(start: Height) -> Network {
             ..Default::default()
         })
         .expect("failed to set test activation heights")
-        .with_zip234_start_height(start)
+        .with_nsm_reissuance_height(start)
         .clear_funding_streams()
         .with_slow_start_interval(Height::MIN)
         .with_disable_pow(true)

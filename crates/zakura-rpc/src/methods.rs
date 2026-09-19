@@ -3135,7 +3135,7 @@ where
             miner_params,
             chain_info
                 .value_pools
-                .issuance_deficit_amount()
+                .nsm_value_balance_amount()
                 .constrain()
                 .ok(),
             mempool_txs,
@@ -3533,9 +3533,9 @@ where
             None => best_chain_tip_height(&self.latest_chain_tip)?,
         };
 
-        // ZIP 234 derives the block subsidy from the issuance deficit after the parent
+        // ZIP 234 derives the block subsidy from the NSM value balance after the parent
         // block, so look the parent's chain value pools up when the rules apply.
-        let issuance_deficit = if is_zip234_active(&net, height) {
+        let nsm_value_balance = if is_zip234_active(&net, height) {
             let parent = height.previous().map_misc_error()?;
 
             let zakura_state::ReadResponse::BlockInfo(parent_info) = call_service(
@@ -3553,14 +3553,14 @@ where
                      heights can be at most one block above the best chain tip",
                 )?
                 .value_pools()
-                .issuance_deficit_amount()
+                .nsm_value_balance_amount()
                 .constrain()
                 .ok()
         } else {
             None
         };
 
-        let subsidy = block_subsidy(height, &net, issuance_deficit).map_misc_error()?;
+        let subsidy = block_subsidy(height, &net, nsm_value_balance).map_misc_error()?;
 
         let (lockbox_streams, mut funding_streams): (Vec<_>, Vec<_>) =
             funding_stream_values(height, &net, subsidy)

@@ -1055,3 +1055,150 @@ fn scheduled_issuance_stops_at_a_halving_overflow_inside_slow_start() {
         Amount::<NonNegative>::zero()
     );
 }
+
+/// The ZIP 234 fraction tracks the halving interval, so ZIP 218's 25-second blocks do not
+/// pay the balance out three times as fast.
+#[test]
+fn block_subsidy_fraction_tracks_the_halving_interval() {
+    use crate::parameters::subsidy::{block_subsidy_fraction_numerator, halving_interval};
+
+    let _init_guard = zakura_test::init();
+
+    let nu7 = Height(4_000_000);
+    let network = testnet::Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            blossom: Some(1_000_000),
+            canopy: Some(1_000_001),
+            nu7: Some(nu7.0),
+            ..Default::default()
+        })
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid");
+
+    // 150-second blocks before Blossom, 75 after it, 25 from NU7. The halving period stays
+    // at about four years of wall-clock time, so the interval scales with the spacing.
+    for (height, interval, numerator) in [
+        (Height(999_999), 840_000, 8_252),
+        (Height(1_000_000), 1_680_000, 4_126),
+        (Height(nu7.0 - 1), 1_680_000, 4_126),
+        (nu7, 5_040_000, 1_375),
+        (Height(nu7.0 + 1), 5_040_000, 1_375),
+    ] {
+        assert_eq!(
+            halving_interval(height, &network),
+            interval,
+            "halving interval at {height:?}",
+        );
+        assert_eq!(
+            block_subsidy_fraction_numerator(height, &network),
+            numerator,
+            "fraction numerator at {height:?}",
+        );
+    }
+}
+
+/// Applying the fraction once per block over a halving interval halves the balance.
+#[test]
+fn block_subsidy_fraction_halves_the_balance_over_one_interval() {
+    use crate::parameters::subsidy::{
+        block_subsidy_fraction_numerator, halving_interval, BLOCK_SUBSIDY_FRACTION_DENOMINATOR,
+    };
+
+    let _init_guard = zakura_test::init();
+
+    let nu7 = Height(4_000_000);
+    let network = testnet::Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            blossom: Some(1),
+            canopy: Some(2),
+            nu7: Some(nu7.0),
+            ..Default::default()
+        })
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid");
+
+    for height in [Height(nu7.0 - 1), nu7] {
+        let numerator = block_subsidy_fraction_numerator(height, &network);
+        let interval = u32::try_from(halving_interval(height, &network)).expect("a valid interval");
+
+        // `(1 - f)^interval` in fixed point, one block at a time. Rounding each step down
+        // only makes the remainder smaller, so the tolerance is one-sided in practice.
+        let mut remaining = BLOCK_SUBSIDY_FRACTION_DENOMINATOR;
+        for _ in 0..interval {
+            remaining -= remaining * numerator / BLOCK_SUBSIDY_FRACTION_DENOMINATOR;
+        }
+
+        let half = BLOCK_SUBSIDY_FRACTION_DENOMINATOR / 2;
+        let error = remaining.abs_diff(half);
+        assert!(
+            error * 1_000 < half,
+            "one halving interval at {height:?} must leave about half, left {remaining} of \
+             {BLOCK_SUBSIDY_FRACTION_DENOMINATOR}",
+        );
+    }
+}
+
+/// A positive balance always pays at least one zatoshi, so the balance reaches zero in a
+/// finite number of blocks.
+#[test]
+fn reissuance_drains_a_small_balance() {
+    use crate::parameters::subsidy::reissuance_bonus;
+
+    let _init_guard = zakura_test::init();
+
+    let start = Height(1_000_000);
+    let network = testnet::Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            blossom: Some(1),
+            canopy: Some(2),
+            nu7: Some(start.0),
+            ..Default::default()
+        })
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid");
+
+    let initial = 20i64;
+    let mut balance = initial;
+
+    for block in 0..initial {
+        let bonus = i64::from(
+            reissuance_bonus(
+                Amount::try_from(balance).expect("valid amount"),
+                start,
+                &network,
+            )
+            .expect("valid bonus"),
+        );
+
+        assert!(
+            bonus >= 1,
+            "a balance of {balance} must pay at least one zatoshi, block {block}",
+        );
+        balance -= bonus;
+    }
+
+    assert_eq!(
+        balance, 0,
+        "the balance must drain within its own value in blocks"
+    );
+}
+
+proptest::proptest! {
+    #[test]
+    fn reissuance_arithmetic_matches_integer_oracle(balance in 0i64..=crate::amount::MAX_MONEY) {
+        use crate::parameters::subsidy::{reissuance_bonus, block_subsidy_fraction_numerator, BLOCK_SUBSIDY_FRACTION_DENOMINATOR};
+        let network = Network::new_default_testnet();
+        let height = Height(3_000_000);
+        let numerator = i128::try_from(block_subsidy_fraction_numerator(height, &network)).unwrap();
+        let denominator = i128::try_from(BLOCK_SUBSIDY_FRACTION_DENOMINATOR).unwrap();
+        let expected = (i128::from(balance) * numerator + denominator - 1) / denominator;
+        let actual = reissuance_bonus(Amount::try_from(balance).unwrap(), height, &network).unwrap();
+        proptest::prop_assert_eq!(i128::from(i64::from(actual)), expected);
+    }
+}

@@ -10,7 +10,7 @@ use zakura_chain::{
 };
 
 use super::{
-    POW_ADJUSTMENT_BLOCK_SPAN, POW_DAMPING_FACTOR, POW_MAX_ADJUST_DOWN_PERCENT,
+    MAX_POW_ADJUSTMENT_BLOCK_SPAN, POW_DAMPING_FACTOR, POW_MAX_ADJUST_DOWN_PERCENT,
     POW_MAX_ADJUST_UP_PERCENT, POW_MEDIAN_BLOCK_SPAN,
 };
 
@@ -27,14 +27,14 @@ pub struct AdjustedDifficulty {
     /// The `header.difficulty_threshold`s from the previous
     /// `PoWAveragingWindow + PoWMedianBlockSpan` (28) blocks, in reverse height
     /// order.
-    relevant_difficulty_thresholds: BoundedVec<CompactDifficulty, 1, POW_ADJUSTMENT_BLOCK_SPAN>,
+    relevant_difficulty_thresholds: BoundedVec<CompactDifficulty, 1, MAX_POW_ADJUSTMENT_BLOCK_SPAN>,
     /// The `header.time`s from the previous
     /// `PoWAveragingWindow + PoWMedianBlockSpan` (28) blocks, in reverse height
     /// order.
     ///
     /// The calculation uses only the first and last `PoWMedianBlockSpan` times.
     /// The calculation ignores times `11..=16`.
-    relevant_times: BoundedVec<DateTime<Utc>, 1, POW_ADJUSTMENT_BLOCK_SPAN>,
+    relevant_times: BoundedVec<DateTime<Utc>, 1, MAX_POW_ADJUSTMENT_BLOCK_SPAN>,
 }
 
 /// Invalid branch context supplied to a difficulty calculation.
@@ -49,10 +49,10 @@ pub enum AdjustedDifficultyError {
     /// The predecessor height could not produce a candidate height.
     #[error("candidate height overflows the block-height range")]
     HeightOverflow,
-    /// The context did not contain exactly the height-dependent predecessor span.
-    #[error("difficulty context has {actual} entries, expected exactly {expected}")]
+    /// The context length was outside the height-dependent accepted range.
+    #[error("difficulty context has {actual} entries; nearest valid boundary is {expected}")]
     ContextLength {
-        /// Required predecessor count.
+        /// Nearest valid predecessor-count boundary.
         expected: usize,
         /// Supplied predecessor count, capped at one beyond the maximum span.
         actual: usize,
@@ -62,10 +62,12 @@ pub enum AdjustedDifficultyError {
 impl AdjustedDifficulty {
     /// Create an `AdjustedDifficulty` from a `candidate_block`, `network`, and `context`.
     ///
-    /// The caller supplies the previous
-    /// `PoWAveragingWindow + PoWMedianBlockSpan` (28) `difficulty_threshold`s and
-    /// `time`s from the relevant chain for `candidate_block`, in reverse height
-    /// order, starting with the previous block.
+    /// The caller supplies at least the active
+    /// `PoWAveragingWindow + PoWMedianBlockSpan` (28) `difficulty_threshold`s
+    /// and `time`s from the relevant chain for `candidate_block`, in reverse
+    /// height order, starting with the previous block. The caller may include
+    /// additional authenticated retained context up to
+    /// [`MAX_POW_ADJUSTMENT_BLOCK_SPAN`]; inactive entries are ignored.
     ///
     /// Miners supply block times.
     /// The `time` values might not follow reverse chronological order.
@@ -109,33 +111,55 @@ impl AdjustedDifficulty {
         let candidate_height =
             (previous_block_height + 1).ok_or(AdjustedDifficultyError::HeightOverflow)?;
 
-        let (thresholds, times) = context
+        let (mut thresholds, mut times) = context
             .into_iter()
-            .take(POW_ADJUSTMENT_BLOCK_SPAN + 1)
+            .take(MAX_POW_ADJUSTMENT_BLOCK_SPAN + 1)
             .unzip::<_, _, Vec<_>, Vec<_>>();
 
-        let span = u32::try_from(POW_ADJUSTMENT_BLOCK_SPAN)
+        let active_span = u32::try_from(
+            NetworkUpgrade::averaging_window_for_height(network, candidate_height)
+                + POW_MEDIAN_BLOCK_SPAN,
+        )
+        .map_err(|_| AdjustedDifficultyError::HeightOverflow)?;
+        let maximum_span = u32::try_from(MAX_POW_ADJUSTMENT_BLOCK_SPAN)
             .map_err(|_| AdjustedDifficultyError::HeightOverflow)?;
-        let expected = usize::try_from(candidate_height.0.min(span))
+        let active_required = usize::try_from(candidate_height.0.min(active_span))
             .map_err(|_| AdjustedDifficultyError::HeightOverflow)?;
-        if thresholds.len() != expected {
+        let maximum_allowed = usize::try_from(candidate_height.0.min(maximum_span))
+            .map_err(|_| AdjustedDifficultyError::HeightOverflow)?;
+        if thresholds.len() < active_required {
             return Err(AdjustedDifficultyError::ContextLength {
-                expected,
+                expected: active_required,
                 actual: thresholds.len(),
             });
         }
+        if thresholds.len() > maximum_allowed {
+            return Err(AdjustedDifficultyError::ContextLength {
+                expected: maximum_allowed,
+                actual: thresholds.len(),
+            });
+        }
+
+        thresholds.truncate(active_required);
+        times.truncate(active_required);
 
         let actual = thresholds.len();
         let relevant_difficulty_thresholds: BoundedVec<
             CompactDifficulty,
             1,
-            POW_ADJUSTMENT_BLOCK_SPAN,
+            MAX_POW_ADJUSTMENT_BLOCK_SPAN,
         > = thresholds
             .try_into()
-            .map_err(|_| AdjustedDifficultyError::ContextLength { expected, actual })?;
-        let relevant_times: BoundedVec<DateTime<Utc>, 1, POW_ADJUSTMENT_BLOCK_SPAN> = times
+            .map_err(|_| AdjustedDifficultyError::ContextLength {
+                expected: active_required,
+                actual,
+            })?;
+        let relevant_times: BoundedVec<DateTime<Utc>, 1, MAX_POW_ADJUSTMENT_BLOCK_SPAN> = times
             .try_into()
-            .map_err(|_| AdjustedDifficultyError::ContextLength { expected, actual })?;
+            .map_err(|_| AdjustedDifficultyError::ContextLength {
+                expected: active_required,
+                actual,
+            })?;
 
         Ok(AdjustedDifficulty {
             candidate_time: candidate_header_time,
@@ -161,10 +185,7 @@ impl AdjustedDifficulty {
         self.network.clone()
     }
 
-    /// Returns the averaging window in force at the candidate height.
-    ///
-    /// `PoWAveragingWindow` in the Zcash specification, which ZIP 218 widens at
-    /// NU7.
+    /// Returns the averaging window selected by the candidate block's upgrade.
     fn averaging_window(&self) -> usize {
         NetworkUpgrade::averaging_window_for_height(&self.network, self.candidate_height)
     }
@@ -236,9 +257,10 @@ impl AdjustedDifficulty {
     /// Implements `MeanTarget` from the Zcash specification.
     fn mean_target_difficulty(&self) -> ExpandedDifficulty {
         // `threshold_bits` returns `PoWLimit` before it calls this function at early-chain heights.
-        // A valid relevant chain contains at least 17 blocks at later heights.
+        // A valid relevant chain contains at least one full averaging window at later heights.
 
         let averaging_window = self.averaging_window();
+
         let averaging_window_thresholds =
             &self.relevant_difficulty_thresholds.as_slice()[0..averaging_window];
 

@@ -170,14 +170,6 @@ impl ZakuraDb {
         Ok(Arc::new(HistoryTree::from(history_tree)))
     }
 
-    /// Returns all the history tip trees.
-    /// We only store the history tree for the tip, so this method is only used in tests and
-    /// upgrades.
-    pub(crate) fn history_trees_full_tip(&self) -> BTreeMap<RawBytes, Arc<HistoryTree>> {
-        self.try_history_trees_full_tip()
-            .expect("stored history tree snapshots must be valid")
-    }
-
     /// Tries to return all the history tip trees.
     ///
     /// We only store the history tree for the tip, so this method is only used in tests and

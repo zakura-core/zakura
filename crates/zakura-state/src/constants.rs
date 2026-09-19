@@ -97,6 +97,17 @@ pub const MAX_PRUNE_HEIGHTS_PER_COMMIT: u32 = 100;
 /// or [`config::database_format_version_on_disk()`] to get the full semantic format version.
 const DATABASE_FORMAT_VERSION: u64 = 28;
 
+/// Reserved for NuTachyon databases derived from production database format 28.
+///
+/// This reservation lives on `main` so a future production format cannot give version 29 a
+/// different meaning while NuTachyon development remains out of tree.
+const RESERVED_NUTACHYON_DATABASE_FORMAT_MAJOR_VERSION: u64 = 29;
+
+const _: () = assert!(
+    DATABASE_FORMAT_VERSION != RESERVED_NUTACHYON_DATABASE_FORMAT_MAJOR_VERSION,
+    "production database format conflicts with reserved NuTachyon major version 29",
+);
+
 /// The database format minor version, incremented each time the on-disk database format has a
 /// significant data format change.
 ///

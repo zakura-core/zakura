@@ -494,7 +494,7 @@ where
 
             check::shielded_action_limits_are_valid(&block.transactions, height, &network)?;
 
-            // ZIP 234 derives the block subsidy from the issuance deficit after the parent
+            // ZIP 234 derives the block subsidy from the NSM value balance after the parent
             // block, so a block at or above the start height needs its parent's chain
             // value pools. Wait for the parent commit if its verification is still running.
             //
@@ -527,8 +527,9 @@ where
                         ));
                     };
 
-                    // `nsm_value_balance_is_non_negative` exempts heights below the start,
-                    // so the parent of the first active block can have a negative deficit.
+                    // `nsm_value_balance_is_non_negative` rejects committed blocks that leave
+                    // the balance negative from NU7, so a negative parent balance fails here
+                    // instead of paying a bonus.
                     Some(zakura_chain::parameters::subsidy::parent_nsm_value_balance(
                         parent_info.value_pools().nsm_value_balance_amount(),
                     )?)

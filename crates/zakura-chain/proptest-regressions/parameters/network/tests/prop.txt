@@ -4,4 +4,4 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc 6cb1f56fede06a6be728663d4dd86f892ff7589c922ce94ca034242036f9daba # shrinks to claims = [0]
+cc cde1465c964bb5dd984508507244603371383e1978d9f459c95956770a2a621d # shrinks to balance = 2100000000000000, height = 3

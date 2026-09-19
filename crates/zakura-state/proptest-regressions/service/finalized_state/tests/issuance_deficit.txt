@@ -4,4 +4,4 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc 6cb1f56fede06a6be728663d4dd86f892ff7589c922ce94ca034242036f9daba # shrinks to claims = [0]
+cc 63867b80526168d68d075ddd481c32c359e35e6e30e04cad2cc936bd269bfe55 # shrinks to shortfall = 1

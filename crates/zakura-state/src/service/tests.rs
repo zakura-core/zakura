@@ -41,6 +41,71 @@ use crate::{
 const LAST_BLOCK_HEIGHT: u32 = 10;
 
 #[tokio::test(flavor = "multi_thread")]
+async fn block_info_does_not_wait_for_a_queued_parent() {
+    let _init_guard = zakura_test::init();
+    use tower::Service;
+
+    let (mut state, _, _, _) =
+        StateService::new(Config::ephemeral(), &Network::Mainnet, Height(1), 0)
+            .await
+            .unwrap();
+    let genesis: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let parent: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let hash = parent.hash();
+    let limit = Duration::from_secs(10);
+
+    assert!(matches!(
+        timeout(limit, (&mut state).oneshot(Request::BlockInfo(hash)))
+            .await
+            .unwrap()
+            .unwrap(),
+        Response::BlockInfo(None)
+    ));
+
+    // Without genesis, the writer queues this parent but cannot commit it.
+    let commit = state
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::CommitCheckpointVerifiedBlock(parent.into()));
+    assert_eq!(state.finalized_state_queued_blocks.len(), 1);
+    assert!(matches!(
+        (&mut state)
+            .oneshot(Request::KnownBlock(hash))
+            .await
+            .unwrap(),
+        Response::KnownBlock(Some(_))
+    ));
+    assert!(matches!(
+        timeout(limit, (&mut state).oneshot(Request::BlockInfo(hash)))
+            .await
+            .unwrap()
+            .unwrap(),
+        Response::BlockInfo(None)
+    ));
+
+    timeout(
+        limit,
+        (&mut state).oneshot(Request::CommitCheckpointVerifiedBlock(genesis.into())),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    timeout(limit, commit).await.unwrap().unwrap();
+    assert!(matches!(
+        timeout(limit, (&mut state).oneshot(Request::BlockInfo(hash)))
+            .await
+            .unwrap()
+            .unwrap(),
+        Response::BlockInfo(Some(_))
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn await_block_info_waits_for_checkpoint_commit() {
     let _init_guard = zakura_test::init();
     let state = init_test(&Network::Mainnet).await;

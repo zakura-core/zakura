@@ -7,8 +7,8 @@ use zakura_chain::{
     block::{Block, Height},
     parameters::{
         subsidy::{
-            expected_issued_supply, is_zip234_active, BLOCK_SUBSIDY_FRACTION_DENOMINATOR,
-            BLOCK_SUBSIDY_FRACTION_NUMERATOR,
+            block_subsidy_fraction_numerator, expected_issued_supply, is_zip234_active,
+            BLOCK_SUBSIDY_FRACTION_DENOMINATOR,
         },
         testnet::{ConfiguredActivationHeights, RegtestParameters},
         Network, NetworkKind, NetworkUpgrade,
@@ -22,7 +22,7 @@ use crate::{
         finalized_state::{CheckpointVerifiedBlock, FinalizedState},
         non_finalized_state::NonFinalizedState,
     },
-    CommitBlockError, Config, SemanticallyVerifiedBlock,
+    CommitBlockError, Config, SemanticallyVerifiedBlock, ValidateContextError,
 };
 
 use super::rollback::{child_block, coinbase_tx};
@@ -69,12 +69,13 @@ pub(super) fn accounting_network(reissuance: bool) -> Network {
 /// `deficit`, or zero where reissuance is inactive.
 ///
 /// This oracle restates `ceil(deficit * BLOCK_SUBSIDY_FRACTION)` independently of
-/// `block_subsidy`.
+/// `block_subsidy`, and reads the fraction from the network so the tests follow ZIP 218's
+/// spacing change.
 fn reissuance_bonus(network: &Network, height: Height, deficit: i128) -> i128 {
     if !is_zip234_active(network, height) {
         return 0;
     }
-    let numerator = i128::try_from(BLOCK_SUBSIDY_FRACTION_NUMERATOR).unwrap();
+    let numerator = i128::try_from(block_subsidy_fraction_numerator(height, network)).unwrap();
     let denominator = i128::try_from(BLOCK_SUBSIDY_FRACTION_DENOMINATOR).unwrap();
     (deficit * numerator + denominator - 1) / denominator
 }
@@ -85,7 +86,7 @@ pub(super) fn state_below_start(network: &Network) -> (FinalizedState, Arc<Block
     state_below_start_with_config(network, &Config::ephemeral())
 }
 
-fn state_below_start_with_config(
+pub(super) fn state_below_start_with_config(
     network: &Network,
     config: &Config,
 ) -> (FinalizedState, Arc<Block>) {
@@ -166,7 +167,7 @@ pub(super) fn commit(
             CheckpointVerifiedBlock::from(block.clone()).into(),
             None,
             None,
-            "issuance deficit test",
+            "NSM value balance test",
         )
         .map(|_| ())
         .map_err(|error| error.inner().clone())
@@ -260,7 +261,7 @@ proptest::proptest! {
     #![proptest_config(proptest::test_runner::Config::with_cases(32))]
 
     #[test]
-    fn checkpoint_claim_sequences_preserve_deficit(
+    fn checkpoint_claim_sequences_preserve_balance(
         claims in proptest::collection::vec(0u64..=1_000_000, 1..32),
         reissuance in proptest::bool::ANY,
     ) {
@@ -331,7 +332,7 @@ proptest::proptest! {
     /// Exercise accounting transitions through real databases. Partial claims intentionally
     /// bypass semantic subsidy validation; this property tests the state accounting layer.
     #[test]
-    fn deficit_rollback_replay_and_fork_equivalence(
+    fn balance_rollback_replay_and_fork_equivalence(
         claims in proptest::collection::vec(0u32..=1_000_000, 2..12),
         target_offset in 0usize..12,
         reissuance in proptest::bool::ANY,
@@ -408,7 +409,7 @@ proptest::proptest! {
     #![proptest_config(proptest::test_runner::Config::with_cases(64))]
 
     #[test]
-    fn non_finalized_forks_keep_independent_deficits(
+    fn non_finalized_forks_keep_independent_balances(
         shortfall in 1i64..1_000_000,
         reissuance in proptest::bool::ANY,
     ) {
@@ -430,20 +431,10 @@ proptest::proptest! {
             let info = forks.chain_iter().find_map(|chain| chain.block_info(block.hash().into())).unwrap();
             proptest::prop_assert_eq!(i64::from(info.value_pools().nsm_value_balance_amount()), expected);
         }
-        // Reissuance rejects a block that leaves the deficit negative.
+        // From NU7, the state rejects a block that leaves the balance negative.
         let over = start_block(&state, &network, &parent, 1);
-        proptest::prop_assert_eq!(
-            forks.commit_new_chain(SemanticallyVerifiedBlock::from(over), &state.db).is_err(),
-            reissuance,
-        );
-        if reissuance {
-            proptest::prop_assert_eq!(forks.chain_count(), 2);
-        } else {
-            proptest::prop_assert_eq!(forks.chain_count(), 3);
-            forks = NonFinalizedState::new(&network);
-            forks.commit_new_chain(SemanticallyVerifiedBlock::from(full.clone()), &state.db).unwrap();
-            forks.commit_new_chain(SemanticallyVerifiedBlock::from(partial.clone()), &state.db).unwrap();
-        }
+        proptest::prop_assert!(forks.commit_new_chain(SemanticallyVerifiedBlock::from(over), &state.db).is_err());
+        proptest::prop_assert_eq!(forks.chain_count(), 2);
         proptest::prop_assert_eq!(state.db.finalized_value_pool(), before);
         for (index, (parent, parent_deficit)) in [(&full, deficit - bonus), (&partial, deficit - bonus + shortfall)].into_iter().enumerate() {
             let height = START.next().unwrap();
@@ -467,11 +458,11 @@ proptest::proptest! {
         let best = forks.best_chain().unwrap();
         let root_pools = *best.block_info(START.into()).unwrap().value_pools();
         let tip_before = best.non_finalized_tip_with_value_balance();
-        state.commit_finalized_direct(forks.finalize(), None, None, "deficit property").unwrap();
+        state.commit_finalized_direct(forks.finalize(), None, None, "balance property").unwrap();
         proptest::prop_assert_eq!(state.db.finalized_value_pool(), root_pools);
         proptest::prop_assert_eq!(forks.chain_count(), 1);
         proptest::prop_assert_eq!(forks.best_chain().unwrap().non_finalized_tip_with_value_balance(), tip_before);
-        state.commit_finalized_direct(forks.finalize(), None, None, "deficit property").unwrap();
+        state.commit_finalized_direct(forks.finalize(), None, None, "balance property").unwrap();
         proptest::prop_assert_eq!(state.db.finalized_value_pool(), tip_before.2);
 
     }
@@ -579,24 +570,45 @@ fn startup_migration_failure_preserves_version_and_retry_matches_fresh_sync() {
     );
 }
 
+/// From NU7, both commit paths reject a block that overdraws the NSM value balance, and
+/// agree on the balance after a block that does not.
 #[test]
-fn signed_deficit_survives_both_commit_paths_before_reissuance() {
+fn signed_balance_agrees_across_both_commit_paths() {
     let _guard = zakura_test::init();
     let network = accounting_network(false);
     for excess in [-1, 0, 1, 1_000_000] {
         let (mut state, parent) = state_below_start(&network);
         let block = start_block(&state, &network, &parent, excess);
         let mut forks = NonFinalizedState::new(&network);
-        forks
-            .commit_new_chain(SemanticallyVerifiedBlock::from(block.clone()), &state.db)
-            .unwrap();
+        let fork_result =
+            forks.commit_new_chain(SemanticallyVerifiedBlock::from(block.clone()), &state.db);
+        let finalized_result = commit(&mut state, &block);
+
+        if excess > 0 {
+            assert!(
+                matches!(fork_result,
+                    Err(ValidateContextError::NegativeNsmValueBalance { height, .. }) if height == START
+                ),
+                "excess {excess}: {fork_result:?}"
+            );
+            assert!(
+                matches!(finalized_result,
+                    Err(CommitBlockError::ValidateContextError(ref error))
+                        if matches!(**error, ValidateContextError::NegativeNsmValueBalance { height, .. } if height == START)
+                ),
+                "excess {excess}: {finalized_result:?}"
+            );
+            continue;
+        }
+
+        fork_result.unwrap();
+        finalized_result.unwrap();
         let fork_pools = *forks
             .best_chain()
             .unwrap()
             .block_info(block.hash().into())
             .unwrap()
             .value_pools();
-        commit(&mut state, &block).unwrap();
         assert_eq!(state.db.finalized_value_pool(), fork_pools);
         assert_eq!(i64::from(fork_pools.nsm_value_balance_amount()), -excess);
     }

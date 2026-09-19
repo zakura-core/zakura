@@ -3533,7 +3533,7 @@ where
             None => best_chain_tip_height(&self.latest_chain_tip)?,
         };
 
-        // ZIP 234 derives the block subsidy from the issuance deficit after the parent
+        // ZIP 234 derives the block subsidy from the NSM value balance after the parent
         // block, so look the parent's chain value pools up when the rules apply.
         let nsm_value_balance = if is_zip234_active(&net, height) {
             let parent = height.previous().map_misc_error()?;

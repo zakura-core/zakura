@@ -127,7 +127,7 @@ fn chain_pool_total_limit_includes_every_pool() {
         orchard: share,
         deferred: share,
         ironwood: share,
-        // The issuance deficit holds value that is in no pool, so `total` excludes it.
+        // The NSM value balance holds value that is in no pool, so `total` excludes it.
         nsm_value_balance: Amount::zero(),
     };
     assert_eq!(at_cap.total(), Ok(Amount::try_from(MAX_MONEY).unwrap()));

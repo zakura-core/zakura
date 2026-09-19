@@ -799,14 +799,14 @@ pub enum ValidateContextError {
     },
 
     #[error(
-        "block makes the ZIP 234 issuance deficit negative: deficit {deficit_before:?} \
-         changes by {deficit_change:?} at {height:?}"
+        "block makes the ZIP 234 NSM value balance negative: balance {balance_before:?} \
+         changes by {balance_change:?} at {height:?}"
     )]
     #[non_exhaustive]
     NegativeNsmValueBalance {
         height: block::Height,
-        deficit_before: amount::Amount<NegativeAllowed>,
-        deficit_change: amount::Amount<NegativeAllowed>,
+        balance_before: amount::Amount<NegativeAllowed>,
+        balance_change: amount::Amount<NegativeAllowed>,
     },
 
     #[error("error updating a note commitment tree: {0}")]
@@ -1367,8 +1367,8 @@ mod tests {
             },
             ValidateContextError::NegativeNsmValueBalance {
                 height,
-                deficit_before: amount::Amount::zero(),
-                deficit_change: amount::Amount::try_from(-1)
+                balance_before: amount::Amount::zero(),
+                balance_change: amount::Amount::try_from(-1)
                     .expect("minus one zatoshi is a valid amount"),
             },
             ValidateContextError::InvalidBlockCommitment(

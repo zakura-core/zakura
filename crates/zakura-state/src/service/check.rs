@@ -8,7 +8,7 @@ use zakura_chain::{
         self, merkle::AuthDataRoot, Block, ChainHistoryBlockTxAuthCommitmentHash, CommitmentError,
     },
     history_tree::HistoryTree,
-    parameters::{subsidy::is_zip234_active, Network, NetworkUpgrade},
+    parameters::{Network, NetworkUpgrade},
     value_balance::ValueBalance,
     work::difficulty::CompactDifficulty,
 };
@@ -45,7 +45,7 @@ mod tests;
 
 pub(crate) use difficulty::AdjustedDifficulty;
 
-/// Checks that the block at `height` does not make the ZIP 234 issuance deficit negative.
+/// Checks that the block at `height` does not make the ZIP 234 NSM value balance negative.
 ///
 /// `value_pools` are the chain value pools before the block, and `block_value_pool_change`
 /// is the block's change to them.
@@ -56,8 +56,9 @@ pub(crate) use difficulty::AdjustedDifficulty;
 /// > created as a result of accepting a block at height, then all nodes MUST reject the
 /// > block as invalid.
 ///
-/// zips#1354 applies this rule from NU7 because it starts reissuance at NU7. Zakura starts
-/// reissuance at the later ZIP 234 start height, and applies the rule from that height.
+/// The rule holds from NU7, not from the later reissuance start height. Between the two
+/// no block claims a bonus, so nothing there can drive the balance negative, but matching
+/// the draft costs nothing and leaves one rule instead of two.
 ///
 /// Check before adding pools so an overdraw reports this consensus rule.
 #[allow(clippy::unwrap_in_result)]
@@ -67,26 +68,30 @@ pub(crate) fn nsm_value_balance_is_non_negative(
     value_pools: &ValueBalance<NonNegative>,
     block_value_pool_change: &ValueBalance<NegativeAllowed>,
 ) -> Result<(), ValidateContextError> {
-    if !is_zip234_active(network, height) {
+    let nu7_active = NetworkUpgrade::Nu7
+        .activation_height(network)
+        .is_some_and(|nu7| height >= nu7);
+
+    if !nu7_active {
         return Ok(());
     }
 
-    let deficit_before = value_pools.nsm_value_balance_amount();
-    let deficit_change = block_value_pool_change.nsm_value_balance_amount();
+    let balance_before = value_pools.nsm_value_balance_amount();
+    let balance_change = block_value_pool_change.nsm_value_balance_amount();
 
-    let deficit_after = (deficit_before + deficit_change).map_err(|_| {
+    let balance_after = (balance_before + balance_change).map_err(|_| {
         ValidateContextError::NegativeNsmValueBalance {
             height,
-            deficit_before,
-            deficit_change,
+            balance_before,
+            balance_change,
         }
     })?;
 
-    if deficit_after.zatoshis() < 0 {
+    if balance_after.zatoshis() < 0 {
         return Err(ValidateContextError::NegativeNsmValueBalance {
             height,
-            deficit_before,
-            deficit_change,
+            balance_before,
+            balance_change,
         });
     }
 
@@ -549,7 +554,8 @@ mod nsm_value_balance_boundary_tests {
                         &change,
                     );
                     let sum = i128::from(before) + i128::from(delta);
-                    let reject = height >= 3 && !(0..=i128::from(MAX_MONEY)).contains(&sum);
+                    // Rejection starts at NU7, before the reissuance height.
+                    let reject = height >= 2 && !(0..=i128::from(MAX_MONEY)).contains(&sum);
                     assert_eq!(
                         result.is_err(),
                         reject,

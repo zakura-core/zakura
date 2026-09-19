@@ -586,8 +586,8 @@ fn roundtrip_block_info_with_ironwood_value_pool() {
     assert_value_properties(block_info);
 }
 
-/// A `BlockInfo` written before the issuance deficit leg still decodes, with a zero
-/// deficit. The `nsm_value_balance_pool` database upgrade replaces that placeholder.
+/// A `BlockInfo` written before the NSM value balance leg still decodes, with a zero
+/// balance. The `nsm_value_balance_pool` database upgrade replaces that placeholder.
 #[test]
 fn block_info_decodes_pre_nsm_value_balance_value_pools() {
     let _init_guard = zakura_test::init();

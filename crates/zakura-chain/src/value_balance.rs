@@ -31,7 +31,8 @@ pub struct ValueBalance<C> {
     ironwood: Amount<C>,
     /// Scheduled issuance minus issued value since NU7, with no historical seed.
     /// This accounting counter funds reissuance but holds no spendable value.
-    /// Monetary totals exclude it. The signed type preserves negative accounting states.
+    /// Monetary totals exclude it. The signed type preserves pre-reissuance states;
+    /// contextual validation rejects negative balances from the reissuance start.
     nsm_value_balance: Amount<NegativeAllowed>,
 }
 
@@ -217,7 +218,7 @@ where
             orchard: self.orchard.constrain().map_err(Orchard)?,
             deferred: self.deferred.constrain().map_err(Deferred)?,
             ironwood: self.ironwood.constrain().map_err(Ironwood)?,
-            // The deficit is signed in every `ValueBalance`, so it survives the conversion
+            // The balance is signed in every `ValueBalance`, so it survives the conversion
             // unchanged.
             nsm_value_balance: self.nsm_value_balance,
         })
@@ -462,7 +463,7 @@ impl ValueBalance<NonNegative> {
     /// Accepts 32-byte (pre-`deferred`), 40-byte (pre-`ironwood`), 48-byte
     /// (pre-`nsm_value_balance`) and 56-byte records; missing trailing pools default to zero.
     ///
-    /// A zero `nsm_value_balance` on a shorter record is a placeholder, not the real deficit.
+    /// A zero `nsm_value_balance` on a shorter record is a placeholder, not the real balance.
     /// The `nsm_value_balance_pool` database upgrade recomputes it from the halving schedule
     /// and the stored pools before any block reads it.
     #[allow(clippy::unwrap_in_result)]
@@ -530,7 +531,7 @@ impl ValueBalance<NonNegative> {
             56 => Amount::from_bytes(
                 bytes[48..56]
                     .try_into()
-                    .expect("issuance deficit amount should be parsable"),
+                    .expect("NSM value balance amount should be parsable"),
             )
             .map_err(NsmValueBalance)?,
             _ => return Err(Unparsable),
@@ -569,13 +570,13 @@ pub enum ValueBalanceError {
     /// ironwood amount error {0}
     Ironwood(amount::Error),
 
-    /// issuance deficit amount error {0}
+    /// NSM value balance amount error {0}
     NsmValueBalance(amount::Error),
 
     /// scheduled issuance calculation failed: {0}
     ScheduledIssuance(crate::parameters::subsidy::SubsidyError),
 
-    /// the block has no coinbase height, so its issuance deficit change is undefined
+    /// the block has no coinbase height, so its NSM value balance change is undefined
     MissingCoinbaseHeight,
 
     /// total amount error {0}
@@ -594,10 +595,10 @@ impl fmt::Display for ValueBalanceError {
             Orchard(e) => format!("orchard amount err: {e}"),
             Deferred(e) => format!("deferred amount err: {e}"),
             Ironwood(e) => format!("ironwood amount err: {e}"),
-            NsmValueBalance(e) => format!("issuance deficit amount err: {e}"),
+            NsmValueBalance(e) => format!("NSM value balance amount err: {e}"),
             ScheduledIssuance(e) => format!("scheduled issuance calculation failed: {e}"),
             MissingCoinbaseHeight => {
-                "block has no coinbase height, so its issuance deficit change is undefined"
+                "block has no coinbase height, so its NSM value balance change is undefined"
                     .to_string()
             }
             Total(e) => format!("total amount err: {e}"),

@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, HashSet},
     fmt,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use crate::{
@@ -636,6 +636,8 @@ pub struct ParametersBuilder {
     checkpoints: Arc<CheckpointList>,
     /// Height at which the soft-fork to temporarily disable Orchard in transactions activates
     temporary_orchard_disabling_soft_fork_height: Option<Height>,
+    /// The configured ZIP 234 start height, see [`Parameters::configured_nsm_reissuance_height`].
+    nsm_reissuance_height: Option<Height>,
     /// The NSM value balance immediately before NU7, see
     /// [`Parameters::initial_nsm_value_balance`].
     initial_nsm_value_balance: Amount<NonNegative>,
@@ -679,6 +681,7 @@ impl Default for ParametersBuilder {
             temporary_orchard_disabling_soft_fork_height: Some(
                 super::TESTNET_TEMPORARY_ORCHARD_DISABLING_SOFT_FORK_HEIGHT,
             ),
+            nsm_reissuance_height: None,
             // A seed measures one chain's own history, so it is meaningless on a network
             // built from these defaults. The default Testnet sets its own in
             // `Parameters::default`.
@@ -1013,6 +1016,15 @@ impl ParametersBuilder {
         self
     }
 
+    /// Sets the height at which ZIP 234 reissuance starts, replacing the crossing rule in
+    /// [`subsidy::nsm_reissuance_height`](super::subsidy::nsm_reissuance_height).
+    ///
+    /// Reissuance still waits for NU7, so a height below NU7 activation starts it at NU7.
+    pub fn with_nsm_reissuance_height(mut self, height: Height) -> Self {
+        self.nsm_reissuance_height = Some(height);
+        self
+    }
+
     /// Sets zips#1354's `INITIAL_NSM_VALUE_BALANCE`, the value the NSM value balance holds
     /// immediately before NU7 activates.
     ///
@@ -1048,6 +1060,7 @@ impl ParametersBuilder {
             lockbox_disbursements,
             checkpoints,
             temporary_orchard_disabling_soft_fork_height,
+            nsm_reissuance_height,
             initial_nsm_value_balance,
         } = self;
         Parameters {
@@ -1067,6 +1080,8 @@ impl ParametersBuilder {
             lockbox_disbursements,
             checkpoints,
             temporary_orchard_disabling_soft_fork_height,
+            configured_nsm_reissuance_height: nsm_reissuance_height,
+            nsm_reissuance_crossing_height: DerivedHeight::default(),
             initial_nsm_value_balance,
         }
     }
@@ -1123,6 +1138,7 @@ impl ParametersBuilder {
             lockbox_disbursements,
             checkpoints: _,
             temporary_orchard_disabling_soft_fork_height: _,
+            nsm_reissuance_height,
             // Compare the configured seed with public Testnet's seed below.
             initial_nsm_value_balance: _,
         } = Self::default();
@@ -1140,6 +1156,7 @@ impl ParametersBuilder {
             && self.pre_blossom_halving_interval == pre_blossom_halving_interval
             && self.post_blossom_halving_interval == post_blossom_halving_interval
             && self.lockbox_disbursements == lockbox_disbursements
+            && self.nsm_reissuance_height == nsm_reissuance_height
             && self.initial_nsm_value_balance == testnet::INITIAL_NSM_VALUE_BALANCE
     }
 }
@@ -1159,6 +1176,9 @@ pub struct RegtestParameters {
     pub max_block_time_start_height: Option<Height>,
     /// Whether funding stream addresses should be repeated to fill all required funding stream periods.
     pub extend_funding_stream_addresses_as_required: Option<bool>,
+    /// The height at which ZIP 234 reissuance starts, see
+    /// [`ParametersBuilder::with_nsm_reissuance_height`].
+    pub nsm_reissuance_height: Option<Height>,
     /// The NSM value balance immediately before NU7, see
     /// [`ParametersBuilder::with_initial_nsm_value_balance`].
     pub initial_nsm_value_balance: Option<Amount<NonNegative>>,
@@ -1209,9 +1229,34 @@ pub struct Parameters {
     checkpoints: Arc<CheckpointList>,
     /// Height at which the soft-fork to temporarily disable Orchard in transactions activates
     temporary_orchard_disabling_soft_fork_height: Option<Height>,
+    /// The configured ZIP 234 start height, if any.
+    configured_nsm_reissuance_height: Option<Height>,
+    /// The ZIP 234 start height that the crossing rule derives from the other fields.
+    nsm_reissuance_crossing_height: DerivedHeight,
     /// The NSM value balance immediately before NU7 activates.
     initial_nsm_value_balance: Amount<NonNegative>,
 }
+
+/// A height derived from the other [`Parameters`] fields and computed on first use.
+///
+/// Equality ignores it, because equal parameters derive equal heights.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DerivedHeight(OnceLock<Option<Height>>);
+
+impl DerivedHeight {
+    /// Returns the height, computing it with `derive` on first use.
+    pub(crate) fn get_or_init(&self, derive: impl FnOnce() -> Option<Height>) -> Option<Height> {
+        *self.0.get_or_init(derive)
+    }
+}
+
+impl PartialEq for DerivedHeight {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for DerivedHeight {}
 
 impl Default for Parameters {
     /// Returns an instance of the default public testnet [`Parameters`].
@@ -1242,6 +1287,7 @@ impl Parameters {
             checkpoints,
             extend_funding_stream_addresses_as_required,
             max_block_time_start_height,
+            nsm_reissuance_height,
             initial_nsm_value_balance,
         }: RegtestParameters,
     ) -> Result<Self, ParametersBuilderError> {
@@ -1270,6 +1316,10 @@ impl Parameters {
 
         if Some(true) == extend_funding_stream_addresses_as_required {
             parameters = parameters.extend_funding_streams();
+        }
+
+        if let Some(height) = nsm_reissuance_height {
+            parameters = parameters.with_nsm_reissuance_height(height);
         }
 
         if let Some(balance) = initial_nsm_value_balance {
@@ -1322,6 +1372,9 @@ impl Parameters {
             lockbox_disbursements: _,
             checkpoints: _,
             temporary_orchard_disabling_soft_fork_height: _,
+            // The ZIP 234 start height is configurable on Regtest
+            configured_nsm_reissuance_height: _,
+            nsm_reissuance_crossing_height: _,
             // Regtest chains start empty, so the seed is always zero. It stays out of the
             // identity check for the same reason the halving interval stays in: it is
             // derived from the defaults above, not chosen.
@@ -1439,11 +1492,23 @@ impl Parameters {
         self.temporary_orchard_disabling_soft_fork_height
     }
 
+    /// Returns the configured height at which ZIP 234 reissuance starts, or `None` if the
+    /// crossing rule in [`subsidy::nsm_reissuance_height`](super::subsidy::nsm_reissuance_height)
+    /// applies.
+    pub fn configured_nsm_reissuance_height(&self) -> Option<Height> {
+        self.configured_nsm_reissuance_height
+    }
+
     /// Returns zips#1354's `INITIAL_NSM_VALUE_BALANCE` for this network.
     ///
     /// See [`ParametersBuilder::with_initial_nsm_value_balance`].
     pub fn initial_nsm_value_balance(&self) -> Amount<NonNegative> {
         self.initial_nsm_value_balance
+    }
+
+    /// Returns the cached start height that the ZIP 234 crossing rule derives.
+    pub(crate) fn nsm_reissuance_crossing_height(&self) -> &DerivedHeight {
+        &self.nsm_reissuance_crossing_height
     }
 }
 

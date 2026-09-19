@@ -65,7 +65,7 @@ use zakura_chain::{
     chain_tip::{ChainTip, NetworkChainTipHeightEstimator},
     parameters::{
         subsidy::{
-            block_subsidy, founders_reward, funding_stream_values, miner_subsidy,
+            block_subsidy, founders_reward, funding_stream_values, is_zip234_active, miner_subsidy,
             FundingStreamReceiver,
         },
         ConsensusBranchId, Network, NetworkUpgrade,
@@ -853,6 +853,9 @@ pub trait Rpc {
     /// # Notes
     ///
     /// If `height` is not supplied, uses the tip height.
+    ///
+    /// From the ZIP 234 reissuance start height, the subsidy depends on the parent block's
+    /// chain value pools, so `height` must be at most one block above the best chain tip.
     #[method(name = "getblocksubsidy")]
     async fn get_block_subsidy(&self, height: Option<u32>) -> Result<GetBlockSubsidyResponse>;
 
@@ -1239,7 +1242,8 @@ where
                 long_poll_id,
                 vec![],
                 submit_old,
-            );
+            )
+            .map_misc_error()?;
             let block =
                 proposal_block_from_template(&template, None, &self.network).map_misc_error()?;
             tokio::time::timeout(
@@ -2966,18 +2970,33 @@ where
                 // when the tip changes.
                 let precompute_coinbase = |network, height, params| {
                     tokio::task::spawn_blocking(move || {
-                        TransactionTemplate::new_coinbase(&network, height, &params, Amount::zero())
-                            .expect("valid coinbase tx")
+                        TransactionTemplate::new_coinbase(
+                            &network,
+                            height,
+                            &params,
+                            Amount::zero(),
+                            None,
+                        )
+                        .expect("valid coinbase tx")
                     })
                 };
 
-                let precomputed_coinbase = precompute_coinbase(
-                    self.network.clone(),
-                    precomputed_height,
-                    miner_params.clone(),
-                )
-                .await
-                .expect("valid coinbase tx");
+                // ZIP 234 derives the subsidy from the new tip's value pools. Those pools
+                // are unknown until the tip arrives, so this optimization cannot construct
+                // a valid post-activation coinbase in advance.
+                let precomputed_coinbase = if is_zip234_active(&self.network, precomputed_height) {
+                    None
+                } else {
+                    Some(
+                        precompute_coinbase(
+                            self.network.clone(),
+                            precomputed_height,
+                            miner_params.clone(),
+                        )
+                        .await
+                        .expect("valid coinbase tx"),
+                    )
+                };
 
                 let _ = wait_for_new_tip.await;
 
@@ -3057,7 +3076,8 @@ where
                     // BIP-34 height and subsidies wouldn't match the block.
                     let next_height = chain_info.tip_height.next().map_misc_error()?;
                     let precomputed_coinbase = (next_height == precomputed_height)
-                        .then_some(precomputed_coinbase);
+                        .then_some(precomputed_coinbase)
+                        .flatten();
 
                     // Respond instantly with an empty block upon a chain tip change so that
                     // the miner doesn't waste their effort trying to extend a shorter
@@ -3070,7 +3090,8 @@ where
                         server_long_poll_id,
                         vec![],
                         submit_old,
-                    );
+                    )
+                    .map_misc_error()?;
                     return self.finish_mining_template(template, &chain_info, miner_params).await;
                 }
 
@@ -3095,7 +3116,7 @@ where
         //
         // Apart from random weighted transaction selection,
         // the template only depends on the previously fetched data.
-        // This processing never fails.
+        // This processing fails only if the coinbase transaction cannot be built.
 
         tracing::debug!(
             mempool_tx_hashes = ?mempool_txs
@@ -3112,9 +3133,15 @@ where
             &self.network,
             height,
             miner_params,
+            chain_info
+                .value_pools
+                .nsm_value_balance_amount()
+                .constrain()
+                .ok(),
             mempool_txs,
             mempool_tx_deps,
-        );
+        )
+        .map_misc_error()?;
 
         tracing::debug!(
             selected_mempool_tx_hashes = ?mempool_txs
@@ -3134,7 +3161,8 @@ where
             server_long_poll_id,
             mempool_txs,
             submit_old,
-        );
+        )
+        .map_misc_error()?;
         self.finish_mining_template(template, &chain_info, miner_params)
             .await
     }
@@ -3505,7 +3533,34 @@ where
             None => best_chain_tip_height(&self.latest_chain_tip)?,
         };
 
-        let subsidy = block_subsidy(height, &net, None).map_misc_error()?;
+        // ZIP 234 derives the block subsidy from the NSM value balance after the parent
+        // block, so look the parent's chain value pools up when the rules apply.
+        let nsm_value_balance = if is_zip234_active(&net, height) {
+            let parent = height.previous().map_misc_error()?;
+
+            let zakura_state::ReadResponse::BlockInfo(parent_info) = call_service(
+                self.read_state.clone(),
+                zakura_state::ReadRequest::BlockInfo(parent.into()),
+            )
+            .await?
+            else {
+                unreachable!("unmatched response to a BlockInfo request");
+            };
+
+            parent_info
+                .ok_or_misc_error(
+                    "the ZIP 234 subsidy needs the parent block, which is not in the best chain; \
+                     heights can be at most one block above the best chain tip",
+                )?
+                .value_pools()
+                .nsm_value_balance_amount()
+                .constrain()
+                .ok()
+        } else {
+            None
+        };
+
+        let subsidy = block_subsidy(height, &net, nsm_value_balance).map_misc_error()?;
 
         let (lockbox_streams, mut funding_streams): (Vec<_>, Vec<_>) =
             funding_stream_values(height, &net, subsidy)

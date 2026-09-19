@@ -8,7 +8,7 @@ use chrono::{DateTime, Duration, Utc};
 use zakura_chain::{
     block,
     parameters::{
-        testnet::{Parameters, RegtestParameters},
+        testnet::{ConfiguredActivationHeights, Parameters, RegtestParameters},
         Network, NetworkUpgrade, POW_AVERAGING_WINDOW,
     },
     work::difficulty::{CompactDifficulty, ExpandedDifficulty, ParameterDifficulty as _, U256},
@@ -172,6 +172,145 @@ fn difficulty_windows_upgrades_testnet_minimum_and_partitions_match() {
         testnet.target_difficulty_limit().to_compact(),
         "ZIP 205/208 minimum difficulty begins strictly above six target spacings"
     );
+}
+
+const NU7_VECTOR_TARGET_BITS: [u32; 5] =
+    [0x1e0ffff0, 0x1e0e0000, 0x1e0c8000, 0x1e0b4000, 0x1e0a2000];
+const NU7_VECTOR_TIME_STEPS: [i64; 7] = [19, 31, 23, 29, 17, 37, 21];
+
+fn compact_vector_target(bits: u32) -> CompactDifficulty {
+    CompactDifficulty::from_bytes_in_display_order(&bits.to_be_bytes())
+        .expect("the fixed compact target is valid")
+}
+
+fn nu7_vector_context(
+    candidate_time: DateTime<Utc>,
+    len: usize,
+) -> Vec<(CompactDifficulty, DateTime<Utc>)> {
+    let mut time = candidate_time;
+    (0..len)
+        .map(|index| {
+            time -= Duration::seconds(NU7_VECTOR_TIME_STEPS[index % NU7_VECTOR_TIME_STEPS.len()]);
+            (
+                compact_vector_target(NU7_VECTOR_TARGET_BITS[index % NU7_VECTOR_TARGET_BITS.len()]),
+                time,
+            )
+        })
+        .collect()
+}
+
+fn configured_nu7_testnet(nu7_height: u32) -> Network {
+    Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            blossom: Some(1),
+            nu7: Some(nu7_height),
+            ..Default::default()
+        })
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid")
+}
+
+/// Fixed expected `nBits` values independently calculated from the ZIP 218
+/// difficulty formulas using integer arithmetic.
+#[test]
+fn nu7_difficulty_vectors_match_expected_nbits() {
+    const NU7: u32 = 200;
+
+    let network = configured_nu7_testnet(NU7);
+    assert!(!network.disable_pow());
+    let candidate_time =
+        DateTime::from_timestamp(2_000_000_000, 0).expect("test timestamp is in range");
+    let context = nu7_vector_context(candidate_time, MAX_POW_ADJUSTMENT_BLOCK_SPAN);
+
+    // At NU7 - 1, the 17-target mean has nBits 0x1e0d0965. Its 425-second
+    // median gap is damped and bounded to 1,071 seconds, producing 0x1e0af369.
+    // At and after NU7, the 102-target mean has nBits 0x1e0cd18e. Its
+    // 2,572-second median gap is damped to 2,555 seconds, producing 0x1e0cd7fd.
+    for (height, expected_bits, wrong_window_bits) in [
+        (NU7 - 1, 0x1e0af369, 0x1e0cd7fd),
+        (NU7, 0x1e0cd7fd, 0x1e0af369),
+        (NU7 + 1, 0x1e0cd7fd, 0x1e0af369),
+    ] {
+        let adjustment = AdjustedDifficulty::new_from_header_time(
+            candidate_time,
+            block::Height(height - 1),
+            &network,
+            context.iter().copied(),
+        )
+        .expect("the vector supplies the complete height-dependent context");
+        assert_eq!(
+            adjustment.expected_difficulty_threshold(),
+            compact_vector_target(expected_bits),
+            "unexpected nBits at candidate height {height}"
+        );
+
+        let wrong_window_target = compact_vector_target(wrong_window_bits);
+        assert!(matches!(
+            validate_contextual_difficulty_and_time(wrong_window_target, adjustment),
+            Err(ContextualValidationError::InvalidDifficultyThreshold {
+                difficulty_threshold,
+                expected_difficulty,
+            }) if difficulty_threshold == wrong_window_target
+                && expected_difficulty == compact_vector_target(expected_bits)
+        ));
+    }
+}
+
+#[test]
+fn nu7_moves_the_pow_limit_cutoff_to_height_102() {
+    let network = configured_nu7_testnet(1);
+    let candidate_time =
+        DateTime::from_timestamp(2_000_000_000, 0).expect("test timestamp is in range");
+
+    for (height, expected_bits) in [(102, 0x2007ffff), (103, 0x1e0caecf)] {
+        let context = nu7_vector_context(
+            candidate_time,
+            usize::try_from(height).expect("test height fits in usize"),
+        );
+        let actual = AdjustedDifficulty::new_from_header_time(
+            candidate_time,
+            block::Height(height - 1),
+            &network,
+            context,
+        )
+        .expect("the vector supplies every predecessor back to genesis")
+        .expected_difficulty_threshold();
+        assert_eq!(
+            actual,
+            compact_vector_target(expected_bits),
+            "unexpected nBits at candidate height {height}"
+        );
+    }
+}
+
+#[test]
+fn nu7_testnet_minimum_difficulty_gap_is_strictly_above_150_seconds() {
+    let network = configured_nu7_testnet(200);
+    let candidate_height = block::Height(300_000);
+    let candidate_time =
+        DateTime::from_timestamp(2_000_000_000, 0).expect("test timestamp is in range");
+
+    for (gap, expected_bits) in [(150, 0x1e0cd7fd), (151, 0x2007ffff)] {
+        let mut context = nu7_vector_context(candidate_time, MAX_POW_ADJUSTMENT_BLOCK_SPAN);
+        context[0].1 = candidate_time - Duration::seconds(gap);
+        let actual = AdjustedDifficulty::new_from_header_time(
+            candidate_time,
+            candidate_height
+                .previous()
+                .expect("the test candidate is not genesis"),
+            &network,
+            context,
+        )
+        .expect("the vector supplies the complete post-NU7 context")
+        .expected_difficulty_threshold();
+        assert_eq!(
+            actual,
+            compact_vector_target(expected_bits),
+            "unexpected nBits for a {gap}-second parent gap"
+        );
+    }
 }
 
 #[test]
@@ -1007,8 +1146,6 @@ fn contextual_writer_hold_microbench() {
 /// Pin the existing 17-block calculation with a nonuniform mean and an irrelevant tail.
 #[test]
 fn candidate_height_window_preserves_existing_targets() {
-    use zakura_chain::parameters::testnet::ConfiguredActivationHeights;
-
     // NU7 widens the averaging window, so this network stops at NU6.3.
     let custom = Parameters::build()
         .with_activation_heights(ConfiguredActivationHeights {

@@ -161,8 +161,10 @@ const REGISTRY_MISS_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 ///
 /// The configured limits count blocks, so the syncer multiplies them by
 /// [`lookahead_limit_multiplier`] to keep the same time window at shorter target
-/// spacings. A future shorter target spacing increases the in-flight bound and
-/// its RAM bound by the same ratio.
+/// spacings. After NU7, the in-flight bound and its RAM bound are three times the
+/// configured value. ZIP 218 scales `BLOCK_DOWNLOAD_WINDOW` and
+/// `MAX_BLOCKS_IN_TRANSIT_PER_PEER` by the same factor:
+/// <https://zips.z.cash/zip-0218#block-count-based-constants>
 ///
 /// Once these malicious blocks start failing validation, the syncer will cancel all
 /// the pending download and verify tasks, drop all the blocks, and start a new

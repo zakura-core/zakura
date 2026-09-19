@@ -5,10 +5,13 @@ use chrono::{DateTime, Duration};
 use zakura_chain::{
     block::{merkle::AuthDataRoot, ChainHistoryBlockTxAuthCommitmentHash, CommitmentError},
     history_tree::HistoryTree,
-    parameters::{Network, NetworkUpgrade, POW_AVERAGING_WINDOW},
+    parameters::{
+        testnet::{ConfiguredActivationHeights, Parameters},
+        Network, NetworkUpgrade, POW_AVERAGING_WINDOW,
+    },
     sapling,
     serialization::ZcashDeserializeInto,
-    work::difficulty::ParameterDifficulty,
+    work::difficulty::{CompactDifficulty, ParameterDifficulty},
 };
 
 use super::super::*;
@@ -175,8 +178,8 @@ fn header_daa_accepts_valid_threshold_with_full_context() {
     .expect("expected DAA threshold is accepted");
 }
 
-/// The difficulty-context reader takes the span selected for the candidate
-/// height. Every currently configured upgrade uses the existing span.
+/// The difficulty-context reader takes the span for the candidate height, which
+/// ZIP 218 widens at NU7.
 #[test]
 fn difficulty_context_follows_the_candidate_height() {
     let _init_guard = zakura_test::init();
@@ -191,13 +194,107 @@ fn difficulty_context_follows_the_candidate_height() {
     );
     let ancestors = 0..difficulty::MAX_POW_ADJUSTMENT_BLOCK_SPAN * 2;
 
-    for candidate_height in [NU7 - 1, NU7, NU7 + 1] {
+    for (candidate_height, expected) in [
+        (NU7 - 1, difficulty::POW_ADJUSTMENT_BLOCK_SPAN),
+        (NU7, difficulty::MAX_POW_ADJUSTMENT_BLOCK_SPAN),
+        (NU7 + 1, difficulty::MAX_POW_ADJUSTMENT_BLOCK_SPAN),
+    ] {
         assert_eq!(
             difficulty_context(&network, block::Height(candidate_height), ancestors.clone()).len(),
-            difficulty::POW_ADJUSTMENT_BLOCK_SPAN,
+            expected,
             "candidate height {candidate_height}",
         );
     }
+}
+
+/// Block verification enforces a fixed post-NU7 threshold using the complete
+/// difficulty context on a PoW-enabled configured Testnet.
+#[test]
+fn block_daa_enforces_the_post_nu7_context() {
+    let _init_guard = zakura_test::init();
+
+    let network = Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            blossom: Some(1),
+            nu7: Some(347_400),
+            ..Default::default()
+        })
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid");
+    assert!(!network.disable_pow());
+
+    // The candidate's coinbase height selects the difficulty context.
+    let candidate = zakura_test::vectors::BLOCK_MAINNET_347499_BYTES
+        .zcash_deserialize_into::<Arc<Block>>()
+        .expect("block 347499 deserializes");
+    let parent_height = block::Height(347_498);
+    let candidate_height = parent_height.next().expect("test height is valid");
+    assert!(
+        difficulty::pow_adjustment_block_span_for_height(&network, candidate_height)
+            > difficulty::POW_ADJUSTMENT_BLOCK_SPAN
+    );
+    let candidate_time =
+        DateTime::from_timestamp(2_000_000_000, 0).expect("test timestamp is in-range");
+    let target_bits = [0x1e0ffff0, 0x1e0e0000, 0x1e0c8000, 0x1e0b4000, 0x1e0a2000];
+    let time_steps = [19, 31, 23, 29, 17, 37, 21];
+    let compact = |bits: u32| {
+        CompactDifficulty::from_bytes_in_display_order(&bits.to_be_bytes())
+            .expect("the fixed compact target is valid")
+    };
+    let mut time = candidate_time;
+    let context: Vec<_> = (0..difficulty::MAX_POW_ADJUSTMENT_BLOCK_SPAN)
+        .map(|index| {
+            time -= Duration::seconds(time_steps[index % time_steps.len()]);
+            (compact(target_bits[index % target_bits.len()]), time)
+        })
+        .collect();
+    let expected = compact(0x1e0cd7fd);
+
+    let relevant_headers: Vec<block::Header> = context
+        .iter()
+        .map(|(threshold, time)| {
+            let mut header = *candidate.header;
+            header.difficulty_threshold = *threshold;
+            header.time = *time;
+            header
+        })
+        .collect();
+    let mut candidate = (*candidate).clone();
+    let mut header = *candidate.header;
+    header.time = candidate_time;
+    header.difficulty_threshold = expected;
+    candidate.header = Arc::new(header);
+
+    block_is_valid_for_recent_chain_data(
+        &candidate,
+        candidate_height,
+        &network,
+        Some(block::Height(0)),
+        Some(parent_height),
+        relevant_headers.clone(),
+    )
+    .expect("the independently calculated post-NU7 threshold is accepted");
+
+    let mut wrong_window_candidate = candidate.clone();
+    let mut header = *wrong_window_candidate.header;
+    header.difficulty_threshold = compact(0x1e0af369);
+    wrong_window_candidate.header = Arc::new(header);
+    assert!(matches!(
+        block_is_valid_for_recent_chain_data(
+            &wrong_window_candidate,
+            candidate_height,
+            &network,
+            Some(block::Height(0)),
+            Some(parent_height),
+            relevant_headers,
+        ),
+        Err(ValidateContextError::InvalidDifficultyThreshold {
+            difficulty_threshold,
+            expected_difficulty,
+        }) if difficulty_threshold == compact(0x1e0af369) && expected_difficulty == expected
+    ));
 }
 
 #[test]

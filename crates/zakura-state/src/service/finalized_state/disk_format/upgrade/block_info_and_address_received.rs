@@ -214,16 +214,13 @@ impl DiskFormatUpgrade for Upgrade {
             };
 
             // Add this block's value pool changes to the total value pool.
-            value_pool = value_pool
-                .add_chain_value_pool_change(
-                    block
-                        .chain_value_pool_change(
-                            &network,
-                            &utxos,
-                            deferred_pool_balance_change.map(DeferredPoolBalanceChange::new),
-                        )
-                        .unwrap_or_default(),
+            value_pool = block
+                .chain_value_pool_change(
+                    &network,
+                    &utxos,
+                    deferred_pool_balance_change.map(DeferredPoolBalanceChange::new),
                 )
+                .and_then(|change| value_pool.add_chain_value_pool_change(change))
                 .and_then(|pools| pools.seed_nsm_value_balance(height, &network))
                 .map_err(|error| {
                     super::FormatChangeError::InvalidPostcondition(format!(

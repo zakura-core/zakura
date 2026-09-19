@@ -62,33 +62,12 @@ impl HeaderChainStore {
             EngineMetadata::decode(&metadata_bytes)?;
             return Ok(false);
         }
-        if version == 4 {
-            // Version five only widens the retained validation context, which
-            // [`Self::resize_validation_context`] backfills next. Recording the new
-            // format first means a release that reads 27 context rows never opens a
-            // wider context: it rejects the format marker instead.
-            let mut metadata = decode_v4_engine_metadata(&metadata_bytes)?;
-            metadata.disk_format = HeaderChainDiskVersion::CURRENT;
-            let mut batch = DiskWriteBatch::new();
-            self.put_value(
-                &mut batch,
-                HEADER_ENGINE_META,
-                super::METADATA_KEY,
-                &metadata,
-            )?;
-            self.db.write(batch)?;
-            tracing::info!(
-                from_version = version,
-                to_version = HeaderChainDiskVersion::CURRENT.0,
-                "migrated the authenticated durable header-chain format"
-            );
-            return Ok(true);
-        }
         let from_version = HeaderChainDiskVersion(version);
         let mut metadata = match version {
             1 => decode_v1_engine_metadata(&metadata_bytes, config.network_policy_digest())?,
             2 => decode_v2_engine_metadata(&metadata_bytes, config.network_policy_digest())?,
             3 => decode_v3_engine_metadata(&metadata_bytes)?,
+            4 => decode_v4_engine_metadata(&metadata_bytes)?,
             _ => return Err(HeaderChainValueError::UnsupportedDiskFormat(version).into()),
         };
         if metadata.network_id != config.network().kind() {
@@ -117,6 +96,27 @@ impl HeaderChainStore {
             return Err(HeaderChainStoreError::Incoherent(
                 "legacy metadata does not match the configured engine policy",
             ));
+        }
+        if version == 4 {
+            // Version five only widens the retained validation context, which
+            // [`Self::resize_validation_context`] backfills next. Recording the new
+            // format first means a release that reads 27 context rows never opens a
+            // wider context: it rejects the format marker instead.
+            metadata.disk_format = HeaderChainDiskVersion::CURRENT;
+            let mut batch = DiskWriteBatch::new();
+            self.put_value(
+                &mut batch,
+                HEADER_ENGINE_META,
+                super::METADATA_KEY,
+                &metadata,
+            )?;
+            self.db.write(batch)?;
+            tracing::info!(
+                from_version = version,
+                to_version = HeaderChainDiskVersion::CURRENT.0,
+                "migrated the authenticated durable header-chain format"
+            );
+            return Ok(true);
         }
 
         let frontier = metadata.frontiers.finalized;

@@ -147,3 +147,70 @@ async fn nsm_fee_semantic_verification_rounds_the_block_total() {
         }
     }
 }
+
+proptest::proptest! {
+    #![proptest_config(proptest::test_runner::Config::with_cases(32))]
+
+    #[test]
+    fn max_money_aggregate_fees_reject_before_recycling(
+        first in 1_000i64..=zakura_chain::amount::MAX_MONEY,
+        excess in 1i64..=1_000,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use zakura_chain::{
+            amount::MAX_MONEY,
+            block_info::BlockInfo,
+            transparent::{Input, OutPoint, Script},
+        };
+        let _guard = zakura_test::init();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let network = zip234_test_network(Height(4));
+            for height in [Height(1), Height(2), Height(4)] {
+                let subsidy = block_subsidy(height, &network,
+                    Some(Amount::try_from(ZIP234_TEST_DEFICIT).unwrap())).unwrap();
+                let mut block = zip234_test_block(&network, height, subsidy);
+                for index in [1u8, 2] {
+                    let mut tx = v5_coinbase_transaction(NetworkUpgrade::Nu7, height, &network);
+                    *tx.inputs_mut() = vec![Input::PrevOut {
+                        outpoint: OutPoint { hash: zakura_chain::transaction::Hash([index; 32]), index: 0 },
+                        unlock_script: Script::new(&[]), sequence: u32::MAX,
+                    }];
+                    block.transactions.push(Arc::new(tx));
+                }
+                Arc::make_mut(&mut block.header).merkle_root = block.transactions.iter().collect();
+                let mut parent_pools = zakura_chain::value_balance::ValueBalance::zero();
+                parent_pools.set_nsm_value_balance_amount(Amount::try_from(ZIP234_TEST_DEFICIT).unwrap());
+                let state = service_fn(move |request: zs::Request| async move {
+                    Ok::<_, BoxError>(match request {
+                        zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+                        zs::Request::CheckParentInputs { .. } => zs::Response::ParentInputs(zs::ParentInputs::Inconclusive),
+                        zs::Request::AwaitBlockInfo(_) => zs::Response::BlockInfo(Some(BlockInfo::new(parent_pools, 0))),
+                        zs::Request::CommitSemanticallyVerifiedBlock(_) => panic!("overflowing fees must not reach state commit"),
+                        _ => panic!("unexpected state request: {request:?}"),
+                    })
+                });
+                let fees = [first, MAX_MONEY - first + excess];
+                let index = Arc::new(AtomicUsize::new(0));
+                // NU7 has no production branch ID. Mock transaction verification while
+                // exercising fee aggregation in the real semantic block verifier.
+                let transaction = service_fn(move |request| {
+                    let index = index.clone();
+                    async move {
+                        let mut response = accept_block_transaction(request);
+                        if let tx::Response::Block { miner_fee: Some(fee), .. } = &mut response {
+                            *fee = Amount::try_from(fees[index.fetch_add(1, Ordering::SeqCst)]).unwrap();
+                        }
+                        Ok::<_, BoxError>(response)
+                    }
+                });
+                let verifier = SemanticBlockVerifier::new(&network, state, transaction);
+                let result = tokio::time::timeout(std::time::Duration::from_secs(10),
+                    verifier.oneshot(Request::Commit(Arc::new(block)))).await.unwrap();
+                assert!(matches!(result, Err(VerifyBlockError::Block {
+                    source: BlockError::SummingMinerFees { .. },
+                })), "height={height:?}, fees={fees:?}: {result:?}");
+            }
+        });
+    }
+}

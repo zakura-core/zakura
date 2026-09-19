@@ -1120,3 +1120,6 @@ pub fn founders_reward(net: &Network, height: Height) -> Amount<NonNegative> {
         Amount::zero()
     }
 }
+
+#[cfg(test)]
+mod tests;

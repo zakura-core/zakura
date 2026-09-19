@@ -167,7 +167,7 @@ impl TestStore {
         let required = usize::try_from(parent.height.0)
             .expect("the test height fits in memory")
             .saturating_add(1)
-            .min(crate::POW_ADJUSTMENT_BLOCK_SPAN);
+            .min(crate::MAX_POW_ADJUSTMENT_BLOCK_SPAN);
         let mut predecessors = Vec::with_capacity(required);
         let mut hash = parent.hash;
         while predecessors.len() < required {

@@ -1202,3 +1202,191 @@ proptest::proptest! {
         proptest::prop_assert_eq!(i128::from(i64::from(actual)), expected);
     }
 }
+
+/// Checks the ZIP 234 crossing rule on the 75-second schedule.
+#[test]
+fn zip234_crossing_height() {
+    use crate::parameters::subsidy::{zip234_crossing_height, ZIP234_START_HALVING};
+
+    let _init_guard = zakura_test::init();
+
+    assert_eq!(
+        zip234_crossing_height(&Network::Mainnet, ZIP234_START_HALVING),
+        Some(Height(5_342_746)),
+    );
+    assert_eq!(
+        zip234_crossing_height(&Network::new_default_testnet(), ZIP234_START_HALVING),
+        Some(Height(5_412_346)),
+    );
+
+    // ZIP 234's own rule, after the second halving, gives its planned Mainnet start in
+    // February 2027.
+    assert_eq!(
+        zip234_crossing_height(&Network::Mainnet, 2),
+        Some(Height(3_662_746)),
+    );
+
+    // Regtest's short halving interval issues too little for the reserve to fall below
+    // the crossing threshold.
+    assert_eq!(
+        zip234_crossing_height(
+            &Network::new_regtest(Default::default()),
+            ZIP234_START_HALVING
+        ),
+        None,
+    );
+}
+
+/// Returns the default Testnet parameters with NU7 at `nu7`.
+fn testnet_with_nu7(nu7: Option<u32>) -> testnet::ParametersBuilder {
+    let mut activation_heights: ConfiguredActivationHeights = Network::new_default_testnet()
+        .parameters()
+        .expect("Testnet has parameters")
+        .activation_heights()
+        .into();
+    activation_heights.nu7 = nu7;
+
+    testnet::Parameters::build()
+        .with_activation_heights(activation_heights)
+        .expect("activation heights are valid")
+}
+
+/// Checks where ZIP 234 reissuance starts relative to NU7 and the crossing height.
+#[test]
+fn nsm_reissuance_height_follows_nu7_and_the_crossing_rule() {
+    use crate::parameters::subsidy::nsm_reissuance_height;
+
+    let _init_guard = zakura_test::init();
+
+    const TESTNET_CROSSING: u32 = 5_412_346;
+
+    // A network without NU7 never starts reissuance.
+    assert_eq!(nsm_reissuance_height(&Network::Mainnet), None);
+    assert_eq!(nsm_reissuance_height(&Network::new_default_testnet()), None);
+    let no_nu7 = testnet_with_nu7(None)
+        .to_network()
+        .expect("configured testnet is valid");
+    assert_eq!(nsm_reissuance_height(&no_nu7), None);
+
+    // NU7 before the crossing height maps the crossing height through the halving clock.
+    // Each 75-second block after NU7 is three 25-second blocks.
+    for nu7 in [4_200_000, 4_500_000, 5_000_000, TESTNET_CROSSING - 1] {
+        let network = testnet_with_nu7(Some(nu7))
+            .to_network()
+            .expect("configured testnet is valid");
+        let expected = nu7 + 3 * (TESTNET_CROSSING - nu7);
+
+        assert_eq!(
+            nsm_reissuance_height(&network),
+            Some(Height(expected)),
+            "NU7 at {nu7}",
+        );
+    }
+
+    // NU7 at or after the crossing height starts reissuance at NU7.
+    for nu7 in [TESTNET_CROSSING, 6_000_000] {
+        let network = testnet_with_nu7(Some(nu7))
+            .to_network()
+            .expect("configured testnet is valid");
+
+        assert_eq!(
+            nsm_reissuance_height(&network),
+            Some(Height(nu7)),
+            "NU7 at {nu7}",
+        );
+    }
+
+    // A configured start height replaces the crossing height, but not NU7.
+    let configured = |nu7, start| {
+        testnet_with_nu7(Some(nu7))
+            .with_nsm_reissuance_height(Height(start))
+            .to_network()
+            .expect("configured testnet is valid")
+    };
+    assert_eq!(
+        nsm_reissuance_height(&configured(4_200_000, 4_200_010)),
+        Some(Height(4_200_010)),
+    );
+    assert_eq!(
+        nsm_reissuance_height(&configured(4_200_000, 1)),
+        Some(Height(4_200_000)),
+    );
+
+    let regtest = |nsm_reissuance_height| {
+        Network::new_regtest(testnet::RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu7: Some(10),
+                ..Default::default()
+            },
+            nsm_reissuance_height,
+            ..Default::default()
+        })
+    };
+    assert_eq!(nsm_reissuance_height(&regtest(None)), None);
+    assert_eq!(
+        nsm_reissuance_height(&regtest(Some(Height(20)))),
+        Some(Height(20)),
+    );
+}
+
+/// Compare the generalized schedule with the previous two-era consensus formula.
+#[test]
+fn spacing_schedule_preserves_existing_halving_and_subsidy() {
+    use crate::parameters::{subsidy::constants::MAX_BLOCK_SUBSIDY, testnet};
+    let _init_guard = zakura_test::init();
+    let mut networks: Vec<_> = Network::iter().collect();
+    for blossom in [4, 1_000] {
+        networks.push(
+            testnet::Parameters::build()
+                .with_slow_start_interval(Height(20))
+                .with_halving_interval(100)
+                .unwrap()
+                .with_activation_heights(testnet::ConfiguredActivationHeights {
+                    blossom: Some(blossom),
+                    canopy: Some(blossom + 2),
+                    ..Default::default()
+                })
+                .unwrap()
+                .clear_funding_streams()
+                .to_network()
+                .unwrap(),
+        );
+    }
+    for network in networks {
+        let blossom = NetworkUpgrade::Blossom.activation_height(&network).unwrap();
+        let shift = network.slow_start_shift();
+        let mut heights = vec![
+            Height(0),
+            shift,
+            (shift + 1).unwrap(),
+            blossom.previous().unwrap(),
+            blossom,
+            blossom.next().unwrap(),
+            Height::MAX,
+        ];
+        for index in 1..=8 {
+            let height = height_for_halving(index, &network).unwrap();
+            heights.extend([height.previous().unwrap(), height, height.next().unwrap()]);
+            assert_eq!(halving(height, &network), index);
+            assert_eq!(halving(height.previous().unwrap(), &network), index - 1);
+        }
+        for height in heights {
+            let old_halving = previous_halving(height, &network);
+            assert_eq!(
+                halving(height, &network),
+                old_halving,
+                "{network:?} at {height:?}"
+            );
+            if height >= network.slow_start_interval() {
+                let ratio = if height < blossom { 1 } else { 2 };
+                let expected = 1u64
+                    .checked_shl(old_halving)
+                    .map_or(0, |divisor| MAX_BLOCK_SUBSIDY / ratio / divisor);
+                assert_eq!(
+                    block_subsidy(height, &network, None).unwrap(),
+                    Amount::<NonNegative>::try_from(expected).unwrap()
+                );
+            }
+        }
+    }
+}

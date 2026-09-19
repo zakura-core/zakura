@@ -979,6 +979,11 @@ struct DTestnetParameters {
     /// If unset, the default activation height for the network is used; the soft fork
     /// cannot be disabled via configuration.
     temporary_orchard_disabling_soft_fork_height: Option<u32>,
+    /// Height at which ZIP 234 reissuance starts.
+    ///
+    /// If unset, the ZIP 234 crossing rule sets it. Reissuance never starts below NU7
+    /// activation.
+    nsm_reissuance_height: Option<u32>,
     /// The NSM value balance in zatoshi immediately before NU7 activates.
     ///
     /// If unset, the balance starts at zero, which is right for a chain with no
@@ -1100,6 +1105,9 @@ impl From<Arc<testnet::Parameters>> for DTestnetParameters {
             extend_funding_stream_addresses_as_required: None,
             temporary_orchard_disabling_soft_fork_height: params
                 .temporary_orchard_disabling_soft_fork_height()
+                .map(|height| height.0),
+            nsm_reissuance_height: params
+                .configured_nsm_reissuance_height()
                 .map(|height| height.0),
             initial_nsm_value_balance: match i64::from(params.initial_nsm_value_balance()) {
                 0 => None,
@@ -1375,6 +1383,7 @@ where
         checkpoints,
         extend_funding_stream_addresses_as_required,
         temporary_orchard_disabling_soft_fork_height,
+        nsm_reissuance_height,
         initial_nsm_value_balance,
     } = params;
 
@@ -1469,6 +1478,11 @@ where
         );
     }
 
+    if let Some(height) = nsm_reissuance_height {
+        params_builder = params_builder
+            .with_nsm_reissuance_height(height.try_into().map_err(de::Error::custom)?);
+    }
+
     if let Some(balance) = initial_nsm_value_balance {
         let balance = i64::try_from(balance)
             .map_err(de::Error::custom)
@@ -1511,6 +1525,7 @@ fn build_regtest_params<'de, D: Deserializer<'de>>(
         checkpoints,
         extend_funding_stream_addresses_as_required,
         max_block_time_start_height,
+        nsm_reissuance_height,
         initial_nsm_value_balance,
         ..
     } = params;
@@ -1540,6 +1555,7 @@ fn build_regtest_params<'de, D: Deserializer<'de>>(
         checkpoints: Some(checkpoints),
         max_block_time_start_height: max_block_time_start_height.map(zakura_chain::block::Height),
         extend_funding_stream_addresses_as_required,
+        nsm_reissuance_height: nsm_reissuance_height.map(zakura_chain::block::Height),
         initial_nsm_value_balance,
     })
 }

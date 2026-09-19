@@ -27,20 +27,71 @@ pub use network_chain_tip_height_estimator::NetworkChainTipHeightEstimator;
 /// without receiving a new block before being considered far from the tip.
 /// Because the comparison is inclusive, the node is considered far from the tip
 /// once the estimated distance exceeds 16 blocks.
-///
-/// [`at_or_near_tip_threshold`] scales this value for shorter target spacings.
 pub const AT_OR_NEAR_TIP_THRESHOLD: block::HeightDiff = 16;
 
-/// Returns the maximum estimated distance to the network chain tip that is
-/// considered at or near tip, when the network tip is at `height`.
+/// Returns whether the estimated network tip is within the near-tip time window
+/// of the local tip.
 ///
-/// Scales [`AT_OR_NEAR_TIP_THRESHOLD`] by the ratio of the post-Blossom target
-/// spacing to the target spacing at `height`, so the threshold stays about 20
-/// minutes. That is 16 blocks at 75 seconds, and 48 blocks at the 25 second
-/// spacing that ZIP 218 activates at NU7. Longer spacings keep 16 blocks.
-pub fn at_or_near_tip_threshold(network: &Network, height: block::Height) -> block::HeightDiff {
-    let spacing = NetworkUpgrade::target_spacing_for_height(network, height).num_seconds();
-    AT_OR_NEAR_TIP_THRESHOLD * (i64::from(POST_BLOSSOM_POW_TARGET_SPACING) / spacing).max(1)
+/// Each segment uses its own target spacing, so a range crossing a spacing
+/// change is not treated as if every block had the spacing at the estimated
+/// tip. Spacings longer than the post-Blossom spacing retain the baseline
+/// 16-block window.
+fn is_at_or_near_tip(
+    network: &Network,
+    local_tip: block::Height,
+    estimated_tip: block::Height,
+) -> bool {
+    let current_spacing =
+        NetworkUpgrade::target_spacing_for_height(network, local_tip).num_seconds();
+    let spacing_changes = NetworkUpgrade::target_spacings(network)
+        .filter(|(height, _)| *height > local_tip)
+        .map(|(height, spacing)| (height, spacing.num_seconds()));
+
+    is_at_or_near_tip_with_spacing_changes(
+        local_tip,
+        estimated_tip,
+        current_spacing,
+        spacing_changes,
+    )
+}
+
+/// The segmented near-tip calculation, with an injectable spacing schedule for
+/// activation-boundary tests.
+fn is_at_or_near_tip_with_spacing_changes(
+    local_tip: block::Height,
+    estimated_tip: block::Height,
+    current_spacing: i64,
+    spacing_changes: impl IntoIterator<Item = (block::Height, i64)>,
+) -> bool {
+    if estimated_tip <= local_tip {
+        return true;
+    }
+
+    let baseline_spacing = i64::from(POST_BLOSSOM_POW_TARGET_SPACING);
+    let time_limit = AT_OR_NEAR_TIP_THRESHOLD * baseline_spacing;
+    let mut elapsed = 0;
+    let mut segment_start = local_tip
+        .next()
+        .expect("an estimated tip above the local tip means the local tip is below Height::MAX");
+    let mut segment_spacing = current_spacing.min(baseline_spacing);
+
+    for (change_height, next_spacing) in spacing_changes {
+        if change_height > estimated_tip {
+            break;
+        }
+
+        let segment_blocks = i64::from(change_height.0 - segment_start.0);
+        elapsed += segment_blocks * segment_spacing;
+        if elapsed > time_limit {
+            return false;
+        }
+
+        segment_start = change_height;
+        segment_spacing = next_spacing.min(baseline_spacing);
+    }
+
+    let remaining_blocks = i64::from(estimated_tip.0 - segment_start.0) + 1;
+    elapsed + remaining_blocks * segment_spacing <= time_limit
 }
 
 /// An interface for querying the chain tip.
@@ -149,16 +200,14 @@ pub trait ChainTip {
 
     /// Returns `true` if the node is at or near the network chain tip.
     ///
-    /// Returns `false` if the chain is empty or the node is more than
-    /// [`at_or_near_tip_threshold`] blocks behind the estimated network tip,
-    /// meaning stall detection should remain active.
+    /// Returns `false` if the chain is empty or the node is outside the near-tip
+    /// time window, meaning stall detection should remain active.
     fn is_at_or_near_network_tip(&self, network: &Network) -> bool {
         match self.estimate_distance_to_network_chain_tip(network) {
             None => false,
-            Some((distance, height)) => {
-                let estimated_tip = (height + distance).unwrap_or(height);
-                distance <= at_or_near_tip_threshold(network, estimated_tip)
-            }
+            Some((distance, _height)) if distance <= 0 => true,
+            Some((distance, height)) => (height + distance)
+                .is_some_and(|estimated_tip| is_at_or_near_tip(network, height, estimated_tip)),
         }
     }
 }

@@ -33,8 +33,8 @@ use zakura_chain::{
     parameters::{
         checkpoint::list::CheckpointList,
         subsidy::{
-            block_subsidy, funding_stream_values, is_zip234_active, FundingStreamReceiver,
-            SubsidyError,
+            block_subsidy, funding_stream_values, is_zip234_active, parent_nsm_value_balance,
+            FundingStreamReceiver, SubsidyError,
         },
         Network, NetworkUpgrade, GENESIS_PREVIOUS_BLOCK_HASH,
     },
@@ -1321,16 +1321,22 @@ where
                     };
                     let parent_info = parent_info
                         .expect("AwaitBlockInfo only returns after the parent block commits");
-                    let nsm_value_balance = parent_info
-                        .value_pools()
-                        .nsm_value_balance_amount()
-                        .constrain()
-                        .ok();
-                    let deferred_pool_balance_change = deferred_pool_balance_change(
-                        req_block.block.height,
-                        &network,
-                        nsm_value_balance,
-                    )?;
+                    // The verifier has already advanced its progress past this block, so
+                    // report a failure here as a commit failure, which resets the verifier.
+                    let deferred_pool_balance_change = parent_nsm_value_balance(
+                        parent_info.value_pools().nsm_value_balance_amount(),
+                    )
+                    .map_err(VerifyCheckpointError::from)
+                    .and_then(|nsm_value_balance| {
+                        deferred_pool_balance_change(
+                            req_block.block.height,
+                            &network,
+                            Some(nsm_value_balance),
+                        )
+                    })
+                    .map_err(|error| {
+                        VerifyCheckpointError::CommitCheckpointVerified(error.into())
+                    })?;
                     req_block.block = req_block
                         .block
                         .with_deferred_pool_balance_change(deferred_pool_balance_change);

@@ -1755,15 +1755,25 @@ fn state_commit_context_errors_keep_misbehavior_scores() {
 /// A balance that pays a nonzero ZIP 234 bonus.
 const ZIP234_TEST_DEFICIT: i64 = 400_000_000;
 
-/// `ceil(ZIP234_TEST_DEFICIT * BLOCK_SUBSIDY_FRACTION)` at `height` on `network`.
-fn zip234_test_bonus(network: &Network, height: Height) -> i64 {
-    let numerator = i128::try_from(
-        zakura_chain::parameters::subsidy::block_subsidy_fraction_numerator(height, network),
-    )
-    .expect("the fraction numerator fits in i128");
-    let bonus = (i128::from(ZIP234_TEST_DEFICIT) * numerator + 9_999_999_999) / 10_000_000_000;
+/// Restates ZIP 234's `ceil(balance * BLOCK_SUBSIDY_FRACTION)` at `height` on `network`
+/// independently of `block_subsidy`.
+fn zip234_bonus(network: &Network, height: Height, balance: i64) -> i64 {
+    use zakura_chain::parameters::subsidy::{
+        block_subsidy_fraction_numerator, BLOCK_SUBSIDY_FRACTION_DENOMINATOR,
+    };
+
+    let numerator = i128::try_from(block_subsidy_fraction_numerator(height, network))
+        .expect("the fraction numerator fits in i128");
+    let denominator = i128::try_from(BLOCK_SUBSIDY_FRACTION_DENOMINATOR)
+        .expect("the fraction denominator fits in i128");
+    let bonus = (i128::from(balance) * numerator + denominator - 1) / denominator;
 
     i64::try_from(bonus).expect("the bonus fits in i64")
+}
+
+/// `ceil(ZIP234_TEST_DEFICIT * BLOCK_SUBSIDY_FRACTION)` at `height` on `network`.
+fn zip234_test_bonus(network: &Network, height: Height) -> i64 {
+    zip234_bonus(network, height, ZIP234_TEST_DEFICIT)
 }
 
 /// Returns the chain value pools after `parent` on `network`, `balance` zatoshi behind the
@@ -1848,9 +1858,7 @@ async fn zip234_block_verification_checks_the_reissuance_bonus() {
     // The largest deficit that still rounds up to a one-zatoshi bonus.
     let boundary = i64::try_from(10_000_000_000 / numerator).expect("the boundary fits in i64");
     for deficit in [0i64, 1, 2, boundary, boundary + 1, ZIP234_TEST_DEFICIT] {
-        let bonus =
-            i64::try_from((i128::from(deficit) * numerator + 9_999_999_999) / 10_000_000_000)
-                .unwrap();
+        let bonus = zip234_bonus(&network, start, deficit);
         let allowed = (halving_subsidy + Amount::try_from(bonus).unwrap()).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(10), verify(deficit, allowed))
             .await
@@ -1907,13 +1915,12 @@ async fn zip234_block_verification_checks_the_reissuance_bonus() {
         }),
     ));
 
-    // A parent that issued more than the schedule has a negative balance. The state rejects
-    // such a parent at a ZIP 234 height, so semantic verification only has to refuse to
-    // compute a subsidy from it.
+    // A parent that issued more than the schedule has a negative balance, which
+    // semantic verification reports instead of computing a subsidy from it.
     assert!(matches!(
         verify(-1, halving_subsidy).await,
         Err(VerifyBlockError::Subsidy(
-            SubsidyError::MissingNsmValueBalance
+            SubsidyError::NegativeNsmValueBalance
         )),
     ));
 }
@@ -2171,7 +2178,7 @@ mod zip218_shielded_action_limits {
         block::{Block, Height},
         parameters::{
             testnet::{ConfiguredActivationHeights, Parameters},
-            Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET, ORCHARD_BLOCK_ACTION_LIMIT,
+            Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET, ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
             SAPLING_BLOCK_IO_LIMIT, SPROUT_BLOCK_JOINSPLIT_LIMIT,
         },
         primitives::Groth16Proof,
@@ -2226,7 +2233,7 @@ mod zip218_shielded_action_limits {
     fn limits_activate_at_the_nu7_height() {
         let network = nu7_activation_testnet(2);
         let over_limit_tx =
-            fake_v5_with_orchard_actions(limit_plus_one(ORCHARD_BLOCK_ACTION_LIMIT));
+            fake_v5_with_orchard_actions(limit_plus_one(ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT));
 
         check::shielded_action_limits_are_valid(
             [over_limit_tx.clone()].iter(),
@@ -2242,8 +2249,8 @@ mod zip218_shielded_action_limits {
         assert_eq!(
             err,
             TransactionError::OrchardActionsExceedBlockLimit {
-                actions: ORCHARD_BLOCK_ACTION_LIMIT + 1,
-                limit: ORCHARD_BLOCK_ACTION_LIMIT,
+                actions: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT + 1,
+                limit: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
             }
         );
     }
@@ -2253,7 +2260,7 @@ mod zip218_shielded_action_limits {
         let cases: [(&str, Arc<Transaction>); 3] = [
             (
                 "Orchard actions",
-                fake_v5_with_orchard_actions(limit_as_usize(ORCHARD_BLOCK_ACTION_LIMIT)),
+                fake_v5_with_orchard_actions(limit_as_usize(ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT)),
             ),
             (
                 "Sapling spends and outputs",
@@ -2345,7 +2352,7 @@ mod zip218_shielded_action_limits {
     fn a_cost_above_the_global_budget_is_rejected() {
         let err = check::shielded_action_limits_are_valid(
             [
-                fake_v5_with_orchard_actions(limit_as_usize(ORCHARD_BLOCK_ACTION_LIMIT)),
+                fake_v5_with_orchard_actions(limit_as_usize(ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT)),
                 fake_v5_with_sapling_outputs(1),
             ]
             .iter(),
@@ -2363,16 +2370,48 @@ mod zip218_shielded_action_limits {
         );
     }
 
-    /// Ironwood actions count against the Orchard limit, alone or mixed with
-    /// Orchard actions, in one transaction or across transactions.
+    /// Ironwood has its own per-pool limit, which Orchard actions do not
+    /// consume.
     #[test]
-    fn ironwood_actions_above_the_orchard_limit_are_rejected() {
-        let over_limit = limit_plus_one(ORCHARD_BLOCK_ACTION_LIMIT);
-        let orchard_half = over_limit / 2;
-        let ironwood_half = over_limit - orchard_half;
+    fn ironwood_actions_above_the_ironwood_limit_are_rejected() {
+        let over_limit = limit_plus_one(ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT);
 
-        let cases: [(&str, Vec<Arc<Transaction>>); 3] = [
+        let cases: [(&str, Vec<Arc<Transaction>>); 2] = [
             ("Ironwood actions alone", vec![ironwood_tx(0, over_limit)]),
+            (
+                "Ironwood actions across transactions",
+                vec![ironwood_tx(0, over_limit - 1), ironwood_tx(0, 1)],
+            ),
+        ];
+
+        for (case, transactions) in cases {
+            let err = check::shielded_action_limits_are_valid(
+                transactions.iter(),
+                Height(1),
+                &nu7_active_testnet(),
+            )
+            .expect_err("Ironwood actions above the Ironwood limit must fail");
+
+            assert_eq!(
+                err,
+                TransactionError::IronwoodActionsExceedBlockLimit {
+                    actions: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT + 1,
+                    limit: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
+                },
+                "{case}"
+            );
+        }
+    }
+
+    /// Each Orchard-protocol pool can reach its own per-pool limit, but the two
+    /// pools share one global budget, so together they cannot exceed it.
+    #[test]
+    fn orchard_and_ironwood_actions_share_the_global_budget() {
+        let over_budget = limit_plus_one(GLOBAL_SHIELDED_BUDGET);
+        let orchard_half = over_budget / 2;
+        let ironwood_half = over_budget - orchard_half;
+
+        let cases: [(&str, Vec<Arc<Transaction>>); 2] = [
             (
                 "Orchard and Ironwood actions in one transaction",
                 vec![ironwood_tx(orchard_half, ironwood_half)],
@@ -2392,13 +2431,13 @@ mod zip218_shielded_action_limits {
                 Height(1),
                 &nu7_active_testnet(),
             )
-            .expect_err("Ironwood actions above the Orchard limit must fail");
+            .expect_err("Orchard plus Ironwood actions above the global budget must fail");
 
             assert_eq!(
                 err,
-                TransactionError::OrchardActionsExceedBlockLimit {
-                    actions: ORCHARD_BLOCK_ACTION_LIMIT + 1,
-                    limit: ORCHARD_BLOCK_ACTION_LIMIT,
+                TransactionError::ShieldedCostExceedsBlockBudget {
+                    cost: GLOBAL_SHIELDED_BUDGET + 1,
+                    limit: GLOBAL_SHIELDED_BUDGET,
                 },
                 "{case}"
             );
@@ -2406,8 +2445,8 @@ mod zip218_shielded_action_limits {
     }
 
     #[test]
-    fn ironwood_actions_at_the_orchard_limit_are_accepted() {
-        let limit = limit_as_usize(ORCHARD_BLOCK_ACTION_LIMIT);
+    fn ironwood_actions_at_the_ironwood_limit_are_accepted() {
+        let limit = limit_as_usize(ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT);
         let orchard_half = limit / 2;
 
         for tx in [
@@ -2415,7 +2454,7 @@ mod zip218_shielded_action_limits {
             ironwood_tx(orchard_half, limit - orchard_half),
         ] {
             check::shielded_action_limits_are_valid([tx].iter(), Height(1), &nu7_active_testnet())
-                .expect("Orchard and Ironwood actions exactly at the Orchard limit must pass");
+                .expect("Orchard and Ironwood actions exactly at the global budget must pass");
         }
     }
 
@@ -2424,7 +2463,7 @@ mod zip218_shielded_action_limits {
     fn ironwood_actions_count_in_the_global_budget() {
         let err = check::shielded_action_limits_are_valid(
             [
-                ironwood_tx(0, limit_as_usize(ORCHARD_BLOCK_ACTION_LIMIT)),
+                ironwood_tx(0, limit_as_usize(ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT)),
                 fake_v5_with_sapling_outputs(1),
             ]
             .iter(),

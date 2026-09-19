@@ -1193,7 +1193,7 @@ fn reissuance_activation_and_rounding_boundary_matrix() {
                     crate::amount::MAX_MONEY,
                 ] {
                     let expected_bonus = if active {
-                        (i128::from(deficit) * numerator + 9_999_999_999) / 10_000_000_000
+                        reissuance_bonus_oracle(deficit, numerator)
                     } else {
                         0
                     };
@@ -1423,4 +1423,13 @@ fn halving_interval_must_be_positive_and_representable_in_seconds() {
             assert_eq!(halving(Height::MAX, &network), 0);
         }
     }
+}
+
+/// Restates ZIP 234's `ceil(balance * numerator / BLOCK_SUBSIDY_FRACTION_DENOMINATOR)`
+/// independently of `block_subsidy`.
+fn reissuance_bonus_oracle(balance: i64, numerator: i128) -> i128 {
+    use crate::parameters::subsidy::BLOCK_SUBSIDY_FRACTION_DENOMINATOR;
+
+    let denominator = i128::try_from(BLOCK_SUBSIDY_FRACTION_DENOMINATOR).unwrap();
+    (i128::from(balance) * numerator + denominator - 1) / denominator
 }

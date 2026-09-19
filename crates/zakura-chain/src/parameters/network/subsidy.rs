@@ -20,7 +20,7 @@ pub use fees::miner_fee_share;
 use std::{collections::HashMap, sync::OnceLock};
 
 use crate::{
-    amount::{self, Amount, NonNegative, MAX_MONEY},
+    amount::{self, Amount, NegativeAllowed, NonNegative, MAX_MONEY},
     block::{Height, HeightDiff},
     parameters::{network_upgrade::POST_BLOSSOM_POW_TARGET_SPACING, Network, NetworkUpgrade},
     transparent,
@@ -790,6 +790,18 @@ impl<'a> Pre218Schedule<'a> {
 /// has to fetch the money reserve.
 pub fn is_zip234_active(network: &Network, height: Height) -> bool {
     nsm_reissuance_height(network).is_some_and(|start| height >= start)
+}
+
+/// Returns the NSM value balance after a block's parent, in the form [`block_subsidy`] takes.
+///
+/// The state stores a signed balance. Returns [`SubsidyError::NegativeNsmValueBalance`] if
+/// the parent's chain issued more than the halving schedule.
+pub fn parent_nsm_value_balance(
+    nsm_value_balance: Amount<NegativeAllowed>,
+) -> Result<Amount<NonNegative>, SubsidyError> {
+    nsm_value_balance
+        .constrain()
+        .map_err(|_| SubsidyError::NegativeNsmValueBalance)
 }
 
 /// Applies the [ZIP 234] reissuance fraction at `height` to `amount`, rounding up.

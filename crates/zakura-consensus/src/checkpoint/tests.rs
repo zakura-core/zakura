@@ -256,15 +256,13 @@ async fn generated_local_seed_chain_passes_checkpoint_verification() -> Result<(
     Ok(())
 }
 
-/// A checkpoint at the ZIP 234 start height must wait for its parent's state.
-#[tokio::test(flavor = "multi_thread")]
-async fn checkpoint_sync_crosses_zip234_activation() -> Result<(), Report> {
-    use zakura_chain::{
-        block_info::BlockInfo,
-        parameters::testnet::{ConfiguredActivationHeights, ConfiguredCheckpoints, Parameters},
+/// Returns a network whose ZIP 234 start is at height 1, with Mainnet blocks 0 and 1 as
+/// its checkpoints.
+fn zip234_crossing_fixture() -> Result<(Network, Arc<Block>, Arc<Block>), Report> {
+    use zakura_chain::parameters::testnet::{
+        ConfiguredActivationHeights, ConfiguredCheckpoints, Parameters,
     };
 
-    let _init_guard = zakura_test::init();
     let block0 =
         Arc::<Block>::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])?;
     let block1 = Arc::<Block>::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_1_BYTES[..])?;
@@ -293,6 +291,19 @@ async fn checkpoint_sync_crosses_zip234_activation() -> Result<(), Report> {
         .disable_temporary_orchard_disabling_soft_fork()
         .with_target_difficulty_limit(target_difficulty_limit)?
         .to_network()?;
+
+    Ok((network, block0, block1))
+}
+
+/// A checkpoint at the ZIP 234 start height must wait for its parent's state.
+#[tokio::test(flavor = "multi_thread")]
+async fn checkpoint_sync_crosses_zip234_activation() -> Result<(), Report> {
+    use zakura_chain::block_info::BlockInfo;
+
+    let _init_guard = zakura_test::init();
+    let (network, block0, block1) = zip234_crossing_fixture()?;
+    let hash0 = block0.hash();
+    let hash1 = block1.hash();
 
     let parent_commit_gate = Arc::new(tokio::sync::Notify::new());
     let (parent_committed, _) = tokio::sync::watch::channel(false);
@@ -349,6 +360,83 @@ async fn checkpoint_sync_crosses_zip234_activation() -> Result<(), Report> {
 
     assert_eq!(block0_result??, hash0);
     assert_eq!(block1_result??, hash1);
+
+    Ok(())
+}
+
+/// A parent with a negative issuance deficit fails the child's commit after the verifier
+/// has advanced past it, so the commit task must reset the verifier to the state tip.
+#[tokio::test(flavor = "multi_thread")]
+async fn checkpoint_negative_parent_deficit_resets_the_verifier() -> Result<(), Report> {
+    use zakura_chain::{block_info::BlockInfo, value_balance::ValueBalance};
+
+    let _init_guard = zakura_test::init();
+    let (network, block0, block1) = zip234_crossing_fixture()?;
+    let hash0 = block0.hash();
+
+    let mut parent_pools = ValueBalance::zero();
+    parent_pools.set_nsm_value_balance_amount(Amount::try_from(-1)?);
+
+    let tip_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let state_tip_requests = tip_requests.clone();
+    let state_service = tower::service_fn(move |request: zs::Request| {
+        let tip_requests = state_tip_requests.clone();
+        async move {
+            match request {
+                zs::Request::CommitCheckpointVerifiedBlock(block) => {
+                    assert_eq!(block.height, block::Height(0), "the child never commits");
+                    Ok(zs::Response::Committed(block.hash))
+                }
+                zs::Request::AwaitBlockInfo(hash) => {
+                    assert_eq!(hash, hash0);
+                    Ok(zs::Response::BlockInfo(Some(BlockInfo::new(
+                        parent_pools,
+                        0,
+                    ))))
+                }
+                zs::Request::Tip => {
+                    tip_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(zs::Response::Tip(Some((block::Height(0), hash0))))
+                }
+                _ => {
+                    unreachable!("checkpoint test uses only commit, parent info, and tip requests")
+                }
+            }
+        }
+    });
+    let mut verifier = CheckpointVerifier::from_list(
+        [(block::Height(0), hash0), (block::Height(1), block1.hash())],
+        &network,
+        None,
+        state_service,
+    )?;
+
+    let block0_result = verifier.ready().await?.call(block0);
+    let block1_result = verifier.ready().await?.call(block1);
+    let (block0_result, block1_result) = tokio::join!(
+        timeout(Duration::from_secs(VERIFY_TIMEOUT_SECONDS), block0_result),
+        timeout(Duration::from_secs(VERIFY_TIMEOUT_SECONDS), block1_result),
+    );
+
+    assert_eq!(block0_result??, hash0);
+    let error = block1_result?.expect_err("a negative parent deficit fails the commit");
+    let VerifyCheckpointError::CommitCheckpointVerified(source) = &error else {
+        panic!("unexpected checkpoint error: {error:?}");
+    };
+    assert!(
+        matches!(
+            source.downcast_ref::<VerifyCheckpointError>(),
+            Some(VerifyCheckpointError::SubsidyError(
+                SubsidyError::NegativeNsmValueBalance
+            ))
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        tip_requests.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the commit task resets the verifier to the state tip",
+    );
 
     Ok(())
 }

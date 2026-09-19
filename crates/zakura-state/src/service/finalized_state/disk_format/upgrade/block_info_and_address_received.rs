@@ -10,7 +10,10 @@ use zakura_chain::{
     amount::{DeferredPoolBalanceChange, NonNegative},
     block::{Block, Height},
     block_info::BlockInfo,
-    parameters::subsidy::{block_subsidy, funding_stream_values, FundingStreamReceiver},
+    parameters::subsidy::{
+        block_subsidy, funding_stream_values, is_zip234_active, parent_nsm_value_balance,
+        FundingStreamReceiver,
+    },
     transparent::{self, OutPoint, Utxo},
     value_balance::ValueBalance,
 };
@@ -184,16 +187,17 @@ impl DiskFormatUpgrade for Upgrade {
             let deferred_pool_balance_change = {
                 // ZIP 234 derives the block subsidy from the money reserve after the parent
                 // block, which is the running value pool.
-                let block_subsidy = block_subsidy(
-                    height,
-                    &network,
-                    value_pool.nsm_value_balance_amount().constrain().ok(),
-                )
-                .map_err(|error| {
-                    super::FormatChangeError::InvalidPostcondition(format!(
-                        "invalid block subsidy at height {height:?}: {error}"
-                    ))
-                })?;
+                let block_subsidy = is_zip234_active(&network, height)
+                    .then(|| parent_nsm_value_balance(value_pool.nsm_value_balance_amount()))
+                    .transpose()
+                    .and_then(|nsm_value_balance| {
+                        block_subsidy(height, &network, nsm_value_balance)
+                    })
+                    .map_err(|error| {
+                        super::FormatChangeError::InvalidPostcondition(format!(
+                            "invalid block subsidy at height {height:?}: {error}"
+                        ))
+                    })?;
 
                 // See [ZIP-1015](https://zips.z.cash/zip-1015).
                 let deferred_pool_balance_change =

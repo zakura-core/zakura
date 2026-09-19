@@ -1437,7 +1437,7 @@ pub enum Request {
     /// [`block::Height`] using `.into()`.
     Block(HashOrHeight),
 
-    /// Looks up the [`BlockInfo`] for a block hash.
+    /// Looks up the [`BlockInfo`](zakura_chain::block_info::BlockInfo) for a block hash.
     ///
     /// This request waits until the block commits if needed.
     ///
@@ -1451,7 +1451,8 @@ pub enum Request {
     /// [`AWAIT_BLOCK_INFO_TIMEOUT`](crate::constants::AWAIT_BLOCK_INFO_TIMEOUT).
     AwaitBlockInfo(block::Hash),
 
-    /// Looks up the [`BlockInfo`] for a committed block hash without waiting.
+    /// Looks up the [`BlockInfo`](zakura_chain::block_info::BlockInfo) for a committed block
+    /// hash without waiting.
     ///
     /// This request checks every non-finalized chain and the finalized state.
     ///

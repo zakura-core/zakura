@@ -5,10 +5,13 @@ use chrono::{DateTime, Duration};
 use zakura_chain::{
     block::{merkle::AuthDataRoot, ChainHistoryBlockTxAuthCommitmentHash, CommitmentError},
     history_tree::HistoryTree,
-    parameters::{Network, NetworkUpgrade, POW_AVERAGING_WINDOW},
+    parameters::{
+        testnet::{ConfiguredActivationHeights, Parameters},
+        Network, NetworkUpgrade, POW_AVERAGING_WINDOW,
+    },
     sapling,
     serialization::ZcashDeserializeInto,
-    work::difficulty::ParameterDifficulty,
+    work::difficulty::{CompactDifficulty, ParameterDifficulty},
 };
 
 use super::super::*;
@@ -204,19 +207,24 @@ fn difficulty_context_follows_the_candidate_height() {
     }
 }
 
-/// Block verification accepts the expected threshold with the full post-NU7
-/// difficulty context.
+/// Block verification enforces a fixed post-NU7 threshold using the complete
+/// difficulty context on a PoW-enabled configured Testnet.
 #[test]
-fn block_daa_reads_the_post_nu7_context() {
+fn block_daa_enforces_the_post_nu7_context() {
     let _init_guard = zakura_test::init();
 
-    let network = Network::new_regtest(
-        zakura_chain::parameters::testnet::ConfiguredActivationHeights {
+    let network = Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            blossom: Some(1),
             nu7: Some(347_400),
             ..Default::default()
-        }
-        .into(),
-    );
+        })
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid");
+    assert!(!network.disable_pow());
+
     // The candidate's coinbase height selects the difficulty context.
     let candidate = zakura_test::vectors::BLOCK_MAINNET_347499_BYTES
         .zcash_deserialize_into::<Arc<Block>>()
@@ -227,16 +235,22 @@ fn block_daa_reads_the_post_nu7_context() {
         difficulty::pow_adjustment_block_span_for_height(&network, candidate_height)
             > difficulty::POW_ADJUSTMENT_BLOCK_SPAN
     );
-    let candidate_time = DateTime::from_timestamp(15_000, 0).expect("test timestamp is in-range");
-    let context = daa_context(&network, parent_height, candidate_time);
-    let expected = AdjustedDifficulty::new_from_header_time(
-        candidate_time,
-        parent_height,
-        &network,
-        context.clone(),
-    )
-    .expect("the test supplies the complete post-NU7 difficulty context")
-    .expected_difficulty_threshold();
+    let candidate_time =
+        DateTime::from_timestamp(2_000_000_000, 0).expect("test timestamp is in-range");
+    let target_bits = [0x1e0ffff0, 0x1e0e0000, 0x1e0c8000, 0x1e0b4000, 0x1e0a2000];
+    let time_steps = [19, 31, 23, 29, 17, 37, 21];
+    let compact = |bits: u32| {
+        CompactDifficulty::from_bytes_in_display_order(&bits.to_be_bytes())
+            .expect("the fixed compact target is valid")
+    };
+    let mut time = candidate_time;
+    let context: Vec<_> = (0..difficulty::MAX_POW_ADJUSTMENT_BLOCK_SPAN)
+        .map(|index| {
+            time -= Duration::seconds(time_steps[index % time_steps.len()]);
+            (compact(target_bits[index % target_bits.len()]), time)
+        })
+        .collect();
+    let expected = compact(0x1e0cd7fd);
 
     let relevant_headers: Vec<block::Header> = context
         .iter()
@@ -259,9 +273,28 @@ fn block_daa_reads_the_post_nu7_context() {
         &network,
         Some(block::Height(0)),
         Some(parent_height),
-        relevant_headers,
+        relevant_headers.clone(),
     )
-    .expect("the post-NU7 difficulty context is complete");
+    .expect("the independently calculated post-NU7 threshold is accepted");
+
+    let mut wrong_window_candidate = candidate.clone();
+    let mut header = *wrong_window_candidate.header;
+    header.difficulty_threshold = compact(0x1e0af369);
+    wrong_window_candidate.header = Arc::new(header);
+    assert!(matches!(
+        block_is_valid_for_recent_chain_data(
+            &wrong_window_candidate,
+            candidate_height,
+            &network,
+            Some(block::Height(0)),
+            Some(parent_height),
+            relevant_headers,
+        ),
+        Err(ValidateContextError::InvalidDifficultyThreshold {
+            difficulty_threshold,
+            expected_difficulty,
+        }) if difficulty_threshold == compact(0x1e0af369) && expected_difficulty == expected
+    ));
 }
 
 #[test]

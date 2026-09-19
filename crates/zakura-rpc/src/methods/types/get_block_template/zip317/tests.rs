@@ -9,15 +9,16 @@ use zakura_chain::{
     amount::Amount,
     block::{Height, MAX_BLOCK_BYTES},
     parameters::Network,
-    serialization::ZcashSerialize,
+    serialization::{ZcashDeserializeInto, ZcashSerialize},
     transaction,
     transparent::{OutPoint, Output, Script},
 };
 use zakura_node_services::mempool::TransactionDependencies;
+use zcash_transparent::coinbase::MAX_COINBASE_SCRIPT_LEN;
 
 use crate::methods::types::{get_block_template::MinerParams, transaction::TransactionTemplate};
 
-use super::{block_template_overhead_bytes, max_coinbase_bytes, select_mempool_transactions};
+use super::{block_template_overhead_bytes, select_mempool_transactions};
 
 /// Replaces `transaction`'s inner transaction with one that has exactly
 /// `target_size` serialized bytes.
@@ -69,17 +70,36 @@ fn reserves_serialized_block_and_pool_tag_overhead() {
     let height = Height(1_000_000);
     let miner_params =
         MinerParams::from(Address::from(TransparentAddress::PublicKeyHash([0x7e; 20])));
-    let fake_coinbase =
+    let coinbase_resources =
+        TransactionTemplate::coinbase_resource_usage(&network, height, &miner_params, None)
+            .expect("test coinbase resource usage is valid");
+    let coinbase =
         TransactionTemplate::new_coinbase(&network, height, &miner_params, Amount::zero(), None)
             .expect("test coinbase template is valid");
-    assert!(
-        max_coinbase_bytes(&fake_coinbase) > fake_coinbase.data.as_ref().len(),
-        "the test coinbase leaves room for a pool tag",
+    let transaction: transaction::Transaction = coinbase
+        .data
+        .as_ref()
+        .zcash_deserialize_into()
+        .expect("test coinbase transaction is valid");
+    let coinbase_script_len = transaction.inputs()[0]
+        .coinbase_script()
+        .expect("generated coinbase input has a canonical script")
+        .len();
+    assert_eq!(
+        coinbase_resources.max_serialized_size,
+        coinbase.data.as_ref().len() + MAX_COINBASE_SCRIPT_LEN - coinbase_script_len,
+        "the resource estimate reserves the exact coinbase size plus pool tag space",
     );
+    assert_eq!(coinbase_resources.sigops, coinbase.sigops);
+    assert_eq!(
+        coinbase_resources.shielded_action_counts,
+        transaction.shielded_action_counts(),
+    );
+
     let max_block_bytes = usize::try_from(MAX_BLOCK_BYTES).expect("fits in memory");
     let max_mempool_transaction_bytes = max_block_bytes
         - block_template_overhead_bytes(&network)
-        - max_coinbase_bytes(&fake_coinbase);
+        - coinbase_resources.max_serialized_size;
 
     let template_transactions = |transaction_size| {
         let transaction = network
@@ -214,7 +234,7 @@ mod zip218_template_limits {
     use zakura_chain::{
         parameters::{
             testnet::{ConfiguredActivationHeights, Parameters},
-            Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET, ORCHARD_BLOCK_ACTION_LIMIT,
+            Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET, ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
             SAPLING_BLOCK_IO_LIMIT, SPROUT_BLOCK_JOINSPLIT_LIMIT,
         },
         transaction::{
@@ -231,7 +251,7 @@ mod zip218_template_limits {
 
     use super::{
         super::{BlockTemplateLimits, MinerParams},
-        Amount, Height, TransactionTemplate,
+        Height, TransactionTemplate,
     };
 
     /// A transaction that fills the Orchard limit leaves no room under the
@@ -242,7 +262,7 @@ mod zip218_template_limits {
         let mut limits = nu7_template_limits();
 
         let orchard_tx = verified_unmined_tx(fake_v5_with_orchard_actions(
-            usize::try_from(ORCHARD_BLOCK_ACTION_LIMIT).expect("the limit fits in usize"),
+            usize::try_from(ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT).expect("the limit fits in usize"),
         ));
         let sapling_tx = verified_unmined_tx(fake_v5_with_sapling_outputs(1));
 
@@ -256,31 +276,57 @@ mod zip218_template_limits {
         );
     }
 
-    /// Ironwood actions share the Orchard capacity, so a template cannot
-    /// exceed the Orchard limit by mixing Orchard and Ironwood transactions.
+    /// Ironwood has its own per-pool capacity, which Orchard transactions do
+    /// not consume.
     #[test]
-    fn ironwood_actions_share_the_orchard_capacity() {
-        let limit = usize::try_from(ORCHARD_BLOCK_ACTION_LIMIT).expect("the limit fits in usize");
+    fn ironwood_actions_have_their_own_capacity() {
+        let limit =
+            usize::try_from(ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT).expect("the limit fits in usize");
+        let mut limits = nu7_template_limits();
+
+        let over_limit_ironwood_tx = verified_unmined_tx(ironwood_tx(0, limit + 1));
+        let at_limit_ironwood_tx = verified_unmined_tx(ironwood_tx(0, limit));
+
+        assert!(
+            !limits.try_add(&over_limit_ironwood_tx),
+            "Ironwood actions past the Ironwood per-pool limit must not be selected"
+        );
+        assert!(
+            limits.try_add(&at_limit_ironwood_tx),
+            "Ironwood actions exactly at the per-pool limit fit in an empty template"
+        );
+        assert_eq!(limits.remaining_ironwood_actions, 0);
+        assert_eq!(
+            limits.remaining_orchard_actions, ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
+            "Ironwood actions leave the Orchard per-pool capacity untouched"
+        );
+    }
+
+    /// Orchard and Ironwood draw on one global budget, so a template cannot
+    /// spend the per-pool capacity twice.
+    #[test]
+    fn orchard_and_ironwood_actions_share_the_global_budget() {
+        let limit =
+            usize::try_from(ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT).expect("the limit fits in usize");
         let orchard_half = limit / 2;
         let mut limits = nu7_template_limits();
 
         let orchard_tx = verified_unmined_tx(fake_v5_with_orchard_actions(orchard_half));
-        let over_limit_ironwood_tx = verified_unmined_tx(ironwood_tx(0, limit + 1 - orchard_half));
-        let at_limit_ironwood_tx = verified_unmined_tx(ironwood_tx(0, limit - orchard_half));
+        let over_budget_ironwood_tx = verified_unmined_tx(ironwood_tx(0, limit + 1 - orchard_half));
+        let at_budget_ironwood_tx = verified_unmined_tx(ironwood_tx(0, limit - orchard_half));
 
         assert!(limits.try_add(&orchard_tx));
         assert!(
-            !limits.try_add(&over_limit_ironwood_tx),
-            "Ironwood actions past the remaining Orchard capacity must not be selected"
+            !limits.try_add(&over_budget_ironwood_tx),
+            "Ironwood actions past the remaining global budget must not be selected"
         );
         assert!(
-            limits.try_add(&at_limit_ironwood_tx),
-            "Ironwood actions that fill the remaining Orchard capacity fit"
+            limits.try_add(&at_budget_ironwood_tx),
+            "Ironwood actions that fill the remaining global budget fit"
         );
-        assert_eq!(limits.remaining_orchard_and_ironwood_actions, 0);
         assert_eq!(
             limits.remaining_shielded_cost,
-            GLOBAL_SHIELDED_BUDGET - ORCHARD_BLOCK_ACTION_LIMIT
+            GLOBAL_SHIELDED_BUDGET - ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT
         );
     }
 
@@ -290,7 +336,8 @@ mod zip218_template_limits {
     fn the_shielded_limits_only_bind_after_activation() {
         let network = nu7_activation_testnet(2);
         let over_limit_tx = verified_unmined_tx(fake_v5_with_orchard_actions(
-            usize::try_from(ORCHARD_BLOCK_ACTION_LIMIT + 1).expect("the limit fits in usize"),
+            usize::try_from(ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT + 1)
+                .expect("the limit fits in usize"),
         ));
 
         let mut pre_activation = template_limits(&network, Height(1));
@@ -324,19 +371,20 @@ mod zip218_template_limits {
         assert_eq!(limits.cost, GLOBAL_SHIELDED_BUDGET - 1);
     }
 
-    /// Coinbase Ironwood actions consume the Orchard capacity and the global
-    /// budget.
+    /// Coinbase Ironwood actions consume the Ironwood capacity and the global
+    /// budget, and leave the Orchard capacity alone.
     #[test]
-    fn the_coinbase_ironwood_actions_consume_orchard_capacity() {
+    fn the_coinbase_ironwood_actions_consume_ironwood_capacity() {
         let network = nu7_activation_testnet(1);
         let coinbase_counts = ironwood_tx(0, 2).shielded_action_counts();
         let limits =
             BlockTemplateLimits::remaining_shielded_limits(&network, Height(1), coinbase_counts);
 
         assert_eq!(
-            limits.orchard_and_ironwood_actions,
-            ORCHARD_BLOCK_ACTION_LIMIT - 2
+            limits.ironwood_actions,
+            ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT - 2
         );
+        assert_eq!(limits.orchard_actions, ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT);
         assert_eq!(limits.cost, GLOBAL_SHIELDED_BUDGET - 2);
     }
 
@@ -351,11 +399,11 @@ mod zip218_template_limits {
     fn template_limits(network: &Network, height: Height) -> BlockTemplateLimits {
         let miner_params =
             MinerParams::from(Address::from(TransparentAddress::PublicKeyHash([0x7e; 20])));
-        let fake_coinbase_tx =
-            TransactionTemplate::new_coinbase(network, height, &miner_params, Amount::zero(), None)
-                .expect("valid coinbase transaction template");
+        let coinbase_resources =
+            TransactionTemplate::coinbase_resource_usage(network, height, &miner_params, None)
+                .expect("valid coinbase resource usage");
 
-        BlockTemplateLimits::initial(network, height, &fake_coinbase_tx)
+        BlockTemplateLimits::initial(network, height, coinbase_resources)
     }
 
     fn nu7_template_limits() -> BlockTemplateLimits {
@@ -363,7 +411,8 @@ mod zip218_template_limits {
             remaining_bytes: usize::MAX,
             remaining_sigops: u32::MAX,
             remaining_unpaid_actions: u32::MAX,
-            remaining_orchard_and_ironwood_actions: ORCHARD_BLOCK_ACTION_LIMIT,
+            remaining_orchard_actions: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
+            remaining_ironwood_actions: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
             remaining_sapling_ios: SAPLING_BLOCK_IO_LIMIT,
             remaining_sprout_joinsplits: SPROUT_BLOCK_JOINSPLIT_LIMIT,
             remaining_shielded_cost: GLOBAL_SHIELDED_BUDGET,

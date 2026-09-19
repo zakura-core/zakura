@@ -56,7 +56,7 @@ proptest! {
         let actual = i64::from(block_subsidy(Height(height), &network, Some(Amount::try_from(balance).unwrap())).unwrap());
         let bonus = if height >= 3 {
             let numerator = i128::try_from(block_subsidy_fraction_numerator(Height(height), &network)).unwrap();
-            (i128::from(balance) * numerator + 9_999_999_999) / 10_000_000_000
+            super::reissuance_bonus_oracle(balance, numerator)
         } else {
             0
         };

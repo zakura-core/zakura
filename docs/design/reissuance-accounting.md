@@ -93,10 +93,36 @@ chain's own history, as the measured Mainnet and Testnet constants do. The migra
 performs cumulative schedule arithmetic without clamping either operand to MAX_MONEY. It
 checks the eligible balance after the offset.
 
-The migration writes batches of 10,000 BlockInfo records. It preserves monetary
+The migration skips records before NU7, except for the preceding block when it
+must receive a nonzero seed. Earlier legacy records already decode with a zero
+balance. If NU7 is unscheduled or the tip precedes the first affected block, the
+migration performs no data writes, including to the separately stored tip pools.
+
+The migration reads no history before the pre-NU7 baseline and does not audit
+or repair the absolute historical Deferred balance. A nonzero NSM seed is written
+at that baseline, but Deferred changes are validated only from NU7 onward.
+A constant historical monetary-pool offset cancels. Each post-activation Deferred
+change must match funding minus disbursements before the corresponding NSM balance
+is written. This rejects mixed replay/commit histories whose changing Deferred
+undercount would otherwise distort the NSM balance.
+
+Malformed monetary records, invalid totals, missing required rows, and disagreement
+between tip records remain errors. Detecting or repairing other historical
+corruption is a separate database-integrity task. Cancellation and failures preserve
+the version marker so startup can retry. Older binaries require a backup or a
+separate sync to downgrade.
+
+The migration writes batches of 10,000 affected BlockInfo records. It preserves monetary
 pools and block sizes. It updates the separately stored tip balance last.
 Cancellation or a failed write leaves the version marker unchanged. Restarting
 the migration recomputes every balance, including already rewritten records.
+
+The migration refuses a database whose finalized tip is at or above the ZIP 234
+start height. Older versions committed those blocks without reissuance, so their
+Deferred balances differ from a fresh sync. Startup fails until the operator
+deletes the database. The error says to delete it and sync again. The refusal
+happens before format 29 writes any record. An operator can move a format 28
+database back to the v28 path to restore it for the older binary.
 
 A missing baseline, malformed record, invalid pool total, or arithmetic error
 stops migration. Do not replace such data with zero. Restore a verified database

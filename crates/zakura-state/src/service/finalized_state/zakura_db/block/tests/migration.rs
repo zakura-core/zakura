@@ -29,9 +29,9 @@ use crate::{
         },
         header_chain::{
             migration::{initialize_header_chain_reconciled, HeaderChainInitializationError},
-            HeaderChainStore,
+            HeaderChainStore, HeaderChainStoreError,
         },
-        ZakuraDb,
+        FallibleDiskValue, ZakuraDb,
     },
     Config,
 };
@@ -315,12 +315,55 @@ fn existing_narrow_validation_context_is_backfilled_before_startup() {
     downgrade.zs_insert(
         &metadata_cf,
         RawBytes::new_raw_bytes(Vec::new()),
-        RawBytes::new_raw_bytes(metadata),
+        RawBytes::new_raw_bytes(metadata.clone()),
     );
     state
         .db
         .write(downgrade)
         .expect("the pre-ZIP 218 context fixture writes");
+
+    // Reject incompatible version-four metadata without changing its bytes, so
+    // the release that wrote it can still reopen the database.
+    let mut incompatible =
+        decode_v4_engine_metadata(&metadata).expect("the version-four metadata fixture decodes");
+    incompatible.network_policy_digest[0] ^= 1;
+    let incompatible = incompatible
+        .encode()
+        .expect("the incompatible metadata fixture encodes");
+    let mut corrupt = DiskWriteBatch::new();
+    corrupt.zs_insert(
+        &metadata_cf,
+        RawBytes::new_raw_bytes(Vec::new()),
+        RawBytes::new_raw_bytes(incompatible.clone()),
+    );
+    state
+        .db
+        .write(corrupt)
+        .expect("the incompatible metadata fixture writes");
+    assert!(matches!(
+        store.migrate_to_current(&config),
+        Err(HeaderChainStoreError::Incoherent(
+            "legacy network policy does not match the configured policy"
+        ))
+    ));
+    assert_eq!(
+        state
+            .db
+            .raw_get_cf(&metadata_cf, b"")
+            .expect("the rejected metadata row reads")
+            .expect("the rejected metadata row remains present"),
+        incompatible,
+    );
+    let mut restore = DiskWriteBatch::new();
+    restore.zs_insert(
+        &metadata_cf,
+        RawBytes::new_raw_bytes(Vec::new()),
+        RawBytes::new_raw_bytes(metadata),
+    );
+    state
+        .db
+        .write(restore)
+        .expect("the valid version-four metadata fixture is restored");
 
     assert!(store
         .migrate_to_current(&config)
@@ -343,6 +386,9 @@ fn existing_narrow_validation_context_is_backfilled_before_startup() {
         ))
     );
 
+    // Model a restart after the version marker commits but before the context
+    // resize. A fresh store must complete the idempotent backfill.
+    let store = HeaderChainStore::new(state.header_chain_disk_db());
     assert_eq!(
         store
             .resize_validation_context(&state)

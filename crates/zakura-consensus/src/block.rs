@@ -527,14 +527,12 @@ where
                         ));
                     };
 
-                    // The balance is signed, but `nsm_value_balance_is_non_negative` rejects
-                    // any committed block at a ZIP 234 height that leaves it negative, so a
-                    // committed parent at this height always constrains.
-                    parent_info
-                        .value_pools()
-                        .nsm_value_balance_amount()
-                        .constrain()
-                        .ok()
+                    // `nsm_value_balance_is_non_negative` rejects committed blocks that leave
+                    // the balance negative from NU7, so a negative parent balance fails here
+                    // instead of paying a bonus.
+                    Some(zakura_chain::parameters::subsidy::parent_nsm_value_balance(
+                        parent_info.value_pools().nsm_value_balance_amount(),
+                    )?)
                 } else {
                     None
                 };

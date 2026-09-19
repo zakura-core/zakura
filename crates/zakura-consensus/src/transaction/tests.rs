@@ -25,7 +25,7 @@ use zakura_chain::{
     orchard::{Action, AuthorizedAction, Flags},
     parameters::{
         testnet::{ConfiguredActivationHeights, Parameters},
-        Network, NetworkUpgrade, ORCHARD_BLOCK_ACTION_LIMIT,
+        Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET, ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
     },
     primitives::{ed25519, x25519, Groth16Proof},
     sapling,
@@ -4455,11 +4455,13 @@ async fn v5_with_duplicate_orchard_action() {
     }
 }
 
-/// The mempool rejects a transaction whose Orchard and Ironwood actions exceed
-/// the ZIP 218 Orchard limit, because no block can include it. The check runs
-/// before any state service query, and only at or after NU7 activation.
+/// The mempool rejects a transaction whose own shielded actions exceed a ZIP 218
+/// per-block limit or the global budget, because no block can include it. The
+/// check runs before any state service query, and only at or after NU7
+/// activation. Ironwood has its own per-pool limit, and shares the global budget
+/// with Orchard.
 #[tokio::test]
-async fn mempool_applies_the_orchard_limit_to_ironwood_actions() {
+async fn mempool_applies_the_zip218_limits_to_ironwood_actions() {
     let _init_guard = zakura_test::init();
 
     let height = Height(1);
@@ -4473,14 +4475,9 @@ async fn mempool_applies_the_orchard_limit_to_ironwood_actions() {
         .to_network()
         .expect("configured testnet is valid");
 
-    let limit = usize::try_from(ORCHARD_BLOCK_ACTION_LIMIT).expect("the limit fits in usize");
+    let limit =
+        usize::try_from(ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT).expect("the limit fits in usize");
     let orchard_half = limit / 2;
-    let over_limit = || {
-        Some(TransactionError::OrchardActionsExceedBlockLimit {
-            actions: ORCHARD_BLOCK_ACTION_LIMIT + 1,
-            limit: ORCHARD_BLOCK_ACTION_LIMIT,
-        })
-    };
 
     // The fake proofs fail the proof size check, which the verifier runs after
     // the shielded limits. That error shows a transaction passed the limits.
@@ -4488,13 +4485,19 @@ async fn mempool_applies_the_orchard_limit_to_ironwood_actions() {
         (
             0,
             limit + 1,
-            over_limit(),
+            Some(TransactionError::IronwoodActionsExceedBlockLimit {
+                actions: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT + 1,
+                limit: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
+            }),
             TransactionError::IronwoodProofSize,
         ),
         (
             orchard_half,
             limit + 1 - orchard_half,
-            over_limit(),
+            Some(TransactionError::ShieldedCostExceedsBlockBudget {
+                cost: GLOBAL_SHIELDED_BUDGET + 1,
+                limit: GLOBAL_SHIELDED_BUDGET,
+            }),
             TransactionError::OrchardProofSize,
         ),
         (0, limit, None, TransactionError::IronwoodProofSize),

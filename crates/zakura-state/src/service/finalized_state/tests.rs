@@ -65,3 +65,31 @@ fn checkpoint_prune_range_retains_current_height_when_range_ends_before_it() {
         "no checkpoint prune range means there is no archive backlog to drain"
     );
 }
+
+/// A missing local branch ID must not become peer-delivery failure evidence.
+#[test]
+fn missing_branch_id_preserves_local_commit_failure() {
+    use crate::{error::VctCommitFailure, ValidateContextError};
+    use zakura_chain::{history_tree::HistoryTreeError, parameters::NetworkUpgrade};
+
+    let _init_guard = zakura_test::init();
+    let state = super::FinalizedState::new(&crate::Config::ephemeral(), &Network::Mainnet)
+        .expect("the ephemeral state opens");
+    let error = ValidateContextError::HistoryTreeError(std::sync::Arc::new(
+        HistoryTreeError::MissingBranchId {
+            network_upgrade: NetworkUpgrade::Nu7,
+        },
+    ));
+    for failure in [
+        VctCommitFailure::CurrentRoots,
+        VctCommitFailure::SuccessorBoundary,
+    ] {
+        let result = state.vct_reject_supplied_root(Height(1), error.clone(), failure);
+        assert_eq!(result.vct_failure(), None);
+        assert_eq!(result.vct_retryable_height(), None);
+        assert!(matches!(
+            result.inner(),
+            crate::CommitBlockError::ValidateContextError(source) if source.as_ref() == &error
+        ));
+    }
+}

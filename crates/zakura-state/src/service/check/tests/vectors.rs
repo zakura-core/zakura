@@ -175,6 +175,95 @@ fn header_daa_accepts_valid_threshold_with_full_context() {
     .expect("expected DAA threshold is accepted");
 }
 
+/// The difficulty-context reader takes the span for the candidate height, which
+/// ZIP 218 widens at NU7.
+#[test]
+fn difficulty_context_follows_the_candidate_height() {
+    let _init_guard = zakura_test::init();
+
+    const NU7: u32 = 1_000;
+    let network = Network::new_regtest(
+        zakura_chain::parameters::testnet::ConfiguredActivationHeights {
+            nu7: Some(NU7),
+            ..Default::default()
+        }
+        .into(),
+    );
+    let ancestors = 0..difficulty::MAX_POW_ADJUSTMENT_BLOCK_SPAN * 2;
+
+    for (candidate_height, expected) in [
+        (NU7 - 1, difficulty::POW_ADJUSTMENT_BLOCK_SPAN),
+        (NU7, difficulty::MAX_POW_ADJUSTMENT_BLOCK_SPAN),
+        (NU7 + 1, difficulty::MAX_POW_ADJUSTMENT_BLOCK_SPAN),
+    ] {
+        assert_eq!(
+            difficulty_context(&network, block::Height(candidate_height), ancestors.clone()).len(),
+            expected,
+            "candidate height {candidate_height}",
+        );
+    }
+}
+
+/// Block verification accepts the expected threshold with the full post-NU7
+/// difficulty context.
+#[test]
+fn block_daa_reads_the_post_nu7_context() {
+    let _init_guard = zakura_test::init();
+
+    let network = Network::new_regtest(
+        zakura_chain::parameters::testnet::ConfiguredActivationHeights {
+            nu7: Some(347_400),
+            ..Default::default()
+        }
+        .into(),
+    );
+    // The candidate's coinbase height selects the difficulty context.
+    let candidate = zakura_test::vectors::BLOCK_MAINNET_347499_BYTES
+        .zcash_deserialize_into::<Arc<Block>>()
+        .expect("block 347499 deserializes");
+    let parent_height = block::Height(347_498);
+    let candidate_height = parent_height.next().expect("test height is valid");
+    assert!(
+        difficulty::pow_adjustment_block_span_for_height(&network, candidate_height)
+            > difficulty::POW_ADJUSTMENT_BLOCK_SPAN
+    );
+    let candidate_time = DateTime::from_timestamp(15_000, 0).expect("test timestamp is in-range");
+    let context = daa_context(&network, parent_height, candidate_time);
+    let expected = AdjustedDifficulty::new_from_header_time(
+        candidate_time,
+        parent_height,
+        &network,
+        context.clone(),
+    )
+    .expect("the test supplies the complete post-NU7 difficulty context")
+    .expected_difficulty_threshold();
+
+    let relevant_headers: Vec<block::Header> = context
+        .iter()
+        .map(|(threshold, time)| {
+            let mut header = *candidate.header;
+            header.difficulty_threshold = *threshold;
+            header.time = *time;
+            header
+        })
+        .collect();
+    let mut candidate = (*candidate).clone();
+    let mut header = *candidate.header;
+    header.time = candidate_time;
+    header.difficulty_threshold = expected;
+    candidate.header = Arc::new(header);
+
+    block_is_valid_for_recent_chain_data(
+        &candidate,
+        candidate_height,
+        &network,
+        Some(block::Height(0)),
+        Some(parent_height),
+        relevant_headers,
+    )
+    .expect("the post-NU7 difficulty context is complete");
+}
+
 #[test]
 fn header_daa_rejects_bad_threshold_with_full_context() {
     let _init_guard = zakura_test::init();
@@ -303,11 +392,11 @@ fn daa_context(
     let target_spacing = NetworkUpgrade::target_spacing_for_height(network, candidate_height);
     let difficulty = network.target_difficulty_limit().to_compact();
 
-    // The difficulty context spans the whole chain below the adjustment span,
-    // and the span itself above it.
+    // The difficulty context spans the whole chain below the retained span,
+    // and the retained span itself above it. Readers take the active span.
     let context_len = usize::try_from(candidate_height.0)
         .expect("test candidate height fits in usize")
-        .min(difficulty::POW_ADJUSTMENT_BLOCK_SPAN);
+        .min(difficulty::MAX_POW_ADJUSTMENT_BLOCK_SPAN);
 
     (0..context_len)
         .map(|offset| {

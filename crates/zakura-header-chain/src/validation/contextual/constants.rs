@@ -1,4 +1,7 @@
-use zakura_chain::parameters::MAX_POW_AVERAGING_WINDOW;
+use zakura_chain::{
+    block,
+    parameters::{Network, NetworkUpgrade, MAX_POW_AVERAGING_WINDOW, POW_AVERAGING_WINDOW},
+};
 
 /// The median block span for time median calculations.
 ///
@@ -10,14 +13,33 @@ pub const POW_MEDIAN_BLOCK_SPAN: usize = 11;
 /// `PoWAveragingWindow + PoWMedianBlockSpan` in the Zcash specification based on
 /// > ActualTimespan(height : N) := MedianTime(height) − MedianTime(height − PoWAveragingWindow)
 ///
-/// ZIP 218 widens `PoWAveragingWindow` at NU7, so this span covers the largest
-/// consensus window at any height. The header chain therefore carries this
-/// wider context from genesis onwards and ignores entries beyond the window in
-/// force at the candidate height.
-pub const POW_ADJUSTMENT_BLOCK_SPAN: usize = MAX_POW_AVERAGING_WINDOW + POW_MEDIAN_BLOCK_SPAN;
+pub const POW_ADJUSTMENT_BLOCK_SPAN: usize = POW_AVERAGING_WINDOW + POW_MEDIAN_BLOCK_SPAN;
 
-/// Durable predecessors needed below a separately retained parent frontier.
+/// Active predecessors needed below a separately retained parent frontier.
 pub const POW_PREDECESSOR_CONTEXT_SPAN: usize = POW_ADJUSTMENT_BLOCK_SPAN - 1;
+
+/// The largest difficulty-adjustment context retained for future consensus
+/// rules.
+///
+/// ZIP 218 widens `PoWAveragingWindow` to 102 blocks. Retaining that future
+/// window does not make it active before NU7.
+pub const MAX_POW_ADJUSTMENT_BLOCK_SPAN: usize = MAX_POW_AVERAGING_WINDOW + POW_MEDIAN_BLOCK_SPAN;
+
+/// Maximum retained predecessors below a separately retained parent frontier.
+pub const MAX_POW_PREDECESSOR_CONTEXT_SPAN: usize = MAX_POW_ADJUSTMENT_BLOCK_SPAN - 1;
+
+/// Returns the difficulty-adjustment block span that validating a block at
+/// `candidate_height` reads.
+///
+/// The candidate block's upgrade selects the averaging window, so ZIP 218 widens
+/// this span from [`POW_ADJUSTMENT_BLOCK_SPAN`] to [`MAX_POW_ADJUSTMENT_BLOCK_SPAN`]
+/// at NU7.
+pub fn pow_adjustment_block_span_for_height(
+    network: &Network,
+    candidate_height: block::Height,
+) -> usize {
+    NetworkUpgrade::averaging_window_for_height(network, candidate_height) + POW_MEDIAN_BLOCK_SPAN
+}
 
 /// The damping factor for median timespan variance.
 ///

@@ -89,7 +89,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0 # zizmor: ignore[cache-poisoning] -- CI lint job; runs clippy and a locked build check, nothing published/released
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v1.17.0 # zizmor: ignore[cache-poisoning] -- CI lint job; runs clippy and a locked build check, nothing published/released
         with:
           components: clippy
           toolchain: stable
@@ -122,7 +122,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
         with:
           toolchain: 1.97 # MSRV
           # Keep this non-critical-path check cold rather than reserving 1.2 GB
@@ -149,7 +149,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0 # zizmor: ignore[cache-poisoning] -- CI docs job; builds rustdoc only, nothing published/released
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v1.17.0 # zizmor: ignore[cache-poisoning] -- CI docs job; builds rustdoc only, nothing published/released
         with:
           toolchain: nightly
           cache-on-failure: true
@@ -172,12 +172,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
         with:
           toolchain: stable
           # These checks do not compile workspace crates.
           cache: false
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
         with:
           toolchain: nightly
           components: rustfmt
@@ -256,7 +256,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
         with:
           toolchain: stable
           cache: false
@@ -279,12 +279,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0 # zizmor: ignore[cache-poisoning] -- CI unused-deps job; runs cargo-udeps only, nothing published/released
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v1.17.0 # zizmor: ignore[cache-poisoning] -- CI unused-deps job; runs cargo-udeps only, nothing published/released
         with:
           toolchain: nightly
           cache-on-failure: true
           cache-save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b #v2.87.4
+      - uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 #v2.87.9
         with:
           tool: cargo-udeps
       - uses: ./.github/actions/setup-zakura-build
@@ -304,7 +304,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
         with:
           persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 #v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
         with:
           # cargo-deny is installed from a prebuilt binary and does not compile
           # workspace crates.
@@ -312,14 +312,14 @@ jobs:
       # Install cargo-deny from a prebuilt binary instead of the EmbarkStudios
       # Docker action: that action rebuilds a container from a Docker Hub base
       # image on every run, which intermittently fails with registry timeouts.
-      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b #v2.87.4
+      - uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 #v2.87.9
         with:
           tool: cargo-deny@0.19.5
 
       - name: Install cargo-vet
         # v2.84.1 resolves `latest` to cargo-vet 0.10.0, which cannot read
         # trusted-publisher entries generated by cargo-vet 0.10.2.
-        uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b #v2.87.4
+        uses: taiki-e/install-action@c3ec0de9ae7f1019cea21aa96aa0a895b9552063 #v2.87.9
         with:
           tool: cargo-vet@0.10.2
 
@@ -407,7 +407,7 @@ jobs:
           persist-credentials: false
       - name: Run zizmor workflow audit
         if: github.event_name != 'pull_request' || steps.workflow-audit-changes.outputs.audit == 'true'
-        uses: zizmorcore/zizmor-action@70fb788f84895a7701f5643d103d587e460b5c99 #v0.6.3
+        uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 #v0.6.4
         with:
           advanced-security: false
           annotations: true

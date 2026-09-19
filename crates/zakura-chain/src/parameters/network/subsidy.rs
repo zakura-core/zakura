@@ -17,7 +17,7 @@ pub(crate) mod constants;
 use std::collections::HashMap;
 
 use crate::{
-    amount::{self, Amount, NonNegative, MAX_MONEY},
+    amount::{self, Amount, NegativeAllowed, NonNegative, MAX_MONEY},
     block::{Height, HeightDiff},
     parameters::{Network, NetworkUpgrade},
     transparent,
@@ -397,6 +397,14 @@ pub enum SubsidyError {
     #[error("miner fees are invalid")]
     InvalidMinerFees,
 
+    #[error("ZIP 234 block subsidy needs the NSM value balance after the parent block")]
+    MissingNsmValueBalance,
+
+    #[error(
+        "issued supply exceeds the scheduled supply, so the ZIP 234 NSM value balance is negative"
+    )]
+    NegativeNsmValueBalance,
+
     #[error("addition of amounts overflowed")]
     Overflow,
 
@@ -470,6 +478,103 @@ pub fn halving(height: Height, network: &Network) -> u32 {
         .max(0)
         .try_into()
         .expect("halving index is non-negative and fits in u32")
+}
+
+/// `ln(2)` scaled by [`BLOCK_SUBSIDY_FRACTION_DENOMINATOR`], from [ZIP 234].
+///
+/// [ZIP 234]: https://zips.z.cash/zip-0234
+pub const LN2_SCALED: u128 = 6_931_680_000;
+
+/// The denominator of [ZIP 234]'s `BLOCK_SUBSIDY_FRACTION`.
+///
+/// [ZIP 234]: https://zips.z.cash/zip-0234
+pub const BLOCK_SUBSIDY_FRACTION_DENOMINATOR: u128 = 10_000_000_000;
+
+/// Returns `HalvingInterval(height)`: the number of blocks in a halving period at `height`.
+///
+/// Each target spacing era keeps the halving period at about four years of wall-clock
+/// time, so the interval scales by the inverse of the spacing. On Mainnet that gives
+/// 840,000 blocks before Blossom at 150 seconds, 1,680,000 after it at 75 seconds, and
+/// 5,040,000 from NU7 at ZIP 218's 25 seconds.
+pub fn halving_interval(height: Height, network: &Network) -> HeightDiff {
+    let post_blossom_spacing = HeightDiff::from(POST_BLOSSOM_POW_TARGET_SPACING);
+    let spacing = NetworkUpgrade::target_spacing_for_height(network, height).num_seconds();
+
+    network.post_blossom_halving_interval() * post_blossom_spacing / spacing
+}
+
+/// Returns the numerator of [ZIP 234]'s `BLOCK_SUBSIDY_FRACTION` at `height`.
+///
+/// # Consensus
+///
+/// > BLOCK_SUBSIDY_FRACTION(height) = floor(LN2_SCALED / HalvingInterval(height))
+/// >                                  / BLOCK_SUBSIDY_FRACTION_DENOMINATOR
+///
+/// The fraction removes `ln(2) / HalvingInterval` of the balance per block, so the
+/// balance halves once per halving period whatever the target spacing. A fixed numerator
+/// would pay out three times as fast under ZIP 218's 25-second blocks.
+///
+/// On Mainnet this is 4126 after Blossom and 1375 from NU7.
+///
+/// [ZIP 234]: https://zips.z.cash/zip-0234
+pub fn block_subsidy_fraction_numerator(height: Height, network: &Network) -> u128 {
+    let interval = u128::try_from(halving_interval(height, network).max(1))
+        .expect("a positive halving interval fits in u128");
+
+    LN2_SCALED / interval
+}
+
+/// Converts a non-negative amount to a `u128`.
+fn amount_to_u128(amount: Amount<NonNegative>) -> u128 {
+    u128::try_from(i64::from(amount)).expect("non-negative amounts fit in u128")
+}
+
+/// Returns the NSM value balance after a block's parent, in the form [`block_subsidy`] takes.
+///
+/// The state stores a signed balance. Returns [`SubsidyError::NegativeNsmValueBalance`] if
+/// the parent's chain issued more than the halving schedule.
+pub fn parent_nsm_value_balance(
+    nsm_value_balance: Amount<NegativeAllowed>,
+) -> Result<Amount<NonNegative>, SubsidyError> {
+    nsm_value_balance
+        .constrain()
+        .map_err(|_| SubsidyError::NegativeNsmValueBalance)
+}
+
+/// Applies the [ZIP 234] reissuance fraction at `height` to `amount`, rounding up.
+///
+/// [ZIP 234]: https://zips.z.cash/zip-0234
+fn reissuance_amount(
+    amount: Amount<NonNegative>,
+    height: Height,
+    network: &Network,
+) -> Result<Amount<NonNegative>, SubsidyError> {
+    let subsidy = amount_to_u128(amount)
+        .checked_mul(block_subsidy_fraction_numerator(height, network))
+        .ok_or(SubsidyError::Overflow)?
+        .div_ceil(BLOCK_SUBSIDY_FRACTION_DENOMINATOR);
+
+    let subsidy = i64::try_from(subsidy).map_err(|_| SubsidyError::Overflow)?;
+
+    Ok(Amount::try_from(subsidy)?)
+}
+
+/// Returns the [ZIP 234] reissuance bonus for a block, given the `NsmValueBalance` after
+/// its parent.
+///
+/// The halving schedule keeps issuing new ZEC. The bonus reissues value removed from
+/// circulation.
+///
+/// The state supplies the balance after the parent block; see
+/// `Block::nsm_value_balance_change`.
+///
+/// [ZIP 234]: https://zips.z.cash/zip-0234
+pub fn reissuance_bonus(
+    nsm_value_balance: Amount<NonNegative>,
+    height: Height,
+    network: &Network,
+) -> Result<Amount<NonNegative>, SubsidyError> {
+    reissuance_amount(nsm_value_balance, height, network)
 }
 
 /// Returns `ExpectedIssuedSupply(height)` from zips#1354: the total block subsidy the

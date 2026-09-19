@@ -192,15 +192,6 @@ pub enum StateInitError {
         source: BoxError,
     },
 
-    /// Startup could not safely select or publish an older state cache.
-    #[error("cannot reuse state cache at {path:?}: {source}. Existing caches have been retained")]
-    DatabaseReuse {
-        /// Source, destination, or startup lock associated with the failure.
-        path: PathBuf,
-        /// Underlying filesystem, lock, or candidate-validation error.
-        source: BoxError,
-    },
-
     /// RocksDB could not open the requested primary or secondary database.
     #[error(
         "cannot open state database at {path:?}. Hint: check whether another process holds the database lock and whether cache_dir is readable and writable"

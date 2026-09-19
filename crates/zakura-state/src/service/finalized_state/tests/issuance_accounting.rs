@@ -482,8 +482,8 @@ fn startup_migration_failure_preserves_version_and_retry_matches_fresh_sync() {
     std::fs::rename(&new_path, &old_path).unwrap();
     assert!(FinalizedState::new(&config, &network).is_err());
     assert!(
-        old_path.exists(),
-        "checkpoint reuse retains the legacy database for recovery"
+        !old_path.exists(),
+        "the upgrader moves the legacy database out of the old binary's path"
     );
     assert!(new_path.exists());
     let db = ZakuraDb::new(
@@ -498,10 +498,7 @@ fn startup_migration_failure_preserves_version_and_retry_matches_fresh_sync() {
         false,
     )
     .unwrap();
-    assert_eq!(
-        db.format_version_on_disk().unwrap(),
-        Some(old_version.clone())
-    );
+    assert_eq!(db.format_version_on_disk().unwrap(), Some(old_version));
     let mut batch = DiskWriteBatch::new();
     let _ = db
         .raw_block_info_cf()
@@ -518,35 +515,6 @@ fn startup_migration_failure_preserves_version_and_retry_matches_fresh_sync() {
     assert_eq!(
         *upgraded.db.block_info(START.into()).unwrap().value_pools(),
         expected
-    );
-    let source = ZakuraDb::new(
-        &config,
-        STATE_DATABASE_KIND,
-        &old_version,
-        &network,
-        true,
-        STATE_COLUMN_FAMILIES_IN_CODE
-            .iter()
-            .map(ToString::to_string),
-        false,
-    )
-    .unwrap();
-    assert_eq!(source.format_version_on_disk().unwrap(), Some(old_version));
-    assert_eq!(
-        source
-            .raw_block_info_cf()
-            .zs_get(&Height(1))
-            .unwrap()
-            .as_bytes(),
-        vec![0; 51]
-    );
-    assert_eq!(
-        source
-            .raw_chain_value_pools_cf()
-            .zs_get(&())
-            .unwrap()
-            .as_bytes(),
-        &tip_bytes[..48]
     );
 }
 

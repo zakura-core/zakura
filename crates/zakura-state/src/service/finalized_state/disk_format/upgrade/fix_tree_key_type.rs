@@ -126,15 +126,5 @@ mod tests {
             .expect("the malformed snapshot writes");
         let error = quick_check(&state.db).expect_err("snapshot decoding must return an error");
         assert!(error.contains("cannot load stored history tree snapshots"));
-
-        // Shutdown checks a current-format database and panics on an invalid one,
-        // so remove the malformed snapshot before the state drops.
-        state
-            .db
-            .raw_history_tree_cf()
-            .new_batch_for_writing()
-            .zs_delete(&RawBytes::new_raw_bytes(Vec::new()))
-            .write_batch()
-            .expect("the malformed snapshot deletes");
     }
 }

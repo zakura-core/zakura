@@ -821,8 +821,7 @@ pub fn state_database_format_version_on_disk(
 /// returns `Ok(Some(major_version.0.0))`.
 /// (This happens even if the database directory was just newly created.)
 ///
-/// If there is no existing on-disk database, or the config is ephemeral, returns `Ok(None)`.
-/// Ephemeral configuration cannot identify a live database; use its handle for version access.
+/// If there is no existing on-disk database, returns `Ok(None)`.
 ///
 /// This is the format of the data on disk, the version
 /// implemented by the running Zebra code can be different.
@@ -832,12 +831,8 @@ pub fn database_format_version_on_disk(
     major_version: u64,
     network: &Network,
 ) -> Result<Option<Version>, BoxError> {
-    // Ephemeral configuration does not identify an existing database.
-    if config.ephemeral {
-        return Ok(None);
-    }
+    let version_path = config.version_file_path(&db_kind, major_version, network);
     let db_path = config.db_path(db_kind, major_version, network);
-    let version_path = db_path.join(DATABASE_FORMAT_VERSION_FILE_NAME);
 
     database_format_version_at_path(&version_path, &db_path, major_version)
 }
@@ -892,8 +887,7 @@ pub(crate) fn database_format_version_at_path(
 // Hide this destructive method from the public API, except in tests.
 #[allow(unused_imports)]
 pub(crate) use hidden::{
-    write_database_format_version_at_path, write_database_format_version_to_disk,
-    write_state_database_format_version_to_disk,
+    write_database_format_version_to_disk, write_state_database_format_version_to_disk,
 };
 
 pub(crate) mod hidden {
@@ -925,7 +919,6 @@ pub(crate) mod hidden {
     /// (Or a new database is created.)
     ///
     /// The database path is based on its kind, `major_version_in_code`, and network.
-    /// Ephemeral configuration is a no-op; its live database uses the path-based writer.
     ///
     /// # Correctness
     ///
@@ -946,25 +939,13 @@ pub(crate) mod hidden {
         changed_version: &Version,
         network: &Network,
     ) -> Result<(), BoxError> {
-        // A config alone cannot identify the ephemeral database owned by a live handle.
-        if config.ephemeral {
-            return Ok(());
-        }
-        write_database_format_version_at_path(
-            &config.db_path(db_kind, major_version_in_code, network),
-            changed_version,
-        )
-    }
-
-    /// Writes a version atomically in an exclusively owned database or unpublished checkpoint.
-    pub(crate) fn write_database_format_version_at_path(
-        db_path: &Path,
-        changed_version: &Version,
-    ) -> Result<(), BoxError> {
+        // Write the version file atomically so the cache is not corrupted if Zebra shuts down or
+        // crashes.
         atomic_write(
-            db_path.join(DATABASE_FORMAT_VERSION_FILE_NAME),
+            config.version_file_path(db_kind, major_version_in_code, network),
             changed_version.to_string().as_bytes(),
         )??;
+
         Ok(())
     }
 }

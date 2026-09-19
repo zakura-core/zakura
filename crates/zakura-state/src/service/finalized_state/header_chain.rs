@@ -3209,8 +3209,7 @@ impl HeaderChainRuntime {
         }
         if !expectation.staged.is_empty() {
             let staged_check_start = std::time::Instant::now();
-            let staged_header_count = u32::try_from(expectation.staged.len())
-                .expect("the retained header count is bounded below u32::MAX");
+            let staged_header_count = u32::try_from(expectation.staged.len()).unwrap_or(u32::MAX);
             let put_nodes: HashMap<_, _> = transition
                 .change_set()
                 .put_nodes

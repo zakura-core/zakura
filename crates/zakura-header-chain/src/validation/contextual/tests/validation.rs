@@ -8,7 +8,7 @@ use chrono::{DateTime, Duration, Utc};
 use zakura_chain::{
     block,
     parameters::{
-        testnet::{Parameters, RegtestParameters},
+        testnet::{ConfiguredActivationHeights, Parameters, RegtestParameters},
         Network, NetworkUpgrade, POW_AVERAGING_WINDOW,
     },
     work::difficulty::{CompactDifficulty, ExpandedDifficulty, ParameterDifficulty as _, U256},
@@ -172,6 +172,69 @@ fn difficulty_windows_upgrades_testnet_minimum_and_partitions_match() {
         testnet.target_difficulty_limit().to_compact(),
         "ZIP 205/208 minimum difficulty begins strictly above six target spacings"
     );
+}
+
+/// Fixed expected `nBits` values independently calculated from the ZIP 218
+/// difficulty formulas using integer arithmetic.
+#[test]
+fn nu7_difficulty_vectors_match_expected_nbits() {
+    const NU7: u32 = 200;
+    const TARGET_BITS: [u32; 5] = [0x1e0ffff0, 0x1e0e0000, 0x1e0c8000, 0x1e0b4000, 0x1e0a2000];
+    const TIME_STEPS: [i64; 7] = [19, 31, 23, 29, 17, 37, 21];
+
+    let network = Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            blossom: Some(1),
+            nu7: Some(NU7),
+            ..Default::default()
+        })
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid");
+    let candidate_time =
+        DateTime::from_timestamp(2_000_000_000, 0).expect("test timestamp is in range");
+    let compact = |bits: u32| {
+        CompactDifficulty::from_bytes_in_display_order(&bits.to_be_bytes())
+            .expect("the fixed compact target is valid")
+    };
+    let mut time = candidate_time;
+    let context: Vec<_> = (0..MAX_POW_ADJUSTMENT_BLOCK_SPAN)
+        .map(|index| {
+            time -= Duration::seconds(TIME_STEPS[index % TIME_STEPS.len()]);
+            (compact(TARGET_BITS[index % TARGET_BITS.len()]), time)
+        })
+        .collect();
+
+    for (height, expected_bits, neighboring_bits) in [
+        (NU7 - 1, 0x1e0af369, 0x1e0af368),
+        (NU7, 0x1e0cd7fd, 0x1e0cd7fc),
+        (NU7 + 1, 0x1e0cd7fd, 0x1e0cd7fc),
+    ] {
+        let previous_height = block::Height(height - 1);
+        let adjustment = AdjustedDifficulty::new_from_header_time(
+            candidate_time,
+            previous_height,
+            &network,
+            context.iter().copied(),
+        )
+        .expect("the vector supplies the complete height-dependent context");
+        assert_eq!(
+            adjustment.expected_difficulty_threshold(),
+            compact(expected_bits),
+            "unexpected nBits at candidate height {height}"
+        );
+
+        let neighboring_target = compact(neighboring_bits);
+        assert!(matches!(
+            validate_contextual_difficulty_and_time(neighboring_target, adjustment),
+            Err(ContextualValidationError::InvalidDifficultyThreshold {
+                difficulty_threshold,
+                expected_difficulty,
+            }) if difficulty_threshold == neighboring_target
+                && expected_difficulty == compact(expected_bits)
+        ));
+    }
 }
 
 #[test]

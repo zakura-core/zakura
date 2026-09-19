@@ -116,6 +116,18 @@ impl ZakuraDb {
             .expect("column family was created when database was created")
     }
 
+    /// Read legacy pool bytes during checked format upgrades.
+    pub(crate) fn raw_chain_value_pools_cf(&self) -> TypedColumnFamily<'_, (), RawBytes> {
+        TypedColumnFamily::new(&self.db, CHAIN_VALUE_POOLS)
+            .expect("database creation installs the pool column family")
+    }
+
+    /// Read legacy block-info bytes during checked format upgrades.
+    pub(crate) fn raw_block_info_cf(&self) -> TypedColumnFamily<'_, Height, RawBytes> {
+        TypedColumnFamily::new(&self.db, BLOCK_INFO)
+            .expect("database creation installs the block-info column family")
+    }
+
     // History tree methods
 
     /// Returns the ZIP-221 history tree of the finalized tip.
@@ -281,6 +293,7 @@ impl DiskWriteBatch {
         let block_value_pool_change = finalized
             .block
             .chain_value_pool_change(
+                &db.network(),
                 &utxos_spent_by_block,
                 finalized.deferred_pool_balance_change,
             )

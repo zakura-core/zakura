@@ -139,6 +139,41 @@ fn zs_iter_opts_increments_key_by_one() {
     }
 }
 
+fn wait_for_child(child: &mut std::process::Child) -> std::process::ExitStatus {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("database test subprocess exceeded 30 seconds");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum ReuseStep {
+    Checkpoint,
+    Version,
+    Publish,
+}
+
+type ReuseHook = Box<dyn FnMut(ReuseStep, &std::path::Path, &std::path::Path)>;
+thread_local! {
+    static REUSE_HOOK: std::cell::RefCell<Option<ReuseHook>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn reuse_step(step: ReuseStep, staged: &std::path::Path, destination: &std::path::Path) {
+    REUSE_HOOK.with_borrow_mut(|hook| {
+        if let Some(hook) = hook {
+            hook(step, staged, destination);
+        }
+    });
+}
+
 mod major_upgrade_reuse {
     use std::fs;
 
@@ -177,12 +212,22 @@ mod major_upgrade_reuse {
     }
 
     fn reuse(config: &Config, restorable: &[u64]) -> Option<Version> {
+        try_reuse(config, restorable).unwrap()
+    }
+
+    fn try_reuse(
+        config: &Config,
+        restorable: &[u64],
+    ) -> Result<Option<Version>, crate::StateInitError> {
+        let guard =
+            super::super::DatabaseStartupGuard::acquire(config, KIND, &Network::Mainnet, false)?;
         DiskDb::try_reusing_previous_db_after_major_upgrade(
             restorable,
             &Version::new(29, 0, 0),
             config,
             KIND,
             &Network::Mainnet,
+            &guard,
         )
     }
 
@@ -212,7 +257,7 @@ mod major_upgrade_reuse {
             create_db(&config, 28, version_file);
 
             assert_eq!(reuse(&config, RESTORABLE), Some(expected.clone()));
-            // The version file moved with the directory, so a crash after the rename
+            // Publication includes the full source version, so an interruption
             // cannot make the next startup infer 29.0.0.
             assert_eq!(version_on_disk(&config, 29), Some(expected));
         }
@@ -225,7 +270,7 @@ mod major_upgrade_reuse {
         create_db(&config, 27, Some("27.3.0"));
 
         assert_eq!(reuse(&config, RESTORABLE), Some(Version::new(27, 3, 0)));
-        assert!(!config.db_path(KIND, 27, &Network::Mainnet).exists());
+        assert!(config.db_path(KIND, 27, &Network::Mainnet).exists());
         assert_eq!(version_on_disk(&config, 29), Some(Version::new(27, 3, 0)));
     }
 
@@ -260,4 +305,398 @@ mod major_upgrade_reuse {
         assert_eq!(reuse(&config, RESTORABLE), None);
         assert!(config.db_path(KIND, 28, &Network::Mainnet).exists());
     }
+    #[test]
+    fn checkpoint_runs_pending_migrations_and_reopens_current_state() {
+        use crate::{
+            constants::state_database_format_version_in_code,
+            service::finalized_state::{zakura_db::ZakuraDb, STATE_COLUMN_FAMILIES_IN_CODE},
+        };
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = config(&tempdir);
+        create_db(&config, 27, Some("27.3.0"));
+        let version = state_database_format_version_in_code();
+        let open = || {
+            ZakuraDb::new(
+                &config,
+                KIND,
+                &version,
+                &Network::Mainnet,
+                false,
+                STATE_COLUMN_FAMILIES_IN_CODE
+                    .iter()
+                    .map(ToString::to_string),
+                false,
+            )
+            .unwrap()
+        };
+        let db = open();
+        assert_eq!(db.format_version_on_disk().unwrap(), Some(version.clone()));
+        assert_eq!(version_on_disk(&config, 27), Some(Version::new(27, 3, 0)));
+        drop(db);
+        let db = open();
+        assert_eq!(db.format_version_on_disk().unwrap(), Some(version));
+    }
+
+    #[test]
+    fn skips_malformed_candidates_but_does_not_hide_all_invalid_caches() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = config(&tempdir);
+        create_db(&config, 28, Some("not-a-version"));
+        assert!(try_reuse(&config, RESTORABLE).is_err());
+        assert!(!config.db_path(KIND, 29, &Network::Mainnet).exists());
+        create_db(&config, 27, Some("27.3.0"));
+        assert_eq!(reuse(&config, RESTORABLE), Some(Version::new(27, 3, 0)));
+        assert_eq!(
+            fs::read_to_string(config.version_file_path(KIND, 28, &Network::Mainnet)).unwrap(),
+            "not-a-version"
+        );
+    }
+
+    #[test]
+    fn skips_ineligible_versions_and_structurally_invalid_candidates() {
+        for version in ["26.0.0", "30.0.0"] {
+            let tempdir = tempfile::tempdir().unwrap();
+            let config = config(&tempdir);
+            create_db(&config, 28, Some(version));
+            assert!(try_reuse(&config, &[28, 29]).is_err());
+            create_db(&config, 27, Some("27.0.0"));
+            assert_eq!(reuse(&config, &[28, 29]), Some(Version::new(27, 0, 0)));
+        }
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = config(&tempdir);
+        fs::create_dir_all(config.db_path(KIND, 28, &Network::Mainnet)).unwrap();
+        create_db(&config, 27, Some("27.0.0"));
+        assert_eq!(reuse(&config, RESTORABLE), Some(Version::new(27, 0, 0)));
+    }
+
+    #[test]
+    fn does_not_replace_an_invalid_current_path() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = config(&tempdir);
+        create_db(&config, 28, Some("28.1.5"));
+        let current = config.db_path(KIND, 29, &Network::Mainnet);
+        fs::create_dir_all(&current).unwrap();
+        fs::write(current.join("sentinel"), "preserve").unwrap();
+        assert!(try_reuse(&config, RESTORABLE).is_err());
+        assert_eq!(
+            fs::read_to_string(current.join("sentinel")).unwrap(),
+            "preserve"
+        );
+    }
+
+    #[test]
+    fn checkpoint_preserves_source_siblings_and_all_column_families() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = config(&tempdir);
+        create_db(&config, 28, Some("1.5"));
+        let source_path = config.db_path(KIND, 28, &Network::Mainnet);
+        let sibling = source_path.parent().unwrap().join("testnet");
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(sibling.join("sentinel"), "preserve").unwrap();
+        {
+            let source = DB::open_cf(&DiskDb::options(), &source_path, ["future_cf"]).unwrap();
+            source
+                .put_cf(source.cf_handle("future_cf").unwrap(), b"key", b"original")
+                .unwrap();
+            source.flush().unwrap();
+        }
+        assert_eq!(reuse(&config, RESTORABLE), Some(Version::new(28, 1, 5)));
+        assert_eq!(
+            fs::read_to_string(
+                source_path.join(crate::constants::DATABASE_FORMAT_VERSION_FILE_NAME)
+            )
+            .unwrap(),
+            "1.5"
+        );
+        assert_eq!(
+            fs::read_to_string(sibling.join("sentinel")).unwrap(),
+            "preserve"
+        );
+        let destination_path = config.db_path(KIND, 29, &Network::Mainnet);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let sst = fs::read_dir(&source_path)
+                .unwrap()
+                .map(Result::unwrap)
+                .find(|e| e.path().extension().is_some_and(|ext| ext == "sst"))
+                .unwrap();
+            assert_eq!(
+                sst.metadata().unwrap().ino(),
+                fs::metadata(destination_path.join(sst.file_name()))
+                    .unwrap()
+                    .ino()
+            );
+        }
+        let source = DB::open_cf(&DiskDb::options(), &source_path, ["future_cf"]).unwrap();
+        let destination =
+            DB::open_cf(&DiskDb::options(), &destination_path, ["future_cf"]).unwrap();
+        let source_cf = source.cf_handle("future_cf").unwrap();
+        let destination_cf = destination.cf_handle("future_cf").unwrap();
+        assert_eq!(
+            destination.get_cf(destination_cf, b"key").unwrap().unwrap(),
+            b"original"
+        );
+        destination
+            .put_cf(destination_cf, b"key", b"destination")
+            .unwrap();
+        source.put_cf(source_cf, b"key", b"source").unwrap();
+        assert_eq!(
+            source.get_cf(source_cf, b"key").unwrap().unwrap(),
+            b"source"
+        );
+        assert_eq!(
+            destination.get_cf(destination_cf, b"key").unwrap().unwrap(),
+            b"destination"
+        );
+    }
+
+    #[test]
+    fn startup_guard_serializes_writers_and_low_level_opens() {
+        use super::super::DatabaseStartupGuard;
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = config(&tempdir);
+        create_db(&config, 28, Some("28.0.0"));
+        let guard = DatabaseStartupGuard::acquire(&config, KIND, &Network::Mainnet, false).unwrap();
+        let other = config.clone();
+        std::thread::spawn(move || {
+            assert!(try_reuse(&other, RESTORABLE).is_err());
+            assert!(DiskDb::new(
+                &other,
+                KIND,
+                &Version::new(29, 0, 0),
+                &Network::Mainnet,
+                [],
+                false
+            )
+            .is_err());
+        })
+        .join()
+        .unwrap();
+        assert!(!config.db_path(KIND, 29, &Network::Mainnet).exists());
+        drop(guard);
+        assert_eq!(reuse(&config, RESTORABLE), Some(Version::new(28, 0, 0)));
+    }
+
+    #[test]
+    fn unpublished_failures_preserve_source_and_retry() {
+        use super::{ReuseStep, REUSE_HOOK};
+        struct ClearHook;
+        impl Drop for ClearHook {
+            fn drop(&mut self) {
+                REUSE_HOOK.with_borrow_mut(|hook| *hook = None);
+            }
+        }
+        for step in [
+            ReuseStep::Checkpoint,
+            ReuseStep::Version,
+            ReuseStep::Publish,
+        ] {
+            let tempdir = tempfile::tempdir().unwrap();
+            let config = config(&tempdir);
+            create_db(&config, 28, Some("28.0.0"));
+            REUSE_HOOK.with_borrow_mut(|hook| {
+                *hook = Some(Box::new(move |actual, staged, destination| {
+                    if actual != step {
+                        return;
+                    }
+                    match step {
+                        ReuseStep::Checkpoint => fs::create_dir(staged).unwrap(),
+                        ReuseStep::Version => fs::create_dir(
+                            staged.join(crate::constants::DATABASE_FORMAT_VERSION_FILE_NAME),
+                        )
+                        .unwrap(),
+                        ReuseStep::Publish => {
+                            fs::write(destination, "external destination").unwrap();
+                        }
+                    }
+                }))
+            });
+            let reset = ClearHook;
+            assert!(try_reuse(&config, RESTORABLE).is_err());
+            drop(reset);
+            assert_eq!(version_on_disk(&config, 28), Some(Version::new(28, 0, 0)));
+            let current = config.db_path(KIND, 29, &Network::Mainnet);
+            if step == ReuseStep::Publish {
+                assert_eq!(
+                    fs::read_to_string(&current).unwrap(),
+                    "external destination"
+                );
+                fs::remove_file(&current).unwrap();
+            } else {
+                assert!(!current.exists());
+            }
+            assert!(fs::read_dir(current.parent().unwrap())
+                .unwrap()
+                .next()
+                .is_none());
+            assert_eq!(reuse(&config, RESTORABLE), Some(Version::new(28, 0, 0)));
+        }
+    }
+
+    /// Runs only when explicitly spawned by the parent test, in a separate process.
+    #[test]
+    fn locked_source_child() {
+        let Some(path) = std::env::var_os("ZAKURA_REUSE_LOCK_TEST") else {
+            return;
+        };
+        let path = std::path::PathBuf::from(path);
+        let _source = DB::open(&DiskDb::options(), path.join("state/v28/mainnet")).unwrap();
+        fs::write(path.join("ready"), "").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !path.join("release").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "parent must release the child within 30 seconds"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn live_source_process_is_never_moved_or_bypassed() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let config = config(&tempdir);
+        create_db(&config, 28, Some("28.0.0"));
+        create_db(&config, 27, Some("27.0.0"));
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "service::finalized_state::disk_db::tests::major_upgrade_reuse::locked_source_child"])
+            .env("ZAKURA_REUSE_LOCK_TEST", tempdir.path()).spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !tempdir.path().join("ready").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child must acquire the source lock"
+            );
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "child exited before acquiring the lock"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let result = try_reuse(&config, RESTORABLE);
+        fs::write(tempdir.path().join("release"), "").unwrap();
+        assert!(super::wait_for_child(&mut child).success());
+        assert!(matches!(
+            result,
+            Err(crate::StateInitError::DatabaseOpen { .. })
+        ));
+        assert_eq!(version_on_disk(&config, 28), Some(Version::new(28, 0, 0)));
+        assert!(!config.db_path(KIND, 29, &Network::Mainnet).exists());
+        assert_eq!(reuse(&config, RESTORABLE), Some(Version::new(28, 0, 0)));
+    }
+}
+
+#[test]
+fn ephemeral_version_io_owns_exactly_one_directory_per_database() {
+    use crate::{
+        config::{database_format_version_on_disk, write_database_format_version_to_disk},
+        constants::{
+            state_database_format_version_in_code, DATABASE_FORMAT_VERSION_FILE_NAME,
+            STATE_DATABASE_KIND,
+        },
+        service::finalized_state::{zakura_db::ZakuraDb, STATE_COLUMN_FAMILIES_IN_CODE},
+    };
+    use std::fs;
+    // Isolate the OS temporary directory without changing this test process's environment.
+    let Some(root) = std::env::var_os("ZAKURA_EPHEMERAL_PATH_TEST") else {
+        let root = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "service::finalized_state::disk_db::tests::ephemeral_version_io_owns_exactly_one_directory_per_database"])
+            .env("ZAKURA_EPHEMERAL_PATH_TEST", root.path())
+            .env("TMPDIR", root.path()).env("TMP", root.path()).env("TEMP", root.path())
+            .spawn().unwrap();
+        assert!(wait_for_child(&mut child).success());
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    let config = Config::ephemeral();
+    let version = state_database_format_version_in_code();
+    let entries = || fs::read_dir(&root).unwrap().count();
+    let before = entries();
+    let guard = super::DatabaseStartupGuard::acquire(
+        &config,
+        STATE_DATABASE_KIND,
+        &Network::Mainnet,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        DiskDb::try_reusing_previous_db_after_major_upgrade(
+            &[27, 28, 29],
+            &version,
+            &config,
+            STATE_DATABASE_KIND,
+            &Network::Mainnet,
+            &guard,
+        )
+        .unwrap(),
+        None
+    );
+    assert_eq!(
+        database_format_version_on_disk(
+            &config,
+            STATE_DATABASE_KIND,
+            version.major,
+            &Network::Mainnet
+        )
+        .unwrap(),
+        None
+    );
+    write_database_format_version_to_disk(
+        &config,
+        STATE_DATABASE_KIND,
+        version.major,
+        &version,
+        &Network::Mainnet,
+    )
+    .unwrap();
+    assert_eq!(
+        entries(),
+        before,
+        "config-only probes must not allocate temporary paths"
+    );
+    let open = || {
+        ZakuraDb::new(
+            &config,
+            STATE_DATABASE_KIND,
+            &version,
+            &Network::Mainnet,
+            true,
+            STATE_COLUMN_FAMILIES_IN_CODE
+                .iter()
+                .map(ToString::to_string),
+            false,
+        )
+        .unwrap()
+    };
+    let first = open();
+    let second = open();
+    assert_ne!(first.path(), second.path());
+    assert_eq!(entries(), before + 2);
+    let written = Version::new(28, 1, 5);
+    first.update_format_version_on_disk(&written).unwrap();
+    assert_eq!(
+        first.format_version_on_disk().unwrap(),
+        Some(written.clone())
+    );
+    assert_eq!(
+        fs::read_to_string(first.path().join(DATABASE_FORMAT_VERSION_FILE_NAME)).unwrap(),
+        written.to_string()
+    );
+    assert_eq!(
+        second.format_version_on_disk().unwrap(),
+        Some(Version::new(version.major, 0, 0))
+    );
+    assert_eq!(
+        entries(),
+        before + 2,
+        "live version I/O must reuse the open database path"
+    );
+    let first_path = first.path().to_owned();
+    drop(first);
+    assert!(!first_path.exists());
+    assert!(second.path().exists());
+    drop(second);
+    assert_eq!(entries(), before);
 }

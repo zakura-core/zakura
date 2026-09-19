@@ -819,6 +819,53 @@ mod database_tests {
     }
 
     #[test]
+    fn migration_accepts_first_deferred_payment_at_slow_start_end() {
+        use zakura_chain::parameters::testnet::{
+            self, ConfiguredFundingStreamRecipient, ConfiguredFundingStreams,
+        };
+        for nu7 in [None, Some(4), Some(20)] {
+            let network = testnet::Parameters::build()
+                .with_slow_start_interval(Height(8))
+                .with_activation_heights(ConfiguredActivationHeights {
+                    blossom: Some(1),
+                    canopy: Some(2),
+                    nu7,
+                    ..Default::default()
+                })
+                .unwrap()
+                .with_lockbox_disbursements(vec![])
+                .with_funding_streams(vec![ConfiguredFundingStreams {
+                    height_range: Some(Height(8)..Height(100)),
+                    recipients: Some(vec![ConfiguredFundingStreamRecipient {
+                        receiver: FundingStreamReceiver::Deferred,
+                        numerator: 12,
+                        addresses: None,
+                    }]),
+                }])
+                .to_network()
+                .unwrap();
+            let db = healthy_deferred_db(network, 10, 48);
+            assert_eq!(
+                read_block_info(&db, Height(7))
+                    .unwrap()
+                    .value_pools()
+                    .deferred_amount(),
+                Amount::<NonNegative>::zero()
+            );
+            assert!(
+                read_block_info(&db, Height(8))
+                    .unwrap()
+                    .value_pools()
+                    .deferred_amount()
+                    > Amount::<NonNegative>::zero()
+            );
+            let (_tx, rx) = crossbeam_channel::bounded(1);
+            Upgrade.run(Some(Height(9)), &db, &rx).unwrap();
+            assert!(Upgrade.validate(&db, &rx).unwrap().is_ok());
+        }
+    }
+
+    #[test]
     fn migration_only_needs_deferred_records_from_the_nu7_baseline() {
         let db = healthy_deferred_db(slow_start_deferred_network(Some(4)), 11, 48);
         let baseline_total = i64::from(

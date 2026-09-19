@@ -224,7 +224,12 @@ impl DiskFormatUpgrade for Upgrade {
                         )
                         .unwrap_or_default(),
                 )
-                .expect("value pool change should not overflow");
+                .and_then(|pools| pools.seed_nsm_value_balance(height, &network))
+                .map_err(|error| {
+                    super::FormatChangeError::InvalidPostcondition(format!(
+                        "invalid monetary pools or NSM seed at {height:?}: {error}"
+                    ))
+                })?;
 
             let mut batch = DiskWriteBatch::new();
 

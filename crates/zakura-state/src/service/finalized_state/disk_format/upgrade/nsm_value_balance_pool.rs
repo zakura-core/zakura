@@ -2,7 +2,7 @@
 //!
 //! The balance holds `INITIAL_NSM_VALUE_BALANCE` on the last block below NU7, and from
 //! NU7 it falls by each block's additional block subsidy. Earlier records carry zero.
-//! `Block::nsm_value_balance_change` applies the same rule as the chain grows.
+//! Live commits derive the same seed with `ValueBalance::seed_nsm_value_balance`.
 
 use crossbeam_channel::{Receiver, TryRecvError};
 use semver::Version;
@@ -14,7 +14,7 @@ use zakura_chain::{
     parameters::{
         subsidy::{
             funding_stream_values, halving_block_subsidy, scheduled_issuance_zatoshis,
-            FundingStreamReceiver, ParameterSubsidy,
+            FundingStreamReceiver,
         },
         Network, NetworkUpgrade,
     },
@@ -112,9 +112,10 @@ fn backfill(
     let Some(activation) = NetworkUpgrade::Nu7.activation_height(&network) else {
         return Ok(());
     };
-    // A nonzero seed belongs to the last block below NU7. Earlier legacy records
-    // already decode with the required zero balance and do not need rewriting.
-    let start = if network.initial_nsm_value_balance().is_zero() {
+    // The seed can be nonzero even when no override is configured.
+    let explicit_zero = matches!(&network, Network::Testnet(params)
+        if params.configured_initial_nsm_value_balance().is_some_and(|seed| seed.is_zero()));
+    let start = if explicit_zero {
         activation
     } else {
         Height(activation.0.saturating_sub(1))
@@ -246,13 +247,13 @@ fn balance_at(
     Ok(scheduled - i128::from(i64::from(value_pools.total()?)))
 }
 
-/// Returns the offset that makes the backfilled balance start at
-/// `INITIAL_NSM_VALUE_BALANCE` on the last block below NU7.
+/// Returns the offset for an explicit seed override on a configured network.
+/// Derived seeds have zero offset.
 ///
 /// `balance_at` measures the whole gap between the schedule and the chain, back to
 /// genesis. Subtracting this offset leaves the seed there, and leaves each later block
 /// the seed minus the bonuses claimed since, which is what
-/// `Block::nsm_value_balance_change` accumulates.
+/// live commits accumulate after initializing the derived seed.
 ///
 /// The offset is zero when the constant matches the chain's own history, as the measured
 /// Mainnet and Testnet constants do.
@@ -278,7 +279,15 @@ fn baseline(db: &ZakuraDb) -> Result<i128, FormatChangeError> {
         ))
     })?;
 
-    Ok(historical - i128::from(i64::from(network.initial_nsm_value_balance())))
+    let seed = info
+        .value_pools()
+        .initial_nsm_value_balance(seed_height, &network)
+        .map_err(|error| {
+            FormatChangeError::InvalidPostcondition(format!(
+                "invalid NSM seed at {seed_height:?}: {error}"
+            ))
+        })?;
+    Ok(historical - i128::from(i64::from(seed)))
 }
 
 fn eligible_balance(
@@ -939,7 +948,7 @@ mod database_tests {
             self, ConfiguredFundingStreamRecipient, ConfiguredFundingStreams,
         };
         let tip = Height(8_388_607);
-        for nu7 in [None, Some(tip.0 + 1)] {
+        for nu7 in [None, Some(tip.0 + 2)] {
             for deferred in [false, true] {
                 let network = testnet::Parameters::build()
                     .with_slow_start_interval(Height(12_500_000))
@@ -1007,6 +1016,7 @@ mod database_tests {
             ConfiguredLockboxDisbursement,
         };
         testnet::Parameters::build()
+            .with_initial_nsm_value_balance(Amount::zero())
             .with_slow_start_interval(Height(8))
             .with_activation_heights(ConfiguredActivationHeights {
                 blossom: Some(1),

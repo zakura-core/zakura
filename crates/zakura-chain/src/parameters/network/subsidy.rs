@@ -236,8 +236,8 @@ pub trait ParameterSubsidy {
     /// [7.10]: https://zips.z.cash/protocol/protocol.pdf#zip214fundingstreams
     fn funding_stream_address_change_interval(&self) -> HeightDiff;
 
-    /// Returns zips#1354's `INITIAL_NSM_VALUE_BALANCE`: the value the NSM value balance
-    /// holds immediately before NU7 activates.
+    /// Returns the expected public seed or configured override, or zero when unset.
+    /// State derives the actual seed from monetary pools unless a configured override applies.
     fn initial_nsm_value_balance(&self) -> Amount<NonNegative>;
 }
 

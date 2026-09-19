@@ -61,6 +61,7 @@ pub(super) fn accounting_network(reissuance: bool) -> Network {
             ..Default::default()
         },
         nsm_reissuance_height: reissuance.then_some(START),
+        initial_nsm_value_balance: Some(Amount::zero()),
         ..Default::default()
     })
 }
@@ -470,6 +471,21 @@ proptest::proptest! {
 
 #[test]
 fn startup_migration_failure_preserves_version_and_retry_matches_fresh_sync() {
+    migration_retry_matches_fresh_sync(accounting_network(false));
+}
+
+#[test]
+fn derived_nsm_seed_migration_retry_matches_fresh_sync() {
+    migration_retry_matches_fresh_sync(Network::new_regtest(RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            nu7: Some(2),
+            ..Default::default()
+        },
+        ..Default::default()
+    }));
+}
+
+fn migration_retry_matches_fresh_sync(network: Network) {
     use crate::{
         constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
         service::finalized_state::{
@@ -478,7 +494,6 @@ fn startup_migration_failure_preserves_version_and_retry_matches_fresh_sync() {
         },
     };
     let _guard = zakura_test::init();
-    let network = accounting_network(false);
     let dir = tempfile::tempdir().unwrap();
     let config = Config {
         cache_dir: dir.path().to_owned(),

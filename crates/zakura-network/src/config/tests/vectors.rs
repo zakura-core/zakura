@@ -999,3 +999,23 @@ fn zakura_secret_key_honors_configured_key_and_disabled_cache() {
         "disabled cache dir must still yield a persistent Zakura identity path outside the peer cache",
     );
 }
+
+#[test]
+fn configured_nsm_seed_roundtrip_distinguishes_derived_and_explicit_zero() {
+    for seed in [None, Some(0), Some(123)] {
+        let field = seed
+            .map(|seed| format!("initial_nsm_value_balance = {seed}\n"))
+            .unwrap_or_default();
+        let text = format!("network = 'Regtest'\n[testnet_parameters]\n{field}");
+        let config: Config = toml::from_str(&text).unwrap();
+        let roundtrip: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(config.network, roundtrip.network);
+        let Network::Testnet(params) = &roundtrip.network else {
+            panic!("Regtest uses testnet parameters")
+        };
+        assert_eq!(
+            params.configured_initial_nsm_value_balance().map(i64::from),
+            seed
+        );
+    }
+}

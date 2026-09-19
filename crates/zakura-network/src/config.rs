@@ -986,8 +986,8 @@ struct DTestnetParameters {
     nsm_reissuance_height: Option<u32>,
     /// The NSM value balance in zatoshi immediately before NU7 activates.
     ///
-    /// If unset, the balance starts at zero, which is right for a chain with no
-    /// pre-NU7 history of its own.
+    /// If unset on a configured network, state derives the balance from its historical
+    /// scheduled issuance and monetary pools. An explicit value overrides that derivation.
     initial_nsm_value_balance: Option<u64>,
 }
 
@@ -1109,11 +1109,11 @@ impl From<Arc<testnet::Parameters>> for DTestnetParameters {
             nsm_reissuance_height: params
                 .configured_nsm_reissuance_height()
                 .map(|height| height.0),
-            initial_nsm_value_balance: match i64::from(params.initial_nsm_value_balance()) {
-                0 => None,
-                // The amount type keeps this non-negative, so the cast cannot wrap.
-                balance => Some(balance as u64),
-            },
+            initial_nsm_value_balance: params.configured_initial_nsm_value_balance().map(
+                |balance| {
+                    u64::try_from(i64::from(balance)).expect("configured seeds are nonnegative")
+                },
+            ),
         }
     }
 }

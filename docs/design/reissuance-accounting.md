@@ -19,6 +19,19 @@ If NU7 is unscheduled or the tip precedes activation, the migration performs no
 data writes, including to the separately stored tip pools. Otherwise it preserves
 monetary pools and block sizes and writes the separately stored tip pools last.
 Both paths validate the tip before advancing the format version.
+
+The migration reads no history before the pre-NU7 baseline and does not audit
+or repair the absolute historical Deferred balance. It derives the counter from
+changes since that baseline, so a constant historical monetary-pool offset cancels.
+Each post-activation Deferred change must match funding minus disbursements before
+the corresponding deficit is written. This rejects mixed replay/commit histories
+whose Deferred undercount changes after the baseline and would otherwise distort
+the NSM counter. The format marker remains unchanged on failure.
+Existing monetary records are inputs to the migration: malformed records, invalid
+totals, missing required rows, and disagreement between the tip records remain
+errors. These checks do not establish that every other monetary-pool change is correct;
+detecting or repairing historical corruption is a separate database-integrity task.
+
 Failures and cancellation preserve the version marker so startup can retry.
 Older binaries cannot read the expanded records; downgrade requires a backup
 or a separate sync.

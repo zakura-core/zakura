@@ -282,7 +282,7 @@ proptest::proptest! {
 /// Construct an accounting fixture with the exact permitted subsidy.
 /// Semantic subsidy validation lives in zakura-consensus block tests.
 pub(super) fn permitted_start_block(
-    _state: &FinalizedState,
+    state: &FinalizedState,
     network: &Network,
     parent: &Block,
 ) -> Arc<Block> {

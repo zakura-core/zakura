@@ -647,6 +647,56 @@ mod database_tests {
     }
 
     #[test]
+    fn seeded_migration_ignores_history_before_the_nu7_baseline() {
+        const SEED: i64 = 1_234_567;
+        let healthy = legacy_db_with_seed(4, 48, SEED);
+        let offset = legacy_db_with_seed(4, 48, SEED);
+        let mut batch = DiskWriteBatch::new();
+        // A constant historical Deferred offset cancels from NSM accounting.
+        for height in 1..4 {
+            let mut bytes = offset.raw_block_info_cf().zs_get(&Height(height)).unwrap();
+            bytes.0[32..40].copy_from_slice(&7i64.to_le_bytes());
+            let _ = offset
+                .raw_block_info_cf()
+                .with_batch_for_writing(&mut batch)
+                .zs_insert(&Height(height), &bytes);
+        }
+        let mut pools = offset.raw_chain_value_pools_cf().zs_get(&()).unwrap();
+        pools.0[32..40].copy_from_slice(&7i64.to_le_bytes());
+        let _ = offset
+            .raw_chain_value_pools_cf()
+            .with_batch_for_writing(&mut batch)
+            .zs_insert(&(), &pools);
+        // Seeding the baseline must not require its predecessor's record.
+        let _ = offset
+            .raw_block_info_cf()
+            .with_batch_for_writing(&mut batch)
+            .zs_delete(&Height(0));
+        offset.write_batch(batch).unwrap();
+        let (_tx, rx) = crossbeam_channel::bounded(1);
+        for db in [&healthy, &offset] {
+            Upgrade.run(Some(Height(3)), db, &rx).unwrap();
+            assert!(Upgrade.validate(db, &rx).unwrap().is_ok());
+        }
+        for height in 1..4 {
+            assert_eq!(
+                read_block_info(&healthy, Height(height))
+                    .unwrap()
+                    .value_pools()
+                    .nsm_value_balance_amount(),
+                read_block_info(&offset, Height(height))
+                    .unwrap()
+                    .value_pools()
+                    .nsm_value_balance_amount(),
+            );
+        }
+        assert_eq!(
+            &offset.raw_chain_value_pools_cf().zs_get(&()).unwrap().0[..48],
+            &pools.0
+        );
+    }
+
+    #[test]
     fn migration_rejects_overdraw_between_nu7_and_reissuance() {
         // NU7 starts at 2; reissuance starts at 20,000. The tip must not hide an
         // invalid intermediate row, even when its own balance remains positive.

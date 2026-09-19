@@ -674,9 +674,11 @@ impl NonFinalizedState {
         // Transparent spend validation can read missing UTXOs from disk.
         // TODO: if those disk reads show up in profiles, run them in parallel.
         let unspent_utxo_snapshot_start = Instant::now();
-        let unspent_utxos = block_has_transparent_spends(&prepared.block)
-            .then(|| new_chain.unspent_utxos())
-            .unwrap_or_default();
+        let unspent_utxos = if block_has_transparent_spends(&prepared.block) {
+            new_chain.unspent_utxos()
+        } else {
+            HashMap::new()
+        };
         contextual_metrics.record_duration(
             "state.contextual.unspent_utxo_snapshot.duration_seconds",
             "state.contextual.mined.unspent_utxo_snapshot.duration_seconds",

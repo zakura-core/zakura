@@ -829,7 +829,7 @@ fn reissuance_amount(
 /// `Block::nsm_value_balance_change`.
 ///
 /// [ZIP 234]: https://zips.z.cash/zip-0234
-pub fn reissuance_bonus(
+fn reissuance_bonus(
     nsm_value_balance: Amount<NonNegative>,
     height: Height,
     network: &Network,
@@ -984,7 +984,22 @@ fn next_subsidy_boundary(height: Height, net: &Network) -> Option<Height> {
 /// `BlockSubsidy(height)` as described in [protocol specification §7.8][7.8]
 ///
 /// [7.8]: https://zips.z.cash/protocol/protocol.pdf#subsidies
-pub fn block_subsidy(height: Height, net: &Network) -> Result<Amount<NonNegative>, SubsidyError> {
+pub fn block_subsidy(
+    height: Height,
+    net: &Network,
+    nsm_value_balance: Option<Amount<NonNegative>>,
+) -> Result<Amount<NonNegative>, SubsidyError> {
+    if is_zip234_active(net, height) {
+        // The caller reads the NSM value balance from the parent block, so every caller
+        // that can reach a ZIP 234 height must supply it.
+        let nsm_value_balance = nsm_value_balance.ok_or(SubsidyError::MissingNsmValueBalance)?;
+
+        let halving_subsidy = halving_block_subsidy(height, net)?;
+        let bonus = reissuance_bonus(nsm_value_balance, height, net)?;
+
+        return Ok((halving_subsidy + bonus)?);
+    }
+
     halving_block_subsidy(height, net)
 }
 

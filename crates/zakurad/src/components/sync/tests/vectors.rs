@@ -4480,7 +4480,7 @@ fn lookahead_limit_at(network: &Network, max_checkpoint_height: Height, tip: Hei
     chain_sync.lookahead_limit(0)
 }
 
-/// Every currently configured upgrade preserves the existing lookahead limits.
+/// ZIP 218 scales the block-count lookahead limits where the target spacing is 25 seconds.
 #[tokio::test]
 async fn lookahead_limit_scales_with_target_spacing() {
     let _init_guard = zakura_test::init();
@@ -4493,7 +4493,7 @@ async fn lookahead_limit_scales_with_target_spacing() {
         }
         .into(),
     );
-    let multiplier = 1;
+    let multiplier = 3;
 
     let sync_config = ZakuradConfig::default().sync;
     let checkpoint_limit = sync_config.checkpoint_verify_concurrency_limit;

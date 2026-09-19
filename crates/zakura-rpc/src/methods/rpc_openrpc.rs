@@ -184,7 +184,7 @@ pub static METHODS: ::phf::Map<&str, openrpsee::openrpc::RpcMethod> = ::phf::phf
     deprecated: false,
 },
 "getnetworksolps" => openrpsee::openrpc::RpcMethod {
-    description: "Returns the estimated network solutions per second based on the last `num_blocks` before\n`height`.\n\nIf `num_blocks` is not supplied, uses 120 blocks. If it is 0 or -1, uses the difficulty\naveraging window at `height`.\nIf `height` is not supplied or is -1, uses the tip height.\n\nzcashd reference: [`getnetworksolps`](https://zcash.github.io/rpc/getnetworksolps.html)\nmethod: post\ntags: mining\n",
+    description: "Returns the estimated network solutions per second based on the last `num_blocks` before\n`height`.\n\nIf `num_blocks` is not supplied, uses 120 blocks. If it is 0 or -1, uses the difficulty\naveraging window at `height`, which ZIP 218 widens at NU7.\nIf `height` is not supplied or is -1, uses the tip height.\n\nzcashd reference: [`getnetworksolps`](https://zcash.github.io/rpc/getnetworksolps.html)\nmethod: post\ntags: mining\n",
     params: |_g| vec![
         _g.param::<i32>("num_blocks", crate::methods::PARAM_NUM_BLOCKS_DESC, false),
         _g.param::<i32>("height", crate::methods::PARAM_HEIGHT_DESC, false),

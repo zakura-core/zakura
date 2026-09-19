@@ -36,7 +36,7 @@ const EXTRA_SPACINGS_TO_MINE_A_BLOCK: i32 = 2;
 /// testnet, for a block at `height`.
 ///
 /// The time scales with the target spacing at `height`, so it stays below the minimum difficulty
-/// gap when a future upgrade shortens the spacing. At 75-second spacing it is 150 seconds.
+/// gap after ZIP 218 shortens the spacing at NU7. Before NU7 it is 150 seconds.
 fn extra_time_to_mine_a_block(network: &Network, height: Height) -> Result<Duration32, BoxError> {
     let extra_time =
         NetworkUpgrade::target_spacing_for_height(network, height) * EXTRA_SPACINGS_TO_MINE_A_BLOCK;
@@ -314,9 +314,9 @@ fn adjust_difficulty_and_time_for_testnet(
     // > then the block is a minimum-difficulty block.
     //
     // The max time is always a minimum difficulty block, because the minimum difficulty
-    // gap is 7.5 minutes at 75-second spacing, but the maximum gap is 90 minutes.
-    // This means that testnet blocks have two valid time ranges with different
-    // difficulties:
+    // gap is 7.5 minutes (2.5 minutes after ZIP 218 activates at NU7), but the maximum gap
+    // is 90 minutes. This means that testnet blocks have two valid time ranges with different
+    // difficulties, shown here before NU7:
     // * 1s - 7m30s: standard difficulty
     // * 7m31s - 90m: minimum difficulty
     //
@@ -469,7 +469,7 @@ mod tests {
         // The minimum difficulty gap is 6 target spacings, and the template keeps the standard
         // difficulty for the first 4 of them.
         let pre_nu7_offset = 4 * 75;
-        let post_nu7_offset = 4 * 75;
+        let post_nu7_offset = 4 * 25;
 
         let testnet = Network::new_default_testnet();
         assert_eq!(
@@ -481,7 +481,7 @@ mod tests {
             pre_nu7_offset
         );
 
-        // Configuring NU7 does not yet change its 75-second spacing.
+        // The block at NU7 already uses the NU7 spacing.
         for tip in [NU7 - 1, NU7, NU7 + 1_000] {
             assert_eq!(
                 last_standard_difficulty_offset(&regtest, Height(tip)),

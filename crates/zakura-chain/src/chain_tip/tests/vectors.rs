@@ -6,9 +6,9 @@ use crate::{
     parameters::{testnet::ConfiguredActivationHeights, Network},
 };
 
-/// The near-tip threshold preserves existing behavior for configured upgrades.
+/// The near-tip threshold preserves its time window when NU7 shortens the target spacing.
 #[test]
-fn near_tip_threshold_preserves_current_behavior() {
+fn near_tip_threshold_follows_nu7_spacing() {
     let _init_guard = zakura_test::init();
 
     const NU7: u32 = 1_000;
@@ -31,9 +31,9 @@ fn near_tip_threshold_preserves_current_behavior() {
     assert!(is_near(100, 16));
     assert!(!is_near(100, 17));
 
-    // NU7 currently preserves the 75-second target spacing.
-    assert!(is_near(2_000, 16));
-    assert!(!is_near(2_000, 17));
+    // After NU7, 48 blocks at 25 seconds cover the same 20-minute window.
+    assert!(is_near(2_000, 48));
+    assert!(!is_near(2_000, 49));
 }
 
 /// A spacing change inside the estimated distance uses each segment's spacing.

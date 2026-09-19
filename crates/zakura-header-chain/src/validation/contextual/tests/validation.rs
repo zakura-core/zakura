@@ -1009,10 +1009,11 @@ fn contextual_writer_hold_microbench() {
 fn candidate_height_window_preserves_existing_targets() {
     use zakura_chain::parameters::testnet::ConfiguredActivationHeights;
 
+    // NU7 widens the averaging window, so this network stops at NU6.3.
     let custom = Parameters::build()
         .with_activation_heights(ConfiguredActivationHeights {
             blossom: Some(100),
-            nu7: Some(200),
+            nu6_3: Some(200),
             ..Default::default()
         })
         .unwrap()

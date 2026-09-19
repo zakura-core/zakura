@@ -175,6 +175,31 @@ fn header_daa_accepts_valid_threshold_with_full_context() {
     .expect("expected DAA threshold is accepted");
 }
 
+/// The difficulty-context reader takes the span selected for the candidate
+/// height. Every currently configured upgrade uses the existing span.
+#[test]
+fn difficulty_context_follows_the_candidate_height() {
+    let _init_guard = zakura_test::init();
+
+    const NU7: u32 = 1_000;
+    let network = Network::new_regtest(
+        zakura_chain::parameters::testnet::ConfiguredActivationHeights {
+            nu7: Some(NU7),
+            ..Default::default()
+        }
+        .into(),
+    );
+    let ancestors = 0..difficulty::MAX_POW_ADJUSTMENT_BLOCK_SPAN * 2;
+
+    for candidate_height in [NU7 - 1, NU7, NU7 + 1] {
+        assert_eq!(
+            difficulty_context(&network, block::Height(candidate_height), ancestors.clone()).len(),
+            difficulty::POW_ADJUSTMENT_BLOCK_SPAN,
+            "candidate height {candidate_height}",
+        );
+    }
+}
+
 #[test]
 fn header_daa_rejects_bad_threshold_with_full_context() {
     let _init_guard = zakura_test::init();
@@ -303,11 +328,11 @@ fn daa_context(
     let target_spacing = NetworkUpgrade::target_spacing_for_height(network, candidate_height);
     let difficulty = network.target_difficulty_limit().to_compact();
 
-    // The difficulty context spans the whole chain below the adjustment span,
-    // and the span itself above it.
+    // The difficulty context spans the whole chain below the retained span,
+    // and the retained span itself above it. Readers take the active span.
     let context_len = usize::try_from(candidate_height.0)
         .expect("test candidate height fits in usize")
-        .min(difficulty::POW_ADJUSTMENT_BLOCK_SPAN);
+        .min(difficulty::MAX_POW_ADJUSTMENT_BLOCK_SPAN);
 
     (0..context_len)
         .map(|offset| {

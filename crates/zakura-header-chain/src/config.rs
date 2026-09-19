@@ -309,6 +309,16 @@ impl EngineConfig {
         self.network_policy_digest.bytes()
     }
 
+    /// Returns true if startup may rebind a store to a changed network policy digest.
+    ///
+    /// Mainnet and the default Testnet change their parameters only in a release, which
+    /// sets or corrects the activation of a future network upgrade. Startup still audits
+    /// every retained header under the new policy before it rebinds the digest.
+    /// Configured networks keep an exact policy match.
+    pub fn permits_network_policy_rebind(&self) -> bool {
+        matches!(self.network, Network::Mainnet) || self.network.is_default_testnet()
+    }
+
     /// This method returns the cached trust pins for transition verification.
     pub(crate) fn trust_pins(&self) -> Arc<[Frontier]> {
         self.trust_pins.clone()
@@ -655,19 +665,38 @@ mod tests {
 
     #[test]
     fn network_policy_digest_production_vectors_are_stable() {
+        // Workspace tests enable zakura-chain's test-only NU7 branch ID through
+        // feature unification. Keep fixed vectors for both branch-ID tables.
+        let (mainnet, testnet) = match NetworkUpgrade::Nu7.branch_id().map(u32::from) {
+            None => (
+                [
+                    155, 25, 210, 72, 169, 56, 188, 83, 145, 108, 183, 163, 241, 215, 149, 47, 1,
+                    203, 88, 159, 161, 223, 122, 35, 202, 150, 151, 23, 180, 79, 213, 227,
+                ],
+                [
+                    181, 237, 71, 113, 41, 49, 73, 140, 81, 171, 95, 235, 173, 69, 7, 96, 136, 95,
+                    108, 87, 105, 220, 207, 73, 32, 244, 3, 148, 82, 40, 118, 52,
+                ],
+            ),
+            Some(0xffff_fffe) => (
+                [
+                    70, 42, 62, 13, 194, 181, 154, 236, 22, 4, 49, 244, 249, 87, 56, 227, 232, 135,
+                    198, 229, 49, 181, 42, 158, 207, 87, 233, 125, 62, 230, 116, 185,
+                ],
+                [
+                    146, 248, 125, 164, 61, 162, 68, 18, 34, 49, 137, 203, 156, 253, 168, 169, 52,
+                    75, 40, 4, 13, 80, 78, 36, 9, 125, 171, 172, 229, 171, 66, 79,
+                ],
+            ),
+            branch => panic!("update the network policy vectors for NU7 branch ID {branch:?}"),
+        };
         assert_eq!(
             NetworkPolicyDigest::for_network(&Network::Mainnet).bytes(),
-            [
-                194, 57, 177, 97, 206, 155, 29, 146, 54, 0, 199, 228, 234, 86, 92, 5, 64, 147, 209,
-                14, 202, 8, 85, 60, 63, 148, 123, 33, 130, 251, 214, 146,
-            ],
+            mainnet,
         );
         assert_eq!(
             NetworkPolicyDigest::for_network(&Network::new_default_testnet()).bytes(),
-            [
-                142, 170, 84, 198, 97, 138, 9, 46, 120, 73, 23, 105, 58, 135, 75, 69, 51, 1, 2,
-                176, 60, 219, 147, 52, 105, 73, 48, 188, 172, 74, 57, 181,
-            ],
+            testnet,
         );
     }
 

@@ -75,6 +75,15 @@ pub mod activation_heights {
         pub const NU6_2: Height = Height(4_052_000);
         /// The block height at which `NU6.3` activates on Testnet.
         pub const NU6_3: Height = Height(4_134_000);
+        /// The block height at which `NU7` activates on Testnet.
+        ///
+        /// This is an estimate, not a final height. The "NU7 timeline" forum post
+        /// (<https://forum.zcashcommunity.com/t/nu7-timeline/57655>) schedules Testnet
+        /// activation for 2026-10-06 but gives no height, so this height targets
+        /// 12:00 UTC that day at 75-second blocks. Replace it once the final
+        /// Testnet height is published.
+        /// <https://github.com/zakura-core/zakura/issues/1059> tracks the final height.
+        pub const NU7: Height = Height(4_386_000);
     }
 
     /// Network upgrade activation heights for Mainnet.
@@ -103,5 +112,14 @@ pub mod activation_heights {
         pub const NU6_2: Height = Height(3_364_600);
         /// The block height at which `NU6.3` activates on Mainnet.
         pub const NU6_3: Height = Height(3_428_143);
+        /// The block height at which `NU7` activates on Mainnet.
+        ///
+        /// This is an estimate, not a final height. The "NU7 timeline" forum post
+        /// (<https://forum.zcashcommunity.com/t/nu7-timeline/57655>) schedules Mainnet
+        /// activation for 2026-11-05 but gives no height, so this height targets
+        /// 12:00 UTC that day at 75-second blocks. The Mainnet height is final
+        /// on 2026-10-20.
+        /// <https://github.com/zakura-core/zakura/issues/1059> tracks the final height.
+        pub const NU7: Height = Height(3_543_000);
     }
 }

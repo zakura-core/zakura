@@ -336,32 +336,6 @@ jobs:
       - name: Check generated zakurad config compatibility
         run: cargo nextest run --profile zakura-config --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst" --no-fail-fast
 
-  nu7:
-    name: NU7 feature tests
-    needs: changes
-    # Compiles its own binaries, because the shared nextest archive is built
-    # without this feature.
-    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
-    permissions:
-      contents: read
-      id-token: write
-      statuses: write
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f #v2.0.0
-        with:
-          toolchain: stable
-      - uses: ./.github/actions/setup-zakura-build
-      - name: Test NU7 builds
-        run: |
-          cargo test --locked --features nu7 \
-            -p zakura-consensus -p zakura-state --lib
-          cargo check --locked -p zakura --features nu7
-
   network-dependent:
     name: network-dependent acceptance tests
     needs: changes
@@ -490,7 +464,6 @@ jobs:
       - build-tests
       - unit-tests
       - zakura-config
-      - nu7
       - network-dependent
       - pruned-storage
       - check-no-git-dependencies
@@ -508,7 +481,7 @@ jobs:
           # check-no-git-dependencies is A-release-label only, publish-graph
           # skips on PRs that do not touch Cargo manifests or this check.
           # Failed, non-skipped jobs still fail this aggregate status.
-          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, network-dependent, nu7, publish-graph
+          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, network-dependent, publish-graph
 
   report-nightly-result:
     name: report nightly release test result

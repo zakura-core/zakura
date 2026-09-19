@@ -67,10 +67,9 @@ pub(crate) fn nsm_value_balance_is_non_negative(
     value_pools: &ValueBalance<NonNegative>,
     block_value_pool_change: &ValueBalance<NegativeAllowed>,
 ) -> Result<(), ValidateContextError> {
-    let nu7_active = cfg!(feature = "nu7")
-        && NetworkUpgrade::Nu7
-            .activation_height(network)
-            .is_some_and(|nu7| height >= nu7);
+    let nu7_active = NetworkUpgrade::Nu7
+        .activation_height(network)
+        .is_some_and(|nu7| height >= nu7);
 
     if !nu7_active {
         return Ok(());
@@ -539,9 +538,7 @@ mod nsm_value_balance_boundary_tests {
                     );
                     let sum = i128::from(before) + i128::from(delta);
                     // Rejection starts at NU7, before the reissuance height.
-                    let reject = cfg!(feature = "nu7")
-                        && height >= 2
-                        && !(0..=i128::from(MAX_MONEY)).contains(&sum);
+                    let reject = height >= 2 && !(0..=i128::from(MAX_MONEY)).contains(&sum);
                     assert_eq!(
                         result.is_err(),
                         reject,

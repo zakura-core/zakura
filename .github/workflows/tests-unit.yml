@@ -358,10 +358,8 @@ jobs:
       - uses: ./.github/actions/setup-zakura-build
       - name: Test NU7 builds
         run: |
-          cargo test --locked --features zakura-chain/nu7 \
-            -p zakura-chain -p zakura-header-chain --lib
           cargo test --locked --features nu7 \
-            -p zakura-consensus -p zakura-rpc -p zakura-state --lib
+            -p zakura-consensus -p zakura-state --lib
           cargo check --locked -p zakura --features nu7
 
       - name: Extended reissuance properties
@@ -370,9 +368,9 @@ jobs:
           NSM_ARITHMETIC_CASES: '10000'
           NSM_HISTORY_CASES: '1000'
         run: |
-          cargo test --locked -p zakura-chain --features nu7 reissuance_matches_integer_oracle
-          cargo test --locked -p zakura-chain --features nu7 balance_ignores_transfers
-          cargo test --locked -p zakura-state --features nu7 balance_rollback_replay_and_fork_equivalence
+          cargo test --locked -p zakura-chain reissuance_matches_integer_oracle
+          cargo test --locked -p zakura-chain balance_ignores_transfers
+          cargo test --locked -p zakura-state balance_rollback_replay_and_fork_equivalence
 
   network-dependent:
     name: network-dependent acceptance tests

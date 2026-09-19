@@ -1,6 +1,6 @@
 # Reissuance accounting
 
-This implementation keeps reissuance behind the disabled-by-default `nu7` feature.
+Reissuance activates by height alone, from the ZIP 234 start height, in every build.
 Production activation still requires policy guidance and a production NU7 branch ID.
 
 ## The seed

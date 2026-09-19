@@ -532,7 +532,7 @@ fn signed_balance_agrees_across_both_commit_paths() {
             forks.commit_new_chain(SemanticallyVerifiedBlock::from(block.clone()), &state.db);
         let finalized_result = commit(&mut state, &block);
 
-        if cfg!(feature = "nu7") && excess > 0 {
+        if excess > 0 {
             assert!(
                 matches!(fork_result,
                     Err(ValidateContextError::NegativeNsmValueBalance { height, .. }) if height == START

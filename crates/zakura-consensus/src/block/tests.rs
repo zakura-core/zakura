@@ -1626,11 +1626,9 @@ fn state_commit_context_errors_keep_misbehavior_scores() {
     assert_eq!(router_error.misbehavior_score(), 100);
 }
 /// A balance that pays a nonzero ZIP 234 bonus.
-#[cfg(feature = "nu7")]
 const ZIP234_TEST_DEFICIT: i64 = 400_000_000;
 
 /// `ceil(ZIP234_TEST_DEFICIT * BLOCK_SUBSIDY_FRACTION)` at `height` on `network`.
-#[cfg(feature = "nu7")]
 fn zip234_test_bonus(network: &Network, height: Height) -> i64 {
     let numerator = i128::try_from(
         zakura_chain::parameters::subsidy::block_subsidy_fraction_numerator(height, network),
@@ -1646,7 +1644,6 @@ fn zip234_test_bonus(network: &Network, height: Height) -> i64 {
 ///
 /// The balance is stored in its own value pool leg, and the transparent pool is set so that
 /// the test can isolate subsidy validation from the historical-baseline policy.
-#[cfg(feature = "nu7")]
 fn zip234_parent_pools(
     network: &Network,
     parent: Height,
@@ -1671,7 +1668,6 @@ fn zip234_parent_pools(
 
 /// Semantic verification checks the coinbase against the ZIP 234 subsidy, which depends on
 /// the parent's chain value pools.
-#[cfg(feature = "nu7")]
 #[tokio::test]
 async fn zip234_block_verification_checks_the_reissuance_bonus() {
     use zakura_chain::{block_info::BlockInfo, parameters::subsidy::halving_block_subsidy};
@@ -1796,7 +1792,6 @@ async fn zip234_block_verification_checks_the_reissuance_bonus() {
 }
 
 /// A proposal uses its committed parent's balance and rejects an excessive bonus.
-#[cfg(feature = "nu7")]
 #[tokio::test]
 async fn zip234_proposal_with_committed_parent_checks_the_bonus_without_waiting() {
     use zakura_chain::{block_info::BlockInfo, parameters::subsidy::halving_block_subsidy};
@@ -1855,7 +1850,6 @@ async fn zip234_proposal_with_committed_parent_checks_the_bonus_without_waiting(
 }
 
 /// A proposal must reject an uncommitted parent without waiting for its commit.
-#[cfg(feature = "nu7")]
 #[tokio::test]
 async fn zip234_proposal_with_uncommitted_parent_is_rejected_without_waiting() {
     use zakura_chain::parameters::subsidy::halving_block_subsidy;
@@ -1897,7 +1891,6 @@ async fn zip234_proposal_with_uncommitted_parent_is_rejected_without_waiting() {
 }
 
 /// A network with NU7 at height 1 and ZIP 234 reissuance from `start`.
-#[cfg(feature = "nu7")]
 fn zip234_test_network(start: Height) -> Network {
     let genesis_block =
         Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
@@ -1933,7 +1926,6 @@ fn zip234_test_network(start: Height) -> Network {
 }
 
 /// A block at `height` whose coinbase pays `coinbase_value`.
-#[cfg(feature = "nu7")]
 fn zip234_test_block(
     network: &Network,
     height: Height,

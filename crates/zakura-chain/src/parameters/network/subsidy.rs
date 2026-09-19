@@ -780,14 +780,12 @@ impl<'a> Pre218Schedule<'a> {
     }
 }
 
-/// Returns whether ZIP 234 is compiled in and applies to `network` at `height`.
+/// Returns whether ZIP 234 applies to `network` at `height`.
 ///
-/// [`nsm_reissuance_height`] gives the ZIP's height whatever the build, so that the height
-/// arithmetic is testable everywhere. This is the check that decides whether a block
-/// subsidy actually follows ZIP 234, and so whether a caller has to fetch the money
-/// reserve.
+/// This check decides whether a block subsidy follows ZIP 234, and so whether a caller
+/// has to fetch the money reserve.
 pub fn is_zip234_active(network: &Network, height: Height) -> bool {
-    cfg!(feature = "nu7") && nsm_reissuance_height(network).is_some_and(|start| height >= start)
+    nsm_reissuance_height(network).is_some_and(|start| height >= start)
 }
 
 /// Applies the [ZIP 234] reissuance fraction at `height` to `amount`, rounding up.

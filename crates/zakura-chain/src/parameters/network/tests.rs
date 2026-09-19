@@ -858,10 +858,6 @@ fn reissuance_drains_a_small_balance() {
 
     let _init_guard = zakura_test::init();
 
-    if !cfg!(feature = "nu7") {
-        return;
-    }
-
     let start = Height(1_000_000);
     let network = testnet::Parameters::build()
         .with_activation_heights(ConfiguredActivationHeights {
@@ -922,16 +918,6 @@ fn zip234_issuance() {
         .with_nsm_reissuance_height(start)
         .to_network()
         .expect("configured testnet is valid");
-
-    if !cfg!(feature = "nu7") {
-        // Without ZIP 234, the subsidy stays on the halving schedule.
-        let balance = Amount::<NonNegative>::try_from(1_000_000_000_000i64).expect("valid amount");
-        assert_eq!(
-            block_subsidy(start, &network, Some(balance)).expect("valid subsidy"),
-            block_subsidy(start, &network, None).expect("valid subsidy"),
-        );
-        return;
-    }
 
     // ZIP 234 needs the NSM value balance at its start height.
     assert_eq!(
@@ -1085,8 +1071,7 @@ fn reissuance_activation_and_rounding_boundary_matrix() {
                 nu7.map(|n| Height(n.max(configured_start)))
             );
             for height in 1..=11 {
-                let active =
-                    cfg!(feature = "nu7") && nu7.is_some_and(|n| height >= n.max(configured_start));
+                let active = nu7.is_some_and(|n| height >= n.max(configured_start));
                 assert_eq!(is_zip234_active(&network, Height(height)), active);
                 let scheduled = halving_block_subsidy(Height(height), &network).unwrap();
                 if active {

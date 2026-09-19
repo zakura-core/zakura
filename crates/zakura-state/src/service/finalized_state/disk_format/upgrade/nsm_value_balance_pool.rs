@@ -258,10 +258,9 @@ fn eligible_balance(
                 "invalid NSM value balance at {height:?}: {error}"
             ))
         })?;
-    if cfg!(feature = "nu7")
-        && NetworkUpgrade::Nu7
-            .activation_height(network)
-            .is_some_and(|start| height >= start)
+    if NetworkUpgrade::Nu7
+        .activation_height(network)
+        .is_some_and(|start| height >= start)
         && i64::from(eligible) < 0
     {
         return Err(FormatChangeError::InvalidPostcondition(format!(
@@ -402,14 +401,10 @@ mod tests {
                 Amount::try_from(i64::try_from(scheduled - baseline + 1).unwrap()).unwrap(),
             );
             let result = eligible_balance(&network, Height(h), pools, baseline);
-            if cfg!(feature = "nu7") {
-                assert!(matches!(
-                    result,
-                    Err(FormatChangeError::InvalidPostcondition(_))
-                ));
-            } else {
-                assert_eq!(i64::from(result.unwrap()), -1);
-            }
+            assert!(matches!(
+                result,
+                Err(FormatChangeError::InvalidPostcondition(_))
+            ));
         }
     }
 
@@ -635,23 +630,10 @@ mod database_tests {
 
             let (_tx, rx) = crossbeam_channel::bounded(1);
             let result = Upgrade.run(Some(Height(3)), &db, &rx);
-            if cfg!(feature = "nu7") {
-                assert!(matches!(
-                    result,
-                    Err(FormatChangeError::InvalidPostcondition(_))
-                ));
-            } else {
-                result.unwrap();
-                assert_eq!(
-                    i64::from(
-                        read_block_info(&db, Height(overdraw_height))
-                            .unwrap()
-                            .value_pools()
-                            .nsm_value_balance_amount()
-                    ),
-                    -1,
-                );
-            }
+            assert!(matches!(
+                result,
+                Err(FormatChangeError::InvalidPostcondition(_))
+            ));
         }
     }
 

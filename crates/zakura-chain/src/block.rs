@@ -5,13 +5,13 @@ use std::{collections::HashMap, fmt, ops::Neg, sync::Arc};
 use halo2::pasta::pallas;
 
 use crate::{
-    amount::{DeferredPoolBalanceChange, NegativeAllowed},
+    amount::{Amount, DeferredPoolBalanceChange, NegativeAllowed},
     block::merkle::{auth_digest_or_placeholder, AuthDataRoot},
     fmt::DisplayToDebug,
     ironwood,
     memory::{inline_size_bytes, vec_capacity_bytes, AttributedMemorySize},
     orchard,
-    parameters::{Network, NetworkUpgrade},
+    parameters::{subsidy::halving_block_subsidy, Network, NetworkUpgrade},
     sapling,
     serialization::TrustedPreallocate,
     sprout,
@@ -287,12 +287,15 @@ impl Block {
     /// Note that the chain value pool has the opposite sign to the transaction value pool.
     pub fn chain_value_pool_change(
         &self,
+        network: &Network,
         utxos: &HashMap<transparent::OutPoint, transparent::Utxo>,
         deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
     ) -> Result<ValueBalance<NegativeAllowed>, ValueBalanceError> {
-        self.chain_value_pool_change_from_utxos(deferred_pool_balance_change, |transaction| {
-            transaction.value_balance(utxos)
-        })
+        self.chain_value_pool_change_from_utxos(
+            network,
+            deferred_pool_balance_change,
+            |transaction| transaction.value_balance(utxos),
+        )
     }
 
     /// Returns the overall chain value pool change using borrowed ordered UTXOs.
@@ -307,16 +310,20 @@ impl Block {
     /// This method panics if `utxos` omits a transparent input's UTXO.
     pub fn chain_value_pool_change_from_ordered_utxos(
         &self,
+        network: &Network,
         utxos: &HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
         deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
     ) -> Result<ValueBalance<NegativeAllowed>, ValueBalanceError> {
-        self.chain_value_pool_change_from_utxos(deferred_pool_balance_change, |transaction| {
-            transaction.value_balance_from_ordered_utxos(utxos)
-        })
+        self.chain_value_pool_change_from_utxos(
+            network,
+            deferred_pool_balance_change,
+            |transaction| transaction.value_balance_from_ordered_utxos(utxos),
+        )
     }
 
     fn chain_value_pool_change_from_utxos<F>(
         &self,
+        network: &Network,
         deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
         mut transaction_value_balance: F,
     ) -> Result<ValueBalance<NegativeAllowed>, ValueBalanceError>
@@ -333,11 +340,51 @@ impl Block {
                 acc + transaction_value_balance(tx)?
             })?;
 
-        Ok(*tx_pool_sum.neg().set_deferred_amount(
+        let mut change = *tx_pool_sum.neg().set_deferred_amount(
             deferred_pool_balance_change
                 .map(DeferredPoolBalanceChange::value)
                 .unwrap_or_default(),
-        ))
+        );
+
+        change.set_issuance_deficit_amount(self.issuance_deficit_change(network, &change)?);
+
+        Ok(change)
+    }
+
+    /// Returns scheduled issuance minus issued value, starting at NU7 with no seed.
+    ///
+    /// Should historical unclaimed subsidy and fees seed this balance? We need guidance before including those funds. Update the baseline
+    /// in `zakura-state/src/service/finalized_state/disk_format/upgrade/issuance_deficit_pool.rs`
+    /// together with this rule and its accounting tests.
+    fn issuance_deficit_change(
+        &self,
+        network: &Network,
+        change: &ValueBalance<NegativeAllowed>,
+    ) -> Result<Amount<NegativeAllowed>, ValueBalanceError> {
+        let height = self
+            .coinbase_height()
+            .ok_or(ValueBalanceError::MissingCoinbaseHeight)?;
+
+        if !NetworkUpgrade::Nu7
+            .activation_height(network)
+            .is_some_and(|start| height >= start)
+        {
+            return Ok(Amount::zero());
+        }
+
+        // Genesis contributes no issuance, including on networks without slow start.
+        let scheduled = if height == Height(0) {
+            Amount::zero()
+        } else {
+            halving_block_subsidy(height, network)
+                .map_err(ValueBalanceError::ScheduledIssuance)?
+                .constrain::<NegativeAllowed>()
+                .map_err(ValueBalanceError::IssuanceDeficit)?
+        };
+
+        let issued = change.total().map_err(ValueBalanceError::IssuanceDeficit)?;
+
+        (scheduled - issued).map_err(ValueBalanceError::IssuanceDeficit)
     }
 
     /// Compute the root of the authorizing data Merkle tree,
@@ -389,5 +436,93 @@ pub const MAX_BLOCK_LOCATOR_LENGTH: u64 = 101;
 impl TrustedPreallocate for Hash {
     fn max_allocation() -> u64 {
         MAX_BLOCK_LOCATOR_LENGTH
+    }
+}
+
+#[cfg(test)]
+mod issuance_deficit_properties {
+    use super::*;
+    use crate::{
+        parameters::testnet::{ConfiguredActivationHeights, RegtestParameters},
+        transparent::Input,
+    };
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(std::env::var("NSM_ARITHMETIC_CASES").ok().and_then(|value| value.parse().ok()).unwrap_or(1024)))]
+
+        #[test]
+        fn deficit_ignores_transfers_and_tracks_removed_value(
+            height in 1u32..20,
+            removed in 0i64..1_000_000_000,
+            transfer in 0i64..1_000_000_000,
+            pool in 0usize..5,
+        ) {
+            let network = Network::new_regtest(RegtestParameters {
+                activation_heights: ConfiguredActivationHeights { nu7: Some(3), ..Default::default() },
+                ..Default::default()
+            });
+            let mut block = (*genesis::regtest_genesis_block()).clone();
+            let transaction = Arc::make_mut(&mut block.transactions[0]);
+            let Input::Coinbase { height: coinbase_height, .. } = &mut transaction.inputs_mut()[0] else {
+                panic!("genesis has a coinbase input");
+            };
+            *coinbase_height = Height(height);
+            let amount = Amount::<NegativeAllowed>::try_from(transfer).unwrap();
+            let destination = match pool {
+                0 => ValueBalance::from_sprout_amount(amount),
+                1 => ValueBalance::from_sapling_amount(amount),
+                2 => ValueBalance::from_orchard_amount(amount),
+                3 => ValueBalance::from_ironwood_amount(amount),
+                _ => { let mut pools = ValueBalance::zero(); pools.set_deferred_amount(amount); pools },
+            };
+            let change = (destination + ValueBalance::from_transparent_amount(Amount::try_from(-transfer - removed).unwrap())).unwrap();
+            let actual = block.issuance_deficit_change(&network, &change).unwrap();
+            let expected = if height < 3 { 0 } else {
+                i64::from(halving_block_subsidy(Height(height), &network).unwrap()) + removed
+            };
+            prop_assert_eq!(i64::from(actual), expected);
+            let reverse = -change;
+            prop_assert_eq!((change + reverse).unwrap(), ValueBalance::<NegativeAllowed>::zero());
+        }
+    }
+    #[test]
+    fn issuance_accounting_activation_genesis_and_sign_boundaries() {
+        for activation in [None, Some(1), Some(3)] {
+            let network = Network::new_regtest(RegtestParameters {
+                activation_heights: ConfiguredActivationHeights {
+                    nu7: activation,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            for height in 0..5 {
+                let mut block = (*genesis::regtest_genesis_block()).clone();
+                let transaction = Arc::make_mut(&mut block.transactions[0]);
+                let Input::Coinbase { height: h, .. } = &mut transaction.inputs_mut()[0] else {
+                    unreachable!()
+                };
+                *h = Height(height);
+                let scheduled = if height == 0 {
+                    0
+                } else {
+                    i64::from(halving_block_subsidy(Height(height), &network).unwrap())
+                };
+                for issued in [-1, 0, 1, scheduled, scheduled + 1] {
+                    let change =
+                        ValueBalance::from_transparent_amount(Amount::try_from(issued).unwrap());
+                    let expected = if activation.is_some_and(|start| height >= start) {
+                        scheduled - issued
+                    } else {
+                        0
+                    };
+                    assert_eq!(
+                        i64::from(block.issuance_deficit_change(&network, &change).unwrap()),
+                        expected,
+                        "activation {activation:?}, height {height}, issued {issued}"
+                    );
+                }
+            }
+        }
     }
 }

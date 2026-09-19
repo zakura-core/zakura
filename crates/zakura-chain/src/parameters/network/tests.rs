@@ -14,7 +14,7 @@ use crate::{
             block_subsidy, constants::POST_BLOSSOM_HALVING_INTERVAL, funding_stream_address_period,
             halving, halving_divisor, height_for_halving, ParameterSubsidy,
         },
-        testnet::ConfiguredActivationHeights,
+        testnet::{self, ConfiguredActivationHeights},
         NetworkUpgrade,
     },
 };

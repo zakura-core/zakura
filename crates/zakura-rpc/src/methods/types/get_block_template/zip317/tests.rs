@@ -352,7 +352,7 @@ mod zip218_template_limits {
         let miner_params =
             MinerParams::from(Address::from(TransparentAddress::PublicKeyHash([0x7e; 20])));
         let fake_coinbase_tx =
-            TransactionTemplate::new_coinbase(network, height, &miner_params, Amount::zero())
+            TransactionTemplate::new_coinbase(network, height, &miner_params, Amount::zero(), None)
                 .expect("valid coinbase transaction template");
 
         BlockTemplateLimits::initial(network, height, &fake_coinbase_tx)

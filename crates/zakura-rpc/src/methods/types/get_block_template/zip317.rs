@@ -14,6 +14,7 @@ use rand::{
 };
 
 use zakura_chain::{
+    amount::{self, Amount},
     block::{Height, MAX_BLOCK_BYTES},
     parameters::{
         Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET, ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
@@ -25,7 +26,7 @@ use zakura_chain::{
     },
     work::equihash::Solution,
 };
-use zakura_consensus::MAX_BLOCK_SIGOPS;
+use zakura_consensus::{error::TransactionError, MAX_BLOCK_SIGOPS};
 use zakura_node_services::mempool::TransactionDependencies;
 
 use crate::methods::types::transaction::{CoinbaseResourceUsage, TransactionTemplate};
@@ -74,20 +75,21 @@ fn block_template_overhead_bytes(net: &Network) -> usize {
 /// and sigops do not depend on the reward amount, which lets selection avoid
 /// generating a zero-fee shielded proof.
 ///
-/// Returns selected transactions from `mempool_txs`.
+/// Returns selected transactions from `mempool_txs`, or an error if coinbase
+/// resource usage cannot be calculated from the parent balance.
 ///
 /// [ZIP-317]: https://zips.z.cash/zip-0317#block-production
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::unwrap_in_result)]
 pub fn select_mempool_transactions(
     net: &Network,
     height: Height,
     miner_params: &MinerParams,
+    nsm_value_balance: Option<Amount<amount::NonNegative>>,
     mempool_txs: Vec<VerifiedUnminedTx>,
     mempool_tx_deps: TransactionDependencies,
-) -> Vec<SelectedMempoolTx> {
+) -> Result<Vec<SelectedMempoolTx>, TransactionError> {
     let coinbase_resources =
-        TransactionTemplate::coinbase_resource_usage(net, height, miner_params)
-            .expect("valid coinbase resource usage");
+        TransactionTemplate::coinbase_resource_usage(net, height, miner_params, nsm_value_balance)?;
 
     let tx_dependencies = mempool_tx_deps.dependencies();
     let (independent_mempool_txs, mut dependent_mempool_txs): (HashMap<_, _>, HashMap<_, _>) =
@@ -134,7 +136,7 @@ pub fn select_mempool_transactions(
         );
     }
 
-    selected_txs
+    Ok(selected_txs)
 }
 
 /// Returns a fee-weighted index and the total weight of `transactions`.

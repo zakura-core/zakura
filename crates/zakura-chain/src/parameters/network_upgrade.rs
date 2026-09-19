@@ -291,6 +291,35 @@ pub const POST_NU7_POW_AVERAGING_WINDOW: usize = 102;
 /// window remains height-dependent; see [`NetworkUpgrade::averaging_window`].
 pub const MAX_POW_AVERAGING_WINDOW: usize = POST_NU7_POW_AVERAGING_WINDOW;
 
+/// Per-block limit on the total number of Orchard actions, applied from NU7
+/// activation onwards.
+///
+/// `OrchardBlockActionLimit` in ZIP 218.
+pub const ORCHARD_BLOCK_ACTION_LIMIT: u32 = 330;
+
+/// Per-block limit on the total number of Sapling spends plus outputs, applied
+/// from NU7 activation onwards.
+///
+/// `SaplingBlockIOLimit` in ZIP 218.
+pub const SAPLING_BLOCK_IO_LIMIT: u32 = 300;
+
+/// Per-block limit on the total number of Sprout JoinSplits, applied from NU7
+/// activation onwards.
+///
+/// `SproutBlockJoinSplitLimit` in ZIP 218, which sets it to 25. Zakura sets it
+/// to zero, because ZIP 2003 disallows version 4 transactions from NU7
+/// activation, and only version 2, 3, and 4 transactions can contain
+/// JoinSplits. So no block at or after NU7 can contain a JoinSplit.
+pub const SPROUT_BLOCK_JOINSPLIT_LIMIT: u32 = 0;
+
+/// Per-block budget for the total shielded cost across all pools, applied from
+/// NU7 activation onwards.
+///
+/// `GlobalShieldedBudget` in ZIP 218. It bounds the worst-case shielded sync
+/// bandwidth per block whichever combination of pools a block uses. Sprout
+/// JoinSplits count twice because each produces two shielded outputs.
+pub const GLOBAL_SHIELDED_BUDGET: u32 = 330;
+
 /// The multiplier used to derive the testnet minimum difficulty block time gap
 /// threshold.
 ///
@@ -530,13 +559,6 @@ impl NetworkUpgrade {
         }
     }
 
-    /// Returns the averaging window timespan for the network upgrade.
-    ///
-    /// `AveragingWindowTimespan` from the Zcash specification.
-    pub fn averaging_window_timespan(&self) -> Duration {
-        self.target_spacing() * self.averaging_window().try_into().expect("fits in i32")
-    }
-
     /// Returns the averaging window for difficulty threshold arithmetic mean
     /// calculations.
     ///
@@ -552,11 +574,28 @@ impl NetworkUpgrade {
         }
     }
 
-    /// Returns the averaging window for `network` and `height`.
+    /// Returns the difficulty averaging window at the selected network height.
     ///
     /// See [`NetworkUpgrade::averaging_window`] for details.
     pub fn averaging_window_for_height(network: &Network, height: block::Height) -> usize {
         NetworkUpgrade::current(network, height).averaging_window()
+    }
+
+    /// Returns the averaging window timespan for the network upgrade.
+    ///
+    /// `AveragingWindowTimespan` from the Zcash specification.
+    pub fn averaging_window_timespan(&self) -> Duration {
+        self.target_spacing() * self.averaging_window().try_into().expect("fits in i32")
+    }
+
+    /// Returns `true` if NU7's consensus rules apply at `height` on `network`.
+    ///
+    /// This is `IsNU7Activated(height)` from ZIP 218. It treats every upgrade
+    /// after NU7 as NU7-active, including upgrades that share or replace NU7's
+    /// activation height. Networks that configure neither NU7 nor a later
+    /// upgrade never activate it.
+    pub fn is_nu7_active(network: &Network, height: block::Height) -> bool {
+        NetworkUpgrade::current(network, height) >= NetworkUpgrade::Nu7
     }
 
     /// Returns the averaging window timespan for `network` and `height`.

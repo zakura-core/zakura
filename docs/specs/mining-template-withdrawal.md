@@ -65,34 +65,23 @@ The cases above describe possible triggers, not observed production incidents.
    Drop the preparation future when its parent becomes stale or after 30 seconds.
    Keep solved-block verification and commit outside this cancellation path.
 
-## Verification plan
+## Tests
 
-- Exercise the real transaction-expiry check at the last valid height and the first
-  invalid height. Check that only the rejection invalidates the template.
-- Exercise the background worker through the RPC boundary with a boxed router error.
-  Verify that long polling wakes without a tip change and that recovery waits for
-  validation. Verify that failed recovery never returns a template.
-- Exercise failure before subscription and during an outstanding long poll.
-- Check work-ID isolation, duplicate rejection, old-parent rejection, parent recovery,
-  retained notifications, and bounded-storage overflow.
-- Round-trip legacy and revised long-poll IDs. Check that a withdrawal disallows old
-  shares while a mempool-only change still permits them.
-- Keep the internal solver's unavailable-template cancellation tests. Exercise the
-  generator's rejection wait during both the RPC request and refresh delay.
-- Run the existing mempool expiry/dependency tests, RPC tests, prepared-candidate
-  tests, and internal-miner tests.
-
-### Verification results
-
-The implementation passed these checks with Rust 1.97.0:
-
-- Consensus library: 226 tests passed.
-- RPC library: 142 tests passed; one existing test remained ignored.
-- Internal-miner template tests: five tests passed.
-- Mempool expiry and dependent-removal tests: two tests passed.
-- Clippy passed for all targets in `zakura-consensus`, `zakura-rpc`, and `zakura`
-  with the internal miner enabled and warnings denied.
-- Formatting, diff whitespace, and changelog checks passed.
+- `zakura-consensus`: `template_rejection_distinguishes_expiry_from_service_failure`
+  separates a real transaction-expiry rejection from a service failure.
+- `zakura-rpc`: `template_rejection_wakes_long_poll_and_validates_recovery` and
+  `template_rejection_before_long_poll_is_not_lost` cover withdrawal, validated
+  recovery, and a rejection that precedes the long poll it must wake.
+- `zakura-rpc`: `template_rejection_targets_work_and_ignores_old_parents`,
+  `template_rejection_storage_fails_closed_at_capacity`,
+  `prepared_template_tracking_keeps_new_recovery_work_at_capacity`, and
+  `template_rejection_retains_notifications_for_late_subscribers` cover the
+  rejection state itself.
+- `zakura-rpc`: `long_poll_withdrawal_changes_id_and_disallows_old_work` checks that a
+  withdrawal disallows old shares and that the revised ID round-trips.
+- `zakurad`: `template_rejection_cancels_during_rpc_wait` and
+  `template_rejection_cancels_during_refresh_delay` cover the internal miner's two
+  cancellation points.
 
 ## Limits and follow-up measurements
 

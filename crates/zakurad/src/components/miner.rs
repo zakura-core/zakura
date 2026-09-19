@@ -28,7 +28,7 @@ use zakura_network::AddressBookPeers;
 use zakura_node_services::mempool;
 use zakura_rpc::{
     client::{
-        BlockTemplateTimeSource,
+        BlockTemplateResponse, BlockTemplateTimeSource,
         GetBlockTemplateCapability::{CoinbaseTxn, LongPoll},
         GetBlockTemplateParameters,
         GetBlockTemplateRequestMode::Template,
@@ -64,6 +64,26 @@ fn should_replace_mining_template(
 }
 
 /// Cancels mining when the current template changes or becomes unavailable.
+/// Whether the internal miner may keep solving work that a template update did not invalidate.
+///
+/// An external long poll withdraws every old share when the server rejects a template. The
+/// internal miner can keep work that already passed validation on the same parent.
+fn keep_validated_work(
+    parameters: &GetBlockTemplateParameters,
+    template: &BlockTemplateResponse,
+    active_work_prepared: bool,
+) -> bool {
+    // Only a new revision of the same work context is a withdrawal; anything else is new work.
+    parameters.long_poll_id().is_some_and(|old| {
+        let new = template.long_poll_id();
+        new.same_work_context(&old) && new.revision() != old.revision()
+    })
+        // The work being solved must have passed validation on this parent itself.
+        && active_work_prepared
+        // Past the template's max time the solved header would be invalid anyway.
+        && chrono::Utc::now().timestamp() < i64::from(template.max_time().timestamp())
+}
+
 fn cancel_if_mining_template_changed(
     template_receiver: &mut WatchReceiver<Option<Arc<Block>>>,
     old_header: block::Header,
@@ -330,13 +350,7 @@ where
     while !template_sender.is_closed() && !is_shutting_down() {
         let template: Result<_, _> = tokio::select! {
             biased;
-            _ = async {
-                if let Some(work_id) = &active_work_id {
-                    rpc.wait_for_mining_template_rejection(work_id).await;
-                } else {
-                    std::future::pending::<()>().await;
-                }
-            } => {
+            _ = rpc.wait_for_mining_template_withdrawal(active_work_id.as_deref()) => {
                 template_sender.send_replace(None);
                 active_work_id = None;
                 continue;
@@ -383,16 +397,10 @@ where
         if rpc.mining_template_withdrawn(&work_id) {
             continue;
         }
-        // External long polls withdraw all old shares on rejection. The internal miner
-        // can preserve work that already passed validation on the same parent.
-        if parameters.long_poll_id().is_some_and(|old| {
-            let new = template.long_poll_id();
-            new.same_work_context(&old) && new.revision() != old.revision()
-        }) && active_work_id
+        let active_work_prepared = active_work_id
             .as_ref()
-            .is_some_and(|id| rpc.mining_template_prepared(id))
-            && chrono::Utc::now().timestamp() < i64::from(template.max_time().timestamp())
-        {
+            .is_some_and(|work_id| rpc.mining_template_prepared(work_id));
+        if keep_validated_work(&parameters, &template, active_work_prepared) {
             submit_old = Some(true);
         }
 
@@ -447,13 +455,7 @@ where
         if !template_sender.is_closed() && !is_shutting_down() {
             tokio::select! {
                 _ = sleep(BLOCK_TEMPLATE_REFRESH_LIMIT) => {},
-                _ = async {
-                    if let Some(work_id) = &active_work_id {
-                        rpc.wait_for_mining_template_rejection(work_id).await;
-                    } else {
-                        std::future::pending::<()>().await;
-                    }
-                } => {
+                _ = rpc.wait_for_mining_template_withdrawal(active_work_id.as_deref()) => {
                     template_sender.send_replace(None);
                     active_work_id = None;
                 }

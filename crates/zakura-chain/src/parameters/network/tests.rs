@@ -14,6 +14,7 @@ use crate::{
             block_subsidy, constants::POST_BLOSSOM_HALVING_INTERVAL, funding_stream_address_period,
             halving, halving_divisor, height_for_halving, ParameterSubsidy,
         },
+        testnet::ConfiguredActivationHeights,
         NetworkUpgrade,
     },
 };
@@ -45,6 +46,44 @@ fn funding_stream_period_uses_floor_division_for_negative_periods() {
     assert_eq!(0, funding_stream_address_period(Height(50), &parameters));
     assert_eq!(-1, funding_stream_address_period(Height(49), &parameters));
     assert_eq!(-2, funding_stream_address_period(Height(39), &parameters));
+}
+
+/// Regtest derives its first halving, so NU7's 25 second spacing moves it.
+#[test]
+fn regtest_first_halving_follows_the_target_spacing() {
+    let _init_guard = zakura_test::init();
+
+    let regtest = Network::new_regtest(Default::default());
+    assert_eq!(regtest.height_for_first_halving(), Height(287));
+
+    let nu7_regtest = Network::new_regtest(
+        ConfiguredActivationHeights {
+            nu7: Some(1),
+            ..Default::default()
+        }
+        .into(),
+    );
+    let first_halving = nu7_regtest.height_for_first_halving();
+    assert_eq!(first_halving, Height(859));
+    assert_eq!(
+        Some(first_halving),
+        height_for_halving(1, &nu7_regtest),
+        "the first halving matches the subsidy schedule"
+    );
+
+    // Funding stream recipients rotate on period boundaries aligned to the
+    // derived first halving, which starts period 48.
+    let period = |height: Height| funding_stream_address_period(height, &nu7_regtest);
+    let interval = nu7_regtest.funding_stream_address_change_interval();
+    assert_eq!(period(first_halving), 48);
+    assert_eq!(
+        period((first_halving - 1).expect("the test height is valid")),
+        47
+    );
+    assert_eq!(
+        period((first_halving + interval).expect("the test height is valid")),
+        49
+    );
 }
 
 #[test]

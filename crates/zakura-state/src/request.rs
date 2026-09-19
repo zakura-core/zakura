@@ -1442,6 +1442,15 @@ pub enum Request {
     /// [`AWAIT_BLOCK_INFO_TIMEOUT`](crate::constants::AWAIT_BLOCK_INFO_TIMEOUT).
     AwaitBlockInfo(block::Hash),
 
+    /// Looks up the [`BlockInfo`](zakura_chain::block_info::BlockInfo) for a committed block
+    /// hash without waiting.
+    ///
+    /// This request checks every non-finalized chain and the finalized state.
+    ///
+    /// Returns [`Response::BlockInfo(Some(block_info))`](Response::BlockInfo) if the block
+    /// has committed, and [`Response::BlockInfo(None)`](Response::BlockInfo) otherwise.
+    BlockInfo(block::Hash),
+
     /// Looks up a block by hash in any current chain or by height in the current best chain.
     ///
     /// Returns
@@ -1614,6 +1623,7 @@ impl Request {
             Request::CheckParentInputs { .. } => "check_parent_inputs",
             Request::Block(_) => "block",
             Request::AwaitBlockInfo(_) => "await_block_info",
+            Request::BlockInfo(_) => "block_info",
             Request::AnyChainBlock(_) => "any_chain_block",
             Request::BlockHeader(_) => "block_header",
             Request::FindBlockHashes { .. } => "find_block_hashes",
@@ -2248,6 +2258,7 @@ impl TryFrom<Request> for ReadRequest {
             Request::BestChainBlockHash(hash) => Ok(ReadRequest::BestChainBlockHash(hash)),
 
             Request::Block(hash_or_height) => Ok(ReadRequest::Block(hash_or_height)),
+            Request::BlockInfo(hash) => Ok(ReadRequest::BlockInfo(hash.into())),
             Request::AnyChainBlock(hash_or_height) => {
                 Ok(ReadRequest::AnyChainBlock(hash_or_height))
             }

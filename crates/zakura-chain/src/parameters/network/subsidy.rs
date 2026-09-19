@@ -14,7 +14,7 @@
 
 pub(crate) mod constants;
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::OnceLock};
 
 use crate::{
     amount::{self, Amount, NegativeAllowed, NonNegative, MAX_MONEY},
@@ -24,7 +24,7 @@ use crate::{
 };
 
 use constants::{
-    testnet, BLOSSOM_POW_TARGET_SPACING_RATIO, FUNDING_STREAM_RECEIVER_DENOMINATOR,
+    mainnet, testnet, BLOSSOM_POW_TARGET_SPACING_RATIO, FUNDING_STREAM_RECEIVER_DENOMINATOR,
     FUNDING_STREAM_SPECIFICATION, LOCKBOX_SPECIFICATION, MAX_BLOCK_SUBSIDY,
     POST_BLOSSOM_HALVING_INTERVAL, PRE_BLOSSOM_HALVING_INTERVAL,
 };
@@ -240,13 +240,6 @@ pub trait ParameterSubsidy {
 
 /// Network methods related to Block Subsidy and Funding Streams
 impl ParameterSubsidy for Network {
-    fn initial_nsm_value_balance(&self) -> Amount<NonNegative> {
-        match self {
-            Network::Mainnet => constants::mainnet::INITIAL_NSM_VALUE_BALANCE,
-            Network::Testnet(params) => params.initial_nsm_value_balance(),
-        }
-    }
-
     fn height_for_first_halving(&self) -> Height {
         // First halving on Mainnet is at Canopy
         // while in Testnet is at block constant height of `1_116_000`
@@ -284,6 +277,13 @@ impl ParameterSubsidy for Network {
 
     fn funding_stream_address_change_interval(&self) -> HeightDiff {
         self.post_blossom_halving_interval() / 48
+    }
+
+    fn initial_nsm_value_balance(&self) -> Amount<NonNegative> {
+        match self {
+            Network::Mainnet => mainnet::INITIAL_NSM_VALUE_BALANCE,
+            Network::Testnet(params) => params.initial_nsm_value_balance(),
+        }
     }
 }
 
@@ -524,9 +524,269 @@ pub fn block_subsidy_fraction_numerator(height: Height, network: &Network) -> u1
     LN2_SCALED / interval
 }
 
+/// The halving after which the [ZIP 234] start rule looks for its crossing height.
+///
+/// ZIP 234 looks after the second halving. The 2026-09-14 coinholder poll chose a
+/// February 2031 start, which is the same crossing one halving later.
+///
+/// [ZIP 234]: https://zips.z.cash/zip-0234
+pub const ZIP234_START_HALVING: u32 = 3;
+
+/// Returns the height at which [ZIP 234] reissuance starts on `network`, or `None` if it
+/// never starts.
+///
+/// # Consensus
+///
+/// TODO: take this height from the deployment ZIP once it names one. zips#1363 calls it
+/// `NSMReissuanceHeight` and leaves it TBD, and zips#1354 has no separate height at all.
+/// Until then Zakura derives it, which is a known divergence from both drafts.
+///
+/// No ZIP defines this height. zips#1354 starts reissuance at NU7 activation. The
+/// 2026-09-14 coinholder poll (Q2) chose February 2031 instead, and Zakura derives that
+/// date from ZIP 234's own start definition, applied after the third halving instead of
+/// the second:
+///
+/// > the lowest height after the second halving at which the NSM issuance would be less
+/// > than the current BTC-style issuance neglecting any ZEC removed from circulation
+///
+/// So the crossing height is the lowest height after [`ZIP234_START_HALVING`] at which
+/// `ceil(BLOCK_SUBSIDY_FRACTION * (MAX_MONEY - ScheduledSupply(height - 1)))` is less than
+/// that block's halving subsidy. `ScheduledSupply` sums the halving subsidies from
+/// genesis, so the money reserve follows the scheduled supply. The calculation uses the
+/// 75-second schedule that ZIP 234 is written against, as if ZIP 218 never changed the
+/// target spacing. On Mainnet the crossing height is 5,342,746, about 2031-02-14.
+///
+/// daira's reading of the forum proposal has the reserve follow ZIP 234's smoothed
+/// issuance from 2027 instead. That reading gives 5,342,695 on Mainnet, the same day.
+///
+/// ZIP 218's 25-second blocks move that date to a different height. The start is the
+/// lowest height whose position on the halving clock in [`halving`] reaches the crossing
+/// height's position on the 75-second schedule. If NU7 activates at height `N` below the
+/// crossing height `H`, the start is `N + 3 * (H - N)`.
+///
+/// Reissuance is an NU7 rule, so it never starts below NU7 activation, and never starts
+/// on a network without NU7. Configured testnets and Regtest can replace the crossing
+/// height with [`ParametersBuilder::with_nsm_reissuance_height`]. Mainnet and the default
+/// Testnet always use the crossing rule.
+///
+/// [ZIP 234]: https://zips.z.cash/zip-0234
+/// [`ParametersBuilder::with_nsm_reissuance_height`]: super::testnet::ParametersBuilder::with_nsm_reissuance_height
+pub fn nsm_reissuance_height(network: &Network) -> Option<Height> {
+    let nu7 = NetworkUpgrade::Nu7.activation_height(network)?;
+
+    // The crossing calculation evaluates the halving clock hundreds of times, and block
+    // verification asks for the start height at every block, so each network caches it.
+    let start = match network {
+        Network::Mainnet => {
+            static MAINNET_START: OnceLock<Option<Height>> = OnceLock::new();
+            *MAINNET_START.get_or_init(|| nsm_reissuance_crossing_height(network))
+        }
+        Network::Testnet(params) => params.configured_nsm_reissuance_height().or_else(|| {
+            params
+                .nsm_reissuance_crossing_height()
+                .get_or_init(|| nsm_reissuance_crossing_height(network))
+        }),
+    }?;
+
+    Some(start.max(nu7))
+}
+
+/// Returns the real chain height at the [ZIP 234] crossing height after
+/// [`ZIP234_START_HALVING`], ignoring NU7 activation.
+///
+/// See [`nsm_reissuance_height`] for the rule.
+///
+/// [ZIP 234]: https://zips.z.cash/zip-0234
+fn nsm_reissuance_crossing_height(network: &Network) -> Option<Height> {
+    let crossing = zip234_crossing_height(network, ZIP234_START_HALVING)?;
+
+    Some(Height(Pre218Schedule::new(network).real_height(crossing.0)))
+}
+
+/// Returns the lowest height after halving `halving` at which
+/// `ceil(BLOCK_SUBSIDY_FRACTION * (MAX_MONEY - ScheduledSupply(height - 1)))` is less than
+/// the block's halving subsidy, on `network`'s 75-second schedule.
+///
+/// Returns `None` if no such height exists. See [`nsm_reissuance_height`].
+pub(crate) fn zip234_crossing_height(network: &Network, halving: u32) -> Option<Height> {
+    let schedule = Pre218Schedule::new(network);
+    // The crossing runs on the 75-second schedule, so it uses that era's fraction.
+    let post_blossom_numerator =
+        LN2_SCALED / u128::try_from(network.post_blossom_halving_interval().max(1)).ok()?;
+    let max_money = u128::try_from(MAX_MONEY).ok()?;
+    let first_candidate = schedule.halving_height(halving)?.checked_add(1)?;
+
+    // The real schedule matches the 75-second schedule below NU7 and in the slow start, so
+    // the cumulative sum of the real schedule gives the scheduled supply up to there.
+    let identical_below = schedule
+        .spacing_change
+        .map_or(first_candidate, |change| change.height)
+        .max(network.slow_start_interval().0);
+    let mut height = first_candidate.min(identical_below);
+    let mut supply = amount_to_u128(expected_issued_supply(Height(height - 1), network).ok()?);
+
+    // The subsidy is constant within each run of heights, so a run holds the crossing
+    // height if the money reserve falls far enough before the run ends.
+    loop {
+        let subsidy = schedule.subsidy(height)?;
+        let run_end = schedule.run_end(height);
+        let candidate = height.max(first_candidate);
+
+        if candidate <= run_end {
+            // After the slow start, a zero halving subsidy stays zero. No reissuance amount
+            // is below zero, so the rule never crosses.
+            if subsidy == 0 {
+                return None;
+            }
+
+            // `ceil(fraction * reserve) < subsidy` holds when `reserve <= max_reserve`.
+            let max_reserve =
+                (subsidy - 1) * BLOCK_SUBSIDY_FRACTION_DENOMINATOR / post_blossom_numerator;
+            let reserve =
+                max_money.saturating_sub(supply + u128::from(candidate - height) * subsidy);
+            let crossing =
+                u128::from(candidate) + reserve.saturating_sub(max_reserve).div_ceil(subsidy);
+
+            if crossing <= u128::from(run_end) {
+                return u32::try_from(crossing).ok().map(Height);
+            }
+        }
+
+        if run_end >= Height::MAX_AS_U32 {
+            return None;
+        }
+
+        supply += u128::from(run_end - height + 1) * subsidy;
+        height = run_end + 1;
+    }
+}
+
 /// Converts a non-negative amount to a `u128`.
 fn amount_to_u128(amount: Amount<NonNegative>) -> u128 {
     u128::try_from(i64::from(amount)).expect("non-negative amounts fit in u128")
+}
+
+/// ZIP 218's change to the target spacing at NU7.
+#[derive(Clone, Copy)]
+struct SpacingChange {
+    /// The NU7 activation height.
+    height: u32,
+    /// The post-Blossom target spacing divided by the NU7 target spacing.
+    ratio: u32,
+}
+
+/// `network`'s halving schedule as if ZIP 218 never changed the target spacing.
+///
+/// Below NU7 this is the network's own schedule. From NU7 it keeps the post-Blossom
+/// target spacing, so its height `x` sits at the same position on the halving clock as
+/// the real height `N + ratio * (x - N)`, where `N` is the NU7 activation height.
+struct Pre218Schedule<'a> {
+    network: &'a Network,
+    /// The NU7 spacing change, or `None` if NU7 keeps the pre-NU7 target spacing.
+    spacing_change: Option<SpacingChange>,
+}
+
+impl<'a> Pre218Schedule<'a> {
+    fn new(network: &'a Network) -> Self {
+        // NU7 always activates at or after Blossom, because an unconfigured Blossom takes the
+        // next configured upgrade's height. The post-Blossom spacing of 75 seconds is a
+        // multiple of the NU7 spacing in every build.
+        let ratio = NetworkUpgrade::Blossom.target_spacing().num_seconds()
+            / NetworkUpgrade::Nu7.target_spacing().num_seconds();
+        let spacing_change = NetworkUpgrade::Nu7
+            .activation_height(network)
+            .filter(|_| ratio > 1)
+            .and_then(|height| {
+                Some(SpacingChange {
+                    height: height.0,
+                    ratio: u32::try_from(ratio).ok()?,
+                })
+            });
+
+        Self {
+            network,
+            spacing_change,
+        }
+    }
+
+    /// Returns the real height at the same position on the halving clock as `height`.
+    fn real_height(&self, height: u32) -> u32 {
+        match self.spacing_change {
+            Some(change) if height > change.height => (height - change.height)
+                .saturating_mul(change.ratio)
+                .saturating_add(change.height)
+                .min(Height::MAX_AS_U32),
+            _ => height,
+        }
+    }
+
+    /// Returns the first height of halving `halving`, or `None` if that halving never
+    /// starts.
+    fn halving_height(&self, halving: u32) -> Option<u32> {
+        let real = height_for_halving(halving, self.network)?.0;
+
+        Some(match self.spacing_change {
+            Some(change) if real > change.height => {
+                change.height + (real - change.height).div_ceil(change.ratio)
+            }
+            _ => real,
+        })
+    }
+
+    /// Returns the halving subsidy at `height`.
+    fn subsidy(&self, height: u32) -> Option<u128> {
+        match self.spacing_change {
+            Some(change)
+                if height >= change.height
+                    && Height(height) >= self.network.slow_start_interval() =>
+            {
+                // `halving_block_subsidy` at the post-Blossom spacing.
+                let Some(halving_div) =
+                    halving_divisor(Height(self.real_height(height)), self.network)
+                else {
+                    return Some(0);
+                };
+
+                Some(u128::from(
+                    MAX_BLOCK_SUBSIDY / u64::from(BLOSSOM_POW_TARGET_SPACING_RATIO) / halving_div,
+                ))
+            }
+            _ => halving_block_subsidy(Height(height), self.network)
+                .ok()
+                .map(amount_to_u128),
+        }
+    }
+
+    /// Returns the last height of the run of equal subsidies that starts at `height`.
+    fn run_end(&self, height: u32) -> u32 {
+        // The slow start subsidy changes at every height.
+        if Height(height) < self.network.slow_start_interval() {
+            return height;
+        }
+
+        match self.spacing_change {
+            Some(change) if height >= change.height => {
+                let next_halving = halving(Height(self.real_height(height)), self.network) + 1;
+
+                self.halving_height(next_halving)
+                    .map_or(Height::MAX_AS_U32, |next| next - 1)
+            }
+            spacing_change => {
+                let end = next_subsidy_boundary(Height(height), self.network)
+                    .map_or(Height::MAX_AS_U32, |next| next.0 - 1);
+
+                spacing_change.map_or(end, |change| end.min(change.height - 1))
+            }
+        }
+    }
+}
+
+/// Returns whether ZIP 234 applies to `network` at `height`.
+///
+/// This check decides whether a block subsidy follows ZIP 234, and so whether a caller
+/// has to fetch the money reserve.
+pub fn is_zip234_active(network: &Network, height: Height) -> bool {
+    nsm_reissuance_height(network).is_some_and(|start| height >= start)
 }
 
 /// Returns the NSM value balance after a block's parent, in the form [`block_subsidy`] takes.
@@ -728,7 +988,9 @@ pub fn block_subsidy(height: Height, net: &Network) -> Result<Amount<NonNegative
     halving_block_subsidy(height, net)
 }
 
-/// Returns the block subsidy under the halving schedule.
+/// `BlockSubsidy(height)` under the halving schedule, ignoring ZIP 234.
+///
+/// ZIP 234 issues this subsidy plus a reissuance bonus. See [`block_subsidy`].
 pub fn halving_block_subsidy(
     height: Height,
     net: &Network,
@@ -831,7 +1093,9 @@ pub fn founders_reward(net: &Network, height: Height) -> Amount<NonNegative> {
     // inconsistency in the definition of the founders reward, which should occur only before
     // Canopy, so we check if Canopy is active as well.
     if halving(height, net) < 1 && NetworkUpgrade::current(net, height) < NetworkUpgrade::Canopy {
-        block_subsidy(height, net)
+        // The founders reward ends at the first halving, which is long before ZIP 234
+        // starts, so the halving schedule is the whole subsidy here.
+        halving_block_subsidy(height, net)
             .map(|subsidy| subsidy.div_exact(5))
             .expect("block subsidy must be valid for founders rewards")
     } else {

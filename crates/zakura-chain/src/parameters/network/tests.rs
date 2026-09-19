@@ -1150,3 +1150,129 @@ proptest::proptest! {
         proptest::prop_assert_eq!(i128::from(i64::from(actual)), expected);
     }
 }
+
+/// Checks the ZIP 234 crossing rule on the 75-second schedule.
+#[test]
+fn zip234_crossing_height() {
+    use crate::parameters::subsidy::{zip234_crossing_height, ZIP234_START_HALVING};
+
+    let _init_guard = zakura_test::init();
+
+    assert_eq!(
+        zip234_crossing_height(&Network::Mainnet, ZIP234_START_HALVING),
+        Some(Height(5_342_746)),
+    );
+    assert_eq!(
+        zip234_crossing_height(&Network::new_default_testnet(), ZIP234_START_HALVING),
+        Some(Height(5_412_346)),
+    );
+
+    // ZIP 234's own rule, after the second halving, gives its planned Mainnet start in
+    // February 2027.
+    assert_eq!(
+        zip234_crossing_height(&Network::Mainnet, 2),
+        Some(Height(3_662_746)),
+    );
+
+    // Regtest's short halving interval issues too little for the reserve to fall below
+    // the crossing threshold.
+    assert_eq!(
+        zip234_crossing_height(
+            &Network::new_regtest(Default::default()),
+            ZIP234_START_HALVING
+        ),
+        None,
+    );
+}
+
+/// Returns the default Testnet parameters with NU7 at `nu7`.
+fn testnet_with_nu7(nu7: Option<u32>) -> testnet::ParametersBuilder {
+    let mut activation_heights: ConfiguredActivationHeights = Network::new_default_testnet()
+        .parameters()
+        .expect("Testnet has parameters")
+        .activation_heights()
+        .into();
+    activation_heights.nu7 = nu7;
+
+    testnet::Parameters::build()
+        .with_activation_heights(activation_heights)
+        .expect("activation heights are valid")
+}
+
+/// Checks where ZIP 234 reissuance starts relative to NU7 and the crossing height.
+#[test]
+fn nsm_reissuance_height_follows_nu7_and_the_crossing_rule() {
+    use crate::parameters::subsidy::nsm_reissuance_height;
+
+    let _init_guard = zakura_test::init();
+
+    const TESTNET_CROSSING: u32 = 5_412_346;
+
+    // A network without NU7 never starts reissuance.
+    assert_eq!(nsm_reissuance_height(&Network::Mainnet), None);
+    assert_eq!(nsm_reissuance_height(&Network::new_default_testnet()), None);
+    let no_nu7 = testnet_with_nu7(None)
+        .to_network()
+        .expect("configured testnet is valid");
+    assert_eq!(nsm_reissuance_height(&no_nu7), None);
+
+    // NU7 before the crossing height maps the crossing height through the halving clock.
+    // Each 75-second block after NU7 is three 25-second blocks.
+    for nu7 in [4_200_000, 4_500_000, 5_000_000, TESTNET_CROSSING - 1] {
+        let network = testnet_with_nu7(Some(nu7))
+            .to_network()
+            .expect("configured testnet is valid");
+        let expected = nu7 + 3 * (TESTNET_CROSSING - nu7);
+
+        assert_eq!(
+            nsm_reissuance_height(&network),
+            Some(Height(expected)),
+            "NU7 at {nu7}",
+        );
+    }
+
+    // NU7 at or after the crossing height starts reissuance at NU7.
+    for nu7 in [TESTNET_CROSSING, 6_000_000] {
+        let network = testnet_with_nu7(Some(nu7))
+            .to_network()
+            .expect("configured testnet is valid");
+
+        assert_eq!(
+            nsm_reissuance_height(&network),
+            Some(Height(nu7)),
+            "NU7 at {nu7}",
+        );
+    }
+
+    // A configured start height replaces the crossing height, but not NU7.
+    let configured = |nu7, start| {
+        testnet_with_nu7(Some(nu7))
+            .with_nsm_reissuance_height(Height(start))
+            .to_network()
+            .expect("configured testnet is valid")
+    };
+    assert_eq!(
+        nsm_reissuance_height(&configured(4_200_000, 4_200_010)),
+        Some(Height(4_200_010)),
+    );
+    assert_eq!(
+        nsm_reissuance_height(&configured(4_200_000, 1)),
+        Some(Height(4_200_000)),
+    );
+
+    let regtest = |nsm_reissuance_height| {
+        Network::new_regtest(testnet::RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu7: Some(10),
+                ..Default::default()
+            },
+            nsm_reissuance_height,
+            ..Default::default()
+        })
+    };
+    assert_eq!(nsm_reissuance_height(&regtest(None)), None);
+    assert_eq!(
+        nsm_reissuance_height(&regtest(Some(Height(20)))),
+        Some(Height(20)),
+    );
+}

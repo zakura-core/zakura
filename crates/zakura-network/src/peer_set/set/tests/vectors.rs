@@ -30,6 +30,145 @@ use crate::{
 use super::{PeerSetBuilder, PeerVersions};
 
 #[test]
+fn disconnect_request_wakes_idle_buffer_and_closes_last_peer() {
+    use tower::{buffer::Buffer, util::BoxService};
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+    let versions = PeerVersions {
+        peer_versions: vec![CURRENT_NETWORK_PROTOCOL_VERSION],
+    };
+    let (discovered, mut handles) = versions.mock_peer_discovery();
+    let (minimum, _tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+    runtime.block_on(async move {
+        let (mut peers, _guard) = PeerSetBuilder::new()
+            .with_discover(discovered)
+            .with_minimum_peer_version(minimum)
+            .build();
+        peers.ready().await.unwrap();
+        let addr = *peers.ready_services.keys().next().unwrap();
+        let disconnect_tx = peers.disconnect_sender();
+        let bans = peers.bans.clone();
+        let network = Buffer::new(BoxService::new(peers), 1);
+        let network = crate::peer_set::initialize::with_disconnect_requests(network, disconnect_tx);
+        timeout(
+            Duration::from_secs(1),
+            network.oneshot(Request::DisconnectPeer(addr)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(handles[0]
+            .try_to_receive_outbound_client_request()
+            .is_closed());
+        assert!(!bans.contains(addr.ip()));
+    });
+}
+
+#[test]
+fn disconnect_control_removes_busy_peer_without_banning() {
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+    let versions = PeerVersions {
+        peer_versions: vec![CURRENT_NETWORK_PROTOCOL_VERSION],
+    };
+    let (discovered, _handles) = versions.mock_peer_discovery();
+    let (minimum, _tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+    runtime.block_on(async move {
+        let (mut peers, _guard) = PeerSetBuilder::new()
+            .with_discover(discovered)
+            .with_minimum_peer_version(minimum)
+            .build();
+        peers.ready().await.unwrap();
+        let addr = *peers.ready_services.keys().next().unwrap();
+        let disconnect_tx = peers.disconnect_sender();
+        let _pending = peers.call(Request::Peers);
+        assert!(peers.ready_services.is_empty());
+        assert!(peers.cancel_handles.contains_key(&addr));
+        let (done, received) = tokio::sync::oneshot::channel();
+        disconnect_tx.send((addr, done)).await.unwrap();
+        assert!(peers.ready().now_or_never().is_none());
+        received.await.unwrap();
+        assert!(!peers.cancel_handles.contains_key(&addr));
+        assert!(!peers.bans.contains(addr.ip()));
+    });
+}
+
+#[tokio::test]
+async fn disconnect_request_bypasses_unready_network() {
+    use std::task::{Context, Poll};
+    use tower::{buffer::Buffer, util::BoxService};
+    struct Unready;
+    impl Service<Request> for Unready {
+        type Response = Response;
+        type Error = BoxError;
+        type Future = futures::future::Ready<Result<Response, BoxError>>;
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), BoxError>> {
+            Poll::Pending
+        }
+        fn call(&mut self, _: Request) -> Self::Future {
+            panic!("the unready network must not receive disconnect requests")
+        }
+    }
+    let (disconnect_tx, mut disconnect_rx) = tokio::sync::mpsc::channel(1);
+    let network = Buffer::new(BoxService::new(Unready), 1);
+    let network = crate::peer_set::initialize::with_disconnect_requests(network, disconnect_tx);
+    let addr = PeerSocketAddr::from(([203, 0, 113, 7], 8233));
+    let acknowledge = tokio::spawn(async move {
+        let (received_addr, done) = disconnect_rx.recv().await.unwrap();
+        assert_eq!(received_addr, addr);
+        done.send(()).unwrap();
+    });
+    assert!(matches!(
+        timeout(
+            Duration::from_secs(1),
+            network.oneshot(Request::DisconnectPeer(addr))
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        Response::Nil
+    ));
+    acknowledge.await.unwrap();
+}
+
+#[test]
+fn disconnect_request_removes_peer_without_banning() {
+    let (runtime, _init_guard) = zakura_test::init_async();
+    let _guard = runtime.enter();
+    let versions = PeerVersions {
+        peer_versions: vec![CURRENT_NETWORK_PROTOCOL_VERSION; 2],
+    };
+    let (discovered, _handles) = versions.mock_peer_discovery();
+    let (minimum, _tip) = MinimumPeerVersion::with_mock_chain_tip(&Network::Mainnet);
+    runtime.block_on(async move {
+        let (mut peers, _guard) = PeerSetBuilder::new()
+            .with_discover(discovered)
+            .with_minimum_peer_version(minimum)
+            .max_conns_per_ip(2)
+            .build();
+        peers.ready().await.unwrap();
+        assert_eq!(peers.ready_services.len(), 2);
+        let addr = *peers.ready_services.keys().next().unwrap();
+        assert!(matches!(
+            peers.call(Request::DisconnectPeer(addr)).await.unwrap(),
+            Response::Nil
+        ));
+        assert!(!peers.ready_services.contains_key(&addr));
+        assert_eq!(peers.ready_services.len(), 1);
+        assert!(!peers.bans.contains(addr.ip()));
+        // Repeated removal is harmless and cannot select another peer.
+        peers
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::DisconnectPeer(addr))
+            .await
+            .unwrap();
+        assert_eq!(peers.ready_services.len(), 1);
+    });
+}
+
+#[test]
 fn peer_set_ready_single_connection() {
     // We are going to use just one peer version in this test
     let peer_versions = PeerVersions {

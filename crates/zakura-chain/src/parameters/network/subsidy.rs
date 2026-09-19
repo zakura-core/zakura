@@ -242,7 +242,7 @@ pub trait ParameterSubsidy {
 impl ParameterSubsidy for Network {
     fn initial_nsm_value_balance(&self) -> Amount<NonNegative> {
         match self {
-            Network::Mainnet => mainnet::INITIAL_NSM_VALUE_BALANCE,
+            Network::Mainnet => constants::mainnet::INITIAL_NSM_VALUE_BALANCE,
             Network::Testnet(params) => params.initial_nsm_value_balance(),
         }
     }

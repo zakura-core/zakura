@@ -73,6 +73,13 @@ impl ContextualMetrics {
     }
 }
 
+fn block_has_transparent_spends(block: &Block) -> bool {
+    block
+        .transactions
+        .iter()
+        .any(|transaction| transaction.spent_outpoints().next().is_some())
+}
+
 /// The state of the chains in memory, including queued blocks.
 ///
 /// Clones of the non-finalized state contain independent copies of the chains.
@@ -663,11 +670,13 @@ impl NonFinalizedState {
             });
         }
 
-        // Reads from disk
-        //
-        // TODO: if these disk reads show up in profiles, run them in parallel, using std::thread::spawn()
+        // Avoid cloning the non-finalized UTXO set when this block cannot use it.
+        // Transparent spend validation can read missing UTXOs from disk.
+        // TODO: if those disk reads show up in profiles, run them in parallel.
         let unspent_utxo_snapshot_start = Instant::now();
-        let unspent_utxos = new_chain.unspent_utxos();
+        let unspent_utxos = block_has_transparent_spends(&prepared.block)
+            .then(|| new_chain.unspent_utxos())
+            .unwrap_or_default();
         contextual_metrics.record_duration(
             "state.contextual.unspent_utxo_snapshot.duration_seconds",
             "state.contextual.mined.unspent_utxo_snapshot.duration_seconds",

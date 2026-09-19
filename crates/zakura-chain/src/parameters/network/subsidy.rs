@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use crate::{
     amount::{self, Amount, NegativeAllowed, NonNegative, MAX_MONEY},
     block::{Height, HeightDiff},
-    parameters::{Network, NetworkUpgrade},
+    parameters::{network_upgrade::POST_BLOSSOM_POW_TARGET_SPACING, Network, NetworkUpgrade},
     transparent,
 };
 

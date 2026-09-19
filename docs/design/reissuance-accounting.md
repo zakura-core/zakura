@@ -43,3 +43,11 @@ Accounting tests cover transfers, historical exclusion, signed balances, forks,
 finalization, rollback, alternate replay, reopen, migration failure, and retry.
 Checkpoint fixtures isolate accounting and may bypass semantic claim rules.
 They do not establish production NU7 transaction support.
+
+## Seeded NSM accounting
+
+The balance is seeded on the last block before NU7 using the network's
+`initial_nsm_value_balance`. Configured networks can override the seed. From
+NU7 onward, both commit paths reject a negative balance. Migration reconstructs
+the same seed and subsequent changes, while rollback and replay preserve it.
+Reissuance payout calculation and parent-aware verification follow separately.

@@ -24,6 +24,10 @@ fn funding_stream_period_uses_floor_division_for_negative_periods() {
     struct TestParameters;
 
     impl ParameterSubsidy for TestParameters {
+        fn initial_nsm_value_balance(&self) -> Amount<NonNegative> {
+            Amount::zero()
+        }
+
         fn height_for_first_halving(&self) -> Height {
             Height(100)
         }

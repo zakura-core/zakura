@@ -2557,6 +2557,13 @@ impl UpdateWith<(ValueBalance<NegativeAllowed>, Height, usize)> for Chain {
         &mut self,
         (block_value_pool_change, height, size): &(ValueBalance<NegativeAllowed>, Height, usize),
     ) -> Result<(), ValidateContextError> {
+        check::nsm_value_balance_is_non_negative(
+            &self.network,
+            *height,
+            &self.chain_value_pools,
+            block_value_pool_change,
+        )?;
+
         match self
             .chain_value_pools
             .add_chain_value_pool_change(*block_value_pool_change)

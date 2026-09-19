@@ -2609,9 +2609,6 @@ impl WriteBlockWorkerTask {
                     }
 
                     let finalized_tip = finalized_state.db.tip();
-                    notify_block_rejected(block_commit_sender, ordered_block.0.hash);
-                    let _ = ordered_block.1.send(Err(error.clone()));
-
                     // The commit failed and the queue is being reset, so clear
                     // any buffered look-ahead block.
                     vct_write_retry_manager.reset(finalized_state);
@@ -2635,6 +2632,11 @@ impl WriteBlockWorkerTask {
                         );
                         return BlockWriteTaskExit::Completed;
                     }
+
+                    // Publish the reset before reporting failure, so the verifier's
+                    // recovery Tip request can drain queued replacements.
+                    notify_block_rejected(block_commit_sender, ordered_block.0.hash);
+                    let _ = ordered_block.1.send(Err(error));
                 }
             }
         }

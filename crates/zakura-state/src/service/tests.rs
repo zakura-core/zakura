@@ -2866,3 +2866,67 @@ async fn parent_input_check_requires_a_chain_that_continues_the_finalized_tip() 
         );
     }
 }
+
+/// A failed checkpoint commit requests Tip during recovery. That request must release
+/// a same-hash replacement queued before the writer reported the failure.
+#[tokio::test(flavor = "multi_thread")]
+async fn checkpoint_recovery_tip_request_releases_queued_replacement() {
+    let _init_guard = zakura_test::init();
+    let limit = Duration::from_secs(10);
+    let (mut state, _, _, _) =
+        StateService::new(Config::ephemeral(), &Network::Mainnet, Height(1), 0)
+            .await
+            .unwrap();
+    let genesis: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let child: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let parent = genesis.hash();
+    timeout(
+        limit,
+        state.queue_and_commit_to_finalized_state(genesis.into()),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+
+    // Keep the real writer alive but control its response and reset ordering.
+    let real_writer = state.block_write_sender.finalized.take().unwrap();
+    let (gate, mut intercepted) = tokio::sync::mpsc::unbounded_channel();
+    state.block_write_sender.finalized = Some(gate);
+    let (reset_tx, reset_rx) = tokio::sync::mpsc::unbounded_channel();
+    let real_reset_rx = std::mem::replace(&mut state.invalid_block_write_reset_receiver, reset_rx);
+
+    let old_response = state.queue_and_commit_to_finalized_state(child.clone().into());
+    let old_write = intercepted.try_recv().unwrap();
+    let replacement = state.queue_and_commit_to_finalized_state(child.clone().into());
+    assert_eq!(state.finalized_state_queued_blocks.len(), 1);
+    assert!(intercepted.try_recv().is_err());
+    reset_tx.send(parent).unwrap();
+    old_write
+        .1
+        .send(Err(CommitBlockError::WriteTaskExited.into()))
+        .unwrap();
+    assert!(old_response.await.unwrap().is_err());
+
+    // The checkpoint task asks for Tip after receiving the error, even if its
+    // generation has since been superseded or its original caller was dropped.
+    let _ = state
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::Tip)
+        .await
+        .unwrap();
+    let replacement_write = timeout(limit, intercepted.recv())
+        .await
+        .expect("recovery must release the replacement without another block request")
+        .expect("the writer channel stays open");
+    assert!(state.finalized_state_queued_blocks.is_empty());
+    real_writer.send(replacement_write).unwrap();
+    timeout(limit, replacement).await.unwrap().unwrap().unwrap();
+    state.invalid_block_write_reset_receiver = real_reset_rx;
+}

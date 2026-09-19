@@ -1708,6 +1708,12 @@ impl Service<Request> for StateService {
 
         self.poll_non_finalized_write_failures(cx);
 
+        // A failed checkpoint commit requests Tip during recovery. Consume its
+        // queue reset here so a waiting replacement does not need another block.
+        if self.block_write_sender.finalized.is_some() {
+            self.drain_finalized_queue_and_commit();
+        }
+
         // Hand off from finalized to non-finalized writes as soon as the final checkpoint block is
         // durably written, without waiting for a semantically verified block to arrive.
         self.try_handoff_to_non_finalized_write();

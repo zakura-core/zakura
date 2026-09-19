@@ -2279,7 +2279,14 @@ where
         if db.contains_body_at_height(height) && body_hash == Some(hash) {
             continue;
         }
-        metadata.push((height, hash, size_hints.get(&height).copied().flatten()));
+        // A confirmed size from the current full-state fork describes a different
+        // block during a reorg. Reserve the unknown-size budget for its replacement.
+        let size = if body_hash.is_some_and(|body_hash| body_hash != hash) {
+            None
+        } else {
+            size_hints.get(&height).copied().flatten()
+        };
+        metadata.push((height, hash, size));
     }
 
     Ok(crate::BlockSyncBodyMetadata {

@@ -1,14 +1,14 @@
 //! Writing blocks to the finalized and non-finalized states.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
-use indexmap::{IndexMap, IndexSet};
+use indexmap::IndexMap;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{
@@ -1327,34 +1327,77 @@ const REJECTED_ANCESTOR_MAP_LIMIT: usize = MAX_BLOCK_REORG_HEIGHT as usize * 2;
 
 /// Block write outcomes that wake [`crate::Request::AwaitBlockInfo`] readers.
 ///
-/// The watch version advances after every commit, rejection, or reconsideration.
+/// Track the latest admission for each hash: different bodies can share a hash,
+/// and an older write can fail after its replacement has already been queued.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct BlockWriteNotice {
-    /// Recently rejected block hashes, oldest first.
-    rejected: IndexSet<block::Hash>,
+    next_attempt: u64,
+    attempts: HashMap<block::Hash, (u64, bool)>,
+    recent_attempts: VecDeque<(block::Hash, u64)>,
 }
 
 impl BlockWriteNotice {
-    /// Returns true if the write task recently rejected the block with `hash`.
+    /// Returns true if the latest retained attempt for `hash` was rejected.
     pub(crate) fn is_rejected(&self, hash: &block::Hash) -> bool {
-        self.rejected.contains(hash)
+        self.attempts
+            .get(hash)
+            .is_some_and(|(_, rejected)| *rejected)
     }
+}
+
+/// Registers a new admission and clears any rejection of an older attempt.
+/// Only write outcomes need to wake readers; admitting a retry cannot answer them.
+pub(super) fn start_block_write(
+    sender: &watch::Sender<BlockWriteNotice>,
+    hash: block::Hash,
+) -> u64 {
+    let mut attempt = 0;
+    sender.send_if_modified(|notice| {
+        notice.next_attempt = notice
+            .next_attempt
+            .checked_add(1)
+            .expect("block write attempts cannot exhaust u64");
+        attempt = notice.next_attempt;
+        notice.attempts.insert(hash, (attempt, false));
+        notice.recent_attempts.push_back((hash, attempt));
+        // Bound the cache without scanning pending writes on each commit.
+        // Expiring an older attempt must not discard its newer replacement.
+        if notice.recent_attempts.len() > REJECTED_ANCESTOR_MAP_LIMIT {
+            let (expired_hash, expired_attempt) = notice
+                .recent_attempts
+                .pop_front()
+                .expect("the attempt history exceeded its limit");
+            if notice
+                .attempts
+                .get(&expired_hash)
+                .is_some_and(|(current, _)| *current == expired_attempt)
+            {
+                notice.attempts.remove(&expired_hash);
+            }
+        }
+        false
+    });
+    attempt
 }
 
 /// Wakes readers after `hash` commits.
 fn notify_block_committed(sender: &watch::Sender<BlockWriteNotice>, hash: block::Hash) {
     sender.send_modify(|notice| {
-        notice.rejected.shift_remove(&hash);
+        notice.attempts.remove(&hash);
     });
 }
 
-/// Wakes readers after the write task rejects `hash`, so they stop waiting for it.
-fn notify_block_rejected(sender: &watch::Sender<BlockWriteNotice>, hash: block::Hash) {
+/// Rejects only readers of the latest admitted attempt for `hash`.
+fn notify_block_rejected(
+    sender: &watch::Sender<BlockWriteNotice>,
+    hash: block::Hash,
+    attempt: u64,
+) {
     sender.send_modify(|notice| {
-        notice.rejected.shift_remove(&hash);
-        notice.rejected.insert(hash);
-        while notice.rejected.len() > REJECTED_ANCESTOR_MAP_LIMIT {
-            notice.rejected.shift_remove_index(0);
+        if let Some((current, rejected)) = notice.attempts.get_mut(&hash) {
+            if *current == attempt {
+                *rejected = true;
+            }
         }
     });
 }
@@ -1779,7 +1822,7 @@ impl BlockWriteSender {
         tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
         tokio::sync::mpsc::UnboundedReceiver<NonFinalizedWriteFailure>,
         watch::Receiver<VctRootRepairStatus>,
-        watch::Receiver<BlockWriteNotice>,
+        watch::Sender<BlockWriteNotice>,
         Arc<OnceLock<BlockWriteTaskFailure>>,
         Option<Arc<std::thread::JoinHandle<BlockWriteTaskExit>>>,
     ) {
@@ -1816,7 +1859,7 @@ impl BlockWriteSender {
         tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
         tokio::sync::mpsc::UnboundedReceiver<NonFinalizedWriteFailure>,
         watch::Receiver<VctRootRepairStatus>,
-        watch::Receiver<BlockWriteNotice>,
+        watch::Sender<BlockWriteNotice>,
         Arc<OnceLock<BlockWriteTaskFailure>>,
         Option<Arc<std::thread::JoinHandle<BlockWriteTaskExit>>>,
     ) {
@@ -1832,8 +1875,8 @@ impl BlockWriteSender {
             tokio::sync::mpsc::unbounded_channel();
         let (vct_root_repair_sender, vct_root_repair_receiver) =
             watch::channel(VctRootRepairStatus::default());
-        let (block_commit_sender, block_commit_receiver) =
-            watch::channel(BlockWriteNotice::default());
+        let (block_commit_sender, _) = watch::channel(BlockWriteNotice::default());
+        let admission_sender = block_commit_sender.clone();
         let task_failure = Arc::new(OnceLock::new());
         let worker_task_failure = task_failure.clone();
 
@@ -1883,7 +1926,7 @@ impl BlockWriteSender {
             invalid_block_write_reset_receiver,
             non_finalized_rejected_receiver,
             vct_root_repair_receiver,
-            block_commit_receiver,
+            admission_sender,
             task_failure,
             Some(Arc::new(task)),
         )
@@ -2635,7 +2678,11 @@ impl WriteBlockWorkerTask {
 
                     // Publish the reset before reporting failure, so the verifier's
                     // recovery Tip request can drain queued replacements.
-                    notify_block_rejected(block_commit_sender, ordered_block.0.hash);
+                    notify_block_rejected(
+                        block_commit_sender,
+                        ordered_block.0.hash,
+                        ordered_block.2,
+                    );
                     let _ = ordered_block.1.send(Err(error));
                 }
             }
@@ -2851,7 +2898,7 @@ impl WriteBlockWorkerTask {
                 }
             };
 
-            let Some(((queued_child, rsp_tx, admission), queued_at, _write_slot)) =
+            let Some(((queued_child, rsp_tx, admission, attempt), queued_at, _write_slot)) =
                 queued_child_and_rsp_tx
             else {
                 continue;
@@ -2992,7 +3039,7 @@ impl WriteBlockWorkerTask {
                 // Readers waiting for an invalid block stop waiting. A local write failure
                 // can succeed on retry, so its readers keep waiting.
                 if failure_kind == NonFinalizedWriteFailureKind::Invalid {
-                    notify_block_rejected(block_commit_sender, child_hash);
+                    notify_block_rejected(block_commit_sender, child_hash, attempt);
                 }
 
                 // Update the caller with the error.

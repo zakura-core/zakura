@@ -432,6 +432,14 @@ fn all_upgrades_and_wrong_commitments_with_fake_activation_heights() -> Result<(
             nu7: Some(50),
         })
         .expect("failed to set activation heights")
+        // These chains are generated for their commitments, not their coinbases, so blocks
+        // from NU7 claim arbitrary amounts. Seed the NSM value balance so an over-claim
+        // cannot drive it below zero, which `nsm_value_balance_is_non_negative` rejects
+        // from NU7. Half of MAX_MONEY leaves room on both sides of the balance.
+        .with_initial_nsm_value_balance(
+            zakura_chain::amount::Amount::try_from(zakura_chain::amount::MAX_MONEY / 2)
+                .expect("a valid amount"),
+        )
         .extend_funding_streams()
         .to_network()
         .expect("failed to build configured network");

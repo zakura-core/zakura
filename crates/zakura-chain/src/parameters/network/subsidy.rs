@@ -232,10 +232,21 @@ pub trait ParameterSubsidy {
     ///
     /// [7.10]: https://zips.z.cash/protocol/protocol.pdf#zip214fundingstreams
     fn funding_stream_address_change_interval(&self) -> HeightDiff;
+
+    /// Returns zips#1354's `INITIAL_NSM_VALUE_BALANCE`: the value the NSM value balance
+    /// holds immediately before NU7 activates.
+    fn initial_nsm_value_balance(&self) -> Amount<NonNegative>;
 }
 
 /// Network methods related to Block Subsidy and Funding Streams
 impl ParameterSubsidy for Network {
+    fn initial_nsm_value_balance(&self) -> Amount<NonNegative> {
+        match self {
+            Network::Mainnet => constants::mainnet::INITIAL_NSM_VALUE_BALANCE,
+            Network::Testnet(params) => params.initial_nsm_value_balance(),
+        }
+    }
+
     fn height_for_first_halving(&self) -> Height {
         // First halving on Mainnet is at Canopy
         // while in Testnet is at block constant height of `1_116_000`

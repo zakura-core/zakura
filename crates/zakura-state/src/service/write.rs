@@ -539,7 +539,6 @@ impl HeaderChainWriter {
         let store = HeaderChainStore::new(finalized_state.db.header_chain_disk_db());
         store.migrate_to_current(&config)?;
         let runtime = if store.is_initialized()? {
-            store.resize_validation_context(&finalized_state.db)?;
             let persisted_finalized = store.snapshot()?.frontiers.finalized;
             let (full_state_height, full_state_hash) = finalized_state
                 .db
@@ -554,6 +553,15 @@ impl HeaderChainWriter {
                 || persisted_hash != Some(persisted_finalized.hash)
             {
                 return Err(HeaderChainAttachmentError::FinalizedDivergence);
+            }
+            // Resize only after the divergence check, so a rolled-back full state
+            // reports its divergence instead of a validation-context failure.
+            let resized_rows = store.resize_validation_context(&finalized_state.db)?;
+            if resized_rows > 0 {
+                tracing::info!(
+                    resized_rows,
+                    "resized the retained header-chain validation context"
+                );
             }
             store
                 .startup_reconciled_streaming(

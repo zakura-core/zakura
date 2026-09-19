@@ -309,6 +309,16 @@ impl EngineConfig {
         self.network_policy_digest.bytes()
     }
 
+    /// Returns true if startup may rebind a store to a changed network policy digest.
+    ///
+    /// Mainnet and the default Testnet change their parameters only in a release, which
+    /// sets or corrects the activation of a future network upgrade. Startup still audits
+    /// every retained header under the new policy before it rebinds the digest.
+    /// Configured networks keep an exact policy match.
+    pub fn permits_network_policy_rebind(&self) -> bool {
+        matches!(self.network, Network::Mainnet) || self.network.is_default_testnet()
+    }
+
     /// This method returns the cached trust pins for transition verification.
     pub(crate) fn trust_pins(&self) -> Arc<[Frontier]> {
         self.trust_pins.clone()

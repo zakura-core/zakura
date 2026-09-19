@@ -1,8 +1,13 @@
 //! Fixed test vectors for chain tip distance checks.
 
+use chrono::{DateTime, Duration};
+
 use crate::{
     block::Height,
-    chain_tip::{is_at_or_near_tip_with_spacing_changes, mock::MockChainTip, ChainTip},
+    chain_tip::{
+        is_at_or_near_tip_with_spacing_changes, mock::MockChainTip, ChainTip,
+        NetworkChainTipHeightEstimator,
+    },
     parameters::{testnet::ConfiguredActivationHeights, Network},
 };
 
@@ -52,16 +57,18 @@ fn near_tip_threshold_handles_spacing_change_boundaries() {
         )
     };
 
-    // Sixteen old-spacing blocks are exactly the baseline 20-minute window.
+    // The activation block already uses the new spacing.
     assert!(crosses_activation(ACTIVATION.0 - 16, ACTIVATION.0));
-    assert!(!crosses_activation(ACTIVATION.0 - 16, ACTIVATION.0 + 1));
+    assert!(crosses_activation(ACTIVATION.0 - 16, ACTIVATION.0 + 2));
+    assert!(!crosses_activation(ACTIVATION.0 - 16, ACTIVATION.0 + 3));
 
     // Do not apply the new 48-block threshold to old-spacing blocks.
     assert!(!crosses_activation(ACTIVATION.0 - 48, ACTIVATION.0));
 
     // A mixed range sums the old- and new-spacing segments.
     assert!(crosses_activation(ACTIVATION.0 - 10, ACTIVATION.0 + 18));
-    assert!(!crosses_activation(ACTIVATION.0 - 10, ACTIVATION.0 + 19));
+    assert!(crosses_activation(ACTIVATION.0 - 10, ACTIVATION.0 + 20));
+    assert!(!crosses_activation(ACTIVATION.0 - 10, ACTIVATION.0 + 21));
 
     // Entirely post-activation, 48 blocks are 20 minutes.
     assert!(is_at_or_near_tip_with_spacing_changes(
@@ -90,4 +97,28 @@ fn near_tip_threshold_handles_spacing_change_boundaries() {
         150,
         [],
     ));
+}
+
+/// The activation block is the first block mined at the new target spacing.
+#[test]
+fn network_tip_estimator_switches_spacing_before_the_activation_block() {
+    const ACTIVATION: u32 = 1_000;
+    let network = Network::new_regtest(
+        ConfiguredActivationHeights {
+            nu7: Some(ACTIVATION),
+            ..Default::default()
+        }
+        .into(),
+    );
+    let current_time =
+        DateTime::from_timestamp(2_000_000_000, 0).expect("test timestamp is in range");
+    let estimate_after = |seconds| {
+        NetworkChainTipHeightEstimator::new(current_time, Height(ACTIVATION - 1), &network)
+            .estimate_height_at(current_time + Duration::seconds(seconds))
+    };
+
+    assert_eq!(estimate_after(24), Height(ACTIVATION - 1));
+    assert_eq!(estimate_after(25), Height(ACTIVATION));
+    assert_eq!(estimate_after(49), Height(ACTIVATION));
+    assert_eq!(estimate_after(50), Height(ACTIVATION + 1));
 }

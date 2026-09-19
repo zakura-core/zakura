@@ -239,7 +239,7 @@ pub static METHODS: ::phf::Map<&str, openrpsee::openrpc::RpcMethod> = ::phf::phf
     deprecated: false,
 },
 "getblocksubsidy" => openrpsee::openrpc::RpcMethod {
-    description: "Returns the block subsidy reward of the block at `height`, taking into account the mining slow start.\nReturns an error if `height` is less than the height of the first halving for the current network.\n\nzcashd reference: [`getblocksubsidy`](https://zcash.github.io/rpc/getblocksubsidy.html)\nmethod: post\ntags: mining\n\n# Parameters\n\n- `height`: (numeric, optional, example=1) Can be any valid current or future height.\n\n# Notes\n\nIf `height` is not supplied, uses the tip height.\n",
+    description: "Returns the block subsidy reward of the block at `height`, taking into account the mining slow start.\nReturns an error if `height` is less than the height of the first halving for the current network.\n\nzcashd reference: [`getblocksubsidy`](https://zcash.github.io/rpc/getblocksubsidy.html)\nmethod: post\ntags: mining\n\n# Parameters\n\n- `height`: (numeric, optional, example=1) Can be any valid current or future height.\n\n# Notes\n\nIf `height` is not supplied, uses the tip height.\n\nFrom the ZIP 234 reissuance start height, the subsidy depends on the parent block\'s\nchain value pools, so `height` must be at most one block above the best chain tip.\n",
     params: |_g| vec![
         _g.param::<u32>("height", crate::methods::PARAM_HEIGHT_DESC, false),
     ],

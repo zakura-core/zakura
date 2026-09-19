@@ -4530,6 +4530,21 @@ async fn lookahead_limit_scales_with_target_spacing() {
         lookahead_limit_at(&regtest, Height(0), Height(NU7)),
         full_limit * multiplier
     );
+
+    // Inbound gossip reads the same configured value as a height window above the
+    // tip, so it scales by the same factor as the syncer.
+    for tip in [Height(NU7 - 1), Height(NU7)] {
+        let window = crate::components::inbound::downloads::max_lookahead_height(
+            &regtest,
+            Some(tip),
+            full_limit,
+        ) - tip;
+        assert_eq!(
+            usize::try_from(window).expect("the window is positive"),
+            lookahead_limit_at(&regtest, Height(0), tip),
+            "tip {tip:?}"
+        );
+    }
 }
 
 /// The downloader must not drop blocks inside the syncer's scaled request window.

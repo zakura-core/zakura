@@ -1184,40 +1184,6 @@ proptest::proptest! {
     }
 }
 
-/// Checks the ZIP 234 crossing rule on the 75-second schedule.
-#[test]
-fn zip234_crossing_height() {
-    use crate::parameters::subsidy::{zip234_crossing_height, ZIP234_START_HALVING};
-
-    let _init_guard = zakura_test::init();
-
-    assert_eq!(
-        zip234_crossing_height(&Network::Mainnet, ZIP234_START_HALVING),
-        Some(Height(5_342_746)),
-    );
-    assert_eq!(
-        zip234_crossing_height(&Network::new_default_testnet(), ZIP234_START_HALVING),
-        Some(Height(5_412_346)),
-    );
-
-    // ZIP 234's own rule, after the second halving, gives its planned Mainnet start in
-    // February 2027.
-    assert_eq!(
-        zip234_crossing_height(&Network::Mainnet, 2),
-        Some(Height(3_662_746)),
-    );
-
-    // Regtest's short halving interval issues too little for the reserve to fall below
-    // the crossing threshold.
-    assert_eq!(
-        zip234_crossing_height(
-            &Network::new_regtest(Default::default()),
-            ZIP234_START_HALVING
-        ),
-        None,
-    );
-}
-
 /// Returns the default Testnet parameters with NU7 at `nu7`.
 fn testnet_with_nu7(nu7: Option<u32>) -> testnet::ParametersBuilder {
     let mut activation_heights: ConfiguredActivationHeights = Network::new_default_testnet()
@@ -1232,80 +1198,76 @@ fn testnet_with_nu7(nu7: Option<u32>) -> testnet::ParametersBuilder {
         .expect("activation heights are valid")
 }
 
-/// Checks where ZIP 234 reissuance starts relative to NU7 and the crossing height.
+/// An unset reissuance height stays inactive, even on networks with NU7 enabled.
 #[test]
-fn nsm_reissuance_height_follows_nu7_and_the_crossing_rule() {
-    use crate::parameters::subsidy::nsm_reissuance_height;
+fn nsm_reissuance_requires_an_explicit_height() {
+    use crate::parameters::subsidy::{is_zip234_active, nsm_reissuance_height};
 
     let _init_guard = zakura_test::init();
+    let configured = testnet_with_nu7(Some(4_200_000))
+        .to_network()
+        .expect("configured testnet is valid");
+    let regtest = Network::new_regtest(testnet::RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            nu7: Some(10),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
 
-    const TESTNET_CROSSING: u32 = 5_412_346;
+    for network in [
+        Network::Mainnet,
+        Network::new_default_testnet(),
+        configured,
+        regtest,
+    ] {
+        assert_eq!(nsm_reissuance_height(&network), None, "{network:?}");
+        assert!(!is_zip234_active(&network, Height::MAX), "{network:?}");
+    }
+}
 
-    // A network without NU7 never starts reissuance.
-    assert_eq!(nsm_reissuance_height(&Network::Mainnet), None);
-    assert_eq!(nsm_reissuance_height(&Network::new_default_testnet()), None);
+/// Explicit heights survive NU7 gating and activate reissuance at the exact boundary.
+#[test]
+fn nsm_reissuance_height_respects_nu7() {
+    use crate::parameters::subsidy::{is_zip234_active, nsm_reissuance_height};
+
+    let _init_guard = zakura_test::init();
     let no_nu7 = testnet_with_nu7(None)
+        .with_nsm_reissuance_height(Height(4_200_010))
         .to_network()
         .expect("configured testnet is valid");
     assert_eq!(nsm_reissuance_height(&no_nu7), None);
+    assert!(!is_zip234_active(&no_nu7, Height::MAX));
 
-    // NU7 before the crossing height maps the crossing height through the halving clock.
-    // Each 75-second block after NU7 is three 25-second blocks.
-    for nu7 in [4_200_000, 4_500_000, 5_000_000, TESTNET_CROSSING - 1] {
-        let network = testnet_with_nu7(Some(nu7))
-            .to_network()
-            .expect("configured testnet is valid");
-        let expected = nu7 + 3 * (TESTNET_CROSSING - nu7);
-
-        assert_eq!(
-            nsm_reissuance_height(&network),
-            Some(Height(expected)),
-            "NU7 at {nu7}",
-        );
-    }
-
-    // NU7 at or after the crossing height starts reissuance at NU7.
-    for nu7 in [TESTNET_CROSSING, 6_000_000] {
-        let network = testnet_with_nu7(Some(nu7))
-            .to_network()
-            .expect("configured testnet is valid");
-
-        assert_eq!(
-            nsm_reissuance_height(&network),
-            Some(Height(nu7)),
-            "NU7 at {nu7}",
-        );
-    }
-
-    // A configured start height replaces the crossing height, but not NU7.
-    let configured = |nu7, start| {
-        testnet_with_nu7(Some(nu7))
+    for (start, expected) in [
+        (1, 4_200_000),
+        (4_200_000, 4_200_000),
+        (4_200_010, 4_200_010),
+    ] {
+        let network = testnet_with_nu7(Some(4_200_000))
             .with_nsm_reissuance_height(Height(start))
             .to_network()
-            .expect("configured testnet is valid")
-    };
-    assert_eq!(
-        nsm_reissuance_height(&configured(4_200_000, 4_200_010)),
-        Some(Height(4_200_010)),
-    );
-    assert_eq!(
-        nsm_reissuance_height(&configured(4_200_000, 1)),
-        Some(Height(4_200_000)),
-    );
+            .expect("configured testnet is valid");
 
-    let regtest = |nsm_reissuance_height| {
-        Network::new_regtest(testnet::RegtestParameters {
+        assert_eq!(nsm_reissuance_height(&network), Some(Height(expected)));
+        assert!(!is_zip234_active(&network, Height(expected - 1)));
+        assert!(is_zip234_active(&network, Height(expected)));
+        assert!(is_zip234_active(&network, Height(expected + 1)));
+    }
+
+    for (start, expected) in [(1, 10), (10, 10), (20, 20)] {
+        let network = Network::new_regtest(testnet::RegtestParameters {
             activation_heights: ConfiguredActivationHeights {
                 nu7: Some(10),
                 ..Default::default()
             },
-            nsm_reissuance_height,
+            nsm_reissuance_height: Some(Height(start)),
             ..Default::default()
-        })
-    };
-    assert_eq!(nsm_reissuance_height(&regtest(None)), None);
-    assert_eq!(
-        nsm_reissuance_height(&regtest(Some(Height(20)))),
-        Some(Height(20)),
-    );
+        });
+
+        assert_eq!(nsm_reissuance_height(&network), Some(Height(expected)));
+        assert!(!is_zip234_active(&network, Height(expected - 1)));
+        assert!(is_zip234_active(&network, Height(expected)));
+        assert!(is_zip234_active(&network, Height(expected + 1)));
+    }
 }

@@ -24,7 +24,7 @@ use crate::{
 };
 
 use constants::{
-    testnet, BLOSSOM_POW_TARGET_SPACING_RATIO, FUNDING_STREAM_RECEIVER_DENOMINATOR,
+    mainnet, testnet, BLOSSOM_POW_TARGET_SPACING_RATIO, FUNDING_STREAM_RECEIVER_DENOMINATOR,
     FUNDING_STREAM_SPECIFICATION, LOCKBOX_SPECIFICATION, MAX_BLOCK_SUBSIDY,
     POST_BLOSSOM_HALVING_INTERVAL, PRE_BLOSSOM_HALVING_INTERVAL,
 };
@@ -240,13 +240,6 @@ pub trait ParameterSubsidy {
 
 /// Network methods related to Block Subsidy and Funding Streams
 impl ParameterSubsidy for Network {
-    fn initial_nsm_value_balance(&self) -> Amount<NonNegative> {
-        match self {
-            Network::Mainnet => constants::mainnet::INITIAL_NSM_VALUE_BALANCE,
-            Network::Testnet(params) => params.initial_nsm_value_balance(),
-        }
-    }
-
     fn height_for_first_halving(&self) -> Height {
         // First halving on Mainnet is at Canopy
         // while in Testnet is at block constant height of `1_116_000`
@@ -284,6 +277,13 @@ impl ParameterSubsidy for Network {
 
     fn funding_stream_address_change_interval(&self) -> HeightDiff {
         self.post_blossom_halving_interval() / 48
+    }
+
+    fn initial_nsm_value_balance(&self) -> Amount<NonNegative> {
+        match self {
+            Network::Mainnet => mainnet::INITIAL_NSM_VALUE_BALANCE,
+            Network::Testnet(params) => params.initial_nsm_value_balance(),
+        }
     }
 }
 
@@ -503,9 +503,35 @@ pub const BLOCK_SUBSIDY_FRACTION_NUMERATOR: u128 = 1_375;
 /// [halving-preserving NSM draft]: https://github.com/zcash/zips/blob/60720df9e971e19d8b6f67f1869426d78c96d250/zips/draft-judah-nsm-halving-preserving-issuance.md
 pub const BLOCK_SUBSIDY_FRACTION_DENOMINATOR: u128 = 10_000_000_000;
 
+/// Returns the NSM reissuance start height on `network`, or `None` if it is not scheduled.
+///
+/// Mainnet and default Testnet use constants that remain unset until the NU7 deployment
+/// ZIP selects their heights. Configured testnets and Regtest can set a height with
+/// [`ParametersBuilder::with_nsm_reissuance_height`].
+///
+/// Reissuance never starts before NU7 activation or on a network without NU7.
+///
+/// [`ParametersBuilder::with_nsm_reissuance_height`]: super::testnet::ParametersBuilder::with_nsm_reissuance_height
+pub fn nsm_reissuance_height(network: &Network) -> Option<Height> {
+    let nu7 = NetworkUpgrade::Nu7.activation_height(network)?;
+    let start = match network {
+        Network::Mainnet => mainnet::NSM_REISSUANCE_HEIGHT,
+        Network::Testnet(params) => params.configured_nsm_reissuance_height(),
+    }?;
+
+    Some(start.max(nu7))
+}
+
 /// Converts a non-negative amount to a `u128`.
 fn amount_to_u128(amount: Amount<NonNegative>) -> u128 {
     u128::try_from(i64::from(amount)).expect("non-negative amounts fit in u128")
+}
+
+/// Returns whether NSM reissuance is active on `network` at `height`.
+///
+/// Callers use this to decide whether to fetch the money reserve for the block subsidy.
+pub fn is_zip234_active(network: &Network, height: Height) -> bool {
+    nsm_reissuance_height(network).is_some_and(|start| height >= start)
 }
 
 /// Validates a signed parent NSM value balance for [`reissuance_bonus`].
@@ -706,7 +732,9 @@ pub fn block_subsidy(height: Height, net: &Network) -> Result<Amount<NonNegative
     halving_block_subsidy(height, net)
 }
 
-/// Returns the block subsidy under the halving schedule.
+/// `BlockSubsidy(height)` under the halving schedule, ignoring ZIP 234.
+///
+/// ZIP 234 issues this subsidy plus a reissuance bonus. See [`block_subsidy`].
 pub fn halving_block_subsidy(
     height: Height,
     net: &Network,
@@ -809,7 +837,9 @@ pub fn founders_reward(net: &Network, height: Height) -> Amount<NonNegative> {
     // inconsistency in the definition of the founders reward, which should occur only before
     // Canopy, so we check if Canopy is active as well.
     if halving(height, net) < 1 && NetworkUpgrade::current(net, height) < NetworkUpgrade::Canopy {
-        block_subsidy(height, net)
+        // The founders reward ends at the first halving, which is long before ZIP 234
+        // starts, so the halving schedule is the whole subsidy here.
+        halving_block_subsidy(height, net)
             .map(|subsidy| subsidy.div_exact(5))
             .expect("block subsidy must be valid for founders rewards")
     } else {

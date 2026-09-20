@@ -636,6 +636,8 @@ pub struct ParametersBuilder {
     checkpoints: Arc<CheckpointList>,
     /// Height at which the soft-fork to temporarily disable Orchard in transactions activates
     temporary_orchard_disabling_soft_fork_height: Option<Height>,
+    /// The configured NSM reissuance start height, see [`Parameters::configured_nsm_reissuance_height`].
+    nsm_reissuance_height: Option<Height>,
     /// The NSM value balance immediately before NU7, see
     /// [`Parameters::initial_nsm_value_balance`].
     initial_nsm_value_balance: Amount<NonNegative>,
@@ -679,6 +681,7 @@ impl Default for ParametersBuilder {
             temporary_orchard_disabling_soft_fork_height: Some(
                 super::TESTNET_TEMPORARY_ORCHARD_DISABLING_SOFT_FORK_HEIGHT,
             ),
+            nsm_reissuance_height: None,
             // A seed measures one chain's own history, so it is meaningless on a network
             // built from these defaults. The default Testnet sets its own in
             // `Parameters::default`.
@@ -1013,6 +1016,14 @@ impl ParametersBuilder {
         self
     }
 
+    /// Sets the height at which NSM reissuance starts. Unset heights leave it unscheduled.
+    ///
+    /// Reissuance still waits for NU7, so a height below NU7 activation starts it at NU7.
+    pub fn with_nsm_reissuance_height(mut self, height: Height) -> Self {
+        self.nsm_reissuance_height = Some(height);
+        self
+    }
+
     /// Sets zips#1354's `INITIAL_NSM_VALUE_BALANCE`, the value the NSM value balance holds
     /// immediately before NU7 activates.
     ///
@@ -1048,6 +1059,7 @@ impl ParametersBuilder {
             lockbox_disbursements,
             checkpoints,
             temporary_orchard_disabling_soft_fork_height,
+            nsm_reissuance_height,
             initial_nsm_value_balance,
         } = self;
         Parameters {
@@ -1067,6 +1079,7 @@ impl ParametersBuilder {
             lockbox_disbursements,
             checkpoints,
             temporary_orchard_disabling_soft_fork_height,
+            configured_nsm_reissuance_height: nsm_reissuance_height,
             initial_nsm_value_balance,
         }
     }
@@ -1123,7 +1136,8 @@ impl ParametersBuilder {
             lockbox_disbursements,
             checkpoints: _,
             temporary_orchard_disabling_soft_fork_height: _,
-            // Compare the configured seed with public Testnet's seed below.
+            // Compare the configured start height and seed with public Testnet below.
+            nsm_reissuance_height: _,
             initial_nsm_value_balance: _,
         } = Self::default();
 
@@ -1140,6 +1154,7 @@ impl ParametersBuilder {
             && self.pre_blossom_halving_interval == pre_blossom_halving_interval
             && self.post_blossom_halving_interval == post_blossom_halving_interval
             && self.lockbox_disbursements == lockbox_disbursements
+            && self.nsm_reissuance_height == testnet::NSM_REISSUANCE_HEIGHT
             && self.initial_nsm_value_balance == testnet::INITIAL_NSM_VALUE_BALANCE
     }
 }
@@ -1159,6 +1174,9 @@ pub struct RegtestParameters {
     pub max_block_time_start_height: Option<Height>,
     /// Whether funding stream addresses should be repeated to fill all required funding stream periods.
     pub extend_funding_stream_addresses_as_required: Option<bool>,
+    /// The height at which NSM reissuance starts, see
+    /// [`ParametersBuilder::with_nsm_reissuance_height`].
+    pub nsm_reissuance_height: Option<Height>,
     /// The NSM value balance immediately before NU7, see
     /// [`ParametersBuilder::with_initial_nsm_value_balance`].
     pub initial_nsm_value_balance: Option<Amount<NonNegative>>,
@@ -1209,6 +1227,8 @@ pub struct Parameters {
     checkpoints: Arc<CheckpointList>,
     /// Height at which the soft-fork to temporarily disable Orchard in transactions activates
     temporary_orchard_disabling_soft_fork_height: Option<Height>,
+    /// The configured NSM reissuance start height, if any.
+    configured_nsm_reissuance_height: Option<Height>,
     /// The NSM value balance immediately before NU7 activates.
     initial_nsm_value_balance: Amount<NonNegative>,
 }
@@ -1219,6 +1239,7 @@ impl Default for Parameters {
         Self {
             network_name: "Testnet".to_string(),
             max_block_time_start_height: TESTNET_MAX_TIME_START_HEIGHT,
+            configured_nsm_reissuance_height: testnet::NSM_REISSUANCE_HEIGHT,
             initial_nsm_value_balance: testnet::INITIAL_NSM_VALUE_BALANCE,
             ..Self::build().finish()
         }
@@ -1242,6 +1263,7 @@ impl Parameters {
             checkpoints,
             extend_funding_stream_addresses_as_required,
             max_block_time_start_height,
+            nsm_reissuance_height,
             initial_nsm_value_balance,
         }: RegtestParameters,
     ) -> Result<Self, ParametersBuilderError> {
@@ -1270,6 +1292,10 @@ impl Parameters {
 
         if Some(true) == extend_funding_stream_addresses_as_required {
             parameters = parameters.extend_funding_streams();
+        }
+
+        if let Some(height) = nsm_reissuance_height {
+            parameters = parameters.with_nsm_reissuance_height(height);
         }
 
         if let Some(balance) = initial_nsm_value_balance {
@@ -1322,6 +1348,8 @@ impl Parameters {
             lockbox_disbursements: _,
             checkpoints: _,
             temporary_orchard_disabling_soft_fork_height: _,
+            // The NSM reissuance start height is configurable on Regtest
+            configured_nsm_reissuance_height: _,
             // Regtest chains start empty, so the seed is always zero. It stays out of the
             // identity check for the same reason the halving interval stays in: it is
             // derived from the defaults above, not chosen.
@@ -1437,6 +1465,11 @@ impl Parameters {
     /// transactions activates.
     pub fn temporary_orchard_disabling_soft_fork_height(&self) -> Option<Height> {
         self.temporary_orchard_disabling_soft_fork_height
+    }
+
+    /// Returns the configured NSM reissuance start height, or `None` if it is not scheduled.
+    pub fn configured_nsm_reissuance_height(&self) -> Option<Height> {
+        self.configured_nsm_reissuance_height
     }
 
     /// Returns zips#1354's `INITIAL_NSM_VALUE_BALANCE` for this network.

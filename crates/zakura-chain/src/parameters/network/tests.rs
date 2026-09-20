@@ -14,7 +14,7 @@ use crate::{
             block_subsidy, constants::POST_BLOSSOM_HALVING_INTERVAL, funding_stream_address_period,
             halving, halving_divisor, height_for_halving, ParameterSubsidy,
         },
-        testnet::ConfiguredActivationHeights,
+        testnet::{self, ConfiguredActivationHeights},
         NetworkUpgrade,
     },
 };
@@ -1181,5 +1181,93 @@ proptest::proptest! {
         proptest::prop_assert_eq!(i128::from(i64::from(actual)), expected);
         proptest::prop_assert!(i64::from(actual) <= balance);
         proptest::prop_assert!(balance == 0 || i64::from(actual) > 0);
+    }
+}
+
+/// Returns the default Testnet parameters with NU7 at `nu7`.
+fn testnet_with_nu7(nu7: Option<u32>) -> testnet::ParametersBuilder {
+    let mut activation_heights: ConfiguredActivationHeights = Network::new_default_testnet()
+        .parameters()
+        .expect("Testnet has parameters")
+        .activation_heights()
+        .into();
+    activation_heights.nu7 = nu7;
+
+    testnet::Parameters::build()
+        .with_activation_heights(activation_heights)
+        .expect("activation heights are valid")
+}
+
+/// An unset reissuance height stays inactive, even on networks with NU7 enabled.
+#[test]
+fn nsm_reissuance_requires_an_explicit_height() {
+    use crate::parameters::subsidy::{is_zip234_active, nsm_reissuance_height};
+
+    let _init_guard = zakura_test::init();
+    let configured = testnet_with_nu7(Some(4_200_000))
+        .to_network()
+        .expect("configured testnet is valid");
+    let regtest = Network::new_regtest(testnet::RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            nu7: Some(10),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+
+    for network in [
+        Network::Mainnet,
+        Network::new_default_testnet(),
+        configured,
+        regtest,
+    ] {
+        assert_eq!(nsm_reissuance_height(&network), None, "{network:?}");
+        assert!(!is_zip234_active(&network, Height::MAX), "{network:?}");
+    }
+}
+
+/// Explicit heights survive NU7 gating and activate reissuance at the exact boundary.
+#[test]
+fn nsm_reissuance_height_respects_nu7() {
+    use crate::parameters::subsidy::{is_zip234_active, nsm_reissuance_height};
+
+    let _init_guard = zakura_test::init();
+    let no_nu7 = testnet_with_nu7(None)
+        .with_nsm_reissuance_height(Height(4_200_010))
+        .to_network()
+        .expect("configured testnet is valid");
+    assert_eq!(nsm_reissuance_height(&no_nu7), None);
+    assert!(!is_zip234_active(&no_nu7, Height::MAX));
+
+    for (start, expected) in [
+        (1, 4_200_000),
+        (4_200_000, 4_200_000),
+        (4_200_010, 4_200_010),
+    ] {
+        let network = testnet_with_nu7(Some(4_200_000))
+            .with_nsm_reissuance_height(Height(start))
+            .to_network()
+            .expect("configured testnet is valid");
+
+        assert_eq!(nsm_reissuance_height(&network), Some(Height(expected)));
+        assert!(!is_zip234_active(&network, Height(expected - 1)));
+        assert!(is_zip234_active(&network, Height(expected)));
+        assert!(is_zip234_active(&network, Height(expected + 1)));
+    }
+
+    for (start, expected) in [(1, 10), (10, 10), (20, 20)] {
+        let network = Network::new_regtest(testnet::RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu7: Some(10),
+                ..Default::default()
+            },
+            nsm_reissuance_height: Some(Height(start)),
+            ..Default::default()
+        });
+
+        assert_eq!(nsm_reissuance_height(&network), Some(Height(expected)));
+        assert!(!is_zip234_active(&network, Height(expected - 1)));
+        assert!(is_zip234_active(&network, Height(expected)));
+        assert!(is_zip234_active(&network, Height(expected + 1)));
     }
 }

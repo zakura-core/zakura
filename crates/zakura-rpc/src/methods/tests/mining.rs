@@ -52,7 +52,11 @@ fn rpc<M: MempoolService, R: ReadStateService>(
     read: R,
     tip: MockChainTip,
 ) -> (TestRpc<M, R>, Verifier) {
-    let verifier: Verifier = MockService::build().for_unit_tests();
+    // Template construction runs on the blocking pool and can exceed the mock
+    // default of 300 ms on busy CI runners. Use the enclosing test deadline.
+    let verifier: Verifier = MockService::build()
+        .with_max_request_delay(Duration::from_secs(10))
+        .for_unit_tests();
     let (_, rx) = watch::channel(None);
     let (rpc, queue) = RpcImpl::new(
         network,
@@ -479,18 +483,27 @@ fn rejection_during_construction_rebuilds_template() {
         tokio::pin!(request);
         assert!(futures::poll!(&mut request).is_pending());
         rpc.gbt.template_rejections.send_modify(|state| {
-            state.reject(Hash([1; 32]), "rejected-work");
+            assert!(state.reject(Hash([1; 32]), "rejected-work"));
         });
-        gate.release().await;
-        let (response, ()) = bounded(async {
-            tokio::join!(request, async {
-                verifier
-                    .expect_request_that(|req| {
-                        matches!(req, zakura_consensus::Request::Prepare { .. })
-                    })
-                    .await
-                    .respond(Hash([9; 32]));
-            })
+        let (response, (), ()) = bounded(async {
+            tokio::join!(
+                request,
+                async {
+                    verifier
+                        .expect_request_that(|req| {
+                            matches!(req, zakura_consensus::Request::Prepare { .. })
+                        })
+                        .await
+                        .respond(Hash([9; 32]));
+                },
+                async {
+                    // Reproduce construction taking longer than the default mock
+                    // deadline before the verifier can receive its request.
+                    tokio::time::sleep(zakura_test::mock_service::DEFAULT_MAX_REQUEST_DELAY * 2)
+                        .await;
+                    gate.release().await;
+                }
+            )
         })
         .await;
         let template = response.unwrap().try_into_template().unwrap();
@@ -532,7 +545,7 @@ fn recovery_construction_yields_and_rechecks_parent() {
             tokio::pin!(request);
             assert!(futures::poll!(&mut request).is_pending());
             // Recovery must wait for construction before asking the verifier.
-            verifier.expect_no_requests().await;
+            assert!(verifier.try_next_request().now_or_never().is_none());
             if change_tip {
                 tip.send_best_tip_hash(Hash([2; 32]));
             }

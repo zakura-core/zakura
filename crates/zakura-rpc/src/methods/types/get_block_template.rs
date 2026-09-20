@@ -12,6 +12,7 @@ use std::{
     collections::{HashSet, VecDeque},
     fmt::{self},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use derive_getters::Getters;
@@ -19,7 +20,7 @@ use derive_new::new;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee_types::{ErrorCode, ErrorObject};
 use rand::{rngs::OsRng, RngCore};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Semaphore};
 use tower::{Service, ServiceExt};
 use zcash_keys::address::Address;
 use zcash_protocol::memo::MemoBytes;
@@ -58,7 +59,7 @@ use crate::{
     methods::types::{
         default_roots::DefaultRoots, long_poll::LongPollId, transaction::TransactionTemplate,
     },
-    server::error::OkOrError,
+    server::error::{LegacyCode, MapError, OkOrError},
     MinedBlockEvent, PendingBlockRegistry, SubmitBlockChannel,
 };
 
@@ -70,6 +71,11 @@ pub use parameters::{
     GetBlockTemplateCapability, GetBlockTemplateParameters, GetBlockTemplateRequestMode,
 };
 pub use proposal::{BlockProposalResponse, BlockTemplateTimeSource};
+
+/// Proof construction can itself use multiple cores. Admit one build across RPC clones.
+const MAX_TEMPLATE_BUILDS: usize = 1;
+/// Bound admission waits without cancelling an already running proof.
+const TEMPLATE_BUILD_WAIT: Duration = Duration::from_secs(30);
 
 /// Rejections for the current template parent. Overflow fails closed until the tip changes.
 #[derive(Clone, Debug, Default)]
@@ -715,6 +721,9 @@ where
     /// Coalesces detached template preparation work to the newest template.
     template_preparation_queue: TemplatePreparationQueue<BlockTemplateResponse>,
 
+    /// Shared by foreground construction and long-poll coinbase precomputation.
+    template_build_slots: Arc<Semaphore>,
+
     /// Retains failures so late subscribers cannot miss template withdrawal.
     pub(crate) template_rejections: watch::Sender<TemplateRejections>,
 }
@@ -744,8 +753,37 @@ where
             mined_submissions: Default::default(),
             optimistic_block_inventory,
             template_preparation_queue: TemplatePreparationQueue::default(),
+            template_build_slots: Arc::new(Semaphore::new(MAX_TEMPLATE_BUILDS)),
             template_rejections: watch::channel(TemplateRejections::default()).0,
         }
+    }
+
+    /// Runs bounded proof work off the async worker, retaining capacity across cancellation.
+    pub(crate) async fn run_template_build<T: Send + 'static>(
+        &self,
+        build: impl FnOnce() -> T + Send + 'static,
+    ) -> RpcResult<T> {
+        let permit = tokio::time::timeout(
+            TEMPLATE_BUILD_WAIT,
+            self.template_build_slots.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| {
+            ErrorObject::owned(
+                LegacyCode::Misc.into(),
+                "timed out waiting for mining template construction capacity",
+                None::<()>,
+            )
+        })?
+        .map_misc_error()?;
+
+        tokio::task::spawn_blocking(move || {
+            // Dropping the RPC future cannot release capacity while this job still owns work.
+            let _permit = permit;
+            build()
+        })
+        .await
+        .map_misc_error()
     }
 
     pub(crate) fn reserve_mined_submission(

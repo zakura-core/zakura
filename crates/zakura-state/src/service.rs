@@ -45,16 +45,19 @@ use zakura_chain::{
 
 use crate::{
     constants::{
-        MAX_BLOCK_REORG_HEIGHT, MAX_FIND_BLOCK_HASHES_RESULTS, MAX_FIND_BLOCK_HEADERS_RESULTS,
-        MAX_HEADER_SYNC_HEIGHT_RANGE, MAX_HISTORICAL_TREE_REPLAY_BLOCKS, MAX_LEGACY_CHAIN_BLOCKS,
+        AWAIT_BLOCK_INFO_TIMEOUT, MAX_BLOCK_REORG_HEIGHT, MAX_FIND_BLOCK_HASHES_RESULTS,
+        MAX_FIND_BLOCK_HEADERS_RESULTS, MAX_HEADER_SYNC_HEIGHT_RANGE,
+        MAX_HISTORICAL_TREE_REPLAY_BLOCKS, MAX_LEGACY_CHAIN_BLOCKS,
     },
-    error::{CommitBlockError, CommitCheckpointVerifiedError, InvalidateError, ReconsiderError},
+    error::{
+        AwaitBlockInfoError, CommitBlockError, CommitCheckpointVerifiedError, InvalidateError,
+        ReconsiderError,
+    },
     request::TimedSpan,
     response::NonFinalizedBlocksListener,
     service::{
         block_iter::{any_ancestor_blocks, any_chain_ancestor_iter},
         chain_tip::{ChainTipBlock, ChainTipChange, ChainTipSender, LatestChainTip},
-        check::difficulty::POW_ADJUSTMENT_BLOCK_SPAN,
         finalized_state::{
             header_chain::{HeaderChainStore, HeaderChainStoreError},
             FinalizedState, ZakuraDb,
@@ -225,6 +228,12 @@ pub(crate) struct StateService {
     /// or reorg.
     non_finalized_rejected_receiver:
         tokio::sync::mpsc::UnboundedReceiver<write::NonFinalizedWriteFailure>,
+
+    /// Receives a notification after each block commit, rejection, or reconsideration.
+    block_commit_receiver: tokio::sync::watch::Receiver<write::BlockWriteNotice>,
+
+    /// The longest time an [`Request::AwaitBlockInfo`] request waits for its block.
+    await_block_info_timeout: Duration,
 
     // Pending UTXO Request Tracking
     //
@@ -544,6 +553,7 @@ impl StateService {
             invalid_block_write_reset_receiver,
             non_finalized_rejected_receiver,
             vct_root_repair_receiver,
+            block_commit_receiver,
             block_write_failure,
             block_write_task,
         ) = write::BlockWriteSender::spawn(
@@ -607,6 +617,8 @@ impl StateService {
             non_finalized_failed_ancestors: IndexMap::new(),
             invalid_block_write_reset_receiver,
             non_finalized_rejected_receiver,
+            block_commit_receiver,
+            await_block_info_timeout: AWAIT_BLOCK_INFO_TIMEOUT,
             pending_utxos,
             last_prune: Instant::now(),
             read_service: read_service.clone(),
@@ -2005,6 +2017,49 @@ impl Service<Request> for StateService {
                 .boxed()
             }
 
+            // Wait for a parent block to commit before a contextual consensus calculation.
+            Request::AwaitBlockInfo(hash) => {
+                let mut block_commit_receiver = self.block_commit_receiver.clone();
+                let read_service = self.read_service.clone();
+                let limit = self.await_block_info_timeout;
+
+                async move {
+                    let wait = async {
+                        loop {
+                            // Mark this notice as seen before the read, so a write that lands
+                            // after the read still wakes this request.
+                            block_commit_receiver.borrow_and_update();
+
+                            let response = read_service
+                                .clone()
+                                .oneshot(ReadRequest::BlockInfo(hash.into()))
+                                .await?;
+                            let ReadResponse::BlockInfo(block_info) = response else {
+                                unreachable!("wrong response to ReadRequest::BlockInfo");
+                            };
+
+                            if block_info.is_some() {
+                                return Ok(Response::BlockInfo(block_info));
+                            }
+
+                            if block_commit_receiver.borrow().is_rejected(&hash) {
+                                return Err(AwaitBlockInfoError::Rejected { hash }.into());
+                            }
+
+                            block_commit_receiver
+                                .changed()
+                                .await
+                                .map_err(BoxError::from)?;
+                        }
+                    };
+
+                    tokio::time::timeout(limit, wait)
+                        .await
+                        .map_err(|_elapsed| AwaitBlockInfoError::TimedOut { hash, limit })?
+                }
+                .boxed()
+            }
+
             // Used by sync, inbound, and block verifier to check if a block is already in the state
             // before downloading or validating it.
             Request::KnownBlock(hash) => {
@@ -2783,7 +2838,11 @@ impl Service<ReadRequest> for ReadStateService {
 
             // Used by getblock
             ReadRequest::BlockInfo(hash_or_height) => Ok(ReadResponse::BlockInfo(
-                read::block_info(state.latest_best_chain(), &state.db, hash_or_height),
+                read::block_info_by_hash_or_best_chain_height(
+                    &state.latest_non_finalized_state(),
+                    &state.db,
+                    hash_or_height,
+                ),
             )),
 
             // Used by the StateService.
@@ -3574,11 +3633,16 @@ fn check_prepared_mined_relay_eligibility_for_state(
 
     // Take only the headers `block_is_valid_for_recent_chain_data` reads. The
     // iterator walks to genesis, so collecting it would load every ancestor
-    // header to check the most recent `POW_ADJUSTMENT_BLOCK_SPAN` of them.
+    // header to check the most recent difficulty-adjustment span of them. The
+    // candidate block's upgrade selects that span.
     let relevant_headers =
         any_chain_ancestor_iter::<block::Header>(non_finalized_state, db, parent_hash);
     let parent_height = relevant_headers.height;
-    let relevant_headers: Vec<_> = relevant_headers.take(POW_ADJUSTMENT_BLOCK_SPAN).collect();
+    let Some(context_height) = parent_height.and_then(|parent_height| parent_height.next().ok())
+    else {
+        return Ok(PreparedMinedRelayEligibility::Unavailable);
+    };
+    let relevant_headers = check::difficulty_context(network, context_height, relevant_headers);
     let Some(parent_height) = parent_height.filter(|_| !relevant_headers.is_empty()) else {
         return Ok(PreparedMinedRelayEligibility::Unavailable);
     };

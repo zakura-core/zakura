@@ -18,9 +18,10 @@ proptest! {
         let orchard = value_balance1.orchard + value_balance2.orchard;
         let deferred = value_balance1.deferred + value_balance2.deferred;
         let ironwood = value_balance1.ironwood + value_balance2.ironwood;
+        let nsm_value_balance = value_balance1.nsm_value_balance + value_balance2.nsm_value_balance;
 
-        match (transparent, sprout, sapling, orchard, deferred, ironwood) {
-            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood)) => prop_assert_eq!(
+        match (transparent, sprout, sapling, orchard, deferred, ironwood, nsm_value_balance) {
+            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood), Ok(nsm_value_balance)) => prop_assert_eq!(
                 value_balance1 + value_balance2,
                 Ok(ValueBalance {
                     transparent,
@@ -28,7 +29,8 @@ proptest! {
                     sapling,
                     orchard,
                     deferred,
-                    ironwood
+                    ironwood,
+                    nsm_value_balance
                 })
             ),
             _ => prop_assert!(
@@ -39,7 +41,8 @@ proptest! {
                         | ValueBalanceError::Sapling(_)
                         | ValueBalanceError::Orchard(_)
                         | ValueBalanceError::Deferred(_)
-                        | ValueBalanceError::Ironwood(_))
+                        | ValueBalanceError::Ironwood(_)
+                        | ValueBalanceError::NsmValueBalance(_))
                 )
             ),
         }
@@ -57,9 +60,10 @@ proptest! {
         let orchard = value_balance1.orchard - value_balance2.orchard;
         let deferred = value_balance1.deferred - value_balance2.deferred;
         let ironwood = value_balance1.ironwood - value_balance2.ironwood;
+        let nsm_value_balance = value_balance1.nsm_value_balance - value_balance2.nsm_value_balance;
 
-        match (transparent, sprout, sapling, orchard, deferred, ironwood) {
-            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood)) => prop_assert_eq!(
+        match (transparent, sprout, sapling, orchard, deferred, ironwood, nsm_value_balance) {
+            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood), Ok(nsm_value_balance)) => prop_assert_eq!(
                 value_balance1 - value_balance2,
                 Ok(ValueBalance {
                     transparent,
@@ -67,7 +71,8 @@ proptest! {
                     sapling,
                     orchard,
                     deferred,
-                    ironwood
+                    ironwood,
+                    nsm_value_balance
                 })
             ),
             _ => prop_assert!(matches!(
@@ -77,7 +82,8 @@ proptest! {
                         | ValueBalanceError::Sapling(_)
                         | ValueBalanceError::Orchard(_)
                         | ValueBalanceError::Deferred(_)
-                        | ValueBalanceError::Ironwood(_))
+                        | ValueBalanceError::Ironwood(_)
+                        | ValueBalanceError::NsmValueBalance(_))
                 )),
         }
     }
@@ -97,9 +103,10 @@ proptest! {
         let orchard = value_balance1.orchard + value_balance2.orchard;
         let deferred = value_balance1.deferred + value_balance2.deferred;
         let ironwood = value_balance1.ironwood + value_balance2.ironwood;
+        let nsm_value_balance = value_balance1.nsm_value_balance + value_balance2.nsm_value_balance;
 
-        match (transparent, sprout, sapling, orchard, deferred, ironwood) {
-            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood)) => prop_assert_eq!(
+        match (transparent, sprout, sapling, orchard, deferred, ironwood, nsm_value_balance) {
+            (Ok(transparent), Ok(sprout), Ok(sapling), Ok(orchard), Ok(deferred), Ok(ironwood), Ok(nsm_value_balance)) => prop_assert_eq!(
                 collection.iter().sum::<Result<ValueBalance<NegativeAllowed>, ValueBalanceError>>(),
                 Ok(ValueBalance {
                     transparent,
@@ -107,7 +114,8 @@ proptest! {
                     sapling,
                     orchard,
                     deferred,
-                    ironwood
+                    ironwood,
+                    nsm_value_balance
                 })
             ),
             _ => prop_assert!(matches!(
@@ -117,7 +125,8 @@ proptest! {
                         | ValueBalanceError::Sapling(_)
                         | ValueBalanceError::Orchard(_)
                         | ValueBalanceError::Deferred(_)
-                        | ValueBalanceError::Ironwood(_))
+                        | ValueBalanceError::Ironwood(_)
+                        | ValueBalanceError::NsmValueBalance(_))
                  ))
         }
     }
@@ -132,7 +141,7 @@ proptest! {
     }
 
     #[test]
-    fn value_balance_deserialization(bytes in any::<[u8; 48]>()) {
+    fn value_balance_deserialization(bytes in any::<[u8; 56]>()) {
         let _init_guard = zakura_test::init();
 
         if let Ok(deserialized) = ValueBalance::<NonNegative>::from_bytes(&bytes) {
@@ -140,7 +149,7 @@ proptest! {
         }
     }
 
-    /// The legacy version of [`ValueBalance`] had 32 bytes compared to the current 48 bytes,
+    /// The legacy version of [`ValueBalance`] had 32 bytes compared to the current 56 bytes,
     /// but it's possible to correctly instantiate the current version of [`ValueBalance`] from
     /// the legacy format, so we test if Zebra can still deserialize the legacy format.
     #[test]
@@ -149,7 +158,7 @@ proptest! {
 
         if let Ok(deserialized) = ValueBalance::<NonNegative>::from_bytes(&bytes) {
             let deserialized = deserialized.to_bytes();
-            let mut extended_bytes = [0u8; 48];
+            let mut extended_bytes = [0u8; 56];
             extended_bytes[..32].copy_from_slice(&bytes);
             prop_assert_eq!(extended_bytes, deserialized);
         }
@@ -165,7 +174,7 @@ proptest! {
 
         if let Ok(deserialized) = ValueBalance::<NonNegative>::from_bytes(&bytes) {
             let deserialized = deserialized.to_bytes();
-            let mut extended_bytes = [0u8; 48];
+            let mut extended_bytes = [0u8; 56];
             extended_bytes[..40].copy_from_slice(&bytes);
             prop_assert_eq!(extended_bytes, deserialized);
         }

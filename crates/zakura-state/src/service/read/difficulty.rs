@@ -16,10 +16,8 @@ use crate::{
     service::{
         block_iter::any_chain_ancestor_iter,
         check::{
-            difficulty::{
-                BLOCK_MAX_TIME_SINCE_MEDIAN, POW_ADJUSTMENT_BLOCK_SPAN, POW_MEDIAN_BLOCK_SPAN,
-            },
-            AdjustedDifficulty,
+            difficulty::{BLOCK_MAX_TIME_SINCE_MEDIAN, POW_MEDIAN_BLOCK_SPAN},
+            difficulty_context, AdjustedDifficulty,
         },
         finalized_state::ZakuraDb,
         read::{self, tree::history_tree, FINALIZED_STATE_QUERY_RETRIES},
@@ -38,7 +36,7 @@ const EXTRA_SPACINGS_TO_MINE_A_BLOCK: i32 = 2;
 /// testnet, for a block at `height`.
 ///
 /// The time scales with the target spacing at `height`, so it stays below the minimum difficulty
-/// gap when a future upgrade shortens the spacing. At 75-second spacing it is 150 seconds.
+/// gap after ZIP 218 shortens the spacing at NU7. Before NU7 it is 150 seconds.
 fn extra_time_to_mine_a_block(network: &Network, height: Height) -> Result<Duration32, BoxError> {
     let extra_time =
         NetworkUpgrade::target_spacing_for_height(network, height) * EXTRA_SPACINGS_TO_MINE_A_BLOCK;
@@ -61,7 +59,7 @@ pub fn get_block_template_chain_info(
     network: &Network,
 ) -> Result<GetBlockTemplateChainInfo, BoxError> {
     let mut best_relevant_chain_and_history_tree_result =
-        best_relevant_chain_and_history_tree(non_finalized_state, db);
+        best_relevant_chain_and_history_tree(non_finalized_state, db, network);
 
     // Retry the finalized state query if it was interrupted by a finalizing block.
     //
@@ -72,7 +70,7 @@ pub fn get_block_template_chain_info(
         }
 
         best_relevant_chain_and_history_tree_result =
-            best_relevant_chain_and_history_tree(non_finalized_state, db);
+            best_relevant_chain_and_history_tree(non_finalized_state, db, network);
     }
 
     let (best_tip_height, best_tip_hash, best_relevant_chain, best_tip_history_tree) =
@@ -169,6 +167,7 @@ pub fn solution_rate(
 fn best_relevant_chain_and_history_tree(
     non_finalized_state: &NonFinalizedState,
     db: &ZakuraDb,
+    network: &Network,
 ) -> Result<
     (
         Height,
@@ -182,13 +181,20 @@ fn best_relevant_chain_and_history_tree(
         BoxError::from("Zakura's state is empty, wait until it syncs to the chain tip")
     })?;
 
-    let best_relevant_chain: Vec<_> = any_chain_ancestor_iter::<block::Header>(
-        non_finalized_state,
-        db,
-        state_tip_before_queries.1,
-    )
-    .take(POW_ADJUSTMENT_BLOCK_SPAN)
-    .collect();
+    // The template's candidate block, one above the tip, selects the averaging window.
+    let candidate_height = state_tip_before_queries
+        .0
+        .next()
+        .map_err(|_| BoxError::from("the best chain tip is at the maximum height"))?;
+    let best_relevant_chain = difficulty_context(
+        network,
+        candidate_height,
+        any_chain_ancestor_iter::<block::Header>(
+            non_finalized_state,
+            db,
+            state_tip_before_queries.1,
+        ),
+    );
 
     if best_relevant_chain.is_empty() {
         return Err("missing genesis block, wait until it is committed".into());
@@ -308,9 +314,9 @@ fn adjust_difficulty_and_time_for_testnet(
     // > then the block is a minimum-difficulty block.
     //
     // The max time is always a minimum difficulty block, because the minimum difficulty
-    // gap is 7.5 minutes at 75-second spacing, but the maximum gap is 90 minutes.
-    // This means that testnet blocks have two valid time ranges with different
-    // difficulties:
+    // gap is 7.5 minutes (2.5 minutes after ZIP 218 activates at NU7), but the maximum gap
+    // is 90 minutes. This means that testnet blocks have two valid time ranges with different
+    // difficulties, shown here before NU7:
     // * 1s - 7m30s: standard difficulty
     // * 7m31s - 90m: minimum difficulty
     //
@@ -397,6 +403,9 @@ fn adjust_difficulty_and_time_for_testnet(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::service::check::difficulty::{
+        pow_adjustment_block_span_for_height, POW_ADJUSTMENT_BLOCK_SPAN,
+    };
     use zakura_chain::{
         parameters::testnet::ConfiguredActivationHeights, serialization::ZcashDeserializeInto,
         work::difficulty::ParameterDifficulty,
@@ -407,7 +416,13 @@ mod tests {
     fn last_standard_difficulty_offset(network: &Network, tip_height: Height) -> u32 {
         let tip_time = DateTime32::from(1_700_000_000);
         let difficulty = network.target_difficulty_limit().to_compact();
-        let relevant_data = vec![(difficulty, tip_time.to_chrono()); POW_ADJUSTMENT_BLOCK_SPAN];
+        let span = pow_adjustment_block_span_for_height(
+            network,
+            tip_height
+                .next()
+                .expect("the test tip is below the maximum height"),
+        );
+        let relevant_data = vec![(difficulty, tip_time.to_chrono()); span];
 
         let is_standard = |offset: u32| {
             let mut result = GetBlockTemplateChainInfo {
@@ -454,7 +469,7 @@ mod tests {
         // The minimum difficulty gap is 6 target spacings, and the template keeps the standard
         // difficulty for the first 4 of them.
         let pre_nu7_offset = 4 * 75;
-        let post_nu7_offset = 4 * 75;
+        let post_nu7_offset = 4 * 25;
 
         let testnet = Network::new_default_testnet();
         assert_eq!(
@@ -466,7 +481,7 @@ mod tests {
             pre_nu7_offset
         );
 
-        // Configuring NU7 does not yet change its 75-second spacing.
+        // The block at NU7 already uses the NU7 spacing.
         for tip in [NU7 - 1, NU7, NU7 + 1_000] {
             assert_eq!(
                 last_standard_difficulty_offset(&regtest, Height(tip)),

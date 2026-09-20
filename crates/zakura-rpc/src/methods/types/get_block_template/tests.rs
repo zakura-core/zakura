@@ -16,10 +16,11 @@ use zakura_chain::{
         testnet::{self, ConfiguredActivationHeights, ConfiguredFundingStreams},
         Network, NetworkUpgrade,
     },
-    serialization::ZcashDeserializeInto,
+    serialization::{ZcashDeserializeInto, ZcashSerialize},
     transaction::Transaction,
     transparent,
 };
+use zakura_script::Sigops;
 
 use crate::client::TransactionTemplate;
 use crate::config::mining::{default_miner_address, MinerAddressType};
@@ -158,6 +159,7 @@ fn transparent_coinbase() -> anyhow::Result<()> {
         for nu in NetworkUpgrade::iter().filter(|nu| nu >= &NetworkUpgrade::Sapling) {
             if let Some(height) = nu.activation_height(&net) {
                 let transaction = coinbase_transaction(&net, height, &miner_params)?;
+                assert_coinbase_resource_usage(&net, height, &miner_params, &transaction)?;
                 assert!(transaction.sapling_outputs().next().is_none());
                 assert!(transaction.orchard_shielded_data().is_none());
                 assert!(transaction.ironwood_shielded_data().is_none());
@@ -332,6 +334,7 @@ fn shielded_coinbase_paths() -> anyhow::Result<()> {
     );
 
     let sapling_tx = coinbase_transaction(&net, sapling_height, &sapling_params)?;
+    assert_coinbase_resource_usage(&net, sapling_height, &sapling_params, &sapling_tx)?;
     assert!(
         sapling_tx.sapling_outputs().next().is_some(),
         "a Sapling miner address should receive a Sapling output"
@@ -346,6 +349,7 @@ fn shielded_coinbase_paths() -> anyhow::Result<()> {
     );
 
     let pre_nu5_tx = coinbase_transaction(&net, canopy_height, &unified_params)?;
+    assert_coinbase_resource_usage(&net, canopy_height, &unified_params, &pre_nu5_tx)?;
     assert!(
         pre_nu5_tx.sapling_outputs().next().is_some(),
         "a pre-NU5 unified address should fall back to its Sapling receiver"
@@ -360,6 +364,7 @@ fn shielded_coinbase_paths() -> anyhow::Result<()> {
     );
 
     let pre_nu6_2_tx = coinbase_transaction(&net, nu5_height, &unified_params)?;
+    assert_coinbase_resource_usage(&net, nu5_height, &unified_params, &pre_nu6_2_tx)?;
     assert!(
         pre_nu6_2_tx.orchard_shielded_data().is_some(),
         "an NU5 unified address should prefer its Orchard receiver"
@@ -374,6 +379,7 @@ fn shielded_coinbase_paths() -> anyhow::Result<()> {
     );
 
     let nu6_2_tx = coinbase_transaction(&net, nu6_2_height, &unified_params)?;
+    assert_coinbase_resource_usage(&net, nu6_2_height, &unified_params, &nu6_2_tx)?;
     assert!(
         nu6_2_tx.orchard_shielded_data().is_some(),
         "an NU6.2 unified address should receive an Orchard output"
@@ -388,6 +394,7 @@ fn shielded_coinbase_paths() -> anyhow::Result<()> {
     );
 
     let nu6_3_tx = coinbase_transaction(&net, nu6_3_height, &unified_params)?;
+    assert_coinbase_resource_usage(&net, nu6_3_height, &unified_params, &nu6_3_tx)?;
     assert!(
         nu6_3_tx.ironwood_shielded_data().is_some(),
         "an NU6.3 unified address should receive an Ironwood output"
@@ -438,4 +445,31 @@ fn coinbase_transaction(
             // which must pass.
             .zcash_deserialize_into::<Transaction>()?,
     )
+}
+
+fn assert_coinbase_resource_usage(
+    net: &Network,
+    height: Height,
+    miner_params: &MinerParams,
+    transaction: &Transaction,
+) -> anyhow::Result<()> {
+    use zcash_transparent::coinbase::MAX_COINBASE_SCRIPT_LEN;
+
+    let resources = TransactionTemplate::coinbase_resource_usage(net, height, miner_params)?;
+    let coinbase_script_len = transaction.inputs()[0]
+        .coinbase_script()
+        .expect("generated coinbase input has a canonical script")
+        .len();
+
+    assert_eq!(
+        resources.max_serialized_size,
+        transaction.zcash_serialized_size() + MAX_COINBASE_SCRIPT_LEN - coinbase_script_len,
+    );
+    assert_eq!(resources.sigops, transaction.sigops()?);
+    assert_eq!(
+        resources.shielded_action_counts,
+        transaction.shielded_action_counts(),
+    );
+
+    Ok(())
 }

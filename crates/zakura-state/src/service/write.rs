@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{
@@ -1325,6 +1325,40 @@ fn commit_operator_change(
 /// We allow enough space for multiple concurrent chain forks with errors.
 const REJECTED_ANCESTOR_MAP_LIMIT: usize = MAX_BLOCK_REORG_HEIGHT as usize * 2;
 
+/// Block write outcomes that wake [`crate::Request::AwaitBlockInfo`] readers.
+///
+/// The watch version advances after every commit, rejection, or reconsideration.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BlockWriteNotice {
+    /// Recently rejected block hashes, oldest first.
+    rejected: IndexSet<block::Hash>,
+}
+
+impl BlockWriteNotice {
+    /// Returns true if the write task recently rejected the block with `hash`.
+    pub(crate) fn is_rejected(&self, hash: &block::Hash) -> bool {
+        self.rejected.contains(hash)
+    }
+}
+
+/// Wakes readers after `hash` commits.
+fn notify_block_committed(sender: &watch::Sender<BlockWriteNotice>, hash: block::Hash) {
+    sender.send_modify(|notice| {
+        notice.rejected.shift_remove(&hash);
+    });
+}
+
+/// Wakes readers after the write task rejects `hash`, so they stop waiting for it.
+fn notify_block_rejected(sender: &watch::Sender<BlockWriteNotice>, hash: block::Hash) {
+    sender.send_modify(|notice| {
+        notice.rejected.shift_remove(&hash);
+        notice.rejected.insert(hash);
+        while notice.rejected.len() > REJECTED_ANCESTOR_MAP_LIMIT {
+            notice.rejected.shift_remove_index(0);
+        }
+    });
+}
+
 /// Run contextual validation on the prepared block and add it to the
 /// non-finalized state if it is contextually valid.
 pub(crate) fn validate_and_commit_non_finalized(
@@ -1491,6 +1525,8 @@ struct WriteBlockWorkerTask {
     chain_tip_sender: ChainTipSender,
     non_finalized_state_sender: watch::Sender<NonFinalizedState>,
     vct_root_repair_sender: watch::Sender<VctRootRepairStatus>,
+    /// Notifies contextual readers after each block commit, rejection, or reconsideration.
+    block_commit_sender: watch::Sender<BlockWriteNotice>,
     /// If `Some`, the non-finalized state is written to this backup directory
     /// synchronously before each channel update, instead of via the async backup task.
     backup_dir_path: Option<PathBuf>,
@@ -1743,6 +1779,7 @@ impl BlockWriteSender {
         tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
         tokio::sync::mpsc::UnboundedReceiver<NonFinalizedWriteFailure>,
         watch::Receiver<VctRootRepairStatus>,
+        watch::Receiver<BlockWriteNotice>,
         Arc<OnceLock<BlockWriteTaskFailure>>,
         Option<Arc<std::thread::JoinHandle<BlockWriteTaskExit>>>,
     ) {
@@ -1779,6 +1816,7 @@ impl BlockWriteSender {
         tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
         tokio::sync::mpsc::UnboundedReceiver<NonFinalizedWriteFailure>,
         watch::Receiver<VctRootRepairStatus>,
+        watch::Receiver<BlockWriteNotice>,
         Arc<OnceLock<BlockWriteTaskFailure>>,
         Option<Arc<std::thread::JoinHandle<BlockWriteTaskExit>>>,
     ) {
@@ -1794,6 +1832,8 @@ impl BlockWriteSender {
             tokio::sync::mpsc::unbounded_channel();
         let (vct_root_repair_sender, vct_root_repair_receiver) =
             watch::channel(VctRootRepairStatus::default());
+        let (block_commit_sender, block_commit_receiver) =
+            watch::channel(BlockWriteNotice::default());
         let task_failure = Arc::new(OnceLock::new());
         let worker_task_failure = task_failure.clone();
 
@@ -1811,6 +1851,7 @@ impl BlockWriteSender {
                         chain_tip_sender,
                         non_finalized_state_sender,
                         vct_root_repair_sender,
+                        block_commit_sender,
                         backup_dir_path,
                         header_chain,
                         attach_header_chain_at_handoff,
@@ -1842,6 +1883,7 @@ impl BlockWriteSender {
             invalid_block_write_reset_receiver,
             non_finalized_rejected_receiver,
             vct_root_repair_receiver,
+            block_commit_receiver,
             task_failure,
             Some(Arc::new(task)),
         )
@@ -2155,6 +2197,7 @@ impl WriteBlockWorkerTask {
             chain_tip_sender,
             non_finalized_state_sender,
             vct_root_repair_sender,
+            block_commit_sender,
             backup_dir_path,
             header_chain,
             attach_header_chain_at_handoff,
@@ -2451,8 +2494,10 @@ impl WriteBlockWorkerTask {
                     }
 
                     let tip_block = ChainTipBlock::from(finalized);
+                    let committed_hash = tip_block.hash;
                     prev_finalized_note_commitment_trees = Some(note_commitment_trees);
                     chain_tip_sender.set_finalized_tip(tip_block);
+                    notify_block_committed(block_commit_sender, committed_hash);
                 }
                 Err((ordered_block, error)) => {
                     let mut attributed_failure_repair = None;
@@ -2564,6 +2609,7 @@ impl WriteBlockWorkerTask {
                     }
 
                     let finalized_tip = finalized_state.db.tip();
+                    notify_block_rejected(block_commit_sender, ordered_block.0.hash);
                     let _ = ordered_block.1.send(Err(error.clone()));
 
                     // The commit failed and the queue is being reset, so clear
@@ -2794,6 +2840,9 @@ impl WriteBlockWorkerTask {
                             non_finalized_state_sender,
                             backup_dir_path.as_deref(),
                         );
+                        // Reconsideration restores blocks without committing them,
+                        // so wake readers waiting for one of those blocks.
+                        block_commit_sender.send_modify(|_| {});
                     }
                     let _ = rsp_tx.send(result);
                     None
@@ -2938,6 +2987,12 @@ impl WriteBlockWorkerTask {
                     kind: failure_kind,
                 });
 
+                // Readers waiting for an invalid block stop waiting. A local write failure
+                // can succeed on retry, so its readers keep waiting.
+                if failure_kind == NonFinalizedWriteFailureKind::Invalid {
+                    notify_block_rejected(block_commit_sender, child_hash);
+                }
+
                 // Update the caller with the error.
                 let _ = rsp_tx.send(result.map(|()| child_hash).map_err(Into::into));
 
@@ -2961,6 +3016,8 @@ impl WriteBlockWorkerTask {
                 non_finalized_state_sender,
                 backup_dir_path.as_deref(),
             );
+
+            notify_block_committed(block_commit_sender, child_hash);
 
             // Update the caller with the result.
             let _ = rsp_tx.send(result.map(|()| child_hash).map_err(Into::into));
@@ -2997,14 +3054,14 @@ impl WriteBlockWorkerTask {
                         return header_chain_finalization_failure(error);
                     }
                 };
-                if header_chain.is_some() {
-                    update_latest_chain_channels(
-                        non_finalized_state,
-                        chain_tip_sender,
-                        non_finalized_state_sender,
-                        backup_dir_path.as_deref(),
-                    );
-                }
+                // Finalization drops side chains that fork below the new finalized tip,
+                // so readers must not keep seeing them in the published state.
+                update_latest_chain_channels(
+                    non_finalized_state,
+                    chain_tip_sender,
+                    non_finalized_state_sender,
+                    backup_dir_path.as_deref(),
+                );
             }
 
             // Update the metrics if semantic and contextual validation passes

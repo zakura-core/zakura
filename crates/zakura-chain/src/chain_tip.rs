@@ -70,11 +70,13 @@ fn is_at_or_near_tip_with_spacing_changes(
     let baseline_spacing = i64::from(POST_BLOSSOM_POW_TARGET_SPACING);
     let time_limit = AT_OR_NEAR_TIP_THRESHOLD * baseline_spacing;
     let mut elapsed = 0;
-    let mut segment_start = local_tip;
+    let mut segment_start = local_tip
+        .next()
+        .expect("an estimated tip above the local tip means the local tip is below Height::MAX");
     let mut segment_spacing = current_spacing.min(baseline_spacing);
 
     for (change_height, next_spacing) in spacing_changes {
-        if change_height >= estimated_tip {
+        if change_height > estimated_tip {
             break;
         }
 
@@ -88,7 +90,7 @@ fn is_at_or_near_tip_with_spacing_changes(
         segment_spacing = next_spacing.min(baseline_spacing);
     }
 
-    let remaining_blocks = i64::from(estimated_tip.0 - segment_start.0);
+    let remaining_blocks = i64::from(estimated_tip.0 - segment_start.0) + 1;
     elapsed + remaining_blocks * segment_spacing <= time_limit
 }
 

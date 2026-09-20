@@ -14,6 +14,7 @@ use crate::{
             block_subsidy, constants::POST_BLOSSOM_HALVING_INTERVAL, funding_stream_address_period,
             halving, halving_divisor, height_for_halving, ParameterSubsidy,
         },
+        testnet::ConfiguredActivationHeights,
         NetworkUpgrade,
     },
 };
@@ -23,6 +24,10 @@ fn funding_stream_period_uses_floor_division_for_negative_periods() {
     struct TestParameters;
 
     impl ParameterSubsidy for TestParameters {
+        fn initial_nsm_value_balance(&self) -> Amount<NonNegative> {
+            Amount::zero()
+        }
+
         fn height_for_first_halving(&self) -> Height {
             Height(100)
         }
@@ -45,6 +50,44 @@ fn funding_stream_period_uses_floor_division_for_negative_periods() {
     assert_eq!(0, funding_stream_address_period(Height(50), &parameters));
     assert_eq!(-1, funding_stream_address_period(Height(49), &parameters));
     assert_eq!(-2, funding_stream_address_period(Height(39), &parameters));
+}
+
+/// Regtest derives its first halving, so NU7's 25 second spacing moves it.
+#[test]
+fn regtest_first_halving_follows_the_target_spacing() {
+    let _init_guard = zakura_test::init();
+
+    let regtest = Network::new_regtest(Default::default());
+    assert_eq!(regtest.height_for_first_halving(), Height(287));
+
+    let nu7_regtest = Network::new_regtest(
+        ConfiguredActivationHeights {
+            nu7: Some(1),
+            ..Default::default()
+        }
+        .into(),
+    );
+    let first_halving = nu7_regtest.height_for_first_halving();
+    assert_eq!(first_halving, Height(859));
+    assert_eq!(
+        Some(first_halving),
+        height_for_halving(1, &nu7_regtest),
+        "the first halving matches the subsidy schedule"
+    );
+
+    // Funding stream recipients rotate on period boundaries aligned to the
+    // derived first halving, which starts period 48.
+    let period = |height: Height| funding_stream_address_period(height, &nu7_regtest);
+    let interval = nu7_regtest.funding_stream_address_change_interval();
+    assert_eq!(period(first_halving), 48);
+    assert_eq!(
+        period((first_halving - 1).expect("the test height is valid")),
+        47
+    );
+    assert_eq!(
+        period((first_halving + interval).expect("the test height is valid")),
+        49
+    );
 }
 
 #[test]
@@ -397,6 +440,276 @@ fn is_nu7_active_from_the_nu7_activation_height() -> Result<(), Report> {
     Ok(())
 }
 
+/// Tests `halving` against ZIP 218's `Halving` formula on a configured Testnet
+/// whose Blossom height is below `SlowStartShift`, with and without NU7.
+///
+/// On such a network the formula's pre-Blossom term is negative.
+#[test]
+fn halving_matches_zip_218_when_blossom_is_below_the_slow_start_shift() {
+    use crate::parameters::{
+        testnet::{self, ConfiguredActivationHeights},
+        NU7_POW_TARGET_SPACING_RATIO,
+    };
+
+    let _init_guard = zakura_test::init();
+
+    let blossom = 4;
+    let nu7 = 2_000_000;
+
+    for configured_nu7 in [None, Some(nu7)] {
+        let network = testnet::Parameters::build()
+            .with_activation_heights(ConfiguredActivationHeights {
+                blossom: Some(blossom),
+                canopy: Some(blossom + 2),
+                nu7: configured_nu7,
+                ..Default::default()
+            })
+            .expect("activation heights are valid")
+            .clear_funding_streams()
+            .to_network()
+            .expect("configured testnet is valid");
+
+        let slow_start_shift = i128::from(network.slow_start_shift().0);
+        assert!(i128::from(blossom) < slow_start_shift);
+
+        let pre_blossom_interval = i128::from(network.pre_blossom_halving_interval());
+        let post_blossom_interval = i128::from(network.post_blossom_halving_interval());
+        let post_nu7_interval = post_blossom_interval * i128::from(NU7_POW_TARGET_SPACING_RATIO);
+        let nu7_activation = configured_nu7.map(i128::from);
+
+        // `Halving(height)` from ZIP 218, as an exact fraction over the product
+        // of the three halving intervals. A negative index has no meaning, so
+        // `halving` returns zero there.
+        let zip_halving = |height: Height| -> u32 {
+            let height = i128::from(height.0);
+            let blossom = i128::from(blossom);
+            let (pre_blossom_blocks, post_blossom_blocks, post_nu7_blocks) = if height < blossom {
+                (height - slow_start_shift, 0, 0)
+            } else {
+                match nu7_activation {
+                    Some(nu7) if height >= nu7 => {
+                        (blossom - slow_start_shift, nu7 - blossom, height - nu7)
+                    }
+                    _ => (blossom - slow_start_shift, height - blossom, 0),
+                }
+            };
+
+            let numerator = pre_blossom_blocks * post_blossom_interval * post_nu7_interval
+                + post_blossom_blocks * pre_blossom_interval * post_nu7_interval
+                + post_nu7_blocks * pre_blossom_interval * post_blossom_interval;
+            let denominator = pre_blossom_interval * post_blossom_interval * post_nu7_interval;
+
+            numerator
+                .div_euclid(denominator)
+                .max(0)
+                .try_into()
+                .expect("the test halving index fits in u32")
+        };
+
+        let slow_start_shift = network.slow_start_shift();
+        let mut heights = vec![
+            slow_start_shift,
+            (slow_start_shift + 1).expect("the height is valid"),
+            Height(nu7 - 1),
+            Height(nu7),
+            Height(nu7 + 1),
+            Height(Height::MAX.0 / 2),
+        ];
+        for halving_index in 1..=4 {
+            let halving_height =
+                height_for_halving(halving_index, &network).expect("the halving has a height");
+            heights.push(halving_height);
+            heights.push(
+                halving_height
+                    .previous()
+                    .expect("the halving is above genesis"),
+            );
+            assert_eq!(halving_index, zip_halving(halving_height));
+        }
+
+        for height in heights {
+            assert_eq!(
+                zip_halving(height),
+                halving(height, &network),
+                "halving at {height:?} with NU7 at {configured_nu7:?}",
+            );
+        }
+    }
+}
+
+/// Tests the ZIP 218 target spacing, halving, and block subsidy across the NU7
+/// activation boundary on a configured Testnet.
+#[test]
+fn post_nu7_spacing_halving_and_subsidy() -> Result<(), Report> {
+    use crate::parameters::{
+        testnet::{self, ConfiguredActivationHeights},
+        NU7_POW_TARGET_SPACING_RATIO, POST_BLOSSOM_POW_TARGET_SPACING, POST_NU7_POW_TARGET_SPACING,
+    };
+
+    let _init_guard = zakura_test::init();
+
+    // Choose parameters where slow_start_shift == blossom_height, so the
+    // pre-Blossom term of the spec's halving sum is exactly zero and the halving
+    // boundaries land on multiples of the post-Blossom halving interval.
+    let blossom = 1u32;
+    let canopy = blossom + u32::try_from(POST_BLOSSOM_HALVING_INTERVAL).unwrap();
+    let nu7 = canopy + u32::try_from(POST_BLOSSOM_HALVING_INTERVAL * 2).unwrap();
+
+    let network = testnet::Parameters::build()
+        // slow_start_shift = slow_start_interval / 2 = 1, the Blossom height.
+        .with_slow_start_interval(Height(2))
+        .with_activation_heights(ConfiguredActivationHeights {
+            blossom: Some(blossom),
+            canopy: Some(canopy),
+            nu7: Some(nu7),
+            ..Default::default()
+        })
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid");
+
+    let nu7_height = Height(nu7);
+
+    // The target spacing shortens exactly at the NU7 activation height.
+    assert_eq!(
+        i64::from(POST_BLOSSOM_POW_TARGET_SPACING),
+        NetworkUpgrade::target_spacing_for_height(&network, (nu7_height - 1).unwrap())
+            .num_seconds()
+    );
+    assert_eq!(
+        i64::from(POST_NU7_POW_TARGET_SPACING),
+        NetworkUpgrade::target_spacing_for_height(&network, nu7_height).num_seconds()
+    );
+
+    // Three post-Blossom halvings have elapsed at NU7 activation:
+    //   Halving = floor(0/PreBlossom + 1 + 2) = 3
+    assert_eq!(3, halving(nu7_height, &network));
+    assert_eq!(8, halving_divisor(nu7_height, &network).unwrap());
+
+    // BlockSubsidy(NU7) = floor(MAX / (BlossomRatio * NU7Ratio * 2^Halving))
+    //                   = floor(1_250_000_000 / (2 * 3 * 8)) = 26_041_666 zatoshi
+    assert_eq!(
+        Amount::<NonNegative>::try_from(26_041_666)?,
+        block_subsidy(nu7_height, &network)?,
+    );
+
+    // The third halving boundary lands exactly at NU7 here, so the block before
+    // NU7 is still in halving era 2: floor(1_250_000_000 / (2 * 4)) zatoshi.
+    assert_eq!(2, halving((nu7_height - 1).unwrap(), &network));
+    assert_eq!(
+        Amount::<NonNegative>::try_from(156_250_000)?,
+        block_subsidy((nu7_height - 1).unwrap(), &network)?,
+    );
+
+    // The halving counter does not reset at NU7. The next boundary arrives after
+    // one PostNU7HalvingInterval (= PostBlossomHalvingInterval * 3) of blocks.
+    let post_nu7_halving_interval =
+        POST_BLOSSOM_HALVING_INTERVAL * i64::from(NU7_POW_TARGET_SPACING_RATIO);
+    let next_halving = (nu7_height + post_nu7_halving_interval).unwrap();
+    assert_eq!(4, halving(next_halving, &network));
+    assert_eq!(Some(next_halving), height_for_halving(4, &network));
+    assert_eq!(
+        3,
+        halving(
+            height_for_halving(4, &network)
+                .expect("the fourth halving has a height")
+                .previous()
+                .expect("the fourth halving is above genesis"),
+            &network,
+        )
+    );
+    assert_eq!(16, halving_divisor(next_halving, &network).unwrap());
+    assert_eq!(
+        Amount::<NonNegative>::try_from(13_020_833)?,
+        block_subsidy(next_halving, &network)?,
+    );
+
+    Ok(())
+}
+
+/// Tests that the averaging window widens at NU7 and that every build retains
+/// enough context for the wider window.
+#[test]
+fn averaging_window_changes_at_nu7_activation_height() -> Result<(), Report> {
+    use crate::parameters::{
+        testnet::{self, ConfiguredActivationHeights},
+        MAX_POW_AVERAGING_WINDOW, POST_NU7_POW_AVERAGING_WINDOW, PRE_NU7_POW_AVERAGING_WINDOW,
+    };
+
+    let _init_guard = zakura_test::init();
+
+    let network = testnet::Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            blossom: Some(1),
+            nu7: Some(10),
+            ..Default::default()
+        })
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid");
+
+    assert_eq!(POST_NU7_POW_AVERAGING_WINDOW, MAX_POW_AVERAGING_WINDOW);
+
+    assert_eq!(
+        PRE_NU7_POW_AVERAGING_WINDOW,
+        NetworkUpgrade::averaging_window_for_height(&network, Height(9))
+    );
+    assert_eq!(
+        POST_NU7_POW_AVERAGING_WINDOW,
+        NetworkUpgrade::averaging_window_for_height(&network, Height(10))
+    );
+    assert_eq!(
+        POST_NU7_POW_AVERAGING_WINDOW,
+        NetworkUpgrade::averaging_window_for_height(&network, Height(11))
+    );
+
+    Ok(())
+}
+
+/// Tests that slow-start subsidies stay unscaled when NU7 activates during slow
+/// start.
+///
+/// ZIP 218 adds its NU7 subsidy case after the existing slow-start cases, just as
+/// the Blossom case follows them, so slow start takes precedence.
+#[test]
+fn slow_start_subsidy_is_not_scaled_when_nu7_activates_early() -> Result<(), Report> {
+    use crate::parameters::{
+        subsidy::constants::MAX_BLOCK_SUBSIDY,
+        testnet::{self, ConfiguredActivationHeights},
+    };
+
+    let _init_guard = zakura_test::init();
+
+    let network = testnet::Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            blossom: Some(1),
+            nu7: Some(2),
+            ..Default::default()
+        })
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid");
+
+    let slow_start_interval = network.slow_start_interval();
+    assert!(slow_start_interval > Height(3));
+    assert_eq!(
+        NetworkUpgrade::current(&network, Height(2)),
+        NetworkUpgrade::Nu7
+    );
+
+    // floor(MaxBlockSubsidy / SlowStartInterval) * height, with no spacing ratio.
+    let slow_start_rate = MAX_BLOCK_SUBSIDY / u64::from(slow_start_interval);
+    assert_eq!(
+        Amount::<NonNegative>::try_from(slow_start_rate * 2)?,
+        block_subsidy(Height(2), &network)?,
+    );
+
+    Ok(())
+}
+
 /// Compare the generalized schedule with the previous two-era consensus formula.
 #[test]
 fn spacing_schedule_preserves_existing_halving_and_subsidy() {
@@ -456,6 +769,149 @@ fn spacing_schedule_preserves_existing_halving_and_subsidy() {
                 );
             }
         }
+    }
+}
+
+/// Checks the closed-form cumulative halving subsidy against a per-height sum across
+/// halvings and the NU7 spacing change.
+#[test]
+fn expected_issued_supply_matches_per_height_sum() {
+    use crate::parameters::{
+        subsidy::{expected_issued_supply, halving_block_subsidy},
+        testnet::{self, ConfiguredActivationHeights},
+    };
+
+    let _init_guard = zakura_test::init();
+
+    let nu7 = Height(5_000);
+    let network = testnet::Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            blossom: Some(1),
+            canopy: Some(2),
+            nu7: Some(nu7.0),
+            ..Default::default()
+        })
+        .expect("activation heights are valid")
+        .with_slow_start_interval(Height(100))
+        .with_halving_interval(1_000)
+        .expect("halving interval is valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid");
+    let last_height = Height(25_000);
+
+    assert!(
+        halving(nu7, &network) > 1 && halving(last_height, &network) > halving(nu7, &network) + 1,
+        "the range must cross halvings on both sides of NU7",
+    );
+
+    // `expected_issued_supply` walks halving and spacing boundaries rather than
+    // every height, so check it against the sum it is standing in for.
+    let mut brute_force = Amount::<NonNegative>::zero();
+    for height in 1..=last_height.0 {
+        brute_force = (brute_force
+            + halving_block_subsidy(Height(height), &network).expect("valid subsidy"))
+        .expect("sum is in range");
+
+        assert_eq!(
+            expected_issued_supply(Height(height), &network).expect("valid cumulative subsidy"),
+            brute_force,
+            "cumulative subsidies must match the per-height sum at height {height}",
+        );
+    }
+}
+
+#[test]
+fn scheduled_issuance_boundary_differences_match_block_subsidy() {
+    use crate::parameters::subsidy::{halving_block_subsidy, scheduled_issuance_zatoshis};
+    for network in [
+        Network::Mainnet,
+        Network::new_default_testnet(),
+        Network::new_regtest(Default::default()),
+    ] {
+        assert_eq!(scheduled_issuance_zatoshis(Height(0), &network).unwrap(), 0);
+        let mut boundaries = vec![
+            Height(1),
+            network.slow_start_shift(),
+            network.slow_start_interval(),
+            Height(Height::MAX_AS_U32),
+        ];
+        boundaries.extend(NetworkUpgrade::target_spacings(&network).map(|(height, _)| height));
+        boundaries.extend((0..35).filter_map(|n| height_for_halving(n, &network)));
+        for boundary in boundaries {
+            for h in [
+                boundary.0.saturating_sub(1),
+                boundary.0,
+                boundary.0.saturating_add(1),
+            ] {
+                if h == 0 || h > Height::MAX_AS_U32 {
+                    continue;
+                }
+                let previous = scheduled_issuance_zatoshis(Height(h - 1), &network).unwrap();
+                let current = scheduled_issuance_zatoshis(Height(h), &network).unwrap();
+                let block = u128::try_from(i64::from(
+                    halving_block_subsidy(Height(h), &network).unwrap(),
+                ))
+                .unwrap();
+                assert_eq!(current - previous, block, "network {network:?}, height {h}");
+                assert_eq!(
+                    block_subsidy(Height(h), &network).unwrap(),
+                    halving_block_subsidy(Height(h), &network).unwrap()
+                );
+            }
+        }
+    }
+}
+
+/// Checks the initial NSM balances against value pools measured by `getblock` at
+/// the last pre-NU6 block on each public network.
+#[test]
+fn initial_nsm_value_balances_match_pre_nu6_chain_value_pools() {
+    use crate::parameters::subsidy::scheduled_issuance_zatoshis;
+
+    let cases = [
+        (
+            Network::Mainnet,
+            Height(2_726_399),
+            "https://mainnet.zcashexplorer.app/blocks/2726399",
+            [
+                1_402_654_579_762_796u128, // transparent
+                2_605_536_175_709,         // Sprout
+                101_161_389_852_194,       // Sapling
+                68_541_635_763_781,        // Orchard
+                0,                         // Deferred
+                0,                         // Ironwood
+            ],
+        ),
+        (
+            Network::new_default_testnet(),
+            Height(2_975_999),
+            "https://testnet.zcashexplorer.app/blocks/2975999",
+            [
+                1_433_024_042_538_559u128, // transparent
+                42_832_983_037_484,        // Sprout
+                123_413_239_739_335,       // Sapling
+                3_798_966_269_665,         // Orchard
+                0,                         // Deferred
+                0,                         // Ironwood
+            ],
+        ),
+    ];
+
+    for (network, height, explorer, value_pools) in cases {
+        let scheduled = scheduled_issuance_zatoshis(height, &network)
+            .expect("the public network issuance schedule is valid");
+        let issued = value_pools.into_iter().sum::<u128>();
+        let measured_seed = scheduled
+            .checked_sub(issued)
+            .expect("scheduled issuance is at least the issued supply");
+        let configured_seed = u128::try_from(i64::from(network.initial_nsm_value_balance()))
+            .expect("the initial NSM value balance is non-negative");
+
+        assert_eq!(
+            measured_seed, configured_seed,
+            "{network:?} value pools at {height:?}, see {explorer}",
+        );
     }
 }
 
@@ -557,5 +1013,173 @@ fn halving_interval_must_be_positive_and_representable_in_seconds() {
         if interval == max_interval {
             assert_eq!(halving(Height::MAX, &network), 0);
         }
+    }
+}
+
+/// A halving interval of one overflows the halving divisor inside the default slow start.
+/// Cumulative issuance must stop there, like the per-block subsidy.
+#[test]
+fn scheduled_issuance_stops_at_a_halving_overflow_inside_slow_start() {
+    use crate::parameters::{
+        subsidy::{halving_block_subsidy, halving_divisor, scheduled_issuance_zatoshis},
+        testnet,
+    };
+    let network = testnet::Parameters::build()
+        .with_halving_interval(1)
+        .expect("the halving interval is valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("the configured testnet is valid");
+    let slow_start_end = network.slow_start_interval().0;
+    let cutoff = (1..slow_start_end)
+        .find(|h| halving_divisor(Height(*h), &network).is_none())
+        .expect("the halving divisor overflows inside slow start");
+
+    let mut direct = 0u128;
+    for h in 1..=slow_start_end + 2 {
+        let block = u128::try_from(i64::from(
+            halving_block_subsidy(Height(h), &network).expect("valid subsidy"),
+        ))
+        .expect("subsidies are non-negative");
+        direct += block;
+        if h.abs_diff(cutoff) <= 2 || h + 2 >= slow_start_end {
+            assert_eq!(
+                scheduled_issuance_zatoshis(Height(h), &network).expect("valid issuance"),
+                direct,
+                "height {h}, cutoff {cutoff}"
+            );
+        }
+    }
+    assert_eq!(
+        halving_block_subsidy(Height(cutoff), &network).expect("valid subsidy"),
+        Amount::<NonNegative>::zero()
+    );
+}
+
+/// The fixed NSM fraction must be revisited if NU7 target spacing changes.
+#[test]
+fn block_subsidy_fraction_uses_the_nu7_spacing() {
+    use crate::parameters::subsidy::{BLOCK_SUBSIDY_FRACTION_NUMERATOR, LN2_SCALED};
+
+    let _init_guard = zakura_test::init();
+
+    assert_eq!(NetworkUpgrade::Nu7.target_spacing().num_seconds(), 25);
+    let interval = Network::Mainnet.post_blossom_halving_interval()
+        * NetworkUpgrade::Blossom.target_spacing().num_seconds()
+        / NetworkUpgrade::Nu7.target_spacing().num_seconds();
+    assert_eq!(interval, 5_040_000);
+    assert_eq!(
+        BLOCK_SUBSIDY_FRACTION_NUMERATOR,
+        LN2_SCALED / u128::try_from(interval).expect("the halving interval is positive"),
+    );
+}
+
+/// Applying the fraction once per block over a halving interval halves the balance.
+#[test]
+fn block_subsidy_fraction_halves_the_balance_over_one_interval() {
+    use crate::parameters::subsidy::reissuance_bonus;
+
+    let _init_guard = zakura_test::init();
+
+    // Exercise the actual ceiling payout on every block. Rounding the payout up
+    // leaves less than the ideal exponential remainder, especially at small balances.
+    let initial = 10_000_000_000i64;
+    let mut remaining =
+        Amount::<NonNegative>::try_from(initial).expect("100 ZEC is a valid amount");
+    for _ in 0..5_040_000 {
+        remaining = (remaining - reissuance_bonus(remaining).expect("valid bonus"))
+            .expect("the bonus never exceeds the remaining balance");
+    }
+
+    let half = initial / 2;
+    let error = i64::from(remaining).abs_diff(half);
+    assert!(
+        error * 1_000 < u64::try_from(half).expect("half the initial balance is positive"),
+        "one halving interval must leave about half, left {remaining} of {initial}",
+    );
+}
+
+/// A positive balance always pays at least one zatoshi, so the balance reaches zero in a
+/// finite number of blocks.
+#[test]
+fn reissuance_drains_a_small_balance() {
+    use crate::parameters::subsidy::reissuance_bonus;
+
+    let _init_guard = zakura_test::init();
+
+    let initial = 20i64;
+    let mut balance = initial;
+
+    for block in 0..initial {
+        let bonus = i64::from(
+            reissuance_bonus(Amount::try_from(balance).expect("valid amount"))
+                .expect("valid bonus"),
+        );
+
+        assert!(
+            bonus >= 1,
+            "a balance of {balance} must pay at least one zatoshi, block {block}",
+        );
+        balance -= bonus;
+    }
+
+    assert_eq!(
+        balance, 0,
+        "the balance must drain within its own value in blocks"
+    );
+}
+
+/// Check zero, ceiling boundaries, and the largest representable balance explicitly.
+#[test]
+fn reissuance_bonus_rounding_boundaries() {
+    use crate::{amount::MAX_MONEY, parameters::subsidy::reissuance_bonus};
+
+    for (balance, expected) in [
+        (0, 0),
+        (1, 1),
+        (10_000_000_000 - 1, 1_375),
+        (10_000_000_000, 1_375),
+        (10_000_000_000 + 1, 1_376),
+        (MAX_MONEY, 288_750_000),
+    ] {
+        let actual = reissuance_bonus(Amount::try_from(balance).unwrap()).unwrap();
+        assert_eq!(i64::from(actual), expected, "balance {balance}");
+    }
+}
+
+/// A signed parent balance must be rejected, not clamped, when negative.
+#[test]
+fn parent_nsm_value_balance_rejects_negative_amounts() {
+    use crate::{
+        amount::MAX_MONEY,
+        parameters::subsidy::{parent_nsm_value_balance, SubsidyError},
+    };
+
+    for balance in [-MAX_MONEY, -1] {
+        assert!(matches!(
+            parent_nsm_value_balance(Amount::try_from(balance).unwrap()),
+            Err(SubsidyError::NegativeNsmValueBalance),
+        ));
+    }
+    for balance in [0, 1, MAX_MONEY] {
+        let actual = parent_nsm_value_balance(Amount::try_from(balance).unwrap()).unwrap();
+        assert_eq!(i64::from(actual), balance);
+    }
+}
+
+proptest::proptest! {
+    #[test]
+    fn reissuance_arithmetic_matches_integer_oracle(balance in 0i64..=crate::amount::MAX_MONEY) {
+        use crate::parameters::subsidy::{
+            reissuance_bonus, BLOCK_SUBSIDY_FRACTION_DENOMINATOR,
+            BLOCK_SUBSIDY_FRACTION_NUMERATOR,
+        };
+        let numerator = i128::try_from(BLOCK_SUBSIDY_FRACTION_NUMERATOR).unwrap();
+        let denominator = i128::try_from(BLOCK_SUBSIDY_FRACTION_DENOMINATOR).unwrap();
+        let expected = (i128::from(balance) * numerator + denominator - 1) / denominator;
+        let actual = reissuance_bonus(Amount::try_from(balance).unwrap()).unwrap();
+        proptest::prop_assert_eq!(i128::from(i64::from(actual)), expected);
+        proptest::prop_assert!(i64::from(actual) <= balance);
+        proptest::prop_assert!(balance == 0 || i64::from(actual) > 0);
     }
 }

@@ -3,18 +3,21 @@
 use std::{borrow::Borrow, sync::Arc};
 
 use zakura_chain::{
+    amount::{NegativeAllowed, NonNegative},
     block::{
         self, merkle::AuthDataRoot, Block, ChainHistoryBlockTxAuthCommitmentHash, CommitmentError,
     },
     history_tree::HistoryTree,
     parameters::{Network, NetworkUpgrade},
+    value_balance::ValueBalance,
     work::difficulty::CompactDifficulty,
 };
 
 use crate::{
     service::{
-        block_iter::any_chain_ancestor_iter, check::difficulty::POW_ADJUSTMENT_BLOCK_SPAN,
-        finalized_state::ZakuraDb, non_finalized_state::NonFinalizedState,
+        block_iter::any_chain_ancestor_iter,
+        check::difficulty::pow_adjustment_block_span_for_height, finalized_state::ZakuraDb,
+        non_finalized_state::NonFinalizedState,
     },
     BoxError, SemanticallyVerifiedBlock, ValidateContextError,
 };
@@ -42,6 +45,78 @@ mod tests;
 
 pub(crate) use difficulty::AdjustedDifficulty;
 
+/// Checks that the block at `height` does not make the ZIP 234 NSM value balance negative.
+///
+/// `value_pools` are the chain value pools before the block, and `block_value_pool_change`
+/// is the block's change to them.
+///
+/// # Consensus
+///
+/// > [NU7 onward] If NsmValueBalance(height) would become negative in the block chain
+/// > created as a result of accepting a block at height, then all nodes MUST reject the
+/// > block as invalid.
+///
+/// The rule holds from NU7, not from the later reissuance start height. Between the two
+/// no block claims a bonus, so nothing there can drive the balance negative, but matching
+/// the draft costs nothing and leaves one rule instead of two.
+///
+/// Check before adding pools so an overdraw reports this consensus rule.
+#[allow(clippy::unwrap_in_result)]
+pub(crate) fn nsm_value_balance_is_non_negative(
+    network: &Network,
+    height: block::Height,
+    value_pools: &ValueBalance<NonNegative>,
+    block_value_pool_change: &ValueBalance<NegativeAllowed>,
+) -> Result<(), ValidateContextError> {
+    let nu7_active = NetworkUpgrade::Nu7
+        .activation_height(network)
+        .is_some_and(|nu7| height >= nu7);
+
+    if !nu7_active {
+        return Ok(());
+    }
+
+    let balance_before = value_pools.nsm_value_balance_amount();
+    let balance_change = block_value_pool_change.nsm_value_balance_amount();
+
+    let balance_after = (balance_before + balance_change).map_err(|_| {
+        ValidateContextError::NegativeNsmValueBalance {
+            height,
+            balance_before,
+            balance_change,
+        }
+    })?;
+
+    if balance_after.zatoshis() < 0 {
+        return Err(ValidateContextError::NegativeNsmValueBalance {
+            height,
+            balance_before,
+            balance_change,
+        });
+    }
+
+    Ok(())
+}
+
+/// Returns the most recent difficulty-context entries that validating a block at
+/// `candidate_height` reads.
+///
+/// The candidate block's upgrade selects the averaging window, so ZIP 218 widens
+/// this context at NU7.
+pub(crate) fn difficulty_context<C: IntoIterator>(
+    network: &Network,
+    candidate_height: block::Height,
+    context: C,
+) -> Vec<C::Item> {
+    context
+        .into_iter()
+        .take(pow_adjustment_block_span_for_height(
+            network,
+            candidate_height,
+        ))
+        .collect()
+}
+
 /// Check that the semantically verified block is contextually valid for `network`,
 /// based on the `finalized_tip_height` and `relevant_headers`.
 ///
@@ -50,7 +125,7 @@ pub(crate) use difficulty::AdjustedDifficulty;
 ///
 /// The relevant headers are the ancestors of `block`, starting with its parent at
 /// `parent_height`. Only headers are read, because the difficulty context spans
-/// up to `POW_ADJUSTMENT_BLOCK_SPAN` blocks and only needs their difficulty and time.
+/// up to `MAX_POW_ADJUSTMENT_BLOCK_SPAN` blocks and only needs their difficulty and time.
 #[tracing::instrument(skip(semantically_verified, finalized_tip_height, relevant_headers))]
 pub(crate) fn block_is_valid_for_recent_chain<C>(
     semantically_verified: &SemanticallyVerifiedBlock,
@@ -90,10 +165,7 @@ where
         .expect("finalized state must contain at least one block to do contextual validation");
     check::block_is_not_orphaned(finalized_tip_height, candidate_height)?;
 
-    let relevant_headers: Vec<_> = relevant_headers
-        .into_iter()
-        .take(POW_ADJUSTMENT_BLOCK_SPAN)
-        .collect();
+    let relevant_headers = difficulty_context(network, candidate_height, relevant_headers);
 
     let Some(parent_height) = parent_height.filter(|_| !relevant_headers.is_empty()) else {
         warn!(
@@ -113,7 +185,7 @@ where
     //
     // TODO: accept a NotReadyToBeCommitted error in those tests instead
     #[cfg(test)]
-    if relevant_headers.len() < POW_ADJUSTMENT_BLOCK_SPAN {
+    if relevant_headers.len() < pow_adjustment_block_span_for_height(network, candidate_height) {
         return Ok(());
     }
 
@@ -125,7 +197,7 @@ where
     // verified blocks, so there will be at least 1 million blocks in the state when it is
     // called. So this error should never happen on Mainnet or the default Testnet.
     //
-    // It's okay to use a relevant chain of fewer than `POW_ADJUSTMENT_BLOCK_SPAN` blocks, because
+    // It's okay to use a relevant chain shorter than the adjustment span, because
     // the MedianTime function uses height 0 if passed a negative height by the ActualTimespan function:
     // > ActualTimespan(height : N) := MedianTime(height) − MedianTime(height − PoWAveragingWindow)
     // > MedianTime(height : N) := median([[ nTime(𝑖) for 𝑖 from max(0, height − PoWMedianBlockSpan) up to height − 1 ]])
@@ -166,10 +238,10 @@ pub(crate) fn header_is_valid_for_recent_chain<C>(
 where
     C: IntoIterator<Item = (CompactDifficulty, chrono::DateTime<chrono::Utc>)>,
 {
-    let relevant_headers: Vec<_> = relevant_headers
-        .into_iter()
-        .take(POW_ADJUSTMENT_BLOCK_SPAN)
-        .collect();
+    let candidate_height = previous_block_height
+        .next()
+        .map_err(|_| ValidateContextError::NotReadyToBeCommitted)?;
+    let relevant_headers = difficulty_context(network, candidate_height, relevant_headers);
 
     let difficulty_adjustment = AdjustedDifficulty::new_from_header_time(
         candidate_header.time,
@@ -448,4 +520,50 @@ pub(crate) fn initial_contextual_validity(
     check::nullifier::no_duplicates_in_finalized_chain(semantically_verified, finalized_state)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod nsm_value_balance_boundary_tests {
+    use super::*;
+    use zakura_chain::{
+        amount::{Amount, MAX_MONEY},
+        parameters::testnet::{ConfiguredActivationHeights, RegtestParameters},
+    };
+
+    #[test]
+    fn rejection_matrix_covers_activation_sign_and_arithmetic_limits() {
+        let network = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu7: Some(2),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        for height in [1, 2, 3, 4] {
+            for before in [-MAX_MONEY, -1, 0, 1, MAX_MONEY] {
+                for delta in [-MAX_MONEY, -1, 0, 1, MAX_MONEY] {
+                    let mut pools = ValueBalance::<NonNegative>::zero();
+                    pools.set_nsm_value_balance_amount(Amount::try_from(before).unwrap());
+                    let mut change = ValueBalance::<NegativeAllowed>::zero();
+                    change.set_nsm_value_balance_amount(Amount::try_from(delta).unwrap());
+                    let result = nsm_value_balance_is_non_negative(
+                        &network,
+                        block::Height(height),
+                        &pools,
+                        &change,
+                    );
+                    let sum = i128::from(before) + i128::from(delta);
+                    // Rejection starts at NU7, before the reissuance height.
+                    let reject = height >= 2 && !(0..=i128::from(MAX_MONEY)).contains(&sum);
+                    assert_eq!(
+                        result.is_err(),
+                        reject,
+                        "height {height}, before {before}, delta {delta}"
+                    );
+                    assert_eq!(i64::from(pools.nsm_value_balance_amount()), before);
+                    assert_eq!(i64::from(change.nsm_value_balance_amount()), delta);
+                }
+            }
+        }
+    }
 }

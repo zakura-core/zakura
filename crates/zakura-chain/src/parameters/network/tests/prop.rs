@@ -30,3 +30,17 @@ proptest! {
         assert_eq!(Network::new_default_testnet().is_max_block_time_enforced(height), TESTNET_MAX_TIME_START_HEIGHT <= height);
     }
 }
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn cumulative_schedule_matches_direct_sum(height in 0u32..25_000, regtest in any::<bool>()) {
+        use crate::parameters::subsidy::{halving_block_subsidy, scheduled_issuance_zatoshis};
+        let network = if regtest { Network::new_regtest(Default::default()) } else { Network::Mainnet };
+        let direct: u128 = (1..=height).map(|h| {
+            u128::try_from(i64::from(halving_block_subsidy(Height(h), &network).unwrap())).unwrap()
+        }).sum();
+        prop_assert_eq!(scheduled_issuance_zatoshis(Height(height), &network).unwrap(), direct);
+    }
+}

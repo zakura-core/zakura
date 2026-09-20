@@ -49,7 +49,7 @@ pub use constants::{
     MAX_HISTORICAL_TREE_REPLAY_BLOCKS,
 };
 pub use error::{
-    BoxError, CloneError, CommitBlockError, CommitCheckpointVerifiedError,
+    AwaitBlockInfoError, BoxError, CloneError, CommitBlockError, CommitCheckpointVerifiedError,
     CommitSemanticallyVerifiedError, DuplicateNullifierError, HistoricalSubtreeUnavailable,
     HistoricalSubtreeUnavailableReason, HistoricalTreeUnavailable, MissingSproutTipTree,
     StateInitError, ValidateContextError,

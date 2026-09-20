@@ -162,10 +162,3 @@ Before production activation:
 
 Passing the bounded properties does not establish that every possible state or
 failure has been tested.
-
-## Replacement stack integration order
-
-This layer wires verification and payout recovery. Mining templates and subsidy
-RPCs receive parent balances in the following PR; until then, their calls at
-active reissuance heights report a missing-balance error. Land that integration
-before enabling payouts on configured networks.

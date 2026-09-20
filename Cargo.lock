@@ -8014,7 +8014,7 @@ dependencies = [
 
 [[package]]
 name = "zakura-rpc"
-version = "10.0.1-rc1"
+version = "11.0.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

@@ -31,7 +31,10 @@ use zakura_chain::{
     },
     chain_sync_status::ChainSyncStatus,
     chain_tip::ChainTip,
-    parameters::Network,
+    parameters::{
+        subsidy::{is_zip234_active, parent_nsm_value_balance},
+        Network,
+    },
     serialization::{DateTime32, ZcashDeserializeInto},
     transaction::VerifiedUnminedTx,
     work::difficulty::{CompactDifficulty, ExpandedDifficulty},
@@ -452,11 +455,13 @@ impl BlockTemplateResponse {
                 height,
                 miner_params,
                 txs_fee,
-                chain_info
-                    .value_pools
-                    .nsm_value_balance_amount()
-                    .constrain()
-                    .ok(),
+                if is_zip234_active(net, height) {
+                    Some(parent_nsm_value_balance(
+                        chain_info.value_pools.nsm_value_balance_amount(),
+                    )?)
+                } else {
+                    None
+                },
             )?,
         };
 

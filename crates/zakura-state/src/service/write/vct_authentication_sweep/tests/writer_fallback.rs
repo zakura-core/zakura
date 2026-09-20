@@ -64,7 +64,7 @@ impl RunningWriter {
             .finalized
             .as_ref()
             .expect("checkpoint writes are enabled")
-            .send((CheckpointVerifiedBlock::from(block), sender))
+            .send((CheckpointVerifiedBlock::from(block), sender, 0))
             .expect("the writer accepts the checkpoint block");
         receiver
     }

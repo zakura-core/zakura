@@ -22,17 +22,25 @@ mod tests;
 /// Bounds semantically verified blocks retained while their parents are unavailable.
 pub(crate) const MAX_QUEUED_BLOCKS: usize = crate::MAX_BLOCK_REORG_HEIGHT as usize;
 
-/// A queued checkpoint verified block, and its corresponding [`Result`] channel.
-pub type QueuedCheckpointVerified = (
+/// A checkpoint verified block and its response channel.
+pub type CheckpointCommit = (
     CheckpointVerifiedBlock,
     oneshot::Sender<Result<block::Hash, CommitCheckpointVerifiedError>>,
 );
 
-/// A queued semantically verified block, and its corresponding [`Result`] channel.
+/// A checkpoint verified block, its response channel, and write attempt identity.
+pub type QueuedCheckpointVerified = (
+    CheckpointVerifiedBlock,
+    oneshot::Sender<Result<block::Hash, CommitCheckpointVerifiedError>>,
+    u64,
+);
+
+/// A semantically verified block, response channel, admission reporter, and write attempt identity.
 pub type QueuedSemanticallyVerified = (
     SemanticallyVerifiedBlock,
     oneshot::Sender<Result<block::Hash, CommitSemanticallyVerifiedError>>,
     Option<BlockAdmission>,
+    u64,
 );
 
 /// A queue of blocks, awaiting the arrival of parent blocks.
@@ -150,7 +158,7 @@ impl QueuedBlocks {
         let mut descendants = Vec::new();
         while let Some(parent) = parents.pop() {
             let children = self.dequeue_children(parent);
-            parents.extend(children.iter().map(|(block, _, _)| block.hash));
+            parents.extend(children.iter().map(|(block, _, _, _)| block.hash));
             descendants.extend(children);
         }
         descendants
@@ -164,7 +172,7 @@ impl QueuedBlocks {
     ) -> Vec<block::Hash> {
         let descendants = self.dequeue_descendants(failed_parent);
         let mut failed_hashes = Vec::with_capacity(descendants.len());
-        for (block, response, admission) in descendants {
+        for (block, response, admission, _) in descendants {
             failed_hashes.push(block.hash);
             if let Some(admission) = admission {
                 admission.reject();
@@ -190,7 +198,7 @@ impl QueuedBlocks {
         mem::swap(&mut self.by_height, &mut by_height);
 
         for hash in by_height.into_values().flatten() {
-            let (expired_block, expired_sender, admission) =
+            let (expired_block, expired_sender, admission, _) =
                 self.blocks.remove(&hash).expect("block is present");
             let parent_hash = &expired_block.block.header.previous_block_hash;
 

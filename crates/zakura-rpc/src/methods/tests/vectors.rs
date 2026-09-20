@@ -3225,15 +3225,9 @@ async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
 
     const BALANCE: i64 = 400_000_000;
 
-    // `ceil(balance * BLOCK_SUBSIDY_FRACTION)`, read from the network so the test follows
-    // ZIP 218's change to the halving interval.
-    let bonus = |height, balance: i64| {
-        let numerator = i128::try_from(
-            zakura_chain::parameters::subsidy::block_subsidy_fraction_numerator(height, &network),
-        )
-        .expect("the fraction numerator fits in i128");
-
-        i64::try_from((i128::from(balance.max(0)) * numerator + 9_999_999_999) / 10_000_000_000)
+    // Compute the fixed NU7 ceiling payout independently of the production helper.
+    let bonus = |balance: i64| {
+        i64::try_from((i128::from(balance.max(0)) * 1_375 + 9_999_999_999) / 10_000_000_000)
             .expect("the bonus fits in i64")
     };
 
@@ -3262,7 +3256,7 @@ async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
         for (balance, succeeds) in [(0i64, true), (1, true), (BALANCE, true), (-1, false)] {
             let expected_subsidy = (halving_block_subsidy(height, &network)
                 .expect("valid subsidy")
-                + Amount::try_from(bonus(height, balance)).expect("valid bonus"))
+                + Amount::try_from(bonus(balance)).expect("valid bonus"))
             .expect("valid subsidy");
             let mut read_state: MockService<_, _, _, BoxError> =
                 MockService::build().for_unit_tests();
@@ -3341,7 +3335,7 @@ async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
         for (balance, succeeds) in [(0i64, true), (1, true), (BALANCE, true), (-1, false)] {
             let expected_subsidy = (halving_block_subsidy(height, &network)
                 .expect("valid subsidy")
-                + Amount::try_from(bonus(height, balance)).expect("valid bonus"))
+                + Amount::try_from(bonus(balance)).expect("valid bonus"))
             .expect("valid subsidy");
             let mempool: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();
             let read_state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();

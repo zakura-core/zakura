@@ -715,6 +715,7 @@ async fn a_full_orphan_queue_still_admits_a_block_whose_parent_is_available() ->
         grandchild.clone(),
         grandchild_tx,
         None,
+        0,
     ));
 
     // Fill the rest of the queue with blocks whose parents this state will never have.
@@ -730,6 +731,7 @@ async fn a_full_orphan_queue_still_admits_a_block_whose_parent_is_available() ->
             Arc::new(orphan_block).prepare(),
             orphan_tx,
             None,
+            0,
         ));
         orphan_count += 1;
     }
@@ -2428,6 +2430,7 @@ async fn unpublished_writer_transitions_block_optimistic_relay_and_bound_bodies(
             Arc::new(block).prepare(),
             tx,
             Some(admission.clone()),
+            0,
         ));
         state.send_ready_non_finalized_queued(parent);
         (admission, rx)
@@ -2865,4 +2868,119 @@ async fn parent_input_check_requires_a_chain_that_continues_the_finalized_tip() 
             "overlap parent {parent:?}"
         );
     }
+}
+
+/// A failed checkpoint commit requests Tip during recovery. That request must release
+/// a same-hash replacement queued before the writer reported the failure.
+#[tokio::test(flavor = "multi_thread")]
+async fn checkpoint_recovery_tip_request_releases_queued_replacement() {
+    let _init_guard = zakura_test::init();
+    let limit = Duration::from_secs(10);
+    let (mut state, _, _, _) =
+        StateService::new(Config::ephemeral(), &Network::Mainnet, Height(1), 0)
+            .await
+            .unwrap();
+    let genesis: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let child: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let parent = genesis.hash();
+    timeout(
+        limit,
+        state.queue_and_commit_to_finalized_state(genesis.into()),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+
+    // Keep the real writer alive but control its response and reset ordering.
+    let real_writer = state.block_write_sender.finalized.take().unwrap();
+    let (gate, mut intercepted) = tokio::sync::mpsc::unbounded_channel();
+    state.block_write_sender.finalized = Some(gate);
+    let (reset_tx, reset_rx) = tokio::sync::mpsc::unbounded_channel();
+    let real_reset_rx = std::mem::replace(&mut state.invalid_block_write_reset_receiver, reset_rx);
+
+    let old_response = state.queue_and_commit_to_finalized_state(child.clone().into());
+    let old_write = intercepted.try_recv().unwrap();
+    let replacement = state.queue_and_commit_to_finalized_state(child.clone().into());
+    assert_eq!(state.finalized_state_queued_blocks.len(), 1);
+    assert!(intercepted.try_recv().is_err());
+    reset_tx.send(parent).unwrap();
+    old_write
+        .1
+        .send(Err(CommitBlockError::WriteTaskExited.into()))
+        .unwrap();
+    assert!(old_response.await.unwrap().is_err());
+
+    // The checkpoint task asks for Tip after receiving the error, even if its
+    // generation has since been superseded or its original caller was dropped.
+    let _ = state
+        .ready()
+        .await
+        .unwrap()
+        .call(Request::Tip)
+        .await
+        .unwrap();
+    let replacement_write = timeout(limit, intercepted.recv())
+        .await
+        .expect("recovery must release the replacement without another block request")
+        .expect("the writer channel stays open");
+    assert!(state.finalized_state_queued_blocks.is_empty());
+    real_writer.send(replacement_write).unwrap();
+    timeout(limit, replacement).await.unwrap().unwrap().unwrap();
+    state.invalid_block_write_reset_receiver = real_reset_rx;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn await_block_info_waits_for_a_valid_retry_after_rejection() {
+    let _init_guard = zakura_test::init();
+    let limit = Duration::from_secs(10);
+    let chain = v4_coinbase_mainnet_chain();
+    let mut state = state_with_finalized_parent(&chain).await;
+    let later: Block = zakura_test::vectors::BLOCK_MAINNET_419201_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let spend = later
+        .transactions
+        .iter()
+        .find(|tx| !tx.is_coinbase() && !tx.inputs().is_empty())
+        .unwrap()
+        .clone();
+    let mut bad = (*chain[2]).clone();
+    bad.transactions.push(spend);
+    let bad = Arc::new(bad).prepare();
+    let hash = bad.hash;
+    assert_eq!(hash, chain[2].hash());
+    timeout(
+        limit,
+        state.queue_and_commit_to_non_finalized_state(bad, None),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap_err();
+
+    // Hold a valid retry before its writer runs.
+    let real_writer = state.block_write_sender.non_finalized.take().unwrap();
+    let (gate, mut intercepted) = tokio::sync::mpsc::unbounded_channel();
+    state.block_write_sender.non_finalized = Some(gate);
+    let valid_retry =
+        state.queue_and_commit_to_non_finalized_state(chain[2].clone().prepare(), None);
+    let message = timeout(limit, intercepted.recv()).await.unwrap().unwrap();
+    let mut wait = state.call(Request::AwaitBlockInfo(hash));
+    assert!(
+        timeout(Duration::from_millis(50), &mut wait).await.is_err(),
+        "a previous rejection must not fail a waiter for an admitted retry"
+    );
+
+    // Committing the retry must wake the same waiter.
+    real_writer.send(message).unwrap();
+    timeout(limit, valid_retry).await.unwrap().unwrap().unwrap();
+    assert!(matches!(
+        timeout(limit, wait).await.unwrap().unwrap(),
+        Response::BlockInfo(Some(_))
+    ));
 }

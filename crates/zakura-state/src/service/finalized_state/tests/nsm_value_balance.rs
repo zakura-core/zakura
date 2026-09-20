@@ -5,8 +5,9 @@
 
 use zakura_chain::{
     amount::{Amount, NonNegative},
-    block::Height,
+    block::{Block, Height},
     parameters::{
+        subsidy::is_zip234_active,
         testnet::{ConfiguredActivationHeights, RegtestParameters},
         Network, NetworkKind, NetworkUpgrade,
     },
@@ -20,8 +21,8 @@ use crate::{
 
 use super::{
     issuance_accounting::{
-        accounting_network, child_block_with_history_commitment, commit, start_block,
-        state_below_start, state_below_start_with_config, START,
+        accounting_network, child_block_with_history_commitment, commit, permitted_start_block,
+        start_block, state_below_start, state_below_start_with_config, START,
     },
     rollback::{child_block, coinbase_tx},
 };
@@ -39,7 +40,8 @@ fn is_negative_balance_at_start(error: &ValidateContextError) -> bool {
 fn non_finalized_state_rejects_a_block_that_makes_the_balance_negative() {
     let _init_guard = zakura_test::init();
 
-    let network = accounting_network();
+    let network = accounting_network(true);
+    assert!(is_zip234_active(&network, START));
     let (state, parent) = state_below_start(&network);
 
     let over = start_block(&state, &network, &parent, 1);
@@ -62,7 +64,7 @@ fn nu7_rejects_a_negative_balance_below_the_reissuance_start() {
 
     let _init_guard = zakura_test::init();
 
-    let network = accounting_network();
+    let network = accounting_network(true);
     let nu7 = NetworkUpgrade::Nu7
         .activation_height(&network)
         .expect("the test network activates NU7");
@@ -70,6 +72,10 @@ fn nu7_rejects_a_negative_balance_below_the_reissuance_start() {
     assert!(
         nu7 < START,
         "the fixture must leave a gap between NU7 and the reissuance start",
+    );
+    assert!(
+        !is_zip234_active(&network, nu7),
+        "no block at NU7 claims a bonus on this network",
     );
 
     let address = Address::from_script_hash(NetworkKind::Regtest, [0x42; 20]);
@@ -132,7 +138,7 @@ fn nu7_rejects_a_negative_balance_below_the_reissuance_start() {
 fn finalized_state_rejects_a_block_that_makes_the_balance_negative() {
     let _init_guard = zakura_test::init();
 
-    let network = accounting_network();
+    let network = accounting_network(true);
     let (mut state, parent) = state_below_start(&network);
     let pools_before = state.db.finalized_value_pool();
 
@@ -167,6 +173,7 @@ fn seeded_network() -> Network {
             nu7: Some(2),
             ..Default::default()
         },
+        nsm_reissuance_height: Some(START),
         initial_nsm_value_balance: Some(
             Amount::try_from(SEED).expect("the seed is a valid amount"),
         ),
@@ -298,4 +305,35 @@ fn rollback_across_the_seed_height_restores_it_on_replay() {
         before,
         "replay must restore the seed and every later change",
     );
+}
+
+/// Older versions committed blocks at or above the ZIP 234 start without reissuance,
+/// so the migration requires a resync instead of keeping their Deferred balances.
+#[test]
+fn migration_requires_resync_after_the_reissuance_start() {
+    use crate::service::finalized_state::disk_format::upgrade::{
+        nsm_value_balance_pool::Upgrade, DiskFormatUpgrade, FormatChangeError,
+    };
+    let _guard = zakura_test::init();
+    let network = accounting_network(true);
+    let (mut state, parent) = state_below_start(&network);
+    let (_cancel, cancel_receiver) = crossbeam_channel::bounded(1);
+
+    // A tip below the start migrates.
+    Upgrade
+        .run(Some(parent_height(&parent)), &state.db, &cancel_receiver)
+        .unwrap();
+
+    let block = permitted_start_block(&state, &network, &parent);
+    commit(&mut state, &block).unwrap();
+    let pools = state.db.finalized_value_pool();
+    let result = Upgrade.run(Some(START), &state.db, &cancel_receiver);
+    assert!(matches!(result, Err(FormatChangeError::ResyncRequired(_))));
+    assert_eq!(state.db.finalized_value_pool(), pools);
+}
+
+fn parent_height(parent: &Block) -> Height {
+    parent
+        .coinbase_height()
+        .expect("the parent has a coinbase height")
 }

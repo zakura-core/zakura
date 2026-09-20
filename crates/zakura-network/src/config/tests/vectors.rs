@@ -846,6 +846,68 @@ fn max_block_time_start_height_serialization_roundtrip() {
         .is_max_block_time_enforced(start_height));
 }
 
+#[test]
+fn nsm_reissuance_height_serialization_roundtrip() {
+    use zakura_chain::parameters::{
+        subsidy::{is_zip234_active, nsm_reissuance_height},
+        testnet::{ConfiguredActivationHeights, RegtestParameters},
+    };
+
+    let _init_guard = zakura_test::init();
+    let mut activation_heights: ConfiguredActivationHeights = Network::new_default_testnet()
+        .parameters()
+        .expect("Testnet has parameters")
+        .activation_heights()
+        .into();
+    activation_heights.nu7 = Some(4_200_000);
+
+    for start in [None, Some(Height(4_200_010))] {
+        let mut builder = testnet::Parameters::build()
+            .with_activation_heights(activation_heights)
+            .expect("activation heights are valid");
+        if let Some(height) = start {
+            builder = builder.with_nsm_reissuance_height(height);
+        }
+        let testnet = builder.to_network().expect("configured testnet is valid");
+        let regtest = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu7: Some(10),
+                ..Default::default()
+            },
+            nsm_reissuance_height: start,
+            ..Default::default()
+        });
+
+        for network in [testnet, regtest] {
+            let mut config = Config {
+                network,
+                initial_testnet_peers: [].into(),
+                ..Config::for_test(P2pStack::Dual)
+            };
+            config.zakura.apply_network_defaults(&config.network);
+
+            let serialized = toml::to_string(&config).expect("the custom network serializes");
+            assert_eq!(
+                serialized.contains("nsm_reissuance_height"),
+                start.is_some()
+            );
+            let deserialized: Config =
+                toml::from_str(&serialized).expect("the custom network deserializes");
+            assert_eq!(config, deserialized);
+            assert_eq!(nsm_reissuance_height(&deserialized.network), start);
+            if let Some(height) = start {
+                assert!(!is_zip234_active(
+                    &deserialized.network,
+                    Height(height.0 - 1)
+                ));
+                assert!(is_zip234_active(&deserialized.network, height));
+            } else {
+                assert!(!is_zip234_active(&deserialized.network, Height::MAX));
+            }
+        }
+    }
+}
+
 /// With no `zakura_node_secret_key` and a writable identity directory, the
 /// generated Zakura iroh identity must be persisted on first use and reused on
 /// every later startup, so the node's `EndpointId` is stable across restarts.

@@ -347,7 +347,7 @@ impl NonFinalizedState {
     /// chain and update all side-chains to match.
     pub fn finalize(&mut self) -> FinalizableBlock {
         // Chain::cmp uses the partial cumulative work, receipt order, and the hash of the tip block.
-        // Neither of these fields has interior mutability.
+        // None of these fields has interior mutability.
         // (And when the tip block is dropped for a chain, the chain is also dropped.)
         #[allow(clippy::mutable_key_type)]
         let chains = mem::take(&mut self.chain_set);

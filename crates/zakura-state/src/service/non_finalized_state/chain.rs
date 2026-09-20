@@ -2657,8 +2657,8 @@ impl PartialEq for Chain {
     /// Chain equality for [`NonFinalizedState::chain_set`][1], using proof of
     /// work, then the tip receipt order, then its hash.
     ///
-    /// Two chains with the same cumulative work and tip hash are equal; the
-    /// `chain_set` uses this to keep tip hashes unique.
+    /// Retained copies of a tip keep the same receipt order, so equal work and
+    /// tip hashes compare equal and the `chain_set` keeps tip hashes unique.
     ///
     /// [1]: super::NonFinalizedState::chain_set
     fn eq(&self, other: &Self) -> bool {

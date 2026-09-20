@@ -37,6 +37,7 @@ pub struct BlockAndHash {
 #[derive(serde::Deserialize, serde::Serialize)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct NonFinalizedChainTips {
+    /// Tip block hashes in display byte order.
     #[prost(bytes = "vec", repeated, tag = "1")]
     pub hashes: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
 }

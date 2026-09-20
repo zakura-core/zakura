@@ -32,6 +32,7 @@ message BlockAndHash {
 
 // Complete retained fork set for a trusted secondary.
 message NonFinalizedChainTips {
+  // Tip block hashes in display byte order.
   repeated bytes hashes = 1;
 };
 

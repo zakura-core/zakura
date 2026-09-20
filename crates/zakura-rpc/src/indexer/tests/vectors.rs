@@ -185,6 +185,103 @@ fn block_and_hash_decode_rejects_a_missing_coinbase() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn non_finalized_stream_preserves_receipts_and_negotiates_snapshots() -> Result<()> {
+    use zakura_chain::serialization::BytesInDisplayOrder;
+    use zakura_state::{NonFinalizedBlocksListener, NonFinalizedStateChange};
+
+    let _init_guard = zakura_test::init();
+    let (server, client, mut state, _tip, _mempool) = start_server_and_get_client().await?;
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+    let hash = block.hash();
+    for (session, snapshots) in [
+        (None, false),
+        (None, true),
+        (Some("previous-primary".to_owned()), true),
+        (Some(indexer::receipt_session().to_owned()), true),
+    ] {
+        let same_session = session.as_deref() == Some(indexer::receipt_session());
+        let mut client = client.clone();
+        let request = tokio::spawn(async move {
+            client
+                .non_finalized_state_change(indexer::NonFinalizedStateChangeRequest {
+                    chain_tip_hashes: vec![hash.bytes_in_display_order().to_vec()],
+                    receipt_session: session,
+                    include_chain_snapshot: snapshots,
+                })
+                .await
+        });
+        let (sender, receiver) = tokio::sync::mpsc::channel(8);
+        state
+            .expect_request(ReadRequest::NonFinalizedBlocksListener {
+                known_chain_tips: if same_session {
+                    [hash].into_iter().collect()
+                } else {
+                    Default::default()
+                },
+            })
+            .await
+            .respond(ReadResponse::NonFinalizedBlocksListener(
+                NonFinalizedBlocksListener(Arc::new(receiver)),
+            ));
+        let response = request.await??;
+        assert_eq!(
+            response
+                .metadata()
+                .get(indexer::RECEIPT_SESSION_HEADER)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            indexer::receipt_session()
+        );
+        let mut stream = response.into_inner();
+        for change in [
+            NonFinalizedStateChange::Block {
+                hash,
+                block: block.clone(),
+                receipt_order: Some(2),
+            },
+            NonFinalizedStateChange::ChainTips(vec![hash]),
+            NonFinalizedStateChange::ChainTips(vec![]),
+            NonFinalizedStateChange::Block {
+                hash,
+                block: block.clone(),
+                receipt_order: Some(1),
+            },
+        ] {
+            sender.send(change).await?;
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let first = stream.message().await.unwrap().unwrap();
+            assert_eq!(first.receipt_order, Some(2));
+            assert_eq!(first.decode().unwrap().1, hash);
+            if snapshots {
+                let snapshot = stream.message().await.unwrap().unwrap();
+                assert!(snapshot.data.is_empty());
+                assert_eq!(
+                    snapshot.chain_snapshot.unwrap().hashes,
+                    vec![hash.bytes_in_display_order().to_vec()]
+                );
+                assert!(stream
+                    .message()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .chain_snapshot
+                    .unwrap()
+                    .hashes
+                    .is_empty());
+            }
+            let last = stream.message().await.unwrap().unwrap();
+            assert_eq!(last.receipt_order, Some(1));
+            assert_eq!(last.decode().unwrap().1, hash);
+        })
+        .await?;
+    }
+    server.abort();
+    Ok(())
+}
+
 /// Tests that `GetBlock` returns the requested block and rejects invalid
 /// requests.
 async fn test_get_block(

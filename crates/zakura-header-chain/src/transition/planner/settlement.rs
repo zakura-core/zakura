@@ -97,7 +97,7 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
     projected.refresh_verified_after_operator_change(
         context
             .full_state_authority
-            .and_then(|authority| authority.verified_tip(&event)),
+            .and_then(|authority| authority.verified_tip(event)),
     )?;
 
     let (mut selected_tip, _) = projected.graph().view_select_best_header_chain()?;

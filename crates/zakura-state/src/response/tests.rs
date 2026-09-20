@@ -98,6 +98,59 @@ async fn sends_all_blocks_when_no_known_tips() {
     assert_idle(&mut received).await;
 }
 
+#[tokio::test]
+async fn snapshots_carry_receipts_and_known_tip_changes() {
+    use super::NonFinalizedStateChange::{Block as ReceivedBlock, ChainTips};
+
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let blocks = fake_chain(&network, 2);
+    let finalized = FinalizedState::new(&Config::ephemeral(), &network).unwrap();
+    finalized.set_finalized_value_pool(ValueBalance::<NonNegative>::fake_populated_pool());
+    let mut state = NonFinalizedState::new(&network);
+    let mut root = blocks[0].clone().prepare();
+    root.receipt_order = Some(2);
+    state.commit_new_chain(root, &finalized).unwrap();
+    let mut child = blocks[1].clone().prepare();
+    child.receipt_order = Some(1);
+    state.commit_block(child, &finalized).unwrap();
+    let (sender, receiver) = watch::channel(state.clone());
+    let mut received =
+        NonFinalizedBlocksListener::spawn(WatchReceiver::new(receiver), HashSet::new()).unwrap();
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for (block, expected) in [(&blocks[0], 2), (&blocks[1], 1)] {
+            match received.recv().await.unwrap() {
+                ReceivedBlock {
+                    hash,
+                    receipt_order,
+                    ..
+                } => {
+                    assert_eq!(hash, block.hash());
+                    assert_eq!(receipt_order, Some(expected));
+                }
+                change => panic!("expected a block before its snapshot: {change:?}"),
+            }
+        }
+        assert!(matches!(received.recv().await.unwrap(), ChainTips(tips)
+            if tips == vec![blocks[1].hash()]));
+
+        for tips in [vec![blocks[0].hash()], vec![]] {
+            assert!(state.reconcile_chain_tips(&tips));
+            sender.send(state.clone()).unwrap();
+            loop {
+                match received.recv().await.unwrap() {
+                    ChainTips(actual) if actual == tips => break,
+                    ChainTips(_) => continue,
+                    change => panic!("known blocks must not be resent: {change:?}"),
+                }
+            }
+        }
+    })
+    .await
+    .expect("snapshots should arrive before timeout");
+}
+
 /// When the caller provides a known chain tip, only blocks above it are sent;
 /// the tip and its ancestors are skipped.
 #[tokio::test]

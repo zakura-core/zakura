@@ -52,3 +52,7 @@ request them. Older servers omit receipt metadata and retain their hash-based
 policy. Older clients can decode block messages but cannot mirror the new tie
 policy exactly, so upgrade trusted secondaries alongside the primary. Ordinary
 block encodings and the P2P header protocol are unchanged.
+
+The generated Rust request and response structs gain fields, which breaks
+exhaustive struct literals in library consumers. The RPC crate therefore advances
+to the next major version even though the wire extension is additive.

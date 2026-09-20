@@ -2,7 +2,6 @@
 
 use std::{
     future::Future,
-    sync::Mutex,
     task::{Context, Poll},
 };
 
@@ -226,65 +225,112 @@ async fn bounded<T>(future: impl Future<Output = T>) -> T {
         .expect("test work must complete")
 }
 
-/// Blocks only the construction thread. The independent watchdog makes inline execution
-/// fail without deadlocking the single-worker runtime or its shutdown.
-fn construction_gate() -> (
-    Arc<dyn Fn() + Send + Sync>,
-    tokio::sync::oneshot::Receiver<()>,
-    std::sync::mpsc::Sender<()>,
-) {
-    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
-    let entered_tx = Mutex::new(Some(entered_tx));
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let release_rx = Mutex::new(release_rx);
-    let hook = Arc::new(move || {
-        if let Some(tx) = entered_tx.lock().unwrap().take() {
-            let _ = tx.send(());
-            release_rx
-                .lock()
-                .unwrap()
-                .recv_timeout(Duration::from_secs(5))
-                .expect("async worker must remain free to release construction");
-        }
-    });
-    (hook, entered_rx, release_tx)
+/// A single blocking thread lets these tests hold construction at its scheduling
+/// boundary without adding instrumentation to the RPC implementation.
+fn mining_runtime(test: impl Future<Output = ()>) {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap()
+        .block_on(test);
 }
 
-#[tokio::test]
-async fn normal_template_construction_leaves_runtime_responsive() {
-    let (_, info) = watch::channel(chain_info(2, 1, 400_000_000));
-    let (mut rpc, _, _) = mining_rpc(info);
-    let (hook, entered, release) = construction_gate();
-    rpc.template_build_hook = Some(hook);
-    let request = tokio::spawn(async move { rpc.get_block_template(None).await });
-    bounded(entered).await.unwrap();
-    // This task can run before construction finishes, even on one Tokio worker.
-    release.send(()).unwrap();
-    bounded(request).await.unwrap().unwrap();
+struct BlockingPoolGate {
+    release: Option<std::sync::mpsc::Sender<()>>,
+    task: Option<JoinHandle<()>>,
+}
+
+impl BlockingPoolGate {
+    async fn new() -> Self {
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let task = tokio::task::spawn_blocking(move || {
+            entered.send(()).unwrap();
+            // An OS deadline also bounds runtime shutdown if a test fails.
+            released.recv_timeout(Duration::from_secs(10)).unwrap();
+        });
+        let gate = Self {
+            release: Some(release),
+            task: Some(task),
+        };
+        bounded(started).await.unwrap();
+        gate
+    }
+
+    async fn release(mut self) {
+        self.release.take().unwrap().send(()).unwrap();
+        bounded(self.task.take().unwrap()).await.unwrap();
+    }
+}
+
+impl Drop for BlockingPoolGate {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+#[test]
+fn normal_template_construction_leaves_runtime_responsive() {
+    mining_runtime(async {
+        let (_, info) = watch::channel(chain_info(2, 1, 400_000_000));
+        let (rpc, _, _) = mining_rpc(info);
+        let gate = BlockingPoolGate::new().await;
+        let request = rpc.get_block_template(None);
+        tokio::pin!(request);
+        assert!(
+            futures::poll!(&mut request).is_pending(),
+            "construction must yield to the blocking pool"
+        );
+        gate.release().await;
+        bounded(request).await.unwrap();
+    });
+}
+
+fn template_id(info: &GetBlockTemplateChainInfo) -> types::long_poll::LongPollId {
+    types::long_poll::LongPollInput::new(info.tip_height, info.tip_hash, info.max_time, vec![])
+        .generate_id()
 }
 
 #[tokio::test]
 async fn template_worker_panic_is_an_rpc_error() {
     let (_, info) = watch::channel(chain_info(2, 1, 0));
-    let (mut rpc, _, _) = mining_rpc(info);
-    rpc.template_build_hook = Some(Arc::new(|| panic!("test construction panic")));
-    let error = bounded(rpc.get_block_template(None)).await.unwrap_err();
+    let (rpc, _, _) = mining_rpc(info);
+    // The synchronous constructor requires a parent below Height::MAX. Exercise
+    // its actual invariant panic rather than injecting a panic into production.
+    let invalid_parent = chain_info(Height::MAX.0, 1, 0);
+    let error = bounded(rpc.build_mining_template(
+        None,
+        rpc.gbt.miner_params().unwrap(),
+        &invalid_parent,
+        template_id(&invalid_parent),
+        vec![],
+        None,
+    ))
+    .await
+    .unwrap_err();
     assert_eq!(error.code(), -1);
-    assert!(error.message().contains("test construction panic"));
+    assert!(error
+        .message()
+        .contains("chain tip must be below Height::MAX"));
 }
 
-#[tokio::test]
-async fn tip_change_during_construction_does_not_publish_stale_work() {
-    let (_, info) = watch::channel(chain_info(2, 1, 0));
-    let (mut rpc, tip, _) = mining_rpc(info);
-    let (hook, entered, release) = construction_gate();
-    rpc.template_build_hook = Some(hook);
-    let request = tokio::spawn(async move { rpc.get_block_template(None).await });
-    bounded(entered).await.unwrap();
-    tip.send_best_tip_hash(Hash([2; 32]));
-    release.send(()).unwrap();
-    let error = bounded(request).await.unwrap().unwrap_err();
-    assert!(error.message().contains("parent changed"));
+#[test]
+fn tip_change_during_construction_does_not_publish_stale_work() {
+    mining_runtime(async {
+        let (_, info) = watch::channel(chain_info(2, 1, 0));
+        let (rpc, tip, _) = mining_rpc(info);
+        let gate = BlockingPoolGate::new().await;
+        let request = rpc.get_block_template(None);
+        tokio::pin!(request);
+        assert!(futures::poll!(&mut request).is_pending());
+        tip.send_best_tip_hash(Hash([2; 32]));
+        gate.release().await;
+        let error = bounded(request).await.unwrap_err();
+        assert!(error.message().contains("parent changed"));
+    });
 }
 
 #[tokio::test]
@@ -319,83 +365,84 @@ fn assert_reward(template: &BlockTemplateResponse, balance: i64) {
     assert_eq!(paid, expected);
 }
 
-#[tokio::test]
-async fn long_poll_builds_on_new_parent_without_blocking_runtime() {
-    for (old_height, new_height) in [(0, 1), (0, 2), (2, 3), (1, 2), (2, 5), (4, 2)] {
-        let (info_tx, info) = watch::channel(chain_info(old_height, 1, 0));
-        let (mut rpc, tip, _) = mining_rpc(info);
+#[test]
+fn long_poll_builds_on_new_parent_without_blocking_runtime() {
+    mining_runtime(async {
+        for (old_height, new_height) in [(0, 1), (0, 2), (2, 3), (1, 2), (2, 5), (4, 2)] {
+            let (info_tx, info) = watch::channel(chain_info(old_height, 1, 0));
+            let (rpc, tip, _) = mining_rpc(info);
+            let initial = bounded(rpc.get_block_template(None))
+                .await
+                .unwrap()
+                .try_into_template()
+                .unwrap();
+            let request = rpc.get_block_template(Some(GetBlockTemplateParameters {
+                long_poll_id: Some(initial.long_poll_id),
+                ..Default::default()
+            }));
+            tokio::pin!(request);
+            assert!(
+                futures::poll!(&mut request).is_pending(),
+                "matching long poll must wait"
+            );
+            let gate = BlockingPoolGate::new().await;
+            let next = chain_info(new_height, 2, 400_000_000);
+            info_tx.send_replace(next.clone());
+            tip.send_best_tip_height(next.tip_height);
+            tip.send_best_tip_hash(next.tip_hash);
+            assert!(
+                futures::poll!(&mut request).is_pending(),
+                "tip-change construction must yield to the blocking pool"
+            );
+            gate.release().await;
+            let template = bounded(request).await.unwrap().try_into_template().unwrap();
+            assert_eq!(template.previous_block_hash, next.tip_hash);
+            assert_eq!(template.height, new_height + 1);
+            assert_reward(&template, 400_000_000);
+        }
+    });
+}
+
+#[test]
+fn simultaneous_long_polls_remain_responsive() {
+    mining_runtime(async {
+        let (info_tx, info) = watch::channel(chain_info(2, 1, 0));
+        let (rpc, tip, _) = mining_rpc(info);
         let initial = bounded(rpc.get_block_template(None))
             .await
             .unwrap()
             .try_into_template()
             .unwrap();
-        let (hook, entered, release) = construction_gate();
-        rpc.template_build_hook = Some(hook);
-        let request = rpc.get_block_template(Some(GetBlockTemplateParameters {
-            long_poll_id: Some(initial.long_poll_id),
-            ..Default::default()
-        }));
-        tokio::pin!(request);
-        assert!(
-            futures::poll!(&mut request).is_pending(),
-            "matching long poll must wait"
-        );
-        let next = chain_info(new_height, 2, 400_000_000);
+        let mut requests: Vec<_> = (0..4)
+            .map(|_| {
+                Box::pin(rpc.get_block_template(Some(GetBlockTemplateParameters {
+                    long_poll_id: Some(initial.long_poll_id),
+                    ..Default::default()
+                })))
+            })
+            .collect();
+        for request in &mut requests {
+            assert!(futures::poll!(request).is_pending());
+        }
+        let gate = BlockingPoolGate::new().await;
+        let next = chain_info(3, 2, 400_000_000);
         info_tx.send_replace(next.clone());
         tip.send_best_tip_height(next.tip_height);
         tip.send_best_tip_hash(next.tip_hash);
-        let (response, ()) = bounded(async {
-            tokio::join!(request, async {
-                entered.await.unwrap();
-                release.send(()).unwrap();
-            })
-        })
-        .await;
-        let template = response.unwrap().try_into_template().unwrap();
-        assert_eq!(template.previous_block_hash, next.tip_hash);
-        assert_eq!(template.height, new_height + 1);
-        assert_reward(&template, 400_000_000);
-    }
-}
-
-#[tokio::test]
-async fn simultaneous_long_polls_remain_responsive() {
-    let (info_tx, info) = watch::channel(chain_info(2, 1, 0));
-    let (mut rpc, tip, _) = mining_rpc(info);
-    let initial = bounded(rpc.get_block_template(None))
-        .await
-        .unwrap()
-        .try_into_template()
-        .unwrap();
-    let (hook, entered, release) = construction_gate();
-    rpc.template_build_hook = Some(hook);
-    let mut requests: Vec<_> = (0..4)
-        .map(|_| {
-            Box::pin(rpc.get_block_template(Some(GetBlockTemplateParameters {
-                long_poll_id: Some(initial.long_poll_id),
-                ..Default::default()
-            })))
-        })
-        .collect();
-    for request in &mut requests {
-        assert!(futures::poll!(request).is_pending());
-    }
-    let next = chain_info(3, 2, 400_000_000);
-    info_tx.send_replace(next.clone());
-    tip.send_best_tip_height(next.tip_height);
-    tip.send_best_tip_hash(next.tip_hash);
-    let (responses, ()) = bounded(async {
-        tokio::join!(futures::future::join_all(requests), async {
-            entered.await.unwrap();
-            release.send(()).unwrap();
-        })
-    })
-    .await;
-    for response in responses {
-        let template = response.unwrap().try_into_template().unwrap();
-        assert_eq!(template.previous_block_hash, next.tip_hash);
-        assert_reward(&template, 400_000_000);
-    }
+        for request in &mut requests {
+            assert!(
+                futures::poll!(request).is_pending(),
+                "each awakened request must yield to the blocking pool"
+            );
+        }
+        gate.release().await;
+        let responses = bounded(futures::future::join_all(requests)).await;
+        for response in responses {
+            let template = response.unwrap().try_into_template().unwrap();
+            assert_eq!(template.previous_block_hash, next.tip_hash);
+            assert_reward(&template, 400_000_000);
+        }
+    });
 }
 
 #[tokio::test]
@@ -422,72 +469,101 @@ async fn long_poll_preserves_negative_balance_error() {
     assert!(error.message().contains("NSM value balance is negative"));
 }
 
-#[tokio::test]
-async fn rejection_during_construction_rebuilds_off_worker() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let (_, info) = watch::channel(chain_info(2, 1, 400_000_000));
-    let (mut rpc, _, mut verifier) = mining_rpc(info);
-    let (first_hook, first_entered, first_release) = construction_gate();
-    let (recovery_hook, recovery_entered, recovery_release) = construction_gate();
-    let builds = AtomicUsize::new(0);
-    rpc.template_build_hook = Some(Arc::new(move || {
-        if builds.fetch_add(1, Ordering::SeqCst) == 0 {
-            first_hook();
-        } else {
-            recovery_hook();
-        }
-    }));
-    let rejections = rpc.gbt.template_rejections.clone();
-    let request = tokio::spawn(async move { rpc.get_block_template(None).await });
-    bounded(first_entered).await.unwrap();
-    rejections.send_modify(|state| {
-        state.reject(Hash([1; 32]), "rejected-work");
-    });
-    first_release.send(()).unwrap();
-    bounded(recovery_entered).await.unwrap();
-    recovery_release.send(()).unwrap();
-    let validation = verifier
-        .expect_request_that(|req| matches!(req, zakura_consensus::Request::Prepare { .. }))
+#[test]
+fn rejection_during_construction_rebuilds_template() {
+    mining_runtime(async {
+        let (_, info) = watch::channel(chain_info(2, 1, 400_000_000));
+        let (rpc, _, mut verifier) = mining_rpc(info);
+        let gate = BlockingPoolGate::new().await;
+        let request = rpc.get_block_template(None);
+        tokio::pin!(request);
+        assert!(futures::poll!(&mut request).is_pending());
+        rpc.gbt.template_rejections.send_modify(|state| {
+            state.reject(Hash([1; 32]), "rejected-work");
+        });
+        gate.release().await;
+        let (response, ()) = bounded(async {
+            tokio::join!(request, async {
+                verifier
+                    .expect_request_that(|req| {
+                        matches!(req, zakura_consensus::Request::Prepare { .. })
+                    })
+                    .await
+                    .respond(Hash([9; 32]));
+            })
+        })
         .await;
-    validation.respond(Hash([9; 32]));
-    let template = bounded(request)
-        .await
-        .unwrap()
-        .unwrap()
-        .try_into_template()
-        .unwrap();
-    assert_eq!(template.long_poll_id.revision, 1);
-    assert_eq!(template.submit_old, Some(false));
-    assert_reward(&template, 400_000_000);
-    assert!(rejections.borrow().is_prepared(template.work_id()));
+        let template = response.unwrap().try_into_template().unwrap();
+        assert_eq!(template.long_poll_id.revision, 1);
+        assert_eq!(template.submit_old, Some(false));
+        assert_reward(&template, 400_000_000);
+        assert!(rpc
+            .gbt
+            .template_rejections
+            .borrow()
+            .is_prepared(template.work_id()));
+    });
 }
 
-#[tokio::test]
-async fn recovery_rejects_tip_change_during_construction() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let (_, info) = watch::channel(chain_info(2, 1, 0));
-    let (mut rpc, tip, mut verifier) = mining_rpc(info);
-    let (hook, entered, release) = construction_gate();
-    let builds = AtomicUsize::new(0);
-    rpc.template_build_hook = Some(Arc::new(move || {
-        if builds.fetch_add(1, Ordering::SeqCst) == 1 {
-            hook();
+#[test]
+fn recovery_construction_yields_and_rechecks_parent() {
+    mining_runtime(async {
+        for change_tip in [false, true] {
+            let chain = chain_info(2, 1, 400_000_000);
+            let (_, info) = watch::channel(chain.clone());
+            let (rpc, tip, mut verifier) = mining_rpc(info);
+            let params = rpc.gbt.miner_params().unwrap();
+            let template = bounded(rpc.build_mining_template(
+                None,
+                params,
+                &chain,
+                template_id(&chain),
+                vec![],
+                None,
+            ))
+            .await
+            .unwrap();
+            rpc.gbt.template_rejections.send_modify(|state| {
+                state.set_parent(chain.tip_hash);
+                state.reject(chain.tip_hash, "rejected-work");
+            });
+            let gate = BlockingPoolGate::new().await;
+            let request = rpc.finish_mining_template(template, &chain, params);
+            tokio::pin!(request);
+            assert!(futures::poll!(&mut request).is_pending());
+            // Recovery must wait for construction before asking the verifier.
+            verifier.expect_no_requests().await;
+            if change_tip {
+                tip.send_best_tip_hash(Hash([2; 32]));
+            }
+            gate.release().await;
+            let (response, ()) = bounded(async {
+                tokio::join!(request, async {
+                    verifier
+                        .expect_request_that(|req| {
+                            matches!(req, zakura_consensus::Request::Prepare { .. })
+                        })
+                        .await
+                        .respond(Hash([9; 32]));
+                })
+            })
+            .await;
+            if change_tip {
+                assert!(response
+                    .unwrap_err()
+                    .message()
+                    .contains("changed during recovery"));
+            } else {
+                let template = response.unwrap().try_into_template().unwrap();
+                assert_reward(&template, 400_000_000);
+                assert!(rpc
+                    .gbt
+                    .template_rejections
+                    .borrow()
+                    .is_prepared(template.work_id()));
+            }
         }
-    }));
-    rpc.gbt.template_rejections.send_modify(|state| {
-        state.set_parent(Hash([1; 32]));
-        state.reject(Hash([1; 32]), "rejected-work");
     });
-    let request = tokio::spawn(async move { rpc.get_block_template(None).await });
-    bounded(entered).await.unwrap();
-    tip.send_best_tip_hash(Hash([2; 32]));
-    release.send(()).unwrap();
-    verifier
-        .expect_request_that(|req| matches!(req, zakura_consensus::Request::Prepare { .. }))
-        .await
-        .respond(Hash([9; 32]));
-    let error = bounded(request).await.unwrap().unwrap_err();
-    assert!(error.message().contains("changed during recovery"));
 }
 
 #[tokio::test]

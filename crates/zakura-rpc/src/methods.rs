@@ -1020,10 +1020,6 @@ where
 
     /// Handler for the `getblocktemplate` RPC.
     gbt: GetBlockTemplateHandler<BlockVerifierRouter, SyncStatus>,
-
-    /// Per-instance synchronization hook at the blocking construction boundary.
-    #[cfg(test)]
-    template_build_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// A type alias for the last event logged by the server.
@@ -1164,8 +1160,6 @@ where
             address_book,
             last_warn_error_log_rx,
             gbt,
-            #[cfg(test)]
-            template_build_hook: None,
         };
 
         // run the process queue
@@ -1225,13 +1219,7 @@ where
         let network = self.network.clone();
         let miner_params = miner_params.clone();
         let chain_info = chain_info.clone();
-        #[cfg(test)]
-        let hook = self.template_build_hook.clone();
         tokio::task::spawn_blocking(move || {
-            #[cfg(test)]
-            if let Some(hook) = hook {
-                hook();
-            }
             BlockTemplateResponse::new_internal(
                 &network,
                 precomputed_coinbase,

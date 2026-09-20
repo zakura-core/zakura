@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use zakura_chain::{
     block::{self, Height},
-    parameters::{Network, NetworkKind},
+    parameters::Network,
     work::difficulty::U256,
 };
 use zakura_header_chain::{
@@ -322,11 +322,11 @@ fn existing_narrow_validation_context_is_backfilled_before_startup() {
         .write(downgrade)
         .expect("the pre-ZIP 218 context fixture writes");
 
-    // A different network kind must still be rejected without changing its bytes,
-    // even though Mainnet permits a network policy change.
+    // Reject incompatible version-four metadata without changing its bytes, so
+    // the release that wrote it can still reopen the database.
     let mut incompatible =
         decode_v4_engine_metadata(&metadata).expect("the version-four metadata fixture decodes");
-    incompatible.network_id = NetworkKind::Testnet;
+    incompatible.network_policy_digest[0] ^= 1;
     let incompatible = incompatible
         .encode()
         .expect("the incompatible metadata fixture encodes");
@@ -343,7 +343,7 @@ fn existing_narrow_validation_context_is_backfilled_before_startup() {
     assert!(matches!(
         store.migrate_to_current(&config),
         Err(HeaderChainStoreError::Incoherent(
-            "legacy network kind does not match the configured network"
+            "legacy network policy does not match the configured policy"
         ))
     ));
     assert_eq!(

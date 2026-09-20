@@ -18,7 +18,6 @@ pub(super) fn classify_and_plan<S: StoreAuditSnapshot>(
         snapshot_before_repair,
         mut metadata,
         trust_anchor_changed,
-        network_policy_changed,
         ..
     } = audited;
     let ReconstructedDerivedViews {
@@ -37,9 +36,6 @@ pub(super) fn classify_and_plan<S: StoreAuditSnapshot>(
     let mut repairs = BTreeSet::new();
     if trust_anchor_changed {
         repairs.insert(RecoveryRepair::TrustAnchorConfiguration);
-    }
-    if network_policy_changed {
-        repairs.insert(RecoveryRepair::NetworkPolicyConfiguration);
     }
     let accepted_nodes = header_nodes.len();
     let mut actual_child_edges = Vec::with_capacity(accepted_nodes);
@@ -98,7 +94,6 @@ pub(super) fn classify_and_plan<S: StoreAuditSnapshot>(
     if !repairs.is_empty() {
         metadata.state_version = metadata.state_version.checked_next()?;
         metadata.anchor_manifest_digest = config.trust_anchor_digest();
-        metadata.network_policy_digest = config.network_policy_digest();
         if repairs.contains(&RecoveryRepair::SelectedProjection)
             || repairs.contains(&RecoveryRepair::InheritedEligibility)
         {

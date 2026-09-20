@@ -36,7 +36,6 @@ pub(super) fn audit_authoritative<S: StoreAuditSnapshot>(
         consensus_invalid_body_tombstones,
         validation_contexts,
         trust_anchor_changed,
-        network_policy_changed,
         early_violations,
     } = rows;
     let mut violations = early_violations;
@@ -139,6 +138,5 @@ pub(super) fn audit_authoritative<S: StoreAuditSnapshot>(
         source_header_nodes,
         consensus_invalid_body_tombstones,
         trust_anchor_changed,
-        network_policy_changed,
     })
 }

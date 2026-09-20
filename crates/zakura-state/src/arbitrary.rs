@@ -105,6 +105,7 @@ impl ContextuallyVerifiedBlock {
             transaction_hashes,
             deferred_pool_balance_change: _,
             auth_data_root: _,
+            receipt_order,
         } = block.into();
 
         Self {
@@ -118,6 +119,7 @@ impl ContextuallyVerifiedBlock {
             spent_outputs: Arc::new(new_outputs),
             transaction_hashes,
             chain_value_pool_change: ValueBalance::zero(),
+            receipt_order,
         }
     }
 }

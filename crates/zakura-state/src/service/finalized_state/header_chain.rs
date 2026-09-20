@@ -271,6 +271,10 @@ struct TestHeaderCompletionAuthority<'a>(Option<&'a dyn FullStateEvidenceAuthori
 
 #[cfg(test)]
 impl FullStateEvidenceAuthority for TestHeaderCompletionAuthority<'_> {
+    fn verified_tip(&self, event: &TransitionEvent) -> Option<Frontier> {
+        self.0.and_then(|inner| inner.verified_tip(event))
+    }
+
     fn authorizes_full_state(&self, event: &TransitionEvent) -> bool {
         self.0
             .is_some_and(|inner| inner.authorizes_full_state(event))
@@ -304,6 +308,10 @@ struct StateIssuedAuthority<'a> {
 }
 
 impl FullStateEvidenceAuthority for StateIssuedAuthority<'_> {
+    fn verified_tip(&self, event: &TransitionEvent) -> Option<Frontier> {
+        self.inner.and_then(|inner| inner.verified_tip(event))
+    }
+
     fn authorizes_full_state(&self, event: &TransitionEvent) -> bool {
         self.inner
             .is_some_and(|inner| inner.authorizes_full_state(event))

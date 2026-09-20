@@ -52,26 +52,36 @@ fn state_from_chain(network: &Network, blocks: &[Arc<Block>]) -> NonFinalizedSta
 }
 
 /// Receives the next block hash, failing if none arrives promptly.
-async fn recv_hash(rx: &mut mpsc::Receiver<(block::Hash, Arc<Block>)>) -> block::Hash {
-    tokio::time::timeout(Duration::from_secs(10), rx.recv())
-        .await
-        .expect("listener should send a block before timing out")
-        .expect("listener channel should stay open")
-        .0
+async fn recv_hash(rx: &mut mpsc::Receiver<super::NonFinalizedStateChange>) -> block::Hash {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match rx.recv().await.expect("listener channel should stay open") {
+                super::NonFinalizedStateChange::Block { hash, .. } => return hash,
+                super::NonFinalizedStateChange::ChainTips(_) => continue,
+            }
+        }
+    })
+    .await
+    .expect("listener should send a block before timing out")
 }
 
-/// Asserts the listener doesn't send any more blocks within a short window.
-async fn assert_idle(rx: &mut mpsc::Receiver<(block::Hash, Arc<Block>)>) {
+/// Snapshot boundaries may arrive, but no additional blocks should be sent.
+async fn assert_idle(rx: &mut mpsc::Receiver<super::NonFinalizedStateChange>) {
     assert!(
-        tokio::time::timeout(Duration::from_millis(200), rx.recv())
-            .await
-            .is_err(),
-        "listener should not send any more blocks",
+        tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                match rx.recv().await.expect("listener channel should stay open") {
+                    super::NonFinalizedStateChange::Block { .. } => return,
+                    super::NonFinalizedStateChange::ChainTips(_) => continue,
+                }
+            }
+        })
+        .await
+        .is_err(),
+        "listener should not send any more blocks"
     );
 }
 
-/// With no known chain tips, every block currently in the non-finalized state
-/// is sent in ascending height order.
 #[tokio::test]
 async fn sends_all_blocks_when_no_known_tips() {
     let network = Network::Mainnet;

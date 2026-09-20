@@ -32,7 +32,6 @@ use zakura_chain::{
     value_balance::ValueBalance,
     work::difficulty::PartialCumulativeWork,
 };
-use zakura_header_chain::{ChainScore, SuffixWork};
 
 use crate::{
     request::Treestate, service::check, ContextuallyVerifiedBlock, HashOrHeight, OutputLocation,
@@ -2617,66 +2616,34 @@ impl UpdateWith<(ValueBalance<NegativeAllowed>, Height, usize)> for Chain {
 impl Ord for Chain {
     /// Chain order for the [`NonFinalizedState`][1]'s `chain_set`.
     ///
-    /// Chains with higher cumulative Proof of Work are [`Ordering::Greater`],
-    /// breaking ties using the tip block hash.
+    /// Greater work wins, then the earlier tip receipt, then the raw tip hash.
+    /// Missing receipt orders precede live receipts and tie by hash, so backup
+    /// replay order cannot decide the best chain after restart.
     ///
-    /// Despite the consensus rules, Zebra uses the tip block hash as a
-    /// tie-breaker. Zebra blocks are downloaded in parallel, so download
-    /// timestamps may not be unique. (And Zebra currently doesn't track
-    /// download times, because [`Block`](block::Block)s are immutable.)
-    ///
-    /// This departure from the consensus rules may delay network convergence,
-    /// for as long as the greater hash belongs to the later mined block.
-    /// But Zebra nodes should converge as soon as the tied work is broken.
-    ///
-    /// "At a given point in time, each full validator is aware of a set of candidate blocks.
-    /// These form a tree rooted at the genesis block, where each node in the tree
-    /// refers to its parent via the hashPrevBlock block header field.
-    ///
-    /// A path from the root toward the leaves of the tree consisting of a sequence
-    /// of one or more valid blocks consistent with consensus rules,
-    /// is called a valid block chain.
-    ///
-    /// In order to choose the best valid block chain in its view of the overall block tree,
-    /// a node sums the work ... of all blocks in each valid block chain,
-    /// and considers the valid block chain with greatest total work to be best.
-    ///
-    /// To break ties between leaf blocks, a node will prefer the block that it received first.
-    ///
-    /// The consensus protocol is designed to ensure that for any given block height,
-    /// the vast majority of nodes should eventually agree on their best valid block chain
-    /// up to that height."
-    ///
-    /// <https://zips.z.cash/protocol/protocol.pdf#blockchain>
+    /// See <https://zips.z.cash/protocol/protocol.pdf#blockchain>.
     ///
     /// # Correctness
     ///
-    /// `Chain::cmp` is used in a `BTreeSet`, so the fields accessed by `cmp` must not have
-    /// interior mutability.
-    ///
-    /// `cmp` returns [`Ordering::Equal`] only when both the cumulative work and
-    /// the tip hash match. The [`NonFinalizedState::chain_set`][2] is a
-    /// `BTreeSet<Arc<Chain>>`, so an attempt to insert a chain that compares
-    /// equal to an existing entry is a no-op rather than a process-fatal panic.
-    /// Callers that need to replace such a chain must remove the existing entry
-    /// first.
+    /// Ordering keys must not change while a chain is in the set. Forks and
+    /// reconsideration retain the original block's receipt order, and duplicate
+    /// deliveries must not replace the stored block with a new receipt.
     ///
     /// [1]: super::NonFinalizedState
-    /// [2]: super::NonFinalizedState::chain_set
     fn cmp(&self, other: &Self) -> Ordering {
-        let score = |chain: &Self| {
-            let tip = chain
-                .blocks
-                .values()
-                .last()
-                .expect("a non-finalized chain always contains a block")
-                .hash;
-            ChainScore::new(
-                SuffixWork::new(chain.partial_cumulative_work.as_u256()),
-                tip,
-            )
-        };
-        score(self).cmp(&score(other))
+        self.partial_cumulative_work
+            .cmp(&other.partial_cumulative_work)
+            .then_with(|| {
+                let self_tip = self
+                    .tip_block()
+                    .expect("non-finalized chains contain a block");
+                let other_tip = other
+                    .tip_block()
+                    .expect("non-finalized chains contain a block");
+                other_tip
+                    .receipt_order
+                    .cmp(&self_tip.receipt_order)
+                    .then_with(|| self_tip.hash.0.cmp(&other_tip.hash.0))
+            })
     }
 }
 
@@ -2688,7 +2655,7 @@ impl PartialOrd for Chain {
 
 impl PartialEq for Chain {
     /// Chain equality for [`NonFinalizedState::chain_set`][1], using proof of
-    /// work, then the tip block hash as a tie-breaker.
+    /// work, then the tip receipt order, then its hash.
     ///
     /// Two chains with the same cumulative work and tip hash are equal; the
     /// `chain_set` uses this to keep tip hashes unique.

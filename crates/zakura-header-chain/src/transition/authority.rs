@@ -42,6 +42,12 @@ pub trait FullStateEvidenceAuthority: Send + Sync {
     /// Return true only when the complete event is the writer's staged mutation.
     fn authorizes_full_state(&self, event: &TransitionEvent) -> bool;
 
+    /// Return the full state's selected tip for this exact staged operator event.
+    /// The planner still checks eligibility, verified ancestry, and greatest work.
+    fn verified_tip(&self, _event: &TransitionEvent) -> Option<crate::Frontier> {
+        None
+    }
+
     /// Return the header-engine version that the writer consumed to authorize this event.
     fn full_state_authorization_version(&self, _event: &TransitionEvent) -> Option<StateVersion> {
         None

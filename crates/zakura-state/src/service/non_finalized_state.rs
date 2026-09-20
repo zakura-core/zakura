@@ -151,6 +151,30 @@ impl Clone for NonFinalizedState {
 }
 
 impl NonFinalizedState {
+    /// Reconcile a trusted primary's complete fork set after its snapshot blocks arrive.
+    ///
+    /// Returns false without changing state if any tip is missing or the fork
+    /// limit is exceeded. Retained ancestors can become tips after invalidation.
+    pub fn reconcile_chain_tips(&mut self, tips: &[block::Hash]) -> bool {
+        if tips.len() > MAX_NON_FINALIZED_CHAIN_FORKS {
+            return false;
+        }
+        let mut chains = Vec::with_capacity(tips.len());
+        for tip in tips {
+            let Some(chain) = self.find_chain(|chain| chain.contains_block_hash(*tip)) else {
+                return false;
+            };
+            let Some(chain) = chain.fork(*tip) else {
+                return false;
+            };
+            chains.push(Arc::new(chain));
+        }
+        self.chain_set = chains.into_iter().collect();
+        self.update_metrics_for_chains();
+        self.update_metrics_bars();
+        true
+    }
+
     /// Returns a new non-finalized state for `network`.
     pub fn new(network: &Network) -> NonFinalizedState {
         NonFinalizedState {
@@ -322,7 +346,7 @@ impl NonFinalizedState {
     /// Finalize the lowest height block in the non-finalized portion of the best
     /// chain and update all side-chains to match.
     pub fn finalize(&mut self) -> FinalizableBlock {
-        // Chain::cmp uses the partial cumulative work, and the hash of the tip block.
+        // Chain::cmp uses the partial cumulative work, receipt order, and the hash of the tip block.
         // Neither of these fields has interior mutability.
         // (And when the tip block is dropped for a chain, the chain is also dropped.)
         #[allow(clippy::mutable_key_type)]
@@ -649,10 +673,17 @@ impl NonFinalizedState {
     fn validate_and_commit(
         &self,
         new_chain: Arc<Chain>,
-        prepared: SemanticallyVerifiedBlock,
+        mut prepared: SemanticallyVerifiedBlock,
         finalized_state: &ZakuraDb,
         contextual_metrics: ContextualMetrics,
     ) -> Result<Arc<Chain>, ValidateContextError> {
+        // Re-delivery cannot change the ordering key of a retained block.
+        if let Some(chain) = self.find_chain(|chain| chain.contains_block_hash(prepared.hash)) {
+            prepared.receipt_order = chain
+                .block(prepared.hash.into())
+                .expect("the selected chain contains this block")
+                .receipt_order;
+        }
         if self
             .invalidated_blocks
             .values()
@@ -887,7 +918,7 @@ impl NonFinalizedState {
     /// Returns the first chain satisfying the given predicate.
     ///
     /// If multiple chains satisfy the predicate, returns the chain with the highest difficulty.
-    /// (Using the tip block hash tie-breaker.)
+    /// (Using receipt order, then tip hash to break ties.)
     pub fn find_chain<P>(&self, mut predicate: P) -> Option<Arc<Chain>>
     where
         P: FnMut(&Chain) -> bool,

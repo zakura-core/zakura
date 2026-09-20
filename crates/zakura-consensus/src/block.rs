@@ -11,7 +11,10 @@ use std::{
     collections::HashSet,
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
 };
 
@@ -46,8 +49,21 @@ mod tests;
 /// Bounds the optional read that can prove an input missing at the block's parent.
 const PARENT_INPUT_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Bounds the wait for another request's pending commit of the same block.
-/// After this limit, the verifier reports the pending duplicate to the caller.
+// Shared by all verifier instances so retained blocks have one local order.
+static NEXT_RECEIPT_ORDER: AtomicU64 = AtomicU64::new(1);
+
+/// Reserves an order before verification can yield. Proposals do not claim priority.
+fn receipt_order_for(request: &Request) -> Option<u64> {
+    (!request.is_proposal()).then(|| {
+        NEXT_RECEIPT_ORDER
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |order| {
+                order.checked_add(1)
+            })
+            .expect("a process cannot receive u64::MAX blocks")
+    })
+}
+
+/// Bounds waiting for another request's pending commit of the same block.
 const PENDING_COMMIT_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Asynchronous semantic block verification.
@@ -340,6 +356,7 @@ where
     }
 
     fn call(&mut self, request: Request) -> Self::Future {
+        let receipt_order = receipt_order_for(&request);
         let mut state_service = self.state_service.clone();
         let mut transaction_verifier = self.transaction_verifier.clone();
         let network = self.network.clone();
@@ -454,6 +471,7 @@ where
                     prepared_block.block = block;
                     prepared_block.hash = hash;
                     prepared_block.height = height;
+                    prepared_block.receipt_order = receipt_order;
                     let admission = request.admission();
                     if source == PreparedCandidateSource::ServerTemplate {
                         if let Some(admission) = &admission {
@@ -695,6 +713,7 @@ where
                 transaction_hashes,
                 deferred_pool_balance_change: Some(deferred_pool_balance_change),
                 auth_data_root: None,
+                receipt_order,
             };
 
             // Return early for proposal requests.

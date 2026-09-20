@@ -94,7 +94,11 @@ pub(super) fn derive_finality_and_retention<'engine, 'ctx>(
     if work_rebased {
         metadata.work_origin = projected.graph().view_finalized_frontier();
     }
-    projected.refresh_verified_after_operator_change()?;
+    projected.refresh_verified_after_operator_change(
+        context
+            .full_state_authority
+            .and_then(|authority| authority.verified_tip(&event)),
+    )?;
 
     let (mut selected_tip, _) = projected.graph().view_select_best_header_chain()?;
     let full_state_finalized = match event {

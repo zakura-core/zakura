@@ -2524,3 +2524,87 @@ mod zip218_shielded_action_limits {
         })
     }
 }
+
+#[tokio::test]
+async fn receipt_order_precedes_polling_and_cached_mining_uses_solved_submission() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
+    let _init_guard = zakura_test::init();
+    for cache_hit in [false, true] {
+        let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+        let candidate = Arc::new(nu5_prepared_test_block(&network, None));
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let state = service_fn({
+            let received = received.clone();
+            move |request: zs::Request| {
+                let received = received.clone();
+                async move {
+                    let response = match request {
+                        zs::Request::KnownBlock(hash) => zs::Response::KnownBlock(
+                            (hash == block::Hash([0; 32])).then_some(zs::KnownBlock::Finalized),
+                        ),
+                        zs::Request::CheckBlockProposalValidity(block) => {
+                            assert!(block.receipt_order.is_none());
+                            zs::Response::ValidBlockProposal
+                        }
+                        zs::Request::CheckParentInputs { .. } => {
+                            zs::Response::ParentInputs(zs::ParentInputs::Inconclusive)
+                        }
+                        zs::Request::CommitSemanticallyVerifiedBlockWithAdmission {
+                            block, ..
+                        } => {
+                            received.lock().unwrap().push(
+                                block
+                                    .receipt_order
+                                    .expect("solved submissions have receipt order"),
+                            );
+                            zs::Response::Committed(block.hash)
+                        }
+                        _ => panic!("unexpected receipt-order test request: {request:?}"),
+                    };
+                    Ok::<_, BoxError>(response)
+                }
+            }
+        });
+        let transaction_calls = Arc::new(AtomicUsize::new(0));
+        let transaction = service_fn({
+            let calls = transaction_calls.clone();
+            move |request| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                async move { Ok::<_, BoxError>(accept_block_transaction(request)) }
+            }
+        });
+        let mut verifier = SemanticBlockVerifier::new(&network, state, transaction);
+        if cache_hit {
+            verifier
+                .call(Request::Prepare {
+                    block: candidate.clone(),
+                    work_id: Some("receipt-test".into()),
+                    source: PreparedCandidateSource::ClientProposal,
+                })
+                .await
+                .unwrap();
+        }
+        let request = || Request::CommitMined {
+            block: candidate.clone(),
+            work_id: Some("receipt-test".into()),
+            admission: zs::BlockAdmission::pending(),
+        };
+        let early = verifier.call(request());
+        let late = verifier.call(request());
+        late.await.unwrap();
+        early.await.unwrap();
+        let receipts = received.lock().unwrap();
+        assert_eq!(receipts.len(), 2);
+        assert!(
+            receipts[1] < receipts[0],
+            "polling order cannot replace receipt order"
+        );
+        assert_eq!(
+            transaction_calls.load(Ordering::Relaxed),
+            if cache_hit { 1 } else { 2 }
+        );
+    }
+}

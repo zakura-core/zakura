@@ -167,6 +167,8 @@ pub struct TrustedChainSync {
     /// The finalized-tip updater, retained so `sync()` can wait for any in-flight
     /// secondary database catch-up before committing a streamed block.
     finalized_tip_updater: Option<JoinHandle<()>>,
+    /// Receipt orders from distinct primary processes must never be compared.
+    receipt_session: Option<String>,
 }
 
 /// Signals the finalized-tip updater to stop, then waits for it to finish.
@@ -380,6 +382,7 @@ impl TrustedChainSync {
             non_finalized_state_sender,
             started_sync_sender,
             finalized_tip_updater: Some(finalized_tip_updater),
+            receipt_session: None,
         };
 
         let sync_task = tokio::spawn(async move {
@@ -455,6 +458,36 @@ impl TrustedChainSync {
                 }
             };
 
+            if let Some(snapshot) = message.chain_snapshot {
+                let tips = snapshot
+                    .hashes
+                    .into_iter()
+                    .map(|bytes| {
+                        bytes
+                            .try_into()
+                            .ok()
+                            .map(|bytes| block::Hash::from_bytes_in_display_order(&bytes))
+                    })
+                    .collect::<Option<Vec<_>>>();
+                if tips
+                    .as_ref()
+                    .is_none_or(|tips| !self.non_finalized_state.reconcile_chain_tips(tips))
+                {
+                    tracing::warn!(
+                        "incomplete non-finalized snapshot, requesting all primary forks"
+                    );
+                    self.non_finalized_state =
+                        NonFinalizedState::new(&self.non_finalized_state.network);
+                    non_finalized_blocks_listener = None;
+                    tokio::time::sleep(COMMIT_RETRY_DELAY).await;
+                } else {
+                    self.take_over_finalized_tip_updates().await;
+                    self.try_catch_up_with_primary().await;
+                    self.publish_current_state().await;
+                }
+                continue;
+            }
+            let receipt_order = message.receipt_order;
             let Some((block, hash)) = message.decode() else {
                 tracing::warn!("received malformed non-finalized state change message");
                 non_finalized_blocks_listener = None;
@@ -477,7 +510,8 @@ impl TrustedChainSync {
                 continue;
             }
 
-            let block = SemanticallyVerifiedBlock::with_hash(Arc::new(block), hash);
+            let mut block = SemanticallyVerifiedBlock::with_hash(Arc::new(block), hash);
+            block.receipt_order = receipt_order;
             match self.try_commit(block).await {
                 Ok(CommitOutcome::Committed) => {
                     last_failed_commit_hash = None;
@@ -674,9 +708,11 @@ impl TrustedChainSync {
                 .chain_iter()
                 .map(|c| c.non_finalized_tip_hash().bytes_in_display_order().to_vec())
                 .collect(),
+            receipt_session: self.receipt_session.clone(),
+            include_chain_snapshot: true,
         };
 
-        tokio::time::timeout(
+        let response = tokio::time::timeout(
             SUBSCRIBE_TIMEOUT,
             self.indexer_rpc_client
                 .clone()
@@ -685,8 +721,20 @@ impl TrustedChainSync {
         .await
         .map_err(|_| {
             Status::deadline_exceeded("non_finalized_state_change subscription timed out")
-        })?
-        .map(|a| a.into_inner())
+        })??;
+        let session = response
+            .metadata()
+            .get(crate::indexer::RECEIPT_SESSION_HEADER)
+            .map(|value| value.to_str().map(str::to_owned))
+            .transpose()
+            .map_err(|_| Status::internal("invalid receipt session"))?;
+        if session != self.receipt_session {
+            // The server sends a complete snapshot when the session changes,
+            // even if the request supplied tips from the previous process.
+            self.non_finalized_state = NonFinalizedState::new(&self.non_finalized_state.network);
+            self.receipt_session = session;
+        }
+        Ok(response.into_inner())
     }
 
     /// Catches up to the primary database, then prunes and publishes any blocks

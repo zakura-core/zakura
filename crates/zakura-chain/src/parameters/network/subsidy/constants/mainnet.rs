@@ -31,6 +31,11 @@ pub(crate) const NU6_1_LOCKBOX_DISBURSEMENTS: [(&str, Amount<NonNegative>); 10] 
 pub(crate) const EXPECTED_NU6_1_LOCKBOX_DISBURSEMENTS_TOTAL: Amount<NonNegative> =
     Amount::new_from_zec(78_750);
 
+/// The NSM reissuance start height on Mainnet.
+///
+/// TODO: set this once the NU7 deployment ZIP selects the Mainnet height.
+pub(crate) const NSM_REISSUANCE_HEIGHT: Option<Height> = None;
+
 /// `INITIAL_NSM_VALUE_BALANCE` on Mainnet: block subsidy and fees the coinbase
 /// transactions below NU6 never claimed, which seeds the NSM value balance at NU7.
 ///

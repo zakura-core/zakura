@@ -979,10 +979,9 @@ struct DTestnetParameters {
     /// If unset, the default activation height for the network is used; the soft fork
     /// cannot be disabled via configuration.
     temporary_orchard_disabling_soft_fork_height: Option<u32>,
-    /// Height at which ZIP 234 reissuance starts.
+    /// Height at which NSM reissuance starts on a custom network.
     ///
-    /// If unset, the ZIP 234 crossing rule sets it. Reissuance never starts below NU7
-    /// activation.
+    /// If unset, reissuance is not scheduled. Reissuance never starts below NU7 activation.
     nsm_reissuance_height: Option<u32>,
     /// The NSM value balance in zatoshi immediately before NU7 activates.
     ///

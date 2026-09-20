@@ -848,33 +848,64 @@ fn max_block_time_start_height_serialization_roundtrip() {
 
 #[test]
 fn nsm_reissuance_height_serialization_roundtrip() {
-    let _init_guard = zakura_test::init();
-    let start_height = Height(42);
-    let mut config = Config {
-        network: testnet::Parameters::build()
-            .with_nsm_reissuance_height(start_height)
-            .to_network()
-            .expect("failed to build configured network"),
-        initial_testnet_peers: [].into(),
-        ..Config::for_test(P2pStack::Dual)
+    use zakura_chain::parameters::{
+        subsidy::{is_zip234_active, nsm_reissuance_height},
+        testnet::{ConfiguredActivationHeights, RegtestParameters},
     };
-    config.zakura.apply_network_defaults(&config.network);
 
-    let serialized = toml::to_string(&config).expect("the custom network serializes");
-    assert!(
-        serialized.contains("nsm_reissuance_height = 42"),
-        "{serialized}"
-    );
-    let deserialized: Config =
-        toml::from_str(&serialized).expect("the custom network deserializes");
-    assert_eq!(config, deserialized);
-    let Network::Testnet(params) = &deserialized.network else {
-        panic!("the custom network deserializes as a testnet");
-    };
-    assert_eq!(
-        params.configured_nsm_reissuance_height(),
-        Some(start_height)
-    );
+    let _init_guard = zakura_test::init();
+    let mut activation_heights: ConfiguredActivationHeights = Network::new_default_testnet()
+        .parameters()
+        .expect("Testnet has parameters")
+        .activation_heights()
+        .into();
+    activation_heights.nu7 = Some(4_200_000);
+
+    for start in [None, Some(Height(4_200_010))] {
+        let mut builder = testnet::Parameters::build()
+            .with_activation_heights(activation_heights)
+            .expect("activation heights are valid");
+        if let Some(height) = start {
+            builder = builder.with_nsm_reissuance_height(height);
+        }
+        let testnet = builder.to_network().expect("configured testnet is valid");
+        let regtest = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu7: Some(10),
+                ..Default::default()
+            },
+            nsm_reissuance_height: start,
+            ..Default::default()
+        });
+
+        for network in [testnet, regtest] {
+            let mut config = Config {
+                network,
+                initial_testnet_peers: [].into(),
+                ..Config::for_test(P2pStack::Dual)
+            };
+            config.zakura.apply_network_defaults(&config.network);
+
+            let serialized = toml::to_string(&config).expect("the custom network serializes");
+            assert_eq!(
+                serialized.contains("nsm_reissuance_height"),
+                start.is_some()
+            );
+            let deserialized: Config =
+                toml::from_str(&serialized).expect("the custom network deserializes");
+            assert_eq!(config, deserialized);
+            assert_eq!(nsm_reissuance_height(&deserialized.network), start);
+            if let Some(height) = start {
+                assert!(!is_zip234_active(
+                    &deserialized.network,
+                    Height(height.0 - 1)
+                ));
+                assert!(is_zip234_active(&deserialized.network, height));
+            } else {
+                assert!(!is_zip234_active(&deserialized.network, Height::MAX));
+            }
+        }
+    }
 }
 
 /// With no `zakura_node_secret_key` and a writable identity directory, the

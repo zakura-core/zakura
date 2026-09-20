@@ -503,6 +503,113 @@ pub const BLOCK_SUBSIDY_FRACTION_NUMERATOR: u128 = 1_375;
 /// [halving-preserving NSM draft]: https://github.com/zcash/zips/blob/60720df9e971e19d8b6f67f1869426d78c96d250/zips/draft-judah-nsm-halving-preserving-issuance.md
 pub const BLOCK_SUBSIDY_FRACTION_DENOMINATOR: u128 = 10_000_000_000;
 
+/// The halving era whose internal NSM reference crossing determines the proposed
+/// reissuance start.
+#[allow(
+    dead_code,
+    reason = "the calculator derives future deployment constants without activating them"
+)]
+const NSM_REISSUANCE_START_HALVING: u32 = 3;
+
+/// Calculates the proposed NSM reissuance crossing on `network`'s actual spacing
+/// schedule, without activating reissuance.
+///
+/// The crossing is the first height after the third halving where the reference
+/// NSM subsidy, assuming no funds were removed from circulation, is less than the
+/// scheduled block subsidy. ZIP 218's 25-second spacing, its effect on halving
+/// heights, and per-block subsidy rounding are included through `network`.
+///
+/// Searches through [`Height::MAX`] if the fourth halving is beyond the supported
+/// height range. Returns `None` when NU7 is not configured or the third halving era
+/// has no crossing within the supported heights.
+#[allow(
+    dead_code,
+    reason = "the calculator derives future deployment constants without activating them"
+)]
+pub(crate) fn nsm_reissuance_crossing_height(
+    network: &Network,
+) -> Result<Option<Height>, SubsidyError> {
+    let Some(nu7) = NetworkUpgrade::Nu7.activation_height(network) else {
+        return Ok(None);
+    };
+    let Some(third_halving) = height_for_halving(NSM_REISSUANCE_START_HALVING, network) else {
+        return Ok(None);
+    };
+    let run_end = match height_for_halving(NSM_REISSUANCE_START_HALVING + 1, network) {
+        Some(fourth_halving) => fourth_halving
+            .previous()
+            .map_err(|_| SubsidyError::UnsupportedHeight)?,
+        None => Height::MAX,
+    };
+
+    let first_candidate = Height(
+        third_halving
+            .0
+            .checked_add(1)
+            .ok_or(SubsidyError::Overflow)?,
+    )
+    .max(nu7);
+    if first_candidate > run_end {
+        return Ok(None);
+    }
+
+    let parent = first_candidate
+        .previous()
+        .map_err(|_| SubsidyError::UnsupportedHeight)?;
+    let supply_before_first = scheduled_issuance_zatoshis(parent, network)?;
+    let subsidy = amount_to_u128(halving_block_subsidy(first_candidate, network)?);
+    let max_money = u128::try_from(MAX_MONEY).map_err(|_| SubsidyError::Overflow)?;
+
+    Ok(first_nsm_crossing_in_subsidy_run(
+        first_candidate.0,
+        run_end.0,
+        supply_before_first,
+        subsidy,
+        max_money,
+    )?
+    .map(Height))
+}
+
+/// Returns the first reference NSM crossing in a constant-subsidy run.
+///
+/// `supply_before_first` is the scheduled supply after the parent of `first`.
+#[allow(
+    dead_code,
+    reason = "the calculator derives future deployment constants without activating them"
+)]
+pub(super) fn first_nsm_crossing_in_subsidy_run(
+    first: u32,
+    run_end: u32,
+    supply_before_first: u128,
+    subsidy: u128,
+    max_money: u128,
+) -> Result<Option<u32>, SubsidyError> {
+    if first > run_end || subsidy == 0 {
+        return Ok(None);
+    }
+
+    // `ceil(fraction * reserve) < subsidy` exactly when the reserve is at most
+    // this threshold. Subtracting one implements the strict inequality.
+    let max_reserve = subsidy
+        .checked_sub(1)
+        .and_then(|subsidy| subsidy.checked_mul(BLOCK_SUBSIDY_FRACTION_DENOMINATOR))
+        .ok_or(SubsidyError::Overflow)?
+        / BLOCK_SUBSIDY_FRACTION_NUMERATOR;
+    let reserve = max_money.saturating_sub(supply_before_first);
+    let blocks_until_crossing = reserve.saturating_sub(max_reserve).div_ceil(subsidy);
+    let crossing = u128::from(first)
+        .checked_add(blocks_until_crossing)
+        .ok_or(SubsidyError::Overflow)?;
+
+    if crossing > u128::from(run_end) {
+        Ok(None)
+    } else {
+        Ok(Some(
+            u32::try_from(crossing).map_err(|_| SubsidyError::Overflow)?,
+        ))
+    }
+}
+
 /// Returns the NSM reissuance start height on `network`, or `None` if it is not scheduled.
 ///
 /// Mainnet and default Testnet use constants that remain unset until the NU7 deployment

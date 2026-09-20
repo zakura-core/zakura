@@ -767,6 +767,245 @@ fn nsm_reissuance_height_respects_nu7() {
     }
 }
 
+/// The direct crossing uses the spacing-aware halving and scheduled-supply rules.
+#[test]
+fn nsm_reissuance_crossing_uses_the_post_nu7_schedule() {
+    use crate::{
+        amount::MAX_MONEY,
+        parameters::subsidy::{
+            halving_block_subsidy, nsm_reissuance_crossing_height, scheduled_issuance_zatoshis,
+            BLOCK_SUBSIDY_FRACTION_DENOMINATOR, BLOCK_SUBSIDY_FRACTION_NUMERATOR,
+        },
+    };
+
+    let _init_guard = zakura_test::init();
+    let reference_subsidy = |height: Height, network: &Network| {
+        let parent = height
+            .previous()
+            .expect("crossings after the third halving have parents");
+        let supply =
+            scheduled_issuance_zatoshis(parent, network).expect("scheduled supply is valid");
+        let reserve = u128::try_from(MAX_MONEY)
+            .expect("MAX_MONEY is positive")
+            .saturating_sub(supply);
+
+        reserve
+            .checked_mul(BLOCK_SUBSIDY_FRACTION_NUMERATOR)
+            .expect("the reference subsidy product fits in u128")
+            .div_ceil(BLOCK_SUBSIDY_FRACTION_DENOMINATOR)
+    };
+
+    let mut boundaries = Vec::new();
+    for nu7 in [4_200_000, 4_400_000, 4_600_000] {
+        let network = testnet_with_nu7(Some(nu7))
+            .to_network()
+            .expect("configured testnet is valid");
+        let crossing = nsm_reissuance_crossing_height(&network)
+            .expect("crossing arithmetic is valid")
+            .expect("the default Testnet schedule has a crossing");
+        let previous = crossing.previous().expect("the crossing is above genesis");
+        let scheduled = |height| {
+            u128::try_from(i64::from(
+                halving_block_subsidy(height, &network).expect("scheduled subsidy is valid"),
+            ))
+            .expect("scheduled subsidies are non-negative")
+        };
+
+        assert_eq!(halving(crossing, &network), 3);
+        assert!(
+            reference_subsidy(previous, &network) >= scheduled(previous),
+            "the height before the crossing must not satisfy the strict inequality"
+        );
+        assert!(
+            reference_subsidy(crossing, &network) < scheduled(crossing),
+            "the crossing must satisfy the strict inequality"
+        );
+
+        boundaries.push((
+            height_for_halving(3, &network).expect("the third halving has a height"),
+            crossing,
+        ));
+    }
+
+    for pair in boundaries.windows(2) {
+        assert!(
+            pair[0].0 > pair[1].0,
+            "a later NU7 height leaves fewer 25-second blocks before the third halving"
+        );
+        assert!(
+            pair[0].1 > pair[1].1,
+            "a later NU7 height leaves fewer 25-second blocks before the crossing"
+        );
+    }
+}
+
+/// The proposed Mainnet schedule places the direct crossing in February 2031.
+///
+/// The NU7 height and timestamp are the estimates from the 2026-09-17 NU7 timeline,
+/// not consensus constants. This test checks the calendar interpretation of the
+/// spacing-aware equation without activating reissuance.
+#[test]
+fn estimated_mainnet_nsm_crossing_lands_in_february_2031() {
+    use chrono::{Datelike, Duration, TimeZone, Utc};
+
+    use crate::parameters::{
+        constants::activation_heights::mainnet, subsidy::nsm_reissuance_crossing_height,
+    };
+
+    const ESTIMATED_NU7_HEIGHT: u32 = 3_543_000;
+
+    let _init_guard = zakura_test::init();
+    let network = testnet::Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            before_overwinter: Some(mainnet::BEFORE_OVERWINTER.0),
+            overwinter: Some(mainnet::OVERWINTER.0),
+            sapling: Some(mainnet::SAPLING.0),
+            blossom: Some(mainnet::BLOSSOM.0),
+            heartwood: Some(mainnet::HEARTWOOD.0),
+            canopy: Some(mainnet::CANOPY.0),
+            nu5: Some(mainnet::NU5.0),
+            nu6: Some(mainnet::NU6.0),
+            nu6_1: Some(mainnet::NU6_1.0),
+            nu6_2: Some(mainnet::NU6_2.0),
+            nu6_3: Some(mainnet::NU6_3.0),
+            nu7: Some(ESTIMATED_NU7_HEIGHT),
+        })
+        .expect("the estimated Mainnet activation schedule is ordered")
+        .clear_funding_streams()
+        .to_network()
+        .expect("the Mainnet subsidy schedule is valid");
+
+    assert_eq!(
+        height_for_halving(2, &network),
+        Some(mainnet::NU6),
+        "the configured network reproduces Mainnet's second halving"
+    );
+
+    let crossing = nsm_reissuance_crossing_height(&network)
+        .expect("crossing arithmetic is valid")
+        .expect("the estimated Mainnet schedule has a crossing");
+    assert_eq!(crossing, Height(8_940_474));
+
+    let estimated_nu7_time = Utc
+        .with_ymd_and_hms(2026, 11, 5, 12, 0, 0)
+        .single()
+        .expect("the estimated NU7 timestamp is valid");
+    let post_nu7_blocks = i64::from(crossing.0 - ESTIMATED_NU7_HEIGHT);
+    let crossing_time = estimated_nu7_time
+        + Duration::seconds(post_nu7_blocks * NetworkUpgrade::Nu7.target_spacing().num_seconds());
+
+    assert_eq!(
+        (crossing_time.year(), crossing_time.month()),
+        (2031, 2),
+        "estimated crossing time: {crossing_time}"
+    );
+}
+
+/// A third halving era can extend to the maximum supported height without a fourth halving.
+#[test]
+fn nsm_reissuance_crossing_without_a_fourth_halving() {
+    use crate::parameters::subsidy::nsm_reissuance_crossing_height;
+
+    let _init_guard = zakura_test::init();
+    for (interval, expected_third, expected_crossing) in [
+        (
+            100_000_000,
+            Some(Height(1_799_999_995)),
+            Some(Height(1_799_999_996)),
+        ),
+        (200_000_000, None, None),
+    ] {
+        let network = testnet::Parameters::build()
+            .with_slow_start_interval(Height(0))
+            .with_halving_interval(interval)
+            .expect("the positive halving interval fits in target seconds")
+            .with_activation_heights(ConfiguredActivationHeights {
+                blossom: Some(1),
+                canopy: Some(1),
+                nu7: Some(1),
+                ..Default::default()
+            })
+            .expect("the simultaneous activation heights are ordered")
+            .clear_funding_streams()
+            .to_network()
+            .expect("the custom schedule is valid");
+
+        assert_eq!(height_for_halving(3, &network), expected_third);
+        assert_eq!(height_for_halving(4, &network), None);
+        assert_eq!(
+            nsm_reissuance_crossing_height(&network).expect("crossing arithmetic is valid"),
+            expected_crossing,
+            "a missing fourth halving must not suppress a crossing within the supported heights"
+        );
+    }
+}
+
+/// Networks without NU7 or without enough scheduled issuance have no direct crossing.
+#[test]
+fn nsm_reissuance_crossing_can_be_absent() {
+    use crate::parameters::subsidy::nsm_reissuance_crossing_height;
+
+    let _init_guard = zakura_test::init();
+    assert_eq!(
+        nsm_reissuance_crossing_height(&Network::Mainnet).expect("valid arithmetic"),
+        None,
+        "Mainnet has no NU7 height yet"
+    );
+
+    let regtest = Network::new_regtest(
+        ConfiguredActivationHeights {
+            nu7: Some(1),
+            ..Default::default()
+        }
+        .into(),
+    );
+    assert_eq!(
+        nsm_reissuance_crossing_height(&regtest).expect("valid arithmetic"),
+        None,
+        "Regtest's short schedule does not drain enough reserve during the third halving"
+    );
+}
+
+proptest::proptest! {
+    /// The closed-form constant-subsidy search agrees with a block-by-block oracle.
+    #[test]
+    fn nsm_crossing_run_matches_linear_oracle(
+        first in 1u32..10_000,
+        run_length in 0u32..100,
+        supply_before_first in 0u128..1_000_000,
+        subsidy in 1u128..1_000_000,
+        excess_reserve in 0u128..100_000_000,
+    ) {
+        use crate::parameters::subsidy::{
+            first_nsm_crossing_in_subsidy_run, BLOCK_SUBSIDY_FRACTION_DENOMINATOR,
+            BLOCK_SUBSIDY_FRACTION_NUMERATOR,
+        };
+
+        let run_end = first + run_length;
+        let threshold = (subsidy - 1) * BLOCK_SUBSIDY_FRACTION_DENOMINATOR
+            / BLOCK_SUBSIDY_FRACTION_NUMERATOR;
+        let max_money = supply_before_first + threshold + excess_reserve;
+        let expected = (first..=run_end).find(|height| {
+            let issued_in_run = u128::from(*height - first) * subsidy;
+            let reserve = max_money.saturating_sub(supply_before_first + issued_in_run);
+            let reference_subsidy = (reserve * BLOCK_SUBSIDY_FRACTION_NUMERATOR)
+                .div_ceil(BLOCK_SUBSIDY_FRACTION_DENOMINATOR);
+
+            reference_subsidy < subsidy
+        });
+        let actual = first_nsm_crossing_in_subsidy_run(
+            first,
+            run_end,
+            supply_before_first,
+            subsidy,
+            max_money,
+        )
+        .expect("generated arithmetic fits");
+
+        proptest::prop_assert_eq!(actual, expected);
+    }
+}
+
 /// Checks the closed-form cumulative halving subsidy against a per-height sum across
 /// halvings and the NU7 spacing change.
 #[test]

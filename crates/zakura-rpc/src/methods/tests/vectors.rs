@@ -3292,7 +3292,12 @@ async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
                 assert_eq!(response.total_block_subsidy(), Zec::from(expected_subsidy));
                 assert_eq!(response.miner(), Zec::from(expected_subsidy));
             } else {
-                response.expect_err("a negative balance is an error");
+                let error = response.expect_err("a negative balance is an error");
+                assert_eq!(error.code(), -1);
+                assert!(
+                    error.message().contains("NSM value balance is negative"),
+                    "{error}"
+                );
             }
         }
 
@@ -3408,7 +3413,12 @@ async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
             );
 
             if !succeeds {
-                response.expect_err("a negative balance is an error");
+                let error = response.expect_err("a negative balance is an error");
+                assert_eq!(error.code(), -1);
+                assert!(
+                    error.message().contains("NSM value balance is negative"),
+                    "{error}"
+                );
                 continue;
             }
 

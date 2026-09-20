@@ -63,3 +63,5 @@ block encodings and the P2P header protocol are unchanged.
 The generated Rust request and response structs gain fields, which breaks
 exhaustive struct literals in library consumers. The RPC crate therefore advances
 to the next major version even though the wire extension is additive.
+The header-chain crate also advances to the next major version because its
+public operator-error enum gains a variant.

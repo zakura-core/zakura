@@ -294,6 +294,40 @@ fn normal_template_construction_leaves_runtime_responsive() {
 }
 
 #[test]
+fn precomputed_template_does_not_wait_for_proof_capacity() {
+    mining_runtime(async {
+        let chain = chain_info(1, 1, 0);
+        let (_, info) = watch::channel(chain.clone());
+        let (rpc, _, _) = mining_rpc(info);
+        let params = rpc.gbt.miner_params().unwrap();
+        let coinbase =
+            TransactionTemplate::new_coinbase(&network(), Height(2), params, Amount::zero(), None)
+                .unwrap();
+        let expected_coinbase = coinbase.data.clone();
+        let gate = BlockingPoolGate::new().await;
+        let handler = rpc.gbt.clone();
+        let mut proof = Box::pin(handler.run_template_build(|| ()));
+        assert!(futures::poll!(&mut proof).is_pending());
+
+        let mut template = Box::pin(rpc.build_mining_template(
+            Some(coinbase),
+            params,
+            &chain,
+            template_id(&chain),
+            vec![],
+            Some(false),
+        ));
+        let Poll::Ready(Ok(template)) = futures::poll!(&mut template) else {
+            panic!("a precomputed coinbase must not wait behind proof construction");
+        };
+        assert_eq!(template.coinbase_txn.data, expected_coinbase);
+        assert_eq!(template.previous_block_hash, chain.tip_hash);
+        gate.release().await;
+        bounded(proof).await.unwrap();
+    });
+}
+
+#[test]
 fn template_build_paths_retain_capacity_when_cancelled() {
     mining_runtime(async {
         for path in ["normal", "precompute", "tip change", "recovery"] {
@@ -498,12 +532,17 @@ fn long_poll_builds_on_new_parent_without_blocking_runtime() {
             info_tx.send_replace(next.clone());
             tip.send_best_tip_height(next.tip_height);
             tip.send_best_tip_hash(next.tip_hash);
-            assert!(
-                futures::poll!(&mut request).is_pending(),
-                "tip-change construction must yield to the blocking pool"
-            );
+            let response = match futures::poll!(&mut request) {
+                Poll::Ready(response) if (old_height, new_height) == (0, 1) => Some(response),
+                Poll::Pending if (old_height, new_height) != (0, 1) => None,
+                _ => panic!("only a matching precomputed coinbase can bypass the blocking pool"),
+            };
             gate.release().await;
-            let template = bounded(request).await.unwrap().try_into_template().unwrap();
+            let response = match response {
+                Some(response) => response,
+                None => bounded(request).await,
+            };
+            let template = response.unwrap().try_into_template().unwrap();
             assert_eq!(template.previous_block_hash, next.tip_hash);
             assert_eq!(template.height, new_height + 1);
             assert_reward(&template, 400_000_000);

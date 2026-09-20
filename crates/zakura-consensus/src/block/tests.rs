@@ -1840,7 +1840,7 @@ async fn zip234_block_verification_checks_the_reissuance_bonus() {
         };
 
     // Exercise zero, single-zatoshi rounding, a rounding boundary, and a larger deficit.
-    let numerator = 1_375;
+    let numerator = 1_375i128;
     // The largest deficit that still rounds up to a one-zatoshi bonus.
     let boundary = i64::try_from(10_000_000_000 / numerator).expect("the boundary fits in i64");
     for deficit in [0i64, 1, 2, boundary, boundary + 1, ZIP234_TEST_DEFICIT] {

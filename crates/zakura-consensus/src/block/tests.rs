@@ -1753,25 +1753,16 @@ fn state_commit_context_errors_keep_misbehavior_scores() {
 /// A balance that pays a nonzero ZIP 234 bonus.
 const ZIP234_TEST_DEFICIT: i64 = 400_000_000;
 
-/// Restates ZIP 234's `ceil(balance * BLOCK_SUBSIDY_FRACTION)` at `height` on `network`
-/// independently of `block_subsidy`.
-fn zip234_bonus(network: &Network, height: Height, balance: i64) -> i64 {
-    use zakura_chain::parameters::subsidy::{
-        block_subsidy_fraction_numerator, BLOCK_SUBSIDY_FRACTION_DENOMINATOR,
-    };
-
-    let numerator = i128::try_from(block_subsidy_fraction_numerator(height, network))
-        .expect("the fraction numerator fits in i128");
-    let denominator = i128::try_from(BLOCK_SUBSIDY_FRACTION_DENOMINATOR)
-        .expect("the fraction denominator fits in i128");
-    let bonus = (i128::from(balance) * numerator + denominator - 1) / denominator;
+/// Restates the fixed NU7 ceiling payout independently of `block_subsidy`.
+fn zip234_bonus(balance: i64) -> i64 {
+    let bonus = (i128::from(balance) * 1_375 + 9_999_999_999) / 10_000_000_000;
 
     i64::try_from(bonus).expect("the bonus fits in i64")
 }
 
-/// `ceil(ZIP234_TEST_DEFICIT * BLOCK_SUBSIDY_FRACTION)` at `height` on `network`.
-fn zip234_test_bonus(network: &Network, height: Height) -> i64 {
-    zip234_bonus(network, height, ZIP234_TEST_DEFICIT)
+/// The fixed NU7 ceiling payout for [`ZIP234_TEST_DEFICIT`].
+fn zip234_test_bonus() -> i64 {
+    zip234_bonus(ZIP234_TEST_DEFICIT)
 }
 
 /// Returns the chain value pools after `parent` on `network`, `balance` zatoshi behind the
@@ -1814,7 +1805,7 @@ async fn zip234_block_verification_checks_the_reissuance_bonus() {
     let parent = start.previous().expect("the start is above genesis");
     let halving_subsidy = halving_block_subsidy(start, &network).expect("valid halving subsidy");
     let with_bonus = (halving_subsidy
-        + Amount::try_from(zip234_test_bonus(&network, start)).expect("valid bonus"))
+        + Amount::try_from(zip234_test_bonus()).expect("valid bonus"))
     .expect("valid subsidy");
 
     let verify =
@@ -1849,14 +1840,11 @@ async fn zip234_block_verification_checks_the_reissuance_bonus() {
         };
 
     // Exercise zero, single-zatoshi rounding, a rounding boundary, and a larger deficit.
-    let numerator = i128::try_from(
-        zakura_chain::parameters::subsidy::block_subsidy_fraction_numerator(start, &network),
-    )
-    .expect("the fraction numerator fits in i128");
+    let numerator = 1_375;
     // The largest deficit that still rounds up to a one-zatoshi bonus.
     let boundary = i64::try_from(10_000_000_000 / numerator).expect("the boundary fits in i64");
     for deficit in [0i64, 1, 2, boundary, boundary + 1, ZIP234_TEST_DEFICIT] {
-        let bonus = zip234_bonus(&network, start, deficit);
+        let bonus = zip234_bonus(deficit);
         let allowed = (halving_subsidy + Amount::try_from(bonus).unwrap()).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(10), verify(deficit, allowed))
             .await
@@ -1934,7 +1922,7 @@ async fn zip234_proposal_with_committed_parent_checks_the_bonus_without_waiting(
     let parent_pools =
         zip234_parent_pools(&network, start.previous().unwrap(), ZIP234_TEST_DEFICIT);
     let subsidy = (halving_block_subsidy(start, &network).unwrap()
-        + Amount::try_from(zip234_test_bonus(&network, start)).unwrap())
+        + Amount::try_from(zip234_test_bonus()).unwrap())
     .unwrap();
     for excess in [0, 1] {
         let claim = (subsidy + Amount::try_from(excess).unwrap()).unwrap();

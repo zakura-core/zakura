@@ -1349,7 +1349,20 @@ fn trusted_snapshot_reconciles_known_forks_without_changing_receipts() {
     assert_eq!(state.best_tip().unwrap().1, a.hash());
     assert!(!state.reconcile_chain_tips(&[block::Hash([0xff; 32])]));
     assert_eq!(state.chain_set.len(), 2);
+    let original_chains: Vec<_> = state.chain_iter().cloned().collect();
+    for tips in [[a.hash(), b.hash()], [b.hash(), a.hash()]] {
+        assert!(state.reconcile_chain_tips(&tips));
+        assert!(state
+            .chain_iter()
+            .zip(&original_chains)
+            .all(|(after, before)| Arc::ptr_eq(after, before)));
+    }
+    let original_b = original_chains
+        .iter()
+        .find(|chain| chain.non_finalized_tip_hash() == b.hash())
+        .unwrap();
     assert!(state.reconcile_chain_tips(&[b.hash()]));
+    assert!(Arc::ptr_eq(state.best_chain().unwrap(), original_b));
     assert_eq!(state.best_tip().unwrap().1, b.hash());
     assert_eq!(
         state

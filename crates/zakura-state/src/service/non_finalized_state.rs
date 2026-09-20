@@ -159,8 +159,19 @@ impl NonFinalizedState {
         if tips.len() > MAX_NON_FINALIZED_CHAIN_FORKS {
             return false;
         }
+        if tips.len() == self.chain_set.len()
+            && self
+                .chain_iter()
+                .all(|chain| tips.contains(&chain.non_finalized_tip_hash()))
+        {
+            return true;
+        }
         let mut chains = Vec::with_capacity(tips.len());
         for tip in tips {
+            if let Some(chain) = self.find_chain(|chain| chain.non_finalized_tip_hash() == *tip) {
+                chains.push(chain);
+                continue;
+            }
             let Some(chain) = self.find_chain(|chain| chain.contains_block_hash(*tip)) else {
                 return false;
             };

@@ -469,10 +469,11 @@ impl TrustedChainSync {
                             .map(|bytes| block::Hash::from_bytes_in_display_order(&bytes))
                     })
                     .collect::<Option<Vec<_>>>();
-                if tips
-                    .as_ref()
-                    .is_none_or(|tips| !self.non_finalized_state.reconcile_chain_tips(tips))
-                {
+                let reconciled = match tips {
+                    Some(tips) => self.reconcile_chain_snapshot(&tips).await,
+                    None => false,
+                };
+                if !reconciled {
                     tracing::warn!(
                         "incomplete non-finalized snapshot, requesting all primary forks"
                     );
@@ -480,10 +481,6 @@ impl TrustedChainSync {
                         NonFinalizedState::new(&self.non_finalized_state.network);
                     non_finalized_blocks_listener = None;
                     tokio::time::sleep(COMMIT_RETRY_DELAY).await;
-                } else {
-                    self.take_over_finalized_tip_updates().await;
-                    self.try_catch_up_with_primary().await;
-                    self.publish_current_state().await;
                 }
                 continue;
             }
@@ -539,6 +536,19 @@ impl TrustedChainSync {
                 }
             };
         }
+    }
+
+    /// Reconcile retained forks without taking finalized updates away from the
+    /// checkpoint sync task. Only a real block can initiate that handoff.
+    async fn reconcile_chain_snapshot(&mut self, tips: &[block::Hash]) -> bool {
+        if !self.non_finalized_state.reconcile_chain_tips(tips) {
+            return false;
+        }
+        if self.finalized_tip_updater.is_none() {
+            self.try_catch_up_with_primary().await;
+            self.publish_current_state().await;
+        }
+        true
     }
 
     async fn try_commit(
@@ -879,6 +889,74 @@ mod tests {
         assert!(block_height_is_finalized(Some(finalized_tip), Height(9)));
         assert!(block_height_is_finalized(Some(finalized_tip), Height(10)));
         assert!(!block_height_is_finalized(Some(finalized_tip), Height(11)));
+    }
+
+    #[tokio::test]
+    async fn empty_snapshots_keep_finalized_updates_alive_until_a_block_arrives() {
+        use zakura_chain::{chain_tip::ChainTip, serialization::ZcashDeserializeInto};
+
+        let _init_guard = zakura_test::init();
+        let network = Network::Mainnet;
+        let finalized =
+            zakura_state::FinalizedState::new(&zakura_state::Config::ephemeral(), &network)
+                .unwrap();
+        let (tip_sender, tip, mut tip_change) = ChainTipSender::new(None, &network);
+        let mut finalized_sender = tip_sender.finalized_sender();
+        let (started, mut started_receiver) = tokio::sync::watch::channel(false);
+        let (advance, mut advances) = tokio::sync::mpsc::channel::<ChainTipBlock>(1);
+        let updater = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = started_receiver.changed() => return,
+                    next = advances.recv() => {
+                        let Some(next) = next else { return };
+                        finalized_sender.set_finalized_tip(next);
+                    }
+                }
+            }
+        });
+        let state = NonFinalizedState::new(&network);
+        let (state_sender, mut state_receiver) = tokio::sync::watch::channel(state.clone());
+        let mut syncer = TrustedChainSync {
+            indexer_rpc_client: IndexerClient::new(
+                Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+            ),
+            db: finalized.db.clone(),
+            non_finalized_state: state,
+            chain_tip_sender: tip_sender,
+            non_finalized_state_sender: state_sender,
+            started_sync_sender: started.clone(),
+            finalized_tip_updater: Some(updater),
+            receipt_session: None,
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for bytes in [
+                &zakura_test::vectors::BLOCK_MAINNET_1_BYTES[..],
+                &zakura_test::vectors::BLOCK_MAINNET_2_BYTES[..],
+            ] {
+                assert!(syncer.reconcile_chain_snapshot(&[]).await);
+                assert!(!*started.borrow());
+                assert!(!state_receiver.has_changed().unwrap());
+                let block: Arc<Block> = bytes.zcash_deserialize_into().unwrap();
+                let hash = block.hash();
+                advance
+                    .send(CheckpointVerifiedBlock::from(block).into())
+                    .await
+                    .unwrap();
+                tip_change.wait_for_tip_change().await.unwrap();
+                assert_eq!(tip.best_tip_hash(), Some(hash));
+            }
+
+            syncer.take_over_finalized_tip_updates().await;
+            assert!(*started.borrow());
+            assert!(syncer.reconcile_chain_snapshot(&[]).await);
+            state_receiver.changed().await.unwrap();
+            assert!(state_receiver.borrow().is_chain_set_empty());
+        })
+        .await
+        .expect("snapshot handoff should not stall finalized updates");
     }
 
     #[tokio::test]

@@ -46,6 +46,8 @@ message after each batch of blocks. Its complete retained tip set covers changes
 to already-known blocks, including invalidation and reconsideration. Snapshot
 messages contain no block data. Missing tips cause a complete resubscription.
 An empty tip set clears the mirror's non-finalized state.
+An initial empty snapshot leaves finalized-tip tracking active during checkpoint
+sync. The first real block transfers that responsibility to the block syncer.
 
 These fields are additive. Servers send snapshot messages only to clients that
 request them. Older servers omit receipt metadata and retain their hash-based

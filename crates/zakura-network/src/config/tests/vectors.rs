@@ -129,6 +129,41 @@ async fn empty_peer_cache_update_preserves_existing_cache() {
 }
 
 #[test]
+fn configured_nsm_seed_is_preserved_and_controls_public_peer_compatibility() {
+    use zakura_chain::parameters::subsidy::ParameterSubsidy;
+
+    let public_seed = i64::from(Network::new_default_testnet().initial_nsm_value_balance());
+    for seed in [None, Some(0), Some(1), Some(public_seed)] {
+        for public_peers in [false, true] {
+            let peers = if public_peers {
+                ""
+            } else {
+                "initial_testnet_peers = []\n"
+            };
+            let seed_field = seed
+                .map(|seed| format!("initial_nsm_value_balance = {seed}\n"))
+                .unwrap_or_default();
+            let config = format!("network = 'Testnet'\n{peers}[testnet_parameters]\ncheckpoints = true\n{seed_field}");
+            let parsed = toml::from_str::<Config>(&config);
+            if public_peers && seed.is_some_and(|seed| seed != public_seed) {
+                assert!(
+                    parsed.is_err(),
+                    "a different seed changes consensus: {config}"
+                );
+                continue;
+            }
+            let parsed = parsed.unwrap_or_else(|error| panic!("{config}: {error}"));
+            assert_eq!(
+                i64::from(parsed.network.initial_nsm_value_balance()),
+                seed.unwrap_or(public_seed)
+            );
+            let roundtrip: Config = toml::from_str(&toml::to_string(&parsed).unwrap()).unwrap();
+            assert_eq!(parsed.network, roundtrip.network);
+        }
+    }
+}
+
+#[test]
 fn testnet_params_serialization_roundtrip() {
     let _init_guard = zakura_test::init();
 

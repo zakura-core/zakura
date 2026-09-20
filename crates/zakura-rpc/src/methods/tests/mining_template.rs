@@ -30,7 +30,13 @@ enum Interleaving {
     StalePreparation,
     ConcurrentParentChange,
     StaleParentSelection,
-    StaleFallback { success: bool, notice_lags: bool },
+    StaleFallback {
+        success: bool,
+        notice_lags: bool,
+    },
+    FallbackDeadline {
+        validation_fails_after: Option<Duration>,
+    },
     FastPathFallback,
 }
 
@@ -94,6 +100,22 @@ async fn mining_template_retries_stale_fallback_before_tip_notice() {
 #[tokio::test]
 async fn mining_template_tip_wakeup_retries_stale_fallback() {
     check_interleaving(Interleaving::FastPathFallback).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn mining_template_fallback_timeout_includes_tip_check() {
+    check_interleaving(Interleaving::FallbackDeadline {
+        validation_fails_after: None,
+    })
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn mining_template_fallback_error_leaves_only_remaining_time_for_tip_check() {
+    check_interleaving(Interleaving::FallbackDeadline {
+        validation_fails_after: Some(Duration::from_secs(20)),
+    })
+    .await;
 }
 
 async fn check_interleaving(interleaving: Interleaving) {
@@ -275,11 +297,10 @@ async fn check_interleaving(interleaving: Interleaving) {
         return;
     }
 
-    if let Interleaving::StaleFallback {
-        success,
-        notice_lags,
-    } = interleaving
-    {
+    if matches!(
+        interleaving,
+        Interleaving::StaleFallback { .. } | Interleaving::FallbackDeadline { .. }
+    ) {
         preparation
             .take()
             .unwrap()
@@ -309,6 +330,42 @@ async fn check_interleaving(interleaving: Interleaving) {
                 matches!(request, zakura_consensus::Request::Prepare { .. })
             })
             .await;
+        if let Interleaving::FallbackDeadline {
+            validation_fails_after,
+        } = interleaving
+        {
+            let started = tokio::time::Instant::now();
+            let mut fallback = Some(fallback);
+            let stalled_tip = if let Some(delay) = validation_fails_after {
+                tokio::time::advance(delay).await;
+                fallback
+                    .take()
+                    .unwrap()
+                    .respond_error("fallback validation failed".into());
+                Some(read_state.expect_request(ReadRequest::Tip).await)
+            } else {
+                None
+            };
+            // Leave validation or the tip read pending. Neither can extend recovery's deadline.
+            let error = tokio::time::timeout_at(started + Duration::from_secs(31), pending)
+                .await
+                .expect("fallback recovery must finish within its original 30-second budget")
+                .unwrap()
+                .expect_err("stalled recovery must return an error");
+            assert!(error.message().contains("deadline has elapsed"));
+            assert_eq!(started.elapsed(), Duration::from_secs(30));
+            drop(fallback);
+            drop(stalled_tip);
+            queue.abort();
+            return;
+        }
+        let Interleaving::StaleFallback {
+            success,
+            notice_lags,
+        } = interleaving
+        else {
+            unreachable!("deadline cases return before stale fallback cases")
+        };
         if !notice_lags {
             tip_sender.set_best_non_finalized_tip(make_tip(parent_b));
         }
@@ -403,7 +460,10 @@ async fn check_interleaving(interleaving: Interleaving) {
     match interleaving {
         Interleaving::ConcurrentParentChange
         | Interleaving::StaleParentSelection
-        | Interleaving::StaleFallback { .. } => unreachable!("handled before the long-poll cases"),
+        | Interleaving::StaleFallback { .. }
+        | Interleaving::FallbackDeadline { .. } => {
+            unreachable!("handled before the long-poll cases")
+        }
         Interleaving::FastPathFallback => {
             read_state
                 .expect_request(ReadRequest::ChainInfo)

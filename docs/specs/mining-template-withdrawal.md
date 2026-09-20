@@ -59,7 +59,8 @@ The cases above describe possible triggers, not observed production incidents.
    External miners must cooperate; RPC cannot force them to stop.
 5. Enter empty-template recovery for the affected parent.
    Validate the empty template before returning it.
-   Return an error if validation fails or exceeds 30 seconds in the current context.
+   Validation and the committed-tip check share a 30-second deadline. Return an error
+   if recovery fails or exceeds that deadline in the current context.
    If the parent or rejection revision changed, rebuild from fresh state instead of
    returning a transient RPC error that would trigger the internal miner's backoff.
    On a validation failure, also check the committed state tip because its notification
@@ -85,6 +86,8 @@ The cases above describe possible triggers, not observed production incidents.
 - Change the parent during fallback validation, including before the tip notification
   arrives and in the tip-wakeup fast path. Retry stale results while preserving errors
   for failures on the current parent.
+- Stall fallback validation or fail it after part of its budget is spent, then stall
+  the committed-tip check. Require an error within the original 30-second deadline.
 - Check work-ID isolation, duplicate rejection, old-parent rejection, parent recovery,
   retained notifications, and bounded-storage overflow.
 - Round-trip legacy and revised long-poll IDs. Check that a withdrawal disallows old

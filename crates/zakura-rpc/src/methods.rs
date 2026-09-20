@@ -1264,8 +1264,9 @@ where
             );
             let block =
                 proposal_block_from_template(&template, None, &self.network).map_misc_error()?;
-            let validation = tokio::time::timeout(
-                Duration::from_secs(30),
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let validation = tokio::time::timeout_at(
+                deadline,
                 self.gbt
                     .block_verifier_router()
                     .oneshot(zakura_consensus::Request::Prepare {
@@ -1301,8 +1302,8 @@ where
             if !matches!(validation, Ok(Ok(_))) {
                 // State commits precede tip notifications. A failed proposal can already
                 // have a stale parent even while both watches still name the old one.
-                let response = tokio::time::timeout(
-                    Duration::from_secs(30),
+                let response = tokio::time::timeout_at(
+                    deadline,
                     call_service(self.read_state.clone(), zakura_state::ReadRequest::Tip),
                 )
                 .await

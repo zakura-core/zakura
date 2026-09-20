@@ -3241,8 +3241,11 @@ async fn check_template_rejection_recovery(reject_before_poll: bool) {
     let read_state = tower::service_fn(move |request| {
         let chain_info = chain_info.clone();
         async move {
-            assert!(matches!(request, ReadRequest::ChainInfo));
-            Ok::<_, BoxError>(ReadResponse::ChainInfo(chain_info))
+            Ok::<_, BoxError>(match request {
+                ReadRequest::ChainInfo => ReadResponse::ChainInfo(chain_info),
+                ReadRequest::Tip => ReadResponse::Tip(Some((height, parent))),
+                _ => panic!("unexpected request: {request:?}"),
+            })
         }
     });
     let state: MockService<_, _, _, BoxError> = MockService::build().for_unit_tests();

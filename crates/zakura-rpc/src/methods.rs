@@ -1202,19 +1202,41 @@ where
         }
     }
 
+    /// Selects a parent only while it is current. Check under the rejection-state write lock
+    /// so an older caller cannot clear a newer parent's rejection records.
+    fn select_mining_template_parent(&self, parent: block::Hash) -> bool {
+        let mut selected = false;
+        self.gbt.template_rejections.send_if_modified(|state| {
+            if self
+                .latest_chain_tip
+                .best_tip_hash()
+                .is_some_and(|tip| tip != parent)
+            {
+                return false;
+            }
+            selected = true;
+            let changed = state.parent != Some(parent);
+            state.set_parent(parent);
+            changed
+        });
+        selected
+    }
+
+    /// Returns `None` when the caller must rebuild after a context change.
     async fn finish_mining_template(
         &self,
         mut template: BlockTemplateResponse,
         chain_info: &zakura_state::GetBlockTemplateChainInfo,
         miner_params: &types::get_block_template::MinerParams,
-    ) -> Result<GetBlockTemplateResponse> {
+    ) -> Result<Option<GetBlockTemplateResponse>> {
         let state = self.gbt.template_rejections.borrow().clone();
-        if state.parent != Some(chain_info.tip_hash) {
-            return Err(ErrorObject::owned(
-                0,
-                "template parent changed; retry",
-                None::<()>,
-            ));
+        if state.parent != Some(chain_info.tip_hash)
+            || self
+                .latest_chain_tip
+                .best_tip_hash()
+                .is_some_and(|tip| tip != chain_info.tip_hash)
+        {
+            return Ok(None);
         }
         if state.needs_fallback() {
             if state.saturated {
@@ -1242,7 +1264,7 @@ where
             );
             let block =
                 proposal_block_from_template(&template, None, &self.network).map_misc_error()?;
-            tokio::time::timeout(
+            let validation = tokio::time::timeout(
                 Duration::from_secs(30),
                 self.gbt
                     .block_verifier_router()
@@ -1252,34 +1274,54 @@ where
                         source: zakura_consensus::PreparedCandidateSource::ServerTemplate,
                     }),
             )
-            .await
-            .map_misc_error()?
-            .map_misc_error()?;
-            // A fallback must still belong to the context we just validated.
-            let current = self.gbt.template_rejections.borrow();
-            if current.parent != state.parent
-                || current.revision != state.revision
-                || current.contains(template.work_id())
-                || self
-                    .latest_chain_tip
-                    .best_tip_hash()
-                    .is_some_and(|tip| tip != chain_info.tip_hash)
-            {
-                return Err(ErrorObject::owned(
-                    0,
-                    "template changed during recovery; retry",
-                    None::<()>,
-                ));
-            }
-            drop(current);
-            self.gbt.template_rejections.send_if_modified(|state| {
-                state.mark_prepared(chain_info.tip_hash, template.work_id());
+            .await;
+            // Check the context before propagating a stale validation error, and atomically
+            // record successful recovery so another rejection cannot slip between the two.
+            let mut current_context = false;
+            self.gbt.template_rejections.send_if_modified(|current| {
+                if current.parent != state.parent
+                    || current.revision != state.revision
+                    || current.contains(template.work_id())
+                    || self
+                        .latest_chain_tip
+                        .best_tip_hash()
+                        .is_some_and(|tip| tip != chain_info.tip_hash)
+                {
+                    return false;
+                }
+                current_context = true;
+                if matches!(validation, Ok(Ok(_))) {
+                    current.mark_prepared(chain_info.tip_hash, template.work_id());
+                }
                 false
             });
+            if !current_context {
+                return Ok(None);
+            }
+            if !matches!(validation, Ok(Ok(_))) {
+                // State commits precede tip notifications. A failed proposal can already
+                // have a stale parent even while both watches still name the old one.
+                let response = tokio::time::timeout(
+                    Duration::from_secs(30),
+                    call_service(self.read_state.clone(), zakura_state::ReadRequest::Tip),
+                )
+                .await
+                .map_misc_error()??;
+                match response {
+                    zakura_state::ReadResponse::Tip(Some((_, tip)))
+                        if tip != chain_info.tip_hash =>
+                    {
+                        return Ok(None);
+                    }
+                    zakura_state::ReadResponse::Tip(_) => {}
+                    _ => unreachable!("unmatched response to a tip request"),
+                }
+            }
+            validation.map_misc_error()?.map_misc_error()?;
         } else {
             self.prepare_template_in_background(&template);
         }
-        Ok(template.into())
+        Ok(Some(template.into()))
     }
 
     fn prepare_template_in_background(&self, template: &BlockTemplateResponse) {
@@ -2839,8 +2881,8 @@ where
         // Set up the loop.
         let mut max_time_reached = false;
 
-        // The loop returns the server long poll ID, which should be different to the client one.
-        let (server_long_poll_id, chain_info, mempool_txs, mempool_tx_deps, submit_old) = loop {
+        // Retry from fresh state if a concurrent caller or tip change supersedes the build.
+        loop {
             // Check if we are synced to the tip.
             // The result of this check can change during long polling.
             //
@@ -2869,17 +2911,9 @@ where
                 cur_time,
                 ..
             } = fetch_chain_info(read_state.clone()).await?;
-            if latest_chain_tip
-                .best_tip_hash()
-                .is_some_and(|tip| tip != tip_hash)
-            {
+            if !self.select_mining_template_parent(tip_hash) {
                 continue;
             }
-            self.gbt.template_rejections.send_if_modified(|state| {
-                let changed = state.parent != Some(tip_hash);
-                state.set_parent(tip_hash);
-                changed
-            });
             let rejection_state = template_rejections.borrow_and_update().clone();
 
             // Fetch the mempool data for the block template:
@@ -2929,13 +2963,57 @@ where
                         .map(|old_long_poll_id| server_long_poll_id.submit_old(old_long_poll_id))
                 };
 
-                break (
-                    server_long_poll_id,
-                    chain_info,
+                // - Processing fetched data to create a transaction template
+                //
+                // Apart from random weighted transaction selection,
+                // the template only depends on the previously fetched data.
+                // This processing never fails.
+
+                tracing::debug!(
+                    mempool_tx_hashes = ?mempool_txs
+                        .iter()
+                        .map(|tx| tx.transaction.id().mined_id())
+                        .collect::<Vec<_>>(),
+                    "selecting transactions for the template from the mempool"
+                );
+
+                let height = chain_info.tip_height.next().map_misc_error()?;
+
+                // Randomly select some mempool transactions.
+                let mempool_txs = select_mempool_transactions(
+                    &self.network,
+                    height,
+                    miner_params,
                     mempool_txs,
                     mempool_tx_deps,
+                );
+
+                tracing::debug!(
+                    selected_mempool_tx_hashes = ?mempool_txs
+                        .iter()
+                        .map(|#[cfg(not(test))] tx, #[cfg(test)] (_, tx)| tx.transaction.id().mined_id())
+                        .collect::<Vec<_>>(),
+                    "selected transactions for the template from the mempool"
+                );
+
+                // - After this point, the template only depends on the previously fetched data.
+
+                let template = BlockTemplateResponse::new_internal(
+                    &self.network,
+                    None,
+                    miner_params,
+                    &chain_info,
+                    server_long_poll_id,
+                    mempool_txs,
                     submit_old,
                 );
+                if let Some(template) = self
+                    .finish_mining_template(template, &chain_info, miner_params)
+                    .await?
+                {
+                    return Ok(template);
+                }
+                continue;
             }
 
             // - Polling wait conditions
@@ -3030,15 +3108,9 @@ where
 
                 precomputed_coinbase = wait_for_new_tip => {
                     let chain_info = fetch_chain_info(read_state.clone()).await?;
-                    if latest_chain_tip.best_tip_hash().is_some_and(|tip| tip != chain_info.tip_hash) {
+                    if !self.select_mining_template_parent(chain_info.tip_hash) {
                         continue;
                     }
-
-                    self.gbt.template_rejections.send_if_modified(|state| {
-                        let changed = state.parent != Some(chain_info.tip_hash);
-                        state.set_parent(chain_info.tip_hash);
-                        changed
-                    });
                     let mut server_long_poll_id = LongPollInput::new(
                         chain_info.tip_height,
                         chain_info.tip_hash,
@@ -3071,7 +3143,9 @@ where
                         vec![],
                         submit_old,
                     );
-                    return self.finish_mining_template(template, &chain_info, miner_params).await;
+                    if let Some(template) = self.finish_mining_template(template, &chain_info, miner_params).await? {
+                        return Ok(template);
+                    }
                 }
 
                 // The max time does not elapse during normal operation on mainnet,
@@ -3089,54 +3163,7 @@ where
                     max_time_reached = true;
                 }
             }
-        };
-
-        // - Processing fetched data to create a transaction template
-        //
-        // Apart from random weighted transaction selection,
-        // the template only depends on the previously fetched data.
-        // This processing never fails.
-
-        tracing::debug!(
-            mempool_tx_hashes = ?mempool_txs
-                .iter()
-                .map(|tx| tx.transaction.id().mined_id())
-                .collect::<Vec<_>>(),
-            "selecting transactions for the template from the mempool"
-        );
-
-        let height = chain_info.tip_height.next().map_misc_error()?;
-
-        // Randomly select some mempool transactions.
-        let mempool_txs = select_mempool_transactions(
-            &self.network,
-            height,
-            miner_params,
-            mempool_txs,
-            mempool_tx_deps,
-        );
-
-        tracing::debug!(
-            selected_mempool_tx_hashes = ?mempool_txs
-                .iter()
-                .map(|#[cfg(not(test))] tx, #[cfg(test)] (_, tx)| tx.transaction.id().mined_id())
-                .collect::<Vec<_>>(),
-            "selected transactions for the template from the mempool"
-        );
-
-        // - After this point, the template only depends on the previously fetched data.
-
-        let template = BlockTemplateResponse::new_internal(
-            &self.network,
-            None,
-            miner_params,
-            &chain_info,
-            server_long_poll_id,
-            mempool_txs,
-            submit_old,
-        );
-        self.finish_mining_template(template, &chain_info, miner_params)
-            .await
+        }
     }
 
     async fn submit_block(

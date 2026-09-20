@@ -17,11 +17,7 @@ use semver::Version;
 use zakura_chain::{diagnostic::task::WaitForPanics, parameters::Network};
 
 use crate::{
-    config::{
-        database_format_version_at_path, database_format_version_on_disk,
-        write_database_format_version_at_path,
-    },
-    constants::DATABASE_FORMAT_VERSION_FILE_NAME,
+    config::database_format_version_on_disk,
     service::finalized_state::{
         disk_db::{DatabaseStartupGuard, DiskDb},
         disk_format::{
@@ -29,7 +25,7 @@ use crate::{
             upgrade::{DbFormatChange, DbFormatChangeThreadHandle},
         },
     },
-    BoxError, Config, StateInitError,
+    write_database_format_version_to_disk, BoxError, Config, StateInitError,
 };
 
 use super::disk_format::upgrade::restorable_db_versions;
@@ -148,22 +144,22 @@ impl ZakuraDb {
         }
 
         // A read-only secondary instance must never modify the primary's cache directory, so it
-        // skips DB reuse (which creates and publishes a checkpoint) and reads the format
-        // version directly. The cache directory is
+        // skips DB reuse (which publishes a checkpoint) and reads the on-disk version directly.
+        // The cache directory is
         // checked for readability first, so a missing or unreadable directory returns a typed
         // `ReadOnlyCacheDirUnreadable` error here instead of panicking on the version-file read.
+        let version_path =
+            config.version_file_path(&db_kind, format_version_in_code.major, network);
         let startup_guard =
             DatabaseStartupGuard::acquire(config, db_kind.as_ref(), network, read_only)?;
         let read_disk_version = || {
             database_format_version_on_disk(config, &db_kind, format_version_in_code.major, network)
                 .map_err(|source| StateInitError::DatabaseFormatVersion {
-                    path: config.version_file_path(&db_kind, format_version_in_code.major, network),
+                    path: version_path.clone(),
                     source,
                 })
         };
-        let disk_version = if config.ephemeral {
-            None
-        } else if read_only {
+        let disk_version = if read_only {
             DiskDb::check_cache_dir_readable(&config.cache_dir)?;
 
             read_disk_version()?
@@ -318,21 +314,28 @@ impl ZakuraDb {
     ///
     /// See `database_format_version_on_disk()` for details.
     pub fn format_version_on_disk(&self) -> Result<Option<Version>, BoxError> {
-        database_format_version_at_path(
-            &self.path().join(DATABASE_FORMAT_VERSION_FILE_NAME),
-            self.path(),
+        database_format_version_on_disk(
+            self.config(),
+            self.db_kind(),
             self.major_version(),
+            &self.network(),
         )
     }
 
     /// Updates the format of this database on disk to the suppled version.
     ///
-    /// Writes to this open database while its RocksDB lock is held.
+    /// See `write_database_format_version_to_disk()` for details.
     pub(crate) fn update_format_version_on_disk(
         &self,
         new_version: &Version,
     ) -> Result<(), BoxError> {
-        write_database_format_version_at_path(self.path(), new_version)
+        write_database_format_version_to_disk(
+            self.config(),
+            self.db_kind(),
+            self.major_version(),
+            new_version,
+            &self.network(),
+        )
     }
 
     /// Returns the configured network for this database.
@@ -414,9 +417,13 @@ impl ZakuraDb {
             // which would then make unrelated PRs fail when Zebra starts up.
 
             // If the upgrade has completed, or we've done a downgrade, check the state is valid.
-            let disk_version = self
-                .format_version_on_disk()
-                .expect("unexpected invalid or unreadable database version file");
+            let disk_version = database_format_version_on_disk(
+                &self.config,
+                self.db_kind(),
+                self.major_version(),
+                &self.network(),
+            )
+            .expect("unexpected invalid or unreadable database version file");
 
             if let Some(disk_version) = disk_version {
                 // We need to keep the cancel handle until the format check has finished,

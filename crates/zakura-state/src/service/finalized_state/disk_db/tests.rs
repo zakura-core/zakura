@@ -237,62 +237,35 @@ mod major_upgrade_reuse {
     }
 
     #[test]
-    fn keeps_the_older_major_of_an_interrupted_upgrade() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let config = config(&tempdir);
-        create_db(&config, 28, Some("27.3.0"));
-
-        assert_eq!(reuse(&config, RESTORABLE), Some(Version::new(27, 3, 0)));
-        assert_eq!(version_on_disk(&config, 29), Some(Version::new(27, 3, 0)));
-    }
-
-    #[test]
-    fn resolves_legacy_and_missing_version_files_to_the_old_major() {
-        for (version_file, expected) in [
-            (Some("1.5"), Version::new(28, 1, 5)),
-            (None, Version::new(28, 0, 0)),
-        ] {
+    fn reuses_each_released_database_format() {
+        // These are the database formats used by stable Zakura releases through v1.4.0.
+        for version in ["28.0.0", "28.0.1", "28.0.3", "28.1.5"] {
             let tempdir = tempfile::tempdir().unwrap();
             let config = config(&tempdir);
-            create_db(&config, 28, version_file);
-
+            create_db(&config, 28, Some(version));
+            let expected = version.parse::<Version>().unwrap();
             assert_eq!(reuse(&config, RESTORABLE), Some(expected.clone()));
-            // Publication includes the full source version, so an interruption
-            // cannot make the next startup infer 29.0.0.
             assert_eq!(version_on_disk(&config, 29), Some(expected));
+            assert_eq!(version_on_disk(&config, 28), Some(version.parse().unwrap()));
         }
     }
 
     #[test]
-    fn reuses_a_database_two_majors_back() {
+    fn does_not_discover_older_development_formats() {
         let tempdir = tempfile::tempdir().unwrap();
         let config = config(&tempdir);
         create_db(&config, 27, Some("27.3.0"));
-
-        assert_eq!(reuse(&config, RESTORABLE), Some(Version::new(27, 3, 0)));
-        assert!(config.db_path(KIND, 27, &Network::Mainnet).exists());
-        assert_eq!(version_on_disk(&config, 29), Some(Version::new(27, 3, 0)));
+        assert_eq!(reuse(&config, RESTORABLE), None);
+        assert!(!config.db_path(KIND, 29, &Network::Mainnet).exists());
     }
 
     #[test]
-    fn prefers_the_newest_older_database() {
+    fn does_not_reuse_an_unsupported_major_upgrade() {
         let tempdir = tempfile::tempdir().unwrap();
         let config = config(&tempdir);
-        create_db(&config, 27, Some("27.3.0"));
         create_db(&config, 28, Some("28.1.5"));
-
-        assert_eq!(reuse(&config, RESTORABLE), Some(Version::new(28, 1, 5)));
-        assert!(config.db_path(KIND, 27, &Network::Mainnet).exists());
-    }
-
-    #[test]
-    fn does_not_skip_a_major_without_a_reusable_upgrade() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let config = config(&tempdir);
-        create_db(&config, 27, Some("27.3.0"));
-
-        assert_eq!(reuse(&config, &[27, 29]), None);
-        assert!(config.db_path(KIND, 27, &Network::Mainnet).exists());
+        assert_eq!(reuse(&config, &[27, 28]), None);
+        assert!(!config.db_path(KIND, 29, &Network::Mainnet).exists());
     }
 
     #[test]
@@ -313,7 +286,7 @@ mod major_upgrade_reuse {
         };
         let tempdir = tempfile::tempdir().unwrap();
         let config = config(&tempdir);
-        create_db(&config, 27, Some("27.3.0"));
+        create_db(&config, 28, Some("28.1.5"));
         let version = state_database_format_version_in_code();
         let open = || {
             ZakuraDb::new(
@@ -331,64 +304,33 @@ mod major_upgrade_reuse {
         };
         let db = open();
         assert_eq!(db.format_version_on_disk().unwrap(), Some(version.clone()));
-        assert_eq!(version_on_disk(&config, 27), Some(Version::new(27, 3, 0)));
+        assert_eq!(version_on_disk(&config, 28), Some(Version::new(28, 1, 5)));
         drop(db);
         let db = open();
         assert_eq!(db.format_version_on_disk().unwrap(), Some(version));
     }
 
     #[test]
-    fn skips_malformed_candidates_but_does_not_hide_all_invalid_caches() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let config = config(&tempdir);
-        create_db(&config, 28, Some("not-a-version"));
-        assert!(try_reuse(&config, RESTORABLE).is_err());
-        assert!(!config.db_path(KIND, 29, &Network::Mainnet).exists());
-        create_db(&config, 27, Some("27.3.0"));
-        assert_eq!(reuse(&config, RESTORABLE), Some(Version::new(27, 3, 0)));
-        assert_eq!(
-            fs::read_to_string(config.version_file_path(KIND, 28, &Network::Mainnet)).unwrap(),
-            "not-a-version"
-        );
-    }
-
-    #[test]
-    fn skips_ineligible_versions_and_structurally_invalid_candidates() {
-        for version in ["26.0.0", "30.0.0"] {
+    fn invalid_source_is_reported_without_falling_back() {
+        for version in ["not-a-version", "27.3.0", "29.0.0"] {
             let tempdir = tempfile::tempdir().unwrap();
             let config = config(&tempdir);
             create_db(&config, 28, Some(version));
-            assert!(try_reuse(&config, &[28, 29]).is_err());
-            create_db(&config, 27, Some("27.0.0"));
-            assert_eq!(reuse(&config, &[28, 29]), Some(Version::new(27, 0, 0)));
+            create_db(&config, 27, Some("27.3.0"));
+            assert!(try_reuse(&config, RESTORABLE).is_err());
+            assert!(!config.db_path(KIND, 29, &Network::Mainnet).exists());
+            assert_eq!(
+                fs::read_to_string(config.version_file_path(KIND, 28, &Network::Mainnet)).unwrap(),
+                version
+            );
         }
-        let tempdir = tempfile::tempdir().unwrap();
-        let config = config(&tempdir);
-        fs::create_dir_all(config.db_path(KIND, 28, &Network::Mainnet)).unwrap();
-        create_db(&config, 27, Some("27.0.0"));
-        assert_eq!(reuse(&config, RESTORABLE), Some(Version::new(27, 0, 0)));
-    }
-
-    #[test]
-    fn does_not_replace_an_invalid_current_path() {
-        let tempdir = tempfile::tempdir().unwrap();
-        let config = config(&tempdir);
-        create_db(&config, 28, Some("28.1.5"));
-        let current = config.db_path(KIND, 29, &Network::Mainnet);
-        fs::create_dir_all(&current).unwrap();
-        fs::write(current.join("sentinel"), "preserve").unwrap();
-        assert!(try_reuse(&config, RESTORABLE).is_err());
-        assert_eq!(
-            fs::read_to_string(current.join("sentinel")).unwrap(),
-            "preserve"
-        );
     }
 
     #[test]
     fn checkpoint_preserves_source_siblings_and_all_column_families() {
         let tempdir = tempfile::tempdir().unwrap();
         let config = config(&tempdir);
-        create_db(&config, 28, Some("1.5"));
+        create_db(&config, 28, Some("28.1.5"));
         let source_path = config.db_path(KIND, 28, &Network::Mainnet);
         let sibling = source_path.parent().unwrap().join("testnet");
         fs::create_dir_all(&sibling).unwrap();
@@ -406,7 +348,7 @@ mod major_upgrade_reuse {
                 source_path.join(crate::constants::DATABASE_FORMAT_VERSION_FILE_NAME)
             )
             .unwrap(),
-            "1.5"
+            "28.1.5"
         );
         assert_eq!(
             fs::read_to_string(sibling.join("sentinel")).unwrap(),
@@ -585,118 +527,4 @@ mod major_upgrade_reuse {
         assert!(!config.db_path(KIND, 29, &Network::Mainnet).exists());
         assert_eq!(reuse(&config, RESTORABLE), Some(Version::new(28, 0, 0)));
     }
-}
-
-#[test]
-fn ephemeral_version_io_owns_exactly_one_directory_per_database() {
-    use crate::{
-        config::{database_format_version_on_disk, write_database_format_version_to_disk},
-        constants::{
-            state_database_format_version_in_code, DATABASE_FORMAT_VERSION_FILE_NAME,
-            STATE_DATABASE_KIND,
-        },
-        service::finalized_state::{zakura_db::ZakuraDb, STATE_COLUMN_FAMILIES_IN_CODE},
-    };
-    use std::fs;
-    // Isolate the OS temporary directory without changing this test process's environment.
-    let Some(root) = std::env::var_os("ZAKURA_EPHEMERAL_PATH_TEST") else {
-        let root = tempfile::tempdir().unwrap();
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "service::finalized_state::disk_db::tests::ephemeral_version_io_owns_exactly_one_directory_per_database"])
-            .env("ZAKURA_EPHEMERAL_PATH_TEST", root.path())
-            .env("TMPDIR", root.path()).env("TMP", root.path()).env("TEMP", root.path())
-            .spawn().unwrap();
-        assert!(wait_for_child(&mut child).success());
-        return;
-    };
-    let root = std::path::PathBuf::from(root);
-    let config = Config::ephemeral();
-    let version = state_database_format_version_in_code();
-    let entries = || fs::read_dir(&root).unwrap().count();
-    let before = entries();
-    let guard = super::DatabaseStartupGuard::acquire(
-        &config,
-        STATE_DATABASE_KIND,
-        &Network::Mainnet,
-        false,
-    )
-    .unwrap();
-    assert_eq!(
-        DiskDb::try_reusing_previous_db_after_major_upgrade(
-            &[27, 28, 29],
-            &version,
-            &config,
-            STATE_DATABASE_KIND,
-            &Network::Mainnet,
-            &guard,
-        )
-        .unwrap(),
-        None
-    );
-    assert_eq!(
-        database_format_version_on_disk(
-            &config,
-            STATE_DATABASE_KIND,
-            version.major,
-            &Network::Mainnet
-        )
-        .unwrap(),
-        None
-    );
-    write_database_format_version_to_disk(
-        &config,
-        STATE_DATABASE_KIND,
-        version.major,
-        &version,
-        &Network::Mainnet,
-    )
-    .unwrap();
-    assert_eq!(
-        entries(),
-        before,
-        "config-only probes must not allocate temporary paths"
-    );
-    let open = || {
-        ZakuraDb::new(
-            &config,
-            STATE_DATABASE_KIND,
-            &version,
-            &Network::Mainnet,
-            true,
-            STATE_COLUMN_FAMILIES_IN_CODE
-                .iter()
-                .map(ToString::to_string),
-            false,
-        )
-        .unwrap()
-    };
-    let first = open();
-    let second = open();
-    assert_ne!(first.path(), second.path());
-    assert_eq!(entries(), before + 2);
-    let written = Version::new(28, 1, 5);
-    first.update_format_version_on_disk(&written).unwrap();
-    assert_eq!(
-        first.format_version_on_disk().unwrap(),
-        Some(written.clone())
-    );
-    assert_eq!(
-        fs::read_to_string(first.path().join(DATABASE_FORMAT_VERSION_FILE_NAME)).unwrap(),
-        written.to_string()
-    );
-    assert_eq!(
-        second.format_version_on_disk().unwrap(),
-        Some(Version::new(version.major, 0, 0))
-    );
-    assert_eq!(
-        entries(),
-        before + 2,
-        "live version I/O must reuse the open database path"
-    );
-    let first_path = first.path().to_owned();
-    drop(first);
-    assert!(!first_path.exists());
-    assert!(second.path().exists());
-    drop(second);
-    assert_eq!(entries(), before);
 }

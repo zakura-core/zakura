@@ -1503,12 +1503,10 @@ impl DiskDb {
 
     // Private methods
 
-    /// Checkpoints the newest usable older cache through a chain of restorable upgrades.
+    /// Reuses only the previous major format, when its upgrade is supported.
     ///
-    /// Invalid candidates are reported and skipped. Once a source is selected, failure
-    /// to lock, checkpoint, or publish it aborts startup rather than creating empty state.
-    /// The source and its version marker are retained. The destination receives the full
-    /// source version before publication so interrupted migrations remain retryable.
+    /// The source stays locked while a checkpoint and its format marker are published.
+    /// Never move a live RocksDB directory or fall back to older caches on failure.
     pub(super) fn try_reusing_previous_db_after_major_upgrade(
         restorable_db_versions: &[u64],
         format_version_in_code: &Version,
@@ -1517,142 +1515,106 @@ impl DiskDb {
         network: &Network,
         _guard: &DatabaseStartupGuard,
     ) -> Result<Option<Version>, StateInitError> {
-        if config.ephemeral {
+        if config.ephemeral || !restorable_db_versions.contains(&format_version_in_code.major) {
             return Ok(None);
         }
+        let Some(old_major) = format_version_in_code.major.checked_sub(1) else {
+            return Ok(None);
+        };
         let db_kind = db_kind.as_ref();
         let new_path = config.db_path(db_kind, format_version_in_code.major, network);
+        let old_path = config.db_path(db_kind, old_major, network);
         let error = |path: &Path, source: crate::BoxError| StateInitError::DatabaseReuse {
             path: path.to_owned(),
             source,
         };
+        if new_path
+            .try_exists()
+            .map_err(|e| error(&new_path, e.into()))?
+            || !old_path
+                .try_exists()
+                .map_err(|e| error(&old_path, e.into()))?
+        {
+            return Ok(None);
+        }
+        let canonical = fs::canonicalize(&old_path).map_err(|e| error(&old_path, e.into()))?;
+        let cache =
+            fs::canonicalize(&config.cache_dir).map_err(|e| error(&config.cache_dir, e.into()))?;
+        if !canonical.starts_with(cache) {
+            return Err(error(
+                &old_path,
+                "state cache is outside the configured cache directory".into(),
+            ));
+        }
+
         let mut opts = DiskDb::options();
         opts.create_if_missing(false);
         opts.create_missing_column_families(false);
         opts.set_disable_auto_compactions(true);
+        // Opening a primary takes RocksDB's native lock, including against released binaries.
+        let families = Self::construct_column_families(opts.clone(), &old_path, [], false);
+        let source = DB::open_cf_descriptors(&opts, &old_path, families).map_err(|source| {
+            StateInitError::DatabaseOpen {
+                path: old_path.clone(),
+                source,
+            }
+        })?;
+        let version = database_format_version_at_path(
+            &old_path.join(DATABASE_FORMAT_VERSION_FILE_NAME),
+            &old_path,
+            old_major,
+        )
+        .map_err(|e| error(&old_path, e))?
+        .expect("the locked source database exists");
+        if version.major != old_major {
+            return Err(error(
+                &old_path,
+                format!("expected format {old_major}.x, found {version}").into(),
+            ));
+        }
 
-        // An existing destination is authoritative, even if malformed or empty.
-        // Do not overwrite it or quietly fall back to an older database.
+        let parent = new_path
+            .parent()
+            .expect("database paths include a major directory");
+        fs::create_dir_all(parent).map_err(|e| error(parent, e.into()))?;
+        let staging = tempfile::Builder::new()
+            .prefix(".reuse-")
+            .tempdir_in(parent)
+            .map_err(|e| error(parent, e.into()))?;
+        let checkpoint_path = staging.path().join("db");
+        #[cfg(test)]
+        tests::reuse_step(tests::ReuseStep::Checkpoint, &checkpoint_path, &new_path);
+        rocksdb::checkpoint::Checkpoint::new(&source)
+            .and_then(|checkpoint| checkpoint.create_checkpoint(&checkpoint_path))
+            .map_err(|e| error(&old_path, e.into()))?;
+        #[cfg(test)]
+        tests::reuse_step(tests::ReuseStep::Version, &checkpoint_path, &new_path);
+        // Write the source version before publication so a restart still runs its migrations.
+        write_database_format_version_at_path(&checkpoint_path, &version)
+            .map_err(|e| error(&checkpoint_path, e))?;
+        #[cfg(test)]
+        tests::reuse_step(tests::ReuseStep::Publish, &checkpoint_path, &new_path);
         if new_path
             .try_exists()
             .map_err(|e| error(&new_path, e.into()))?
         {
-            DB::list_cf(&opts, &new_path).map_err(|e| error(&new_path, e.into()))?;
-            return Ok(None);
-        }
-
-        let mut major = format_version_in_code.major;
-        let mut rejected = Vec::new();
-        while major > 0 && restorable_db_versions.contains(&major) {
-            major -= 1;
-            let old_path = config.db_path(db_kind, major, network);
-            if !old_path
-                .try_exists()
-                .map_err(|e| error(&old_path, e.into()))?
-            {
-                continue;
-            }
-            let read_version = || {
-                database_format_version_at_path(
-                    &old_path.join(DATABASE_FORMAT_VERSION_FILE_NAME),
-                    &old_path,
-                    major,
-                )?
-                .ok_or_else(|| "existing cache has no format version".into())
-            };
-            let candidate = (|| -> Result<Version, crate::BoxError> {
-                let canonical = fs::canonicalize(&old_path)?;
-                if !canonical.starts_with(fs::canonicalize(&config.cache_dir)?) {
-                    return Err("state cache is outside the configured cache directory".into());
-                }
-                DB::list_cf(&opts, &old_path)?;
-                let version = read_version()?;
-                if version > *format_version_in_code
-                    || (version.major..format_version_in_code.major)
-                        .any(|m| !restorable_db_versions.contains(&(m + 1)))
-                {
-                    return Err(format!("no supported upgrade chain from {version}").into());
-                }
-                Ok(version)
-            })();
-            let version = match candidate {
-                Ok(version) => version,
-                Err(source) => {
-                    warn!(?old_path, %source, "skipping unusable state cache");
-                    rejected.push(format!("{}: {source}", old_path.display()));
-                    continue;
-                }
-            };
-
-            // A read-only RocksDB handle would not exclude a live old-version writer.
-            let families = Self::construct_column_families(opts.clone(), &old_path, [], false);
-            let source = DB::open_cf_descriptors(&opts, &old_path, families).map_err(|source| {
-                StateInitError::DatabaseOpen {
-                    path: old_path.clone(),
-                    source,
-                }
-            })?;
-            let locked_version = read_version().map_err(|e| error(&old_path, e))?;
-            if locked_version != version {
-                return Err(error(
-                    &old_path,
-                    "cache version changed during discovery; retry startup".into(),
-                ));
-            }
-            let parent = new_path
-                .parent()
-                .expect("database paths include a major directory");
-            fs::create_dir_all(parent).map_err(|e| error(parent, e.into()))?;
-            let staging = tempfile::Builder::new()
-                .prefix(".reuse-")
-                .tempdir_in(parent)
-                .map_err(|e| error(parent, e.into()))?;
-            let checkpoint_path = staging.path().join("db");
-            #[cfg(test)]
-            tests::reuse_step(tests::ReuseStep::Checkpoint, &checkpoint_path, &new_path);
-            rocksdb::checkpoint::Checkpoint::new(&source)
-                .and_then(|checkpoint| checkpoint.create_checkpoint(&checkpoint_path))
-                .map_err(|e| error(&old_path, e.into()))?;
-            #[cfg(test)]
-            tests::reuse_step(tests::ReuseStep::Version, &checkpoint_path, &new_path);
-            write_database_format_version_at_path(&checkpoint_path, &version)
-                .map_err(|e| error(&checkpoint_path, e))?;
-
-            #[cfg(test)]
-            tests::reuse_step(tests::ReuseStep::Publish, &checkpoint_path, &new_path);
-            // All writable constructors hold the same startup guard. A destination
-            // created externally still takes precedence; never replace its contents.
-            if new_path
-                .try_exists()
-                .map_err(|e| error(&new_path, e.into()))?
-            {
-                return Err(error(
-                    &new_path,
-                    "destination appeared during checkpoint creation; retry startup".into(),
-                ));
-            }
-            fs::rename(&checkpoint_path, &new_path).map_err(|e| error(&new_path, e.into()))?;
-            #[cfg(unix)]
-            {
-                // Persist both directory entries after the checkpoint's version file is durable.
-                fs::File::open(parent)
-                    .and_then(|dir| dir.sync_all())
-                    .map_err(|e| error(parent, e.into()))?;
-                fs::File::open(staging.path())
-                    .and_then(|dir| dir.sync_all())
-                    .map_err(|e| error(staging.path(), e.into()))?;
-            }
-            info!(%version, ?old_path, ?new_path, "reused state checkpoint; retained source cache");
-            return Ok(Some(version));
-        }
-        if rejected.is_empty() {
-            Ok(None)
-        } else {
-            Err(error(
+            return Err(error(
                 &new_path,
-                format!("no usable older cache: {}", rejected.join("; ")).into(),
-            ))
+                "destination appeared during checkpoint creation; retry startup".into(),
+            ));
         }
+        fs::rename(&checkpoint_path, &new_path).map_err(|e| error(&new_path, e.into()))?;
+        #[cfg(unix)]
+        {
+            fs::File::open(parent)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|e| error(parent, e.into()))?;
+            fs::File::open(staging.path())
+                .and_then(|dir| dir.sync_all())
+                .map_err(|e| error(staging.path(), e.into()))?;
+        }
+        info!(%version, ?old_path, ?new_path, "reused previous-major state checkpoint");
+        Ok(Some(version))
     }
 
     /// Returns the database options for the finalized state database.

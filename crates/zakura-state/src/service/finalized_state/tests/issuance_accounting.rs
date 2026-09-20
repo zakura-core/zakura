@@ -497,7 +497,7 @@ fn startup_migration_failure_preserves_version_and_retry_matches_fresh_sync() {
         .with_batch_for_writing(&mut batch)
         .zs_insert(&(), &RawBytes::from_bytes(&tip_bytes[..48]));
     state.db.write_batch(batch).unwrap();
-    let old_version = semver::Version::new(28, 2, 0);
+    let old_version = semver::Version::new(28, 1, 5);
     state
         .db
         .update_format_version_on_disk(&old_version)

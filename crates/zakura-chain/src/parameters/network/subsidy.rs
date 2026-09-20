@@ -14,7 +14,7 @@
 
 pub(crate) mod constants;
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::OnceLock};
 
 use crate::{
     amount::{self, Amount, NegativeAllowed, NonNegative, MAX_MONEY},
@@ -505,10 +505,6 @@ pub const BLOCK_SUBSIDY_FRACTION_DENOMINATOR: u128 = 10_000_000_000;
 
 /// The halving era whose internal NSM reference crossing determines the proposed
 /// reissuance start.
-#[allow(
-    dead_code,
-    reason = "the calculator derives future deployment constants without activating them"
-)]
 const NSM_REISSUANCE_START_HALVING: u32 = 3;
 
 /// Calculates the proposed NSM reissuance crossing on `network`'s actual spacing
@@ -522,10 +518,6 @@ const NSM_REISSUANCE_START_HALVING: u32 = 3;
 /// Searches through [`Height::MAX`] if the fourth halving is beyond the supported
 /// height range. Returns `None` when NU7 is not configured or the third halving era
 /// has no crossing within the supported heights.
-#[allow(
-    dead_code,
-    reason = "the calculator derives future deployment constants without activating them"
-)]
 pub(crate) fn nsm_reissuance_crossing_height(
     network: &Network,
 ) -> Result<Option<Height>, SubsidyError> {
@@ -573,10 +565,6 @@ pub(crate) fn nsm_reissuance_crossing_height(
 /// Returns the first reference NSM crossing in a constant-subsidy run.
 ///
 /// `supply_before_first` is the scheduled supply after the parent of `first`.
-#[allow(
-    dead_code,
-    reason = "the calculator derives future deployment constants without activating them"
-)]
 pub(super) fn first_nsm_crossing_in_subsidy_run(
     first: u32,
     run_end: u32,
@@ -612,21 +600,34 @@ pub(super) fn first_nsm_crossing_in_subsidy_run(
 
 /// Returns the NSM reissuance start height on `network`, or `None` if it is not scheduled.
 ///
-/// Mainnet and default Testnet use constants that remain unset until the NU7 deployment
-/// ZIP selects their heights. Configured testnets and Regtest can set a height with
-/// [`ParametersBuilder::with_nsm_reissuance_height`].
-///
-/// Reissuance never starts before NU7 activation or on a network without NU7.
-///
-/// [`ParametersBuilder::with_nsm_reissuance_height`]: super::testnet::ParametersBuilder::with_nsm_reissuance_height
+/// NU7 activation determines the first reference crossing strictly after the third
+/// halving and before the fourth halving. No crossing leaves reissuance unscheduled.
+/// The result depends only on network parameters, never chain balances.
+/// Reissuance never starts on a network without NU7. There is no deployment-height
+/// constant or configuration override.
 pub fn nsm_reissuance_height(network: &Network) -> Option<Height> {
-    let nu7 = NetworkUpgrade::Nu7.activation_height(network)?;
+    NetworkUpgrade::Nu7.activation_height(network)?;
+    let derive = || {
+        nsm_reissuance_crossing_height(network)
+            .expect("validated network schedules fit the u128 crossing arithmetic")
+    };
+    // Block validation queries this repeatedly; immutable parameters determine the
+    // result, including the absence of a crossing, so derive it only once per network.
     let start = match network {
-        Network::Mainnet => mainnet::NSM_REISSUANCE_HEIGHT,
-        Network::Testnet(params) => params.configured_nsm_reissuance_height(),
+        Network::Mainnet => {
+            static MAINNET_CROSSING: OnceLock<Option<Height>> = OnceLock::new();
+            *MAINNET_CROSSING.get_or_init(derive)
+        }
+        Network::Testnet(params) => {
+            #[cfg(any(test, feature = "proptest-impl"))]
+            if let Some(start) = params.test_nsm_reissuance_height() {
+                return Some(start.max(NetworkUpgrade::Nu7.activation_height(network)?));
+            }
+            params.nsm_reissuance_crossing_height().get_or_init(derive)
+        }
     }?;
 
-    Some(start.max(nu7))
+    Some(start)
 }
 
 /// Converts a non-negative amount to a `u128`.

@@ -57,7 +57,7 @@ pub(super) fn accounting_network(reissuance: bool) -> Network {
             nu7: Some(2),
             ..Default::default()
         },
-        nsm_reissuance_height: reissuance.then_some(START),
+        test_nsm_reissuance_height: reissuance.then_some(START),
         ..Default::default()
     })
 }

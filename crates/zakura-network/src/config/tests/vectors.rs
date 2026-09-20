@@ -847,7 +847,7 @@ fn max_block_time_start_height_serialization_roundtrip() {
 }
 
 #[test]
-fn nsm_reissuance_height_serialization_roundtrip() {
+fn nsm_reissuance_height_is_derived_after_config_roundtrip() {
     use zakura_chain::parameters::{
         subsidy::{is_zip234_active, nsm_reissuance_height},
         testnet::{ConfiguredActivationHeights, RegtestParameters},
@@ -860,51 +860,65 @@ fn nsm_reissuance_height_serialization_roundtrip() {
         .activation_heights()
         .into();
     activation_heights.nu7 = Some(4_200_000);
-
-    for start in [None, Some(Height(4_200_010))] {
-        let mut builder = testnet::Parameters::build()
-            .with_activation_heights(activation_heights)
-            .expect("activation heights are valid");
-        if let Some(height) = start {
-            builder = builder.with_nsm_reissuance_height(height);
-        }
-        let testnet = builder.to_network().expect("configured testnet is valid");
-        let regtest = Network::new_regtest(RegtestParameters {
-            activation_heights: ConfiguredActivationHeights {
-                nu7: Some(10),
-                ..Default::default()
-            },
-            nsm_reissuance_height: start,
+    let testnet = testnet::Parameters::build()
+        .with_activation_heights(activation_heights)
+        .expect("valid activation heights")
+        .to_network()
+        .expect("valid Testnet");
+    let regtest = Network::new_regtest(RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            nu7: Some(10),
             ..Default::default()
-        });
+        },
+        ..Default::default()
+    });
+    assert!(nsm_reissuance_height(&testnet).is_some());
+    assert_eq!(nsm_reissuance_height(&regtest), None);
 
-        for network in [testnet, regtest] {
-            let mut config = Config {
-                network,
-                initial_testnet_peers: [].into(),
-                ..Config::for_test(P2pStack::Dual)
-            };
-            config.zakura.apply_network_defaults(&config.network);
-
-            let serialized = toml::to_string(&config).expect("the custom network serializes");
-            assert_eq!(
-                serialized.contains("nsm_reissuance_height"),
-                start.is_some()
-            );
-            let deserialized: Config =
-                toml::from_str(&serialized).expect("the custom network deserializes");
-            assert_eq!(config, deserialized);
-            assert_eq!(nsm_reissuance_height(&deserialized.network), start);
-            if let Some(height) = start {
-                assert!(!is_zip234_active(
-                    &deserialized.network,
-                    Height(height.0 - 1)
-                ));
-                assert!(is_zip234_active(&deserialized.network, height));
-            } else {
-                assert!(!is_zip234_active(&deserialized.network, Height::MAX));
-            }
+    for network in [testnet, regtest] {
+        let expected = nsm_reissuance_height(&network);
+        let mut config = Config {
+            network,
+            initial_testnet_peers: [].into(),
+            ..Config::for_test(P2pStack::Dual)
+        };
+        config.zakura.apply_network_defaults(&config.network);
+        let serialized = toml::to_string(&config).expect("network serializes");
+        assert!(!serialized.contains("nsm_reissuance_height"));
+        let deserialized: Config = toml::from_str(&serialized).expect("network deserializes");
+        assert_eq!(config, deserialized);
+        assert_eq!(nsm_reissuance_height(&deserialized.network), expected);
+        if let Some(height) = expected {
+            assert!(!is_zip234_active(
+                &deserialized.network,
+                height.previous().expect("positive height")
+            ));
+            assert!(is_zip234_active(&deserialized.network, height));
+        } else {
+            assert!(!is_zip234_active(&deserialized.network, Height::MAX));
         }
+
+        // Both ordinary Testnet and Regtest configuration reject the removed override.
+        let mut value: toml::Value = toml::from_str(&serialized).expect("valid TOML");
+        let network = value
+            .get_mut("network")
+            .expect("network is serialized")
+            .as_table_mut()
+            .expect("configured network is a table");
+        let params = if network.contains_key("params") {
+            network
+                .get_mut("params")
+                .expect("Regtest has params")
+                .as_table_mut()
+                .expect("params are a table")
+        } else {
+            network
+        };
+        params.insert(
+            "nsm_reissuance_height".to_owned(),
+            toml::Value::Integer(4_200_010),
+        );
+        assert!(toml::from_str::<Config>(&toml::to_string(&value).expect("valid TOML")).is_err());
     }
 }
 

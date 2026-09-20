@@ -293,6 +293,108 @@ fn normal_template_construction_leaves_runtime_responsive() {
     });
 }
 
+#[test]
+fn template_build_paths_retain_capacity_when_cancelled() {
+    mining_runtime(async {
+        for path in ["normal", "precompute", "tip change", "recovery"] {
+            let old_height = if path == "precompute" { 0 } else { 2 };
+            let chain = chain_info(old_height, 1, 0);
+            let (info_tx, info) = watch::channel(chain.clone());
+            let (rpc, tip, _) = mining_rpc(info);
+            let initial = bounded(rpc.get_block_template(None))
+                .await
+                .unwrap()
+                .try_into_template()
+                .unwrap();
+            let gate = BlockingPoolGate::new().await;
+            tokio::time::pause();
+
+            let mut request = match path {
+                "normal" => rpc.get_block_template(None).boxed(),
+                "recovery" => {
+                    rpc.gbt.template_rejections.send_modify(|state| {
+                        state.reject(chain.tip_hash, "rejected-work");
+                    });
+                    rpc.finish_mining_template(initial, &chain, rpc.gbt.miner_params().unwrap())
+                        .boxed()
+                }
+                _ => rpc
+                    .get_block_template(Some(GetBlockTemplateParameters {
+                        long_poll_id: Some(initial.long_poll_id),
+                        ..Default::default()
+                    }))
+                    .boxed(),
+            };
+            assert!(futures::poll!(&mut request).is_pending(), "{path}");
+            if path == "tip change" {
+                let next = chain_info(3, 2, 400_000_000);
+                info_tx.send_replace(next.clone());
+                tip.send_best_tip_height(next.tip_height);
+                tip.send_best_tip_hash(next.tip_hash);
+                assert!(futures::poll!(&mut request).is_pending());
+            }
+            // The build is queued behind the occupied blocking pool. Its caller disconnects.
+            drop(request);
+            let handler = rpc.gbt.clone();
+            let mut contender = Box::pin(handler.run_template_build(|| ()));
+            assert!(futures::poll!(&mut contender).is_pending());
+            tokio::time::advance(Duration::from_secs(31)).await;
+            let Poll::Ready(Err(error)) = futures::poll!(&mut contender) else {
+                panic!("{path} must retain its slot until the queued job finishes");
+            };
+            assert_eq!(error.code(), -1);
+            assert!(error.message().contains("construction capacity"));
+
+            gate.release().await;
+            bounded(handler.run_template_build(|| ())).await.unwrap();
+            tokio::time::resume();
+        }
+    });
+}
+
+#[test]
+fn running_template_build_retains_capacity_when_cancelled() {
+    mining_runtime(async {
+        let (_, info) = watch::channel(chain_info(2, 1, 0));
+        let (rpc, _, _) = mining_rpc(info);
+        let handler = rpc.gbt.clone();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let build = tokio::spawn(async move {
+            handler
+                .run_template_build(move || {
+                    entered.send(()).unwrap();
+                    released.recv_timeout(Duration::from_secs(10)).unwrap();
+                })
+                .await
+        });
+        bounded(started).await.unwrap();
+        build.abort();
+        assert!(bounded(build).await.unwrap_err().is_cancelled());
+
+        // A cancelled waiter must be removed before any blocking job is spawned for it.
+        let (ran, cancelled) = tokio::sync::oneshot::channel();
+        let mut waiter = Box::pin(rpc.gbt.run_template_build(move || ran.send(())));
+        assert!(futures::poll!(&mut waiter).is_pending());
+        drop(waiter);
+        assert!(bounded(cancelled).await.is_err());
+
+        tokio::time::pause();
+        let mut contender = Box::pin(rpc.gbt.run_template_build(|| ()));
+        assert!(futures::poll!(&mut contender).is_pending());
+        tokio::time::advance(Duration::from_secs(29)).await;
+        assert!(futures::poll!(&mut contender).is_pending());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let Poll::Ready(Err(error)) = futures::poll!(&mut contender) else {
+            panic!("a running build must retain capacity after its caller disconnects");
+        };
+        assert_eq!(error.code(), -1);
+        assert!(error.message().contains("construction capacity"));
+        release.send(()).unwrap();
+        bounded(rpc.gbt.run_template_build(|| ())).await.unwrap();
+    });
+}
+
 fn template_id(info: &GetBlockTemplateChainInfo) -> types::long_poll::LongPollId {
     types::long_poll::LongPollInput::new(info.tip_height, info.tip_hash, info.max_time, vec![])
         .generate_id()
@@ -319,6 +421,8 @@ async fn template_worker_panic_is_an_rpc_error() {
     assert!(error
         .message()
         .contains("chain tip must be below Height::MAX"));
+    // A worker panic must also release construction capacity.
+    bounded(rpc.get_block_template(None)).await.unwrap();
 }
 
 #[test]

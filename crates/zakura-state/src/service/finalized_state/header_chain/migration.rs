@@ -83,16 +83,9 @@ impl HeaderChainStore {
             };
             return Err(HeaderChainStoreError::Incoherent(message));
         }
-        if metadata.network_policy_digest != config.network_policy_digest()
-            && !config.permits_network_policy_rebind()
-        {
-            return Err(HeaderChainStoreError::Incoherent(
-                "legacy network policy does not match the configured policy",
-            ));
-        }
         // Mode must match: Integrated and HeadersOnly authenticate migration
         // differently. Trust-anchor digest may differ (for example when a release
-        // extends the checkpoint list), and so may a release network's policy digest
+        // extends the checkpoint list), and so may the diagnostic network policy digest
         // (for example when a release sets an activation height). Keep the durable
         // digests for now; post-migration startup audits with `allow_trust_anchor_update`
         // and rebinds them atomically.

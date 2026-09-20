@@ -1311,107 +1311,60 @@ fn a_newer_header_chain_disk_format_does_not_classify_as_initialized() {
     ));
 }
 
+/// Version-three stores preserve their diagnostic digest until startup audits the rows.
 #[test]
-fn version_three_migration_rejects_a_configured_network_policy_mismatch_atomically() {
-    let db_config = Config::ephemeral();
-    let (engine_config, anchor, mut metadata) = fixture();
-    metadata.network_policy_digest = [0x73; 32];
-    let metadata_value = mark_metadata_as_v3(&metadata);
-    let db = open(&db_config, engine_config.network());
-    let store = HeaderChainStore::new(db);
-    store
-        .initialize(
-            EngineMetadata {
-                disk_format: HeaderChainDiskVersion::CURRENT,
-                network_policy_digest: engine_config.network_policy_digest(),
-                ..metadata.clone()
-            },
-            anchor,
-        )
-        .expect("the current fixture initializes");
-    let mut batch = DiskWriteBatch::new();
-    store
-        .put_raw(
-            &mut batch,
-            HEADER_ENGINE_META,
-            METADATA_KEY,
-            &metadata_value,
-        )
-        .expect("the mismatched version-three metadata stages");
-    store.db.write(batch).expect("the legacy fixture commits");
-
-    assert!(matches!(
-        store.migrate_to_current(&engine_config),
-        Err(HeaderChainStoreError::Incoherent(
-            "legacy network policy does not match the configured policy"
-        ))
-    ));
-    let metadata_cf = store
-        .cf(HEADER_ENGINE_META)
-        .expect("the metadata column family exists");
-    assert_eq!(
+fn version_three_migration_keeps_a_policy_change_for_startup() {
+    for (engine_config, anchor, mut metadata) in [mainnet_fixture(), fixture()] {
+        let db_config = Config::ephemeral();
+        metadata.network_policy_digest = [0x73; 32];
+        let metadata_value = mark_metadata_as_v3(&metadata);
+        let db = open(&db_config, engine_config.network());
+        let store = HeaderChainStore::new(db.clone());
         store
-            .db
-            .raw_get_cf(&metadata_cf, METADATA_KEY)
-            .expect("the metadata remains readable"),
-        Some(metadata_value)
-    );
-}
-
-/// A version-three Mainnet store written by an earlier release migrates, and startup rebinds its
-/// network policy digest.
-#[test]
-fn version_three_migration_keeps_a_release_network_policy_change_for_startup() {
-    let db_config = Config::ephemeral();
-    let (engine_config, anchor, mut metadata) = mainnet_fixture();
-    metadata.network_policy_digest = [0x73; 32];
-    let metadata_value = mark_metadata_as_v3(&metadata);
-    let db = open(&db_config, engine_config.network());
-    let store = HeaderChainStore::new(db.clone());
-    store
-        .initialize(
-            EngineMetadata {
-                disk_format: HeaderChainDiskVersion::CURRENT,
-                ..metadata.clone()
-            },
-            anchor,
-        )
-        .expect("the current fixture initializes");
-    let mut batch = DiskWriteBatch::new();
-    store
-        .put_raw(
-            &mut batch,
-            HEADER_ENGINE_META,
-            METADATA_KEY,
-            &metadata_value,
-        )
-        .expect("the earlier release's version-three metadata stages");
-    stage_full_state_canonical_hash(&store, &mut batch, metadata.frontiers.finalized);
-    store.db.write(batch).expect("the legacy fixture commits");
-
-    assert!(store
-        .migrate_to_current(&engine_config)
-        .expect("a release network migrates across a policy change"));
-    assert_eq!(
+            .initialize(
+                EngineMetadata {
+                    disk_format: HeaderChainDiskVersion::CURRENT,
+                    ..metadata.clone()
+                },
+                anchor,
+            )
+            .expect("the current fixture initializes");
+        let mut batch = DiskWriteBatch::new();
         store
-            .metadata()
-            .expect("the migrated metadata is readable")
-            .network_policy_digest,
-        [0x73; 32],
-        "migration keeps the durable digest for the startup audit",
-    );
+            .put_raw(
+                &mut batch,
+                HEADER_ENGINE_META,
+                METADATA_KEY,
+                &metadata_value,
+            )
+            .expect("the earlier release's version-three metadata stages");
+        stage_full_state_canonical_hash(&store, &mut batch, metadata.frontiers.finalized);
+        store.db.write(batch).expect("the legacy fixture commits");
 
-    let (_, report) = HeaderChainStore::new(db.clone())
-        .startup(&engine_config)
-        .expect("startup rebinds the migrated release policy");
-    assert_eq!(
-        report.repairs,
-        BTreeSet::from([RecoveryRepair::NetworkPolicyConfiguration])
-    );
-    let (_, reopened) = HeaderChainStore::new(db)
-        .startup(&engine_config)
-        .expect("the rebound policy and its migration record pass the audit");
-    assert!(reopened.repairs.is_empty());
+        assert!(store
+            .migrate_to_current(&engine_config)
+            .expect("migration accepts a diagnostic policy change"));
+        assert_eq!(
+            store
+                .metadata()
+                .expect("the migrated metadata is readable")
+                .network_policy_digest,
+            [0x73; 32],
+            "migration keeps the durable digest for the startup audit",
+        );
+
+        let (_, report) = HeaderChainStore::new(db.clone())
+            .startup(&engine_config)
+            .expect("startup updates the migrated policy digest");
+        assert_eq!(
+            report.repairs,
+            BTreeSet::from([RecoveryRepair::NetworkPolicyConfiguration])
+        );
+        let (_, reopened) = HeaderChainStore::new(db)
+            .startup(&engine_config)
+            .expect("the rebound policy and its migration record pass the audit");
+        assert!(reopened.repairs.is_empty());
+    }
 }
 
 #[test]
@@ -1676,10 +1629,9 @@ fn release_network_startup_atomically_rebinds_a_changed_network_policy() {
     assert!(reopened.repairs.is_empty());
 }
 
-/// Configured networks keep an exact policy match: changing their activation heights still
-/// requires a new header-chain database.
+/// Startup accepts a future activation change on a configured network after auditing.
 #[test]
-fn configured_network_startup_rejects_a_changed_network_policy() {
+fn configured_network_startup_rebinds_a_changed_network_policy() {
     let db_config = Config::ephemeral();
     let (engine_config, anchor, metadata) = fixture();
     let changed_config = EngineConfig::new(
@@ -1705,11 +1657,21 @@ fn configured_network_startup_rejects_a_changed_network_policy() {
         .initialize(metadata, anchor)
         .expect("the current fixture initializes");
 
-    assert!(matches!(
-        store.startup(&changed_config),
-        Err(HeaderChainStoreError::Recovery(RecoveryFailure::Source { violations }))
-            if violations == vec![zakura_header_chain::AuditViolation::Configuration]
-    ));
+    let (runtime, report) = store
+        .startup(&changed_config)
+        .expect("a future activation change passes the source audit");
+    assert_eq!(
+        report.repairs,
+        BTreeSet::from([RecoveryRepair::NetworkPolicyConfiguration])
+    );
+    assert_eq!(
+        runtime
+            .store
+            .metadata()
+            .expect("the audited metadata is readable")
+            .network_policy_digest,
+        changed_config.network_policy_digest()
+    );
 }
 
 #[test]

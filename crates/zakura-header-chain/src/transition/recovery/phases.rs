@@ -68,8 +68,6 @@ pub(super) fn load_pre_audit_store_rows<S: StoreAuditSnapshot>(
         || metadata.disk_format != crate::HeaderChainDiskVersion::CURRENT
         || metadata.mode != config.mode
         || metadata.network_id != config.network().kind()
-        || network_policy_changed
-            && !(allow_trust_anchor_update && config.permits_network_policy_rebind())
         || trust_anchor_changed && !allow_trust_anchor_update
     {
         return Err(source_failure(AuditViolation::Configuration));

@@ -351,20 +351,6 @@ fn witness_descends_to(
     node.hash == frontier.hash && node.height == frontier.height
 }
 
-/// Returns true if a disk migration's recorded network policy is acceptable.
-///
-/// A migration records the policy digest it ran under. A release network may later rebind
-/// the store to a changed policy (see [`EngineConfig::permits_network_policy_rebind`]), so
-/// its migration record may carry an earlier digest. Other networks require an exact match.
-fn migration_policy_is_valid(
-    network_policy_digest: [u8; 32],
-    metadata: &EngineMetadata,
-    config: &EngineConfig,
-) -> bool {
-    network_policy_digest == metadata.network_policy_digest
-        || config.permits_network_policy_rebind()
-}
-
 fn finality_history_starts_validly(
     record: FinalityRecord,
     checkpoint: Option<crate::FinalityHistoryCheckpoint>,
@@ -423,25 +409,20 @@ fn source_matches_mode(
             _,
             FinalitySource::DiskMigration {
                 from_version,
-                network_policy_digest,
                 authentication: crate::DiskMigrationAuthentication::FullState,
+                ..
             },
-        ) => {
-            (1..=3).contains(&from_version.0)
-                && migration_policy_is_valid(network_policy_digest, metadata, config)
-                && record.previous == record.current
-        }
+        ) => (1..=3).contains(&from_version.0) && record.previous == record.current,
         (
             EngineMode::HeadersOnly,
             None,
             FinalitySource::DiskMigration {
                 from_version,
-                network_policy_digest,
                 authentication: crate::DiskMigrationAuthentication::HeadersOnlyDepth { .. },
+                ..
             },
         ) => {
             (1..=3).contains(&from_version.0)
-                && migration_policy_is_valid(network_policy_digest, metadata, config)
                 && record.previous == record.current
                 && record
                     .headers_only_depth_witness(config.limits.local_finality_depth.get())

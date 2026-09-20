@@ -258,8 +258,7 @@ pub enum RecoveryRepair {
     RetentionMetadata,
     /// Recovery rebuilds the selected-tip body-unavailability alarm from its durable node.
     BodyAvailabilityAlarm,
-    /// Recovery rebinds a fully audited release-network store to the configured network
-    /// policy, after a release changes an activation height or branch ID.
+    /// Recovery updates the diagnostic network policy digest after the source audit.
     NetworkPolicyConfiguration,
 }
 

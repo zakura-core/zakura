@@ -41,11 +41,11 @@ use super::MinerParams;
 
 /// Used in the return type of [`select_mempool_transactions()`] for test compilations.
 #[cfg(test)]
-type SelectedMempoolTx = (InBlockTxDependenciesDepth, VerifiedUnminedTx);
+pub(crate) type SelectedMempoolTx = (InBlockTxDependenciesDepth, VerifiedUnminedTx);
 
 /// Used in the return type of [`select_mempool_transactions()`] for non-test compilations.
 #[cfg(not(test))]
-type SelectedMempoolTx = VerifiedUnminedTx;
+pub(crate) type SelectedMempoolTx = VerifiedUnminedTx;
 
 /// The serialized size of the block header nonce.
 const BLOCK_HEADER_NONCE_BYTES: usize = 32;

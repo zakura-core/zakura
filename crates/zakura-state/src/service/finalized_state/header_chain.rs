@@ -67,6 +67,11 @@ const TOMBSTONE_LIMIT: usize = 65_536;
 const RECONSTRUCTION_PROGRESS_KEY: &[u8] = b"reconstruction-progress-v1";
 const RETAINED_PATH_LEASE_IDLE: Duration = Duration::from_secs(30);
 
+#[cfg(test)]
+thread_local! {
+    static TEST_HEADER_NODE_DISK_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 #[cfg(feature = "internal-bench")]
 static BENCH_WITNESS_POINT_READS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -3203,6 +3208,8 @@ impl HeaderChainRuntime {
             return Ok(ApplyResult::ResourceStalled(receipt));
         }
         if !expectation.staged.is_empty() {
+            let staged_check_start = std::time::Instant::now();
+            let staged_header_count = u32::try_from(expectation.staged.len()).unwrap_or(u32::MAX);
             let put_nodes: HashMap<_, _> = transition
                 .change_set()
                 .put_nodes
@@ -3219,9 +3226,9 @@ impl HeaderChainRuntime {
                 let projected = if deleted.contains(&expected.hash) {
                     None
                 } else if let Some(node) = put_nodes.get(&expected.hash) {
-                    Some((*node).clone())
+                    Some(*node)
                 } else {
-                    self.store.header_node(expected.hash)?
+                    transition_engine.graph().header_node(expected.hash)
                 };
                 let matches = projected.is_some_and(|node| {
                     node.height == expected.height
@@ -3234,6 +3241,10 @@ impl HeaderChainRuntime {
                     });
                 }
             }
+            metrics::histogram!("state.header.full_state_expectation.headers")
+                .record(f64::from(staged_header_count));
+            metrics::histogram!("state.header.full_state_expectation.duration_seconds")
+                .record(staged_check_start.elapsed().as_secs_f64());
         }
         if let Some(expected) = expectation.verified {
             let actual = transition.change_set().metadata.frontiers.verified_best;
@@ -3723,6 +3734,16 @@ pub struct HeaderChainStore {
 }
 
 impl HeaderChainStore {
+    #[cfg(test)]
+    fn reset_header_node_disk_reads() {
+        TEST_HEADER_NODE_DISK_READS.with(|reads| reads.set(0));
+    }
+
+    #[cfg(test)]
+    fn header_node_disk_reads() -> u64 {
+        TEST_HEADER_NODE_DISK_READS.with(std::cell::Cell::get)
+    }
+
     /// Attach the header-chain adapter to the existing finalized-state database.
     pub fn new(db: DiskDb) -> Self {
         Self {
@@ -5827,6 +5848,15 @@ impl HeaderChainStore {
     }
 
     fn header_node(&self, hash: block::Hash) -> Result<Option<HeaderNode>, StoreError> {
+        #[cfg(test)]
+        TEST_HEADER_NODE_DISK_READS.with(|reads| {
+            reads.set(
+                reads
+                    .get()
+                    .checked_add(1)
+                    .expect("test header-node disk read count stays below u64::MAX"),
+            );
+        });
         let value = self
             .get_value::<HeaderNodeDisk>(HEADER_NODE_BY_HASH, hash.0)
             .map_err(store_error)?;

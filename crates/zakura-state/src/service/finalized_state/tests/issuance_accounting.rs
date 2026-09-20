@@ -321,6 +321,96 @@ pub(super) fn permitted_start_block(
     )
 }
 
+#[test]
+fn mining_template_uses_the_selected_parents_balance() {
+    use crate::{service::read::difficulty::get_block_template_chain_info, tests::FakeChainHelper};
+
+    let _guard = zakura_test::init();
+    let network = accounting_network(true);
+    let (state, parent) = state_below_start(&network);
+    let mut forks = NonFinalizedState::new(&network);
+    let balance = i64::from(state.db.finalized_value_pool().nsm_value_balance_amount());
+    assert!(balance > 0);
+
+    let assert_parent = |forks: &NonFinalizedState, parent: &Block, expected_balance: i64| {
+        let info = get_block_template_chain_info(forks, &state.db, &network).unwrap();
+        assert_eq!(info.tip_hash, parent.hash());
+        assert_eq!(info.tip_height, parent.coinbase_height().unwrap());
+        assert_eq!(
+            i64::from(info.value_pools.nsm_value_balance_amount()),
+            expected_balance,
+        );
+    };
+
+    // With no non-finalized chain, the template must use the finalized tip's balance.
+    assert_parent(&forks, &parent, balance);
+
+    let bonus = i64::try_from(reissuance_bonus(&network, START, i128::from(balance))).unwrap();
+    assert!(bonus > 0);
+    // These accounting fixtures bypass semantic subsidy validation. The shortfall
+    // gives the competing branch a distinct balance, and its higher work selects it.
+    for (work, shortfall) in [(10, 0), (20, 1_000)] {
+        let block =
+            start_block(&state, &network, &parent, bonus - balance - shortfall).set_work(work);
+        forks
+            .commit_new_chain(SemanticallyVerifiedBlock::from(block.clone()), &state.db)
+            .unwrap();
+        assert_parent(&forks, &block, balance - bonus + shortfall);
+    }
+    assert_eq!(forks.chain_count(), 2);
+}
+
+#[test]
+fn mining_template_requires_parent_pools_at_reissuance_activation() {
+    use crate::service::{
+        finalized_state::DiskWriteBatch, read::difficulty::get_block_template_chain_info,
+    };
+
+    let _guard = zakura_test::init();
+    for start in [START, START.next().unwrap()] {
+        let network = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu7: Some(2),
+                ..Default::default()
+            },
+            nsm_reissuance_height: Some(start),
+            ..Default::default()
+        });
+        let (state, parent) = state_below_start(&network);
+        let forks = NonFinalizedState::new(&network);
+        let parent_height = parent.coinbase_height().unwrap();
+        let parent_info = state.db.block_info(parent_height.into()).unwrap();
+        let mut batch = DiskWriteBatch::new();
+        let _ = state
+            .db
+            .block_info_cf()
+            .with_batch_for_writing(&mut batch)
+            .zs_delete(&parent_height);
+        state.db.write_batch(batch).unwrap();
+
+        let result = get_block_template_chain_info(&forks, &state.db, &network);
+        // Restore the fixture before the database's shutdown integrity check.
+        let mut batch = DiskWriteBatch::new();
+        let _ = state
+            .db
+            .block_info_cf()
+            .with_batch_for_writing(&mut batch)
+            .zs_insert(&parent_height, &parent_info);
+        state.db.write_batch(batch).unwrap();
+
+        if start == START {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "missing chain value pools for the ZIP 234 candidate block parent",
+            );
+        } else {
+            let info = result.unwrap();
+            assert_eq!(info.tip_hash, parent.hash());
+            assert_eq!(info.value_pools, Default::default());
+        }
+    }
+}
+
 proptest::proptest! {
     #![proptest_config(proptest::test_runner::Config::with_cases(std::env::var("NSM_HISTORY_CASES").ok().and_then(|value| value.parse().ok()).unwrap_or(64)))]
 

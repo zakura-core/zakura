@@ -1219,20 +1219,20 @@ where
         let network = self.network.clone();
         let miner_params = miner_params.clone();
         let chain_info = chain_info.clone();
-        tokio::task::spawn_blocking(move || {
-            BlockTemplateResponse::new_internal(
-                &network,
-                precomputed_coinbase,
-                &miner_params,
-                &chain_info,
-                long_poll_id,
-                mempool_txs,
-                submit_old,
-            )
-        })
-        .await
-        .map_misc_error()?
-        .map_misc_error()
+        self.gbt
+            .run_template_build(move || {
+                BlockTemplateResponse::new_internal(
+                    &network,
+                    precomputed_coinbase,
+                    &miner_params,
+                    &chain_info,
+                    long_poll_id,
+                    mempool_txs,
+                    submit_old,
+                )
+            })
+            .await?
+            .map_misc_error()
     }
 
     async fn finish_mining_template(
@@ -3005,7 +3005,7 @@ where
                 // seconds if the miner mines to a shielded address, and we want to return fast
                 // when the tip changes.
                 let precompute_coinbase = |network, height, params| {
-                    tokio::task::spawn_blocking(move || {
+                    self.gbt.run_template_build(move || {
                         TransactionTemplate::new_coinbase(
                             &network,
                             height,
@@ -3013,7 +3013,6 @@ where
                             Amount::zero(),
                             None,
                         )
-                        .expect("valid coinbase tx")
                     })
                 };
 
@@ -3029,14 +3028,14 @@ where
                             precomputed_height,
                             miner_params.clone(),
                         )
-                        .await
-                        .expect("valid coinbase tx"),
+                        .await?
+                        .map_misc_error()?,
                     )
                 };
 
                 let _ = wait_for_new_tip.await;
 
-                precomputed_coinbase
+                Ok::<_, ErrorObject<'static>>(precomputed_coinbase)
             };
 
             // Wait for the maximum block time to elapse. This can change the block header
@@ -3084,6 +3083,7 @@ where
                 }
 
                 precomputed_coinbase = wait_for_new_tip => {
+                    let precomputed_coinbase = precomputed_coinbase?;
                     let chain_info = fetch_chain_info(read_state.clone()).await?;
                     if latest_chain_tip.best_tip_hash().is_some_and(|tip| tip != chain_info.tip_hash) {
                         continue;

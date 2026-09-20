@@ -20,11 +20,6 @@ pub(crate) const FIRST_HALVING: Height = Height(1_116_000);
 /// The start height of post-NU6 funding streams on Testnet as described in [ZIP-1015](https://zips.z.cash/zip-1015).
 pub(crate) const POST_NU6_FUNDING_STREAM_START_HEIGHT: u32 = 2_976_000;
 
-/// The NSM reissuance start height on default Testnet.
-///
-/// TODO: set this once the NU7 deployment ZIP selects the default Testnet height.
-pub(crate) const NSM_REISSUANCE_HEIGHT: Option<Height> = None;
-
 /// `INITIAL_NSM_VALUE_BALANCE` on Testnet, measured the same way as Mainnet's at the
 /// last pre-NU6 height, 2,975,999.
 ///

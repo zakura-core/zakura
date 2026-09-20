@@ -693,13 +693,13 @@ fn testnet_with_nu7(nu7: Option<u32>) -> testnet::ParametersBuilder {
         .expect("activation heights are valid")
 }
 
-/// An unset reissuance height stays inactive, even on networks with NU7 enabled.
+/// Missing NU7 or a schedule with no crossing leaves reissuance inactive.
 #[test]
-fn nsm_reissuance_requires_an_explicit_height() {
+fn nsm_reissuance_requires_nu7_and_a_crossing() {
     use crate::parameters::subsidy::{is_zip234_active, nsm_reissuance_height};
 
     let _init_guard = zakura_test::init();
-    let configured = testnet_with_nu7(Some(4_200_000))
+    let configured = testnet_with_nu7(None)
         .to_network()
         .expect("configured testnet is valid");
     let regtest = Network::new_regtest(testnet::RegtestParameters {
@@ -721,14 +721,14 @@ fn nsm_reissuance_requires_an_explicit_height() {
     }
 }
 
-/// Explicit heights survive NU7 gating and activate reissuance at the exact boundary.
+/// Artificial test fixtures still respect NU7 gating.
 #[test]
-fn nsm_reissuance_height_respects_nu7() {
+fn test_nsm_reissuance_fixture_respects_nu7() {
     use crate::parameters::subsidy::{is_zip234_active, nsm_reissuance_height};
 
     let _init_guard = zakura_test::init();
     let no_nu7 = testnet_with_nu7(None)
-        .with_nsm_reissuance_height(Height(4_200_010))
+        .with_test_nsm_reissuance_height(Height(4_200_010))
         .to_network()
         .expect("configured testnet is valid");
     assert_eq!(nsm_reissuance_height(&no_nu7), None);
@@ -738,9 +738,10 @@ fn nsm_reissuance_height_respects_nu7() {
         (1, 4_200_000),
         (4_200_000, 4_200_000),
         (4_200_010, 4_200_010),
+        (12_000_000, 12_000_000),
     ] {
         let network = testnet_with_nu7(Some(4_200_000))
-            .with_nsm_reissuance_height(Height(start))
+            .with_test_nsm_reissuance_height(Height(start))
             .to_network()
             .expect("configured testnet is valid");
 
@@ -756,7 +757,7 @@ fn nsm_reissuance_height_respects_nu7() {
                 nu7: Some(10),
                 ..Default::default()
             },
-            nsm_reissuance_height: Some(Height(start)),
+            test_nsm_reissuance_height: Some(Height(start)),
             ..Default::default()
         });
 
@@ -764,6 +765,156 @@ fn nsm_reissuance_height_respects_nu7() {
         assert!(!is_zip234_active(&network, Height(expected - 1)));
         assert!(is_zip234_active(&network, Height(expected)));
         assert!(is_zip234_active(&network, Height(expected + 1)));
+    }
+}
+
+/// Derived activation reaches the subsidy path, without requiring an explicit height.
+#[test]
+fn derived_nsm_crossing_activates_block_subsidy() {
+    use crate::parameters::subsidy::{
+        block_subsidy, halving_block_subsidy, is_zip234_active, nsm_reissuance_crossing_height,
+        nsm_reissuance_height, SubsidyError,
+    };
+
+    let _init_guard = zakura_test::init();
+    for nu7 in [4_200_000, 4_400_000, 4_600_000] {
+        let network = testnet_with_nu7(Some(nu7))
+            .to_network()
+            .expect("configured testnet is valid");
+        let equal_network = testnet_with_nu7(Some(nu7))
+            .to_network()
+            .expect("configured testnet is valid");
+        let crossing = nsm_reissuance_crossing_height(&network)
+            .expect("valid schedule arithmetic")
+            .expect("this schedule has a crossing");
+        assert_eq!(nsm_reissuance_height(&network), Some(crossing));
+        assert_eq!(
+            network, equal_network,
+            "caching must not change network equality"
+        );
+        assert_eq!(nsm_reissuance_height(&network.clone()), Some(crossing));
+
+        let previous = crossing.previous().expect("crossings have a parent");
+        assert!(!is_zip234_active(&network, previous));
+        assert_eq!(
+            block_subsidy(previous, &network, None),
+            halving_block_subsidy(previous, &network)
+        );
+        for height in [crossing, Height(crossing.0 + 1)] {
+            assert!(is_zip234_active(&network, height));
+            assert_eq!(
+                block_subsidy(height, &network, None),
+                Err(SubsidyError::MissingNsmValueBalance)
+            );
+            let scheduled = halving_block_subsidy(height, &network).expect("valid subsidy");
+            let balance = Amount::try_from(1).expect("one zatoshi is valid");
+            assert_eq!(
+                block_subsidy(height, &network, Some(balance)),
+                Ok((scheduled + balance).expect("subsidy plus one fits"))
+            );
+        }
+    }
+}
+
+/// NU7 inside the third era can cross immediately; its fourth-halving boundary is excluded.
+#[test]
+fn nsm_crossing_respects_network_search_boundaries() {
+    use crate::parameters::subsidy::{nsm_reissuance_crossing_height, nsm_reissuance_height};
+
+    let _init_guard = zakura_test::init();
+    let baseline = testnet_with_nu7(None).to_network().expect("valid testnet");
+    let third = height_for_halving(3, &baseline).expect("third halving exists");
+    let fourth = height_for_halving(4, &baseline).expect("fourth halving exists");
+    for nu7 in [third.0, third.0 + 1, fourth.0 - 1, fourth.0, fourth.0 + 1] {
+        let network = testnet_with_nu7(Some(nu7))
+            .to_network()
+            .expect("valid testnet");
+        let calculated = nsm_reissuance_crossing_height(&network).expect("valid arithmetic");
+        assert_eq!(nsm_reissuance_height(&network), calculated);
+        if nu7 >= fourth.0 {
+            assert_eq!(
+                calculated, None,
+                "NU7 at or beyond the fourth halving has no third-era crossing"
+            );
+        } else {
+            let crossing = calculated.expect("this third era contains a crossing");
+            assert!(crossing > third);
+            assert!(crossing >= Height(nu7));
+            assert!(crossing < height_for_halving(4, &network).expect("fourth halving exists"));
+            if nu7 == fourth.0 - 1 {
+                assert_eq!(
+                    crossing,
+                    Height(nu7),
+                    "a late NU7 starts at the first candidate"
+                );
+            }
+        }
+    }
+}
+
+/// A run includes its final height but must not accept the following block.
+#[test]
+fn nsm_crossing_includes_only_the_permitted_run() {
+    use crate::parameters::subsidy::{
+        first_nsm_crossing_in_subsidy_run, BLOCK_SUBSIDY_FRACTION_DENOMINATOR,
+        BLOCK_SUBSIDY_FRACTION_NUMERATOR,
+    };
+
+    let subsidy = 26_041_666;
+    let threshold =
+        (subsidy - 1) * BLOCK_SUBSIDY_FRACTION_DENOMINATOR / BLOCK_SUBSIDY_FRACTION_NUMERATOR;
+    for (reserve, expected) in [
+        (threshold - 1, Some(10)),
+        (threshold, Some(10)),
+        (threshold + 1, Some(11)),
+        (threshold + 2 * subsidy, Some(12)),
+        (threshold + 2 * subsidy + 1, None),
+    ] {
+        assert_eq!(
+            first_nsm_crossing_in_subsidy_run(10, 12, 0, subsidy, reserve),
+            Ok(expected)
+        );
+    }
+    assert_eq!(
+        first_nsm_crossing_in_subsidy_run(10, 9, 0, subsidy, threshold),
+        Ok(None)
+    );
+    assert_eq!(first_nsm_crossing_in_subsidy_run(10, 12, 0, 0, 0), Ok(None));
+}
+
+proptest::proptest! {
+    /// Check the full network wrapper over NU7 dates before, within, and after the third era.
+    #[test]
+    fn derived_nsm_crossing_matches_network_inequality(nu7 in 4_200_000u32..8_000_000) {
+        use crate::{amount::MAX_MONEY, parameters::subsidy::{
+            halving_block_subsidy, nsm_reissuance_height, scheduled_issuance_zatoshis,
+            BLOCK_SUBSIDY_FRACTION_DENOMINATOR, BLOCK_SUBSIDY_FRACTION_NUMERATOR,
+        }};
+
+        let network = testnet_with_nu7(Some(nu7)).to_network().expect("valid testnet");
+        let third = height_for_halving(3, &network).expect("third halving exists");
+        let fourth = height_for_halving(4, &network).expect("fourth halving exists");
+        let first = Height((third.0 + 1).max(nu7));
+        let qualifies = |height: Height| {
+            let supply = scheduled_issuance_zatoshis(height.previous().expect("positive height"), &network).expect("valid supply");
+            let reserve = u128::try_from(MAX_MONEY).expect("positive limit").saturating_sub(supply);
+            let reference = (reserve * BLOCK_SUBSIDY_FRACTION_NUMERATOR).div_ceil(BLOCK_SUBSIDY_FRACTION_DENOMINATOR);
+            let scheduled = u128::try_from(i64::from(halving_block_subsidy(height, &network).expect("valid subsidy"))).expect("non-negative subsidy");
+            reference < scheduled
+        };
+        match nsm_reissuance_height(&network) {
+            Some(crossing) => {
+                proptest::prop_assert!(crossing >= first && crossing < fourth);
+                proptest::prop_assert!(qualifies(crossing));
+                if crossing > first {
+                    proptest::prop_assert!(!qualifies(crossing.previous().expect("positive height")));
+                }
+            }
+            None => {
+                // Within a constant-subsidy era, the reference subsidy only decreases.
+                proptest::prop_assert!(first >= fourth || !qualifies(fourth.previous().expect("positive height")));
+            }
+        }
     }
 }
 
@@ -885,6 +1036,10 @@ fn estimated_mainnet_nsm_crossing_lands_in_february_2031() {
         .expect("crossing arithmetic is valid")
         .expect("the estimated Mainnet schedule has a crossing");
     assert_eq!(crossing, Height(8_940_474));
+    assert_eq!(
+        crate::parameters::subsidy::nsm_reissuance_height(&network),
+        Some(crossing)
+    );
 
     let estimated_nu7_time = Utc
         .with_ymd_and_hms(2026, 11, 5, 12, 0, 0)
@@ -1113,7 +1268,7 @@ fn reissuance_drains_a_small_balance() {
         })
         .expect("activation heights are valid")
         .clear_funding_streams()
-        .with_nsm_reissuance_height(start)
+        .with_test_nsm_reissuance_height(start)
         .to_network()
         .expect("configured testnet is valid");
 
@@ -1215,7 +1370,7 @@ fn zip234_issuance() {
         })
         .expect("activation heights are valid")
         .clear_funding_streams()
-        .with_nsm_reissuance_height(start)
+        .with_test_nsm_reissuance_height(start)
         .to_network()
         .expect("configured testnet is valid");
 
@@ -1363,7 +1518,7 @@ fn reissuance_activation_and_rounding_boundary_matrix() {
                     nu7,
                     ..Default::default()
                 },
-                nsm_reissuance_height: Some(Height(configured_start)),
+                test_nsm_reissuance_height: Some(Height(configured_start)),
                 ..Default::default()
             });
             assert_eq!(

@@ -3219,7 +3219,7 @@ async fn zip234_mining_rpcs_include_the_reissuance_bonus() {
             nu7: Some(1),
             ..Default::default()
         },
-        nsm_reissuance_height: Some(start),
+        test_nsm_reissuance_height: Some(start),
         ..Default::default()
     });
 

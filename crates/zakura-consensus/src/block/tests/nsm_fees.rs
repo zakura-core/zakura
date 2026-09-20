@@ -12,7 +12,7 @@ fn nsm_fee_claims_at_activation_and_reissuance() {
             nu7: Some(5),
             ..Default::default()
         },
-        nsm_reissuance_height: Some(Height(10)),
+        test_nsm_reissuance_height: Some(Height(10)),
         ..Default::default()
     });
     for height in [Height(4), Height(5), Height(9), Height(10)] {

@@ -423,7 +423,7 @@ impl TrustedChainSync {
                     .subscribe_to_non_finalized_state_change()
                     .await
                 {
-                    Ok(listener) => Some(listener),
+                    Ok(listener) => listener,
                     Err(err) => {
                         tracing::warn!(?err, "failed to subscribe to non-finalized state changes");
                         tokio::time::sleep(POLL_DELAY).await;
@@ -705,13 +705,14 @@ impl TrustedChainSync {
     }
 
     /// Subscribes to non-finalized state changes and returns the response stream.
+    /// Returns `None` after a session change so the caller resubscribes with empty tips.
     ///
     /// Passes every local chain tip so the server only streams missing blocks,
     /// rather than the whole state on each subscription. With no local chains,
     /// the server streams every non-finalized block.
     async fn subscribe_to_non_finalized_state_change(
         &mut self,
-    ) -> Result<Streaming<BlockAndHash>, Status> {
+    ) -> Result<Option<Streaming<BlockAndHash>>, Status> {
         let request = NonFinalizedStateChangeRequest {
             chain_tip_hashes: self
                 .non_finalized_state
@@ -739,12 +740,13 @@ impl TrustedChainSync {
             .transpose()
             .map_err(|_| Status::internal("invalid receipt session"))?;
         if session != self.receipt_session {
-            // The server sends a complete snapshot when the session changes,
-            // even if the request supplied tips from the previous process.
+            // A legacy server can omit the session after honoring our old tips.
+            // Discard that response and explicitly request the complete state.
             self.non_finalized_state = NonFinalizedState::new(&self.non_finalized_state.network);
             self.receipt_session = session;
+            return Ok(None);
         }
-        Ok(response.into_inner())
+        Ok(Some(response.into_inner()))
     }
 
     /// Catches up to the primary database, then prunes and publishes any blocks
@@ -867,6 +869,8 @@ pub fn init_read_state_with_syncer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod subscriptions;
 
     #[test]
     fn rejects_non_loopback_plaintext_indexer_connection() {

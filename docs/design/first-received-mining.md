@@ -42,7 +42,9 @@ The trusted indexer stream carries optional `receipt_order` metadata. Its
 `x-zakura-receipt-session` response header identifies the primary process that
 assigned those orders. A secondary returns that value as `receipt_session` on
 resubscription. If it differs, the server ignores the secondary's known tips and
-sends a complete snapshot. The secondary discards its old receipt-order domain.
+sends a complete snapshot. The secondary discards its old receipt-order domain
+and resubscribes with empty tips whenever the response session changes, including
+when an older server omits it.
 
 Secondaries request `include_chain_snapshot` to receive a `chain_snapshot`
 message after each batch of blocks. Its complete retained tip set covers changes

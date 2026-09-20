@@ -160,21 +160,6 @@ where
             // timed-out send means the consumer is hung. In both cases the task
             // ends rather than blocking forever.
             loop {
-                // A full listener buffer means the state-side task is blocked
-                // sending into it, so it may already have missed non-finalized
-                // state updates. The stream can no longer guarantee
-                // completeness, so drop the subscription instead of silently
-                // missing blocks.
-                if non_finalized_state_change.capacity() == 0 {
-                    span.in_scope(|| {
-                        tracing::warn!(
-                            "slow consumer, dropping non_finalized_state_change stream after \
-                             buffer filled"
-                        );
-                    });
-                    return;
-                }
-
                 let Some(change) = non_finalized_state_change.recv().await else {
                     break;
                 };

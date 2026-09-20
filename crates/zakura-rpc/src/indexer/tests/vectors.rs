@@ -282,6 +282,73 @@ async fn non_finalized_stream_preserves_receipts_and_negotiates_snapshots() -> R
     Ok(())
 }
 
+#[tokio::test]
+async fn non_finalized_snapshot_drains_a_full_listener_buffer() -> Result<()> {
+    use zakura_chain::serialization::BytesInDisplayOrder;
+    use zakura_state::{NonFinalizedBlocksListener, NonFinalizedStateChange};
+
+    let _init_guard = zakura_test::init();
+    let (server, mut client, mut state, _tip, _mempool) = start_server_and_get_client().await?;
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+    let hash = block.hash();
+    let request = tokio::spawn(async move {
+        client
+            .non_finalized_state_change(indexer::NonFinalizedStateChangeRequest {
+                chain_tip_hashes: vec![hash.bytes_in_display_order().to_vec()],
+                receipt_session: Some("previous-primary".into()),
+                include_chain_snapshot: true,
+            })
+            .await
+    });
+    // Fill the production-sized listener before the RPC gets it, then send a
+    // larger snapshot. Repeated ancestors can appear in multiple retained forks.
+    let capacity = usize::try_from(zakura_state::MAX_BLOCK_REORG_HEIGHT)? * 2;
+    let count = capacity + 100;
+    let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
+    let change = NonFinalizedStateChange::Block {
+        hash,
+        block,
+        receipt_order: Some(1),
+    };
+    for _ in 0..capacity {
+        sender.try_send(change.clone())?;
+    }
+    assert_eq!(receiver.capacity(), 0);
+    state
+        .expect_request(ReadRequest::NonFinalizedBlocksListener {
+            known_chain_tips: Default::default(),
+        })
+        .await
+        .respond(ReadResponse::NonFinalizedBlocksListener(
+            NonFinalizedBlocksListener(Arc::new(receiver)),
+        ));
+    let producer = tokio::spawn(async move {
+        for _ in capacity..count {
+            sender.send(change.clone()).await?;
+        }
+        sender
+            .send(NonFinalizedStateChange::ChainTips(vec![hash]))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut stream = request.await.unwrap().unwrap().into_inner();
+        for _ in 0..count {
+            let message = stream.message().await.unwrap().expect("snapshot block");
+            assert_eq!(message.receipt_order, Some(1));
+            assert_eq!(message.decode().unwrap().1, hash);
+        }
+        let snapshot = stream.message().await.unwrap().expect("snapshot boundary");
+        assert_eq!(
+            snapshot.chain_snapshot.unwrap().hashes,
+            vec![hash.bytes_in_display_order().to_vec()]
+        );
+        producer.await.unwrap().unwrap();
+    })
+    .await?;
+    server.abort();
+    Ok(())
+}
+
 /// Tests that `GetBlock` returns the requested block and rejects invalid
 /// requests.
 async fn test_get_block(

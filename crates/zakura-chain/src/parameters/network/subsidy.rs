@@ -19,7 +19,7 @@ use std::{collections::HashMap, sync::OnceLock};
 use crate::{
     amount::{self, Amount, NegativeAllowed, NonNegative, MAX_MONEY},
     block::{Height, HeightDiff},
-    parameters::{network_upgrade::POST_BLOSSOM_POW_TARGET_SPACING, Network, NetworkUpgrade},
+    parameters::{Network, NetworkUpgrade},
     transparent,
 };
 
@@ -480,49 +480,28 @@ pub fn halving(height: Height, network: &Network) -> u32 {
         .expect("halving index is non-negative and fits in u32")
 }
 
-/// `ln(2)` scaled by [`BLOCK_SUBSIDY_FRACTION_DENOMINATOR`], from [ZIP 234].
+/// `ln(2)` scaled by [`BLOCK_SUBSIDY_FRACTION_DENOMINATOR`] and rounded up to a
+/// multiple of 1,680,000, as specified by the [halving-preserving NSM draft].
 ///
-/// [ZIP 234]: https://zips.z.cash/zip-0234
+/// [halving-preserving NSM draft]: https://github.com/zcash/zips/blob/60720df9e971e19d8b6f67f1869426d78c96d250/zips/draft-judah-nsm-halving-preserving-issuance.md
 pub const LN2_SCALED: u128 = 6_931_680_000;
 
-/// The denominator of [ZIP 234]'s `BLOCK_SUBSIDY_FRACTION`.
+/// The numerator of the [halving-preserving NSM draft]'s `BLOCK_SUBSIDY_FRACTION` from NU7.
 ///
-/// [ZIP 234]: https://zips.z.cash/zip-0234
+/// ZIP 218 reduces the target spacing from 75 to 25 seconds, tripling the number
+/// of blocks in the same four-year payout half-life. This is
+/// `floor(LN2_SCALED / 5_040_000)`. The fraction is fixed on every network,
+/// including custom networks with shorter or longer scheduled halving intervals.
+/// Reissuance always uses the NU7 payout rate; future spacing changes must
+/// explicitly revisit this constant.
+///
+/// [halving-preserving NSM draft]: https://github.com/zcash/zips/blob/60720df9e971e19d8b6f67f1869426d78c96d250/zips/draft-judah-nsm-halving-preserving-issuance.md
+pub const BLOCK_SUBSIDY_FRACTION_NUMERATOR: u128 = 1_375;
+
+/// The denominator of the [halving-preserving NSM draft]'s `BLOCK_SUBSIDY_FRACTION`.
+///
+/// [halving-preserving NSM draft]: https://github.com/zcash/zips/blob/60720df9e971e19d8b6f67f1869426d78c96d250/zips/draft-judah-nsm-halving-preserving-issuance.md
 pub const BLOCK_SUBSIDY_FRACTION_DENOMINATOR: u128 = 10_000_000_000;
-
-/// Returns `HalvingInterval(height)`: the number of blocks in a halving period at `height`.
-///
-/// Each target spacing era keeps the halving period at about four years of wall-clock
-/// time, so the interval scales by the inverse of the spacing. On Mainnet that gives
-/// 840,000 blocks before Blossom at 150 seconds, 1,680,000 after it at 75 seconds, and
-/// 5,040,000 from NU7 at ZIP 218's 25 seconds.
-pub fn halving_interval(height: Height, network: &Network) -> HeightDiff {
-    let post_blossom_spacing = HeightDiff::from(POST_BLOSSOM_POW_TARGET_SPACING);
-    let spacing = NetworkUpgrade::target_spacing_for_height(network, height).num_seconds();
-
-    network.post_blossom_halving_interval() * post_blossom_spacing / spacing
-}
-
-/// Returns the numerator of [ZIP 234]'s `BLOCK_SUBSIDY_FRACTION` at `height`.
-///
-/// # Consensus
-///
-/// > BLOCK_SUBSIDY_FRACTION(height) = floor(LN2_SCALED / HalvingInterval(height))
-/// >                                  / BLOCK_SUBSIDY_FRACTION_DENOMINATOR
-///
-/// The fraction removes `ln(2) / HalvingInterval` of the balance per block, so the
-/// balance halves once per halving period whatever the target spacing. A fixed numerator
-/// would pay out three times as fast under ZIP 218's 25-second blocks.
-///
-/// On Mainnet this is 4126 after Blossom and 1375 from NU7.
-///
-/// [ZIP 234]: https://zips.z.cash/zip-0234
-pub fn block_subsidy_fraction_numerator(height: Height, network: &Network) -> u128 {
-    let interval = u128::try_from(halving_interval(height, network).max(1))
-        .expect("a positive halving interval fits in u128");
-
-    LN2_SCALED / interval
-}
 
 /// The halving after which the [ZIP 234] start rule looks for its crossing height.
 ///
@@ -789,7 +768,7 @@ pub fn is_zip234_active(network: &Network, height: Height) -> bool {
     nsm_reissuance_height(network).is_some_and(|start| height >= start)
 }
 
-/// Returns the NSM value balance after a block's parent, in the form [`block_subsidy`] takes.
+/// Validates a signed parent NSM value balance for [`reissuance_bonus`].
 ///
 /// The state stores a signed balance. Returns [`SubsidyError::NegativeNsmValueBalance`] if
 /// the parent's chain issued more than the halving schedule.
@@ -801,16 +780,12 @@ pub fn parent_nsm_value_balance(
         .map_err(|_| SubsidyError::NegativeNsmValueBalance)
 }
 
-/// Applies the [ZIP 234] reissuance fraction at `height` to `amount`, rounding up.
+/// Applies the [halving-preserving NSM draft] reissuance fraction to `amount`, rounding up.
 ///
-/// [ZIP 234]: https://zips.z.cash/zip-0234
-fn reissuance_amount(
-    amount: Amount<NonNegative>,
-    height: Height,
-    network: &Network,
-) -> Result<Amount<NonNegative>, SubsidyError> {
+/// [halving-preserving NSM draft]: https://github.com/zcash/zips/blob/60720df9e971e19d8b6f67f1869426d78c96d250/zips/draft-judah-nsm-halving-preserving-issuance.md
+fn reissuance_amount(amount: Amount<NonNegative>) -> Result<Amount<NonNegative>, SubsidyError> {
     let subsidy = amount_to_u128(amount)
-        .checked_mul(block_subsidy_fraction_numerator(height, network))
+        .checked_mul(BLOCK_SUBSIDY_FRACTION_NUMERATOR)
         .ok_or(SubsidyError::Overflow)?
         .div_ceil(BLOCK_SUBSIDY_FRACTION_DENOMINATOR);
 
@@ -819,22 +794,25 @@ fn reissuance_amount(
     Ok(Amount::try_from(subsidy)?)
 }
 
-/// Returns the [ZIP 234] reissuance bonus for a block, given the `NsmValueBalance` after
-/// its parent.
+/// Returns the reissuance bonus from the [halving-preserving NSM draft], given
+/// the `NsmValueBalance` after the parent block. This is the arithmetic component
+/// of `AdditionalBlockSubsidy`.
 ///
 /// The halving schedule keeps issuing new ZEC. The bonus reissues value removed from
-/// circulation.
+/// circulation. This helper does not check the reissuance activation height;
+/// callers must gate its use and supply the balance from the actual parent.
+/// It always uses the fixed NU7 fraction, even for a pre-activation balance.
+/// A zero balance pays zero; a positive balance pays at least one zatoshi and
+/// never more than that balance.
 ///
 /// The state supplies the balance after the parent block; see
 /// `Block::nsm_value_balance_change`.
 ///
-/// [ZIP 234]: https://zips.z.cash/zip-0234
-fn reissuance_bonus(
+/// [halving-preserving NSM draft]: https://github.com/zcash/zips/blob/60720df9e971e19d8b6f67f1869426d78c96d250/zips/draft-judah-nsm-halving-preserving-issuance.md
+pub fn reissuance_bonus(
     nsm_value_balance: Amount<NonNegative>,
-    height: Height,
-    network: &Network,
 ) -> Result<Amount<NonNegative>, SubsidyError> {
-    reissuance_amount(nsm_value_balance, height, network)
+    reissuance_amount(nsm_value_balance)
 }
 
 /// Returns `ExpectedIssuedSupply(height)` from zips#1354: the total block subsidy the
@@ -995,7 +973,7 @@ pub fn block_subsidy(
         let nsm_value_balance = nsm_value_balance.ok_or(SubsidyError::MissingNsmValueBalance)?;
 
         let halving_subsidy = halving_block_subsidy(height, net)?;
-        let bonus = reissuance_bonus(nsm_value_balance, height, net)?;
+        let bonus = reissuance_bonus(nsm_value_balance)?;
 
         return Ok((halving_subsidy + bonus)?);
     }

@@ -229,8 +229,8 @@ pub(crate) struct StateService {
     non_finalized_rejected_receiver:
         tokio::sync::mpsc::UnboundedReceiver<write::NonFinalizedWriteFailure>,
 
-    /// Receives a notification after each block commit, rejection, or reconsideration.
-    block_commit_receiver: tokio::sync::watch::Receiver<write::BlockWriteNotice>,
+    /// Tracks write admissions and notifies readers of commits, rejections, or reconsideration.
+    block_commit_sender: tokio::sync::watch::Sender<write::BlockWriteNotice>,
 
     /// The longest time an [`Request::AwaitBlockInfo`] request waits for its block.
     await_block_info_timeout: Duration,
@@ -553,7 +553,7 @@ impl StateService {
             invalid_block_write_reset_receiver,
             non_finalized_rejected_receiver,
             vct_root_repair_receiver,
-            block_commit_receiver,
+            block_commit_sender,
             block_write_failure,
             block_write_task,
         ) = write::BlockWriteSender::spawn(
@@ -617,7 +617,7 @@ impl StateService {
             non_finalized_failed_ancestors: IndexMap::new(),
             invalid_block_write_reset_receiver,
             non_finalized_rejected_receiver,
-            block_commit_receiver,
+            block_commit_sender,
             await_block_info_timeout: AWAIT_BLOCK_INFO_TIMEOUT,
             pending_utxos,
             last_prune: Instant::now(),
@@ -704,7 +704,12 @@ impl StateService {
         }
 
         let (rsp_tx, rsp_rx) = oneshot::channel();
-        let queued = (checkpoint_verified, rsp_tx);
+        let attempt = if self.block_write_sender.finalized.is_some() {
+            write::start_block_write(&self.block_commit_sender, checkpoint_verified.hash)
+        } else {
+            0
+        };
+        let queued = (checkpoint_verified, rsp_tx, attempt);
 
         if self.block_write_sender.finalized.is_some() {
             // We're still committing checkpoint verified blocks
@@ -910,7 +915,7 @@ impl StateService {
         queued: QueuedCheckpointVerified,
         error: impl Into<CommitCheckpointVerifiedError>,
     ) {
-        let (finalized, rsp_tx) = queued;
+        let (finalized, rsp_tx, _) = queued;
 
         // The block sender might have already given up on this block,
         // so ignore any channel send errors.
@@ -933,7 +938,7 @@ impl StateService {
         queued: QueuedSemanticallyVerified,
         error: impl Into<CommitSemanticallyVerifiedError>,
     ) {
-        let (finalized, rsp_tx, admission) = queued;
+        let (finalized, rsp_tx, admission, _) = queued;
 
         if let Some(admission) = admission {
             admission.reject();
@@ -1103,9 +1108,10 @@ impl StateService {
         {
             tracing::debug!("replacing older queued request with new request");
             let (rsp_tx, rsp_rx) = oneshot::channel();
-            let (_, old_rsp_tx, old_admission) = self.non_finalized_state_queued_blocks.replace(
+            let attempt = write::start_block_write(&self.block_commit_sender, hash);
+            let (_, old_rsp_tx, old_admission, _) = self.non_finalized_state_queued_blocks.replace(
                 semantically_verified.hash,
-                (semantically_verified, rsp_tx, admission),
+                (semantically_verified, rsp_tx, admission, attempt),
             );
             if let Some(old_admission) = old_admission {
                 old_admission.reject();
@@ -1133,10 +1139,12 @@ impl StateService {
             rsp_rx
         } else {
             let (rsp_tx, rsp_rx) = oneshot::channel();
+            let attempt = write::start_block_write(&self.block_commit_sender, hash);
             self.non_finalized_state_queued_blocks.queue((
                 semantically_verified,
                 rsp_tx,
                 admission,
+                attempt,
             ));
             rsp_rx
         };
@@ -1238,7 +1246,7 @@ impl StateService {
                         );
                         continue;
                     };
-                    let (SemanticallyVerifiedBlock { hash, .. }, _, _) = &queued_child;
+                    let (SemanticallyVerifiedBlock { hash, .. }, _, _, _) = &queued_child;
                     let hash = *hash;
 
                     self.non_finalized_block_write_sent_hashes
@@ -1708,6 +1716,12 @@ impl Service<Request> for StateService {
 
         self.poll_non_finalized_write_failures(cx);
 
+        // A failed checkpoint commit requests Tip during recovery. Consume its
+        // queue reset here so a waiting replacement does not need another block.
+        if self.block_write_sender.finalized.is_some() {
+            self.drain_finalized_queue_and_commit();
+        }
+
         // Hand off from finalized to non-finalized writes as soon as the final checkpoint block is
         // durably written, without waiting for a semantically verified block to arrive.
         self.try_handoff_to_non_finalized_write();
@@ -2019,7 +2033,7 @@ impl Service<Request> for StateService {
 
             // Wait for a parent block to commit before a contextual consensus calculation.
             Request::AwaitBlockInfo(hash) => {
-                let mut block_commit_receiver = self.block_commit_receiver.clone();
+                let mut block_commit_receiver = self.block_commit_sender.subscribe();
                 let read_service = self.read_service.clone();
                 let limit = self.await_block_info_timeout;
 
@@ -2156,6 +2170,7 @@ impl Service<Request> for StateService {
             | Request::UnspentBestChainUtxo(_)
             | Request::CheckParentInputs { .. }
             | Request::Block(_)
+            | Request::BlockInfo(_)
             | Request::AnyChainBlock(_)
             | Request::BlockHeader(_)
             | Request::FindBlockHashes { .. }

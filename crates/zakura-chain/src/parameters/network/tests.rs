@@ -851,90 +851,47 @@ fn expected_issued_supply_matches_per_height_sum() {
     }
 }
 
-/// The ZIP 234 fraction tracks the halving interval, so ZIP 218's 25-second blocks do not
-/// pay the balance out three times as fast.
+/// The fixed NSM fraction must be revisited if NU7 target spacing changes.
 #[test]
-fn block_subsidy_fraction_tracks_the_halving_interval() {
-    use crate::parameters::subsidy::{block_subsidy_fraction_numerator, halving_interval};
+fn block_subsidy_fraction_uses_the_nu7_spacing() {
+    use crate::parameters::subsidy::{BLOCK_SUBSIDY_FRACTION_NUMERATOR, LN2_SCALED};
 
     let _init_guard = zakura_test::init();
 
-    let nu7 = Height(4_000_000);
-    let network = testnet::Parameters::build()
-        .with_activation_heights(ConfiguredActivationHeights {
-            blossom: Some(1_000_000),
-            canopy: Some(1_000_001),
-            nu7: Some(nu7.0),
-            ..Default::default()
-        })
-        .expect("activation heights are valid")
-        .clear_funding_streams()
-        .to_network()
-        .expect("configured testnet is valid");
-
-    // 150-second blocks before Blossom, 75 after it, 25 from NU7. The halving period stays
-    // at about four years of wall-clock time, so the interval scales with the spacing.
-    for (height, interval, numerator) in [
-        (Height(999_999), 840_000, 8_252),
-        (Height(1_000_000), 1_680_000, 4_126),
-        (Height(nu7.0 - 1), 1_680_000, 4_126),
-        (nu7, 5_040_000, 1_375),
-        (Height(nu7.0 + 1), 5_040_000, 1_375),
-    ] {
-        assert_eq!(
-            halving_interval(height, &network),
-            interval,
-            "halving interval at {height:?}",
-        );
-        assert_eq!(
-            block_subsidy_fraction_numerator(height, &network),
-            numerator,
-            "fraction numerator at {height:?}",
-        );
-    }
+    assert_eq!(NetworkUpgrade::Nu7.target_spacing().num_seconds(), 25);
+    let interval = Network::Mainnet.post_blossom_halving_interval()
+        * NetworkUpgrade::Blossom.target_spacing().num_seconds()
+        / NetworkUpgrade::Nu7.target_spacing().num_seconds();
+    assert_eq!(interval, 5_040_000);
+    assert_eq!(
+        BLOCK_SUBSIDY_FRACTION_NUMERATOR,
+        LN2_SCALED / u128::try_from(interval).expect("the halving interval is positive"),
+    );
 }
 
 /// Applying the fraction once per block over a halving interval halves the balance.
 #[test]
 fn block_subsidy_fraction_halves_the_balance_over_one_interval() {
-    use crate::parameters::subsidy::{
-        block_subsidy_fraction_numerator, halving_interval, BLOCK_SUBSIDY_FRACTION_DENOMINATOR,
-    };
+    use crate::parameters::subsidy::reissuance_bonus;
 
     let _init_guard = zakura_test::init();
 
-    let nu7 = Height(4_000_000);
-    let network = testnet::Parameters::build()
-        .with_activation_heights(ConfiguredActivationHeights {
-            blossom: Some(1),
-            canopy: Some(2),
-            nu7: Some(nu7.0),
-            ..Default::default()
-        })
-        .expect("activation heights are valid")
-        .clear_funding_streams()
-        .to_network()
-        .expect("configured testnet is valid");
-
-    for height in [Height(nu7.0 - 1), nu7] {
-        let numerator = block_subsidy_fraction_numerator(height, &network);
-        let interval = u32::try_from(halving_interval(height, &network)).expect("a valid interval");
-
-        // `(1 - f)^interval` in fixed point, one block at a time. Rounding each step down
-        // only makes the remainder smaller, so the tolerance is one-sided in practice.
-        let mut remaining = BLOCK_SUBSIDY_FRACTION_DENOMINATOR;
-        for _ in 0..interval {
-            remaining -= remaining * numerator / BLOCK_SUBSIDY_FRACTION_DENOMINATOR;
-        }
-
-        let half = BLOCK_SUBSIDY_FRACTION_DENOMINATOR / 2;
-        let error = remaining.abs_diff(half);
-        assert!(
-            error * 1_000 < half,
-            "one halving interval at {height:?} must leave about half, left {remaining} of \
-             {BLOCK_SUBSIDY_FRACTION_DENOMINATOR}",
-        );
+    // Exercise the actual ceiling payout on every block. Rounding the payout up
+    // leaves less than the ideal exponential remainder, especially at small balances.
+    let initial = 10_000_000_000i64;
+    let mut remaining =
+        Amount::<NonNegative>::try_from(initial).expect("100 ZEC is a valid amount");
+    for _ in 0..5_040_000 {
+        remaining = (remaining - reissuance_bonus(remaining).expect("valid bonus"))
+            .expect("the bonus never exceeds the remaining balance");
     }
+
+    let half = initial / 2;
+    let error = i64::from(remaining).abs_diff(half);
+    assert!(
+        error * 1_000 < u64::try_from(half).expect("half the initial balance is positive"),
+        "one halving interval must leave about half, left {remaining} of {initial}",
+    );
 }
 
 /// A positive balance always pays at least one zatoshi, so the balance reaches zero in a
@@ -983,6 +940,61 @@ fn reissuance_drains_a_small_balance() {
         balance, 0,
         "the balance must drain within its own value in blocks"
     );
+}
+
+/// Check zero, ceiling boundaries, and the largest representable balance explicitly.
+#[test]
+fn reissuance_bonus_rounding_boundaries() {
+    use crate::{amount::MAX_MONEY, parameters::subsidy::reissuance_bonus};
+
+    for (balance, expected) in [
+        (0, 0),
+        (1, 1),
+        (10_000_000_000 - 1, 1_375),
+        (10_000_000_000, 1_375),
+        (10_000_000_000 + 1, 1_376),
+        (MAX_MONEY, 288_750_000),
+    ] {
+        let actual = reissuance_bonus(Amount::try_from(balance).unwrap()).unwrap();
+        assert_eq!(i64::from(actual), expected, "balance {balance}");
+    }
+}
+
+/// A signed parent balance must be rejected, not clamped, when negative.
+#[test]
+fn parent_nsm_value_balance_rejects_negative_amounts() {
+    use crate::{
+        amount::MAX_MONEY,
+        parameters::subsidy::{parent_nsm_value_balance, SubsidyError},
+    };
+
+    for balance in [-MAX_MONEY, -1] {
+        assert!(matches!(
+            parent_nsm_value_balance(Amount::try_from(balance).unwrap()),
+            Err(SubsidyError::NegativeNsmValueBalance),
+        ));
+    }
+    for balance in [0, 1, MAX_MONEY] {
+        let actual = parent_nsm_value_balance(Amount::try_from(balance).unwrap()).unwrap();
+        assert_eq!(i64::from(actual), balance);
+    }
+}
+
+proptest::proptest! {
+    #[test]
+    fn reissuance_arithmetic_matches_integer_oracle(balance in 0i64..=crate::amount::MAX_MONEY) {
+        use crate::parameters::subsidy::{
+            reissuance_bonus, BLOCK_SUBSIDY_FRACTION_DENOMINATOR,
+            BLOCK_SUBSIDY_FRACTION_NUMERATOR,
+        };
+        let numerator = i128::try_from(BLOCK_SUBSIDY_FRACTION_NUMERATOR).unwrap();
+        let denominator = i128::try_from(BLOCK_SUBSIDY_FRACTION_DENOMINATOR).unwrap();
+        let expected = (i128::from(balance) * numerator + denominator - 1) / denominator;
+        let actual = reissuance_bonus(Amount::try_from(balance).unwrap()).unwrap();
+        proptest::prop_assert_eq!(i128::from(i64::from(actual)), expected);
+        proptest::prop_assert!(i64::from(actual) <= balance);
+        proptest::prop_assert!(balance == 0 || i64::from(actual) > 0);
+    }
 }
 
 /// Checks the ZIP 234 reissuance bonus.
@@ -1172,13 +1184,7 @@ fn reissuance_activation_and_rounding_boundary_matrix() {
                         scheduled
                     );
                 }
-                let numerator = i128::try_from(
-                    crate::parameters::subsidy::block_subsidy_fraction_numerator(
-                        Height(height),
-                        &network,
-                    ),
-                )
-                .unwrap();
+                let numerator = 1_375;
                 // The largest deficit that still rounds up to a one-zatoshi bonus.
                 let boundary = i64::try_from(10_000_000_000 / numerator).unwrap();
                 for deficit in [
@@ -1432,4 +1438,55 @@ fn reissuance_bonus_oracle(balance: i64, numerator: i128) -> i128 {
 
     let denominator = i128::try_from(BLOCK_SUBSIDY_FRACTION_DENOMINATOR).unwrap();
     (i128::from(balance) * numerator + denominator - 1) / denominator
+}
+
+/// Preserve the measured seed checks from the merged accounting layer.
+#[test]
+fn initial_nsm_value_balances_match_pre_nu6_chain_value_pools() {
+    use crate::parameters::subsidy::scheduled_issuance_zatoshis;
+
+    let cases = [
+        (
+            Network::Mainnet,
+            Height(2_726_399),
+            "https://mainnet.zcashexplorer.app/blocks/2726399",
+            [
+                1_402_654_579_762_796u128, // transparent
+                2_605_536_175_709,         // Sprout
+                101_161_389_852_194,       // Sapling
+                68_541_635_763_781,        // Orchard
+                0,                         // Deferred
+                0,                         // Ironwood
+            ],
+        ),
+        (
+            Network::new_default_testnet(),
+            Height(2_975_999),
+            "https://testnet.zcashexplorer.app/blocks/2975999",
+            [
+                1_433_024_042_538_559u128, // transparent
+                42_832_983_037_484,        // Sprout
+                123_413_239_739_335,       // Sapling
+                3_798_966_269_665,         // Orchard
+                0,                         // Deferred
+                0,                         // Ironwood
+            ],
+        ),
+    ];
+
+    for (network, height, explorer, value_pools) in cases {
+        let scheduled = scheduled_issuance_zatoshis(height, &network)
+            .expect("the public network issuance schedule is valid");
+        let issued = value_pools.into_iter().sum::<u128>();
+        let measured_seed = scheduled
+            .checked_sub(issued)
+            .expect("scheduled issuance is at least the issued supply");
+        let configured_seed = u128::try_from(i64::from(network.initial_nsm_value_balance()))
+            .expect("the initial NSM value balance is non-negative");
+
+        assert_eq!(
+            measured_seed, configured_seed,
+            "{network:?} value pools at {height:?}, see {explorer}",
+        );
+    }
 }

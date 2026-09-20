@@ -6,10 +6,7 @@ use zakura_chain::{
     amount::{Amount, NonNegative},
     block::{Block, Height},
     parameters::{
-        subsidy::{
-            block_subsidy_fraction_numerator, expected_issued_supply, is_zip234_active,
-            BLOCK_SUBSIDY_FRACTION_DENOMINATOR,
-        },
+        subsidy::{expected_issued_supply, is_zip234_active},
         testnet::{ConfiguredActivationHeights, RegtestParameters},
         Network, NetworkKind, NetworkUpgrade,
     },
@@ -70,15 +67,12 @@ pub(super) fn accounting_network(reissuance: bool) -> Network {
 /// `deficit`, or zero where reissuance is inactive.
 ///
 /// This oracle restates `ceil(deficit * BLOCK_SUBSIDY_FRACTION)` independently of
-/// `block_subsidy`, and reads the fraction from the network so the tests follow ZIP 218's
-/// spacing change.
+/// `block_subsidy`, using the fixed NU7 fraction on every network.
 fn reissuance_bonus(network: &Network, height: Height, deficit: i128) -> i128 {
     if !is_zip234_active(network, height) {
         return 0;
     }
-    let numerator = i128::try_from(block_subsidy_fraction_numerator(height, network)).unwrap();
-    let denominator = i128::try_from(BLOCK_SUBSIDY_FRACTION_DENOMINATOR).unwrap();
-    (deficit * numerator + denominator - 1) / denominator
+    (deficit * 1_375 + 9_999_999_999) / 10_000_000_000
 }
 
 /// Returns a finalized state with Regtest blocks up to the parent of [`START`], and that

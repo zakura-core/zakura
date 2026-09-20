@@ -1999,7 +1999,7 @@ async fn derived_nsm_crossing_gates_block_verification() {
                             ))
                         })
                     ),
-                    "height {height}, claimed bonus {claimed_bonus}: {result:?}"
+                    "height {height:?}, claimed bonus {claimed_bonus}: {result:?}"
                 );
             }
         }

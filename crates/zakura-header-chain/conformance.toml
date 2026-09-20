@@ -478,7 +478,7 @@ id = "LC-FINAL-05"
 name = "Authenticated disk migration"
 status = "implemented"
 owner = "zakura_state::HeaderChainStore::migrate_to_current"
-tests = ["DG-07::version_three_integrated_migration_authenticates_the_full_state_frontier", "DG-07::version_three_migration_rejects_a_network_policy_mismatch_atomically", "DG-07::every_legacy_headers_only_version_migrates_with_a_complete_depth_proof"]
+tests = ["DG-07::version_three_integrated_migration_authenticates_the_full_state_frontier", "DG-07::version_three_migration_rejects_a_configured_network_policy_mismatch_atomically", "DG-07::version_three_migration_keeps_a_release_network_policy_change_for_startup", "DG-07::every_legacy_headers_only_version_migrates_with_a_complete_depth_proof"]
 networks = ["mainnet", "testnet", "custom"]
 
 [[rule]]

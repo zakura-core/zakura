@@ -65,8 +65,8 @@ use zakura_chain::{
     chain_tip::{ChainTip, NetworkChainTipHeightEstimator},
     parameters::{
         subsidy::{
-            block_subsidy, founders_reward, funding_stream_values, miner_subsidy,
-            FundingStreamReceiver,
+            block_subsidy, founders_reward, funding_stream_values, is_zip234_active, miner_subsidy,
+            parent_nsm_value_balance, FundingStreamReceiver,
         },
         ConsensusBranchId, Network, NetworkUpgrade,
     },
@@ -853,6 +853,9 @@ pub trait Rpc {
     /// # Notes
     ///
     /// If `height` is not supplied, uses the tip height.
+    ///
+    /// From the ZIP 234 reissuance start height, the subsidy depends on the parent block's
+    /// chain value pools, so `height` must be at most one block above the best chain tip.
     #[method(name = "getblocksubsidy")]
     async fn get_block_subsidy(&self, height: Option<u32>) -> Result<GetBlockSubsidyResponse>;
 
@@ -1202,6 +1205,36 @@ where
         }
     }
 
+    /// Builds proofs on the blocking pool and maps construction or worker failures to RPC errors.
+    #[allow(clippy::too_many_arguments)]
+    async fn build_mining_template(
+        &self,
+        precomputed_coinbase: Option<TransactionTemplate<zakura_chain::amount::NegativeOrZero>>,
+        miner_params: &types::get_block_template::MinerParams,
+        chain_info: &zakura_state::GetBlockTemplateChainInfo,
+        long_poll_id: types::long_poll::LongPollId,
+        mempool_txs: Vec<types::get_block_template::zip317::SelectedMempoolTx>,
+        submit_old: Option<bool>,
+    ) -> Result<BlockTemplateResponse> {
+        let network = self.network.clone();
+        let miner_params = miner_params.clone();
+        let chain_info = chain_info.clone();
+        self.gbt
+            .run_template_build(move || {
+                BlockTemplateResponse::new_internal(
+                    &network,
+                    precomputed_coinbase,
+                    &miner_params,
+                    &chain_info,
+                    long_poll_id,
+                    mempool_txs,
+                    submit_old,
+                )
+            })
+            .await?
+            .map_misc_error()
+    }
+
     async fn finish_mining_template(
         &self,
         mut template: BlockTemplateResponse,
@@ -1209,7 +1242,13 @@ where
         miner_params: &types::get_block_template::MinerParams,
     ) -> Result<GetBlockTemplateResponse> {
         let state = self.gbt.template_rejections.borrow().clone();
-        if state.parent != Some(chain_info.tip_hash) {
+        if state.parent != Some(chain_info.tip_hash)
+            || self
+                .latest_chain_tip
+                .best_tip_hash()
+                .is_some_and(|tip| tip != chain_info.tip_hash)
+            || (!state.needs_fallback() && state.revision != template.long_poll_id.revision)
+        {
             return Err(ErrorObject::owned(
                 0,
                 "template parent changed; retry",
@@ -1231,15 +1270,16 @@ where
                 template.submit_old
             };
             long_poll_id.revision = state.revision;
-            template = BlockTemplateResponse::new_internal(
-                &self.network,
-                None,
-                miner_params,
-                chain_info,
-                long_poll_id,
-                vec![],
-                submit_old,
-            );
+            template = self
+                .build_mining_template(
+                    None,
+                    miner_params,
+                    chain_info,
+                    long_poll_id,
+                    vec![],
+                    submit_old,
+                )
+                .await?;
             let block =
                 proposal_block_from_template(&template, None, &self.network).map_misc_error()?;
             tokio::time::timeout(
@@ -2965,23 +3005,37 @@ where
                 // seconds if the miner mines to a shielded address, and we want to return fast
                 // when the tip changes.
                 let precompute_coinbase = |network, height, params| {
-                    tokio::task::spawn_blocking(move || {
-                        TransactionTemplate::new_coinbase(&network, height, &params, Amount::zero())
-                            .expect("valid coinbase tx")
+                    self.gbt.run_template_build(move || {
+                        TransactionTemplate::new_coinbase(
+                            &network,
+                            height,
+                            &params,
+                            Amount::zero(),
+                            None,
+                        )
                     })
                 };
 
-                let precomputed_coinbase = precompute_coinbase(
-                    self.network.clone(),
-                    precomputed_height,
-                    miner_params.clone(),
-                )
-                .await
-                .expect("valid coinbase tx");
+                // ZIP 234 derives the subsidy from the new tip's value pools. Those pools
+                // are unknown until the tip arrives, so this optimization cannot construct
+                // a valid post-activation coinbase in advance.
+                let precomputed_coinbase = if is_zip234_active(&self.network, precomputed_height) {
+                    None
+                } else {
+                    Some(
+                        precompute_coinbase(
+                            self.network.clone(),
+                            precomputed_height,
+                            miner_params.clone(),
+                        )
+                        .await?
+                        .map_misc_error()?,
+                    )
+                };
 
                 let _ = wait_for_new_tip.await;
 
-                precomputed_coinbase
+                Ok::<_, ErrorObject<'static>>(precomputed_coinbase)
             };
 
             // Wait for the maximum block time to elapse. This can change the block header
@@ -3029,6 +3083,7 @@ where
                 }
 
                 precomputed_coinbase = wait_for_new_tip => {
+                    let precomputed_coinbase = precomputed_coinbase?;
                     let chain_info = fetch_chain_info(read_state.clone()).await?;
                     if latest_chain_tip.best_tip_hash().is_some_and(|tip| tip != chain_info.tip_hash) {
                         continue;
@@ -3057,20 +3112,21 @@ where
                     // BIP-34 height and subsidies wouldn't match the block.
                     let next_height = chain_info.tip_height.next().map_misc_error()?;
                     let precomputed_coinbase = (next_height == precomputed_height)
-                        .then_some(precomputed_coinbase);
+                        .then_some(precomputed_coinbase)
+                        .flatten();
 
-                    // Respond instantly with an empty block upon a chain tip change so that
-                    // the miner doesn't waste their effort trying to extend a shorter
-                    // chain.
-                    let template = BlockTemplateResponse::new_internal(
-                        &self.network,
+                    // Build an empty block on the new tip. After ZIP 234 activation,
+                    // its proof must wait for the new parent's pools; build it off the
+                    // async worker so other RPC requests can continue.
+                    let template = self.build_mining_template(
                         precomputed_coinbase,
                         miner_params,
                         &chain_info,
                         server_long_poll_id,
                         vec![],
                         submit_old,
-                    );
+                    )
+                    .await?;
                     return self.finish_mining_template(template, &chain_info, miner_params).await;
                 }
 
@@ -3095,7 +3151,7 @@ where
         //
         // Apart from random weighted transaction selection,
         // the template only depends on the previously fetched data.
-        // This processing never fails.
+        // This processing fails only if the coinbase transaction cannot be built.
 
         tracing::debug!(
             mempool_tx_hashes = ?mempool_txs
@@ -3112,9 +3168,18 @@ where
             &self.network,
             height,
             miner_params,
+            if is_zip234_active(&self.network, height) {
+                Some(
+                    parent_nsm_value_balance(chain_info.value_pools.nsm_value_balance_amount())
+                        .map_misc_error()?,
+                )
+            } else {
+                None
+            },
             mempool_txs,
             mempool_tx_deps,
-        );
+        )
+        .map_misc_error()?;
 
         tracing::debug!(
             selected_mempool_tx_hashes = ?mempool_txs
@@ -3126,15 +3191,16 @@ where
 
         // - After this point, the template only depends on the previously fetched data.
 
-        let template = BlockTemplateResponse::new_internal(
-            &self.network,
-            None,
-            miner_params,
-            &chain_info,
-            server_long_poll_id,
-            mempool_txs,
-            submit_old,
-        );
+        let template = self
+            .build_mining_template(
+                None,
+                miner_params,
+                &chain_info,
+                server_long_poll_id,
+                mempool_txs,
+                submit_old,
+            )
+            .await?;
         self.finish_mining_template(template, &chain_info, miner_params)
             .await
     }
@@ -3505,7 +3571,43 @@ where
             None => best_chain_tip_height(&self.latest_chain_tip)?,
         };
 
-        let subsidy = block_subsidy(height, &net, None).map_misc_error()?;
+        // ZIP 234 derives the block subsidy from the NSM value balance after the parent
+        // block, so look the parent's chain value pools up when the rules apply.
+        let nsm_value_balance = if is_zip234_active(&net, height) {
+            let parent = height.previous().map_misc_error()?;
+
+            let zakura_state::ReadResponse::BlockInfo(parent_info) = tokio::time::timeout(
+                Duration::from_secs(30),
+                call_service(
+                    self.read_state.clone(),
+                    zakura_state::ReadRequest::BlockInfo(parent.into()),
+                ),
+            )
+            .await
+            .map_err(|_| {
+                ErrorObject::owned(
+                    server::error::LegacyCode::Misc.into(),
+                    "timed out waiting for parent block information",
+                    None::<()>,
+                )
+            })??
+            else {
+                unreachable!("unmatched response to a BlockInfo request");
+            };
+
+            let parent_info = parent_info.ok_or_misc_error(
+                "the ZIP 234 subsidy needs the parent block, which is not in the best chain; \
+                 heights can be at most one block above the best chain tip",
+            )?;
+            Some(
+                parent_nsm_value_balance(parent_info.value_pools().nsm_value_balance_amount())
+                    .map_misc_error()?,
+            )
+        } else {
+            None
+        };
+
+        let subsidy = block_subsidy(height, &net, nsm_value_balance).map_misc_error()?;
 
         let (lockbox_streams, mut funding_streams): (Vec<_>, Vec<_>) =
             funding_stream_values(height, &net, subsidy)

@@ -615,7 +615,7 @@ where
 
             // Sum up some block totals from the transaction responses.
             let mut sigops = 0;
-            let mut block_miner_fees = Ok(Amount::zero());
+            let mut block_transaction_fees = Ok(Amount::zero());
 
             use futures::StreamExt;
             while let Some(result) = async_checks.next().await {
@@ -656,10 +656,9 @@ where
 
                 sigops += response.sigops();
 
-                // Coinbase transactions consume the miner fee,
-                // so they don't add any value to the block's total miner fee.
+                // Sum full non-coinbase fees before applying the aggregate NSM split.
                 if let Some(miner_fee) = response.miner_fee() {
-                    block_miner_fees += miner_fee;
+                    block_transaction_fees += miner_fee;
                 }
             }
 
@@ -673,8 +672,8 @@ where
                 })?;
             }
 
-            let block_miner_fees =
-                block_miner_fees.map_err(|amount_error| BlockError::SummingMinerFees {
+            let block_transaction_fees =
+                block_transaction_fees.map_err(|amount_error| BlockError::SummingMinerFees {
                     height,
                     hash,
                     source: amount_error,
@@ -683,7 +682,7 @@ where
             check::miner_fees_are_valid(
                 &coinbase_tx,
                 height,
-                block_miner_fees,
+                block_transaction_fees,
                 expected_block_subsidy,
                 deferred_pool_balance_change,
                 &network,

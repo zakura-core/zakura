@@ -420,6 +420,7 @@ proptest! {
                         .await
                         .expect("getblockchaininfo should call mock state service with correct request")
                         .respond(zakura_state::ReadResponse::ChainInfo(GetBlockTemplateChainInfo {
+                            value_pools: Default::default(),
                             tip_hash: genesis_hash,
                             tip_height: Height::MIN,
                             chain_history_root: HistoryTree::default().hash(),
@@ -536,6 +537,7 @@ proptest! {
                         .await
                         .expect("getblockchaininfo should call mock state service with correct request")
                         .respond(zakura_state::ReadResponse::ChainInfo(GetBlockTemplateChainInfo {
+                            value_pools: Default::default(),
                             tip_hash: block_hash,
                             tip_height: block_height,
                             chain_history_root: HistoryTree::default().hash(),

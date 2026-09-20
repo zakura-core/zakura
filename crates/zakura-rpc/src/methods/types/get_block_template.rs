@@ -394,8 +394,7 @@ impl BlockTemplateResponse {
         miner_params: &MinerParams,
         chain_info: &GetBlockTemplateChainInfo,
         long_poll_id: LongPollId,
-        #[cfg(not(test))] mempool_txs: Vec<VerifiedUnminedTx>,
-        #[cfg(test)] mempool_txs: Vec<(InBlockTxDependenciesDepth, VerifiedUnminedTx)>,
+        mempool_txs: Vec<zip317::SelectedMempoolTx>,
         submit_old: Option<bool>,
     ) -> Result<Self, TransactionError> {
         // Determine the next block height.

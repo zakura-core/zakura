@@ -1219,8 +1219,7 @@ where
         miner_params: &types::get_block_template::MinerParams,
         chain_info: &zakura_state::GetBlockTemplateChainInfo,
         long_poll_id: types::long_poll::LongPollId,
-        #[cfg(not(test))] mempool_txs: Vec<zakura_chain::transaction::VerifiedUnminedTx>,
-        #[cfg(test)] mempool_txs: Vec<(usize, zakura_chain::transaction::VerifiedUnminedTx)>,
+        mempool_txs: Vec<types::get_block_template::zip317::SelectedMempoolTx>,
         submit_old: Option<bool>,
     ) -> Result<BlockTemplateResponse> {
         let network = self.network.clone();

@@ -11,10 +11,7 @@ use std::{
     collections::HashSet,
     future::Future,
     pin::Pin,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -38,6 +35,7 @@ use crate::{error::*, primitives, transaction as tx, BoxError};
 
 pub mod check;
 mod prepared;
+mod receipt;
 pub mod request;
 pub mod subsidy;
 
@@ -48,20 +46,6 @@ mod tests;
 
 /// Bounds the optional read that can prove an input missing at the block's parent.
 const PARENT_INPUT_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-// Shared by all verifier instances so retained blocks have one local order.
-static NEXT_RECEIPT_ORDER: AtomicU64 = AtomicU64::new(1);
-
-/// Reserves an order before verification can yield. Proposals do not claim priority.
-fn receipt_order_for(request: &Request) -> Option<u64> {
-    (!request.is_proposal()).then(|| {
-        NEXT_RECEIPT_ORDER
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |order| {
-                order.checked_add(1)
-            })
-            .expect("a process cannot receive u64::MAX blocks")
-    })
-}
 
 /// Bounds waiting for another request's pending commit of the same block.
 const PENDING_COMMIT_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -74,6 +58,7 @@ pub struct SemanticBlockVerifier<S, V> {
     state_service: S,
     transaction_verifier: V,
     prepared_candidates: prepared::PreparedCandidateCache,
+    receipt_orders: receipt::ReceiptRegistry,
 }
 
 /// Block verification errors.
@@ -332,6 +317,7 @@ where
             state_service,
             transaction_verifier,
             prepared_candidates: Default::default(),
+            receipt_orders: Default::default(),
         }
     }
 }
@@ -356,7 +342,8 @@ where
     }
 
     fn call(&mut self, request: Request) -> Self::Future {
-        let receipt_order = receipt_order_for(&request);
+        let receipt =
+            (!request.is_proposal()).then(|| self.receipt_orders.register(request.block()));
         let mut state_service = self.state_service.clone();
         let mut transaction_verifier = self.transaction_verifier.clone();
         let network = self.network.clone();
@@ -368,6 +355,7 @@ where
         let span = tracing::debug_span!("block", height = ?block.coinbase_height());
 
         async move {
+            let receipt_order = receipt.as_ref().map(|receipt| receipt.order);
             let hash = zakura_header_chain::validate_encoding_version_hash(&block.header)
                 .map_err(BlockError::from)?;
             let preparation_start = request.should_cache().then(std::time::Instant::now);

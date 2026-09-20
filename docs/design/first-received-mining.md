@@ -12,6 +12,9 @@ Proposals and templates do not establish receipt order. A solved submission gets
 its own order even when verification reuses a prepared template. Retained blocks
 keep their original order through duplicate delivery, forks, invalidation, and
 reconsideration. The comparator reads the current tip block directly.
+Overlapping deliveries of the same complete block share their first receipt.
+Different bodies with the same header hash do not share priority. In-flight
+registrations are removed when their last verification completes or is cancelled.
 
 For example, A arrives before B, but B finishes verification first. Mining can
 briefly use B while A is unverified. Once A passes, equal-work selection chooses

@@ -2598,13 +2598,96 @@ async fn receipt_order_precedes_polling_and_cached_mining_uses_solved_submission
         early.await.unwrap();
         let receipts = received.lock().unwrap();
         assert_eq!(receipts.len(), 2);
-        assert!(
-            receipts[1] < receipts[0],
-            "polling order cannot replace receipt order"
+        assert_eq!(
+            receipts[1], receipts[0],
+            "overlapping copies share their first receipt"
         );
         assert_eq!(
             transaction_calls.load(Ordering::Relaxed),
             if cache_hit { 1 } else { 2 }
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_receipt_keeps_first_priority_through_real_state_deduplication() {
+    use zakura_chain::chain_tip::ChainTip;
+
+    let _init_guard = zakura_test::init();
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        for cache_hit in [false, true] {
+            let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+            let (state, _, tip, _) = zs::init_test_services(&network).await;
+            let genesis: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+                .zcash_deserialize_into()
+                .unwrap();
+            state
+                .clone()
+                .oneshot(zs::Request::CommitCheckpointVerifiedBlock(
+                    genesis.clone().into(),
+                ))
+                .await
+                .unwrap();
+            let mut a = nu5_prepared_test_block(&network, None);
+            let commitment = block::ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+                &block::CHAIN_HISTORY_ACTIVATION_RESERVED.into(),
+                &a.auth_data_root(),
+            );
+            let header = Arc::make_mut(&mut a.header);
+            header.previous_block_hash = genesis.hash();
+            header.time = genesis.header.time + chrono::Duration::seconds(150);
+            header.commitment_bytes = <[u8; 32]>::from(commitment).into();
+            let a = Arc::new(a);
+            let mut b = a.as_ref().clone();
+            Arc::make_mut(&mut b.header).nonce.0[0] ^= 1;
+            let b = Arc::new(b);
+            let transaction = service_fn(|request| async move {
+                Ok::<_, BoxError>(accept_block_transaction(request))
+            });
+            let mut verifier = SemanticBlockVerifier::new(&network, state.clone(), transaction);
+            if cache_hit {
+                for (block, work_id) in [(a.clone(), "a"), (b.clone(), "b")] {
+                    verifier
+                        .call(Request::Prepare {
+                            block,
+                            work_id: Some(work_id.into()),
+                            source: PreparedCandidateSource::ClientProposal,
+                        })
+                        .await
+                        .unwrap();
+                }
+            }
+
+            // A arrives first but its first verification is held. B and the
+            // duplicate A finish before it, using the real state's deduplication.
+            let early_a = verifier.call(Request::Commit(a.clone()));
+            let later_b = verifier.call(Request::CommitMined {
+                block: b.clone(),
+                work_id: Some("b".into()),
+                admission: zs::BlockAdmission::pending(),
+            });
+            let duplicate_a = verifier.call(Request::CommitMined {
+                block: Arc::new(a.as_ref().clone()),
+                work_id: Some("a".into()),
+                admission: zs::BlockAdmission::pending(),
+            });
+            later_b.await.unwrap();
+            assert_eq!(tip.best_tip_hash(), Some(b.hash()));
+            duplicate_a.await.unwrap();
+            assert_eq!(tip.best_tip_hash(), Some(a.hash()));
+            assert!(early_a.await.unwrap_err().is_duplicate_request());
+            assert_eq!(tip.best_tip_hash(), Some(a.hash()));
+
+            // Cancellation releases an unpolled request's registration.
+            let mut c = a.as_ref().clone();
+            Arc::make_mut(&mut c.header).nonce.0[1] ^= 1;
+            let c = Arc::new(c);
+            let cancelled = verifier.call(Request::Commit(c.clone()));
+            drop(cancelled);
+            verifier.call(Request::Commit(c)).await.unwrap();
+            assert_eq!(tip.best_tip_hash(), Some(a.hash()));
+        }
+    })
+    .await
+    .expect("duplicate receipt regression must finish");
 }

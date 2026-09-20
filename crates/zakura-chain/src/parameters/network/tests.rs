@@ -1056,90 +1056,47 @@ fn scheduled_issuance_stops_at_a_halving_overflow_inside_slow_start() {
     );
 }
 
-/// The ZIP 234 fraction tracks the halving interval, so ZIP 218's 25-second blocks do not
-/// pay the balance out three times as fast.
+/// The fixed NSM fraction must be revisited if NU7 target spacing changes.
 #[test]
-fn block_subsidy_fraction_tracks_the_halving_interval() {
-    use crate::parameters::subsidy::{block_subsidy_fraction_numerator, halving_interval};
+fn block_subsidy_fraction_uses_the_nu7_spacing() {
+    use crate::parameters::subsidy::{BLOCK_SUBSIDY_FRACTION_NUMERATOR, LN2_SCALED};
 
     let _init_guard = zakura_test::init();
 
-    let nu7 = Height(4_000_000);
-    let network = testnet::Parameters::build()
-        .with_activation_heights(ConfiguredActivationHeights {
-            blossom: Some(1_000_000),
-            canopy: Some(1_000_001),
-            nu7: Some(nu7.0),
-            ..Default::default()
-        })
-        .expect("activation heights are valid")
-        .clear_funding_streams()
-        .to_network()
-        .expect("configured testnet is valid");
-
-    // 150-second blocks before Blossom, 75 after it, 25 from NU7. The halving period stays
-    // at about four years of wall-clock time, so the interval scales with the spacing.
-    for (height, interval, numerator) in [
-        (Height(999_999), 840_000, 8_252),
-        (Height(1_000_000), 1_680_000, 4_126),
-        (Height(nu7.0 - 1), 1_680_000, 4_126),
-        (nu7, 5_040_000, 1_375),
-        (Height(nu7.0 + 1), 5_040_000, 1_375),
-    ] {
-        assert_eq!(
-            halving_interval(height, &network),
-            interval,
-            "halving interval at {height:?}",
-        );
-        assert_eq!(
-            block_subsidy_fraction_numerator(height, &network),
-            numerator,
-            "fraction numerator at {height:?}",
-        );
-    }
+    assert_eq!(NetworkUpgrade::Nu7.target_spacing().num_seconds(), 25);
+    let interval = Network::Mainnet.post_blossom_halving_interval()
+        * NetworkUpgrade::Blossom.target_spacing().num_seconds()
+        / NetworkUpgrade::Nu7.target_spacing().num_seconds();
+    assert_eq!(interval, 5_040_000);
+    assert_eq!(
+        BLOCK_SUBSIDY_FRACTION_NUMERATOR,
+        LN2_SCALED / u128::try_from(interval).expect("the halving interval is positive"),
+    );
 }
 
 /// Applying the fraction once per block over a halving interval halves the balance.
 #[test]
 fn block_subsidy_fraction_halves_the_balance_over_one_interval() {
-    use crate::parameters::subsidy::{
-        block_subsidy_fraction_numerator, halving_interval, BLOCK_SUBSIDY_FRACTION_DENOMINATOR,
-    };
+    use crate::parameters::subsidy::reissuance_bonus;
 
     let _init_guard = zakura_test::init();
 
-    let nu7 = Height(4_000_000);
-    let network = testnet::Parameters::build()
-        .with_activation_heights(ConfiguredActivationHeights {
-            blossom: Some(1),
-            canopy: Some(2),
-            nu7: Some(nu7.0),
-            ..Default::default()
-        })
-        .expect("activation heights are valid")
-        .clear_funding_streams()
-        .to_network()
-        .expect("configured testnet is valid");
-
-    for height in [Height(nu7.0 - 1), nu7] {
-        let numerator = block_subsidy_fraction_numerator(height, &network);
-        let interval = u32::try_from(halving_interval(height, &network)).expect("a valid interval");
-
-        // `(1 - f)^interval` in fixed point, one block at a time. Rounding each step down
-        // only makes the remainder smaller, so the tolerance is one-sided in practice.
-        let mut remaining = BLOCK_SUBSIDY_FRACTION_DENOMINATOR;
-        for _ in 0..interval {
-            remaining -= remaining * numerator / BLOCK_SUBSIDY_FRACTION_DENOMINATOR;
-        }
-
-        let half = BLOCK_SUBSIDY_FRACTION_DENOMINATOR / 2;
-        let error = remaining.abs_diff(half);
-        assert!(
-            error * 1_000 < half,
-            "one halving interval at {height:?} must leave about half, left {remaining} of \
-             {BLOCK_SUBSIDY_FRACTION_DENOMINATOR}",
-        );
+    // Exercise the actual ceiling payout on every block. Rounding the payout up
+    // leaves less than the ideal exponential remainder, especially at small balances.
+    let initial = 10_000_000_000i64;
+    let mut remaining =
+        Amount::<NonNegative>::try_from(initial).expect("100 ZEC is a valid amount");
+    for _ in 0..5_040_000 {
+        remaining = (remaining - reissuance_bonus(remaining).expect("valid bonus"))
+            .expect("the bonus never exceeds the remaining balance");
     }
+
+    let half = initial / 2;
+    let error = i64::from(remaining).abs_diff(half);
+    assert!(
+        error * 1_000 < u64::try_from(half).expect("half the initial balance is positive"),
+        "one halving interval must leave about half, left {remaining} of {initial}",
+    );
 }
 
 /// A positive balance always pays at least one zatoshi, so the balance reaches zero in a
@@ -1150,30 +1107,13 @@ fn reissuance_drains_a_small_balance() {
 
     let _init_guard = zakura_test::init();
 
-    let start = Height(1_000_000);
-    let network = testnet::Parameters::build()
-        .with_activation_heights(ConfiguredActivationHeights {
-            blossom: Some(1),
-            canopy: Some(2),
-            nu7: Some(start.0),
-            ..Default::default()
-        })
-        .expect("activation heights are valid")
-        .clear_funding_streams()
-        .to_network()
-        .expect("configured testnet is valid");
-
     let initial = 20i64;
     let mut balance = initial;
 
     for block in 0..initial {
         let bonus = i64::from(
-            reissuance_bonus(
-                Amount::try_from(balance).expect("valid amount"),
-                start,
-                &network,
-            )
-            .expect("valid bonus"),
+            reissuance_bonus(Amount::try_from(balance).expect("valid amount"))
+                .expect("valid bonus"),
         );
 
         assert!(
@@ -1189,17 +1129,58 @@ fn reissuance_drains_a_small_balance() {
     );
 }
 
+/// Check zero, ceiling boundaries, and the largest representable balance explicitly.
+#[test]
+fn reissuance_bonus_rounding_boundaries() {
+    use crate::{amount::MAX_MONEY, parameters::subsidy::reissuance_bonus};
+
+    for (balance, expected) in [
+        (0, 0),
+        (1, 1),
+        (10_000_000_000 - 1, 1_375),
+        (10_000_000_000, 1_375),
+        (10_000_000_000 + 1, 1_376),
+        (MAX_MONEY, 288_750_000),
+    ] {
+        let actual = reissuance_bonus(Amount::try_from(balance).unwrap()).unwrap();
+        assert_eq!(i64::from(actual), expected, "balance {balance}");
+    }
+}
+
+/// A signed parent balance must be rejected, not clamped, when negative.
+#[test]
+fn parent_nsm_value_balance_rejects_negative_amounts() {
+    use crate::{
+        amount::MAX_MONEY,
+        parameters::subsidy::{parent_nsm_value_balance, SubsidyError},
+    };
+
+    for balance in [-MAX_MONEY, -1] {
+        assert!(matches!(
+            parent_nsm_value_balance(Amount::try_from(balance).unwrap()),
+            Err(SubsidyError::NegativeNsmValueBalance),
+        ));
+    }
+    for balance in [0, 1, MAX_MONEY] {
+        let actual = parent_nsm_value_balance(Amount::try_from(balance).unwrap()).unwrap();
+        assert_eq!(i64::from(actual), balance);
+    }
+}
+
 proptest::proptest! {
     #[test]
     fn reissuance_arithmetic_matches_integer_oracle(balance in 0i64..=crate::amount::MAX_MONEY) {
-        use crate::parameters::subsidy::{reissuance_bonus, block_subsidy_fraction_numerator, BLOCK_SUBSIDY_FRACTION_DENOMINATOR};
-        let network = Network::new_default_testnet();
-        let height = Height(3_000_000);
-        let numerator = i128::try_from(block_subsidy_fraction_numerator(height, &network)).unwrap();
+        use crate::parameters::subsidy::{
+            reissuance_bonus, BLOCK_SUBSIDY_FRACTION_DENOMINATOR,
+            BLOCK_SUBSIDY_FRACTION_NUMERATOR,
+        };
+        let numerator = i128::try_from(BLOCK_SUBSIDY_FRACTION_NUMERATOR).unwrap();
         let denominator = i128::try_from(BLOCK_SUBSIDY_FRACTION_DENOMINATOR).unwrap();
         let expected = (i128::from(balance) * numerator + denominator - 1) / denominator;
-        let actual = reissuance_bonus(Amount::try_from(balance).unwrap(), height, &network).unwrap();
+        let actual = reissuance_bonus(Amount::try_from(balance).unwrap()).unwrap();
         proptest::prop_assert_eq!(i128::from(i64::from(actual)), expected);
+        proptest::prop_assert!(i64::from(actual) <= balance);
+        proptest::prop_assert!(balance == 0 || i64::from(actual) > 0);
     }
 }
 

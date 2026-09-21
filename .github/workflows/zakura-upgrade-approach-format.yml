@@ -1,0 +1,182 @@
+name: Upgrade approach state format
+
+# One-off: open the newest retained Mainnet fixture below the handoff with a
+# read-write v29 zakurad so it renames state/v28 to state/v29, then publish
+# that volume as a zakura-vct-approach snapshot. Read-only tip-height cannot
+# do this rename, and rebuilding from the sandblast archive resyncs ~1.8M blocks.
+on:
+  workflow_dispatch:
+    inputs:
+      max_checkpoint:
+        description: "Upgrade the highest retained fixture strictly below this height"
+        required: false
+        default: "3489716"
+      region:
+        description: "Region to upgrade, or both runtime regions"
+        type: choice
+        options: [all, nyc1, sfo3]
+        default: all
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zakura-upgrade-approach-format
+  cancel-in-progress: false
+
+jobs:
+  upgrade:
+    strategy:
+      fail-fast: false
+      matrix:
+        region: ${{ fromJSON(inputs.region == 'nyc1' && '["nyc1"]' || inputs.region == 'sfo3' && '["sfo3"]' || '["nyc1","sfo3"]') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install doctl and the fleet SSH key
+        uses: ./.github/actions/do-cli
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+          ssh_private_key: ${{ secrets.DO_SSH_PRIVATE_KEY }}
+
+      - name: Clone the retained fixture
+        id: droplet
+        uses: ./.github/actions/do-droplet
+        with:
+          name: zakura-pr-fmt-${{ github.run_id }}-${{ matrix.region }}
+          size: c-8
+          policy: correctness
+          regions: ${{ matrix.region }}
+          snapshot_mode: pre-checkpoint
+          max_checkpoint: ${{ inputs.max_checkpoint }}
+          ssh_fingerprint: ${{ vars.DO_SSH_KEY_FINGERPRINT }}
+          tag: zakura-pr-node
+          state_network: mainnet
+          volume_name: zakura-pr-fmt-${{ github.run_id }}-${{ matrix.region }}
+
+      - name: Wait for SSH
+        uses: ./.github/actions/do-wait-ssh
+        with:
+          ip: ${{ steps.droplet.outputs.ip }}
+
+      - name: Upgrade the database in place and record its height
+        id: upgrade
+        env:
+          IP: ${{ steps.droplet.outputs.ip }}
+          VOLUME_NAME: ${{ steps.droplet.outputs.volume_name }}
+          STOP_HEIGHT: ${{ steps.droplet.outputs.snapshot_height }}
+        run: |
+          set -euo pipefail
+          [[ "$STOP_HEIGHT" =~ ^[0-9]+$ ]] || {
+            echo "selected snapshot has no numeric height" >&2
+            exit 1
+          }
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=240 -i /tmp/do_ssh \
+            "root@${IP}" \
+            "VOLUME_NAME=$(printf '%q' "$VOLUME_NAME") STOP_HEIGHT=$(printf '%q' "$STOP_HEIGHT") bash -s" <<'REMOTE'
+          set -euo pipefail
+          dev="/dev/disk/by-id/scsi-0DO_Volume_${VOLUME_NAME}"
+          for _ in $(seq 1 30); do [ -e "$dev" ] && break; sleep 2; done
+          [ -e "$dev" ] || { echo "state volume device not found: $dev" >&2; exit 1; }
+          mkdir -p /mnt/state
+          mount "$dev" /mnt/state
+          if [ -d /mnt/state/tip/state ]; then
+            cache=/mnt/state/tip
+          elif [ -d /mnt/state/state ]; then
+            cache=/mnt/state
+          else
+            echo "no state directory on the volume" >&2
+            find /mnt/state -maxdepth 3 -type d >&2
+            exit 1
+          fi
+          echo "cache=$cache"
+          find "$cache/state" -mindepth 1 -maxdepth 1 -type d -name 'v*' -printf '%f\n'
+          cd /root/zakura
+          git fetch --no-tags origin main
+          git checkout --detach origin/main
+          export CARGO_TARGET_DIR=/root/cargo-target
+          cargo build --release -p zakura
+          cat > /root/upgrade.toml <<TOML
+          [network]
+          network = "Mainnet"
+          listen_addr = "127.0.0.1:8233"
+          p2p_stack = "zakura"
+
+          [state]
+          cache_dir = "$cache"
+          storage_mode = "pruned"
+          debug_stop_at_height = $STOP_HEIGHT
+
+          [consensus]
+          checkpoint_sync = true
+          vct_fast_sync = true
+          TOML
+          set +e
+          timeout 45m /root/cargo-target/release/zakurad -c /root/upgrade.toml start
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            echo "zakurad exited $status during the format upgrade" >&2
+            exit "$status"
+          fi
+          find "$cache" -name LOCK -delete
+          printf '[state]\nstorage_mode = "pruned"\n' > /root/tip-height.toml
+          output=$(timeout 10m /root/cargo-target/release/zakurad -c /root/tip-height.toml \
+            tip-height --cache-dir "$cache" --network Mainnet 2>&1) || {
+            printf '%s\n' "$output" >&2
+            exit 1
+          }
+          height=$(printf '%s\n' "$output" | awk '/^[0-9]+$/ { print }')
+          [[ "$height" =~ ^[0-9]+$ ]] || {
+            printf 'tip-height was not numeric:\n%s\n' "$output" >&2
+            exit 1
+          }
+          [ -d "$cache/state/v29/mainnet" ] || {
+            echo "upgrade did not produce state/v29/mainnet" >&2
+            find "$cache/state" -mindepth 1 -maxdepth 1 -type d -name 'v*' -printf '%f\n' >&2
+            exit 1
+          }
+          printf '%s\n' "$height" > /root/upgraded-height
+          echo "upgraded height=$height"
+          sync
+          umount /mnt/state
+          REMOTE
+          height=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i /tmp/do_ssh \
+            "root@${IP}" "cat /root/upgraded-height")
+          [[ "$height" =~ ^[0-9]+$ ]]
+          echo "height=$height" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the upgraded approach snapshot
+        id: snapshot
+        env:
+          VOLUME_ID: ${{ steps.droplet.outputs.volume_id }}
+          REGION: ${{ matrix.region }}
+          HEIGHT: ${{ steps.upgrade.outputs.height }}
+        run: |
+          set -euo pipefail
+          stamp=$(date -u +%Y%m%d-%H%M)
+          name="zakura-vct-approach-mainnet-${stamp}-${REGION}-finalized-h${HEIGHT}"
+          id=$(python3 - "$VOLUME_ID" "$name" "$REGION" <<'PY'
+          import sys
+          sys.path.insert(0, ".github/workflows/scripts")
+          from do_snapshot import create_snapshot
+          print(create_snapshot(sys.argv[1], sys.argv[2], sys.argv[3], timeout=1800))
+          PY
+          )
+          echo "Published $name ($id)"
+          echo "snapshot_id=$id" >> "$GITHUB_OUTPUT"
+          echo "snapshot_name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Cleanup droplet and volume
+        if: always()
+        uses: ./.github/actions/do-teardown
+        with:
+          droplet_id: ${{ steps.droplet.outputs.id }}
+          droplet_name: zakura-pr-fmt-${{ github.run_id }}-${{ matrix.region }}
+          volume_ids: ${{ steps.droplet.outputs.volume_id }}
+          volume_names: ${{ steps.droplet.outputs.volume_name }}

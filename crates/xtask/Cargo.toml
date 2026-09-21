@@ -21,5 +21,6 @@ tempfile.workspace = true
 toml.workspace = true
 tonic-prost-build.workspace = true
 
+# Intentional: this is a CLI tool that prints to stdout/stderr. Do not inherit
+# the workspace clippy print_* / missing-docs deny set.
 [lints]
-workspace = true

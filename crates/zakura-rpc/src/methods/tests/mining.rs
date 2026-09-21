@@ -215,9 +215,16 @@ fn mining_rpc(
         }
     });
     let read = tower::service_fn(move |request| {
-        assert!(matches!(request, ReadRequest::ChainInfo));
         let info = info.borrow().clone();
-        async move { Ok::<_, BoxError>(ReadResponse::ChainInfo(info)) }
+        async move {
+            Ok::<_, BoxError>(match request {
+                ReadRequest::ChainInfo => ReadResponse::ChainInfo(info),
+                // The fallback path confirms a failed proposal against committed
+                // state, which can be ahead of both watches.
+                ReadRequest::Tip => ReadResponse::Tip(Some((info.tip_height, info.tip_hash))),
+                other => unreachable!("unexpected read request: {other:?}"),
+            })
+        }
     });
     let (rpc, verifier) = rpc(network(), mempool, read, tip);
     (rpc, sender, verifier)
@@ -869,7 +876,7 @@ fn rejection_during_construction_rebuilds_template() {
 }
 
 #[test]
-fn recovery_construction_yields_and_rechecks_parent() {
+fn recovery_construction_yields_and_rebuilds_on_parent_change() {
     mining_runtime(async {
         for change_tip in [false, true] {
             let chain = chain_info(2, 1, 400_000_000);
@@ -912,10 +919,13 @@ fn recovery_construction_yields_and_rechecks_parent() {
             })
             .await;
             if change_tip {
-                assert!(response
-                    .unwrap_err()
-                    .message()
-                    .contains("changed during recovery"));
+                assert!(
+                    response
+                        .expect("a superseded recovery is not an error")
+                        .is_none(),
+                    "a tip change during recovery must ask the caller to rebuild, \
+                     not surface a transient error to the miner"
+                );
             } else {
                 let template = response
                     .unwrap()
@@ -930,6 +940,60 @@ fn recovery_construction_yields_and_rechecks_parent() {
                     .is_prepared(template.work_id()));
             }
         }
+    });
+}
+
+#[test]
+fn failed_recovery_validation_rebuilds_when_committed_state_moved_on() {
+    mining_runtime(async {
+        let chain = chain_info(2, 1, 400_000_000);
+        let (info_tx, info) = watch::channel(chain.clone());
+        let (rpc, _tip, mut verifier) = mining_rpc(info);
+        let params = rpc.gbt.miner_params().unwrap();
+        let template = bounded(rpc.build_mining_template(
+            None,
+            params,
+            &chain,
+            template_id(&chain),
+            vec![],
+            None,
+        ))
+        .await
+        .unwrap();
+        rpc.gbt.template_rejections.send_modify(|state| {
+            state.set_parent(chain.tip_hash);
+            state.reject(chain.tip_hash, "rejected-work");
+        });
+
+        // Committed state moves on while both watches still name the old parent, so
+        // the context re-check passes and only the committed-tip read can tell that
+        // the proposal failed because the tip moved rather than because it is bad.
+        info_tx.send_modify(|current| current.tip_hash = Hash([7; 32]));
+
+        let (response, ()) = bounded(async {
+            tokio::join!(
+                rpc.finish_mining_template(template, &chain, params),
+                async {
+                    verifier
+                        .expect_request_that(|req| {
+                            matches!(req, zakura_consensus::Request::Prepare { .. })
+                        })
+                        .await
+                        .respond_error(
+                            "proposal is not based on the current best chain tip".into(),
+                        );
+                }
+            )
+        })
+        .await;
+
+        assert!(
+            response
+                .expect("a stale proposal failure is not the miner's error to see")
+                .is_none(),
+            "when committed state has moved past the template's parent, the caller \
+             must rebuild instead of receiving the verifier's own error"
+        );
     });
 }
 

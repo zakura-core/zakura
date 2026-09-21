@@ -50,6 +50,7 @@ after operator invalidation and reconsideration. The planner checks that the
 chosen path is eligible, fully verified, and has greatest cumulative work.
 When full state evicts a fork, the same atomic transition clears its retained
 body verification markers. Its headers stay eligible for download and validation.
+This also applies when reconsideration restores a branch at the fork limit.
 The header limit allows one extra candidate beyond the ten full-state forks,
 so an independent header download tip can remain selected.
 

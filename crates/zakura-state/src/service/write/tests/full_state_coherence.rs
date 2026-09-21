@@ -63,6 +63,15 @@ fn assert_selected_header_matches_full_state(
 
 #[test]
 fn fork_eviction_demotes_only_bodies_missing_from_full_state() {
+    assert_fork_eviction_body_evidence(false);
+}
+
+#[test]
+fn reconsideration_eviction_demotes_only_bodies_missing_from_full_state() {
+    assert_fork_eviction_body_evidence(true);
+}
+
+fn assert_fork_eviction_body_evidence(reconsider: bool) {
     use zakura_header_chain::{RowLimit, StoreAuditRead, StoreAuditSnapshot};
 
     let _init_guard = zakura_test::init();
@@ -93,8 +102,15 @@ fn fork_eviction_demotes_only_bodies_missing_from_full_state() {
     header.merkle_root = merkle_root;
     header.commitment_bytes = <[u8; 32]>::from(finalized.db.history_tree().hash().unwrap()).into();
 
-    let mut siblings = Vec::new();
+    let mut siblings: Vec<Arc<Block>> = Vec::new();
     for order in 0..=crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS {
+        let refill_after_invalidation =
+            reconsider && order == crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS;
+        if refill_after_invalidation {
+            let mut staged = live.clone();
+            staged.invalidate_block(siblings[0].hash()).unwrap();
+            commit_operator_change(&writer, &mut live, staged, siblings[0].hash(), true).unwrap();
+        }
         let mut block = template.clone();
         Arc::make_mut(&mut Arc::make_mut(&mut block).header).nonce.0[..8]
             .copy_from_slice(&u64::try_from(order).unwrap().to_le_bytes());
@@ -109,10 +125,26 @@ fn fork_eviction_demotes_only_bodies_missing_from_full_state() {
             Frontier::new(height, block.hash()),
         );
         siblings.push(block);
-        assert_eq!(live.best_tip().unwrap().1, siblings[0].hash());
+        assert_eq!(
+            live.best_tip().unwrap().1,
+            siblings[usize::from(refill_after_invalidation)].hash()
+        );
         assert!(live.any_chain_contains(&siblings[order].hash()));
     }
-    let evicted = siblings[siblings.len() - 2].hash();
+    if reconsider {
+        assert_eq!(
+            live.chain_iter().count(),
+            crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS
+        );
+        let mut staged = live.clone();
+        staged
+            .reconsider_block(siblings[0].hash(), &finalized.db)
+            .unwrap();
+        commit_operator_change(&writer, &mut live, staged, siblings[0].hash(), false).unwrap();
+        assert_eq!(live.best_tip().unwrap().1, siblings[0].hash());
+    }
+    let evicted_index = siblings.len() - if reconsider { 1 } else { 2 };
+    let evicted = siblings[evicted_index].hash();
     assert!(!live.any_chain_contains(&evicted));
     assert_eq!(
         live.chain_iter().count(),
@@ -150,7 +182,7 @@ fn fork_eviction_demotes_only_bodies_missing_from_full_state() {
     );
 
     // Replaying an evicted body restores its verified marker and demotes the next eviction.
-    let replay = siblings[siblings.len() - 2].clone();
+    let replay = siblings[evicted_index].clone();
     let mut staged = live.clone();
     staged
         .commit_new_chain(replay.prepare(), &finalized.db)

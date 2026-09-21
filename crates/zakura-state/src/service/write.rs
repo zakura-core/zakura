@@ -292,6 +292,7 @@ impl PreparedFullStateTransition {
         if matches!(
             &header_request.event,
             TransitionEvent::VerifiedBlockAccepted(_)
+                | TransitionEvent::OperatorReconsider(_)
                 | TransitionEvent::VerifiedChainChanged(
                     zakura_header_chain::VerifiedChainChanged {
                         cause: VerifiedChangeCause::Grow | VerifiedChangeCause::Reset,

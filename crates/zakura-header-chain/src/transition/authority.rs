@@ -48,7 +48,7 @@ pub trait FullStateEvidenceAuthority: Send + Sync {
         None
     }
 
-    /// Bodies evicted from full state by this exact staged block acceptance.
+    /// Bodies evicted by this exact staged block acceptance or reconsideration.
     /// Their headers remain eligible, but no longer represent retained verified bodies.
     fn evicted_bodies(&self, _event: &TransitionEvent) -> &[zakura_chain::block::Hash] {
         &[]

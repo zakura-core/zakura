@@ -57,7 +57,7 @@ pub(super) fn accounting_network(reissuance: bool) -> Network {
             nu7: Some(2),
             ..Default::default()
         },
-        nsm_reissuance_height: reissuance.then_some(START),
+        test_nsm_reissuance_height: reissuance.then_some(START),
         initial_nsm_value_balance: Some(Amount::zero()),
         ..Default::default()
     })
@@ -373,7 +373,7 @@ fn mining_template_requires_parent_pools_at_reissuance_activation() {
                 nu7: Some(2),
                 ..Default::default()
             },
-            nsm_reissuance_height: Some(start),
+            test_nsm_reissuance_height: Some(start),
             ..Default::default()
         });
         let (state, parent) = state_below_start(&network);

@@ -275,6 +275,12 @@ jobs:
       - name: Diff against the latest published API
         env:
           PACKAGE: ${{ matrix.package }}
+          # setup-rust-toolchain denies Cargo build warnings by default.
+          # cargo-public-api passes --cap-lints allow, which does not cover
+          # that gate. Dependency future-incompat reports, such as
+          # primitive-types on the pinned nightly, stay visible and must not
+          # fail the diff.
+          CARGO_BUILD_WARNINGS: warn
         run: |
           # cargo-public-api builds both the current and published crate with
           # the pinned nightly. Nightly-only warnings are evidence, not the

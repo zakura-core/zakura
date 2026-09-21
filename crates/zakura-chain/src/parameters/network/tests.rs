@@ -1426,6 +1426,7 @@ fn configured_networks_require_bounded_derived_nsm_seeds() {
             ..Default::default()
         })
         .unwrap()
+        .clear_funding_streams()
         .to_network()
         .expect("an ordinary derived NSM seed fits in Amount");
 }

@@ -120,8 +120,8 @@ it sits after the `'rebuild` loop falls through — it is reachable only when al
 `MAX_TEMPLATE_REBUILDS` attempts were superseded in turn.
 
 Raising the constant from 4 to 16 and alternating the two builds, to keep host
-drift out of the comparison. Measured on `3dc3d847a`, an earlier revision of
-#1088 whose loop ran `0..MAX_TEMPLATE_REBUILDS`; the branch now runs
+drift out of the comparison. Measured on `3dc3d847a`, an earlier revision of #1088
+whose loop ran `0..MAX_TEMPLATE_REBUILDS`; the branch now runs
 `0..=MAX_TEMPLATE_REBUILDS`, one attempt more, which is why the residual on
 `bd6bea7ec` is lower. The conclusion is unchanged:
 

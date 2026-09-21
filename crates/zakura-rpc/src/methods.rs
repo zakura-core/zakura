@@ -1319,8 +1319,11 @@ where
                 .await?;
             let block =
                 proposal_block_from_template(&template, None, &self.network).map_misc_error()?;
-            tokio::time::timeout(
-                Duration::from_secs(30),
+            // One deadline covers validation and the committed-tip check that follows it,
+            // so a slow validation cannot hand the tip read an already-expired budget.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            let validation = tokio::time::timeout_at(
+                deadline,
                 self.gbt
                     .block_verifier_router()
                     .oneshot(zakura_consensus::Request::Prepare {
@@ -1329,30 +1332,52 @@ where
                         source: zakura_consensus::PreparedCandidateSource::ServerTemplate,
                     }),
             )
-            .await
-            .map_misc_error()?
-            .map_misc_error()?;
-            // A fallback must still belong to the context we just validated.
-            let current = self.gbt.template_rejections.borrow();
-            if current.parent != state.parent
-                || current.revision != state.revision
-                || current.contains(template.work_id())
-                || self
-                    .latest_chain_tip
-                    .best_tip_hash()
-                    .is_some_and(|tip| tip != chain_info.tip_hash)
-            {
-                return Err(ErrorObject::owned(
-                    0,
-                    "template changed during recovery; retry",
-                    None::<()>,
-                ));
-            }
-            drop(current);
-            self.gbt.template_rejections.send_if_modified(|state| {
-                state.mark_prepared(chain_info.tip_hash, template.work_id());
+            .await;
+            // A fallback must still belong to the context it was validated against.
+            // Check that and record success under one write lock, so a rejection cannot
+            // land between the two and leave this work marked prepared for a stale parent.
+            let mut current_context = false;
+            self.gbt.template_rejections.send_if_modified(|current| {
+                if current.parent != state.parent
+                    || current.revision != state.revision
+                    || current.contains(template.work_id())
+                    || self
+                        .latest_chain_tip
+                        .best_tip_hash()
+                        .is_some_and(|tip| tip != chain_info.tip_hash)
+                {
+                    return false;
+                }
+                current_context = true;
+                if matches!(validation, Ok(Ok(_))) {
+                    current.mark_prepared(chain_info.tip_hash, template.work_id());
+                }
                 false
             });
+            if !current_context {
+                return Ok(None);
+            }
+            if !matches!(validation, Ok(Ok(_))) {
+                // State commits precede tip notifications, so a proposal can fail against
+                // a parent that both watches still name. Confirm against committed state
+                // before surfacing a verifier error the caller can do nothing about.
+                let response = tokio::time::timeout_at(
+                    deadline,
+                    call_service(self.read_state.clone(), zakura_state::ReadRequest::Tip),
+                )
+                .await
+                .map_misc_error()??;
+                match response {
+                    zakura_state::ReadResponse::Tip(Some((_, tip)))
+                        if tip != chain_info.tip_hash =>
+                    {
+                        return Ok(None);
+                    }
+                    zakura_state::ReadResponse::Tip(_) => {}
+                    _ => unreachable!("unmatched response to a tip request"),
+                }
+            }
+            validation.map_misc_error()?.map_misc_error()?;
         } else {
             self.prepare_template_in_background(&template);
         }

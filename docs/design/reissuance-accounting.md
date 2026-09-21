@@ -10,14 +10,29 @@ The balance holds `INITIAL_NSM_VALUE_BALANCE` on the last block below NU7: the b
 subsidy and fees that earlier coinbase transactions never claimed. The 2026-09-15
 ZIP Editor call settled this, and zips#1354 defines the constant.
 
-`Network::initial_nsm_value_balance` in
-`crates/zakura-chain/src/parameters/network/subsidy.rs` holds the value. Mainnet and
-Testnet carry the measured constants. Every other network carries zero, because a chain
-with no history before NU7 has nothing to seed, and
-`ParametersBuilder::with_initial_nsm_value_balance` overrides it.
+State derives the seed at `NU7 - 1` from `scheduled_issuance_zatoshis` minus the
+monetary pool total at that height. Both inputs are local: the calculation uses no
+RPC, block scan, or archive node. The monetary total excludes the NSM balance.
+
+Mainnet and public Testnet check the derived seed against the measured constants
+in `Network::initial_nsm_value_balance`. A mismatch fails the state update or
+migration. The draft still leaves the exact values as a TODO; these constants
+retain #1040's measurements, which still need an independent zcashd cross-check.
+
+Configured networks derive their own seed by default. An explicit
+`initial_nsm_value_balance`, including zero, overrides the derivation for synthetic
+histories. Omitting the setting and specifying zero have different meanings.
+A configured network can omit the seed only when cumulative scheduled issuance
+through `NU7 - 1` is at most `MAX_MONEY`, which guarantees that every possible
+derived seed fits the stored amount. Networks with larger schedules must supply
+an explicit bounded seed or change their schedule.
+A configured network that already activated NU7 with the old implicit zero seed
+must set an explicit zero to preserve its rules, or resync under the new rules.
+The existing format-29 validation detects an inconsistent stored balance.
 
 Let `N` denote NU7 activation, `S(h)` cumulative scheduled issuance with zero genesis
-issuance, `I(h)` the sum of the six monetary pools, and `C` the seed. The stored balance
+issuance, `I(h)` the sum of the six monetary pools, and `C = S(N-1) - I(N-1)`
+(unless a configured network overrides the seed). The stored balance
 is:
 
 - `D(h) = 0` for `h < N - 1`, or when the network has no NU7 activation.
@@ -25,10 +40,13 @@ is:
 - `D(h) = C + (S(h) - S(N-1)) - (I(h) - I(N-1))` for `h >= N`.
 - For NU7 at genesis there is no seeded block, so `D(h) = S(h) - I(h)`.
 
-`Block::nsm_value_balance_change` in `crates/zakura-chain/src/block.rs` applies the rule
-as the chain grows, and the migration in
+Both commit paths call `ValueBalance::seed_nsm_value_balance` after applying the
+last pre-NU7 block's monetary changes. Later blocks use `Block::nsm_value_balance_change`.
+The migration in
 `crates/zakura-state/src/service/finalized_state/disk_format/upgrade/nsm_value_balance_pool.rs`
-applies it to an existing database. Change both together.
+uses the same seed derivation. Non-finalized rollback clears the seed when it
+removes the last pre-NU7 block. Finalized rollback restores the target BlockInfo
+pools. Replay derives the seed again.
 
 ## Fee recycling
 
@@ -90,8 +108,8 @@ to v28: older decoders cannot read the expanded BlockInfo layout. Downgrade
 requires a pre-upgrade backup or a separate sync.
 
 The migration reads legacy pool records and offsets them so the balance starts at the
-seed on the last block below NU7. The offset is zero when the constant matches the
-chain's own history, as the measured Mainnet and Testnet constants do. The migration
+seed on the last block below NU7. Derived seeds have zero offset. Only an explicit
+configured-network override can introduce an offset. The migration
 performs cumulative schedule arithmetic without clamping either operand to MAX_MONEY. It
 checks the eligible balance after the offset.
 
@@ -103,7 +121,9 @@ migration performs no data writes, including to the separately stored tip pools.
 The migration reads no history before the pre-NU7 baseline and does not audit
 or repair the absolute historical Deferred balance. A nonzero NSM seed is written
 at that baseline, but Deferred changes are validated only from NU7 onward.
-A constant historical monetary-pool offset cancels. Each post-activation Deferred
+A historical monetary-pool error changes the derived seed; the public-network
+constant check rejects a changed total. An explicit configured seed still cancels
+a constant historical offset. Each post-activation Deferred
 change must match funding minus disbursements before the corresponding NSM balance
 is written. This rejects mixed replay/commit histories whose changing Deferred
 undercount would otherwise distort the NSM balance.
@@ -117,7 +137,10 @@ separate sync to downgrade.
 The migration writes batches of 10,000 affected BlockInfo records. It preserves monetary
 pools and block sizes. It updates the separately stored tip balance last.
 Cancellation or a failed write leaves the version marker unchanged. Restarting
-the migration recomputes every balance, including already rewritten records.
+the migration recomputes every balance, including already rewritten records. It
+always rewrites and validates the `NU7 - 1` seed row, including for an explicit
+zero, so a v27 attempt interrupted under different seed configuration cannot
+leave a mixed history.
 
 The migration refuses a database whose finalized tip is at or above the ZIP 234
 start height. Older versions committed those blocks without reissuance, so their

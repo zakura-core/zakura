@@ -58,6 +58,7 @@ pub(super) fn accounting_network(reissuance: bool) -> Network {
             ..Default::default()
         },
         nsm_reissuance_height: reissuance.then_some(START),
+        initial_nsm_value_balance: Some(Amount::zero()),
         ..Default::default()
     })
 }
@@ -554,6 +555,21 @@ proptest::proptest! {
 
 #[test]
 fn startup_migration_failure_preserves_version_and_retry_matches_fresh_sync() {
+    migration_retry_matches_fresh_sync(accounting_network(false));
+}
+
+#[test]
+fn derived_nsm_seed_migration_retry_matches_fresh_sync() {
+    migration_retry_matches_fresh_sync(Network::new_regtest(RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            nu7: Some(2),
+            ..Default::default()
+        },
+        ..Default::default()
+    }));
+}
+
+fn migration_retry_matches_fresh_sync(network: Network) {
     use crate::{
         constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
         service::finalized_state::{
@@ -562,7 +578,6 @@ fn startup_migration_failure_preserves_version_and_retry_matches_fresh_sync() {
         },
     };
     let _guard = zakura_test::init();
-    let network = accounting_network(false);
     let dir = tempfile::tempdir().unwrap();
     let config = Config {
         cache_dir: dir.path().to_owned(),
@@ -680,7 +695,9 @@ fn legacy_migration_reopens_and_replays_across_activation() {
             let block = start_block(&state, &network, &parent, excess);
             commit(&mut state, &block).unwrap();
             let expected = state.db.finalized_value_pool();
-            let before_activation = *state.db.block_info(Height(1).into()).unwrap().value_pools();
+            let before_activation_info = state.db.block_info(Height(1).into()).unwrap();
+            let before_activation = *before_activation_info.value_pools();
+            let before_activation_size = before_activation_info.size();
 
             if migrate_before_activation {
                 drop(state);
@@ -725,12 +742,6 @@ fn legacy_migration_reopens_and_replays_across_activation() {
                 .with_batch_for_writing(&mut batch)
                 .zs_insert(&(), &RawBytes::from_bytes(&tip_bytes[..48]));
             state.db.write_batch(batch).unwrap();
-            let legacy_anchor = state
-                .db
-                .raw_block_info_cf()
-                .zs_get(&Height(1))
-                .unwrap()
-                .as_bytes();
             state
                 .db
                 .update_format_version_on_disk(&semver::Version::new(28, 2, 0))
@@ -742,24 +753,18 @@ fn legacy_migration_reopens_and_replays_across_activation() {
                 upgraded.db.format_version_on_disk().unwrap(),
                 Some(state_database_format_version_in_code())
             );
+            let upgraded_anchor = upgraded.db.block_info(Height(1).into()).unwrap();
             assert_eq!(
-                upgraded
-                    .db
-                    .raw_block_info_cf()
-                    .zs_get(&Height(1))
-                    .unwrap()
-                    .as_bytes(),
-                legacy_anchor
+                *upgraded_anchor.value_pools(),
+                before_activation,
+                "migration must preserve the seed-height pools semantically",
             );
+            assert_eq!(upgraded_anchor.size(), before_activation_size);
             if migrate_before_activation {
                 assert_eq!(
-                    upgraded
-                        .db
-                        .raw_chain_value_pools_cf()
-                        .zs_get(&())
-                        .unwrap()
-                        .as_bytes(),
-                    tip_bytes[..48]
+                    upgraded.db.finalized_value_pool(),
+                    before_activation,
+                    "migration must preserve the pre-activation tip pools semantically",
                 );
             } else {
                 assert_eq!(upgraded.db.finalized_value_pool(), expected);

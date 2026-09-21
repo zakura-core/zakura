@@ -1403,7 +1403,7 @@ fn rollback_prunes_ironwood_nullifiers_above_target() {
 }
 
 #[test]
-fn legacy_block_info_replay_preserves_slow_start_deferred_funding() {
+fn legacy_block_info_replay_preserves_slow_start_deferred_funding_and_nsm_seed() {
     use crate::service::finalized_state::disk_format::upgrade::{
         block_info_and_address_received::Upgrade, DiskFormatUpgrade,
     };
@@ -1419,6 +1419,7 @@ fn legacy_block_info_replay_preserves_slow_start_deferred_funding() {
         .with_activation_heights(ConfiguredActivationHeights {
             blossom: Some(1),
             canopy: Some(2),
+            nu7: Some(4),
             ..Default::default()
         })
         .unwrap()
@@ -1490,6 +1491,7 @@ fn legacy_block_info_replay_preserves_slow_start_deferred_funding() {
         parent = block;
     }
     assert!(snapshots[1].deferred_amount() > Amount::<NonNegative>::zero());
+    assert!(i64::from(snapshots[2].nsm_value_balance_amount()) > 0);
     let mut batch = DiskWriteBatch::new();
     for h in [2, 3] {
         let _ = state

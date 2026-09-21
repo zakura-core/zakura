@@ -11,10 +11,7 @@ use crate::{
     ironwood,
     memory::{inline_size_bytes, vec_capacity_bytes, AttributedMemorySize},
     orchard,
-    parameters::{
-        subsidy::{halving_block_subsidy, ParameterSubsidy},
-        Network, NetworkUpgrade,
-    },
+    parameters::{subsidy::halving_block_subsidy, Network, NetworkUpgrade},
     sapling,
     serialization::TrustedPreallocate,
     sprout,
@@ -288,6 +285,9 @@ impl Block {
     /// UTXOs, which are ignored.
     ///
     /// Note that the chain value pool has the opposite sign to the transaction value pool.
+    ///
+    /// The NSM seed is excluded. After adding these changes, state calls
+    /// [`ValueBalance::seed_nsm_value_balance`].
     pub fn chain_value_pool_change(
         &self,
         network: &Network,
@@ -307,6 +307,8 @@ impl Block {
     /// input in this block. This includes UTXOs created by earlier transactions
     /// in the same block. The map can also contain unrelated UTXOs, which this
     /// method ignores.
+    ///
+    /// The NSM seed is excluded, as in [`Self::chain_value_pool_change`].
     ///
     /// # Panics
     ///
@@ -392,16 +394,8 @@ impl Block {
             return Ok(Amount::zero());
         };
 
-        // The seed lands on the last block below NU7, so the balance already holds it when
-        // the first NU7 block claims its bonus. NU7 at genesis has no such block, and a
-        // chain with no history before NU7 has nothing to seed.
-        if nu7.0.checked_sub(1) == Some(height.0) {
-            return network
-                .initial_nsm_value_balance()
-                .constrain::<NegativeAllowed>()
-                .map_err(ValueBalanceError::NsmValueBalance);
-        }
-
+        // State initializes the seed from cumulative monetary pools at NU7 - 1.
+        // A block alone only supplies the changes from NU7 onward.
         if height < nu7 {
             return Ok(Amount::zero());
         }

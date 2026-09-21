@@ -317,6 +317,7 @@ impl DiskWriteBatch {
 
         let new_value_pool = value_pool
             .add_chain_value_pool_change(block_value_pool_change)
+            .and_then(|pools| pools.seed_nsm_value_balance(finalized.height, &db.network()))
             .map_err(|value_balance_error| ValidateContextError::AddValuePool {
                 value_balance_error,
                 chain_value_pools: Box::new(value_pool),

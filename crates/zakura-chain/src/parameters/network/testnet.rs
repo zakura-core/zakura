@@ -442,7 +442,7 @@ fn check_derived_nsm_seed_schedule(network: &Network) -> Result<(), ParametersBu
     }
     let Some(seed_height) = NetworkUpgrade::Nu7
         .activation_height(network)
-        .and_then(Height::previous)
+        .and_then(|activation| activation.previous().ok())
     else {
         return Ok(());
     };

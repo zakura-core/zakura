@@ -83,7 +83,7 @@ impl DiskFormatUpgrade for Upgrade {
         let baseline = baseline(db)?;
         if let Some(seed_height) = NetworkUpgrade::Nu7
             .activation_height(&network)
-            .and_then(Height::previous)
+            .and_then(|activation| activation.previous().ok())
             .filter(|seed_height| *seed_height <= tip_height)
         {
             let seed_info = read_block_info(db, seed_height)?;

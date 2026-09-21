@@ -1393,6 +1393,44 @@ fn halving_interval_must_be_positive_and_representable_in_seconds() {
     }
 }
 
+#[test]
+fn configured_networks_require_bounded_derived_nsm_seeds() {
+    use super::{error::ParametersBuilderError, testnet};
+
+    let builder = testnet::Parameters::build()
+        .with_activation_heights(testnet::ConfiguredActivationHeights {
+            blossom: Some(1),
+            canopy: Some(2),
+            nu7: Some(20_000_000),
+            ..Default::default()
+        })
+        .unwrap()
+        .clear_funding_streams();
+
+    assert!(matches!(
+        builder.clone().to_network(),
+        Err(ParametersBuilderError::DerivedNsmSeedExceedsMaxMoney {
+            seed_height: Height(19_999_999),
+            scheduled_issuance,
+        }) if scheduled_issuance > u128::try_from(MAX_MONEY).unwrap()
+    ));
+
+    builder
+        .with_initial_nsm_value_balance(Amount::zero())
+        .to_network()
+        .expect("an explicit bounded NSM seed avoids oversized derivation");
+
+    testnet::Parameters::build()
+        .with_activation_heights(testnet::ConfiguredActivationHeights {
+            nu7: Some(3),
+            ..Default::default()
+        })
+        .unwrap()
+        .clear_funding_streams()
+        .to_network()
+        .expect("an ordinary derived NSM seed fits in Amount");
+}
+
 /// Restates ZIP 234's `ceil(balance * numerator / BLOCK_SUBSIDY_FRACTION_DENOMINATOR)`
 /// independently of `block_subsidy`.
 fn reissuance_bonus_oracle(balance: i64, numerator: i128) -> i128 {

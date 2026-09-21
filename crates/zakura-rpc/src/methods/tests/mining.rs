@@ -316,6 +316,13 @@ fn template_build_paths_retain_capacity_when_cancelled() {
                         state.reject(chain.tip_hash, "rejected-work");
                     });
                     rpc.finish_mining_template(initial, &chain, rpc.gbt.miner_params().unwrap())
+                        .map(|result| {
+                            result.map(|template| {
+                                template.expect(
+                                    "recovery parent is unchanged, so finish returns a template",
+                                )
+                            })
+                        })
                         .boxed()
                 }
                 _ => rpc
@@ -425,20 +432,168 @@ async fn template_worker_panic_is_an_rpc_error() {
     bounded(rpc.get_block_template(None)).await.unwrap();
 }
 
+/// A template superseded during construction is rebuilt on the new tip, not returned
+/// and not reported as an error. The tip change here is an equal-height reorg: same
+/// height, different hash.
 #[test]
-fn tip_change_during_construction_does_not_publish_stale_work() {
+fn tip_change_during_construction_rebuilds_on_new_parent() {
     mining_runtime(async {
-        let (_, info) = watch::channel(chain_info(2, 1, 0));
+        let (info_tx, info) = watch::channel(chain_info(2, 1, 0));
         let (rpc, tip, _) = mining_rpc(info);
         let gate = BlockingPoolGate::new().await;
         let request = rpc.get_block_template(None);
         tokio::pin!(request);
         assert!(futures::poll!(&mut request).is_pending());
-        tip.send_best_tip_hash(Hash([2; 32]));
+
+        let next = chain_info(2, 2, 0);
+        info_tx.send_replace(next.clone());
+        tip.send_best_tip_hash(next.tip_hash);
         gate.release().await;
-        let error = bounded(request).await.unwrap_err();
-        assert!(error.message().contains("parent changed"));
+
+        let template = bounded(request).await.unwrap().try_into_template().unwrap();
+        assert_eq!(template.previous_block_hash, next.tip_hash);
+        assert_eq!(template.height, 3);
+        assert_eq!(
+            rpc.gbt.template_rejections.borrow().parent,
+            Some(next.tip_hash)
+        );
     });
+}
+
+/// Pathological churn is bounded: after the configured number of rebuilds, the
+/// RPC preserves the previous transient error instead of rebuilding forever.
+#[tokio::test]
+async fn template_rebuild_limit_returns_parent_changed_error() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    let initial = chain_info(2, 1, 0);
+    let (info_tx, info) = watch::channel(initial.clone());
+    let (tip, tip_sender) = MockChainTip::new();
+    tip_sender.send_best_tip_height(initial.tip_height);
+    tip_sender.send_best_tip_hash(initial.tip_hash);
+    let tip_sender = Arc::new(tip_sender);
+    let attempts = Arc::new(AtomicUsize::new(0));
+
+    let mempool_info = info.clone();
+    let mempool_info_tx = info_tx.clone();
+    let mempool_tip_sender = tip_sender.clone();
+    let mempool_attempts = attempts.clone();
+    let mempool = tower::service_fn(move |_| {
+        let current_tip = mempool_info.borrow().tip_hash;
+        let attempt = mempool_attempts.fetch_add(1, Ordering::SeqCst);
+        let next_hash =
+            u8::try_from(attempt + 2).expect("test rebuild count fits in a block hash byte");
+        let next = chain_info(2, next_hash, 0);
+        mempool_info_tx.send_replace(next.clone());
+        mempool_tip_sender.send_best_tip_hash(next.tip_hash);
+        async move {
+            Ok::<_, BoxError>(mempool::Response::FullTransactions {
+                transactions: vec![],
+                transaction_dependencies: Default::default(),
+                last_seen_tip_hash: current_tip,
+            })
+        }
+    });
+    let read_info = info.clone();
+    let read = tower::service_fn(move |request| {
+        assert!(matches!(request, ReadRequest::ChainInfo));
+        let info = read_info.borrow().clone();
+        async move { Ok::<_, BoxError>(ReadResponse::ChainInfo(info)) }
+    });
+    let (rpc, _) = rpc(network(), mempool, read, tip);
+
+    let error = bounded(rpc.get_block_template(None)).await.unwrap_err();
+    assert_eq!(error.code(), 0);
+    assert_eq!(error.message(), "template parent changed; retry");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        MAX_TEMPLATE_REBUILDS + 1,
+        "the initial build plus every permitted rebuild must be attempted"
+    );
+}
+
+/// Two callers race across a tip change. The slow caller fetched chain info for the old
+/// parent; the fast caller selects the new parent while the slow one is still building.
+/// Both must return work on the new parent, and the slow caller must not clobber the
+/// parent the fast caller selected.
+#[test]
+fn concurrent_caller_selecting_new_parent_makes_slow_caller_rebuild() {
+    mining_runtime(async {
+        let (info_tx, info) = watch::channel(chain_info(2, 1, 0));
+        let (rpc, tip, mut verifier) = mining_rpc(info);
+        let gate = BlockingPoolGate::new().await;
+
+        let slow = rpc.get_block_template(None);
+        tokio::pin!(slow);
+        assert!(futures::poll!(&mut slow).is_pending());
+
+        let next = chain_info(2, 2, 0);
+        info_tx.send_replace(next.clone());
+        tip.send_best_tip_hash(next.tip_hash);
+
+        let fast = rpc.get_block_template(None);
+        tokio::pin!(fast);
+        assert!(futures::poll!(&mut fast).is_pending());
+        assert_eq!(
+            rpc.gbt.template_rejections.borrow().parent,
+            Some(next.tip_hash),
+            "the fast caller selects the new parent before building"
+        );
+        rpc.gbt.template_rejections.send_modify(|state| {
+            assert!(state.reject(next.tip_hash, "rejected-work"));
+        });
+
+        gate.release().await;
+        let (slow, fast, ()) = bounded(async {
+            tokio::join!(slow, fast, async {
+                for _ in 0..2 {
+                    verifier
+                        .expect_request_that(|req| {
+                            matches!(req, zakura_consensus::Request::Prepare { .. })
+                        })
+                        .await
+                        .respond(Hash([9; 32]));
+                }
+            })
+        })
+        .await;
+        for response in [slow, fast] {
+            let template = response.unwrap().try_into_template().unwrap();
+            assert_eq!(template.previous_block_hash, next.tip_hash);
+        }
+        assert_eq!(
+            rpc.gbt.template_rejections.borrow().parent,
+            Some(next.tip_hash),
+            "the slow caller's rebuild must not reset the parent"
+        );
+        assert!(
+            rpc.gbt
+                .template_rejections
+                .borrow()
+                .contains("rejected-work"),
+            "the slow caller must not clear the new parent's rejection records"
+        );
+    });
+}
+
+/// A caller whose chain info is already behind the tip watch cannot select its stale
+/// parent, even if the parent was selected earlier by someone else.
+#[tokio::test]
+async fn stale_parent_selection_is_refused() {
+    let (_, info) = watch::channel(chain_info(2, 1, 0));
+    let (rpc, tip, _) = mining_rpc(info);
+    assert!(rpc.select_mining_template_parent(Hash([1; 32])));
+    tip.send_best_tip_hash(Hash([2; 32]));
+    assert!(!rpc.select_mining_template_parent(Hash([1; 32])));
+    assert_eq!(
+        rpc.gbt.template_rejections.borrow().parent,
+        Some(Hash([1; 32])),
+        "a refused selection leaves the state untouched"
+    );
+    assert!(rpc.select_mining_template_parent(Hash([2; 32])));
 }
 
 #[tokio::test]
@@ -508,6 +663,58 @@ fn long_poll_builds_on_new_parent_without_blocking_runtime() {
             assert_eq!(template.height, new_height + 1);
             assert_reward(&template, 400_000_000);
         }
+    });
+}
+
+/// A rebuild must remember that the long-poll deadline already woke the request.
+/// Otherwise, restoring the original tip and long-poll ID can make it wait forever
+/// because a clamped current time disables the deadline timer.
+#[test]
+fn superseded_deadline_build_does_not_resume_long_polling() {
+    mining_runtime(async {
+        let mut original = chain_info(2, 1, 0);
+        original.cur_time = 1654008727.into();
+        let deadline = original
+            .max_time
+            .saturating_duration_since(original.cur_time)
+            .to_std();
+        let (info_tx, info) = watch::channel(original.clone());
+        let (rpc, tip, _) = mining_rpc(info);
+        let initial = bounded(rpc.get_block_template(None))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        let gate = BlockingPoolGate::new().await;
+        tokio::time::pause();
+
+        let request = rpc.get_block_template(Some(GetBlockTemplateParameters {
+            long_poll_id: Some(initial.long_poll_id),
+            ..Default::default()
+        }));
+        tokio::pin!(request);
+        assert!(futures::poll!(&mut request).is_pending());
+        tokio::time::advance(deadline + Duration::from_millis(1)).await;
+        assert!(
+            futures::poll!(&mut request).is_pending(),
+            "the deadline build must wait for blocking-pool capacity"
+        );
+
+        let other = chain_info(2, 2, 0);
+        info_tx.send_replace(other.clone());
+        tip.send_best_tip_hash(other.tip_hash);
+        assert!(rpc.select_mining_template_parent(other.tip_hash));
+
+        let mut restored = original;
+        restored.cur_time = restored.max_time;
+        info_tx.send_replace(restored.clone());
+        tip.send_best_tip_hash(restored.tip_hash);
+
+        gate.release().await;
+        tokio::time::resume();
+        let template = bounded(request).await.unwrap().try_into_template().unwrap();
+        assert_eq!(template.previous_block_hash, restored.tip_hash);
+        assert_eq!(template.submit_old, Some(false));
     });
 }
 
@@ -671,7 +878,11 @@ fn recovery_construction_yields_and_rechecks_parent() {
                     .message()
                     .contains("changed during recovery"));
             } else {
-                let template = response.unwrap().try_into_template().unwrap();
+                let template = response
+                    .unwrap()
+                    .expect("parent is unchanged, so recovery returns a template")
+                    .try_into_template()
+                    .unwrap();
                 assert_reward(&template, 400_000_000);
                 assert!(rpc
                     .gbt

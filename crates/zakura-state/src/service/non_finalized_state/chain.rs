@@ -18,7 +18,7 @@ use zakura_chain::{
     history_tree::HistoryTree,
     ironwood, orchard,
     parallel::tree::NoteCommitmentTrees,
-    parameters::Network,
+    parameters::{Network, NetworkUpgrade},
     primitives::Groth16Proof,
     sapling,
     serialization::ZcashSerialize as _,
@@ -2566,6 +2566,7 @@ impl UpdateWith<(ValueBalance<NegativeAllowed>, Height, usize)> for Chain {
         match self
             .chain_value_pools
             .add_chain_value_pool_change(*block_value_pool_change)
+            .and_then(|pools| pools.seed_nsm_value_balance(*height, &self.network))
         {
             Ok(chain_value_pools) => {
                 self.chain_value_pools = chain_value_pools;
@@ -2604,6 +2605,15 @@ impl UpdateWith<(ValueBalance<NegativeAllowed>, Height, usize)> for Chain {
         use std::ops::Neg;
 
         if position == RevertPosition::Tip {
+            // The seed is state-derived and is not part of the block's pool delta.
+            if NetworkUpgrade::Nu7
+                .activation_height(&self.network)
+                .and_then(|activation| activation.0.checked_sub(1))
+                == Some(height.0)
+            {
+                self.chain_value_pools
+                    .set_nsm_value_balance_amount(Amount::zero());
+            }
             self.chain_value_pools = self
                 .chain_value_pools
                 .add_chain_value_pool_change(block_value_pool_change.neg())

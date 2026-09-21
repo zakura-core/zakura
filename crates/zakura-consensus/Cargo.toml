@@ -22,9 +22,6 @@ categories = ["asynchronous", "cryptography::cryptocurrencies"]
 [features]
 default = []
 
-# NU7 consensus rules. Off by default until NU7 has activation heights.
-nu7 = []
-
 # Production features that activate extra dependencies, or extra features in dependencies
 
 progress-bar = [

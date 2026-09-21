@@ -3,9 +3,10 @@
 use std::{collections::HashSet, fs, net::SocketAddr, time::Duration};
 
 use zakura_chain::{
+    amount::Amount,
     block::Height,
     parameters::{
-        testnet::{self, ConfiguredFundingStreams},
+        testnet::{self, ConfiguredActivationHeights, ConfiguredFundingStreams},
         Network,
     },
 };
@@ -1028,5 +1029,57 @@ fn zakura_secret_key_honors_configured_key_and_disabled_cache() {
             .and_then(|name| name.to_str()),
         Some("mainnet.zakura-iroh-secret-key"),
         "disabled cache dir must still yield a persistent Zakura identity path outside the peer cache",
+    );
+}
+
+#[test]
+fn configured_nsm_seed_roundtrip_distinguishes_derived_and_explicit_zero() {
+    for seed in [None, Some(0), Some(123)] {
+        let field = seed
+            .map(|seed| format!("initial_nsm_value_balance = {seed}\n"))
+            .unwrap_or_default();
+        let text = format!("network = 'Regtest'\n[testnet_parameters]\n{field}");
+        let config: Config = toml::from_str(&text).unwrap();
+        let roundtrip: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(config.network, roundtrip.network);
+        let Network::Testnet(params) = &roundtrip.network else {
+            panic!("Regtest uses testnet parameters")
+        };
+        assert_eq!(
+            params.configured_initial_nsm_value_balance().map(i64::from),
+            seed
+        );
+    }
+}
+
+#[test]
+fn configured_network_rejects_an_oversized_omitted_nsm_seed() {
+    let network = testnet::Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            blossom: Some(1),
+            canopy: Some(2),
+            nu7: Some(20_000_000),
+            ..Default::default()
+        })
+        .unwrap()
+        .with_initial_nsm_value_balance(Amount::zero())
+        .extend_funding_streams()
+        .to_network()
+        .expect("the explicit bounded seed makes the configured network valid");
+    let explicit = Config {
+        network,
+        initial_testnet_peers: Default::default(),
+        ..Config::default()
+    };
+    let explicit = toml::to_string(&explicit).unwrap();
+    toml::from_str::<Config>(&explicit).expect("the explicit bounded seed must round-trip");
+
+    let derived = explicit.replace("initial_nsm_value_balance = 0\n", "");
+    let error = toml::from_str::<Config>(&derived)
+        .expect_err("the oversized omitted seed must be rejected")
+        .to_string();
+    assert!(
+        error.contains("scheduled issuance") && error.contains("exceeds MAX_MONEY"),
+        "unexpected configuration error: {error}",
     );
 }

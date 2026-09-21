@@ -1026,16 +1026,12 @@ where
         //
         // https://zips.z.cash/zip-2003
         //
-        // The `nu7` feature gates this rule until NU7 has activation heights,
-        // so default builds accept V4 at NU7.
-        //
         // `activation_height` falls back to the next upgrade's height when this
         // network omits NU7. The only later upgrade is `ZFuture`, which exists
         // only under `cfg(zcash_unstable = "zfuture")`.
-        if cfg!(feature = "nu7")
-            && NetworkUpgrade::Nu7
-                .activation_height(network)
-                .is_some_and(|nu7_height| height >= nu7_height)
+        if NetworkUpgrade::Nu7
+            .activation_height(network)
+            .is_some_and(|nu7_height| height >= nu7_height)
         {
             return Err(TransactionError::UnsupportedByNetworkUpgrade(
                 transaction.version(),

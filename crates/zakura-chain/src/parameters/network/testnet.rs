@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::{
-    amount::{Amount, NonNegative},
+    amount::{Amount, NonNegative, MAX_MONEY},
     block::{self, Height, HeightDiff},
     parameters::{
         checkpoint::list::{CheckpointList, TESTNET_CHECKPOINT_LIST},
@@ -21,8 +21,8 @@ use crate::{
                 BLOSSOM_POW_TARGET_SPACING_RATIO, FUNDING_STREAM_RECEIVER_DENOMINATOR,
                 MAX_BLOCK_SUBSIDY, POST_BLOSSOM_HALVING_INTERVAL, PRE_BLOSSOM_HALVING_INTERVAL,
             },
-            funding_stream_address_period, FundingStreamReceiver, FundingStreamRecipient,
-            FundingStreams, ParameterSubsidy,
+            funding_stream_address_period, scheduled_issuance_zatoshis, FundingStreamReceiver,
+            FundingStreamRecipient, FundingStreams, ParameterSubsidy,
         },
         Network, NetworkKind, NetworkUpgrade,
     },
@@ -428,6 +428,42 @@ fn check_lockbox_disbursements(
     Ok(())
 }
 
+/// Checks that an omitted NSM seed is bounded for every possible valid monetary-pool total.
+///
+/// The derived seed subtracts the issued supply, which is non-negative, from the cumulative
+/// schedule. Bounding the schedule at the seed height therefore guarantees that the result
+/// cannot exceed the existing `Amount` representation.
+fn check_derived_nsm_seed_schedule(network: &Network) -> Result<(), ParametersBuilderError> {
+    let Network::Testnet(params) = network else {
+        return Ok(());
+    };
+    if params.configured_initial_nsm_value_balance().is_some() {
+        return Ok(());
+    }
+    let Some(seed_height) = NetworkUpgrade::Nu7
+        .activation_height(network)
+        .and_then(|activation| activation.previous().ok())
+    else {
+        return Ok(());
+    };
+
+    let scheduled_issuance =
+        scheduled_issuance_zatoshis(seed_height, network).map_err(|source| {
+            ParametersBuilderError::InvalidDerivedNsmSeedSchedule {
+                seed_height,
+                source,
+            }
+        })?;
+    if scheduled_issuance > u128::from(MAX_MONEY.unsigned_abs()) {
+        return Err(ParametersBuilderError::DerivedNsmSeedExceedsMaxMoney {
+            seed_height,
+            scheduled_issuance,
+        });
+    }
+
+    Ok(())
+}
+
 /// The divisor used to calculate the founders reward from the block subsidy.
 ///
 /// The founders reward is 20% of the block subsidy, calculated with exact division.
@@ -640,7 +676,7 @@ pub struct ParametersBuilder {
     nsm_reissuance_height: Option<Height>,
     /// The NSM value balance immediately before NU7, see
     /// [`Parameters::initial_nsm_value_balance`].
-    initial_nsm_value_balance: Amount<NonNegative>,
+    initial_nsm_value_balance: Option<Amount<NonNegative>>,
 }
 
 impl Default for ParametersBuilder {
@@ -682,10 +718,8 @@ impl Default for ParametersBuilder {
                 super::TESTNET_TEMPORARY_ORCHARD_DISABLING_SOFT_FORK_HEIGHT,
             ),
             nsm_reissuance_height: None,
-            // A seed measures one chain's own history, so it is meaningless on a network
-            // built from these defaults. The default Testnet sets its own in
-            // `Parameters::default`.
-            initial_nsm_value_balance: Amount::zero(),
+            // Configured networks derive their seed unless an override is supplied.
+            initial_nsm_value_balance: None,
         }
     }
 }
@@ -1027,10 +1061,11 @@ impl ParametersBuilder {
     /// Sets zips#1354's `INITIAL_NSM_VALUE_BALANCE`, the value the NSM value balance holds
     /// immediately before NU7 activates.
     ///
-    /// The seed is a measurement of one chain's own history, so it defaults to zero on
-    /// every network but Mainnet and the default Testnet.
+    /// Configured networks derive their seed from chain state unless this override is set.
+    /// Derivation requires cumulative scheduled issuance through the block before NU7 to fit
+    /// in `MAX_MONEY`.
     pub fn with_initial_nsm_value_balance(mut self, balance: Amount<NonNegative>) -> Self {
-        self.initial_nsm_value_balance = balance;
+        self.initial_nsm_value_balance = Some(balance);
         self
     }
 
@@ -1102,6 +1137,7 @@ impl ParametersBuilder {
 
         check_founders_reward_is_exact(&network)?;
         check_lockbox_disbursements(&self.lockbox_disbursements)?;
+        check_derived_nsm_seed_schedule(&network)?;
 
         // Final check that the configured checkpoints are valid for this network.
         if network.checkpoint_list().hash(Height(0)) != Some(network.genesis_hash()) {
@@ -1155,7 +1191,7 @@ impl ParametersBuilder {
             && self.post_blossom_halving_interval == post_blossom_halving_interval
             && self.lockbox_disbursements == lockbox_disbursements
             && self.nsm_reissuance_height == testnet::NSM_REISSUANCE_HEIGHT
-            && self.initial_nsm_value_balance == testnet::INITIAL_NSM_VALUE_BALANCE
+            && self.initial_nsm_value_balance == Some(testnet::INITIAL_NSM_VALUE_BALANCE)
     }
 }
 
@@ -1230,7 +1266,7 @@ pub struct Parameters {
     /// The configured NSM reissuance start height, if any.
     configured_nsm_reissuance_height: Option<Height>,
     /// The NSM value balance immediately before NU7 activates.
-    initial_nsm_value_balance: Amount<NonNegative>,
+    initial_nsm_value_balance: Option<Amount<NonNegative>>,
 }
 
 impl Default for Parameters {
@@ -1240,7 +1276,7 @@ impl Default for Parameters {
             network_name: "Testnet".to_string(),
             max_block_time_start_height: TESTNET_MAX_TIME_START_HEIGHT,
             configured_nsm_reissuance_height: testnet::NSM_REISSUANCE_HEIGHT,
-            initial_nsm_value_balance: testnet::INITIAL_NSM_VALUE_BALANCE,
+            initial_nsm_value_balance: Some(testnet::INITIAL_NSM_VALUE_BALANCE),
             ..Self::build().finish()
         }
     }
@@ -1309,11 +1345,14 @@ impl Parameters {
         }
         check_lockbox_disbursements(&parameters.lockbox_disbursements)?;
 
-        Ok(Self {
+        let parameters = Self {
             network_name: "Regtest".to_string(),
             network_magic: magics::REGTEST,
             ..parameters.finish()
-        })
+        };
+        check_derived_nsm_seed_schedule(&Network::new_configured_testnet(parameters.clone()))?;
+
+        Ok(parameters)
     }
 
     /// Returns true if the instance of [`Parameters`] represents the default public Testnet.
@@ -1472,10 +1511,16 @@ impl Parameters {
         self.configured_nsm_reissuance_height
     }
 
-    /// Returns zips#1354's `INITIAL_NSM_VALUE_BALANCE` for this network.
+    /// Returns the expected public seed or configured override, or zero when unset.
+    /// Use [`Self::configured_initial_nsm_value_balance`] to distinguish derivation from zero.
     ///
     /// See [`ParametersBuilder::with_initial_nsm_value_balance`].
     pub fn initial_nsm_value_balance(&self) -> Amount<NonNegative> {
+        self.initial_nsm_value_balance.unwrap_or_default()
+    }
+
+    /// Returns an explicit seed override, or `None` to derive it from chain state.
+    pub fn configured_initial_nsm_value_balance(&self) -> Option<Amount<NonNegative>> {
         self.initial_nsm_value_balance
     }
 }

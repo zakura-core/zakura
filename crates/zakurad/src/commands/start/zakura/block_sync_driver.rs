@@ -1158,14 +1158,15 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
                             .complete(terminal);
                         completed
                     }
-                    _ = transfer_handoff.wait_for_legacy_yield(),
-                        if class == BlockApplyClass::Checkpoint =>
+                    _ = transfer_handoff.wait_for_legacy_yield() =>
                     {
-                        // The checkpoint verifier owns transactional range commits after it
-                        // accepts a request. A partial range cannot commit until another request
-                        // supplies every missing body. Legacy fallback uses the same verifier, so
-                        // it can complete the range after this driver transfers completion
-                        // responsibility.
+                        // Checkpoint: the shared verifier can hold a partial range until another
+                        // supplier finishes it; legacy uses that verifier, so transfer lets it
+                        // complete the range.
+                        // Full: Accepted Commits are not cancellable and have no other escape
+                        // hatch. Transfer releases the apply lease so FallbackDraining cannot
+                        // wedge for the full drain deadline when Commit hangs. The dropped
+                        // Commit future may still finish in the background (AlreadyInChain).
                         let result = abandon_block_apply(
                             &transfer_block_sync,
                             transfer_owner,
@@ -1178,10 +1179,22 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
                             .take()
                             .expect("accepted operation has one terminal result")
                             .complete(super::BlockApplyTerminal::TransferredToLegacy);
+                        let class_label = match class {
+                            BlockApplyClass::Checkpoint => "checkpoint",
+                            BlockApplyClass::Full => "full",
+                        };
                         metrics::counter!(
-                            "sync.zakura.apply.checkpoint_transferred_to_legacy"
+                            "sync.zakura.apply.transferred_to_legacy",
+                            "class" => class_label,
                         )
                         .increment(1);
+                        // Keep the historical checkpoint-only series for existing dashboards.
+                        if class == BlockApplyClass::Checkpoint {
+                            metrics::counter!(
+                                "sync.zakura.apply.checkpoint_transferred_to_legacy"
+                            )
+                            .increment(1);
+                        }
                         BlockApplyCompletion { class, result }
                     }
                 }
@@ -1897,10 +1910,11 @@ mod tests {
         }
     }
 
-    fn spawn_checkpoint_driver<BlockVerifier>(
+    fn spawn_block_sync_driver<BlockVerifier>(
         block_verifier: BlockVerifier,
         handoff: Arc<SyncCoordinator>,
         trace: ZakuraTrace,
+        max_checkpoint_height: block::Height,
     ) -> TestDriver
     where
         BlockVerifier:
@@ -1939,7 +1953,7 @@ mod tests {
             None,
             None,
             block_verifier,
-            block::Height::MAX,
+            max_checkpoint_height,
             sync::MIN_CHECKPOINT_CONCURRENCY_LIMIT,
             sync::MIN_CONCURRENCY_LIMIT,
             sync::DEFAULT_ZAKURA_BLOCK_APPLY_CONCURRENCY_LIMIT,
@@ -1957,6 +1971,20 @@ mod tests {
             driver_task,
             reactor_task,
         }
+    }
+
+    fn spawn_checkpoint_driver<BlockVerifier>(
+        block_verifier: BlockVerifier,
+        handoff: Arc<SyncCoordinator>,
+        trace: ZakuraTrace,
+    ) -> TestDriver
+    where
+        BlockVerifier:
+            Service<zakura_consensus::Request, Response = block::Hash> + Clone + Send + 'static,
+        BlockVerifier::Error: std::fmt::Debug + Send + Sync + 'static,
+        BlockVerifier::Future: Send + 'static,
+    {
+        spawn_block_sync_driver(block_verifier, handoff, trace, block::Height::MAX)
     }
 
     async fn submit_checkpoint(driver: &TestDriver, token: BlockApplyToken) {
@@ -2040,6 +2068,57 @@ mod tests {
             "transfer must not wait for the verifier to admit the request"
         );
 
+        drop(lease);
+        driver.shutdown().await;
+    }
+
+    /// Full applies previously had no legacy-yield transfer arm, so a hung Commit
+    /// could keep FallbackDraining blocked until the 30-minute drain deadline.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fallback_transfers_full_apply_while_commit_is_pending() {
+        let (release_tx, release_rx) = watch::channel(false);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let verifier_calls = calls.clone();
+        let verifier = service_fn(move |request: zakura_consensus::Request| {
+            let mut release_rx = release_rx.clone();
+            let verifier_calls = verifier_calls.clone();
+            async move {
+                let zakura_consensus::Request::Commit(block) = request else {
+                    panic!("unexpected consensus request: {request:?}");
+                };
+                verifier_calls.fetch_add(1, Ordering::SeqCst);
+                while !*release_rx.borrow() {
+                    release_rx
+                        .changed()
+                        .await
+                        .expect("commit release sender stays open");
+                }
+                Ok::<_, zakura_consensus::BoxError>(block.hash())
+            }
+        });
+        let handoff = SyncCoordinator::new();
+        // Height 1 is above this ceiling, so the apply is classified Full.
+        let driver = spawn_block_sync_driver(
+            verifier,
+            handoff.clone(),
+            ZakuraTrace::noop(),
+            block::Height(0),
+        );
+
+        submit_checkpoint(&driver, 1).await;
+        wait_for_count(calls.as_ref(), 1, "the full verifier Commit call").await;
+
+        let lease = tokio::time::timeout(
+            Duration::from_secs(1),
+            handoff.acquire_legacy_fallback(Duration::from_secs(1)),
+        )
+        .await
+        .expect("pending full apply transfers without waiting for Commit")
+        .expect("fallback acquires the apply lease after full transfer");
+
+        // Orphan Commit may still finish after transfer; releasing it keeps the
+        // test from hanging on the dropped apply future's background work.
+        let _ = release_tx.send(true);
         drop(lease);
         driver.shutdown().await;
     }

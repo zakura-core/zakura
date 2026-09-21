@@ -20,11 +20,10 @@ use zakura_chain::{
 pub const MEMPOOL_LONG_POLL_INTERVAL: u64 = 5;
 
 /// The maximum number of times `getblocktemplate` rebuilds a template that was
-/// superseded (by a tip change or a concurrent caller) before it was returned.
+/// superseded by a tip, parent selection, or rejection revision change.
 ///
-/// Every rebuild is triggered by an actual tip change, so this is only reached under
-/// pathological tip churn. Past the bound the RPC returns the transient
-/// "template parent changed; retry" error so the miner can decide what to do.
+/// Past the bound the RPC returns the transient "template parent changed; retry"
+/// error so the miner can decide what to do.
 pub const MAX_TEMPLATE_REBUILDS: usize = 4;
 
 /// A range of valid block template nonces, that goes from `u32::MIN` to `u32::MAX` as a string.

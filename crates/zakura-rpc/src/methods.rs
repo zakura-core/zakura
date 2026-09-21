@@ -1259,8 +1259,9 @@ where
     }
 
     /// Returns `Ok(None)` when the template was superseded while it was being built:
-    /// the tip moved, or a concurrent caller selected a newer parent. The caller must
-    /// rebuild from fresh state rather than surface a transient error to the miner.
+    /// the tip moved, a concurrent caller selected a newer parent, or the rejection
+    /// revision changed outside fallback mode. The caller must rebuild from fresh state
+    /// rather than surface a transient error to the miner.
     async fn finish_mining_template(
         &self,
         mut template: BlockTemplateResponse,
@@ -2897,12 +2898,12 @@ where
             .ok_or_error(0, "miner parameters are required for get_block_template")?;
 
         // A template can be superseded while it is being built: the tip moves (a new
-        // block, or an equal-height reorg), or a concurrent caller selects a newer parent
-        // first. Returning an error for that makes miners drop their current job (the
-        // internal miner backs off for 20 seconds) even though fresh work is one read
-        // away, so rebuild on the current tip instead. Every rebuild is triggered by a
-        // real tip change; the bound only guards against pathological churn.
-        'rebuild: for rebuild in 0..MAX_TEMPLATE_REBUILDS {
+        // block, or an equal-height reorg), a concurrent caller selects a newer parent,
+        // or the rejection revision changes outside fallback mode. Returning an error
+        // for that makes miners drop their current job (the internal miner backs off for
+        // 20 seconds) even though fresh work is one read away, so rebuild from current
+        // state instead. The bound guards against pathological tip or rejection churn.
+        'rebuild: for rebuild in 0..=MAX_TEMPLATE_REBUILDS {
             if rebuild > 0 {
                 metrics::counter!("mining.template.rebuilt").increment(1);
                 tracing::debug!(

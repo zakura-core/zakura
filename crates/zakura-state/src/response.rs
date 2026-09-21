@@ -253,9 +253,11 @@ impl MinedTx {
 /// non-finalized state is full so that the [`NonFinalizedBlocksListener`]
 /// reliably receives updates whenever the non-finalized state changes.
 ///
-/// If the buffer does fill, sends apply backpressure (the sender awaits a free
-/// slot) rather than dropping blocks, so the listener still receives every
-/// block once the consumer catches up.
+/// If the buffer fills, sends wait for a free slot and finish the current
+/// snapshot. The underlying watch channel can skip intermediate states during
+/// that wait, so this is not a lossless block history. Snapshot clients reconcile
+/// the emitted tip set. Legacy RPC clients disconnect on a full buffer so they
+/// can resubscribe instead of silently continuing after possible gaps.
 // `MAX_BLOCK_REORG_HEIGHT` is a small `u32` constant (the reorg limit), so
 // widening it to `usize` and doubling it cannot overflow on any supported
 // platform.
@@ -372,11 +374,9 @@ impl NonFinalizedBlocksListener {
 
             // # Correctness
             //
-            // This loop should check that the non-finalized state receiver has
-            // changed sooner than the non-finalized state could possibly have
-            // changed to avoid missing updates, so the logic here should be
-            // quicker than the contextual verification logic that precedes
-            // commits to the non-finalized state.
+            // Each batch represents one observed state. The watch channel can
+            // coalesce updates while sends are blocked, so consumers must use
+            // snapshot markers or resubscribe after buffer saturation.
             //
             // See the `NON_FINALIZED_STATE_CHANGE_BUFFER_SIZE` documentation
             // for more details.

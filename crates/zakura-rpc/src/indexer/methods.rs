@@ -160,6 +160,19 @@ where
             // timed-out send means the consumer is hung. In both cases the task
             // ends rather than blocking forever.
             loop {
+                // A blocked listener can miss intermediate watch updates. Legacy
+                // clients lack snapshot markers to reconcile that gap, so retain
+                // their disconnect signal. Snapshot clients can drain full batches.
+                if !include_chain_snapshot && non_finalized_state_change.capacity() == 0 {
+                    span.in_scope(|| {
+                        tracing::warn!(
+                            "slow legacy consumer, dropping non_finalized_state_change stream \
+                             after buffer filled"
+                        );
+                    });
+                    return;
+                }
+
                 let Some(change) = non_finalized_state_change.recv().await else {
                     break;
                 };

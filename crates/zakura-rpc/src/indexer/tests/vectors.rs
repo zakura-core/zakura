@@ -283,6 +283,49 @@ async fn non_finalized_stream_preserves_receipts_and_negotiates_snapshots() -> R
 }
 
 #[tokio::test]
+async fn legacy_non_finalized_stream_closes_on_a_full_listener_buffer() -> Result<()> {
+    use zakura_state::{NonFinalizedBlocksListener, NonFinalizedStateChange};
+
+    let _init_guard = zakura_test::init();
+    let (server, mut client, mut state, _tip, _mempool) = start_server_and_get_client().await?;
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+    let request = tokio::spawn(async move {
+        client
+            .non_finalized_state_change(indexer::NonFinalizedStateChangeRequest::default())
+            .await
+    });
+    let capacity = usize::try_from(zakura_state::MAX_BLOCK_REORG_HEIGHT)? * 2;
+    let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
+    for _ in 0..capacity {
+        sender.try_send(NonFinalizedStateChange::Block {
+            hash: block.hash(),
+            block: block.clone(),
+            receipt_order: Some(1),
+        })?;
+    }
+    assert_eq!(receiver.capacity(), 0);
+    state
+        .expect_request(ReadRequest::NonFinalizedBlocksListener {
+            known_chain_tips: Default::default(),
+        })
+        .await
+        .respond(ReadResponse::NonFinalizedBlocksListener(
+            NonFinalizedBlocksListener(Arc::new(receiver)),
+        ));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut stream = request.await.unwrap().unwrap().into_inner();
+        assert!(
+            stream.message().await.unwrap().is_none(),
+            "legacy clients need a disconnect when buffer saturation can hide state updates"
+        );
+        sender.closed().await;
+    })
+    .await?;
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn non_finalized_snapshot_drains_a_full_listener_buffer() -> Result<()> {
     use zakura_chain::serialization::BytesInDisplayOrder;
     use zakura_state::{NonFinalizedBlocksListener, NonFinalizedStateChange};

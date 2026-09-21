@@ -67,6 +67,9 @@ failed batch is discarded and resubscription uses the last published snapshot.
 Legacy servers without snapshot markers retain incremental publication.
 An initial empty snapshot leaves finalized-tip tracking active during checkpoint
 sync. The first real block transfers that responsibility to the block syncer.
+Snapshot clients can drain a full listener buffer and reconcile the completed
+batch. Streams without snapshot support close when that buffer fills so legacy
+clients can reconnect after possible gaps in state updates.
 
 These fields are additive. Servers send snapshot messages only to clients that
 request them. Older servers omit receipt metadata and retain their hash-based

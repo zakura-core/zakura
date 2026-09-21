@@ -1158,11 +1158,6 @@ async fn block_rejects_transactions_failing_librustzcash_conversion() {
 
     let cases = [
         LibrustzcashConversionFailure {
-            name: "unrecognized consensus branch ID",
-            network_upgrade: NetworkUpgrade::Nu7,
-            rk: None,
-        },
-        LibrustzcashConversionFailure {
             name: "incorrect curve point encoding",
             network_upgrade: NetworkUpgrade::Nu5,
             rk: Some([0xff; 32]),

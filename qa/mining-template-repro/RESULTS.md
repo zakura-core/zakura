@@ -214,9 +214,22 @@ but the proposal verifier's own message propagated verbatim:
 best chain tip"`. That is the fallback branch's `Request::Prepare` failing because
 the tip moved underneath it, with the error returned rather than rebuilt.
 
-This is the part #1088 explicitly defers, and it is where the remaining #1083 work
-lands: #1083 re-reads the tip before propagating a stale validation error and
-returns `Ok(None)` instead. These numbers are the case for finishing that work.
+This is the part #1088 explicitly defers. That work is now #1090, which ports #1083's
+rework: the context re-check and the recovery record happen under one write
+lock, and a failed validation is confirmed against committed state before being
+surfaced. Measured with the same Lever E parameters, two runs each:
+
+| | #1088 | #1090 |
+| --- | --- | --- |
+| Raw verifier errors to client | 3 065 / 6 305 | **0 / 0** |
+| `template changed during recovery` | 209 / 184 | **0 / 0** |
+| Rebuild-budget exhaustion | 0 / 0 | 841 / 993 |
+| Total withholds | 3 274 / 6 489 | 841 / 993 |
+
+Both error classes go to zero. What remains is the bounded-rebuild message from #1088,
+the intended transient signal rather than verifier internals. The residual
+is larger than in #1088's own measurements because this scenario re-arms a
+rejection on every parent, so each rebuild lands back in fallback mode.
 
 Caveat: in production the node's own templates are valid, so fallback mode should
 rarely be entered at all. The finding is about how badly it behaves once something

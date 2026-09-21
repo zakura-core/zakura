@@ -4305,17 +4305,13 @@ mod zakura_header_sync_driver_tests {
                 .acquire_legacy_fallback(Duration::from_secs(5))
                 .await
         });
-        tokio::task::yield_now().await;
-        assert!(
-            !drain.is_finished(),
-            "fallback waits for the in-flight apply before legacy sync resumes"
-        );
-
-        release_first.notify_waiters();
-        let _fallback_lease = drain
+        // The first Commit stays parked. Full transfer must release the lease
+        // without waiting for that Commit to finish.
+        let _fallback_lease = tokio::time::timeout(Duration::from_secs(1), drain)
             .await
+            .expect("in-flight full apply transfers before the drain deadline")
             .expect("fallback drain task exits")
-            .expect("fallback acquires the lease after the apply drains");
+            .expect("fallback acquires the lease without waiting for Commit");
         action_tx
             .send(BlockSyncAction::QueryBlocksByHeightRange {
                 peer: test_zakura_peer(78),
@@ -4326,26 +4322,19 @@ mod zakura_header_sync_driver_tests {
             .expect("driver action channel stays open");
         wait_for_query_seen(query_seen_rx).await;
 
-        // Check the verifier was called for the first block.
+        // The queued body never enters the verifier. The in-flight Commit was
+        // already counted, then dropped on transfer.
         assert_eq!(
             commit_count.load(Ordering::SeqCst),
             1,
             "fallback must not start the queued body after yielding"
         );
 
-        // Second block was acknowledged as abandoned.
         capture.flush().await;
         let reader = capture.reader().unwrap();
         let commit_state = reader.table(COMMIT_STATE_TABLE.table());
         let rows = commit_state.rows();
-        assert_abandoned_apply_trace_rows(&rows, [2]);
-        commit_state.assert_row(
-            cs_trace::REACTOR_EVENT_SENT,
-            &[
-                (cs_trace::APPLY_TOKEN, TraceValue::U64(1)),
-                (cs_trace::RESULT, TraceValue::Str("committed")),
-            ],
-        );
+        assert_abandoned_apply_trace_rows(&rows, [1, 2]);
 
         let _ = shutdown_tx.send(());
         driver.await.expect("driver task exits cleanly");

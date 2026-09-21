@@ -13,7 +13,7 @@ fn network() -> Network {
             nu7: Some(5),
             ..Default::default()
         },
-        nsm_reissuance_height: Some(Height(10)),
+        test_nsm_reissuance_height: Some(Height(10)),
         ..Default::default()
     })
 }

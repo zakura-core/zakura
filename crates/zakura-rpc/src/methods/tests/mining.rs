@@ -41,7 +41,7 @@ fn network() -> Network {
             nu7: Some(1),
             ..Default::default()
         },
-        nsm_reissuance_height: Some(Height(3)),
+        test_nsm_reissuance_height: Some(Height(3)),
         ..Default::default()
     })
 }
@@ -943,7 +943,7 @@ async fn shielded_template_rewards() {
                     nu7: Some(104),
                     ..Default::default()
                 },
-                nsm_reissuance_height: Some(Height(104)),
+                test_nsm_reissuance_height: Some(Height(104)),
                 ..Default::default()
             })
         } else {

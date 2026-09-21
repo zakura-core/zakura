@@ -749,7 +749,7 @@ fn rollback_crosses_the_nsm_reissuance_height() {
             nu7: Some(2),
             ..Default::default()
         },
-        nsm_reissuance_height: Some(start),
+        test_nsm_reissuance_height: Some(start),
         ..Default::default()
     });
     let address = Address::from_script_hash(NetworkKind::Regtest, [0x42; 20]);

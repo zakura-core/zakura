@@ -173,7 +173,7 @@ fn seeded_network() -> Network {
             nu7: Some(2),
             ..Default::default()
         },
-        nsm_reissuance_height: Some(START),
+        test_nsm_reissuance_height: Some(START),
         initial_nsm_value_balance: Some(
             Amount::try_from(SEED).expect("the seed is a valid amount"),
         ),

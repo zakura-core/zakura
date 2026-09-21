@@ -114,9 +114,12 @@ chain with no pre-NU7 history; a fork of Testnet has four million blocks of it.
 ## What happens at activation
 
 Fee recycling starts at NU7 unconditionally: 60% of aggregate block fees go to
-NSM and the miner claims the subsidy plus the remaining 40%. NSM reissuance is
-separate and only starts if `nsm_reissuance_offset` is set; it is clamped to at
-least the NU7 height. See `docs/design/reissuance-accounting.md`.
+NSM and the miner claims the subsidy plus the remaining 40%.
+
+ZIP 234 NSM reissuance is separate, and stays unscheduled on the fork:
+`DTestnetParameters` exposes only `initial_nsm_value_balance`, with no
+configurable reissuance start height on this base. See
+`docs/design/reissuance-accounting.md`.
 
 Seeding a fork changes the header-chain network policy digest, because that
 digest binds the full activation list. On the current database format this is

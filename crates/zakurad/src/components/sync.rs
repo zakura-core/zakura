@@ -1326,11 +1326,7 @@ where
         }
     }
 
-    /// Runs one legacy recovery round after the coordinator releases its apply permits, then
-    /// returns apply ownership to Zakura.
-    ///
-    /// A Full semantic write that already entered the state service can still commit during the
-    /// round. See [`crate::commands::start::zakura::LegacyFallbackLease`].
+    /// Runs one fully drained legacy recovery round, then returns apply ownership to Zakura.
     async fn run_legacy_fallback_round(
         &mut self,
         block_sync_handoff: &std::sync::Arc<crate::commands::start::zakura::SyncCoordinator>,

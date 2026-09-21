@@ -4305,13 +4305,17 @@ mod zakura_header_sync_driver_tests {
                 .acquire_legacy_fallback(Duration::from_secs(5))
                 .await
         });
-        // The first Commit stays parked. Full transfer must release the lease
-        // without waiting for that Commit to finish.
-        let _fallback_lease = tokio::time::timeout(Duration::from_secs(1), drain)
+        tokio::task::yield_now().await;
+        assert!(
+            !drain.is_finished(),
+            "fallback waits for the in-flight apply before legacy sync resumes"
+        );
+
+        release_first.notify_waiters();
+        let _fallback_lease = drain
             .await
-            .expect("in-flight full apply transfers before the drain deadline")
             .expect("fallback drain task exits")
-            .expect("fallback acquires the lease without waiting for Commit");
+            .expect("fallback acquires the lease after the apply drains");
         action_tx
             .send(BlockSyncAction::QueryBlocksByHeightRange {
                 peer: test_zakura_peer(78),
@@ -4322,8 +4326,7 @@ mod zakura_header_sync_driver_tests {
             .expect("driver action channel stays open");
         wait_for_query_seen(query_seen_rx).await;
 
-        // The queued body never enters the verifier. The in-flight Commit was
-        // already counted, then dropped on transfer.
+        // The queued body never enters the verifier after fallback starts.
         assert_eq!(
             commit_count.load(Ordering::SeqCst),
             1,
@@ -4334,7 +4337,14 @@ mod zakura_header_sync_driver_tests {
         let reader = capture.reader().unwrap();
         let commit_state = reader.table(COMMIT_STATE_TABLE.table());
         let rows = commit_state.rows();
-        assert_abandoned_apply_trace_rows(&rows, [1, 2]);
+        assert_abandoned_apply_trace_rows(&rows, [2]);
+        commit_state.assert_row(
+            cs_trace::REACTOR_EVENT_SENT,
+            &[
+                (cs_trace::APPLY_TOKEN, TraceValue::U64(1)),
+                (cs_trace::RESULT, TraceValue::Str("committed")),
+            ],
+        );
 
         let _ = shutdown_tx.send(());
         driver.await.expect("driver task exits cleanly");
@@ -4828,12 +4838,12 @@ mod zakura_header_sync_driver_tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn block_sync_pending_full_apply_emits_stalled_trace_without_finishing() {
+    async fn block_sync_stalled_full_apply_fails_without_synthetic_completion() {
         let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
         let block_hash = block.hash();
         let block_height = block.coinbase_height().expect("test block has height");
         let mut capture = TraceCapture::for_test(
-            "block_sync_pending_full_apply_emits_stalled_trace_without_finishing",
+            "block_sync_stalled_full_apply_fails_without_synthetic_completion",
         )
         .unwrap();
         let trace = zakura_network::zakura::ZakuraTrace::new(capture.tracer(), "01");
@@ -4895,16 +4905,26 @@ mod zakura_header_sync_driver_tests {
         assert_eq!(
             commit_state.count(cs_trace::COMMIT_FINISH),
             0,
-            "pending full verifier must not produce a finish row before it resolves"
+            "a fatal Full stall must not invent a verifier result"
+        );
+        assert_eq!(
+            commit_state.count(cs_trace::REACTOR_EVENT_SENT),
+            0,
+            "a fatal Full stall must not emit synthetic retry or invalidity evidence"
         );
 
-        apply_task.abort();
+        assert_eq!(
+            apply_task
+                .await
+                .expect("apply task exits at the stall deadline"),
+            zakura::block_sync_driver::BlockApplyCompletion::FatalFullCommitStall
+        );
         let _ = capture.finish().await.unwrap();
         reactor_task.abort();
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn buffered_native_commit_blocks_legacy_fallback_past_every_diagnostic_interval() {
+    async fn buffered_native_commit_blocks_legacy_fallback_until_its_real_result() {
         let block = mainnet_block(&BLOCK_MAINNET_1_BYTES);
         let block_hash = block.hash();
         let block_height = block.coinbase_height().expect("test block has height");
@@ -4977,15 +4997,13 @@ mod zakura_header_sync_driver_tests {
         });
 
         tokio::task::yield_now().await;
-        for _ in 0..3 {
-            tokio::time::advance(Duration::from_secs(60)).await;
-            tokio::task::yield_now().await;
-            assert!(
-                !legacy_started.load(Ordering::SeqCst),
-                "legacy apply authorization must stay blocked while the verifier commit is alive"
-            );
-            assert!(!fallback.is_finished());
-        }
+        tokio::time::advance(ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT - Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !legacy_started.load(Ordering::SeqCst),
+            "legacy apply authorization must stay blocked while the verifier commit is alive"
+        );
+        assert!(!fallback.is_finished());
 
         release_commit_tx
             .send(true)

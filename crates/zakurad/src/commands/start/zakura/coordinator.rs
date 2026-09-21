@@ -96,14 +96,9 @@ pub(crate) enum BlockApplyTerminal {
     TransferredToLegacy,
 }
 
-/// Authorization for one legacy fallback round after native admission stops.
-///
-/// The coordinator waits until its apply permits and registered operations are gone. That wait
-/// does not cover a Full semantic write that has already entered `StateService::call`: the state
-/// service queues that write synchronously before returning the response future, and transfer
-/// drops the future after releasing the permit. The queued write can still commit after this
-/// lease activates and later surface as `AlreadyInChain`. Incomplete checkpoint ranges are
-/// transferred to the shared checkpoint verifier so fallback can supply their missing bodies.
+/// Authorization for one legacy fallback round after native admission stops and Full applies
+/// drain. Incomplete checkpoint ranges are transferred to the shared checkpoint verifier so
+/// fallback can supply their missing bodies.
 #[derive(Debug)]
 pub(crate) struct LegacyFallbackLease {
     coordinator: Arc<SyncCoordinator>,
@@ -184,9 +179,6 @@ impl SyncCoordinator {
     }
 
     /// Whether fallback is draining or holds the legacy apply lease.
-    ///
-    /// The lease stops new native applies. It does not wait for a Full write the state service
-    /// has already queued.
     pub(crate) fn is_yielded_to_legacy(&self) -> bool {
         matches!(
             self.apply_phase(),
@@ -309,11 +301,7 @@ impl SyncCoordinator {
         }
     }
 
-    /// Stop native admission, wait until this epoch's permits and operations are gone, then
-    /// authorize one legacy round.
-    ///
-    /// A Full write already queued inside the state service is not part of that wait. See
-    /// [`LegacyFallbackLease`].
+    /// Stop native admission, quiesce the exact epoch, then authorize one legacy round.
     pub(crate) async fn acquire_legacy_fallback(
         self: &Arc<Self>,
         diagnostic_interval: Duration,
@@ -410,7 +398,7 @@ impl SyncCoordinator {
                         operations,
                         apply_epoch = self.apply_phase().epoch().get(),
                         elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                        "native block applies remain active while fallback waits for the coordinator lease"
+                        "native block applies remain active while fallback waits for its exclusive lease"
                     );
                 }
             }
@@ -734,6 +722,12 @@ impl AcceptedBlockApplyOperation {
     pub(crate) fn complete(mut self, terminal: BlockApplyTerminal) {
         drop(self.permit.take());
         self.coordinator.finish_operation(self.id, terminal);
+        self.finished = true;
+    }
+
+    pub(crate) fn fail(mut self) {
+        self.coordinator.fail_operation(self.id);
+        drop(self.permit.take());
         self.finished = true;
     }
 }

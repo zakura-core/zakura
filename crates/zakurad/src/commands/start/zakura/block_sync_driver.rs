@@ -50,9 +50,17 @@ struct PendingBlockApply {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BlockApplyCompletion {
-    class: BlockApplyClass,
-    result: BlockApplyResult,
+pub(crate) enum BlockApplyCompletion {
+    Finished {
+        class: BlockApplyClass,
+        result: BlockApplyResult,
+    },
+    FatalFullCommitStall,
+}
+
+enum CommitObservation {
+    Finished(BlockApplyOutcome),
+    FullCommitStalled,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -148,7 +156,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
 
         if shutting_down {
             if let Some(completed) = in_flight_applies.next().await {
-                handle_completed_block_apply(
+                if handle_completed_block_apply(
                     &block_sync_handoff,
                     completed,
                     &mut pending_applies,
@@ -165,7 +173,9 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     block_sync.clone(),
                     trace.clone(),
                     throughput_probe.clone(),
-                );
+                ) {
+                    return;
+                }
                 continue;
             }
 
@@ -174,7 +184,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
 
         if !in_flight_applies.is_empty() {
             if let Some(Some(completed)) = in_flight_applies.next().now_or_never() {
-                handle_completed_block_apply(
+                if handle_completed_block_apply(
                     &block_sync_handoff,
                     completed,
                     &mut pending_applies,
@@ -191,7 +201,9 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     block_sync.clone(),
                     trace.clone(),
                     throughput_probe.clone(),
-                );
+                ) {
+                    return;
+                }
                 continue;
             }
         }
@@ -229,7 +241,7 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                     let Some(completed) = completed else {
                         continue;
                     };
-                    handle_completed_block_apply(
+                    if handle_completed_block_apply(
                         &block_sync_handoff,
                         completed,
                         &mut pending_applies,
@@ -246,7 +258,9 @@ pub(crate) async fn drive_block_sync_actions<ReadState, BlockVerifier>(
                         block_sync.clone(),
                         trace.clone(),
                         throughput_probe.clone(),
-                    );
+                    ) {
+                        return;
+                    }
                     continue;
                 }
                 action = actions.recv() => {
@@ -997,7 +1011,8 @@ fn handle_completed_block_apply<ReadState, BlockVerifier>(
     block_sync: BlockSyncHandle,
     trace: ZakuraTrace,
     throughput_probe: Option<BlocksyncThroughputProbe>,
-) where
+) -> bool
+where
     ReadState: Service<
             zakura_state::ReadRequest,
             Response = zakura_state::ReadResponse,
@@ -1011,7 +1026,13 @@ fn handle_completed_block_apply<ReadState, BlockVerifier>(
     BlockVerifier::Error: std::fmt::Debug + Send + Sync + 'static,
     BlockVerifier::Future: Send + 'static,
 {
-    decrement_in_flight_apply_count(completed.class, checkpoint_in_flight, full_in_flight);
+    let BlockApplyCompletion::Finished { class, .. } = completed else {
+        error!("a Full block commit stalled; stopping the critical block-sync driver");
+        metrics::counter!("sync.zakura.apply.full_commit_stall_fatal.total").increment(1);
+        return true;
+    };
+
+    decrement_in_flight_apply_count(class, checkpoint_in_flight, full_in_flight);
 
     drain_pending_block_applies(
         handoff,
@@ -1030,6 +1051,7 @@ fn handle_completed_block_apply<ReadState, BlockVerifier>(
         trace,
         throughput_probe,
     );
+    false
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1144,31 +1166,40 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
                 tokio::select! {
                     biased;
                     completed = &mut apply => {
-                        let terminal = match completed.result {
-                            BlockApplyResult::Committed | BlockApplyResult::Duplicate => {
-                                super::BlockApplyTerminal::Committed
+                        match completed {
+                            BlockApplyCompletion::Finished { result, .. } => {
+                                let terminal = match result {
+                                    BlockApplyResult::Committed | BlockApplyResult::Duplicate => {
+                                        super::BlockApplyTerminal::Committed
+                                    }
+                                    BlockApplyResult::Rejected
+                                    | BlockApplyResult::Unavailable
+                                    | BlockApplyResult::TimedOut => {
+                                        super::BlockApplyTerminal::Rejected
+                                    }
+                                };
+                                accepted
+                                    .take()
+                                    .expect("accepted operation has one terminal result")
+                                    .complete(terminal);
                             }
-                            BlockApplyResult::Rejected
-                            | BlockApplyResult::Unavailable
-                            | BlockApplyResult::TimedOut => super::BlockApplyTerminal::Rejected,
-                        };
-                        accepted
-                            .take()
-                            .expect("accepted operation has one terminal result")
-                            .complete(terminal);
+                            BlockApplyCompletion::FatalFullCommitStall => {
+                                accepted
+                                    .take()
+                                    .expect("accepted operation has one terminal result")
+                                    .fail();
+                            }
+                        }
                         completed
                     }
-                    _ = transfer_handoff.wait_for_legacy_yield() =>
+                    _ = transfer_handoff.wait_for_legacy_yield(),
+                        if class == BlockApplyClass::Checkpoint =>
                     {
-                        // Checkpoint: the shared verifier can hold a partial range until another
-                        // supplier finishes it; legacy uses that verifier, so transfer lets it
-                        // complete the range.
-                        // Full: Accepted Commits are not cancellable and have no other escape
-                        // hatch. Transfer releases the coordinator permit so FallbackDraining
-                        // cannot wedge for the full drain deadline when Commit hangs. Once
-                        // StateService::call has queued the non-finalized write, dropping this
-                        // future does not cancel that write. It can still commit and later
-                        // surface as AlreadyInChain.
+                        // The checkpoint verifier owns transactional range commits after it
+                        // accepts a request. A partial range cannot commit until another request
+                        // supplies every missing body. Legacy fallback uses the same verifier, so
+                        // it can complete the range after this driver transfers completion
+                        // responsibility.
                         let result = abandon_block_apply(
                             &transfer_block_sync,
                             transfer_owner,
@@ -1181,23 +1212,11 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
                             .take()
                             .expect("accepted operation has one terminal result")
                             .complete(super::BlockApplyTerminal::TransferredToLegacy);
-                        let class_label = match class {
-                            BlockApplyClass::Checkpoint => "checkpoint",
-                            BlockApplyClass::Full => "full",
-                        };
                         metrics::counter!(
-                            "sync.zakura.apply.transferred_to_legacy",
-                            "class" => class_label,
+                            "sync.zakura.apply.checkpoint_transferred_to_legacy"
                         )
                         .increment(1);
-                        // Keep the historical checkpoint-only series for existing dashboards.
-                        if class == BlockApplyClass::Checkpoint {
-                            metrics::counter!(
-                                "sync.zakura.apply.checkpoint_transferred_to_legacy"
-                            )
-                            .increment(1);
-                        }
-                        BlockApplyCompletion { class, result }
+                        BlockApplyCompletion::Finished { class, result }
                     }
                 }
             }
@@ -1390,7 +1409,7 @@ where
             ?expected_hash,
             "Zakura block sync cannot apply body without coinbase height"
         );
-        return BlockApplyCompletion {
+        return BlockApplyCompletion::Finished {
             class,
             result: BlockApplyResult::Rejected,
         };
@@ -1400,10 +1419,10 @@ where
     let started = Instant::now();
     // Throughput-probe mode (debug only): skip consensus verify+commit and
     // advance its in-memory synthetic frontier, discarding the body.
-    let outcome = match throughput_probe.as_ref() {
+    let observation = match throughput_probe.as_ref() {
         Some(probe) => {
             let (result, _) = probe.apply_block(block.as_ref());
-            probe_body_outcome(owner, source, expected_hash, result)
+            CommitObservation::Finished(probe_body_outcome(owner, source, expected_hash, result))
         }
         None => {
             commit_block_sync_body_with_stall_trace(
@@ -1420,6 +1439,15 @@ where
             .await
         }
     };
+    let CommitObservation::Finished(outcome) = observation else {
+        error!(
+            ?height,
+            ?expected_hash,
+            timeout = ?ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
+            "Full block commit remained pending past the fatal stall deadline"
+        );
+        return BlockApplyCompletion::FatalFullCommitStall;
+    };
     let result = outcome.result();
     trace.trace_block_commit_finished(token, class, height, expected_hash, result, started);
     let _ = block_sync.send_control(BlockSyncEvent::BlockApplyFinished {
@@ -1432,7 +1460,7 @@ where
     });
     trace.trace_block_apply_finished(token, height, expected_hash, result, false);
 
-    BlockApplyCompletion { class, result }
+    BlockApplyCompletion::Finished { class, result }
 }
 
 #[cfg(test)]
@@ -1468,7 +1496,7 @@ async fn commit_block_sync_body_with_stall_trace<BlockVerifier>(
     token: BlockApplyToken,
     height: block::Height,
     expected_hash: block::Hash,
-) -> BlockApplyOutcome
+) -> CommitObservation
 where
     BlockVerifier:
         Service<zakura_consensus::Request, Response = block::Hash> + Clone + Send + 'static,
@@ -1481,7 +1509,13 @@ where
 
     tokio::pin!(commit);
     tokio::select! {
-        outcome = &mut commit => block_commit_outcome(owner, source, Some(height), expected_hash, outcome),
+        outcome = &mut commit => CommitObservation::Finished(block_commit_outcome(
+            owner,
+            source,
+            Some(height),
+            expected_hash,
+            outcome,
+        )),
         _ = tokio::time::sleep(ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT) => {
             trace.trace_block_commit_stalled(
                 token,
@@ -1490,7 +1524,17 @@ where
                 expected_hash,
                 ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT,
             );
-            block_commit_outcome(owner, source, Some(height), expected_hash, commit.await)
+            if class == BlockApplyClass::Full {
+                CommitObservation::FullCommitStalled
+            } else {
+                CommitObservation::Finished(block_commit_outcome(
+                    owner,
+                    source,
+                    Some(height),
+                    expected_hash,
+                    commit.await,
+                ))
+            }
         }
     }
 }
@@ -2074,28 +2118,18 @@ mod tests {
         driver.shutdown().await;
     }
 
-    /// Full applies previously had no legacy-yield transfer arm, so a hung Commit
-    /// could keep FallbackDraining blocked until the 30-minute drain deadline.
-    #[tokio::test(flavor = "current_thread")]
-    async fn fallback_transfers_full_apply_while_commit_is_pending() {
-        let (release_tx, release_rx) = watch::channel(false);
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn stalled_full_apply_fails_closed_without_activating_fallback() {
         let calls = Arc::new(AtomicUsize::new(0));
         let verifier_calls = calls.clone();
         let verifier = service_fn(move |request: zakura_consensus::Request| {
-            let mut release_rx = release_rx.clone();
             let verifier_calls = verifier_calls.clone();
             async move {
-                let zakura_consensus::Request::Commit(block) = request else {
+                let zakura_consensus::Request::Commit(_block) = request else {
                     panic!("unexpected consensus request: {request:?}");
                 };
                 verifier_calls.fetch_add(1, Ordering::SeqCst);
-                while !*release_rx.borrow() {
-                    release_rx
-                        .changed()
-                        .await
-                        .expect("commit release sender stays open");
-                }
-                Ok::<_, zakura_consensus::BoxError>(block.hash())
+                std::future::pending::<Result<block::Hash, zakura_consensus::BoxError>>().await
             }
         });
         let handoff = SyncCoordinator::new();
@@ -2110,18 +2144,33 @@ mod tests {
         submit_checkpoint(&driver, 1).await;
         wait_for_count(calls.as_ref(), 1, "the full verifier Commit call").await;
 
-        let lease = tokio::time::timeout(
-            Duration::from_secs(1),
-            handoff.acquire_legacy_fallback(Duration::from_secs(1)),
-        )
-        .await
-        .expect("pending full apply transfers without waiting for Commit")
-        .expect("fallback acquires the apply lease after full transfer");
+        let drain_handoff = handoff.clone();
+        let fallback = tokio::spawn(async move {
+            drain_handoff
+                .acquire_legacy_fallback(Duration::from_secs(1))
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !fallback.is_finished(),
+            "fallback must wait while the accepted Full apply is still live"
+        );
 
-        // Orphan Commit may still finish after transfer; releasing it keeps the
-        // test from hanging on the dropped apply future's background work.
-        let _ = release_tx.send(true);
-        drop(lease);
+        tokio::time::advance(ZAKURA_BLOCK_SYNC_DRIVER_TIMEOUT).await;
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            handoff.apply_phase(),
+            zakura_node_services::sync_lifecycle::ApplyPhase::Failed { .. }
+        ));
+        assert!(driver.driver_task.is_finished());
+        assert!(
+            fallback
+                .await
+                .expect("fallback acquisition task exits")
+                .is_err(),
+            "a fatal Full commit stall must not activate legacy fallback"
+        );
+
         driver.shutdown().await;
     }
 

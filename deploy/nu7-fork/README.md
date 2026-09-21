@@ -62,6 +62,17 @@ The DigitalOcean Testnet state snapshot is refreshed weekly (Monday 04:00 UTC by
 week. That is harmless for a fork — the activation height is relative to the
 seed, not to the public chain.
 
+## The state volume
+
+`fork.py provision` attaches a clone of the Testnet state snapshot but nothing
+mounts it, because in CI that is `pr-node-run.sh`'s job. `fork.py seed` mounts it
+at `host.snapshot_mount` using DigitalOcean's `/dev/disk/by-id/scsi-0DO_Volume_*`
+convention, then copies `state/v<db-format>/testnet` out of it.
+
+That snapshot is taken in `tip` mode, which is a **pruned** database, so
+`host.storage_mode` defaults to `pruned` to match. Describing a pruned seed as an
+archive node would misreport what the node actually holds.
+
 ## Reconfiguring
 
 ```sh

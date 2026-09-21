@@ -38,9 +38,18 @@ ssh_string = ""
 # landed in PR #1093 — a build without it has no NU7 consensus branch at all.
 commit = "feat/nu7-fork-testnet"
 
+# Where the cloned state volume is mounted. `fork.py seed` mounts it here if it
+# is attached but not yet mounted, matching .github/workflows/scripts/pr-node-run.sh.
+snapshot_mount = "/mnt/snapshots"
+
 # Holds the untouched seed: state/v<db-format>/testnet, as cloned from the
 # DigitalOcean Testnet state snapshot. fork.py only ever reads this.
+# "tip" is the subdirectory do_provision.py's `--mode tip` snapshot uses.
 pristine_cache_dir = "/mnt/snapshots/tip"
+
+# Must match how the seed was built. do_provision.py's `tip` snapshot is a
+# pruned database, so opening it as an archive node would misdescribe it.
+storage_mode = "pruned"
 
 # The fork's own working cache, wiped and re-seeded on every reconfigure.
 fork_cache_dir = "/mnt/data/zakura-fork"

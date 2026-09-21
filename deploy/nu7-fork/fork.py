@@ -252,7 +252,7 @@ def render_nodes_toml(config: dict, plan: dict) -> str:
         # Without a miner address the node refuses getblocktemplate, so the
         # external miner cannot produce a single block.
         f'miner_address = "{miner_address}"',
-        'storage_mode = "archive"',
+        f'storage_mode = "{host.get("storage_mode", "pruned")}"',
         # The fork has no Zakura v2 peers and must not dial the public network.
         'p2p_stack = "legacy"',
         "checkpoint_sync = true",
@@ -306,6 +306,30 @@ def cmd_provision(config: dict, args) -> int:
     return 0
 
 
+def mount_state_volume(config: dict) -> None:
+    """Mount the cloned state volume if it is attached but not yet mounted.
+
+    A droplet from `do_provision.py` has the volume attached, but nothing has
+    mounted it: in CI that is pr-node-run.sh's job. The device path follows
+    DigitalOcean's by-id convention, matching that script.
+    """
+    host = config["host"]["ssh_string"]
+    mount_point = config["host"]["snapshot_mount"]
+    volume = config["droplet"]["volume_name"]
+    device = f"/dev/disk/by-id/scsi-0DO_Volume_{volume}"
+
+    result = ssh(
+        host,
+        f"if mountpoint -q {shlex.quote(mount_point)}; then echo mounted; else "
+        f"for _ in $(seq 1 30); do [ -e {shlex.quote(device)} ] && break; sleep 2; done; "
+        f"test -e {shlex.quote(device)} || {{ echo 'no state volume device: {device}' >&2; exit 1; }}; "
+        f"mkdir -p {shlex.quote(mount_point)} && mount {shlex.quote(device)} {shlex.quote(mount_point)} "
+        f"&& echo newly-mounted; fi",
+        capture=True,
+    )
+    print(f"[seed] state volume: {result.stdout.strip()}")
+
+
 def cmd_seed(config: dict, args) -> int:
     """Copy the pristine Testnet state into the fork's own state directory.
 
@@ -319,6 +343,7 @@ def cmd_seed(config: dict, args) -> int:
     target = f"{target_root}/state/v{version}/{state_dir_name(config['fork']['network_name'])}"
 
     print(f"[seed] {pristine} -> {target}")
+    mount_state_volume(config)
     # Fail loudly if the seed is missing or is a different database format:
     # silently seeding nothing makes the fork sync from genesis instead.
     ssh(host, f"test -d {shlex.quote(pristine)} || "

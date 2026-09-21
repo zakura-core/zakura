@@ -73,6 +73,13 @@ impl ContextualMetrics {
     }
 }
 
+fn block_has_transparent_spends(block: &Block) -> bool {
+    block
+        .transactions
+        .iter()
+        .any(|transaction| transaction.spent_outpoints().next().is_some())
+}
+
 /// The state of the chains in memory, including queued blocks.
 ///
 /// Clones of the non-finalized state contain independent copies of the chains.
@@ -663,11 +670,15 @@ impl NonFinalizedState {
             });
         }
 
-        // Reads from disk
-        //
-        // TODO: if these disk reads show up in profiles, run them in parallel, using std::thread::spawn()
+        // Avoid cloning the non-finalized UTXO set when this block cannot use it.
+        // Transparent spend validation can read missing UTXOs from disk.
+        // TODO: if those disk reads show up in profiles, run them in parallel.
         let unspent_utxo_snapshot_start = Instant::now();
-        let unspent_utxos = new_chain.unspent_utxos();
+        let unspent_utxos = if block_has_transparent_spends(&prepared.block) {
+            new_chain.unspent_utxos()
+        } else {
+            HashMap::new()
+        };
         contextual_metrics.record_duration(
             "state.contextual.unspent_utxo_snapshot.duration_seconds",
             "state.contextual.mined.unspent_utxo_snapshot.duration_seconds",
@@ -724,16 +735,20 @@ impl NonFinalizedState {
         let block_hash = prepared.hash;
         let transaction_count = prepared.block.transactions.len();
         let spent_utxo_count = spent_utxos.len();
-        let contextual =
-            ContextuallyVerifiedBlock::with_block_and_spent_utxos(prepared, spent_utxos).map_err(
-                |value_balance_error| ValidateContextError::CalculateBlockChainValueChange {
-                    value_balance_error,
-                    height,
-                    block_hash,
-                    transaction_count,
-                    spent_utxo_count,
-                },
-            );
+        let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+            &self.network,
+            prepared,
+            spent_utxos,
+        )
+        .map_err(|value_balance_error| {
+            ValidateContextError::CalculateBlockChainValueChange {
+                value_balance_error,
+                height,
+                block_hash,
+                transaction_count,
+                spent_utxo_count,
+            }
+        });
         contextual_metrics.record_duration(
             "state.contextual.block_construction.duration_seconds",
             "state.contextual.mined.block_construction.duration_seconds",

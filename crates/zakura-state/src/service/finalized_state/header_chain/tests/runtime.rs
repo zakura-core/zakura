@@ -447,9 +447,15 @@ fn atomic_finality_context_can_use_a_newly_staged_anchor_path() {
         .initialize(metadata, anchor.clone())
         .expect("the empty schema initializes");
 
+    // Stage one node past the retained predecessor span, so the context cap
+    // binds whatever difficulty averaging window this build uses.
+    let predecessor_span = zakura_header_chain::MAX_POW_PREDECESSOR_CONTEXT_SPAN;
+    let staged_len =
+        u32::try_from(predecessor_span + 1).expect("the retained predecessor span fits in u32");
+
     let mut nodes = Vec::new();
     let mut parent = anchor;
-    for height in 1..=28 {
+    for height in 1..=staged_len {
         let mut header = *parent.header;
         header.previous_block_hash = parent.hash;
         header.time += chrono::Duration::seconds(1);
@@ -478,14 +484,14 @@ fn atomic_finality_context_can_use_a_newly_staged_anchor_path() {
     let staged: HashMap<_, _> = nodes.iter().map(|node| (node.hash, node)).collect();
     let contexts = authenticated_context_headers(&store, parent.hash, Some(&staged))
         .expect("the atomic batch can authenticate context from its staged node overlay");
-    assert_eq!(contexts.len(), 27);
+    assert_eq!(contexts.len(), predecessor_span);
     assert_eq!(
         contexts.first().map(|context| context.height),
         Some(block::Height(1))
     );
     assert_eq!(
         contexts.last().map(|context| context.height),
-        Some(block::Height(27))
+        Some(block::Height(staged_len - 1))
     );
     assert_eq!(
         parent.header.previous_block_hash,
@@ -567,6 +573,80 @@ fn body_refill_snapshot_holds_the_complete_transition_barrier() {
 
     assert_eq!(full_state, Frontier::new(anchor.height, anchor.hash));
     assert_eq!(selected_projection, vec![full_state]);
+}
+
+#[test]
+fn body_refill_does_not_attach_committed_sizes_to_another_fork() {
+    use crate::arbitrary::Prepare;
+    use crate::tests::setup::{new_state_with_mainnet_genesis, transaction_v4_from_coinbase};
+    use zakura_chain::serialization::ZcashSerialize;
+
+    let _init_guard = zakura_test::init();
+    let (engine_config, anchor, metadata) = mainnet_fixture();
+    let (finalized, mut full_state, _) = new_state_with_mainnet_genesis();
+    let store = HeaderChainStore::new(finalized.db.header_chain_disk_db());
+    store
+        .initialize(metadata, anchor.clone())
+        .expect("header schema initializes");
+
+    let mut old: block::Block = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .expect("height one parses");
+    let selected_header = old.header.clone();
+    let mut old_header = *old.header;
+    old_header.nonce.0[0] ^= 1;
+    old.header = Arc::new(old_header);
+    // The state fixture requires a modern coinbase transaction version.
+    old.transactions[0] = transaction_v4_from_coinbase(&old.transactions[0]).into();
+    let old = Arc::new(old);
+    full_state
+        .commit_new_chain(old.clone().prepare(), &finalized)
+        .expect("old branch commits");
+
+    let selected_hash = selected_header.hash();
+    let (runtime, _) = store
+        .startup_reconciled(
+            &engine_config,
+            Frontier::new(anchor.height, anchor.hash),
+            Vec::new(),
+            vec![VerifiedHeaderRef {
+                height: block::Height(1),
+                hash: selected_hash,
+                header: selected_header,
+            }],
+        )
+        .expect("selected fork restores");
+
+    let old_size = u32::try_from(
+        old.zcash_serialize_to_vec()
+            .expect("old block serializes")
+            .len(),
+    )
+    .expect("test block size fits u32");
+    assert_eq!(
+        crate::service::read::block_size_hints(
+            full_state.best_chain(),
+            &finalized.db,
+            block::Height(1),
+            1
+        ),
+        vec![(block::Height(1), Some(old_size))],
+        "the old branch has a confirmed size at the same height",
+    );
+    let metadata = crate::service::missing_block_body_metadata(
+        || full_state.best_chain(),
+        &finalized.db,
+        Some(&runtime.reader()),
+        block::Height(2),
+        10,
+    )
+    .expect("fork refill metadata reads");
+    assert_eq!(metadata.anchor, Frontier::new(anchor.height, anchor.hash));
+    assert_eq!(
+        metadata.blocks,
+        vec![(block::Height(1), selected_hash, None)],
+        "a selected fork must not inherit the other block's confirmed size"
+    );
 }
 
 #[test]

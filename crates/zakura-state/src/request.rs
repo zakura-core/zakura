@@ -25,6 +25,7 @@ use zakura_chain::{
     history_tree::HistoryTree,
     ironwood, orchard,
     parallel::tree::NoteCommitmentTrees,
+    parameters::Network,
     sapling,
     serialization::SerializationError,
     sprout,
@@ -653,6 +654,7 @@ impl ContextuallyVerifiedBlock {
     ///
     /// This function panics if `spent_outputs` omits a transparent input's UTXO.
     pub fn with_block_and_spent_utxos(
+        network: &Network,
         semantically_verified: SemanticallyVerifiedBlock,
         spent_outputs: HashMap<transparent::OutPoint, transparent::OrderedUtxo>,
     ) -> Result<Self, ValueBalanceError> {
@@ -667,6 +669,7 @@ impl ContextuallyVerifiedBlock {
         } = semantically_verified;
 
         let chain_value_pool_change = block.chain_value_pool_change_from_ordered_utxos(
+            network,
             &spent_outputs,
             deferred_pool_balance_change,
         )?;
@@ -724,6 +727,15 @@ impl CheckpointVerifiedBlock {
     /// different block.
     pub fn with_precomputed_auth_data_root(mut self) -> Self {
         self.0.auth_data_root = Some(self.0.block.auth_data_root());
+        self
+    }
+
+    /// Returns this checkpoint block with its deferred pool balance change.
+    pub fn with_deferred_pool_balance_change(
+        mut self,
+        deferred_pool_balance_change: Option<DeferredPoolBalanceChange>,
+    ) -> Self {
+        self.0.deferred_pool_balance_change = deferred_pool_balance_change;
         self
     }
 }
@@ -840,6 +852,7 @@ mod tests {
                 .expect("the genesis block deserializes"),
         );
         let contextual = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+            &Network::Mainnet,
             SemanticallyVerifiedBlock::from(block),
             HashMap::new(),
         )
@@ -856,6 +869,7 @@ mod tests {
         assert_eq!(&semantic.new_outputs, contextual.new_outputs.as_ref());
 
         let unique = ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+            &Network::Mainnet,
             SemanticallyVerifiedBlock::from(contextual.block.clone()),
             HashMap::new(),
         )
@@ -1409,6 +1423,16 @@ pub enum Request {
     /// Checks verified blocks in the finalized chain and the _best_ non-finalized chain.
     UnspentBestChainUtxo(transparent::OutPoint),
 
+    /// Checks a candidate block's external inputs against the UTXO set at `parent`.
+    /// Returns [`ParentInputs::Inconclusive`](crate::ParentInputs::Inconclusive) if the parent
+    /// context changes during the read. Callers must omit outputs created within the candidate block.
+    CheckParentInputs {
+        /// Parent whose UTXO set must contain the inputs.
+        parent: block::Hash,
+        /// External inputs from one bounded block.
+        outpoints: Arc<[transparent::OutPoint]>,
+    },
+
     /// Looks up a block by hash or height in the current best chain.
     ///
     /// Returns
@@ -1419,6 +1443,29 @@ pub enum Request {
     /// Note: the [`HashOrHeight`] can be constructed from a [`block::Hash`] or
     /// [`block::Height`] using `.into()`.
     Block(HashOrHeight),
+
+    /// Looks up the [`BlockInfo`](zakura_chain::block_info::BlockInfo) for a block hash.
+    ///
+    /// This request waits until the block commits if needed.
+    ///
+    /// This request checks every non-finalized chain and the finalized state.
+    ///
+    /// Returns [`Response::BlockInfo(Some(block_info))`](Response::BlockInfo) after the block
+    /// commits. The response future remains pending while the block is unknown.
+    ///
+    /// Returns [`AwaitBlockInfoError`](crate::AwaitBlockInfoError) if the state rejects the
+    /// block or the block does not commit within
+    /// [`AWAIT_BLOCK_INFO_TIMEOUT`](crate::constants::AWAIT_BLOCK_INFO_TIMEOUT).
+    AwaitBlockInfo(block::Hash),
+
+    /// Looks up the [`BlockInfo`](zakura_chain::block_info::BlockInfo) for a committed block
+    /// hash without waiting.
+    ///
+    /// This request checks every non-finalized chain and the finalized state.
+    ///
+    /// Returns [`Response::BlockInfo(Some(block_info))`](Response::BlockInfo) if the block
+    /// has committed, and [`Response::BlockInfo(None)`](Response::BlockInfo) otherwise.
+    BlockInfo(block::Hash),
 
     /// Looks up a block by hash in any current chain or by height in the current best chain.
     ///
@@ -1590,7 +1637,10 @@ impl Request {
             Request::BlockLocator => "block_locator",
             Request::Transaction(_) => "transaction",
             Request::UnspentBestChainUtxo { .. } => "unspent_best_chain_utxo",
+            Request::CheckParentInputs { .. } => "check_parent_inputs",
             Request::Block(_) => "block",
+            Request::AwaitBlockInfo(_) => "await_block_info",
+            Request::BlockInfo(_) => "block_info",
             Request::AnyChainBlock(_) => "any_chain_block",
             Request::BlockHeader(_) => "block_header",
             Request::FindBlockHashes { .. } => "find_block_hashes",
@@ -1649,9 +1699,10 @@ pub enum ReadRequest {
     /// with the pool values of the current best chain tip.
     TipPoolValues,
 
-    /// Looks up the block info after a block by hash or height in the current best chain.
+    /// Looks up the block info after a block by hash in any chain, or by height in the
+    /// current best chain.
     ///
-    /// * [`ReadResponse::BlockInfo(Some(pool_values))`](ReadResponse::BlockInfo) if the block is in the best chain;
+    /// * [`ReadResponse::BlockInfo(Some(pool_values))`](ReadResponse::BlockInfo) if the block is found;
     /// * [`ReadResponse::BlockInfo(None)`](ReadResponse::BlockInfo) otherwise.
     BlockInfo(HashOrHeight),
 
@@ -1754,6 +1805,16 @@ pub enum ReadRequest {
     ///
     /// Checks verified blocks in the finalized chain and the _best_ non-finalized chain.
     UnspentBestChainUtxo(transparent::OutPoint),
+
+    /// Checks a candidate block's external inputs against the UTXO set at `parent`.
+    /// Returns [`ParentInputs::Inconclusive`](crate::ParentInputs::Inconclusive) if the parent
+    /// context changes during the read. Callers must omit outputs created within the candidate block.
+    CheckParentInputs {
+        /// Parent whose UTXO set must contain the inputs.
+        parent: block::Hash,
+        /// External inputs from one bounded block.
+        outpoints: Arc<[transparent::OutPoint]>,
+    },
 
     /// Looks up a UTXO identified by the given [`OutPoint`](transparent::OutPoint),
     /// returning `None` immediately if it is unknown.
@@ -2142,6 +2203,7 @@ impl ReadRequest {
             ReadRequest::TransactionIdsForBlock(_) => "transaction_ids_for_block",
             ReadRequest::AnyChainTransactionIdsForBlock(_) => "any_chain_transaction_ids_for_block",
             ReadRequest::UnspentBestChainUtxo { .. } => "unspent_best_chain_utxo",
+            ReadRequest::CheckParentInputs { .. } => "check_parent_inputs",
             ReadRequest::AnyChainUtxo { .. } => "any_chain_utxo",
             ReadRequest::BlockLocator => "block_locator",
             ReadRequest::FindBlockHashes { .. } => "find_block_hashes",
@@ -2213,11 +2275,15 @@ impl TryFrom<Request> for ReadRequest {
             Request::BestChainBlockHash(hash) => Ok(ReadRequest::BestChainBlockHash(hash)),
 
             Request::Block(hash_or_height) => Ok(ReadRequest::Block(hash_or_height)),
+            Request::BlockInfo(hash) => Ok(ReadRequest::BlockInfo(hash.into())),
             Request::AnyChainBlock(hash_or_height) => {
                 Ok(ReadRequest::AnyChainBlock(hash_or_height))
             }
             Request::BlockHeader(hash_or_height) => Ok(ReadRequest::BlockHeader(hash_or_height)),
             Request::Transaction(tx_hash) => Ok(ReadRequest::Transaction(tx_hash)),
+            Request::CheckParentInputs { parent, outpoints } => {
+                Ok(ReadRequest::CheckParentInputs { parent, outpoints })
+            }
             Request::UnspentBestChainUtxo(outpoint) => {
                 Ok(ReadRequest::UnspentBestChainUtxo(outpoint))
             }
@@ -2252,6 +2318,8 @@ impl TryFrom<Request> for ReadRequest {
             Request::AwaitUtxo(_) => Err("ReadService does not track pending UTXOs. \
                      Manually convert the request to ReadRequest::AnyChainUtxo, \
                      and handle pending UTXOs"),
+
+            Request::AwaitBlockInfo(_) => Err("ReadService does not track pending block commits"),
 
             Request::KnownBlock(_) => Err("ReadService does not track queued blocks"),
 

@@ -18,7 +18,7 @@ use std::{
 use zakura_chain::{
     amount::{Amount, NonNegative},
     block::{Block, Height, MAX_BLOCK_BYTES},
-    parameters::NetworkUpgrade,
+    parameters::{Network, NetworkUpgrade},
     serialization::{ZcashDeserialize, ZcashSerialize},
     transaction::{self, LockTime, Transaction},
     transparent,
@@ -61,6 +61,7 @@ fn main() {
 
         let start = Instant::now();
         black_box(ContextuallyVerifiedBlock::with_block_and_spent_utxos(
+            black_box(&Network::Mainnet),
             black_box(prepared),
             black_box(spent_utxos),
         ))

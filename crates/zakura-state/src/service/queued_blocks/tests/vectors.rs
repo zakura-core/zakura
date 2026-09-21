@@ -24,7 +24,7 @@ trait IntoQueued {
 impl IntoQueued for Arc<Block> {
     fn into_queued(self) -> QueuedSemanticallyVerified {
         let (rsp_tx, _) = oneshot::channel();
-        (self.prepare(), rsp_tx, None)
+        (self.prepare(), rsp_tx, None, 0)
     }
 }
 
@@ -87,10 +87,10 @@ fn dequeue_gives_right_children() -> Result<()> {
     assert_eq!(2, children.len());
     assert!(children
         .iter()
-        .any(|(block, _, _)| block.hash == child1.hash()));
+        .any(|(block, _, _, _)| block.hash == child1.hash()));
     assert!(children
         .iter()
-        .any(|(block, _, _)| block.hash == child2.hash()));
+        .any(|(block, _, _, _)| block.hash == child2.hash()));
     assert_eq!(0, queue.blocks.len());
     assert_eq!(0, queue.by_parent.len());
     assert_eq!(0, queue.by_height.len());
@@ -301,7 +301,7 @@ fn dequeue_descendants_removes_the_complete_failed_subtree() -> Result<()> {
     let mut responses = Vec::new();
     for block in [failed_child, failed_grandchild, sibling] {
         let (response, receiver) = oneshot::channel();
-        queue.queue((block.prepare(), response, None));
+        queue.queue((block.prepare(), response, None, 0));
         responses.push(receiver);
     }
     let error = CommitSemanticallyVerifiedError::from(CommitBlockError::HeaderChainError {

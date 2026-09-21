@@ -27,6 +27,7 @@ use tracing::Instrument;
 use zakura_chain::{
     block::{self, Height, HeightDiff},
     chain_tip::ChainTip,
+    parameters::Network,
 };
 use zakura_network::{self as zn, PeerSocketAddr};
 use zakura_state as zs;
@@ -37,7 +38,7 @@ use crate::components::{
         legacy_trace::{
             LegacyBlockOutcome, LegacyDiagnosticSnapshot, LegacySyncTrace, LegacyTaskState,
         },
-        BLOCK_DOWNLOAD_TIMEOUT, FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT,
+        lookahead_limit_multiplier, BLOCK_DOWNLOAD_TIMEOUT, FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT,
         FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT_LIMIT,
     },
 };
@@ -65,6 +66,45 @@ pub const VERIFICATION_PIPELINE_SCALING_MULTIPLIER: usize = 2;
 /// The maximum height difference between Zebra's state tip and a downloaded block.
 /// Blocks higher than this will get dropped and return an error.
 pub const VERIFICATION_PIPELINE_DROP_LIMIT: HeightDiff = 50_000;
+
+/// Returns the downloader's drop, pause, and reset heights for `tip_height`.
+///
+/// `multiplier` scales `lookahead_limit` and [`VERIFICATION_PIPELINE_DROP_LIMIT`]
+/// together, so the syncer never requests blocks that the downloader would drop
+/// just because they arrived before earlier blocks were committed.
+pub(super) fn lookahead_heights(
+    tip_height: Option<block::Height>,
+    lookahead_limit: usize,
+    multiplier: usize,
+) -> (block::Height, block::Height, block::Height) {
+    let lookahead_limit = lookahead_limit * multiplier;
+    let drop_limit = VERIFICATION_PIPELINE_DROP_LIMIT
+        * HeightDiff::try_from(multiplier).expect("the lookahead multiplier fits in HeightDiff");
+
+    if let Some(tip_height) = tip_height {
+        // Scale the height limit with the lookahead limit,
+        // so users with low capacity or under DoS can reduce them both.
+        let lookahead_pause = HeightDiff::try_from(
+            lookahead_limit + lookahead_limit * VERIFICATION_PIPELINE_SCALING_MULTIPLIER,
+        )
+        .expect("fits in HeightDiff");
+
+        (
+            (tip_height + drop_limit).expect("tip is much lower than Height::MAX"),
+            (tip_height + lookahead_pause).expect("tip is much lower than Height::MAX"),
+            (tip_height + lookahead_pause / 2).expect("tip is much lower than Height::MAX"),
+        )
+    } else {
+        let genesis_drop = drop_limit.try_into().expect("fits in u32");
+        let genesis_lookahead = u32::try_from(lookahead_limit - 1).expect("fits in u32");
+
+        (
+            block::Height(genesis_drop),
+            block::Height(genesis_lookahead),
+            block::Height(genesis_lookahead / 2),
+        )
+    }
+}
 
 #[derive(Copy, Clone, Debug)]
 pub(super) struct AlwaysHedge;
@@ -301,6 +341,9 @@ where
     /// The configured lookahead limit, after applying the minimum limit.
     lookahead_limit: usize,
 
+    /// The configured network, which sets the target spacing for the lookahead limit.
+    chain_network: Network,
+
     /// The largest block height for the checkpoint verifier, based on the current config.
     max_checkpoint_height: Height,
 
@@ -411,18 +454,21 @@ where
     /// `verifier` services.
     ///
     /// Uses the `latest_chain_tip` and `lookahead_limit` to drop blocks
-    /// that are too far ahead of the current state tip.
+    /// that are too far ahead of the current state tip. The `chain_network`
+    /// target spacing at the tip scales the `lookahead_limit`.
     /// Uses `max_checkpoint_height` to work around a known block timeout (#5125).
     ///
     /// The [`Downloads`] stream is agnostic to the network policy, so retry and
     /// timeout limits should be applied to the `network` service passed into
     /// this constructor.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         network: ZN,
         verifier: ZV,
         latest_chain_tip: ZSTip,
         past_lookahead_limit_sender: watch::Sender<bool>,
         lookahead_limit: usize,
+        chain_network: Network,
         max_checkpoint_height: Height,
         trace: LegacySyncTrace,
     ) -> Self {
@@ -434,6 +480,7 @@ where
             verifier,
             latest_chain_tip,
             lookahead_limit,
+            chain_network,
             max_checkpoint_height,
             past_lookahead_limit_sender: Arc::new(std::sync::Mutex::new(
                 past_lookahead_limit_sender,
@@ -561,6 +608,7 @@ where
         let latest_chain_tip = self.latest_chain_tip.clone();
 
         let lookahead_limit = self.lookahead_limit;
+        let chain_network = self.chain_network.clone();
         let max_checkpoint_height = self.max_checkpoint_height;
 
         let past_lookahead_limit_sender = self.past_lookahead_limit_sender.clone();
@@ -651,27 +699,11 @@ where
                 // reporting a height but not yet a hash would fall into the no-tip regime.
                 let best_tip = latest_chain_tip.best_tip_height_and_hash();
 
-                let (lookahead_drop_height, lookahead_pause_height, lookahead_reset_height) = if let Some(tip_height) = tip_height {
-                    // Scale the height limit with the lookahead limit,
-                    // so users with low capacity or under DoS can reduce them both.
-                    let lookahead_pause = HeightDiff::try_from(
-                        lookahead_limit + lookahead_limit * VERIFICATION_PIPELINE_SCALING_MULTIPLIER,
-                    )
-                        .expect("fits in HeightDiff");
-
-
-                    ((tip_height + VERIFICATION_PIPELINE_DROP_LIMIT).expect("tip is much lower than Height::MAX"),
-                     (tip_height + lookahead_pause).expect("tip is much lower than Height::MAX"),
-                     (tip_height + lookahead_pause/2).expect("tip is much lower than Height::MAX"))
-                } else {
-                    let genesis_drop = VERIFICATION_PIPELINE_DROP_LIMIT.try_into().expect("fits in u32");
-                    let genesis_lookahead =
-                        u32::try_from(lookahead_limit - 1).expect("fits in u32");
-
-                    (block::Height(genesis_drop),
-                     block::Height(genesis_lookahead),
-                     block::Height(genesis_lookahead/2))
-                };
+                // The target spacing at the tip scales the lookahead limit.
+                let multiplier =
+                    tip_height.map_or(1, |tip_height| lookahead_limit_multiplier(&chain_network, tip_height));
+                let (lookahead_drop_height, lookahead_pause_height, lookahead_reset_height) =
+                    lookahead_heights(tip_height, lookahead_limit, multiplier);
 
                 // Get the finalized tip height, assuming we're using the non-finalized state.
                 //
@@ -827,10 +859,12 @@ where
                     .call(zakura_consensus::Request::Commit(block)).boxed();
 
                 // Add a shorter timeout to workaround a known bug (#5125)
-                let short_timeout_max = (max_checkpoint_height + FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT_LIMIT).expect("checkpoint block height is in valid range");
-                if block_height >= max_checkpoint_height && block_height <= short_timeout_max {
+                let short_timeout_max = (max_checkpoint_height + FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT_LIMIT).unwrap_or(Height::MAX);
+                // The final checkpoint can wait for its entire range; only fully verified blocks
+                // need the short timeout. Preserve the error type for the sync retry handler.
+                if block_height > max_checkpoint_height && block_height <= short_timeout_max {
                     rsp = timeout(FINAL_CHECKPOINT_BLOCK_VERIFY_TIMEOUT, rsp)
-                        .map_err(|timeout| format!("initial fully verified block timed out: retrying: {timeout:?}").into())
+                        .map_err(BoxError::from)
                         .map(|nested_result| nested_result.and_then(convert::identity)).boxed();
                 }
 
@@ -917,6 +951,11 @@ where
             .lock()
             .expect("thread panicked while holding the past_lookahead_limit_sender mutex guard")
             .send(false);
+    }
+
+    /// Returns true if `hash` has an in-flight download and verify task.
+    pub(super) fn contains(&self, hash: &block::Hash) -> bool {
+        self.cancel_handles.contains_key(hash)
     }
 
     /// Get the number of currently in-flight download and verify tasks.

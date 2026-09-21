@@ -43,6 +43,13 @@ pub use request::{PreparedCandidateSource, Request};
 #[cfg(test)]
 mod tests;
 
+/// Bounds the optional read that can prove an input missing at the block's parent.
+const PARENT_INPUT_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Bounds the wait for another request's pending commit of the same block.
+/// After this limit, the verifier reports the pending duplicate to the caller.
+const PENDING_COMMIT_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Asynchronous semantic block verification.
 #[derive(Debug)]
 pub struct SemanticBlockVerifier<S, V> {
@@ -93,6 +100,16 @@ pub enum VerifyBlockError {
 
     #[error("invalid block subsidy: {0}")]
     Subsidy(#[from] SubsidyError),
+
+    #[error("transparent input {outpoint:?} is absent from committed parent {parent}")]
+    MissingTransparentInput {
+        parent: block::Hash,
+        outpoint: transparent::OutPoint,
+    },
+
+    /// The UTXO wait expired, and no chain that could accept the block contains its parent.
+    #[error("parent {parent} is not in a chain that can accept the block")]
+    ParentUnavailable { parent: block::Hash },
 
     /// Errors originating from the state service, which may arise from general failures in interacting with the state.
     /// This is for errors that are not specifically related to block depth or commit failures.
@@ -184,6 +201,10 @@ impl VerifyBlockError {
             Self::ValidateProposal(_) | Self::StateService { .. } => {
                 BodyVerificationClass::Retryable(TransientBodyFailureKind::VerifierUnavailable)
             }
+            Self::MissingTransparentInput { .. } => consensus("context.missing_transparent_output"),
+            Self::ParentUnavailable { .. } => {
+                BodyVerificationClass::Retryable(TransientBodyFailureKind::MissingContext)
+            }
             Self::Transaction(error) => error.body_verification_class(),
             Self::Subsidy(_) => consensus("block.subsidy"),
         }
@@ -202,6 +223,9 @@ impl VerifyBlockError {
     /// Returns the state location for duplicate commit requests.
     pub fn duplicate_location(&self) -> Option<&zs::KnownBlock> {
         match self {
+            VerifyBlockError::Block {
+                source: BlockError::AlreadyInChain(_, location),
+            } => Some(location),
             VerifyBlockError::Commit(commit_err) => commit_err.duplicate_location(),
             _ => None,
         }
@@ -212,11 +236,29 @@ impl VerifyBlockError {
         use VerifyBlockError::*;
         match self {
             Block { source } => source.misbehavior_score(),
-            Equihash { .. } | Subsidy(_) => 100,
+            Equihash { .. } | Subsidy(_) | MissingTransparentInput { .. } => 100,
             Transaction(err) => err.mempool_misbehavior_score(),
             Commit(err) => err.misbehavior_score(),
             _other => 0,
         }
+    }
+}
+
+/// Checks a block's external inputs against the UTXO set at `parent`.
+/// A failed or slow read is inconclusive, because only the state can prove an input missing.
+async fn check_parent_inputs<S>(
+    state_service: S,
+    parent: block::Hash,
+    outpoints: Arc<[transparent::OutPoint]>,
+) -> zs::ParentInputs
+where
+    S: Service<zs::Request, Response = zs::Response, Error = BoxError>,
+{
+    let check = state_service.oneshot(zs::Request::CheckParentInputs { parent, outpoints });
+    match tokio::time::timeout(PARENT_INPUT_CHECK_TIMEOUT, check).await {
+        Ok(Ok(zs::Response::ParentInputs(inputs))) => inputs,
+        Ok(Ok(_)) => unreachable!("wrong response to Request::CheckParentInputs"),
+        Ok(Err(_)) | Err(_) => zs::ParentInputs::Inconclusive,
     }
 }
 
@@ -314,19 +356,33 @@ where
             let preparation_start = request.should_cache().then(std::time::Instant::now);
             // Check that this block is actually a new block.
             tracing::trace!("checking that block is not already in state");
-            match state_service
-                .ready()
-                .await
-                .map_err(|source| VerifyBlockError::Depth { source, hash })?
-                .call(zs::Request::KnownBlock(hash))
-                .await
-                .map_err(|source| VerifyBlockError::Depth { source, hash })?
-            {
-                zs::Response::KnownBlock(Some(location)) => {
-                    return Err(BlockError::AlreadyInChain(hash, location).into())
+            let pending_commit_deadline = tokio::time::Instant::now() + PENDING_COMMIT_WAIT_LIMIT;
+            loop {
+                match state_service
+                    .ready()
+                    .await
+                    .map_err(|source| VerifyBlockError::Depth { source, hash })?
+                    .call(zs::Request::KnownBlock(hash))
+                    .await
+                    .map_err(|source| VerifyBlockError::Depth { source, hash })?
+                {
+                    // The previous caller may have timed out after submitting its commit.
+                    // Wait for that commit before reporting a duplicate or verifying again.
+                    // Some callers have no timeout, so the wait has its own limit.
+                    zs::Response::KnownBlock(Some(
+                        location @ (zs::KnownBlock::WriteChannel | zs::KnownBlock::Queue),
+                    )) => {
+                        if tokio::time::Instant::now() >= pending_commit_deadline {
+                            return Err(BlockError::AlreadyInChain(hash, location).into());
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                    zs::Response::KnownBlock(Some(location)) => {
+                        return Err(BlockError::AlreadyInChain(hash, location).into())
+                    }
+                    zs::Response::KnownBlock(None) => break,
+                    _ => unreachable!("wrong response to Request::KnownBlock"),
                 }
-                zs::Response::KnownBlock(None) => {}
-                _ => unreachable!("wrong response to Request::KnownBlock"),
             }
 
             tracing::trace!("performing block checks");
@@ -436,8 +492,56 @@ where
                 .map_err(VerifyBlockError::Time)?;
             let coinbase_tx = check::coinbase_is_first(&block)?;
 
-            let expected_block_subsidy =
-                zakura_chain::parameters::subsidy::block_subsidy(height, &network)?;
+            check::shielded_action_limits_are_valid(&block.transactions, height, &network)?;
+
+            // ZIP 234 derives the block subsidy from the NSM value balance after the parent
+            // block, so a block at or above the start height needs its parent's chain
+            // value pools. Wait for the parent commit if its verification is still running.
+            //
+            // Proposals skip proof of work and can name any parent, so they never wait:
+            // a proposal whose parent has not committed is rejected immediately.
+            let nsm_value_balance =
+                if zakura_chain::parameters::subsidy::is_zip234_active(&network, height) {
+                    let parent_hash = block.header.previous_block_hash;
+                    let parent_request = if request.is_proposal() {
+                        zs::Request::BlockInfo(parent_hash)
+                    } else {
+                        zs::Request::AwaitBlockInfo(parent_hash)
+                    };
+
+                    let zs::Response::BlockInfo(parent_info) = state_service
+                        .ready()
+                        .await
+                        .map_err(|source| VerifyBlockError::Depth { source, hash })?
+                        .call(parent_request)
+                        .await
+                        .map_err(|source| VerifyBlockError::Depth { source, hash })?
+                    else {
+                        unreachable!("wrong response to a block info request");
+                    };
+
+                    let Some(parent_info) = parent_info else {
+                        // AwaitBlockInfo only returns after the parent block commits.
+                        return Err(VerifyBlockError::ValidateProposal(
+                            format!("proposal parent {parent_hash} has not committed").into(),
+                        ));
+                    };
+
+                    // `nsm_value_balance_is_non_negative` rejects committed blocks that leave
+                    // the balance negative from NU7, so a negative parent balance fails here
+                    // instead of paying a bonus.
+                    Some(zakura_chain::parameters::subsidy::parent_nsm_value_balance(
+                        parent_info.value_pools().nsm_value_balance_amount(),
+                    )?)
+                } else {
+                    None
+                };
+
+            let expected_block_subsidy = zakura_chain::parameters::subsidy::block_subsidy(
+                height,
+                &network,
+                nsm_value_balance,
+            )?;
 
             // See [ZIP-1015](https://zips.z.cash/zip-1015).
             let deferred_pool_balance_change =
@@ -455,6 +559,23 @@ where
                 &block,
                 &transaction_hashes,
             ));
+
+            let external_inputs: Arc<[transparent::OutPoint]> = block
+                .transactions
+                .iter()
+                .flat_map(|transaction| transaction.inputs())
+                .filter_map(transparent::Input::outpoint)
+                .filter(|outpoint| !known_utxos.contains_key(outpoint))
+                .collect();
+            let parent = block.header.previous_block_hash;
+            if !external_inputs.is_empty() {
+                if let zs::ParentInputs::Missing(outpoint) =
+                    check_parent_inputs(state_service.clone(), parent, external_inputs.clone())
+                        .await
+                {
+                    return Err(VerifyBlockError::MissingTransparentInput { parent, outpoint });
+                }
+            }
 
             let known_outpoint_hashes: Arc<HashSet<transaction::Hash>> =
                 Arc::new(known_utxos.keys().map(|outpoint| outpoint.hash).collect());
@@ -488,14 +609,39 @@ where
 
             // Sum up some block totals from the transaction responses.
             let mut sigops = 0;
-            let mut block_miner_fees = Ok(Amount::zero());
+            let mut block_transaction_fees = Ok(Amount::zero());
 
             use futures::StreamExt;
             while let Some(result) = async_checks.next().await {
                 tracing::trace!(?result, remaining = async_checks.len());
-                let response = result
-                    .map_err(Into::into)
-                    .map_err(VerifyBlockError::Transaction)?;
+                let response = match result.map_err(Into::into) {
+                    // The UTXO wait expired. The parent may have committed during the wait,
+                    // so check its context again before reporting an unscored timeout.
+                    Err(TransactionError::TransparentInputNotFound)
+                        if !external_inputs.is_empty() =>
+                    {
+                        return Err(
+                            match check_parent_inputs(
+                                state_service.clone(),
+                                parent,
+                                external_inputs.clone(),
+                            )
+                            .await
+                            {
+                                zs::ParentInputs::Missing(outpoint) => {
+                                    VerifyBlockError::MissingTransparentInput { parent, outpoint }
+                                }
+                                zs::ParentInputs::ParentUnavailable => {
+                                    VerifyBlockError::ParentUnavailable { parent }
+                                }
+                                zs::ParentInputs::Inconclusive => VerifyBlockError::Transaction(
+                                    TransactionError::TransparentInputNotFound,
+                                ),
+                            },
+                        );
+                    }
+                    result => result.map_err(VerifyBlockError::Transaction)?,
+                };
 
                 assert!(
                     matches!(response, tx::Response::Block { .. }),
@@ -504,10 +650,9 @@ where
 
                 sigops += response.sigops();
 
-                // Coinbase transactions consume the miner fee,
-                // so they don't add any value to the block's total miner fee.
+                // Sum full non-coinbase fees before applying the aggregate NSM split.
                 if let Some(miner_fee) = response.miner_fee() {
-                    block_miner_fees += miner_fee;
+                    block_transaction_fees += miner_fee;
                 }
             }
 
@@ -521,8 +666,8 @@ where
                 })?;
             }
 
-            let block_miner_fees =
-                block_miner_fees.map_err(|amount_error| BlockError::SummingMinerFees {
+            let block_transaction_fees =
+                block_transaction_fees.map_err(|amount_error| BlockError::SummingMinerFees {
                     height,
                     hash,
                     source: amount_error,
@@ -531,7 +676,7 @@ where
             check::miner_fees_are_valid(
                 &coinbase_tx,
                 height,
-                block_miner_fees,
+                block_transaction_fees,
                 expected_block_subsidy,
                 deferred_pool_balance_change,
                 &network,

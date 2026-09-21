@@ -49,6 +49,8 @@ The cases above describe possible triggers, not observed production incidents.
    Failed validation checks the committed state tip to cover delayed tip notifications.
    Validation and that read share one 30-second deadline. Successful recovery checks
    freshness and records prepared work under the same write lock.
+   Recheck freshness after the state-tip read before returning its result or either
+   error, including a timeout, so a superseded response triggers a rebuild.
    Bound rejection storage at 64 IDs; stop issuing templates on overflow until the
    parent changes.
 2. Classify concrete consensus and contextual errors.

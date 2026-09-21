@@ -1258,6 +1258,23 @@ where
         selected
     }
 
+    /// Checks the validation context while the caller holds the rejection-state lock.
+    fn recovery_context_changed(
+        &self,
+        current: &types::get_block_template::TemplateRejections,
+        parent: block::Hash,
+        revision: u64,
+        work_id: &str,
+    ) -> bool {
+        current.parent != Some(parent)
+            || current.revision != revision
+            || current.contains(work_id)
+            || self
+                .latest_chain_tip
+                .best_tip_hash()
+                .is_some_and(|tip| tip != parent)
+    }
+
     /// Returns `Ok(None)` when the template was superseded while it was being built:
     /// the tip moved, a concurrent caller selected a newer parent, or the rejection
     /// revision changed outside fallback mode. The caller must rebuild from fresh state
@@ -1321,14 +1338,12 @@ where
             // record successful recovery so another rejection cannot slip between the two.
             let mut current_context = false;
             self.gbt.template_rejections.send_if_modified(|current| {
-                if current.parent != state.parent
-                    || current.revision != state.revision
-                    || current.contains(template.work_id())
-                    || self
-                        .latest_chain_tip
-                        .best_tip_hash()
-                        .is_some_and(|tip| tip != chain_info.tip_hash)
-                {
+                if self.recovery_context_changed(
+                    current,
+                    chain_info.tip_hash,
+                    state.revision,
+                    template.work_id(),
+                ) {
                     return false;
                 }
                 current_context = true;
@@ -1347,9 +1362,17 @@ where
                     deadline,
                     call_service(self.read_state.clone(), zakura_state::ReadRequest::Tip),
                 )
-                .await
-                .map_misc_error()??;
-                match response {
+                .await;
+                // The read can finish or fail after another caller has moved recovery on.
+                if self.recovery_context_changed(
+                    &self.gbt.template_rejections.borrow(),
+                    chain_info.tip_hash,
+                    state.revision,
+                    template.work_id(),
+                ) {
+                    return Ok(None);
+                }
+                match response.map_misc_error()?? {
                     zakura_state::ReadResponse::Tip(Some((_, tip)))
                         if tip != chain_info.tip_hash =>
                     {

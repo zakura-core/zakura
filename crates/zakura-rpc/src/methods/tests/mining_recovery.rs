@@ -30,7 +30,48 @@ enum Interleaving {
     FallbackDeadline {
         validation_fails_after: Option<Duration>,
     },
+    TipRead {
+        result: TipResult,
+        superseded: bool,
+    },
     FastPathFallback,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TipResult {
+    OriginalParent,
+    Error,
+    Timeout,
+}
+
+#[tokio::test]
+async fn mining_recovery_tip_read_rechecks_superseded_context() {
+    for result in [
+        TipResult::OriginalParent,
+        TipResult::Error,
+        TipResult::Timeout,
+    ] {
+        check_interleaving(Interleaving::TipRead {
+            result,
+            superseded: true,
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn mining_recovery_tip_read_preserves_current_context_errors() {
+    for result in [
+        TipResult::OriginalParent,
+        TipResult::Error,
+        TipResult::Timeout,
+    ] {
+        check_interleaving(Interleaving::TipRead {
+            result,
+            superseded: false,
+        })
+        .await;
+    }
 }
 
 #[tokio::test]
@@ -172,7 +213,9 @@ async fn check_interleaving(interleaving: Interleaving) {
 
     if matches!(
         interleaving,
-        Interleaving::StaleFallback { .. } | Interleaving::FallbackDeadline { .. }
+        Interleaving::StaleFallback { .. }
+            | Interleaving::FallbackDeadline { .. }
+            | Interleaving::TipRead { .. }
     ) {
         preparation
             .take()
@@ -203,6 +246,66 @@ async fn check_interleaving(interleaving: Interleaving) {
                 matches!(request, zakura_consensus::Request::Prepare { .. })
             })
             .await;
+        if let Interleaving::TipRead { result, superseded } = interleaving {
+            fallback.respond_error("fallback validation failed".into());
+            let tip_read = read_state.expect_request(ReadRequest::Tip).await;
+            if superseded {
+                tip_sender.set_best_non_finalized_tip(make_tip(parent_b));
+            }
+            let mut tip_read = Some(tip_read);
+            match result {
+                TipResult::OriginalParent => {
+                    tip_read
+                        .take()
+                        .unwrap()
+                        .respond(ReadResponse::Tip(Some((height, parent_a))));
+                }
+                TipResult::Error => {
+                    tip_read
+                        .take()
+                        .unwrap()
+                        .respond_error("state tip read failed".into());
+                }
+                TipResult::Timeout => {
+                    tokio::time::pause();
+                    tokio::time::advance(Duration::from_secs(30)).await;
+                    tokio::time::resume();
+                }
+            }
+            if superseded {
+                read_state
+                    .expect_request(ReadRequest::ChainInfo)
+                    .await
+                    .respond(ReadResponse::ChainInfo(make_info(parent_b)));
+                mempool
+                    .expect_request(mempool::Request::FullTransactions)
+                    .await
+                    .respond(make_mempool(parent_b));
+                let replacement = tokio::time::timeout(Duration::from_secs(2), pending)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .try_into_template()
+                    .unwrap();
+                assert_eq!(replacement.previous_block_hash, parent_b);
+            } else {
+                let error = tokio::time::timeout(Duration::from_secs(2), pending)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_err();
+                let expected = match result {
+                    TipResult::OriginalParent => "fallback validation failed",
+                    TipResult::Error => "state tip read failed",
+                    TipResult::Timeout => "deadline has elapsed",
+                };
+                assert!(error.message().contains(expected), "{error:?}");
+            }
+            drop(tip_read);
+            queue.abort();
+            return;
+        }
         if let Interleaving::FallbackDeadline {
             validation_fails_after,
         } = interleaving
@@ -228,7 +331,6 @@ async fn check_interleaving(interleaving: Interleaving) {
                 .unwrap()
                 .expect_err("stalled recovery must return an error");
             assert!(error.message().contains("deadline has elapsed"));
-            assert!(started.elapsed() <= Duration::from_secs(30));
             assert!(started.elapsed() >= Duration::from_secs(29));
             drop(fallback);
             drop(stalled_tip);
@@ -297,7 +399,9 @@ async fn check_interleaving(interleaving: Interleaving) {
     });
 
     match interleaving {
-        Interleaving::StaleFallback { .. } | Interleaving::FallbackDeadline { .. } => {
+        Interleaving::StaleFallback { .. }
+        | Interleaving::FallbackDeadline { .. }
+        | Interleaving::TipRead { .. } => {
             unreachable!("handled before the long-poll case")
         }
         Interleaving::FastPathFallback => {

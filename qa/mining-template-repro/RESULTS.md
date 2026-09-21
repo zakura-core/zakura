@@ -106,3 +106,35 @@ consistent with those residual cases exhausting `MAX_TEMPLATE_REBUILDS` at a blo
 every 72 ms — far faster than any real network. The bound behaves as documented.
 
 #1088 also puts the storm below the pre-#1074 baseline, at 67 withholds against 84.
+
+## What the residual withholds under #1088 are
+
+They are retry-budget exhaustion, not an unhandled path. Two independent checks:
+
+After #1088 exactly one site still returns `template parent changed; retry`, and
+it sits after the `'rebuild` loop falls through — it is reachable only when all
+`MAX_TEMPLATE_REBUILDS` attempts were superseded in turn.
+
+Raising the constant from 4 to 16 and alternating the two builds, to keep host
+drift out of the comparison:
+
+| Build | Blocks | Withholds | Templates | p50 | p90 | max | CPU s |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| bound 4, run 1 | 551 | 92 | 10 883 | 54 ms | 110 ms | 411 ms | 81.5 |
+| bound 16, run 1 | 593 | **0** | 12 661 | 46 ms | 107 ms | 299 ms | 96.7 |
+| bound 4, run 2 | 600 | 66 | 13 411 | 43 ms | 99 ms | 318 ms | 100.4 |
+| bound 16, run 2 | 631 | **0** | 13 677 | 43 ms | 97 ms | 277 ms | 99.5 |
+
+The higher bound removes the residual entirely and costs nothing measurable.
+Latency does not get worse — tail latency is lower, because a call that exhausts
+the budget has already paid for four builds before erroring, and the client then
+starts over anyway.
+
+A single earlier run had suggested the higher bound raised latency. Alternating the
+builds showed that was host drift, not the bound.
+
+This only matters at the synthetic storm rate of a block every ~72 ms; at a
+realistic single-producer rate the bound of 4 already yields zero. It is worth
+weighing anyway, because the cost of one leaked error is asymmetric: per #1088's
+own description the internal miner clears its work and backs off for
+`BLOCK_TEMPLATE_WAIT_TIME`, 20 seconds.

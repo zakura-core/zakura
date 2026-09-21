@@ -262,13 +262,17 @@ impl QueuedBlocks {
             .expect("replacement hash exists in the queue");
         let replacement = self
             .blocks
-            .get(&hash)
+            .get_mut(&hash)
             .expect("replacement was inserted under the same hash");
         assert_eq!(old.0.height, replacement.0.height);
         assert_eq!(
             old.0.block.header.previous_block_hash,
             replacement.0.block.header.previous_block_hash
         );
+        // The queue can retain a body longer than the verifier's retry receipt cache.
+        if old.0.block == replacement.0.block {
+            replacement.0.receipt_order = old.0.receipt_order;
+        }
 
         for outpoint in old.0.new_outputs.keys() {
             self.known_utxos.remove(outpoint);

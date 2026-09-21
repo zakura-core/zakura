@@ -425,20 +425,91 @@ async fn template_worker_panic_is_an_rpc_error() {
     bounded(rpc.get_block_template(None)).await.unwrap();
 }
 
+/// A template superseded during construction is rebuilt on the new tip, not returned
+/// and not reported as an error. The tip change here is an equal-height reorg: same
+/// height, different hash.
 #[test]
-fn tip_change_during_construction_does_not_publish_stale_work() {
+fn tip_change_during_construction_rebuilds_on_new_parent() {
     mining_runtime(async {
-        let (_, info) = watch::channel(chain_info(2, 1, 0));
+        let (info_tx, info) = watch::channel(chain_info(2, 1, 0));
         let (rpc, tip, _) = mining_rpc(info);
         let gate = BlockingPoolGate::new().await;
         let request = rpc.get_block_template(None);
         tokio::pin!(request);
         assert!(futures::poll!(&mut request).is_pending());
-        tip.send_best_tip_hash(Hash([2; 32]));
+
+        let next = chain_info(2, 2, 0);
+        info_tx.send_replace(next.clone());
+        tip.send_best_tip_hash(next.tip_hash);
         gate.release().await;
-        let error = bounded(request).await.unwrap_err();
-        assert!(error.message().contains("parent changed"));
+
+        let template = bounded(request).await.unwrap().try_into_template().unwrap();
+        assert_eq!(template.previous_block_hash, next.tip_hash);
+        assert_eq!(template.height, 3);
+        assert_eq!(
+            rpc.gbt.template_rejections.borrow().parent,
+            Some(next.tip_hash)
+        );
     });
+}
+
+/// Two callers race across a tip change. The slow caller fetched chain info for the old
+/// parent; the fast caller selects the new parent while the slow one is still building.
+/// Both must return work on the new parent, and the slow caller must not clobber the
+/// parent the fast caller selected.
+#[test]
+fn concurrent_caller_selecting_new_parent_makes_slow_caller_rebuild() {
+    mining_runtime(async {
+        let (info_tx, info) = watch::channel(chain_info(2, 1, 0));
+        let (rpc, tip, _) = mining_rpc(info);
+        let gate = BlockingPoolGate::new().await;
+
+        let slow = rpc.get_block_template(None);
+        tokio::pin!(slow);
+        assert!(futures::poll!(&mut slow).is_pending());
+
+        let next = chain_info(2, 2, 0);
+        info_tx.send_replace(next.clone());
+        tip.send_best_tip_hash(next.tip_hash);
+
+        let fast = rpc.get_block_template(None);
+        tokio::pin!(fast);
+        assert!(futures::poll!(&mut fast).is_pending());
+        assert_eq!(
+            rpc.gbt.template_rejections.borrow().parent,
+            Some(next.tip_hash),
+            "the fast caller selects the new parent before building"
+        );
+
+        gate.release().await;
+        let (slow, fast) = bounded(async { tokio::join!(slow, fast) }).await;
+        for response in [slow, fast] {
+            let template = response.unwrap().try_into_template().unwrap();
+            assert_eq!(template.previous_block_hash, next.tip_hash);
+        }
+        assert_eq!(
+            rpc.gbt.template_rejections.borrow().parent,
+            Some(next.tip_hash),
+            "the slow caller's rebuild must not reset the parent"
+        );
+    });
+}
+
+/// A caller whose chain info is already behind the tip watch cannot select its stale
+/// parent, even if the parent was selected earlier by someone else.
+#[tokio::test]
+async fn stale_parent_selection_is_refused() {
+    let (_, info) = watch::channel(chain_info(2, 1, 0));
+    let (rpc, tip, _) = mining_rpc(info);
+    assert!(rpc.select_mining_template_parent(Hash([1; 32])));
+    tip.send_best_tip_hash(Hash([2; 32]));
+    assert!(!rpc.select_mining_template_parent(Hash([1; 32])));
+    assert_eq!(
+        rpc.gbt.template_rejections.borrow().parent,
+        Some(Hash([1; 32])),
+        "a refused selection leaves the state untouched"
+    );
+    assert!(rpc.select_mining_template_parent(Hash([2; 32])));
 }
 
 #[tokio::test]

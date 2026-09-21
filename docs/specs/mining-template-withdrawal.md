@@ -37,6 +37,13 @@ The cases above describe possible triggers, not observed production incidents.
 1. Retain rejected server work IDs in a watch channel scoped to the current parent.
    Retained state covers failures before subscription and between checking and waiting.
    Ignore late results for another parent.
+   Select the parent and check that it is still the best tip under the same write lock,
+   so a delayed caller cannot clear a newer parent's rejection records.
+   If the parent changes while a template is being built (a new block, an equal-height
+   reorg, or a concurrent caller selecting a newer parent), rebuild on the current tip
+   instead of returning a transient error: miners treat that error as lost work, and the
+   internal miner backs off for 20 seconds. Bound the rebuilds; past the bound, return
+   the transient error.
    Bound rejection storage at 64 IDs; stop issuing templates on overflow until the
    parent changes.
 2. Classify concrete consensus and contextual errors.

@@ -73,7 +73,7 @@ The cases above describe possible triggers, not observed production incidents.
    External miners must cooperate; RPC cannot force them to stop.
 5. Enter empty-template recovery for the affected parent.
    Validate the empty template before returning it.
-   Return an error if validation fails or exceeds 30 seconds.
+   Return an error if validation fails or exceeds 30 seconds in the current context.
    Recheck the recovery context before publication.
    Do not issue further speculative transaction sets until the parent changes.
    This conservative recovery avoids an unbounded candidate fingerprint blacklist.
@@ -89,6 +89,9 @@ The cases above describe possible triggers, not observed production incidents.
   Verify that long polling wakes without a tip change and that recovery waits for
   validation. Verify that failed recovery never returns a template.
 - Exercise failure before subscription and during an outstanding long poll.
+- Hold fallback validation and state-tip responses pending across parent and rejection
+  changes. Require a rebuild before those obsolete responses finish, and preserve
+  errors when the context stays current.
 - Check work-ID isolation, duplicate rejection, old-parent rejection, parent recovery,
   retained notifications, and bounded-storage overflow.
 - Round-trip legacy and revised long-poll IDs. Check that a withdrawal disallows old
@@ -109,6 +112,9 @@ The implementation passed these checks with Rust 1.97.0:
 - Clippy passed for all targets in `zakura-consensus`, `zakura-rpc`, and `zakura`
   with the internal miner enabled and warnings denied.
 - Formatting, diff whitespace, and changelog checks passed.
+
+Fallback recovery also passed 11 focused RPC regressions with Rust 1.97.1, covering
+stale results, pending validation and tip reads, and the shared recovery deadline.
 
 ## Limits and follow-up measurements
 

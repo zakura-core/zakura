@@ -19,7 +19,6 @@ edition.workspace = true
 rust-version.workspace = true
 
 readme = "../../README.md"
-homepage.workspace = true
 # crates.io is limited to 5 keywords and categories
 keywords.workspace = true
 # Must be one of <https://crates.io/category_slugs>

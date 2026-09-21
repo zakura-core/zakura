@@ -30,7 +30,6 @@ resolver = "2"
 authors = ["Zakura Contributors"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/zakura-core/zakura"
-homepage = "https://github.com/zakura-core/zakura"
 keywords = ["zakura", "zcash"]
 rust-version = "1.97"
 edition = "2021"
@@ -123,7 +122,6 @@ proptest = "1.6"
 proptest-derive = "0.5"
 prost = "0.14"
 rand = "0.8.5"
-rand_chacha = "0.3"
 rand_core = "0.6"
 rand_10 = { package = "rand", version = "0.10" }
 rand_chacha_10 = { package = "rand_chacha", version = "0.10" }

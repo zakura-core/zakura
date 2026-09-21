@@ -5,7 +5,6 @@ authors.workspace = true
 description = "Fork-aware header-chain domain types and transition engine for Zakura"
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 keywords.workspace = true
 categories = ["cryptography::cryptocurrencies"]
 edition.workspace = true

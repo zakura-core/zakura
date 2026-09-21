@@ -123,12 +123,14 @@ fn chain_fixture() -> (Network, Arc<Block>, Arc<Block>) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unidentified_or_changed_sessions_resubscribe_before_waiting_for_blocks() {
+async fn receipt_sessions_reset_orders_before_replaying_known_blocks() {
     let _init_guard = zakura_test::init();
     tokio::time::timeout(Duration::from_secs(10), async {
         for (previous_session, next_session) in [
             (Some("old-primary"), None),
             (Some("old-primary"), Some("new-primary")),
+            (None, Some("new-primary")),
+            (Some("same-primary"), Some("same-primary")),
             (None, None),
         ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -155,10 +157,10 @@ async fn unidentified_or_changed_sessions_resubscribe_before_waiting_for_blocks(
                 .unwrap();
             let mut state = NonFinalizedState::new(&network);
             let mut prepared = SemanticallyVerifiedBlock::from(block.clone());
-            prepared.receipt_order = Some(1);
+            prepared.receipt_order = previous_session.map(|_| 1);
             state.commit_new_chain(prepared, &finalized.db).unwrap();
-            let (tip_sender, tip, mut tip_change) = ChainTipSender::new(None, &network);
-            let (state_sender, mut state_receiver) = watch::channel(state.clone());
+            let (tip_sender, _tip, _tip_change) = ChainTipSender::new(None, &network);
+            let (state_sender, state_receiver) = watch::channel(state.clone());
             let (started, _) = watch::channel(true);
             let mut syncer = TrustedChainSync {
                 indexer_rpc_client: IndexerClient::connect(endpoint).await.unwrap(),
@@ -178,21 +180,24 @@ async fn unidentified_or_changed_sessions_resubscribe_before_waiting_for_blocks(
                 vec![block.hash().bytes_in_display_order().to_vec()]
             );
             assert_eq!(request.receipt_session.as_deref(), previous_session);
-            // Keep this stream open and idle. A legacy server skipped the known
-            // chain, so waiting for a block here would stall until the timeout.
-            let (_idle_sender, idle_receiver) = mpsc::channel(1);
-            let mut reply = Response::new(ReceiverStream::new(idle_receiver));
-            if let Some(session) = next_session {
-                reply.metadata_mut().insert(
-                    crate::indexer::RECEIPT_SESSION_HEADER,
-                    session.parse().unwrap(),
-                );
-            }
-            response.send(reply).unwrap();
-
-            let (request, response) = received.recv().await.unwrap();
-            assert!(request.chain_tip_hashes.is_empty());
-            assert_eq!(request.receipt_session.as_deref(), next_session);
+            let response = if previous_session != next_session {
+                // An idle response must trigger a reset before any block arrives.
+                let (_idle_sender, idle_receiver) = mpsc::channel(1);
+                let mut reply = Response::new(ReceiverStream::new(idle_receiver));
+                if let Some(session) = next_session {
+                    reply.metadata_mut().insert(
+                        crate::indexer::RECEIPT_SESSION_HEADER,
+                        session.parse().unwrap(),
+                    );
+                }
+                response.send(reply).unwrap();
+                let (request, response) = received.recv().await.unwrap();
+                assert!(request.chain_tip_hashes.is_empty());
+                assert_eq!(request.receipt_session.as_deref(), next_session);
+                response
+            } else {
+                response
+            };
             let (blocks, receiver) = mpsc::channel(1);
             let mut reply = Response::new(ReceiverStream::new(receiver));
             if let Some(session) = next_session {
@@ -202,45 +207,37 @@ async fn unidentified_or_changed_sessions_resubscribe_before_waiting_for_blocks(
                 );
             }
             response.send(reply).unwrap();
-            let mut replacement = block.as_ref().clone();
-            Arc::make_mut(&mut replacement.header).nonce.0[0] ^= 1;
-            let replacement = Arc::new(replacement);
-            blocks
-                .send(Ok(BlockAndHash::new(
-                    replacement.hash(),
-                    replacement.clone(),
-                )))
-                .await
-                .unwrap();
-            if next_session.is_some() {
-                blocks
-                    .send(Ok(BlockAndHash {
-                        chain_snapshot: Some(crate::indexer::NonFinalizedChainTips {
-                            hashes: vec![replacement.hash().bytes_in_display_order().to_vec()],
-                        }),
-                        ..Default::default()
-                    }))
-                    .await
-                    .unwrap();
+            let mut message = BlockAndHash::new(block.hash(), block.clone());
+            message.receipt_order = Some(7);
+            blocks.send(Ok(message)).await.unwrap();
+            // End this stream. The next request proves the replay was consumed.
+            drop(blocks);
+            let (_, next_response) = received.recv().await.unwrap();
+            let (_idle_sender, idle_receiver) = mpsc::channel(1);
+            let mut reply = Response::new(ReceiverStream::new(idle_receiver));
+            if let Some(session) = next_session {
+                reply.metadata_mut().insert(
+                    crate::indexer::RECEIPT_SESSION_HEADER,
+                    session.parse().unwrap(),
+                );
             }
-            state_receiver
-                .wait_for(|state| {
-                    state
-                        .best_tip()
-                        .is_some_and(|(_, hash)| hash == replacement.hash())
-                })
-                .await
-                .unwrap();
-            while tip.best_tip_hash() != Some(replacement.hash()) {
-                tip_change.wait_for_tip_change().await.unwrap();
-            }
-            assert_eq!(tip.best_tip_hash(), Some(replacement.hash()));
-            assert_eq!(
-                state_receiver.borrow().best_tip().unwrap().1,
-                replacement.hash()
-            );
-            assert_eq!(state_receiver.borrow().chain_iter().count(), 1);
-            assert!(!state_receiver.borrow().any_chain_contains(&block.hash()));
+            next_response.send(reply).unwrap();
+            let expected_order = if previous_session == next_session {
+                previous_session.map(|_| 1)
+            } else {
+                next_session.map(|_| 7)
+            };
+            let state = state_receiver.borrow();
+            let retained: SemanticallyVerifiedBlock = state
+                .best_chain()
+                .unwrap()
+                .tip_block()
+                .unwrap()
+                .clone()
+                .into();
+            assert_eq!(retained.receipt_order, expected_order);
+            assert_eq!(state.best_tip().unwrap().1, block.hash());
+            assert_eq!(state.chain_iter().count(), 1);
             assert!(!sync.is_finished());
             sync.abort();
             server.abort();
@@ -251,10 +248,10 @@ async fn unidentified_or_changed_sessions_resubscribe_before_waiting_for_blocks(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn empty_legacy_session_clears_published_fork_and_tracks_finalized_tip() {
+async fn empty_new_session_clears_old_orders_and_tracks_finalized_tip() {
     let _init_guard = zakura_test::init();
     tokio::time::timeout(Duration::from_secs(15), async {
-        for previous_session in [Some("previous-primary"), None] {
+        for next_session in [Some("new-primary"), None] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let endpoint = format!("http://{}", listener.local_addr().unwrap());
             let (requests, mut received) = mpsc::channel(1);
@@ -278,9 +275,9 @@ async fn empty_legacy_session_clears_published_fork_and_tracks_finalized_tip() {
                 )
                 .unwrap();
             let mut state = NonFinalizedState::new(&network);
-            state
-                .commit_new_chain(block.clone().into(), &finalized.db)
-                .unwrap();
+            let mut prepared = SemanticallyVerifiedBlock::from(block.clone());
+            prepared.receipt_order = Some(1);
+            state.commit_new_chain(prepared, &finalized.db).unwrap();
             let (tip_sender, tip, mut tip_change) = ChainTipSender::new(None, &network);
             let (state_sender, mut state_receiver) = watch::channel(state.clone());
             let (started, _) = watch::channel(true);
@@ -292,22 +289,32 @@ async fn empty_legacy_session_clears_published_fork_and_tracks_finalized_tip() {
                 non_finalized_state_sender: state_sender,
                 started_sync_sender: started,
                 finalized_tip_updater: None,
-                receipt_session: previous_session.map(str::to_owned),
+                receipt_session: Some("previous-primary".into()),
             };
             syncer.update_channels();
             assert_eq!(tip.best_tip_hash(), Some(block.hash()));
             let sync = tokio::spawn(async move { syncer.sync().await });
             let (_, response) = received.recv().await.unwrap();
             let (_first_sender, first_stream) = mpsc::channel(1);
-            response
-                .send(Response::new(ReceiverStream::new(first_stream)))
-                .unwrap();
+            let mut reply = Response::new(ReceiverStream::new(first_stream));
+            if let Some(session) = next_session {
+                reply.metadata_mut().insert(
+                    crate::indexer::RECEIPT_SESSION_HEADER,
+                    session.parse().unwrap(),
+                );
+            }
+            response.send(reply).unwrap();
             let (request, response) = received.recv().await.unwrap();
             assert!(request.chain_tip_hashes.is_empty());
             let (_idle_sender, idle_stream) = mpsc::channel(1);
-            response
-                .send(Response::new(ReceiverStream::new(idle_stream)))
-                .unwrap();
+            let mut reply = Response::new(ReceiverStream::new(idle_stream));
+            if let Some(session) = next_session {
+                reply.metadata_mut().insert(
+                    crate::indexer::RECEIPT_SESSION_HEADER,
+                    session.parse().unwrap(),
+                );
+            }
+            response.send(reply).unwrap();
             state_receiver
                 .wait_for(|state| state.is_chain_set_empty())
                 .await
@@ -316,7 +323,7 @@ async fn empty_legacy_session_clears_published_fork_and_tracks_finalized_tip() {
                 tip_change.wait_for_tip_change().await.unwrap();
             }
 
-            // The legacy stream remains empty as the shared finalized database advances.
+            // The new session stays empty while the shared finalized database advances.
             let mut next = block.as_ref().clone();
             Arc::make_mut(&mut next.header).nonce.0[0] ^= 1;
             let next = Arc::new(next);
@@ -338,259 +345,13 @@ async fn empty_legacy_session_clears_published_fork_and_tracks_finalized_tip() {
         }
     })
     .await
-    .expect("an empty legacy primary must replace the published fork without a block message");
-}
-
-fn snapshot_response(
-    receiver: mpsc::Receiver<Result<BlockAndHash, Status>>,
-) -> Response<BlockStream> {
-    let mut response = Response::new(ReceiverStream::new(receiver));
-    response.metadata_mut().insert(
-        crate::indexer::RECEIPT_SESSION_HEADER,
-        "primary".parse().unwrap(),
-    );
-    response
+    .expect("a session reset must clear published receipts even without a block message");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn interrupted_snapshots_preserve_published_state_until_a_complete_boundary() {
+async fn mirror_prefers_primary_receipt_over_delivery_order_and_hash() {
     let _init_guard = zakura_test::init();
-    tokio::time::timeout(Duration::from_secs(15), async {
-        for change_session in [false, true] {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let endpoint = format!("http://{}", listener.local_addr().unwrap());
-            let (requests, mut received) = mpsc::channel(1);
-            let server = tokio::spawn(async move {
-                tonic::transport::Server::builder()
-                    .add_service(SubscriptionServer(requests))
-                    .serve_with_incoming(TcpIncoming::from(listener))
-                    .await
-                    .unwrap();
-            });
-            let (network, genesis, a) = chain_fixture();
-            let mut b = a.as_ref().clone();
-            Arc::make_mut(&mut b.header).nonce.0[0] ^= 1;
-            let b = Arc::new(b);
-            let mut finalized =
-                zakura_state::FinalizedState::new(&zakura_state::Config::ephemeral(), &network)
-                    .unwrap();
-            finalized
-                .commit_finalized_direct(
-                    CheckpointVerifiedBlock::from(genesis.clone()).into(),
-                    None,
-                    None,
-                    "snapshot test",
-                )
-                .unwrap();
-            let mut state = NonFinalizedState::new(&network);
-            let mut prepared = SemanticallyVerifiedBlock::from(a.clone());
-            prepared.receipt_order = Some(2);
-            state.commit_new_chain(prepared, &finalized.db).unwrap();
-            let (tip_sender, tip, mut tip_change) = ChainTipSender::new(None, &network);
-            let (state_sender, mut state_receiver) = watch::channel(state.clone());
-            let (started, _) = watch::channel(true);
-            let mut syncer = TrustedChainSync {
-                indexer_rpc_client: IndexerClient::connect(endpoint).await.unwrap(),
-                db: finalized.db.clone(),
-                non_finalized_state: state,
-                chain_tip_sender: tip_sender,
-                non_finalized_state_sender: state_sender,
-                started_sync_sender: started,
-                finalized_tip_updater: None,
-                receipt_session: Some(
-                    if change_session {
-                        "old-primary"
-                    } else {
-                        "primary"
-                    }
-                    .into(),
-                ),
-            };
-            syncer.update_channels();
-            state_receiver.borrow_and_update();
-            let sync = tokio::spawn(async move { syncer.sync().await });
-            let (_, mut response) = received.recv().await.unwrap();
-            let (_reset_sender, reset_stream) = mpsc::channel(1);
-            if change_session {
-                response.send(snapshot_response(reset_stream)).unwrap();
-                let (request, next_response) = received.recv().await.unwrap();
-                assert!(request.chain_tip_hashes.is_empty());
-                response = next_response;
-            }
-            let expected_tips = if change_session {
-                vec![]
-            } else {
-                vec![a.hash().bytes_in_display_order().to_vec()]
-            };
-            let expected_tip = if change_session {
-                genesis.hash()
-            } else {
-                a.hash()
-            };
-            let (blocks, stream) = mpsc::channel(2);
-            response.send(snapshot_response(stream)).unwrap();
-            let mut message = BlockAndHash::new(b.hash(), b.clone());
-            message.receipt_order = Some(1);
-            blocks.send(Ok(message.clone())).await.unwrap();
-            blocks
-                .send(Err(Status::unavailable("interrupted snapshot")))
-                .await
-                .unwrap();
-
-            // Receiving the next request proves the client consumed the preceding
-            // block and stream error. None of that unfinished batch may be visible.
-            let (request, response) = received.recv().await.unwrap();
-            assert_eq!(request.chain_tip_hashes, expected_tips);
-            assert_eq!(tip.best_tip_hash(), Some(expected_tip));
-            assert_eq!(
-                state_receiver.borrow().best_tip().map(|(_, hash)| hash),
-                (!change_session).then_some(a.hash())
-            );
-            state_receiver.borrow_and_update();
-            let (blocks, stream) = mpsc::channel(2);
-            response.send(snapshot_response(stream)).unwrap();
-            blocks.send(Ok(message)).await.unwrap();
-            assert!(
-                tokio::time::timeout(
-                    Duration::from_millis(100),
-                    state_receiver.wait_for(|state| state
-                        .best_tip()
-                        .is_some_and(|(_, hash)| hash == b.hash()))
-                )
-                .await
-                .is_err(),
-                "replayed blocks must wait for the snapshot boundary"
-            );
-            let snapshot = |hashes: Vec<block::Hash>| BlockAndHash {
-                chain_snapshot: Some(crate::indexer::NonFinalizedChainTips {
-                    hashes: hashes
-                        .into_iter()
-                        .map(|hash| hash.bytes_in_display_order().to_vec())
-                        .collect(),
-                }),
-                ..Default::default()
-            };
-            blocks.send(Ok(snapshot(vec![b.hash()]))).await.unwrap();
-            state_receiver
-                .wait_for(|state| state.best_tip().is_some_and(|(_, hash)| hash == b.hash()))
-                .await
-                .unwrap();
-            while tip.best_tip_hash() != Some(b.hash()) {
-                tip_change.wait_for_tip_change().await.unwrap();
-            }
-            assert_eq!(state_receiver.borrow().chain_iter().count(), 1);
-            blocks.send(Ok(snapshot(vec![]))).await.unwrap();
-            state_receiver
-                .wait_for(|state| state.is_chain_set_empty())
-                .await
-                .unwrap();
-            while tip.best_tip_hash() != Some(genesis.hash()) {
-                tip_change.wait_for_tip_change().await.unwrap();
-            }
-            sync.abort();
-            server.abort();
-        }
-    })
-    .await
-    .expect("snapshot recovery must finish");
-}
-
-/// Builds a valid child using the parent's committed history root.
-fn child_block(parent: &Block, state: &NonFinalizedState) -> Arc<Block> {
-    use zakura_chain::{transaction::Transaction, transparent::Input};
-
-    let mut child = parent.clone();
-    let height = parent.coinbase_height().unwrap().next().unwrap();
-    let Transaction::V5 {
-        inputs,
-        expiry_height,
-        ..
-    } = Arc::make_mut(&mut child.transactions[0])
-    else {
-        panic!("the fixture uses a v5 coinbase");
-    };
-    *expiry_height = height;
-    let Input::Coinbase {
-        height: coinbase_height,
-        ..
-    } = &mut inputs[0]
-    else {
-        panic!("the fixture starts with a coinbase input");
-    };
-    *coinbase_height = height;
-    let history_root = state
-        .find_chain(|chain| chain.non_finalized_tip_hash() == parent.hash())
-        .unwrap()
-        .history_block_commitment_tree()
-        .hash()
-        .unwrap();
-    let commitment = block::ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
-        &history_root,
-        &child.auth_data_root(),
-    );
-    let header = Arc::make_mut(&mut child.header);
-    header.previous_block_hash = parent.hash();
-    header.time += chrono::Duration::seconds(1);
-    header.merkle_root = child.transactions.iter().collect();
-    header.commitment_bytes = <[u8; 32]>::from(commitment).into();
-    Arc::new(child)
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn full_fork_set_retries_replacement_in_empty_staging() {
-    use zakura_state::constants::MAX_NON_FINALIZED_CHAIN_FORKS;
-
-    let _init_guard = zakura_test::init();
-    tokio::time::timeout(Duration::from_secs(15), async {
-        let (network, genesis, old_root) = chain_fixture();
-        let mut finalized =
-            zakura_state::FinalizedState::new(&zakura_state::Config::ephemeral(), &network)
-                .unwrap();
-        finalized
-            .commit_finalized_direct(
-                CheckpointVerifiedBlock::from(genesis).into(),
-                None,
-                None,
-                "fork replacement test",
-            )
-            .unwrap();
-        let mut old_state = NonFinalizedState::new(&network);
-        old_state
-            .commit_new_chain(old_root.clone().into(), &finalized.db)
-            .unwrap();
-        let old_child = child_block(&old_root, &old_state);
-        for nonce in 0..MAX_NON_FINALIZED_CHAIN_FORKS {
-            let mut fork = old_child.as_ref().clone();
-            Arc::make_mut(&mut fork.header).nonce.0[0] = u8::try_from(nonce).unwrap();
-            old_state
-                .commit_block(Arc::new(fork).into(), &finalized.db)
-                .unwrap();
-        }
-        assert_eq!(
-            old_state.chain_iter().count(),
-            MAX_NON_FINALIZED_CHAIN_FORKS
-        );
-        let old_tip = old_state.best_tip().unwrap().1;
-
-        let mut replacement_root = old_root.as_ref().clone();
-        Arc::make_mut(&mut replacement_root.header).nonce.0[0] ^= 128;
-        let replacement_root = Arc::new(replacement_root);
-        let mut primary_state = NonFinalizedState::new(&network);
-        primary_state
-            .commit_new_chain(replacement_root.clone().into(), &finalized.db)
-            .unwrap();
-        let replacement_tip = child_block(&replacement_root, &primary_state);
-        primary_state
-            .commit_block(replacement_tip.clone().into(), &finalized.db)
-            .unwrap();
-
-        // The replacement is valid, but its first block loses to all ten old forks.
-        let mut crowded = old_state.clone();
-        crowded
-            .commit_new_chain(replacement_root.clone().into(), &finalized.db)
-            .unwrap();
-        assert!(!crowded.any_chain_contains(&replacement_root.hash()));
-
+    tokio::time::timeout(Duration::from_secs(10), async {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let (requests, mut received) = mpsc::channel(1);
@@ -601,90 +362,63 @@ async fn full_fork_set_retries_replacement_in_empty_staging() {
                 .await
                 .unwrap();
         });
-        let (tip_sender, tip, mut tip_change) = ChainTipSender::new(None, &network);
-        let (state_sender, mut state_receiver) = watch::channel(old_state.clone());
+        let (network, genesis, block) = chain_fixture();
+        let mut alternative = block.as_ref().clone();
+        Arc::make_mut(&mut alternative.header).nonce.0[0] ^= 1;
+        let alternative = Arc::new(alternative);
+        let (early, late) = if block.hash().0 < alternative.hash().0 {
+            (block, alternative)
+        } else {
+            (alternative, block)
+        };
+        let mut finalized =
+            zakura_state::FinalizedState::new(&zakura_state::Config::ephemeral(), &network)
+                .unwrap();
+        finalized
+            .commit_finalized_direct(
+                CheckpointVerifiedBlock::from(genesis).into(),
+                None,
+                None,
+                "receipt test",
+            )
+            .unwrap();
+        let (tip_sender, _tip, _tip_change) = ChainTipSender::new(None, &network);
+        let state = NonFinalizedState::new(&network);
+        let (state_sender, mut state_receiver) = watch::channel(state.clone());
         let (started, _) = watch::channel(true);
         let mut syncer = TrustedChainSync {
             indexer_rpc_client: IndexerClient::connect(endpoint).await.unwrap(),
             db: finalized.db.clone(),
-            non_finalized_state: old_state,
+            non_finalized_state: state,
             chain_tip_sender: tip_sender,
             non_finalized_state_sender: state_sender,
             started_sync_sender: started,
             finalized_tip_updater: None,
             receipt_session: Some("primary".into()),
         };
-        syncer.update_channels();
         let sync = tokio::spawn(async move { syncer.sync().await });
-        let (request, response) = received.recv().await.unwrap();
-        assert_eq!(
-            request.chain_tip_hashes.len(),
-            MAX_NON_FINALIZED_CHAIN_FORKS
-        );
+        let (_, response) = received.recv().await.unwrap();
         let (blocks, stream) = mpsc::channel(2);
-        response.send(snapshot_response(stream)).unwrap();
-        for block in [&replacement_root, &replacement_tip] {
-            blocks
-                .send(Ok(BlockAndHash::new(block.hash(), block.clone())))
-                .await
-                .unwrap();
+        let mut reply = Response::new(ReceiverStream::new(stream));
+        reply.metadata_mut().insert(
+            crate::indexer::RECEIPT_SESSION_HEADER,
+            "primary".parse().unwrap(),
+        );
+        response.send(reply).unwrap();
+        // Deliver the higher-hash block first, opposite to the primary's order.
+        for (block, order) in [(late, 2), (early.clone(), 1)] {
+            let mut message = BlockAndHash::new(block.hash(), block);
+            message.receipt_order = Some(order);
+            blocks.send(Ok(message)).await.unwrap();
         }
-
-        // The missing parent must request a full replay, without replacing the
-        // published view with either an empty state or a partial replacement.
-        let (request, response) = received.recv().await.unwrap();
-        assert!(
-            request.chain_tip_hashes.is_empty(),
-            "obsolete forks must not seed the retry"
-        );
-        assert_eq!(request.receipt_session.as_deref(), Some("primary"));
-        assert_eq!(tip.best_tip_hash(), Some(old_tip));
-        assert_eq!(
-            state_receiver.borrow().chain_iter().count(),
-            MAX_NON_FINALIZED_CHAIN_FORKS
-        );
-        let (blocks, stream) = mpsc::channel(2);
-        response.send(snapshot_response(stream)).unwrap();
-        for block in [&replacement_root, &replacement_tip] {
-            blocks
-                .send(Ok(BlockAndHash::new(block.hash(), block.clone())))
-                .await
-                .unwrap();
-        }
-        assert!(
-            tokio::time::timeout(
-                Duration::from_millis(100),
-                state_receiver.wait_for(|state| state.any_chain_contains(&replacement_root.hash()))
-            )
-            .await
-            .is_err(),
-            "replacement blocks must stay private until the boundary"
-        );
-        blocks
-            .send(Ok(BlockAndHash {
-                chain_snapshot: Some(crate::indexer::NonFinalizedChainTips {
-                    hashes: vec![replacement_tip.hash().bytes_in_display_order().to_vec()],
-                }),
-                ..Default::default()
-            }))
-            .await
-            .unwrap();
         state_receiver
-            .wait_for(|state| {
-                state
-                    .best_tip()
-                    .is_some_and(|(_, hash)| hash == replacement_tip.hash())
-            })
+            .wait_for(|state| state.chain_iter().count() == 2)
             .await
             .unwrap();
-        while tip.best_tip_hash() != Some(replacement_tip.hash()) {
-            tip_change.wait_for_tip_change().await.unwrap();
-        }
-        assert_eq!(state_receiver.borrow().chain_iter().count(), 1);
-        assert!(!state_receiver.borrow().any_chain_contains(&old_root.hash()));
+        assert_eq!(state_receiver.borrow().best_tip().unwrap().1, early.hash());
         sync.abort();
         server.abort();
     })
     .await
-    .expect("a full old fork set must not prevent snapshot replacement");
+    .expect("the mirror must apply the primary's receipt order before timeout");
 }

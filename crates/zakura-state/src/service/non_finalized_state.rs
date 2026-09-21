@@ -158,41 +158,6 @@ impl Clone for NonFinalizedState {
 }
 
 impl NonFinalizedState {
-    /// Reconcile a trusted primary's complete fork set after its snapshot blocks arrive.
-    ///
-    /// Returns false without changing state if any tip is missing or the fork
-    /// limit is exceeded. Retained ancestors can become tips after invalidation.
-    pub fn reconcile_chain_tips(&mut self, tips: &[block::Hash]) -> bool {
-        if tips.len() > MAX_NON_FINALIZED_CHAIN_FORKS {
-            return false;
-        }
-        if tips.len() == self.chain_set.len()
-            && self
-                .chain_iter()
-                .all(|chain| tips.contains(&chain.non_finalized_tip_hash()))
-        {
-            return true;
-        }
-        let mut chains = Vec::with_capacity(tips.len());
-        for tip in tips {
-            if let Some(chain) = self.find_chain(|chain| chain.non_finalized_tip_hash() == *tip) {
-                chains.push(chain);
-                continue;
-            }
-            let Some(chain) = self.find_chain(|chain| chain.contains_block_hash(*tip)) else {
-                return false;
-            };
-            let Some(chain) = chain.fork(*tip) else {
-                return false;
-            };
-            chains.push(Arc::new(chain));
-        }
-        self.chain_set = chains.into_iter().collect();
-        self.update_metrics_for_chains();
-        self.update_metrics_bars();
-        true
-    }
-
     /// Returns a new non-finalized state for `network`.
     pub fn new(network: &Network) -> NonFinalizedState {
         NonFinalizedState {

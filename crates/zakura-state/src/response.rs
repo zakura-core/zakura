@@ -253,11 +253,9 @@ impl MinedTx {
 /// non-finalized state is full so that the [`NonFinalizedBlocksListener`]
 /// reliably receives updates whenever the non-finalized state changes.
 ///
-/// If the buffer fills, sends wait for a free slot and finish the current
-/// snapshot. The underlying watch channel can skip intermediate states during
-/// that wait, so this is not a lossless block history. Snapshot clients reconcile
-/// the emitted tip set. Legacy RPC clients disconnect on a full buffer so they
-/// can resubscribe instead of silently continuing after possible gaps.
+/// If the buffer does fill, sends apply backpressure (the sender awaits a free
+/// slot) rather than dropping blocks, so the listener still receives every
+/// block once the consumer catches up.
 // `MAX_BLOCK_REORG_HEIGHT` is a small `u32` constant (the reorg limit), so
 // widening it to `usize` and doubling it cannot overflow on any supported
 // platform.
@@ -265,24 +263,17 @@ const NON_FINALIZED_STATE_CHANGE_BUFFER_SIZE: usize = 2 * MAX_BLOCK_REORG_HEIGHT
 
 /// A listener for changes in the non-finalized state.
 #[derive(Clone, Debug)]
-pub struct NonFinalizedBlocksListener(
-    pub Arc<tokio::sync::mpsc::Receiver<NonFinalizedStateChange>>,
-);
+pub struct NonFinalizedBlocksListener(pub Arc<tokio::sync::mpsc::Receiver<NonFinalizedBlock>>);
 
-/// A trusted mirror update. A snapshot marker follows all blocks needed for its tips.
+/// A validated block with its primary verifier's optional receipt order.
 #[derive(Clone, Debug)]
-pub enum NonFinalizedStateChange {
-    /// A validated block and its source-local receipt order.
-    Block {
-        /// Block hash.
-        hash: block::Hash,
-        /// Complete block.
-        block: Arc<Block>,
-        /// Order at the primary verifier, absent for restored blocks.
-        receipt_order: Option<u64>,
-    },
-    /// The complete set of retained chain tips after the preceding blocks.
-    ChainTips(Vec<block::Hash>),
+pub struct NonFinalizedBlock {
+    /// Block hash.
+    pub hash: block::Hash,
+    /// Complete block.
+    pub block: Arc<Block>,
+    /// Process-local order, absent for restored blocks or older primaries.
+    pub receipt_order: Option<u64>,
 }
 
 impl NonFinalizedBlocksListener {
@@ -296,10 +287,10 @@ impl NonFinalizedBlocksListener {
     ///
     /// Returns an error if the receiver has been dropped.
     async fn take_and_send_blocks<'a>(
-        sender: &tokio::sync::mpsc::Sender<NonFinalizedStateChange>,
+        sender: &tokio::sync::mpsc::Sender<NonFinalizedBlock>,
         non_finalized_state: &'a NonFinalizedState,
         take_cond: impl Fn(&&ContextuallyVerifiedBlock) -> bool + Copy + 'a,
-    ) -> Result<(), tokio::sync::mpsc::error::SendError<NonFinalizedStateChange>> {
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<NonFinalizedBlock>> {
         let new_blocks = non_finalized_state
             .chain_iter()
             .flat_map(move |chain| {
@@ -311,7 +302,7 @@ impl NonFinalizedBlocksListener {
                 blocks.reverse();
                 blocks
             })
-            .map(|cv_block| NonFinalizedStateChange::Block {
+            .map(|cv_block| NonFinalizedBlock {
                 hash: cv_block.hash,
                 block: cv_block.block.clone(),
                 receipt_order: cv_block.receipt_order,
@@ -321,14 +312,6 @@ impl NonFinalizedBlocksListener {
             sender.send(new_block_with_hash).await?;
         }
 
-        sender
-            .send(NonFinalizedStateChange::ChainTips(
-                non_finalized_state
-                    .chain_iter()
-                    .map(|chain| chain.non_finalized_tip_hash())
-                    .collect(),
-            ))
-            .await?;
         Ok(())
     }
 
@@ -374,9 +357,11 @@ impl NonFinalizedBlocksListener {
 
             // # Correctness
             //
-            // Each batch represents one observed state. The watch channel can
-            // coalesce updates while sends are blocked, so consumers must use
-            // snapshot markers or resubscribe after buffer saturation.
+            // This loop should check that the non-finalized state receiver has
+            // changed sooner than the non-finalized state could possibly have
+            // changed to avoid missing updates, so the logic here should be
+            // quicker than the contextual verification logic that precedes
+            // commits to the non-finalized state.
             //
             // See the `NON_FINALIZED_STATE_CHANGE_BUFFER_SIZE` documentation
             // for more details.
@@ -417,7 +402,7 @@ impl NonFinalizedBlocksListener {
     /// # Panics
     ///
     /// If the `Arc` has more than one strong reference, this will panic.
-    pub fn unwrap(self) -> tokio::sync::mpsc::Receiver<NonFinalizedStateChange> {
+    pub fn unwrap(self) -> tokio::sync::mpsc::Receiver<NonFinalizedBlock> {
         Arc::try_unwrap(self.0).unwrap()
     }
 }

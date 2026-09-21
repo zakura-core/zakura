@@ -395,11 +395,10 @@ pub struct SemanticallyVerifiedBlock {
     /// finalized committer. `None` means the committer falls back to computing
     /// it from the block's transactions.
     pub auth_data_root: Option<AuthDataRoot>,
-    /// Local order in which the full-block verifier received this submission.
+    /// Original verifier receipt order, also forwarded by trusted mirrors.
     ///
-    /// Earlier receipts win equal-work ties after validation. This is not block
-    /// data and is not persisted. Restored blocks have no order and precede new
-    /// receipts, with hash ordering between unstamped blocks.
+    /// This is process-local metadata, not serialized block data. Restored
+    /// blocks have no order. Orders from different primary sessions cannot be compared.
     pub receipt_order: Option<u64>,
 }
 

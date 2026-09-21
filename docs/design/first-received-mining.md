@@ -53,19 +53,16 @@ the restored full-state path with the durable header engine before publication.
 
 ## Trusted mirrors
 
-The [trusted mirror snapshot protocol](trusted-mirror-snapshots.md) supplies the
-complete fork set and identifies the primary process. The block stream also
-carries optional `receipt_order` metadata so the secondary uses the same tie
-preference as its primary. Receipt orders from different primary processes must
-never be compared. Resetting local forks when the session changes discards the
-old receipt-order domain before accepting the replacement snapshot.
+[Receipt metadata](trusted-mirror-receipts.md) lets trusted secondaries use the
+primary's arrival order even when their stream delivers blocks in a different
+order. A process session identifies which primary assigned those orders.
+Changing sessions clears old receipt metadata before replaying blocks. Same-session
+reconnects and duplicate deliveries preserve the original orders.
 
 Older servers omit receipt metadata and retain their hash-based policy. Older
-clients can decode block messages but cannot mirror the new tie policy exactly,
-so upgrade trusted secondaries alongside the primary. Receipt metadata is an
-additive wire field. Ordinary block encodings and the P2P header protocol are
-unchanged.
+clients can decode block messages but cannot reproduce the new tie preference,
+so upgrade trusted secondaries alongside the primary. The stream remains
+incremental. Complete fork snapshots and broader mirror recovery are separate work.
 
-The public Rust block and message structs gain receipt fields, and the
-header-chain operator-error enum gains a variant. These public API changes must
+The header-chain operator-error enum gains a variant. This public API change must
 be accounted for when selecting crate versions for the next release.

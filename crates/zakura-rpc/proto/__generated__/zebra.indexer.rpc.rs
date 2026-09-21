@@ -24,22 +24,10 @@ pub struct BlockAndHash {
     /// The encoded block data.
     #[prost(bytes = "vec", tag = "2")]
     pub data: ::prost::alloc::vec::Vec<u8>,
-    /// Source-local verifier receipt order. Present only for live non-finalized
-    /// blocks. Compare orders only within the response's receipt session.
+    /// Source-local verifier receipt order. Compare only within the response's
+    /// receipt session. Absent for restored blocks and older primaries.
     #[prost(uint64, optional, tag = "3")]
     pub receipt_order: ::core::option::Option<u64>,
-    /// Snapshot boundary, sent only when requested. This message has no block
-    /// data. All retained tips are complete after the preceding block messages.
-    #[prost(message, optional, tag = "4")]
-    pub chain_snapshot: ::core::option::Option<NonFinalizedChainTips>,
-}
-/// Complete retained fork set for a trusted secondary.
-#[derive(serde::Deserialize, serde::Serialize)]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct NonFinalizedChainTips {
-    /// Tip block hashes in display byte order.
-    #[prost(bytes = "vec", repeated, tag = "1")]
-    pub hashes: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
 }
 /// An encoded block and its height.
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -91,12 +79,9 @@ pub struct NonFinalizedStateChangeRequest {
     #[prost(bytes = "vec", repeated, tag = "1")]
     pub chain_tip_hashes: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
     /// Session from the previous response's x-zakura-receipt-session metadata.
-    /// A missing or changed session forces a complete non-finalized snapshot.
+    /// A missing or changed session requests all non-finalized blocks again.
     #[prost(string, optional, tag = "2")]
     pub receipt_session: ::core::option::Option<::prost::alloc::string::String>,
-    /// Opt in to snapshot boundaries, including updates involving known blocks.
-    #[prost(bool, tag = "3")]
-    pub include_chain_snapshot: bool,
 }
 /// Represents a change in the mempool.
 #[derive(serde::Deserialize, serde::Serialize)]

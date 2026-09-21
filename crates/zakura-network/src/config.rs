@@ -986,7 +986,8 @@ struct DTestnetParameters {
     /// The NSM value balance in zatoshi immediately before NU7 activates.
     ///
     /// If unset on a configured network, state derives the balance from its historical
-    /// scheduled issuance and monetary pools. An explicit value overrides that derivation.
+    /// scheduled issuance and monetary pools. The cumulative schedule through the block
+    /// before NU7 must then fit in `MAX_MONEY`. An explicit value overrides that derivation.
     initial_nsm_value_balance: Option<u64>,
 }
 

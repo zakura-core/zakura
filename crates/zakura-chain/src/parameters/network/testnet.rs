@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::{
-    amount::{Amount, NonNegative},
+    amount::{Amount, NonNegative, MAX_MONEY},
     block::{self, Height, HeightDiff},
     parameters::{
         checkpoint::list::{CheckpointList, TESTNET_CHECKPOINT_LIST},
@@ -21,8 +21,8 @@ use crate::{
                 BLOSSOM_POW_TARGET_SPACING_RATIO, FUNDING_STREAM_RECEIVER_DENOMINATOR,
                 MAX_BLOCK_SUBSIDY, POST_BLOSSOM_HALVING_INTERVAL, PRE_BLOSSOM_HALVING_INTERVAL,
             },
-            funding_stream_address_period, FundingStreamReceiver, FundingStreamRecipient,
-            FundingStreams, ParameterSubsidy,
+            funding_stream_address_period, scheduled_issuance_zatoshis, FundingStreamReceiver,
+            FundingStreamRecipient, FundingStreams, ParameterSubsidy,
         },
         Network, NetworkKind, NetworkUpgrade,
     },
@@ -423,6 +423,44 @@ fn check_lockbox_disbursements(
 
         total = (total + *amount)
             .map_err(|_| ParametersBuilderError::InvalidLockboxDisbursementTotal)?;
+    }
+
+    Ok(())
+}
+
+/// Checks that an omitted NSM seed is bounded for every possible valid monetary-pool total.
+///
+/// The derived seed subtracts the issued supply, which is non-negative, from the cumulative
+/// schedule. Bounding the schedule at the seed height therefore guarantees that the result
+/// cannot exceed the existing `Amount` representation.
+fn check_derived_nsm_seed_schedule(network: &Network) -> Result<(), ParametersBuilderError> {
+    let Network::Testnet(params) = network else {
+        return Ok(());
+    };
+    if params.configured_initial_nsm_value_balance().is_some() {
+        return Ok(());
+    }
+    let Some(seed_height) = NetworkUpgrade::Nu7
+        .activation_height(network)
+        .and_then(Height::previous)
+    else {
+        return Ok(());
+    };
+
+    let scheduled_issuance =
+        scheduled_issuance_zatoshis(seed_height, network).map_err(|source| {
+            ParametersBuilderError::InvalidDerivedNsmSeedSchedule {
+                seed_height,
+                source,
+            }
+        })?;
+    if scheduled_issuance
+        > u128::try_from(MAX_MONEY).expect("MAX_MONEY is non-negative and fits in u128")
+    {
+        return Err(ParametersBuilderError::DerivedNsmSeedExceedsMaxMoney {
+            seed_height,
+            scheduled_issuance,
+        });
     }
 
     Ok(())
@@ -1026,6 +1064,8 @@ impl ParametersBuilder {
     /// immediately before NU7 activates.
     ///
     /// Configured networks derive their seed from chain state unless this override is set.
+    /// Derivation requires cumulative scheduled issuance through the block before NU7 to fit
+    /// in `MAX_MONEY`.
     pub fn with_initial_nsm_value_balance(mut self, balance: Amount<NonNegative>) -> Self {
         self.initial_nsm_value_balance = Some(balance);
         self
@@ -1099,6 +1139,7 @@ impl ParametersBuilder {
 
         check_founders_reward_is_exact(&network)?;
         check_lockbox_disbursements(&self.lockbox_disbursements)?;
+        check_derived_nsm_seed_schedule(&network)?;
 
         // Final check that the configured checkpoints are valid for this network.
         if network.checkpoint_list().hash(Height(0)) != Some(network.genesis_hash()) {
@@ -1306,11 +1347,14 @@ impl Parameters {
         }
         check_lockbox_disbursements(&parameters.lockbox_disbursements)?;
 
-        Ok(Self {
+        let parameters = Self {
             network_name: "Regtest".to_string(),
             network_magic: magics::REGTEST,
             ..parameters.finish()
-        })
+        };
+        check_derived_nsm_seed_schedule(&Network::new_configured_testnet(parameters.clone()))?;
+
+        Ok(parameters)
     }
 
     /// Returns true if the instance of [`Parameters`] represents the default public Testnet.

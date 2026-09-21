@@ -695,7 +695,9 @@ fn legacy_migration_reopens_and_replays_across_activation() {
             let block = start_block(&state, &network, &parent, excess);
             commit(&mut state, &block).unwrap();
             let expected = state.db.finalized_value_pool();
-            let before_activation = *state.db.block_info(Height(1).into()).unwrap().value_pools();
+            let before_activation_info = state.db.block_info(Height(1).into()).unwrap();
+            let before_activation = *before_activation_info.value_pools();
+            let before_activation_size = before_activation_info.size();
 
             if migrate_before_activation {
                 drop(state);
@@ -740,12 +742,6 @@ fn legacy_migration_reopens_and_replays_across_activation() {
                 .with_batch_for_writing(&mut batch)
                 .zs_insert(&(), &RawBytes::from_bytes(&tip_bytes[..48]));
             state.db.write_batch(batch).unwrap();
-            let legacy_anchor = state
-                .db
-                .raw_block_info_cf()
-                .zs_get(&Height(1))
-                .unwrap()
-                .as_bytes();
             state
                 .db
                 .update_format_version_on_disk(&semver::Version::new(28, 2, 0))
@@ -757,24 +753,18 @@ fn legacy_migration_reopens_and_replays_across_activation() {
                 upgraded.db.format_version_on_disk().unwrap(),
                 Some(state_database_format_version_in_code())
             );
+            let upgraded_anchor = upgraded.db.block_info(Height(1).into()).unwrap();
             assert_eq!(
-                upgraded
-                    .db
-                    .raw_block_info_cf()
-                    .zs_get(&Height(1))
-                    .unwrap()
-                    .as_bytes(),
-                legacy_anchor
+                *upgraded_anchor.value_pools(),
+                before_activation,
+                "migration must preserve the seed-height pools semantically",
             );
+            assert_eq!(upgraded_anchor.size(), before_activation_size);
             if migrate_before_activation {
                 assert_eq!(
-                    upgraded
-                        .db
-                        .raw_chain_value_pools_cf()
-                        .zs_get(&())
-                        .unwrap()
-                        .as_bytes(),
-                    tip_bytes[..48]
+                    upgraded.db.finalized_value_pool(),
+                    before_activation,
+                    "migration must preserve the pre-activation tip pools semantically",
                 );
             } else {
                 assert_eq!(upgraded.db.finalized_value_pool(), expected);

@@ -2855,6 +2855,91 @@ async fn unchecked_blocks_do_not_keep_retry_receipts() {
     }
 }
 
+/// Pending duplicates must not erase the receipt if the outstanding commit fails.
+#[tokio::test(start_paused = true)]
+async fn pending_duplicates_preserve_receipts_after_transient_commit_failure() {
+    use std::sync::Mutex;
+    use tokio::sync::Notify;
+
+    let _init_guard = zakura_test::init();
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    for location in [zs::KnownBlock::Queue, zs::KnownBlock::WriteChannel] {
+        // Duplicates can be detected before verification or at commit submission.
+        for during_lookup in [true, false] {
+            let entered = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let orders = Arc::new(Mutex::new(Vec::new()));
+            let state = service_fn({
+                let entered = entered.clone();
+                let release = release.clone();
+                let orders = orders.clone();
+                let location = location.clone();
+                move |request| {
+                    let entered = entered.clone();
+                    let release = release.clone();
+                    let orders = orders.clone();
+                    let location = location.clone();
+                    async move {
+                        match request {
+                            zs::Request::KnownBlock(_) => {
+                                let pending = during_lookup && orders.lock().unwrap().len() == 1;
+                                Ok(zs::Response::KnownBlock(pending.then_some(location)))
+                            }
+                            zs::Request::CommitSemanticallyVerifiedBlock(block) => {
+                                let attempt = {
+                                    let mut orders = orders.lock().unwrap();
+                                    orders.push(block.receipt_order.unwrap());
+                                    orders.len()
+                                };
+                                if attempt == 1 {
+                                    entered.notify_one();
+                                    release.notified().await;
+                                    return Err::<_, BoxError>(
+                                        zs::CommitBlockError::QueueFull.into(),
+                                    );
+                                }
+                                Err(zs::CommitBlockError::Duplicate {
+                                    hash_or_height: Some(block.hash.into()),
+                                    location,
+                                }
+                                .into())
+                            }
+                            _ => panic!("unexpected request: {request:?}"),
+                        }
+                    }
+                }
+            });
+            let transaction = service_fn(|request| async move {
+                Ok::<_, BoxError>(accept_block_transaction(request))
+            });
+            let mut verifier = SemanticBlockVerifier::new(&Network::Mainnet, state, transaction);
+            tokio::time::timeout(super::PENDING_COMMIT_WAIT_LIMIT * 2, async {
+                let first = tokio::spawn(verifier.call(Request::Commit(block.clone())));
+                entered.notified().await;
+                let duplicate = verifier
+                    .call(Request::Commit(block.clone()))
+                    .await
+                    .unwrap_err();
+                assert_eq!(duplicate.duplicate_location(), Some(&location));
+                release.notify_one();
+                assert!(matches!(
+                    first.await.unwrap(),
+                    Err(VerifyBlockError::Commit(zs::CommitBlockError::QueueFull))
+                ));
+                assert_eq!(
+                    verifier.receipt_orders.register(block.clone()).order,
+                    orders.lock().unwrap()[0],
+                    "a pending duplicate must preserve the receipt when the other attempt fails"
+                );
+            })
+            .await
+            .expect("pending duplicate receipt regression must finish");
+        }
+    }
+}
+
 #[tokio::test]
 async fn pow_checked_missing_parent_keeps_retry_receipt() {
     let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES

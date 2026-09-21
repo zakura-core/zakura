@@ -20,7 +20,9 @@ waiver) retain a receipt after retryable failures or cancellation. Unchecked and
 PoW-invalid blocks cannot occupy the retry cache. Retried blocks retain only a
 complete-body digest and receipt order, bounded to 4096 entries for one hour after
 the last attempt. Capacity eviction or expiry gives a later retry a new receipt.
-Success and permanent rejection clear the retry receipt.
+Success, already committed duplicates, and permanent rejection clear the retry
+receipt. A duplicate still waiting in the commit queue preserves it because the
+outstanding attempt can fail transiently.
 
 For example, A arrives before B, but B finishes verification first. Mining can
 briefly use B while A is unverified. Once A passes, equal-work selection chooses

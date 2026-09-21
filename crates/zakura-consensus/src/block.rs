@@ -232,6 +232,18 @@ impl VerifyBlockError {
         }
     }
 
+    /// Pending duplicates have no final outcome yet, so they must not clear a
+    /// shared receipt that an overlapping verification may still need to retry.
+    fn retains_retry_receipt(&self) -> bool {
+        matches!(
+            self.duplicate_location(),
+            Some(zs::KnownBlock::Queue | zs::KnownBlock::WriteChannel)
+        ) || matches!(
+            self.body_verification_class(),
+            zakura_header_chain::BodyVerificationClass::Retryable(_)
+        )
+    }
+
     /// Returns a suggested misbehaviour score increment for a certain error.
     pub fn misbehavior_score(&self) -> u32 {
         use VerifyBlockError::*;
@@ -747,12 +759,9 @@ where
         }
         .map(move |result: Result<_, VerifyBlockError>| {
             if let Some(receipt) = receipt {
-                let retryable = result.as_ref().is_err_and(|error| {
-                    matches!(
-                        error.body_verification_class(),
-                        zakura_header_chain::BodyVerificationClass::Retryable(_)
-                    )
-                });
+                let retryable = result
+                    .as_ref()
+                    .is_err_and(VerifyBlockError::retains_retry_receipt);
                 receipt.finish(retryable);
             }
             result

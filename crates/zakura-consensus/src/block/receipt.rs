@@ -171,7 +171,7 @@ impl ReceiptRegistry {
 }
 
 impl ReceiptGuard {
-    /// Success, known duplicates, and invalid bodies no longer need a retry receipt.
+    /// Success, committed duplicates, and invalid bodies no longer need a retry receipt.
     pub(super) fn finish(self, retryable: bool) {
         if !retryable {
             let mut registry = self

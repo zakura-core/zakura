@@ -27,6 +27,12 @@ necessary nor by itself sufficient.
   same node under the same load, so a difference between them isolates the reorg.
 - **Lever C** — two nodes on Regtest, each running the internal Equihash solver,
   mining independent chains while partitioned and then joined with `addnode`.
+- **Lever D** — a source node produces blocks at a controlled interval and a target
+  node receives them over p2p and serves every template. Lever A's producers both
+  consumed templates and produced blocks, so its two axes could not be separated;
+  here the block interval is a real input and tip changes arrive from the network.
+- **Lever E** — the fallback-recovery branch, which nothing else reaches. Requires
+  `fault-injection.patch`, since the node's own templates are valid by construction.
 
 ## Requirements
 

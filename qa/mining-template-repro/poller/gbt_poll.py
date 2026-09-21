@@ -26,11 +26,11 @@ def rpc(url, method, params, timeout):
         return json.loads(resp.read())
 
 
-def client_loop(idx, url, deadline, timeout, out_q, stop):
+def client_loop(idx, url, deadline, timeout, out_q, stop, long_poll=True):
     long_poll_id = None
     while not stop.is_set() and time.time() < deadline:
         params = [{"capabilities": CAPABILITIES}]
-        if long_poll_id is not None:
+        if long_poll and long_poll_id is not None:
             params[0]["longpollid"] = long_poll_id
         started = time.time()
         try:
@@ -81,6 +81,9 @@ def main():
     parser.add_argument("--duration", type=float, default=60.0)
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument("--out", required=True)
+    # A static tip never wakes a long poll, so levers that hold the tip still need
+    # plain repeated requests instead.
+    parser.add_argument("--no-long-poll", action="store_true")
     args = parser.parse_args()
 
     url = f"http://{args.rpc}"
@@ -93,7 +96,8 @@ def main():
 
     workers = [
         threading.Thread(target=client_loop,
-                         args=(i, url, deadline, args.timeout, out_q, stop), daemon=True)
+                         args=(i, url, deadline, args.timeout, out_q, stop,
+                               not args.no_long_poll), daemon=True)
         for i in range(args.clients)
     ]
     for worker in workers:

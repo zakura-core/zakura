@@ -1,0 +1,36 @@
+# Lever D block source: the only node that calls generate.
+#
+# Two nodes so the two axes can be varied independently: the source produces
+# blocks, the target receives them over p2p and is the only node serving
+# templates. Tip changes therefore reach the measured node the way they do in
+# production, from the network, rather than from its own generate calls.
+
+[network]
+network = { params = { checkpoints = false, activation_heights = { NU5 = 5 } }, regtest = true }
+listen_addr = "127.0.0.1:18433"
+p2p_stack = "legacy"
+cache_dir = false
+initial_testnet_peers = []
+max_connections_per_ip = 10
+crawl_new_peer_interval = "5s"
+
+[state]
+ephemeral = true
+
+[mempool]
+debug_enable_at_height = 0
+
+[rpc]
+listen_addr = "127.0.0.1:18432"
+enable_cookie_auth = false
+debug_force_finished_sync = true
+
+[metrics]
+endpoint_addr = "127.0.0.1:19005"
+
+[mining]
+internal_miner = false
+miner_address = "tmJymvcUCn1ctbghvTJpXBwHiMEB8P6wxNV"
+
+[tracing]
+filter = "info"

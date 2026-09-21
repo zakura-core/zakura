@@ -176,3 +176,76 @@ near 1e-8. The measured runs agree: zero withholds at one and two producers.
 The right way to read the storm numbers is as an amplifier. It makes a rare race
 observable in 45 seconds so two builds can be compared. The ratios between builds
 transfer; the absolute counts do not.
+
+## Lever E — the fallback-recovery branch
+
+The saturation exit and the recovery re-check never fired in Levers A-D, and #1088
+leaves both unchanged, so they were the untested part of #1080. The node builds its
+own templates, so they are valid by construction and the branch is unreachable
+without help: `fault-injection.patch` adds an env-gated counter
+(`GBT_REPRO_FORCE_TEMPLATE_REJECTIONS`) that forces N background preparations to
+report a template-rejecting failure. The trigger is injected; the behaviour that
+follows is the real code.
+
+**Fallback mode itself is fine.** With five forced rejections and a static tip, the
+node served 15 022 templates and withheld nothing. Entering fallback does not by
+itself cost a miner work.
+
+**Saturation looks unreachable.** Asking for 500 rejections with 64 concurrent
+clients landed only **6**. The first rejection sets `needs_fallback`, and
+`finish_mining_template` then stops calling `prepare_template_in_background` —
+which is the only thing that produces rejections. The state machine disables its own
+input. Only preparations already in flight at that instant can add more, so the 64
+needed to set `saturated` cannot accumulate. That exit appears to be dead code, and
+it cannot be a cause of #1080.
+
+**The fallback branch degrades badly under tip churn.** Re-arming the injection on
+every new parent, with two block producers and 32 clients for 30 s:
+
+| Outcome | Count |
+| --- | --- |
+| Templates served | 3 567 |
+| `template changed during recovery; retry` | 203 |
+| Raw verification error reaching the client | 6 113 |
+
+Nearly two thirds of responses were errors, and most were not a clean retry signal
+but the proposal verifier's own message propagated verbatim:
+`"block could not be full-verified due to: ... proposal is not based on the current
+best chain tip"`. That is the fallback branch's `Request::Prepare` failing because
+the tip moved underneath it, with the error returned rather than rebuilt.
+
+This is the part #1088 explicitly defers, and it is where the remaining #1083 work
+lands: #1083 re-reads the tip before propagating a stale validation error and
+returns `Ok(None)` instead. These numbers are the case for finishing that work.
+
+Caveat: in production the node's own templates are valid, so fallback mode should
+rarely be entered at all. The finding is about how badly it behaves once something
+does put it there, not about how often that happens.
+
+## What a real mining pool actually does
+
+The in-repo pool stack (`docker/mining/`, s-nomp with a pinned
+`node-stratum-pool`) was pointed at a node to measure how long it serves a stale
+job when a withhold occurs. The end-to-end run did not complete: on Regtest
+`getblocksubsidy` returns no funding streams, and the pool dereferences
+`subsidy.fundingstreams` unconditionally for Zcash, so it crashes before producing
+a job. Reading its source answered the question more directly.
+
+- **The pool does not long poll.** There is no long-poll reference anywhere in
+  `stratum-pool/lib/pool.js`. It calls `getblocktemplate` on a timer,
+  `blockRefreshInterval`, which the stack sets to 500 ms and to 2 000 ms on Mainnet.
+- **On a getblocktemplate error it logs and waits for the next tick.** No retry, no
+  backoff, no special handling of the transient message.
+
+Both halves matter, and they point in opposite directions:
+
+A polling client samples at arbitrary moments, so its exposure is roughly the build
+window over the poll interval — tens of milliseconds against 2 s. A long-polling
+client is the opposite: it wakes _at_ the tip change, which is exactly the moment
+the race is live, and every such client starts building at once. That is why the
+harness, which long polls, sees a withhold on most tip changes at fast block rates
+while a polling pool would rarely see one at all.
+
+So the population most exposed to #1080 is long-polling miners, not this pool. When
+the pool does hit it, the cost is bounded by one refresh interval of stale work,
+up to 2 s on Mainnet.

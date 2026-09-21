@@ -91,7 +91,12 @@ def publication_windows(events):
 
 
 def withhold_durations(poll_path):
-    """Per-client gap from the first withheld response to the next served template."""
+    """Per-client gap from the withheld response to the next served template.
+
+    Measured response-to-response. Timing from the request start would fold in the
+    long-poll wait, which is time the client is legitimately parked waiting for a
+    tip change, not work it lost.
+    """
     by_client = collections.defaultdict(list)
     with open(poll_path) as handle:
         for line in handle:
@@ -105,7 +110,7 @@ def withhold_durations(poll_path):
         for event in events:
             if event["outcome"] == "withhold":
                 if streak_start is None:
-                    streak_start = event["ts"]
+                    streak_start = event["ts"] + event["latency"]
             elif event["outcome"] == "template" and streak_start is not None:
                 durations.append(event["ts"] + event["latency"] - streak_start)
                 streak_start = None

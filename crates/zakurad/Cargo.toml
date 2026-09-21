@@ -285,6 +285,7 @@ hex.workspace = true
 tonic-prost-build = { workspace = true, optional = true }
 
 [dev-dependencies]
+secp256k1.workspace = true
 abscissa_core = { workspace = true, default-features = false, features = ["testing"] }
 hex-literal = { workspace = true }
 jsonrpsee-types = { workspace = true }

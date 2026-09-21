@@ -1,0 +1,102 @@
+name: NU7 release readiness
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
+      - '.github/workflows/nu7-release-tests.yml'
+      - 'scripts/test-nsm-release-upgrade.py'
+  merge_group:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '30 6 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nu7-release-tests-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  accounting:
+    name: NU7 adversarial accounting
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          toolchain: stable
+      - uses: ./.github/actions/setup-zakura-build
+      - name: Boundary, rejection, and replay tests
+        run: |
+          cargo test --locked -p zakura-chain --lib nsm_release
+          cargo test --locked -p zakura-state --lib nsm_release
+          cargo test --locked -p zakura-state --lib max_money
+          cargo test --locked -p zakura-state --lib block_daa_enforces
+      - name: Extended histories
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        env:
+          NSM_RELEASE_CASES: '256'
+        run: cargo test --locked -p zakura-state --lib nsm_release_generated
+      - name: Preserve replay seeds
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nu7-property-regressions
+          path: crates/**/proptest-regressions/**
+
+  production:
+    name: NU7 production artifact acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          toolchain: stable
+      - uses: ./.github/actions/setup-zakura-build
+      - name: Production branch and dependency compatibility
+        run: cargo run --locked --release -p xtask -- nu7-readiness
+      - name: Build the production artifact without dev dependency features
+        run: |
+          cargo build --locked --release -p zakura --bin zakurad
+          mkdir -p target/nu7-production-artifact
+          cp target/release/zakurad target/nu7-production-artifact/zakurad
+          sha256sum target/nu7-production-artifact/zakurad
+      - name: Verify actual transaction, RPC, and state integration
+        env:
+          NSM_RELEASE_ACCEPTANCE: '1'
+        run: |
+          export NSM_RELEASE_NODE="$GITHUB_WORKSPACE/target/nu7-production-artifact/zakurad"
+          cargo test --locked --release -p zakura --test acceptance nsm_release_ -- --nocapture
+      - name: Download the previous released Linux binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p target/nu7-old-release
+          gh release download v1.4.0 --repo zakura-core/zakura --dir target/nu7-old-release --pattern zakurad-v1.4.0-linux-x86_64.tar.gz --pattern SHA256SUMS.txt
+          cd target/nu7-old-release
+          sha256sum --check --ignore-missing SHA256SUMS.txt
+          tar -xzf zakurad-v1.4.0-linux-x86_64.tar.gz
+      - name: Upgrade from the released database and compare with fresh replay
+        run: |
+          old_node=$(find "$GITHUB_WORKSPACE/target/nu7-old-release" -type f -name zakurad)
+          test -n "$old_node"
+          python3 scripts/test-nsm-release-upgrade.py --old-binary "$old_node" --new-binary "$GITHUB_WORKSPACE/target/nu7-production-artifact/zakurad" --artifacts "$RUNNER_TEMP/nu7-upgrade"
+      - name: Preserve upgrade and recovery evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nu7-upgrade-evidence
+          path: ${{ runner.temp }}/nu7-upgrade
+          if-no-files-found: ignore

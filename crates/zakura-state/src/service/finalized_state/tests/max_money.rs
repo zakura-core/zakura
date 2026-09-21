@@ -85,7 +85,7 @@ fn total_overflow(error: &ValidateContextError) -> bool {
 
 /// Seed a contextual accounting fixture without generating 21 million ZEC in coinbases.
 /// Preserve the real transparent UTXOs and NSM history; put the remaining supply in Sapling.
-fn set_supply(state: &FinalizedState, total: i64) -> ValueBalance<NonNegative> {
+pub(super) fn set_supply(state: &FinalizedState, total: i64) -> ValueBalance<NonNegative> {
     let height = state.db.finalized_tip_height().unwrap();
     let mut pools = state.db.finalized_value_pool();
     pools.set_sapling_value_balance(ValueBalance::from_sapling_amount(
@@ -172,6 +172,14 @@ fn max_money_commit_rejection_is_atomic_across_activation_and_recovery() {
             })
             .is_none());
 
+        // Reopen immediately: a later successful write must not hide rejected data.
+        drop(state);
+        state = FinalizedState::new(&config, &network).unwrap();
+        assert_eq!(state.db.finalized_tip_hash(), parent.hash());
+        assert_eq!(state.db.finalized_value_pool(), before);
+        assert!(state.db.block(rejected.hash().into()).is_none());
+        assert!(state.db.block_info(height.into()).is_none());
+
         // The same state accepts a sibling that stays within the cap.
         forks
             .commit_new_chain(SemanticallyVerifiedBlock::from(accepted.clone()), &state.db)
@@ -191,6 +199,31 @@ fn max_money_commit_rejection_is_atomic_across_activation_and_recovery() {
                 .value_pools(),
             after
         );
+        // Reject an extension of a populated chain, where undoing tentative changes
+        // must preserve the existing chain and every cached accounting snapshot.
+        let history = forks
+            .best_chain()
+            .unwrap()
+            .history_tree(accepted.hash().into())
+            .unwrap();
+        let extension = child(&state, &network, &accepted, headroom.max(0) + 1);
+        let extension = child_block_with_history_commitment(
+            &accepted,
+            extension.transactions.clone(),
+            &network,
+            &history,
+        );
+        let saved = forks.clone();
+        let error = forks
+            .commit_block(
+                SemanticallyVerifiedBlock::from(extension.clone()),
+                &state.db,
+            )
+            .unwrap_err();
+        assert!(total_overflow(&error), "{error:?}");
+        assert!(forks.eq_internal_state(&saved));
+        assert!(!forks.any_chain_contains(&extension.hash()));
+
         drop(state);
         state = FinalizedState::new(&config, &network).unwrap();
         assert_eq!(state.db.finalized_value_pool(), after);

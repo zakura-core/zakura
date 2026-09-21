@@ -316,6 +316,13 @@ fn template_build_paths_retain_capacity_when_cancelled() {
                         state.reject(chain.tip_hash, "rejected-work");
                     });
                     rpc.finish_mining_template(initial, &chain, rpc.gbt.miner_params().unwrap())
+                        .map(|result| {
+                            result.map(|template| {
+                                template.expect(
+                                    "recovery parent is unchanged, so finish returns a template",
+                                )
+                            })
+                        })
                         .boxed()
                 }
                 _ => rpc
@@ -742,7 +749,11 @@ fn recovery_construction_yields_and_rechecks_parent() {
                     .message()
                     .contains("changed during recovery"));
             } else {
-                let template = response.unwrap().try_into_template().unwrap();
+                let template = response
+                    .unwrap()
+                    .expect("parent is unchanged, so recovery returns a template")
+                    .try_into_template()
+                    .unwrap();
                 assert_reward(&template, 400_000_000);
                 assert!(rpc
                     .gbt

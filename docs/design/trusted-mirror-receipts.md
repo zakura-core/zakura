@@ -11,8 +11,11 @@ response header identifies that process, and a secondary returns it as
 session differs. Older clients can omit the session and retain incremental resume.
 If the response session changes, the secondary clears its old orders and
 resubscribes with empty tips before accepting blocks.
-The published state also clears, and finalized-tip tracking continues if the
-replacement stream is empty.
+The secondary also clears its published non-finalized blocks. Its reported tip
+falls back to the finalized database tip while those blocks reload, so
+`getblockcount` can move backwards by the normal 1,000-block non-finalized window.
+This reset prevents receipt orders from different primary processes being mixed.
+Finalized-tip tracking continues if the replacement stream is empty.
 
 Within the same session, reconnects retain existing orders and duplicate blocks
 do not replace them. Older servers omit the session and receipt fields. The

@@ -84,13 +84,16 @@ correctness bug.
 
 ## #1088
 
+Measured against `1690f6bd2` (main) and `bd6bea7ec` (#1088). #1088 forks from that
+same main commit, and the one commit main has gained since does not touch this path.
+
 | Metric | main | #1088 |
 | --- | --- | --- |
-| Client-visible withholds | 1 789 | **67** |
-| Templates served | 13 484 | 14 262 |
-| Latency p50 / p90 | 39 / 92 ms | 40 / 90 ms |
-| Node CPU seconds | 97.2 | 99.6 |
-| Blocks produced | 618 | 628 |
+| Client-visible withholds | 1 789 | **57 and 48**, two runs |
+| Templates served | 13 484 | 13 097 / 13 531 |
+| Latency p50 / p90 | 39 / 92 ms | 43 / 99 ms |
+| Node CPU seconds | 97.2 | 100.7 / 102.5 |
+| Blocks produced | 618 | 595 / 598 |
 
 At a realistic single-producer block rate, main withheld 11 times and #1088
 withheld **zero**.
@@ -101,12 +104,12 @@ happens; the miner keeps getting work.
 
 The rebuild loop converges and does not pay for itself in latency or CPU: both are
 flat within noise and throughput is slightly up. `mining.template.rebuilt` recorded
-2 673 rebuilds during the storm against 125 withholds that still reached clients,
-consistent with those residual cases exhausting `MAX_TEMPLATE_REBUILDS` at a block
-every 72 ms — far faster than any real network. The bound behaves as documented.
+2 673 rebuilds during a storm against 125 withholds that still reached clients,
+consistent with those residual cases exhausting the rebuild budget at a block every
+72 ms — far faster than any real network. The bound behaves as documented.
 
-Note also that #1088 puts the storm below the pre-#1074 baseline, at 67 withholds
-against 84.
+Note also that #1088 puts the storm below the pre-#1074 baseline, at 48-57
+withholds against 84.
 
 ## What the residual withholds under #1088 are
 
@@ -117,7 +120,10 @@ it sits after the `'rebuild` loop falls through — it is reachable only when al
 `MAX_TEMPLATE_REBUILDS` attempts were superseded in turn.
 
 Raising the constant from 4 to 16 and alternating the two builds, to keep host
-drift out of the comparison:
+drift out of the comparison. Measured on `3dc3d847a`, an earlier revision of
+#1088 whose loop ran `0..MAX_TEMPLATE_REBUILDS`; the branch now runs
+`0..=MAX_TEMPLATE_REBUILDS`, one attempt more, which is why the residual on
+`bd6bea7ec` is lower. The conclusion is unchanged:
 
 | Build | Blocks | Withholds | Templates | p50 | p90 | max | CPU s |
 | --- | --- | --- | --- | --- | --- | --- | --- |

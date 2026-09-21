@@ -1,0 +1,66 @@
+# NU7 fork testnet parameters.
+#
+# Read by deploy/nu7-fork/fork.py. Every value here is safe to change between
+# runs: `fork.py up` re-seeds the chain state and re-renders the node config from
+# whatever this file says.
+#
+# See README.md for the runbook.
+
+[fork]
+# Names the network AND its state directory: zakurad stores the chain under
+# state/v<db-format>/<network_name lowercased>. Changing the name gives the next
+# run a clean cache, which is how a reconfiguration starts from the seed again.
+network_name = "Nu7Fork"
+
+# Distinct from the public Testnet magic (fa1af9bf) so fork nodes only ever talk
+# to each other. Without this the fork would dial real Testnet peers, reject
+# their blocks after activation, and ban them.
+network_magic = [0x7A, 0x6B, 0x75, 0x37]
+
+# NU7 activates this many blocks above the seeded tip.
+#
+# On an isolated fork we mine every one of these blocks ourselves, and the
+# Testnet minimum-difficulty rule sets the pace: the gap is target spacing x 6,
+# so 450s per block before NU7 and 150s after. An offset of 10 is therefore
+# about 75 minutes to activation. Raise it only if you want to wait longer.
+activation_offset = 10
+
+# NOTE: ZIP 234 NSM reissuance has no configurable start height on this base —
+# DTestnetParameters exposes only initial_nsm_value_balance — so reissuance stays
+# unscheduled. Fee recycling still begins at NU7 activation.
+# See docs/design/reissuance-accounting.md.
+
+[host]
+# Set by `fork.py provision`, or fill in by hand to target an existing host.
+ssh_string = ""
+
+# The ref built and deployed. Must contain the finalized NU7 branch ID, which
+# landed in PR #1093 — a build without it has no NU7 consensus branch at all.
+commit = "feat/nu7-fork-testnet"
+
+# Holds the untouched seed: state/v<db-format>/testnet, as cloned from the
+# DigitalOcean Testnet state snapshot. fork.py only ever reads this.
+pristine_cache_dir = "/mnt/snapshots/tip"
+
+# The fork's own working cache, wiped and re-seeded on every reconfigure.
+fork_cache_dir = "/mnt/data/zakura-fork"
+
+rpc_listen_addr = "127.0.0.1:18232"
+listen_addr = "0.0.0.0:18233"
+metrics_endpoint = "127.0.0.1:9999"
+
+[droplet]
+# Only used by `fork.py provision`.
+name = "zakura-nu7-fork-1"
+size = "c-8"
+regions = "nyc1,sfo3,nyc3"
+# Absent from the reaper's sweep list, so the node outlives a CI run.
+tag = "zakura-nu7-fork"
+# Must start with zakura-pr- (do_provision.py enforces this). The reaper deletes
+# such volumes only while DETACHED, so never leave this volume unattached.
+volume_name = "zakura-pr-nu7-fork-state"
+
+[miner]
+# Transparent address receiving the fork's coinbase. Testnet-encoded, because a
+# configured testnet keeps NetworkKind::Testnet address prefixes.
+address = ""

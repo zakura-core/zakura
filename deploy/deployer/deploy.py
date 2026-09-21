@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
 import os
 import shlex
 import shutil
@@ -57,6 +58,12 @@ DEFAULTS = {
     "listen_addr": "[::]:8233",
     "identity_dir": "",     # e.g. "/root/.zakura" -> pins the iroh node_id; "" uses zakurad default
     "network_cache_dir": "",
+    # Optional explicit peer seeds -> rendered `initial_testnet_peers`.
+    # None omits the key so zakurad keeps its default DNS seeds. A configured
+    # testnet incompatible with the public one MUST set this (an empty list is
+    # fine): zakurad refuses to load such a config while the default seeds are
+    # present. See build_configured_testnet in crates/zakura-network/src/config.rs.
+    "initial_testnet_peers": None,
     "rpc_listen_addr": "",  # empty -> RPC stays disabled
     "rpc_enable_cookie_auth": None,
     "port": None,           # ssh port; None -> ssh default
@@ -68,6 +75,10 @@ DEFAULTS = {
     # e.g. "127.0.0.1:8080" -> renders [health] (/healthy, /ready); "" omits it.
     # Both endpoints are unauthenticated, so keep them on loopback.
     "health_listen_addr": "",
+    # Transparent address receiving coinbase output, rendered as [mining].
+    # Required before the node will serve getblocktemplate, so an external miner
+    # (deploy/nu7-fork/miner) cannot produce blocks without it. "" omits it.
+    "miner_address": "",
     "tracing_filter": "",    # e.g. "info,zakura_network::zakura=debug"; "" uses zakurad default
     "checkpoint_sync": True,
     # Setting this false keeps checkpoint sync on while selecting the legacy non-VCT path.
@@ -75,6 +86,13 @@ DEFAULTS = {
     # Optional fleet-wide [defaults.zakura] table -> rendered [network.zakura].
     # Keys: dev_network, listen_addr, bootstrap_peers. Absent -> no section.
     "zakura": None,
+    # Optional [defaults.testnet_parameters] table -> rendered
+    # [network.testnet_parameters], for configured testnets such as the NU7 fork.
+    # Absent -> no section, so the node runs the default public network.
+    "testnet_parameters": None,
+    # Extra cargo features for the release build, comma-separated (e.g.
+    # "internal-miner"). Empty keeps the stock default-feature fleet build.
+    "cargo_features": "",
     # Process deploys are for manually supervised nodes, like the testnet
     # zcashd-compat Zakura sidecar, where systemd would fight the local runbook.
     "working_dir": "",
@@ -106,16 +124,20 @@ class Node:
     listen_addr: str
     identity_dir: str
     network_cache_dir: str
+    initial_testnet_peers: object  # list | None: explicit peer seeds
     rpc_listen_addr: str
     rpc_enable_cookie_auth: object
     storage_mode: str
     p2p_stack: str
     metrics_endpoint: str
     health_listen_addr: str
+    miner_address: str
     tracing_filter: str
     checkpoint_sync: bool
     vct_fast_sync: bool
     zakura: object  # dict | None: fleet-wide [network.zakura] settings
+    testnet_parameters: object  # dict | None: [network.testnet_parameters] settings
+    cargo_features: str
     working_dir: str
     start_command: str
     process_pattern: str
@@ -231,6 +253,7 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             listen_addr=merged["listen_addr"],
             identity_dir=merged["identity_dir"],
             network_cache_dir=merged["network_cache_dir"],
+            initial_testnet_peers=merged.get("initial_testnet_peers"),
             rpc_listen_addr=merged["rpc_listen_addr"],
             rpc_enable_cookie_auth=merged["rpc_enable_cookie_auth"],
             storage_mode=merged["storage_mode"],
@@ -239,10 +262,13 @@ def load_nodes(config_path: Path, only: list[str] | None) -> list[Node]:
             ),
             metrics_endpoint=merged["metrics_endpoint"],
             health_listen_addr=merged["health_listen_addr"],
+            miner_address=merged["miner_address"],
             tracing_filter=merged["tracing_filter"],
             checkpoint_sync=merged["checkpoint_sync"],
             vct_fast_sync=merged["vct_fast_sync"],
             zakura=merged.get("zakura"),
+            testnet_parameters=merged.get("testnet_parameters"),
+            cargo_features=merged["cargo_features"],
             working_dir=merged["working_dir"],
             start_command=merged["start_command"],
             process_pattern=merged["process_pattern"],
@@ -317,11 +343,11 @@ def ensure_data_mount_for_path(path: Path, *, purpose: str) -> None:
         )
 
 
-def prune_cached_binaries(cache_dir: Path, current_sha: str) -> None:
+def prune_cached_binaries(cache_dir: Path, current_name: str) -> None:
     retain = build_cache_retain()
     binaries = [
         path for path in cache_dir.glob("zakurad-*")
-        if path.is_file() and path.name != f"zakurad-{current_sha}"
+        if path.is_file() and path.name != current_name
     ]
     binaries.sort(key=lambda path: path.stat().st_mtime, reverse=True)
     for old_binary in binaries[max(0, retain - 1):]:
@@ -345,8 +371,20 @@ def resolve_sha(root: Path, commit: str) -> str:
     )
 
 
-def cached_binary(sha: str) -> Path:
-    return build_cache_dir() / f"zakurad-{sha}"
+def feature_slug(features: str) -> str:
+    """Short, filesystem-safe tag for a feature set; "" for the stock build.
+
+    The stock build keeps its historic `zakurad-<sha>` cache name, so existing
+    fleet caches stay valid and a featured build can never be mistaken for it.
+    """
+    normalized = ",".join(sorted(f.strip() for f in features.split(",") if f.strip()))
+    if not normalized:
+        return ""
+    return "-" + hashlib.sha256(normalized.encode()).hexdigest()[:12]
+
+
+def cached_binary(sha: str, features: str = "") -> Path:
+    return build_cache_dir() / f"zakurad-{sha}{feature_slug(features)}"
 
 
 def binary_is_runnable(binary: Path) -> bool:
@@ -363,12 +401,12 @@ def binary_is_runnable(binary: Path) -> bool:
         return False
 
 
-def build_commit(root: Path, sha: str, *, force: bool = False) -> Path:
+def build_commit(root: Path, sha: str, *, force: bool = False, features: str = "") -> Path:
     """Build zakurad at `sha` into the cache, or reuse an existing cached build."""
     cache_dir = build_cache_dir()
     ensure_data_mount_for_path(cache_dir, purpose="build cache")
     cache_dir.mkdir(parents=True, exist_ok=True)
-    target = cached_binary(sha)
+    target = cached_binary(sha, features)
     if target.exists() and not force:
         if binary_is_runnable(target):
             print(f"[build] reusing cached binary for {sha[:9]} -> {target.name}")
@@ -384,8 +422,11 @@ def build_commit(root: Path, sha: str, *, force: bool = False) -> Path:
     print(f"[build] checking out {sha[:9]} into {work.name}")
     run(["git", "worktree", "add", "--detach", str(work), sha], cwd=root)
     try:
-        print(f"[build] cargo build --release -p zakura ({sha[:9]}) ...")
-        run(["cargo", "build", "--release", "--locked", "-p", "zakura"], cwd=work)
+        cargo_cmd = ["cargo", "build", "--release", "--locked", "-p", "zakura"]
+        if features:
+            cargo_cmd += ["--features", features]
+        print(f"[build] {' '.join(cargo_cmd[:6])} ({sha[:9]}{', features: ' + features if features else ''}) ...")
+        run(cargo_cmd, cwd=work)
         # Respect CARGO_TARGET_DIR (set per-worktree or shared) when locating the
         # output, falling back to the in-worktree target dir.
         target_dir = os.environ.get("CARGO_TARGET_DIR")
@@ -397,22 +438,28 @@ def build_commit(root: Path, sha: str, *, force: bool = False) -> Path:
         os.chmod(tmp, 0o755)
         tmp.replace(target)
         print(f"[build] cached -> {target}")
-        prune_cached_binaries(cache_dir, sha)
+        prune_cached_binaries(cache_dir, target.name)
     finally:
         run(["git", "worktree", "remove", "--force", str(work)], cwd=root, check=False)
         shutil.rmtree(work, ignore_errors=True)
     return target
 
 
-def build_nodes(nodes: list[Node], *, force: bool = False) -> dict[str, Path]:
-    """Resolve + build every distinct commit once. Returns sha -> binary path."""
+def build_nodes(nodes: list[Node], *, force: bool = False) -> dict[tuple[str, str], Path]:
+    """Resolve + build every distinct (commit, features) pair once.
+
+    Returns (sha, cargo_features) -> binary path. Features are part of the key
+    because a fork node built with `internal-miner` is a different artifact from
+    the stock fleet binary at the same commit.
+    """
     root = repo_root()
-    by_sha: dict[str, Path] = {}
+    by_build: dict[tuple[str, str], Path] = {}
     for node in nodes:
         node.sha = resolve_sha(root, node.commit)
-    for sha in dict.fromkeys(n.sha for n in nodes):  # unique, order-preserving
-        by_sha[sha] = build_commit(root, sha, force=force)
-    return by_sha
+    for key in dict.fromkeys((n.sha, n.cargo_features) for n in nodes):  # unique, ordered
+        sha, features = key
+        by_build[key] = build_commit(root, sha, force=force, features=features)
+    return by_build
 
 
 # --------------------------------------------------------------------------- #
@@ -426,6 +473,61 @@ def render_template(name: str, subst: dict[str, str]) -> str:
     return text
 
 
+def toml_scalar(value: object) -> str:
+    """Render one TOML scalar. Booleans must be checked before ints."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return f'"{value}"'
+
+
+def toml_key(key: str) -> str:
+    """Quote a bare key only when TOML requires it, e.g. the "NU6.1" upgrade names."""
+    return key if key.replace("_", "").replace("-", "").isalnum() else f'"{key}"'
+
+
+def render_toml_pair(key: str, value: object) -> str:
+    """Render one `key = value` line, choosing an inline or multi-line array."""
+    if isinstance(value, list):
+        if not value:
+            return f"{toml_key(key)} = []"
+        # Strings (peer lists, addresses) read better one per line; numeric
+        # arrays such as network_magic stay inline.
+        if any(isinstance(item, str) for item in value):
+            items = "".join(f"    {toml_scalar(item)},\n" for item in value)
+            return f"{toml_key(key)} = [\n{items}]"
+        inline = ", ".join(toml_scalar(item) for item in value)
+        return f"{toml_key(key)} = [{inline}]"
+    return f"{toml_key(key)} = {toml_scalar(value)}"
+
+
+def is_table_array(value: object) -> bool:
+    return isinstance(value, list) and bool(value) and all(isinstance(i, dict) for i in value)
+
+
+def render_toml_table(header: str, table: dict) -> list[str]:
+    """Render `[header]` and its contents, recursing into nested tables.
+
+    Scalars are emitted before any sub-table, because in TOML every key after a
+    sub-table header belongs to that sub-table.
+    """
+    lines = [f"[{header}]"]
+    for key, value in table.items():
+        if isinstance(value, dict) or is_table_array(value):
+            continue
+        lines.append(render_toml_pair(key, value))
+    for key, value in table.items():
+        if is_table_array(value):
+            for entry in value:
+                lines.append(f"[[{header}.{toml_key(key)}]]")
+                for sub_key, sub_value in entry.items():
+                    lines.append(render_toml_pair(sub_key, sub_value))
+        elif isinstance(value, dict):
+            lines.extend(render_toml_table(f"{header}.{toml_key(key)}", value))
+    return lines
+
+
 def render_zakura_block(zakura: object) -> str:
     """Render a fleet-wide [network.zakura] section from a dict, or "" if unset.
 
@@ -437,19 +539,22 @@ def render_zakura_block(zakura: object) -> str:
         return ""
     lines = ["[network.zakura]"]
     for key, value in zakura.items():
-        if isinstance(value, bool):
-            lines.append(f"{key} = {'true' if value else 'false'}")
-        elif isinstance(value, (int, float)):
-            lines.append(f"{key} = {value}")
-        elif isinstance(value, list):
-            if value:
-                items = "".join(f'    "{v}",\n' for v in value)
-                lines.append(f"{key} = [\n{items}]")
-            else:
-                lines.append(f"{key} = []")
-        else:
-            lines.append(f'{key} = "{value}"')
+        lines.append(render_toml_pair(key, value))
     # Leading/trailing blank lines so the section reads cleanly between [network] and [state].
+    return "\n" + "\n".join(lines) + "\n"
+
+
+def render_testnet_params_block(params: object) -> str:
+    """Render [network.testnet_parameters] from a dict, or "" if unset.
+
+    Keys pass through verbatim, so the deployer does not need to learn every
+    field of `DTestnetParameters` in crates/zakura-network/src/config.rs. Nested
+    tables (`activation_heights`) and arrays of tables (`lockbox_disbursements`)
+    are rendered as such.
+    """
+    if not params:
+        return ""
+    lines = render_toml_table("network.testnet_parameters", dict(params))
     return "\n" + "\n".join(lines) + "\n"
 
 
@@ -468,6 +573,9 @@ def render_node_config(node: Node) -> str:
     health_block = (
         f'[health]\nlisten_addr = "{node.health_listen_addr}"\n' if node.health_listen_addr else ""
     )
+    mining_block = (
+        f'[mining]\nminer_address = "{node.miner_address}"\n' if node.miner_address else ""
+    )
     filter_line = f'filter = "{node.tracing_filter}"' if node.tracing_filter else "# filter unset (zakurad default)"
     network_cache_line = (
         f'cache_dir = "{node.network_cache_dir}"' if node.network_cache_dir else "# cache_dir unset (zakurad default)"
@@ -475,17 +583,25 @@ def render_node_config(node: Node) -> str:
     identity_dir_line = (
         f'identity_dir = "{node.identity_dir}"' if node.identity_dir else "# identity_dir unset (zakurad default)"
     )
+    initial_peers_line = (
+        render_toml_pair("initial_testnet_peers", node.initial_testnet_peers)
+        if node.initial_testnet_peers is not None
+        else "# initial_testnet_peers unset (zakurad default DNS seeds)"
+    )
     return render_template("zakura.toml", {
         "NETWORK": node.network,
         "LISTEN_ADDR": node.listen_addr,
         "IDENTITY_DIR": identity_dir_line,
         "NETWORK_CACHE_DIR": network_cache_line,
+        "INITIAL_TESTNET_PEERS": initial_peers_line,
         "STATE_CACHE_DIR": node.state_cache_dir,
         "STORAGE_MODE": node.storage_mode,
         "P2P_STACK": node.p2p_stack,
+        "TESTNET_PARAMS_BLOCK": render_testnet_params_block(node.testnet_parameters),
         "ZAKURA_BLOCK": render_zakura_block(node.zakura),
         "METRICS_BLOCK": metrics_block,
         "HEALTH_BLOCK": health_block,
+        "MINING_BLOCK": mining_block,
         "TRACING_FILTER": filter_line,
         "LOG_FILE": node.log_file,
         "RPC_BLOCK": rpc_block,
@@ -823,12 +939,12 @@ def cmd_build(args) -> int:
 
 def cmd_deploy(args) -> int:
     nodes = load_nodes(Path(args.config), args.node)
-    by_sha = build_nodes(nodes, force=args.force)
+    by_build = build_nodes(nodes, force=args.force)
 
     results: list[tuple[str, bool, str]] = []
 
     def work(node: Node) -> tuple[str, bool, str]:
-        binary = by_sha[node.sha]
+        binary = by_build[(node.sha, node.cargo_features)]
         try:
             if node.deploy_kind not in ("systemd", "process", "docker"):
                 return (node.name, False, f"unknown deploy_kind: {node.deploy_kind}")

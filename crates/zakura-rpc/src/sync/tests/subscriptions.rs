@@ -202,7 +202,14 @@ async fn changed_sessions_resubscribe_before_waiting_for_blocks() {
                 .send(Ok(BlockAndHash::new(block.hash(), block.clone())))
                 .await
                 .unwrap();
-            state_receiver.changed().await.unwrap();
+            state_receiver
+                .wait_for(|state| {
+                    state
+                        .best_tip()
+                        .is_some_and(|(_, hash)| hash == block.hash())
+                })
+                .await
+                .unwrap();
             while tip.best_tip_hash() != Some(block.hash()) {
                 tip_change.wait_for_tip_change().await.unwrap();
             }
@@ -215,4 +222,93 @@ async fn changed_sessions_resubscribe_before_waiting_for_blocks() {
     })
     .await
     .expect("session changes must recover without waiting for a new block");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_legacy_session_clears_published_fork_and_tracks_finalized_tip() {
+    let _init_guard = zakura_test::init();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (requests, mut received) = mpsc::channel(1);
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(SubscriptionServer(requests))
+                .serve_with_incoming(TcpIncoming::from(listener))
+                .await
+                .unwrap();
+        });
+        let (network, genesis, block) = chain_fixture();
+        let mut finalized =
+            zakura_state::FinalizedState::new(&zakura_state::Config::ephemeral(), &network)
+                .unwrap();
+        finalized
+            .commit_finalized_direct(
+                CheckpointVerifiedBlock::from(genesis.clone()).into(),
+                None,
+                None,
+                "legacy reset test",
+            )
+            .unwrap();
+        let mut state = NonFinalizedState::new(&network);
+        state
+            .commit_new_chain(block.clone().into(), &finalized.db)
+            .unwrap();
+        let (tip_sender, tip, mut tip_change) = ChainTipSender::new(None, &network);
+        let (state_sender, mut state_receiver) = watch::channel(state.clone());
+        let (started, _) = watch::channel(true);
+        let mut syncer = TrustedChainSync {
+            indexer_rpc_client: IndexerClient::connect(endpoint).await.unwrap(),
+            db: finalized.db.clone(),
+            non_finalized_state: state,
+            chain_tip_sender: tip_sender,
+            non_finalized_state_sender: state_sender,
+            started_sync_sender: started,
+            finalized_tip_updater: None,
+            receipt_session: Some("previous-primary".into()),
+        };
+        syncer.update_channels();
+        assert_eq!(tip.best_tip_hash(), Some(block.hash()));
+        let sync = tokio::spawn(async move { syncer.sync().await });
+        let (_, response) = received.recv().await.unwrap();
+        let (_first_sender, first_stream) = mpsc::channel(1);
+        response
+            .send(Response::new(ReceiverStream::new(first_stream)))
+            .unwrap();
+        let (request, response) = received.recv().await.unwrap();
+        assert!(request.chain_tip_hashes.is_empty());
+        let (_idle_sender, idle_stream) = mpsc::channel(1);
+        response
+            .send(Response::new(ReceiverStream::new(idle_stream)))
+            .unwrap();
+        state_receiver
+            .wait_for(|state| state.is_chain_set_empty())
+            .await
+            .unwrap();
+        while tip.best_tip_hash() != Some(genesis.hash()) {
+            tip_change.wait_for_tip_change().await.unwrap();
+        }
+
+        // The legacy stream remains empty as the shared finalized database advances.
+        let mut next = block.as_ref().clone();
+        Arc::make_mut(&mut next.header).nonce.0[0] ^= 1;
+        let next = Arc::new(next);
+        finalized
+            .commit_finalized_direct(
+                CheckpointVerifiedBlock::from(next.clone()).into(),
+                None,
+                None,
+                "legacy reset test",
+            )
+            .unwrap();
+        while tip.best_tip_hash() != Some(next.hash()) {
+            tip_change.wait_for_tip_change().await.unwrap();
+        }
+        assert!(state_receiver.borrow().is_chain_set_empty());
+        assert!(!sync.is_finished());
+        sync.abort();
+        server.abort();
+    })
+    .await
+    .expect("an empty legacy primary must replace the published fork without a block message");
 }

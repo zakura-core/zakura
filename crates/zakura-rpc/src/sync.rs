@@ -417,6 +417,9 @@ impl TrustedChainSync {
             self.chain_tip_sender.set_finalized_tip(finalized_tip_block);
         }
 
+        let mut empty_state_refresh = tokio::time::interval(POLL_DELAY);
+        empty_state_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut message_deadline = tokio::time::Instant::now() + STREAM_MESSAGE_TIMEOUT;
         loop {
             let Some(ref mut non_finalized_state_change) = non_finalized_blocks_listener else {
                 non_finalized_blocks_listener = match self
@@ -430,17 +433,27 @@ impl TrustedChainSync {
                         None
                     }
                 };
+                message_deadline = tokio::time::Instant::now() + STREAM_MESSAGE_TIMEOUT;
 
                 continue;
             };
 
-            let message = match tokio::time::timeout(
-                STREAM_MESSAGE_TIMEOUT,
-                non_finalized_state_change.message(),
-            )
-            .await
-            {
-                Ok(Ok(Some(block_and_hash))) => block_and_hash,
+            let next_message = tokio::select! {
+                message = tokio::time::timeout_at(message_deadline, non_finalized_state_change.message()) => message,
+                _ = empty_state_refresh.tick(), if self.finalized_tip_updater.is_none()
+                    && self.non_finalized_state.is_chain_set_empty() => {
+                    // A legacy primary has no empty-snapshot message. Keep its
+                    // finalized state current even when the block stream is idle.
+                    self.try_catch_up_with_primary().await;
+                    self.publish_current_state().await;
+                    continue;
+                }
+            };
+            let message = match next_message {
+                Ok(Ok(Some(block_and_hash))) => {
+                    message_deadline = tokio::time::Instant::now() + STREAM_MESSAGE_TIMEOUT;
+                    block_and_hash
+                }
                 Ok(Ok(None)) => {
                     tracing::warn!("non-finalized state change stream ended unexpectedly");
                     non_finalized_blocks_listener = None;
@@ -744,6 +757,11 @@ impl TrustedChainSync {
             // Discard that response and explicitly request the complete state.
             self.non_finalized_state = NonFinalizedState::new(&self.non_finalized_state.network);
             self.receipt_session = session;
+            if self.finalized_tip_updater.is_none() {
+                // Only the sync loop owns finalized updates after the first block.
+                self.try_catch_up_with_primary().await;
+                self.publish_current_state().await;
+            }
             return Ok(None);
         }
         Ok(Some(response.into_inner()))

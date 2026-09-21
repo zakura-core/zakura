@@ -139,14 +139,14 @@ mod common;
 use std::{
     cmp::Ordering,
     collections::HashSet,
-    env, fs,
-    net::SocketAddr,
-    panic,
-    path::Path,
+    env, fs, panic,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
+
+#[cfg(not(target_os = "windows"))]
+use std::{net::SocketAddr, path::Path};
 
 use color_eyre::{
     eyre::{eyre, WrapErr},
@@ -171,7 +171,7 @@ use zakura_chain::{
 use zakura_node_services::rpc_client::RpcRequestClient;
 use zakura_rpc::{
     client::{
-        BlockTemplateResponse, DefaultRoots, GetBlockHashResponse, GetBlockTemplateParameters,
+        BlockTemplateResponse, DefaultRoots, GetBlockTemplateParameters,
         GetBlockTemplateRequestMode, GetBlockTemplateResponse, SubmitBlockErrorResponse,
         SubmitBlockResponse, TransactionTemplate,
     },
@@ -183,6 +183,9 @@ use zakura_rpc::{
     MinedBlockEvent, MinerParams, SubmitBlockChannel,
 };
 use zakura_state::{constants::LOCK_FILE_ERROR, state_database_format_version_in_code};
+
+#[cfg(not(target_os = "windows"))]
+use zakura_rpc::client::GetBlockHashResponse;
 use zakura_test::{
     args,
     command::{to_regex::CollectRegexSet, ContextFrom},

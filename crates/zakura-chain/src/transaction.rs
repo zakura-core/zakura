@@ -186,6 +186,8 @@ pub enum Transaction {
         lock_time: LockTime,
         /// The latest block height that this transaction can be added to the chain.
         expiry_height: block::Height,
+        /// The amount removed from circulation by this transaction, as defined by ZIP-233.
+        zip233_amount: Amount<NonNegative>,
         /// The transparent inputs to the transaction.
         inputs: Vec<transparent::Input>,
         /// The transparent outputs from the transaction.
@@ -783,6 +785,15 @@ impl Transaction {
                 block::Height(0) => None,
                 block::Height(expiry_height) => Some(block::Height(*expiry_height)),
             },
+        }
+    }
+
+    /// Returns the amount removed from circulation by this transaction, as defined by ZIP-233.
+    #[cfg(zcash_unstable = "nutachyon")]
+    pub fn zip233_amount(&self) -> Amount<NonNegative> {
+        match self {
+            Transaction::V7 { zip233_amount, .. } => *zip233_amount,
+            _ => Amount::zero(),
         }
     }
 

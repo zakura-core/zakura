@@ -782,9 +782,15 @@ where
         spent_utxos: &HashMap<transparent::OutPoint, transparent::Utxo>,
     ) -> Result<Amount<NonNegative>, TransactionError> {
         match tx.value_balance(spent_utxos) {
-            Ok(value_balance) => value_balance
-                .remaining_transaction_value()
-                .map_err(|_| TransactionError::IncorrectFee),
+            Ok(value_balance) => {
+                let fee = value_balance
+                    .remaining_transaction_value()
+                    .map_err(|_| TransactionError::IncorrectFee)?;
+                #[cfg(zcash_unstable = "nutachyon")]
+                let fee = (fee - tx.zip233_amount()).map_err(|_| TransactionError::IncorrectFee)?;
+
+                Ok(fee)
+            }
             Err(_) => Err(TransactionError::IncorrectFee),
         }
     }

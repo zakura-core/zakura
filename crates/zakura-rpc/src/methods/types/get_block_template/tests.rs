@@ -255,6 +255,7 @@ fn nu_tachyon_template_converts_to_proposal_block() -> anyhow::Result<()> {
         cur_time: now,
         min_time: now,
         max_time: now,
+        value_pools: Default::default(),
     };
     let long_poll_id = LongPollInput::new(tip_height, chain_info.tip_hash, now, []).generate_id();
     let template = super::BlockTemplateResponse::new_internal(
@@ -265,7 +266,7 @@ fn nu_tachyon_template_converts_to_proposal_block() -> anyhow::Result<()> {
         long_poll_id,
         vec![],
         None,
-    );
+    )?;
 
     let block = proposal_block_from_template(&template, None, &net)?;
 

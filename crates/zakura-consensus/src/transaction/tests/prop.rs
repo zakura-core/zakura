@@ -346,6 +346,7 @@ fn mock_transparent_transaction(
             outputs,
             lock_time,
             expiry_height,
+            zip233_amount: Amount::zero(),
             sapling_shielded_data: None,
             orchard_shielded_data: None,
             ironwood_shielded_data: None,

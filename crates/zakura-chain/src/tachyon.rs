@@ -134,8 +134,11 @@ impl From<&Tachygram> for [u8; 32] {
 
 impl From<zcash_tachyon::Tachygram> for Tachygram {
     fn from(tachygram: zcash_tachyon::Tachygram) -> Self {
-        let field: halo2::pasta::pallas::Base = tachygram.into();
-        Self(field.into())
+        let mut bytes = [0; 32];
+        tachygram
+            .write(&mut bytes[..])
+            .expect("a 32-byte buffer always fits a serialized Tachygram");
+        Self(bytes)
     }
 }
 
@@ -211,5 +214,14 @@ mod tests {
         assert_eq!(epoch_of_pool_height(EPOCH_LENGTH), 1);
         assert!(is_epoch_first(0));
         assert!(is_epoch_first(EPOCH_LENGTH));
+    }
+
+    #[test]
+    fn tachygram_conversion_preserves_canonical_bytes() {
+        let mut bytes = [0; 32];
+        bytes[0] = 1;
+        let tachygram = zcash_tachyon::Tachygram::read(&bytes[..]).unwrap();
+
+        assert_eq!(Tachygram::from(tachygram), Tachygram(bytes));
     }
 }

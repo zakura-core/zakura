@@ -623,6 +623,7 @@ mod tests {
             network_upgrade: NetworkUpgrade::NuTachyon,
             lock_time: LockTime::min_lock_time_timestamp(),
             expiry_height: Height(0),
+            zip233_amount: Amount::zero(),
             inputs: Vec::new(),
             outputs: Vec::new(),
             sapling_shielded_data: None,
@@ -648,6 +649,7 @@ mod tests {
             network_upgrade: NetworkUpgrade::NuTachyon,
             lock_time: LockTime::min_lock_time_timestamp(),
             expiry_height: Height(0),
+            zip233_amount: Amount::zero(),
             inputs: vec![transparent::Input::PrevOut {
                 outpoint: transparent::OutPoint {
                     hash: parent,

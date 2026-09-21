@@ -1858,6 +1858,7 @@ mod tests {
             network_upgrade: NetworkUpgrade::NuTachyon,
             lock_time: LockTime::unlocked(),
             expiry_height: Height(1),
+            zip233_amount: Amount::zero(),
             inputs: Vec::new(),
             outputs: Vec::new(),
             sapling_shielded_data: None,

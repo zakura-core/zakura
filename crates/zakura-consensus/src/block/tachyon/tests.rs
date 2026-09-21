@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use zakura_chain::{
+    amount::Amount,
     block::{Block, Height},
     parameters::NetworkUpgrade,
     serialization::ZcashDeserialize,
@@ -50,8 +51,6 @@ fn action_descriptor_digest(descriptors: &[action::Descriptor]) -> [u8; 32] {
 /// A structurally valid action with a random `rk` and dummy signature: block-level coherence
 /// never checks signatures.
 fn dummy_action() -> zcash_tachyon::Action {
-    use halo2::pasta::group::CurveAffine;
-
     let mut rng = rand_10::rng();
 
     let sk = private::SpendingKey::random(&mut rng);
@@ -63,9 +62,11 @@ fn dummy_action() -> zcash_tachyon::Action {
     };
     let alpha = ActionEntropy::random(&mut rng).randomizer::<effect::Output>(note.commitment());
     let rk = private::ActionSigningKey::new(&alpha).derive_action_public();
+    let cv = value::Trapdoor::random(&mut rng)
+        .commit(value::Positive::try_from(100u64).expect("valid value"));
 
     zcash_tachyon::Action {
-        cv: value::Commitment::from(halo2::pasta::pallas::Affine::generator()),
+        cv,
         rk,
         sig: action::Signature::read(&[0x01u8; 64][..]).expect("64 bytes"),
     }
@@ -115,6 +116,7 @@ fn v7_transaction(tachyon_bundle: TachyonBundle) -> Arc<Transaction> {
         network_upgrade: NetworkUpgrade::NuTachyon,
         lock_time: LockTime::min_lock_time_timestamp(),
         expiry_height: Height(0),
+        zip233_amount: Amount::zero(),
         inputs: Vec::new(),
         outputs: Vec::new(),
         sapling_shielded_data: None,
@@ -136,7 +138,9 @@ fn block_with(transactions: Vec<Arc<Transaction>>) -> Block {
 }
 
 fn tachygram(value: u64) -> Tachygram {
-    Tachygram::from(halo2::pasta::pallas::Base::from(value))
+    let mut bytes = [0; 32];
+    bytes[..8].copy_from_slice(&value.to_le_bytes());
+    Tachygram::read(&bytes[..]).expect("a small integer is a canonical field element")
 }
 
 /// Rule 1: two proof stamps sharing a tachygram anywhere in the block are rejected.

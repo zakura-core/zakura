@@ -882,6 +882,7 @@ impl ZcashSerialize for Transaction {
                 network_upgrade,
                 lock_time,
                 expiry_height,
+                zip233_amount,
                 inputs,
                 outputs,
                 sapling_shielded_data,
@@ -904,6 +905,7 @@ impl ZcashSerialize for Transaction {
                 ))?;
                 lock_time.zcash_serialize(&mut writer)?;
                 writer.write_u32::<LittleEndian>(expiry_height.0)?;
+                zip233_amount.zcash_serialize(&mut writer)?;
                 inputs.zcash_serialize(&mut writer)?;
                 outputs.zcash_serialize(&mut writer)?;
                 sapling_shielded_data.zcash_serialize(&mut writer)?;
@@ -1302,6 +1304,7 @@ impl ZcashDeserialize for Transaction {
 
                 let lock_time = LockTime::zcash_deserialize(&mut limited_reader)?;
                 let expiry_height = block::Height(limited_reader.read_u32::<LittleEndian>()?);
+                let zip233_amount = Amount::<NonNegative>::zcash_deserialize(&mut limited_reader)?;
                 let inputs: Vec<transparent::Input> = Vec::zcash_deserialize(&mut limited_reader)?;
                 let outputs = Vec::zcash_deserialize(&mut limited_reader)?;
 
@@ -1328,6 +1331,7 @@ impl ZcashDeserialize for Transaction {
                     network_upgrade,
                     lock_time,
                     expiry_height,
+                    zip233_amount,
                     inputs,
                     outputs,
                     sapling_shielded_data,

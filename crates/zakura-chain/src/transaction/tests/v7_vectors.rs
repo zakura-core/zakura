@@ -11,6 +11,7 @@ use zcash_tachyon::{
 };
 
 use crate::{
+    amount::Amount,
     block::Height,
     parameters::{NetworkUpgrade, TX_V7_VERSION_GROUP_ID},
     serialization::{SerializationError, ZcashDeserialize, ZcashSerialize},
@@ -27,11 +28,15 @@ fn action_with_seed(seed: u8, signature_byte: u8) -> Action {
         &<[u8; 32]>::from(verification_key),
     ))
     .expect("the verification key is a valid curve point");
+    let mut descriptor_bytes = [0; 64];
+    descriptor_bytes[..32].copy_from_slice(pallas::Affine::generator().to_bytes().as_ref());
+    descriptor_bytes[32..].copy_from_slice(verification_key.to_bytes().as_ref());
+    let descriptor = zcash_tachyon::action::Descriptor::read(&descriptor_bytes[..])
+        .expect("the locally generated points have canonical encodings");
 
     Action {
-        cv: zcash_tachyon::value::Commitment::from(pallas::Affine::generator()),
-        rk: zcash_tachyon::keys::public::ActionVerificationKey::try_from(verification_key)
-            .expect("a non-identity verification key is valid"),
+        cv: descriptor.cv,
+        rk: descriptor.rk,
         sig: zcash_tachyon::action::Signature::read(&[signature_byte; 64][..])
             .expect("test signature bytes are canonical"),
     }
@@ -42,7 +47,8 @@ fn default_anchor() -> Anchor {
 }
 
 fn tachygram(seed: u8) -> Tachygram {
-    Tachygram::from(pallas::Base::from_uniform_bytes(&[seed; 64]))
+    Tachygram::read(&pallas::Base::from_uniform_bytes(&[seed; 64]).to_repr()[..])
+        .expect("a locally generated field element has a canonical encoding")
 }
 
 fn transaction_with_tachyon_bundle(bundle: TachyonBundle) -> Transaction {
@@ -52,6 +58,7 @@ fn transaction_with_tachyon_bundle(bundle: TachyonBundle) -> Transaction {
         network_upgrade: NetworkUpgrade::NuTachyon,
         lock_time: LockTime::unlocked(),
         expiry_height: Height(0),
+        zip233_amount: Amount::zero(),
         inputs: Vec::new(),
         outputs: Vec::new(),
         sapling_shielded_data: None,
@@ -152,6 +159,7 @@ fn v7_is_nu_tachyon_gated_and_matches_zakura_primitives() {
         network_upgrade: NetworkUpgrade::Nu6_3,
         lock_time: LockTime::unlocked(),
         expiry_height: Height(0),
+        zip233_amount: Amount::zero(),
         inputs: Vec::new(),
         outputs: Vec::new(),
         sapling_shielded_data: None,
@@ -233,6 +241,39 @@ fn v7_tachyon_fixtures_round_trip() {
             "{name} authorization digest differs"
         );
     }
+}
+
+#[test]
+fn v7_zip233_amount_round_trips_and_matches_zakura_primitives() {
+    let _init_guard = zakura_test::init();
+
+    let zip233_amount = Amount::try_from(123_456u64).expect("ZIP-233 amount is in range");
+    let mut transaction = empty_transaction();
+    let Transaction::V7 {
+        zip233_amount: transaction_zip233_amount,
+        ..
+    } = &mut transaction
+    else {
+        unreachable!("empty_transaction always returns V7")
+    };
+    *transaction_zip233_amount = zip233_amount;
+
+    let bytes = transaction
+        .zcash_serialize_to_vec()
+        .expect("a V7 ZIP-233 amount has a valid wire encoding");
+    assert_eq!(&bytes[20..28], &123_456u64.to_le_bytes());
+
+    let decoded = Transaction::zcash_deserialize(&bytes[..])
+        .expect("Zakura must deserialize its V7 ZIP-233 amount");
+    assert_eq!(decoded.zip233_amount(), zip233_amount);
+
+    let zakura_primitives_transaction = transaction
+        .to_librustzcash(NetworkUpgrade::NuTachyon)
+        .expect("zakura-primitives must accept Zakura's V7 ZIP-233 encoding");
+    assert_eq!(
+        u64::from(zakura_primitives_transaction.zip233_amount()),
+        123_456
+    );
 }
 
 /// Prints the canonical encodings consumed by `zakura-primitives` tests.

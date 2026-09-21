@@ -9,6 +9,7 @@ use chrono::Utc;
 use tower::{service_fn, ServiceExt};
 
 use zakura_chain::{
+    amount::Amount,
     block::Height,
     parameters::{testnet::ConfiguredActivationHeights, Network, NetworkUpgrade},
     transaction::{HashType, LockTime, Transaction},
@@ -57,6 +58,7 @@ fn v7_transaction(
         network_upgrade,
         lock_time: LockTime::min_lock_time_timestamp(),
         expiry_height: Height(0),
+        zip233_amount: Amount::zero(),
         inputs: Vec::new(),
         outputs: Vec::new(),
         sapling_shielded_data: None,
@@ -329,8 +331,6 @@ async fn v7_with_wrong_sighash_signatures_is_rejected() {
 /// A tachyon action whose value commitment is the identity point is rejected.
 #[tokio::test(flavor = "multi_thread")]
 async fn v7_with_identity_cv_is_rejected() {
-    use halo2::pasta::group::CurveAffine;
-
     let _init_guard = zakura_test::init();
     let (network, height) = nutachyon_network();
 
@@ -344,7 +344,7 @@ async fn v7_with_identity_cv_is_rejected() {
     let rk = private::ActionSigningKey::new(&alpha).derive_action_public();
 
     let action = zcash_tachyon::Action {
-        cv: value::Commitment::from(halo2::pasta::pallas::Affine::identity()),
+        cv: value::Commitment::default(),
         rk,
         sig: action::Signature::read(&[0x01u8; 64][..]).expect("64 bytes"),
     };

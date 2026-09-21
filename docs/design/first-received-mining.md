@@ -48,6 +48,10 @@ Its `header_best` may differ from the fully validated `verified_best` on equal
 work. The atomic full-state transition publishes the verified choice, including
 after operator invalidation and reconsideration. The planner checks that the
 chosen path is eligible, fully verified, and has greatest cumulative work.
+When full state evicts a fork, the same atomic transition clears its retained
+body verification markers. Its headers stay eligible for download and validation.
+The header limit allows one extra candidate beyond the ten full-state forks,
+so an independent header download tip can remain selected.
 
 ## Restart
 

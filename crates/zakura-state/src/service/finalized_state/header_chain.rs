@@ -271,6 +271,10 @@ struct TestHeaderCompletionAuthority<'a>(Option<&'a dyn FullStateEvidenceAuthori
 
 #[cfg(test)]
 impl FullStateEvidenceAuthority for TestHeaderCompletionAuthority<'_> {
+    fn evicted_bodies(&self, event: &TransitionEvent) -> &[block::Hash] {
+        self.0.map_or(&[], |inner| inner.evicted_bodies(event))
+    }
+
     fn verified_tip(&self, event: &TransitionEvent) -> Option<Frontier> {
         self.0.and_then(|inner| inner.verified_tip(event))
     }
@@ -308,6 +312,10 @@ struct StateIssuedAuthority<'a> {
 }
 
 impl FullStateEvidenceAuthority for StateIssuedAuthority<'_> {
+    fn evicted_bodies(&self, event: &TransitionEvent) -> &[block::Hash] {
+        self.inner.map_or(&[], |inner| inner.evicted_bodies(event))
+    }
+
     fn verified_tip(&self, event: &TransitionEvent) -> Option<Frontier> {
         self.inner.and_then(|inner| inner.verified_tip(event))
     }

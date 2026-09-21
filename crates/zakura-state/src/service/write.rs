@@ -147,6 +147,7 @@ struct PreparedAuthority {
     transition: zakura_header_chain::TransitionFingerprint,
     retention_references: Vec<block::Hash>,
     verified_tip: Option<Frontier>,
+    evicted_bodies: Vec<block::Hash>,
 }
 
 impl PreparedAuthority {
@@ -157,6 +158,7 @@ impl PreparedAuthority {
                 transition,
                 retention_references: Vec::new(),
                 verified_tip: None,
+                evicted_bodies: Vec::new(),
             })
             .ok_or(HeaderChainStoreError::Incoherent(
                 "prepared full-state event has no stable identity",
@@ -182,6 +184,14 @@ impl FullStateEvidenceAuthority for PreparedAuthority {
         self.authorizes_full_state(event)
             .then_some(self.verified_tip)
             .flatten()
+    }
+
+    fn evicted_bodies(&self, event: &TransitionEvent) -> &[block::Hash] {
+        if self.authorizes_full_state(event) {
+            &self.evicted_bodies
+        } else {
+            &[]
+        }
     }
 
     fn authorizes_retention_reference(&self, reference: block::Hash) -> bool {
@@ -279,6 +289,18 @@ impl PreparedFullStateTransition {
             staged_tips.clone(),
         )?;
         authority.verified_tip = Some(expected_verified);
+        if matches!(
+            &header_request.event,
+            TransitionEvent::VerifiedBlockAccepted(_)
+                | TransitionEvent::VerifiedChainChanged(
+                    zakura_header_chain::VerifiedChainChanged {
+                        cause: VerifiedChangeCause::Grow | VerifiedChangeCause::Reset,
+                        ..
+                    }
+                )
+        ) {
+            authority.evicted_bodies = live_non_finalized.evicted_blocks(&non_finalized_after);
+        }
         let mut retention_references = context.retention_references.to_vec();
         retention_references.extend(staged_tips.iter().copied());
         retention_references.sort_unstable_by_key(|hash| hash.0);

@@ -454,9 +454,7 @@ fn check_derived_nsm_seed_schedule(network: &Network) -> Result<(), ParametersBu
                 source,
             }
         })?;
-    if scheduled_issuance
-        > u128::try_from(MAX_MONEY).expect("MAX_MONEY is non-negative and fits in u128")
-    {
+    if scheduled_issuance > u128::from(MAX_MONEY.unsigned_abs()) {
         return Err(ParametersBuilderError::DerivedNsmSeedExceedsMaxMoney {
             seed_height,
             scheduled_issuance,

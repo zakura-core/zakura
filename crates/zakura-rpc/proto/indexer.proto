@@ -68,7 +68,8 @@ message NonFinalizedStateChangeRequest {
   repeated bytes chain_tip_hashes = 1;
 
   // Session from the previous response's x-zakura-receipt-session metadata.
-  // A missing or changed session requests all non-finalized blocks again.
+  // A different session requests all non-finalized blocks again. Omitting the
+  // session preserves known tips for clients that predate receipt ordering.
   optional string receipt_session = 2;
 };
 

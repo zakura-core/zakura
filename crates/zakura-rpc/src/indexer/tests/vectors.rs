@@ -638,12 +638,11 @@ async fn non_finalized_stream_preserves_receipts_within_a_session() -> Result<()
     let (server, client, mut state, _tip, _mempool) = start_server_and_get_client().await?;
     let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
     let hash = block.hash();
-    for session in [
-        None,
-        Some("previous-primary".to_owned()),
-        Some(indexer::receipt_session().to_owned()),
+    for (session, retain_known_tips) in [
+        (None, true),
+        (Some("previous-primary".to_owned()), false),
+        (Some(indexer::receipt_session().to_owned()), true),
     ] {
-        let same_session = session.as_deref() == Some(indexer::receipt_session());
         let mut client = client.clone();
         let request = tokio::spawn(async move {
             client
@@ -656,7 +655,7 @@ async fn non_finalized_stream_preserves_receipts_within_a_session() -> Result<()
         let (sender, receiver) = tokio::sync::mpsc::channel(8);
         state
             .expect_request(ReadRequest::NonFinalizedBlocksListener {
-                known_chain_tips: if same_session {
+                known_chain_tips: if retain_known_tips {
                     [hash].into_iter().collect()
                 } else {
                     Default::default()

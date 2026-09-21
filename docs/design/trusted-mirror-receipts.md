@@ -7,9 +7,10 @@ first-received mining policy added separately.
 
 Receipt orders belong to one primary process. The `x-zakura-receipt-session`
 response header identifies that process, and a secondary returns it as
-`receipt_session` when reconnecting. The server ignores known tips when the
-session is absent or different. If the response session changes, the secondary
-clears its old orders and resubscribes with empty tips before accepting blocks.
+`receipt_session` when reconnecting. The server ignores known tips when a supplied
+session differs. Older clients can omit the session and retain incremental resume.
+If the response session changes, the secondary clears its old orders and
+resubscribes with empty tips before accepting blocks.
 The published state also clears, and finalized-tip tracking continues if the
 replacement stream is empty.
 

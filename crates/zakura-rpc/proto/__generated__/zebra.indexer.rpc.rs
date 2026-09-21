@@ -79,7 +79,8 @@ pub struct NonFinalizedStateChangeRequest {
     #[prost(bytes = "vec", repeated, tag = "1")]
     pub chain_tip_hashes: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
     /// Session from the previous response's x-zakura-receipt-session metadata.
-    /// A missing or changed session requests all non-finalized blocks again.
+    /// A different session requests all non-finalized blocks again. Omitting the
+    /// session preserves known tips for clients that predate receipt ordering.
     #[prost(string, optional, tag = "2")]
     pub receipt_session: ::core::option::Option<::prost::alloc::string::String>,
 }

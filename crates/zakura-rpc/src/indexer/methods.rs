@@ -123,7 +123,12 @@ where
         // rejected up front.
         let request = request.into_inner();
         let mut known_chain_tips = decode_known_chain_tips(request.chain_tip_hashes)?;
-        if request.receipt_session.as_deref() != Some(super::receipt_session()) {
+        // Older clients send resume tips without a receipt session.
+        if request
+            .receipt_session
+            .as_deref()
+            .is_some_and(|session| session != super::receipt_session())
+        {
             known_chain_tips.clear();
         }
 

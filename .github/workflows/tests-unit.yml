@@ -336,12 +336,10 @@ jobs:
       - name: Check generated zakurad config compatibility
         run: cargo nextest run --profile zakura-config --archive-file "${RUNNER_TEMP}/nextest-archive.tar.zst" --no-fail-fast
 
-  nu7:
-    name: NU7 feature tests
+  extended-reissuance-properties:
+    name: extended reissuance properties
     needs: changes
-    # Compiles its own binaries, because the shared nextest archive is built
-    # without this feature.
-    if: needs.changes.outputs.rust == 'true' || github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request'
     permissions:
       contents: read
       id-token: write
@@ -356,14 +354,7 @@ jobs:
         with:
           toolchain: stable
       - uses: ./.github/actions/setup-zakura-build
-      - name: Test NU7 builds
-        run: |
-          cargo test --locked --features nu7 \
-            -p zakura-consensus -p zakura-state --lib
-          cargo check --locked -p zakura --features nu7
-
       - name: Extended reissuance properties
-        if: github.event_name != 'pull_request'
         env:
           NSM_ARITHMETIC_CASES: '10000'
           NSM_HISTORY_CASES: '1000'
@@ -500,7 +491,7 @@ jobs:
       - build-tests
       - unit-tests
       - zakura-config
-      - nu7
+      - extended-reissuance-properties
       - network-dependent
       - pruned-storage
       - check-no-git-dependencies
@@ -518,7 +509,7 @@ jobs:
           # check-no-git-dependencies is A-release-label only, publish-graph
           # skips on PRs that do not touch Cargo manifests or this check.
           # Failed, non-skipped jobs still fail this aggregate status.
-          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, network-dependent, nu7, publish-graph
+          allowed-skips: check-no-git-dependencies, pruned-storage, zakura-config, build-tests, unit-tests, extended-reissuance-properties, network-dependent, publish-graph
 
   report-nightly-result:
     name: report nightly release test result

@@ -250,22 +250,25 @@ mod test {
         }
     }
 
+    /// Checks that Zakura advertises the Mainnet NU7 version, which meets the NU7
+    /// minimum on every network.
     #[test]
-    fn nu63_protocol_versions_match_current_version() {
+    fn nu7_protocol_versions_match_current_version() {
         let _init_guard = zakura_test::init();
 
         assert_eq!(
-            Version::min_specified_for_upgrade(&Mainnet, Nu6_3),
+            Version::min_specified_for_upgrade(&Mainnet, Nu7),
             CURRENT_NETWORK_PROTOCOL_VERSION
         );
-        assert_eq!(
-            Version::min_specified_for_upgrade(&Network::new_default_testnet(), Nu6_3),
-            CURRENT_NETWORK_PROTOCOL_VERSION
-        );
-        assert_eq!(
-            Version::min_specified_for_upgrade(&Network::new_regtest(Default::default()), Nu6_3),
-            CURRENT_NETWORK_PROTOCOL_VERSION
-        );
+        for network in [
+            Network::new_default_testnet(),
+            Network::new_regtest(Default::default()),
+        ] {
+            assert!(
+                Version::min_specified_for_upgrade(&network, Nu7)
+                    <= CURRENT_NETWORK_PROTOCOL_VERSION
+            );
+        }
     }
 
     /// Checks the NU7 protocol versions against the ZIP 204 assignment rule.

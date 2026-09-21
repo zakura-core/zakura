@@ -186,7 +186,7 @@ fn block_and_hash_decode_rejects_a_missing_coinbase() -> Result<()> {
 }
 
 #[tokio::test]
-async fn non_finalized_stream_preserves_receipts_and_negotiates_snapshots() -> Result<()> {
+async fn non_finalized_stream_negotiates_snapshot_sessions() -> Result<()> {
     use zakura_chain::serialization::BytesInDisplayOrder;
     use zakura_state::{NonFinalizedBlocksListener, NonFinalizedStateChange};
 

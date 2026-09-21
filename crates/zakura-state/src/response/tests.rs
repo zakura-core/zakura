@@ -99,7 +99,7 @@ async fn sends_all_blocks_when_no_known_tips() {
 }
 
 #[tokio::test]
-async fn snapshots_carry_receipts_and_known_tip_changes() {
+async fn snapshots_carry_known_tip_changes() {
     use super::NonFinalizedStateChange::{Block as ReceivedBlock, ChainTips};
 
     let _init_guard = zakura_test::init();

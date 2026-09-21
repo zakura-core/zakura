@@ -1325,7 +1325,7 @@ fn receipt_fallback_and_backup_restore_ignore_replay_order() {
 }
 
 #[test]
-fn trusted_snapshot_reconciles_known_forks_without_changing_receipts() {
+fn trusted_snapshot_reconciles_known_forks() {
     let _init_guard = zakura_test::init();
     let network = Network::Mainnet;
     let root = Arc::new(network.test_block(653599, 583999).unwrap());

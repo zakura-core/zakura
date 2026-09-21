@@ -167,7 +167,7 @@ pub struct TrustedChainSync {
     /// The finalized-tip updater, retained so `sync()` can wait for any in-flight
     /// secondary database catch-up before committing a streamed block.
     finalized_tip_updater: Option<JoinHandle<()>>,
-    /// Receipt orders from distinct primary processes must never be compared.
+    /// Identifies the primary process whose fork snapshot is staged locally.
     receipt_session: Option<String>,
 }
 

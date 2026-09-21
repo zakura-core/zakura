@@ -116,7 +116,7 @@ class AffectedSemverPackagesTest(unittest.TestCase):
             changed_files=[".github/workflows/scripts/patch_registry_for_semver.sh"],
         )
 
-        self.assertEqual(affected, ["zakura-header-chain", "zakura-network", "zakura-rpc"])
+        self.assertEqual(affected, ["zakura-network", "zakura-rpc"])
 
     def test_package_manifest_selects_that_package(self):
         registry_dependency = {
@@ -135,7 +135,7 @@ class AffectedSemverPackagesTest(unittest.TestCase):
 
         self.assertEqual(affected, ["base"])
 
-    def test_checks_header_chain_and_its_dependents(self):
+    def test_excludes_publishable_crate_without_registry_baseline(self):
         packages = [
             self.package("zakura-header-chain"),
             self.package(
@@ -149,7 +149,7 @@ class AffectedSemverPackagesTest(unittest.TestCase):
             changed_files=["zakura-header-chain/src/lib.rs"],
         )
 
-        self.assertEqual(affected, ["zakura-header-chain", "dependent"])
+        self.assertEqual(affected, ["dependent"])
 
     def test_excludes_zakura_node_package_from_semver_enforcement(self):
         packages = [

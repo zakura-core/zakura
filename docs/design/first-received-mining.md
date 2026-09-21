@@ -46,44 +46,19 @@ the restored full-state path with the durable header engine before publication.
 
 ## Trusted mirrors
 
-The trusted indexer stream carries optional `receipt_order` metadata. Its
-`x-zakura-receipt-session` response header identifies the primary process that
-assigned those orders. A secondary returns that value as `receipt_session` on
-resubscription. If it differs, the server ignores the secondary's known tips and
-sends a complete snapshot. The secondary discards its old receipt-order domain
-and resubscribes with empty tips whenever the response session changes, including
-when an older server omits it. Reconnecting to a legacy server also clears any
-local forks because two missing session identifiers cannot establish that the
-primary is unchanged. After the block syncer has taken over publication,
-it immediately clears the published fork and refreshes the finalized tip while
-the replacement stream is empty, even if a legacy server sends no messages.
+The [trusted mirror snapshot protocol](trusted-mirror-snapshots.md) supplies the
+complete fork set and identifies the primary process. The block stream also
+carries optional `receipt_order` metadata so the secondary uses the same tie
+preference as its primary. Receipt orders from different primary processes must
+never be compared. Resetting local forks when the session changes discards the
+old receipt-order domain before accepting the replacement snapshot.
 
-Secondaries request `include_chain_snapshot` to receive a `chain_snapshot`
-message after each batch of blocks. Its complete retained tip set covers changes
-to already-known blocks, including invalidation and reconsideration. Snapshot
-messages contain no block data. Missing tips cause a complete resubscription.
-An empty tip set clears the mirror's non-finalized state. With session-aware
-servers, blocks stay private until the snapshot marker reconciles the full fork
-set. Only then does the mirror publish the new state and tip. A disconnected batch
-is discarded and resubscription uses the last published snapshot. Incomplete
-snapshots and block commit failures request all forks again in empty private
-staging, so obsolete forks cannot consume the replacement's fork capacity. The
-last published state stays visible until a complete replacement is ready.
-Legacy servers without snapshot markers retain incremental publication.
-An initial empty snapshot leaves finalized-tip tracking active during checkpoint
-sync. The first real block transfers that responsibility to the block syncer.
-Snapshot clients can drain a full listener buffer and reconcile the completed
-batch. Streams without snapshot support close when that buffer fills so legacy
-clients can reconnect after possible gaps in state updates.
+Older servers omit receipt metadata and retain their hash-based policy. Older
+clients can decode block messages but cannot mirror the new tie policy exactly,
+so upgrade trusted secondaries alongside the primary. Receipt metadata is an
+additive wire field. Ordinary block encodings and the P2P header protocol are
+unchanged.
 
-These fields are additive. Servers send snapshot messages only to clients that
-request them. Older servers omit receipt metadata and retain their hash-based
-policy. Older clients can decode block messages but cannot mirror the new tie
-policy exactly, so upgrade trusted secondaries alongside the primary. Ordinary
-block encodings and the P2P header protocol are unchanged.
-
-The generated Rust request and response structs gain fields, which breaks
-exhaustive struct literals in library consumers. The RPC crate therefore advances
-to the next major version even though the wire extension is additive.
-The header-chain crate also advances to the next major version because its
-public operator-error enum gains a variant.
+The public Rust block and message structs gain receipt fields, and the
+header-chain operator-error enum gains a variant. These public API changes must
+be accounted for when selecting crate versions for the next release.

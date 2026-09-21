@@ -1,4 +1,4 @@
-spec_version = "1.5"
+spec_version = "1.6"
 
 # Phase 0 registers the complete rule catalog without implementation claims.
 # Later checkpoints change a status after the manifest can name its owner and tests.

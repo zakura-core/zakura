@@ -8,11 +8,9 @@ order is assigned before asynchronous verification, so a later block cannot gain
 priority by finishing validation faster. Only valid blocks enter chain selection.
 A greater-work chain still replaces an earlier equal-work winner.
 
-Full state retains at most ten forks. At that limit, it keeps the newly accepted
-branch and the nine highest-ranked other branches. This leaves the accepted
-parent available for a child that could make its branch best, while preserving
-the current mining winner. Evicted bodies leave the duplicate cache and can be
-downloaded and validated again.
+[Fork retention](../specs/fork-aware-header-chain-engine.md#lc-retain-01)
+keeps newly accepted parents available for extension and evicted bodies eligible
+for download and validation again.
 
 Proposals and templates do not establish receipt order. A solved submission gets
 its own order even when verification reuses a prepared template. Retained blocks
@@ -48,11 +46,6 @@ Its `header_best` may differ from the fully validated `verified_best` on equal
 work. The atomic full-state transition publishes the verified choice, including
 after operator invalidation and reconsideration. The planner checks that the
 chosen path is eligible, fully verified, and has greatest cumulative work.
-When full state evicts a fork, the same atomic transition clears its retained
-body verification markers. Its headers stay eligible for download and validation.
-This also applies when reconsideration restores a branch at the fork limit.
-The header limit allows one extra candidate beyond the ten full-state forks,
-so an independent header download tip can remain selected.
 
 ## Restart
 

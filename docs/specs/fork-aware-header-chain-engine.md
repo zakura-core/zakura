@@ -1,13 +1,15 @@
 # Fork-aware headers-only chain engine specification
 
 Status: normative design oracle for the replacement of PR #229<br>
-Version: 1.5<br>
-Date: 2026-09-20<br>
+Version: 1.6<br>
+Date: 2026-09-21<br>
 Scope: Zakura native (v2 P2P) header sync and its integration with Zakura full state
 
 Version 1.4 removes every backward-compatibility surface from this engine. There is exactly one header-sync message set, one codec, one status message, and one supported stream version. The previous native stream version 7, its dual-version negotiation, and the legacy Zcash `getheaders` fallback are not implemented, not served, and not tested. The legacy Zcash P2P stack is out of scope entirely: this engine neither reads, writes, nor changes it.
 
-Version 1.5 separates header scheduling from full-state equal-work selection. Headers retain deterministic raw-hash ordering. Full state prefers the first-received valid leaf block and supplies that choice through the authenticated atomic transition, including operator changes. This adds no header wire or disk fields. Restored full-state blocks lack receipt metadata and use the hash fallback, and startup reconciles that restored path before publication.
+Version 1.5 makes full-state fork eviction recoverable. Newly accepted branches remain available for extension within the existing full-state fork limit. Atomic block acceptance and reconsideration clear verification markers for evicted bodies while leaving their headers eligible. This adds no wire or disk fields.
+
+Version 1.6 separates header scheduling from full-state equal-work selection. Headers retain deterministic raw-hash ordering. Full state prefers the first-received valid leaf block and supplies that choice through the authenticated atomic transition, including operator changes. This adds no header wire or disk fields. Restored full-state blocks lack receipt metadata and use the hash fallback, and startup reconciles that restored path before publication.
 
 ## Document overview
 
@@ -730,7 +732,7 @@ The “architecture dependency check” asserts that wallet scanning, FlyClient 
 
 **LC-ACCEPT-04 [LS] — Terminating body-failure handling.** Body-invalid and body-unavailable cases MUST terminate each retry episode in either deterministic reselection or an explicit persistent alarm; neither may produce an infinite silent retry.
 
-**LC-ACCEPT-05 [LS] — Explained parity differences.** The full-state/header differential suite MUST enumerate and explain every intentional difference. Version 1.5 acceptance MUST contain no unresolved design placeholders.
+**LC-ACCEPT-05 [LS] — Explained parity differences.** The full-state/header differential suite MUST enumerate and explain every intentional difference. Version 1.6 acceptance MUST contain no unresolved design placeholders.
 
 ## 8. Implementation oracle and source authority
 

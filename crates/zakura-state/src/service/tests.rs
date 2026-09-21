@@ -821,12 +821,11 @@ async fn fork_eviction_allows_new_and_replayed_parents_to_extend() {
     template.transactions = vec![Arc::new(transaction_v4_from_coinbase(
         &template.transactions[0],
     ))];
-    let mut siblings = Vec::new();
-    for order in 0..=crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS {
-        let mut block = template.clone();
-        Arc::make_mut(&mut block.header).nonce.0[..8]
-            .copy_from_slice(&u64::try_from(order).unwrap().to_le_bytes());
-        let block = Arc::new(block);
+    let mut siblings =
+        Arc::new(template).make_fake_siblings(crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS + 1);
+    // Receipt order deliberately opposes the hash tie-breaker.
+    siblings.reverse();
+    for (order, block) in siblings.iter().enumerate() {
         let mut prepared = block.clone().prepare();
         prepared.receipt_order = Some(u64::try_from(order).unwrap());
         tokio::time::timeout(
@@ -837,7 +836,6 @@ async fn fork_eviction_allows_new_and_replayed_parents_to_extend() {
         .unwrap()
         .unwrap()
         .unwrap();
-        siblings.push(block);
         let retained = state.read_service.latest_non_finalized_state();
         assert_eq!(retained.best_tip().unwrap().1, siblings[0].hash());
         assert!(retained.any_chain_contains(&siblings[order].hash()));
@@ -936,8 +934,11 @@ async fn assert_reconsideration_eviction_replay(header_runtime: bool) {
     header.commitment_bytes =
         <[u8; 32]>::from(state.read_service.db.history_tree().hash().unwrap()).into();
 
-    let mut siblings: Vec<Arc<Block>> = Vec::new();
-    for order in 0..=crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS {
+    let mut siblings =
+        template.make_fake_siblings(crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS + 1);
+    // Receipt order deliberately opposes the hash tie-breaker.
+    siblings.reverse();
+    for (order, block) in siblings.iter().enumerate() {
         if order == crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS {
             timeout(limit, state.send_invalidate_block(siblings[0].hash()))
                 .await
@@ -945,9 +946,6 @@ async fn assert_reconsideration_eviction_replay(header_runtime: bool) {
                 .unwrap()
                 .unwrap();
         }
-        let mut block = template.clone();
-        Arc::make_mut(&mut Arc::make_mut(&mut block).header).nonce.0[..8]
-            .copy_from_slice(&u64::try_from(order).unwrap().to_le_bytes());
         let mut prepared = block.clone().prepare();
         prepared.receipt_order = Some(u64::try_from(order).unwrap());
         timeout(
@@ -958,7 +956,6 @@ async fn assert_reconsideration_eviction_replay(header_runtime: bool) {
         .unwrap()
         .unwrap()
         .unwrap();
-        siblings.push(block);
     }
     assert_eq!(
         state

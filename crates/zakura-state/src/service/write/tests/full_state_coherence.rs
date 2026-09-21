@@ -102,8 +102,11 @@ fn assert_fork_eviction_body_evidence(reconsider: bool) {
     header.merkle_root = merkle_root;
     header.commitment_bytes = <[u8; 32]>::from(finalized.db.history_tree().hash().unwrap()).into();
 
-    let mut siblings: Vec<Arc<Block>> = Vec::new();
-    for order in 0..=crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS {
+    let mut siblings =
+        template.make_fake_siblings(crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS + 1);
+    // Receipt order deliberately opposes the hash tie-breaker.
+    siblings.reverse();
+    for (order, block) in siblings.iter().enumerate() {
         let refill_after_invalidation =
             reconsider && order == crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS;
         if refill_after_invalidation {
@@ -111,9 +114,6 @@ fn assert_fork_eviction_body_evidence(reconsider: bool) {
             staged.invalidate_block(siblings[0].hash()).unwrap();
             commit_operator_change(&writer, &mut live, staged, siblings[0].hash(), true).unwrap();
         }
-        let mut block = template.clone();
-        Arc::make_mut(&mut Arc::make_mut(&mut block).header).nonce.0[..8]
-            .copy_from_slice(&u64::try_from(order).unwrap().to_le_bytes());
         let mut prepared = block.clone().prepare();
         prepared.receipt_order = Some(u64::try_from(order).unwrap());
         let mut staged = live.clone();
@@ -124,7 +124,6 @@ fn assert_fork_eviction_body_evidence(reconsider: bool) {
             staged,
             Frontier::new(height, block.hash()),
         );
-        siblings.push(block);
         assert_eq!(
             live.best_tip().unwrap().1,
             siblings[usize::from(refill_after_invalidation)].hash()

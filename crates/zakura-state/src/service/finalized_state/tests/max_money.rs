@@ -35,7 +35,7 @@ fn network() -> Network {
             nu7: Some(3),
             ..Default::default()
         },
-        nsm_reissuance_height: Some(Height(5)),
+        test_nsm_reissuance_height: Some(Height(5)),
         initial_nsm_value_balance: Some(Amount::try_from(1_000_000_000_000i64).unwrap()),
         ..Default::default()
     })

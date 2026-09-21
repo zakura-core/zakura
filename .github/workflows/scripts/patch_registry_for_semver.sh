@@ -16,7 +16,9 @@ set -euo pipefail
 #   cannot change, so give the crate's bindgen build-dependency the feature.
 # - stun-rs 0.1.11 uses precis-core 0.1 traits, but precis-profiles 0.1.14
 #   switched to precis-core 0.2. Pin its profiles dependency to the compatible
-#   version in our workspace lock file.
+#   version in our workspace lock file. Path-patched crates are not lint-capped,
+#   so also drop the unused `stunt_attribute_impl` re-export that fails under
+#   CARGO_BUILD_WARNINGS=deny.
 readonly original_cargo_home="${CARGO_HOME:-$HOME/.cargo}"
 patch_root=$(mktemp -d "$RUNNER_TEMP/semver-registry.XXXXXX")
 readonly patch_root
@@ -79,6 +81,12 @@ if [[ "$(grep -Fx -A1 '[dependencies.precis-profiles]' "$stun_rs_manifest")" != 
 fi
 sed -i '/^\[dependencies\.precis-profiles\]$/,/^version = / s/^version = "0.1.12"$/version = "=0.1.13"/' \
   "$stun_rs_manifest"
+readonly stun_rs_attributes="$stun_rs_source/src/attributes.rs"
+if [[ "$(grep -Fxc 'pub(crate) use stunt_attribute_impl;' "$stun_rs_attributes")" != 1 ]]; then
+  echo "stun-rs $stun_rs_version no longer matches the expected unused stunt_attribute_impl re-export" >&2
+  exit 1
+fi
+sed -i '/^pub(crate) use stunt_attribute_impl;$/d' "$stun_rs_attributes"
 
 mkdir -p "$patched_cargo_home"
 ln -s "$original_cargo_home/registry" "$patched_cargo_home/registry"

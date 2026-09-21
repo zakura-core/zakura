@@ -17,15 +17,12 @@ independently.
 
 - Added the ZIP 218 per-block shielded action limits at NU7. From the configured
   NU7 activation height onwards, blocks may contain at most 330 Orchard actions,
-  300 Sapling spends plus outputs, no Sprout JoinSplits, and a global shielded
-  cost of 330 where each JoinSplit counts twice. `getblocktemplate` only selects
-  transactions that fit these limits. Networks without an NU7 activation height
-  follow today's consensus
-  ([#1027](https://github.com/zakura-core/zakura/pull/1027)).
-- Counted Ironwood actions against the ZIP 218 Orchard action limit and in the
-  global shielded budget. This goes beyond ZIP 218, which names only Orchard
-  actions, because NU6.3 moves new Orchard-protocol value to the Ironwood pool
-  ([#1027](https://github.com/zakura-core/zakura/pull/1027)).
+  330 Ironwood actions, 300 Sapling spends plus outputs, no Sprout JoinSplits,
+  and a global shielded cost of 330 where each JoinSplit counts twice.
+  `getblocktemplate` only selects transactions that fit these limits. Networks
+  without an NU7 activation height follow today's consensus
+  ([#1027](https://github.com/zakura-core/zakura/pull/1027),
+  [#1041](https://github.com/zakura-core/zakura/pull/1041)).
 - Rejected mempool transactions whose own shielded actions exceed a ZIP 218
   per-block limit, with misbehavior score 100, because no block can include
   them. ZIP 218 does not specify this rejection
@@ -48,19 +45,12 @@ independently.
 - Seeded the NSM balance before NU7 and rejected negative balances from NU7,
   with matching database migration and configurable initial balances
   ([#1070](https://github.com/zakura-core/zakura/pull/1070)).
-- Added explicit NSM reissuance start heights, with Mainnet and default Testnet
-  left unscheduled until the deployment ZIP selects their heights. Custom Testnets
-  and Regtest can configure their own heights
-  ([#1072](https://github.com/zakura-core/zakura/pull/1072)).
 - Verified reissuance rewards using the actual parent's NSM balance, with
   matching checkpoint funding, rollback, replay, and migration checks
   ([#1073](https://github.com/zakura-core/zakura/pull/1073)).
 - Used parent NSM balances in mining templates, coinbase rewards, and subsidy
   RPCs after reissuance activation
   ([#1074](https://github.com/zakura-core/zakura/pull/1074)).
-- Added an off-by-default `nu7-experimental` build feature for staging
-  candidate NU7 consensus rules without changing default-build behavior
-  ([#958](https://github.com/zakura-core/zakura/pull/958)).
 - Added `network.zakura.nat_traversal` to opt in to QUIC NAT traversal with
   native peers. It remains disabled by default; enabling it allows candidate
   address exchange and UDP probes but does not enable relays or external
@@ -72,11 +62,6 @@ independently.
 
 ### Changed
 
-- Gave Ironwood its own ZIP 218 per-block action limit of 330, instead of
-  counting Ironwood actions against the Orchard limit. Both pools still draw on
-  the one global shielded budget of 330, so a block cannot spend the per-pool
-  capacity twice
-  ([#1041](https://github.com/zakura-core/zakura/pull/1041)).
 - Updated the common libraries to `1.3.0-alpha.1`, including the removal of
   unused experimental ZIP 233 fields
   ([#1042](https://github.com/zakura-core/zakura/pull/1042)).
@@ -89,8 +74,10 @@ independently.
   (ZIP 2003). Mainnet and default Testnet remain unscheduled;
   [#1059](https://github.com/zakura-core/zakura/issues/1059) tracks their
   activation heights ([#1060](https://github.com/zakura-core/zakura/pull/1060)).
-- Zakura advertises network protocol version 170190, the NU7 version from
-  ZIP 204 ([#1060](https://github.com/zakura-core/zakura/pull/1060)).
+- Set the NU7 peer protocol versions to the ZIP 204 values: 170180 on Testnet
+  and Regtest, and 170190 on Mainnet
+  ([#998](https://github.com/zakura-core/zakura/pull/998),
+  [#1060](https://github.com/zakura-core/zakura/pull/1060)).
 - Scaled target-spacing-dependent node timing at NU7, including Testnet mining,
   RPC work estimation, sync and gossip lookahead, near-tip detection, stall
   warnings, and checkpoint progress hints
@@ -128,26 +115,14 @@ independently.
 - Keep the connection and unrelated services running when a persistent native
   P2P stream write times out
   ([#943](https://github.com/zakura-core/zakura/pull/943)).
-- Builds with the `nu7` feature reject version 4 transactions from the NU7
-  activation height, implementing ZIP 2003
-  ([#959](https://github.com/zakura-core/zakura/pull/959)).
-- Default builds accept version 4 transactions at NU7 on configured networks
-  that set an NU7 activation height. Previously every build rejected them at
-  NU7. Mainnet and Testnet have no NU7 activation height, so this change does
-  not affect them ([#959](https://github.com/zakura-core/zakura/pull/959)).
-- Renamed the off-by-default `nu7-experimental` build feature to `nu7`,
-  because the 2026-09-14 coinholder poll ratified the NU7 rules. The feature
-  stays off by default until NU7 has activation heights
-  ([#997](https://github.com/zakura-core/zakura/pull/997)).
-- Set the NU7 peer protocol versions to the ZIP 204 values: 170180 on Testnet
-  and Regtest, and 170190 on Mainnet
-  ([#998](https://github.com/zakura-core/zakura/pull/998)).
 
 ### Removed
 
-- Removed the `nu7` build feature from `zakura-consensus` and `zakurad`. NU7
-  rules activate by height in every build
-  ([#1060](https://github.com/zakura-core/zakura/pull/1060)).
+- Removed the temporary `nu7` / `nu7-experimental` build feature from
+  `zakura-consensus` and `zakurad`. NU7 rules activate by height in every build
+  ([#958](https://github.com/zakura-core/zakura/pull/958),
+  [#997](https://github.com/zakura-core/zakura/pull/997),
+  [#1060](https://github.com/zakura-core/zakura/pull/1060)).
 - Remove the explicit `nsm_reissuance_height` configuration override; networks
   with NU7 configured use the calculated crossover
   ([#1082](https://github.com/zakura-core/zakura/pull/1082)).
@@ -239,7 +214,6 @@ independently.
   same identity, and disabled the new QUIC NAT traversal address exchange and
   peer-directed probes
   ([#935](https://github.com/zakura-core/zakura/pull/935)).
-
 - Dual-stack checkpoint sync can recompute from current commitment trees when
   compatible native peers cannot supply VCT metadata. Nodes already using frozen
   VCT trees still wait for authenticated metadata

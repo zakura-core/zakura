@@ -14779,6 +14779,105 @@ async fn reactor_publishes_block_sync_candidate_gap() {
 }
 
 #[tokio::test]
+async fn testnet_fork_body_reports_wrong_branch_hint_and_keeps_selected_body() {
+    let losing = mainnet_block(include_bytes!("tests/fixtures/testnet-4351709-losing.bin"));
+    let selected = mainnet_block(include_bytes!(
+        "tests/fixtures/testnet-4351709-selected.bin"
+    ));
+    let height = block::Height(4_351_709);
+    assert_eq!(losing.coinbase_height(), Some(height));
+    assert_eq!(selected.coinbase_height(), Some(height));
+    assert_ne!(losing.hash(), selected.hash());
+    assert_eq!(block_size(&losing), 1_670);
+    assert_eq!(block_size(&selected), 7_592);
+
+    for (size, expect_mismatch) in [
+        (BlockSizeEstimate::Advertised(block_size(&losing)), true),
+        (BlockSizeEstimate::Unknown, false),
+    ] {
+        let config = immediate_body_download_config();
+        assert_eq!(config.size_deviation_tolerance, 200);
+        let parent = block::Height(height.0 - 1);
+        let parent_hash = selected.header.previous_block_hash;
+        let (tip_tx, tip_rx) = watch::channel((parent, parent_hash));
+        let startup = BlockSyncStartup::new(
+            BlockSyncFrontiers {
+                finalized_height: block::Height(4_350_714),
+                verified_block_tip: parent,
+                verified_block_hash: parent_hash,
+            },
+            (parent, parent_hash),
+            tip_rx,
+            config.clone(),
+        );
+        let (handle, mut actions, task) = spawn_block_sync_reactor(startup);
+        let service = BlockSyncService::new_with_handle_for_test(config, handle.clone());
+        let (_, inbound_tx, mut outbound_rx) = connect_peer_with_status(
+            &service,
+            &mut actions,
+            42,
+            height,
+            selected.hash(),
+            1,
+            MAX_BS_RESPONSE_BYTES,
+        )
+        .await;
+        tip_tx
+            .send((height, selected.hash()))
+            .expect("tip watch is live");
+        while !matches!(
+            next_action(&mut actions).await,
+            BlockSyncAction::QueryNeededBlocks { .. }
+        ) {}
+        handle
+            .send(BlockSyncEvent::NeededBlocks(vec![BlockSyncBlockMeta {
+                height,
+                hash: selected.hash(),
+                size,
+            }]))
+            .await
+            .expect("selected metadata queues");
+        assert_eq!(
+            wait_for_outbound_getblocks(&mut outbound_rx).await,
+            (height, 1)
+        );
+        inbound_tx
+            .send(
+                BlockSyncMessage::Block(selected.clone())
+                    .encode_frame()
+                    .expect("captured body encodes"),
+            )
+            .await
+            .expect("captured body queues");
+        let mut saw_mismatch = false;
+        let mut saw_submit = false;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !(saw_submit && saw_mismatch == expect_mismatch) {
+                match next_action(&mut actions).await {
+                    BlockSyncAction::QueryNeededBlocks { .. } => {}
+                    BlockSyncAction::Misbehavior { reason, .. } => {
+                        assert!(
+                            expect_mismatch,
+                            "an unknown size must not report a mismatch"
+                        );
+                        assert_eq!(reason, BlockSyncMisbehavior::SizeMismatch);
+                        saw_mismatch = true;
+                    }
+                    BlockSyncAction::SubmitBlock { block, .. } => {
+                        assert_eq!(block.hash(), selected.hash());
+                        saw_submit = true;
+                    }
+                    action => panic!("unexpected replay action: {action:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the selected body is submitted even with the old branch's size hint");
+        task.abort();
+    }
+}
+
+#[tokio::test]
 async fn oversize_body_policy_reports_size_mismatch_and_keeps_the_body() {
     let mut config = ZakuraBlockSyncConfig {
         size_deviation_tolerance: 100,

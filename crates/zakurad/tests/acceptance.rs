@@ -3877,6 +3877,7 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
         Height(block_template.height()),
         &miner_params,
         Amount::zero(),
+        None,
     )
     .expect("coinbase transaction should be valid under the given parameters");
 
@@ -3943,6 +3944,7 @@ async fn nu6_funding_streams_and_coinbase_balance() -> Result<()> {
         Height(block_template.height()),
         &miner_params,
         Amount::zero(),
+        None,
     )
     .expect("coinbase transaction should be valid under the given parameters");
 
@@ -4443,6 +4445,7 @@ async fn wake_debug_mempool(rpc_client: &RpcRequestClient) -> Result<()> {
 }
 
 /// Generates blocks through a cookie-authenticated test RPC listener.
+#[cfg(not(target_os = "windows"))]
 async fn generate_with_cookie(
     rpc_address: SocketAddr,
     cookie_path: &Path,

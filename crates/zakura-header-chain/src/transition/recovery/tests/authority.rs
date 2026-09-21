@@ -684,7 +684,7 @@ fn oversized_auxiliary_and_context_tables_fail_before_rows_are_loaded() {
             header: store.nodes[0].header.clone(),
             height: block::Height(0),
         };
-        crate::POW_PREDECESSOR_CONTEXT_SPAN + 1
+        crate::MAX_POW_PREDECESSOR_CONTEXT_SPAN + 1
     ];
     store.failed_read = Some(AuditRead::ValidationContexts);
 
@@ -692,7 +692,7 @@ fn oversized_auxiliary_and_context_tables_fail_before_rows_are_loaded() {
         audit_store(&store, &config),
         Err(RecoveryFailure::Store(StoreError::LimitExceeded {
             collection: crate::StoreCollection::ValidationContexts,
-            limit: crate::RowLimit::new(crate::POW_PREDECESSOR_CONTEXT_SPAN),
+            limit: crate::RowLimit::new(crate::MAX_POW_PREDECESSOR_CONTEXT_SPAN),
         }))
     );
 }
@@ -713,18 +713,22 @@ fn fatal_configuration_mismatch_fails_before_collection_visit() {
 }
 
 #[test]
-fn policy_mismatch_fails_before_collection_visit() {
+fn policy_mismatch_updates_digest_only_after_source_audit() {
     let (mut store, config) = fixture();
     store.metadata.network_policy_digest[0] ^= 1;
     store.snapshot = store.metadata.snapshot();
-    store.failed_read = Some(AuditRead::HeaderNodes);
-
+    let plan = audit_store(&store, &config).expect("a digest mismatch is diagnostic");
+    assert!(plan
+        .repairs
+        .contains(&RecoveryRepair::NetworkPolicyConfiguration));
     assert_eq!(
-        audit_store(&store, &config),
-        Err(RecoveryFailure::Source {
-            violations: vec![AuditViolation::Configuration],
-        })
+        plan.metadata.network_policy_digest,
+        config.network_policy_digest()
     );
+
+    let child_hash = store.nodes[1].hash;
+    store.nodes[1].block_work = zakura_chain::work::difficulty::Work::zero();
+    assert!(violations(&store, &config).contains(&AuditViolation::Work(child_hash)));
 }
 
 #[test]

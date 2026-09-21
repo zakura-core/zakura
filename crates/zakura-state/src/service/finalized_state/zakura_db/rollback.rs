@@ -14,7 +14,10 @@ use zakura_chain::{
     ironwood, orchard,
     parallel::tree::{NoteCommitmentTreeError, NoteCommitmentTrees},
     parameters::{
-        subsidy::{block_subsidy, funding_stream_values, FundingStreamReceiver, SubsidyError},
+        subsidy::{
+            block_subsidy, funding_stream_values, is_zip234_active, parent_nsm_value_balance,
+            FundingStreamReceiver, SubsidyError,
+        },
         Network, NetworkUpgrade,
     },
     sapling,
@@ -473,7 +476,7 @@ fn prepare_rollback(
             .block(height.into())
             .ok_or(RollbackFinalizedStateError::MissingBlock { height })?;
         let semantically_verified = SemanticallyVerifiedBlock::from(block.clone())
-            .with_deferred_pool_balance_change(deferred_pool_balance_change(height, network)?);
+            .with_deferred_pool_balance_change(deferred_pool_balance_change(db, height, network)?);
 
         reverse_transparent_block(
             db,
@@ -696,14 +699,29 @@ fn rebuild_treestate_to_height(
 }
 
 fn deferred_pool_balance_change(
+    db: &ZakuraDb,
     height: Height,
     network: &Network,
 ) -> Result<Option<DeferredPoolBalanceChange>, RollbackFinalizedStateError> {
-    if height <= network.slow_start_interval() {
-        return Ok(None);
-    }
+    // Block commits apply the deferred funding stream at every height, including heights
+    // in slow start on configured networks, so rollback must reverse it at every height too.
+    // ZIP 234 derives the block subsidy from the money reserve after the parent block.
+    // Every block being rolled back is finalized, so its parent's pools are in the db.
+    let nsm_value_balance = if is_zip234_active(network, height) {
+        height
+            .previous()
+            .ok()
+            .and_then(|parent| db.block_info(parent.into()))
+            .map(|parent_info| {
+                parent_nsm_value_balance(parent_info.value_pools().nsm_value_balance_amount())
+            })
+            .transpose()?
+    } else {
+        None
+    };
 
-    let deferred_amount = funding_stream_values(height, network, block_subsidy(height, network)?)?
+    let block_subsidy = block_subsidy(height, network, nsm_value_balance)?;
+    let deferred_amount = funding_stream_values(height, network, block_subsidy)?
         .remove(&FundingStreamReceiver::Deferred)
         .unwrap_or_default()
         .checked_sub(network.lockbox_disbursement_total_amount(height))
@@ -1507,6 +1525,74 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Height(4), Height(5), Height(6)],
             "a request at or above U is served from the index"
+        );
+    }
+}
+
+#[cfg(test)]
+mod deferred_pool_tests {
+    use zakura_chain::{
+        amount::{Amount, NonNegative},
+        block::Height,
+        parameters::{
+            subsidy::{block_subsidy, funding_stream_values, FundingStreamReceiver},
+            testnet::{
+                self, ConfiguredActivationHeights, ConfiguredFundingStreamRecipient,
+                ConfiguredFundingStreams,
+            },
+        },
+    };
+
+    use crate::{config::Config, service::finalized_state::FinalizedState};
+
+    /// Rollback reverses the deferred funding stream inside slow start, where block commits
+    /// already apply it on configured networks.
+    #[test]
+    fn deferred_pool_change_applies_during_slow_start() {
+        let _init_guard = zakura_test::init();
+
+        let network = testnet::Parameters::build()
+            .with_activation_heights(ConfiguredActivationHeights {
+                blossom: Some(1),
+                canopy: Some(2),
+                ..Default::default()
+            })
+            .expect("activation heights are valid")
+            .with_funding_streams(vec![ConfiguredFundingStreams {
+                height_range: Some(Height(2)..Height(100)),
+                recipients: Some(vec![ConfiguredFundingStreamRecipient {
+                    receiver: FundingStreamReceiver::Deferred,
+                    numerator: 12,
+                    addresses: None,
+                }]),
+            }])
+            .to_network()
+            .expect("configured testnet is valid");
+
+        let height = Height(10);
+        assert!(height <= network.slow_start_interval());
+
+        let expected = funding_stream_values(
+            height,
+            &network,
+            block_subsidy(height, &network, None).expect("valid subsidy"),
+        )
+        .expect("valid funding streams")
+        .remove(&FundingStreamReceiver::Deferred)
+        .expect("the deferred stream is active");
+        assert!(expected > Amount::<NonNegative>::zero());
+
+        let state = FinalizedState::new(&Config::ephemeral(), &network)
+            .expect("an ephemeral database opens");
+        let change = super::deferred_pool_balance_change(&state.db, height, &network)
+            .expect("the deferred change is valid")
+            .expect("the deferred change is always computed");
+
+        assert_eq!(
+            change.value(),
+            expected
+                .constrain::<zakura_chain::amount::NegativeAllowed>()
+                .expect("valid amount")
         );
     }
 }

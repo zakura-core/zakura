@@ -25,7 +25,7 @@ use zakura_chain::{
     orchard::{Action, AuthorizedAction, Flags},
     parameters::{
         testnet::{ConfiguredActivationHeights, Parameters},
-        Network, NetworkUpgrade,
+        Network, NetworkUpgrade, GLOBAL_SHIELDED_BUDGET, ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
     },
     primitives::{ed25519, x25519, Groth16Proof},
     sapling,
@@ -35,8 +35,8 @@ use zakura_chain::{
     sprout,
     transaction::{
         arbitrary::{
-            insert_fake_orchard_shielded_data, test_transactions, transactions_from_blocks,
-            v5_transactions,
+            fake_v6_with_orchard_and_ironwood_actions, insert_fake_orchard_shielded_data,
+            test_transactions, transactions_from_blocks, v5_transactions,
         },
         zip317, Hash, HashType, JoinSplitData, LockTime, Transaction,
     },
@@ -46,7 +46,7 @@ use zakura_chain::{ironwood, orchard};
 
 use zakura_node_services::mempool;
 use zakura_state::ValidateContextError;
-use zakura_test::mock_service::MockService;
+use zakura_test::mock_service::{MockService, PanicAssertion};
 
 use crate::{error::TransactionError, primitives, transaction::POLL_MEMPOOL_DELAY, BoxError};
 
@@ -1813,38 +1813,41 @@ async fn dont_skip_verification_of_block_transactions_in_mempool() {
     };
 
     // Both block requests go through full verification (no mempool bypass), so each
-    // calls AwaitUtxo on the state service.
-    let utxo_clone = utxo.clone();
-    tokio::spawn(async move {
-        state
-            .expect_request(zakura_state::Request::AwaitUtxo(input_outpoint))
-            .await
-            .expect("verifier should call mock state service with correct request")
-            .respond(zakura_state::Response::Utxo(utxo_clone));
-
-        state
-            .expect_request(zakura_state::Request::AwaitUtxo(input_outpoint))
-            .await
-            .expect("verifier should call mock state service with correct request")
-            .respond(zakura_state::Response::Utxo(utxo));
-    });
-
-    // Briefly yield and sleep so the spawned task can first expect the requests.
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-    let crate::transaction::Response::Block { .. } = verifier
-        .clone()
-        .oneshot(make_request.clone()(Arc::new([input_outpoint.hash].into())))
+    // calls AwaitUtxo on the state service. Pair each request with its response before
+    // starting the next request so the mock cannot miss the second call.
+    let first_verification = tokio::spawn(
+        verifier
+            .clone()
+            .oneshot(make_request.clone()(Arc::new([input_outpoint.hash].into()))),
+    );
+    state
+        .expect_request(zakura_state::Request::AwaitUtxo(input_outpoint))
         .await
+        .expect("verifier should call mock state service with correct request")
+        .respond(zakura_state::Response::Utxo(utxo.clone()));
+
+    let crate::transaction::Response::Block { .. } = first_verification
+        .await
+        .expect("block verification task should not panic")
         .expect("should succeed after calling state service")
     else {
         panic!("unexpected response variant from transaction verifier for Block request")
     };
 
-    let crate::transaction::Response::Block { .. } = verifier
-        .clone()
-        .oneshot(make_request.clone()(Arc::new(HashSet::new())))
+    let second_verification = tokio::spawn(
+        verifier
+            .clone()
+            .oneshot(make_request(Arc::new(HashSet::new()))),
+    );
+    state
+        .expect_request(zakura_state::Request::AwaitUtxo(input_outpoint))
         .await
+        .expect("verifier should call mock state service with correct request")
+        .respond(zakura_state::Response::Utxo(utxo));
+
+    let crate::transaction::Response::Block { .. } = second_verification
+        .await
+        .expect("block verification task should not panic")
         .expect("should succeed after calling state service")
     else {
         panic!("unexpected response variant from transaction verifier for Block request")
@@ -2986,7 +2989,8 @@ async fn v5_transaction_with_last_valid_expiry_height() {
 /// is equal to the height of the block the transaction belongs to.
 #[tokio::test]
 async fn v5_coinbase_transaction_expiry_height() {
-    let network = Network::new_default_testnet();
+    // Keep this expiry-height test independent of future NU7 activation heights.
+    let network = configured_network_with_nu7(None);
     let state_service =
         service_fn(|_| async { unreachable!("State service should not be called") });
     let verifier = Verifier::new_for_tests(&network, state_service);
@@ -3210,7 +3214,9 @@ async fn v5_transaction_with_exceeding_expiry_height() {
 
     let transaction_hash = transaction.hash();
 
-    let verification_result = Verifier::new_for_tests(&Network::Mainnet, state)
+    // Keep this expiry-height test independent of future NU7 activation heights.
+    let network = configured_network_with_nu7(None);
+    let verification_result = Verifier::new_for_tests(&network, state)
         .oneshot(Request::Block {
             transaction_hash: transaction.hash(),
             transaction: Arc::new(transaction.clone()),
@@ -4450,6 +4456,188 @@ async fn v5_with_duplicate_orchard_action() {
             ))
         );
     }
+}
+
+/// The mempool rejects a transaction whose own shielded actions exceed a ZIP 218
+/// per-block limit or the global budget, because no block can include it. The
+/// check runs before any state service query, and only at or after NU7
+/// activation. Ironwood has its own per-pool limit, and shares the global budget
+/// with Orchard.
+#[tokio::test]
+async fn mempool_applies_the_zip218_limits_to_ironwood_actions() {
+    let _init_guard = zakura_test::init();
+
+    let height = Height(1);
+    let network = Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            nu7: Some(height.0),
+            ..Default::default()
+        })
+        .expect("activation heights are valid")
+        .clear_funding_streams()
+        .to_network()
+        .expect("configured testnet is valid");
+
+    let limit =
+        usize::try_from(ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT).expect("the limit fits in usize");
+    let orchard_half = limit / 2;
+
+    // The fake proofs fail the proof size check, which the verifier runs after
+    // the shielded limits. That error shows a transaction passed the limits.
+    let cases = [
+        (
+            0,
+            limit + 1,
+            Some(TransactionError::IronwoodActionsExceedBlockLimit {
+                actions: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT + 1,
+                limit: ORCHARD_PROTOCOL_BLOCK_ACTION_LIMIT,
+            }),
+            TransactionError::IronwoodProofSize,
+        ),
+        (
+            orchard_half,
+            limit + 1 - orchard_half,
+            Some(TransactionError::ShieldedCostExceedsBlockBudget {
+                cost: GLOBAL_SHIELDED_BUDGET + 1,
+                limit: GLOBAL_SHIELDED_BUDGET,
+            }),
+            TransactionError::OrchardProofSize,
+        ),
+        (0, limit, None, TransactionError::IronwoodProofSize),
+        (
+            orchard_half,
+            limit - orchard_half,
+            None,
+            TransactionError::OrchardProofSize,
+        ),
+    ];
+
+    for (orchard_actions, ironwood_actions, limit_error, proof_size_error) in cases {
+        let tx = fake_v6_with_orchard_and_ironwood_actions(
+            NetworkUpgrade::Nu7,
+            orchard_actions,
+            ironwood_actions,
+        );
+
+        let response = Verifier::new_for_tests(
+            &network,
+            service_fn(|_| async { unreachable!("state service should not be called") }),
+        )
+        .oneshot(Request::Mempool {
+            transaction: Arc::unwrap_or_clone(tx).into(),
+            height,
+        })
+        .await;
+
+        assert_eq!(
+            response,
+            Err(limit_error.unwrap_or(proof_size_error)),
+            "{orchard_actions} Orchard and {ironwood_actions} Ironwood actions",
+        );
+    }
+}
+
+/// Checks that ZIP 2003 accepts V4 transactions below NU7 and rejects them
+/// from NU7.
+#[test]
+fn v4_deprecation_boundary() {
+    let _init_guard = zakura_test::init();
+
+    let nu7 = Height(2_000_000);
+    let transaction = test_transactions(&Network::Mainnet)
+        .map(|(_, transaction)| transaction)
+        .find(|transaction| matches!(**transaction, Transaction::V4 { .. }))
+        .expect("the test vectors contain a V4 transaction");
+    let network = configured_network_with_nu7(Some(nu7));
+
+    assert!(
+        verify_v4_at(
+            &network,
+            &transaction,
+            nu7.previous().expect("NU7 is above the minimum height"),
+        )
+        .is_ok(),
+        "a V4 transaction must be valid below the NU7 activation height",
+    );
+
+    let expected = Err(TransactionError::UnsupportedByNetworkUpgrade(
+        transaction.version(),
+        NetworkUpgrade::Nu7,
+    ));
+    assert_eq!(
+        verify_v4_at(&network, &transaction, nu7),
+        expected,
+        "a V4 transaction must be invalid at the NU7 activation height",
+    );
+    assert_eq!(
+        verify_v4_at(
+            &network,
+            &transaction,
+            nu7.next().expect("NU7 is below the maximum height"),
+        ),
+        expected,
+        "a V4 transaction must be invalid after the NU7 activation height",
+    );
+
+    for network in [
+        Network::Mainnet,
+        Network::new_default_testnet(),
+        configured_network_with_nu7(None),
+    ] {
+        assert_eq!(NetworkUpgrade::Nu7.activation_height(&network), None);
+        assert!(!NetworkUpgrade::is_nu7_active(&network, Height::MAX));
+        assert!(
+            verify_v4_at(&network, &transaction, Height::MAX).is_ok(),
+            "a network without an exact NU7 activation must keep accepting V4",
+        );
+    }
+}
+
+/// Returns a configured network whose latest upgrade is NU6.3 unless `nu7`
+/// supplies an exact NU7 activation height.
+fn configured_network_with_nu7(nu7: Option<Height>) -> Network {
+    Parameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            before_overwinter: Some(1),
+            overwinter: Some(2),
+            sapling: Some(3),
+            blossom: Some(4),
+            heartwood: Some(5),
+            canopy: Some(6),
+            nu5: Some(7),
+            nu6: Some(8),
+            nu6_1: Some(9),
+            nu6_2: Some(10),
+            nu6_3: Some(11),
+            nu7: nu7.map(|height| height.0),
+            #[cfg(zcash_unstable = "zfuture")]
+            zfuture: None,
+        })
+        .expect("activation heights are ordered")
+        .clear_funding_streams()
+        .to_network()
+        .expect("the configured network parameters are valid")
+}
+
+/// A [`Verifier`] with concrete service types for calling its associated
+/// network-upgrade check in tests.
+type TestVerifier = Verifier<
+    MockService<zakura_state::Request, zakura_state::Response, PanicAssertion>,
+    MockService<mempool::Request, mempool::Response, PanicAssertion>,
+>;
+
+/// Runs the V4 network-upgrade check at `height` on `network`.
+fn verify_v4_at(
+    network: &Network,
+    transaction: &Transaction,
+    height: Height,
+) -> Result<(), TransactionError> {
+    TestVerifier::verify_v4_transaction_network_upgrade(
+        transaction,
+        network,
+        height,
+        NetworkUpgrade::current(network, height),
+    )
 }
 
 /// Checks the activation boundary of the temporary Orchard-disabling soft fork:

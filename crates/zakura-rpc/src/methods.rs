@@ -1216,6 +1216,20 @@ where
         mempool_txs: Vec<types::get_block_template::zip317::SelectedMempoolTx>,
         submit_old: Option<bool>,
     ) -> Result<BlockTemplateResponse> {
+        // An empty template with a completed coinbase has no proof work to queue.
+        if precomputed_coinbase.is_some() && mempool_txs.is_empty() {
+            return BlockTemplateResponse::new_internal(
+                &self.network,
+                precomputed_coinbase,
+                miner_params,
+                chain_info,
+                long_poll_id,
+                mempool_txs,
+                submit_old,
+            )
+            .map_misc_error();
+        }
+
         let network = self.network.clone();
         let miner_params = miner_params.clone();
         let chain_info = chain_info.clone();

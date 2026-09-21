@@ -71,3 +71,23 @@ fn nsm_fee_rounding_is_per_block() {
         two,
     );
 }
+
+proptest::proptest! {
+    #[test]
+    fn max_money_fee_split_conserves_value(fees in 0i64..=MAX_MONEY) {
+        let network = network();
+        for fees in [0, 1, MAX_MONEY - 1, MAX_MONEY, fees] {
+            for height in [Height(4), Height(5), Height(9), Height(10)] {
+                let amount = Amount::try_from(fees).unwrap();
+                let miner = miner_fee_share(height, &network, amount);
+                let contribution = (amount - miner).unwrap();
+                let expected_contribution = if height >= Height(5) {
+                    i128::from(fees) * 3 / 5
+                } else { 0 };
+                proptest::prop_assert_eq!(i128::from(i64::from(contribution)), expected_contribution);
+                proptest::prop_assert_eq!((miner + contribution).unwrap(), amount);
+                proptest::prop_assert!(i64::from(miner) <= fees);
+            }
+        }
+    }
+}

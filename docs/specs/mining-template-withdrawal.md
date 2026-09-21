@@ -51,6 +51,8 @@ The cases above describe possible triggers, not observed production incidents.
    freshness and records prepared work under the same write lock.
    Recheck freshness after the state-tip read before returning its result or either
    error, including a timeout, so a superseded response triggers a rebuild.
+   Watch parent and rejection changes during both waits and abandon superseded
+   recovery promptly. This stops waiting, but does not preempt dispatched proof work.
    Bound rejection storage at 64 IDs; stop issuing templates on overflow until the
    parent changes.
 2. Classify concrete consensus and contextual errors.

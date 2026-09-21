@@ -861,17 +861,24 @@ fn recovery_construction_yields_and_rechecks_parent() {
                 tip.send_best_tip_hash(Hash([2; 32]));
             }
             gate.release().await;
-            let (response, ()) = bounded(async {
-                tokio::join!(request, async {
-                    verifier
-                        .expect_request_that(|req| {
-                            matches!(req, zakura_consensus::Request::Prepare { .. })
-                        })
-                        .await
-                        .respond(Hash([9; 32]));
+            let response = if change_tip {
+                let response = bounded(request).await;
+                assert!(verifier.try_next_request().now_or_never().is_none());
+                response
+            } else {
+                let (response, ()) = bounded(async {
+                    tokio::join!(request, async {
+                        verifier
+                            .expect_request_that(|req| {
+                                matches!(req, zakura_consensus::Request::Prepare { .. })
+                            })
+                            .await
+                            .respond(Hash([9; 32]));
+                    })
                 })
-            })
-            .await;
+                .await;
+                response
+            };
             if change_tip {
                 assert!(response.unwrap().is_none());
             } else {

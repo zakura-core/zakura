@@ -1275,10 +1275,37 @@ where
                 .is_some_and(|tip| tip != parent)
     }
 
-    /// Returns `Ok(None)` when the template was superseded while it was being built:
-    /// the tip moved, a concurrent caller selected a newer parent, or the rejection
-    /// revision changed outside fallback mode. The caller must rebuild from fresh state
-    /// rather than surface a transient error to the miner.
+    /// Waits until recovery is superseded, ignoring notifications that leave its context intact.
+    async fn wait_for_recovery_context_change(
+        &self,
+        parent: block::Hash,
+        revision: u64,
+        work_id: &str,
+    ) {
+        let mut tip = self.latest_chain_tip.clone();
+        let mut rejections = self.gbt.template_rejections.subscribe();
+        let mut tip_open = true;
+        let mut rejections_open = true;
+        loop {
+            tip.mark_best_tip_seen();
+            let changed = {
+                let current = rejections.borrow_and_update();
+                self.recovery_context_changed(&current, parent, revision, work_id)
+            };
+            if changed {
+                return;
+            }
+            tokio::select! {
+                result = tip.best_tip_changed(), if tip_open => tip_open = result.is_ok(),
+                result = rejections.changed(), if rejections_open => rejections_open = result.is_ok(),
+                // Closing a watch does not supersede its last value. Keep the recovery deadline.
+                else => std::future::pending::<()>().await,
+            }
+        }
+    }
+
+    /// Returns `Ok(None)` when a parent or rejection change supersedes construction or recovery.
+    /// The caller must rebuild from fresh state rather than return a transient error to the miner.
     async fn finish_mining_template(
         &self,
         mut template: BlockTemplateResponse,
@@ -1323,17 +1350,25 @@ where
             let block =
                 proposal_block_from_template(&template, None, &self.network).map_misc_error()?;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-            let validation = tokio::time::timeout_at(
-                deadline,
-                self.gbt
-                    .block_verifier_router()
-                    .oneshot(zakura_consensus::Request::Prepare {
+            let context_changed = self.wait_for_recovery_context_change(
+                chain_info.tip_hash,
+                state.revision,
+                template.work_id(),
+            );
+            tokio::pin!(context_changed);
+            // Stop waiting on obsolete recovery. Dispatched proof work can still finish.
+            let validation = tokio::select! {
+                biased;
+                _ = &mut context_changed => return Ok(None),
+                result = tokio::time::timeout_at(
+                    deadline,
+                    self.gbt.block_verifier_router().oneshot(zakura_consensus::Request::Prepare {
                         block: Arc::new(block),
                         work_id: Some(template.work_id().clone()),
                         source: zakura_consensus::PreparedCandidateSource::ServerTemplate,
                     }),
-            )
-            .await;
+                ) => result,
+            };
             // Check the context before propagating a stale validation error, and atomically
             // record successful recovery so another rejection cannot slip between the two.
             let mut current_context = false;
@@ -1358,11 +1393,14 @@ where
             if !matches!(validation, Ok(Ok(_))) {
                 // State commits precede tip notifications. A failed proposal can already
                 // have a stale parent even while both watches still name the old one.
-                let response = tokio::time::timeout_at(
-                    deadline,
-                    call_service(self.read_state.clone(), zakura_state::ReadRequest::Tip),
-                )
-                .await;
+                let response = tokio::select! {
+                    biased;
+                    _ = &mut context_changed => return Ok(None),
+                    result = tokio::time::timeout_at(
+                        deadline,
+                        call_service(self.read_state.clone(), zakura_state::ReadRequest::Tip),
+                    ) => result,
+                };
                 // The read can finish or fail after another caller has moved recovery on.
                 if self.recovery_context_changed(
                     &self.gbt.template_rejections.borrow(),

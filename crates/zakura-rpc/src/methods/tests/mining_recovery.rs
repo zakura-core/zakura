@@ -34,14 +34,37 @@ enum Interleaving {
         result: TipResult,
         superseded: bool,
     },
+    PendingValidation {
+        same_parent: bool,
+    },
     FastPathFallback,
 }
 
 #[derive(Clone, Copy, Debug)]
 enum TipResult {
     OriginalParent,
+    Pending,
     Error,
     Timeout,
+}
+
+#[tokio::test]
+async fn mining_recovery_abandons_pending_validation_on_tip_change() {
+    check_interleaving(Interleaving::PendingValidation { same_parent: false }).await;
+}
+
+#[tokio::test]
+async fn mining_recovery_abandons_pending_validation_on_rejection() {
+    check_interleaving(Interleaving::PendingValidation { same_parent: true }).await;
+}
+
+#[tokio::test]
+async fn mining_recovery_abandons_pending_tip_read_on_tip_change() {
+    check_interleaving(Interleaving::TipRead {
+        result: TipResult::Pending,
+        superseded: true,
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -216,6 +239,7 @@ async fn check_interleaving(interleaving: Interleaving) {
         Interleaving::StaleFallback { .. }
             | Interleaving::FallbackDeadline { .. }
             | Interleaving::TipRead { .. }
+            | Interleaving::PendingValidation { .. }
     ) {
         preparation
             .take()
@@ -246,6 +270,52 @@ async fn check_interleaving(interleaving: Interleaving) {
                 matches!(request, zakura_consensus::Request::Prepare { .. })
             })
             .await;
+        if let Interleaving::PendingValidation { same_parent } = interleaving {
+            let parent = if same_parent {
+                rpc.gbt.template_rejections.send_modify(|state| {
+                    assert!(state.reject(parent_a, "another-invalid-template"));
+                });
+                parent_a
+            } else {
+                tip_sender.set_best_non_finalized_tip(make_tip(parent_b));
+                parent_b
+            };
+            // Keep the old verifier response pending until fresh work has been returned.
+            let fresh_read = tokio::time::timeout(
+                Duration::from_secs(2),
+                read_state.expect_request(ReadRequest::ChainInfo),
+            )
+            .await
+            .expect("a context change must abandon the pending verification");
+            fresh_read.respond(ReadResponse::ChainInfo(make_info(parent)));
+            mempool
+                .expect_request(mempool::Request::FullTransactions)
+                .await
+                .respond(make_mempool(parent));
+            if same_parent {
+                verifier
+                    .expect_request_that(|request| {
+                        matches!(request, zakura_consensus::Request::Prepare { .. })
+                    })
+                    .await
+                    .respond(parent);
+            }
+            let replacement = tokio::time::timeout(Duration::from_secs(2), pending)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .try_into_template()
+                .unwrap();
+            assert_eq!(replacement.previous_block_hash, parent);
+            if same_parent {
+                assert!(rpc.mining_template_prepared(replacement.work_id()));
+                assert_eq!(replacement.long_poll_id.revision, 2);
+            }
+            drop(fallback);
+            queue.abort();
+            return;
+        }
         if let Interleaving::TipRead { result, superseded } = interleaving {
             fallback.respond_error("fallback validation failed".into());
             let tip_read = read_state.expect_request(ReadRequest::Tip).await;
@@ -254,6 +324,7 @@ async fn check_interleaving(interleaving: Interleaving) {
             }
             let mut tip_read = Some(tip_read);
             match result {
+                TipResult::Pending => {}
                 TipResult::OriginalParent => {
                     tip_read
                         .take()
@@ -296,6 +367,7 @@ async fn check_interleaving(interleaving: Interleaving) {
                     .unwrap()
                     .unwrap_err();
                 let expected = match result {
+                    TipResult::Pending => unreachable!("only superseded reads remain pending"),
                     TipResult::OriginalParent => "fallback validation failed",
                     TipResult::Error => "state tip read failed",
                     TipResult::Timeout => "deadline has elapsed",
@@ -401,7 +473,8 @@ async fn check_interleaving(interleaving: Interleaving) {
     match interleaving {
         Interleaving::StaleFallback { .. }
         | Interleaving::FallbackDeadline { .. }
-        | Interleaving::TipRead { .. } => {
+        | Interleaving::TipRead { .. }
+        | Interleaving::PendingValidation { .. } => {
             unreachable!("handled before the long-poll case")
         }
         Interleaving::FastPathFallback => {

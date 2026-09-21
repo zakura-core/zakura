@@ -940,7 +940,8 @@ mod database_tests {
     #[test]
     fn migration_batch_boundaries_retry_and_idempotence() {
         for (affected, pool_len) in [(9_999, 40), (10_000, 48), (10_001, 48)] {
-            let rows = affected + 2;
+            // Genesis is the only unaffected row; the seed row is always rewritten.
+            let rows = affected + 1;
             for fail_write in [0, 1] {
                 let db = legacy_db(rows, pool_len);
                 let (_tx, rx) = crossbeam_channel::bounded(1);
@@ -1164,8 +1165,8 @@ mod database_tests {
                     assert!(Upgrade.validate(&db, &rx).unwrap().is_ok());
                     let after = db.raw_chain_value_pools_cf().zs_get(&()).unwrap();
                     assert_eq!(&after.0[..pool_len], &before.0);
-                    if nu7.is_none_or(|start| tip < start) {
-                        assert_eq!(writes, 0, "inactive NU7 requires no backfill writes");
+                    if nu7.is_none_or(|start| tip < start.saturating_sub(1)) {
+                        assert_eq!(writes, 0, "pre-seed history requires no backfill writes");
                         assert_eq!(after.0, before.0);
                     }
                     Upgrade.run(Some(Height(tip)), &db, &rx).unwrap();

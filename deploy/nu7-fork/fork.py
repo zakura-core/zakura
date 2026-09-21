@@ -247,7 +247,7 @@ def render_nodes_toml(config: dict, plan: dict) -> str:
         # Mandatory: zakurad refuses to load a config that pairs the default
         # public DNS seeds with testnet parameters incompatible with Testnet.
         "initial_testnet_peers = []",
-        f'log_file = "{host.get("log_file", "/mnt/data/logs/zakura-fork.log")}"',
+        f'log_file = "{host.get("log_file", "/var/log/zakura/zakura-fork.log")}"',
         f'metrics_endpoint = "{host["metrics_endpoint"]}"',
         # Without a miner address the node refuses getblocktemplate, so the
         # external miner cannot produce a single block.

@@ -52,7 +52,11 @@ pristine_cache_dir = "/mnt/snapshots/tip"
 storage_mode = "pruned"
 
 # The fork's own working cache, wiped and re-seeded on every reconfigure.
-fork_cache_dir = "/mnt/data/zakura-fork"
+# On the root disk, not /mnt/data: a provisioned droplet has no /mnt/data, and
+# the deployer asserts that /mnt/data paths are real mount points.
+fork_cache_dir = "/var/lib/zakura-fork"
+
+log_file = "/var/log/zakura/zakura-fork.log"
 
 rpc_listen_addr = "127.0.0.1:18232"
 listen_addr = "0.0.0.0:18233"

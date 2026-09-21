@@ -16,6 +16,7 @@ use zakura_chain::{
 
 static NEXT_RECEIPT_ORDER: AtomicU64 = AtomicU64::new(1);
 const MAX_RETRY_RECEIPTS: usize = 4096;
+const MAX_RETRY_RECEIPTS_PER_HASH: usize = 4;
 const RETRY_RECEIPT_TTL: Duration = Duration::from_secs(60 * 60);
 
 /// Active calls keep their bodies. Retries retain only a digest and order, for
@@ -89,8 +90,21 @@ impl RetryReceipts {
     fn insert(&mut self, hash: block::Hash, block: &Block, order: u64, now: Instant) {
         let body = body_digest(block);
         let entry = (now + RETRY_RECEIPT_TTL, order);
-        self.by_hash.entry(hash).or_default().insert(body, entry);
+        let receipts = self.by_hash.entry(hash).or_default();
+        if let Some(previous) = receipts.insert(body, entry) {
+            self.by_expiry.remove(&previous);
+        }
         self.by_expiry.insert(entry, (hash, body));
+        // One checked header can accompany many unchecked bodies, including
+        // canceled attempts. Evict its own variants before unrelated receipts.
+        if receipts.len() > MAX_RETRY_RECEIPTS_PER_HASH {
+            let (&old_body, &old_entry) = receipts
+                .iter()
+                .min_by_key(|(_, entry)| **entry)
+                .expect("a header exceeding its receipt limit has entries");
+            receipts.remove(&old_body);
+            self.by_expiry.remove(&old_entry);
+        }
         self.prune(now);
     }
 }
@@ -282,5 +296,56 @@ mod tests {
             MAX_RETRY_RECEIPTS
         );
         assert!(registry.register(block).order > retry_order);
+    }
+
+    #[test]
+    fn retrying_and_canceling_body_variants_cannot_evict_unrelated_receipts() {
+        let registry = ReceiptRegistry::default();
+        let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        let first = checked_receipt(&registry, block.clone());
+        let original_order = first.order;
+        first.finish(true);
+
+        // Leave exactly one header's allowance available in the global cache.
+        for nonce in 0..MAX_RETRY_RECEIPTS - MAX_RETRY_RECEIPTS_PER_HASH - 1 {
+            let mut other = block.as_ref().clone();
+            Arc::make_mut(&mut other.header).nonce.0[..8]
+                .copy_from_slice(&u64::try_from(nonce).unwrap().to_le_bytes());
+            checked_receipt(&registry, Arc::new(other)).finish(true);
+        }
+
+        let mut variant = block.as_ref().clone();
+        Arc::make_mut(&mut variant.header).nonce.0[8] ^= 1;
+        let variant_hash = variant.hash();
+        let mut last_variant = None;
+        for value in 0..MAX_RETRY_RECEIPTS * 2 {
+            Arc::make_mut(&mut variant.transactions[0]).outputs_mut()[0].value =
+                u64::try_from(value).unwrap().try_into().unwrap();
+            assert_eq!(variant.hash(), variant_hash);
+            let body = Arc::new(variant.clone());
+            let receipt = checked_receipt(&registry, body.clone());
+            last_variant = Some((body, receipt.order));
+            if value % 2 == 0 {
+                receipt.finish(true);
+            } else {
+                // Cancellation drops the guard without classifying the body.
+                drop(receipt);
+            }
+        }
+
+        {
+            let registry = registry.0.lock().unwrap();
+            assert_eq!(registry.retries.by_expiry.len(), MAX_RETRY_RECEIPTS);
+            assert_eq!(
+                registry.retries.by_hash[&variant_hash].len(),
+                MAX_RETRY_RECEIPTS_PER_HASH
+            );
+            assert!(registry.active.is_empty());
+        }
+        assert_eq!(registry.register(block).order, original_order);
+        let (last_body, last_order) = last_variant.unwrap();
+        assert_eq!(registry.register(last_body).order, last_order);
     }
 }

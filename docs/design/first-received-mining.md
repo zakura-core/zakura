@@ -19,7 +19,10 @@ Only blocks that passed proof-of-work checks (or the network's authenticated
 waiver) retain a receipt after retryable failures or cancellation. Unchecked and
 PoW-invalid blocks cannot occupy the retry cache. Retried blocks retain only a
 complete-body digest and receipt order, bounded to 4096 entries for one hour after
-the last attempt. Capacity eviction or expiry gives a later retry a new receipt.
+the last attempt. Each header can retain at most four body variants, including
+canceled attempts. Additional variants evict that header's oldest cached variant
+before they can displace unrelated receipts. Capacity eviction or expiry gives a
+later retry a new receipt.
 Success, already committed duplicates, and permanent rejection clear the retry
 receipt. A duplicate still waiting in the commit queue preserves it because the
 outstanding attempt can fail transiently.

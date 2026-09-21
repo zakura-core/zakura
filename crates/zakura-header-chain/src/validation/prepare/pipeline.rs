@@ -143,17 +143,25 @@ pub fn prepare_headers(
             let target = validate_compact_target(header, &rules.network)
                 .map_err(|error| invalid(offset, HeaderRule::CompactTarget, error))?;
 
+            // A network seeded with unsolved blocks enforces proof of work only
+            // from its configured start height. Checkpoint and semantic
+            // verification make the same exemption, so header sync has to as
+            // well, or it rejects the seed chain it is trying to download.
+            let skip_pow = rules.network.should_skip_pow_at_height(*height);
+
             // Hash-to-target filter, unless authenticated custom policy waives PoW.
-            if !rules.pow_policy.is_authenticated_custom_waiver() {
+            if !skip_pow && !rules.pow_policy.is_authenticated_custom_waiver() {
                 validate_hash_filter(*hash, target)
                     .map_err(|error| invalid(offset, HeaderRule::HashToTarget, error))?;
             }
 
             // Equihash solution under the authenticated proof-of-work policy.
-            rules
-                .pow_policy
-                .validate_solution(header)
-                .map_err(|error| invalid(offset, HeaderRule::Equihash, error))?;
+            if !skip_pow {
+                rules
+                    .pow_policy
+                    .validate_solution(header)
+                    .map_err(|error| invalid(offset, HeaderRule::Equihash, error))?;
+            }
 
             // Accept current timestamps; assign an exact deadline to future ones.
             let canonical_header_time = header

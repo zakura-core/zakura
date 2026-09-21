@@ -501,7 +501,8 @@ fn seeded_blocks_below_pow_start_height_skip_the_difficulty_adjustment() {
             candidate,
             network,
             difficulty_context(&generated.blocks, index),
-        );
+        )
+        .expect("the seeded chain supplies a full difficulty context");
 
         difficulty_threshold_and_time_are_valid(candidate.header.difficulty_threshold, adjustment)
             .unwrap_or_else(|error| {
@@ -518,6 +519,7 @@ fn seeded_blocks_below_pow_start_height_skip_the_difficulty_adjustment() {
                 network,
                 difficulty_context(&generated.blocks, index),
             )
+            .expect("the seeded chain supplies a full difficulty context")
             .expected_difficulty_threshold();
             generated.blocks[index].header.difficulty_threshold != expected
         })
@@ -571,6 +573,7 @@ fn first_block_at_pow_start_height_expects_the_configured_limit() {
         network,
         difficulty_context(&generated.blocks, generated.blocks.len()),
     )
+    .expect("the seeded chain supplies a full difficulty context")
     .expected_difficulty_threshold();
 
     let expected_target: U256 = expected

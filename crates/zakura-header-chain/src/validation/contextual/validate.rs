@@ -74,7 +74,17 @@ pub fn validate_contextual_difficulty_and_time(
         });
     }
 
-    if network.disable_pow() {
+    // Blocks below a configured `pow_start_height` get the same relaxation as a
+    // PoW-disabled network, for the same reason: they are seed blocks generated
+    // at the network's PoW limit, and once the seeded chain is longer than
+    // `PoWAveragingWindow` the adjustment starts deriving an expectation from
+    // their spacing. Those blocks sit before Blossom activates, so the
+    // adjustment measures them against the fixed pre-Blossom spacing no matter
+    // what the network targets, and a chain seeded at any other spacing would be
+    // rejected at replay. The first block at `pow_start_height` and everything
+    // after it is checked strictly, which is what pins the live chain to its
+    // configured difficulty.
+    if network.disable_pow() || network.should_skip_pow_at_height(candidate_height) {
         if difficulty_threshold.to_work().is_none() {
             return Err(ContextualValidationError::InvalidDifficultyThreshold {
                 difficulty_threshold,

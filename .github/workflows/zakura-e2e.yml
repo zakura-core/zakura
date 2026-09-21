@@ -17,7 +17,7 @@ on:
   # - block-sync fuzz must run after every merge to `main`, even when
   #   the merged PR did not touch an obviously Zakura-specific path.
   pull_request:
-    branches: [main, "adam/**", "feat/**", "split/**", "release/**"]
+    branches: [main, "feat/**", "split/**", "release/**"]
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
   push:

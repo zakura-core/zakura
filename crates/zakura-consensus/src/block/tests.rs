@@ -38,6 +38,8 @@ use crate::{block::check::subsidy_is_valid, transaction};
 
 use super::*;
 
+mod nsm_fees;
+
 static VALID_BLOCK_TRANSCRIPT: Lazy<Vec<(Request, Result<block::Hash, ExpectedTranscriptError>)>> =
     Lazy::new(|| {
         let block: Arc<_> =
@@ -1911,6 +1913,99 @@ async fn zip234_block_verification_checks_the_reissuance_bonus() {
     ));
 }
 
+/// The derived crossing gates parent lookups and coinbase claims in semantic verification.
+#[tokio::test]
+async fn derived_nsm_crossing_gates_block_verification() {
+    use zakura_chain::{
+        block_info::BlockInfo,
+        parameters::subsidy::{
+            halving_block_subsidy, nsm_reissuance_height, scheduled_issuance_zatoshis,
+        },
+        value_balance::ValueBalance,
+    };
+
+    let _init_guard = zakura_test::init();
+    let network = zip234_test_network_builder()
+        .to_network()
+        .expect("the fixture has valid network parameters");
+    let start = nsm_reissuance_height(&network)
+        .expect("the full-length halving schedule has a reissuance crossing");
+    assert!(start > Height(1), "NU7 must precede the derived crossing");
+
+    for height in [start.previous().unwrap(), start, start.next().unwrap()] {
+        let active = height >= start;
+        let parent = height.previous().unwrap();
+        let supply = i64::try_from(scheduled_issuance_zatoshis(parent, &network).unwrap())
+            .expect("the scheduled supply fits in i64");
+        let mut parent_pools = ValueBalance::from_transparent_amount(
+            Amount::try_from(supply - ZIP234_TEST_DEFICIT).unwrap(),
+        );
+        parent_pools.set_nsm_value_balance_amount(Amount::try_from(ZIP234_TEST_DEFICIT).unwrap());
+        let scheduled = halving_block_subsidy(height, &network).unwrap();
+        let bonus = zip234_test_bonus();
+
+        // The exact claim changes at the crossing. Also reject an early bonus,
+        // a missing bonus once active, and a one-zatoshi overclaim on either side.
+        for claimed_bonus in [0, bonus, if active { bonus + 1 } else { 1 }] {
+            let valid = claimed_bonus == if active { bonus } else { 0 };
+            let claim = (scheduled + Amount::try_from(claimed_bonus).unwrap()).unwrap();
+            let block = zip234_test_block(&network, height, claim);
+            let hash = block.hash();
+            let expected_parent = block.header.previous_block_hash;
+            let state = service_fn(move |request: zs::Request| async move {
+                Ok::<_, BoxError>(match request {
+                    zs::Request::KnownBlock(requested_hash) => {
+                        assert_eq!(requested_hash, hash);
+                        zs::Response::KnownBlock(None)
+                    }
+                    zs::Request::AwaitBlockInfo(requested_parent) => {
+                        assert!(
+                            active,
+                            "the pre-crossing block must not request an NSM balance"
+                        );
+                        assert_eq!(requested_parent, expected_parent);
+                        zs::Response::BlockInfo(Some(BlockInfo::new(parent_pools, 0)))
+                    }
+                    zs::Request::CommitSemanticallyVerifiedBlock(block) => {
+                        assert!(valid, "an invalid coinbase must not reach state commit");
+                        assert_eq!(block.hash, hash);
+                        zs::Response::Committed(block.hash)
+                    }
+                    _ => panic!("unexpected state request: {request:?}"),
+                })
+            });
+            // NU7 has no production branch ID yet, so use the existing transaction
+            // stub while exercising the real semantic block and subsidy checks.
+            let transaction = service_fn(|request| async move {
+                Ok::<_, BoxError>(accept_block_transaction(request))
+            });
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                SemanticBlockVerifier::new(&network, state, transaction)
+                    .oneshot(Request::Commit(Arc::new(block))),
+            )
+            .await
+            .expect("semantic verification completes");
+
+            if valid {
+                assert_eq!(result.unwrap(), hash);
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(VerifyBlockError::Block {
+                            source: BlockError::Transaction(TransactionError::Subsidy(
+                                SubsidyError::InvalidMinerFees
+                            ))
+                        })
+                    ),
+                    "height {height:?}, claimed bonus {claimed_bonus}: {result:?}"
+                );
+            }
+        }
+    }
+}
+
 /// A proposal uses its committed parent's balance and rejects an excessive bonus.
 #[tokio::test]
 async fn zip234_proposal_with_committed_parent_checks_the_bonus_without_waiting() {
@@ -2012,6 +2107,14 @@ async fn zip234_proposal_with_uncommitted_parent_is_rejected_without_waiting() {
 
 /// A network with NU7 at height 1 and ZIP 234 reissuance from `start`.
 fn zip234_test_network(start: Height) -> Network {
+    zip234_test_network_builder()
+        .with_test_nsm_reissuance_height(start)
+        .to_network()
+        .expect("failed to build configured network")
+}
+
+/// NU7 fixture parameters with the full halving schedule and no reissuance override.
+fn zip234_test_network_builder() -> zakura_chain::parameters::testnet::ParametersBuilder {
     let genesis_block =
         Block::zcash_deserialize(&zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES[..])
             .expect("genesis block should deserialize");
@@ -2034,15 +2137,12 @@ fn zip234_test_network(start: Height) -> Network {
             ..Default::default()
         })
         .expect("failed to set test activation heights")
-        .with_nsm_reissuance_height(start)
         .clear_funding_streams()
         .with_slow_start_interval(Height::MIN)
         .with_disable_pow(true)
         .disable_temporary_orchard_disabling_soft_fork()
         .with_target_difficulty_limit(target_difficulty_limit)
         .expect("failed to set target difficulty limit")
-        .to_network()
-        .expect("failed to build configured network")
 }
 
 /// A block at `height` whose coinbase pays `coinbase_value`.

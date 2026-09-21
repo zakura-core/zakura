@@ -2,7 +2,7 @@
 //!
 //! The balance holds `INITIAL_NSM_VALUE_BALANCE` on the last block below NU7, and from
 //! NU7 it falls by each block's additional block subsidy. Earlier records carry zero.
-//! `Block::nsm_value_balance_change` applies the same rule as the chain grows.
+//! Live commits derive the same seed with `ValueBalance::seed_nsm_value_balance`.
 
 use crossbeam_channel::{Receiver, TryRecvError};
 use semver::Version;
@@ -14,7 +14,7 @@ use zakura_chain::{
     parameters::{
         subsidy::{
             funding_stream_values, halving_block_subsidy, scheduled_issuance_zatoshis,
-            FundingStreamReceiver, ParameterSubsidy,
+            FundingStreamReceiver,
         },
         Network, NetworkUpgrade,
     },
@@ -80,7 +80,25 @@ impl DiskFormatUpgrade for Upgrade {
                 "tip pools disagree with BlockInfo at {tip_height:?}"
             )));
         }
-        let expected = eligible_balance(&network, tip_height, tip_pools, baseline(db)?)?;
+        let baseline = baseline(db)?;
+        if let Some(seed_height) = NetworkUpgrade::Nu7
+            .activation_height(&network)
+            .and_then(|activation| activation.previous().ok())
+            .filter(|seed_height| *seed_height <= tip_height)
+        {
+            let seed_info = read_block_info(db, seed_height)?;
+            let expected_seed =
+                eligible_balance(&network, seed_height, *seed_info.value_pools(), baseline)?;
+            if seed_info.value_pools().nsm_value_balance_amount() != expected_seed {
+                return Ok(Err(format!(
+                    "NSM seed {:?} does not match the configured {expected_seed:?} \
+                     at {seed_height:?}",
+                    seed_info.value_pools().nsm_value_balance_amount(),
+                )));
+            }
+        }
+
+        let expected = eligible_balance(&network, tip_height, tip_pools, baseline)?;
 
         if tip_pools.nsm_value_balance_amount() != expected {
             return Ok(Err(format!(
@@ -112,13 +130,9 @@ fn backfill(
     let Some(activation) = NetworkUpgrade::Nu7.activation_height(&network) else {
         return Ok(());
     };
-    // A nonzero seed belongs to the last block below NU7. Earlier legacy records
-    // already decode with the required zero balance and do not need rewriting.
-    let start = if network.initial_nsm_value_balance().is_zero() {
-        activation
-    } else {
-        Height(activation.0.saturating_sub(1))
-    };
+    // Always rewrite the seed row, including for an explicit zero. A previous v27 attempt
+    // can have stored that row under different configured seed rules before interruption.
+    let start = Height(activation.0.saturating_sub(1));
     if tip_height < start {
         return Ok(());
     }
@@ -246,13 +260,13 @@ fn balance_at(
     Ok(scheduled - i128::from(i64::from(value_pools.total()?)))
 }
 
-/// Returns the offset that makes the backfilled balance start at
-/// `INITIAL_NSM_VALUE_BALANCE` on the last block below NU7.
+/// Returns the offset for an explicit seed override on a configured network.
+/// Derived seeds have zero offset.
 ///
 /// `balance_at` measures the whole gap between the schedule and the chain, back to
 /// genesis. Subtracting this offset leaves the seed there, and leaves each later block
 /// the seed minus the bonuses claimed since, which is what
-/// `Block::nsm_value_balance_change` accumulates.
+/// live commits accumulate after initializing the derived seed.
 ///
 /// The offset is zero when the constant matches the chain's own history, as the measured
 /// Mainnet and Testnet constants do.
@@ -278,7 +292,15 @@ fn baseline(db: &ZakuraDb) -> Result<i128, FormatChangeError> {
         ))
     })?;
 
-    Ok(historical - i128::from(i64::from(network.initial_nsm_value_balance())))
+    let seed = info
+        .value_pools()
+        .initial_nsm_value_balance(seed_height, &network)
+        .map_err(|error| {
+            FormatChangeError::InvalidPostcondition(format!(
+                "invalid NSM seed at {seed_height:?}: {error}"
+            ))
+        })?;
+    Ok(historical - i128::from(i64::from(seed)))
 }
 
 fn eligible_balance(
@@ -415,6 +437,7 @@ mod tests {
                 ..Default::default()
             })
             .unwrap()
+            .with_initial_nsm_value_balance(Amount::zero())
             .clear_funding_streams()
             .to_network()
             .unwrap();
@@ -438,7 +461,7 @@ mod tests {
                 nu7: Some(2),
                 ..Default::default()
             },
-            nsm_reissuance_height: Some(Height(3)),
+            test_nsm_reissuance_height: Some(Height(3)),
             ..Default::default()
         });
         let baseline =
@@ -468,7 +491,7 @@ mod tests {
                 nu7: Some(4),
                 ..Default::default()
             },
-            nsm_reissuance_height: Some(Height(20_000)),
+            test_nsm_reissuance_height: Some(Height(20_000)),
             initial_nsm_value_balance: Some(Amount::try_from(SEED).unwrap()),
             ..Default::default()
         });
@@ -550,7 +573,7 @@ mod database_tests {
                 nu7: Some(2),
                 ..Default::default()
             },
-            nsm_reissuance_height: Some(Height(20_000)),
+            test_nsm_reissuance_height: Some(Height(20_000)),
             initial_nsm_value_balance: Some(Amount::try_from(seed).unwrap()),
             ..Default::default()
         })
@@ -664,6 +687,46 @@ mod database_tests {
         }
 
         assert!(Upgrade.validate(&db, &rx).unwrap().is_ok());
+    }
+
+    #[test]
+    fn migration_repairs_a_stale_seed_row_after_an_explicit_zero_override() {
+        const STALE_SEED: i64 = 1_234_567;
+        const ROWS: u32 = 4;
+
+        let db = legacy_db(ROWS, 56);
+        let mut stale_info = db.raw_block_info_cf().zs_get(&Height(1)).unwrap();
+        stale_info.0[48..56].copy_from_slice(&STALE_SEED.to_le_bytes());
+        let mut batch = DiskWriteBatch::new();
+        let _ = db
+            .raw_block_info_cf()
+            .with_batch_for_writing(&mut batch)
+            .zs_insert(&Height(1), &stale_info);
+        db.write_batch(batch).unwrap();
+
+        let (_tx, rx) = crossbeam_channel::bounded(1);
+        Upgrade.run(Some(Height(ROWS - 1)), &db, &rx).unwrap();
+        assert_eq!(
+            read_block_info(&db, Height(1))
+                .unwrap()
+                .value_pools()
+                .nsm_value_balance_amount(),
+            Amount::<NegativeAllowed>::zero(),
+        );
+        assert!(Upgrade.validate(&db, &rx).unwrap().is_ok());
+
+        let mut stale_info = db.raw_block_info_cf().zs_get(&Height(1)).unwrap();
+        stale_info.0[48..56].copy_from_slice(&STALE_SEED.to_le_bytes());
+        let mut batch = DiskWriteBatch::new();
+        let _ = db
+            .raw_block_info_cf()
+            .with_batch_for_writing(&mut batch)
+            .zs_insert(&Height(1), &stale_info);
+        db.write_batch(batch).unwrap();
+        assert!(Upgrade.validate(&db, &rx).unwrap().is_err());
+
+        Upgrade.run(Some(Height(ROWS - 1)), &db, &rx).unwrap();
+        assert_upgraded(&db, ROWS);
     }
 
     #[test]
@@ -790,7 +853,15 @@ mod database_tests {
 
     #[test]
     fn migration_before_activation_leaves_legacy_data_unchanged() {
-        for network in [Network::Mainnet, accounting_network(0)] {
+        let configured = Network::new_regtest(RegtestParameters {
+            activation_heights: ConfiguredActivationHeights {
+                nu7: Some(3),
+                ..Default::default()
+            },
+            initial_nsm_value_balance: Some(Amount::zero()),
+            ..Default::default()
+        });
+        for network in [Network::Mainnet, configured] {
             let db = legacy_db_on(network, 2, 48);
             let tip = db.raw_block_info_cf().zs_get(&Height(1)).unwrap().0;
             let pools = db.raw_chain_value_pools_cf().zs_get(&()).unwrap().0;
@@ -823,7 +894,7 @@ mod database_tests {
         for rows in [3, 4] {
             for pool_len in [40, 48, 56] {
                 let db = legacy_db(rows, pool_len);
-                let before: Vec<_> = (0..2)
+                let before: Vec<_> = (0..1)
                     .map(|h| db.raw_block_info_cf().zs_get(&Height(h)).unwrap().0)
                     .collect();
                 let (_tx, rx) = crossbeam_channel::bounded(1);
@@ -838,7 +909,7 @@ mod database_tests {
                         bytes
                     );
                 }
-                for h in 2..rows {
+                for h in 1..rows {
                     assert_eq!(
                         db.raw_block_info_cf().zs_get(&Height(h)).unwrap().0.len(),
                         60
@@ -869,7 +940,8 @@ mod database_tests {
     #[test]
     fn migration_batch_boundaries_retry_and_idempotence() {
         for (affected, pool_len) in [(9_999, 40), (10_000, 48), (10_001, 48)] {
-            let rows = affected + 2;
+            // Genesis is the only unaffected row; the seed row is always rewritten.
+            let rows = affected + 1;
             for fail_write in [0, 1] {
                 let db = legacy_db(rows, pool_len);
                 let (_tx, rx) = crossbeam_channel::bounded(1);
@@ -939,7 +1011,7 @@ mod database_tests {
             self, ConfiguredFundingStreamRecipient, ConfiguredFundingStreams,
         };
         let tip = Height(8_388_607);
-        for nu7 in [None, Some(tip.0 + 1)] {
+        for nu7 in [None, Some(tip.0 + 2)] {
             for deferred in [false, true] {
                 let network = testnet::Parameters::build()
                     .with_slow_start_interval(Height(12_500_000))
@@ -950,6 +1022,7 @@ mod database_tests {
                         ..Default::default()
                     })
                     .unwrap()
+                    .with_initial_nsm_value_balance(Amount::zero())
                     .with_funding_streams(vec![ConfiguredFundingStreams {
                         height_range: Some(Height(2)..Height(12_500_001)),
                         recipients: Some(if deferred {
@@ -1007,6 +1080,7 @@ mod database_tests {
             ConfiguredLockboxDisbursement,
         };
         testnet::Parameters::build()
+            .with_initial_nsm_value_balance(Amount::zero())
             .with_slow_start_interval(Height(8))
             .with_activation_heights(ConfiguredActivationHeights {
                 blossom: Some(1),
@@ -1091,8 +1165,8 @@ mod database_tests {
                     assert!(Upgrade.validate(&db, &rx).unwrap().is_ok());
                     let after = db.raw_chain_value_pools_cf().zs_get(&()).unwrap();
                     assert_eq!(&after.0[..pool_len], &before.0);
-                    if nu7.is_none_or(|start| tip < start) {
-                        assert_eq!(writes, 0, "inactive NU7 requires no backfill writes");
+                    if nu7.is_none_or(|start| tip < start.saturating_sub(1)) {
+                        assert_eq!(writes, 0, "pre-seed history requires no backfill writes");
                         assert_eq!(after.0, before.0);
                     }
                     Upgrade.run(Some(Height(tip)), &db, &rx).unwrap();

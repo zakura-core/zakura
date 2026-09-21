@@ -2989,7 +2989,8 @@ async fn v5_transaction_with_last_valid_expiry_height() {
 /// is equal to the height of the block the transaction belongs to.
 #[tokio::test]
 async fn v5_coinbase_transaction_expiry_height() {
-    let network = Network::new_default_testnet();
+    // Keep this expiry-height test independent of future NU7 activation heights.
+    let network = configured_network_with_nu7(None);
     let state_service =
         service_fn(|_| async { unreachable!("State service should not be called") });
     let verifier = Verifier::new_for_tests(&network, state_service);
@@ -3213,7 +3214,9 @@ async fn v5_transaction_with_exceeding_expiry_height() {
 
     let transaction_hash = transaction.hash();
 
-    let verification_result = Verifier::new_for_tests(&Network::Mainnet, state)
+    // Keep this expiry-height test independent of future NU7 activation heights.
+    let network = configured_network_with_nu7(None);
+    let verification_result = Verifier::new_for_tests(&network, state)
         .oneshot(Request::Block {
             transaction_hash: transaction.hash(),
             transaction: Arc::new(transaction.clone()),
@@ -4535,7 +4538,7 @@ async fn mempool_applies_the_zip218_limits_to_ironwood_actions() {
 }
 
 /// Checks that ZIP 2003 accepts V4 transactions below NU7 and rejects them
-/// from NU7 when the `nu7` feature is enabled.
+/// from NU7.
 #[test]
 fn v4_deprecation_boundary() {
     let _init_guard = zakura_test::init();
@@ -4557,18 +4560,14 @@ fn v4_deprecation_boundary() {
         "a V4 transaction must be valid below the NU7 activation height",
     );
 
-    let expected = if cfg!(feature = "nu7") {
-        Err(TransactionError::UnsupportedByNetworkUpgrade(
-            transaction.version(),
-            NetworkUpgrade::Nu7,
-        ))
-    } else {
-        Ok(())
-    };
+    let expected = Err(TransactionError::UnsupportedByNetworkUpgrade(
+        transaction.version(),
+        NetworkUpgrade::Nu7,
+    ));
     assert_eq!(
         verify_v4_at(&network, &transaction, nu7),
         expected,
-        "V4 deprecation must match the `nu7` feature at NU7",
+        "a V4 transaction must be invalid at the NU7 activation height",
     );
     assert_eq!(
         verify_v4_at(
@@ -4577,14 +4576,21 @@ fn v4_deprecation_boundary() {
             nu7.next().expect("NU7 is below the maximum height"),
         ),
         expected,
-        "V4 deprecation must match the `nu7` feature after NU7",
+        "a V4 transaction must be invalid after the NU7 activation height",
     );
 
-    let no_nu7 = configured_network_with_nu7(None);
-    assert!(
-        verify_v4_at(&no_nu7, &transaction, Height::MAX).is_ok(),
-        "a network without an exact NU7 activation must keep accepting V4",
-    );
+    for network in [
+        Network::Mainnet,
+        Network::new_default_testnet(),
+        configured_network_with_nu7(None),
+    ] {
+        assert_eq!(NetworkUpgrade::Nu7.activation_height(&network), None);
+        assert!(!NetworkUpgrade::is_nu7_active(&network, Height::MAX));
+        assert!(
+            verify_v4_at(&network, &transaction, Height::MAX).is_ok(),
+            "a network without an exact NU7 activation must keep accepting V4",
+        );
+    }
 }
 
 /// Returns a configured network whose latest upgrade is NU6.3 unless `nu7`

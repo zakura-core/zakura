@@ -5390,6 +5390,14 @@ impl HeaderChainStore {
     }
 
     fn recovery_batch(&self, plan: &RecoveryPlan) -> Result<DiskWriteBatch, HeaderChainStoreError> {
+        if plan
+            .repairs
+            .contains(&RecoveryRepair::NetworkPolicyConfiguration)
+        {
+            tracing::warn!(
+                "header-chain network policy changed; source audit passed, updating stored digest"
+            );
+        }
         let mut batch = DiskWriteBatch::new();
         if plan.repairs.contains(&RecoveryRepair::InheritedEligibility) {
             for node in &plan.header_nodes {

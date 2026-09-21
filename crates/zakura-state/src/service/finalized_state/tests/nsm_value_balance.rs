@@ -173,7 +173,7 @@ fn seeded_network() -> Network {
             nu7: Some(2),
             ..Default::default()
         },
-        nsm_reissuance_height: Some(START),
+        test_nsm_reissuance_height: Some(START),
         initial_nsm_value_balance: Some(
             Amount::try_from(SEED).expect("the seed is a valid amount"),
         ),
@@ -240,11 +240,25 @@ fn the_seed_lands_on_the_last_block_below_nu7() {
 /// Rolling back below the seed height clears the seed, and replay restores it.
 #[test]
 fn rollback_across_the_seed_height_restores_it_on_replay() {
+    rollback_seed_history(seeded_network());
+    rollback_seed_history(derived_seed_network());
+}
+
+fn derived_seed_network() -> Network {
+    Network::new_regtest(RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            nu7: Some(2),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+}
+
+fn rollback_seed_history(network: Network) {
     use crate::{rollback_finalized_state, RollbackFinalizedStateOptions};
 
     let _init_guard = zakura_test::init();
 
-    let network = seeded_network();
     let (_nu7, seed_height) = seed_height(&network);
     let dir = tempfile::tempdir().expect("a temporary directory is available");
     let config = Config {
@@ -336,4 +350,134 @@ fn parent_height(parent: &Block) -> Height {
     parent
         .coinbase_height()
         .expect("the parent has a coinbase height")
+}
+
+#[test]
+fn derived_seed_survives_non_finalized_forks_and_finalization() {
+    fn coinbase_tx(
+        height: Height,
+        value: Amount<NonNegative>,
+        address: &Address,
+    ) -> std::sync::Arc<zakura_chain::transaction::Transaction> {
+        use zakura_chain::{
+            transaction::{LockTime, Transaction},
+            transparent::{Input, Output},
+        };
+        std::sync::Arc::new(Transaction::V5 {
+            network_upgrade: NetworkUpgrade::Nu5,
+            lock_time: LockTime::unlocked(),
+            expiry_height: height,
+            inputs: vec![Input::Coinbase {
+                height,
+                data: vec![0; 8],
+                sequence: u32::MAX,
+            }],
+            outputs: vec![Output::new(value, address.script())],
+            sapling_shielded_data: None,
+            orchard_shielded_data: None,
+        })
+    }
+
+    use zakura_chain::parameters::subsidy::scheduled_issuance_zatoshis;
+    let _guard = zakura_test::init();
+    let network = Network::new_regtest(RegtestParameters {
+        activation_heights: ConfiguredActivationHeights {
+            nu7: Some(3),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let mut state = FinalizedState::new(&Config::ephemeral(), &network).unwrap();
+    let genesis = zakura_chain::block::genesis::regtest_genesis_block();
+    commit(&mut state, &genesis).unwrap();
+    let address = Address::from_script_hash(NetworkKind::Regtest, [0x42; 20]);
+    let root = child_block(
+        &genesis,
+        vec![coinbase_tx(
+            Height(1),
+            Amount::try_from(1).unwrap(),
+            &address,
+        )],
+    );
+    let mut forks = NonFinalizedState::new(&network);
+    forks
+        .commit_new_chain(SemanticallyVerifiedBlock::from(root.clone()), &state.db)
+        .unwrap();
+    let history = forks
+        .best_chain()
+        .unwrap()
+        .history_tree(root.hash().into())
+        .unwrap();
+    let seed_block = child_block_with_history_commitment(
+        &root,
+        vec![coinbase_tx(
+            Height(2),
+            Amount::try_from(2).unwrap(),
+            &address,
+        )],
+        &network,
+        &history,
+    );
+    forks
+        .commit_block(
+            SemanticallyVerifiedBlock::from(seed_block.clone()),
+            &state.db,
+        )
+        .unwrap();
+    let expected =
+        i64::try_from(scheduled_issuance_zatoshis(Height(2), &network).unwrap()).unwrap() - 3;
+    let seeded = forks
+        .best_chain()
+        .unwrap()
+        .non_finalized_tip_with_value_balance()
+        .2;
+    assert_eq!(i64::from(seeded.nsm_value_balance_amount()), expected);
+
+    // Reverting the seed block must clear its state-derived balance.
+    let fork = forks.best_chain().unwrap().fork(root.hash()).unwrap();
+    assert_eq!(
+        i64::from(
+            fork.non_finalized_tip_with_value_balance()
+                .2
+                .nsm_value_balance_amount()
+        ),
+        0
+    );
+    let alternative = child_block_with_history_commitment(
+        &root,
+        vec![coinbase_tx(
+            Height(2),
+            Amount::try_from(3).unwrap(),
+            &address,
+        )],
+        &network,
+        &history,
+    );
+    forks
+        .commit_block(
+            SemanticallyVerifiedBlock::from(alternative.clone()),
+            &state.db,
+        )
+        .unwrap();
+    let alternative_pools = forks
+        .chain_iter()
+        .find_map(|chain| chain.block_info(alternative.hash().into()))
+        .unwrap();
+    assert_eq!(
+        i64::from(alternative_pools.value_pools().nsm_value_balance_amount()),
+        expected - 1
+    );
+    // Finalization recalculates the seed from finalized monetary pools.
+    let selected = forks
+        .best_chain()
+        .unwrap()
+        .non_finalized_tip_with_value_balance()
+        .2;
+    state
+        .commit_finalized_direct(forks.finalize(), None, None, "derived seed test")
+        .unwrap();
+    state
+        .commit_finalized_direct(forks.finalize(), None, None, "derived seed test")
+        .unwrap();
+    assert_eq!(state.db.finalized_value_pool(), selected);
 }

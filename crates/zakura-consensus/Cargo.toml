@@ -22,9 +22,6 @@ categories = ["asynchronous", "cryptography::cryptocurrencies"]
 [features]
 default = []
 
-# NU7 consensus rules. Off by default until NU7 has activation heights.
-nu7 = []
-
 # Production features that activate extra dependencies, or extra features in dependencies
 
 progress-bar = [
@@ -74,7 +71,7 @@ zakura-script = { path = "../zakura-script", version = "3.2.4" }
 zakura-state = { path = "../zakura-state", version = "9.0.0" }
 zakura-node-services = { path = "../zakura-node-services", version = "3.2.5" }
 zakura-chain = { path = "../zakura-chain", version = "9.0.0" }
-zakura-header-chain = { path = "../zakura-header-chain", version = "2.1.1" }
+zakura-header-chain = { path = "../zakura-header-chain", version = "3.0.0" }
 
 zcash_protocol.workspace = true
 

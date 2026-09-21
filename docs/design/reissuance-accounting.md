@@ -1,6 +1,7 @@
 # Reissuance accounting
 
-Reissuance activates by height alone, from the ZIP 234 start height, in every build.
+Fee recycling activates at NU7 and reissuance at the ZIP 234 start height.
+Both activate by height alone in every build.
 Production activation still requires policy guidance and a production NU7 branch ID.
 
 ## The seed
@@ -9,14 +10,29 @@ The balance holds `INITIAL_NSM_VALUE_BALANCE` on the last block below NU7: the b
 subsidy and fees that earlier coinbase transactions never claimed. The 2026-09-15
 ZIP Editor call settled this, and zips#1354 defines the constant.
 
-`Network::initial_nsm_value_balance` in
-`crates/zakura-chain/src/parameters/network/subsidy.rs` holds the value. Mainnet and
-Testnet carry the measured constants. Every other network carries zero, because a chain
-with no history before NU7 has nothing to seed, and
-`ParametersBuilder::with_initial_nsm_value_balance` overrides it.
+State derives the seed at `NU7 - 1` from `scheduled_issuance_zatoshis` minus the
+monetary pool total at that height. Both inputs are local: the calculation uses no
+RPC, block scan, or archive node. The monetary total excludes the NSM balance.
+
+Mainnet and public Testnet check the derived seed against the measured constants
+in `Network::initial_nsm_value_balance`. A mismatch fails the state update or
+migration. The draft still leaves the exact values as a TODO; these constants
+retain #1040's measurements, which still need an independent zcashd cross-check.
+
+Configured networks derive their own seed by default. An explicit
+`initial_nsm_value_balance`, including zero, overrides the derivation for synthetic
+histories. Omitting the setting and specifying zero have different meanings.
+A configured network can omit the seed only when cumulative scheduled issuance
+through `NU7 - 1` is at most `MAX_MONEY`, which guarantees that every possible
+derived seed fits the stored amount. Networks with larger schedules must supply
+an explicit bounded seed or change their schedule.
+A configured network that already activated NU7 with the old implicit zero seed
+must set an explicit zero to preserve its rules, or resync under the new rules.
+The existing format-29 validation detects an inconsistent stored balance.
 
 Let `N` denote NU7 activation, `S(h)` cumulative scheduled issuance with zero genesis
-issuance, `I(h)` the sum of the six monetary pools, and `C` the seed. The stored balance
+issuance, `I(h)` the sum of the six monetary pools, and `C = S(N-1) - I(N-1)`
+(unless a configured network overrides the seed). The stored balance
 is:
 
 - `D(h) = 0` for `h < N - 1`, or when the network has no NU7 activation.
@@ -24,52 +40,51 @@ is:
 - `D(h) = C + (S(h) - S(N-1)) - (I(h) - I(N-1))` for `h >= N`.
 - For NU7 at genesis there is no seeded block, so `D(h) = S(h) - I(h)`.
 
-`Block::nsm_value_balance_change` in `crates/zakura-chain/src/block.rs` applies the rule
-as the chain grows, and the migration in
+Both commit paths call `ValueBalance::seed_nsm_value_balance` after applying the
+last pre-NU7 block's monetary changes. Later blocks use `Block::nsm_value_balance_change`.
+The migration in
 `crates/zakura-state/src/service/finalized_state/disk_format/upgrade/nsm_value_balance_pool.rs`
-applies it to an existing database. Change both together.
+uses the same seed derivation. Non-finalized rollback clears the seed when it
+removes the last pre-NU7 block. Finalized rollback restores the target BlockInfo
+pools. Replay derives the seed again.
 
-## Fee recycling scope
+## Fee recycling
 
-Fee recycling is deferred to a separate change. The NU7 deployment draft's
-[NSM reserve rules] propose contributing `floor(6 * TransactionFees(h) / 10)` from
-aggregate block fees without adding transaction fields. This implementation retains
-the full fee claim in coinbase validation and block templates. Deferring that work does
-not exclude fee recycling from the intended NU7 scope.
+The NU7 deployment draft's [NSM reserve rules] contribute
+`floor(6 * TransactionFees(h) / 10)` from aggregate block fees to NSM.
+Contributions start at NU7 activation in every build, including the interval before
+reissuance starts. Before NU7, the miner receives all fees.
 
-For example, with 1,000 zatoshi in fees, the current implementation requires the
-coinbase to claim all 1,000. The draft would leave 400 for the miner and contribute
-600 to NSM. Omitting ZIP 233's transaction fields does not rule out that contribution.
+For example, with 1,000 zatoshi in fees, the miner receives 400 and NSM receives 600.
+The calculation rounds down the contribution once per block, so the remainder favors
+miners. Two transactions paying one zatoshi each contribute one zatoshi together.
+Rounding each transaction separately would incorrectly contribute zero.
 
-The follow-up must update coinbase validation, block templates, and activation tests
-together. Once coinbases withhold the contribution, the existing calculation below
-will include it through the reduction in issued value. Adding it again would count
-the same fees twice.
+`subsidy::miner_fee_share` in `zakura-chain` supplies the same calculation to coinbase
+validation and block templates. The coinbase must claim the subsidy plus the miner's
+share, subject to the existing funding stream and deferred pool rules. Claiming one
+zatoshi more or less than the permitted amount is rejected.
+
+In `getblocktemplate`, non-coinbase `fee` fields still report the full transaction fee.
+The coinbase `fee` is the negative amount of fees it collects, excluding the NSM
+contribution. For the 1,000-zatoshi example, it is `-400`. Miners that change the
+transaction list must recompute the split from the new aggregate fees.
 
 [NSM reserve rules]: https://github.com/zcash/zips/blob/32f447759aba83acfb20aab0757b68147643de22/zips/draft-valargroup-deploy-nu7.md#L120-L149
 
 ## Running total
 
-zips#1354 defines the balance by what each block claims:
+The balance follows this recurrence from NU7 onward:
 
-```
+```text
 NSMValueBalance(h) = NSMValueBalance(h - 1) - AdditionalBlockSubsidy(h) + removed(h)
 ```
 
-Under the currently implemented full fee claim rule, `removed(h)` is zero for
-semantically valid blocks from NU7 onward. This describes the current implementation,
-not the complete NU7 deployment proposal.
-
-A block carries no reference to its parent's balance, so the implementation derives the
-bonus from the block. Under the currently implemented ZIP 236 rule, the coinbase claims
-exactly `BlockSubsidy(h)` plus all transaction fees from NU6 onward. Fees move between
-transactions inside the block, so the block's change across the six monetary pools is
-`BlockSubsidy(h)`.
-That is the halving subsidy plus the bonus, so the halving subsidy minus it is
-`-AdditionalBlockSubsidy(h)`. The two definitions therefore agree from NU7 onward
-under the current fee rules. With fee recycling, the monetary pool change would instead
-be `BlockSubsidy(h) - removed(h)`, yielding
-`-AdditionalBlockSubsidy(h) + removed(h)` from the same calculation.
+Here, `removed(h)` is the fee contribution. The block's change across the six monetary
+pools is `BlockSubsidy(h) - removed(h)`. Subtracting that change from the halving
+subsidy yields `-AdditionalBlockSubsidy(h) + removed(h)`. The contribution is already
+included through reduced issuance and must not be credited a second time. The same
+accounting applies during replay and the format 29 backfill.
 
 Transfers between monetary pools leave the balance unchanged. Reductions in issued value
 increase it. The balance itself holds no spendable value and does not contribute to
@@ -93,8 +108,8 @@ to v28: older decoders cannot read the expanded BlockInfo layout. Downgrade
 requires a pre-upgrade backup or a separate sync.
 
 The migration reads legacy pool records and offsets them so the balance starts at the
-seed on the last block below NU7. The offset is zero when the constant matches the
-chain's own history, as the measured Mainnet and Testnet constants do. The migration
+seed on the last block below NU7. Derived seeds have zero offset. Only an explicit
+configured-network override can introduce an offset. The migration
 performs cumulative schedule arithmetic without clamping either operand to MAX_MONEY. It
 checks the eligible balance after the offset.
 
@@ -106,7 +121,9 @@ migration performs no data writes, including to the separately stored tip pools.
 The migration reads no history before the pre-NU7 baseline and does not audit
 or repair the absolute historical Deferred balance. A nonzero NSM seed is written
 at that baseline, but Deferred changes are validated only from NU7 onward.
-A constant historical monetary-pool offset cancels. Each post-activation Deferred
+A historical monetary-pool error changes the derived seed; the public-network
+constant check rejects a changed total. An explicit configured seed still cancels
+a constant historical offset. Each post-activation Deferred
 change must match funding minus disbursements before the corresponding NSM balance
 is written. This rejects mixed replay/commit histories whose changing Deferred
 undercount would otherwise distort the NSM balance.
@@ -120,7 +137,10 @@ separate sync to downgrade.
 The migration writes batches of 10,000 affected BlockInfo records. It preserves monetary
 pools and block sizes. It updates the separately stored tip balance last.
 Cancellation or a failed write leaves the version marker unchanged. Restarting
-the migration recomputes every balance, including already rewritten records.
+the migration recomputes every balance, including already rewritten records. It
+always rewrites and validates the `NU7 - 1` seed row, including for an explicit
+zero, so a v27 attempt interrupted under different seed configuration cannot
+leave a mixed history.
 
 The migration refuses a database whose finalized tip is at or above the ZIP 234
 start height. Older versions committed those blocks without reissuance, so their
@@ -135,8 +155,10 @@ backup or repair the identified corruption before retrying startup.
 
 ## Validation and activation requirements
 
-The tests cover integer rounding, schedule sums, the seed and its rollback,
-the fixed NU7 fraction, its half-life over 5,040,000 blocks, termination from a small balance, transfers through every monetary
+The tests cover aggregate fee rounding, fee activation before reissuance, coinbase
+claims and template fees, the resulting NSM contribution, schedule sums, the seed and
+its rollback, the fixed NU7 fraction, its half-life over 5,040,000 blocks,
+termination from a small balance, transfers through every monetary
 pool, reductions in issued value, contextual rejection from NU7, independent
 non-finalized forks, finalized rollback, replay, alternate branches, restart,
 fresh replay equivalence, legacy records, migration batch boundaries, failed
@@ -150,7 +172,6 @@ not establish support for a ZIP 233 transaction format.
 
 Before production activation:
 
-- Implement and validate the deployment draft's fee recycling rules in the follow-up.
 - Resolve the reissuance start height against the deployment ZIP.
 - Assign the production NU7 branch ID and activation heights.
 - Run real transaction verification across activation on a private network.
@@ -162,10 +183,3 @@ Before production activation:
 
 Passing the bounded properties does not establish that every possible state or
 failure has been tested.
-
-## Replacement stack integration order
-
-This layer wires verification and payout recovery. Mining templates and subsidy
-RPCs receive parent balances in the following PR; until then, their calls at
-active reissuance heights report a missing-balance error. Land that integration
-before enabling payouts on configured networks.

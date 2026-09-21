@@ -37,8 +37,18 @@ The cases above describe possible triggers, not observed production incidents.
 1. Retain rejected server work IDs in a watch channel scoped to the current parent.
    Retained state covers failures before subscription and between checking and waiting.
    Ignore late results for another parent.
-   Check parent freshness while holding the rejection-state write lock, so a delayed
-   template caller cannot clear a newer parent's rejection records.
+   Select the parent and check that it is still the best tip under the same write lock,
+   so a delayed caller cannot clear a newer parent's rejection records.
+   If the parent or rejection revision changes while a template is being built (a new
+   block, an equal-height reorg, a concurrent caller selecting a newer parent, or a
+   rejection update outside fallback mode), rebuild from current state instead of
+   returning a transient error: miners treat that error as lost work, and the internal
+   miner backs off for 20 seconds. Bound the rebuilds; past the bound, return the
+   transient error.
+   Fallback recovery also rebuilds when validation finishes in a superseded context.
+   Failed validation checks the committed state tip to cover delayed tip notifications.
+   Validation and that read share one 30-second deadline. Successful recovery checks
+   freshness and records prepared work under the same write lock.
    Bound rejection storage at 64 IDs; stop issuing templates on overflow until the
    parent changes.
 2. Classify concrete consensus and contextual errors.
@@ -59,13 +69,8 @@ The cases above describe possible triggers, not observed production incidents.
    External miners must cooperate; RPC cannot force them to stop.
 5. Enter empty-template recovery for the affected parent.
    Validate the empty template before returning it.
-   Validation and the committed-tip check share a 30-second deadline. Return an error
-   if recovery fails or exceeds that deadline in the current context.
-   If the parent or rejection revision changed, rebuild from fresh state instead of
-   returning a transient RPC error that would trigger the internal miner's backoff.
-   On a validation failure, also check the committed state tip because its notification
-   may still lag the commit.
-   Check the recovery context and record successful preparation under the same lock.
+   Return an error if validation fails or exceeds 30 seconds.
+   Recheck the recovery context before publication.
    Do not issue further speculative transaction sets until the parent changes.
    This conservative recovery avoids an unbounded candidate fingerprint blacklist.
 6. Discard queued speculative preparation during recovery.
@@ -80,14 +85,6 @@ The cases above describe possible triggers, not observed production incidents.
   Verify that long polling wakes without a tip change and that recovery waits for
   validation. Verify that failed recovery never returns a template.
 - Exercise failure before subscription and during an outstanding long poll.
-- Hold one caller's mempool response across another caller's parent change and require
-  fresh work from both callers without another block. Preserve newer rejection records
-  when an older caller attempts to select its parent.
-- Change the parent during fallback validation, including before the tip notification
-  arrives and in the tip-wakeup fast path. Retry stale results while preserving errors
-  for failures on the current parent.
-- Stall fallback validation or fail it after part of its budget is spent, then stall
-  the committed-tip check. Require an error within the original 30-second deadline.
 - Check work-ID isolation, duplicate rejection, old-parent rejection, parent recovery,
   retained notifications, and bounded-storage overflow.
 - Round-trip legacy and revised long-poll IDs. Check that a withdrawal disallows old

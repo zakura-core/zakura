@@ -1,5 +1,7 @@
 //! Tests for types and functions for the `getblocktemplate` RPC.
 
+mod nsm_fees;
+
 use anyhow::anyhow;
 use std::iter;
 use zakura_chain::amount::Amount;
@@ -192,7 +194,7 @@ fn local_genesis_activation_coinbase_includes_lockbox_marker() -> anyhow::Result
         .ok_or(anyhow!("hard-coded address must be valid"))?,
     );
     let transaction =
-        TransactionTemplate::new_coinbase(&net, height, &miner_params, Amount::zero())?
+        TransactionTemplate::new_coinbase(&net, height, &miner_params, Amount::zero(), None)?
             .data()
             .as_ref()
             .zcash_deserialize_into::<Transaction>()?;
@@ -277,7 +279,7 @@ fn coinbase_tag_and_limit() {
         .expect("maximum-length tag is valid");
     let max_params = params(Some(max_tag)).expect("maximum-length tag fits miner params");
     let max_coinbase =
-        TransactionTemplate::new_coinbase(&net, Height::MAX, &max_params, Amount::zero())
+        TransactionTemplate::new_coinbase(&net, Height::MAX, &max_params, Amount::zero(), None)
             .expect("maximum-length tag fits a coinbase transaction")
             .data()
             .as_ref()
@@ -438,7 +440,7 @@ fn coinbase_transaction(
     miner_params: &MinerParams,
 ) -> anyhow::Result<Transaction> {
     Ok(
-        TransactionTemplate::new_coinbase(net, height, miner_params, Amount::zero())?
+        TransactionTemplate::new_coinbase(net, height, miner_params, Amount::zero(), None)?
             .data()
             .as_ref()
             // Deserialization contains checks for elementary consensus rules,
@@ -455,7 +457,7 @@ fn assert_coinbase_resource_usage(
 ) -> anyhow::Result<()> {
     use zcash_transparent::coinbase::MAX_COINBASE_SCRIPT_LEN;
 
-    let resources = TransactionTemplate::coinbase_resource_usage(net, height, miner_params)?;
+    let resources = TransactionTemplate::coinbase_resource_usage(net, height, miner_params, None)?;
     let coinbase_script_len = transaction.inputs()[0]
         .coinbase_script()
         .expect("generated coinbase input has a canonical script")

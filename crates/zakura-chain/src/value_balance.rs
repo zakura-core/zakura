@@ -29,10 +29,9 @@ pub struct ValueBalance<C> {
     orchard: Amount<C>,
     deferred: Amount<C>,
     ironwood: Amount<C>,
-    /// Scheduled issuance minus issued value since NU7, with no historical seed.
+    /// Historical unclaimed issuance plus scheduled issuance minus issued value since NU7.
     /// This accounting counter funds reissuance but holds no spendable value.
-    /// Monetary totals exclude it. The signed type preserves pre-reissuance states;
-    /// contextual validation rejects negative balances from the reissuance start.
+    /// Monetary totals exclude it. Contextual validation rejects negative balances from NU7.
     nsm_value_balance: Amount<NegativeAllowed>,
 }
 
@@ -375,6 +374,68 @@ impl ValueBalance<NonNegative> {
         Ok(chain_value_pool)
     }
 
+    /// Derives the seed from the monetary pools at the supplied pre-NU7 height.
+    /// Public networks check the result against their measured consensus seed.
+    /// Configured networks can override the seed for synthetic histories.
+    pub fn initial_nsm_value_balance(
+        &self,
+        height: crate::block::Height,
+        network: &crate::parameters::Network,
+    ) -> Result<Amount<NonNegative>, ValueBalanceError> {
+        use crate::parameters::{
+            subsidy::{scheduled_issuance_zatoshis, ParameterSubsidy, SubsidyError},
+            Network,
+        };
+
+        let public = match network {
+            Network::Mainnet => true,
+            Network::Testnet(params) => {
+                if params.is_default_testnet() {
+                    true
+                } else if let Some(seed) = params.configured_initial_nsm_value_balance() {
+                    return Ok(seed);
+                } else {
+                    false
+                }
+            }
+        };
+        let scheduled = scheduled_issuance_zatoshis(height, network).map_err(ScheduledIssuance)?;
+        let scheduled =
+            i128::try_from(scheduled).map_err(|_| ScheduledIssuance(SubsidyError::Overflow))?;
+        // total() excludes the NSM balance, including during migration retries.
+        let issued = i128::from(i64::from(self.total().map_err(Total)?));
+        let seed = i64::try_from(scheduled - issued)
+            .map_err(|_| ScheduledIssuance(SubsidyError::Overflow))?;
+        let seed = Amount::<NonNegative>::try_from(seed).map_err(NsmValueBalance)?;
+        if public && seed != network.initial_nsm_value_balance() {
+            return Err(NsmSeedMismatch {
+                derived: seed,
+                expected: network.initial_nsm_value_balance(),
+            });
+        }
+        Ok(seed)
+    }
+
+    /// Initializes the NSM balance after applying the last pre-NU7 block's monetary changes.
+    /// No other height changes the NSM balance here, including NU7 at genesis.
+    pub fn seed_nsm_value_balance(
+        mut self,
+        height: crate::block::Height,
+        network: &crate::parameters::Network,
+    ) -> Result<Self, ValueBalanceError> {
+        if crate::parameters::NetworkUpgrade::Nu7
+            .activation_height(network)
+            .and_then(|activation| activation.0.checked_sub(1))
+            == Some(height.0)
+        {
+            self.nsm_value_balance = self
+                .initial_nsm_value_balance(height, network)?
+                .constrain()
+                .map_err(NsmValueBalance)?;
+        }
+        Ok(self)
+    }
+
     /// Returns `IssuedSupply` from [protocol specification §4.17][4.17]: the total value
     /// across every chain value pool.
     ///
@@ -573,6 +634,14 @@ pub enum ValueBalanceError {
     /// NSM value balance amount error {0}
     NsmValueBalance(amount::Error),
 
+    /// the derived NSM seed differs from the expected public-network seed
+    NsmSeedMismatch {
+        /// Seed derived from cumulative issuance and monetary pools.
+        derived: Amount<NonNegative>,
+        /// Expected seed measured from the public network.
+        expected: Amount<NonNegative>,
+    },
+
     /// scheduled issuance calculation failed: {0}
     ScheduledIssuance(crate::parameters::subsidy::SubsidyError),
 
@@ -596,6 +665,9 @@ impl fmt::Display for ValueBalanceError {
             Deferred(e) => format!("deferred amount err: {e}"),
             Ironwood(e) => format!("ironwood amount err: {e}"),
             NsmValueBalance(e) => format!("NSM value balance amount err: {e}"),
+            NsmSeedMismatch { derived, expected } => {
+                format!("derived NSM seed {derived:?} does not match expected {expected:?}")
+            }
             ScheduledIssuance(e) => format!("scheduled issuance calculation failed: {e}"),
             MissingCoinbaseHeight => {
                 "block has no coinbase height, so its NSM value balance change is undefined"

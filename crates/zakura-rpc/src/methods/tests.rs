@@ -2,7 +2,8 @@
 
 #![allow(clippy::unwrap_in_result)]
 
-mod mining_template;
+mod mining;
+mod mining_recovery;
 mod prop;
 mod snapshot;
 pub mod utils;

@@ -65,8 +65,8 @@ use zakura_chain::{
     chain_tip::{ChainTip, NetworkChainTipHeightEstimator},
     parameters::{
         subsidy::{
-            block_subsidy, founders_reward, funding_stream_values, miner_subsidy,
-            FundingStreamReceiver,
+            block_subsidy, founders_reward, funding_stream_values, is_zip234_active, miner_subsidy,
+            parent_nsm_value_balance, FundingStreamReceiver,
         },
         ConsensusBranchId, Network, NetworkUpgrade,
     },
@@ -116,7 +116,7 @@ use types::{
     chain_tips::{self, GetChainTipsResponse},
     get_block_template::{
         constants::{
-            DEFAULT_SOLUTION_RATE_WINDOW_SIZE, MEMPOOL_LONG_POLL_INTERVAL,
+            DEFAULT_SOLUTION_RATE_WINDOW_SIZE, MAX_TEMPLATE_REBUILDS, MEMPOOL_LONG_POLL_INTERVAL,
             ZCASHD_FUNDING_STREAM_ORDER,
         },
         proposal::proposal_block_from_template,
@@ -853,6 +853,9 @@ pub trait Rpc {
     /// # Notes
     ///
     /// If `height` is not supplied, uses the tip height.
+    ///
+    /// From the ZIP 234 reissuance start height, the subsidy depends on the parent block's
+    /// chain value pools, so `height` must be at most one block above the best chain tip.
     #[method(name = "getblocksubsidy")]
     async fn get_block_subsidy(&self, height: Option<u32>) -> Result<GetBlockSubsidyResponse>;
 
@@ -1202,8 +1205,41 @@ where
         }
     }
 
-    /// Selects a parent only while it is current. Check under the rejection-state write lock
-    /// so an older caller cannot clear a newer parent's rejection records.
+    /// Builds proofs on the blocking pool and maps construction or worker failures to RPC errors.
+    #[allow(clippy::too_many_arguments)]
+    async fn build_mining_template(
+        &self,
+        precomputed_coinbase: Option<TransactionTemplate<zakura_chain::amount::NegativeOrZero>>,
+        miner_params: &types::get_block_template::MinerParams,
+        chain_info: &zakura_state::GetBlockTemplateChainInfo,
+        long_poll_id: types::long_poll::LongPollId,
+        mempool_txs: Vec<types::get_block_template::zip317::SelectedMempoolTx>,
+        submit_old: Option<bool>,
+    ) -> Result<BlockTemplateResponse> {
+        let network = self.network.clone();
+        let miner_params = miner_params.clone();
+        let chain_info = chain_info.clone();
+        self.gbt
+            .run_template_build(move || {
+                BlockTemplateResponse::new_internal(
+                    &network,
+                    precomputed_coinbase,
+                    &miner_params,
+                    &chain_info,
+                    long_poll_id,
+                    mempool_txs,
+                    submit_old,
+                )
+            })
+            .await?
+            .map_misc_error()
+    }
+
+    /// Selects `parent` for new templates, but only while it is still the best tip.
+    ///
+    /// The tip check and the parent update happen under the rejection-state write lock,
+    /// so a caller that fetched its chain info before a tip change cannot overwrite the
+    /// parent (and clear the rejection records) that a faster caller already selected.
     fn select_mining_template_parent(&self, parent: block::Hash) -> bool {
         let mut selected = false;
         self.gbt.template_rejections.send_if_modified(|state| {
@@ -1222,7 +1258,10 @@ where
         selected
     }
 
-    /// Returns `None` when the caller must rebuild after a context change.
+    /// Returns `Ok(None)` when the template was superseded while it was being built:
+    /// the tip moved, a concurrent caller selected a newer parent, or the rejection
+    /// revision changed outside fallback mode. The caller must rebuild from fresh state
+    /// rather than surface a transient error to the miner.
     async fn finish_mining_template(
         &self,
         mut template: BlockTemplateResponse,
@@ -1235,6 +1274,7 @@ where
                 .latest_chain_tip
                 .best_tip_hash()
                 .is_some_and(|tip| tip != chain_info.tip_hash)
+            || (!state.needs_fallback() && state.revision != template.long_poll_id.revision)
         {
             return Ok(None);
         }
@@ -1253,15 +1293,16 @@ where
                 template.submit_old
             };
             long_poll_id.revision = state.revision;
-            template = BlockTemplateResponse::new_internal(
-                &self.network,
-                None,
-                miner_params,
-                chain_info,
-                long_poll_id,
-                vec![],
-                submit_old,
-            );
+            template = self
+                .build_mining_template(
+                    None,
+                    miner_params,
+                    chain_info,
+                    long_poll_id,
+                    vec![],
+                    submit_old,
+                )
+                .await?;
             let block =
                 proposal_block_from_template(&template, None, &self.network).map_misc_error()?;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -2877,294 +2918,350 @@ where
             .miner_params()
             .ok_or_error(0, "miner parameters are required for get_block_template")?;
 
-        // - Checks and fetches that can change during long polling
-        //
-        // Set up the loop.
+        // A template can be superseded while it is being built: the tip moves (a new
+        // block, or an equal-height reorg), a concurrent caller selects a newer parent,
+        // or the rejection revision changes outside fallback mode. Returning an error
+        // for that makes miners drop their current job (the internal miner backs off for
+        // 20 seconds) even though fresh work is one read away, so rebuild from current
+        // state instead. The bound guards against pathological tip or rejection churn.
         let mut max_time_reached = false;
-
-        // Retry from fresh state if a concurrent caller or tip change supersedes the build.
-        loop {
-            // Check if we are synced to the tip.
-            // The result of this check can change during long polling.
-            //
-            // Optional TODO:
-            // - add `async changed()` method to ChainSyncStatus (like `ChainTip`)
-            check_synced_to_tip(&self.network, latest_chain_tip.clone(), sync_status.clone())?;
-            // TODO: return an error if we have no peers, like `zcashd` does,
-            //       and add a developer config that mines regardless of how many peers we have.
-            // https://github.com/zcash/zcash/blob/6fdd9f1b81d3b228326c9826fa10696fc516444b/src/miner.cpp#L865-L880
-
-            // We're just about to fetch state data, then maybe wait for any changes.
-            // Mark all the changes before the fetch as seen.
-            // Changes are also ignored in any clones made after the mark.
-            latest_chain_tip.mark_best_tip_seen();
-
-            // Fetch the state data and local time for the block template:
-            // - if the tip block hash changes, we must return from long polling,
-            // - if the local clock changes on testnet, we might return from long polling
-            //
-            // We always return after 90 minutes on mainnet, even if we have the same response,
-            // because the max time has been reached.
-            let chain_info @ zakura_state::GetBlockTemplateChainInfo {
-                tip_hash,
-                tip_height,
-                max_time,
-                cur_time,
-                ..
-            } = fetch_chain_info(read_state.clone()).await?;
-            if !self.select_mining_template_parent(tip_hash) {
-                continue;
+        'rebuild: for rebuild in 0..=MAX_TEMPLATE_REBUILDS {
+            if rebuild > 0 {
+                metrics::counter!("mining.template.rebuilt").increment(1);
+                tracing::debug!(
+                    rebuild,
+                    "template superseded before it was returned; rebuilding on the current tip"
+                );
             }
-            let rejection_state = template_rejections.borrow_and_update().clone();
 
-            // Fetch the mempool data for the block template:
-            // - if the mempool transactions change, we might return from long polling.
+            // - Checks and fetches that can change during long polling
             //
-            // If the chain fork has just changed, miners want to get the new block as fast
-            // as possible, rather than wait for transactions to re-verify. This increases
-            // miner profits (and any delays can cause chain forks). So we don't wait between
-            // the chain tip changing and getting mempool transactions.
-            //
-            // Optional TODO:
-            // - add a `MempoolChange` type with an `async changed()` method (like `ChainTip`)
-            let Some((mempool_txs, mempool_tx_deps)) =
-                fetch_mempool_transactions(mempool.clone(), tip_hash)
-                    .await?
-                    // If the mempool and state responses are out of sync:
-                    // - if we are not long polling, omit mempool transactions from the template,
-                    // - if we are long polling, continue to the next iteration of the loop to make fresh state and mempool requests.
-                    .or_else(|| client_long_poll_id.is_none().then(Default::default))
-            else {
-                continue;
-            };
+            // Set up the loop.
+            // The loop returns the server long poll ID, which should be different to the client one.
+            let (server_long_poll_id, chain_info, mempool_txs, mempool_tx_deps, submit_old) = loop {
+                // Check if we are synced to the tip.
+                // The result of this check can change during long polling.
+                //
+                // Optional TODO:
+                // - add `async changed()` method to ChainSyncStatus (like `ChainTip`)
+                check_synced_to_tip(&self.network, latest_chain_tip.clone(), sync_status.clone())?;
+                // TODO: return an error if we have no peers, like `zcashd` does,
+                //       and add a developer config that mines regardless of how many peers we have.
+                // https://github.com/zcash/zcash/blob/6fdd9f1b81d3b228326c9826fa10696fc516444b/src/miner.cpp#L865-L880
 
-            // - Long poll ID calculation
-            let mut server_long_poll_id = LongPollInput::new(
-                tip_height,
-                tip_hash,
-                max_time,
-                mempool_txs.iter().map(|tx| tx.transaction.id()),
-            )
-            .generate_id();
-            server_long_poll_id.revision = rejection_state.revision;
+                // We're just about to fetch state data, then maybe wait for any changes.
+                // Mark all the changes before the fetch as seen.
+                // Changes are also ignored in any clones made after the mark.
+                latest_chain_tip.mark_best_tip_seen();
 
-            // The loop finishes if:
-            // - the client didn't pass a long poll ID,
-            // - the server long poll ID is different to the client long poll ID, or
-            // - the previous loop iteration waited until the max time.
-            if Some(&server_long_poll_id) != client_long_poll_id.as_ref() || max_time_reached {
-                // On testnet, the max time changes the block difficulty, so old shares are invalid.
-                // On mainnet, this means there has been 90 minutes without a new block or mempool
-                // transaction, which is very unlikely. So the miner should probably reset anyway.
-                let submit_old = if max_time_reached {
-                    Some(false)
-                } else {
-                    client_long_poll_id
-                        .as_ref()
-                        .map(|old_long_poll_id| server_long_poll_id.submit_old(old_long_poll_id))
+                // Fetch the state data and local time for the block template:
+                // - if the tip block hash changes, we must return from long polling,
+                // - if the local clock changes on testnet, we might return from long polling
+                //
+                // We always return after 90 minutes on mainnet, even if we have the same response,
+                // because the max time has been reached.
+                let chain_info @ zakura_state::GetBlockTemplateChainInfo {
+                    tip_hash,
+                    tip_height,
+                    max_time,
+                    cur_time,
+                    ..
+                } = fetch_chain_info(read_state.clone()).await?;
+                if !self.select_mining_template_parent(tip_hash) {
+                    continue;
+                }
+                let rejection_state = template_rejections.borrow_and_update().clone();
+
+                // Fetch the mempool data for the block template:
+                // - if the mempool transactions change, we might return from long polling.
+                //
+                // If the chain fork has just changed, miners want to get the new block as fast
+                // as possible, rather than wait for transactions to re-verify. This increases
+                // miner profits (and any delays can cause chain forks). So we don't wait between
+                // the chain tip changing and getting mempool transactions.
+                //
+                // Optional TODO:
+                // - add a `MempoolChange` type with an `async changed()` method (like `ChainTip`)
+                let Some((mempool_txs, mempool_tx_deps)) =
+                    fetch_mempool_transactions(mempool.clone(), tip_hash)
+                        .await?
+                        // If the mempool and state responses are out of sync:
+                        // - if we are not long polling, omit mempool transactions from the template,
+                        // - if we are long polling, continue to the next iteration of the loop to make fresh state and mempool requests.
+                        .or_else(|| client_long_poll_id.is_none().then(Default::default))
+                else {
+                    continue;
                 };
 
-                // - Processing fetched data to create a transaction template
+                // - Long poll ID calculation
+                let mut server_long_poll_id = LongPollInput::new(
+                    tip_height,
+                    tip_hash,
+                    max_time,
+                    mempool_txs.iter().map(|tx| tx.transaction.id()),
+                )
+                .generate_id();
+                server_long_poll_id.revision = rejection_state.revision;
+
+                // The loop finishes if:
+                // - the client didn't pass a long poll ID,
+                // - the server long poll ID is different to the client long poll ID, or
+                // - the previous loop iteration waited until the max time.
+                if Some(&server_long_poll_id) != client_long_poll_id.as_ref() || max_time_reached {
+                    // On testnet, the max time changes the block difficulty, so old shares are invalid.
+                    // On mainnet, this means there has been 90 minutes without a new block or mempool
+                    // transaction, which is very unlikely. So the miner should probably reset anyway.
+                    let submit_old = if max_time_reached {
+                        Some(false)
+                    } else {
+                        client_long_poll_id.as_ref().map(|old_long_poll_id| {
+                            server_long_poll_id.submit_old(old_long_poll_id)
+                        })
+                    };
+
+                    break (
+                        server_long_poll_id,
+                        chain_info,
+                        mempool_txs,
+                        mempool_tx_deps,
+                        submit_old,
+                    );
+                }
+
+                // - Polling wait conditions
                 //
-                // Apart from random weighted transaction selection,
-                // the template only depends on the previously fetched data.
-                // This processing never fails.
+                // TODO: when we're happy with this code, split it into a function.
+                //
+                // Periodically check the mempool for changes.
+                //
+                // Optional TODO:
+                // Remove this polling wait if we switch to using futures to detect sync status
+                // and mempool changes.
+                let wait_for_mempool_request =
+                    tokio::time::sleep(Duration::from_secs(MEMPOOL_LONG_POLL_INTERVAL));
 
-                tracing::debug!(
-                    mempool_tx_hashes = ?mempool_txs
-                        .iter()
-                        .map(|tx| tx.transaction.id().mined_id())
-                        .collect::<Vec<_>>(),
-                    "selecting transactions for the template from the mempool"
-                );
+                // Return immediately if the chain tip has changed.
+                // The clone preserves the seen status of the chain tip.
+                let mut wait_for_new_tip = latest_chain_tip.clone();
+                let wait_for_new_tip = wait_for_new_tip.best_tip_changed();
+                // `+2`: we expect the tip to advance by one block before waking us up.
+                let precomputed_height = Height(chain_info.tip_height.0 + 2);
+                let wait_for_new_tip = async {
+                    // Precompute the coinbase tx for an empty block that will sit on the new tip. We
+                    // will return this provisional block upon a chain tip change so that miners can
+                    // mine on the newest tip, and don't waste their effort on a shorter chain while we
+                    // compute a new template for a properly filled block. We do this precomputation
+                    // before we start waiting for a new tip since computing the coinbase tx takes a few
+                    // seconds if the miner mines to a shielded address, and we want to return fast
+                    // when the tip changes.
+                    let precompute_coinbase = |network, height, params| {
+                        self.gbt.run_template_build(move || {
+                            TransactionTemplate::new_coinbase(
+                                &network,
+                                height,
+                                &params,
+                                Amount::zero(),
+                                None,
+                            )
+                        })
+                    };
 
-                let height = chain_info.tip_height.next().map_misc_error()?;
+                    // ZIP 234 derives the subsidy from the new tip's value pools. Those pools
+                    // are unknown until the tip arrives, so this optimization cannot construct
+                    // a valid post-activation coinbase in advance.
+                    let precomputed_coinbase =
+                        if is_zip234_active(&self.network, precomputed_height) {
+                            None
+                        } else {
+                            Some(
+                                precompute_coinbase(
+                                    self.network.clone(),
+                                    precomputed_height,
+                                    miner_params.clone(),
+                                )
+                                .await?
+                                .map_misc_error()?,
+                            )
+                        };
 
-                // Randomly select some mempool transactions.
-                let mempool_txs = select_mempool_transactions(
-                    &self.network,
-                    height,
-                    miner_params,
-                    mempool_txs,
-                    mempool_tx_deps,
-                );
+                    let _ = wait_for_new_tip.await;
 
-                tracing::debug!(
-                    selected_mempool_tx_hashes = ?mempool_txs
-                        .iter()
-                        .map(|#[cfg(not(test))] tx, #[cfg(test)] (_, tx)| tx.transaction.id().mined_id())
-                        .collect::<Vec<_>>(),
-                    "selected transactions for the template from the mempool"
-                );
+                    Ok::<_, ErrorObject<'static>>(precomputed_coinbase)
+                };
 
-                // - After this point, the template only depends on the previously fetched data.
+                // Wait for the maximum block time to elapse. This can change the block header
+                // on testnet. (On mainnet it can happen due to a network disconnection, or a
+                // rapid drop in hash rate.)
+                //
+                // This duration might be slightly lower than the actual maximum,
+                // if cur_time was clamped to min_time. In that case the wait is very long,
+                // and it's ok to return early.
+                //
+                // It can also be zero if cur_time was clamped to max_time. In that case,
+                // we want to wait for another change, and ignore this timeout. So we use an
+                // `OptionFuture::None`.
+                let duration_until_max_time = max_time.saturating_duration_since(cur_time);
+                let wait_for_max_time: OptionFuture<_> = if duration_until_max_time.seconds() > 0 {
+                    Some(tokio::time::sleep(duration_until_max_time.to_std()))
+                } else {
+                    None
+                }
+                .into();
 
-                let template = BlockTemplateResponse::new_internal(
-                    &self.network,
+                // Optional TODO:
+                // `zcashd` generates the next coinbase transaction while waiting for changes.
+                // When Zebra supports shielded coinbase, we might want to do this in parallel.
+                // But the coinbase value depends on the selected transactions, so this needs
+                // further analysis to check if it actually saves us any time.
+
+                tokio::select! {
+                    // Poll the futures in the listed order, for efficiency.
+                    // We put the most frequent conditions first.
+                    biased;
+
+                    _ = template_rejections.changed() => { continue; }
+
+                    // This timer elapses every few seconds
+                    _elapsed = wait_for_mempool_request => {
+                        tracing::debug!(
+                            ?max_time,
+                            ?cur_time,
+                            ?server_long_poll_id,
+                            ?client_long_poll_id,
+                            MEMPOOL_LONG_POLL_INTERVAL,
+                            "checking for a new mempool change after waiting a few seconds"
+                        );
+                    }
+
+                    precomputed_coinbase = wait_for_new_tip => {
+                        let precomputed_coinbase = precomputed_coinbase?;
+                        let chain_info = fetch_chain_info(read_state.clone()).await?;
+                        if !self.select_mining_template_parent(chain_info.tip_hash) {
+                            continue;
+                        }
+                        let mut server_long_poll_id = LongPollInput::new(
+                            chain_info.tip_height,
+                            chain_info.tip_hash,
+                            chain_info.max_time,
+                            vec![]
+                        )
+                        .generate_id();
+                        server_long_poll_id.revision = self.gbt.template_rejections.borrow().revision;
+
+                        let submit_old = client_long_poll_id
+                            .as_ref()
+                            .map(|old_long_poll_id| server_long_poll_id.submit_old(old_long_poll_id));
+
+                        // Discard the precomputed coinbase if our `+2` guess was wrong
+                        // (multi-block advance, reorg, or spurious notification) — its
+                        // BIP-34 height and subsidies wouldn't match the block.
+                        let next_height = chain_info.tip_height.next().map_misc_error()?;
+                        let precomputed_coinbase = (next_height == precomputed_height)
+                            .then_some(precomputed_coinbase)
+                            .flatten();
+
+                        // Build an empty block on the new tip. After ZIP 234 activation,
+                        // its proof must wait for the new parent's pools; build it off the
+                        // async worker so other RPC requests can continue.
+                        let template = self.build_mining_template(
+                            precomputed_coinbase,
+                            miner_params,
+                            &chain_info,
+                            server_long_poll_id,
+                            vec![],
+                            submit_old,
+                        )
+                        .await?;
+                        if let Some(template) = self.finish_mining_template(template, &chain_info, miner_params).await? {
+                            return Ok(template);
+                        }
+                        continue 'rebuild;
+                    }
+
+                    // The max time does not elapse during normal operation on mainnet,
+                    // and it rarely elapses on testnet.
+                    Some(_elapsed) = wait_for_max_time => {
+                        // This log is very rare so it's ok to be info.
+                        tracing::info!(
+                            ?max_time,
+                            ?cur_time,
+                            ?server_long_poll_id,
+                            ?client_long_poll_id,
+                            "returning from long poll because max time was reached"
+                        );
+
+                        max_time_reached = true;
+                    }
+                }
+            };
+
+            // - Processing fetched data to create a transaction template
+            //
+            // Apart from random weighted transaction selection,
+            // the template only depends on the previously fetched data.
+            // This processing fails only if the coinbase transaction cannot be built.
+
+            tracing::debug!(
+                mempool_tx_hashes = ?mempool_txs
+                    .iter()
+                    .map(|tx| tx.transaction.id().mined_id())
+                    .collect::<Vec<_>>(),
+                "selecting transactions for the template from the mempool"
+            );
+
+            let height = chain_info.tip_height.next().map_misc_error()?;
+
+            // Randomly select some mempool transactions.
+            let mempool_txs = select_mempool_transactions(
+                &self.network,
+                height,
+                miner_params,
+                if is_zip234_active(&self.network, height) {
+                    Some(
+                        parent_nsm_value_balance(chain_info.value_pools.nsm_value_balance_amount())
+                            .map_misc_error()?,
+                    )
+                } else {
+                    None
+                },
+                mempool_txs,
+                mempool_tx_deps,
+            )
+            .map_misc_error()?;
+
+            tracing::debug!(
+                selected_mempool_tx_hashes = ?mempool_txs
+                    .iter()
+                    .map(|#[cfg(not(test))] tx, #[cfg(test)] (_, tx)| tx.transaction.id().mined_id())
+                    .collect::<Vec<_>>(),
+                "selected transactions for the template from the mempool"
+            );
+
+            // - After this point, the template only depends on the previously fetched data.
+
+            let template = self
+                .build_mining_template(
                     None,
                     miner_params,
                     &chain_info,
                     server_long_poll_id,
                     mempool_txs,
                     submit_old,
-                );
-                if let Some(template) = self
-                    .finish_mining_template(template, &chain_info, miner_params)
-                    .await?
-                {
-                    return Ok(template);
-                }
-                continue;
-            }
-
-            // - Polling wait conditions
-            //
-            // TODO: when we're happy with this code, split it into a function.
-            //
-            // Periodically check the mempool for changes.
-            //
-            // Optional TODO:
-            // Remove this polling wait if we switch to using futures to detect sync status
-            // and mempool changes.
-            let wait_for_mempool_request =
-                tokio::time::sleep(Duration::from_secs(MEMPOOL_LONG_POLL_INTERVAL));
-
-            // Return immediately if the chain tip has changed.
-            // The clone preserves the seen status of the chain tip.
-            let mut wait_for_new_tip = latest_chain_tip.clone();
-            let wait_for_new_tip = wait_for_new_tip.best_tip_changed();
-            // `+2`: we expect the tip to advance by one block before waking us up.
-            let precomputed_height = Height(chain_info.tip_height.0 + 2);
-            let wait_for_new_tip = async {
-                // Precompute the coinbase tx for an empty block that will sit on the new tip. We
-                // will return this provisional block upon a chain tip change so that miners can
-                // mine on the newest tip, and don't waste their effort on a shorter chain while we
-                // compute a new template for a properly filled block. We do this precomputation
-                // before we start waiting for a new tip since computing the coinbase tx takes a few
-                // seconds if the miner mines to a shielded address, and we want to return fast
-                // when the tip changes.
-                let precompute_coinbase = |network, height, params| {
-                    tokio::task::spawn_blocking(move || {
-                        TransactionTemplate::new_coinbase(&network, height, &params, Amount::zero())
-                            .expect("valid coinbase tx")
-                    })
-                };
-
-                let precomputed_coinbase = precompute_coinbase(
-                    self.network.clone(),
-                    precomputed_height,
-                    miner_params.clone(),
                 )
-                .await
-                .expect("valid coinbase tx");
-
-                let _ = wait_for_new_tip.await;
-
-                precomputed_coinbase
-            };
-
-            // Wait for the maximum block time to elapse. This can change the block header
-            // on testnet. (On mainnet it can happen due to a network disconnection, or a
-            // rapid drop in hash rate.)
-            //
-            // This duration might be slightly lower than the actual maximum,
-            // if cur_time was clamped to min_time. In that case the wait is very long,
-            // and it's ok to return early.
-            //
-            // It can also be zero if cur_time was clamped to max_time. In that case,
-            // we want to wait for another change, and ignore this timeout. So we use an
-            // `OptionFuture::None`.
-            let duration_until_max_time = max_time.saturating_duration_since(cur_time);
-            let wait_for_max_time: OptionFuture<_> = if duration_until_max_time.seconds() > 0 {
-                Some(tokio::time::sleep(duration_until_max_time.to_std()))
-            } else {
-                None
-            }
-            .into();
-
-            // Optional TODO:
-            // `zcashd` generates the next coinbase transaction while waiting for changes.
-            // When Zebra supports shielded coinbase, we might want to do this in parallel.
-            // But the coinbase value depends on the selected transactions, so this needs
-            // further analysis to check if it actually saves us any time.
-
-            tokio::select! {
-                // Poll the futures in the listed order, for efficiency.
-                // We put the most frequent conditions first.
-                biased;
-
-                _ = template_rejections.changed() => { continue; }
-
-                // This timer elapses every few seconds
-                _elapsed = wait_for_mempool_request => {
-                    tracing::debug!(
-                        ?max_time,
-                        ?cur_time,
-                        ?server_long_poll_id,
-                        ?client_long_poll_id,
-                        MEMPOOL_LONG_POLL_INTERVAL,
-                        "checking for a new mempool change after waiting a few seconds"
-                    );
-                }
-
-                precomputed_coinbase = wait_for_new_tip => {
-                    let chain_info = fetch_chain_info(read_state.clone()).await?;
-                    if !self.select_mining_template_parent(chain_info.tip_hash) {
-                        continue;
-                    }
-                    let mut server_long_poll_id = LongPollInput::new(
-                        chain_info.tip_height,
-                        chain_info.tip_hash,
-                        chain_info.max_time,
-                        vec![]
-                    )
-                    .generate_id();
-                    server_long_poll_id.revision = self.gbt.template_rejections.borrow().revision;
-
-                    let submit_old = client_long_poll_id
-                        .as_ref()
-                        .map(|old_long_poll_id| server_long_poll_id.submit_old(old_long_poll_id));
-
-                    // Discard the precomputed coinbase if our `+2` guess was wrong
-                    // (multi-block advance, reorg, or spurious notification) — its
-                    // BIP-34 height and subsidies wouldn't match the block.
-                    let next_height = chain_info.tip_height.next().map_misc_error()?;
-                    let precomputed_coinbase = (next_height == precomputed_height)
-                        .then_some(precomputed_coinbase);
-
-                    // Respond instantly with an empty block upon a chain tip change so that
-                    // the miner doesn't waste their effort trying to extend a shorter
-                    // chain.
-                    let template = BlockTemplateResponse::new_internal(
-                        &self.network,
-                        precomputed_coinbase,
-                        miner_params,
-                        &chain_info,
-                        server_long_poll_id,
-                        vec![],
-                        submit_old,
-                    );
-                    if let Some(template) = self.finish_mining_template(template, &chain_info, miner_params).await? {
-                        return Ok(template);
-                    }
-                }
-
-                // The max time does not elapse during normal operation on mainnet,
-                // and it rarely elapses on testnet.
-                Some(_elapsed) = wait_for_max_time => {
-                    // This log is very rare so it's ok to be info.
-                    tracing::info!(
-                        ?max_time,
-                        ?cur_time,
-                        ?server_long_poll_id,
-                        ?client_long_poll_id,
-                        "returning from long poll because max time was reached"
-                    );
-
-                    max_time_reached = true;
-                }
+                .await?;
+            if let Some(template) = self
+                .finish_mining_template(template, &chain_info, miner_params)
+                .await?
+            {
+                return Ok(template);
             }
         }
+
+        Err(ErrorObject::owned(
+            0,
+            "template parent changed; retry",
+            None::<()>,
+        ))
     }
 
     async fn submit_block(
@@ -3533,7 +3630,43 @@ where
             None => best_chain_tip_height(&self.latest_chain_tip)?,
         };
 
-        let subsidy = block_subsidy(height, &net, None).map_misc_error()?;
+        // ZIP 234 derives the block subsidy from the NSM value balance after the parent
+        // block, so look the parent's chain value pools up when the rules apply.
+        let nsm_value_balance = if is_zip234_active(&net, height) {
+            let parent = height.previous().map_misc_error()?;
+
+            let zakura_state::ReadResponse::BlockInfo(parent_info) = tokio::time::timeout(
+                Duration::from_secs(30),
+                call_service(
+                    self.read_state.clone(),
+                    zakura_state::ReadRequest::BlockInfo(parent.into()),
+                ),
+            )
+            .await
+            .map_err(|_| {
+                ErrorObject::owned(
+                    server::error::LegacyCode::Misc.into(),
+                    "timed out waiting for parent block information",
+                    None::<()>,
+                )
+            })??
+            else {
+                unreachable!("unmatched response to a BlockInfo request");
+            };
+
+            let parent_info = parent_info.ok_or_misc_error(
+                "the ZIP 234 subsidy needs the parent block, which is not in the best chain; \
+                 heights can be at most one block above the best chain tip",
+            )?;
+            Some(
+                parent_nsm_value_balance(parent_info.value_pools().nsm_value_balance_amount())
+                    .map_misc_error()?,
+            )
+        } else {
+            None
+        };
+
+        let subsidy = block_subsidy(height, &net, nsm_value_balance).map_misc_error()?;
 
         let (lockbox_streams, mut funding_streams): (Vec<_>, Vec<_>) =
             funding_stream_values(height, &net, subsidy)

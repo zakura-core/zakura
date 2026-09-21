@@ -409,25 +409,20 @@ fn source_matches_mode(
             _,
             FinalitySource::DiskMigration {
                 from_version,
-                network_policy_digest,
                 authentication: crate::DiskMigrationAuthentication::FullState,
+                ..
             },
-        ) => {
-            (1..=3).contains(&from_version.0)
-                && network_policy_digest == metadata.network_policy_digest
-                && record.previous == record.current
-        }
+        ) => (1..=3).contains(&from_version.0) && record.previous == record.current,
         (
             EngineMode::HeadersOnly,
             None,
             FinalitySource::DiskMigration {
                 from_version,
-                network_policy_digest,
                 authentication: crate::DiskMigrationAuthentication::HeadersOnlyDepth { .. },
+                ..
             },
         ) => {
             (1..=3).contains(&from_version.0)
-                && network_policy_digest == metadata.network_policy_digest
                 && record.previous == record.current
                 && record
                     .headers_only_depth_witness(config.limits.local_finality_depth.get())

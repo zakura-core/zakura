@@ -11,10 +11,7 @@ use crate::{
     ironwood,
     memory::{inline_size_bytes, vec_capacity_bytes, AttributedMemorySize},
     orchard,
-    parameters::{
-        subsidy::{halving_block_subsidy, ParameterSubsidy},
-        Network, NetworkUpgrade,
-    },
+    parameters::{subsidy::halving_block_subsidy, Network, NetworkUpgrade},
     sapling,
     serialization::TrustedPreallocate,
     sprout,
@@ -288,6 +285,9 @@ impl Block {
     /// UTXOs, which are ignored.
     ///
     /// Note that the chain value pool has the opposite sign to the transaction value pool.
+    ///
+    /// The NSM seed is excluded. After adding these changes, state calls
+    /// [`ValueBalance::seed_nsm_value_balance`].
     pub fn chain_value_pool_change(
         &self,
         network: &Network,
@@ -307,6 +307,8 @@ impl Block {
     /// input in this block. This includes UTXOs created by earlier transactions
     /// in the same block. The map can also contain unrelated UTXOs, which this
     /// method ignores.
+    ///
+    /// The NSM seed is excluded, as in [`Self::chain_value_pool_change`].
     ///
     /// # Panics
     ///
@@ -366,23 +368,16 @@ impl Block {
     /// > NSMValueBalance(height) = NSMValueBalance(height - 1)
     /// >   - AdditionalBlockSubsidy(height) + removed(height)
     ///
-    /// Fee recycling is deferred to a separate change. The NU7 deployment draft proposes
-    /// contributing `floor(6 * TransactionFees(height) / 10)` to this balance without new
-    /// transaction fields. This implementation still requires the coinbase to claim all
-    /// fees, so `removed(height)` is zero for semantically valid blocks under the current
-    /// rules. This is an implementation limit, not a claim about the final NU7 scope.
+    /// The NU7 deployment draft's fee recycling rule makes
+    /// `removed(height) = floor(6 * TransactionFees(height) / 10)`. Coinbase
+    /// validation and block templates use `subsidy::miner_fee_share` to withhold that
+    /// contribution from the aggregate fees, starting at NU7 activation in every build.
     ///
-    /// A block carries no reference to its parent's balance, so this derives
-    /// `AdditionalBlockSubsidy(height)` from the block instead. Under the currently
-    /// implemented ZIP 236 rule, the coinbase claims exactly `BlockSubsidy(height)` plus
-    /// all transaction fees from NU6 onward. Fees move between transactions inside the
-    /// block, so the block's change across the six monetary pools is `BlockSubsidy(height)`.
-    /// This equals the halving subsidy plus the bonus, so subtracting it from the
-    /// halving subsidy gives `-AdditionalBlockSubsidy(height)`.
-    ///
-    /// Once coinbase validation and block templates withhold the fee contribution,
-    /// the monetary pool change will be `BlockSubsidy(height) - removed(height)`, so this
-    /// calculation will already include the contribution. It must not be added twice.
+    /// The block's change across the six monetary pools is therefore
+    /// `BlockSubsidy(height) - removed(height)`. Subtracting that from the halving
+    /// subsidy gives `-AdditionalBlockSubsidy(height) + removed(height)` without
+    /// knowing the parent's balance. The contribution is already included through
+    /// reduced issuance and must not be credited a second time.
     ///
     /// `zakura-state/src/service/check.rs::nsm_value_balance_is_non_negative` rejects a
     /// block that would drive the running total below zero.
@@ -399,16 +394,8 @@ impl Block {
             return Ok(Amount::zero());
         };
 
-        // The seed lands on the last block below NU7, so the balance already holds it when
-        // the first NU7 block claims its bonus. NU7 at genesis has no such block, and a
-        // chain with no history before NU7 has nothing to seed.
-        if nu7.0.checked_sub(1) == Some(height.0) {
-            return network
-                .initial_nsm_value_balance()
-                .constrain::<NegativeAllowed>()
-                .map_err(ValueBalanceError::NsmValueBalance);
-        }
-
+        // State initializes the seed from cumulative monetary pools at NU7 - 1.
+        // A block alone only supplies the changes from NU7 onward.
         if height < nu7 {
             return Ok(Amount::zero());
         }

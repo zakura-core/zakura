@@ -32,7 +32,7 @@ fn nsm_fee_templates_pay_miner_and_credit_balance_once() {
             nu7: Some(5),
             ..Default::default()
         },
-        nsm_reissuance_height: Some(Height(10)),
+        test_nsm_reissuance_height: Some(Height(10)),
         ..Default::default()
     });
     let miner = MinerParams::new(

@@ -666,6 +666,58 @@ fn long_poll_builds_on_new_parent_without_blocking_runtime() {
     });
 }
 
+/// A rebuild must remember that the long-poll deadline already woke the request.
+/// Otherwise, restoring the original tip and long-poll ID can make it wait forever
+/// because a clamped current time disables the deadline timer.
+#[test]
+fn superseded_deadline_build_does_not_resume_long_polling() {
+    mining_runtime(async {
+        let mut original = chain_info(2, 1, 0);
+        original.cur_time = 1654008727.into();
+        let deadline = original
+            .max_time
+            .saturating_duration_since(original.cur_time)
+            .to_std();
+        let (info_tx, info) = watch::channel(original.clone());
+        let (rpc, tip, _) = mining_rpc(info);
+        let initial = bounded(rpc.get_block_template(None))
+            .await
+            .unwrap()
+            .try_into_template()
+            .unwrap();
+        let gate = BlockingPoolGate::new().await;
+        tokio::time::pause();
+
+        let request = rpc.get_block_template(Some(GetBlockTemplateParameters {
+            long_poll_id: Some(initial.long_poll_id),
+            ..Default::default()
+        }));
+        tokio::pin!(request);
+        assert!(futures::poll!(&mut request).is_pending());
+        tokio::time::advance(deadline + Duration::from_millis(1)).await;
+        assert!(
+            futures::poll!(&mut request).is_pending(),
+            "the deadline build must wait for blocking-pool capacity"
+        );
+
+        let other = chain_info(2, 2, 0);
+        info_tx.send_replace(other.clone());
+        tip.send_best_tip_hash(other.tip_hash);
+        assert!(rpc.select_mining_template_parent(other.tip_hash));
+
+        let mut restored = original;
+        restored.cur_time = restored.max_time;
+        info_tx.send_replace(restored.clone());
+        tip.send_best_tip_hash(restored.tip_hash);
+
+        gate.release().await;
+        tokio::time::resume();
+        let template = bounded(request).await.unwrap().try_into_template().unwrap();
+        assert_eq!(template.previous_block_hash, restored.tip_hash);
+        assert_eq!(template.submit_old, Some(false));
+    });
+}
+
 #[test]
 fn simultaneous_long_polls_remain_responsive() {
     mining_runtime(async {

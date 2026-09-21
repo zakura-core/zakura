@@ -2903,6 +2903,7 @@ where
         // for that makes miners drop their current job (the internal miner backs off for
         // 20 seconds) even though fresh work is one read away, so rebuild from current
         // state instead. The bound guards against pathological tip or rejection churn.
+        let mut max_time_reached = false;
         'rebuild: for rebuild in 0..=MAX_TEMPLATE_REBUILDS {
             if rebuild > 0 {
                 metrics::counter!("mining.template.rebuilt").increment(1);
@@ -2915,8 +2916,6 @@ where
             // - Checks and fetches that can change during long polling
             //
             // Set up the loop.
-            let mut max_time_reached = false;
-
             // The loop returns the server long poll ID, which should be different to the client one.
             let (server_long_poll_id, chain_info, mempool_txs, mempool_tx_deps, submit_old) = loop {
                 // Check if we are synced to the tip.

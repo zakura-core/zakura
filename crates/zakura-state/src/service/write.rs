@@ -2921,6 +2921,9 @@ impl WriteBlockWorkerTask {
                         non_finalized_state.reconsider_block(hash, &finalized_state.db)
                     };
                     if result.is_ok() {
+                        let evicted = non_finalized_state_sender
+                            .borrow()
+                            .evicted_blocks(non_finalized_state);
                         update_channels_after_operator_change(
                             non_finalized_state,
                             finalized_state,
@@ -2928,6 +2931,10 @@ impl WriteBlockWorkerTask {
                             non_finalized_state_sender,
                             backup_dir_path.as_deref(),
                         );
+                        if !evicted.is_empty() {
+                            let _ = non_finalized_write_update_sender
+                                .send(NonFinalizedWriteUpdate::Evicted(evicted));
+                        }
                         // Reconsideration restores blocks without committing them,
                         // so wake readers waiting for one of those blocks.
                         block_commit_sender.send_modify(|_| {});

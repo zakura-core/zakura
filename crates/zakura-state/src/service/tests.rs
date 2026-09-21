@@ -891,6 +891,160 @@ async fn fork_eviction_allows_new_and_replayed_parents_to_extend() {
 }
 
 #[tokio::test]
+async fn reconsideration_eviction_allows_legacy_replay() {
+    assert_reconsideration_eviction_replay(false).await;
+}
+
+#[tokio::test]
+async fn reconsideration_eviction_allows_header_integrated_replay() {
+    assert_reconsideration_eviction_replay(true).await;
+}
+
+async fn assert_reconsideration_eviction_replay(header_runtime: bool) {
+    use crate::tests::FakeChainHelper;
+
+    let _init_guard = zakura_test::init();
+    let limit = Duration::from_secs(10);
+    let network = Network::new_regtest(Default::default());
+    let config = Config {
+        enable_zakura_header_seed_from_committed_blocks: header_runtime,
+        ..Config::ephemeral()
+    };
+    let (mut state, _, _, _) = StateService::new(config, &network, Height::MAX, 0)
+        .await
+        .unwrap();
+    let genesis = block::genesis::regtest_genesis_block();
+    let mut parent = genesis.make_fake_child();
+    Arc::make_mut(&mut Arc::make_mut(&mut parent).header).time += chrono::Duration::seconds(1);
+    for block in [genesis, parent.clone()] {
+        timeout(
+            limit,
+            state.queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block)),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    }
+    let mut template = parent.make_fake_child();
+    let transaction = transaction_v4_from_coinbase(&template.transactions[0]);
+    Arc::make_mut(&mut template).transactions[0] = Arc::new(transaction);
+    let merkle_root = template.transactions.iter().cloned().collect();
+    let header = Arc::make_mut(&mut Arc::make_mut(&mut template).header);
+    header.time += chrono::Duration::seconds(1);
+    header.merkle_root = merkle_root;
+    header.commitment_bytes =
+        <[u8; 32]>::from(state.read_service.db.history_tree().hash().unwrap()).into();
+
+    let mut siblings: Vec<Arc<Block>> = Vec::new();
+    for order in 0..=crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS {
+        if order == crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS {
+            timeout(limit, state.send_invalidate_block(siblings[0].hash()))
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        let mut block = template.clone();
+        Arc::make_mut(&mut Arc::make_mut(&mut block).header).nonce.0[..8]
+            .copy_from_slice(&u64::try_from(order).unwrap().to_le_bytes());
+        let mut prepared = block.clone().prepare();
+        prepared.receipt_order = Some(u64::try_from(order).unwrap());
+        timeout(
+            limit,
+            state.queue_and_commit_to_non_finalized_state(prepared, None),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        siblings.push(block);
+    }
+    assert_eq!(
+        state
+            .read_service
+            .header_chain_reader_receiver
+            .borrow()
+            .is_some(),
+        header_runtime
+    );
+    assert_eq!(
+        state
+            .read_service
+            .latest_non_finalized_state()
+            .chain_iter()
+            .count(),
+        crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS
+    );
+    timeout(limit, state.send_reconsider_block(siblings[0].hash()))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    let evicted = siblings.last().unwrap();
+    assert!(!state
+        .read_service
+        .latest_non_finalized_state()
+        .any_chain_contains(&evicted.hash()));
+    let known = timeout(limit, state.call(Request::KnownBlock(evicted.hash())))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(known, Response::KnownBlock(None)),
+        "an evicted body must be downloadable again: {known:?}"
+    );
+    assert!(!state.can_fork_chain_at(&evicted.hash()));
+    assert!(!state
+        .non_finalized_failed_ancestors
+        .contains_key(&evicted.hash()));
+
+    let mut prepared = evicted.clone().prepare();
+    prepared.receipt_order = Some(u64::try_from(siblings.len()).unwrap());
+    timeout(
+        limit,
+        state.queue_and_commit_to_non_finalized_state(prepared, None),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    let retained = state.read_service.latest_non_finalized_state();
+    assert_eq!(retained.best_tip().unwrap().1, siblings[0].hash());
+    let history_root = retained
+        .find_chain(|chain| chain.contains_block_hash(evicted.hash()))
+        .unwrap()
+        .history_tree(crate::HashOrHeight::Hash(evicted.hash()))
+        .unwrap()
+        .hash()
+        .unwrap();
+    let mut child = evicted.make_fake_child();
+    let merkle_root = child.transactions.iter().cloned().collect();
+    let header = Arc::make_mut(&mut Arc::make_mut(&mut child).header);
+    header.time += chrono::Duration::seconds(1);
+    header.merkle_root = merkle_root;
+    header.commitment_bytes = <[u8; 32]>::from(history_root).into();
+    timeout(
+        limit,
+        state.queue_and_commit_to_non_finalized_state(child.clone().prepare(), None),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        state
+            .read_service
+            .latest_non_finalized_state()
+            .best_tip()
+            .unwrap()
+            .1,
+        child.hash()
+    );
+}
+
+#[tokio::test]
 async fn state_init_loads_the_embedded_mainnet_frontier_grid() {
     let network = Network::Mainnet;
     let config = Config::ephemeral();

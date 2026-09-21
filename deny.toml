@@ -15,6 +15,7 @@ ignore = [
     "RUSTSEC-2025-0119", # number_prefix — transitive via indicatif
     "RUSTSEC-2025-0141", # bincode — direct dependency
     "RUSTSEC-2024-0436", # paste — transitive via netwatch/netlink-packet-core
+    "RUSTSEC-2026-0285", # rustls — fixed release requires a new supply-chain audit
 ]
 
 # This section is considered when running `cargo deny check licenses`.
@@ -215,7 +216,7 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 
 # List of URLs for allowed Git repositories
-allow-git = []
+allow-git = ["https://github.com/zakura-core/common.git"]
 
 [sources.allow-org]
 github = [

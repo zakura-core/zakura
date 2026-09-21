@@ -55,7 +55,11 @@ Secondaries request `include_chain_snapshot` to receive a `chain_snapshot`
 message after each batch of blocks. Its complete retained tip set covers changes
 to already-known blocks, including invalidation and reconsideration. Snapshot
 messages contain no block data. Missing tips cause a complete resubscription.
-An empty tip set clears the mirror's non-finalized state.
+An empty tip set clears the mirror's non-finalized state. With session-aware
+servers, blocks stay private until the snapshot marker reconciles the full fork
+set. Only then does the mirror publish the new state and tip. A disconnected or
+failed batch is discarded and resubscription uses the last published snapshot.
+Legacy servers without snapshot markers retain incremental publication.
 An initial empty snapshot leaves finalized-tip tracking active during checkpoint
 sync. The first real block transfers that responsibility to the block syncer.
 

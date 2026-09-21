@@ -441,7 +441,8 @@ impl TrustedChainSync {
             let next_message = tokio::select! {
                 message = tokio::time::timeout_at(message_deadline, non_finalized_state_change.message()) => message,
                 _ = empty_state_refresh.tick(), if self.finalized_tip_updater.is_none()
-                    && self.non_finalized_state.is_chain_set_empty() => {
+                    && self.non_finalized_state.is_chain_set_empty()
+                    && self.non_finalized_state_sender.borrow().is_chain_set_empty() => {
                     // A legacy primary has no empty-snapshot message. Keep its
                     // finalized state current even when the block stream is idle.
                     self.try_catch_up_with_primary().await;
@@ -456,16 +457,19 @@ impl TrustedChainSync {
                 }
                 Ok(Ok(None)) => {
                     tracing::warn!("non-finalized state change stream ended unexpectedly");
+                    self.discard_pending_snapshot();
                     non_finalized_blocks_listener = None;
                     continue;
                 }
                 Ok(Err(err)) => {
                     tracing::warn!(?err, "error receiving non-finalized state change");
+                    self.discard_pending_snapshot();
                     non_finalized_blocks_listener = None;
                     continue;
                 }
                 Err(_) => {
                     tracing::debug!("non-finalized state change stream timed out, re-subscribing");
+                    self.discard_pending_snapshot();
                     non_finalized_blocks_listener = None;
                     continue;
                 }
@@ -500,6 +504,7 @@ impl TrustedChainSync {
             let receipt_order = message.receipt_order;
             let Some((block, hash)) = message.decode() else {
                 tracing::warn!("received malformed non-finalized state change message");
+                self.discard_pending_snapshot();
                 non_finalized_blocks_listener = None;
                 continue;
             };
@@ -541,6 +546,7 @@ impl TrustedChainSync {
                         last_failed_commit_hash = Some(hash);
                     }
 
+                    self.discard_pending_snapshot();
                     non_finalized_blocks_listener = None;
 
                     // Back off so a persistently failing block doesn't turn
@@ -548,6 +554,21 @@ impl TrustedChainSync {
                     tokio::time::sleep(COMMIT_RETRY_DELAY).await;
                 }
             };
+        }
+    }
+
+    /// Modern streams stage blocks privately until their complete fork boundary.
+    /// Reconnect using the last published snapshot, never an unfinished batch.
+    fn discard_pending_snapshot(&mut self) {
+        if self.receipt_session.is_some() {
+            self.non_finalized_state = self.non_finalized_state_sender.borrow().clone();
+        }
+    }
+
+    /// Legacy servers have no snapshot boundary and keep incremental publication.
+    async fn publish_incremental_state(&mut self) {
+        if self.receipt_session.is_none() {
+            self.publish_current_state().await;
         }
     }
 
@@ -575,7 +596,7 @@ impl TrustedChainSync {
                 height = ?block.height,
                 "skipping block finalized while the secondary caught up"
             );
-            self.publish_current_state().await;
+            self.publish_incremental_state().await;
             return Ok(CommitOutcome::AlreadyFinalized);
         }
 
@@ -598,7 +619,7 @@ impl TrustedChainSync {
                 height = ?block.height,
                 "skipping block finalized while bridging the finalized gap"
             );
-            self.publish_current_state().await;
+            self.publish_incremental_state().await;
             return Ok(CommitOutcome::AlreadyFinalized);
         }
 
@@ -609,10 +630,8 @@ impl TrustedChainSync {
 
     /// Commits `block` to the non-finalized state, starting a new chain if it
     /// builds on the finalized tip or extending an existing chain otherwise.
-    /// Then prunes finalized blocks and publishes the updated state.
-    ///
-    /// Updating the channels here means bridge blocks committed by
-    /// [`Self::fill_finalized_gap`] also advance the published chain tip.
+    /// Then prunes finalized blocks. Modern streams publish only at their
+    /// snapshot boundary. Legacy streams publish each block, including bridges.
     fn commit(&mut self, block: SemanticallyVerifiedBlock) -> Result<(), ValidateContextError> {
         if self.db.finalized_tip_hash() == block.block.header.previous_block_hash {
             let _ = self.prune_finalized();
@@ -622,7 +641,9 @@ impl TrustedChainSync {
             let _ = self.prune_finalized();
         }
 
-        self.update_channels();
+        if self.receipt_session.is_none() {
+            self.update_channels();
+        }
 
         Ok(())
     }
@@ -767,13 +788,13 @@ impl TrustedChainSync {
         Ok(Some(response.into_inner()))
     }
 
-    /// Catches up to the primary database, then prunes and publishes any blocks
-    /// that became finalized.
+    /// Catches up to the primary database and prunes finalized blocks. Modern
+    /// streams defer publication until the complete snapshot is reconciled.
     async fn try_catch_up_with_primary(&mut self) {
         let _ = self.db.spawn_try_catch_up_with_primary().await;
 
         if self.prune_finalized() {
-            self.publish_current_state().await;
+            self.publish_incremental_state().await;
         }
     }
 

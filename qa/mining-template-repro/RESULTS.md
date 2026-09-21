@@ -227,9 +227,24 @@ surfaced. Measured with the same Lever E parameters, two runs each:
 | Total withholds | 3 274 / 6 489 | 841 / 993 |
 
 Both error classes go to zero. What remains is the bounded-rebuild message from #1088,
-the intended transient signal rather than verifier internals. The residual
-is larger than in #1088's own measurements because this scenario re-arms a
-rejection on every parent, so each rebuild lands back in fallback mode.
+the intended transient signal rather than verifier internals.
+
+The residual is entirely rebuild-budget exhaustion, established three ways rather
+than inferred from the error string:
+
+- There is one site that emits it, after the `'rebuild` loop falls through.
+- `mining.template.rebuilt` recorded 8 652 rebuilds across 3 999 requests, 2.16
+  each, with 21.4% of requests reaching the cap.
+- Raising the constant from 4 to 24 removes it completely: 3 517 requests, **zero**
+  withholds, 2.75 rebuilds each.
+
+It is larger than in #1088's own measurements because this scenario re-arms a
+rejection on every parent, so each rebuild lands back in fallback mode, and the
+fallback path is slow: it builds a second template and waits on a verifier round
+trip, which is ample time for the tip to move again.
+
+As with #1088, this does not argue for changing the constant. The rejections are
+injected and the block rate is hundreds of times faster than target spacing.
 
 Caveat: in production the node's own templates are valid, so fallback mode should
 rarely be entered at all. The finding is about how badly it behaves once something

@@ -711,7 +711,7 @@ mod database_tests {
                 .unwrap()
                 .value_pools()
                 .nsm_value_balance_amount(),
-            Amount::zero(),
+            Amount::<NegativeAllowed>::zero(),
         );
         assert!(Upgrade.validate(&db, &rx).unwrap().is_ok());
 

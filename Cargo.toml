@@ -48,26 +48,26 @@ edition = "2021"
 # gate refers to `zakura-assets` and nothing else.
 zakura-assets = { version = "=0.3489716.0" }
 incrementalmerkletree = { version = "0.8.2", features = ["legacy-api"] }
-orchard = { version = "1.3.0-alpha.1", package = "zakura-orchard", git = "https://github.com/zakura-core/common.git", rev = "1929e9f745f58e20404e91dea2b73d743f6aaf73" }
-sapling-crypto = { version = "1.3.0-alpha.1", package = "zakura-sapling-crypto", git = "https://github.com/zakura-core/common.git", rev = "1929e9f745f58e20404e91dea2b73d743f6aaf73" }
-zcash_address = { version = "1.3.0-alpha.1", package = "zakura-address", git = "https://github.com/zakura-core/common.git", rev = "1929e9f745f58e20404e91dea2b73d743f6aaf73" }
+orchard = { version = "1.3.0-alpha.1", package = "zakura-orchard", git = "https://github.com/zakura-core/common.git", rev = "659cfb53dc083851d0216f493a9a9ef9b08a5a3a" }
+sapling-crypto = { version = "1.3.0-alpha.1", package = "zakura-sapling-crypto", git = "https://github.com/zakura-core/common.git", rev = "659cfb53dc083851d0216f493a9a9ef9b08a5a3a" }
+zcash_address = { version = "1.3.0-alpha.1", package = "zakura-address", git = "https://github.com/zakura-core/common.git", rev = "659cfb53dc083851d0216f493a9a9ef9b08a5a3a" }
 zcash_history = "0.5.0"
-zcash_keys = { version = "1.3.0-alpha.1", package = "zakura-keys", git = "https://github.com/zakura-core/common.git", rev = "1929e9f745f58e20404e91dea2b73d743f6aaf73" }
-zcash_primitives = { version = "1.3.0-alpha.1", package = "zakura-primitives", git = "https://github.com/zakura-core/common.git", rev = "1929e9f745f58e20404e91dea2b73d743f6aaf73" }
-zcash_proofs = { version = "1.3.0-alpha.1", package = "zakura-proofs", git = "https://github.com/zakura-core/common.git", rev = "1929e9f745f58e20404e91dea2b73d743f6aaf73" }
-zcash_transparent = { version = "1.3.0-alpha.1", package = "zakura-transparent", git = "https://github.com/zakura-core/common.git", rev = "1929e9f745f58e20404e91dea2b73d743f6aaf73" }
-zcash_protocol = { version = "1.3.0-alpha.1", package = "zakura-protocol", git = "https://github.com/zakura-core/common.git", rev = "1929e9f745f58e20404e91dea2b73d743f6aaf73" }
+zcash_keys = { version = "1.3.0-alpha.1", package = "zakura-keys", git = "https://github.com/zakura-core/common.git", rev = "659cfb53dc083851d0216f493a9a9ef9b08a5a3a" }
+zcash_primitives = { version = "1.3.0-alpha.1", package = "zakura-primitives", git = "https://github.com/zakura-core/common.git", rev = "659cfb53dc083851d0216f493a9a9ef9b08a5a3a" }
+zcash_proofs = { version = "1.3.0-alpha.1", package = "zakura-proofs", git = "https://github.com/zakura-core/common.git", rev = "659cfb53dc083851d0216f493a9a9ef9b08a5a3a" }
+zcash_transparent = { version = "1.3.0-alpha.1", package = "zakura-transparent", git = "https://github.com/zakura-core/common.git", rev = "659cfb53dc083851d0216f493a9a9ef9b08a5a3a" }
+zcash_protocol = { version = "1.3.0-alpha.1", package = "zakura-protocol", git = "https://github.com/zakura-core/common.git", rev = "659cfb53dc083851d0216f493a9a9ef9b08a5a3a" }
 abscissa_core = { version = "0.7", default-features = false }
 base64 = "0.22.1"
 bech32 = "0.11.0"
-bellman = { version = "1.3.0-alpha.1", package = "zakura-bellman", git = "https://github.com/zakura-core/common.git", rev = "1929e9f745f58e20404e91dea2b73d743f6aaf73" }
+bellman = { version = "1.3.0-alpha.1", package = "zakura-bellman", git = "https://github.com/zakura-core/common.git", rev = "659cfb53dc083851d0216f493a9a9ef9b08a5a3a" }
 bincode = "1.3"
 bitflags = "2.9"
 bitflags-serde-legacy = "0.1.1"
 bitvec = "1.0"
 blake2b_simd = "1.0"
 blake2s_simd = "1.0"
-bls12_381 = { version = "1.3.0-alpha.1", package = "zakura-bls12-381", git = "https://github.com/zakura-core/common.git", rev = "1929e9f745f58e20404e91dea2b73d743f6aaf73" }
+bls12_381 = { version = "1.3.0-alpha.1", package = "zakura-bls12-381", git = "https://github.com/zakura-core/common.git", rev = "659cfb53dc083851d0216f493a9a9ef9b08a5a3a" }
 bs58 = "0.5"
 byteorder = "1.5"
 bytes = "1.10"
@@ -86,7 +86,7 @@ futures = "0.3.31"
 futures-core = "0.3.31"
 futures-util = "0.3.31"
 group = "0.14"
-halo2 = { version = "1.3.0-alpha.1", package = "zakura-halo2-proofs", git = "https://github.com/zakura-core/common.git", rev = "1929e9f745f58e20404e91dea2b73d743f6aaf73" }
+halo2 = { version = "1.3.0-alpha.1", package = "zakura-halo2-proofs", git = "https://github.com/zakura-core/common.git", rev = "659cfb53dc083851d0216f493a9a9ef9b08a5a3a" }
 hex = "0.4.3"
 hex-literal = "0.4"
 howudoin = "0.1"
@@ -105,7 +105,7 @@ itertools = "0.14"
 jsonrpsee = "0.24.8"
 jsonrpsee-proc-macros = "0.24.9"
 jsonrpsee-types = "0.24.9"
-jubjub = { version = "1.3.0-alpha.1", package = "zakura-jubjub", git = "https://github.com/zakura-core/common.git", rev = "1929e9f745f58e20404e91dea2b73d743f6aaf73" }
+jubjub = { version = "1.3.0-alpha.1", package = "zakura-jubjub", git = "https://github.com/zakura-core/common.git", rev = "659cfb53dc083851d0216f493a9a9ef9b08a5a3a" }
 lazy_static = "1.4"
 libzcash_script = "0.1"
 log = "0.4.27"
@@ -127,8 +127,8 @@ rand_10 = { package = "rand", version = "0.10" }
 rand_chacha_10 = { package = "rand_chacha", version = "0.10" }
 rand_core_10 = { package = "rand_core", version = "0.10" }
 rayon = "1.10"
-reddsa = { version = "1.3.0-alpha.1", package = "zakura-reddsa", git = "https://github.com/zakura-core/common.git", rev = "1929e9f745f58e20404e91dea2b73d743f6aaf73" }
-redjubjub = { version = "1.3.0-alpha.1", package = "zakura-redjubjub", git = "https://github.com/zakura-core/common.git", rev = "1929e9f745f58e20404e91dea2b73d743f6aaf73" }
+reddsa = { version = "1.3.0-alpha.1", package = "zakura-reddsa", git = "https://github.com/zakura-core/common.git", rev = "659cfb53dc083851d0216f493a9a9ef9b08a5a3a" }
+redjubjub = { version = "1.3.0-alpha.1", package = "zakura-redjubjub", git = "https://github.com/zakura-core/common.git", rev = "659cfb53dc083851d0216f493a9a9ef9b08a5a3a" }
 regex = "1.11"
 reqwest = { version = "0.12", default-features = false }
 ripemd = "0.1"
@@ -149,7 +149,7 @@ serde_json = "1.0.140"
 serde_with = "3.12"
 sha2 = "0.10"
 schemars = "1"
-sinsemilla = { version = "1.3.0-alpha.1", package = "zakura-sinsemilla", git = "https://github.com/zakura-core/common.git", rev = "1929e9f745f58e20404e91dea2b73d743f6aaf73" }
+sinsemilla = { version = "1.3.0-alpha.1", package = "zakura-sinsemilla", git = "https://github.com/zakura-core/common.git", rev = "659cfb53dc083851d0216f493a9a9ef9b08a5a3a" }
 spandoc = "0.2"
 anyhow = "1.0"
 strum = "0.27"

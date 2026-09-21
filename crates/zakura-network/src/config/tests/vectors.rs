@@ -1063,7 +1063,7 @@ fn configured_network_rejects_an_oversized_omitted_nsm_seed() {
         })
         .unwrap()
         .with_initial_nsm_value_balance(Amount::zero())
-        .clear_funding_streams()
+        .extend_funding_streams()
         .to_network()
         .expect("the explicit bounded seed makes the configured network valid");
     let explicit = Config {

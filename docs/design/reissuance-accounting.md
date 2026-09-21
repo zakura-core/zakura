@@ -22,6 +22,10 @@ retain #1040's measurements, which still need an independent zcashd cross-check.
 Configured networks derive their own seed by default. An explicit
 `initial_nsm_value_balance`, including zero, overrides the derivation for synthetic
 histories. Omitting the setting and specifying zero have different meanings.
+A configured network can omit the seed only when cumulative scheduled issuance
+through `NU7 - 1` is at most `MAX_MONEY`, which guarantees that every possible
+derived seed fits the stored amount. Networks with larger schedules must supply
+an explicit bounded seed or change their schedule.
 A configured network that already activated NU7 with the old implicit zero seed
 must set an explicit zero to preserve its rules, or resync under the new rules.
 The existing format-29 validation detects an inconsistent stored balance.
@@ -133,7 +137,10 @@ separate sync to downgrade.
 The migration writes batches of 10,000 affected BlockInfo records. It preserves monetary
 pools and block sizes. It updates the separately stored tip balance last.
 Cancellation or a failed write leaves the version marker unchanged. Restarting
-the migration recomputes every balance, including already rewritten records.
+the migration recomputes every balance, including already rewritten records. It
+always rewrites and validates the `NU7 - 1` seed row, including for an explicit
+zero, so a v27 attempt interrupted under different seed configuration cannot
+leave a mixed history.
 
 The migration refuses a database whose finalized tip is at or above the ZIP 234
 start height. Older versions committed those blocks without reissuance, so their

@@ -739,7 +739,8 @@ impl TrustedChainSync {
     }
 
     /// Subscribes to non-finalized state changes and returns the response stream.
-    /// Returns `None` after a session change so the caller resubscribes with empty tips.
+    /// Returns `None` when the primary's identity is new or unknown and local
+    /// forks must be cleared, so the caller resubscribes with empty tips.
     ///
     /// Passes every local chain tip so the server only streams missing blocks,
     /// rather than the whole state on each subscription. With no local chains,
@@ -773,9 +774,11 @@ impl TrustedChainSync {
             .map(|value| value.to_str().map(str::to_owned))
             .transpose()
             .map_err(|_| Status::internal("invalid receipt session"))?;
-        if session != self.receipt_session {
-            // A legacy server can omit the session after honoring our old tips.
-            // Discard that response and explicitly request the complete state.
+        let legacy_reconnect = session.is_none() && !self.non_finalized_state.is_chain_set_empty();
+        if session != self.receipt_session || legacy_reconnect {
+            // Missing identities cannot prove two legacy connections share a
+            // primary. Discard a response that may have honored old tips, then
+            // accept the next legacy response once local forks are empty.
             self.non_finalized_state = NonFinalizedState::new(&self.non_finalized_state.network);
             self.receipt_session = session;
             if self.finalized_tip_updater.is_none() {

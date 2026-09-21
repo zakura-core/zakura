@@ -1164,9 +1164,11 @@ fn drain_pending_block_applies<ReadState, BlockVerifier>(
                         // supplier finishes it; legacy uses that verifier, so transfer lets it
                         // complete the range.
                         // Full: Accepted Commits are not cancellable and have no other escape
-                        // hatch. Transfer releases the apply lease so FallbackDraining cannot
-                        // wedge for the full drain deadline when Commit hangs. The dropped
-                        // Commit future may still finish in the background (AlreadyInChain).
+                        // hatch. Transfer releases the coordinator permit so FallbackDraining
+                        // cannot wedge for the full drain deadline when Commit hangs. Once
+                        // StateService::call has queued the non-finalized write, dropping this
+                        // future does not cancel that write. It can still commit and later
+                        // surface as AlreadyInChain.
                         let result = abandon_block_apply(
                             &transfer_block_sync,
                             transfer_owner,

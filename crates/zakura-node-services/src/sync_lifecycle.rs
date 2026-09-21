@@ -45,12 +45,16 @@ pub enum ApplyPhase {
         /// Native ownership generation.
         epoch: LifecycleEpoch,
     },
-    /// The coordinator closes native admission while previously authorized applies drain.
+    /// The coordinator closes native admission while registered applies leave the coordinator.
+    ///
+    /// A Full write already queued in the state service can outlive this phase.
     FallbackDraining {
         /// Native generation that the coordinator drains.
         epoch: LifecycleEpoch,
     },
-    /// One fully drained legacy fallback lease owns applies.
+    /// The fallback lease owns new applies.
+    ///
+    /// An orphaned Full write from the drained epoch may still commit.
     LegacyFallback {
         /// Drained generation owned by the fallback lease.
         epoch: LifecycleEpoch,

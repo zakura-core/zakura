@@ -98,8 +98,12 @@ pub(crate) enum BlockApplyTerminal {
 
 /// Authorization for one legacy fallback round after native admission stops.
 ///
-/// Full semantic commits drain before this lease activates. The block driver transfers incomplete
-/// checkpoint ranges to the shared checkpoint verifier so fallback can supply their missing bodies.
+/// The coordinator waits until its apply permits and registered operations are gone. That wait
+/// does not cover a Full semantic write that has already entered `StateService::call`: the state
+/// service queues that write synchronously before returning the response future, and transfer
+/// drops the future after releasing the permit. The queued write can still commit after this
+/// lease activates and later surface as `AlreadyInChain`. Incomplete checkpoint ranges are
+/// transferred to the shared checkpoint verifier so fallback can supply their missing bodies.
 #[derive(Debug)]
 pub(crate) struct LegacyFallbackLease {
     coordinator: Arc<SyncCoordinator>,
@@ -179,7 +183,10 @@ impl SyncCoordinator {
         *self.lock_phase()
     }
 
-    /// Whether fallback is draining or has acquired exclusive legacy authorization.
+    /// Whether fallback is draining or holds the legacy apply lease.
+    ///
+    /// The lease stops new native applies. It does not wait for a Full write the state service
+    /// has already queued.
     pub(crate) fn is_yielded_to_legacy(&self) -> bool {
         matches!(
             self.apply_phase(),
@@ -302,7 +309,11 @@ impl SyncCoordinator {
         }
     }
 
-    /// Stop native admission, quiesce the exact epoch, then authorize one legacy round.
+    /// Stop native admission, wait until this epoch's permits and operations are gone, then
+    /// authorize one legacy round.
+    ///
+    /// A Full write already queued inside the state service is not part of that wait. See
+    /// [`LegacyFallbackLease`].
     pub(crate) async fn acquire_legacy_fallback(
         self: &Arc<Self>,
         diagnostic_interval: Duration,
@@ -399,7 +410,7 @@ impl SyncCoordinator {
                         operations,
                         apply_epoch = self.apply_phase().epoch().get(),
                         elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                        "native block applies remain active while fallback waits for its exclusive lease"
+                        "native block applies remain active while fallback waits for the coordinator lease"
                     );
                 }
             }

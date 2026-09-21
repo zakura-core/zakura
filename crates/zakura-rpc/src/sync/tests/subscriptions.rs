@@ -494,3 +494,197 @@ async fn interrupted_snapshots_preserve_published_state_until_a_complete_boundar
     .await
     .expect("snapshot recovery must finish");
 }
+
+/// Builds a valid child using the parent's committed history root.
+fn child_block(parent: &Block, state: &NonFinalizedState) -> Arc<Block> {
+    use zakura_chain::{transaction::Transaction, transparent::Input};
+
+    let mut child = parent.clone();
+    let height = parent.coinbase_height().unwrap().next().unwrap();
+    let Transaction::V5 {
+        inputs,
+        expiry_height,
+        ..
+    } = Arc::make_mut(&mut child.transactions[0])
+    else {
+        panic!("the fixture uses a v5 coinbase");
+    };
+    *expiry_height = height;
+    let Input::Coinbase {
+        height: coinbase_height,
+        ..
+    } = &mut inputs[0]
+    else {
+        panic!("the fixture starts with a coinbase input");
+    };
+    *coinbase_height = height;
+    let history_root = state
+        .find_chain(|chain| chain.non_finalized_tip_hash() == parent.hash())
+        .unwrap()
+        .history_block_commitment_tree()
+        .hash()
+        .unwrap();
+    let commitment = block::ChainHistoryBlockTxAuthCommitmentHash::from_commitments(
+        &history_root,
+        &child.auth_data_root(),
+    );
+    let header = Arc::make_mut(&mut child.header);
+    header.previous_block_hash = parent.hash();
+    header.time += chrono::Duration::seconds(1);
+    header.merkle_root = child.transactions.iter().collect();
+    header.commitment_bytes = <[u8; 32]>::from(commitment).into();
+    Arc::new(child)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_fork_set_retries_replacement_in_empty_staging() {
+    use zakura_state::constants::MAX_NON_FINALIZED_CHAIN_FORKS;
+
+    let _init_guard = zakura_test::init();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let (network, genesis, old_root) = chain_fixture();
+        let mut finalized =
+            zakura_state::FinalizedState::new(&zakura_state::Config::ephemeral(), &network)
+                .unwrap();
+        finalized
+            .commit_finalized_direct(
+                CheckpointVerifiedBlock::from(genesis).into(),
+                None,
+                None,
+                "fork replacement test",
+            )
+            .unwrap();
+        let mut old_state = NonFinalizedState::new(&network);
+        old_state
+            .commit_new_chain(old_root.clone().into(), &finalized.db)
+            .unwrap();
+        let old_child = child_block(&old_root, &old_state);
+        for nonce in 0..MAX_NON_FINALIZED_CHAIN_FORKS {
+            let mut fork = old_child.as_ref().clone();
+            Arc::make_mut(&mut fork.header).nonce.0[0] = u8::try_from(nonce).unwrap();
+            old_state
+                .commit_block(Arc::new(fork).into(), &finalized.db)
+                .unwrap();
+        }
+        assert_eq!(
+            old_state.chain_iter().count(),
+            MAX_NON_FINALIZED_CHAIN_FORKS
+        );
+        let old_tip = old_state.best_tip().unwrap().1;
+
+        let mut replacement_root = old_root.as_ref().clone();
+        Arc::make_mut(&mut replacement_root.header).nonce.0[0] ^= 128;
+        let replacement_root = Arc::new(replacement_root);
+        let mut primary_state = NonFinalizedState::new(&network);
+        primary_state
+            .commit_new_chain(replacement_root.clone().into(), &finalized.db)
+            .unwrap();
+        let replacement_tip = child_block(&replacement_root, &primary_state);
+        primary_state
+            .commit_block(replacement_tip.clone().into(), &finalized.db)
+            .unwrap();
+
+        // The replacement is valid, but its first block loses to all ten old forks.
+        let mut crowded = old_state.clone();
+        crowded
+            .commit_new_chain(replacement_root.clone().into(), &finalized.db)
+            .unwrap();
+        assert!(!crowded.any_chain_contains(&replacement_root.hash()));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (requests, mut received) = mpsc::channel(1);
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(SubscriptionServer(requests))
+                .serve_with_incoming(TcpIncoming::from(listener))
+                .await
+                .unwrap();
+        });
+        let (tip_sender, tip, mut tip_change) = ChainTipSender::new(None, &network);
+        let (state_sender, mut state_receiver) = watch::channel(old_state.clone());
+        let (started, _) = watch::channel(true);
+        let mut syncer = TrustedChainSync {
+            indexer_rpc_client: IndexerClient::connect(endpoint).await.unwrap(),
+            db: finalized.db.clone(),
+            non_finalized_state: old_state,
+            chain_tip_sender: tip_sender,
+            non_finalized_state_sender: state_sender,
+            started_sync_sender: started,
+            finalized_tip_updater: None,
+            receipt_session: Some("primary".into()),
+        };
+        syncer.update_channels();
+        let sync = tokio::spawn(async move { syncer.sync().await });
+        let (request, response) = received.recv().await.unwrap();
+        assert_eq!(
+            request.chain_tip_hashes.len(),
+            MAX_NON_FINALIZED_CHAIN_FORKS
+        );
+        let (blocks, stream) = mpsc::channel(2);
+        response.send(snapshot_response(stream)).unwrap();
+        for block in [&replacement_root, &replacement_tip] {
+            blocks
+                .send(Ok(BlockAndHash::new(block.hash(), block.clone())))
+                .await
+                .unwrap();
+        }
+
+        // The missing parent must request a full replay, without replacing the
+        // published view with either an empty state or a partial replacement.
+        let (request, response) = received.recv().await.unwrap();
+        assert!(
+            request.chain_tip_hashes.is_empty(),
+            "obsolete forks must not seed the retry"
+        );
+        assert_eq!(request.receipt_session.as_deref(), Some("primary"));
+        assert_eq!(tip.best_tip_hash(), Some(old_tip));
+        assert_eq!(
+            state_receiver.borrow().chain_iter().count(),
+            MAX_NON_FINALIZED_CHAIN_FORKS
+        );
+        let (blocks, stream) = mpsc::channel(2);
+        response.send(snapshot_response(stream)).unwrap();
+        for block in [&replacement_root, &replacement_tip] {
+            blocks
+                .send(Ok(BlockAndHash::new(block.hash(), block.clone())))
+                .await
+                .unwrap();
+        }
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                state_receiver.wait_for(|state| state.any_chain_contains(&replacement_root.hash()))
+            )
+            .await
+            .is_err(),
+            "replacement blocks must stay private until the boundary"
+        );
+        blocks
+            .send(Ok(BlockAndHash {
+                chain_snapshot: Some(crate::indexer::NonFinalizedChainTips {
+                    hashes: vec![replacement_tip.hash().bytes_in_display_order().to_vec()],
+                }),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        state_receiver
+            .wait_for(|state| {
+                state
+                    .best_tip()
+                    .is_some_and(|(_, hash)| hash == replacement_tip.hash())
+            })
+            .await
+            .unwrap();
+        while tip.best_tip_hash() != Some(replacement_tip.hash()) {
+            tip_change.wait_for_tip_change().await.unwrap();
+        }
+        assert_eq!(state_receiver.borrow().chain_iter().count(), 1);
+        assert!(!state_receiver.borrow().any_chain_contains(&old_root.hash()));
+        sync.abort();
+        server.abort();
+    })
+    .await
+    .expect("a full old fork set must not prevent snapshot replacement");
+}

@@ -546,7 +546,13 @@ impl TrustedChainSync {
                         last_failed_commit_hash = Some(hash);
                     }
 
-                    self.discard_pending_snapshot();
+                    if self.receipt_session.is_some() {
+                        // Obsolete published forks can evict a replacement's
+                        // parent at the fork limit. Replay into empty staging,
+                        // keeping the published snapshot visible until success.
+                        self.non_finalized_state =
+                            NonFinalizedState::new(&self.non_finalized_state.network);
+                    }
                     non_finalized_blocks_listener = None;
 
                     // Back off so a persistently failing block doesn't turn

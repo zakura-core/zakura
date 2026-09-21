@@ -64,8 +64,11 @@ to already-known blocks, including invalidation and reconsideration. Snapshot
 messages contain no block data. Missing tips cause a complete resubscription.
 An empty tip set clears the mirror's non-finalized state. With session-aware
 servers, blocks stay private until the snapshot marker reconciles the full fork
-set. Only then does the mirror publish the new state and tip. A disconnected or
-failed batch is discarded and resubscription uses the last published snapshot.
+set. Only then does the mirror publish the new state and tip. A disconnected batch
+is discarded and resubscription uses the last published snapshot. Incomplete
+snapshots and block commit failures request all forks again in empty private
+staging, so obsolete forks cannot consume the replacement's fork capacity. The
+last published state stays visible until a complete replacement is ready.
 Legacy servers without snapshot markers retain incremental publication.
 An initial empty snapshot leaves finalized-tip tracking active during checkpoint
 sync. The first real block transfers that responsibility to the block syncer.

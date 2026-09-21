@@ -146,6 +146,7 @@ pub struct PreparedFullStateTransition {
 struct PreparedAuthority {
     transition: zakura_header_chain::TransitionFingerprint,
     retention_references: Vec<block::Hash>,
+    evicted_bodies: Vec<block::Hash>,
 }
 
 impl PreparedAuthority {
@@ -155,6 +156,7 @@ impl PreparedAuthority {
             .map(|transition| Self {
                 transition,
                 retention_references: Vec::new(),
+                evicted_bodies: Vec::new(),
             })
             .ok_or(HeaderChainStoreError::Incoherent(
                 "prepared full-state event has no stable identity",
@@ -174,6 +176,14 @@ impl PreparedAuthority {
 impl FullStateEvidenceAuthority for PreparedAuthority {
     fn authorizes_full_state(&self, event: &TransitionEvent) -> bool {
         event.fingerprint() == Some(self.transition)
+    }
+
+    fn evicted_bodies(&self, event: &TransitionEvent) -> &[block::Hash] {
+        if self.authorizes_full_state(event) {
+            &self.evicted_bodies
+        } else {
+            &[]
+        }
     }
 
     fn authorizes_retention_reference(&self, reference: block::Hash) -> bool {
@@ -266,10 +276,23 @@ impl PreparedFullStateTransition {
             header_request,
             ..
         } = self;
-        let authority = PreparedAuthority::for_event_with_retention(
+        let mut authority = PreparedAuthority::for_event_with_retention(
             &header_request.event,
             staged_tips.clone(),
         )?;
+        if matches!(
+            &header_request.event,
+            TransitionEvent::VerifiedBlockAccepted(_)
+                | TransitionEvent::OperatorReconsider(_)
+                | TransitionEvent::VerifiedChainChanged(
+                    zakura_header_chain::VerifiedChainChanged {
+                        cause: VerifiedChangeCause::Grow | VerifiedChangeCause::Reset,
+                        ..
+                    }
+                )
+        ) {
+            authority.evicted_bodies = live_non_finalized.evicted_blocks(&non_finalized_after);
+        }
         let mut retention_references = context.retention_references.to_vec();
         retention_references.extend(staged_tips.iter().copied());
         retention_references.sort_unstable_by_key(|hash| hash.0);
@@ -1557,14 +1580,14 @@ struct WriteBlockWorkerTask {
     finalized_state: FinalizedState,
     non_finalized_state: NonFinalizedState,
     invalid_block_reset_sender: UnboundedSender<block::Hash>,
-    /// Signals the [`crate::service::StateService`] that a non-finalized block was rejected by
+    /// Signals the [`crate::service::StateService`] that a non-finalized block was rejected or evicted by
     /// the write task, so its hash should be removed from
     /// `non_finalized_block_write_sent_hashes`.
     ///
     /// Without this, a rejected same-hash block locks out a later honest
     /// re-delivery of a block at the same hash as a "duplicate" until restart
     /// or reorg.
-    non_finalized_rejected_sender: UnboundedSender<NonFinalizedWriteFailure>,
+    non_finalized_write_update_sender: UnboundedSender<NonFinalizedWriteUpdate>,
     chain_tip_sender: ChainTipSender,
     non_finalized_state_sender: watch::Sender<NonFinalizedState>,
     vct_root_repair_sender: watch::Sender<VctRootRepairStatus>,
@@ -1576,6 +1599,13 @@ struct WriteBlockWorkerTask {
     header_chain: Option<HeaderChainWriter>,
     attach_header_chain_at_handoff: bool,
     header_chain_observers: HeaderChainObservers,
+}
+
+/// Writer outcomes that retire entries from the service's sent-block cache.
+#[derive(Clone, Debug)]
+pub(in crate::service) enum NonFinalizedWriteUpdate {
+    Failed(NonFinalizedWriteFailure),
+    Evicted(Vec<block::Hash>),
 }
 
 /// One failed non-finalized write that can strand queued descendants.
@@ -1820,7 +1850,7 @@ impl BlockWriteSender {
     ) -> (
         Self,
         tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
-        tokio::sync::mpsc::UnboundedReceiver<NonFinalizedWriteFailure>,
+        tokio::sync::mpsc::UnboundedReceiver<NonFinalizedWriteUpdate>,
         watch::Receiver<VctRootRepairStatus>,
         watch::Sender<BlockWriteNotice>,
         Arc<OnceLock<BlockWriteTaskFailure>>,
@@ -1857,7 +1887,7 @@ impl BlockWriteSender {
     ) -> (
         Self,
         tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
-        tokio::sync::mpsc::UnboundedReceiver<NonFinalizedWriteFailure>,
+        tokio::sync::mpsc::UnboundedReceiver<NonFinalizedWriteUpdate>,
         watch::Receiver<VctRootRepairStatus>,
         watch::Sender<BlockWriteNotice>,
         Arc<OnceLock<BlockWriteTaskFailure>>,
@@ -1871,7 +1901,7 @@ impl BlockWriteSender {
             tokio::sync::mpsc::unbounded_channel();
         let (invalid_block_reset_sender, invalid_block_write_reset_receiver) =
             tokio::sync::mpsc::unbounded_channel();
-        let (non_finalized_rejected_sender, non_finalized_rejected_receiver) =
+        let (non_finalized_write_update_sender, non_finalized_write_update_receiver) =
             tokio::sync::mpsc::unbounded_channel();
         let (vct_root_repair_sender, vct_root_repair_receiver) =
             watch::channel(VctRootRepairStatus::default());
@@ -1890,7 +1920,7 @@ impl BlockWriteSender {
                         finalized_state,
                         non_finalized_state,
                         invalid_block_reset_sender,
-                        non_finalized_rejected_sender,
+                        non_finalized_write_update_sender,
                         chain_tip_sender,
                         non_finalized_state_sender,
                         vct_root_repair_sender,
@@ -1924,7 +1954,7 @@ impl BlockWriteSender {
                     .then_some(finalized_block_write_sender),
             },
             invalid_block_write_reset_receiver,
-            non_finalized_rejected_receiver,
+            non_finalized_write_update_receiver,
             vct_root_repair_receiver,
             admission_sender,
             task_failure,
@@ -2236,7 +2266,7 @@ impl WriteBlockWorkerTask {
             finalized_state,
             non_finalized_state,
             invalid_block_reset_sender,
-            non_finalized_rejected_sender,
+            non_finalized_write_update_sender,
             chain_tip_sender,
             non_finalized_state_sender,
             vct_root_repair_sender,
@@ -2882,6 +2912,9 @@ impl WriteBlockWorkerTask {
                         non_finalized_state.reconsider_block(hash, &finalized_state.db)
                     };
                     if result.is_ok() {
+                        let evicted = non_finalized_state_sender
+                            .borrow()
+                            .evicted_blocks(non_finalized_state);
                         update_channels_after_operator_change(
                             non_finalized_state,
                             finalized_state,
@@ -2889,6 +2922,10 @@ impl WriteBlockWorkerTask {
                             non_finalized_state_sender,
                             backup_dir_path.as_deref(),
                         );
+                        if !evicted.is_empty() {
+                            let _ = non_finalized_write_update_sender
+                                .send(NonFinalizedWriteUpdate::Evicted(evicted));
+                        }
                         // Reconsideration restores blocks without committing them,
                         // so wake readers waiting for one of those blocks.
                         block_commit_sender.send_modify(|_| {});
@@ -3031,10 +3068,12 @@ impl WriteBlockWorkerTask {
                 // If the receiver was dropped (the StateService is shutting
                 // down), ignore the error: the lockout cannot matter once the
                 // service exits.
-                let _ = non_finalized_rejected_sender.send(NonFinalizedWriteFailure {
-                    hash: child_hash,
-                    kind: failure_kind,
-                });
+                let _ = non_finalized_write_update_sender.send(NonFinalizedWriteUpdate::Failed(
+                    NonFinalizedWriteFailure {
+                        hash: child_hash,
+                        kind: failure_kind,
+                    },
+                ));
 
                 // Readers waiting for an invalid block stop waiting. A local write failure
                 // can succeed on retry, so its readers keep waiting.
@@ -3053,6 +3092,10 @@ impl WriteBlockWorkerTask {
             // recorded for a different block body with the same header hash.
             rejected_ancestor_map.shift_remove(&child_hash);
 
+            let evicted = non_finalized_state_sender
+                .borrow()
+                .evicted_blocks(non_finalized_state);
+
             // Committing blocks to the finalized state keeps the same chain,
             // so we can update the chain seen by the rest of the application now.
             //
@@ -3067,6 +3110,11 @@ impl WriteBlockWorkerTask {
             );
 
             notify_block_committed(block_commit_sender, child_hash);
+
+            if !evicted.is_empty() {
+                let _ = non_finalized_write_update_sender
+                    .send(NonFinalizedWriteUpdate::Evicted(evicted));
+            }
 
             // Update the caller with the result.
             let _ = rsp_tx.send(result.map(|()| child_hash).map_err(Into::into));

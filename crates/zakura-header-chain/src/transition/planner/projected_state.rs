@@ -81,6 +81,25 @@ impl<'a> ProjectedTransitionState<'a> {
         Ok(())
     }
 
+    /// Drop body availability after full-state eviction and recheck verified selection.
+    pub(super) fn forget_evicted_bodies(
+        &mut self,
+        hashes: &[block::Hash],
+    ) -> Result<(), TransitionFailure> {
+        for &hash in hashes {
+            if self.graph.view_header_node(hash).is_some_and(|node| {
+                matches!(
+                    node.body_validation_state,
+                    BodyValidationState::Verified { .. }
+                )
+            }) {
+                self.set_body_validation_state(hash, BodyValidationState::Unknown)?;
+                self.verified_selection_dirty = true;
+            }
+        }
+        Ok(())
+    }
+
     /// Replace one retained header's time-dependent validation state.
     pub(super) fn set_header_validation_state(
         &mut self,
@@ -139,10 +158,8 @@ impl<'a> ProjectedTransitionState<'a> {
         Ok(())
     }
 
-    /// Reselect the strongest fully verified eligible path when operator policy dirtied it.
-    pub(super) fn refresh_verified_after_operator_change(
-        &mut self,
-    ) -> Result<(), TransitionFailure> {
+    /// Reselect after operator policy or retained body availability changes.
+    pub(super) fn refresh_verified_selection(&mut self) -> Result<(), TransitionFailure> {
         if self.verified_selection_dirty {
             self.verified = Cow::Owned(select_fully_verified_path(&self.graph)?);
             self.verified_selection_dirty = false;

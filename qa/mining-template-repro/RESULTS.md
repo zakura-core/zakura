@@ -140,16 +140,38 @@ starts over anyway.
 A single earlier run had suggested the higher bound raised latency. Alternating the
 builds showed that was host drift, not the bound.
 
-**This does not justify changing the constant.** The storm runs a block every
-~72 ms. Target spacing is 75 s post-Blossom and 25 s post-NU7
-(`POST_NU7_POW_TARGET_SPACING`, ZIP 218), so the storm is roughly 350x faster than
-the network this code targets.
+### What actually drives the residual
 
-A withhold needs a tip change to land inside a template build. At ~40 ms builds and
-25 s spacing a single collision runs about 0.16%, and exhausting four rebuilds needs
-four in a row, on the order of 1e-11. A shielded coinbase pushing builds to ~500 ms
-still leaves it near 1e-7. A bound of 4 is already far more headroom than the real
-block rate asks for, and the measured single-producer runs agree: zero withholds.
+Not the block rate. Sweeping the number of concurrent block producers on `main` and
+on #1088, with 16 long-poll clients throughout:
+
+| Producers | ms/block | main withholds | #1088 withholds | build p90 |
+| --- | --- | --- | --- | --- |
+| 1 | 29.5 | 20 | **0** | 40 ms |
+| 2 | 46.8 | 948 | **0** | 67 ms |
+| 4 | 76.1 | 1 857 | 67 | 96 ms |
+
+One producer makes the _fastest_ blocks and yields the _fewest_ withholds. The
+driver is the number of template builds in flight when the tip moves. With a single
+producer the same actor builds and then submits, serially, so nothing else is
+mid-build at the moment the tip changes. With four, the other three are always
+mid-build when one of them submits. `MAX_TEMPLATE_BUILDS` is 1, so those builds also
+queue behind each other, stretching p90 build latency from 40 ms to 96 ms and
+widening the window further.
+
+So the harness amplifies on two axes at once: concurrent template consumers, and
+the build latency that contention creates.
+
+**This does not justify changing the constant.** A withhold needs a tip change to
+land inside a build window, so the block interval is the denominator. Target spacing
+is 75 s post-Blossom and 25 s post-NU7 (`POST_NU7_POW_TARGET_SPACING`, ZIP 218),
+against the storm's ~76 ms.
+
+Many concurrent callers is realistic for a pool, so that axis does transfer. The
+block interval is what does not. Even taking the contended 96 ms build window, a
+single collision at 25 s spacing is ~0.4%, and the budget needs five in a row, on
+the order of 1e-12. A shielded coinbase pushing builds to ~500 ms still leaves it
+near 1e-8. The measured runs agree: zero withholds at one and two producers.
 
 The right way to read the storm numbers is as an amplifier. It makes a rare race
 observable in 45 seconds so two builds can be compared. The ratios between builds

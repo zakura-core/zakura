@@ -81,7 +81,7 @@ fn header_consensus_is_valid(
     };
     let required = usize::try_from(node.height.0)
         .unwrap_or(usize::MAX)
-        .min(crate::POW_ADJUSTMENT_BLOCK_SPAN);
+        .min(crate::MAX_POW_ADJUSTMENT_BLOCK_SPAN);
     let mut hash = node.parent_hash;
     let mut context = Vec::with_capacity(required);
     while context.len() < required {

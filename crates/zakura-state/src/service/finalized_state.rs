@@ -38,7 +38,7 @@ use crate::{
     constants::{state_database_format_version_in_code, STATE_DATABASE_KIND},
     error::CommitCheckpointVerifiedError,
     request::{FinalizableBlock, FinalizedBlock, Treestate},
-    service::{check, QueuedCheckpointVerified},
+    service::{check, queued_blocks::CheckpointCommit, QueuedCheckpointVerified},
     CheckpointVerifiedBlock, Config, StateInitError, ValidateContextError,
 };
 
@@ -685,19 +685,21 @@ impl FinalizedState {
     /// order.
     pub fn commit_finalized(
         &mut self,
-        ordered_block: QueuedCheckpointVerified,
+        ordered_block: CheckpointCommit,
         prev_note_commitment_trees: Option<NoteCommitmentTrees>,
         vct_successor_witness: Option<VctSuccessorWitness>,
     ) -> Result<
         (CheckpointVerifiedBlock, NoteCommitmentTrees),
-        (QueuedCheckpointVerified, CommitCheckpointVerifiedError),
+        (CheckpointCommit, CommitCheckpointVerifiedError),
     > {
+        let (block, response) = ordered_block;
         self.commit_finalized_inner(
-            ordered_block,
+            (block, response, 0),
             prev_note_commitment_trees,
             vct_successor_witness,
             None,
         )
+        .map_err(|((block, response, _attempt), error)| ((block, response), error))
     }
 
     /// Commit a checkpoint block and delegate its exact full-state batch to `commit`.
@@ -772,7 +774,7 @@ impl FinalizedState {
             VctAuthenticationProof,
         ) -> Result<(), CommitCheckpointVerifiedError>,
     {
-        let (checkpoint_verified, rsp_tx) = ordered_block;
+        let (checkpoint_verified, rsp_tx, attempt) = ordered_block;
         let result = self.commit_finalized_direct_with_aux(
             checkpoint_verified.clone().into(),
             prev_note_commitment_trees,
@@ -804,7 +806,7 @@ impl FinalizedState {
                 let _ = rsp_tx.send(Ok(hash));
                 Ok((checkpoint_verified, note_commitment_trees))
             }
-            Err(error) => Err(((checkpoint_verified, rsp_tx), error)),
+            Err(error) => Err(((checkpoint_verified, rsp_tx, attempt), error)),
         }
     }
 
@@ -1577,6 +1579,14 @@ impl FinalizedState {
         error: ValidateContextError,
         failure: crate::error::VctCommitFailure,
     ) -> CommitCheckpointVerifiedError {
+        if matches!(
+            error,
+            ValidateContextError::HistoryTreeError(ref error)
+                if matches!(error.as_ref(), zakura_chain::history_tree::HistoryTreeError::MissingBranchId { .. })
+        ) {
+            return error.into();
+        }
+
         metrics::counter!("state.vct.root.rejected.count").increment(1);
         tracing::warn!(
             ?height,

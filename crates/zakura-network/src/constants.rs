@@ -156,6 +156,10 @@ pub const MIN_PEER_RECONNECTION_DELAY: Duration = Duration::from_secs(59 + 20 + 
 /// Zebra rotates its peer inventory registry every time this interval elapses.
 ///
 /// After 2 of these intervals, Zebra's local available and missing inventory entries expire.
+///
+/// After ZIP 218 shortens the target block interval to 25 seconds at NU7, entries last for
+/// 2-4 blocks instead of 1-2 blocks. The entries track how inventory reaches peers, and that
+/// takes the same time at any block interval, so this interval does not change at NU7.
 pub const INVENTORY_ROTATION_INTERVAL: Duration = Duration::from_secs(53);
 
 /// The default peer address crawler interval.
@@ -342,12 +346,16 @@ pub const MAX_ADDRS_IN_ADDRESS_BOOK: usize =
 /// messages from each of our peers.
 pub const TIMESTAMP_TRUNCATION_SECONDS: u32 = 30 * 60;
 
-// TODO: The NU7 and NuTachyon protocol versions are provisional. Update this constant and the
-// mapping in `Version::min_specified_for_upgrade` when their deployment ZIPs are published.
+// TODO: The NuTachyon protocol versions are provisional. Update this constant and the mapping
+// in `Version::min_specified_for_upgrade` when its deployment ZIP is published.
 #[cfg(zcash_unstable = "nutachyon")]
-const CURRENT_NETWORK_PROTOCOL_VERSION_VALUE: u32 = 170_190; // NuTachyon (Mainnet + Testnet).
+const CURRENT_NETWORK_PROTOCOL_VERSION_VALUE: u32 = 170_210; // NuTachyon (Mainnet + Testnet).
 #[cfg(not(zcash_unstable = "nutachyon"))]
-const CURRENT_NETWORK_PROTOCOL_VERSION_VALUE: u32 = 170_160; // NU6.3 (Mainnet + Testnet).
+// ZIP 204 assigns NU7 the protocol version 170_180 on Testnet and 170_190 on Mainnet.
+// `Version::min_specified_for_upgrade` holds the same values. Mainnet and Testnet both have
+// an NU7 height, so one binary advertises the Mainnet value, which also meets the Testnet
+// minimum.
+const CURRENT_NETWORK_PROTOCOL_VERSION_VALUE: u32 = 170_190; // NU7 (Mainnet + Testnet).
 
 /// The Zcash network protocol version implemented by this crate, and advertised
 /// during connection setup.

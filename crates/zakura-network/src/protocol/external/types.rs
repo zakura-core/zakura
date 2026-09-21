@@ -120,20 +120,23 @@ impl Version {
                 170_150
             }
             (Mainnet, Nu6_2) => 170_150,
-            // TODO: these NU6.3, NU7, and NuTachyon protocol versions are provisional, bumped
-            // above Nu6_2's 170_150. Update them when the real values are specified.
             (Testnet(params), Nu6_3) if params.is_default_testnet() || params.is_regtest() => {
                 170_160
             }
             (Mainnet, Nu6_3) => 170_160,
-            (Testnet(params), Nu7) if params.is_default_testnet() || params.is_regtest() => 170_170,
-            (Mainnet, Nu7) => 170_180,
+            // From NU7 onward, ZIP 204 assigns each upgrade a Testnet version of the form
+            // 170_000 + 20·k and a Mainnet version 10 higher, so no two networks share a version.
+            // Regtest uses the Testnet version.
+            (Testnet(params), Nu7) if params.is_default_testnet() || params.is_regtest() => 170_180,
+            (Mainnet, Nu7) => 170_190,
+            // NuTachyon provisionally follows the same assignment pattern. Update these values
+            // if its deployment ZIP assigns different protocol versions.
             #[cfg(zcash_unstable = "nutachyon")]
             (Testnet(params), NuTachyon) if params.is_default_testnet() || params.is_regtest() => {
-                170_190
+                170_200
             }
             #[cfg(zcash_unstable = "nutachyon")]
-            (Mainnet, NuTachyon) => 170_190,
+            (Mainnet, NuTachyon) => 170_210,
 
             // It should be fine to reject peers with earlier network protocol versions on custom testnets for now.
             (Testnet(_), _) => CURRENT_NETWORK_PROTOCOL_VERSION.0,
@@ -267,6 +270,8 @@ mod test {
         }
     }
 
+    /// Checks that Zakura advertises the Mainnet NuTachyon version, which meets the
+    /// NuTachyon minimum on every network.
     #[test]
     #[cfg(zcash_unstable = "nutachyon")]
     fn nu_tachyon_protocol_versions_match_current_version() {
@@ -276,31 +281,71 @@ mod test {
             Version::min_specified_for_upgrade(&Mainnet, NuTachyon),
             CURRENT_NETWORK_PROTOCOL_VERSION
         );
-        assert_eq!(
-            Version::min_specified_for_upgrade(&Network::new_default_testnet(), NuTachyon),
-            CURRENT_NETWORK_PROTOCOL_VERSION
-        );
-        assert_eq!(
-            Version::min_specified_for_upgrade(
-                &Network::new_regtest(Default::default()),
-                NuTachyon
-            ),
-            CURRENT_NETWORK_PROTOCOL_VERSION
-        );
+        for network in [
+            Network::new_default_testnet(),
+            Network::new_regtest(Default::default()),
+        ] {
+            assert!(
+                Version::min_specified_for_upgrade(&network, NuTachyon)
+                    <= CURRENT_NETWORK_PROTOCOL_VERSION
+            );
+        }
     }
 
+    /// Checks that a non-NuTachyon build advertises the Mainnet NU7 version, which
+    /// meets the NU7 minimum on every network.
     #[test]
     #[cfg(not(zcash_unstable = "nutachyon"))]
-    fn nu63_protocol_versions_match_current_version() {
+    fn nu7_protocol_versions_match_current_version() {
         let _init_guard = zakura_test::init();
 
         assert_eq!(
-            Version::min_specified_for_upgrade(&Mainnet, Nu6_3),
+            Version::min_specified_for_upgrade(&Mainnet, Nu7),
             CURRENT_NETWORK_PROTOCOL_VERSION
         );
+        for network in [
+            Network::new_default_testnet(),
+            Network::new_regtest(Default::default()),
+        ] {
+            assert!(
+                Version::min_specified_for_upgrade(&network, Nu7)
+                    <= CURRENT_NETWORK_PROTOCOL_VERSION
+            );
+        }
+    }
+
+    /// Checks the NU7 protocol versions against the ZIP 204 assignment rule.
+    #[test]
+    fn nu7_protocol_versions_follow_zip_204() {
+        let _init_guard = zakura_test::init();
+
+        let testnet = Network::new_default_testnet();
+        let regtest = Network::new_regtest(Default::default());
+
         assert_eq!(
-            Version::min_specified_for_upgrade(&Network::new_default_testnet(), Nu6_3),
-            CURRENT_NETWORK_PROTOCOL_VERSION
+            Version::min_specified_for_upgrade(&Mainnet, Nu7),
+            Version(170_190)
+        );
+        assert_eq!(
+            Version::min_specified_for_upgrade(&testnet, Nu7),
+            Version(170_180)
+        );
+        assert_eq!(
+            Version::min_specified_for_upgrade(&regtest, Nu7),
+            Version(170_180)
+        );
+
+        // ZIP 204: the Testnet version is the least 170_000 + 20·k above the preceding
+        // upgrade's Mainnet version, and the Mainnet version is 10 higher.
+        let preceding_mainnet = Version::min_specified_for_upgrade(&Mainnet, Nu6_3).0;
+        let base = 170_000 + ((preceding_mainnet - 170_000) / 20 + 1) * 20;
+        assert_eq!(
+            Version::min_specified_for_upgrade(&testnet, Nu7),
+            Version(base)
+        );
+        assert_eq!(
+            Version::min_specified_for_upgrade(&Mainnet, Nu7),
+            Version(base + 10)
         );
     }
 

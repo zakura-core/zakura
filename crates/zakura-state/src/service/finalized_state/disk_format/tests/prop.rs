@@ -3,7 +3,7 @@
 use proptest::prelude::*;
 
 use zakura_chain::{
-    amount::{Amount, NonNegative},
+    amount::{Amount, NegativeAllowed, NonNegative},
     block::{self, Height},
     block_info::BlockInfo,
     ironwood, orchard, sapling, sprout,
@@ -591,6 +591,28 @@ fn roundtrip_block_info_with_tachyon_value_pool() {
 
     assert_eq!(block_info.as_bytes().len(), 60);
     assert_value_properties(block_info);
+}
+
+/// A `BlockInfo` written before the NSM value balance leg still decodes, with a zero
+/// balance. The `nsm_value_balance_pool` database upgrade replaces that placeholder.
+#[test]
+fn block_info_decodes_pre_nsm_value_balance_value_pools() {
+    let _init_guard = zakura_test::init();
+
+    let ironwood_amount = Amount::<NonNegative>::try_from(7).expect("7 zatoshi is a valid amount");
+    let value_pools = ValueBalance::from_ironwood_amount(ironwood_amount);
+
+    let mut pre_upgrade_bytes = value_pools.as_bytes()[..48].to_vec();
+    pre_upgrade_bytes.extend_from_slice(&123_u32.to_le_bytes());
+
+    let block_info = BlockInfo::from_bytes(pre_upgrade_bytes);
+
+    assert_eq!(block_info.value_pools().ironwood_amount(), ironwood_amount);
+    assert_eq!(
+        block_info.value_pools().nsm_value_balance_amount(),
+        Amount::<NegativeAllowed>::zero(),
+    );
+    assert_eq!(block_info.size(), 123);
 }
 
 #[test]

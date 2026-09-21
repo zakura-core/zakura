@@ -10,7 +10,10 @@ use zakura_chain::{
     amount::{DeferredPoolBalanceChange, NonNegative},
     block::{Block, Height},
     block_info::BlockInfo,
-    parameters::subsidy::{block_subsidy, funding_stream_values, FundingStreamReceiver},
+    parameters::subsidy::{
+        block_subsidy, funding_stream_values, is_zip234_active, parent_nsm_value_balance,
+        FundingStreamReceiver,
+    },
     transparent::{self, OutPoint, Utxo},
     value_balance::ValueBalance,
 };
@@ -179,38 +182,51 @@ impl DiskFormatUpgrade for Upgrade {
                 } => (block, size, utxos, address_balance_changes),
             };
 
-            // Get the deferred amount which is required to update the value pool.
-            let deferred_pool_balance_change = if height > network.slow_start_interval() {
+            // Get the deferred amount which is required to update the value pool. Block commits
+            // apply it at every height, including heights in slow start on configured networks.
+            let deferred_pool_balance_change = {
+                // ZIP 234 derives the block subsidy from the money reserve after the parent
+                // block, which is the running value pool.
+                let block_subsidy = is_zip234_active(&network, height)
+                    .then(|| parent_nsm_value_balance(value_pool.nsm_value_balance_amount()))
+                    .transpose()
+                    .and_then(|nsm_value_balance| {
+                        block_subsidy(height, &network, nsm_value_balance)
+                    })
+                    .map_err(|error| {
+                        super::FormatChangeError::InvalidPostcondition(format!(
+                            "invalid block subsidy at height {height:?}: {error}"
+                        ))
+                    })?;
+
                 // See [ZIP-1015](https://zips.z.cash/zip-1015).
-                let deferred_pool_balance_change = funding_stream_values(
-                    height,
-                    &network,
-                    block_subsidy(height, &network).unwrap_or_default(),
-                )
-                .expect("should have valid funding stream values")
-                .remove(&FundingStreamReceiver::Deferred)
-                .unwrap_or_default()
-                .checked_sub(network.lockbox_disbursement_total_amount(height));
+                let deferred_pool_balance_change =
+                    funding_stream_values(height, &network, block_subsidy)
+                        .expect("should have valid funding stream values")
+                        .remove(&FundingStreamReceiver::Deferred)
+                        .unwrap_or_default()
+                        .checked_sub(network.lockbox_disbursement_total_amount(height));
 
                 Some(
                     deferred_pool_balance_change
                         .expect("deferred pool balance change should be valid Amount"),
                 )
-            } else {
-                None
             };
 
             // Add this block's value pool changes to the total value pool.
-            value_pool = value_pool
-                .add_chain_value_pool_change(
-                    block
-                        .chain_value_pool_change(
-                            &utxos,
-                            deferred_pool_balance_change.map(DeferredPoolBalanceChange::new),
-                        )
-                        .unwrap_or_default(),
+            value_pool = block
+                .chain_value_pool_change(
+                    &network,
+                    &utxos,
+                    deferred_pool_balance_change.map(DeferredPoolBalanceChange::new),
                 )
-                .expect("value pool change should not overflow");
+                .and_then(|change| value_pool.add_chain_value_pool_change(change))
+                .and_then(|pools| pools.seed_nsm_value_balance(height, &network))
+                .map_err(|error| {
+                    super::FormatChangeError::InvalidPostcondition(format!(
+                        "invalid monetary pools or NSM seed at {height:?}: {error}"
+                    ))
+                })?;
 
             let mut batch = DiskWriteBatch::new();
 

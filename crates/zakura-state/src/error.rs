@@ -44,6 +44,26 @@ impl From<BoxError> for CloneError {
 /// A boxed [`std::error::Error`].
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
+/// A [`crate::Request::AwaitBlockInfo`] request stopped waiting before its block committed.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum AwaitBlockInfoError {
+    /// The state rejected the block, so it will not commit unless it is sent again.
+    #[error("block {hash} was rejected by the state")]
+    Rejected {
+        /// The requested block.
+        hash: block::Hash,
+    },
+
+    /// The block did not commit within the wait limit.
+    #[error("block {hash} did not commit within {limit:?}")]
+    TimedOut {
+        /// The requested block.
+        hash: block::Hash,
+        /// The wait limit.
+        limit: std::time::Duration,
+    },
+}
+
 /// The finalized database has blocks but no persisted Sprout tip frontier.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 #[error("missing Sprout note commitment tree at finalized tip {tip:?}")]
@@ -793,6 +813,17 @@ pub enum ValidateContextError {
         height: Option<block::Height>,
     },
 
+    #[error(
+        "block makes the ZIP 234 NSM value balance negative: balance {balance_before:?} \
+         changes by {balance_change:?} at {height:?}"
+    )]
+    #[non_exhaustive]
+    NegativeNsmValueBalance {
+        height: block::Height,
+        balance_before: amount::Amount<NegativeAllowed>,
+        balance_change: amount::Amount<NegativeAllowed>,
+    },
+
     #[error("error updating a note commitment tree: {0}")]
     NoteCommitmentTreeError(#[from] zakura_chain::parallel::tree::NoteCommitmentTreeError),
 
@@ -1000,6 +1031,7 @@ impl ValidateContextError {
                 consensus("context.calculate_block_chain_value_change")
             }
             Self::AddValuePool { .. } => consensus("context.add_value_pool"),
+            Self::NegativeNsmValueBalance { .. } => consensus("context.negative_nsm_value_balance"),
             Self::UnknownSproutAnchor { .. } => consensus("context.unknown_sprout_anchor"),
             Self::UnknownSaplingAnchor { .. } => consensus("context.unknown_sapling_anchor"),
             Self::UnknownOrchardAnchor { .. } => consensus("context.unknown_orchard_anchor"),
@@ -1034,6 +1066,7 @@ impl ValidateContextError {
             | ValidateContextError::DuplicateIronwoodNullifier { .. }
             | ValidateContextError::NegativeRemainingTransactionValue { .. }
             | ValidateContextError::AddValuePool { .. }
+            | ValidateContextError::NegativeNsmValueBalance { .. }
             | ValidateContextError::InvalidBlockCommitment(_)
             | ValidateContextError::UnknownSproutAnchor { .. }
             | ValidateContextError::UnknownSaplingAnchor { .. }
@@ -1391,6 +1424,12 @@ mod tests {
                 chain_value_pools: Box::new(ValueBalance::<NonNegative>::zero()),
                 block_value_pool_change: Box::new(ValueBalance::<NegativeAllowed>::zero()),
                 height: Some(height),
+            },
+            ValidateContextError::NegativeNsmValueBalance {
+                height,
+                balance_before: amount::Amount::zero(),
+                balance_change: amount::Amount::try_from(-1)
+                    .expect("minus one zatoshi is a valid amount"),
             },
             ValidateContextError::InvalidBlockCommitment(
                 CommitmentError::InvalidChainHistoryActivationReserved { actual: [1; 32] },

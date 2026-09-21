@@ -41,14 +41,15 @@ place; this change adds no downgrade migration.
 the database writable. This record helps explain a database's history. It does not establish
 compatibility, and software without that feature can leave the record stale.
 
-[PR #795](https://github.com/zakura-core/zakura/pull/795) selects major format 29 under
-`zcash_unstable="nutachyon"` and format 28 otherwise. The existing versioned directories
+[PR #795](https://github.com/zakura-core/zakura/pull/795) selects major format 30 under
+`zcash_unstable="nutachyon"` and format 29 otherwise. The existing versioned directories
 separate these builds without a Tachyon-specific path rule.
 
 ## Reserving the Tachyon format number
 
-[PR #1028](https://github.com/zakura-core/zakura/pull/1028) reserves major version 29 on
-`main`. Its compile-time assertion rejects an ordinary build that selects that number.
+[PR #795](https://github.com/zakura-core/zakura/pull/795) reserves major version 30 while
+NuTachyon remains out of tree. Its compile-time assertion rejects an ordinary build that selects
+that number.
 The reservation prevents two incompatible formats from sharing the same version.
 
 When integrating Tachyon, compile that assertion only when
@@ -58,9 +59,9 @@ The Tachyon constant uses the reservation constant so both refer to the same num
 
 | Build | Selected major | Compiler result |
 | --- | --- | --- |
-| Ordinary | 28 | Accept |
-| Ordinary with an accidental version collision | 29 | Reject |
-| Tachyon | 29 | Accept |
+| Ordinary | 29 | Accept |
+| Ordinary with an accidental version collision | 30 | Reject |
+| Tachyon | 30 | Accept |
 
 The reservation controls which build may use a format number. The startup checks control
 whether a build may open an existing database. Both checks remain necessary.
@@ -83,9 +84,9 @@ Run the cross-build upgrade test:
 scripts/test-tachyon-db-upgrade.sh
 ```
 
-The script creates a temporary v28 database with an ordinary build. It commits real Mainnet
+The script creates a temporary v29 database with an ordinary build. It commits real Mainnet
 blocks and writes a non-finalized backup. The Tachyon build then upgrades that database to
-v29, reads the backup, commits another block, and reopens the database. The test also
+v30, reads the backup, commits another block, and reopens the database. The test also
 checks writer metadata and exchanges a serialized history snapshot between the builds.
 CI runs this script and the state tests with Tachyon disabled and enabled.
 

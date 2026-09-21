@@ -28,8 +28,8 @@ fn cross_build_database_upgrade() {
     };
     let network = Network::Mainnet;
     let backup_dir = config.non_finalized_state_backup_dir(&network).unwrap();
-    let ordinary_path = config.db_path(STATE_DATABASE_KIND, 28, &network);
-    let tachyon_path = config.db_path(STATE_DATABASE_KIND, 29, &network);
+    let ordinary_path = config.db_path(STATE_DATABASE_KIND, 29, &network);
+    let tachyon_path = config.db_path(STATE_DATABASE_KIND, 30, &network);
     let writer = DatabaseWriterMetadata::new(
         "Zakura",
         if cfg!(zcash_unstable = "nutachyon") {
@@ -51,7 +51,7 @@ fn cross_build_database_upgrade() {
             !ordinary_path.exists(),
             "producer requires an unused fixture directory"
         );
-        assert_eq!(state_database_format_version_in_code().major, 28);
+        assert_eq!(state_database_format_version_in_code().major, 29);
         let mut state =
             FinalizedState::new_with_database_writer_metadata(&config, &network, writer.clone())
                 .unwrap();
@@ -62,7 +62,7 @@ fn cross_build_database_upgrade() {
         }
         write_semantically_verified_backup_block(&backup_dir, &block(10).into()).unwrap();
         assert_eq!(state.db.database_writer_metadata().unwrap(), Some(writer));
-        assert_eq!(stored_balance_width(&state), 48);
+        assert_eq!(stored_balance_width(&state), 56);
         assert!(ordinary_path.exists());
         assert!(!tachyon_path.exists());
         state.db.shutdown(true);
@@ -89,7 +89,7 @@ fn cross_build_database_upgrade() {
             let old = ZakuraDb::new(
                 &config,
                 STATE_DATABASE_KIND,
-                &semver::Version::new(28, 2, 0),
+                &semver::Version::new(29, 0, 0),
                 &network,
                 true,
                 STATE_COLUMN_FAMILIES_IN_CODE
@@ -106,7 +106,7 @@ fn cross_build_database_upgrade() {
         let mut state =
             FinalizedState::new_with_database_writer_metadata(&config, &network, writer.clone())
                 .unwrap();
-        assert_eq!(state_database_format_version_in_code().major, 29);
+        assert_eq!(state_database_format_version_in_code().major, 30);
         assert!(
             !ordinary_path.exists(),
             "upgrade reuses the ordinary database"
@@ -138,11 +138,11 @@ fn cross_build_database_upgrade() {
         for (path, bytes) in backup_before {
             assert_eq!(std::fs::read(path).unwrap(), bytes);
         }
-        assert_eq!(stored_balance_width(&state), 48);
+        assert_eq!(stored_balance_width(&state), 56);
         state
             .commit_finalized_direct(block(10).into(), None, None, "post-upgrade write")
             .unwrap();
-        assert_eq!(stored_balance_width(&state), 56);
+        assert_eq!(stored_balance_width(&state), 64);
         state.db.shutdown(true);
         drop(state);
         let mut reopened =

@@ -501,7 +501,11 @@ fn rollback_keeps_blocks_for_restore() -> Result<()> {
 
 /// A V1 coinbase transaction at `height` paying `value` to `address`. The miner data pads the
 /// coinbase script past `MIN_COINBASE_SCRIPT_LEN` so it round-trips through the database.
-fn coinbase_tx(height: Height, value: Amount<NonNegative>, address: &Address) -> Arc<Transaction> {
+pub(super) fn coinbase_tx(
+    height: Height,
+    value: Amount<NonNegative>,
+    address: &Address,
+) -> Arc<Transaction> {
     Arc::new(Transaction::V1 {
         inputs: vec![Input::Coinbase {
             height,
@@ -529,7 +533,7 @@ fn spend_tx(outpoint: OutPoint, value: Amount<NonNegative>, address: &Address) -
 /// Builds a child of `parent` containing `transactions` (whose coinbase encodes the new height).
 /// The checkpoint commit doesn't validate the pre-Sapling commitment or merkle root, so the
 /// parent's header is reused with only the parent hash updated.
-fn child_block(parent: &Block, transactions: Vec<Arc<Transaction>>) -> Arc<Block> {
+pub(super) fn child_block(parent: &Block, transactions: Vec<Arc<Transaction>>) -> Arc<Block> {
     let header = block::Header {
         previous_block_hash: parent.hash(),
         ..*parent.header
@@ -626,7 +630,7 @@ fn ironwood_v6_tx(expiry_height: Height) -> (Arc<Transaction>, ironwood::Nullifi
     )
 }
 
-fn child_block_with_history_commitment(
+pub(super) fn child_block_with_history_commitment(
     parent: &Block,
     transactions: Vec<Arc<Transaction>>,
     network: &Network,
@@ -726,6 +730,95 @@ fn rollback_reverses_intra_block_self_spend() {
             .map(|(balance, _)| balance),
         Some(value),
         "address balance is restored to its height-1 value",
+    );
+}
+
+/// Rolling back blocks at and after the ZIP 234 start height recomputes their subsidies from
+/// each parent's chain value pools.
+#[test]
+fn rollback_crosses_the_nsm_reissuance_height() {
+    use zakura_chain::parameters::{subsidy::is_zip234_active, testnet::RegtestParameters};
+
+    let _init_guard = zakura_test::init();
+
+    let start = Height(3);
+    let network = Network::new_regtest(RegtestParameters {
+        // Regtest activates Heartwood at height 1, where the block commitment is reserved.
+        // NU7 activates after it.
+        activation_heights: ConfiguredActivationHeights {
+            nu7: Some(2),
+            ..Default::default()
+        },
+        test_nsm_reissuance_height: Some(start),
+        ..Default::default()
+    });
+    let address = Address::from_script_hash(NetworkKind::Regtest, [0x42; 20]);
+    let dust = Amount::<NonNegative>::try_from(1).expect("1 fits in Amount<NonNegative>");
+
+    let target = start.previous().expect("the start is above genesis");
+    assert!(!is_zip234_active(&network, target));
+    assert!(is_zip234_active(&network, start));
+
+    let synced_dir = TempDir::new().expect("temp dir");
+    let fresh_dir = TempDir::new().expect("temp dir");
+    let synced_config = config_at(synced_dir.path());
+    let fresh_config = config_at(fresh_dir.path());
+    let target_index = usize::try_from(target.0).expect("test height fits in usize");
+
+    // Each block commits to the history tree after its parent, so build the chain while
+    // syncing it.
+    let mut chain = vec![SemanticallyVerifiedBlock::from(
+        zakura_chain::block::genesis::regtest_genesis_block(),
+    )];
+    sync_to(&synced_config, &network, &chain);
+    for height in 1..=5 {
+        let parent = chain
+            .last()
+            .expect("the chain has a genesis block")
+            .block
+            .clone();
+        let transactions = vec![coinbase_tx(Height(height), dust, &address)];
+        let block = if height == 1 {
+            // The Heartwood activation block has the reserved all-zero commitment.
+            child_block(&parent, transactions)
+        } else {
+            let history_tree = open_unchecked_db(&synced_config, &network).history_tree();
+            child_block_with_history_commitment(&parent, transactions, &network, &history_tree)
+        };
+        let block = SemanticallyVerifiedBlock::from(block);
+
+        let mut state = reopen(&synced_config, &network);
+        state
+            .commit_finalized_direct(
+                CheckpointVerifiedBlock::from(block.block.clone()).into(),
+                None,
+                None,
+                "rollback test",
+            )
+            .expect("committing a generated block succeeds");
+        chain.push(block);
+    }
+    sync_to(&fresh_config, &network, &chain[..=target_index]);
+
+    rollback_finalized_state(
+        synced_config.clone(),
+        &network,
+        RollbackFinalizedStateOptions {
+            target_height: target,
+            keep_rolled_back_blocks: true,
+            max_checkpoint_height: Some(Height(0)),
+        },
+    )
+    .expect("rollback across the ZIP 234 start height succeeds");
+
+    let rolled = reopen(&synced_config, &network);
+    let fresh = reopen(&fresh_config, &network);
+    assert_equivalent(
+        &rolled,
+        &fresh,
+        &network,
+        &chain[..=target_index],
+        &chain[target_index + 1..],
     );
 }
 
@@ -874,6 +967,13 @@ fn modern_rollback_network() -> Network {
             nu_tachyon: None,
         })
         .expect("configured activation heights are valid")
+        // These chains are generated for their commitments, not their coinbases, so blocks
+        // from NU7 claim arbitrary amounts. Seed the NSM value balance so an over-claim
+        // cannot drive it below zero, which `nsm_value_balance_is_non_negative` rejects
+        // from NU7. Half of MAX_MONEY leaves room on both sides of the balance.
+        .with_initial_nsm_value_balance(
+            Amount::try_from(zakura_chain::amount::MAX_MONEY / 2).expect("a valid amount"),
+        )
         .extend_funding_streams()
         .to_network()
         .expect("configured network is valid")
@@ -1302,4 +1402,114 @@ fn rollback_prunes_ironwood_nullifiers_above_target() {
         !open_unchecked_db(&config, &network).contains_ironwood_nullifier(&ironwood_nullifier),
         "rollback prunes Ironwood nullifiers above the target"
     );
+}
+
+#[test]
+fn legacy_block_info_replay_preserves_slow_start_deferred_funding_and_nsm_seed() {
+    use crate::service::finalized_state::disk_format::upgrade::{
+        block_info_and_address_received::Upgrade, DiskFormatUpgrade,
+    };
+    use zakura_chain::{
+        amount::DeferredPoolBalanceChange,
+        parameters::{
+            subsidy::{funding_stream_values, FundingStreamReceiver},
+            testnet::{ConfiguredFundingStreamRecipient, ConfiguredFundingStreams},
+        },
+    };
+    let _guard = zakura_test::init();
+    let network = TestnetParameters::build()
+        .with_activation_heights(ConfiguredActivationHeights {
+            blossom: Some(1),
+            canopy: Some(2),
+            nu7: Some(4),
+            ..Default::default()
+        })
+        .unwrap()
+        .with_funding_streams(vec![ConfiguredFundingStreams {
+            height_range: Some(Height(2)..Height(100)),
+            recipients: Some(vec![ConfiguredFundingStreamRecipient {
+                receiver: FundingStreamReceiver::Deferred,
+                numerator: 12,
+                addresses: None,
+            }]),
+        }])
+        .to_network()
+        .unwrap();
+    let mut state = FinalizedState::new(&Config::ephemeral(), &network).unwrap();
+    let mut parent: Arc<Block> = zakura_test::vectors::BLOCK_TESTNET_GENESIS_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    state
+        .commit_finalized_direct(
+            CheckpointVerifiedBlock::from(parent.clone()).into(),
+            None,
+            None,
+            "replay fixture",
+        )
+        .unwrap();
+    let address = Address::from_script_hash(NetworkKind::Testnet, [0x42; 20]);
+    let mut snapshots = Vec::new();
+    for h in 1..=3 {
+        let height = Height(h);
+        assert!(height < network.slow_start_shift());
+        let scheduled = Amount::<NonNegative>::try_from(
+            1_250_000_000u64 / u64::from(network.slow_start_interval()) * u64::from(h),
+        )
+        .unwrap();
+        let deferred = funding_stream_values(height, &network, scheduled)
+            .unwrap()
+            .remove(&FundingStreamReceiver::Deferred)
+            .unwrap_or_default();
+        let transactions = vec![coinbase_tx(height, Amount::try_from(1).unwrap(), &address)];
+        let mut block = if h <= 2 {
+            child_block(&parent, transactions)
+        } else {
+            child_block_with_history_commitment(
+                &parent,
+                transactions,
+                &network,
+                &state.db.history_tree(),
+            )
+        };
+        if h == 2 {
+            Arc::make_mut(&mut Arc::make_mut(&mut block).header).commitment_bytes = [0; 32].into();
+        }
+        state
+            .commit_finalized_direct(
+                CheckpointVerifiedBlock::new(
+                    block.clone(),
+                    None,
+                    Some(DeferredPoolBalanceChange::new(
+                        deferred.constrain().unwrap(),
+                    )),
+                )
+                .into(),
+                None,
+                None,
+                "replay fixture",
+            )
+            .unwrap();
+        snapshots.push(*state.db.block_info(height.into()).unwrap().value_pools());
+        parent = block;
+    }
+    assert!(snapshots[1].deferred_amount() > Amount::<NonNegative>::zero());
+    assert!(i64::from(snapshots[2].nsm_value_balance_amount()) > 0);
+    let mut batch = DiskWriteBatch::new();
+    for h in [2, 3] {
+        let _ = state
+            .db
+            .block_info_cf()
+            .with_batch_for_writing(&mut batch)
+            .zs_delete(&Height(h));
+    }
+    state.db.write_batch(batch).unwrap();
+    let (_tx, rx) = crossbeam_channel::bounded(1);
+    Upgrade.run(Some(Height(3)), &state.db, &rx).unwrap();
+    for (index, expected) in snapshots.into_iter().enumerate() {
+        let height = Height(u32::try_from(index + 1).unwrap());
+        assert_eq!(
+            *state.db.block_info(height.into()).unwrap().value_pools(),
+            expected
+        );
+    }
 }

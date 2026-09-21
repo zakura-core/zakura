@@ -116,8 +116,15 @@ pub enum Response {
     /// Response to [`Request::UnspentBestChainUtxo`] with the UTXO
     UnspentBestChainUtxo(Option<transparent::Utxo>),
 
+    /// Response to [`Request::CheckParentInputs`].
+    ParentInputs(ParentInputs),
+
     /// Response to [`Request::Block`] with the specified block.
     Block(Option<Arc<Block>>),
+
+    /// Response to [`Request::AwaitBlockInfo`] and [`Request::BlockInfo`] with the
+    /// specified block's chain value pools.
+    BlockInfo(Option<BlockInfo>),
 
     /// The response to a `BlockHeader` request.
     BlockHeader {
@@ -161,6 +168,18 @@ pub enum Response {
 
     /// Response to [`Request::CheckBlockProposalValidity`]
     ValidBlockProposal,
+}
+
+/// The result of checking a candidate block's external inputs against its parent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParentInputs {
+    /// The parent is committed, and this input is not unspent in the parent's chain.
+    Missing(transparent::OutPoint),
+    /// The parent is neither in a non-finalized chain nor the finalized tip,
+    /// so no chain can accept the candidate now.
+    ParentUnavailable,
+    /// Every input is unspent at the parent, or the parent context changed during the read.
+    Inconclusive,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -565,6 +584,9 @@ pub enum ReadResponse {
     /// _best_ non-finalized chain, or the finalized chain.
     UnspentBestChainUtxo(Option<transparent::Utxo>),
 
+    /// Response to [`ReadRequest::CheckParentInputs`].
+    ParentInputs(ParentInputs),
+
     /// The response to an `AnyChainUtxo` request, from verified blocks in
     /// _any_ non-finalized chain, or the finalized chain.
     ///
@@ -689,6 +711,12 @@ pub struct GetBlockTemplateChainInfo {
     /// The maximum time the miner can use in this block.
     /// Depends on the `tip_hash`, and the local clock on testnet.
     pub max_time: DateTime32,
+
+    /// The chain value pools as of the end of the chain tip block.
+    ///
+    /// The candidate block's ZIP 234 subsidy is derived from the money reserve after its
+    /// parent, which is this tip. Depends on the `tip_hash`.
+    pub value_pools: ValueBalance<NonNegative>,
 }
 
 /// Conversion from read-only [`ReadResponse`]s to read-write [`Response`]s.
@@ -729,6 +757,7 @@ impl TryFrom<ReadResponse> for Response {
                 Err("there is no corresponding Response for this ReadResponse")
             }
             ReadResponse::UnspentBestChainUtxo(utxo) => Ok(Response::UnspentBestChainUtxo(utxo)),
+            ReadResponse::ParentInputs(inputs) => Ok(Response::ParentInputs(inputs)),
 
 
             ReadResponse::AnyChainUtxo(_) => Err("ReadService does not track pending UTXOs. \
@@ -743,11 +772,12 @@ impl TryFrom<ReadResponse> for Response {
                 Ok(Response::PreparedMinedRelayEligibility(eligibility))
             }
 
+            ReadResponse::BlockInfo(block_info) => Ok(Response::BlockInfo(block_info)),
+
             ReadResponse::UsageInfo(_)
             | ReadResponse::PruningInfo { .. }
             | ReadResponse::BlockRoots(_)
             | ReadResponse::TipPoolValues { .. }
-            | ReadResponse::BlockInfo(_)
             | ReadResponse::TransactionIdsForBlock(_)
             | ReadResponse::AnyChainTransactionIdsForBlock(_)
             | ReadResponse::SaplingTree(_)

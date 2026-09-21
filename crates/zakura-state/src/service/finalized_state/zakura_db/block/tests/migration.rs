@@ -4,13 +4,13 @@ use std::sync::Arc;
 
 use zakura_chain::{
     block::{self, Height},
-    parameters::Network,
+    parameters::{Network, NetworkKind},
     work::difficulty::U256,
 };
 use zakura_header_chain::{
     prepare_headers, CheckpointSet, EngineConfig, EngineMode, Frontier, HeaderBatchInput,
-    HeaderRules, RowLimit, StoreAuditRead, StoreAuditSnapshot, SystemClock, TrustedAnchor,
-    MAX_NON_FINALIZED_NODES_V1,
+    HeaderChainDiskVersion, HeaderRules, RowLimit, StoreAuditRead, StoreAuditSnapshot, SystemClock,
+    TrustedAnchor, MAX_NON_FINALIZED_NODES_V1,
 };
 
 use super::{
@@ -23,14 +23,66 @@ use super::{
 use crate::{
     service::finalized_state::{
         disk_db::{DiskWriteBatch, WriteDisk},
-        disk_format::RawBytes,
+        disk_format::{
+            header_chain_values::{decode_v4_engine_metadata, HeaderChainValueError},
+            RawBytes,
+        },
         header_chain::{
             migration::{initialize_header_chain_reconciled, HeaderChainInitializationError},
-            HeaderChainStore,
+            HeaderChainStore, HeaderChainStoreError,
         },
+        FallibleDiskValue, ZakuraDb,
     },
     Config,
 };
+
+use crate::service::finalized_state::{HEADER_ENGINE_META, HEADER_VALIDATION_CONTEXT};
+
+/// Writes a synthetic finalized header chain from `genesis` to `chain_tip`, and
+/// returns its headers indexed by height.
+fn write_synthetic_finalized_headers(
+    state: &ZakuraDb,
+    genesis: &Arc<block::Block>,
+    chain_tip: u32,
+) -> Vec<Arc<block::Header>> {
+    let header_cf = state
+        .db
+        .cf_handle("block_header_by_height")
+        .expect("the full-state header column exists");
+    let hash_cf = state
+        .db
+        .cf_handle("hash_by_height")
+        .expect("the full-state hash column exists");
+    let height_cf = state
+        .db
+        .cf_handle("height_by_hash")
+        .expect("the full-state reverse hash column exists");
+    let mut headers = vec![genesis.header.clone()];
+    let mut full_state = DiskWriteBatch::new();
+    for height in 1..=chain_tip {
+        let previous = headers
+            .last()
+            .expect("the synthetic chain starts at genesis");
+        let mut header = **previous;
+        header.previous_block_hash = previous.hash();
+        header.time += chrono::Duration::seconds(1);
+        header.nonce.0[0] =
+            u8::try_from(height).expect("the synthetic chain is shorter than 256 blocks");
+        let header = Arc::new(header);
+        let hash = header.hash();
+        let height = Height(height);
+        full_state.zs_insert(&header_cf, height, &header);
+        full_state.zs_insert(&hash_cf, height, hash);
+        full_state.zs_insert(&height_cf, hash, height);
+        headers.push(header);
+    }
+    state
+        .db
+        .write(full_state)
+        .expect("the synthetic finalized header chain writes");
+
+    headers
+}
 
 fn engine_config(network: Network, genesis: &Arc<block::Block>) -> EngineConfig {
     let frontier = Frontier::new(Height(0), genesis.hash());
@@ -204,6 +256,152 @@ fn predecessor_overlay_is_atomically_replaced_from_finalized_state() {
             .len(),
         2
     );
+}
+
+#[test]
+fn existing_narrow_validation_context_is_backfilled_before_startup() {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let genesis = mainnet_block(0);
+    let state = state_with_genesis_config(&network, genesis.clone(), Config::ephemeral());
+    let predecessor_span = zakura_header_chain::MAX_POW_PREDECESSOR_CONTEXT_SPAN;
+    let chain_tip = u32::try_from(predecessor_span + 1)
+        .expect("the validation context span fits in a block height");
+    write_synthetic_finalized_headers(&state, &genesis, chain_tip);
+
+    let config = engine_config(network, &genesis);
+    let (runtime, report) = initialize_header_chain_reconciled(&state, &config, Vec::new())
+        .expect("the complete validation context initializes");
+    assert_eq!(report.validation_context_rows, predecessor_span);
+    drop(runtime);
+
+    let store = HeaderChainStore::new(state.header_chain_disk_db());
+    let mut contexts = Vec::new();
+    store
+        .audit_snapshot()
+        .expect("the initialized store has an audit snapshot")
+        .visit_validation_context_records(RowLimit::new(predecessor_span), &mut |record| {
+            contexts.push(record);
+            Ok(())
+        })
+        .expect("the validation context rows decode");
+    contexts.sort_unstable_by_key(|record| record.height);
+
+    // A build without ZIP 218 retained 17 averaging-window headers plus 10
+    // additional median-time headers below the finalized anchor.
+    let old_predecessor_span = 27;
+    let mut downgrade = DiskWriteBatch::new();
+    let context_cf = state
+        .db
+        .cf_handle(HEADER_VALIDATION_CONTEXT)
+        .expect("the validation context column exists");
+    for context in contexts
+        .iter()
+        .take(predecessor_span - old_predecessor_span)
+    {
+        downgrade.zs_delete(&context_cf, context.header.hash());
+    }
+    // That build also recorded header-chain disk format 4.
+    let metadata_cf = state
+        .db
+        .cf_handle(HEADER_ENGINE_META)
+        .expect("the header-chain metadata column exists");
+    let mut metadata = state
+        .db
+        .raw_get_cf(&metadata_cf, b"")
+        .expect("the metadata row reads")
+        .expect("the initialized store has metadata");
+    metadata[..4].copy_from_slice(&4_u32.to_be_bytes());
+    downgrade.zs_insert(
+        &metadata_cf,
+        RawBytes::new_raw_bytes(Vec::new()),
+        RawBytes::new_raw_bytes(metadata.clone()),
+    );
+    state
+        .db
+        .write(downgrade)
+        .expect("the pre-ZIP 218 context fixture writes");
+
+    // A different network kind must still be rejected without changing its bytes,
+    // even though Mainnet permits a network policy change.
+    let mut incompatible =
+        decode_v4_engine_metadata(&metadata).expect("the version-four metadata fixture decodes");
+    incompatible.network_id = NetworkKind::Testnet;
+    let incompatible = incompatible
+        .encode()
+        .expect("the incompatible metadata fixture encodes");
+    let mut corrupt = DiskWriteBatch::new();
+    corrupt.zs_insert(
+        &metadata_cf,
+        RawBytes::new_raw_bytes(Vec::new()),
+        RawBytes::new_raw_bytes(incompatible.clone()),
+    );
+    state
+        .db
+        .write(corrupt)
+        .expect("the incompatible metadata fixture writes");
+    assert!(matches!(
+        store.migrate_to_current(&config),
+        Err(HeaderChainStoreError::Incoherent(
+            "legacy network kind does not match the configured network"
+        ))
+    ));
+    assert_eq!(
+        state
+            .db
+            .raw_get_cf(&metadata_cf, b"")
+            .expect("the rejected metadata row reads")
+            .expect("the rejected metadata row remains present"),
+        incompatible,
+    );
+    let mut restore = DiskWriteBatch::new();
+    restore.zs_insert(
+        &metadata_cf,
+        RawBytes::new_raw_bytes(Vec::new()),
+        RawBytes::new_raw_bytes(metadata),
+    );
+    state
+        .db
+        .write(restore)
+        .expect("the valid version-four metadata fixture is restored");
+
+    assert!(store
+        .migrate_to_current(&config)
+        .expect("version four migrates to the current format"));
+    let metadata = state
+        .db
+        .raw_get_cf(&metadata_cf, b"")
+        .expect("the metadata row reads")
+        .expect("the migrated store has metadata");
+    assert_eq!(
+        metadata[..4],
+        HeaderChainDiskVersion::CURRENT.0.to_be_bytes()
+    );
+    // The previous release accepts only format 4, so it reports the newer format
+    // instead of reading a validation context wider than its row limit.
+    assert_eq!(
+        decode_v4_engine_metadata(&metadata),
+        Err(HeaderChainValueError::UnsupportedDiskFormat(
+            HeaderChainDiskVersion::CURRENT.0
+        ))
+    );
+
+    // Model a restart after the version marker commits but before the context
+    // resize. A fresh store must complete the idempotent backfill.
+    let store = HeaderChainStore::new(state.header_chain_disk_db());
+    assert_eq!(
+        store
+            .resize_validation_context(&state)
+            .expect("authenticated full state backfills the wider context"),
+        predecessor_span - old_predecessor_span,
+    );
+    let (_, startup) = store
+        .startup(&config)
+        .expect("startup accepts the backfilled validation context");
+    assert!(startup.publication_allowed);
+    let store = HeaderChainStore::new(state.header_chain_disk_db());
+    assert_eq!(store.resize_validation_context(&state).unwrap(), 0);
+    assert!(store.startup(&config).unwrap().1.publication_allowed);
 }
 
 #[test]

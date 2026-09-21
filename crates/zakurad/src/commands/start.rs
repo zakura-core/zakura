@@ -709,6 +709,7 @@ impl StartCmd {
             mempool: mempool.clone(),
             state: state.clone(),
             latest_chain_tip: latest_chain_tip.clone(),
+            network: config.network.network.clone(),
             misbehavior_sender,
         };
         setup_tx

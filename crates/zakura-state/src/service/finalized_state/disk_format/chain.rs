@@ -59,9 +59,9 @@ pub enum HistoryTreeDecodeError {
 
 impl IntoDisk for ValueBalance<NonNegative> {
     #[cfg(not(zcash_unstable = "nutachyon"))]
-    type Bytes = [u8; 48];
-    #[cfg(zcash_unstable = "nutachyon")]
     type Bytes = [u8; 56];
+    #[cfg(zcash_unstable = "nutachyon")]
+    type Bytes = [u8; 64];
 
     fn as_bytes(&self) -> Self::Bytes {
         self.to_bytes()
@@ -263,14 +263,17 @@ impl IntoDisk for BlockInfo {
 
 impl FromDisk for BlockInfo {
     fn from_bytes(bytes: impl AsRef<[u8]>) -> Self {
-        // We have different DB formats for NU6.1, Ironwood, and NuTachyon onward.
+        // We have different DB formats for NU6.1 (Lockbox), Ironwood, the ZIP 234 NSM value
+        // balance, and NuTachyon.
         const NU6_1_VALUE_BALANCE_LEN: usize = 40;
         const IRONWOOD_VALUE_BALANCE_LEN: usize = 48;
+        const NU7_VALUE_BALANCE_LEN: usize = 56;
         #[cfg(zcash_unstable = "nutachyon")]
-        const TACHYON_VALUE_BALANCE_LEN: usize = 56;
+        const TACHYON_VALUE_BALANCE_LEN: usize = 64;
         const BLOCK_SIZE_LEN: usize = 4;
         const NU6_1_BLOCK_INFO_LEN: usize = NU6_1_VALUE_BALANCE_LEN + BLOCK_SIZE_LEN;
         const IRONWOOD_BLOCK_INFO_LEN: usize = IRONWOOD_VALUE_BALANCE_LEN + BLOCK_SIZE_LEN;
+        const NU7_BLOCK_INFO_LEN: usize = NU7_VALUE_BALANCE_LEN + BLOCK_SIZE_LEN;
         #[cfg(zcash_unstable = "nutachyon")]
         const TACHYON_BLOCK_INFO_LEN: usize = TACHYON_VALUE_BALANCE_LEN + BLOCK_SIZE_LEN;
 
@@ -283,9 +286,20 @@ impl FromDisk for BlockInfo {
             TACHYON_BLOCK_INFO_LEN.. => {
                 let value_pools =
                     ValueBalance::<NonNegative>::from_bytes(&bytes[..TACHYON_VALUE_BALANCE_LEN])
-                        .expect("must work for 56 bytes");
+                        .expect("must work for 64 bytes");
                 let size = u32::from_le_bytes(
                     bytes[TACHYON_VALUE_BALANCE_LEN..TACHYON_VALUE_BALANCE_LEN + BLOCK_SIZE_LEN]
+                        .try_into()
+                        .expect("must be 4 bytes"),
+                );
+                BlockInfo::new(value_pools, size)
+            }
+            NU7_BLOCK_INFO_LEN.. => {
+                let value_pools =
+                    ValueBalance::<NonNegative>::from_bytes(&bytes[..NU7_VALUE_BALANCE_LEN])
+                        .expect("must work for 56 bytes");
+                let size = u32::from_le_bytes(
+                    bytes[NU7_VALUE_BALANCE_LEN..NU7_VALUE_BALANCE_LEN + BLOCK_SIZE_LEN]
                         .try_into()
                         .expect("must be 4 bytes"),
                 );

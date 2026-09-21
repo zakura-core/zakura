@@ -3295,3 +3295,31 @@ fn coinbase_v5_with_sapling_spends_deserializes_successfully() {
         "unexpected error: {err}"
     );
 }
+
+/// Orchard and Ironwood actions are counted per pool, and the shielded cost
+/// counts each action in either pool once.
+#[test]
+fn shielded_action_counts_separate_orchard_and_ironwood_actions() {
+    let _init_guard = zakura_test::init();
+
+    for (orchard_actions, ironwood_actions) in [(0, 3), (2, 0), (2, 3)] {
+        let counts = arbitrary::fake_v6_with_orchard_and_ironwood_actions(
+            NetworkUpgrade::Nu6_3,
+            orchard_actions,
+            ironwood_actions,
+        )
+        .shielded_action_counts();
+        let count = |n: usize| u32::try_from(n).expect("a small action count fits in u32");
+
+        assert_eq!(
+            counts,
+            ShieldedActionCounts {
+                orchard_actions: count(orchard_actions),
+                ironwood_actions: count(ironwood_actions),
+                sapling_ios: 0,
+                sprout_joinsplits: 0,
+            }
+        );
+        assert_eq!(counts.cost(), count(orchard_actions + ironwood_actions));
+    }
+}

@@ -1364,6 +1364,8 @@ where
             let block =
                 proposal_block_from_template(&template, None, &self.network).map_misc_error()?;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            // Reserve the final second for a state-tip read even if validation times out.
+            let validation_deadline = deadline - Duration::from_secs(1);
             let context_changed = self.wait_for_recovery_context_change(
                 chain_info.tip_hash,
                 state.revision,
@@ -1375,7 +1377,7 @@ where
                 biased;
                 _ = &mut context_changed => return Ok(None),
                 result = tokio::time::timeout_at(
-                    deadline,
+                    validation_deadline,
                     self.gbt.block_verifier_router().oneshot(zakura_consensus::Request::Prepare {
                         block: Arc::new(block),
                         work_id: Some(template.work_id().clone()),

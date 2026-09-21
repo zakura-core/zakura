@@ -47,7 +47,8 @@ The cases above describe possible triggers, not observed production incidents.
    transient error.
    Fallback recovery also rebuilds when validation finishes in a superseded context.
    Failed validation checks the committed state tip to cover delayed tip notifications.
-   Validation and that read share one 30-second deadline. Successful recovery checks
+   Validation and that read share one 30-second deadline, with validation limited to
+   29 seconds to leave the final second for the read. Successful recovery checks
    freshness and records prepared work under the same write lock.
    Recheck freshness after the state-tip read before returning its result or either
    error, including a timeout, so a superseded response triggers a rebuild.
@@ -73,7 +74,8 @@ The cases above describe possible triggers, not observed production incidents.
    External miners must cooperate; RPC cannot force them to stop.
 5. Enter empty-template recovery for the affected parent.
    Validate the empty template before returning it.
-   Return an error if validation fails or exceeds 30 seconds in the current context.
+   Return an error if validation fails or exceeds 29 seconds in the current context,
+   after checking the committed tip within the overall 30-second deadline.
    Recheck the recovery context before publication.
    Do not issue further speculative transaction sets until the parent changes.
    This conservative recovery avoids an unbounded candidate fingerprint blacklist.
@@ -92,6 +94,8 @@ The cases above describe possible triggers, not observed production incidents.
 - Hold fallback validation and state-tip responses pending across parent and rejection
   changes. Require a rebuild before those obsolete responses finish, and preserve
   errors when the context stays current.
+- Let validation time out with delayed tip notifications. Require time for an
+  asynchronous state-tip read to distinguish a new parent from a current failure.
 - Check work-ID isolation, duplicate rejection, old-parent rejection, parent recovery,
   retained notifications, and bounded-storage overflow.
 - Round-trip legacy and revised long-poll IDs. Check that a withdrawal disallows old
@@ -113,8 +117,9 @@ The implementation passed these checks with Rust 1.97.0:
   with the internal miner enabled and warnings denied.
 - Formatting, diff whitespace, and changelog checks passed.
 
-Fallback recovery also passed 11 focused RPC regressions with Rust 1.97.1, covering
-stale results, pending validation and tip reads, and the shared recovery deadline.
+Fallback recovery also passed 13 focused RPC regressions with Rust 1.97.1, covering
+stale results, pending validation and tip reads, and the shared recovery deadline
+with time reserved for reading the tip after validation times out.
 
 ## Limits and follow-up measurements
 

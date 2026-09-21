@@ -30,6 +30,9 @@ enum Interleaving {
     FallbackDeadline {
         validation_fails_after: Option<Duration>,
     },
+    ValidationTimeout {
+        tip_changed: bool,
+    },
     TipRead {
         result: TipResult,
         superseded: bool,
@@ -145,6 +148,16 @@ async fn mining_template_fallback_error_leaves_only_remaining_time_for_tip_check
     .await;
 }
 
+#[tokio::test]
+async fn mining_recovery_validation_timeout_checks_tip_before_notice() {
+    check_interleaving(Interleaving::ValidationTimeout { tip_changed: true }).await;
+}
+
+#[tokio::test]
+async fn mining_recovery_validation_timeout_preserves_current_context_error() {
+    check_interleaving(Interleaving::ValidationTimeout { tip_changed: false }).await;
+}
+
 async fn check_interleaving(interleaving: Interleaving) {
     let _init_guard = zakura_test::init();
     let network = Network::Mainnet;
@@ -238,6 +251,7 @@ async fn check_interleaving(interleaving: Interleaving) {
         interleaving,
         Interleaving::StaleFallback { .. }
             | Interleaving::FallbackDeadline { .. }
+            | Interleaving::ValidationTimeout { .. }
             | Interleaving::TipRead { .. }
             | Interleaving::PendingValidation { .. }
     ) {
@@ -270,6 +284,50 @@ async fn check_interleaving(interleaving: Interleaving) {
                 matches!(request, zakura_consensus::Request::Prepare { .. })
             })
             .await;
+        if let Interleaving::ValidationTimeout { tip_changed } = interleaving {
+            // Keep validation pending and both watches on A while the state read runs.
+            tokio::time::pause();
+            let started = tokio::time::Instant::now();
+            tokio::time::advance(Duration::from_secs(29)).await;
+            let tip_read = read_state.expect_request(ReadRequest::Tip).await;
+            tokio::time::advance(Duration::from_millis(100)).await;
+            assert!(
+                !pending.is_finished(),
+                "validation must leave time for an asynchronous state-tip response"
+            );
+            assert!(started.elapsed() < Duration::from_secs(30));
+            let parent = if tip_changed { parent_b } else { parent_a };
+            tip_read.respond(ReadResponse::Tip(Some((height, parent))));
+            tokio::time::resume();
+            if tip_changed {
+                let fresh_read = read_state.expect_request(ReadRequest::ChainInfo).await;
+                // Only publish B after its committed state has triggered the retry.
+                tip_sender.set_best_non_finalized_tip(make_tip(parent_b));
+                fresh_read.respond(ReadResponse::ChainInfo(make_info(parent_b)));
+                mempool
+                    .expect_request(mempool::Request::FullTransactions)
+                    .await
+                    .respond(make_mempool(parent_b));
+                let replacement = tokio::time::timeout(Duration::from_secs(2), pending)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .try_into_template()
+                    .unwrap();
+                assert_eq!(replacement.previous_block_hash, parent_b);
+            } else {
+                let error = tokio::time::timeout(Duration::from_secs(2), pending)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_err();
+                assert!(error.message().contains("deadline has elapsed"));
+            }
+            drop(fallback);
+            queue.abort();
+            return;
+        }
         if let Interleaving::PendingValidation { same_parent } = interleaving {
             let parent = if same_parent {
                 rpc.gbt.template_rejections.send_modify(|state| {
@@ -473,6 +531,7 @@ async fn check_interleaving(interleaving: Interleaving) {
     match interleaving {
         Interleaving::StaleFallback { .. }
         | Interleaving::FallbackDeadline { .. }
+        | Interleaving::ValidationTimeout { .. }
         | Interleaving::TipRead { .. }
         | Interleaving::PendingValidation { .. } => {
             unreachable!("handled before the long-poll case")

@@ -1,25 +1,48 @@
 # NU7 / NSM release confidence
 
-The release gate must run against a separately built production artifact. Rust
-unit tests enable a test-only NU7 branch ID and can pass even when the deployed
-binary cannot validate NU7 transactions. Never use a test-built node as evidence
-that production NU7 support works.
+The release gate must run against a separately built production artifact. The
+pre-#1093 dependency stack exposed a test-only NU7 branch ID, allowing unit
+tests to pass while the deployed binary could not validate NU7 transactions.
+Never use a test-built node as evidence that production NU7 support works.
 
 ## Coverage
 
-| Layer | Added checks |
-| --- | --- |
-| Chain accounting | Generated six-pool distributions, stale NSM counters, idempotent activation seeding, wrong-height no-op, oversupply rejection |
-| Contextual state | Mature transparent spends with independently calculated fee recycling, reward rounding and balances; activation and delayed reissuance; derived and overridden seeds; fixed edge cases and generated histories |
-| State persistence | Finalization, reopen, finalized rollback and checkpoint replay agree with the independently calculated history |
-| Forks | Different fee histories produce different bonuses; invalidation, reconsideration and winning-branch finalization agree with fresh replay |
-| Rejection atomicity | Duplicate/value-creating spends and aggregate-cap violations preserve the entire populated fork; rejected checkpoint commits survive reopen without persisting UTXO, nullifier or tree changes; valid siblings still commit |
-| PoW | Header and block checks accept the independently fixed correct threshold and reject the wrong averaging window before, at and after activation |
-| Production compatibility | Non-test `xtask nu7-readiness` checks real branch/dependency compatibility, V5/V6 serialization and digest round trips, wrong signature context and unknown branch decoding |
-| Production transparent transactions | Signed mature P2PK spends, corrupt signatures, wrong branch IDs, exact reward and ±1 payout rejection, proposals and independent second-node submission |
-| Production shielded outputs | Real shielded coinbases, corrupt proof rejection with unchanged tip, valid sibling acceptance across activation and reissuance |
-| RPC/mempool/forks | Queued V4 transaction revalidation, restart, long-poll refresh, invalidate/reconsider, competing branches and P2P convergence |
-| Upgrade/recovery | Previous released binary creates a database containing finalized blocks; new binary reopens it and matches fresh replay, then crosses both boundaries and rehearses graceful and abrupt restart |
+- **Chain accounting**: Generated six-pool distributions, stale NSM counters,
+  idempotent activation seeding, wrong-height no-op, oversupply rejection
+- **Contextual state**: Mature transparent spends with independently calculated
+  fee recycling, reward rounding and balances; activation and delayed
+  reissuance; derived and overridden seeds; fixed edge cases and generated
+  histories
+- **State persistence**: Finalization, reopen, finalized rollback and checkpoint
+  replay agree with the independently calculated history
+- **Forks**: Different fee histories produce different bonuses; invalidation,
+  reconsideration and winning-branch finalization agree with fresh replay
+- **Rejection atomicity**: Duplicate/value-creating spends and aggregate-cap
+  violations preserve the entire populated fork; rejected checkpoint commits
+  survive reopen without persisting UTXO, nullifier or tree changes; valid
+  siblings still commit
+- **PoW**: Header and block checks accept the independently fixed correct
+  threshold and reject the wrong averaging window before, at and after
+  activation
+- **Production compatibility**: Non-test `xtask nu7-readiness` checks real
+  branch/dependency compatibility, V5/V6 serialization and digest round trips,
+  wrong signature context and unknown branch decoding
+- **Production transparent transactions**: Signed mature P2PK spends, corrupt
+  signatures, wrong branch IDs, exact reward and ±1 payout rejection, proposals
+  and independent second-node submission
+- **Production shielded outputs**: Real shielded coinbases, corrupt proof
+  rejection with unchanged tip, valid sibling acceptance across NU7 activation
+- **RPC/mempool/forks**: Queued V4 transaction revalidation, restart, long-poll
+  refresh, invalidate/reconsider, competing branches and P2P convergence
+- **Upgrade/recovery**: Previous released binary creates a database containing
+  finalized blocks; new binary reopens it and matches fresh replay, then crosses
+  NU7 and rehearses graceful and abrupt restart
+
+Production derives the reissuance height from the subsidy reference crossover.
+The short-chain `test_nsm_reissuance_height` override is compiled only into test
+builds; the live-node configurations deliberately do not include it. Reissuance
+boundary coverage is contextual. These short live chains cover NU7 and do not
+claim to reach the production reissuance crossover.
 
 The contextual shielded-state fixture deliberately bypasses cryptographic
 verification. Its synthetic Ironwood bundle proves state atomicity, not proof
@@ -72,58 +95,48 @@ checksum, runs the gate and uploads upgrade evidence. Scheduled/manual runs also
 extend the generated histories to 256 cases. The workflow does not configure
 GitHub branch protection; maintainers must select it as a required check if desired.
 
-## Evidence and remaining release blockers
+## Evidence on PR #1093
 
-Against main `171ef38475cfc042b1cf4af01c8dd4dd589e67d8`:
+The test branch is based on PR #1093 head
+`b497ca29b126c8445dcc444e3d663b861e413b25`, using Common revision
+`c4c255c4be5cacaad77b918a481cbf6d35b1f8fd` and branch ID `0x77190AD8`.
 
-- The focused chain/state/consensus/RPC suite passed all 100 selected tests.
-- All 256 extended generated histories passed. Changed Rust crates passed
-  all-target Clippy with warnings denied; workflow lint, formatting and Python
-  compilation also passed.
-- Three deliberate mutations were detected: counting the NSM counter as issued
-  supply, removing the aggregate cap, and changing the fee-recycling fraction.
-  The production files were restored after each experiment.
-- A normal production-feature debug node accepted signed transparent spends
-  through height 103, rejected a corrupt signature and revalidated the pending
-  mempool at the boundary. Preparing NU7 height 104 failed with
-  `invalid consensus branch id`.
-- A current-binary/current-binary harness smoke run created 1,103 blocks, reopened
-  the persistent state and matched fresh replay. Node-generated NU7 height 1,104
-  failed with `WrongTransactionConsensusBranchId`.
-- Real Sapling and Ironwood coinbase proofs were rejected after corruption and their valid
-  counterparts accepted at heights 1–3. At NU7 height 4 the valid proposal failed
-  with `WrongTransactionConsensusBranchId`.
-- The non-test prerequisite fails explicitly because NU7 has no production
-  consensus branch ID. The pinned protocol dependency must also recognize the
-  authoritative ID; inserting a test placeholder is not a fix.
+- The focused chain/state/consensus/RPC suite passed all 110 selected tests.
+- All 256 extended generated spending histories passed.
+- All-target Clippy with warnings denied, formatting, workflow lint, Markdown
+  lint, Python compilation and changelog validation passed.
+- The standalone production readiness command passes for V5 and V6.
+- All three production-artifact acceptance cases pass: transparent spends and
+  competing forks, Sapling coinbase proofs, and Ironwood coinbase proofs.
+- Transparent acceptance includes exact rewards, malformed signature/branch and
+  ±1 reward rejection, restart, long-poll refresh, mempool revalidation,
+  invalidate/reconsider and P2P convergence after a competing branch wins.
+- The current-version restart/replay rehearsal passes through height 1,110,
+  including graceful stop and abrupt process termination with missing-block replay.
+- The actual v1.4.0 source commit
+  `1e36d1bb6a8a9778a1bd316704b9c8cb75182de6` was built on macOS and used to
+  create the 1,103-block prefix. The new binary recovered the tip from that cache,
+  matched independent fresh replay, crossed NU7 and passed both restart cases.
+  The old/new state formats are 28.1.5 and 29.0.0; this checks startup recovery
+  across that change, not an assertion that RocksDB is migrated in place.
+- Three deliberate accounting mutations were detected before the rebase:
+  counting the NSM counter as issued supply, removing the aggregate cap and
+  changing the fee-recycling fraction. Production sources were restored afterward.
 
-These failures block the release. Post-NU7 production assertions are implemented
-but are not validated by passing contextual tests. The actual previous-release
-upgrade must run on Linux; the local macOS rehearsal used the current binary in
-both roles and is only evidence for the harness up to activation. A protocol
-maintainer must supply the authoritative branch/dependency integration, after
-which the complete production gates and valid shielded-spend histories must pass.
+The local binaries use production features with the debug profile. The workflow
+uses release-profile binaries and the published Linux v1.4.0 archive; that exact
+Linux artifact combination still needs CI execution. The local source build was
+pinned to the GitHub release commit because the checkout's local `v1.4.0` tag
+pointed to an unrelated historical upstream Zebra release.
+
+## Remaining release conditions
+
+PR #1093 resolves the old production branch-ID/dependency incompatibility. Its
+Common Git dependencies are intentionally unpublished, so the crates.io release
+still depends on merging and publishing that compatible Common stack.
+
+The full production reissuance crossover and valid shielded-spend histories
+remain outside these short-chain acceptance cases. Contextual reissuance tests
+and shielded coinbase proof tests must not be presented as that end-to-end evidence.
 Consensus changes also require an independent second reviewer under the shared
 reviewer rule.
-
-## Dependency integration identified during testing
-
-[Valargroup librustzcash PR #76](https://github.com/valargroup/librustzcash/pull/76),
-head `4c88a0bc791eeb7ffacd65ad01bbc33d0d0d3072`, exposes NU7 without an unstable
-build flag and maps it to `0x77190AD8`, matching the
-[NU7 deployment draft](https://github.com/zcash/zips/blob/e753a6a301912cf77202db8f0d840f4796f5cca1/zips/draft-arya-deploy-nu7.md).
-The readiness command now requires this specific ID.
-
-Testing that exact protocol revision as an isolated dependency override failed
-with four `E0004` errors in `zakura-primitives 1.3.0-alpha.1`: its exhaustive
-branch matches omit `BranchId::Nu7` without the unstable build flag. That trial
-restored the original lockfile; no temporary dependency override is part of this
-branch. The current lockfile resolves `zcash_protocol` to 0.10.5.
-
-The required follow-up is to port the relevant unconditional NU7 support into
-`zakura-core/common`'s `zakura-primitives`, test and publish a compatible dependency
-set, then update Zakura's branch-ID table and dependency versions together.
-[Common PR #471](https://github.com/zakura-core/common/pull/471) imports a standalone
-protocol fork but explicitly does not migrate the public-type dependency closure,
-so it does not complete this integration. Merely changing Zakura's branch ID or
-updating its protocol dependency alone does not unblock the release.

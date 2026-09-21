@@ -17,7 +17,7 @@ import urllib.request
 
 
 NU7 = 1104
-REISSUANCE = NU7 + 2
+RESTART_HEIGHT = NU7 + 2
 
 
 def port():
@@ -40,12 +40,13 @@ class Node:
 
     def write_config(self):
         upgrades = "NU5 = 2"
-        extra = ""
+        disbursement = ""
         if self.activate:
             upgrades += f", NU7 = {NU7}"
-            extra = f", nsm_reissuance_height = {REISSUANCE}"
+            disbursement = ', lockbox_disbursements = [{ address = "t2RnBRiqrN1nW4ecZs1Fj3WWjNdnSs4kiX8", amount = 0 }]'
+
         text = f'''[network]
-network = {{ params = {{ activation_heights = {{ {upgrades} }}{extra} }} }}
+network = {{ params = {{ activation_heights = {{ {upgrades} }}{disbursement} }} }}
 listen_addr = "127.0.0.1:{self.p2p_port}"
 p2p_stack = "legacy"
 initial_testnet_peers = []
@@ -157,12 +158,12 @@ def run(args):
             (artifacts / f"block-{height}.hex").write_text(block)
             assert fresh.call("submitblock", [block]) is None, f"replay rejected NU7 block {height}"
             compare(old, fresh, height)
-            # Restart on each side of reissuance. SIGINT exercises persisted state;
+            # Restart after activation. SIGINT exercises persisted state;
             # SIGKILL checks recovery with the latest non-finalized block replayed.
-            if height in (REISSUANCE - 1, REISSUANCE):
-                if height == REISSUANCE - 1:
+            if height in (RESTART_HEIGHT - 1, RESTART_HEIGHT):
+                if height == RESTART_HEIGHT - 1:
                     old.wait_backup()
-                old.stop(abrupt=height == REISSUANCE)
+                old.stop(abrupt=height == RESTART_HEIGHT)
                 old.start()
                 tip = old.call("getblockcount")
                 if tip < height:

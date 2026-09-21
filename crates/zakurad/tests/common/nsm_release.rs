@@ -33,7 +33,6 @@ use zakura_test::{
 };
 
 const NU7: u32 = 104;
-const REISSUANCE: u32 = 106;
 
 struct Node {
     child: TestChild<TempDir>,
@@ -180,7 +179,7 @@ async fn wait_mempool(node: &Node, txid: &str, present: bool) -> Result<()> {
     .map_err(|_| eyre!("mempool failed to revalidate across activation"))?
 }
 
-/// Cross both boundaries with actual spends, validate proposals, reject malformed
+/// Cross NU7 with actual spends, validate proposals, reject malformed
 /// rewards, independently submit to a second node, then restart and replay.
 pub async fn run() -> Result<()> {
     if std::env::var("NSM_RELEASE_ACCEPTANCE").as_deref() != Ok("1") {
@@ -196,9 +195,21 @@ pub async fn run() -> Result<()> {
             nu7: Some(NU7),
             ..Default::default()
         },
-        nsm_reissuance_height: Some(Height(REISSUANCE)),
+        // This schedule co-activates NU6.1 at NU7. Its lockbox is empty, but
+        // consensus still requires an explicitly configured disbursement output.
+        lockbox_disbursements: Some(vec![
+            zakura_chain::parameters::testnet::ConfiguredLockboxDisbursement {
+                address: "t2RnBRiqrN1nW4ecZs1Fj3WWjNdnSs4kiX8".to_string(),
+                amount: Amount::new(0),
+            },
+        ]),
         ..Default::default()
     });
+    let reissuance = zakura_chain::parameters::subsidy::nsm_reissuance_height(&network);
+    assert!(
+        reissuance.is_none_or(|height| height.0 > 110),
+        "short production fixture must not override the reference crossover"
+    );
     let make_node = || -> Result<Node> {
         let mut config = os_assigned_rpc_port_config(false, &network)?;
         config.network.listen_addr =
@@ -221,7 +232,6 @@ pub async fn run() -> Result<()> {
     let lock_script = Script::new(&lock_bytes);
     let mut funding: Vec<(OutPoint, i64)> = Vec::new();
     let mut pending = None;
-    let mut balance = 0i128;
     let mut blocks = Vec::new();
     for h in 1..=110 {
         if h == NU7 {
@@ -234,12 +244,7 @@ pub async fn run() -> Result<()> {
         let mut block =
             proposal_block_from_template(&template, BlockTemplateTimeSource::default(), &network)?;
         let scheduled = i64::from(halving_block_subsidy(Height(h), &network)?);
-        let bonus = if h >= REISSUANCE {
-            i64::try_from((balance * 1_375 + 9_999_999_999) / 10_000_000_000)?
-        } else {
-            0
-        };
-        // Large fees change the next rounded bonus; small fees detect rounding per tx.
+        // Large fees exercise recycling; small fees detect rounding per tx.
         let fees: [i64; 2] = if h < 103 {
             [0, 0]
         } else if h == 105 {
@@ -249,16 +254,20 @@ pub async fn run() -> Result<()> {
         };
         let total = fees.iter().sum::<i64>();
         let recycled = if h >= NU7 { total * 3 / 5 } else { 0 };
-        let expected = scheduled + bonus + total - recycled;
+        let expected = scheduled + total - recycled;
         let coinbase = Arc::make_mut(&mut block.transactions[0]);
         let outputs = coinbase.outputs_mut();
-        assert_eq!(outputs.len(), 1, "fixture has no funding streams");
+        assert_eq!(outputs.len(), if h == NU7 { 2 } else { 1 });
+        let miner_index = outputs
+            .iter()
+            .position(|output| i64::from(output.value) > 0)
+            .expect("the miner receives a positive subsidy");
         assert_eq!(
-            i64::from(outputs[0].value),
-            scheduled + bonus,
+            i64::from(outputs[miner_index].value),
+            scheduled,
             "empty template reward at {h}"
         );
-        outputs[0] = Output::new(Amount::try_from(expected)?, lock_script.clone());
+        outputs[miner_index] = Output::new(Amount::try_from(expected)?, lock_script.clone());
         if h <= 3 {
             funding.push((
                 OutPoint {
@@ -338,7 +347,7 @@ pub async fn run() -> Result<()> {
         if h >= NU7 {
             for adjustment in [-1i64, 1] {
                 let mut invalid = block.clone();
-                Arc::make_mut(&mut invalid.transactions[0]).outputs_mut()[0].value =
+                Arc::make_mut(&mut invalid.transactions[0]).outputs_mut()[miner_index].value =
                     Amount::try_from(expected + adjustment)?;
                 roots(&mut invalid, &template, &network);
                 let response = node
@@ -417,19 +426,17 @@ pub async fn run() -> Result<()> {
             node.call("getbestblockhash", json!([])).await?,
             peer.call("getbestblockhash", json!([])).await?
         );
-        if h >= NU7 {
-            balance += i128::from(recycled - bonus);
-        }
         blocks.push(block);
     }
     let before = node.call("getblockchaininfo", json!([])).await?;
     node.wait_backup().await?;
     let node = Node::start(node.stop()?)?;
+    node.wait_ready().await?;
     assert_eq!(
         node.call("getbestblockhash", json!([])).await?,
         before["bestblockhash"]
     );
-    // Roll the active chain back across reissuance and NU7 using RPC invalidation.
+    // Roll the active chain back across NU7 using RPC invalidation.
     let root = blocks[usize::try_from(NU7 - 2)?].hash();
     let old_template = node.call("getblocktemplate", json!([])).await?;
     let long_poll_id = old_template["longpollid"]
@@ -501,7 +508,7 @@ pub async fn run() -> Result<()> {
 }
 
 /// Exercise real shielded coinbase proofs on both sides of NU7. These are output
-/// proofs; contextual shielded-spend state coverage lives in zakura-state.
+/// proofs; contextual shielded-spend and reissuance coverage lives in zakura-state.
 pub async fn run_shielded(address: zakura_rpc::config::mining::MinerAddressType) -> Result<()> {
     use zakurad::components::With;
 
@@ -515,7 +522,6 @@ pub async fn run_shielded(address: zakura_rpc::config::mining::MinerAddressType)
             nu7: Some(4),
             ..Default::default()
         },
-        nsm_reissuance_height: Some(Height(6)),
         funding_streams: Some(vec![
             zakura_chain::parameters::testnet::ConfiguredFundingStreams {
                 height_range: Some(Height(1)..Height(100)),

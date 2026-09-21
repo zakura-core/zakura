@@ -36,7 +36,7 @@ fn network(start: u32, seed: Option<i64>) -> Network {
             nu7: Some(ACTIVATION),
             ..Default::default()
         },
-        nsm_reissuance_height: Some(Height(start)),
+        test_nsm_reissuance_height: Some(Height(start)),
         initial_nsm_value_balance: seed.map(|value| Amount::try_from(value).unwrap()),
         ..Default::default()
     });

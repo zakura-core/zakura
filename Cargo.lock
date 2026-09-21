@@ -7291,7 +7291,7 @@ dependencies = [
  "toml 1.1.2+spec-1.1.0",
  "tonic-prost-build",
  "zakura-chain",
- "zcash_protocol",
+ "zakura-protocol",
 ]
 
 [[package]]

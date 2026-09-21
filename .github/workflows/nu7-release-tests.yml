@@ -37,15 +37,20 @@ jobs:
       - uses: ./.github/actions/setup-zakura-build
       - name: Boundary, rejection, and replay tests
         run: |
-          cargo test --locked -p zakura-chain --lib nsm_release
-          cargo test --locked -p zakura-state --lib nsm_release
+          cargo test --locked -p zakura-chain --lib nsm
+          cargo test --locked -p zakura-state --lib nsm
           cargo test --locked -p zakura-state --lib max_money
           cargo test --locked -p zakura-state --lib block_daa_enforces
+          cargo test --locked -p zakura-state --lib issuance_accounting
+          cargo test --locked -p zakura-consensus --lib nu7
+          cargo test --locked -p zakura-consensus --lib nsm
+          cargo test --locked -p zakura-rpc --lib nu7
+          cargo test --locked -p zakura-rpc --lib nsm
       - name: Extended histories
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         env:
           NSM_RELEASE_CASES: '256'
-        run: cargo test --locked -p zakura-state --lib nsm_release_generated
+        run: cargo test --locked -p zakura-state --lib nsm_generated
       - name: Preserve replay seeds
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -66,19 +71,19 @@ jobs:
           toolchain: stable
       - uses: ./.github/actions/setup-zakura-build
       - name: Production branch and dependency compatibility
-        run: cargo run --locked --release -p xtask -- nu7-readiness
+        run: cargo run --locked --release -p xtask -- nu7-readiness 2>&1 | tee "$RUNNER_TEMP/nu7-readiness.log"
       - name: Build the production artifact without dev dependency features
         run: |
           cargo build --locked --release -p zakura --bin zakurad
           mkdir -p target/nu7-production-artifact
           cp target/release/zakurad target/nu7-production-artifact/zakurad
-          sha256sum target/nu7-production-artifact/zakurad
+          sha256sum target/nu7-production-artifact/zakurad | tee "$RUNNER_TEMP/nu7-production-sha256.txt"
       - name: Verify actual transaction, RPC, and state integration
         env:
           NSM_RELEASE_ACCEPTANCE: '1'
         run: |
           export NSM_RELEASE_NODE="$GITHUB_WORKSPACE/target/nu7-production-artifact/zakurad"
-          cargo test --locked --release -p zakura --test acceptance nsm_release_ -- --nocapture
+          cargo test --locked --release -p zakura --test acceptance nsm_release_ -- --nocapture 2>&1 | tee "$RUNNER_TEMP/nu7-acceptance.log"
       - name: Download the previous released Linux binary
         env:
           GH_TOKEN: ${{ github.token }}
@@ -98,5 +103,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nu7-upgrade-evidence
-          path: ${{ runner.temp }}/nu7-upgrade
+          path: |
+            ${{ runner.temp }}/nu7-upgrade
+            ${{ runner.temp }}/nu7-readiness.log
+            ${{ runner.temp }}/nu7-production-sha256.txt
+            ${{ runner.temp }}/nu7-acceptance.log
           if-no-files-found: ignore

@@ -354,8 +354,8 @@ where
         // We don't include the block hash, because it's likely already in a parent span
         let span = tracing::debug_span!("block", height = ?block.coinbase_height());
 
+        let receipt_order = receipt.as_ref().map(|receipt| receipt.order);
         async move {
-            let receipt_order = receipt.as_ref().map(|receipt| receipt.order);
             let hash = zakura_header_chain::validate_encoding_version_hash(&block.header)
                 .map_err(BlockError::from)?;
             let preparation_start = request.should_cache().then(std::time::Instant::now);
@@ -740,6 +740,18 @@ where
 
             commit_prepared_block(state_service, prepared_block, request.admission()).await
         }
+        .map(move |result: Result<_, VerifyBlockError>| {
+            if let Some(receipt) = receipt {
+                let retryable = result.as_ref().is_err_and(|error| {
+                    matches!(
+                        error.body_verification_class(),
+                        zakura_header_chain::BodyVerificationClass::Retryable(_)
+                    )
+                });
+                receipt.finish(retryable);
+            }
+            result
+        })
         .instrument(span)
         .boxed()
     }

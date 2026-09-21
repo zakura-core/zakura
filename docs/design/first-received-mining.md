@@ -13,8 +13,11 @@ its own order even when verification reuses a prepared template. Retained blocks
 keep their original order through duplicate delivery, forks, invalidation, and
 reconsideration. The comparator reads the current tip block directly.
 Overlapping deliveries of the same complete block share their first receipt.
-Different bodies with the same header hash do not share priority. In-flight
-registrations are removed when their last verification completes or is cancelled.
+Different bodies with the same header hash do not share priority. Active registrations are removed when their last verification completes or is
+cancelled. Retryable failures and cancellations retain only a complete-body digest
+and receipt order, bounded to 4096 entries for one hour after the last attempt. Capacity eviction or
+expiry gives a later retry a new receipt. Success and permanent rejection clear
+the retry receipt.
 
 For example, A arrives before B, but B finishes verification first. Mining can
 briefly use B while A is unverified. Once A passes, equal-work selection chooses

@@ -2693,3 +2693,78 @@ async fn duplicate_receipt_keeps_first_priority_through_real_state_deduplication
     .await
     .expect("duplicate receipt regression must finish");
 }
+
+#[tokio::test]
+async fn transient_parent_failure_preserves_first_receipt_on_retry() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    };
+    use zakura_chain::block_info::BlockInfo;
+
+    let _init_guard = zakura_test::init();
+    let height = Height(10);
+    let network = zip234_test_network(height);
+    let subsidy = block_subsidy(
+        height,
+        &network,
+        Some(Amount::try_from(ZIP234_TEST_DEFICIT).unwrap()),
+    )
+    .unwrap();
+    let a = Arc::new(zip234_test_block(&network, height, subsidy));
+    let mut b = a.as_ref().clone();
+    Arc::make_mut(&mut b.header).nonce.0[0] ^= 1;
+    let b = Arc::new(b);
+    let parent_pools =
+        zip234_parent_pools(&network, height.previous().unwrap(), ZIP234_TEST_DEFICIT);
+    let fail_once = Arc::new(AtomicBool::new(true));
+    let committed = Arc::new(Mutex::new(Vec::new()));
+    let state = service_fn({
+        let committed = committed.clone();
+        move |request| {
+            let committed = committed.clone();
+            let fail_once = fail_once.clone();
+            async move {
+                Ok::<_, BoxError>(match request {
+                    zs::Request::KnownBlock(_) => zs::Response::KnownBlock(None),
+                    zs::Request::AwaitBlockInfo(hash) => {
+                        if fail_once.swap(false, Ordering::Relaxed) {
+                            return Err(zs::AwaitBlockInfoError::TimedOut {
+                                hash,
+                                limit: std::time::Duration::from_secs(120),
+                            }
+                            .into());
+                        }
+                        zs::Response::BlockInfo(Some(BlockInfo::new(parent_pools, 0)))
+                    }
+                    zs::Request::CheckParentInputs { .. } => {
+                        zs::Response::ParentInputs(zs::ParentInputs::Inconclusive)
+                    }
+                    zs::Request::CommitSemanticallyVerifiedBlock(block) => {
+                        committed
+                            .lock()
+                            .unwrap()
+                            .push((block.hash, block.receipt_order.unwrap()));
+                        zs::Response::Committed(block.hash)
+                    }
+                    _ => panic!("unexpected request: {request:?}"),
+                })
+            }
+        }
+    });
+    let transaction =
+        service_fn(|request| async move { Ok::<_, BoxError>(accept_block_transaction(request)) });
+    let mut verifier = SemanticBlockVerifier::new(&network, state, transaction);
+    assert!(matches!(
+        verifier.call(Request::Commit(a.clone())).await,
+        Err(VerifyBlockError::Depth { .. })
+    ));
+    verifier.call(Request::Commit(b.clone())).await.unwrap();
+    verifier.call(Request::Commit(a.clone())).await.unwrap();
+    let committed = committed.lock().unwrap();
+    assert_eq!([committed[0].0, committed[1].0], [b.hash(), a.hash()]);
+    assert!(
+        committed[1].1 < committed[0].1,
+        "A arrived first, so retrying after its parent wait fails must still beat B"
+    );
+}

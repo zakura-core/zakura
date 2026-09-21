@@ -20,7 +20,7 @@ const RETRY_RECEIPT_TTL: Duration = Duration::from_secs(60 * 60);
 
 /// Active calls keep their bodies. Retries retain only a digest and order, for
 /// at most one hour or 4096 entries, so failed input cannot grow memory forever.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(super) struct ReceiptRegistry(Arc<Mutex<Registry>>);
 
 #[derive(Debug, Default)]
@@ -34,7 +34,19 @@ struct Entry {
     block: Arc<Block>,
     order: u64,
     callers: usize,
+    retry_eligible: bool,
     retryable: bool,
+}
+
+impl Registry {
+    fn receipt_mut(&mut self, hash: block::Hash, order: u64) -> &mut Entry {
+        self.active
+            .get_mut(&hash)
+            .expect("a live guard has an active block")
+            .iter_mut()
+            .find(|entry| entry.order == order)
+            .expect("a live guard has an active receipt")
+    }
 }
 
 #[derive(Debug, Default)]
@@ -123,7 +135,8 @@ impl ReceiptRegistry {
                 .expect("each active caller owns memory, so its count fits in usize");
             entry.order
         } else {
-            let order = registry.retries.take(hash, &block).unwrap_or_else(|| {
+            let saved_order = registry.retries.take(hash, &block);
+            let order = saved_order.unwrap_or_else(|| {
                 NEXT_RECEIPT_ORDER
                     .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |order| {
                         order.checked_add(1)
@@ -134,6 +147,7 @@ impl ReceiptRegistry {
                 block,
                 order,
                 callers: 1,
+                retry_eligible: saved_order.is_some(),
                 retryable: true,
             });
             order
@@ -143,6 +157,16 @@ impl ReceiptRegistry {
             hash,
             order,
         }
+    }
+
+    /// Only checked proof of work (or the network's authenticated waiver) earns
+    /// cache space. Cancellation before that point must not retain unchecked input.
+    pub(super) fn allow_retry(&self, hash: block::Hash, order: u64) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .receipt_mut(hash, order)
+            .retry_eligible = true;
     }
 }
 
@@ -154,14 +178,7 @@ impl ReceiptGuard {
                 .registry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            registry
-                .active
-                .get_mut(&self.hash)
-                .expect("a live guard has an active block")
-                .iter_mut()
-                .find(|entry| entry.order == self.order)
-                .expect("a live guard has an active receipt")
-                .retryable = false;
+            registry.receipt_mut(self.hash, self.order).retryable = false;
         }
     }
 }
@@ -186,7 +203,7 @@ impl Drop for ReceiptGuard {
             if entries.is_empty() {
                 registry.active.remove(&self.hash);
             }
-            if entry.retryable {
+            if entry.retry_eligible && entry.retryable {
                 registry
                     .retries
                     .insert(self.hash, &entry.block, entry.order, Instant::now());
@@ -200,13 +217,19 @@ mod tests {
     use super::*;
     use zakura_chain::serialization::ZcashDeserializeInto;
 
+    fn checked_receipt(registry: &ReceiptRegistry, block: Arc<Block>) -> ReceiptGuard {
+        let receipt = registry.register(block.clone());
+        registry.allow_retry(block.hash(), receipt.order);
+        receipt
+    }
+
     #[test]
     fn retries_and_overlapping_receipts_keep_priority_without_retaining_bodies() {
         let registry = ReceiptRegistry::default();
         let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
             .zcash_deserialize_into()
             .unwrap();
-        let first = registry.register(block.clone());
+        let first = checked_receipt(&registry, block.clone());
         let original_order = first.order;
         let duplicate = registry.register(Arc::new(block.as_ref().clone()));
         assert_eq!(duplicate.order, original_order);
@@ -235,7 +258,7 @@ mod tests {
         let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
             .zcash_deserialize_into()
             .unwrap();
-        let first = registry.register(block.clone());
+        let first = checked_receipt(&registry, block.clone());
         let original_order = first.order;
         drop(first);
         registry
@@ -244,7 +267,7 @@ mod tests {
             .unwrap()
             .retries
             .prune(Instant::now() + RETRY_RECEIPT_TTL);
-        let retry = registry.register(block.clone());
+        let retry = checked_receipt(&registry, block.clone());
         assert!(retry.order > original_order);
         let retry_order = retry.order;
         drop(retry);
@@ -252,7 +275,7 @@ mod tests {
             let mut next = block.as_ref().clone();
             Arc::make_mut(&mut next.header).nonce.0[..8]
                 .copy_from_slice(&u64::try_from(nonce).unwrap().to_le_bytes());
-            drop(registry.register(Arc::new(next)));
+            drop(checked_receipt(&registry, Arc::new(next)));
         }
         assert_eq!(
             registry.0.lock().unwrap().retries.by_expiry.len(),

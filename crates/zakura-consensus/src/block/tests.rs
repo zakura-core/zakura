@@ -2793,6 +2793,96 @@ async fn duplicate_receipt_keeps_first_priority_through_real_state_deduplication
 }
 
 #[tokio::test]
+async fn unchecked_blocks_do_not_keep_retry_receipts() {
+    let _init_guard = zakura_test::init();
+    let valid: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let invalid = (0..=u8::MAX)
+        .map(|nonce| {
+            let mut block = valid.as_ref().clone();
+            Arc::make_mut(&mut block.header).nonce.0[0] = nonce;
+            block
+        })
+        .find(|block| {
+            matches!(
+                check::difficulty_is_valid(
+                    &block.header,
+                    &Network::Mainnet,
+                    &Height(1),
+                    &block.hash(),
+                ),
+                Err(BlockError::DifficultyFilter(..))
+            )
+        })
+        .expect("the fixture has a nonce that fails the proof-of-work filter");
+    for (cancel, unavailable) in [(false, false), (true, false), (false, true)] {
+        let block = Arc::new(invalid.clone());
+        let state = service_fn(move |_| async move {
+            if unavailable {
+                Err::<zs::Response, BoxError>("state unavailable".into())
+            } else {
+                Ok(zs::Response::KnownBlock(None))
+            }
+        });
+        let transaction = service_fn(|_| -> std::future::Ready<Result<tx::Response, BoxError>> {
+            panic!("unchecked blocks cannot reach transaction verification")
+        });
+        let mut verifier = SemanticBlockVerifier::new(&Network::Mainnet, state, transaction);
+        let first = verifier.receipt_orders.register(block.clone());
+        let order = first.order;
+        let attempt = verifier.call(Request::Commit(block.clone()));
+        drop(first);
+        if cancel {
+            drop(attempt);
+        } else {
+            let error = attempt.await.unwrap_err();
+            if unavailable {
+                assert!(matches!(error, VerifyBlockError::Depth { .. }));
+            } else {
+                assert!(matches!(
+                    error,
+                    VerifyBlockError::Block {
+                        source: BlockError::DifficultyFilter(..)
+                    }
+                ));
+            }
+        }
+        assert!(
+            verifier.receipt_orders.register(block).order > order,
+            "unchecked or PoW-invalid blocks must not occupy the retry cache"
+        );
+    }
+}
+
+#[tokio::test]
+async fn pow_checked_missing_parent_keeps_retry_receipt() {
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let state = service_fn(|_| async { Ok::<_, BoxError>(zs::Response::KnownBlock(None)) });
+    let transaction = service_fn(|_| -> std::future::Ready<Result<tx::Response, BoxError>> {
+        panic!("the missing parent is checked before transaction verification")
+    });
+    let mut verifier = SemanticBlockVerifier::new(&Network::Mainnet, state, transaction);
+    let first = verifier.receipt_orders.register(block.clone());
+    let order = first.order;
+    let attempt = verifier.call(Request::CommitMined {
+        block: block.clone(),
+        work_id: None,
+        admission: zs::BlockAdmission::pending(),
+    });
+    drop(first);
+    assert!(matches!(
+        attempt.await,
+        Err(VerifyBlockError::Commit(
+            zs::CommitBlockError::MissingMinedParent
+        ))
+    ));
+    assert_eq!(verifier.receipt_orders.register(block).order, order);
+}
+
+#[tokio::test]
 async fn transient_parent_failure_preserves_first_receipt_on_retry() {
     use std::sync::{
         atomic::{AtomicBool, Ordering},

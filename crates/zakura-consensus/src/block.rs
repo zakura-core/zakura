@@ -348,6 +348,7 @@ where
         let mut transaction_verifier = self.transaction_verifier.clone();
         let network = self.network.clone();
         let prepared_candidates = self.prepared_candidates.clone();
+        let receipt_orders = self.receipt_orders.clone();
 
         let block = request.block();
 
@@ -412,6 +413,10 @@ where
                 // attacks that use any other fields.
                 check::difficulty_is_valid(&block.header, &network, &height, &hash)?;
                 check::equihash_solution_is_valid(&block.header, &network)?;
+            }
+
+            if let Some(order) = receipt_order {
+                receipt_orders.allow_retry(hash, order);
             }
 
             if request.is_mined_commit() {

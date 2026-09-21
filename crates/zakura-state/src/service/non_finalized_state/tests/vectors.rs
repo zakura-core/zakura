@@ -1237,7 +1237,10 @@ fn trusted_snapshot_reconciles_known_forks() {
         let prepared = block.clone().prepare();
         state.commit_block(prepared, &finalized.db).unwrap();
     }
-    assert_eq!(state.best_tip().unwrap().1, a.hash().max(b.hash()));
+    assert_eq!(
+        state.best_tip().unwrap().1,
+        block::Hash(a.hash().0.max(b.hash().0))
+    );
     assert!(!state.reconcile_chain_tips(&[block::Hash([0xff; 32])]));
     assert_eq!(state.chain_set.len(), 2);
     let original_chains: Vec<_> = state.chain_iter().cloned().collect();

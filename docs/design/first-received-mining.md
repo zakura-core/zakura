@@ -26,6 +26,10 @@ later retry a new receipt.
 Success, already committed duplicates, and permanent rejection clear the retry
 receipt. A duplicate still waiting in the commit queue preserves it because the
 outstanding attempt can fail transiently.
+Receipt retention has its own error policy. Missing context, local service
+failures, and blocks ahead of the local clock can retry. Permanent block and
+transaction failures release their receipts even when peer attribution must
+remain inconclusive.
 
 For example, A arrives before B, but B finishes verification first. Mining can
 briefly use B while A is unverified. Once A passes, equal-work selection chooses

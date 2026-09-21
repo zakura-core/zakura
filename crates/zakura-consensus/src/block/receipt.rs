@@ -13,11 +13,69 @@ use zakura_chain::{
     block::{self, Block},
     serialization::ZcashSerialize,
 };
+use zakura_state::{CommitBlockError, KnownBlock, ValidateContextError};
+
+use super::VerifyBlockError;
+use crate::error::{BlockError, TransactionError};
 
 static NEXT_RECEIPT_ORDER: AtomicU64 = AtomicU64::new(1);
 const MAX_RETRY_RECEIPTS: usize = 4096;
 const MAX_RETRY_RECEIPTS_PER_HASH: usize = 4;
 const RETRY_RECEIPT_TTL: Duration = Duration::from_secs(60 * 60);
+
+/// Body-evidence classification protects peer attribution. Receipt retention
+/// instead requires missing context or a local failure that can change on retry.
+pub(super) fn retains_error(error: &VerifyBlockError) -> bool {
+    if let Some(location) = error.duplicate_location() {
+        // The overlapping write can still fail after a pending duplicate returns.
+        return matches!(location, KnownBlock::Queue | KnownBlock::WriteChannel);
+    }
+    match error {
+        VerifyBlockError::Depth { .. }
+        | VerifyBlockError::StateService { .. }
+        | VerifyBlockError::ParentUnavailable { .. }
+        // A block too far ahead of the local clock can become valid as time passes.
+        | VerifyBlockError::Time(_) => true,
+        VerifyBlockError::Commit(error) => match error {
+            CommitBlockError::ValidateContextError(error) => retains_context_error(error),
+            CommitBlockError::HeaderChainError { .. }
+            | CommitBlockError::MissingMinedParent
+            | CommitBlockError::QueueFull
+            | CommitBlockError::WriteTaskExited { .. } => true,
+            _ => false,
+        },
+        VerifyBlockError::Transaction(error)
+        | VerifyBlockError::Block {
+            source: BlockError::Transaction(error),
+        } => retains_transaction_error(error),
+        _ => false,
+    }
+}
+
+/// Keep local context and storage failures, not fixed-parent consensus failures.
+fn retains_context_error(error: &ValidateContextError) -> bool {
+    matches!(
+        error,
+        ValidateContextError::MissingSproutTipTree(_)
+            | ValidateContextError::NotReadyToBeCommitted { .. }
+            | ValidateContextError::VctSuppliedRootUnavailable { .. }
+            | ValidateContextError::VctSuppliedRootAwaitingSuccessor { .. }
+            | ValidateContextError::VctSproutHandoffRootMismatch { .. }
+            | ValidateContextError::NoteCommitmentTreeError(_)
+            | ValidateContextError::HistoryTreeError(_)
+    )
+}
+
+/// Transaction rule failures and generic rejection strings do not earn retries.
+fn retains_transaction_error(error: &TransactionError) -> bool {
+    match error {
+        TransactionError::ValidateContextError(error) => retains_context_error(error),
+        TransactionError::TransparentInputNotFound
+        | TransactionError::Io(_)
+        | TransactionError::InternalDowncastError(_) => true,
+        _ => false,
+    }
+}
 
 /// Active calls keep their bodies. Retries retain only a digest and order, for
 /// at most one hour or 4096 entries, so failed input cannot grow memory forever.

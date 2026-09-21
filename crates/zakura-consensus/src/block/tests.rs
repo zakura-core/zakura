@@ -3041,3 +3041,98 @@ async fn transient_parent_failure_preserves_first_receipt_on_retry() {
         "A arrived first, so retrying after its parent wait fails must still beat B"
     );
 }
+
+#[test]
+fn receipt_retry_policy_drops_permanent_errors_without_changing_peer_attribution() {
+    let ancestor = block::Hash([1; 32]);
+    for error in [
+        VerifyBlockError::from(BlockError::Other(
+            "invalid transparent value balance".into(),
+        )),
+        VerifyBlockError::Transaction(TransactionError::Other(
+            "transaction has Orchard actions (temporarily disabled)".into(),
+        )),
+        VerifyBlockError::from(BlockError::Transaction(TransactionError::Other(
+            "permanent transaction failure".into(),
+        ))),
+        VerifyBlockError::Commit(
+            Box::new(zs::ValidateContextError::InvalidAncestorBlock(ancestor)).into(),
+        ),
+        VerifyBlockError::Transaction(
+            zs::ValidateContextError::InvalidAncestorBlock(ancestor).into(),
+        ),
+    ] {
+        assert!(matches!(
+            error.body_verification_class(),
+            zakura_header_chain::BodyVerificationClass::Retryable(_)
+        ));
+        assert!(!error.retains_retry_receipt(), "{error:?}");
+    }
+
+    for error in [
+        VerifyBlockError::Commit(zs::CommitBlockError::MissingMinedParent),
+        VerifyBlockError::Commit(zs::CommitBlockError::QueueFull),
+        VerifyBlockError::Transaction(TransactionError::TransparentInputNotFound),
+        VerifyBlockError::Transaction(TransactionError::Io("temporary I/O failure".into())),
+        VerifyBlockError::Transaction(TransactionError::InternalDowncastError(
+            "verifier unavailable".into(),
+        )),
+    ] {
+        assert!(error.retains_retry_receipt(), "{error:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nonsequential_block_rejection_clears_retry_receipt() {
+    let _init_guard = zakura_test::init();
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        let network = librustzcash_conversion_test_network(NetworkUpgrade::Nu5);
+        let (state, _, _, _) = zs::init_test_services(&network).await;
+        let genesis: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES
+            .zcash_deserialize_into()
+            .unwrap();
+        state
+            .clone()
+            .oneshot(zs::Request::CommitCheckpointVerifiedBlock(
+                genesis.clone().into(),
+            ))
+            .await
+            .unwrap();
+
+        let mut block = nu5_prepared_test_block(&network, None);
+        block.transactions[0] = Arc::new(v5_coinbase_transaction(
+            NetworkUpgrade::Nu5,
+            Height(2),
+            &network,
+        ));
+        let header = Arc::make_mut(&mut block.header);
+        header.previous_block_hash = genesis.hash();
+        header.time = genesis.header.time + chrono::Duration::seconds(150);
+        header.merkle_root = block.transactions.iter().collect();
+        let block = Arc::new(block);
+        let transaction =
+            service_fn(|request| async { Ok::<_, BoxError>(accept_block_transaction(request)) });
+        let mut verifier = SemanticBlockVerifier::new(&network, state, transaction);
+        let first = verifier.receipt_orders.register(block.clone());
+        let original_order = first.order;
+        let attempt = verifier.call(Request::Commit(block.clone()));
+        drop(first);
+
+        let error = attempt.await.unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                VerifyBlockError::Commit(zs::CommitBlockError::ValidateContextError(error))
+                    if matches!(**error, zs::ValidateContextError::NonSequentialBlock { .. })
+            ),
+            "{error:?}"
+        );
+        assert!(matches!(
+            error.body_verification_class(),
+            zakura_header_chain::BodyVerificationClass::Retryable(_)
+        ));
+        assert!(verifier.receipt_orders.register(block).order > original_order);
+    })
+    .await
+    .expect("the permanent rejection receipt regression must finish");
+}

@@ -232,16 +232,9 @@ impl VerifyBlockError {
         }
     }
 
-    /// Pending duplicates have no final outcome yet, so they must not clear a
-    /// shared receipt that an overlapping verification may still need to retry.
+    /// Preserve priority only when the same block may succeed after a local retry.
     fn retains_retry_receipt(&self) -> bool {
-        matches!(
-            self.duplicate_location(),
-            Some(zs::KnownBlock::Queue | zs::KnownBlock::WriteChannel)
-        ) || matches!(
-            self.body_verification_class(),
-            zakura_header_chain::BodyVerificationClass::Retryable(_)
-        )
+        receipt::retains_error(self)
     }
 
     /// Returns a suggested misbehaviour score increment for a certain error.

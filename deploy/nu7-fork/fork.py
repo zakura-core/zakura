@@ -388,8 +388,10 @@ def cmd_render(config: dict, args) -> int:
 def cmd_deploy(config: dict, args) -> int:
     if not args.nodes.is_file():
         raise ForkError(f"{args.nodes} not found; run `fork.py render` first")
-    run([sys.executable, str(DEPLOYER), "--config", str(args.nodes), "deploy"],
-        cwd=DEPLOYER.parent)
+    # deploy.py takes --config after the subcommand, not before it.
+    for subcommand in ("build", "deploy"):
+        run([sys.executable, str(DEPLOYER), subcommand, "--config", str(args.nodes)],
+            cwd=DEPLOYER.parent)
     return 0
 
 

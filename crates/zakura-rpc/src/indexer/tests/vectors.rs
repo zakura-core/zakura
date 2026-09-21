@@ -185,6 +185,203 @@ fn block_and_hash_decode_rejects_a_missing_coinbase() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn non_finalized_stream_negotiates_snapshot_sessions() -> Result<()> {
+    use zakura_chain::serialization::BytesInDisplayOrder;
+    use zakura_state::{NonFinalizedBlocksListener, NonFinalizedStateChange};
+
+    let _init_guard = zakura_test::init();
+    let (server, client, mut state, _tip, _mempool) = start_server_and_get_client().await?;
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+    let hash = block.hash();
+    for (session, snapshots) in [
+        (None, false),
+        (None, true),
+        (Some("previous-primary".to_owned()), true),
+        (Some(indexer::receipt_session().to_owned()), true),
+    ] {
+        let same_session = session.as_deref() == Some(indexer::receipt_session());
+        let mut client = client.clone();
+        let request = tokio::spawn(async move {
+            client
+                .non_finalized_state_change(indexer::NonFinalizedStateChangeRequest {
+                    chain_tip_hashes: vec![hash.bytes_in_display_order().to_vec()],
+                    receipt_session: session,
+                    include_chain_snapshot: snapshots,
+                })
+                .await
+        });
+        let (sender, receiver) = tokio::sync::mpsc::channel(8);
+        state
+            .expect_request(ReadRequest::NonFinalizedBlocksListener {
+                known_chain_tips: if same_session {
+                    [hash].into_iter().collect()
+                } else {
+                    Default::default()
+                },
+            })
+            .await
+            .respond(ReadResponse::NonFinalizedBlocksListener(
+                NonFinalizedBlocksListener(Arc::new(receiver)),
+            ));
+        let response = request.await??;
+        assert_eq!(
+            response
+                .metadata()
+                .get(indexer::RECEIPT_SESSION_HEADER)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            indexer::receipt_session()
+        );
+        let mut stream = response.into_inner();
+        for change in [
+            NonFinalizedStateChange::Block {
+                hash,
+                block: block.clone(),
+            },
+            NonFinalizedStateChange::ChainTips(vec![hash]),
+            NonFinalizedStateChange::ChainTips(vec![]),
+            NonFinalizedStateChange::Block {
+                hash,
+                block: block.clone(),
+            },
+        ] {
+            sender.send(change).await?;
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let first = stream.message().await.unwrap().unwrap();
+            assert_eq!(first.decode().unwrap().1, hash);
+            if snapshots {
+                let snapshot = stream.message().await.unwrap().unwrap();
+                assert!(snapshot.data.is_empty());
+                assert_eq!(
+                    snapshot.chain_snapshot.unwrap().hashes,
+                    vec![hash.bytes_in_display_order().to_vec()]
+                );
+                assert!(stream
+                    .message()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .chain_snapshot
+                    .unwrap()
+                    .hashes
+                    .is_empty());
+            }
+            let last = stream.message().await.unwrap().unwrap();
+            assert_eq!(last.decode().unwrap().1, hash);
+        })
+        .await?;
+    }
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_non_finalized_stream_closes_on_a_full_listener_buffer() -> Result<()> {
+    use zakura_state::{NonFinalizedBlocksListener, NonFinalizedStateChange};
+
+    let _init_guard = zakura_test::init();
+    let (server, mut client, mut state, _tip, _mempool) = start_server_and_get_client().await?;
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+    let request = tokio::spawn(async move {
+        client
+            .non_finalized_state_change(indexer::NonFinalizedStateChangeRequest::default())
+            .await
+    });
+    let capacity = usize::try_from(zakura_state::MAX_BLOCK_REORG_HEIGHT)? * 2;
+    let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
+    for _ in 0..capacity {
+        sender.try_send(NonFinalizedStateChange::Block {
+            hash: block.hash(),
+            block: block.clone(),
+        })?;
+    }
+    assert_eq!(receiver.capacity(), 0);
+    state
+        .expect_request(ReadRequest::NonFinalizedBlocksListener {
+            known_chain_tips: Default::default(),
+        })
+        .await
+        .respond(ReadResponse::NonFinalizedBlocksListener(
+            NonFinalizedBlocksListener(Arc::new(receiver)),
+        ));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut stream = request.await.unwrap().unwrap().into_inner();
+        assert!(
+            stream.message().await.unwrap().is_none(),
+            "legacy clients need a disconnect when buffer saturation can hide state updates"
+        );
+        sender.closed().await;
+    })
+    .await?;
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn non_finalized_snapshot_drains_a_full_listener_buffer() -> Result<()> {
+    use zakura_chain::serialization::BytesInDisplayOrder;
+    use zakura_state::{NonFinalizedBlocksListener, NonFinalizedStateChange};
+
+    let _init_guard = zakura_test::init();
+    let (server, mut client, mut state, _tip, _mempool) = start_server_and_get_client().await?;
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_1_BYTES.zcash_deserialize_into()?;
+    let hash = block.hash();
+    let request = tokio::spawn(async move {
+        client
+            .non_finalized_state_change(indexer::NonFinalizedStateChangeRequest {
+                chain_tip_hashes: vec![hash.bytes_in_display_order().to_vec()],
+                receipt_session: Some("previous-primary".into()),
+                include_chain_snapshot: true,
+            })
+            .await
+    });
+    // Fill the production-sized listener before the RPC gets it, then send a
+    // larger snapshot. Repeated ancestors can appear in multiple retained forks.
+    let capacity = usize::try_from(zakura_state::MAX_BLOCK_REORG_HEIGHT)? * 2;
+    let count = capacity + 100;
+    let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
+    let change = NonFinalizedStateChange::Block { hash, block };
+    for _ in 0..capacity {
+        sender.try_send(change.clone())?;
+    }
+    assert_eq!(receiver.capacity(), 0);
+    state
+        .expect_request(ReadRequest::NonFinalizedBlocksListener {
+            known_chain_tips: Default::default(),
+        })
+        .await
+        .respond(ReadResponse::NonFinalizedBlocksListener(
+            NonFinalizedBlocksListener(Arc::new(receiver)),
+        ));
+    let producer = tokio::spawn(async move {
+        for _ in capacity..count {
+            sender.send(change.clone()).await?;
+        }
+        sender
+            .send(NonFinalizedStateChange::ChainTips(vec![hash]))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut stream = request.await.unwrap().unwrap().into_inner();
+        for _ in 0..count {
+            let message = stream.message().await.unwrap().expect("snapshot block");
+            assert_eq!(message.decode().unwrap().1, hash);
+        }
+        let snapshot = stream.message().await.unwrap().expect("snapshot boundary");
+        assert_eq!(
+            snapshot.chain_snapshot.unwrap().hashes,
+            vec![hash.bytes_in_display_order().to_vec()]
+        );
+        producer.await.unwrap().unwrap();
+    })
+    .await?;
+    server.abort();
+    Ok(())
+}
+
 /// Tests that `GetBlock` returns the requested block and rejects invalid
 /// requests.
 async fn test_get_block(

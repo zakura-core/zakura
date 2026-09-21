@@ -167,6 +167,8 @@ pub struct TrustedChainSync {
     /// The finalized-tip updater, retained so `sync()` can wait for any in-flight
     /// secondary database catch-up before committing a streamed block.
     finalized_tip_updater: Option<JoinHandle<()>>,
+    /// Identifies the primary process whose fork snapshot is staged locally.
+    receipt_session: Option<String>,
 }
 
 /// Signals the finalized-tip updater to stop, then waits for it to finish.
@@ -380,6 +382,7 @@ impl TrustedChainSync {
             non_finalized_state_sender,
             started_sync_sender,
             finalized_tip_updater: Some(finalized_tip_updater),
+            receipt_session: None,
         };
 
         let sync_task = tokio::spawn(async move {
@@ -414,49 +417,93 @@ impl TrustedChainSync {
             self.chain_tip_sender.set_finalized_tip(finalized_tip_block);
         }
 
+        let mut empty_state_refresh = tokio::time::interval(POLL_DELAY);
+        empty_state_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut message_deadline = tokio::time::Instant::now() + STREAM_MESSAGE_TIMEOUT;
         loop {
             let Some(ref mut non_finalized_state_change) = non_finalized_blocks_listener else {
                 non_finalized_blocks_listener = match self
                     .subscribe_to_non_finalized_state_change()
                     .await
                 {
-                    Ok(listener) => Some(listener),
+                    Ok(listener) => listener,
                     Err(err) => {
                         tracing::warn!(?err, "failed to subscribe to non-finalized state changes");
                         tokio::time::sleep(POLL_DELAY).await;
                         None
                     }
                 };
+                message_deadline = tokio::time::Instant::now() + STREAM_MESSAGE_TIMEOUT;
 
                 continue;
             };
 
-            let message = match tokio::time::timeout(
-                STREAM_MESSAGE_TIMEOUT,
-                non_finalized_state_change.message(),
-            )
-            .await
-            {
-                Ok(Ok(Some(block_and_hash))) => block_and_hash,
+            let next_message = tokio::select! {
+                message = tokio::time::timeout_at(message_deadline, non_finalized_state_change.message()) => message,
+                _ = empty_state_refresh.tick(), if self.finalized_tip_updater.is_none()
+                    && self.non_finalized_state.is_chain_set_empty()
+                    && self.non_finalized_state_sender.borrow().is_chain_set_empty() => {
+                    // A legacy primary has no empty-snapshot message. Keep its
+                    // finalized state current even when the block stream is idle.
+                    self.try_catch_up_with_primary().await;
+                    self.publish_current_state().await;
+                    continue;
+                }
+            };
+            let message = match next_message {
+                Ok(Ok(Some(block_and_hash))) => {
+                    message_deadline = tokio::time::Instant::now() + STREAM_MESSAGE_TIMEOUT;
+                    block_and_hash
+                }
                 Ok(Ok(None)) => {
                     tracing::warn!("non-finalized state change stream ended unexpectedly");
+                    self.discard_pending_snapshot();
                     non_finalized_blocks_listener = None;
                     continue;
                 }
                 Ok(Err(err)) => {
                     tracing::warn!(?err, "error receiving non-finalized state change");
+                    self.discard_pending_snapshot();
                     non_finalized_blocks_listener = None;
                     continue;
                 }
                 Err(_) => {
                     tracing::debug!("non-finalized state change stream timed out, re-subscribing");
+                    self.discard_pending_snapshot();
                     non_finalized_blocks_listener = None;
                     continue;
                 }
             };
 
+            if let Some(snapshot) = message.chain_snapshot {
+                let tips = snapshot
+                    .hashes
+                    .into_iter()
+                    .map(|bytes| {
+                        bytes
+                            .try_into()
+                            .ok()
+                            .map(|bytes| block::Hash::from_bytes_in_display_order(&bytes))
+                    })
+                    .collect::<Option<Vec<_>>>();
+                let reconciled = match tips {
+                    Some(tips) => self.reconcile_chain_snapshot(&tips).await,
+                    None => false,
+                };
+                if !reconciled {
+                    tracing::warn!(
+                        "incomplete non-finalized snapshot, requesting all primary forks"
+                    );
+                    self.non_finalized_state =
+                        NonFinalizedState::new(&self.non_finalized_state.network);
+                    non_finalized_blocks_listener = None;
+                    tokio::time::sleep(COMMIT_RETRY_DELAY).await;
+                }
+                continue;
+            }
             let Some((block, hash)) = message.decode() else {
                 tracing::warn!("received malformed non-finalized state change message");
+                self.discard_pending_snapshot();
                 non_finalized_blocks_listener = None;
                 continue;
             };
@@ -497,6 +544,13 @@ impl TrustedChainSync {
                         last_failed_commit_hash = Some(hash);
                     }
 
+                    if self.receipt_session.is_some() {
+                        // Obsolete published forks can evict a replacement's
+                        // parent at the fork limit. Replay into empty staging,
+                        // keeping the published snapshot visible until success.
+                        self.non_finalized_state =
+                            NonFinalizedState::new(&self.non_finalized_state.network);
+                    }
                     non_finalized_blocks_listener = None;
 
                     // Back off so a persistently failing block doesn't turn
@@ -505,6 +559,34 @@ impl TrustedChainSync {
                 }
             };
         }
+    }
+
+    /// Modern streams stage blocks privately until their complete fork boundary.
+    /// Reconnect using the last published snapshot, never an unfinished batch.
+    fn discard_pending_snapshot(&mut self) {
+        if self.receipt_session.is_some() {
+            self.non_finalized_state = self.non_finalized_state_sender.borrow().clone();
+        }
+    }
+
+    /// Legacy servers have no snapshot boundary and keep incremental publication.
+    async fn publish_incremental_state(&mut self) {
+        if self.receipt_session.is_none() {
+            self.publish_current_state().await;
+        }
+    }
+
+    /// Reconcile retained forks without taking finalized updates away from the
+    /// checkpoint sync task. Only a real block can initiate that handoff.
+    async fn reconcile_chain_snapshot(&mut self, tips: &[block::Hash]) -> bool {
+        if !self.non_finalized_state.reconcile_chain_tips(tips) {
+            return false;
+        }
+        if self.finalized_tip_updater.is_none() {
+            self.try_catch_up_with_primary().await;
+            self.publish_current_state().await;
+        }
+        true
     }
 
     async fn try_commit(
@@ -518,7 +600,7 @@ impl TrustedChainSync {
                 height = ?block.height,
                 "skipping block finalized while the secondary caught up"
             );
-            self.publish_current_state().await;
+            self.publish_incremental_state().await;
             return Ok(CommitOutcome::AlreadyFinalized);
         }
 
@@ -541,7 +623,7 @@ impl TrustedChainSync {
                 height = ?block.height,
                 "skipping block finalized while bridging the finalized gap"
             );
-            self.publish_current_state().await;
+            self.publish_incremental_state().await;
             return Ok(CommitOutcome::AlreadyFinalized);
         }
 
@@ -552,10 +634,8 @@ impl TrustedChainSync {
 
     /// Commits `block` to the non-finalized state, starting a new chain if it
     /// builds on the finalized tip or extending an existing chain otherwise.
-    /// Then prunes finalized blocks and publishes the updated state.
-    ///
-    /// Updating the channels here means bridge blocks committed by
-    /// [`Self::fill_finalized_gap`] also advance the published chain tip.
+    /// Then prunes finalized blocks. Modern streams publish only at their
+    /// snapshot boundary. Legacy streams publish each block, including bridges.
     fn commit(&mut self, block: SemanticallyVerifiedBlock) -> Result<(), ValidateContextError> {
         if self.db.finalized_tip_hash() == block.block.header.previous_block_hash {
             let _ = self.prune_finalized();
@@ -565,7 +645,9 @@ impl TrustedChainSync {
             let _ = self.prune_finalized();
         }
 
-        self.update_channels();
+        if self.receipt_session.is_none() {
+            self.update_channels();
+        }
 
         Ok(())
     }
@@ -661,22 +743,26 @@ impl TrustedChainSync {
     }
 
     /// Subscribes to non-finalized state changes and returns the response stream.
+    /// Returns `None` when the primary's identity is new or unknown and local
+    /// forks must be cleared, so the caller resubscribes with empty tips.
     ///
     /// Passes every local chain tip so the server only streams missing blocks,
     /// rather than the whole state on each subscription. With no local chains,
     /// the server streams every non-finalized block.
     async fn subscribe_to_non_finalized_state_change(
         &mut self,
-    ) -> Result<Streaming<BlockAndHash>, Status> {
+    ) -> Result<Option<Streaming<BlockAndHash>>, Status> {
         let request = NonFinalizedStateChangeRequest {
             chain_tip_hashes: self
                 .non_finalized_state
                 .chain_iter()
                 .map(|c| c.non_finalized_tip_hash().bytes_in_display_order().to_vec())
                 .collect(),
+            receipt_session: self.receipt_session.clone(),
+            include_chain_snapshot: true,
         };
 
-        tokio::time::timeout(
+        let response = tokio::time::timeout(
             SUBSCRIBE_TIMEOUT,
             self.indexer_rpc_client
                 .clone()
@@ -685,17 +771,37 @@ impl TrustedChainSync {
         .await
         .map_err(|_| {
             Status::deadline_exceeded("non_finalized_state_change subscription timed out")
-        })?
-        .map(|a| a.into_inner())
+        })??;
+        let session = response
+            .metadata()
+            .get(crate::indexer::RECEIPT_SESSION_HEADER)
+            .map(|value| value.to_str().map(str::to_owned))
+            .transpose()
+            .map_err(|_| Status::internal("invalid receipt session"))?;
+        let legacy_reconnect = session.is_none() && !self.non_finalized_state.is_chain_set_empty();
+        if session != self.receipt_session || legacy_reconnect {
+            // Missing identities cannot prove two legacy connections share a
+            // primary. Discard a response that may have honored old tips, then
+            // accept the next legacy response once local forks are empty.
+            self.non_finalized_state = NonFinalizedState::new(&self.non_finalized_state.network);
+            self.receipt_session = session;
+            if self.finalized_tip_updater.is_none() {
+                // Only the sync loop owns finalized updates after the first block.
+                self.try_catch_up_with_primary().await;
+                self.publish_current_state().await;
+            }
+            return Ok(None);
+        }
+        Ok(Some(response.into_inner()))
     }
 
-    /// Catches up to the primary database, then prunes and publishes any blocks
-    /// that became finalized.
+    /// Catches up to the primary database and prunes finalized blocks. Modern
+    /// streams defer publication until the complete snapshot is reconciled.
     async fn try_catch_up_with_primary(&mut self) {
         let _ = self.db.spawn_try_catch_up_with_primary().await;
 
         if self.prune_finalized() {
-            self.publish_current_state().await;
+            self.publish_incremental_state().await;
         }
     }
 
@@ -810,6 +916,8 @@ pub fn init_read_state_with_syncer(
 mod tests {
     use super::*;
 
+    mod subscriptions;
+
     #[test]
     fn rejects_non_loopback_plaintext_indexer_connection() {
         let address: SocketAddr = "192.0.2.1:8230"
@@ -831,6 +939,74 @@ mod tests {
         assert!(block_height_is_finalized(Some(finalized_tip), Height(9)));
         assert!(block_height_is_finalized(Some(finalized_tip), Height(10)));
         assert!(!block_height_is_finalized(Some(finalized_tip), Height(11)));
+    }
+
+    #[tokio::test]
+    async fn empty_snapshots_keep_finalized_updates_alive_until_a_block_arrives() {
+        use zakura_chain::{chain_tip::ChainTip, serialization::ZcashDeserializeInto};
+
+        let _init_guard = zakura_test::init();
+        let network = Network::Mainnet;
+        let finalized =
+            zakura_state::FinalizedState::new(&zakura_state::Config::ephemeral(), &network)
+                .unwrap();
+        let (tip_sender, tip, mut tip_change) = ChainTipSender::new(None, &network);
+        let mut finalized_sender = tip_sender.finalized_sender();
+        let (started, mut started_receiver) = tokio::sync::watch::channel(false);
+        let (advance, mut advances) = tokio::sync::mpsc::channel::<ChainTipBlock>(1);
+        let updater = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = started_receiver.changed() => return,
+                    next = advances.recv() => {
+                        let Some(next) = next else { return };
+                        finalized_sender.set_finalized_tip(next);
+                    }
+                }
+            }
+        });
+        let state = NonFinalizedState::new(&network);
+        let (state_sender, mut state_receiver) = tokio::sync::watch::channel(state.clone());
+        let mut syncer = TrustedChainSync {
+            indexer_rpc_client: IndexerClient::new(
+                Endpoint::from_static("http://127.0.0.1:1").connect_lazy(),
+            ),
+            db: finalized.db.clone(),
+            non_finalized_state: state,
+            chain_tip_sender: tip_sender,
+            non_finalized_state_sender: state_sender,
+            started_sync_sender: started.clone(),
+            finalized_tip_updater: Some(updater),
+            receipt_session: None,
+        };
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for bytes in [
+                &zakura_test::vectors::BLOCK_MAINNET_1_BYTES[..],
+                &zakura_test::vectors::BLOCK_MAINNET_2_BYTES[..],
+            ] {
+                assert!(syncer.reconcile_chain_snapshot(&[]).await);
+                assert!(!*started.borrow());
+                assert!(!state_receiver.has_changed().unwrap());
+                let block: Arc<Block> = bytes.zcash_deserialize_into().unwrap();
+                let hash = block.hash();
+                advance
+                    .send(CheckpointVerifiedBlock::from(block).into())
+                    .await
+                    .unwrap();
+                tip_change.wait_for_tip_change().await.unwrap();
+                assert_eq!(tip.best_tip_hash(), Some(hash));
+            }
+
+            syncer.take_over_finalized_tip_updates().await;
+            assert!(*started.borrow());
+            assert!(syncer.reconcile_chain_snapshot(&[]).await);
+            state_receiver.changed().await.unwrap();
+            assert!(state_receiver.borrow().is_chain_set_empty());
+        })
+        .await
+        .expect("snapshot handoff should not stall finalized updates");
     }
 
     #[tokio::test]

@@ -22,6 +22,15 @@ const BLOCK_HEIGHT_BYTE_LEN: usize = std::mem::size_of::<u32>();
 // The generated indexer proto
 tonic::include_proto!("zebra.indexer.rpc");
 
+/// Header identifying the primary process for trusted snapshots.
+pub(crate) const RECEIPT_SESSION_HEADER: &str = "x-zakura-receipt-session";
+
+/// All snapshots from this process share one session.
+pub(crate) fn receipt_session() -> &'static str {
+    static SESSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SESSION.get_or_init(|| format!("{:032x}", rand::random::<u128>()))
+}
+
 pub(crate) const FILE_DESCRIPTOR_SET: &[u8] =
     tonic::include_file_descriptor_set!("indexer_descriptor");
 
@@ -60,6 +69,7 @@ impl BlockAndHash {
             data: block
                 .zcash_serialize_to_vec()
                 .expect("block serialization should not fail"),
+            chain_snapshot: None,
         }
     }
 

@@ -1215,3 +1215,48 @@ fn fork_drops_subtrees_above_fork_point() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn trusted_snapshot_reconciles_known_forks() {
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let root = Arc::new(network.test_block(653599, 583999).unwrap());
+    let a = root
+        .make_fake_child()
+        .set_work(10)
+        .set_block_commitment([1; 32]);
+    let b = root
+        .make_fake_child()
+        .set_work(10)
+        .set_block_commitment([2; 32]);
+    let (mut state, finalized) = new_invalidate_test_state(&network);
+    state
+        .commit_new_chain(root.clone().prepare(), &finalized.db)
+        .unwrap();
+    for block in [&b, &a] {
+        let prepared = block.clone().prepare();
+        state.commit_block(prepared, &finalized.db).unwrap();
+    }
+    assert_eq!(state.best_tip().unwrap().1, a.hash().max(b.hash()));
+    assert!(!state.reconcile_chain_tips(&[block::Hash([0xff; 32])]));
+    assert_eq!(state.chain_set.len(), 2);
+    let original_chains: Vec<_> = state.chain_iter().cloned().collect();
+    for tips in [[a.hash(), b.hash()], [b.hash(), a.hash()]] {
+        assert!(state.reconcile_chain_tips(&tips));
+        assert!(state
+            .chain_iter()
+            .zip(&original_chains)
+            .all(|(after, before)| Arc::ptr_eq(after, before)));
+    }
+    let original_b = original_chains
+        .iter()
+        .find(|chain| chain.non_finalized_tip_hash() == b.hash())
+        .unwrap();
+    assert!(state.reconcile_chain_tips(&[b.hash()]));
+    assert!(Arc::ptr_eq(state.best_chain().unwrap(), original_b));
+    assert_eq!(state.best_tip().unwrap().1, b.hash());
+    assert!(state.reconcile_chain_tips(&[root.hash()]));
+    assert_eq!(state.best_tip().unwrap().1, root.hash());
+    assert!(state.reconcile_chain_tips(&[]));
+    assert!(state.best_tip().is_none());
+}

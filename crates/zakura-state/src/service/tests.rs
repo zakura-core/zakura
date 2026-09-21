@@ -799,6 +799,98 @@ async fn descendant_arriving_after_a_local_parent_failure_completes_immediately(
 }
 
 #[tokio::test]
+async fn fork_eviction_allows_new_and_replayed_parents_to_extend() {
+    use crate::tests::FakeChainHelper;
+
+    let _init_guard = zakura_test::init();
+    let network = Network::Mainnet;
+    let (mut state, _, _, _) = StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
+        .await
+        .expect("the ephemeral state opens");
+    for (_, bytes) in zakura_test::vectors::MAINNET_BLOCKS.range(0..=1) {
+        let block: Arc<Block> = bytes.zcash_deserialize_into().unwrap();
+        state
+            .queue_and_commit_to_finalized_state(CheckpointVerifiedBlock::from(block))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let mut template: Block = zakura_test::vectors::BLOCK_MAINNET_2_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    template.transactions = vec![Arc::new(transaction_v4_from_coinbase(
+        &template.transactions[0],
+    ))];
+    let mut siblings = Vec::new();
+    for order in 0..=crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS {
+        let mut block = template.clone();
+        Arc::make_mut(&mut block.header).nonce.0[..8]
+            .copy_from_slice(&u64::try_from(order).unwrap().to_le_bytes());
+        let block = Arc::new(block);
+        let mut prepared = block.clone().prepare();
+        prepared.receipt_order = Some(u64::try_from(order).unwrap());
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            state.queue_and_commit_to_non_finalized_state(prepared, None),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        siblings.push(block);
+        let retained = state.read_service.latest_non_finalized_state();
+        assert_eq!(retained.best_tip().unwrap().1, siblings[0].hash());
+        assert!(retained.any_chain_contains(&siblings[order].hash()));
+        assert!(retained.chain_iter().count() <= crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS);
+    }
+    let evicted = &siblings[siblings.len() - 2];
+    state.drain_non_finalized_write_updates();
+    assert!(!state.can_fork_chain_at(&evicted.hash()));
+    assert!(!state
+        .non_finalized_block_write_sent_hashes
+        .contains(&evicted.hash()));
+    assert!(!state
+        .non_finalized_failed_ancestors
+        .contains_key(&evicted.hash()));
+
+    // The newest branch can win with a child. An evicted branch can then be
+    // downloaded again and win with two children, without restarting the node.
+    for (parent, depth) in [(siblings.last().unwrap(), 1), (evicted, 2)] {
+        if parent.hash() == evicted.hash() {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                state.queue_and_commit_to_non_finalized_state(parent.clone().prepare(), None),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        }
+        let mut tip = parent.clone();
+        for _ in 0..depth {
+            tip = tip.make_fake_child();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                state.queue_and_commit_to_non_finalized_state(tip.clone().prepare(), None),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        }
+        assert_eq!(
+            state
+                .read_service
+                .latest_non_finalized_state()
+                .best_tip()
+                .unwrap()
+                .1,
+            tip.hash()
+        );
+    }
+}
+
+#[tokio::test]
 async fn state_init_loads_the_embedded_mainnet_frontier_grid() {
     let network = Network::Mainnet;
     let config = Config::ephemeral();

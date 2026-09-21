@@ -8,6 +8,12 @@ order is assigned before asynchronous verification, so a later block cannot gain
 priority by finishing validation faster. Only valid blocks enter chain selection.
 A greater-work chain still replaces an earlier equal-work winner.
 
+Full state retains at most ten forks. At that limit, it keeps the newly accepted
+branch and the nine highest-ranked other branches. This leaves the accepted
+parent available for a child that could make its branch best, while preserving
+the current mining winner. Evicted bodies leave the duplicate cache and can be
+downloaded and validated again.
+
 Proposals and templates do not establish receipt order. A solved submission gets
 its own order even when verification reuses a prepared template. Retained blocks
 keep their original order through duplicate delivery, forks, invalidation, and

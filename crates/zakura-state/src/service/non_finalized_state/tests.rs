@@ -3,11 +3,43 @@
 mod prop;
 mod vectors;
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use metrics::{Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SharedString, Unit};
+use zakura_chain::{
+    block::Block,
+    serialization::ZcashDeserializeInto,
+    transaction::{self, LockTime, Transaction},
+    transparent,
+};
+use zakura_test::vectors::BLOCK_MAINNET_GENESIS_BYTES;
 
-use super::ContextualMetrics;
+use super::{block_has_transparent_spends, ContextualMetrics};
+
+#[test]
+fn coinbase_inputs_do_not_require_an_unspent_utxo_snapshot() {
+    let mut block = BLOCK_MAINNET_GENESIS_BYTES
+        .zcash_deserialize_into::<Block>()
+        .expect("the mainnet genesis block deserializes");
+
+    assert!(block.transactions[0].is_coinbase());
+    assert!(!block_has_transparent_spends(&block));
+
+    block.transactions.push(Arc::new(Transaction::V1 {
+        inputs: vec![transparent::Input::PrevOut {
+            outpoint: transparent::OutPoint {
+                hash: transaction::Hash([0x11; 32]),
+                index: 0,
+            },
+            unlock_script: transparent::Script::new(&[]),
+            sequence: u32::MAX,
+        }],
+        outputs: Vec::new(),
+        lock_time: LockTime::unlocked(),
+    }));
+
+    assert!(block_has_transparent_spends(&block));
+}
 
 #[derive(Default)]
 struct MetricNameRecorder {

@@ -444,6 +444,13 @@ fn daa_context(
 fn seeded_chain_with_pow_start(
     target_spacing_secs: u32,
 ) -> zakura_chain::local_genesis::GeneratedLocalTestnet {
+    seeded_chain_with_pow_start_and_seed_target(target_spacing_secs, None)
+}
+
+fn seeded_chain_with_pow_start_and_seed_target(
+    target_spacing_secs: u32,
+    seed_difficulty_target: Option<[u8; 32]>,
+) -> zakura_chain::local_genesis::GeneratedLocalTestnet {
     let miner_names: Vec<String> = (0..80).map(|i| format!("miner-{i:03}")).collect();
     let generated = zakura_chain::local_genesis::generate_local_testnet_with_funded_keys(
         miner_names,
@@ -451,6 +458,7 @@ fn seeded_chain_with_pow_start(
             disable_pow: true,
             enforce_pow_after_seeded_tip: true,
             target_spacing_secs,
+            seed_difficulty_target,
             maturity_padding_blocks: 8,
             ..Default::default()
         },
@@ -592,5 +600,64 @@ fn first_block_at_pow_start_height_expects_the_configured_limit() {
         "the first live-mined block should be mined at the configured limit, so the \
          chain starts at its equilibrium difficulty: expected {expected_target:x}, \
          limit {limit:x}"
+    );
+}
+
+/// With a seed target tighter than the limit, the first live-mined block
+/// expects the seed target, and the limit stays loose for a later, shorter
+/// spacing. This is how a chain opens at its 75 s equilibrium while keeping a
+/// limit calibrated for 25 s.
+#[test]
+fn first_block_at_pow_start_height_expects_the_seed_target() {
+    let _init_guard = zakura_test::init();
+
+    // 16x tighter than the default private-network limit (0x0f0f...).
+    let seed = [
+        0x00, 0xf0, 0xf0, 0xf0, 0xf0, 0xf0, 0xf0, 0xf0, 0xf0, 0xf0, 0xf0, 0xf0, 0xf0, 0xf0, 0xf0,
+        0xf0, 0xf0, 0xf0, 0xf0, 0xf0, 0xf0, 0xf0, 0xf0, 0xf0, 0xf0, 0xf0, 0xf0, 0xf0, 0xf0, 0xf0,
+        0xf0, 0xf0,
+    ];
+    let generated = seeded_chain_with_pow_start_and_seed_target(75, Some(seed));
+    let network = &generated.network;
+    let pow_start_height = network
+        .pow_start_height()
+        .expect("enforce_pow_after_seeded_tip sets a start height");
+
+    let seeded_tip = generated
+        .blocks
+        .last()
+        .expect("the generated chain is not empty");
+    let candidate_time = seeded_tip.header.time
+        + zakura_chain::parameters::NetworkUpgrade::target_spacing_for_height(
+            network,
+            pow_start_height,
+        );
+
+    let expected_target: U256 = difficulty::AdjustedDifficulty::new_from_header_time(
+        candidate_time,
+        block::Height(pow_start_height.0 - 1),
+        network,
+        seeded_difficulty_context(&generated.blocks, generated.blocks.len()),
+    )
+    .expect("the seeded chain supplies a full difficulty context")
+    .expected_difficulty_threshold()
+    .to_expanded()
+    .expect("an expected difficulty is always representable")
+    .into();
+
+    let seed_target: U256 = generated.blocks[1]
+        .header
+        .difficulty_threshold
+        .to_expanded()
+        .expect("seed blocks declare a representable target")
+        .into();
+    let limit: U256 = network.target_difficulty_limit().into();
+
+    assert!(seed_target < limit / U256::from(8u64));
+    assert!(
+        expected_target <= seed_target
+            && expected_target >= seed_target - seed_target / U256::from(1_000u64),
+        "the first live-mined block should expect the seed target, not the limit: \
+         expected {expected_target:x}, seed {seed_target:x}, limit {limit:x}"
     );
 }

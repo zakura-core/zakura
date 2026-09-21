@@ -61,6 +61,14 @@ pub struct LocalTestnetGenesisOptions {
     /// against: a chain seeded at one limit and run at another is rejected at the
     /// seeded tip.
     pub target_difficulty_limit: [u8; 32],
+    /// Big-endian target the seed blocks declare, if different from
+    /// `target_difficulty_limit`.
+    ///
+    /// The first live block's difficulty is averaged from the seed blocks, so this
+    /// sets where proof-of-work starts. A tighter seed target than the limit lets
+    /// a network open at its expected equilibrium while keeping a looser limit
+    /// for a later, shorter target spacing. Must not be looser than the limit.
+    pub seed_difficulty_target: Option<[u8; 32]>,
     /// Target spacing between generated seeded block timestamps, in seconds.
     pub target_spacing_secs: u32,
     /// Optional UNIX timestamp for the final seeded tip block. If unset, the
@@ -79,6 +87,7 @@ impl Default for LocalTestnetGenesisOptions {
             disable_pow: true,
             enforce_pow_after_seeded_tip: false,
             target_difficulty_limit: LOCAL_TESTNET_TARGET_DIFFICULTY_LIMIT,
+            seed_difficulty_target: None,
             target_spacing_secs: 1,
             seeded_tip_time: None,
             maturity_padding_blocks: 0,
@@ -185,7 +194,16 @@ pub fn generate_local_testnet_with_funded_keys(
 
     let target_difficulty =
         ExpandedDifficulty::from(U256::from_big_endian(&options.target_difficulty_limit));
-    let compact_difficulty = target_difficulty.to_compact();
+    let compact_difficulty = match options.seed_difficulty_target {
+        Some(seed) => {
+            let seed = ExpandedDifficulty::from(U256::from_big_endian(&seed));
+            if seed > target_difficulty {
+                return Err("seed_difficulty_target must not be looser than the limit".into());
+            }
+            seed.to_compact()
+        }
+        None => target_difficulty.to_compact(),
+    };
 
     let seeded_block_count = num_miners.saturating_add(options.maturity_padding_blocks);
     let target_spacing_secs = i64::from(options.target_spacing_secs);
@@ -844,5 +862,60 @@ mod tests {
             .blocks
             .iter()
             .all(|block| block.header.difficulty_threshold == expected.to_compact()));
+    }
+
+    #[test]
+    fn seed_blocks_declare_the_seed_target_under_the_limit() {
+        let seed = {
+            let mut bytes = [0u8; 32];
+            bytes[0] = 0x01;
+            bytes
+        };
+
+        let generated = generate_local_testnet_with_funded_keys(
+            vec!["alice".to_string()],
+            LocalTestnetGenesisOptions {
+                seed_difficulty_target: Some(seed),
+                ..Default::default()
+            },
+        )
+        .expect("local testnet should generate");
+
+        let expected = ExpandedDifficulty::from(U256::from_big_endian(&seed)).to_compact();
+        let params = generated
+            .network
+            .parameters()
+            .expect("a generated local testnet is a configured testnet");
+        assert_eq!(
+            params.target_difficulty_limit(),
+            ExpandedDifficulty::from(U256::from_big_endian(
+                &LOCAL_TESTNET_TARGET_DIFFICULTY_LIMIT
+            ))
+            .to_compact()
+            .to_expanded()
+            .expect("a compact difficulty round-trips")
+        );
+        assert!(generated
+            .blocks
+            .iter()
+            .all(|block| block.header.difficulty_threshold == expected));
+    }
+
+    #[test]
+    fn seed_target_looser_than_the_limit_is_rejected() {
+        let limit = {
+            let mut bytes = [0u8; 32];
+            bytes[1] = 0x01;
+            bytes
+        };
+        let result = generate_local_testnet_with_funded_keys(
+            vec!["alice".to_string()],
+            LocalTestnetGenesisOptions {
+                target_difficulty_limit: limit,
+                seed_difficulty_target: Some([0x0f; 32]),
+                ..Default::default()
+            },
+        );
+        assert!(result.is_err());
     }
 }

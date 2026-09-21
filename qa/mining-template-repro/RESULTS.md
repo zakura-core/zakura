@@ -134,8 +134,17 @@ starts over anyway.
 A single earlier run had suggested the higher bound raised latency. Alternating the
 builds showed that was host drift, not the bound.
 
-This only matters at the synthetic storm rate of a block every ~72 ms; at a
-realistic single-producer rate the bound of 4 already yields zero. It is worth
-weighing anyway, because the cost of one leaked error is asymmetric: per #1088's
-own description the internal miner clears its work and backs off for
-`BLOCK_TEMPLATE_WAIT_TIME`, 20 seconds.
+**This does not justify changing the constant.** The storm runs a block every
+~72 ms. Target spacing is 75 s post-Blossom and 25 s post-NU7
+(`POST_NU7_POW_TARGET_SPACING`, ZIP 218), so the storm is roughly 350x faster than
+the network this code targets.
+
+A withhold needs a tip change to land inside a template build. At ~40 ms builds and
+25 s spacing a single collision runs about 0.16%, and exhausting four rebuilds needs
+four in a row, on the order of 1e-11. A shielded coinbase pushing builds to ~500 ms
+still leaves it near 1e-7. A bound of 4 is already far more headroom than the real
+block rate asks for, and the measured single-producer runs agree: zero withholds.
+
+The right way to read the storm numbers is as an amplifier. It makes a rare race
+observable in 45 seconds so two builds can be compared. The ratios between builds
+transfer; the absolute counts do not.

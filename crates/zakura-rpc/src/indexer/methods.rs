@@ -122,7 +122,6 @@ where
         // the server only streams blocks after those tips. Malformed hashes are
         // rejected up front.
         let request = request.into_inner();
-        let include_chain_snapshot = request.include_chain_snapshot;
         let mut known_chain_tips = decode_known_chain_tips(request.chain_tip_hashes)?;
         if request.receipt_session.as_deref() != Some(super::receipt_session()) {
             known_chain_tips.clear();
@@ -160,42 +159,32 @@ where
             // timed-out send means the consumer is hung. In both cases the task
             // ends rather than blocking forever.
             loop {
-                // A blocked listener can miss intermediate watch updates. Legacy
-                // clients lack snapshot markers to reconcile that gap, so retain
-                // their disconnect signal. Snapshot clients can drain full batches.
-                if !include_chain_snapshot && non_finalized_state_change.capacity() == 0 {
+                // A full listener buffer means the state-side task is blocked
+                // sending into it, so it may already have missed non-finalized
+                // state updates. The stream can no longer guarantee
+                // completeness, so drop the subscription instead of silently
+                // missing blocks.
+                if non_finalized_state_change.capacity() == 0 {
                     span.in_scope(|| {
                         tracing::warn!(
-                            "slow legacy consumer, dropping non_finalized_state_change stream \
-                             after buffer filled"
+                            "slow consumer, dropping non_finalized_state_change stream after \
+                             buffer filled"
                         );
                     });
                     return;
                 }
 
-                let Some(change) = non_finalized_state_change.recv().await else {
+                let Some(zakura_state::NonFinalizedBlock {
+                    hash,
+                    block,
+                    receipt_order,
+                }) = non_finalized_state_change.recv().await
+                else {
                     break;
                 };
 
-                let message = match change {
-                    zakura_state::NonFinalizedStateChange::Block { hash, block } => {
-                        BlockAndHash::new(hash, block)
-                    }
-                    zakura_state::NonFinalizedStateChange::ChainTips(tips)
-                        if include_chain_snapshot =>
-                    {
-                        BlockAndHash {
-                            chain_snapshot: Some(super::NonFinalizedChainTips {
-                                hashes: tips
-                                    .into_iter()
-                                    .map(|hash| hash.bytes_in_display_order().to_vec())
-                                    .collect(),
-                            }),
-                            ..Default::default()
-                        }
-                    }
-                    zakura_state::NonFinalizedStateChange::ChainTips(_) => continue,
-                };
+                let mut message = BlockAndHash::new(hash, block);
+                message.receipt_order = receipt_order;
                 let send = response_sender.send(Ok(message));
                 match tokio::time::timeout(SEND_TIMEOUT, send).await {
                     Ok(Ok(())) => {}

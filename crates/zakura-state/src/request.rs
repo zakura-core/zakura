@@ -395,6 +395,11 @@ pub struct SemanticallyVerifiedBlock {
     /// finalized committer. `None` means the committer falls back to computing
     /// it from the block's transactions.
     pub auth_data_root: Option<AuthDataRoot>,
+    /// Original verifier receipt order, also forwarded by trusted mirrors.
+    ///
+    /// This is process-local metadata, not serialized block data. Restored
+    /// blocks have no order. Orders from different primary sessions cannot be compared.
+    pub receipt_order: Option<u64>,
 }
 
 /// Data required to check a prepared mined block before optimistic relay.
@@ -484,6 +489,8 @@ pub struct ContextuallyVerifiedBlock {
 
     /// The sum of the chain value pool changes of all transactions in this block.
     pub(crate) chain_value_pool_change: ValueBalance<NegativeAllowed>,
+    /// Original verifier receipt order, retained through forks and reconsideration.
+    pub(crate) receipt_order: Option<u64>,
 }
 
 /// Wraps note commitment trees and the history tree together.
@@ -666,6 +673,7 @@ impl ContextuallyVerifiedBlock {
             transaction_hashes,
             deferred_pool_balance_change,
             auth_data_root: _,
+            receipt_order,
         } = semantically_verified;
 
         let chain_value_pool_change = block.chain_value_pool_change_from_ordered_utxos(
@@ -682,6 +690,7 @@ impl ContextuallyVerifiedBlock {
             spent_outputs: Arc::new(spent_outputs),
             transaction_hashes,
             chain_value_pool_change,
+            receipt_order,
         })
     }
 }
@@ -718,6 +727,7 @@ impl CheckpointVerifiedBlock {
             transaction_hashes,
             deferred_pool_balance_change: None,
             auth_data_root: None,
+            receipt_order: None,
         })
     }
 
@@ -757,6 +767,7 @@ impl SemanticallyVerifiedBlock {
             transaction_hashes,
             deferred_pool_balance_change: None,
             auth_data_root: Some(auth_data_root),
+            receipt_order: None,
         }
     }
 
@@ -793,6 +804,7 @@ impl From<Arc<Block>> for SemanticallyVerifiedBlock {
             transaction_hashes,
             deferred_pool_balance_change: None,
             auth_data_root: Some(auth_data_root),
+            receipt_order: None,
         }
     }
 }
@@ -934,6 +946,7 @@ impl From<ContextuallyVerifiedBlock> for SemanticallyVerifiedBlock {
                 valid.chain_value_pool_change.deferred_amount(),
             )),
             auth_data_root: None,
+            receipt_order: valid.receipt_order,
         }
     }
 }
@@ -948,6 +961,7 @@ impl From<FinalizedBlock> for SemanticallyVerifiedBlock {
             transaction_hashes: finalized.transaction_hashes,
             deferred_pool_balance_change: finalized.deferred_pool_balance_change,
             auth_data_root: None,
+            receipt_order: None,
         }
     }
 }

@@ -694,6 +694,7 @@ where
                 transaction_hashes,
                 deferred_pool_balance_change: Some(deferred_pool_balance_change),
                 auth_data_root: None,
+                receipt_order: None,
             };
 
             // Return early for proposal requests.

@@ -21,15 +21,9 @@ message BlockAndHash {
   // The encoded block data.
   bytes data = 2;
 
-  // Snapshot boundary, sent only when requested. This message has no block
-  // data. All retained tips are complete after the preceding block messages.
-  NonFinalizedChainTips chain_snapshot = 4;
-};
-
-// Complete retained fork set for a trusted secondary.
-message NonFinalizedChainTips {
-  // Tip block hashes in display byte order.
-  repeated bytes hashes = 1;
+  // Source-local verifier receipt order. Compare only within the response's
+  // receipt session. Absent for restored blocks and older primaries.
+  optional uint64 receipt_order = 3;
 };
 
 // An encoded block and its height.
@@ -74,11 +68,8 @@ message NonFinalizedStateChangeRequest {
   repeated bytes chain_tip_hashes = 1;
 
   // Session from the previous response's x-zakura-receipt-session metadata.
-  // A missing or changed session forces a complete non-finalized snapshot.
+  // A missing or changed session requests all non-finalized blocks again.
   optional string receipt_session = 2;
-
-  // Opt in to snapshot boundaries, including updates involving known blocks.
-  bool include_chain_snapshot = 3;
 };
 
 // Represents a change in the mempool.

@@ -105,7 +105,8 @@ flat within noise and throughput is slightly up. `mining.template.rebuilt` recor
 consistent with those residual cases exhausting `MAX_TEMPLATE_REBUILDS` at a block
 every 72 ms — far faster than any real network. The bound behaves as documented.
 
-#1088 also puts the storm below the pre-#1074 baseline, at 67 withholds against 84.
+Note also that #1088 puts the storm below the pre-#1074 baseline, at 67 withholds
+against 84.
 
 ## What the residual withholds under #1088 are
 

@@ -1,5 +1,7 @@
 /* The UI renders only text nodes from recorded data. No stored data becomes markup. */
 const $ = (id) => document.getElementById(id);
+const showCpu = new URLSearchParams(location.search).get('cpu') === '1';
+const cpuSuffix = showCpu ? '?cpu=1' : '';
 const number = (n) => Number(n || 0).toLocaleString();
 const ms = (n) => `${(n / 1000).toFixed(1)} ms`;
 const recordingUrl = (run,attempt) => `/block/${encodeURIComponent(run)}/${encodeURIComponent(attempt)}`;
@@ -25,7 +27,7 @@ function table(target, rows) {
   for (const title of ['Block','Hash','Observed','Transactions','Verifier response','Evidence']) head.append(el('th',title));
   const thead = el('thead'); thead.append(head); t.append(thead); const body = el('tbody');
   for (const row of rows) {
-    const tr = el('tr'), link = el('a',row.height == null ? 'Unknown height' : number(row.height)); link.href = blockUrl(row,target==='results');
+    const tr = el('tr'), link = el('a',row.height == null ? 'Unknown height' : number(row.height)); link.href = blockUrl(row,target==='results')+cpuSuffix;
     const first = el('td'); first.append(link); tr.append(first);
     const duration = row.end_us == null ? null : row.end_us-row.start_us;
     tr.append(el('td',row.hash ? `${row.hash.slice(0,12)}…` : '—','hash'),el('td', row.utc_ms ? new Date(row.utc_ms).toLocaleString() : 'Unknown'),el('td',number(row.transactions)),el('td',row.exclusion_reason ? 'Excluded' : duration == null ? 'Pending' : ms(duration),duration >= 500000 ? 'slow' : ''),el('td',quality(row)));
@@ -66,7 +68,7 @@ async function openDetail(run,attempt) {
   const spans=[...data.spans].sort((a,b)=>a.start_us-b.start_us), start=row.start_us || 0;
   const end=Math.max(row.end_us||start,...spans.map(s=>s.end_us)), duration=Math.max(end-start,1);
   renderTimeline(spans,row,start,duration);
-  renderCpu(data.cpu);
+  if(showCpu){$('cpu').hidden=false;renderCpu(data.cpu);}
 }
 function renderMetadata(row,recording) {
   const retention=/^Pruned\(PruningConfig \{ tx_retention: (\d+) \}\)$/.exec(recording.storage);
@@ -102,7 +104,7 @@ async function loadBlockPage() {
   // An old link still identifies the same block if multiple forks share its height.
   if(preferredHash && (rows.length!==1 || rows[0].hash!==preferredHash)){query=preferredHash;rows=await api(`/api/search?q=${encodeURIComponent(query)}`);}
   if(rows.length===1){
-    history.replaceState(null,'',blockUrl(rows[0],query.length===64));
+    history.replaceState(null,'',blockUrl(rows[0],query.length===64)+cpuSuffix);
     return openDetail(rows[0].run,rows[0].attempt);
   }
   $('lookup-title').textContent=rows.length?'Choose a block':'No recorded block found';
@@ -185,7 +187,7 @@ function renderCpu(cpu) {
 }
 if(document.body.dataset.page==='home'){
   const legacy=/^#([a-f0-9]{32})\/(\d{1,20})$/.exec(location.hash);
-  if(legacy)location.replace(recordingUrl(legacy[1],legacy[2]));
+  if(legacy)location.replace(recordingUrl(legacy[1],legacy[2])+cpuSuffix);
   else{refresh();setInterval(refresh,10000);}
 }else{
   loadBlockPage().catch(error=>{$('lookup-title').textContent='Block unavailable';note(error.message);});

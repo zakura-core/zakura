@@ -6,7 +6,7 @@ The home page starts with the latest blocks and search, with slow blocks and fai
 
 The block header shows total recorded time from router entry through the last retained span, alongside verifier response time and work after that response. These are elapsed intervals, not sums of overlapping spans or CPU time. Missing or expired spans can understate the total. The internal attempt number is a process-local counter of verification requests, not a retry count for a block.
 
-The timeline answers where elapsed time went. Linux CPU sampling adds a zoomable flamegraph of process activity during that interval. Parallel spans overlap. Shared batches and other blocks can appear in process samples, so neither view claims an exact allocation of CPU milliseconds to one block.
+The timeline answers where elapsed time went. Continuous CPU sampling is off for normal operation, and normal block pages show stage timings without a CPU section. Keep the sampler stopped and disabled. For a targeted replay, an operator can explicitly run a bounded CPU capture and append `?cpu=1` to the block URL to view its retained stacks. Existing captures remain accessible through this optional view and the profile JSON API. Parallel spans overlap. Shared batches and other blocks can appear in process samples, so neither view claims an exact allocation of CPU milliseconds to one block.
 
 ## Build and local check
 
@@ -93,7 +93,7 @@ sudo systemctl start zakura-profile-collector.service zakura-profile-web.service
 sudo systemctl enable --now zakura-profile-report.timer
 ```
 
-Start the dedicated node with the configured socket after updating its supplementary group membership. Set `/etc/zakura-profile-sampler.env` to the actual supervised node PID, its exact executable path, and a session limit of at most 86,400 seconds.
+Start the dedicated node with the configured socket after updating its supplementary group membership. Leave `zakura-profile-sampler.service` stopped and disabled for normal collection. Only for an explicitly requested CPU profiling session, set `/etc/zakura-profile-sampler.env` to the actual supervised node PID, its exact executable path, and a bounded session limit of at most 86,400 seconds.
 
 ```text
 NODE_PID=12345
@@ -101,7 +101,7 @@ NODE_EXECUTABLE=/usr/local/bin/zakurad
 SESSION_SECONDS=86400
 ```
 
-Then start `zakura-profile-sampler.service`. The sampler verifies `/proc/PID/exe`, process start ticks, and the fresh recorder run before capture. A node restart requires a refreshed PID and a new sampler invocation. No PID-name matching is used. Capabilities are restricted to the sampler unit. An unsupported kernel or denied perf access stops sampling and leaves timelines available. Decoding keeps symbolized stack frames without expanding compiler-inlined calls, which avoids unbounded `addr2line` memory use.
+For that bounded session, start `zakura-profile-sampler.service` manually without enabling it at boot. Replay controllers should restore sampling only if it was running before the replay. The sampler verifies `/proc/PID/exe`, process start ticks, and the fresh recorder run before capture. A node restart requires a refreshed PID and a new sampler invocation. No PID-name matching is used. Capabilities are restricted to the sampler unit. An unsupported kernel or denied perf access stops sampling and leaves timelines available. Decoding keeps symbolized stack frames without expanding compiler-inlined calls, which avoids unbounded `addr2line` memory use.
 
 All profiler services share a one-core CPU cap and a 1 GiB memory cap through `zakura-profile.slice`. The collector and viewer each have a 512 MiB cap. Kernel sample buffers and node recorder memory are additional and must be measured in the canary. Each HTTP query uses a read-only connection with a four-second SQLite work deadline and at most two concurrent readers.
 

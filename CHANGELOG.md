@@ -21,7 +21,8 @@ independently.
   without session or route controls. Block URLs use height or hash and always
   resolve the latest recording, including links to older recordings. Known
   measurement interference is labeled and excluded from timing statistics, and
-  bounded collector batches reduce capture loss.
+  bounded collector batches reduce capture loss. CPU sampling and flamegraphs
+  are reserved for explicitly requested diagnostic sessions.
 
 ## [1.5.0-rc0] - 2026-09-21
 

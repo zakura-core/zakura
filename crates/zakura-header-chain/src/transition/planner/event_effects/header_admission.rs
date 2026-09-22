@@ -137,7 +137,7 @@ pub(super) fn admit_prepared_headers(
             0,
             (prepared.header.difficulty_threshold, prepared.header.time),
         );
-        contextual.truncate(crate::POW_ADJUSTMENT_BLOCK_SPAN);
+        contextual.truncate(crate::MAX_POW_ADJUSTMENT_BLOCK_SPAN);
     }
     if parent.hash != event.target_tip_hash {
         return Err(

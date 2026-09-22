@@ -220,3 +220,60 @@ fn header_writer(
         .expect("the fixture header store audits");
     HeaderChainWriter::new(runtime, config)
 }
+
+#[test]
+fn only_the_latest_block_write_attempt_can_reject_waiters() {
+    let hash = block::Hash([42; 32]);
+    for reject_before_retry in [false, true] {
+        let (sender, receiver) = watch::channel(BlockWriteNotice::default());
+        let old_attempt = start_block_write(&sender, hash);
+        if reject_before_retry {
+            notify_block_rejected(&sender, hash, old_attempt);
+            assert!(receiver.borrow().is_rejected(&hash));
+        }
+
+        let retry = start_block_write(&sender, hash);
+        assert!(!receiver.borrow().is_rejected(&hash));
+        if !reject_before_retry {
+            notify_block_rejected(&sender, hash, old_attempt);
+        }
+        assert!(
+            !receiver.borrow().is_rejected(&hash),
+            "an older write failing after retry admission must not poison that retry"
+        );
+
+        notify_block_rejected(&sender, hash, retry);
+        assert!(receiver.borrow().is_rejected(&hash));
+        notify_block_committed(&sender, hash);
+        assert!(!receiver.borrow().is_rejected(&hash));
+    }
+}
+
+#[test]
+fn expiring_a_block_write_attempt_preserves_its_newer_retry() {
+    let (sender, receiver) = watch::channel(BlockWriteNotice::default());
+    let hash = block::Hash([42; 32]);
+    let old_attempt = start_block_write(&sender, hash);
+    let retry = start_block_write(&sender, hash);
+    for i in 1..REJECTED_ANCESTOR_MAP_LIMIT {
+        let mut other = [0; 32];
+        other[..8].copy_from_slice(&u64::try_from(i).unwrap().to_le_bytes());
+        start_block_write(&sender, block::Hash(other));
+    }
+    assert_eq!(
+        receiver.borrow().recent_attempts.len(),
+        REJECTED_ANCESTOR_MAP_LIMIT
+    );
+    assert!(receiver.borrow().attempts.len() <= REJECTED_ANCESTOR_MAP_LIMIT);
+    notify_block_rejected(&sender, hash, old_attempt);
+    assert!(!receiver.borrow().is_rejected(&hash));
+    notify_block_rejected(&sender, hash, retry);
+    assert!(receiver.borrow().is_rejected(&hash));
+
+    start_block_write(&sender, block::Hash([43; 32]));
+    notify_block_rejected(&sender, hash, retry);
+    assert!(
+        !receiver.borrow().is_rejected(&hash),
+        "a late result cannot reinsert an evicted attempt"
+    );
+}

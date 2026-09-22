@@ -1,7 +1,7 @@
 //! Writing blocks to the finalized and non-finalized states.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
@@ -45,7 +45,7 @@ use crate::{
             DiskWriteBatch, FinalizedState, VctAuthenticationProof, VctAuxiliaryFailureAttribution,
             VctAuxiliaryWindow, VctSuccessorWitness, ZakuraDb,
         },
-        non_finalized_state::NonFinalizedState,
+        non_finalized_state::{ContextualMetrics, NonFinalizedState},
         queued_blocks::{QueuedCheckpointVerified, QueuedSemanticallyVerified},
         ChainTipBlock, ChainTipSender, InvalidateError, ReconsiderError,
     },
@@ -553,6 +553,15 @@ impl HeaderChainWriter {
                 || persisted_hash != Some(persisted_finalized.hash)
             {
                 return Err(HeaderChainAttachmentError::FinalizedDivergence);
+            }
+            // Resize only after the divergence check, so a rolled-back full state
+            // reports its divergence instead of a validation-context failure.
+            let resized_rows = store.resize_validation_context(&finalized_state.db)?;
+            if resized_rows > 0 {
+                tracing::info!(
+                    resized_rows,
+                    "resized the retained header-chain validation context"
+                );
             }
             store
                 .startup_reconciled_streaming(
@@ -1316,9 +1325,100 @@ fn commit_operator_change(
 /// We allow enough space for multiple concurrent chain forks with errors.
 const REJECTED_ANCESTOR_MAP_LIMIT: usize = MAX_BLOCK_REORG_HEIGHT as usize * 2;
 
+/// Block write outcomes that wake [`crate::Request::AwaitBlockInfo`] readers.
+///
+/// Track the latest admission for each hash: different bodies can share a hash,
+/// and an older write can fail after its replacement has already been queued.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BlockWriteNotice {
+    next_attempt: u64,
+    attempts: HashMap<block::Hash, (u64, bool)>,
+    recent_attempts: VecDeque<(block::Hash, u64)>,
+}
+
+impl BlockWriteNotice {
+    /// Returns true if the latest retained attempt for `hash` was rejected.
+    pub(crate) fn is_rejected(&self, hash: &block::Hash) -> bool {
+        self.attempts
+            .get(hash)
+            .is_some_and(|(_, rejected)| *rejected)
+    }
+}
+
+/// Registers a new admission and clears any rejection of an older attempt.
+/// Only write outcomes need to wake readers; admitting a retry cannot answer them.
+pub(super) fn start_block_write(
+    sender: &watch::Sender<BlockWriteNotice>,
+    hash: block::Hash,
+) -> u64 {
+    let mut attempt = 0;
+    sender.send_if_modified(|notice| {
+        notice.next_attempt = notice
+            .next_attempt
+            .checked_add(1)
+            .expect("block write attempts cannot exhaust u64");
+        attempt = notice.next_attempt;
+        notice.attempts.insert(hash, (attempt, false));
+        notice.recent_attempts.push_back((hash, attempt));
+        // Bound the cache without scanning pending writes on each commit.
+        // Expiring an older attempt must not discard its newer replacement.
+        if notice.recent_attempts.len() > REJECTED_ANCESTOR_MAP_LIMIT {
+            let (expired_hash, expired_attempt) = notice
+                .recent_attempts
+                .pop_front()
+                .expect("the attempt history exceeded its limit");
+            if notice
+                .attempts
+                .get(&expired_hash)
+                .is_some_and(|(current, _)| *current == expired_attempt)
+            {
+                notice.attempts.remove(&expired_hash);
+            }
+        }
+        false
+    });
+    attempt
+}
+
+/// Wakes readers after `hash` commits.
+fn notify_block_committed(sender: &watch::Sender<BlockWriteNotice>, hash: block::Hash) {
+    sender.send_modify(|notice| {
+        notice.attempts.remove(&hash);
+    });
+}
+
+/// Rejects only readers of the latest admitted attempt for `hash`.
+fn notify_block_rejected(
+    sender: &watch::Sender<BlockWriteNotice>,
+    hash: block::Hash,
+    attempt: u64,
+) {
+    sender.send_modify(|notice| {
+        if let Some((current, rejected)) = notice.attempts.get_mut(&hash) {
+            if *current == attempt {
+                *rejected = true;
+            }
+        }
+    });
+}
+
 /// Run contextual validation on the prepared block and add it to the
 /// non-finalized state if it is contextually valid.
+pub(crate) fn validate_and_commit_non_finalized(
+    finalized_state: &ZakuraDb,
+    non_finalized_state: &mut NonFinalizedState,
+    prepared: SemanticallyVerifiedBlock,
+) -> Result<(), ValidateContextError> {
+    validate_and_commit_non_finalized_with_metrics(
+        finalized_state,
+        non_finalized_state,
+        prepared,
+        ContextualMetrics::Disabled,
+    )
+}
+
 #[tracing::instrument(
+    name = "validate_and_commit_non_finalized",
     level = "debug",
     skip(finalized_state, non_finalized_state, prepared),
     fields(
@@ -1327,21 +1427,45 @@ const REJECTED_ANCESTOR_MAP_LIMIT: usize = MAX_BLOCK_REORG_HEIGHT as usize * 2;
         chains = non_finalized_state.chain_count()
     )
 )]
-pub(crate) fn validate_and_commit_non_finalized(
+fn validate_and_commit_non_finalized_with_metrics(
     finalized_state: &ZakuraDb,
     non_finalized_state: &mut NonFinalizedState,
     prepared: SemanticallyVerifiedBlock,
+    contextual_metrics: ContextualMetrics,
 ) -> Result<(), ValidateContextError> {
-    check::initial_contextual_validity(finalized_state, non_finalized_state, &prepared)?;
-    let parent_hash = prepared.block.header.previous_block_hash;
+    let total_start = Instant::now();
+    let initial_checks_start = Instant::now();
+    let initial_checks =
+        check::initial_contextual_validity(finalized_state, non_finalized_state, &prepared);
+    contextual_metrics.record_duration(
+        "state.contextual.initial_checks.duration_seconds",
+        "state.contextual.mined.initial_checks.duration_seconds",
+        initial_checks_start.elapsed(),
+    );
+    let result = initial_checks.and_then(|()| {
+        let parent_hash = prepared.block.header.previous_block_hash;
 
-    if finalized_state.finalized_tip_hash() == parent_hash {
-        non_finalized_state.commit_new_chain(prepared, finalized_state)?;
-    } else {
-        non_finalized_state.commit_block(prepared, finalized_state)?;
-    }
+        if finalized_state.finalized_tip_hash() == parent_hash {
+            non_finalized_state.commit_new_chain_with_metrics(
+                prepared,
+                finalized_state,
+                contextual_metrics,
+            )
+        } else {
+            non_finalized_state.commit_block_with_metrics(
+                prepared,
+                finalized_state,
+                contextual_metrics,
+            )
+        }
+    });
+    contextual_metrics.record_duration(
+        "state.contextual.total.duration_seconds",
+        "state.contextual.mined.total.duration_seconds",
+        total_start.elapsed(),
+    );
 
-    Ok(())
+    result
 }
 
 /// Update the [`LatestChainTip`], [`ChainTipChange`], and `non_finalized_state_sender`
@@ -1444,6 +1568,8 @@ struct WriteBlockWorkerTask {
     chain_tip_sender: ChainTipSender,
     non_finalized_state_sender: watch::Sender<NonFinalizedState>,
     vct_root_repair_sender: watch::Sender<VctRootRepairStatus>,
+    /// Notifies contextual readers after each block commit, rejection, or reconsideration.
+    block_commit_sender: watch::Sender<BlockWriteNotice>,
     /// If `Some`, the non-finalized state is written to this backup directory
     /// synchronously before each channel update, instead of via the async backup task.
     backup_dir_path: Option<PathBuf>,
@@ -1696,6 +1822,7 @@ impl BlockWriteSender {
         tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
         tokio::sync::mpsc::UnboundedReceiver<NonFinalizedWriteFailure>,
         watch::Receiver<VctRootRepairStatus>,
+        watch::Sender<BlockWriteNotice>,
         Arc<OnceLock<BlockWriteTaskFailure>>,
         Option<Arc<std::thread::JoinHandle<BlockWriteTaskExit>>>,
     ) {
@@ -1732,6 +1859,7 @@ impl BlockWriteSender {
         tokio::sync::mpsc::UnboundedReceiver<block::Hash>,
         tokio::sync::mpsc::UnboundedReceiver<NonFinalizedWriteFailure>,
         watch::Receiver<VctRootRepairStatus>,
+        watch::Sender<BlockWriteNotice>,
         Arc<OnceLock<BlockWriteTaskFailure>>,
         Option<Arc<std::thread::JoinHandle<BlockWriteTaskExit>>>,
     ) {
@@ -1747,6 +1875,8 @@ impl BlockWriteSender {
             tokio::sync::mpsc::unbounded_channel();
         let (vct_root_repair_sender, vct_root_repair_receiver) =
             watch::channel(VctRootRepairStatus::default());
+        let (block_commit_sender, _) = watch::channel(BlockWriteNotice::default());
+        let admission_sender = block_commit_sender.clone();
         let task_failure = Arc::new(OnceLock::new());
         let worker_task_failure = task_failure.clone();
 
@@ -1764,6 +1894,7 @@ impl BlockWriteSender {
                         chain_tip_sender,
                         non_finalized_state_sender,
                         vct_root_repair_sender,
+                        block_commit_sender,
                         backup_dir_path,
                         header_chain,
                         attach_header_chain_at_handoff,
@@ -1795,6 +1926,7 @@ impl BlockWriteSender {
             invalid_block_write_reset_receiver,
             non_finalized_rejected_receiver,
             vct_root_repair_receiver,
+            admission_sender,
             task_failure,
             Some(Arc::new(task)),
         )
@@ -2108,6 +2240,7 @@ impl WriteBlockWorkerTask {
             chain_tip_sender,
             non_finalized_state_sender,
             vct_root_repair_sender,
+            block_commit_sender,
             backup_dir_path,
             header_chain,
             attach_header_chain_at_handoff,
@@ -2404,8 +2537,10 @@ impl WriteBlockWorkerTask {
                     }
 
                     let tip_block = ChainTipBlock::from(finalized);
+                    let committed_hash = tip_block.hash;
                     prev_finalized_note_commitment_trees = Some(note_commitment_trees);
                     chain_tip_sender.set_finalized_tip(tip_block);
+                    notify_block_committed(block_commit_sender, committed_hash);
                 }
                 Err((ordered_block, error)) => {
                     let mut attributed_failure_repair = None;
@@ -2517,8 +2652,6 @@ impl WriteBlockWorkerTask {
                     }
 
                     let finalized_tip = finalized_state.db.tip();
-                    let _ = ordered_block.1.send(Err(error.clone()));
-
                     // The commit failed and the queue is being reset, so clear
                     // any buffered look-ahead block.
                     vct_write_retry_manager.reset(finalized_state);
@@ -2542,6 +2675,15 @@ impl WriteBlockWorkerTask {
                         );
                         return BlockWriteTaskExit::Completed;
                     }
+
+                    // Publish the reset before reporting failure, so the verifier's
+                    // recovery Tip request can drain queued replacements.
+                    notify_block_rejected(
+                        block_commit_sender,
+                        ordered_block.0.hash,
+                        ordered_block.2,
+                    );
+                    let _ = ordered_block.1.send(Err(error));
                 }
             }
         }
@@ -2747,13 +2889,16 @@ impl WriteBlockWorkerTask {
                             non_finalized_state_sender,
                             backup_dir_path.as_deref(),
                         );
+                        // Reconsideration restores blocks without committing them,
+                        // so wake readers waiting for one of those blocks.
+                        block_commit_sender.send_modify(|_| {});
                     }
                     let _ = rsp_tx.send(result);
                     None
                 }
             };
 
-            let Some(((queued_child, rsp_tx, admission), queued_at, _write_slot)) =
+            let Some(((queued_child, rsp_tx, admission, attempt), queued_at, _write_slot)) =
                 queued_child_and_rsp_tx
             else {
                 continue;
@@ -2762,7 +2907,9 @@ impl WriteBlockWorkerTask {
             let writer_queue_duration = queued_at.elapsed().as_secs_f64();
             metrics::histogram!("state.block_writer.queue.duration_seconds")
                 .record(writer_queue_duration);
-            if admission.is_some() {
+            let is_mined = admission.is_some();
+            let contextual_metrics = ContextualMetrics::for_commit(is_mined);
+            if is_mined {
                 metrics::histogram!("state.block_writer.queue.mined.duration_seconds")
                     .record(writer_queue_duration);
             }
@@ -2782,49 +2929,75 @@ impl WriteBlockWorkerTask {
                 } else {
                     tracing::trace!(?child_hash, "validating queued child");
                     if let Some(writer) = header_chain.as_ref() {
+                        let snapshot_clone_start = Instant::now();
                         let mut staged = non_finalized_state.clone();
-                        validate_and_commit_non_finalized(
+                        contextual_metrics.record_duration(
+                            "state.contextual.snapshot_clone.duration_seconds",
+                            "state.contextual.mined.snapshot_clone.duration_seconds",
+                            snapshot_clone_start.elapsed(),
+                        );
+                        validate_and_commit_non_finalized_with_metrics(
                             &finalized_state.db,
                             &mut staged,
                             queued_child,
+                            contextual_metrics,
                         )
                         .map_err(|error| CommitBlockError::from(Box::new(error)))
                         .and_then(|()| {
                             let accepted = Frontier::new(child_height, child_hash);
-                            let (evidence, event_path, request) =
+                            let transition_prepare_start = Instant::now();
+                            let transition =
                                 verified_request(writer, non_finalized_state, &staged, accepted)
                                     .map_err(|error| CommitBlockError::HeaderChainError {
                                         error: error.to_string(),
-                                    })?;
-                            PreparedFullStateTransition::new(
-                                evidence,
-                                writer
-                                    .runtime
-                                    .publisher()
-                                    .snapshot()
-                                    .frontiers
-                                    .verified_best,
-                                event_path,
-                                staged,
-                                None,
-                                request,
-                            )
-                            .map_err(|error| CommitBlockError::HeaderChainError {
-                                error: error.to_string(),
-                            })?
-                            .commit(&writer.runtime, non_finalized_state, &writer.context())
-                            .map(|_| ())
-                            .map_err(|error| {
-                                CommitBlockError::HeaderChainError {
+                                    })
+                                    .and_then(|(evidence, event_path, request)| {
+                                        PreparedFullStateTransition::new(
+                                            evidence,
+                                            writer
+                                                .runtime
+                                                .publisher()
+                                                .snapshot()
+                                                .frontiers
+                                                .verified_best,
+                                            event_path,
+                                            staged,
+                                            None,
+                                            request,
+                                        )
+                                        .map_err(|error| {
+                                            CommitBlockError::HeaderChainError {
+                                                error: error.to_string(),
+                                            }
+                                        })
+                                    });
+                            contextual_metrics.record_duration(
+                                "state.contextual.header_transition_prepare.duration_seconds",
+                                "state.contextual.mined.header_transition_prepare.duration_seconds",
+                                transition_prepare_start.elapsed(),
+                            );
+                            let transition = transition?;
+
+                            let transition_commit_start = Instant::now();
+                            let result = transition
+                                .commit(&writer.runtime, non_finalized_state, &writer.context())
+                                .map(|_| ())
+                                .map_err(|error| CommitBlockError::HeaderChainError {
                                     error: error.to_string(),
-                                }
-                            })
+                                });
+                            contextual_metrics.record_duration(
+                                "state.contextual.header_transition_commit.duration_seconds",
+                                "state.contextual.mined.header_transition_commit.duration_seconds",
+                                transition_commit_start.elapsed(),
+                            );
+                            result
                         })
                     } else {
-                        validate_and_commit_non_finalized(
+                        validate_and_commit_non_finalized_with_metrics(
                             &finalized_state.db,
                             non_finalized_state,
                             queued_child,
+                            contextual_metrics,
                         )
                         .map_err(|error| CommitBlockError::from(Box::new(error)))
                     }
@@ -2863,6 +3036,12 @@ impl WriteBlockWorkerTask {
                     kind: failure_kind,
                 });
 
+                // Readers waiting for an invalid block stop waiting. A local write failure
+                // can succeed on retry, so its readers keep waiting.
+                if failure_kind == NonFinalizedWriteFailureKind::Invalid {
+                    notify_block_rejected(block_commit_sender, child_hash, attempt);
+                }
+
                 // Update the caller with the error.
                 let _ = rsp_tx.send(result.map(|()| child_hash).map_err(Into::into));
 
@@ -2886,6 +3065,8 @@ impl WriteBlockWorkerTask {
                 non_finalized_state_sender,
                 backup_dir_path.as_deref(),
             );
+
+            notify_block_committed(block_commit_sender, child_hash);
 
             // Update the caller with the result.
             let _ = rsp_tx.send(result.map(|()| child_hash).map_err(Into::into));
@@ -2922,14 +3103,14 @@ impl WriteBlockWorkerTask {
                         return header_chain_finalization_failure(error);
                     }
                 };
-                if header_chain.is_some() {
-                    update_latest_chain_channels(
-                        non_finalized_state,
-                        chain_tip_sender,
-                        non_finalized_state_sender,
-                        backup_dir_path.as_deref(),
-                    );
-                }
+                // Finalization drops side chains that fork below the new finalized tip,
+                // so readers must not keep seeing them in the published state.
+                update_latest_chain_channels(
+                    non_finalized_state,
+                    chain_tip_sender,
+                    non_finalized_state_sender,
+                    backup_dir_path.as_deref(),
+                );
             }
 
             // Update the metrics if semantic and contextual validation passes

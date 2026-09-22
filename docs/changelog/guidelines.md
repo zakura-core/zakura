@@ -123,6 +123,16 @@ cargo release version --verbose --execute --allow-branch '*' -p <crate> major # 
 preparation reviews the accumulated bumps — with `cargo public-api diff` and
 the code diff where useful — rather than originating them on release day.
 
+Bump each crate **at most one release step per publish cycle**. Before
+bumping, check the crate's latest stable release on crates.io: if the
+workspace version is already above it, the pending bump covers further
+changes of the same or lower level, and a change needing a bigger bump
+raises the pending bump's level in place (a pending `7.1.0` over a published
+`7.0.0` becomes `8.0.0`, not `7.1.0 -> 8.0.0` stacked as `9.0.0`). The
+`crates.io publish graph` CI job fails versions that skip numbers the
+project never published. Never hand-write `-rcN` suffixes; release
+preparation owns them.
+
 ## Release assembly
 
 After the `zakura` package version is bumped on the release branch, run:

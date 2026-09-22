@@ -1378,6 +1378,59 @@ fn mismatched_staged_frontier_writes_and_swaps_nothing() {
 }
 
 #[test]
+fn staged_header_expectations_use_the_retained_memory_graph() {
+    let db_config = Config::ephemeral();
+    let (engine_config, anchor, metadata) = fixture();
+    let store = HeaderChainStore::new(open(&db_config, engine_config.network()));
+    store
+        .initialize(metadata.clone(), anchor.clone())
+        .expect("the empty schema initializes");
+    let (runtime, _) = store
+        .startup(&engine_config)
+        .expect("the initial store audits");
+    let evidence = EvidenceId::from_digest([0x75; 32]);
+    let expected_staged = [VerifiedHeaderRef {
+        height: anchor.height,
+        hash: anchor.hash,
+        header: anchor.header.clone(),
+    }];
+    let authority = Authority(evidence);
+
+    HeaderChainStore::reset_header_node_disk_reads();
+    runtime
+        .apply_combined_expected(
+            TransitionRequest {
+                expected_version: metadata.state_version,
+                event: TransitionEvent::OperatorReconsider(
+                    zakura_header_chain::OperatorReconsider {
+                        target: anchor.hash,
+                        id: zakura_header_chain::OperatorInvalidationId::new([0x76; 16]),
+                        invalidation_evidence: None,
+                        evidence,
+                    },
+                ),
+            },
+            &TransitionContext {
+                config: &engine_config,
+                clock: &SystemClock,
+                full_state_authority: Some(&authority),
+                retention_references: &[],
+            },
+            DiskWriteBatch::new(),
+            metadata.frontiers.verified_best,
+            &expected_staged,
+            || {},
+        )
+        .expect("the unchanged staged header is present in the retained memory graph");
+
+    assert_eq!(
+        HeaderChainStore::header_node_disk_reads(),
+        0,
+        "staged-header checks must not issue one RocksDB read per retained header",
+    );
+}
+
+#[test]
 fn checkpoint_auxiliary_staging_does_not_clone_the_retained_engine() {
     let source = include_str!("../../header_chain.rs");
     let start = source

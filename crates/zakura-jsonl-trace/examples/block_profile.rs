@@ -47,8 +47,15 @@ fn main() -> std::io::Result<()> {
         }
         root.finish(Outcome::Success);
         {
-            let _s = context.span(Stage::Finalization);
-            sleep(Duration::from_millis(35));
+            let finalization = context.span(Stage::Finalization);
+            let finalization_context = finalization.context();
+            {
+                let _prepare = finalization_context.span(Stage::FinalizedBatchPrepare);
+                sleep(Duration::from_millis(15));
+            }
+            let commit = finalization_context.span(Stage::FinalizedCommit);
+            let _write = commit.context().span(Stage::RocksdbWrite);
+            sleep(Duration::from_millis(20));
         }
     }
     sleep(Duration::from_secs(2));

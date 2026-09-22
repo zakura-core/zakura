@@ -87,6 +87,10 @@ def main():
                 detail = json.load(response)
             assert detail["complete"]
             assert max(span["end_us"] for span in detail["spans"]) > detail["summary"]["end_us"]
+            stages = {span["stage"]: span for span in detail["spans"]}
+            assert stages["finalized_commit"]["parent"] == stages["finalization"]["span"]
+            assert stages["rocksdb_write"]["parent"] == stages["finalized_commit"]["span"]
+            assert stages["rocksdb_write"]["start_us"] >= detail["summary"]["end_us"]
             with urllib.request.urlopen(origin + "/api/trace" + suffix, timeout=5) as response:
                 assert json.load(response)["traceEvents"]
             print("Passed: 12 sealed profiles, recent/outlier queries, late writer detail, exports, crash recovery, and socket ownership")

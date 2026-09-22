@@ -292,6 +292,34 @@ mod tests {
         }
     }
 
+    /// Values carrying more precision than a zatoshi are rejected, even when scaling them
+    /// by `COIN` happens to land on an integer.
+    ///
+    /// The previous implementation accepted these, because "the product is integral" is an
+    /// artifact rather than a definition. `13253377.913625069` scales to exactly
+    /// `1325337791362507`, but the canonical rendering of that amount is
+    /// `13253377.91362507`, a different `f64`, so this input was never a whole number of
+    /// zatoshis in the first place.
+    #[test]
+    fn rejects_more_precision_than_a_zatoshi_can_carry() {
+        let over_precise = 13_253_377.913_625_069_f64;
+
+        assert_eq!(over_precise * COIN as f64, 1_325_337_791_362_507.0);
+        assert!(Zec::<NonNegative>::from_lossy_zec(over_precise).is_err());
+
+        // The canonical rendering of that amount is a different f64, and is accepted.
+        let canonical = Zec::<NonNegative>::try_from(1_325_337_791_362_507_i64)
+            .expect("valid amount")
+            .lossy_zec();
+        assert_ne!(canonical, over_precise);
+        assert_eq!(
+            Zec::<NonNegative>::from_lossy_zec(canonical)
+                .expect("canonical renderings parse")
+                .zatoshis(),
+            1_325_337_791_362_507,
+        );
+    }
+
     #[test]
     fn rejects_non_finite_values() {
         for lossy in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {

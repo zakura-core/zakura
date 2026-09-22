@@ -25,7 +25,7 @@ comparison-interpreter = []
 libzcash_script = { workspace = true }
 zcash_script = { workspace = true }
 zcash_primitives = { workspace = true }
-zakura-chain = { path = "../zakura-chain", version = "9.0.0-rc0" }
+zakura-chain = { path = "../zakura-chain", version = "8.0.0-rc0" }
 
 rand = { workspace = true }
 thiserror = { workspace = true }

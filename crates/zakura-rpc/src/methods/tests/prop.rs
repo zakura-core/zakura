@@ -436,12 +436,12 @@ proptest! {
 
             let response = response.expect("should succeed without a chain tip");
 
+            // TipPoolValues failed, so the NSM counter is omitted rather than reported as zero.
+            prop_assert_eq!(response.nsm_value_balance_zat(), None);
             prop_assert_eq!(
                 response.best_block_hash,
                 genesis_hash
             );
-            // TipPoolValues failed, so the NSM counter is omitted rather than reported as zero.
-            prop_assert_eq!(response.nsm_value_balance_zat(), None);
 
             mempool.expect_no_requests().await?;
             state.expect_no_requests().await?;
@@ -558,6 +558,9 @@ proptest! {
             // Check response
             match response {
                 Ok(info) => {
+                    // TipPoolValues succeeded with a known zero NSM balance; report Some(0),
+                    // which must stay distinguishable from omitting the field.
+                    prop_assert_eq!(info.nsm_value_balance_zat(), Some(Amount::zero()));
                     prop_assert_eq!(info.chain, network.bip70_network_name());
                     prop_assert_eq!(info.blocks, block_height);
                     prop_assert_eq!(info.best_block_hash, block_hash);
@@ -573,9 +576,6 @@ proptest! {
                     prop_assert_eq!(info.pruned, expected_is_pruned);
                     prop_assert_eq!(info.prune_height, expected_prune_height);
                     prop_assert!(info.estimated_height < Height::MAX);
-                    // TipPoolValues succeeded with a known zero NSM balance; report Some(0),
-                    // which must stay distinguishable from omitting the field.
-                    prop_assert_eq!(info.nsm_value_balance_zat(), Some(Amount::zero()));
 
                     prop_assert_eq!(
                         info.consensus.chain_tip.0,
@@ -683,12 +683,12 @@ proptest! {
 
             let response = response.expect("should succeed with genesis block info");
 
+            // TipPoolValues failed, so the NSM counter is omitted rather than reported as zero.
+            prop_assert_eq!(response.nsm_value_balance_zat(), None);
             prop_assert_eq!(response.best_block_hash, genesis_block.header.hash());
             prop_assert_eq!(response.chain, network.bip70_network_name());
             prop_assert_eq!(response.blocks, Height::MIN);
             prop_assert_eq!(response.value_pools, GetBlockchainInfoBalance::value_pools(ValueBalance::zero(), None));
-            // TipPoolValues failed, so the NSM counter is omitted rather than reported as zero.
-            prop_assert_eq!(response.nsm_value_balance_zat(), None);
 
             let genesis_branch_id = NetworkUpgrade::current(&network, Height::MIN).branch_id().unwrap_or(ConsensusBranchId::RPC_MISSING_ID);
             let next_height = (Height::MIN + 1).expect("genesis height plus one is next height and valid");

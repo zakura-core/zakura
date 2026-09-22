@@ -53,9 +53,7 @@ async function openDetail(run,attempt) {
   $('lookup').hidden=true;
   $('detail').hidden=false; $('detail-title').textContent=`Block ${number(row.height)}`;
   document.title=`Block ${number(row.height)} · Zakura`;
-  $('detail-meta').textContent=`${row.hash} · ${row.outcome || 'unfinished'} · ${quality(row)} · run ${row.run}`;
-  const recording=data.recording;
-  $('detail-cohort').textContent=`${recording.network} · ${recording.storage} · ${recording.build} · Recorded ${new Date(row.utc_ms).toLocaleString()}`;
+  renderMetadata(row,data.recording);
   $('detail-warning').hidden=!row.exclusion_reason;
   $('detail-warning').textContent=row.exclusion_reason ? `Timing excluded from rankings and percentiles. ${row.exclusion_reason} Raw intervals are preserved below and include this interference.` : '';
   const timing=data.timing, formatTime=value=>value==null?'Pending':ms(value);
@@ -68,6 +66,25 @@ async function openDetail(run,attempt) {
   const end=Math.max(row.end_us||start,...spans.map(s=>s.end_us)), duration=Math.max(end-start,1);
   renderTimeline(spans,row,start,duration);
   renderCpu(data.cpu);
+}
+function renderMetadata(row,recording) {
+  const retention=/^Pruned\(PruningConfig \{ tx_retention: (\d+) \}\)$/.exec(recording.storage);
+  const storage=retention ? `Pruned · transaction data retained for ${number(retention[1])} blocks` : recording.storage;
+  const outcome=row.outcome || 'unfinished';
+  const fields=[
+    ['Block hash',row.hash || 'Unknown',true,true],
+    ['Result',outcome[0].toUpperCase()+outcome.slice(1)],
+    ['Timing detail',quality(row)],
+    ['Network',recording.network],
+    ['Storage',storage],
+    ['Recorded',new Date(row.utc_ms).toLocaleString(undefined,{dateStyle:'medium',timeStyle:'long'})],
+    ['Node build',recording.build],
+    ['Profile ID',row.run,true,true]
+  ];
+  $('detail-meta').replaceChildren(...fields.map(([label,value,wide,code])=>{
+    const item=el('div',null,wide?'metadata-item metadata-wide':'metadata-item'),description=el('dd');
+    description.append(el(code?'code':'span',value));item.append(el('dt',label),description);return item;
+  }));
 }
 async function loadBlockPage() {
   const linked=/^\/block\/([a-f0-9]{32})\/(\d{1,20})$/.exec(location.pathname);

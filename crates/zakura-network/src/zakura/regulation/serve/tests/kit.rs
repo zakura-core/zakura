@@ -148,6 +148,9 @@ pub(crate) async fn cancel_mid_production_keeps_execution_until_the_work_ends<
     let mut link = harness.link(1);
     link.session.serve(harness.adapter.request(1)).await;
     await_until(|| harness.capacity.node_slots_held() == 1).await;
+    // Let the spawned work start and block on the stall; cancelling before its
+    // first poll would let it skip the work entirely.
+    assert!(stays_pending(std::future::pending::<()>()).await);
 
     link.cancel.cancel();
     assert!(stays_pending(std::future::pending::<()>()).await);

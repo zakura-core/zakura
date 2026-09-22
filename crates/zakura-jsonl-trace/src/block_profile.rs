@@ -771,12 +771,10 @@ fn thread_id() -> Option<u64> {
 #[cfg(target_os = "linux")]
 fn monotonic_us() -> Option<u64> {
     let value = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
-    Some(
-        u64::try_from(value.tv_sec)
-            .ok()?
-            .checked_mul(1_000_000)?
-            .checked_add(u64::try_from(value.tv_nsec).ok()? / 1000)?,
-    )
+    u64::try_from(value.tv_sec)
+        .ok()?
+        .checked_mul(1_000_000)?
+        .checked_add(u64::try_from(value.tv_nsec).ok()? / 1000)
 }
 #[cfg(not(target_os = "linux"))]
 fn monotonic_us() -> Option<u64> {

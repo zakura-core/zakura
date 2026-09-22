@@ -825,6 +825,8 @@ async fn a_full_orphan_queue_still_admits_a_block_whose_parent_is_available() ->
 
 #[tokio::test]
 async fn descendant_arriving_after_a_local_parent_failure_completes_immediately() {
+    use super::write::{NonFinalizedWriteFailure, NonFinalizedWriteUpdate};
+
     let network = Network::Mainnet;
     let (mut state, _, _, _) = StateService::new(Config::ephemeral(), &network, Height::MAX, 0)
         .await
@@ -835,6 +837,22 @@ async fn descendant_arriving_after_a_local_parent_failure_completes_immediately(
     let block = block.prepare();
     let ancestor = block.block.header.previous_block_hash;
     state.remember_failed_ancestor(ancestor, ancestor, NonFinalizedWriteFailureKind::Retryable);
+    let unrelated = block::Hash([0xff; 32]);
+    state.remember_failed_ancestor(unrelated, unrelated, NonFinalizedWriteFailureKind::Invalid);
+    state.handle_non_finalized_write_update(NonFinalizedWriteUpdate::Evicted(vec![ancestor]));
+    assert!(!state.non_finalized_failed_ancestors.contains_key(&ancestor));
+    assert_eq!(
+        state.non_finalized_failed_ancestors.get(&unrelated),
+        Some(&(unrelated, NonFinalizedWriteFailureKind::Invalid))
+    );
+
+    // A fresh failure sent after eviction must still reject the next child.
+    state.handle_non_finalized_write_update(NonFinalizedWriteUpdate::Failed(
+        NonFinalizedWriteFailure {
+            hash: ancestor,
+            kind: NonFinalizedWriteFailureKind::Retryable,
+        },
+    ));
 
     let response = state
         .queue_and_commit_to_non_finalized_state(block.clone(), None)
@@ -855,6 +873,7 @@ async fn descendant_arriving_after_a_local_parent_failure_completes_immediately(
 
 #[tokio::test]
 async fn fork_eviction_allows_new_and_replayed_parents_to_extend() {
+    use super::write::{NonFinalizedWriteFailure, NonFinalizedWriteUpdate};
     use crate::tests::FakeChainHelper;
 
     let _init_guard = zakura_test::init();
@@ -878,6 +897,14 @@ async fn fork_eviction_allows_new_and_replayed_parents_to_extend() {
     ))];
     let siblings =
         Arc::new(template).make_fake_siblings(crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS + 1);
+    let evicted = &siblings[siblings.len() - 2];
+    // Record a temporary failure before this block succeeds on its next attempt.
+    state.handle_non_finalized_write_update(NonFinalizedWriteUpdate::Failed(
+        NonFinalizedWriteFailure {
+            hash: evicted.hash(),
+            kind: NonFinalizedWriteFailureKind::Retryable,
+        },
+    ));
     for (order, block) in siblings.iter().enumerate() {
         let prepared = block.clone().prepare();
         tokio::time::timeout(
@@ -893,7 +920,6 @@ async fn fork_eviction_allows_new_and_replayed_parents_to_extend() {
         assert!(retained.any_chain_contains(&siblings[order].hash()));
         assert!(retained.chain_iter().count() <= crate::constants::MAX_NON_FINALIZED_CHAIN_FORKS);
     }
-    let evicted = &siblings[siblings.len() - 2];
     state.drain_non_finalized_write_updates();
     assert!(!state.can_fork_chain_at(&evicted.hash()));
     assert!(!state
@@ -905,8 +931,19 @@ async fn fork_eviction_allows_new_and_replayed_parents_to_extend() {
 
     // The newest branch can win with a child. An evicted branch can then be
     // downloaded again and win with two children, without restarting the node.
-    for (parent, depth) in [(siblings.last().unwrap(), 1), (evicted, 2)] {
+    for (parent, mut depth) in [(siblings.last().unwrap(), 1), (evicted, 2)] {
+        let mut tip = parent.clone();
         if parent.hash() == evicted.hash() {
+            tip = tip.make_fake_child();
+            let mut child_response =
+                state.queue_and_commit_to_non_finalized_state(tip.clone().prepare(), None);
+            assert!(
+                matches!(
+                    child_response.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ),
+                "the child waits for its previously valid parent to be downloaded again"
+            );
             tokio::time::timeout(
                 Duration::from_secs(10),
                 state.queue_and_commit_to_non_finalized_state(parent.clone().prepare(), None),
@@ -915,8 +952,13 @@ async fn fork_eviction_allows_new_and_replayed_parents_to_extend() {
             .unwrap()
             .unwrap()
             .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), child_response)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            depth -= 1;
         }
-        let mut tip = parent.clone();
         for _ in 0..depth {
             tip = tip.make_fake_child();
             tokio::time::timeout(

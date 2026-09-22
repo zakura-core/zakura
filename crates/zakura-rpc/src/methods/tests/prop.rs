@@ -434,10 +434,14 @@ proptest! {
 
             let (response, _) = tokio::join!(response_fut, mock_state_handler);
 
+            let response = response.expect("should succeed without a chain tip");
+
             prop_assert_eq!(
-                response.unwrap().best_block_hash,
+                response.best_block_hash,
                 genesis_hash
             );
+            // TipPoolValues failed, so the NSM counter is omitted rather than reported as zero.
+            prop_assert_eq!(response.nsm_value_balance_zat(), None);
 
             mempool.expect_no_requests().await?;
             state.expect_no_requests().await?;
@@ -569,6 +573,9 @@ proptest! {
                     prop_assert_eq!(info.pruned, expected_is_pruned);
                     prop_assert_eq!(info.prune_height, expected_prune_height);
                     prop_assert!(info.estimated_height < Height::MAX);
+                    // TipPoolValues succeeded with a known zero NSM balance; report Some(0),
+                    // which must stay distinguishable from omitting the field.
+                    prop_assert_eq!(info.nsm_value_balance_zat(), Some(Amount::zero()));
 
                     prop_assert_eq!(
                         info.consensus.chain_tip.0,
@@ -680,6 +687,8 @@ proptest! {
             prop_assert_eq!(response.chain, network.bip70_network_name());
             prop_assert_eq!(response.blocks, Height::MIN);
             prop_assert_eq!(response.value_pools, GetBlockchainInfoBalance::value_pools(ValueBalance::zero(), None));
+            // TipPoolValues failed, so the NSM counter is omitted rather than reported as zero.
+            prop_assert_eq!(response.nsm_value_balance_zat(), None);
 
             let genesis_branch_id = NetworkUpgrade::current(&network, Height::MIN).branch_id().unwrap_or(ConsensusBranchId::RPC_MISSING_ID);
             let next_height = (Height::MIN + 1).expect("genesis height plus one is next height and valid");

@@ -21,7 +21,7 @@ const READERS: [InboundReader; 3] = [
 /// `(stream kind, message type)`. The stream cap wins, so an honest sender
 /// cannot send these messages at their protocol maximum. This is a known
 /// finding; the list keeps it visible.
-const ROWS_ABOVE_STREAM_CAP: [(u16, u16); 2] = [(2, 2), (3, 4)];
+const ROWS_ABOVE_STREAM_CAP: [(u16, u16); 3] = [(2, 2), (3, 4), (3, 13)];
 
 /// Every native stream whose service declares message rules, with its table.
 fn native_rule_tables() -> Vec<(Stream, &'static [MessageRule])> {

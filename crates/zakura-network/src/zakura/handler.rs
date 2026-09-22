@@ -8915,7 +8915,7 @@ mod tests {
             (2, 0, u32::MAX, stream.frame_cap, Expect::Oversize(17)),
             // A tighter stream cap still applies to an otherwise legal request.
             (2, 0, 9, 16, Expect::Oversize(16)),
-            (3, 0, 100, 107, Expect::Oversize(107)),
+            (3, 0, 200, 207, Expect::Oversize(207)),
             (
                 2,
                 0,

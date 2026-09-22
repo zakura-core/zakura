@@ -6,12 +6,11 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    io::{self, Cursor, Read, Write},
+    io::Cursor,
     sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
 };
 
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
@@ -22,7 +21,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use zakura_chain::{
     block,
-    serialization::{SerializationError, ZcashDeserialize, ZcashSerialize},
+    serialization::{ZcashDeserialize, ZcashSerialize},
 };
 
 use super::{
@@ -35,14 +34,11 @@ mod bbr;
 #[cfg(feature = "internal-bench")]
 mod bench;
 mod config;
-mod declaration;
 mod error;
 mod events;
 mod peer_registry;
 mod peer_routine;
 mod pipe;
-#[cfg(test)]
-mod property_tests;
 mod reactor;
 mod reorder;
 mod request;

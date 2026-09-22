@@ -1,4 +1,7 @@
-use super::{config::*, declaration::GET_BLOCKS, error::*, *};
+use super::{config::*, error::*, *};
+use crate::zakura::wire_codec::{
+    self, BoundedReader, HashItem, HeightLe, LeU32, Wire, WireError, WireMessage,
+};
 
 /// Zakura stream kind reserved for native block sync.
 pub const ZAKURA_STREAM_BLOCK_SYNC: u16 = 6;
@@ -18,22 +21,48 @@ pub const MSG_BS_BLOCKS_DONE: u8 = 4;
 /// Report that a requested range is not servable.
 pub const MSG_BS_RANGE_UNAVAILABLE: u8 = 5;
 
-/// Stream-6 message rules, checked from each frame header.
+/// Fixed block-header fields before the Equihash solution: version, three
+/// hashes, time, bits, and nonce. Every valid block on every network is at
+/// least this long.
+const MIN_BLOCK_BYTES: usize = 4 + 32 + 32 + 32 + 4 + 4 + 32;
+
+/// Consensus block-size limit in bytes.
+// The cast is lossless: the const assertion below keeps usize at least 32 bits.
+const MAX_BLOCK_USIZE: usize = block::MAX_BLOCK_BYTES as usize;
+const _: () = assert!(usize::BITS >= 32);
+
+/// Discriminator byte plus the fields of each fixed-size message.
+const STATUS_PAYLOAD_BYTES: usize = BLOCK_SYNC_MESSAGE_TYPE_BYTES + StatusItem::MAX_LEN;
+const RANGE_PAYLOAD_BYTES: usize =
+    BLOCK_SYNC_MESSAGE_TYPE_BYTES + HeightLe::MAX_LEN + LeU32::MAX_LEN;
+
+/// Stream-6 message rules, checked from each frame header and by the codec.
 ///
-/// `Status` is a 1-byte discriminator plus 52 status bytes. The range messages
-/// are a discriminator, a height, and a count. `Block` carries one block body
-/// no larger than [`block::MAX_BLOCK_BYTES`]. The `as u16` casts widen u8
-/// discriminators, which is lossless.
+/// The `as u16` casts widen u8 discriminators, which is lossless.
 pub const BLOCK_SYNC_MESSAGE_RULES: [MessageRule; 5] = [
-    MessageRule::announcement(MSG_BS_STATUS as u16, PayloadLen::exact(53)),
-    MessageRule::request(MSG_BS_GET_BLOCKS as u16, PayloadLen::exact(9)),
-    // The block maximum fits usize: `MAX_BS_MESSAGE_BYTES` is a usize above it.
+    MessageRule::announcement(
+        MSG_BS_STATUS as u16,
+        PayloadLen::exact(STATUS_PAYLOAD_BYTES),
+    ),
+    MessageRule::request(
+        MSG_BS_GET_BLOCKS as u16,
+        PayloadLen::exact(RANGE_PAYLOAD_BYTES),
+    ),
     MessageRule::response(
         MSG_BS_BLOCK as u16,
-        PayloadLen::between(2, 1 + block::MAX_BLOCK_BYTES as usize),
+        PayloadLen::between(
+            BLOCK_SYNC_MESSAGE_TYPE_BYTES + MIN_BLOCK_BYTES,
+            BLOCK_SYNC_MESSAGE_TYPE_BYTES + MAX_BLOCK_USIZE,
+        ),
     ),
-    MessageRule::response(MSG_BS_BLOCKS_DONE as u16, PayloadLen::exact(9)),
-    MessageRule::response(MSG_BS_RANGE_UNAVAILABLE as u16, PayloadLen::exact(9)),
+    MessageRule::response(
+        MSG_BS_BLOCKS_DONE as u16,
+        PayloadLen::exact(RANGE_PAYLOAD_BYTES),
+    ),
+    MessageRule::response(
+        MSG_BS_RANGE_UNAVAILABLE as u16,
+        PayloadLen::exact(RANGE_PAYLOAD_BYTES),
+    ),
 ];
 
 /// Maximum block bodies ever requested or reported by stream 6.
@@ -95,106 +124,25 @@ impl BlockSyncMessage {
 
     /// Encode this message as `[u8 message_type][bounded fields...]`.
     pub fn encode(&self) -> Result<Vec<u8>, BlockSyncWireError> {
-        let mut bytes = Vec::new();
-        bytes.write_u8(self.message_type())?;
-        match self {
-            Self::Status(status) => status.encode_to(&mut bytes)?,
-            Self::GetBlocks {
-                start_height,
-                count,
-            } => {
-                GET_BLOCKS.validate(*start_height, *count)?;
-                write_height(&mut bytes, *start_height)?;
-                bytes.write_u32::<LittleEndian>(*count)?;
-            }
-            Self::RangeUnavailable {
-                start_height,
-                count,
-            } => {
-                validate_block_count(*count)?;
-                write_height(&mut bytes, *start_height)?;
-                bytes.write_u32::<LittleEndian>(*count)?;
-            }
-            Self::Block(block) => {
-                block.zcash_serialize(&mut bytes)?;
-                validate_encoded_block_len(
-                    bytes.len().saturating_sub(BLOCK_SYNC_MESSAGE_TYPE_BYTES),
-                )?;
-            }
-            Self::BlocksDone {
-                start_height,
-                returned,
-            } => {
-                validate_block_count(*returned)?;
-                write_height(&mut bytes, *start_height)?;
-                bytes.write_u32::<LittleEndian>(*returned)?;
-            }
-        }
-        validate_payload_len(bytes.len())?;
-        Ok(bytes)
+        self.encode_frame().map(|frame| frame.payload)
     }
 
-    /// Decode a stream-6 message.
+    /// Decode a stream-6 payload; its first byte names the message type.
     pub fn decode(bytes: &[u8]) -> Result<Self, BlockSyncWireError> {
-        validate_payload_len(bytes.len())?;
-        let mut reader = Cursor::new(bytes);
-        let message_type = reader.read_u8()?;
-        let message = match message_type {
-            MSG_BS_STATUS => Self::Status(BlockSyncStatus::decode_from(&mut reader)?),
-            MSG_BS_GET_BLOCKS => {
-                let start_height = read_height(&mut reader)?;
-                let count = reader.read_u32::<LittleEndian>()?;
-                GET_BLOCKS.validate(start_height, count)?;
-                Self::GetBlocks {
-                    start_height,
-                    count,
-                }
-            }
-            MSG_BS_BLOCK => {
-                let block_start = usize::try_from(reader.position())
-                    .map_err(|_| BlockSyncWireError::NumericOverflow("block payload offset"))?;
-                let block = Arc::new(block::Block::zcash_deserialize(&mut reader)?);
-                let block_end = usize::try_from(reader.position())
-                    .map_err(|_| BlockSyncWireError::NumericOverflow("block payload end"))?;
-                validate_encoded_block_len(block_end.saturating_sub(block_start))?;
-                Self::Block(block)
-            }
-            MSG_BS_BLOCKS_DONE => {
-                let start_height = read_height(&mut reader)?;
-                let returned = reader.read_u32::<LittleEndian>()?;
-                validate_block_count(returned)?;
-                Self::BlocksDone {
-                    start_height,
-                    returned,
-                }
-            }
-            MSG_BS_RANGE_UNAVAILABLE => {
-                let start_height = read_height(&mut reader)?;
-                let count = reader.read_u32::<LittleEndian>()?;
-                validate_block_count(count)?;
-                Self::RangeUnavailable {
-                    start_height,
-                    count,
-                }
-            }
-            value => return Err(BlockSyncWireError::UnknownMessageType(value)),
-        };
-        reject_trailing(bytes, &reader)?;
-        Ok(message)
+        let message_type = bytes
+            .first()
+            .ok_or(WireError::Truncated("block-sync message type"))?;
+        wire_codec::decode_payload_exact(u16::from(*message_type), bytes)
     }
 
     /// Convert this message into a bounded Zakura frame.
     pub fn encode_frame(&self) -> Result<Frame, BlockSyncWireError> {
-        Ok(Frame {
-            message_type: u16::from(self.message_type()),
-            flags: 0,
-            payload: self.encode()?,
-        })
+        wire_codec::encode_frame(self)
     }
 
     /// Decode this message from a Zakura frame after checking flags and type agreement.
     pub fn decode_frame(frame: Frame) -> Result<Self, BlockSyncWireError> {
-        Self::decode_frame_with_raw_block_payload(frame).map(|(message, _)| message)
+        wire_codec::decode_frame(&frame)
     }
 
     /// Decode this message and return the raw frame payload for block bodies.
@@ -206,37 +154,23 @@ impl BlockSyncMessage {
     pub(super) fn decode_frame_with_raw_block_payload(
         frame: Frame,
     ) -> Result<(Self, Option<Arc<[u8]>>), BlockSyncWireError> {
+        if frame.message_type != u16::from(MSG_BS_BLOCK) {
+            return Ok((wire_codec::decode_frame(&frame)?, None));
+        }
         if frame.flags != 0 {
-            return Err(BlockSyncWireError::UnsupportedFlags(frame.flags));
+            return Err(WireError::ReservedFlags(frame.flags).into());
         }
-        let frame_message_type = u8::try_from(frame.message_type)
-            .map_err(|_| BlockSyncWireError::UnknownFrameMessageType(frame.message_type))?;
-
-        // If this is a block message, keep the original raw block payload as well;
-        // it can be stored in compact form in the reorder backlog.
-        let (message, raw_block_payload) = if frame_message_type == MSG_BS_BLOCK {
-            let raw_block_payload = Arc::<[u8]>::from(frame.payload.into_boxed_slice());
-            let message = Self::decode(&raw_block_payload)?;
-            (message, Some(raw_block_payload))
-        } else {
-            (Self::decode(&frame.payload)?, None)
-        };
-
-        if frame_message_type != message.message_type() {
-            return Err(BlockSyncWireError::MismatchedFrameMessageType {
-                frame: frame.message_type,
-                payload: message.message_type(),
-            });
-        }
-        Ok((message, raw_block_payload))
+        let raw_block_payload = Arc::<[u8]>::from(frame.payload.into_boxed_slice());
+        let message = wire_codec::decode_payload_exact(frame.message_type, &raw_block_payload)?;
+        Ok((message, Some(raw_block_payload)))
     }
 
     /// Exact serialized length of a `Block` body, derived from the frame payload
     /// length the per-peer decode task already has in hand.
     ///
     /// A block payload is `[message_type][block serialization]` with no trailing
-    /// bytes — `encode` writes exactly those two parts and `decode` calls
-    /// `reject_trailing`, so the block occupies exactly
+    /// bytes — `encode` writes exactly those two parts and `decode` rejects
+    /// trailing bytes, so the block occupies exactly
     /// `payload_len - BLOCK_SYNC_MESSAGE_TYPE_BYTES`. Returning this lets the
     /// reactor account body bytes without re-serializing the whole block on its
     /// single thread (the per-peer task already paid the deserialization cost).
@@ -247,6 +181,143 @@ impl BlockSyncMessage {
                 .unwrap_or(u64::MAX)
         })
     }
+}
+
+impl WireMessage for BlockSyncMessage {
+    type Error = BlockSyncWireError;
+    const RULES: &'static [MessageRule] = &BLOCK_SYNC_MESSAGE_RULES;
+
+    fn message_type(&self) -> u16 {
+        u16::from(BlockSyncMessage::message_type(self))
+    }
+
+    fn encode_payload(&self, out: &mut Vec<u8>) -> Result<(), BlockSyncWireError> {
+        out.push(BlockSyncMessage::message_type(self));
+        match self {
+            Self::Status(status) => StatusItem::encode(status, out)?,
+            Self::GetBlocks {
+                start_height,
+                count,
+            } => {
+                validate_block_range(*start_height, *count)?;
+                encode_range(*start_height, *count, out)?;
+            }
+            Self::Block(block) => {
+                let block_start = out.len();
+                block.zcash_serialize(&mut *out).map_err(WireError::from)?;
+                validate_encoded_block_len(out.len() - block_start)?;
+            }
+            Self::BlocksDone {
+                start_height,
+                returned: count,
+            }
+            | Self::RangeUnavailable {
+                start_height,
+                count,
+            } => {
+                validate_block_count(*count)?;
+                encode_range(*start_height, *count, out)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn decode_payload(
+        message_type: u16,
+        reader: &mut BoundedReader<'_>,
+    ) -> Result<Self, BlockSyncWireError> {
+        let [discriminator] = reader.array("block-sync message type")?;
+        if u16::from(discriminator) != message_type {
+            return Err(BlockSyncWireError::MismatchedFrameMessageType {
+                frame: message_type,
+                payload: discriminator,
+            });
+        }
+        let message = match discriminator {
+            MSG_BS_STATUS => Self::Status(reader.read::<StatusItem>()?),
+            MSG_BS_GET_BLOCKS => {
+                let (start_height, count) = decode_range(reader)?;
+                validate_block_range(start_height, count)?;
+                Self::GetBlocks {
+                    start_height,
+                    count,
+                }
+            }
+            MSG_BS_BLOCK => {
+                let block_len = reader.remaining();
+                validate_encoded_block_len(block_len)?;
+                Self::Block(Arc::new(reader.zcash::<block::Block>()?))
+            }
+            MSG_BS_BLOCKS_DONE => {
+                let (start_height, returned) = decode_range(reader)?;
+                validate_block_count(returned)?;
+                Self::BlocksDone {
+                    start_height,
+                    returned,
+                }
+            }
+            MSG_BS_RANGE_UNAVAILABLE => {
+                let (start_height, count) = decode_range(reader)?;
+                validate_block_count(count)?;
+                Self::RangeUnavailable {
+                    start_height,
+                    count,
+                }
+            }
+            _ => return Err(WireError::UnknownMessageType(message_type).into()),
+        };
+        Ok(message)
+    }
+}
+
+/// Wire encoding of [`BlockSyncStatus`]: two heights, the tip hash, and three
+/// `u32` limits.
+///
+/// Decoding clamps each limit into its local range instead of rejecting it.
+/// The regulation specification does not yet say whether an out-of-range
+/// advertisement is a violation; this is a known gap.
+pub(super) enum StatusItem {}
+
+impl Wire for StatusItem {
+    type Value = BlockSyncStatus;
+    const MIN_LEN: usize = 2 * HeightLe::MAX_LEN + HashItem::MAX_LEN + 3 * LeU32::MAX_LEN;
+    const MAX_LEN: usize = Self::MIN_LEN;
+
+    fn encode(status: &BlockSyncStatus, out: &mut Vec<u8>) -> Result<(), WireError> {
+        HeightLe::encode(&status.servable_low, out)?;
+        HeightLe::encode(&status.servable_high, out)?;
+        HashItem::encode(&status.tip_hash, out)?;
+        LeU32::encode(
+            &clamp_advertised_blocks(status.max_blocks_per_response),
+            out,
+        )?;
+        LeU32::encode(&status.max_inflight_requests, out)?;
+        LeU32::encode(&status.max_response_bytes.max(1), out)
+    }
+
+    fn decode(reader: &mut BoundedReader<'_>) -> Result<BlockSyncStatus, WireError> {
+        Ok(BlockSyncStatus {
+            servable_low: reader.read::<HeightLe>()?,
+            servable_high: reader.read::<HeightLe>()?,
+            tip_hash: reader.read::<HashItem>()?,
+            max_blocks_per_response: clamp_advertised_blocks(reader.read::<LeU32>()?),
+            max_inflight_requests: clamp_advertised_inflight(reader.read::<LeU32>()?),
+            max_response_bytes: clamp_advertised_response_bytes(reader.read::<LeU32>()?),
+        })
+    }
+}
+
+fn encode_range(
+    start_height: block::Height,
+    count: u32,
+    out: &mut Vec<u8>,
+) -> Result<(), WireError> {
+    HeightLe::encode(&start_height, out)?;
+    LeU32::encode(&count, out)
+}
+
+fn decode_range(reader: &mut BoundedReader<'_>) -> Result<(block::Height, u32), WireError> {
+    Ok((reader.read::<HeightLe>()?, reader.read::<LeU32>()?))
 }
 
 pub(super) fn validate_block_count(count: u32) -> Result<(), BlockSyncWireError> {
@@ -262,46 +333,26 @@ pub(super) fn validate_block_count(count: u32) -> Result<(), BlockSyncWireError>
     Ok(())
 }
 
-pub(super) fn validate_payload_len(len: usize) -> Result<(), BlockSyncWireError> {
-    if len > MAX_BS_MESSAGE_BYTES {
-        return Err(BlockSyncWireError::OversizedPayload {
-            actual: len,
-            max: MAX_BS_MESSAGE_BYTES,
-        });
-    }
+/// Check a `GetBlocks` range: a valid count whose last height exists.
+fn validate_block_range(start_height: block::Height, count: u32) -> Result<(), BlockSyncWireError> {
+    validate_block_count(count)?;
+    start_height
+        .0
+        .checked_add(count - 1)
+        .filter(|last_height| *last_height <= block::Height::MAX.0)
+        .ok_or(BlockSyncWireError::BlockRangeOverflow {
+            start: start_height,
+            count,
+        })?;
     Ok(())
 }
 
 fn validate_encoded_block_len(len: usize) -> Result<(), BlockSyncWireError> {
-    let max = usize::try_from(block::MAX_BLOCK_BYTES)
-        .map_err(|_| BlockSyncWireError::NumericOverflow("max block bytes"))?;
-    if len > max {
-        return Err(BlockSyncWireError::OversizedBlock { actual: len, max });
-    }
-    Ok(())
-}
-
-pub(super) fn write_height<W: Write>(
-    writer: &mut W,
-    height: block::Height,
-) -> Result<(), BlockSyncWireError> {
-    writer.write_u32::<LittleEndian>(height.0)?;
-    Ok(())
-}
-
-pub(super) fn read_height<R: Read>(reader: &mut R) -> Result<block::Height, BlockSyncWireError> {
-    let raw = reader.read_u32::<LittleEndian>()?;
-    block::Height::try_from(raw).map_err(|_| BlockSyncWireError::HeightOutOfRange(raw))
-}
-
-pub(super) fn reject_trailing(
-    bytes: &[u8],
-    reader: &Cursor<&[u8]>,
-) -> Result<(), BlockSyncWireError> {
-    let consumed = usize::try_from(reader.position())
-        .map_err(|_| BlockSyncWireError::NumericOverflow("payload cursor"))?;
-    if consumed != bytes.len() {
-        return Err(BlockSyncWireError::TrailingBytes);
+    if len > MAX_BLOCK_USIZE {
+        return Err(BlockSyncWireError::OversizedBlock {
+            actual: len,
+            max: MAX_BLOCK_USIZE,
+        });
     }
     Ok(())
 }

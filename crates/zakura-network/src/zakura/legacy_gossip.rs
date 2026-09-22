@@ -24,8 +24,8 @@ use tower::{Service, ServiceExt};
 use zakura_chain::{
     block::{self, Block, MAX_BLOCK_LOCATOR_LENGTH},
     serialization::{
-        CompactSizeMessage, SerializationError, ZcashDeserialize, ZcashSerialize,
-        MAX_HEADERS_PER_MESSAGE, MAX_PROTOCOL_MESSAGE_LEN,
+        SerializationError, ZcashDeserialize, ZcashSerialize, MAX_HEADERS_PER_MESSAGE,
+        MAX_PROTOCOL_MESSAGE_LEN,
     },
     transaction::{Transaction, UnminedTx, UnminedTxId},
 };
@@ -39,6 +39,9 @@ use crate::{
 };
 
 use super::trace::BlockBodySource;
+use super::wire_codec::{
+    self, BoundedReader, BoundedVec, HashItem, Wire, WireError, WireMessage, Zcash,
+};
 use super::{
     spawn_supervised_peer_task, BoxRunFuture, Frame, FramedSend, MessageRule, OrderedSendError,
     PayloadLen, Peer, RequestResponseService, Service as ZakuraService, ServicePeerDirection,
@@ -48,6 +51,8 @@ use super::{
 };
 
 mod trace;
+#[cfg(test)]
+mod wire_conformance;
 
 use trace::{LegacyRequestError, LegacyRequestResponse, LegacyRequestStart};
 
@@ -156,48 +161,106 @@ const LEGACY_GOSSIP_SERVICE_STREAMS: [Stream; 2] = [
     },
 ];
 
-/// Largest legacy inventory list: a 3-byte CompactSize count plus the maximum
-/// number of 68-byte (witnessed) inventory entries.
-const MAX_TX_INV_LIST_BYTES: usize = 3 + 25_000 * 68;
-/// Largest block-hash list: a 3-byte CompactSize count plus 25,000 hashes.
-const MAX_HASH_LIST_BYTES: usize = 3 + 25_000 * 32;
-/// Largest block locator: a 1-byte count, up to 101 hashes, and a stop hash.
-const MAX_BLOCK_LOCATOR_BYTES: usize = 1 + 101 * 32 + 32;
+/// Most items in one legacy inventory list.
+// The cast is lossless: the protocol cap is 25,000.
+const MAX_INVENTORY_ITEMS: usize = MAX_TX_INV_IN_SENT_MESSAGE as usize;
+/// Most hashes in one block locator.
+// The cast is lossless: the protocol cap is 101.
+const MAX_LOCATOR_HASHES: usize = MAX_BLOCK_LOCATOR_LENGTH as usize;
+/// Consensus block-size limit, which also bounds one transaction.
+// The cast is lossless on the 32-bit and wider targets that zakura supports.
+const MAX_BLOCK_USIZE: usize = block::MAX_BLOCK_BYTES as usize;
+/// Smallest transaction the Zcash codec decodes: a 4-byte header, empty input
+/// and output lists, and a 4-byte lock time. Consensus rejects it, but the
+/// codec bound must not reject what the decoder accepts.
+const MIN_TRANSACTION_BYTES: usize = 4 + 1 + 1 + 4;
+
+/// A transaction inventory entry: `Tx` (4 + 32 bytes) or `Wtx` (4 + 64 bytes).
+pub(super) enum TxIdInventory {}
+
+impl Wire for TxIdInventory {
+    type Value = UnminedTxId;
+    const MIN_LEN: usize = 4 + 32;
+    const MAX_LEN: usize = 4 + 64;
+
+    fn encode(id: &UnminedTxId, out: &mut Vec<u8>) -> Result<(), WireError> {
+        InventoryHash::from(id).zcash_serialize(&mut *out)?;
+        Ok(())
+    }
+
+    fn decode(reader: &mut BoundedReader<'_>) -> Result<UnminedTxId, WireError> {
+        reader
+            .zcash::<InventoryHash>()?
+            .unmined_tx_id()
+            .ok_or(WireError::InvalidItem("transaction inventory"))
+    }
+}
+
+/// A full transaction, no larger than a block.
+type TransactionItem = Zcash<Transaction, MIN_TRANSACTION_BYTES, MAX_BLOCK_USIZE>;
+
+/// A header-only block entry: a header with a 36- or 1344-byte Equihash
+/// solution, then a one-byte zero transaction count.
+type CountedHeaderItem = Zcash<block::CountedHeader, { 140 + 1 + 36 + 1 }, { 140 + 3 + 1344 + 1 }>;
+
+/// Block hashes in `BlocksByHash` requests and hash responses.
+const INVENTORY_HASHES: BoundedVec<HashItem> =
+    BoundedVec::new("inventory hashes", 0, MAX_INVENTORY_ITEMS);
+/// Transaction ids in `TransactionsById` requests and id responses.
+const TRANSACTION_IDS: BoundedVec<TxIdInventory> =
+    BoundedVec::new("transaction ids", 0, MAX_INVENTORY_ITEMS);
+/// Transaction ids in a gossip advertisement, which is never empty.
+const ADVERTISED_TRANSACTION_IDS: BoundedVec<TxIdInventory> =
+    BoundedVec::new("advertised transaction ids", 1, MAX_INVENTORY_ITEMS);
+/// Known-block hashes in a `FindBlocks` or `FindHeaders` locator.
+const BLOCK_LOCATOR: BoundedVec<HashItem> = BoundedVec::new("block locator", 0, MAX_LOCATOR_HASHES);
+/// Headers in a `BlockHeaders` response.
+const COUNTED_HEADERS: BoundedVec<CountedHeaderItem> =
+    BoundedVec::new("block headers", 0, MAX_HEADERS_PER_MESSAGE);
 
 /// Stream-2 gossip rules.
-pub const LEGACY_GOSSIP_MESSAGE_RULES: [MessageRule; 2] = [
-    MessageRule::announcement(MSG_ADVERTISE_BLOCK, PayloadLen::exact(32)),
-    // A non-empty list holds at least one 36-byte legacy inventory entry.
+pub const LEGACY_GOSSIP_MESSAGE_RULES: &[MessageRule] = &[
+    MessageRule::announcement(MSG_ADVERTISE_BLOCK, PayloadLen::exact(HashItem::MAX_LEN)),
     MessageRule::announcement(
         MSG_ADVERTISE_TX_IDS,
-        PayloadLen::between(1 + 36, MAX_TX_INV_LIST_BYTES),
+        PayloadLen::between(
+            ADVERTISED_TRANSACTION_IDS.min_len(),
+            ADVERTISED_TRANSACTION_IDS.max_len(),
+        ),
     ),
 ];
 
+/// Request rows lead [`LEGACY_REQUEST_MESSAGE_RULES`]; responses follow.
+const LEGACY_REQUEST_ROWS: usize = 7;
+
+/// A locator payload: the locator list, then a stop hash.
+const LOCATOR_PAYLOAD: PayloadLen = PayloadLen::between(
+    BLOCK_LOCATOR.min_len() + HashItem::MAX_LEN,
+    BLOCK_LOCATOR.max_len() + HashItem::MAX_LEN,
+);
+
 /// Stream-3 request and response rules.
 ///
-/// Every response repeats the 8-byte request id. Chunked and list responses
-/// add at least one byte after it.
-pub const LEGACY_REQUEST_MESSAGE_RULES: [MessageRule; 16] = [
+/// The request rows derive from the request codec. Responses are decoded by
+/// the chunked response codec; every response repeats the 8-byte request id,
+/// and chunked and list responses add at least one byte after it.
+pub const LEGACY_REQUEST_MESSAGE_RULES: &[MessageRule] = &[
     MessageRule::request(
         MSG_REQUEST_BLOCKS_BY_HASH,
-        PayloadLen::between(1, MAX_HASH_LIST_BYTES),
+        PayloadLen::between(INVENTORY_HASHES.min_len(), INVENTORY_HASHES.max_len()),
     ),
     MessageRule::request(
         MSG_REQUEST_TRANSACTIONS_BY_ID,
-        PayloadLen::between(1, MAX_TX_INV_LIST_BYTES),
+        PayloadLen::between(TRANSACTION_IDS.min_len(), TRANSACTION_IDS.max_len()),
     ),
-    MessageRule::request(
-        MSG_REQUEST_FIND_BLOCKS,
-        PayloadLen::between(1 + 32, MAX_BLOCK_LOCATOR_BYTES),
-    ),
-    MessageRule::request(
-        MSG_REQUEST_FIND_HEADERS,
-        PayloadLen::between(1 + 32, MAX_BLOCK_LOCATOR_BYTES),
-    ),
+    MessageRule::request(MSG_REQUEST_FIND_BLOCKS, LOCATOR_PAYLOAD),
+    MessageRule::request(MSG_REQUEST_FIND_HEADERS, LOCATOR_PAYLOAD),
     MessageRule::request(MSG_REQUEST_MEMPOOL_TRANSACTION_IDS, PayloadLen::exact(0)),
     MessageRule::request(MSG_REQUEST_PING, PayloadLen::exact(0)),
-    MessageRule::request(MSG_REQUEST_PUSH_TRANSACTION, PayloadLen::at_least(1)),
+    MessageRule::request(
+        MSG_REQUEST_PUSH_TRANSACTION,
+        PayloadLen::between(TransactionItem::MIN_LEN, TransactionItem::MAX_LEN),
+    ),
     MessageRule::response(
         MSG_RESPONSE_BLOCK,
         PayloadLen::at_least(RESPONSE_CHUNK_HEADER_BYTES),
@@ -233,12 +296,8 @@ pub const LEGACY_REQUEST_MESSAGE_RULES: [MessageRule; 16] = [
 /// Return the legacy message rules for one of its streams.
 pub(crate) fn legacy_message_rules(stream: Stream) -> Option<&'static [MessageRule]> {
     match stream {
-        stream if stream == LEGACY_GOSSIP_SERVICE_STREAMS[0] => {
-            Some(LEGACY_GOSSIP_MESSAGE_RULES.as_slice())
-        }
-        stream if stream == LEGACY_GOSSIP_SERVICE_STREAMS[1] => {
-            Some(LEGACY_REQUEST_MESSAGE_RULES.as_slice())
-        }
+        stream if stream == LEGACY_GOSSIP_SERVICE_STREAMS[0] => Some(LEGACY_GOSSIP_MESSAGE_RULES),
+        stream if stream == LEGACY_GOSSIP_SERVICE_STREAMS[1] => Some(LEGACY_REQUEST_MESSAGE_RULES),
         _ => None,
     }
 }
@@ -283,53 +342,12 @@ impl LegacyGossipFrame {
 
     /// Convert this typed frame to a Zakura wire frame.
     pub fn encode_frame(&self) -> Result<Frame, LegacyGossipError> {
-        match self {
-            Self::AdvertiseBlock(hash) => {
-                let mut payload = Vec::new();
-                hash.zcash_serialize(&mut payload)?;
-                Ok(Frame {
-                    message_type: MSG_ADVERTISE_BLOCK,
-                    flags: 0,
-                    payload,
-                })
-            }
-            Self::AdvertiseTransactionIds(ids) => {
-                let ids = outbound_tx_id_slice(ids)?;
-                let mut payload = Vec::new();
-                write_tx_id_list(&mut payload, ids)?;
-                Ok(Frame {
-                    message_type: MSG_ADVERTISE_TX_IDS,
-                    flags: 0,
-                    payload,
-                })
-            }
-        }
+        wire_codec::encode_frame(self)
     }
 
     /// Decode a Zakura frame into a typed gossip frame.
     pub fn decode_frame(frame: Frame) -> Result<Self, LegacyGossipError> {
-        if frame.flags != 0 {
-            return Err(LegacyGossipError::UnsupportedFlags(frame.flags));
-        }
-
-        match frame.message_type {
-            MSG_ADVERTISE_BLOCK => {
-                let mut reader = Cursor::new(frame.payload.as_slice());
-                let hash = block::Hash::zcash_deserialize(&mut reader)?;
-                reject_trailing(&reader)?;
-                Ok(Self::AdvertiseBlock(hash))
-            }
-            MSG_ADVERTISE_TX_IDS => {
-                let mut reader = Cursor::new(frame.payload.as_slice());
-                let ids = read_tx_id_list(&mut reader)?;
-                if ids.is_empty() {
-                    return Err(LegacyGossipError::EmptyTransactionAdvertisement);
-                }
-                reject_trailing(&reader)?;
-                Ok(Self::AdvertiseTransactionIds(ids))
-            }
-            message_type => Err(LegacyGossipError::UnknownMessageType(message_type)),
-        }
+        wire_codec::decode_frame(&frame)
     }
 
     fn into_request(self, peer_id: ZakuraPeerId) -> Request {
@@ -387,11 +405,11 @@ impl LegacyRequestFrame {
                 Ok(Self::TransactionsById(ids))
             }
             Request::FindBlocks { known_blocks, stop } => {
-                ensure_block_locator_count(known_blocks.len())?;
+                BLOCK_LOCATOR.check_len(known_blocks.len())?;
                 Ok(Self::FindBlocks { known_blocks, stop })
             }
             Request::FindHeaders { known_blocks, stop } => {
-                ensure_block_locator_count(known_blocks.len())?;
+                BLOCK_LOCATOR.check_len(known_blocks.len())?;
                 Ok(Self::FindHeaders { known_blocks, stop })
             }
             Request::MempoolTransactionIds => Ok(Self::MempoolTransactionIds),
@@ -403,112 +421,12 @@ impl LegacyRequestFrame {
 
     /// Convert this typed request to a Zakura wire frame.
     pub fn encode_frame(&self) -> Result<Frame, LegacyGossipError> {
-        match self {
-            Self::BlocksByHash(hashes) => {
-                let mut payload = Vec::new();
-                write_hash_list(&mut payload, hashes)?;
-                Ok(Frame {
-                    message_type: MSG_REQUEST_BLOCKS_BY_HASH,
-                    flags: 0,
-                    payload,
-                })
-            }
-            Self::TransactionsById(ids) => {
-                let mut payload = Vec::new();
-                write_tx_id_list(&mut payload, ids)?;
-                Ok(Frame {
-                    message_type: MSG_REQUEST_TRANSACTIONS_BY_ID,
-                    flags: 0,
-                    payload,
-                })
-            }
-            Self::FindBlocks { known_blocks, stop } => {
-                let mut payload = Vec::new();
-                write_block_locator(&mut payload, known_blocks, *stop)?;
-                Ok(Frame {
-                    message_type: MSG_REQUEST_FIND_BLOCKS,
-                    flags: 0,
-                    payload,
-                })
-            }
-            Self::FindHeaders { known_blocks, stop } => {
-                let mut payload = Vec::new();
-                write_block_locator(&mut payload, known_blocks, *stop)?;
-                Ok(Frame {
-                    message_type: MSG_REQUEST_FIND_HEADERS,
-                    flags: 0,
-                    payload,
-                })
-            }
-            Self::MempoolTransactionIds => Ok(Frame {
-                message_type: MSG_REQUEST_MEMPOOL_TRANSACTION_IDS,
-                flags: 0,
-                payload: Vec::new(),
-            }),
-            Self::Ping => Ok(Frame {
-                message_type: MSG_REQUEST_PING,
-                flags: 0,
-                payload: Vec::new(),
-            }),
-            Self::PushTransaction(transaction) => Ok(Frame {
-                message_type: MSG_REQUEST_PUSH_TRANSACTION,
-                flags: 0,
-                payload: transaction.transaction().zcash_serialize_to_vec()?,
-            }),
-        }
+        wire_codec::encode_frame(self)
     }
 
     /// Decode a Zakura frame into a typed inventory request.
     pub fn decode_frame(frame: Frame) -> Result<Self, LegacyGossipError> {
-        if frame.flags != 0 {
-            return Err(LegacyGossipError::UnsupportedFlags(frame.flags));
-        }
-
-        match frame.message_type {
-            MSG_REQUEST_BLOCKS_BY_HASH => {
-                let mut reader = Cursor::new(frame.payload.as_slice());
-                let hashes = read_hash_list(&mut reader)?;
-                reject_trailing(&reader)?;
-                Ok(Self::BlocksByHash(hashes))
-            }
-            MSG_REQUEST_TRANSACTIONS_BY_ID => {
-                let mut reader = Cursor::new(frame.payload.as_slice());
-                let ids = read_tx_id_list(&mut reader)?;
-                reject_trailing(&reader)?;
-                Ok(Self::TransactionsById(ids))
-            }
-            MSG_REQUEST_FIND_BLOCKS => {
-                let mut reader = Cursor::new(frame.payload.as_slice());
-                let (known_blocks, stop) = read_block_locator(&mut reader)?;
-                reject_trailing(&reader)?;
-                Ok(Self::FindBlocks { known_blocks, stop })
-            }
-            MSG_REQUEST_FIND_HEADERS => {
-                let mut reader = Cursor::new(frame.payload.as_slice());
-                let (known_blocks, stop) = read_block_locator(&mut reader)?;
-                reject_trailing(&reader)?;
-                Ok(Self::FindHeaders { known_blocks, stop })
-            }
-            MSG_REQUEST_MEMPOOL_TRANSACTION_IDS => {
-                if !frame.payload.is_empty() {
-                    return Err(LegacyGossipError::TrailingBytes);
-                }
-                Ok(Self::MempoolTransactionIds)
-            }
-            MSG_REQUEST_PING => {
-                if !frame.payload.is_empty() {
-                    return Err(LegacyGossipError::TrailingBytes);
-                }
-                Ok(Self::Ping)
-            }
-            MSG_REQUEST_PUSH_TRANSACTION => {
-                let mut reader = Cursor::new(frame.payload.as_slice());
-                let transaction = Transaction::zcash_deserialize(&mut reader)?;
-                reject_trailing(&reader)?;
-                Ok(Self::PushTransaction(UnminedTx::from(transaction)))
-            }
-            message_type => Err(LegacyGossipError::UnknownMessageType(message_type)),
-        }
+        wire_codec::decode_frame(&frame)
     }
 
     fn into_service_request(self, peer_id: ZakuraPeerId) -> Option<Request> {
@@ -579,6 +497,102 @@ impl LegacyRequestKind {
             LegacyRequestKind::Ping => MSG_REQUEST_PING,
             LegacyRequestKind::PushTransaction => MSG_REQUEST_PUSH_TRANSACTION,
         }
+    }
+}
+
+impl WireMessage for LegacyGossipFrame {
+    type Error = LegacyGossipError;
+    const RULES: &'static [MessageRule] = LEGACY_GOSSIP_MESSAGE_RULES;
+
+    fn message_type(&self) -> u16 {
+        match self {
+            Self::AdvertiseBlock(_) => MSG_ADVERTISE_BLOCK,
+            Self::AdvertiseTransactionIds(_) => MSG_ADVERTISE_TX_IDS,
+        }
+    }
+
+    fn encode_payload(&self, out: &mut Vec<u8>) -> Result<(), LegacyGossipError> {
+        match self {
+            Self::AdvertiseBlock(hash) => HashItem::encode(hash, out)?,
+            Self::AdvertiseTransactionIds(ids) => {
+                ADVERTISED_TRANSACTION_IDS.encode(outbound_tx_id_slice(ids)?, out)?
+            }
+        }
+        Ok(())
+    }
+
+    fn decode_payload(
+        message_type: u16,
+        reader: &mut BoundedReader<'_>,
+    ) -> Result<Self, LegacyGossipError> {
+        Ok(match message_type {
+            MSG_ADVERTISE_BLOCK => Self::AdvertiseBlock(reader.read::<HashItem>()?),
+            MSG_ADVERTISE_TX_IDS => {
+                Self::AdvertiseTransactionIds(ADVERTISED_TRANSACTION_IDS.decode(reader)?)
+            }
+            _ => return Err(WireError::UnknownMessageType(message_type).into()),
+        })
+    }
+}
+
+impl WireMessage for LegacyRequestFrame {
+    type Error = LegacyGossipError;
+    const RULES: &'static [MessageRule] =
+        LEGACY_REQUEST_MESSAGE_RULES.split_at(LEGACY_REQUEST_ROWS).0;
+
+    fn message_type(&self) -> u16 {
+        self.kind().message_type()
+    }
+
+    fn encode_payload(&self, out: &mut Vec<u8>) -> Result<(), LegacyGossipError> {
+        match self {
+            Self::BlocksByHash(hashes) => INVENTORY_HASHES.encode(hashes, out)?,
+            Self::TransactionsById(ids) => TRANSACTION_IDS.encode(ids, out)?,
+            Self::FindBlocks { known_blocks, stop } | Self::FindHeaders { known_blocks, stop } => {
+                BLOCK_LOCATOR.encode(known_blocks, out)?;
+                HashItem::encode(&stop.unwrap_or(NO_STOP_HASH), out)?;
+            }
+            Self::MempoolTransactionIds | Self::Ping => {}
+            Self::PushTransaction(transaction) => {
+                TransactionItem::encode(transaction.transaction().as_ref(), out)?
+            }
+        }
+        Ok(())
+    }
+
+    fn decode_payload(
+        message_type: u16,
+        reader: &mut BoundedReader<'_>,
+    ) -> Result<Self, LegacyGossipError> {
+        let locator = |reader: &mut BoundedReader<'_>| -> Result<_, WireError> {
+            let known_blocks = BLOCK_LOCATOR.decode(reader)?;
+            let stop_hash = reader.read::<HashItem>()?;
+            // A zero stop hash is the legacy locator sentinel for "no stop hash".
+            Ok((
+                known_blocks,
+                (stop_hash != NO_STOP_HASH).then_some(stop_hash),
+            ))
+        };
+        Ok(match message_type {
+            MSG_REQUEST_BLOCKS_BY_HASH => Self::BlocksByHash(INVENTORY_HASHES.decode(reader)?),
+            MSG_REQUEST_TRANSACTIONS_BY_ID => {
+                Self::TransactionsById(TRANSACTION_IDS.decode(reader)?)
+            }
+            MSG_REQUEST_FIND_BLOCKS => {
+                let (known_blocks, stop) = locator(reader)?;
+                Self::FindBlocks { known_blocks, stop }
+            }
+            MSG_REQUEST_FIND_HEADERS => {
+                let (known_blocks, stop) = locator(reader)?;
+                Self::FindHeaders { known_blocks, stop }
+            }
+            MSG_REQUEST_MEMPOOL_TRANSACTION_IDS => Self::MempoolTransactionIds,
+            MSG_REQUEST_PING => Self::Ping,
+            MSG_REQUEST_PUSH_TRANSACTION => {
+                Self::PushTransaction(UnminedTx::from(reader.read::<TransactionItem>()?))
+            }
+            _ => return Err(WireError::UnknownMessageType(message_type).into()),
+        })
     }
 }
 
@@ -710,7 +724,7 @@ impl LegacyResponseCodec {
 
         for frame in frames {
             if frame.flags != 0 {
-                return Err(LegacyGossipError::UnsupportedFlags(frame.flags));
+                return Err(WireError::ReservedFlags(frame.flags).into());
             }
 
             match frame.message_type {
@@ -828,7 +842,7 @@ impl LegacyResponseCodec {
                     decode_id_only_response(request_id, frame.payload)?;
                     saw_nil = true;
                 }
-                message_type => return Err(LegacyGossipError::UnknownMessageType(message_type)),
+                message_type => return Err(WireError::UnknownMessageType(message_type).into()),
             }
         }
 
@@ -892,138 +906,6 @@ fn truncate_to_inventory_cap<T>(
     }
 
     Ok(collected)
-}
-
-fn write_hash_list(out: &mut Vec<u8>, hashes: &[block::Hash]) -> Result<(), LegacyGossipError> {
-    ensure_inventory_count(hashes.len())?;
-    CompactSizeMessage::try_from(hashes.len())?.zcash_serialize(&mut *out)?;
-    for hash in hashes {
-        hash.zcash_serialize(&mut *out)?;
-    }
-    Ok(())
-}
-
-fn read_hash_list(reader: &mut Cursor<&[u8]>) -> Result<Vec<block::Hash>, LegacyGossipError> {
-    let count = bounded_inventory_count(reader)?;
-    let mut hashes = Vec::with_capacity(count);
-    for _ in 0..count {
-        hashes.push(block::Hash::zcash_deserialize(&mut *reader)?);
-    }
-    Ok(hashes)
-}
-
-fn write_block_locator(
-    out: &mut Vec<u8>,
-    known_blocks: &[block::Hash],
-    stop: Option<block::Hash>,
-) -> Result<(), LegacyGossipError> {
-    ensure_block_locator_count(known_blocks.len())?;
-    CompactSizeMessage::try_from(known_blocks.len())?.zcash_serialize(&mut *out)?;
-    for hash in known_blocks {
-        hash.zcash_serialize(&mut *out)?;
-    }
-    stop.unwrap_or(NO_STOP_HASH).zcash_serialize(&mut *out)?;
-    Ok(())
-}
-
-fn read_block_locator(
-    reader: &mut Cursor<&[u8]>,
-) -> Result<(Vec<block::Hash>, Option<block::Hash>), LegacyGossipError> {
-    let count = bounded_block_locator_count(reader)?;
-    let mut known_blocks = Vec::with_capacity(count);
-    for _ in 0..count {
-        known_blocks.push(block::Hash::zcash_deserialize(&mut *reader)?);
-    }
-    let stop_hash = block::Hash::zcash_deserialize(&mut *reader)?;
-    // A zero stop hash is the legacy locator sentinel for "no stop hash".
-    let stop = (stop_hash != NO_STOP_HASH).then_some(stop_hash);
-    Ok((known_blocks, stop))
-}
-
-fn write_tx_id_list(out: &mut Vec<u8>, ids: &[UnminedTxId]) -> Result<(), LegacyGossipError> {
-    ensure_inventory_count(ids.len())?;
-    CompactSizeMessage::try_from(ids.len())?.zcash_serialize(&mut *out)?;
-    for id in ids {
-        InventoryHash::from(id).zcash_serialize(&mut *out)?;
-    }
-    Ok(())
-}
-
-fn read_tx_id_list(reader: &mut Cursor<&[u8]>) -> Result<Vec<UnminedTxId>, LegacyGossipError> {
-    let count = bounded_inventory_count(reader)?;
-    let mut ids = Vec::with_capacity(count);
-    for _ in 0..count {
-        let inv = InventoryHash::zcash_deserialize(&mut *reader)?;
-        let Some(id) = inv.unmined_tx_id() else {
-            return Err(LegacyGossipError::NonTransactionInventory);
-        };
-        ids.push(id);
-    }
-    Ok(ids)
-}
-
-fn bounded_inventory_count(reader: &mut Cursor<&[u8]>) -> Result<usize, LegacyGossipError> {
-    let count = usize::from(CompactSizeMessage::zcash_deserialize(reader)?);
-    ensure_inventory_count(count)?;
-    Ok(count)
-}
-
-fn ensure_inventory_count(count: usize) -> Result<(), LegacyGossipError> {
-    let max = usize::try_from(MAX_TX_INV_IN_SENT_MESSAGE)?;
-    if count > max {
-        return Err(LegacyGossipError::TooManyInventoryItems(count));
-    }
-    Ok(())
-}
-
-fn bounded_block_locator_count(reader: &mut Cursor<&[u8]>) -> Result<usize, LegacyGossipError> {
-    let count = usize::from(CompactSizeMessage::zcash_deserialize(reader)?);
-    ensure_block_locator_count(count)?;
-    Ok(count)
-}
-
-fn ensure_block_locator_count(count: usize) -> Result<(), LegacyGossipError> {
-    let max = usize::try_from(MAX_BLOCK_LOCATOR_LENGTH)?;
-    if count > max {
-        return Err(LegacyGossipError::TooManyBlockLocatorHashes(count));
-    }
-    Ok(())
-}
-
-fn write_header_list(
-    out: &mut Vec<u8>,
-    headers: &[block::CountedHeader],
-) -> Result<(), LegacyGossipError> {
-    ensure_header_count(headers.len())?;
-    CompactSizeMessage::try_from(headers.len())?.zcash_serialize(&mut *out)?;
-    for header in headers {
-        header.zcash_serialize(&mut *out)?;
-    }
-    Ok(())
-}
-
-fn read_header_list(
-    reader: &mut Cursor<&[u8]>,
-) -> Result<Vec<block::CountedHeader>, LegacyGossipError> {
-    let count = bounded_header_count(reader)?;
-    let mut headers = Vec::with_capacity(count);
-    for _ in 0..count {
-        headers.push(block::CountedHeader::zcash_deserialize(&mut *reader)?);
-    }
-    Ok(headers)
-}
-
-fn bounded_header_count(reader: &mut Cursor<&[u8]>) -> Result<usize, LegacyGossipError> {
-    let count = usize::from(CompactSizeMessage::zcash_deserialize(reader)?);
-    ensure_header_count(count)?;
-    Ok(count)
-}
-
-fn ensure_header_count(count: usize) -> Result<(), LegacyGossipError> {
-    if count > MAX_HEADERS_PER_MESSAGE {
-        return Err(LegacyGossipError::TooManyHeaders(count));
-    }
-    Ok(())
 }
 
 /// Tracks the cumulative size of an encoded legacy response so the inbound
@@ -1188,7 +1070,7 @@ fn missing_blocks_frame(
     let mut payload = Vec::new();
     // Missing responses also repeat the id, keeping all response-frame validation local.
     payload.extend_from_slice(&request_id.to_le_bytes());
-    write_hash_list(&mut payload, &hashes)?;
+    INVENTORY_HASHES.encode(&hashes, &mut payload)?;
     Ok(Frame {
         message_type: MSG_RESPONSE_MISSING_BLOCKS,
         flags: 0,
@@ -1202,7 +1084,7 @@ fn missing_transactions_frame(
 ) -> Result<Frame, LegacyGossipError> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&request_id.to_le_bytes());
-    write_tx_id_list(&mut payload, &ids)?;
+    TRANSACTION_IDS.encode(&ids, &mut payload)?;
     Ok(Frame {
         message_type: MSG_RESPONSE_MISSING_TRANSACTIONS,
         flags: 0,
@@ -1216,7 +1098,7 @@ fn block_hashes_frame(
 ) -> Result<Frame, LegacyGossipError> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&request_id.to_le_bytes());
-    write_hash_list(&mut payload, &hashes)?;
+    INVENTORY_HASHES.encode(&hashes, &mut payload)?;
     Ok(Frame {
         message_type: MSG_RESPONSE_BLOCK_HASHES,
         flags: 0,
@@ -1230,7 +1112,7 @@ fn block_headers_frame(
 ) -> Result<Frame, LegacyGossipError> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&request_id.to_le_bytes());
-    write_header_list(&mut payload, &headers)?;
+    COUNTED_HEADERS.encode(&headers, &mut payload)?;
     Ok(Frame {
         message_type: MSG_RESPONSE_BLOCK_HEADERS,
         flags: 0,
@@ -1244,7 +1126,7 @@ fn transaction_ids_frame(
 ) -> Result<Frame, LegacyGossipError> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&request_id.to_le_bytes());
-    write_tx_id_list(&mut payload, &ids)?;
+    TRANSACTION_IDS.encode(&ids, &mut payload)?;
     Ok(Frame {
         message_type: MSG_RESPONSE_TRANSACTION_IDS,
         flags: 0,
@@ -1285,10 +1167,10 @@ fn decode_hashes_response(
     payload: Vec<u8>,
 ) -> Result<Vec<block::Hash>, LegacyGossipError> {
     let payload = verify_response_id(request_id, &payload)?;
-    let mut reader = Cursor::new(payload);
-    let hashes = read_hash_list(&mut reader)?;
-    reject_trailing(&reader)?;
-    Ok(hashes)
+    let mut reader = BoundedReader::new(payload);
+    let items = INVENTORY_HASHES.decode(&mut reader)?;
+    reader.finish()?;
+    Ok(items)
 }
 
 fn decode_tx_ids_response(
@@ -1296,10 +1178,10 @@ fn decode_tx_ids_response(
     payload: Vec<u8>,
 ) -> Result<Vec<UnminedTxId>, LegacyGossipError> {
     let payload = verify_response_id(request_id, &payload)?;
-    let mut reader = Cursor::new(payload);
-    let ids = read_tx_id_list(&mut reader)?;
-    reject_trailing(&reader)?;
-    Ok(ids)
+    let mut reader = BoundedReader::new(payload);
+    let items = TRANSACTION_IDS.decode(&mut reader)?;
+    reader.finish()?;
+    Ok(items)
 }
 
 fn decode_block_headers(
@@ -1307,16 +1189,16 @@ fn decode_block_headers(
     payload: Vec<u8>,
 ) -> Result<Vec<block::CountedHeader>, LegacyGossipError> {
     let payload = verify_response_id(request_id, &payload)?;
-    let mut reader = Cursor::new(payload);
-    let headers = read_header_list(&mut reader)?;
-    reject_trailing(&reader)?;
-    Ok(headers)
+    let mut reader = BoundedReader::new(payload);
+    let items = COUNTED_HEADERS.decode(&mut reader)?;
+    reader.finish()?;
+    Ok(items)
 }
 
 fn decode_id_only_response(request_id: u64, payload: Vec<u8>) -> Result<(), LegacyGossipError> {
     let payload = verify_response_id(request_id, &payload)?;
     if !payload.is_empty() {
-        return Err(LegacyGossipError::TrailingBytes);
+        return Err(WireError::TrailingBytes.into());
     }
     Ok(())
 }
@@ -1328,14 +1210,6 @@ fn outbound_tx_id_slice(ids: &[UnminedTxId]) -> Result<&[UnminedTxId], LegacyGos
         return Err(LegacyGossipError::EmptyTransactionAdvertisement);
     }
     Ok(ids)
-}
-
-fn reject_trailing(reader: &Cursor<&[u8]>) -> Result<(), LegacyGossipError> {
-    let len = u64::try_from(reader.get_ref().len())?;
-    if reader.position() != len {
-        return Err(LegacyGossipError::TrailingBytes);
-    }
-    Ok(())
 }
 
 /// Broadcasts legacy gossip frames to outbound-ready Zakura peers.
@@ -3147,30 +3021,9 @@ pub enum LegacyGossipError {
     /// The request is intentionally outside this phase's gossip-only scope.
     #[error("unsupported legacy gossip request: {0}")]
     UnsupportedRequest(&'static str),
-    /// A peer used nonzero flags before any flags are defined.
-    #[error("unsupported legacy gossip flags: {0}")]
-    UnsupportedFlags(u16),
-    /// A peer sent an unknown gossip message type.
-    #[error("unknown legacy gossip message type: {0}")]
-    UnknownMessageType(u16),
     /// Transaction advertisements must not be empty.
     #[error("empty transaction-id advertisement")]
     EmptyTransactionAdvertisement,
-    /// A peer requested or responded with too many inventory items.
-    #[error("too many inventory items in legacy request/response: {0}")]
-    TooManyInventoryItems(usize),
-    /// A peer requested too many block locator hashes.
-    #[error("too many block locator hashes in legacy request: {0}")]
-    TooManyBlockLocatorHashes(usize),
-    /// A peer responded with too many block headers.
-    #[error("too many block headers in legacy response: {0}")]
-    TooManyHeaders(usize),
-    /// Transaction gossip payload included non-transaction inventory.
-    #[error("transaction-id advertisement contained non-transaction inventory")]
-    NonTransactionInventory,
-    /// Payload had bytes after the decoded message.
-    #[error("trailing bytes after legacy gossip payload")]
-    TrailingBytes,
     /// A response frame echoed a different request id.
     #[error("wrong legacy request id in response: expected {expected}, got {actual}")]
     WrongRequestId {
@@ -3207,6 +3060,9 @@ pub enum LegacyGossipError {
     /// Local buffer serialization failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// A structural wire error shared with every typed codec.
+    #[error(transparent)]
+    Wire(#[from] WireError),
     /// Integer conversion failed while checking a peer-controlled bound.
     #[error(transparent)]
     Integer(#[from] std::num::TryFromIntError),
@@ -3303,7 +3159,7 @@ mod tests {
     }
 
     fn encoded_count(count: usize) -> Vec<u8> {
-        CompactSizeMessage::try_from(count)
+        zakura_chain::serialization::CompactSizeMessage::try_from(count)
             .expect("test count is within CompactSizeMessage bounds")
             .zcash_serialize_to_vec()
             .expect("compact size serializes")
@@ -3916,7 +3772,7 @@ mod tests {
         encoded.payload.push(0);
         assert!(matches!(
             LegacyGossipFrame::decode_frame(encoded),
-            Err(LegacyGossipError::TrailingBytes)
+            Err(LegacyGossipError::Wire(WireError::PayloadLength { .. }))
         ));
     }
 
@@ -5128,7 +4984,8 @@ mod tests {
         };
         assert!(matches!(
             LegacyRequestFrame::decode_frame(oversized),
-            Err(LegacyGossipError::TooManyInventoryItems(count)) if count == max + 1
+            Err(LegacyGossipError::Wire(WireError::CountOutOfRange { count, .. }))
+                if count == u64::try_from(max + 1).expect("test count fits u64")
         ));
 
         let max_locator =
@@ -5136,11 +4993,12 @@ mod tests {
         let oversized_locator = Frame {
             message_type: MSG_REQUEST_FIND_HEADERS,
             flags: 0,
-            payload: encoded_count(max_locator + 1),
+            payload: [encoded_count(max_locator + 1), vec![0; 32]].concat(),
         };
         assert!(matches!(
             LegacyRequestFrame::decode_frame(oversized_locator),
-            Err(LegacyGossipError::TooManyBlockLocatorHashes(count)) if count == max_locator + 1
+            Err(LegacyGossipError::Wire(WireError::CountOutOfRange { count, .. }))
+                if count == u64::try_from(max_locator + 1).expect("test count fits u64")
         ));
     }
 
@@ -5603,7 +5461,7 @@ mod tests {
                 flags: 1,
                 payload: Vec::new(),
             }),
-            Err(LegacyGossipError::UnsupportedFlags(1))
+            Err(LegacyGossipError::Wire(WireError::ReservedFlags(1)))
         ));
         assert!(matches!(
             LegacyGossipFrame::decode_frame(Frame {
@@ -5611,15 +5469,18 @@ mod tests {
                 flags: 0,
                 payload: Vec::new(),
             }),
-            Err(LegacyGossipError::UnknownMessageType(99))
+            Err(LegacyGossipError::Wire(WireError::UnknownMessageType(99)))
         ));
         assert!(matches!(
             LegacyGossipFrame::decode_frame(Frame {
                 message_type: MSG_ADVERTISE_TX_IDS,
                 flags: 0,
-                payload: vec![0],
+                payload: [&[0][..], &[0; 36]].concat(),
             }),
-            Err(LegacyGossipError::EmptyTransactionAdvertisement)
+            Err(LegacyGossipError::Wire(WireError::CountOutOfRange {
+                count: 0,
+                ..
+            }))
         ));
     }
 
@@ -5629,11 +5490,12 @@ mod tests {
         let oversized = Frame {
             message_type: MSG_ADVERTISE_TX_IDS,
             flags: 0,
-            payload: encoded_count(max + 1),
+            payload: [encoded_count(max + 1), vec![0; 36]].concat(),
         };
         assert!(matches!(
             LegacyGossipFrame::decode_frame(oversized),
-            Err(LegacyGossipError::TooManyInventoryItems(count)) if count == max + 1
+            Err(LegacyGossipError::Wire(WireError::CountOutOfRange { count, .. }))
+                if count == u64::try_from(max + 1).expect("test count fits u64")
         ));
 
         let ids: HashSet<_> = (0..max + 3)

@@ -1,4 +1,4 @@
-use super::{error::*, wire::*, *};
+use super::{wire::*, *};
 
 /// Default number of blocks advertised per response.
 ///
@@ -174,29 +174,6 @@ pub struct BlockSyncStatus {
     pub max_inflight_requests: u32,
     /// Maximum total response bytes the sender targets per requested range.
     pub max_response_bytes: u32,
-}
-
-impl BlockSyncStatus {
-    pub(super) fn encode_to<W: Write>(&self, writer: &mut W) -> Result<(), BlockSyncWireError> {
-        write_height(writer, self.servable_low)?;
-        write_height(writer, self.servable_high)?;
-        self.tip_hash.zcash_serialize(&mut *writer)?;
-        writer.write_u32::<LittleEndian>(clamp_advertised_blocks(self.max_blocks_per_response))?;
-        writer.write_u32::<LittleEndian>(self.max_inflight_requests)?;
-        writer.write_u32::<LittleEndian>(self.max_response_bytes.max(1))?;
-        Ok(())
-    }
-
-    pub(super) fn decode_from<R: Read>(reader: &mut R) -> Result<Self, BlockSyncWireError> {
-        Ok(Self {
-            servable_low: read_height(reader)?,
-            servable_high: read_height(reader)?,
-            tip_hash: block::Hash::zcash_deserialize(&mut *reader)?,
-            max_blocks_per_response: clamp_advertised_blocks(reader.read_u32::<LittleEndian>()?),
-            max_inflight_requests: clamp_advertised_inflight(reader.read_u32::<LittleEndian>()?),
-            max_response_bytes: clamp_advertised_response_bytes(reader.read_u32::<LittleEndian>()?),
-        })
-    }
 }
 
 impl Default for BlockSyncStatus {

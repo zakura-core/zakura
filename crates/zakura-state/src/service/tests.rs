@@ -40,6 +40,61 @@ use crate::{
 
 const LAST_BLOCK_HEIGHT: u32 = 10;
 
+#[tokio::test]
+async fn sent_sibling_removal_keeps_await_utxo_ready() {
+    use super::write::{NonFinalizedWriteFailure, NonFinalizedWriteUpdate};
+    use crate::tests::FakeChainHelper;
+
+    let _init_guard = zakura_test::init();
+    let block: Arc<Block> = zakura_test::vectors::BLOCK_MAINNET_419201_BYTES
+        .zcash_deserialize_into()
+        .unwrap();
+    let siblings = block.make_fake_siblings(2);
+    let removed = siblings[0].clone().prepare();
+    let in_flight = siblings[1].clone().prepare();
+    let (outpoint, expected_output) = in_flight
+        .new_outputs
+        .iter()
+        .find(|(_, output)| !output.utxo.from_coinbase)
+        .unwrap();
+
+    for update in [
+        NonFinalizedWriteUpdate::Evicted(vec![removed.hash]),
+        NonFinalizedWriteUpdate::Failed(NonFinalizedWriteFailure {
+            hash: removed.hash,
+            kind: NonFinalizedWriteFailureKind::Invalid,
+        }),
+        NonFinalizedWriteUpdate::Failed(NonFinalizedWriteFailure {
+            hash: removed.hash,
+            kind: NonFinalizedWriteFailureKind::Retryable,
+        }),
+    ] {
+        let (mut state, _, _, _) =
+            StateService::new(Config::ephemeral(), &Network::Mainnet, Height::MAX, 0)
+                .await
+                .unwrap();
+        state.non_finalized_block_write_sent_hashes.add(&removed);
+        state.non_finalized_block_write_sent_hashes.add(&in_flight);
+        state.handle_non_finalized_write_update(update);
+        assert!(!state
+            .non_finalized_block_write_sent_hashes
+            .contains(&removed.hash));
+        assert!(state
+            .non_finalized_block_write_sent_hashes
+            .contains(&in_flight.hash));
+
+        let response = timeout(
+            Duration::from_secs(5),
+            state.call(Request::AwaitUtxo(*outpoint)),
+        )
+        .await
+        .expect("a sent sibling still supplies this output before it commits")
+        .unwrap();
+        assert_eq!(response, Response::Utxo(expected_output.utxo.clone()));
+        assert_eq!(state.pending_utxos.len(), 0);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn block_info_does_not_wait_for_a_queued_parent() {
     let _init_guard = zakura_test::init();

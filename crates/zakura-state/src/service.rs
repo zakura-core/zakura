@@ -861,9 +861,8 @@ impl StateService {
         let failure = match update {
             write::NonFinalizedWriteUpdate::Failed(failure) => failure,
             write::NonFinalizedWriteUpdate::Evicted(hashes) => {
-                for hash in hashes {
-                    self.non_finalized_block_write_sent_hashes.remove(&hash);
-                }
+                self.non_finalized_block_write_sent_hashes
+                    .remove_many(&hashes);
                 // Resource eviction does not invalidate queued descendants.
                 return;
             }

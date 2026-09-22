@@ -266,6 +266,65 @@ fn sent_hashes_remove_drops_rejected_hash_and_utxos() -> Result<()> {
 }
 
 #[test]
+fn sent_hashes_remove_many_preserves_other_blocks_across_batches() -> Result<()> {
+    let _init_guard = zakura_test::init();
+    let earlier: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_419200_BYTES.zcash_deserialize_into()?;
+    let block: Arc<Block> =
+        zakura_test::vectors::BLOCK_MAINNET_419201_BYTES.zcash_deserialize_into()?;
+    let earlier = earlier.prepare();
+    let siblings = block.make_fake_siblings(3);
+    let removed = siblings[0].clone().prepare();
+    let retained = siblings[1].clone().prepare();
+    let removed_current = siblings[2].clone().prepare();
+    let unknown_hash = block.make_fake_child().hash();
+
+    let mut sent = SentHashes::default();
+    sent.add(&earlier);
+    sent.finish_batch();
+    sent.add(&removed);
+    sent.add(&retained);
+    sent.finish_batch();
+    sent.add(&removed_current);
+
+    // Empty input must leave both finished and unfinished batches untouched.
+    sent.remove_many(&[]);
+    assert_eq!(sent.sent.len(), 4);
+    assert_eq!(sent.bufs.len(), 2);
+    assert_eq!(sent.curr_buf.len(), 1);
+
+    sent.remove_many(&[
+        earlier.hash,
+        removed.hash,
+        removed_current.hash,
+        removed.hash,
+        unknown_hash,
+    ]);
+
+    assert_eq!(sent.sent.len(), 1);
+    assert!(sent.contains(&retained.hash));
+    assert_eq!(sent.known_utxos.len(), retained.new_outputs.len());
+    for outpoint in retained.new_outputs.keys() {
+        assert!(sent.utxo(outpoint).is_some());
+    }
+    assert!(sent.curr_buf.is_empty());
+    assert_eq!(sent.bufs.len(), 1);
+    assert_eq!(
+        sent.bufs[0].iter().copied().collect::<Vec<_>>(),
+        vec![(retained.hash, retained.height)]
+    );
+
+    // Redelivery acquires a new owner after the previous batch entry was removed.
+    sent.add(&removed_current);
+    sent.remove_many(&[retained.hash, removed_current.hash]);
+    assert!(sent.sent.is_empty());
+    assert!(sent.known_utxos.is_empty());
+    assert!(sent.curr_buf.is_empty());
+    assert!(sent.bufs.is_empty());
+    Ok(())
+}
+
+#[test]
 fn sent_hashes_remove_keeps_outputs_shared_with_sent_sibling() -> Result<()> {
     let _init_guard = zakura_test::init();
     let block: Arc<Block> =

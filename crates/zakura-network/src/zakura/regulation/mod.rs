@@ -11,8 +11,14 @@ pub(crate) use request::{
     RequestAdmission, RequestPolicy, RequestSession, ResponsePermit, WorkAttempt, WorkLease,
 };
 
+mod reservations;
+pub(crate) use reservations::{ClaimRefused, Reservations, ReserveRefused};
+
 mod slots;
 pub(crate) use slots::{SlotBudget, SlotPermit};
+
+mod verdict;
+pub(crate) use verdict::Verdict;
 
 #[cfg(test)]
 mod tests;

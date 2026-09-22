@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use zakura_chain::block;
 
 use super::{events::*, pipe::run_peer, wire::*, FRAME_HEADER_BYTES};
+use crate::zakura::regulation::Reservations;
 #[cfg(any(test, feature = "zakura-testkit"))]
 use crate::zakura::ZakuraSupervisorHandle;
 use crate::zakura::{
@@ -48,6 +49,49 @@ mod stream_tests {
     use super::*;
 
     #[test]
+    fn get_headers_stops_at_the_live_reservation_cap() {
+        let (send, _recv) = crate::zakura::framed_channel(16);
+        let cancel = CancellationToken::new();
+        let reservations = new_response_reservations();
+        let session = PeerSession::from_parts_with_direction_and_reservations(
+            ZakuraPeerId::new(vec![7; 32]).expect("test peer ID has the required length"),
+            1,
+            ServicePeerDirection::Outbound,
+            send,
+            cancel.clone(),
+            cancel,
+            CloseCause::new(),
+            Some(reservations.clone()),
+        );
+        let codec = HeaderSyncCodec::new(zakura_chain::parameters::Network::Mainnet, 1024, 1, 0);
+        let scope = zakura_header_chain::HeaderWorkAuthority {
+            header_generation: zakura_header_chain::HeaderGeneration::new(1),
+            branch: zakura_header_chain::BranchId::new(block::Hash([0; 32]), block::Hash([1; 32])),
+        };
+        let locator = zakura_header_chain::HeaderLocator::for_continuation(
+            zakura_header_chain::Frontier::new(block::Height(1), block::Hash([1; 32])),
+        );
+        let send_get_headers = || {
+            session.try_send_get_headers(
+                &codec,
+                scope,
+                block::Hash([2; 32]),
+                &locator,
+                1,
+                AuxSchema::None,
+            )
+        };
+
+        // Unanswered requests keep their reservations, even after the reactor retires them.
+        for _ in 0..MAX_HS_LIVE_RESPONSE_RESERVATIONS {
+            send_get_headers().expect("the session has reservation room");
+        }
+        assert!(matches!(send_get_headers(), Err(OrderedSendError::Full)));
+        let live = reservations.lock().expect("not poisoned").len();
+        assert_eq!(live, MAX_HS_LIVE_RESPONSE_RESERVATIONS);
+    }
+
+    #[test]
     fn declares_only_capability_bit_five_at_stream_version_eight() {
         assert_eq!(ZAKURA_CAP_HEADER_SYNC, 1 << 5);
         assert_eq!(header_sync_streams().len(), 1);
@@ -79,15 +123,34 @@ struct PeerSessionInner {
     cancel_token: CancellationToken,
     connection_cancel_token: CancellationToken,
     close_cause: CloseCause,
-    commands: Option<mpsc::UnboundedSender<PeerCommand>>,
+    reservations: Option<ResponseReservations>,
     next_request_id: AtomicU64,
 }
 
+/// Most header-sync requests that may await a response from one session.
+///
+/// The reactor sends one request at a time per peer. A request it retires
+/// early keeps its reservation until the peer answers, so the extra room
+/// lets a slow honest peer finish a few retired requests.
+pub(super) const MAX_HS_LIVE_RESPONSE_RESERVATIONS: usize = 4;
+
+/// Live response reservations for one header-sync session, shared by the
+/// sender and the decode pipe.
+pub(super) type ResponseReservations =
+    Arc<StdMutex<Reservations<HeaderSyncRequestId, ExpectedHeadersResponse>>>;
+
+/// Create an empty reservation map for one session.
+pub(super) fn new_response_reservations() -> ResponseReservations {
+    Arc::new(StdMutex::new(Reservations::new(
+        MAX_HS_LIVE_RESPONSE_RESERVATIONS,
+    )))
+}
+
 impl PeerSession {
-    fn new_with_commands(
+    fn new_with_reservations(
         session: &PeerStreamSession,
         direction: ServicePeerDirection,
-        commands: mpsc::UnboundedSender<PeerCommand>,
+        reservations: ResponseReservations,
         session_id: u64,
         connection_cancel_token: CancellationToken,
         close_cause: CloseCause,
@@ -97,7 +160,7 @@ impl PeerSession {
             ZAKURA_HEADER_SYNC_STREAM_VERSION,
             "transport admits only the canonical header-sync stream version"
         );
-        Self::from_parts_with_direction_and_commands(
+        Self::from_parts_with_direction_and_reservations(
             session.peer_id().clone(),
             session_id,
             direction,
@@ -105,7 +168,7 @@ impl PeerSession {
             session.cancel_token(),
             connection_cancel_token,
             close_cause,
-            Some(commands),
+            Some(reservations),
         )
     }
 
@@ -125,7 +188,7 @@ impl PeerSession {
         send: FramedSend,
         cancel_token: CancellationToken,
     ) -> Self {
-        Self::from_parts_with_direction_and_commands(
+        Self::from_parts_with_direction_and_reservations(
             peer_id,
             session_id,
             ServicePeerDirection::Inbound,
@@ -146,7 +209,7 @@ impl PeerSession {
         connection_cancel_token: CancellationToken,
         close_cause: CloseCause,
     ) -> Self {
-        Self::from_parts_with_direction_and_commands(
+        Self::from_parts_with_direction_and_reservations(
             peer_id,
             session_id,
             ServicePeerDirection::Inbound,
@@ -165,7 +228,7 @@ impl PeerSession {
         send: FramedSend,
         cancel_token: CancellationToken,
     ) -> Self {
-        Self::from_parts_with_direction_and_commands(
+        Self::from_parts_with_direction_and_reservations(
             peer_id,
             0,
             direction,
@@ -178,7 +241,7 @@ impl PeerSession {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn from_parts_with_direction_and_commands(
+    fn from_parts_with_direction_and_reservations(
         peer_id: ZakuraPeerId,
         session_id: u64,
         direction: ServicePeerDirection,
@@ -186,7 +249,7 @@ impl PeerSession {
         cancel_token: CancellationToken,
         connection_cancel_token: CancellationToken,
         close_cause: CloseCause,
-        commands: Option<mpsc::UnboundedSender<PeerCommand>>,
+        reservations: Option<ResponseReservations>,
     ) -> Self {
         Self {
             peer_id,
@@ -197,7 +260,7 @@ impl PeerSession {
                 cancel_token,
                 connection_cancel_token,
                 close_cause,
-                commands,
+                reservations,
                 next_request_id: AtomicU64::new(1),
             }),
         }
@@ -295,10 +358,15 @@ impl PeerSession {
                 requested_tree_aux_schema: tree_aux_schema,
             },
         };
-        if let Some(commands) = &self.inner.commands {
-            commands
-                .send(PeerCommand::Reserve(expected))
-                .map_err(|_| OrderedSendError::Closed)?;
+        if let Some(reservations) = &self.inner.reservations {
+            let reserved = reservations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .reserve(request_id, MAX_HS_MESSAGE_BYTES, expected);
+            if reserved.is_err() {
+                metrics::counter!("sync.header.request.reservations_full").increment(1);
+                return Err(OrderedSendError::Full);
+            }
         }
         let result = match self.inner.send.try_send(frame) {
             Ok(()) => Ok(request_id),
@@ -306,17 +374,15 @@ impl PeerSession {
             Err(mpsc::error::TrySendError::Closed(_)) => Err(OrderedSendError::Closed),
         };
         if result.is_err() {
-            if let Some(commands) = &self.inner.commands {
-                let _ = commands.send(PeerCommand::Cancel(request_id));
+            // The frame was never queued, so no response can claim it.
+            if let Some(reservations) = &self.inner.reservations {
+                reservations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .retract(&request_id);
             }
         }
         result
-    }
-
-    pub(super) fn cancel_request(&self, request_id: HeaderSyncRequestId) {
-        if let Some(commands) = &self.inner.commands {
-            let _ = commands.send(PeerCommand::Cancel(request_id));
-        }
     }
 
     pub(super) fn try_send_headers(
@@ -349,12 +415,6 @@ impl PeerSession {
             Err(mpsc::error::TrySendError::Closed(_)) => Err(OrderedSendError::Closed),
         }
     }
-}
-
-#[derive(Debug)]
-pub(super) enum PeerCommand {
-    Reserve(ExpectedHeadersResponse),
-    Cancel(HeaderSyncRequestId),
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -611,11 +671,11 @@ impl Service for HeaderSyncService {
         let connection_cancel_token = peer.cancel_token();
         let close_cause = peer.close_cause();
         let conn_id = peer.conn_id;
-        let (commands_tx, commands_rx) = mpsc::unbounded_channel();
-        let header_sync_session = PeerSession::new_with_commands(
+        let reservations = new_response_reservations();
+        let header_sync_session = PeerSession::new_with_reservations(
             &session,
             peer.direction,
-            commands_tx,
+            reservations.clone(),
             session_id,
             connection_cancel_token.clone(),
             close_cause.clone(),
@@ -667,7 +727,7 @@ impl Service for HeaderSyncService {
                     pipe_peer,
                     session_id,
                     peer.direction,
-                    commands_rx,
+                    reservations,
                     recv,
                     pipe_cancel,
                 )

@@ -83,7 +83,7 @@ NODE_EXECUTABLE=/usr/local/bin/zakurad
 SESSION_SECONDS=86400
 ```
 
-Then start `zakura-profile-sampler.service`. The sampler verifies `/proc/PID/exe`, process start ticks, and the fresh recorder run before capture. A node restart requires a refreshed PID and a new sampler invocation. No PID-name matching is used. Capabilities are restricted to the sampler unit. An unsupported kernel or denied perf access stops sampling and leaves timelines available.
+Then start `zakura-profile-sampler.service`. The sampler verifies `/proc/PID/exe`, process start ticks, and the fresh recorder run before capture. A node restart requires a refreshed PID and a new sampler invocation. No PID-name matching is used. Capabilities are restricted to the sampler unit. An unsupported kernel or denied perf access stops sampling and leaves timelines available. Decoding keeps symbolized stack frames without expanding compiler-inlined calls, which avoids unbounded `addr2line` memory use.
 
 All profiler services share a one-core CPU cap and a 1 GiB memory cap through `zakura-profile.slice`. The collector and viewer each have a 512 MiB cap. Kernel sample buffers and node recorder memory are additional and must be measured in the canary. Each HTTP query uses a read-only connection with a four-second SQLite work deadline and at most two concurrent readers.
 

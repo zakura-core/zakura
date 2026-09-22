@@ -145,7 +145,8 @@ def capture(args, stopping):
             raise RuntimeError(f"perf capture failed ({code}). See private sampler stderr; no kernel settings were changed")
         decoded = raw / f"{key}.txt"
         with decoded.open("wb") as out, stderr.open("ab") as errors:
-            subprocess.run(["perf", "script", "--ns", "--show-lost-events", "-F", "pid,tid,time,event,ip,sym,dso", "-i", str(output)], stdout=out, stderr=errors, timeout=45, preexec_fn=limits, check=True)
+            # Expanding inlined frames starts addr2line, exceeding the sampler memory cap.
+            subprocess.run(["perf", "script", "--no-inline", "--ns", "--show-lost-events", "-F", "pid,tid,time,event,ip,sym,dso", "-i", str(output)], stdout=out, stderr=errors, timeout=45, preexec_fn=limits, check=True)
         with decoded.open(errors="replace") as lines:
             samples, errors, truncated = parse_perf(lines, args.pid, start, end)
         # Stack order is leaf to root. Keep this explicit for flamegraph construction.
